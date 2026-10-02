@@ -154,6 +154,7 @@ impl SessionMemory {
         sid: &str,
         prompt: &str,
         answer: &str,
+        prompt_origin: Origin,
     ) -> agent24_memory::Result<()> {
         self.check_owner()?;
         let deadline = tokio::time::Instant::now() + super::MEMORY_WRITE_BUDGET;
@@ -180,30 +181,31 @@ impl SessionMemory {
         // the next writer cannot allocate a turn number until the transaction
         // has a confirmed outcome.
         let log = self.log.clone();
+        let kv = self.kv.clone();
         let owner = self.owner.clone();
         let sid_owned = sid.to_owned();
         let prompt_owned = prompt.to_owned();
+        let retain_prompt = prompt_owned.clone();
         let answer_owned = answer.to_owned();
+        let user_origin = prompt_origin.clone();
         #[cfg(test)]
         let commit_probe = self.commit_probe.clone();
         let mut append_task = tokio::spawn(async move {
-            let append_result = async {
-                log.append_turn(
+            let append_result = log
+                .append_turn(
                     &owner,
                     &sid_owned,
                     turn_no,
                     &Msg::user(prompt_owned),
-                    Origin {
-                        source: "agent_loop".into(),
-                        trust: Trust::UserSaid,
-                    },
+                    prompt_origin,
                     &Msg::assistant(Some(answer_owned), vec![]),
                     Origin {
                         source: "agent_loop".into(),
                         trust: Trust::Model,
                     },
                 )
-                .await?;
+                .await;
+            let retain_result = if let Ok(ids) = &append_result {
                 #[cfg(test)]
                 if let Some(probe) = &commit_probe
                     && probe.armed.swap(false, Ordering::AcqRel)
@@ -211,15 +213,23 @@ impl SessionMemory {
                     probe.committed.notify_one();
                     probe.release.notified().await;
                 }
-                Ok::<_, MemoryError>(())
-            }
-            .await;
+                if let Some(object) = super::retain::explicit_remember(&retain_prompt) {
+                    super::retain::persist(&kv, &owner, object, ids.user.clone(), user_origin).await
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
             if let Err(err) = &append_result {
                 // This task can finish after remember() was cancelled, in which
                 // case no caller remains to report the append failure.
-                tracing::error!(session_id = %sid_owned, error = %err, "session memory append failed");
+                tracing::error!(session_id = %sid_owned, error = %err, "session memory write failed");
             }
-            (append_result, guard)
+            if let Err(err) = &retain_result {
+                tracing::error!(session_id = %sid_owned, error = %err, "session memory retain failed");
+            }
+            (append_result, retain_result, guard)
         });
         let joined = match tokio::time::timeout_at(deadline, &mut append_task).await {
             Ok(result) => result,
@@ -234,7 +244,7 @@ impl SessionMemory {
                 append_task.await
             }
         };
-        let (append_result, guard) = joined
+        let (append_result, retain_result, guard) = joined
             .map_err(|err| MemoryError::Io(format!("session memory append task failed: {err}")))?;
         append_result?;
         // append_turn is the durable boundary. Any compaction error or timeout
@@ -242,7 +252,7 @@ impl SessionMemory {
         // If confirmation consumed the budget, do not start database work only
         // to cancel its connection acquisition immediately.
         if tokio::time::Instant::now() >= deadline {
-            return Ok(());
+            return retain_result;
         }
         match tokio::time::timeout_at(deadline, self.compact(sid)).await {
             Ok(Ok(())) => {}
@@ -252,7 +262,7 @@ impl SessionMemory {
             Err(_) => tracing::error!("session {sid} compaction timed out; originals retained"),
         }
         drop(guard);
-        Ok(())
+        retain_result
     }
 
     async fn count_user_messages(&self, sid: &str) -> agent24_memory::Result<usize> {

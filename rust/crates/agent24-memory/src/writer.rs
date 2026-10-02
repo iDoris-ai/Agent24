@@ -36,13 +36,14 @@
 //! sits after it) and BULK ROLLBACK (a follow-up). Documented boundaries, not
 //! silent omissions.
 
+use agent24_core::util::now_iso8601;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::Result;
 use crate::artifact::checksum;
 use crate::assertion::{Assertion, AssertionId, AssertionLedger, Modality};
 use crate::event::{EventLog, MemEvent, Origin, Scope, Trust};
+use crate::{MemoryError, Result};
 
 /// A proposed assertion, before the gate decides. Its trust-bearing fields are
 /// PRIVATE: construct via [`Candidate::new`] (which requires an [`Origin`]) and
@@ -123,7 +124,10 @@ enum Outcome {
 pub trait MemoryWriter: Send + Sync {
     /// Decide + persist + audit each candidate, in order. Commit/Hold write the
     /// assertion and its audit event ATOMICALLY; Reject audits only. Returns one
-    /// [`WriteDecision`] per candidate.
+    /// [`WriteDecision`] per candidate. Explicit `UserSaid` remembers may reuse
+    /// an identical current qualified assertion with non-empty evidence and its
+    /// matching commit audit; retries preserve both. Other ID collisions remain
+    /// errors.
     async fn propose(&self, candidates: Vec<Candidate>) -> Result<Vec<WriteDecision>>;
     /// Decide WITHOUT any side effects: no persistence, no audit.
     async fn dry_run(&self, candidates: &[Candidate]) -> Result<Vec<WriteDecision>>;
@@ -225,6 +229,95 @@ impl WriteGate {
         let assertion = Self::to_assertion(c, qualified);
         let audit = Self::audit_event(c, verdict, None);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // Explicit user remembers reuse a deterministic id. Treat that as
+        // idempotent only while the exact qualified assertion is still current.
+        // Do this under the write lock so a concurrent withdrawal cannot race
+        // the check; every other primary-key collision remains an error.
+        if verdict == "commit" && c.origin.trust == Trust::UserSaid && c.explicit_remember {
+            let existing = sqlx::query(
+                "SELECT scope_owner, scope, subject, predicate, object, qualified,
+                        valid_from, valid_to, recorded_from, recorded_to, evidence
+                 FROM mem_assertions WHERE id = ?",
+            )
+            .bind(&c.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some(row) = existing {
+                use sqlx::Row;
+                let now = now_iso8601();
+                let expected_scope = serde_json::to_string(&c.scope)?;
+                let expected_object = serde_json::to_string(&c.object)?;
+                let matching = row.get::<String, _>("scope_owner") == c.scope.owner
+                    && row.get::<String, _>("scope") == expected_scope
+                    && row.get::<String, _>("subject") == c.subject
+                    && row.get::<String, _>("predicate") == c.predicate
+                    && row.get::<String, _>("object") == expected_object
+                    && row.get::<i64, _>("qualified") == 1
+                    && row.get::<String, _>("valid_from") <= now
+                    && row
+                        .get::<Option<String>, _>("valid_to")
+                        .is_none_or(|end| now < end)
+                    && row.get::<String, _>("recorded_from") <= now
+                    && row.get::<Option<String>, _>("recorded_to").is_none();
+                if matching {
+                    let evidence_json = row.get::<String, _>("evidence");
+                    if let Some(evidence) = serde_json::from_str::<Vec<String>>(&evidence_json)
+                        .ok()
+                        .filter(|evidence| !evidence.is_empty())
+                    {
+                        // The audit id is addressed by the original assertion
+                        // content, including its original evidence. Validate the
+                        // immutable event instead of appending a retry's evidence.
+                        let mut original = c.clone();
+                        original.evidence = evidence;
+                        let expected_audit = Self::audit_event(&original, "commit", None);
+                        let audit_row = sqlx::query(
+                            "SELECT scope_owner, scope, kind, payload, origin_source, origin_trust
+                             FROM mem_events WHERE id = ?",
+                        )
+                        .bind(&expected_audit.id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+
+                        if let Some(audit_row) = audit_row {
+                            let body = serde_json::from_str::<Value>(
+                                &audit_row.get::<String, _>("payload"),
+                            )
+                            .ok();
+                            let body_matches = body.is_some_and(|body| {
+                                if body == expected_audit.body {
+                                    return true;
+                                }
+                                let mut system_body = expected_audit.body.clone();
+                                system_body["trust"] = serde_json::json!("System");
+                                [false, true].into_iter().any(|remember| {
+                                    system_body["explicit_remember"] = serde_json::json!(remember);
+                                    body == system_body
+                                })
+                            });
+                            let audit_matches = audit_row.get::<String, _>("scope_owner")
+                                == c.scope.owner
+                                && audit_row.get::<String, _>("scope") == expected_scope
+                                && audit_row.get::<String, _>("kind") == "mem.write_decision"
+                                && audit_row.get::<String, _>("origin_source") == "write_gate"
+                                && audit_row.get::<String, _>("origin_trust") == "system"
+                                && body_matches;
+                            if audit_matches {
+                                tx.commit().await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                return Err(MemoryError::Conflict(format!(
+                    "assertion id {:?} already exists without matching current content, evidence, or commit audit",
+                    c.id
+                )));
+            }
+        }
+
         AssertionLedger::insert_tx(&mut tx, &assertion).await?;
         EventLog::append_tx(&mut tx, &audit).await?;
         tx.commit().await?;
