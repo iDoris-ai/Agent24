@@ -59,15 +59,22 @@ export async function rebuildOpenDesignNativeModules() {
     npm_config_build_from_source: 'true',
   }
 
-  const npmExecutable = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  await run(npmExecutable, ['rebuild', 'better-sqlite3'], { cwd: stagedAppRoot, env: rebuildEnv })
+  if (process.platform === 'win32') {
+    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', 'rebuild', 'better-sqlite3'], {
+      cwd: stagedAppRoot,
+      env: rebuildEnv,
+    })
+  } else {
+    await run('npm', ['rebuild', 'better-sqlite3'], { cwd: stagedAppRoot, env: rebuildEnv })
+  }
 
   const probe = [
     "const Database = require('better-sqlite3')",
     "const db = new Database(':memory:')",
     'db.close()',
   ].join('; ')
-  if (executable != null) {
+  const canProbeHostRuntime = platform === process.platform && arch === process.arch
+  if (executable != null && canProbeHostRuntime) {
     await run(executable, ['-e', probe], {
       cwd: stagedAppRoot,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
@@ -76,7 +83,7 @@ export async function rebuildOpenDesignNativeModules() {
 
   process.stdout.write(
     `Rebuilt Open Design native modules for Electron ${version} (${platform}-${arch}); ` +
-      `runtime probe ${executable == null ? 'deferred to packaged validation' : 'passed'}\n`,
+      `runtime probe ${executable == null || !canProbeHostRuntime ? 'deferred to packaged validation' : 'passed'}\n`,
   )
 }
 
