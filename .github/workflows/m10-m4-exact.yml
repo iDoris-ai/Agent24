@@ -8,7 +8,7 @@ permissions:
 
 env:
   AGENT24_CANDIDATE_SHA: 2f245fa8138da70d832d31c4943a37cdbe68237b
-  OPEN_DESIGN_SHA: fb20aa2bb85d284a8f743c6f67fa94336923f190
+  OPEN_DESIGN_SHA: 327de2887fcd8d6f71a3598e921c0f12521d37d7
 
 jobs:
   acp-two-turn:
@@ -140,6 +140,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          NATIVE_HOME="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
           export HOME="$RUNNER_TEMP/agent24-m4-home"
           mkdir -p "$HOME"
 
@@ -160,7 +161,7 @@ jobs:
             echo "--- Agent24 packaged log (Creative failure) ---" >&2
             cat "$RUNNER_TEMP/agent24-m4-app.log" >&2 || true
             echo "--- Open Design daemon log (Creative failure) ---" >&2
-            cat "$HOME/Library/Application Support/@agent24/desktop/creative/open-design/logs/daemon/latest.log" >&2 || true
+            cat "$NATIVE_HOME/Library/Application Support/@agent24/desktop/creative/open-design/logs/daemon/latest.log" >&2 || true
             exit 1
           fi
 
