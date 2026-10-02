@@ -720,10 +720,18 @@ pub(crate) mod tests {
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        match TEST_LOCK.get_or_init(|| Mutex::new(())).lock() {
+        let guard = match TEST_LOCK.get_or_init(|| Mutex::new(())).lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
-        }
+        };
+        // Dropping an owned generation can hand its final reap to the
+        // long-lived worker. Serializing tests prevents overlapping owners,
+        // but the previous test may release this mutex before that async reap
+        // has released the global generation permit. Start every serialized
+        // fixture from an idle owner boundary so one delayed macOS reap cannot
+        // cascade into unrelated WouldBlock failures.
+        wait_for_reaper_idle();
+        guard
     }
 
     pub(crate) fn wait_for_reaper_idle() {
