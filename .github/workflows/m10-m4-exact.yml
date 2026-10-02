@@ -87,7 +87,7 @@ jobs:
           (
             cd open-design
             pnpm install --frozen-lockfile
-            pnpm --filter @open-design/tools-pack dev -- mac build --to app --portable --namespace agent24-m10-m4 --dir "$RUNNER_TEMP/open-design-pack" --json > "$RUNNER_TEMP/open-design-pack.json"
+            pnpm --silent --filter @open-design/tools-pack dev -- mac build --to app --portable --namespace agent24-m10-m4 --dir "$RUNNER_TEMP/open-design-pack" --json > "$RUNNER_TEMP/open-design-pack.json"
           )
           cat "$RUNNER_TEMP/open-design-pack.json"
           APP_PATH="$(jq -r '.appPath' "$RUNNER_TEMP/open-design-pack.json")"
