@@ -292,6 +292,191 @@ fn recalled_context_survives_approval_wait_and_daemon_restart() {
     assert!(resumed[3].content.as_deref().unwrap().contains("resume-ok"));
 }
 
+#[test]
+fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let received = Arc::new(StdMutex::new(Vec::new()));
+    let run_id = {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let kv = KvStore::open(&path.join("memory.db")).await.unwrap();
+            let org = OrgId::from_store(kv.ensure_org_for_user(LOCAL_USER).await.unwrap());
+            let personal = partition_key(&org, &SpaceId::personal(LOCAL_USER));
+            add_fact(&kv, &personal, "recall-fail-closed", "我对花生过敏").await;
+            let provider = Arc::new(ApprovalProvider {
+                response: Msg::assistant(Some("answer".into()), vec![]),
+                received: Arc::clone(&received),
+            });
+            let state = approval_app(kv.clone(), &path, provider, None).await;
+            sqlx::query(
+                "CREATE TRIGGER reject_recall_snapshot BEFORE INSERT ON run_messages \
+                 WHEN NEW.role = 'system' AND NEW.content LIKE '你记得关于用户的这些事：%' \
+                 BEGIN SELECT RAISE(FAIL, 'injected recall snapshot write failure'); END",
+            )
+            .execute(agent24_store::test_hooks::pool(&state.store))
+            .await
+            .unwrap();
+
+            // Control: the trigger leaves ordinary message inserts untouched.
+            let control = state
+                .runs
+                .start_run(RunCreate {
+                    session_id: None,
+                    prompt: "ordinary control".into(),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let row = state.store.get_run(&control.id).await.unwrap().unwrap();
+                    if row.status == RunStatus::Completed {
+                        break;
+                    }
+                    assert_ne!(row.status, RunStatus::Failed);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("ordinary run should complete");
+            let control_messages = state.store.list_run_messages(&control.id).await.unwrap();
+            assert!(
+                control_messages
+                    .iter()
+                    .any(|message| message.role == "user")
+            );
+            assert!(
+                control_messages
+                    .iter()
+                    .any(|message| message.role == "assistant")
+            );
+
+            let pool = agent24_store::test_hooks::pool(&state.store).clone();
+            drop(state);
+            pool.close().await;
+            let provider = Arc::new(ApprovalProvider {
+                response: Msg::assistant(
+                    None,
+                    vec![ToolCallRequest {
+                        id: "blocked-call".into(),
+                        name: "shell_exec".into(),
+                        arguments: json!({"argv": ["/bin/echo", "must-not-run"]}).to_string(),
+                    }],
+                ),
+                received: Arc::clone(&received),
+            });
+            let state = approval_app(kv, &path, provider, None).await;
+
+            let mut events = state.events.subscribe();
+            let run = state
+                .runs
+                .start_run(RunCreate {
+                    session_id: Some(RECALL_SESSION.into()),
+                    prompt: "我对什么过敏？".into(),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                })
+                .await
+                .unwrap();
+            let failed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let row = state.store.get_run(&run.id).await.unwrap().unwrap();
+                    if matches!(
+                        row.status,
+                        RunStatus::Failed | RunStatus::AwaitingApproval | RunStatus::Completed
+                    ) {
+                        break row;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("snapshot persistence failure should fail the run");
+            assert_eq!(failed.status, RunStatus::Failed);
+            assert_eq!(
+                failed.error.as_ref().map(|error| error.code.as_str()),
+                Some("memory_snapshot_persist_failed")
+            );
+            assert!(
+                failed
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("injected recall snapshot write failure")
+            );
+            assert_eq!(
+                received.lock().unwrap().len(),
+                1,
+                "only control reaches model"
+            );
+            assert!(
+                state
+                    .store
+                    .list_approvals(Some(ApprovalStatus::Pending))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                .map(|(_, body)| serde_json::to_value(body).unwrap())
+                .collect();
+            assert!(!emitted.iter().any(|body| body["type"] == "memory.recalled"));
+            let thread = state.store.list_run_messages(&run.id).await.unwrap();
+            assert!(thread.is_empty(), "failed snapshot must leave no messages");
+            run.id
+        })
+    };
+
+    // Destroy the first runtime and reopen the database as a fresh daemon.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let kv = KvStore::open(&path.join("memory.db")).await.unwrap();
+        let provider = Arc::new(ApprovalProvider {
+            response: Msg::assistant(Some("must not resume".into()), vec![]),
+            received: Arc::clone(&received),
+        });
+        let state = approval_app(kv, &path, provider, Some(0)).await;
+        assert_eq!(state.runs.restore_pending_approvals().await, (0, 0));
+        let row = state.store.get_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(
+            row.error.as_ref().map(|error| error.code.as_str()),
+            Some("memory_snapshot_persist_failed")
+        );
+        assert!(
+            state
+                .store
+                .list_approvals(Some(ApprovalStatus::Pending))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "restart must not call model"
+        );
+        state
+            .runs
+            .resume_run(run_id.clone(), "nonexistent-approval".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.store.get_run(&run_id).await.unwrap().unwrap().status,
+            RunStatus::Failed
+        );
+    });
+}
+
 #[tokio::test]
 async fn recall_budget_zero_one_item_and_default_top_five_match_audit_ids() {
     for mode in 0..3 {
