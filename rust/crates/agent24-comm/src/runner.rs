@@ -252,6 +252,27 @@ impl HyphaeRunner {
         &self.keystore_lock
     }
 
+    /// A new runner over the *same verified binary* (no re-verification,
+    /// no re-copy) but a different `home` — and therefore a different
+    /// `HOME`/cwd for every command it runs. COMM-2b's `import` flow
+    /// (`crate::import`) uses this to run `identity list` / `contact list` /
+    /// `storage outbox list` / `history inbox` against the staging HOME
+    /// before committing, and `identity create --nickname __verify` against
+    /// a one-off verify HOME (COMM-HYPHAE.md §4.1 steps 4–5) — all without
+    /// ever pointing the *real* runner (the one callers hold a shared
+    /// `Arc<HyphaeRunner>` to) at anything but the real home. The returned
+    /// runner gets its own, independent `KeystoreWriteLock`: it is only ever
+    /// used against a throwaway staging/verify HOME that nothing else can
+    /// reach, so there is no writer to serialize against.
+    pub(crate) fn with_home(&self, home: PathBuf) -> Self {
+        Self {
+            bin: self.bin.clone(),
+            home,
+            default_timeout: self.default_timeout,
+            keystore_lock: KeystoreWriteLock::default(),
+        }
+    }
+
     /// The verified Hyphae binary's path. COMM-4a's daemon supervisor
     /// spawns a long-running `hyphae daemon` child itself (not via
     /// [`Self::run`], which is built around a single invocation whose
