@@ -890,7 +890,20 @@ pub(crate) mod tests {
         let mut generation = sleeping_generation();
         assert!(generation.terminate().is_ok());
         assert!(generation.terminate().is_ok());
-        assert!(generation.force_kill().is_ok());
+        let force_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match generation.force_kill() {
+                Ok(()) => break,
+                Err(error)
+                    if cfg!(target_os = "macos")
+                        && error.kind() == io::ErrorKind::WouldBlock
+                        && Instant::now() < force_deadline =>
+                {
+                    thread::sleep(EXIT_POLL);
+                }
+                Err(error) => panic!("force kill was not accepted: {error}"),
+            }
+        }
         assert!(generation.force_kill().is_ok());
         // A force-kill request is terminal for signalling; terminate must not
         // regress it or send SIGTERM after SIGKILL.
