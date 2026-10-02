@@ -64,15 +64,22 @@ As of 2026-10-02:
 | --- | --- | --- |
 | Locked stable `main` | frozen for M10 handoff | tag `stable/main-2026-10-02` -> `9ed354963fd3a48e99b7de7cb853503658fc5906` |
 | Locked `main` -> integration | merged | `ef9d7886772344be3ee3ba6173208977900461b2`; first parent `fa8ab8b448a0def0ad5e59052b30dd3d7c5d45e8`, second parent exact locked `main` |
+| Final integration candidate | frozen for final validation | `79179dfb906f8813d9b038dfe5b276fc9594e802`; normal merge of #657 on top of #658/#656 and the locked-main refresh |
 | COMM timeout evidence flake | fixed | deterministic test-only barrier reviewed at `d5387f1fe525963d5df165b33207486075a9872b`, merged through `d2dd2215d35bc4de5cbbe7ef1ff84058d6b6117b` |
 | Rust 1.99 capability-token lint | fixed | `90e19a8313f860c5b9d8402f7530dd015197322e` |
 | Darwin sidecar pending-force coverage | fixed | integration carries the reviewed bounded retry/coverage through `fa8ab8b448a0def0ad5e59052b30dd3d7c5d45e8` |
 | macOS sidecar cross-test owner flake | fixed | #658 -> `d8ecbf9b123a5e1bdc40ad09cdba81271e1172cf`; test-only idle-boundary fix, three-platform sidecar CI green |
 | Linux Creative release resources | fixed | #656 -> `e30758752c2e2c2946d2c9827f3bf6160f4235b0`; exact reviewed Open Design resources are built/staged fail-closed before desktop packaging |
 | Open Design fork pin | frozen for M10 validation | `327de2887fcd8d6f71a3598e921c0f12521d37d7`, version contract `0.22.2` |
-| Native Creative ABI alignment | final validation in progress | #657; rebuilds the pinned `better-sqlite3` source for Agent24 Electron and probes the staged runtime before packaging |
-| M4 ACP two-turn | green on current validation lineage | real daemon + ACP `initialize` / `session/new` / two `session/prompt` runs in the same session; rerun on the final integration SHA before handoff |
-| M4 packaged Creative | final validation in progress | exact Agent24 + exact Open Design package/CDP path; must render the real Creative surface before M10 closeout |
+| Native Creative ABI alignment | fixed; final candidate contains it | #657 merge `79179dfb906f8813d9b038dfe5b276fc9594e802`, feature head `439442b42204cc8d09698b4b89c8e0f92f1ee209`; rebuilds exact pinned `better-sqlite3` source for Agent24 Electron in an isolated temporary copy and probes the staged runtime before packaging |
+| M4 ACP two-turn | green on final integration SHA | run `37028448533`, job `Real daemon + ACP two-turn`, pins `79179dfb906f8813d9b038dfe5b276fc9594e802`; real daemon + ACP `initialize` / `session/new` / two `session/prompt` runs in one session passed |
+| M4 packaged Creative | green on final integration SHA | run `37028448533`, job `Exact Open Design package + Agent24 Creative`, pins Agent24 `79179dfb906f8813d9b038dfe5b276fc9594e802` + Open Design `327de2887fcd8d6f71a3598e921c0f12521d37d7`; Electron 34.5.8 native runtime probe passed, `creativeShow` returned a ready origin, `/api/ready` reported Open Design `0.22.2`, document state was `complete`, and packaged Agent24 daemon health reported Rust backend `0.5.1` |
+| Final CI | green | run `37028371570` on `79179dfb906f8813d9b038dfe5b276fc9594e802`: TypeScript tests/typecheck, contract/codegen drift, Rust Linux and macOS fmt/clippy/test passed |
+| Sidecar cross-platform | green | run `37028371232` on `79179dfb906f8813d9b038dfe5b276fc9594e802` passed |
+| Workspace-root authority | green | run `37028370911` on `79179dfb906f8813d9b038dfe5b276fc9594e802` passed |
+| Hyphae lock reproduction | green | run `37028569552` on `79179dfb906f8813d9b038dfe5b276fc9594e802` reproduced and matched the locked artifact |
+| Release dry-run | green | run `37028564943` on `79179dfb906f8813d9b038dfe5b276fc9594e802` passed all four macOS/Linux architecture build, package, daemon-health, archive and artifact checks |
+| Linux desktop release package | green | run `37028371170` on `79179dfb906f8813d9b038dfe5b276fc9594e802` built exact Open Design resources, staged them fail-closed, rebuilt the native module for Agent24 Electron, produced AppImage + deb, verified Creative resources inside both artifacts, booted the AppImage to `/health` 200, and verified the deb contains `agent24d` |
 
 Historical #651/#565 conveyor states are superseded by the final validated
 integration-candidate procedure selected for M10. #651 remains a reviewed
@@ -104,7 +111,14 @@ merged:
 This exact stable point, rather than a later moving `origin/main`, is the M10
 handoff base unless the main operator explicitly reports that main has moved
 and requests another integration refresh. The locked SHA remains an ancestor of
-the current integration branch after the subsequent M10 fixes.
+the final integration candidate
+`79179dfb906f8813d9b038dfe5b276fc9594e802` after the subsequent M10 fixes.
+
+A final throwaway merge rehearsal was also run from detached locked main
+`9ed354963fd3a48e99b7de7cb853503658fc5906` using `git merge --no-ff
+--no-commit 79179dfb906f8813d9b038dfe5b276fc9594e802`. Git reported an automatic,
+conflict-free merge. The rehearsal was immediately aborted and the temporary
+worktree removed; it did not move or mutate the protected `main` branch.
 
 The earlier rehearsal against `main@fb511e4b92af9b2941f55fedd427b3203263a1a6`
 did expose the two expected add/add conflicts in
@@ -530,4 +544,10 @@ M10 can be closed only after a final current-main validation records:
   blockers for signed/distributable artifacts;
 - no unresolved release-blocking CI/review finding.
 
-Only then mark the Open Design integration roadmap's M10 milestone complete.
+The integration-side candidate `79179dfb906f8813d9b038dfe5b276fc9594e802`
+has satisfied the pre-landing gates above and its locked-main merge rehearsal is
+conflict-free. It is therefore ready for the main-repository/operator handoff.
+This does **not** by itself close the roadmap milestone: the operator-selected
+boundary still requires the protected-main landing from the locked base and the
+post-merge validation described in §3.2. Only after those main-side steps pass
+should the Open Design integration roadmap's M10 milestone be marked complete.
