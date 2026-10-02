@@ -126,6 +126,7 @@ jobs:
             pnpm --filter @agent24/node-daemon build
             pnpm --filter @agent24/desktop build
             pnpm --filter @agent24/desktop stage:open-design
+            pnpm --filter @agent24/desktop rebuild:open-design-native
             pnpm --filter @agent24/desktop exec electron-builder --mac dir
           )
 
