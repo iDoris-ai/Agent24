@@ -5,6 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
+const OPEN_DESIGN_SHA = '327de2887fcd8d6f71a3598e921c0f12521d37d7'
+const BETTER_SQLITE3_VERSION = '12.10.0'
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const desktopRoot = path.resolve(scriptDir, '..')
 const stagedAppRoot = path.join(desktopRoot, '.open-design-resources', 'app')
@@ -39,6 +41,37 @@ async function run(command, args, options = {}) {
   })
 }
 
+async function resolveNativeSource() {
+  const sourceRootValue = process.env.A24_OPEN_DESIGN_SOURCE_DIR?.trim()
+  if (!sourceRootValue || !path.isAbsolute(sourceRootValue)) {
+    throw new Error('A24_OPEN_DESIGN_SOURCE_DIR must be an absolute exact Open Design checkout path')
+  }
+  const sourceRoot = fs.realpathSync(sourceRootValue)
+  const { stdout: sourceSha } = await run('git', ['rev-parse', 'HEAD'], { cwd: sourceRoot })
+  if (sourceSha.trim() !== OPEN_DESIGN_SHA) {
+    throw new Error(`Open Design native source must be exact ${OPEN_DESIGN_SHA}`)
+  }
+
+  const pnpmRoot = path.join(sourceRoot, 'node_modules', '.pnpm')
+  const packageRoot = path.join(
+    pnpmRoot,
+    `better-sqlite3@${BETTER_SQLITE3_VERSION}`,
+    'node_modules',
+    'better-sqlite3',
+  )
+  const packagePath = path.join(packageRoot, 'package.json')
+  requireFile(packagePath, 'Open Design source better-sqlite3 manifest')
+  requireFile(path.join(packageRoot, 'binding.gyp'), 'Open Design source better-sqlite3 binding.gyp')
+  const manifest = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
+  if (manifest.name !== 'better-sqlite3' || manifest.version !== BETTER_SQLITE3_VERSION) {
+    throw new Error('Open Design source better-sqlite3 identity changed')
+  }
+  if (manifest.scripts?.['build-release'] !== 'node-gyp rebuild --release') {
+    throw new Error('Open Design source better-sqlite3 build-release contract changed')
+  }
+  return packageRoot
+}
+
 export async function rebuildOpenDesignNativeModules() {
   const packagePath = path.join(stagedAppRoot, 'package.json')
   const sqliteManifest = path.join(stagedAppRoot, 'node_modules', 'better-sqlite3', 'package.json')
@@ -46,17 +79,10 @@ export async function rebuildOpenDesignNativeModules() {
   requireFile(sqliteManifest, 'staged Open Design better-sqlite3 manifest')
   const sqliteRoot = path.dirname(sqliteManifest)
   const sqlitePackage = JSON.parse(fs.readFileSync(sqliteManifest, 'utf8'))
-  if (sqlitePackage.name !== 'better-sqlite3') {
+  if (sqlitePackage.name !== 'better-sqlite3' || sqlitePackage.version !== BETTER_SQLITE3_VERSION) {
     throw new Error('staged Open Design better-sqlite3 package identity changed')
   }
-  const buildRelease = sqlitePackage.scripts?.['build-release']
-  const hasPackagedScripts = sqlitePackage.scripts != null
-  if (hasPackagedScripts && buildRelease !== 'node-gyp rebuild --release') {
-    throw new Error('staged Open Design better-sqlite3 build-release contract changed')
-  }
-  if (!hasPackagedScripts) {
-    requireFile(path.join(sqliteRoot, 'binding.gyp'), 'staged Open Design better-sqlite3 binding.gyp')
-  }
+  const nativeSource = await resolveNativeSource()
 
   const { executable, version } = resolveElectronRuntime()
   const arch = process.env.A24_ELECTRON_ARCH?.trim() || process.arch
@@ -72,12 +98,20 @@ export async function rebuildOpenDesignNativeModules() {
     npm_config_build_from_source: 'true',
   }
 
-  const npmArgs = hasPackagedScripts ? ['run', 'build-release'] : ['rebuild', '--foreground-scripts']
   if (process.platform === 'win32') {
-    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', ...npmArgs], { cwd: sqliteRoot, env: rebuildEnv })
+    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', 'run', 'build-release'], {
+      cwd: nativeSource,
+      env: rebuildEnv,
+    })
   } else {
-    await run('npm', npmArgs, { cwd: sqliteRoot, env: rebuildEnv })
+    await run('npm', ['run', 'build-release'], { cwd: nativeSource, env: rebuildEnv })
   }
+
+  const builtModule = path.join(nativeSource, 'build', 'Release', 'better_sqlite3.node')
+  requireFile(builtModule, 'rebuilt Open Design better-sqlite3 native module')
+  const stagedModule = path.join(sqliteRoot, 'build', 'Release', 'better_sqlite3.node')
+  fs.mkdirSync(path.dirname(stagedModule), { recursive: true })
+  fs.copyFileSync(builtModule, stagedModule)
 
   const probe = [
     "const Database = require('better-sqlite3')",
