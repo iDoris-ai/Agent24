@@ -189,6 +189,55 @@ pub async fn import(
     result
 }
 
+#[cfg(test)]
+mod copy_test_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use tokio::sync::Notify;
+
+    struct Barrier {
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    fn barriers() -> &'static Mutex<HashMap<(PathBuf, u8), Barrier>> {
+        static BARRIERS: OnceLock<Mutex<HashMap<(PathBuf, u8), Barrier>>> = OnceLock::new();
+        BARRIERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn locked_barriers() -> MutexGuard<'static, HashMap<(PathBuf, u8), Barrier>> {
+        match barriers().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(super) fn install(source: &Path, attempt: u8) -> (Arc<Notify>, Arc<Notify>) {
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let previous = locked_barriers().insert(
+            (source.to_path_buf(), attempt),
+            Barrier {
+                reached: Arc::clone(&reached),
+                resume: Arc::clone(&resume),
+            },
+        );
+        assert!(previous.is_none(), "duplicate import copy barrier");
+        (reached, resume)
+    }
+
+    pub(super) async fn pause_after_copy(source: &Path, attempt: u8) {
+        let barrier = locked_barriers().remove(&(source.to_path_buf(), attempt));
+        let Some(barrier) = barrier else {
+            return;
+        };
+        barrier.reached.notify_one();
+        barrier.resume.notified().await;
+    }
+}
+
 async fn run_import(
     runner: &HyphaeRunner,
     password_store: &dyn PasswordStore,
@@ -235,6 +284,8 @@ async fn run_import(
     let staging_hyphae = staging_home.join(".hyphae");
     let mut before = fingerprint_all(&source_hyphae).await?;
     let mut db_files = copy_import_files(&source_hyphae, &staging_hyphae).await?;
+    #[cfg(test)]
+    copy_test_hook::pause_after_copy(&source_hyphae, 1).await;
     let mut after = fingerprint_all(&source_hyphae).await?;
     if after != before {
         before = after;
@@ -246,6 +297,8 @@ async fn run_import(
         // 从零重建。
         let _ = tokio::fs::remove_dir_all(staging_home).await;
         db_files = copy_import_files(&source_hyphae, &staging_hyphae).await?;
+        #[cfg(test)]
+        copy_test_hook::pause_after_copy(&source_hyphae, 2).await;
         after = fingerprint_all(&source_hyphae).await?;
         if after != before {
             drop(outbox_lock);
@@ -1630,35 +1683,11 @@ esac
     // enough; these two prove `run_import`'s own `if after != before { .. }`
     // branch actually calls that wipe before retrying, and actually takes
     // the `source_changed` branch when a second mismatch happens too — the
-    // exact two gaps R4 flagged as untested. Both drive a REAL race against
-    // `import()`'s live fingerprint/copy sequence (not a replay of it),
-    // synchronized by polling for `staging_hyphae` — `copy_import_files`'s
-    // very first action is creating it, well before it even reaches
-    // `messages.db-wal`/`-shm` (5th/6th of 6 files) — so the mutation below
-    // always lands before `run_import`'s own post-copy fingerprint, not
-    // racing blind against wall-clock time.
-
-    /// Polls (no sleep — a tight `yield_now` loop; cheap and short-lived)
-    /// until `path`'s existence matches `want_present`, or panics after
-    /// `timeout`. Used to synchronize a background mutator against
-    /// `run_import`'s internal copy steps without any hook in production
-    /// code — `path` is always `staging_hyphae`, whose creation/removal is
-    /// itself a side effect those steps already produce.
-    async fn wait_for_presence(path: &Path, want_present: bool, timeout: Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let present = tokio::fs::try_exists(path).await.unwrap_or(false);
-            if present == want_present {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {path:?} to {}exist",
-                if want_present { "" } else { "not " }
-            );
-            tokio::task::yield_now().await;
-        }
-    }
+    // exact two gaps R4 flagged as untested. Both drive `import()`'s real
+    // fingerprint/copy sequence (not a replay of it), but use the test-only
+    // post-copy barrier above so each source mutation is guaranteed to land
+    // before the corresponding post-copy fingerprint. Production builds do
+    // not compile this barrier.
 
     #[tokio::test]
     async fn import_retries_once_when_the_source_wal_and_shm_vanish_mid_copy_and_excludes_them_from_the_result()
@@ -1674,38 +1703,27 @@ esac
         let comm_dir = tmp.path().join("comm");
         let home = comm_dir.join("hyphae-home");
         tokio::fs::create_dir_all(&home).await.unwrap();
-        let staging_hyphae = comm_dir.join("hyphae-home.staging").join(".hyphae");
 
-        // Simulates a WAL checkpoint landing mid-copy: as soon as the first
-        // copy attempt starts (staging's `.hyphae` appears), delete the
-        // source's wal/shm — exactly the scenario R4 says must not leak a
-        // stale WAL into the committed `messages.db`.
-        let mutator_source = source_hyphae.clone();
-        let mutator_staging = staging_hyphae.clone();
-        let mutator = tokio::spawn(async move {
-            wait_for_presence(&mutator_staging, true, Duration::from_secs(5)).await;
-            tokio::fs::remove_file(mutator_source.join("messages.db-wal"))
+        let source_hyphae_canon = tokio::fs::canonicalize(&source_hyphae).await.unwrap();
+        let (copy_done, resume_copy) = copy_test_hook::install(&source_hyphae_canon, 1);
+        let mutate = async {
+            copy_done.notified().await;
+            tokio::fs::remove_file(source_hyphae.join("messages.db-wal"))
                 .await
                 .unwrap();
-            tokio::fs::remove_file(mutator_source.join("messages.db-shm"))
+            tokio::fs::remove_file(source_hyphae.join("messages.db-shm"))
                 .await
                 .unwrap();
-        });
-
-        let report = import(
-            &runner,
-            &store,
-            &home,
-            ImportRequest {
-                from: from.clone(),
-                confirm: true,
-                password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
-                dry_run: false,
-            },
-        )
-        .await
-        .unwrap();
-        mutator.await.unwrap();
+            resume_copy.notify_one();
+        };
+        let request = ImportRequest {
+            from: from.clone(),
+            confirm: true,
+            password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
+            dry_run: false,
+        };
+        let (result, ()) = tokio::join!(import(&runner, &store, &home, request), mutate);
+        let report = result.unwrap();
 
         assert!(
             !report
@@ -1747,54 +1765,37 @@ esac
         let comm_dir = tmp.path().join("comm");
         let home = comm_dir.join("hyphae-home");
         tokio::fs::create_dir_all(&home).await.unwrap();
-        let staging_hyphae = comm_dir.join("hyphae-home.staging").join(".hyphae");
 
-        // Mutates the source TWICE: once while the first copy is in
-        // flight (forces the first retry), then again while the retry's
-        // own copy is in flight (forces the "still doesn't match" branch).
-        // The second mutation is a content change to `messages.db` rather
-        // than another deletion, since the wal/shm are already gone for
-        // good after the first mutation — any detectable (size/mtime)
-        // change works, this is just a second, independent one.
-        let mutator_source = source_hyphae.clone();
-        let mutator_staging = staging_hyphae.clone();
-        let mutator = tokio::spawn(async move {
-            wait_for_presence(&mutator_staging, true, Duration::from_secs(5)).await;
-            tokio::fs::remove_file(mutator_source.join("messages.db-wal"))
+        let source_hyphae_canon = tokio::fs::canonicalize(&source_hyphae).await.unwrap();
+        let (first_copy_done, resume_first_copy) = copy_test_hook::install(&source_hyphae_canon, 1);
+        let mutate = async {
+            first_copy_done.notified().await;
+            tokio::fs::remove_file(source_hyphae.join("messages.db-wal"))
                 .await
                 .unwrap();
-            tokio::fs::remove_file(mutator_source.join("messages.db-shm"))
+            tokio::fs::remove_file(source_hyphae.join("messages.db-shm"))
                 .await
                 .unwrap();
 
-            // Round 1's mismatch triggers `run_import`'s own
-            // `remove_dir_all(staging_home)` before it retries —
-            // `staging_hyphae` disappears, then `copy_import_files`
-            // recreates it for the retry's copy. That reappearance is the
-            // signal that the retry is now in flight.
-            wait_for_presence(&mutator_staging, false, Duration::from_secs(5)).await;
-            wait_for_presence(&mutator_staging, true, Duration::from_secs(5)).await;
+            let (retry_copy_done, resume_retry_copy) =
+                copy_test_hook::install(&source_hyphae_canon, 2);
+            resume_first_copy.notify_one();
+            retry_copy_done.notified().await;
 
-            let path = mutator_source.join("messages.db");
+            let path = source_hyphae.join("messages.db");
             let mut content = tokio::fs::read(&path).await.unwrap();
             content.extend_from_slice(b"-changed-again");
             tokio::fs::write(&path, &content).await.unwrap();
-        });
-
-        let err = import(
-            &runner,
-            &store,
-            &home,
-            ImportRequest {
-                from: from.clone(),
-                confirm: true,
-                password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
-                dry_run: false,
-            },
-        )
-        .await
-        .unwrap_err();
-        mutator.await.unwrap();
+            resume_retry_copy.notify_one();
+        };
+        let request = ImportRequest {
+            from: from.clone(),
+            confirm: true,
+            password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
+            dry_run: false,
+        };
+        let (result, ()) = tokio::join!(import(&runner, &store, &home, request), mutate);
+        let err = result.unwrap_err();
 
         assert!(
             matches!(err, CommError::Conflict(ref m) if m.contains("source_changed")),
