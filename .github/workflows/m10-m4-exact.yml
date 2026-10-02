@@ -104,6 +104,7 @@ jobs:
           test -f "$RESOURCE_DIR/app/prebundled/agent24-headless.mjs"
           test "$(jq -r '.version' "$RESOURCE_DIR/app/package.json")" = "0.22.2"
           echo "A24_OPEN_DESIGN_RESOURCES_DIR=$RESOURCE_DIR" >> "$GITHUB_ENV"
+          echo "A24_OPEN_DESIGN_SOURCE_DIR=$PWD/open-design" >> "$GITHUB_ENV"
 
       - name: Setup Agent24 toolchains
         shell: bash
