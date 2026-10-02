@@ -105,6 +105,22 @@
       "type": "object",
       "properties": {
         "payload": {
+          "$ref": "#/$defs/MemoryRecalledPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "memory.recalled"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
           "$ref": "#/$defs/RunFailedPayload"
         },
         "type": {
@@ -483,6 +499,25 @@
       "required": [
         "code",
         "message"
+      ]
+    },
+    "MemoryRecalledPayload": {
+      "description": "Assertion ids that were actually included in a run's recalled context.",
+      "type": "object",
+      "properties": {
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "ids"
       ]
     },
     "MemoryWriteFailedPayload": {

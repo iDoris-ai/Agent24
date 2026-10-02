@@ -30,10 +30,10 @@ use agent24_memory::session::Summarizer;
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
-    Approval, ApprovalStatus, Decision, ErrorBody, EventBody, ModelDeltaPayload, RiskClass, Run,
-    RunCancelledPayload, RunCompletedPayload, RunCreate, RunFailedPayload, RunInput, RunMode,
-    RunOutputPayload, RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
-    ToolCompletedStatus, ToolStartedPayload, Usage,
+    Approval, ApprovalStatus, Decision, ErrorBody, EventBody, MemoryRecalledPayload,
+    ModelDeltaPayload, RiskClass, Run, RunCancelledPayload, RunCompletedPayload, RunCreate,
+    RunFailedPayload, RunInput, RunMode, RunOutputPayload, RunStartedPayload, RunStatus, ToolCall,
+    ToolCallStatus, ToolCompletedPayload, ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{RunMessage, RunPatch, Store, StoreError};
 use agent24_tools::{
@@ -367,14 +367,9 @@ impl RunManager {
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
-    ///
-    /// Best-effort, exactly like session memory: a thread-append failure must
-    /// never fail an otherwise-good run. It only degrades durable resume for
-    /// THIS run — and that degrades safely, because a run whose thread cannot be
-    /// reconstructed is aborted rather than replayed (H3, fail-closed). The
-    /// alternative — failing the run on a bookkeeping write — would be strictly
-    /// worse for the same safety outcome.
-    async fn persist_message(&self, run_id: &str, msg: &Msg) {
+    /// Most callers treat this as best-effort bookkeeping; callers that require
+    /// a complete replay prefix must check the result and fail closed.
+    async fn persist_message(&self, run_id: &str, msg: &Msg) -> Result<(), StoreError> {
         let tool_calls =
             serde_json::to_value(&msg.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
         if let Err(err) = self
@@ -390,7 +385,9 @@ impl RunManager {
             .await
         {
             tracing::warn!("run {run_id}: message thread append failed: {err}");
+            return Err(err);
         }
+        Ok(())
     }
 
     pub async fn start_run(self: &Arc<Self>, create: RunCreate) -> Result<Run, AgentError> {
@@ -726,7 +723,7 @@ impl RunManager {
                     if !matches!(approval.status, ApprovalStatus::Approved) {
                         let content = "Plan rejected.".to_owned();
                         let result = Msg::tool_result(call.id.clone(), content.clone());
-                        self.persist_message(&run_id, &result).await;
+                        let _ = self.persist_message(&run_id, &result).await;
                         self.finish_completed(&run_id, &content, run.usage.clone())
                             .await;
                         return;
@@ -764,7 +761,7 @@ impl RunManager {
                 }
             };
             let result = Msg::tool_result(call.id.clone(), content);
-            self.persist_message(&run_id, &result).await;
+            let _ = self.persist_message(&run_id, &result).await;
             messages.push(result);
         }
 
@@ -862,6 +859,28 @@ impl RunManager {
             schedule_id: run.schedule_id.clone(),
         }));
 
+        // Assertion recall is fresh-run context. Keep the audit ids tied to the
+        // exact facts that made it into this message; a recall failure must not
+        // prevent an otherwise valid run from reaching its provider.
+        let recall = if let Some(memory) = self.memory.as_ref() {
+            let load = memory.recall(&run.input.prompt);
+            tokio::select! {
+                result = load => match result {
+                    Ok(recall) => recall,
+                    Err(err) => {
+                        tracing::warn!(run_id = %run_id, error = %err, "memory recall failed");
+                        None
+                    }
+                },
+                () = cancel.cancelled() => {
+                    self.finish_cancelled(&run_id).await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // D1: a session's prior (compacted) context precedes this turn, so a
         // session actually remembers. Empty when memory is off or session-less.
         // A cancel while waiting on a concurrent run's session lock ends the run
@@ -873,12 +892,33 @@ impl RunManager {
             self.finish_cancelled(&run_id).await;
             return;
         };
-        let mut messages = prior_context;
+        let mut messages = Vec::with_capacity(prior_context.len() + 2);
+        if let Some((recalled, ids)) = recall {
+            // Keep the exact recalled context in the durable run thread so an
+            // approval resume reconstructs it without issuing another recall.
+            if let Err(err) = self.persist_message(&run_id, &recalled).await {
+                self.finish_failed(
+                    &run_id,
+                    "memory_snapshot_persist_failed",
+                    &format!("failed to persist recalled memory snapshot: {err}"),
+                )
+                .await;
+                return;
+            }
+            tracing::info!(run_id = %run_id, ids = ?ids, "memory recalled");
+            self.sink
+                .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
+                    run_id: run_id.clone(),
+                    ids,
+                }));
+            messages.push(recalled);
+        }
+        messages.extend(prior_context);
         // Persist this run's opening user turn to the durable thread (H3). Prior
-        // (compacted) context stays in session memory and is reloaded from there
-        // on resume, so only the per-run tail is recorded here.
+        // session context is not copied into the run thread; the recall snapshot
+        // above and this run's own tail are persisted for approval resume.
         let user_msg = Msg::user(run.input.prompt.clone());
-        self.persist_message(&run_id, &user_msg).await;
+        let _ = self.persist_message(&run_id, &user_msg).await;
         messages.push(user_msg);
         // H8: a fresh plan-mode run starts read-only; a Normal run never is.
         let plan_mode = matches!(run.input.mode, RunMode::Plan);
@@ -953,7 +993,7 @@ impl RunManager {
                 let text = res.message.content.clone().unwrap_or_default();
                 // Record the closing assistant turn so the durable thread is a
                 // complete, self-contained transcript (H3).
-                self.persist_message(&run_id, &res.message).await;
+                let _ = self.persist_message(&run_id, &res.message).await;
                 self.sink.emit(EventBody::ModelDelta(ModelDeltaPayload {
                     run_id: run_id.clone(),
                     text: text.clone(),
@@ -1031,7 +1071,7 @@ impl RunManager {
             // call. This is the row H3 keys resume off: an assistant turn on disk
             // whose trailing tool_call has no answering `tool` row is exactly a
             // run that died awaiting approval.
-            self.persist_message(&run_id, &res.message).await;
+            let _ = self.persist_message(&run_id, &res.message).await;
             messages.push(res.message);
             for (idx, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -1045,7 +1085,7 @@ impl RunManager {
                             "skipped: per-turn tool call limit ({MAX_TOOL_CALLS_PER_TURN}) exceeded"
                         ),
                     );
-                    self.persist_message(&run_id, &skipped).await;
+                    let _ = self.persist_message(&run_id, &skipped).await;
                     messages.push(skipped);
                     continue;
                 }
@@ -1060,14 +1100,14 @@ impl RunManager {
                         PlanOutcome::Approved(content) => {
                             plan_mode = false; // full tool set from the next turn
                             let result = Msg::tool_result(call.id.clone(), content);
-                            self.persist_message(&run_id, &result).await;
+                            let _ = self.persist_message(&run_id, &result).await;
                             messages.push(result);
                         }
                         PlanOutcome::Rejected(content) => {
                             // The user declined the plan — the run ends here,
                             // having done nothing but read.
                             let result = Msg::tool_result(call.id.clone(), content.clone());
-                            self.persist_message(&run_id, &result).await;
+                            let _ = self.persist_message(&run_id, &result).await;
                             self.finish_completed(&run_id, &content, usage_total.clone())
                                 .await;
                             return;
@@ -1095,7 +1135,7 @@ impl RunManager {
                          approved before using this tool"
                             .to_owned(),
                     );
-                    self.persist_message(&run_id, &denied).await;
+                    let _ = self.persist_message(&run_id, &denied).await;
                     messages.push(denied);
                     continue;
                 }
@@ -1111,7 +1151,7 @@ impl RunManager {
                 {
                     Ok(content) => {
                         let result = Msg::tool_result(call.id.clone(), content);
-                        self.persist_message(&run_id, &result).await;
+                        let _ = self.persist_message(&run_id, &result).await;
                         messages.push(result);
                     }
                     Err(()) => {

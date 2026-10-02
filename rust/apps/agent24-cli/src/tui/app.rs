@@ -291,6 +291,8 @@ impl App {
             EventBody::ModelCall(_) => {}
             // Session-scoped memory failures have no run id for this run log.
             EventBody::MemoryWriteFailed(_) => {}
+            // Recall audit ids are not rendered by this TUI.
+            EventBody::MemoryRecalled(_) => {}
         }
     }
 

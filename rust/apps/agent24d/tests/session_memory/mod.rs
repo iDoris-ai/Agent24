@@ -1,6 +1,8 @@
 //! M1-T05: real daemon run entry, forced compaction, disk reopen and exact replay.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod recall;
+
 use super::*;
 use crate::os_memory::{OrgId, SpaceId, partition_key};
 use agent24_memory::{
@@ -74,11 +76,20 @@ impl ModelProvider for Provider {
 }
 
 async fn app(kv: KvStore, path: &Path, provider: Arc<Provider>) -> AppState {
+    app_with_recall_budget(kv, path, provider, None).await
+}
+
+async fn app_with_recall_budget(
+    kv: KvStore,
+    path: &Path,
+    provider: Arc<Provider>,
+    recall_budget: Option<usize>,
+) -> AppState {
     let max_recent = if provider.fail_summaries { 1 } else { 2 };
     let router = Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)]));
     let cancel = CancellationToken::new();
     // Use exactly the production constructor; never register a partition in setup.
-    let memory = session_memory(kv, &router, &cancel)
+    let mut memory = session_memory(kv, &router, &cancel)
         .await
         .unwrap()
         .with_policy(CompactionPolicy {
@@ -86,6 +97,9 @@ async fn app(kv: KvStore, path: &Path, provider: Arc<Provider>) -> AppState {
             keep_recent: 1,
             max_summary_chars: 2000,
         });
+    if let Some(budget) = recall_budget {
+        memory = memory.with_recall_budget(budget);
+    }
     let store = Store::open(&path.join("agent24.db")).await.unwrap();
     if store.get_session(SESSION).await.unwrap().is_none() {
         store
@@ -115,14 +129,18 @@ async fn app(kv: KvStore, path: &Path, provider: Arc<Provider>) -> AppState {
     })
 }
 
-async fn run(state: &AppState, prompt: &str) {
+async fn run(state: &AppState, prompt: &str) -> Run {
+    run_in_session(state, SESSION, prompt).await
+}
+
+async fn run_in_session(state: &AppState, session_id: &str, prompt: &str) -> Run {
     let response = crate::runs::create_run(
         State(state.clone()),
         Request::builder()
             .method("POST")
             .uri("/api/v1/runs")
             .body(Body::from(
-                serde_json::json!({"session_id": SESSION, "prompt": prompt}).to_string(),
+                serde_json::json!({"session_id": session_id, "prompt": prompt}).to_string(),
             ))
             .unwrap(),
     )
@@ -146,6 +164,23 @@ async fn run(state: &AppState, prompt: &str) {
     })
     .await
     .expect("run must finish");
+    created
+}
+
+async fn ensure_session(state: &AppState, session_id: &str) {
+    if state.store.get_session(session_id).await.unwrap().is_none() {
+        state
+            .store
+            .insert_session(&Session {
+                id: session_id.into(),
+                title: String::new(),
+                channel: "test".into(),
+                created_at: "2026-10-01T00:00:00Z".into(),
+                updated_at: "2026-10-01T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+    }
 }
 
 async fn assert_history(kv: &KvStore, owner: &str, expected: &[Msg]) {
