@@ -60,7 +60,7 @@
   1. **P0 = M1 收尾**：T07.1（召回注入改为带标注的数据块）、T08（召回评测基线）、T10（记忆 REST + 总开关 + 来源展示）、T11（桌面「记忆」页）。然后**先把 main（含 M10 的 633 个提交）合进 `ab/m1-memory` 并重跑全部 gate，再以 merge 方式落 main**，吸取 M10「分支漂太久」的教训。📐 → 波次 A。
   2. **P1 个人记忆可控（M1.5）**：先出 ADR「原文生命周期内不丢 vs 用户清除权」；回执事件、双时态与用户 supersede、程序性偏好、导出、purge、无痕会话。📐 → 波次 B。
   3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
-  4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**。授权模型归 C11：**P3 触发并交付 F9 的社区子集**（spaces + grants + 交集判定 + 审计事件，契约由 C11 定义），并与 C6 O-2b（scoped memory 回调）同批交付；F9 的其余部分（groups、企业场景）以及 F10 / F11 仍等第二个真实用户。
+  4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**。授权模型归 C11：**P3 触发并交付 F9 的社区子集**（spaces + grants + 交集判定 + 审计事件，契约由 C11 定义），并与 C6 O-2b（scoped memory 回调）同批交付；F9 的其余部分（groups、企业场景）与 F10 仍等第二个真实用户；F11 按 C11 的 P0 / P1 决策门处理。
   5. **P4 企业治理** / **P5 高级记忆**（时态图、巩固 / 反思、**AgentEar 语音摄入**）。📐 → 远期。
 - **依赖**：C1 K-1 ← P0；C6 O-3（Cos72 M4）← P0（roadmap 明写「依赖 M1 全部完成」）；P1 ← P0；P2 ← P1（K-4 ⊂ P2）；P3 ← P1，并带出 C11 F9 社区子集；C9 语音摄入 ← P1 的事件 schema。
 
@@ -121,8 +121,8 @@
   3. **COMM-7** UI：收件历史 / outbox / 重试 + 双仓联调 → 波次 A / B。
   4. **T01-E 收口**（[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)）：冻结当前 F4b 白名单入站 gated-run 路径、不再扩展。→ 波次 B。
   5. **收口后的入站高层授权与持久化**（待立项，责任仓 Agent24）：入站触发 run、request / run 持久化、能力授权（与 C5 对齐），是四仓联调验收（UI / T21 / T22）的前置。← T01-E。→ 波次 B / C。
-  6. **COMM-REL 可发布性**（[COMM-HYPHAE](../design/COMM-HYPHAE.md) §9 的 G3 / R4，待在 Deployment 立正式任务）：COMM-REL-1 把 `hyphae.lock.json` 升级到含 daemon 锁的版本（Hyphae #104 之后）→ COMM-REL-2 发布包加入 `hyphae` 二进制并做打包 / 发布验收（与 C10 配合）。→ 波次 A / B。
-- **依赖**：收口后的入站授权 ← T01-E、C5；COMM-REL-2 ← COMM-REL-1；O-4 渠道接入 ← COMM-7。
+  6. **可发布性**（[COMM-HYPHAE](../design/COMM-HYPHAE.md) §9 的 G3 / R4，已在 [Deployment/TASKS.md](../Deployment/TASKS.md) 立项）：**DEP-C8** 把 `hyphae.lock.json` 升级到含 daemon 锁的版本（Hyphae #104 之后）→ **DEP-C9** 发布包加入 `hyphae` 二进制并做干净机器验收。→ 波次 A / B。
+- **依赖**：收口后的入站授权 ← T01-E、C5；DEP-C9 ← DEP-C8；O-4 渠道接入 ← COMM-7。
 
 ### C9 语音（AgentEar）
 
@@ -133,7 +133,7 @@
   2. **A3 P4 流式（= ADR-032 P3）**：`_a24/model/stream`，见 C2。→ 波次 A / B。
   3. **多轮**：授予 `_a24/memory/private/*` 或宿主会话回调（依赖 C3 P1）。→ 波次 C。
   4. **语音摄入记忆** = C3 P5。
-- **依赖**：C2 P3、C3 P1、C5 A-5。
+- **依赖**：ADR-032 冻结顺序 **P3（流式，= A3 P4）→ P4（= C2 ID-2）→ P5（提案闭环，= A3 P3 = C5 A-5）**，三者串行，P4、P5 都在波次 B 时也须按此先后；多轮 ← C3 P1。
 
 ### C10 桌面、CLI 与发布
 
@@ -162,8 +162,8 @@
 
 | 波次 | 主要内容 | 并行性说明 |
 |---|---|---|
-| **A（近期）** | C3 P0（M1 收尾并合回 main；F11 是否随 P0 待拍板）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）、COMM-REL-1 lock 升级 · C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
-| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C8 T01-E 收口、COMM-REL-2 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P3（= ADR-032 P5）、A3 P4 流式（= ADR-032 P3，A / B）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
+| **A（近期）** | C3 P0（M1 收尾并合回 main；F11 是否随 P0 待拍板）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）、DEP-C8 Hyphae lock 升级 · C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
+| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C8 T01-E 收口、DEP-C9 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P3（= ADR-032 P5）、A3 P4 流式（= ADR-032 P3，A / B）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
 | **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
 | 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
@@ -174,7 +174,7 @@ OD-M11:  F11.0a + F11.0 ──▶ F11.1 / F11.2 / F11.3 ──▶ TPI-W（含 W-
                                                       └─ OD-M12 与 TPI-W 并行；OC-0 调研可提前
 记忆:    C3 P0（M1 合回 main，交付 K-1）──▶ C3 P1 ──▶ C3 P2（含 K-4）/ P3（带出 C11 F9 社区子集）
          C3 P0 ──▶ C6 O-3（Cos72 M4）──▶ O-4（M5，4seas 实例）      （P3 与 O-3 协同设计）
-模型:    C2 ID-1 画像（无前置）；ADR-032 P3 ──▶ P4 = ID-2 ──▶ ID-3 / ID-4 / ID-5；ID-4 ──▶ ID-6
+模型:    C2 ID-1 画像（无前置）；ADR-032 P3（流式）──▶ P4 = ID-2 ──▶ P5（= A3 P3 = C5 A-5）；ID-2 ──▶ ID-3 / ID-4 / ID-5；ID-4 ──▶ ID-6
 隐私:    C5 A-3 法律冻结 ──▶ ID-2 / 出境脱敏（iDoris）──▶ 变异验收 ──▶ 默认路径启用
 Windows: DEP-A7 设计冻结 + sidecar-host / ProcessKit 边界 ──▶ DEP-C2 ──▶ DEP-C3（v0.6，legacy 路径）
          发布后增强：C4 W-2（F12.4，Windows workspace-bound run）、C2 ID-4（更多推理后端）
@@ -192,7 +192,7 @@ Windows: DEP-A7 设计冻结 + sidecar-host / ProcessKit 边界 ──▶ DEP-C2
 | 新增隐私法律 L-PRV-1/2（docs/06） | C5 A-3 | 采纳，排波次 A（先于脱敏实现冻结） |
 | 记忆是 Agent24 的模块，避免与 MemPalace 重复建设（docs/05、BR-19） | C3 | 一致：记忆归 Agent24 C3 |
 | 旧组件主文档里的「Guardian 安全门禁」「三级路由」「21.5 万行」 | C2 / C5、§1 | 已在 internal-AI 主文档按代码改写：路由机制在、画像未生成；Guardian 可选。规模口径：2026-10-03 main 的 Rust 源码约 18.7 万行（不含独立测试文件约 16.4 万行）；internal-AI 引用的 64,885 行是 M10 落地前的旧统计 |
-| README 把 Web3（AAStar）写成已上线支柱 | C12 | **不一致**：Agent24 无接线，应改为「规划中」 |
+| internal-AI 顶层 README 与 web3-aastar 组件文档把 Web3（AAStar）写成已上线支柱 | C12 | **不一致**：Agent24 无接线；internal-AI 的 Agent24 组件文档已改为「规划中」，顶层 README 的生态愿景表述待 internal-AI 维护者确认 |
 | AgentEar 声称已集成 TTS | C9 | 需在 AgentEar 仓库核实；Agent24 侧只依赖 `speak` 反向命令 |
 
 ---
