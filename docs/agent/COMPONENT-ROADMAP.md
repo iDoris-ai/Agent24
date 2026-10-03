@@ -22,7 +22,7 @@
 | C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1a…4b、COMM-5a 已交付；UI 与联调未做 |
 | C9 | 语音（AgentEar） | 附着模块（A3） | ✅ P0–P2（非流式单轮） |
 | C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；macOS 签名包被 Apple 账号阻塞 |
-| C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9–F11 等第二个真实用户 |
+| C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9 社区子集随 C3 P3；F9 其余与 F10 等第二个真实用户；F11 待拍板（P0 或 P1） |
 | C12 | Web3 身份与结算（AAStar） | — | 📐 Agent24 代码中**尚无接线**，只在生态规划中 |
 
 ---
@@ -76,7 +76,7 @@
   4. **W-4 OpenCreator 适配**（= OC-1 的设计内容、OC-2 的实现内容，不是 OC 的外部前置）：大媒体文件（视频、音频）的存放、配额与 TTL；外部服务的出境策略；可能需要新的 workspace 种类。📐 → 波次 C。
   5. **W-5 写回与新种类**：`writeback_policy` 除 `external` 外的取值、写回审批、源码 checkout 类 workspace、并发策略（先 ADR = OD-M12 F12.3，再实现）。📐 → 波次 C。
   6. **W-N 命名收敛**：给三个「Workspace」定不同的名字（例如 文件系统工作区 / 社区工作台 / 记忆作用域），在 ADR 与代码注释中统一。📐 → 随 W-3 一起做。
-- **依赖**（以源编号表达）：OD-M11 内部为 **F11.0a + F11.0 → F11.1 / F11.2 / F11.3**——W-1（F11.0a、F11.3）与 C5 A-1（F11.0、F11.1、F11.2）只是同一里程碑按组件的归属标签，互相交织，不能整体排先后；TPI-W ← F11.0a–F11.3；W-3 ⊂ TPI-W；W-4 由 OC-1 设计、OC-2 实现；C10 Windows ← W-2（F12.4）。
+- **依赖**（以源编号表达）：OD-M11 内部为 **F11.0a + F11.0 → F11.1 / F11.2 / F11.3**——W-1（F11.0a、F11.3）与 C5 A-1（F11.0、F11.1、F11.2）只是同一里程碑按组件的归属标签，互相交织，不能整体排先后；TPI-W ← F11.0a–F11.3；W-3 ⊂ TPI-W；W-4 由 OC-1 设计、OC-2 实现；Windows 上的 workspace-bound run ← W-2（F12.4），但它不是 C10 Windows 发布链的前置。
 
 ### C5 权限、能力与法律
 
@@ -121,8 +121,8 @@
   3. **COMM-7** UI：收件历史 / outbox / 重试 + 双仓联调 → 波次 A / B。
   4. **T01-E 收口**（[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)）：冻结当前 F4b 白名单入站 gated-run 路径、不再扩展。→ 波次 B。
   5. **收口后的入站高层授权与持久化**（待立项，责任仓 Agent24）：入站触发 run、request / run 持久化、能力授权（与 C5 对齐），是四仓联调验收（UI / T21 / T22）的前置。← T01-E。→ 波次 B / C。
-  5. 升级 `hyphae.lock.json` 到含 daemon 锁的版本；发布包加入 `hyphae`（与 C10 配合）。
-- **依赖**：收口后的入站授权 ← T01-E、C5；O-4 渠道接入 ← COMM-7。
+  6. **COMM-REL 可发布性**（[COMM-HYPHAE](../design/COMM-HYPHAE.md) §9 的 G3 / R4，待在 Deployment 立正式任务）：COMM-REL-1 把 `hyphae.lock.json` 升级到含 daemon 锁的版本（Hyphae #104 之后）→ COMM-REL-2 发布包加入 `hyphae` 二进制并做打包 / 发布验收（与 C10 配合）。→ 波次 A / B。
+- **依赖**：收口后的入站授权 ← T01-E、C5；COMM-REL-2 ← COMM-REL-1；O-4 渠道接入 ← COMM-7。
 
 ### C9 语音（AgentEar）
 
@@ -148,7 +148,7 @@
 ### C11 组织化
 
 - **现状**：ADR-030 F8（所有权 = (组织, 空间)）✅。
-- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）；**F11**（`asserted_by` + 冲突断言）按 [SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) 应与 F2（记忆接进 agent loop，即 M1 一线）一起做，不排在 F10 之后，可随 C3 P1 评估。**F9 的社区子集由 C3 P3 触发（波次 C）**；其余部分等第二个真实用户，不排期（[roadmap.md](roadmap.md) M3）。
+- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）；**F11**（`asserted_by` + 冲突断言）按 [SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) 应与 F2（记忆接进 agent loop）一起做；M1 已在分支上完成 F2 对应工作（T03 / T04）但没有带上 F11，**属于对规范的偏离**。**待拍板**：(a) 在 C3 P0 收尾时补 `asserted_by` 最小字段与约束；或 (b) 记录决策，把 F11 移入 C3 P1。**F9 的社区子集由 C3 P3 触发（波次 C）**；其余部分等第二个真实用户，不排期（[roadmap.md](roadmap.md) M3）。
 - **不能等的前置**（[SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) §9）：① 共享空间的不可变 ID（随 C3 P3 定）；② 组织 / 空间是否跨库或跨地区（随 C3 P4 定）；③ agent loop 自身记忆归属迁到 personal space（= C3 P0 的 M1-T02 / T05，已在 `ab/m1-memory` 完成，合回 main 后生效）。
 
 ### C12 Web3 身份与结算（AAStar）
@@ -162,10 +162,10 @@
 
 | 波次 | 主要内容 | 并行性说明 |
 |---|---|---|
-| **A（近期）** | C3 P0（M1 收尾并合回 main）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）· C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
-| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C8 T01-E 收口 · C9 P3 · C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
+| **A（近期）** | C3 P0（M1 收尾并合回 main；F11 是否随 P0 待拍板）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）、COMM-REL-1 lock 升级 · C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
+| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C8 T01-E 收口、COMM-REL-2 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P3（= ADR-032 P5）、A3 P4 流式（= ADR-032 P3，A / B）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
 | **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
-| 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10 / F11（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
+| 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
 **关键依赖链**（一眼看清）
 

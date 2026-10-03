@@ -237,7 +237,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 5. **unsafe 边界** ✅：生产代码只有两处人工审计过的窄 `unsafe`：
    - `os-cwd`：post-fork 的 `fchdir`；
    - `os-fd`：接管继承 fd 的所有权。
-   
+
    `os-proto` 的 fork/exec fd 处理交给 `command-fds` crate。
 6. **法律层**：[docs/laws/](laws/README.md)，包括上下文准入（CONTEXT）、记忆隔离（MEMORY）、审批授权（APPROVAL）。改动涉及哪条法律，要在 PR 模板里写明。
 
