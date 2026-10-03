@@ -30,7 +30,8 @@
 │ run 生命周期 + agent loop（一等公民的取消、事件、持久化）         │
 └──────────────┬──────────────────────────────────────────────────┘
 ┌──────────────▼──────── L3 内核能力服务 ─────────────────────────┐
-│ models（模型网关） tools（工具流水线） policy（fail-closed 审批）│
+│ models（网关+TaskProfile 路由） tools（工具流水线）             │
+│ policy（fail-closed 审批 + 可选 Guardian 本地风险评估）          │
 │ memory（M-D） scheduler（调度） mcp（外部工具） comm（Hyphae）   │
 └──────────────┬──────────────────────────────────────────────────┘
 ┌──────────────▼──────── L2 权威与持久化 ─────────────────────────┐
@@ -84,9 +85,9 @@
 
 | crate | 职责 | 关键约束 |
 |---|---|---|
-| `agent24-models` | 模型网关：`ModelProvider` trait + OpenAI 兼容适配 + 有序注册表 | 路由/健康逻辑在 trait 之上，不进 provider（ADR-026） |
+| `agent24-models` | 模型网关：`ModelProvider` trait + OpenAI 兼容适配 + 有序注册表；其上的 `ModelRouter`（`router.rs`，M-D/D2）按 `TaskProfile`（`Privacy::{Any, LocalOnly}` × `Complexity::{Simple, Complex}`）在 `Tier::{Local, Remote, Lora}` 间选 provider，带健康/冷却 | `LocalOnly` 对远端 fail-closed（本地全挂也报错，不外发）；路由逻辑在 trait 之上，不进 provider（ADR-026）；iDoris 以 OpenAI 兼容 provider 接入（ADR-032） |
 | `agent24-tools` | 工具 trait + 注册表 + 内建工具 | 固定流水线：normalize → 能力白名单 → 审批门 → 超时执行；fs/shell 经 workspace |
-| `agent24-policy` | 审批 broker + 工具门 | fail-closed：超时即拒绝，取消即 aborted，store 行为权威，重复决策 409 |
+| `agent24-policy` | 审批 broker + 工具门；可选的 **Guardian**（`guardian.rs`，M-D/D3）：在人工审批前用 LocalOnly 本地模型给工具调用评风险 | fail-closed：超时即拒绝，取消即 aborted，store 行为权威，重复决策 409。Guardian **默认关闭**（`A24_GUARDIAN=1` 才开），只有明确解析出 `low` 才自动批准，其余一律升级给人；`exec` 默认永远要人审 |
 | `agent24-memory` | M-D 记忆：L0 KV + CanonicalSession | 按文档自陈，agent loop 尚未真正消费 M-D 记忆层（M1 待恢复） |
 | `agent24-scheduler` | cron/every/at 调度 | 先推进 next_run_at 再触发；跳过漏掉的 tick；连续失败自动禁用 |
 | `agent24-mcp` | 外部 MCP server 适配 | 外部工具包装成普通 `Tool`，**不允许**绕过审批的旁路 |
