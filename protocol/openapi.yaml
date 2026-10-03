@@ -1323,7 +1323,7 @@ components:
 
     Session:
       type: object
-      required: [id, title, channel, created_at, updated_at]
+      required: [id, title, channel, workspace_id, created_at, updated_at]
       properties:
         id:
           type: string
@@ -1333,6 +1333,10 @@ components:
           type: string
           description: Open enum
           examples: [desktop, cli, tui, schedule, wechat, nostr]
+        workspace_id:
+          type: [string, "null"]
+          pattern: "^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"
+          description: Opaque workspace identity; null when unbound.
         created_at:
           type: string
           format: date-time
@@ -1349,6 +1353,10 @@ components:
         channel:
           type: string
           default: desktop
+        workspace_id:
+          type: [string, "null"]
+          pattern: "^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"
+          description: Omit/null for a legacy-compatible unbound session.
 
     RunStatus:
       type: string
@@ -1371,10 +1379,14 @@ components:
 
     RunInput:
       type: object
-      required: [prompt]
+      required: [prompt, workspace_id]
       properties:
         prompt:
           type: string
+        workspace_id:
+          type: [string, "null"]
+          pattern: "^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"
+          description: Explicit opaque workspace identity copied from the run request.
         model_override:
           type: [string, "null"]
         mode:
@@ -1390,7 +1402,7 @@ components:
     Run:
       type: object
       required:
-        [id, session_id, status, input, output, error, usage,
+        [id, session_id, workspace_id, status, input, output, error, usage,
          schedule_id, created_at, started_at, ended_at]
       properties:
         id:
@@ -1398,6 +1410,10 @@ components:
         session_id:
           type: [string, "null"]
           description: Null for transient runs (e.g. created by /chat)
+        workspace_id:
+          type: [string, "null"]
+          pattern: "^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"
+          description: Opaque workspace identity; filesystem roots stay outside this public schema.
         status:
           $ref: "#/components/schemas/RunStatus"
         input:
@@ -1434,6 +1450,10 @@ components:
         session_id:
           type: [string, "null"]
           description: Omit/null to create a transient run
+        workspace_id:
+          type: [string, "null"]
+          pattern: "^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"
+          description: Omit/null for legacy-compatible runs; admission is separate.
         prompt:
           type: string
         model_override:

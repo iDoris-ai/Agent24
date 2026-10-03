@@ -21,16 +21,17 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::daemon::RelayProbeStatus;
 use crate::error::{CommError, map_envelope_failure, map_runner_error, map_store_error};
 use crate::npub::is_valid_npub;
 use crate::password::Password;
 use crate::password_store::{Account, PasswordStore};
-use crate::runner::{Envelope, HyphaeRunner, Invocation};
+use crate::runner::{Envelope, ExitClass, HyphaeRunner, Invocation};
 
 type CommResult = Result<Json<Value>, CommError>;
 
@@ -58,6 +59,12 @@ enum Backend {
 #[derive(Clone)]
 pub struct CommState {
     backend: Backend,
+    /// COMM-4a: the Hyphae daemon supervisor, when one has been wired up by
+    /// `agent24d` (`comm_routes.rs`). `None` on every test/`Unconfigured`/
+    /// `BinaryRejected` state that never calls [`CommState::with_daemon`] —
+    /// the `/comm/daemon*` routes then answer `not_configured` same as any
+    /// other route on those backends.
+    daemon: Option<Arc<crate::daemon::HyphaeDaemonSupervisor>>,
 }
 
 impl CommState {
@@ -79,7 +86,17 @@ impl CommState {
                 password_store,
                 home: Arc::new(home),
             },
+            daemon: None,
         }
+    }
+
+    /// Wires in the COMM-4a daemon supervisor. `agent24d` calls this right
+    /// after `ready` whenever it was able to build one; tests that only
+    /// exercise identity/contact/relay routes have no reason to.
+    #[must_use]
+    pub fn with_daemon(mut self, daemon: Arc<crate::daemon::HyphaeDaemonSupervisor>) -> Self {
+        self.daemon = Some(daemon);
+        self
     }
 
     /// Every route answers `not_configured`, message `reason` — no binary
@@ -90,6 +107,7 @@ impl CommState {
             backend: Backend::Unconfigured {
                 reason: Arc::new(reason.into()),
             },
+            daemon: None,
         }
     }
 
@@ -101,6 +119,7 @@ impl CommState {
             backend: Backend::BinaryRejected {
                 reason: Arc::new(reason.into()),
             },
+            daemon: None,
         }
     }
 
@@ -117,6 +136,16 @@ impl CommState {
             }
         }
     }
+
+    /// COMM-4a: the daemon supervisor, or `not_configured` if none was ever
+    /// wired (an `Unconfigured`/`BinaryRejected` backend, per
+    /// `require_ready`, or a `Ready` test state built without
+    /// `with_daemon`).
+    fn require_daemon(&self) -> Result<&crate::daemon::HyphaeDaemonSupervisor, CommError> {
+        self.daemon.as_deref().ok_or_else(|| {
+            CommError::NotConfigured("the hyphae daemon supervisor is not wired up".to_owned())
+        })
+    }
 }
 
 /// The comm router, relative to wherever the caller nests it (`agent24d`
@@ -131,7 +160,74 @@ pub fn router(state: CommState) -> Router {
         .route("/contact", get(list_contact).post(add_contact))
         .route("/relay", get(list_relay).put(set_relay))
         .route("/relay/probe", post(probe_relay))
+        .route("/import", post(import))
+        .route("/daemon", get(daemon_status))
+        .route("/daemon/start", post(daemon_start))
+        .route("/daemon/stop", post(daemon_stop))
+        .route("/send", post(send_message))
+        .route("/history", get(get_history))
+        .route("/inbox/pull", post(pull_inbox))
+        .route("/outbox", get(list_outbox))
+        .route("/outbox/{event_id}/retry", post(retry_outbox))
+        .route("/outbox/clear", post(clear_outbox))
         .with_state(state)
+}
+
+// ---------------------------------------------------------------------
+// daemon (COMM-4a; COMM-HYPHAE.md §4, §5.2 trimmed to what this task tracks)
+// ---------------------------------------------------------------------
+
+/// COMM-4b: the full three-state object (COMM-HYPHAE.md §5.2) — `process`
+/// (COMM-4a), plus `relay_probe` and `catch_up`, which this task adds.
+/// `catch_up` is read fresh from the log file on every call: no route here
+/// ever caches it across requests, matching `relay_probe`'s own "only on
+/// demand" posture (M12 cut periodic probing/tailing).
+async fn daemon_status_json(daemon: &crate::daemon::HyphaeDaemonSupervisor) -> Value {
+    let s = daemon.status();
+    let relay_probe = daemon.relay_probe_status();
+    let catch_up = daemon.catch_up().await;
+    json!({"ok": true, "data": {
+        "process": {
+            "state": s.state,
+            "generation": s.generation,
+            "consecutive_failures": s.consecutive_failures,
+            "reason": s.reason,
+        },
+        "relay_probe": relay_probe.map(|p| json!({
+            "url": p.url,
+            "connected": p.connected,
+            "at_ms": p.at_ms,
+            "error": p.error,
+        })),
+        "catch_up": {
+            "state": catch_up.state,
+            "last_incomplete_at_ms": catch_up.last_incomplete_at_ms,
+        },
+    }})
+}
+
+async fn daemon_status(State(state): State<CommState>) -> CommResult {
+    state.require_ready()?;
+    let daemon = state.require_daemon()?;
+    Ok(Json(daemon_status_json(daemon).await))
+}
+
+async fn daemon_start(State(state): State<CommState>) -> CommResult {
+    state.require_ready()?;
+    let daemon = state.require_daemon()?;
+    daemon.start().await.map_err(|e| match e {
+        crate::daemon::DaemonStartError::NotConfigured(m) => CommError::NotConfigured(m),
+        crate::daemon::DaemonStartError::Locked(m) => CommError::Locked(m),
+        crate::daemon::DaemonStartError::Failed(m) => CommError::Upstream(m),
+    })?;
+    Ok(Json(daemon_status_json(daemon).await))
+}
+
+async fn daemon_stop(State(state): State<CommState>) -> CommResult {
+    state.require_ready()?;
+    let daemon = state.require_daemon()?;
+    daemon.stop().await;
+    Ok(Json(daemon_status_json(daemon).await))
 }
 
 fn args(parts: &[&str]) -> Vec<OsString> {
@@ -215,7 +311,10 @@ async fn read_keystore_salt(home: &Path) -> Result<Option<String>, CommError> {
     Ok(value.get("salt").and_then(Value::as_str).map(str::to_owned))
 }
 
-async fn resolve_account(home: &Path) -> Result<Option<Account>, CommError> {
+/// `pub(crate)`, not private: COMM-4a's daemon supervisor (`daemon.rs`)
+/// needs the same "which keyring account does this HOME's keystore use"
+/// lookup to retrieve the daemon's own password before spawning.
+pub(crate) async fn resolve_account(home: &Path) -> Result<Option<Account>, CommError> {
     Ok(read_keystore_salt(home)
         .await?
         .map(|salt| Account::from_salt(&salt)))
@@ -310,6 +409,18 @@ async fn create_identity(
                 promote_first_identity_password(home, password_store, &account).await;
             }
             drop(guard);
+            // COMM-4a (COMM-HYPHAE.md §6.3): creating a new DEFAULT identity
+            // changes what `daemon --identity` would use, same as
+            // `/identity/default` below — restart it if it's running. Done
+            // after the keystore write lock is released (PR #622 Medium
+            // only needs the lock held through the Pending->Salt rename
+            // above; daemon supervision is unrelated to that critical
+            // section).
+            if req.default
+                && let Some(daemon) = state.daemon.clone()
+            {
+                daemon.on_config_changed().await;
+            }
             Ok(Json(json!({"ok": true, "data": data})))
         }
         Ok(Envelope::Failed {
@@ -497,6 +608,13 @@ async fn use_identity(
         ]))
         .await
         .map_err(map_runner_error)?;
+    // COMM-4a: the default identity just changed — restart the daemon if
+    // it's running (COMM-HYPHAE.md §6.3), without touching its failure count.
+    if matches!(envelope, Envelope::Ok { .. })
+        && let Some(daemon) = state.daemon.clone()
+    {
+        daemon.on_config_changed().await;
+    }
     envelope_response(envelope)
 }
 
@@ -632,6 +750,13 @@ async fn set_relay(State(state): State<CommState>, Json(req): Json<RelaySetReq>)
         })
         .await
         .map_err(map_runner_error)?;
+    // COMM-4a: the relay set just changed — restart the daemon if it's
+    // running (COMM-HYPHAE.md §6.3), without touching its failure count.
+    if matches!(envelope, Envelope::Ok { .. })
+        && let Some(daemon) = state.daemon.clone()
+    {
+        daemon.on_config_changed().await;
+    }
     relay_envelope_response(envelope)
 }
 
@@ -640,13 +765,73 @@ struct RelayProbeReq {
     url: Option<String>,
 }
 
-/// `POST /comm/relay/probe` → `relay info [U] --timeout 5`, run only when a
+/// Resolves the address `probe_relay` is about to probe when the caller
+/// didn't name one explicitly, mirroring Hyphae's OWN `relay info`/`relay
+/// list` resolution precedence (explicit > config > built-in default,
+/// `internal/relayconfig`'s `Resolver::Resolve`, `internal/nostr/relay.go`'s
+/// `relayInfo`: `result.Relays[0]` of that same resolution) by asking `relay
+/// list` and taking its first address.
+///
+/// Codex COMM-4b review, Medium #4: without this, a probe with no explicit
+/// `url` left the target entirely implicit — fine on success (Hyphae's own
+/// success envelope echoes back the `url` it actually used), but a
+/// `network_error` failure's envelope carries no `url` at all, so the
+/// recorded probe ended up with `url: null` even though a real address was
+/// dialed. Resolving it here means `probe_relay` always has an address to
+/// pass explicitly to `relay info` and to record, on either outcome.
+///
+/// Codex COMM-4b review, round 2, Low: an explicit-but-empty `requested`
+/// (`{"url": ""}`) is treated exactly like `None`, not like a real target —
+/// Hyphae's own `relayInfo` (`internal/nostr/relay.go:70`, locked source:
+/// `url := relayInfoURLArg; if url == "" { … resolve the default … }`) falls
+/// through to its own config resolution when the CLI arg is empty, rather
+/// than treating `""` as an address to dial. Before this fix, `Some("")`
+/// matched the `if let Some(url) = requested` arm just like any other
+/// non-empty string, short-circuiting straight past the `relay list`
+/// fallback below and sending a literal empty string on to `relay info`.
+///
+/// Best-effort: if this auxiliary `relay list` call itself fails for any
+/// reason, this returns `None` and `probe_relay` falls back to its old
+/// behavior of leaving the explicit arg off `relay info`, letting Hyphae
+/// resolve it internally — a failure here is not reason to fail the probe
+/// itself.
+async fn effective_probe_target(runner: &HyphaeRunner, requested: Option<&str>) -> Option<String> {
+    if let Some(url) = requested.filter(|url| !url.is_empty()) {
+        return Some(url.to_owned());
+    }
+    let envelope = runner.run(read_invocation(&["relay", "list"])).await.ok()?;
+    let Envelope::Ok { data } = envelope else {
+        return None;
+    };
+    data.get("relays")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `POST /comm/relay/probe` → `relay info <U> --timeout 5`, run only when a
 /// caller explicitly asks (§4, §5.2: comm does not probe periodically —
 /// that was cut, M12). Always expects a JSON body (`{}` when no `url`).
+/// `<U>` is always passed explicitly now (via [`effective_probe_target`]),
+/// even when the caller didn't name one — see that function's doc comment.
+///
+/// COMM-4b: a relay actually being down must not surface as an HTTP error —
+/// Hyphae's own `relay info` contract (`docs/agent/cli-communication-contract.md`:
+/// "失败走网络错误信封和退出码 2") is itself the probe's *negative result*,
+/// not a failure of the probe operation. Only that specific `network_error`
+/// exit is folded into `{connected:false}`; every other failure (bad args,
+/// auth, an unresponsive/timing-out child, …) still surfaces as the matching
+/// `CommError`, same as every other route. The result — success or
+/// network-down — is always written into the daemon's `relay_probe` state
+/// (COMM-HYPHAE.md §5.2) when a daemon supervisor is wired up; it is skipped
+/// (not an error) on a `Ready` state built without one, same as
+/// `set_relay`'s `on_config_changed` call.
 async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeReq>) -> CommResult {
     let (runner, ..) = state.require_ready()?;
+    let target = effective_probe_target(runner, req.url.as_deref()).await;
     let mut argv: Vec<OsString> = vec!["relay".into(), "info".into()];
-    if let Some(url) = &req.url {
+    if let Some(url) = &target {
         argv.push(url.clone().into());
     }
     argv.push("--timeout".into());
@@ -656,6 +841,526 @@ async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeR
             args: argv,
             password: None,
             timeout: Some(Duration::from_secs(7)),
+        })
+        .await
+        .map_err(map_runner_error)?;
+
+    let at_ms = crate::daemon::wall_clock_ms();
+    let probe = match envelope {
+        Envelope::Ok { data } => RelayProbeStatus {
+            url: data
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| target.clone()),
+            connected: data
+                .get("connected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            at_ms,
+            error: None,
+        },
+        Envelope::Failed {
+            exit: ExitClass::NetworkError,
+            message,
+            ..
+        } => RelayProbeStatus {
+            url: target.clone(),
+            connected: false,
+            at_ms,
+            error: Some(message),
+        },
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => return Err(map_envelope_failure(&error, &message, data)),
+    };
+
+    if let Some(daemon) = state.daemon.clone() {
+        daemon.record_relay_probe(probe.clone());
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "data": {"url": probe.url, "connected": probe.connected, "error": probe.error},
+    })))
+}
+
+// ---------------------------------------------------------------------
+// import (COMM-2b, COMM-HYPHAE.md §4.1)
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImportReq {
+    from: String,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /comm/import` → `crate::import::import` (§4.1). The confirm check
+/// and the password-string-to-[`Password`] decode both happen here, before
+/// the real work starts, same as every other route's own request
+/// validation (`invalid_if_blank`, the npub check in `add_contact`, …) —
+/// [`crate::import::import`] itself also checks `confirm` (defense in depth
+/// for its other, non-HTTP callers), but a bad password length should read
+/// as `invalid`, not bubble up from deep inside the import flow.
+async fn import(State(state): State<CommState>, Json(req): Json<ImportReq>) -> CommResult {
+    let (runner, password_store, home) = state.require_ready()?;
+    if !req.confirm {
+        return Err(CommError::ConfirmRequired);
+    }
+    let password = match req.password {
+        Some(s) => {
+            Some(Password::new(s.into_bytes()).map_err(|e| CommError::Invalid(e.to_string()))?)
+        }
+        None => None,
+    };
+    let report = crate::import::import(
+        runner,
+        password_store,
+        home,
+        crate::import::ImportRequest {
+            from: PathBuf::from(req.from),
+            confirm: req.confirm,
+            password,
+            dry_run: req.dry_run,
+        },
+    )
+    .await?;
+    Ok(Json(json!({"ok": true, "data": {
+        "identities": report.identities,
+        "contacts": report.contacts,
+        "outbox": report.outbox,
+        "db_files": report.db_files,
+    }})))
+}
+
+// ---------------------------------------------------------------------
+// send / history / inbox / outbox (COMM-3, COMM-HYPHAE.md §4, §5.1, §5.3)
+// ---------------------------------------------------------------------
+
+/// `from` / `as` default resolution (§4: "`from`/`as` 缺省时，取 `identity
+/// list` 中 `default:true` 的那一项"). Shared by `send`, `history`, and
+/// `inbox/pull`.
+async fn resolve_default_nickname(runner: &HyphaeRunner) -> Result<String, CommError> {
+    let envelope = runner
+        .run(read_invocation(&["identity", "list"]))
+        .await
+        .map_err(map_runner_error)?;
+    let data = match envelope {
+        Envelope::Ok { data } => data,
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => return Err(map_envelope_failure(&error, &message, data)),
+    };
+    let identities = data
+        .as_array()
+        .ok_or_else(|| CommError::Upstream("identity list did not return an array".to_owned()))?;
+    identities
+        .iter()
+        .find(|item| item.get("default").and_then(Value::as_bool) == Some(true))
+        .and_then(|item| item.get("nickname").and_then(Value::as_str))
+        .map(str::to_owned)
+        .ok_or_else(|| CommError::NotConfigured("no default identity is configured".to_owned()))
+}
+
+/// §4's `not_configured` row ("relay 来源不是 `config`", R1): `send` must not
+/// silently fall back to Hyphae's own built-in default relay. Returns the
+/// configured relay count too, for the `5s × relay 数 + 10s` timeout rule
+/// (§3).
+async fn require_relay_configured(runner: &HyphaeRunner) -> Result<usize, CommError> {
+    let envelope = runner
+        .run(read_invocation(&["relay", "list"]))
+        .await
+        .map_err(map_runner_error)?;
+    let data = match envelope {
+        Envelope::Ok { data } => data,
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => return Err(map_envelope_failure(&error, &message, data)),
+    };
+    if data.get("source").and_then(Value::as_str) != Some("config") {
+        return Err(CommError::NotConfigured(
+            "no relay is configured (COMM-HYPHAE.md §9 R1)".to_owned(),
+        ));
+    }
+    let count = data
+        .get("relays")
+        .and_then(Value::as_array)
+        .map(|a| a.len().max(1))
+        .unwrap_or(1);
+    Ok(count)
+}
+
+/// Same relay-count lookup as [`require_relay_configured`], but for `outbox
+/// retry`, which must still be attempted even if a caller cleared the relay
+/// list after the item was queued — only the *timeout* depends on relay
+/// count there, not a hard precondition. Any failure (including
+/// `not_configured`) falls back to a one-relay timeout rather than
+/// propagating.
+async fn relay_count_best_effort(runner: &HyphaeRunner) -> usize {
+    require_relay_configured(runner).await.unwrap_or(1)
+}
+
+fn send_timeout(relay_count: usize) -> Duration {
+    Duration::from_secs(5 * relay_count as u64 + 10)
+}
+
+#[derive(Deserialize)]
+struct SendReq {
+    to: String,
+    content: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default = "default_encrypt")]
+    encrypt: bool,
+}
+
+fn default_encrypt() -> bool {
+    true
+}
+
+/// §5.3's "part success" classification, applied only to `send`'s own data
+/// shape (`published_to`/`history_stored`/…) — `retry`'s data shape is
+/// different (`attempted`/`sent`/`queued`/`marked_failed`) and is never run
+/// through this. `Ok(data)` carries an added `"layer"` field ("L1"/"L2",
+/// §5.1); `Err` is the `partial` row of §4's closed set, data kept intact.
+fn classify_send_result(data: Value) -> Result<Value, CommError> {
+    let published_to = data
+        .get("published_to")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let history_stored_false = data.get("history_stored").and_then(Value::as_bool) == Some(false);
+    let queue_state_unknown =
+        data.get("queue_state_unknown").and_then(Value::as_bool) == Some(true);
+    // Hyphae's real `audit_error` field is a string (Go `AuditError string
+    // `json:"audit_error,omitempty"``), not a bool — set to the underlying
+    // error's message when `audit.LogAction` fails, and omitted entirely
+    // otherwise. A failed audit log does not make Hyphae's own exit code
+    // non-zero (it only prints a stderr warning outside `--json` mode), so
+    // this is the only signal distinguishing "sent cleanly" from "sent, but
+    // local bookkeeping may be wrong" (§5.3).
+    let audit_error = data
+        .get("audit_error")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    if published_to > 0 && (history_stored_false || queue_state_unknown || audit_error) {
+        return Err(CommError::Partial(data));
+    }
+    let layer = if published_to > 0 { "L2" } else { "L1" };
+    let mut data = data;
+    if let Value::Object(map) = &mut data {
+        map.insert("layer".to_owned(), Value::String(layer.to_owned()));
+    }
+    Ok(data)
+}
+
+/// `POST /comm/send` → `agent msg --from F --to T --content C
+/// [--encrypt=false] --password-stdin` (§4). There is deliberately no
+/// "resend" anywhere in this router (§5.3: "任何情形都不提供「重发」") — the
+/// only retry path for an already-sent message is `POST
+/// /comm/outbox/{event_id}/retry`, which reuses the original event_id
+/// rather than minting a new one.
+async fn send_message(State(state): State<CommState>, Json(req): Json<SendReq>) -> CommResult {
+    let (runner, password_store, home) = state.require_ready()?;
+    invalid_if_blank("to", &req.to)?;
+    invalid_if_blank("content", &req.content)?;
+
+    let from = match req.from {
+        Some(nickname) => nickname,
+        None => resolve_default_nickname(runner).await?,
+    };
+    let relay_count = require_relay_configured(runner).await?;
+    let account = resolve_account(home).await?.ok_or_else(|| {
+        CommError::NotConfigured("no keystore exists yet; create an identity first".to_owned())
+    })?;
+    let password = password_store
+        .get(&account)
+        .await
+        .map_err(map_store_error)?;
+
+    let mut argv: Vec<OsString> = vec![
+        "agent".into(),
+        "msg".into(),
+        "--from".into(),
+        from.into(),
+        "--to".into(),
+        req.to.into(),
+        "--content".into(),
+        req.content.into(),
+    ];
+    if !req.encrypt {
+        argv.push("--encrypt=false".into());
+    }
+
+    let envelope = runner
+        .run(Invocation {
+            args: argv,
+            password: Some(password),
+            timeout: Some(send_timeout(relay_count)),
+        })
+        .await
+        .map_err(map_runner_error)?;
+
+    match envelope {
+        Envelope::Ok { data } => Ok(Json(
+            json!({"ok": true, "data": classify_send_result(data)?}),
+        )),
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => Err(map_envelope_failure(&error, &message, data)),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct HistoryQuery {
+    #[serde(rename = "as")]
+    as_: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /comm/history?as=&limit=` → `history inbox --as A --limit N` (§4).
+/// Pull-based, not push-based (JOINT-ROUND1 F1): a caller that wants fresh
+/// inbound messages reflected here must call `POST /comm/inbox/pull` first
+/// when no daemon is polling on its behalf.
+async fn get_history(
+    State(state): State<CommState>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> CommResult {
+    let (runner, ..) = state.require_ready()?;
+    let Query(q) = query.map_err(|e| CommError::Invalid(e.body_text()))?;
+    if let Some(limit) = q.limit
+        && !(1..=200).contains(&limit)
+    {
+        return Err(CommError::Invalid(format!(
+            "limit must be in 1..=200, got {limit}"
+        )));
+    }
+    let as_nickname = match q.as_ {
+        Some(nickname) => nickname,
+        None => resolve_default_nickname(runner).await?,
+    };
+    let limit_str = q.limit.map(|limit| limit.to_string());
+    let mut argv: Vec<&str> = vec!["history", "inbox", "--as", &as_nickname];
+    if let Some(limit_str) = &limit_str {
+        argv.push("--limit");
+        argv.push(limit_str);
+    }
+    run_read(runner, &argv).await
+}
+
+#[derive(Deserialize, Default)]
+struct InboxPullReq {
+    #[serde(rename = "as", default)]
+    as_: Option<String>,
+}
+
+/// `POST /comm/inbox/pull` → `agent inbox --as A --password-stdin`.
+///
+/// **Not in COMM-HYPHAE.md §4's original route table** — added here per
+/// JOINT-ROUND1 (`docs/comm/JOINT-ROUND1.md` F1): `history inbox` is purely
+/// pull-based, so without a daemon polling `agent inbox` on a schedule
+/// (COMM-4a's `--watch-interval`), nothing would ever make a newly-arrived
+/// message show up under `GET /comm/history`. This route exists ONLY for
+/// the no-daemon / manual case; once COMM-4a's daemon is running it already
+/// calls `agent inbox` on its own interval and callers should not need
+/// this. See `docs/design/COMM-HYPHAE.md` §4 for the added table row.
+async fn pull_inbox(State(state): State<CommState>, Json(req): Json<InboxPullReq>) -> CommResult {
+    let (runner, password_store, home) = state.require_ready()?;
+    let as_nickname = match req.as_ {
+        Some(nickname) => nickname,
+        None => resolve_default_nickname(runner).await?,
+    };
+    let account = resolve_account(home).await?.ok_or_else(|| {
+        CommError::NotConfigured("no keystore exists yet; create an identity first".to_owned())
+    })?;
+    let password = password_store
+        .get(&account)
+        .await
+        .map_err(map_store_error)?;
+    let envelope = runner
+        .run(Invocation {
+            args: vec![
+                "agent".into(),
+                "inbox".into(),
+                "--as".into(),
+                as_nickname.into(),
+            ],
+            password: Some(password),
+            timeout: None,
+        })
+        .await
+        .map_err(map_runner_error)?;
+    envelope_response(envelope)
+}
+
+#[derive(Deserialize, Default)]
+struct OutboxQuery {
+    failed_only: Option<bool>,
+}
+
+/// `GET /comm/outbox?failed_only=` → `storage outbox list [--failed-only]`.
+async fn list_outbox(
+    State(state): State<CommState>,
+    query: Result<Query<OutboxQuery>, axum::extract::rejection::QueryRejection>,
+) -> CommResult {
+    let (runner, ..) = state.require_ready()?;
+    let Query(q) = query.map_err(|e| CommError::Invalid(e.body_text()))?;
+    if q.failed_only == Some(true) {
+        run_read(runner, &["storage", "outbox", "list", "--failed-only"]).await
+    } else {
+        run_read(runner, &["storage", "outbox", "list"]).await
+    }
+}
+
+/// Looks an outbox entry up by id before acting on it (§4's `not_found` row:
+/// "outbox 条目不存在（comm 在调用前查证）"), and hands the matching entry
+/// back — not just a boolean — so the caller can read its own `relays`
+/// (Go's `types.OutboxEntry.Relays`) rather than only confirming existence.
+async fn find_outbox_entry(runner: &HyphaeRunner, event_id: &str) -> Result<Value, CommError> {
+    let envelope = runner
+        .run(read_invocation(&["storage", "outbox", "list"]))
+        .await
+        .map_err(map_runner_error)?;
+    let data = match envelope {
+        Envelope::Ok { data } => data,
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => return Err(map_envelope_failure(&error, &message, data)),
+    };
+    let found = data.as_array().and_then(|entries| {
+        entries
+            .iter()
+            .find(|e| e.get("id").and_then(Value::as_str) == Some(event_id))
+            .cloned()
+    });
+    found.ok_or_else(|| CommError::NotFound(format!("no outbox entry with id {event_id:?}")))
+}
+
+/// §5.1/§3's retry timeout rule ("`5s × relay 数 + 10s`") is defined in
+/// terms of how many relays THIS attempt will actually dial — and Hyphae's
+/// own `storage outbox retry` (`internal/messaging/outbox_commands.go`)
+/// prefers the entry's own queued `relays` over whatever `relay list`
+/// reports right now, falling back to the current config only when the
+/// entry has none of its own. Computing the timeout from the current
+/// config instead would silently under- or over-estimate it after the
+/// caller reconfigures relays between enqueue and retry.
+async fn relay_count_for_retry(runner: &HyphaeRunner, entry: &Value) -> usize {
+    match entry.get("relays").and_then(Value::as_array) {
+        Some(relays) if !relays.is_empty() => relays.len(),
+        _ => relay_count_best_effort(runner).await,
+    }
+}
+
+/// Forces `data.event_id` to `event_id` regardless of what Hyphae itself
+/// echoed back (or omitted) — the structural guarantee behind "重试必须沿用
+/// 原 event_id" (§4, §5.3): the id this router hands back is always the one
+/// the caller asked to retry, never derived from trusting the subprocess.
+fn with_event_id(mut data: Value, event_id: &str) -> Value {
+    if let Value::Object(map) = &mut data {
+        map.insert("event_id".to_owned(), Value::String(event_id.to_owned()));
+    }
+    data
+}
+
+/// `POST /comm/outbox/{event_id}/retry` → `storage outbox retry --id E`
+/// (§4). No `--password-stdin`: retry re-signs nothing, it only re-attempts
+/// publishing an already-signed, already-queued event (JOINT-ROUND1 §2 step
+/// 4 confirms this runs unauthenticated against a real binary). This is the
+/// ONLY retry/resend entry point in the whole comm router (§5.3).
+async fn retry_outbox(
+    State(state): State<CommState>,
+    AxumPath(event_id): AxumPath<String>,
+) -> CommResult {
+    let (runner, ..) = state.require_ready()?;
+    invalid_if_blank("event_id", &event_id)?;
+    let entry = find_outbox_entry(runner, &event_id).await?;
+    let relay_count = relay_count_for_retry(runner, &entry).await;
+    let envelope = runner
+        .run(Invocation {
+            args: vec![
+                "storage".into(),
+                "outbox".into(),
+                "retry".into(),
+                "--id".into(),
+                event_id.clone().into(),
+            ],
+            password: None,
+            timeout: Some(send_timeout(relay_count)),
+        })
+        .await
+        .map_err(map_runner_error)?;
+    match envelope {
+        Envelope::Ok { data } => Ok(Json(
+            json!({"ok": true, "data": with_event_id(data, &event_id)}),
+        )),
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => Err(map_envelope_failure(
+            &error,
+            &message,
+            data.map(|d| with_event_id(d, &event_id)),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct OutboxClearReq {
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    min_failures: Option<u32>,
+}
+
+/// `POST /comm/outbox/clear` → `storage outbox clear --failed --yes
+/// [--min-failures N]` (§4). Refuses without `confirm:true` (§4's
+/// `confirm_required` row) — this only clears LOCAL outbox bookkeeping, it
+/// never un-sends an event a relay already accepted (§4's own note on this
+/// row, and §5.3: no operation here ever constructs a new event_id).
+async fn clear_outbox(
+    State(state): State<CommState>,
+    Json(req): Json<OutboxClearReq>,
+) -> CommResult {
+    let (runner, ..) = state.require_ready()?;
+    if !req.confirm {
+        return Err(CommError::ConfirmRequired);
+    }
+    let mut argv: Vec<OsString> = vec![
+        "storage".into(),
+        "outbox".into(),
+        "clear".into(),
+        "--failed".into(),
+        "--yes".into(),
+    ];
+    if let Some(min_failures) = req.min_failures {
+        argv.push("--min-failures".into());
+        argv.push(min_failures.to_string().into());
+    }
+    let envelope = runner
+        .run(Invocation {
+            args: argv,
+            password: None,
+            timeout: None,
         })
         .await
         .map_err(map_runner_error)?;
@@ -904,36 +1609,46 @@ mod tests {
         tokio::fs::create_dir_all(home.join(".hyphae"))
             .await
             .unwrap();
-        // Writes keystore.json immediately (Hyphae's own atomic rename has
-        // already landed), THEN sleeps well past the runner's timeout —
-        // reproducing `RunnerError::Timeout` AFTER the write, exactly the
-        // ordinary operational event (a slow child, `kill_process_group`
-        // landing late) the High finding describes, not an exotic attack.
-        // The keystore write happens BEFORE the process ever reads stdin, so
-        // it lands as early as possible after spawn — the test's own
-        // timeout budget must only cover process startup, not stdin
-        // round-trip latency.
+        // Writes keystore.json before reading stdin, then sleeps. A test-only
+        // runner barrier below pauses *after spawn but before the timeout is
+        // armed*, so the observer can prove this write has actually landed
+        // before allowing the real timeout path to proceed. That ordering is
+        // the fact under test; relying on the shell child merely being
+        // scheduled within a few seconds flakes under a parallel full suite.
         let script = format!(
             "#!/bin/sh\necho '{{\"salt\":\"c2FsdA==\"}}' > \"{}\"\ncat > /dev/null\nsleep 30\n",
             home.join(".hyphae").join("keystore.json").display()
         );
         let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
-        // A generous timeout (this test only waits for the KILL, not the
-        // sleep): under a loaded `cargo test --workspace` run, several
-        // seconds of scheduler contention for the fork/exec itself is not
-        // unusual, and the point under test is "a timeout AFTER the write
-        // lands", not how fast that happens.
-        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(3)));
+        let runner = Arc::new(HyphaeRunner::new(
+            bin,
+            home.clone(),
+            Duration::from_millis(100),
+        ));
+        let (spawned_before_timeout, arm_timeout) =
+            crate::runner::timeout_test_hook::install(runner.bin_path());
         let store = Arc::new(MemoryPasswordStore::new());
-        let state = CommState::ready(runner, store.clone(), home);
+        let state = CommState::ready(runner, store.clone(), home.clone());
+        let keystore = home.join(".hyphae").join("keystore.json");
 
-        let (status, body) = call(
+        let request = call(
             router(state),
             "POST",
             "/identity",
             Some(json!({"nickname": "alice"})),
-        )
-        .await;
+        );
+        let prove_write_then_arm_timeout = async {
+            spawned_before_timeout.notified().await;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !keystore.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fixture child never wrote keystore.json");
+            arm_timeout.notify_one();
+        };
+        let ((status, body), ()) = tokio::join!(request, prove_write_then_arm_timeout);
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
         assert_eq!(body["data"]["password_preserved"], true, "{body:?}");
 
@@ -1075,6 +1790,500 @@ mod tests {
         assert!(
             !keys[0].starts_with("pending-"),
             "no Pending account should survive: {keys:?}"
+        );
+    }
+
+    // ---- import (COMM-2b): HTTP-level status/error mapping ---------------
+
+    #[tokio::test]
+    async fn import_without_confirm_is_bad_request_before_any_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Would fail the test if ever invoked.
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/import",
+            Some(json!({"from": "/nonexistent", "confirm": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "confirm_required");
+    }
+
+    #[tokio::test]
+    async fn import_rejects_a_missing_source_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let missing = tmp.path().join("does-not-exist");
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/import",
+            Some(json!({
+                "from": missing.to_string_lossy(),
+                "confirm": true,
+                "dry_run": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid");
+    }
+
+    // ---- COMM-3: send / history / inbox / outbox --------------------------
+
+    /// A [`CommState::ready`] whose `home` already has an encrypted
+    /// keystore (just the `salt` field — enough for `resolve_account`) and
+    /// whose password store already has that account's password filed —
+    /// standing in for "an identity was already created", without actually
+    /// running `identity create` through the fake binary.
+    async fn ready_state_with_identity(dir: &Path, script: &str) -> CommState {
+        const SALT: &str = "dGVzdC1zYWx0";
+        let home = dir.join("hyphae-home");
+        tokio::fs::create_dir_all(home.join(".hyphae"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            home.join(".hyphae").join("keystore.json"),
+            format!("{{\"salt\":\"{SALT}\"}}"),
+        )
+        .await
+        .unwrap();
+        let bin = install_fixture(dir, "hyphae-fake.sh", script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        store
+            .put(
+                &Account::from_salt(SALT),
+                &Password::new(b"test-password".to_vec()).unwrap(),
+            )
+            .await
+            .unwrap();
+        CommState::ready(runner, store, home)
+    }
+
+    /// §8's COMM-3 row: "relay 不可达时 send 返回 ok，层级为 L1，
+    /// `published_to==0`". `from` is given explicitly so this test does not
+    /// also depend on the default-identity-resolution path.
+    #[tokio::test]
+    async fn send_with_relay_unreachable_is_ok_layer_l1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "relay list") echo '{"ok":true,"data":{"relays":["wss://r"],"source":"config"}}' ;;
+  "agent msg --from alice --to npub1bob --content hi --password-stdin") echo '{"ok":true,"data":{"published_to":0,"queued_for_retry":true,"event_id":"e1","history_stored":true}}' ;;
+  *) echo "{\"ok\":false,\"error\":\"other_error\",\"message\":\"unexpected: $*\"}" >&2; exit 4 ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/send",
+            Some(json!({"to": "npub1bob", "content": "hi", "from": "alice"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["published_to"], 0);
+        assert_eq!(body["data"]["layer"], "L1");
+    }
+
+    /// §8's COMM-3 row: send returns `not_configured` when no relay is
+    /// configured, rather than silently using Hyphae's own built-in default
+    /// relay (§9 R1).
+    #[tokio::test]
+    async fn send_without_configured_relay_is_not_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"ok":true,"data":{"relays":[],"source":"default"}}'
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/send",
+            Some(json!({"to": "npub1bob", "content": "hi", "from": "alice"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["error"], "not_configured");
+    }
+
+    /// §5.3 / §8: `published_to>0` with `history_stored:false` must surface
+    /// as `partial` (with `data` kept intact, event_id included) — not as a
+    /// plain success.
+    #[tokio::test]
+    async fn send_with_published_but_unstored_history_is_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "relay list") echo '{"ok":true,"data":{"relays":["wss://r"],"source":"config"}}' ;;
+  *) echo '{"ok":true,"data":{"published_to":1,"history_stored":false,"event_id":"e9"}}' ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/send",
+            Some(json!({"to": "npub1bob", "content": "hi", "from": "alice"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["error"], "partial");
+        assert_eq!(body["data"]["event_id"], "e9");
+    }
+
+    /// §8: "retry 返回的 event_id 与原 event_id 相等" — even if the fake
+    /// binary's own retry response omitted `event_id` entirely (as the real
+    /// Hyphae binary does in practice, per JOINT-ROUND1 §2 step 4), the
+    /// router must still hand it back.
+    #[tokio::test]
+    async fn outbox_retry_echoes_the_original_event_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "storage outbox list") echo '{"ok":true,"data":[{"id":"e2","status":"pending"}]}' ;;
+  "relay list") echo '{"ok":true,"data":{"relays":["wss://r"],"source":"config"}}' ;;
+  "storage outbox retry --id e2") echo '{"ok":true,"data":{"attempted":true,"sent":true,"queued":false,"marked_failed":false}}' ;;
+  *) echo "{\"ok\":false,\"error\":\"other_error\",\"message\":\"unexpected: $*\"}" >&2; exit 4 ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/outbox/e2/retry", None).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["event_id"], "e2");
+        assert_eq!(body["data"]["sent"], true);
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：并发 `outbox clear`/daemon 把条目
+    /// 移除时，Hyphae 的 `storage outbox retry` 返回 `write_conflict` 且带
+    /// `data`（`{"sent":true,"superseded":true}` 这种「已经拿到 ACK，但条目
+    /// 被并发移除」的情形，见 `internal/messaging/outbox_commands.go`）。路由
+    /// 必须把这份 data 原样带回去，而不是只剩一句 message——`with_event_id`
+    /// 补写的 event_id 也要留在里面。
+    #[tokio::test]
+    async fn outbox_retry_write_conflict_keeps_data_and_injected_event_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "storage outbox list") echo '{"ok":true,"data":[{"id":"e2","relays":["wss://r"]}]}' ;;
+  "storage outbox retry --id e2") echo '{"ok":false,"error":"write_conflict","message":"queue entry superseded","data":{"sent":true,"superseded":true}}' >&2; exit 1 ;;
+  *) echo "{\"ok\":false,\"error\":\"other_error\",\"message\":\"unexpected: $*\"}" >&2; exit 4 ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/outbox/e2/retry", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["error"], "conflict");
+        assert_eq!(body["data"]["sent"], true, "{body:?}");
+        assert_eq!(body["data"]["superseded"], true, "{body:?}");
+        assert_eq!(
+            body["data"]["event_id"], "e2",
+            "with_event_id's injected id must survive into conflict's data: {body:?}"
+        );
+    }
+
+    /// §4/§8: retrying an id absent from `storage outbox list` is
+    /// `not_found`, checked before ever invoking `outbox retry`.
+    #[tokio::test]
+    async fn outbox_retry_of_an_unknown_id_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "storage outbox list") echo '{"ok":true,"data":[]}' ;;
+  *) echo "{\"ok\":false,\"error\":\"other_error\",\"message\":\"should never run: $*\"}" >&2; exit 4 ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/outbox/nope/retry", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+        assert_eq!(body["error"], "not_found");
+    }
+
+    /// §4/§8: `outbox clear` without `confirm:true` is rejected before the
+    /// fake binary is ever invoked (a script that would fail the test if run).
+    #[tokio::test]
+    async fn outbox_clear_without_confirm_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/outbox/clear", Some(json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "confirm_required");
+    }
+
+    #[tokio::test]
+    async fn outbox_clear_with_confirm_invokes_hyphae() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\ncat > /dev/null\necho '{\"ok\":true,\"data\":{\"cleared\":2}}'\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/outbox/clear",
+            Some(json!({"confirm": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["cleared"], 2);
+    }
+
+    /// §5.3: "任何情形都不提供「重发」" — there is no route anywhere in this
+    /// router that would mint a brand-new event_id for an already-sent
+    /// message. `POST /comm/send` itself is the only message-creating route
+    /// and takes no event_id, so "no resend" means no OTHER route accepts
+    /// one for that purpose either.
+    #[tokio::test]
+    async fn there_is_no_resend_route() {
+        let app = router(CommState::unconfigured("x"));
+        for (method, path) in [
+            ("POST", "/send/e1/resend"),
+            ("POST", "/outbox/e1/resend"),
+            ("POST", "/resend"),
+            ("PUT", "/send"),
+        ] {
+            let (status, _) = call(app.clone(), method, path, None).await;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} unexpectedly matched a route: {status}"
+            );
+        }
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）High：Hyphae 真实返回的 `audit_error` 是
+    /// 非空字符串（`internal/messaging/agent.go` 的 `AuditError string
+    /// \`json:"audit_error,omitempty"\`` ），不是布尔值；审计失败时 Hyphae 的
+    /// 退出码仍可能是 0（只在非 json 模式打一行 stderr warning，`sendErr`
+    /// 不受影响）。字符串形态的 `audit_error` 必须被 `classify_send_result`
+    /// 识别为「本地记账异常」，走 §5.3 的 `partial`，而不是被静默当成
+    /// `Some(true)`（布尔读取下恒为 `None`）比较失败从而放行成功。
+    #[tokio::test]
+    async fn send_with_string_audit_error_is_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "relay list") echo '{"ok":true,"data":{"relays":["wss://r"],"source":"config"}}' ;;
+  *) echo '{"ok":true,"data":{"published_to":1,"history_stored":true,"audit_error":"permission denied","event_id":"e7"}}' ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/send",
+            Some(json!({"to": "npub1bob", "content": "hi", "from": "alice"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["error"], "partial");
+        assert_eq!(body["data"]["audit_error"], "permission denied");
+        assert_eq!(body["data"]["event_id"], "e7");
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：retry 的超时要按「这次实际会用
+    /// 哪些 relay」算，而真实 Hyphae 的 `storage outbox retry`
+    /// （`internal/messaging/outbox_commands.go`）优先用 outbox 条目自己入队
+    /// 时保存的 `relays`，只在条目没有自己的 relay 时才落回当前 `relay
+    /// list`。配置变更之后重试（条目保存的 relay 数与当前配置不同）必须按
+    /// 条目自己的数量算超时，不能看当前配置。
+    #[tokio::test]
+    async fn retry_relay_count_prefers_the_entrys_own_relays_over_current_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Current config has drifted to a single relay — if the fix didn't
+        // land, this is what gets used for every retry regardless of what
+        // the entry itself queued against.
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"ok":true,"data":{"relays":["wss://only-now"],"source":"config"}}'
+"#;
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (runner, ..) = state.require_ready().unwrap();
+        let entry = json!({"id": "e1", "relays": ["wss://a", "wss://b", "wss://c"]});
+        assert_eq!(
+            relay_count_for_retry(runner, &entry).await,
+            3,
+            "must use the entry's own 3 queued relays, not the current config's 1"
+        );
+    }
+
+    /// Same helper, the fallback half: an entry with no relays of its own
+    /// (e.g. a legacy entry, or `ResolveRelays` having filled nothing in)
+    /// falls back to whatever is currently configured, same as before this
+    /// fix for every other route.
+    #[tokio::test]
+    async fn retry_relay_count_falls_back_to_current_config_when_entry_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"ok":true,"data":{"relays":["wss://a","wss://b"],"source":"config"}}'
+"#;
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (runner, ..) = state.require_ready().unwrap();
+        let entry = json!({"id": "e1", "relays": []});
+        assert_eq!(relay_count_for_retry(runner, &entry).await, 2);
+    }
+
+    #[tokio::test]
+    async fn history_rejects_an_out_of_range_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `require_ready` succeeds (so the handler reaches the limit check)
+        // but the script would fail the test if the limit check didn't
+        // short-circuit before any invocation.
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "GET", "/history?limit=0&as=alice", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid");
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：`?limit=abc` 这种连类型都不对的
+    /// 查询参数，在 Axum 的 `Query<T>` extractor 阶段就失败了，比
+    /// `get_history` 函数体里 `1..=200` 的范围检查还早——这个失败必须也走
+    /// §4 统一的 `{ok:false,error:"invalid",...}` JSON envelope，不能是
+    /// Axum 默认的纯文本 400。
+    #[tokio::test]
+    async fn history_with_non_numeric_limit_is_invalid_json_not_plain_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "GET", "/history?limit=abc", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid", "{body:?}");
+        assert_eq!(body["ok"], false, "{body:?}");
+    }
+
+    /// Same bug, `limit=-1`: still a `QueryRejection` (`u32` cannot hold a
+    /// negative number) before `get_history`'s own `1..=200` range check
+    /// ever runs.
+    #[tokio::test]
+    async fn history_with_negative_limit_is_invalid_json_not_plain_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "GET", "/history?limit=-1", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid", "{body:?}");
+    }
+
+    /// Same bug, `list_outbox`'s `?failed_only=abc` (`bool` extractor
+    /// failure).
+    #[tokio::test]
+    async fn outbox_list_with_non_bool_failed_only_is_invalid_json_not_plain_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "GET", "/outbox?failed_only=abc", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid", "{body:?}");
+        assert_eq!(body["ok"], false, "{body:?}");
+    }
+
+    // ---- COMM-4b: relay probe only folds `network_error` into ------------
+    // ---- `connected:false`; every other failure still errors (T2) -------
+
+    /// pre-pr-check T2: without the third match arm in `probe_relay`
+    /// (`Envelope::Failed { error, message, data, .. } => return
+    /// Err(...)`), this test goes red — a non-network failure (here
+    /// `other_error`, Hyphae's own exit 4) would otherwise be silently
+    /// folded into `{connected:false}` the same as a real network-down
+    /// probe, hiding a different failure mode (bad `--timeout`, a crashed
+    /// Hyphae, …) behind the "relay is down" result. S3: this is checked at
+    /// the one and only place the invocation's result is interpreted — the
+    /// match in `probe_relay` itself — not at an earlier entry/validation
+    /// step that a later code path could bypass.
+    #[tokio::test]
+    async fn relay_probe_of_a_non_network_failure_is_still_an_http_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho '{\"ok\":false,\"error\":\"other_error\",\"message\":\"boom\"}' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/relay/probe", Some(json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["error"], "upstream", "{body:?}");
+        assert!(
+            body.get("data").is_none() || body["data"].get("connected").is_none(),
+            "a non-network failure must never report connected:false: {body:?}"
+        );
+    }
+
+    // ---- COMM-4b review round 2, Low: `{"url": ""}` == no `url` at all ---
+
+    /// Codex COMM-4b review, round 2, Low: an explicit-but-empty `url`
+    /// (`{"url": ""}`) must resolve the configured default, exactly like
+    /// omitting `url` entirely — matching Hyphae's own `relayInfo`, which
+    /// treats an empty CLI arg as "no override" (`internal/nostr/relay.go:70`,
+    /// locked source). Before the fix, `effective_probe_target` matched
+    /// `Some("")` as if it were a real target, so this never called `relay
+    /// list` at all and sent `relay info ""` straight through — proven here
+    /// by asserting on the exact argv each invocation of the fake binary
+    /// received, not just the final JSON response.
+    #[tokio::test]
+    async fn relay_probe_with_an_explicit_empty_url_resolves_the_default_like_hyphae_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv_log = tmp.path().join("argv.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"{log}\"; done\n\
+             printf -- '---\\n' >> \"{log}\"\n\
+             case \"$1 $2\" in\n\
+             'relay list')\n\
+             echo '{{\"ok\":true,\"data\":{{\"source\":\"config\",\"relays\":[\"wss://relay.example\"]}}}}'\n\
+             ;;\n\
+             'relay info')\n\
+             echo '{{\"ok\":true,\"data\":{{\"url\":\"wss://relay.example\",\"connected\":true}}}}'\n\
+             ;;\n\
+             esac\n",
+            log = argv_log.display(),
+        );
+        let state = ready_state_with_script(tmp.path(), &script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/relay/probe",
+            Some(json!({"url": ""})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["url"], "wss://relay.example", "{body:?}");
+
+        let log = tokio::fs::read_to_string(&argv_log).await.unwrap();
+        let invocations: Vec<Vec<&str>> = log
+            .split("---\n")
+            .map(|chunk| chunk.lines().collect::<Vec<_>>())
+            .filter(|args| !args.is_empty())
+            .collect();
+        assert!(
+            invocations
+                .iter()
+                .any(|args| args.as_slice() == ["relay", "list"]),
+            "an empty `url` must still trigger the `relay list` default-resolution \
+             fallback (the pre-fix short-circuit skipped this entirely): {invocations:?}"
+        );
+        assert!(
+            invocations.iter().any(|args| args.as_slice()
+                == ["relay", "info", "wss://relay.example", "--timeout", "5"]),
+            "the resolved default address must be passed explicitly to `relay info`: \
+             {invocations:?}"
+        );
+        assert!(
+            !invocations.iter().any(|args| {
+                args.first() == Some(&"relay")
+                    && args.get(1) == Some(&"info")
+                    && args.get(2) == Some(&"")
+            }),
+            "`relay info` must never receive a literal empty-string url argument: \
+             {invocations:?}"
         );
     }
 }

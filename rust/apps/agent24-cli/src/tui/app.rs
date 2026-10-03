@@ -530,9 +530,11 @@ mod tests {
         Run {
             id: id.to_owned(),
             session_id: None,
+            workspace_id: None,
             status,
             input: RunInput {
                 prompt: "hi".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },

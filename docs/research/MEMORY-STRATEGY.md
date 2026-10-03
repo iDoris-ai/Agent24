@@ -2,7 +2,7 @@
 
 > 状态：**方案草案，待 jason 拍板**（2026-10-02）。不修改已冻结的 `docs/agent/M1-PLAN-v2.md` 和 `docs/agent/tasks.md`；拍板后再据此修订计划。
 > 输入：B 端 Codex 的四份调研（[R1 论文](m1-memory/R1-papers.md)、[R2 开源框架](m1-memory/R2-frameworks.md)、[R3 商业产品](m1-memory/R3-products.md)、[R4 企业助手](m1-memory/R4-enterprise.md)），当前代码（`ab/m1-memory` @ 1350fb8 之后），以及 [M1 v2 冻结计划](../agent/M1-PLAN-v2.md)。
-> 记号：**[B]** 交给 Mac mini 的 Codex 队列；**[笔记本]** 需要 oMLX 本地模型或本机环境。凡写「建议」，均属设计判断，不代表已实现。
+> 记号：~~**[B]** 交给 Mac mini 的 Codex 队列~~ —— **2026-10-03 作废（jason 裁决）：Agent24 的派活、构建、测试、验收全部在笔记本上做，B 机不再构建 Agent24**，下文 `[B]` 仅为历史记号；**[笔记本]** 需要 oMLX 本地模型或本机环境。凡写「建议」，均属设计判断，不代表已实现。
 
 ---
 
@@ -166,7 +166,7 @@ sensitivity?, retention_policy_id?   # P4
 | T06b / T07b | 不变（笔记本，可选） | 纳入 P2 |
 
 **验收（可证伪）**：会话 A「记住我对花生过敏」→ 重启 → 会话 B 问「我对什么过敏？」时 mock provider 收到该断言（以数据块形式，不在 system 中）→ 撤回 → 会话 C 不再注入，FTS rebuild 后也不会复活；模块分区、另一个 owner、Held 的条目都不出现；关闭总开关后既不写也不召回，重启后依然如此。
-**不做**：编辑、导出、清除、自动抽取、向量、共享空间。
+**不做**：编辑、导出、清除、自动抽取、向量、共享空间、`asserted_by`（F11，移入 P1，见 §7 #7）。
 
 ### 4.2 P1 — 个人记忆可控（M1.5，[B] 为主）
 
@@ -179,17 +179,18 @@ sensitivity?, retention_policy_id?   # P4
 - 导出（JSON + Markdown，可以重新导入）。
 - purge（只能由用户发起，带审计）。
 - 无痕会话（不写 EventLog）。
+- SPEC-ORG-SPACE **F11**：断言加 `asserted_by` + 冲突断言并存（2026-10-03 从「随 F2/P0」移入 P1，见 §7 #7）。
 
 **验收**：purge 之后，任何查询、rebuild、备份恢复都不会让被清除的内容复活；更正之后，召回只返回新值，按 as-of 查询还能得到旧值；导出后导入到干净的机器上，断言数量和来源一致；无痕会话结束后 EventLog 中没有它的任何记录。
 **不做**：自动抽取、共享空间。
 
-### 4.3 P2 — 本地智能（[笔记本] 为主，评测台给 [B]）
+### 4.3 P2 — 本地智能（[笔记本]）
 
 **目标**：不牺牲可控性的前提下，提高召回质量和写入的自动化程度。
 **交付**：
 - T07b：oMLX embedding，按 owner 分区，可从账本重建，模型或维度变化时有重建契约；FTS 和向量各自先过滤，再用 RRF 合并。reranker 只有在评测显示有收益时才开启。
 - T06b：本地 LLM 只提出候选（ADD/UPDATE/RETRACT 提议 + 证据 EventId），一律进 Held，用户在「待确认」列表里确认后才生效。任务以 `source_event_id + extractor_revision` 作为幂等键。
-- 评测台：在 T08 用例集的基础上加入 LongMemEval 形状的中文集（≥100 例，数据结构参照官方 schema），检索、注入、回答三层分开出指标，记录模型、embedding、预算配置。[B] 负责搭建评测框架，[笔记本] 负责跑本地模型。
+- 评测台：在 T08 用例集的基础上加入 LongMemEval 形状的中文集（≥100 例，数据结构参照官方 schema），检索、注入、回答三层分开出指标，记录模型、embedding、预算配置。评测框架与本地模型都在笔记本上（2026-10-03 起 B 机不再构建 Agent24）。
 
 **验收**：在同一份用例集上，FTS + 向量 RRF 的 Hit@5 高于纯 FTS（数值记录在案，提升幅度要可复现）；候选抽取的精确率被测量并记录；未经确认的候选在召回中出现 0 次。
 **不做**：图记忆、自动 supersede。
@@ -283,5 +284,7 @@ sensitivity?, retention_policy_id?   # P4
 | 3 | T10/T11 加暂停总开关 + 来源展示 | 加（M1 范围约 +100 行） |
 | 4 | 企业版管理员能否看员工个人记忆 | 默认不能；合规访问走策略 + 审批 + 审计并对员工可见 |
 | 5 | P3 先社区还是企业团队 | 先社区（Cos72） |
+| 6 | 执行机器（2026-10-03） | 文中 `[B]` 分工作废：Agent24 全部在笔记本派活/构建/测试/验收，B 机不再构建 Agent24 |
+| 7 | F11 `asserted_by` 随 P0 还是 P1（2026-10-03） | **P1**；P0 收尾不补 `asserted_by`，作为对 SPEC-ORG-SPACE「F11 随 F2」的已记录偏离 |
 
-**执行状态**：M1 已暂停（B 端 agent24 项目停用，T07 #652 留在 `ab/m1-memory`），待 open-design 分支与 main 合并完成（基线 tag `stable/main-2026-10-02` @ `9ed3549`）后，在新 main 上恢复并按上表执行。
+**执行状态**：~~M1 已暂停（B 端 agent24 项目停用，T07 #652 留在 `ab/m1-memory`），待 open-design 分支与 main 合并完成（基线 tag `stable/main-2026-10-02` @ `9ed3549`）后，在新 main 上恢复并按上表执行。~~ 2026-10-03：open-design（M10）已落 main，M1 恢复为主干，在笔记本执行；`ab/m1-memory` 先吸收最新 main，再做 T07.1 → T08、T10 → T11。

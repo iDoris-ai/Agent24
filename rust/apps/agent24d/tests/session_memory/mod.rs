@@ -104,6 +104,7 @@ async fn app_with_recall_budget(
     if store.get_session(SESSION).await.unwrap().is_none() {
         store
             .insert_session(&Session {
+                workspace_id: None,
                 id: SESSION.into(),
                 title: String::new(),
                 channel: "test".into(),
@@ -114,6 +115,7 @@ async fn app_with_recall_budget(
             .unwrap();
     }
     AppState::new(AppDeps {
+        workspace_service: None,
         token: "test".into(),
         router,
         tools: agent24_tools::ToolRegistry::new(),
@@ -172,6 +174,7 @@ async fn ensure_session(state: &AppState, session_id: &str) {
         state
             .store
             .insert_session(&Session {
+                workspace_id: None,
                 id: session_id.into(),
                 title: String::new(),
                 channel: "test".into(),

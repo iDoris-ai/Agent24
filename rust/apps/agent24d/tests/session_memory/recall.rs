@@ -87,6 +87,7 @@ async fn approval_app(
     }
     let store = Store::open(&path.join("agent24.db")).await.unwrap();
     let state = AppState::new(AppDeps {
+        workspace_service: None,
         token: "test".into(),
         router,
         tools: agent24_tools::ToolRegistry::builtin(path.to_path_buf()),
@@ -205,6 +206,7 @@ fn recalled_context_survives_approval_wait_and_daemon_restart() {
             let run = state
                 .runs
                 .start_run(RunCreate {
+                    workspace_id: None,
                     session_id: Some(RECALL_SESSION.into()),
                     prompt: "我对什么过敏？".into(),
                     model_override: None,
@@ -248,7 +250,7 @@ fn recalled_context_survives_approval_wait_and_daemon_restart() {
         });
         // Disable fresh recall: only the durable snapshot can supply the facts.
         let state = approval_app(kv, &path, provider, Some(0)).await;
-        let restored = state.runs.restore_pending_approvals().await;
+        let restored = state.runs.restore_pending_approvals().await.unwrap();
         assert_eq!(restored, (1, 0));
         let response = crate::approvals::decide_approval(
             State(state.clone()),
@@ -325,6 +327,7 @@ fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
             let control = state
                 .runs
                 .start_run(RunCreate {
+                    workspace_id: None,
                     session_id: None,
                     prompt: "ordinary control".into(),
                     model_override: None,
@@ -376,6 +379,7 @@ fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
             let run = state
                 .runs
                 .start_run(RunCreate {
+                    workspace_id: None,
                     session_id: Some(RECALL_SESSION.into()),
                     prompt: "我对什么过敏？".into(),
                     model_override: None,
@@ -445,7 +449,10 @@ fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
             received: Arc::clone(&received),
         });
         let state = approval_app(kv, &path, provider, Some(0)).await;
-        assert_eq!(state.runs.restore_pending_approvals().await, (0, 0));
+        assert_eq!(
+            state.runs.restore_pending_approvals().await.unwrap(),
+            (0, 0)
+        );
         let row = state.store.get_run(&run_id).await.unwrap().unwrap();
         assert_eq!(row.status, RunStatus::Failed);
         assert_eq!(

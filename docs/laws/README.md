@@ -66,16 +66,21 @@ F1 与 F8 加起来二十余轮对抗复审，抓到的几乎全是同一类问�
 | 文件 | 覆盖 |
 |---|---|
 | [`CONTEXT.md`](CONTEXT.md) | 什么可以进入 agent 的上下文 |
+| [`MEMORY.md`](MEMORY.md) | 记忆隔离与分区：模块能触到哪、分区迁移的边界、隔离主张的措辞上限 |
+| [`APPROVAL.md`](APPROVAL.md) | 审批与授权：谁能放宽风险级、什么能成为常驻授权 |
 
-## 待迁入（FU-15 的剩余部分）
+## 迁移状态（FU-15）
 
-以下边界今天散在别处，应逐条迁进本目录并编号：
+原来散在别处的边界已迁入并编号：
 
-- `docs/agent/architecture.md`「不可动摇的边界」六条（模块拿不到 `KvStore`、模块 API 无 owner/space 参数、
-  进 key 的只有不可变 ID、迁移必须一个事务…）→ 拟建 `MEMORY.md`
-- `docs/specs/SPEC-ME-FOLLOWUPS.md` F1「不得声称的话」→ 并入 `MEMORY.md`
-- H2 的 inviolable：override store 是 user-local，**永不由模块清单或 persona 写入** → 拟建 `APPROVAL.md`
-- H4：`approve_for_session` 对 external 工具不作为可选项呈现 → 同上
+- ✅ `docs/agent/architecture.md`「不可动摇的边界」六条 → [`MEMORY.md`](MEMORY.md) `L-MEM-1..6`
+- ✅ `docs/specs/SPEC-ME-FOLLOWUPS.md` F1「不得声称的话」→ [`MEMORY.md`](MEMORY.md) `L-MEM-7`（附「不得声称」对照表）
+- ✅ H2 的 inviolable → [`APPROVAL.md`](APPROVAL.md) `L-APPR-1..3`
+- ✅ H4 → [`APPROVAL.md`](APPROVAL.md) `L-APPR-4..7`
 
-**迁移不是复制粘贴** —— 每条都要按上面的形状重写，尤其是「今天靠什么保证」那一栏，
-写的时候大概率会发现有几条其实没有机制。**那正是要找的东西。**
+**仍未建**（等对应功能出现再立）：T13/T14 的 SDK 与非 Rust 参考实现会引入进程边界，届时需要一份
+`WIRE.md`；Cos72（T10）会引入项目根与工作区，`CONTEXT.md` 的 L-CTX-1/2 到那时才第一次有真实代码路径。
+
+**迁移不是复制粘贴** —— 每一条都按法律形状重写了「今天靠什么保证」那一栏。
+写的时候确实发现了几条**没有机制、只有纪律**的：`MEMORY.md` L-MEM-7 的第 ④⑤⑥ 项、
+`APPROVAL.md` L-APPR-1 的未来安装路径、L-APPR-7 的「读权限不存储」。**那些正是要找的东西。**

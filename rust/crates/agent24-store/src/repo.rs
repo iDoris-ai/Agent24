@@ -13,10 +13,11 @@ use agent24_protocol::{
 use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
+use sqlx::{Sqlite, Transaction};
 
 use crate::{Result, Store, StoreError};
 
-fn status_str(s: RunStatus) -> &'static str {
+pub(crate) fn status_str(s: RunStatus) -> &'static str {
     match s {
         RunStatus::Queued => "queued",
         RunStatus::Running => "running",
@@ -25,6 +26,34 @@ fn status_str(s: RunStatus) -> &'static str {
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",
     }
+}
+
+pub(crate) async fn insert_run_tx(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
+    if run.workspace_id != run.input.workspace_id {
+        return Err(StoreError::Conflict(
+            "run workspace identity mismatch".to_owned(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO runs (id, session_id, workspace_id, status, input, output, error, usage,
+                           schedule_id, created_at, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&run.id)
+    .bind(&run.session_id)
+    .bind(run.workspace_id.as_ref().map(|id| id.as_str()))
+    .bind(status_str(run.status))
+    .bind(serde_json::to_string(&run.input)?)
+    .bind(run.output.as_ref().map(serde_json::to_string).transpose()?)
+    .bind(run.error.as_ref().map(serde_json::to_string).transpose()?)
+    .bind(serde_json::to_string(&run.usage)?)
+    .bind(&run.schedule_id)
+    .bind(&run.created_at)
+    .bind(&run.started_at)
+    .bind(&run.ended_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn parse_status(s: &str) -> Result<RunStatus> {
@@ -84,12 +113,24 @@ fn effective(
     (true, None)
 }
 
-fn row_to_run(row: &SqliteRow) -> Result<Run> {
+pub(crate) fn row_to_run(row: &SqliteRow) -> Result<Run> {
+    let workspace_id = row
+        .get::<Option<String>, _>("workspace_id")
+        .map(agent24_protocol::WorkspaceId::parse)
+        .transpose()
+        .map_err(|_| StoreError::Conflict("invalid run workspace_id".to_owned()))?;
+    let input: agent24_protocol::RunInput = serde_json::from_str(&row.get::<String, _>("input"))?;
+    if input.workspace_id != workspace_id {
+        return Err(StoreError::Conflict(
+            "run workspace identity mismatch".to_owned(),
+        ));
+    }
     Ok(Run {
         id: row.get("id"),
         session_id: row.get("session_id"),
+        workspace_id,
         status: parse_status(&row.get::<String, _>("status"))?,
-        input: serde_json::from_str(&row.get::<String, _>("input"))?,
+        input,
         output: row
             .get::<Option<String>, _>("output")
             .map(|s| serde_json::from_str::<RunOutput>(&s))
@@ -116,17 +157,66 @@ pub struct RunPatch {
     pub ended_at: Option<String>,
 }
 
+#[allow(dead_code)]
+pub(crate) async fn transition_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    from: RunStatus,
+    to: RunStatus,
+    patch: &RunPatch,
+) -> Result<bool> {
+    check_run_transition(from, to)
+        .map_err(|_| StoreError::Conflict(format!("run {id} transition conflict")))?;
+    let result = sqlx::query(
+        "UPDATE runs SET status = ?,
+             output = COALESCE(?, output), error = COALESCE(?, error),
+             usage = COALESCE(?, usage), started_at = COALESCE(?, started_at),
+             ended_at = COALESCE(?, ended_at)
+         WHERE id = ? COLLATE BINARY AND status = ? COLLATE BINARY",
+    )
+    .bind(status_str(to))
+    .bind(
+        patch
+            .output
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        patch
+            .error
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        patch
+            .usage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(&patch.started_at)
+    .bind(&patch.ended_at)
+    .bind(id)
+    .bind(status_str(from))
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 impl Store {
     // ── sessions ─────────────────────────────────────────────────────────────
 
     pub async fn insert_session(&self, session: &Session) -> Result<()> {
         sqlx::query(
-            "INSERT INTO sessions (id, title, channel, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, title, channel, workspace_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&session.id)
         .bind(&session.title)
         .bind(&session.channel)
+        .bind(session.workspace_id.as_ref().map(|id| id.as_str()))
         .bind(&session.created_at)
         .bind(&session.updated_at)
         .execute(self.pool())
@@ -139,13 +229,21 @@ impl Store {
             .bind(id)
             .fetch_optional(self.pool())
             .await?;
-        Ok(row.map(|r| Session {
-            id: r.get("id"),
-            title: r.get("title"),
-            channel: r.get("channel"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        }))
+        row.map(|r| {
+            Ok(Session {
+                id: r.get("id"),
+                title: r.get("title"),
+                channel: r.get("channel"),
+                workspace_id: r
+                    .get::<Option<String>, _>("workspace_id")
+                    .map(agent24_protocol::WorkspaceId::parse)
+                    .transpose()
+                    .map_err(|_| StoreError::Conflict("invalid session workspace_id".to_owned()))?,
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+        })
+        .transpose()
     }
 
     /// # Ordering
@@ -168,39 +266,70 @@ impl Store {
         let rows = sqlx::query("SELECT * FROM sessions ORDER BY created_at DESC, id DESC")
             .fetch_all(self.pool())
             .await?;
-        Ok(rows
-            .iter()
-            .map(|r| Session {
-                id: r.get("id"),
-                title: r.get("title"),
-                channel: r.get("channel"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+        rows.iter()
+            .map(|r| {
+                Ok(Session {
+                    id: r.get("id"),
+                    title: r.get("title"),
+                    channel: r.get("channel"),
+                    workspace_id: r
+                        .get::<Option<String>, _>("workspace_id")
+                        .map(agent24_protocol::WorkspaceId::parse)
+                        .transpose()
+                        .map_err(|_| {
+                            StoreError::Conflict("invalid session workspace_id".to_owned())
+                        })?,
+                    created_at: r.get("created_at"),
+                    updated_at: r.get("updated_at"),
+                })
             })
-            .collect())
+            .collect()
     }
 
     // ── runs ─────────────────────────────────────────────────────────────────
 
     pub async fn insert_run(&self, run: &Run) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO runs (id, session_id, status, input, output, error, usage,
-                               schedule_id, created_at, started_at, ended_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&run.id)
-        .bind(&run.session_id)
-        .bind(status_str(run.status))
-        .bind(serde_json::to_string(&run.input)?)
-        .bind(run.output.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(run.error.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(serde_json::to_string(&run.usage)?)
-        .bind(&run.schedule_id)
-        .bind(&run.created_at)
-        .bind(&run.started_at)
-        .bind(&run.ended_at)
-        .execute(self.pool())
-        .await?;
+        if run.workspace_id != run.input.workspace_id {
+            return Err(StoreError::Conflict(
+                "run workspace identity mismatch".to_owned(),
+            ));
+        }
+        if run.workspace_id.is_some() {
+            return Err(StoreError::Conflict(
+                "explicit workspace runs require atomic admission".to_owned(),
+            ));
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let expected_session_workspace = if let Some(session_id) = run.session_id.as_deref() {
+            let row = sqlx::query("SELECT workspace_id FROM sessions WHERE id = ? COLLATE BINARY")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
+            let workspace_id = row.get::<Option<String>, _>("workspace_id");
+            if workspace_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "workspace-bound sessions require atomic admission".to_owned(),
+                ));
+            }
+            Some(workspace_id)
+        } else {
+            None
+        };
+        insert_run_tx(&mut tx, run).await?;
+        if let Some(session_id) = run.session_id.as_deref() {
+            let actual_session_workspace =
+                sqlx::query("SELECT workspace_id FROM sessions WHERE id = ? COLLATE BINARY")
+                    .bind(session_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or_else(|| StoreError::Conflict("run session changed".to_owned()))?
+                    .get::<Option<String>, _>("workspace_id");
+            if Some(actual_session_workspace) != expected_session_workspace {
+                return Err(StoreError::Conflict("run session changed".to_owned()));
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -236,15 +365,26 @@ impl Store {
     pub async fn transition_run(&self, id: &str, to: RunStatus, patch: RunPatch) -> Result<Run> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
 
-        let current = sqlx::query("SELECT status FROM runs WHERE id = ?")
+        let current = sqlx::query("SELECT status, workspace_id FROM runs WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)
-            .await?
-            .map(|r| r.get::<String, _>("status"));
+            .await?;
         let Some(current) = current else {
             return Err(StoreError::NotFound(format!("run {id}")));
         };
-        check_run_transition(parse_status(&current)?, to)?;
+        let workspace_id = current.get::<Option<String>, _>("workspace_id");
+        if workspace_id.is_some()
+            && matches!(
+                to,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            )
+        {
+            return Err(StoreError::Conflict(
+                "workspace-bound runs require workspace-aware transitions".to_owned(),
+            ));
+        }
+        let current_status = current.get::<String, _>("status");
+        check_run_transition(parse_status(&current_status)?, to)?;
 
         let row = sqlx::query(
             "UPDATE runs SET status = ?,
@@ -300,9 +440,10 @@ impl Store {
     pub async fn sweep_orphan_runs(&self, ended_at: &str) -> Result<u64> {
         let result = sqlx::query(
             "UPDATE runs SET status = 'cancelled', ended_at = ?
-             WHERE status IN ('queued', 'running')
-                OR (status = 'awaiting_approval'
-                    AND id NOT IN (SELECT run_id FROM approvals WHERE status = 'pending'))",
+             WHERE workspace_id IS NULL
+               AND (status IN ('queued', 'running')
+                    OR (status = 'awaiting_approval'
+                        AND id NOT IN (SELECT run_id FROM approvals WHERE status = 'pending')))",
         )
         .bind(ended_at)
         .execute(self.pool())
@@ -476,6 +617,46 @@ impl Store {
         rows.iter().map(Self::row_to_approval).collect()
     }
 
+    /// Resolve a pending approval inside the caller's transaction.
+    pub(crate) async fn resolve_approval_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        to: ApprovalStatus,
+        decision: Option<&Decision>,
+        decided_at: &str,
+    ) -> Result<Approval> {
+        agent24_core::check_approval_transition(ApprovalStatus::Pending, to)?;
+        let result = sqlx::query(
+            "UPDATE approvals SET status = ?, decision = ?, decided_at = ?
+             WHERE id = ? AND status = 'pending'",
+        )
+        .bind(approval_status_str(to))
+        .bind(decision.map(serde_json::to_string).transpose()?)
+        .bind(decided_at)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))?;
+            Self::row_to_approval(&row)?;
+            return Err(StoreError::Conflict(format!(
+                "approval {id} already resolved"
+            )));
+        }
+        let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        row.as_ref()
+            .map(Self::row_to_approval)
+            .transpose()?
+            .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))
+    }
+
     /// Resolve a pending approval exactly once (pending-only WHERE clause —
     /// the second resolver gets Conflict, giving the REST layer its 409).
     pub async fn resolve_approval(
@@ -486,27 +667,100 @@ impl Store {
         decided_at: String,
     ) -> Result<Approval> {
         agent24_core::check_approval_transition(ApprovalStatus::Pending, to)?;
-        let result = sqlx::query(
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let approval = Self::resolve_approval_tx(&mut tx, id, to, decision, &decided_at).await?;
+        tx.commit().await?;
+        Ok(approval)
+    }
+
+    /// Resolve a human/client decision only while the approval is still pending
+    /// and not past its persisted expiry. The equality boundary belongs to the
+    /// client decision path; startup/timeout recovery owns strictly later times.
+    pub async fn resolve_approval_client_decision(
+        &self,
+        id: &str,
+        to: ApprovalStatus,
+        decision: &Decision,
+        now: &str,
+    ) -> Result<Approval> {
+        agent24_core::check_approval_transition(ApprovalStatus::Pending, to)?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query(
             "UPDATE approvals SET status = ?, decision = ?, decided_at = ?
-             WHERE id = ? AND status = 'pending'",
+             WHERE id = ? AND status = 'pending' AND expires_at >= ?",
         )
         .bind(approval_status_str(to))
-        .bind(decision.map(serde_json::to_string).transpose()?)
-        .bind(&decided_at)
+        .bind(serde_json::to_string(decision)?)
+        .bind(now)
         .bind(id)
-        .execute(self.pool())
+        .bind(now)
+        .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            return match self.get_approval(id).await? {
-                None => Err(StoreError::NotFound(format!("approval {id}"))),
-                Some(_) => Err(StoreError::Conflict(format!(
-                    "approval {id} already resolved"
-                ))),
-            };
+        if changed.rows_affected() == 0 {
+            let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))?;
+            Self::row_to_approval(&row)?;
+            return Err(StoreError::Conflict(format!(
+                "approval {id} already resolved or expired"
+            )));
         }
-        self.get_approval(id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))
+        let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let approval = Self::row_to_approval(&row)?;
+        tx.commit().await?;
+        Ok(approval)
+    }
+
+    /// Atomically time out every still-pending approval whose persisted
+    /// deadline is strictly before `now`.  The strict boundary complements
+    /// [`Self::resolve_approval_client_decision`], whose client-decision CAS
+    /// accepts `expires_at == now`.
+    pub async fn timeout_expired_approvals(&self, now: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "UPDATE approvals SET status = 'timed_out', decided_at = ?
+             WHERE status = 'pending' AND expires_at < ?
+             RETURNING id, run_id",
+        )
+        .bind(now)
+        .bind(now)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("run_id")?)))
+            .collect()
+    }
+
+    /// Runs still parked after an approval timed out and with no newer pending
+    /// approval need token-less recovery.  Keeping this query durable makes a
+    /// failed recovery cancellation naturally retry on the next scan (and after
+    /// a daemon restart) without keeping an in-memory retry queue.
+    pub async fn timed_out_approval_recovery_run_ids(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT a.run_id
+             FROM approvals a
+             JOIN runs r ON r.id = a.run_id
+             WHERE a.status = 'timed_out'
+               AND r.status = 'awaiting_approval'
+               AND a.rowid = (
+                   SELECT max(latest.rowid) FROM approvals latest
+                   WHERE latest.run_id = a.run_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM approvals p
+                   WHERE p.run_id = a.run_id AND p.status = 'pending'
+               )
+             ORDER BY a.run_id ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| row.try_get("run_id").map_err(StoreError::from))
+            .collect()
     }
 
     /// Fail-closed startup sweep: abort every approval left pending by a
@@ -977,6 +1231,30 @@ mod tests {
 
     use super::*;
 
+    async fn approval_store(payload: &str) -> Store {
+        let store = Store::open_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at)
+             VALUES ('run_1', 'queued', '{}', '{}', '2026-07-24T00:00:00Z')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO approvals
+                (id, run_id, tool_call_id, kind, summary, payload,
+                 available_decisions, status, expires_at, created_at)
+             VALUES ('apr_1', 'run_1', 'tc_1', 'exec', 'summary', ?,
+                     '[]', 'pending', '2026-07-24T00:05:00Z',
+                     '2026-07-24T00:00:00Z')",
+        )
+        .bind(payload)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        store
+    }
+
     #[test]
     fn status_strings_roundtrip_through_serde() {
         // Guards the hand-maintained *_str tables against drifting from the
@@ -1015,5 +1293,248 @@ mod tests {
                     .unwrap();
             assert_eq!(parsed, s);
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_tx_is_visible_then_rolls_back() {
+        let store = approval_store("{}").await;
+        let lock = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            store.resolve_approval("apr_1", ApprovalStatus::Pending, None, "ts".to_owned()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(err, StoreError::Transition(_)));
+        drop(lock);
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let resolved = Store::resolve_approval_tx(
+            &mut tx,
+            "apr_1",
+            ApprovalStatus::Approved,
+            None,
+            "2026-07-24T00:01:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.status, ApprovalStatus::Approved);
+        let row = sqlx::query("SELECT status, decision, decided_at FROM approvals WHERE id = ?")
+            .bind("apr_1")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "approved");
+        assert!(row.get::<Option<String>, _>("decision").is_none());
+        assert_eq!(
+            row.get::<Option<String>, _>("decided_at").as_deref(),
+            Some("2026-07-24T00:01:00Z")
+        );
+        drop(tx);
+        let pending = store.get_approval("apr_1").await.unwrap().unwrap();
+        assert_eq!(pending.status, ApprovalStatus::Pending);
+        assert!(pending.decision.is_none());
+        assert!(pending.decided_at.is_none());
+
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        Store::resolve_approval_tx(
+            &mut tx,
+            "apr_1",
+            ApprovalStatus::Approved,
+            None,
+            "2026-07-24T00:01:00Z",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_rolls_back_decode_failure_and_can_retry() {
+        let store = approval_store("not-json").await;
+        let err = store
+            .resolve_approval(
+                "apr_1",
+                ApprovalStatus::Approved,
+                None,
+                "2026-07-24T00:01:00Z".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Serde(_)));
+        let row = sqlx::query("SELECT status, decision, decided_at FROM approvals WHERE id = ?")
+            .bind("apr_1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert!(row.get::<Option<String>, _>("decision").is_none());
+        assert!(row.get::<Option<String>, _>("decided_at").is_none());
+
+        sqlx::query("UPDATE approvals SET payload = '{}' WHERE id = 'apr_1'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_approval(
+                    "apr_1",
+                    ApprovalStatus::Approved,
+                    None,
+                    "2026-07-24T00:01:00Z".to_owned()
+                )
+                .await
+                .unwrap()
+                .status,
+            ApprovalStatus::Approved
+        );
+
+        sqlx::query("UPDATE approvals SET payload = 'not-json' WHERE id = 'apr_1'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let err = store
+            .resolve_approval("apr_1", ApprovalStatus::Denied, None, "ts".to_owned())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Serde(_)));
+    }
+
+    #[tokio::test]
+    async fn client_decision_expiry_boundary_is_store_atomic() {
+        let store = approval_store("{}").await;
+        let decision = Decision {
+            kind: "approve".to_owned(),
+            reason: None,
+            extra: serde_json::Map::new(),
+        };
+        assert_eq!(
+            store
+                .resolve_approval_client_decision(
+                    "apr_1",
+                    ApprovalStatus::Approved,
+                    &decision,
+                    "2026-07-24T00:05:00Z",
+                )
+                .await
+                .unwrap()
+                .status,
+            ApprovalStatus::Approved
+        );
+
+        let store = approval_store("{}").await;
+        assert!(matches!(
+            store
+                .resolve_approval_client_decision(
+                    "apr_1",
+                    ApprovalStatus::Approved,
+                    &decision,
+                    "2026-07-24T00:05:01Z",
+                )
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_approval_timeout_is_strict_atomic_and_idempotent() {
+        let store = approval_store("{}").await;
+        assert!(
+            store
+                .timeout_expired_approvals("2026-07-24T00:05:00Z")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+
+        assert_eq!(
+            store
+                .timeout_expired_approvals("2026-07-24T00:05:01Z")
+                .await
+                .unwrap(),
+            vec![("apr_1".to_owned(), "run_1".to_owned())]
+        );
+        let timed_out = store.get_approval("apr_1").await.unwrap().unwrap();
+        assert_eq!(timed_out.status, ApprovalStatus::TimedOut);
+        assert_eq!(
+            timed_out.decided_at.as_deref(),
+            Some("2026-07-24T00:05:01Z")
+        );
+        assert!(
+            store
+                .timeout_expired_approvals("2026-07-24T00:05:02Z")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_recovery_candidates_require_parked_run_without_new_pending() {
+        let store = approval_store("{}").await;
+        sqlx::query("UPDATE runs SET status = 'awaiting_approval' WHERE id = 'run_1'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .timeout_expired_approvals("2026-07-24T00:05:01Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.timed_out_approval_recovery_run_ids().await.unwrap(),
+            vec!["run_1".to_owned()]
+        );
+
+        sqlx::query(
+            "INSERT INTO approvals
+                (id, run_id, tool_call_id, kind, summary, payload,
+                 available_decisions, status, expires_at, created_at)
+             VALUES ('apr_2', 'run_1', 'tc_2', 'exec', 'new', '{}',
+                     '[]', 'pending', '2026-07-24T00:10:00Z',
+                     '2026-07-24T00:06:00Z')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            store
+                .timed_out_approval_recovery_run_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query("UPDATE approvals SET status = 'approved' WHERE id = 'apr_2'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .timed_out_approval_recovery_run_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query("DELETE FROM approvals WHERE id = 'apr_2'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.timed_out_approval_recovery_run_ids().await.unwrap(),
+            vec!["run_1".to_owned()]
+        );
     }
 }

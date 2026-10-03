@@ -35,10 +35,14 @@ use agent24_protocol::{
     RunFailedPayload, RunInput, RunMode, RunOutputPayload, RunStartedPayload, RunStatus, ToolCall,
     ToolCallStatus, ToolCompletedPayload, ToolCompletedStatus, ToolStartedPayload, Usage,
 };
-use agent24_store::{RunMessage, RunPatch, Store, StoreError};
+use agent24_store::{
+    RunAdmission, RunAdmissionDenial, RunMessage, RunPatch, RunTerminalTransition, Store,
+    StoreError, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
+};
 use agent24_tools::{
     GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
 };
+use agent24_workspace::WorkspaceService;
 use tokio_util::sync::CancellationToken;
 
 /// Completion→tools round trips per run before the run is failed. A model
@@ -196,6 +200,14 @@ impl Summarizer for RouterSummarizer {
 pub enum AgentError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceStoreError),
+    #[error("workspace run admission denied: {0:?}")]
+    WorkspaceAdmission(RunAdmissionDenial),
+    #[error(transparent)]
+    WorkspaceService(#[from] agent24_workspace::WorkspaceError),
+    #[error("workspace authority service unavailable")]
+    WorkspaceServiceUnavailable,
     #[error("session not found: {0}")]
     SessionNotFound(String),
 }
@@ -207,6 +219,37 @@ fn zero_usage() -> Usage {
         total_tokens: 0,
         cost_usd: 0.0,
     }
+}
+
+#[cfg(test)]
+fn workspace_timestamp(raw: String) -> String {
+    if raw.len() == 20 {
+        raw.strip_suffix('Z')
+            .map(|prefix| format!("{prefix}.000Z"))
+            .unwrap_or(raw)
+    } else {
+        raw
+    }
+}
+
+fn workspace_now_at(time: std::time::SystemTime) -> Result<String, AgentError> {
+    agent24_core::util::iso8601_millis_at(time).map_err(|_| {
+        AgentError::Workspace(WorkspaceStoreError::InvalidValue { field: "timestamp" })
+    })
+}
+
+fn workspace_now() -> Result<String, AgentError> {
+    workspace_now_at(std::time::SystemTime::now())
+}
+
+fn restore_authority_error_must_propagate(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Workspace(WorkspaceStoreError::Database)
+            | AgentError::WorkspaceService(
+                agent24_workspace::WorkspaceError::InfrastructureUnavailable { .. }
+            )
+    )
 }
 
 fn add_usage(mut total: Usage, delta: &Usage) -> Usage {
@@ -264,6 +307,7 @@ pub struct RunManager {
     store: Store,
     router: Arc<ModelRouter>,
     tools: Arc<ToolRegistry>,
+    workspace: Option<Arc<WorkspaceService>>,
     sink: Arc<dyn EventSink>,
     /// Optional per-session conversation memory (D1). `None` = runs start from
     /// the bare prompt, exactly as before.
@@ -276,7 +320,34 @@ pub struct RunManager {
     cancels: Mutex<HashMap<String, CancellationToken>>,
 }
 
+enum ParkedCallStop {
+    CancelRun,
+    RecoveryStopped,
+}
+
 impl RunManager {
+    async fn persist_new_run(&self, run: &Run) -> Result<(), AgentError> {
+        let Some(_) = run.workspace_id.as_ref() else {
+            self.store.insert_run(run).await?;
+            return Ok(());
+        };
+        let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid()))?;
+        let acquired_at = WorkspaceInstant::parse(&run.created_at)?;
+        match self
+            .store
+            .insert_run_with_workspace_admission(run, Some(lease_id), &acquired_at)
+            .await?
+        {
+            RunAdmission::Admitted { lease_id: Some(_) } => Ok(()),
+            RunAdmission::Admitted { lease_id: None } => Err(WorkspaceStoreError::CorruptRow {
+                table: "workspace_leases",
+                field: "row",
+            }
+            .into()),
+            RunAdmission::Denied(denial) => Err(AgentError::WorkspaceAdmission(denial)),
+        }
+    }
+
     pub fn new(
         store: Store,
         router: Arc<ModelRouter>,
@@ -284,7 +355,7 @@ impl RunManager {
         sink: Arc<dyn EventSink>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
-        Self::with_memory(store, router, tools, sink, shutdown, None)
+        Self::with_memory_and_workspace(store, router, tools, sink, shutdown, None, None)
     }
 
     /// Build with optional per-session conversation memory (D1).
@@ -296,15 +367,94 @@ impl RunManager {
         shutdown: CancellationToken,
         memory: Option<SessionMemory>,
     ) -> Arc<Self> {
+        Self::with_memory_and_workspace(store, router, tools, sink, shutdown, memory, None)
+    }
+
+    /// Build with optional session memory and workspace authority service.
+    pub fn with_memory_and_workspace(
+        store: Store,
+        router: Arc<ModelRouter>,
+        tools: Arc<ToolRegistry>,
+        sink: Arc<dyn EventSink>,
+        shutdown: CancellationToken,
+        memory: Option<SessionMemory>,
+        workspace: Option<Arc<WorkspaceService>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             router,
             tools,
+            workspace,
             sink,
             memory,
             shutdown,
             cancels: Mutex::new(HashMap::new()),
         })
+    }
+
+    async fn tool_context_for(
+        &self,
+        run: &Run,
+        tool_call_id: impl Into<String>,
+    ) -> Result<ToolContext, AgentError> {
+        let tool_call_id = tool_call_id.into();
+        let lease_id = self.store.active_workspace_run_lease_id(&run.id).await?;
+        let Some(_) = run.workspace_id.as_ref() else {
+            if lease_id.is_some() {
+                return Err(WorkspaceStoreError::CorruptRow {
+                    table: "runs",
+                    field: "workspace_id",
+                }
+                .into());
+            }
+            return Ok(ToolContext::legacy(
+                run.id.clone(),
+                run.session_id.clone(),
+                run.schedule_id.clone(),
+                tool_call_id,
+            ));
+        };
+        let lease_id = lease_id.ok_or(WorkspaceStoreError::CorruptRow {
+            table: "workspace_leases",
+            field: "row",
+        })?;
+        let service = self
+            .workspace
+            .as_ref()
+            .ok_or(AgentError::WorkspaceServiceUnavailable)?;
+        let authority = service.bind_run_authority(&run.id, &lease_id).await?;
+        Ok(ToolContext::workspace_bound(
+            run.id.clone(),
+            run.session_id.clone(),
+            run.schedule_id.clone(),
+            tool_call_id,
+            authority,
+        ))
+    }
+
+    async fn cancel_workspace_resume_recovery(&self, run_id: &str) {
+        let cancelled = match workspace_now() {
+            Ok(ended_at) => match WorkspaceInstant::parse(&ended_at) {
+                Ok(ended_at) => self
+                    .store
+                    .cancel_workspace_run_recovery(run_id, &ended_at)
+                    .await
+                    .map_err(AgentError::from),
+                Err(err) => Err(AgentError::from(err)),
+            },
+            Err(err) => Err(err),
+        };
+        match cancelled {
+            Ok(RunTerminalTransition::Applied(_)) => {
+                self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
+                    run_id: run_id.to_owned(),
+                }));
+            }
+            Ok(RunTerminalTransition::Conflict) => {
+                tracing::warn!("run {run_id}: recovery cancel conflicted");
+            }
+            Err(err) => tracing::error!("run {run_id}: recovery cancel failed: {err}"),
+        }
     }
 
     /// Create a run (202 semantics: persisted queued, executed in background).
@@ -407,12 +557,19 @@ impl RunManager {
             return Err(AgentError::SessionNotFound(session_id.clone()));
         }
 
+        let created_at = if create.workspace_id.is_some() {
+            workspace_now()?
+        } else {
+            now_iso8601()
+        };
         let run = Run {
             id: format!("run_{}", ulid()),
             session_id: create.session_id.clone(),
+            workspace_id: create.workspace_id.clone(),
             status: RunStatus::Queued,
             input: RunInput {
                 prompt: create.prompt,
+                workspace_id: create.workspace_id,
                 model_override: create.model_override,
                 mode: create.mode,
             },
@@ -420,7 +577,7 @@ impl RunManager {
             error: None,
             usage: zero_usage(),
             schedule_id,
-            created_at: now_iso8601(),
+            created_at,
             started_at: None,
             ended_at: None,
         };
@@ -431,9 +588,10 @@ impl RunManager {
             .lock()
             .await
             .insert(run.id.clone(), token.clone());
-        if let Err(err) = self.store.insert_run(&run).await {
+        let persist = self.persist_new_run(&run).await;
+        if let Err(err) = persist {
             self.cancels.lock().await.remove(&run.id);
-            return Err(err.into());
+            return Err(err);
         }
 
         // Supervised execution: execute() runs in its OWN task whose join
@@ -486,13 +644,98 @@ impl RunManager {
                 // The executor lands the transition asynchronously (<1s)
             }
             None => {
-                self.finish_cancelled(id).await;
+                if run.workspace_id.is_some() {
+                    let ended_at = workspace_now()?;
+                    let ended_at = WorkspaceInstant::parse(&ended_at)?;
+                    if matches!(
+                        self.store
+                            .cancel_workspace_run_recovery(id, &ended_at)
+                            .await?,
+                        RunTerminalTransition::Applied(_)
+                    ) {
+                        self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
+                            run_id: id.to_owned(),
+                        }));
+                    }
+                } else {
+                    self.finish_cancelled(id).await;
+                }
             }
         }
         self.store
             .get_run(id)
             .await?
             .ok_or_else(|| AgentError::Store(StoreError::NotFound(format!("run {id}"))))
+    }
+
+    /// Recover runs that are still parked after their durable approval row was
+    /// timed out by the daemon sweep. Live executors keep their existing
+    /// in-memory timeout behavior; only token-less parked runs are landed
+    /// cancelled here. A failed cancellation leaves the durable candidate in
+    /// place, so the next scan retries it.
+    pub async fn recover_timed_out_approval_runs(&self) -> Result<u64, AgentError> {
+        let run_ids = self.store.timed_out_approval_recovery_run_ids().await?;
+        let mut cancelled = 0u64;
+        for run_id in run_ids {
+            if self.cancels.lock().await.contains_key(&run_id) {
+                continue;
+            }
+            let Some(run) = self.store.get_run(&run_id).await? else {
+                continue;
+            };
+            if run.status != RunStatus::AwaitingApproval {
+                continue;
+            }
+
+            let result = if run.workspace_id.is_some() {
+                let ended_at = workspace_now()
+                    .and_then(|raw| WorkspaceInstant::parse(&raw).map_err(AgentError::from));
+                match ended_at {
+                    Ok(ended_at) => self
+                        .store
+                        .cancel_workspace_run_recovery(&run_id, &ended_at)
+                        .await
+                        .map_err(AgentError::from)
+                        .map(|outcome| match outcome {
+                            RunTerminalTransition::Applied(_) => true,
+                            RunTerminalTransition::Conflict => false,
+                        }),
+                    Err(err) => Err(err),
+                }
+            } else {
+                let ended_at = now_iso8601();
+                self.store
+                    .transition_run(
+                        &run_id,
+                        RunStatus::Cancelled,
+                        RunPatch {
+                            ended_at: Some(ended_at),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| true)
+                    .map_err(AgentError::from)
+            };
+
+            match result {
+                Ok(true) => {
+                    self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
+                        run_id: run_id.clone(),
+                    }));
+                    cancelled += 1;
+                }
+                Ok(false) => {
+                    tracing::debug!("run {run_id}: timed-out approval recovery already settled");
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "run {run_id}: timed-out approval recovery cancel failed; will retry: {err}"
+                    );
+                }
+            }
+        }
+        Ok(cancelled)
     }
 
     /// Startup durable-resume sweep (H3): decide every approval left `pending` by
@@ -504,31 +747,20 @@ impl RunManager {
     /// gone, payload drift, past the resume TTL, or a vanished run) is aborted
     /// fail-closed — its now-approval-less run is then cancelled by the orphan
     /// sweep, which is why THIS must run first. Returns `(restored, aborted)`.
-    pub async fn restore_pending_approvals(&self) -> (u64, u64) {
-        let pending = match self
+    pub async fn restore_pending_approvals(&self) -> Result<(u64, u64), AgentError> {
+        let pending = self
             .store
             .list_approvals(Some(ApprovalStatus::Pending))
-            .await
-        {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::error!("restore sweep: listing pending approvals failed: {err}");
-                return (0, 0);
-            }
-        };
+            .await?;
         let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
         let (mut restored, mut aborted) = (0u64, 0u64);
         for approval in pending {
-            let thread = self
-                .store
-                .list_run_messages(&approval.run_id)
-                .await
-                .unwrap_or_default();
-            let run_status = match self.store.get_run(&approval.run_id).await {
-                Ok(Some(run)) => run.status,
-                // The run row is gone or unreadable — there is nothing to resume.
-                _ => {
-                    self.abort_one_approval(&approval).await;
+            let thread = self.store.list_run_messages(&approval.run_id).await?;
+            let run = match self.store.get_run(&approval.run_id).await? {
+                Some(run) => run,
+                // The run row is gone — there is nothing to resume.
+                None => {
+                    self.abort_one_approval(&approval).await?;
                     aborted += 1;
                     continue;
                 }
@@ -539,12 +771,26 @@ impl RunManager {
             match crate::resume::assess_restore(
                 &approval.payload,
                 &approval.created_at,
-                run_status,
+                run.status,
                 &thread,
                 |name| self.tools.tool_risk_class(name).is_some(),
                 &cutoff,
             ) {
-                crate::resume::RestoreDecision::Restore { .. } => {
+                crate::resume::RestoreDecision::Restore { tool_call_id } => {
+                    if run.workspace_id.is_some()
+                        && let Err(err) = self.tool_context_for(&run, tool_call_id).await
+                    {
+                        if restore_authority_error_must_propagate(&err) {
+                            return Err(err);
+                        }
+                        tracing::warn!(
+                            "restore sweep: aborting approval {} — workspace authority unavailable: {err}",
+                            approval.id
+                        );
+                        self.abort_one_approval(&approval).await?;
+                        aborted += 1;
+                        continue;
+                    }
                     // Re-announce the queued item; the row stays pending.
                     self.sink
                         .emit(EventBody::ApprovalRequired(Box::new(approval.clone())));
@@ -555,25 +801,19 @@ impl RunManager {
                         "restore sweep: aborting approval {} — {reason}",
                         approval.id
                     );
-                    self.abort_one_approval(&approval).await;
+                    self.abort_one_approval(&approval).await?;
                     aborted += 1;
                 }
             }
         }
-        (restored, aborted)
+        Ok((restored, aborted))
     }
 
-    async fn abort_one_approval(&self, approval: &Approval) {
-        if let Err(err) = self
-            .store
+    async fn abort_one_approval(&self, approval: &Approval) -> Result<(), AgentError> {
+        self.store
             .resolve_approval(&approval.id, ApprovalStatus::Aborted, None, now_iso8601())
-            .await
-        {
-            tracing::error!(
-                "restore sweep: aborting approval {} failed: {err}",
-                approval.id
-            );
-        }
+            .await?;
+        Ok(())
     }
 
     /// Resume a run parked awaiting approval whose in-memory task is gone — the
@@ -608,6 +848,11 @@ impl RunManager {
             .ok_or_else(|| {
                 AgentError::Store(StoreError::NotFound(format!("approval {approval_id}")))
             })?;
+        if approval.run_id != run.id {
+            return Err(AgentError::Store(StoreError::Conflict(
+                "approval does not belong to run".to_owned(),
+            )));
+        }
         let thread = self.store.list_run_messages(&run_id).await?;
 
         // Register the cancel token BEFORE spawning, and refuse if one already
@@ -682,6 +927,17 @@ impl RunManager {
             }
         };
 
+        // A bound run must still have fresh workspace authority before restart
+        // recovery may make it live again. The parked approval may have waited
+        // long enough for its workspace/lease authority to become unavailable.
+        if run.workspace_id.is_some()
+            && let Err(err) = self.tool_context_for(&run, tool_call_id.clone()).await
+        {
+            tracing::warn!("run {run_id}: resume workspace authority unavailable — {err}");
+            self.cancel_workspace_resume_recovery(&run_id).await;
+            return;
+        }
+
         // 3. Reconstruct the conversation and return the run to Running.
         let mut messages = thread_to_messages(&thread);
         if let Err(err) = self
@@ -736,28 +992,21 @@ impl RunManager {
                         .await
                     {
                         Ok(content) => content,
-                        Err(()) => {
+                        Err(ParkedCallStop::CancelRun) => {
                             self.finish_cancelled(&run_id).await;
                             return;
                         }
+                        Err(ParkedCallStop::RecoveryStopped) => return,
                     }
                 }
             } else {
-                match self
-                    .run_tool_call(
-                        &run_id,
-                        run.session_id.as_deref(),
-                        run.schedule_id.as_deref(),
-                        &call,
-                        &cancel,
-                    )
-                    .await
-                {
+                match self.run_tool_call(&run, &call, &cancel, true).await {
                     Ok(content) => content,
-                    Err(()) => {
+                    Err(ParkedCallStop::CancelRun) => {
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
+                    Err(ParkedCallStop::RecoveryStopped) => return,
                 }
             };
             let result = Msg::tool_result(call.id.clone(), content);
@@ -777,32 +1026,53 @@ impl RunManager {
     /// content to feed the model, or `Err(())` when the decision was to abort the
     /// whole run.
     ///
-    /// KNOWN LIMITATION (fail-closed): an `approve_for_session` /
-    /// `approve_for_target` on a RESTORED approval executes this call but does
-    /// NOT re-mint the standing grant (that lives in the broker, gone with the
-    /// crashed process). The next matching call is simply asked again — safe,
-    /// just not maximally convenient. Recording it needs the broker handle wired
-    /// into the resume path, deferred.
     async fn settle_parked_call(
         &self,
         run: &Run,
         approval: &Approval,
         call: &ToolCallRequest,
         cancel: &CancellationToken,
-    ) -> Result<String, ()> {
+    ) -> Result<String, ParkedCallStop> {
         let decision = approval.decision.clone().unwrap_or_else(|| Decision {
             kind: "deny".to_owned(),
             reason: Some("no decision was recorded".to_owned()),
             extra: serde_json::Map::new(),
         });
+        if !restored_decision_is_consistent(approval, &decision) {
+            tracing::warn!(
+                "approval {}: restored decision/status provenance is inconsistent",
+                approval.id
+            );
+            return Err(ParkedCallStop::CancelRun);
+        }
         match decision.kind.as_str() {
             "approve" | "approve_for_session" | "approve_for_target" => {
-                let ctx = ToolContext {
-                    run_id: run.id.clone(),
-                    session_id: run.session_id.clone(),
-                    schedule_id: run.schedule_id.clone(),
-                    tool_call_id: call.id.clone(),
+                let ctx = match self.tool_context_for(run, call.id.clone()).await {
+                    Ok(ctx) => ctx,
+                    Err(err) => {
+                        if run.workspace_id.is_some() {
+                            tracing::warn!(
+                                "run {}: settled resume workspace authority unavailable — {err}",
+                                run.id
+                            );
+                            self.cancel_workspace_resume_recovery(&run.id).await;
+                            return Err(ParkedCallStop::RecoveryStopped);
+                        }
+                        return Ok(format!(
+                            "tool error: workspace authority unavailable: {err}"
+                        ));
+                    }
                 };
+                self.tools
+                    .settle_resumed(
+                        &call.name,
+                        &ctx,
+                        &approval.payload,
+                        &approval.id,
+                        &decision,
+                        approval.standing_target.as_deref(),
+                    )
+                    .await;
                 // Run EXACTLY what was approved — the payload the human signed
                 // off (assess_restore already proved it equals the thread's
                 // rebuilt input), so using it directly makes "run A, not B"
@@ -814,7 +1084,9 @@ impl RunManager {
                 {
                     Ok(out) => Ok(out),
                     // The whole-run abort choice is honoured even on resume.
-                    Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled) => Err(()),
+                    Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled) => {
+                        Err(ParkedCallStop::CancelRun)
+                    }
                     Err(err) => Ok(format!("tool error: {err}")),
                 }
             }
@@ -823,7 +1095,7 @@ impl RunManager {
                 decision.reason.as_deref().unwrap_or("no reason given")
             )),
             // "abort" or anything unexpected → cancel the run (fail-closed).
-            _ => Err(()),
+            _ => Err(ParkedCallStop::CancelRun),
         }
     }
 
@@ -1036,17 +1308,18 @@ impl RunManager {
                     self.finish_cancelled(&run_id).await;
                     return;
                 }
+                let ended_at = now_iso8601();
                 match self
-                    .store
-                    .transition_run(
+                    .transition_terminal(
                         &run_id,
                         RunStatus::Completed,
                         RunPatch {
                             output: Some(agent24_protocol::RunOutput { text: text.clone() }),
                             usage: Some(usage_total.clone()),
-                            ended_at: Some(now_iso8601()),
+                            ended_at: Some(ended_at.clone()),
                             ..Default::default()
                         },
+                        &ended_at,
                     )
                     .await
                 {
@@ -1139,27 +1412,19 @@ impl RunManager {
                     messages.push(denied);
                     continue;
                 }
-                match self
-                    .run_tool_call(
-                        &run_id,
-                        run.session_id.as_deref(),
-                        run.schedule_id.as_deref(),
-                        call,
-                        &cancel,
-                    )
-                    .await
-                {
+                match self.run_tool_call(&run, call, &cancel, false).await {
                     Ok(content) => {
                         let result = Msg::tool_result(call.id.clone(), content);
                         let _ = self.persist_message(&run_id, &result).await;
                         messages.push(result);
                     }
-                    Err(()) => {
+                    Err(ParkedCallStop::CancelRun) => {
                         // Cancelled mid-tool, or the user chose abort on an
                         // approval — either way the run lands cancelled
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
+                    Err(ParkedCallStop::RecoveryStopped) => return,
                 }
             }
         }
@@ -1176,17 +1441,14 @@ impl RunManager {
     /// persist running → dispatch → persist terminal + event (+ audit on
     /// policy denial). Returns the content handed back to the model, or
     /// `Err(())` when the run was cancelled mid-call.
-    #[allow(clippy::too_many_arguments)]
     async fn run_tool_call(
         &self,
-        run_id: &str,
-        session_id: Option<&str>,
-        // Set when a schedule fired this run — owns any standing grant the
-        // user mints from its approval (H4).
-        schedule_id: Option<&str>,
+        run: &Run,
         call: &agent24_models::ToolCallRequest,
         cancel: &CancellationToken,
-    ) -> Result<String, ()> {
+        recovery_resume: bool,
+    ) -> Result<String, ParkedCallStop> {
+        let run_id = run.id.as_str();
         let (input, parse_error) = if call.arguments.trim().is_empty() {
             (serde_json::Map::new(), None)
         } else {
@@ -1219,6 +1481,21 @@ impl RunManager {
             started_at: now_iso8601(),
             ended_at: None,
         };
+        let recovery_ctx = if recovery_resume && run.workspace_id.is_some() && parse_error.is_none()
+        {
+            match self.tool_context_for(run, tc.id.clone()).await {
+                Ok(ctx) => Some(ctx),
+                Err(err) => {
+                    tracing::warn!(
+                        "run {run_id}: resumed tool workspace authority unavailable — {err}"
+                    );
+                    self.cancel_workspace_resume_recovery(run_id).await;
+                    return Err(ParkedCallStop::RecoveryStopped);
+                }
+            }
+        } else {
+            None
+        };
         if let Err(err) = self.store.insert_tool_call(&tc).await {
             tracing::error!("tool call persist failed: {err}");
             return Ok("tool error: internal persistence failure".to_owned());
@@ -1246,15 +1523,15 @@ impl RunManager {
 
         let outcome = match parse_error {
             Some(msg) => Err(ToolError::Invalid(msg)),
-            None => {
-                let ctx = ToolContext {
-                    run_id: run_id.to_owned(),
-                    session_id: session_id.map(str::to_owned),
-                    schedule_id: schedule_id.map(str::to_owned),
-                    tool_call_id: tc.id.clone(),
-                };
-                self.tools.dispatch(&call.name, &ctx, &input, cancel).await
-            }
+            None => match recovery_ctx {
+                Some(ctx) => self.tools.dispatch(&call.name, &ctx, &input, cancel).await,
+                None => match self.tool_context_for(run, tc.id.clone()).await {
+                    Ok(ctx) => self.tools.dispatch(&call.name, &ctx, &input, cancel).await,
+                    Err(err) => Err(ToolError::Denied(format!(
+                        "workspace authority unavailable: {err}"
+                    ))),
+                },
+            },
         };
 
         // Back to running unless the run is about to land cancelled (the
@@ -1334,7 +1611,10 @@ impl RunManager {
             Err(err) => tracing::error!("tool call finish persist failed: {err}"),
         }
 
-        if cancelled { Err(()) } else { Ok(content) }
+        if cancelled {
+            return Err(ParkedCallStop::CancelRun);
+        }
+        Ok(content)
     }
 
     /// The tool specs advertised this turn: the full advert set normally, or the
@@ -1479,11 +1759,38 @@ impl RunManager {
         outcome
     }
 
+    async fn transition_terminal(
+        &self,
+        run_id: &str,
+        to: RunStatus,
+        mut patch: RunPatch,
+        _ended_at: &str,
+    ) -> Result<Run, AgentError> {
+        match self.store.active_workspace_run_lease_id(run_id).await? {
+            None => Ok(self.store.transition_run(run_id, to, patch).await?),
+            Some(lease_id) => {
+                let ended_at = workspace_now()?;
+                patch.ended_at = Some(ended_at.clone());
+                let ended_at = WorkspaceInstant::parse(&ended_at)?;
+                match self
+                    .store
+                    .transition_workspace_run_terminal(run_id, to, patch, &lease_id, &ended_at)
+                    .await?
+                {
+                    RunTerminalTransition::Applied(run) => Ok(*run),
+                    RunTerminalTransition::Conflict => Err(AgentError::Store(
+                        StoreError::Conflict("workspace run terminal transition".to_owned()),
+                    )),
+                }
+            }
+        }
+    }
+
     /// Land the completed terminal state + event with the given output text.
     async fn finish_completed(&self, run_id: &str, text: &str, usage: Usage) {
+        let ended_at = now_iso8601();
         match self
-            .store
-            .transition_run(
+            .transition_terminal(
                 run_id,
                 RunStatus::Completed,
                 RunPatch {
@@ -1491,9 +1798,10 @@ impl RunManager {
                         text: text.to_owned(),
                     }),
                     usage: Some(usage.clone()),
-                    ended_at: Some(now_iso8601()),
+                    ended_at: Some(ended_at.clone()),
                     ..Default::default()
                 },
+                &ended_at,
             )
             .await
         {
@@ -1516,16 +1824,17 @@ impl RunManager {
             hint: None,
             details: None,
         };
+        let ended_at = now_iso8601();
         match self
-            .store
-            .transition_run(
+            .transition_terminal(
                 run_id,
                 RunStatus::Failed,
                 RunPatch {
                     error: Some(body.clone()),
-                    ended_at: Some(now_iso8601()),
+                    ended_at: Some(ended_at.clone()),
                     ..Default::default()
                 },
+                &ended_at,
             )
             .await
         {
@@ -1541,15 +1850,16 @@ impl RunManager {
     /// runs) — a raced double-write loses in the store's IMMEDIATE tx and is
     /// logged, never duplicated.
     async fn finish_cancelled(&self, run_id: &str) {
+        let ended_at = now_iso8601();
         match self
-            .store
-            .transition_run(
+            .transition_terminal(
                 run_id,
                 RunStatus::Cancelled,
                 RunPatch {
-                    ended_at: Some(now_iso8601()),
+                    ended_at: Some(ended_at.clone()),
                     ..Default::default()
                 },
+                &ended_at,
             )
             .await
         {
@@ -1559,6 +1869,24 @@ impl RunManager {
             Err(err) => tracing::debug!("run cancel persist skipped: {err}"),
         }
     }
+}
+
+fn restored_decision_is_consistent(approval: &Approval, decision: &Decision) -> bool {
+    if !approval
+        .available_decisions
+        .iter()
+        .any(|offered| offered == &decision.kind)
+    {
+        return false;
+    }
+    matches!(
+        (approval.status, decision.kind.as_str()),
+        (
+            ApprovalStatus::Approved,
+            "approve" | "approve_for_session" | "approve_for_target"
+        ) | (ApprovalStatus::Denied, "deny")
+            | (ApprovalStatus::Aborted, "abort")
+    )
 }
 
 #[cfg(test)]
@@ -1579,6 +1907,12 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+
+    #[test]
+    fn workspace_agent_clock_preserves_fractional_millis() {
+        let now = std::time::UNIX_EPOCH + Duration::from_millis(605);
+        assert_eq!(workspace_now_at(now).unwrap(), "1970-01-01T00:00:00.605Z");
+    }
 
     struct RecordingSink(StdMutex<Vec<String>>);
 
@@ -1796,11 +2130,690 @@ pub(crate) mod tests {
                 id: id.to_owned(),
                 title: "t".to_owned(),
                 channel: "cli".to_owned(),
+                workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now,
             })
             .await
             .unwrap();
+    }
+
+    async fn seed_workspace(store: &Store, id: &str) {
+        let now = workspace_timestamp(now_iso8601());
+        let expires_at = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(
+                agent24_store::WorkspaceTtl::new(6 * 24 * 60 * 60 * 1000).unwrap(),
+            )
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/test/workspace','generation-1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(id).bind(&now).bind(expires_at.as_str()).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'generation-1','root','unix',X'0303030303030303',X'0404040404040404','unix',X'0101010101010101',X'0202020202020202','committed',?)")
+            .bind(id).bind(&now).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_run_admission_and_terminal_release_are_active() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: "2026-09-19T00:00:00.000Z".into(),
+                updated_at: "2026-09-19T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        let first = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id.clone()),
+                prompt: "workspace run".into(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &first.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        let first_release: Option<String> = sqlx::query_scalar(
+            "SELECT released_at FROM workspace_leases WHERE owner_id=? AND kind='run'",
+        )
+        .bind(&first.id)
+        .fetch_one(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert!(first_release.is_some());
+
+        let second = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id),
+                prompt: "workspace run two".into(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&store, &second.id).await.status,
+            RunStatus::Completed
+        );
+
+        let error = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: None,
+                prompt: "must not downgrade".into(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Store(StoreError::Conflict(message))
+                if message == "workspace-bound sessions require atomic admission"
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_bound_tool_call_never_downgrades_without_authority_service() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let provider = ScriptedProvider::new(vec![tool_call_turn(
+            "http_fetch",
+            serde_json::json!({ "url": "http://127.0.0.1:9/" }).to_string(),
+        )]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound-tool".into(),
+                title: "bound-tool".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now_iso8601(),
+                updated_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        let run = manager
+            .start_run(RunCreate {
+                session_id: Some("bound-tool".into()),
+                workspace_id: Some(workspace_id),
+                prompt: "try a tool".into(),
+                model_override: None,
+                mode: RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(
+            done.output
+                .unwrap()
+                .text
+                .contains("workspace authority unavailable")
+        );
+        assert_eq!(
+            store.list_tool_calls(&run.id).await.unwrap()[0].status,
+            ToolCallStatus::Denied
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_bound_fs_uses_fresh_pinned_root_not_legacy_root() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let store = Store::open_memory().await.unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let service = Arc::new(WorkspaceService::compose(store.clone(), state.path()).unwrap());
+        let locator = format!("{WS}.g1");
+        let parent = state.path().join("workspace-roots");
+        let root = parent.join(&locator);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent_meta = std::fs::metadata(&parent).unwrap();
+        let root_meta = std::fs::metadata(&root).unwrap();
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)")
+            .bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap())
+            .bind(root_meta.dev().to_le_bytes().to_vec()).bind(root_meta.ino().to_le_bytes().to_vec())
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)")
+            .bind(WS).bind(&locator).bind(parent_meta.dev().to_le_bytes().to_vec())
+            .bind(parent_meta.ino().to_le_bytes().to_vec()).bind(root_meta.dev().to_le_bytes().to_vec())
+            .bind(root_meta.ino().to_le_bytes().to_vec()).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,channel,workspace_id,created_at,updated_at) VALUES ('s','s','desktop',?,?,?)")
+            .bind(WS).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at) VALUES ('r','s',?,'running',?,?,?)")
+            .bind(WS).bind(format!(r#"{{"prompt":"go","workspace_id":"{WS}","model_override":null,"mode":"normal"}}"#))
+            .bind(r#"{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost_usd":0.0}"#).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','r','run',?)")
+            .bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        let authority = service
+            .bind_run_authority("r", &WorkspaceLeaseId::parse(LEASE).unwrap())
+            .await
+            .unwrap();
+        let ctx = ToolContext::workspace_bound("r", Some("s".into()), None, "tc", authority);
+        let legacy = tempfile::tempdir().unwrap();
+        let read = agent24_tools::FsReadTool::new(vec![legacy.path().to_path_buf()]);
+        let write = agent24_tools::FsWriteTool::new(vec![legacy.path().to_path_buf()]);
+        let path = root.join("bound.txt");
+        std::fs::write(&path, "bound").unwrap();
+        let mut input = serde_json::Map::new();
+        input.insert(
+            "path".into(),
+            serde_json::Value::String(path.to_string_lossy().into()),
+        );
+        assert_eq!(
+            agent24_tools::Tool::call(&read, &ctx, &input, &CancellationToken::new())
+                .await
+                .unwrap(),
+            "bound"
+        );
+        input.insert(
+            "content".into(),
+            serde_json::Value::String("updated".into()),
+        );
+        agent24_tools::Tool::call(&write, &ctx, &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+        let shell = agent24_tools::ShellExecTool::new(legacy.path().to_path_buf());
+        let mut shell_input = serde_json::Map::new();
+        shell_input.insert("argv".into(), serde_json::json!(["/bin/pwd"]));
+        let shell_out =
+            agent24_tools::Tool::call(&shell, &ctx, &shell_input, &CancellationToken::new())
+                .await
+                .unwrap();
+        let shell_json: serde_json::Value = serde_json::from_str(&shell_out).unwrap();
+        assert_eq!(shell_json["exit_code"], 0);
+        assert_eq!(
+            std::path::Path::new(shell_json["stdout"].as_str().unwrap().trim()),
+            root.canonicalize().unwrap()
+        );
+        sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
+            .bind(workspace_timestamp(now_iso8601()))
+            .bind(LEASE)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert!(
+            agent24_tools::Tool::call(&read, &ctx, &input, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            agent24_tools::Tool::call(&shell, &ctx, &shell_input, &CancellationToken::new(),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_legacy_tool_context_rejects_current_bound_run() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let created_at = workspace_timestamp(now_iso8601());
+        let run = Run {
+            id: format!("run_{}", ulid()),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::Running,
+            input: RunInput {
+                prompt: "legacy".into(),
+                workspace_id: None,
+                model_override: None,
+                mode: RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: created_at.clone(),
+            started_at: Some(created_at.clone()),
+            ended_at: None,
+        };
+        store.insert_run(&run).await.unwrap();
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        let mut bound_input = run.input.clone();
+        bound_input.workspace_id = Some(workspace_id.clone());
+        sqlx::query("UPDATE runs SET workspace_id=?, input=? WHERE id=?")
+            .bind(workspace_id.as_str())
+            .bind(serde_json::to_string(&bound_input).unwrap())
+            .bind(&run.id)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,?,?,'run',?)")
+            .bind(format!("wl_{}", ulid())).bind(WORKSPACE_ID).bind("generation-1")
+            .bind(&run.id).bind(&created_at)
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+
+        assert!(matches!(
+            manager.tool_context_for(&run, "tc").await,
+            Err(AgentError::Workspace(WorkspaceStoreError::CorruptRow {
+                table: "runs",
+                field: "workspace_id"
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_admission_error_cleans_cancel_token() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now_iso8601(),
+                updated_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE workspace_allocations")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .start_run(RunCreate {
+                    session_id: Some("bound".into()),
+                    workspace_id: Some(workspace_id),
+                    prompt: "fail admission".into(),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                })
+                .await,
+            Err(AgentError::Workspace(WorkspaceStoreError::Database))
+        ));
+        assert!(manager.cancels.lock().await.is_empty());
+        assert!(store.list_runs(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_terminal_fails_closed_when_exact_lease_is_missing() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: "2026-09-29T00:00:00.000Z".into(),
+                updated_at: "2026-09-29T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        let created_at = workspace_timestamp(now_iso8601());
+        let run = Run {
+            id: format!("run_{}", ulid()),
+            session_id: Some("bound".into()),
+            workspace_id: Some(workspace_id.clone()),
+            status: RunStatus::Queued,
+            input: RunInput {
+                prompt: "go".into(),
+                workspace_id: Some(workspace_id),
+                model_override: None,
+                mode: RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: created_at.clone(),
+            started_at: None,
+            ended_at: None,
+        };
+        let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid())).unwrap();
+        assert!(matches!(
+            store
+                .insert_run_with_workspace_admission(
+                    &run,
+                    Some(lease_id.clone()),
+                    &WorkspaceInstant::parse(&created_at).unwrap(),
+                )
+                .await
+                .unwrap(),
+            RunAdmission::Admitted { lease_id: Some(_) }
+        ));
+        store
+            .transition_run(
+                &run.id,
+                RunStatus::Running,
+                RunPatch {
+                    started_at: Some(created_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?")
+            .bind(lease_id.as_str())
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+
+        manager.finish_cancelled(&run.id).await;
+
+        assert_eq!(
+            store.get_run(&run.id).await.unwrap().unwrap().status,
+            RunStatus::Running
+        );
+        assert!(
+            !sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_workspace_run_releases_exact_lease() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(HangingProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: "2026-09-29T00:00:00.000Z".into(),
+                updated_at: "2026-09-29T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        let run = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id),
+                prompt: "hang".into(),
+                model_override: None,
+                mode: RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        manager.cancel_run(&run.id).await.unwrap();
+        assert_eq!(
+            wait_terminal(&store, &run.id).await.status,
+            RunStatus::Cancelled
+        );
+        let released: Option<String> = sqlx::query_scalar(
+            "SELECT released_at FROM workspace_leases WHERE owner_id=? AND kind='run'",
+        )
+        .bind(&run.id)
+        .fetch_one(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert!(released.is_some());
+    }
+
+    #[tokio::test]
+    async fn tokenless_workspace_cancel_recovers_active_released_and_missing_lease() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        for mode in 0..4 {
+            let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+            seed_workspace(&store, WORKSPACE_ID).await;
+            let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+            store
+                .insert_session(&agent24_protocol::Session {
+                    id: "bound".into(),
+                    title: "bound".into(),
+                    channel: "desktop".into(),
+                    workspace_id: Some(workspace_id.clone()),
+                    created_at: "2026-09-29T00:00:00.000Z".into(),
+                    updated_at: "2026-09-29T00:00:00.000Z".into(),
+                })
+                .await
+                .unwrap();
+            let created_at = workspace_timestamp(now_iso8601());
+            let run = Run {
+                id: format!("run_{}", ulid()),
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id.clone()),
+                status: RunStatus::Queued,
+                input: RunInput {
+                    prompt: "stale".into(),
+                    workspace_id: Some(workspace_id),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: created_at.clone(),
+                started_at: None,
+                ended_at: None,
+            };
+            let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid())).unwrap();
+            assert!(matches!(
+                store
+                    .insert_run_with_workspace_admission(
+                        &run,
+                        Some(lease_id.clone()),
+                        &WorkspaceInstant::parse(&created_at).unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                RunAdmission::Admitted { lease_id: Some(_) }
+            ));
+            store
+                .transition_run(
+                    &run.id,
+                    RunStatus::Running,
+                    RunPatch {
+                        started_at: Some(created_at.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            if mode == 1 {
+                sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
+                    .bind(&created_at)
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            } else if mode == 2 {
+                sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?")
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            } else if mode == 3 {
+                sqlx::query("UPDATE runs SET input=json_set(input,'$.workspace_id',?) WHERE id=?")
+                    .bind("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7")
+                    .bind(&run.id)
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    manager.cancel_run(&run.id).await,
+                    Err(AgentError::Store(StoreError::Conflict(message)))
+                        if message == "run workspace identity mismatch"
+                ));
+                let raw_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=?")
+                    .bind(&run.id)
+                    .fetch_one(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+                assert_eq!(raw_status, "running");
+                assert!(
+                    !sink
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|event| event.as_str() == "run.cancelled")
+                );
+                continue;
+            }
+
+            assert_eq!(
+                manager.cancel_run(&run.id).await.unwrap().status,
+                RunStatus::Cancelled
+            );
+            let active: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM workspace_leases WHERE owner_id=? AND kind='run' AND released_at IS NULL",
+            )
+            .bind(&run.id)
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+            assert_eq!(active, 0);
+            assert_eq!(
+                sink.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.as_str() == "run.cancelled")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_recovery_handles_released_and_missing_workspace_lease_history() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        for missing in [false, true] {
+            let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+            seed_workspace(&store, WORKSPACE_ID).await;
+            let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+            store
+                .insert_session(&agent24_protocol::Session {
+                    id: "bound".into(),
+                    title: "bound".into(),
+                    channel: "desktop".into(),
+                    workspace_id: Some(workspace_id.clone()),
+                    created_at: "2026-09-29T00:00:00.000Z".into(),
+                    updated_at: "2026-09-29T00:00:00.000Z".into(),
+                })
+                .await
+                .unwrap();
+            let created_at = workspace_timestamp(now_iso8601());
+            let run = Run {
+                id: format!("run_{}", ulid()),
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id.clone()),
+                status: RunStatus::Queued,
+                input: RunInput {
+                    prompt: "stale approval".into(),
+                    workspace_id: Some(workspace_id),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: created_at.clone(),
+                started_at: None,
+                ended_at: None,
+            };
+            let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid())).unwrap();
+            assert!(matches!(
+                store
+                    .insert_run_with_workspace_admission(
+                        &run,
+                        Some(lease_id.clone()),
+                        &WorkspaceInstant::parse(&created_at).unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                RunAdmission::Admitted { lease_id: Some(_) }
+            ));
+            sqlx::query("UPDATE runs SET status='awaiting_approval', started_at=? WHERE id=?")
+                .bind(&created_at)
+                .bind(&run.id)
+                .execute(agent24_store::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            let approval = Approval {
+                id: format!("apr_{}", ulid()),
+                run_id: run.id.clone(),
+                tool_call_id: format!("tc_{}", ulid()),
+                kind: "exec".into(),
+                summary: "expired".into(),
+                payload: serde_json::Map::new(),
+                available_decisions: vec!["approve".into(), "deny".into(), "abort".into()],
+                standing_target: None,
+                status: ApprovalStatus::TimedOut,
+                decision: None,
+                expires_at: created_at.clone(),
+                created_at: created_at.clone(),
+                decided_at: Some(created_at.clone()),
+            };
+            store.insert_approval(&approval).await.unwrap();
+            if missing {
+                sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?")
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
+                    .bind(&created_at)
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(manager.recover_timed_out_approval_runs().await.unwrap(), 1);
+            assert_eq!(
+                store.get_run(&run.id).await.unwrap().unwrap().status,
+                RunStatus::Cancelled
+            );
+            let active: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM workspace_leases WHERE owner_id=? AND kind='run' AND released_at IS NULL",
+            )
+            .bind(&run.id)
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+            assert_eq!(active, 0);
+            let seen = sink.0.lock().unwrap().clone();
+            assert_eq!(
+                seen.iter()
+                    .filter(|event| event.as_str() == "run.cancelled")
+                    .count(),
+                1
+            );
+            assert!(!seen.iter().any(|event| event.as_str() == "run.started"));
+        }
     }
 
     /// Run one prompt in a session and wait for it to reach a terminal state.
@@ -1813,6 +2826,7 @@ pub(crate) mod tests {
         let run = manager
             .start_run(RunCreate {
                 session_id: Some(session_id.to_owned()),
+                workspace_id: None,
                 prompt: prompt.to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -1877,6 +2891,7 @@ pub(crate) mod tests {
             let run = manager
                 .start_run(RunCreate {
                     session_id: Some("sess_race".to_owned()),
+                    workspace_id: None,
                     prompt: prompt.to_owned(),
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
@@ -2024,6 +3039,7 @@ pub(crate) mod tests {
         let run = manager
             .start_run(RunCreate {
                 session_id: Some("sess_cancel".to_owned()),
+                workspace_id: None,
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2097,6 +3113,7 @@ pub(crate) mod tests {
         let run_a = manager
             .start_run(RunCreate {
                 session_id: Some("sess_lockwait".to_owned()),
+                workspace_id: None,
                 prompt: "a".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2111,6 +3128,7 @@ pub(crate) mod tests {
         let run_b = manager
             .start_run(RunCreate {
                 session_id: Some("sess_lockwait".to_owned()),
+                workspace_id: None,
                 prompt: "b".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2159,6 +3177,7 @@ pub(crate) mod tests {
     pub(crate) fn create() -> RunCreate {
         RunCreate {
             session_id: None,
+            workspace_id: None,
             prompt: "hi".to_owned(),
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
@@ -2225,6 +3244,7 @@ pub(crate) mod tests {
         let err = manager
             .start_run(RunCreate {
                 session_id: Some("sess_nope".to_owned()),
+                workspace_id: None,
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2520,8 +3540,8 @@ mod approval_tests {
     use super::tests::*;
     use super::*;
     use agent24_models::router::Tier;
-    use agent24_policy::{ApprovalBroker, BrokerGate};
-    use agent24_protocol::{ApprovalStatus, Decision};
+    use agent24_policy::{ApprovalBroker, ApprovalRequest, BrokerGate, Verdict};
+    use agent24_protocol::{ApprovalStatus, Decision, RiskClass};
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
@@ -2642,6 +3662,7 @@ mod approval_tests {
     fn create_plan() -> RunCreate {
         RunCreate {
             session_id: None,
+            workspace_id: None,
             prompt: "do the thing".to_owned(),
             model_override: None,
             mode: RunMode::Plan,
@@ -2879,6 +3900,8 @@ mod approval_tests {
         }
     }
 
+    #[rustfmt::skip]
+    async fn assert_bound_recovery_followup_stops(h:&Harness,run:&Run,call:&agent24_models::ToolCallRequest,lease:&str){assert!(matches!(h.manager.run_tool_call(run,call,&CancellationToken::new(),true).await,Err(ParkedCallStop::RecoveryStopped)));let tool_calls:i64=sqlx::query_scalar("SELECT count(*) FROM tool_calls WHERE run_id='run_1'").fetch_one(agent24_store::test_hooks::pool(&h.store)).await.unwrap();assert_eq!(tool_calls,0);sqlx::query("UPDATE runs SET status='running',ended_at=NULL WHERE id='run_1'").execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();sqlx::query("UPDATE workspace_leases SET released_at=NULL WHERE lease_id=?").bind(lease).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();}
     /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
@@ -2897,9 +3920,11 @@ mod approval_tests {
         let run = Run {
             id: "run_1".to_owned(),
             session_id: None,
+            workspace_id: None,
             status: RunStatus::AwaitingApproval,
             input: RunInput {
                 prompt: "run echo".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },
@@ -2939,7 +3964,7 @@ mod approval_tests {
             standing_target: None,
             status: ApprovalStatus::Pending,
             decision: None,
-            expires_at: now_iso8601(),
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
             created_at: now_iso8601(),
             decided_at: None,
         };
@@ -2976,6 +4001,215 @@ mod approval_tests {
         );
     }
 
+    #[tokio::test]
+    async fn bound_resume_without_fresh_authority_cancels_before_running() {
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WS).unwrap();
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(WS).bind(&now).bind(expires.as_str())
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .insert_session(&agent24_protocol::Session {
+                id: "sess_1".to_owned(),
+                title: "session".to_owned(),
+                channel: "desktop".to_owned(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        let input = RunInput {
+            prompt: "run echo".to_owned(),
+            workspace_id: Some(workspace_id.clone()),
+            model_override: None,
+            mode: RunMode::Normal,
+        };
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
+            .bind(WS)
+            .bind(serde_json::to_string(&input).unwrap())
+            .bind(serde_json::to_string(&zero_usage()).unwrap())
+            .bind(&now)
+            .bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)")
+            .bind(LEASE).bind(WS).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] });
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            args.as_object().unwrap().clone(),
+        );
+        h.store.insert_approval(&approval).await.unwrap();
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wait_terminal(&h.store, "run_1").await.status,
+            RunStatus::Cancelled
+        );
+        assert!(!h.events.lock().unwrap().contains(&"run.started".to_owned()));
+        let released: Option<String> =
+            sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?")
+                .bind(LEASE)
+                .fetch_one(agent24_store::test_hooks::pool(&h.store))
+                .await
+                .unwrap();
+        assert!(released.is_some());
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn bound_settle_authority_loss_after_running_cancels_recovery() {
+        const WS:&str="ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5"; const LEASE:&str="wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let dir=tempfile::tempdir().unwrap(); let h=resume_harness(dir.path().to_path_buf()).await; let workspace_id=agent24_protocol::WorkspaceId::parse(WS).unwrap(); let now=workspace_timestamp(now_iso8601()); let expires=WorkspaceInstant::parse(&now).unwrap().checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap()).unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')").bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"session".into(),channel:"desktop".into(),workspace_id:Some(workspace_id.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap();
+        let input=RunInput{prompt:"run echo".into(),workspace_id:Some(workspace_id),model_override:None,mode:RunMode::Normal};
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'running',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        let run=h.store.get_run("run_1").await.unwrap().unwrap(); let payload=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let mut approval=seed_approval("apr_1","run_1","tc_internal_1",payload.as_object().unwrap().clone()); approval.status=ApprovalStatus::Approved; approval.decision=Some(decision("approve",None)); approval.decided_at=Some(now_iso8601());
+        let call=agent24_models::ToolCallRequest{id:"call_provider_1".into(),name:"shell_exec".into(),arguments:payload.to_string()};
+        assert_bound_recovery_followup_stops(&h,&run,&call,LEASE).await;
+        assert!(matches!(h.manager.settle_parked_call(&run,&approval,&call,&CancellationToken::new()).await,Err(ParkedCallStop::RecoveryStopped)));
+        assert_eq!(h.store.get_run("run_1").await.unwrap().unwrap().status,RunStatus::Cancelled);
+        let released:Option<String>=sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?").bind(LEASE).fetch_one(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); assert!(released.is_some()); assert!(h.events.lock().unwrap().contains(&"run.cancelled".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn bound_resume_later_call_authority_loss_stops_once_without_persistence() {
+        use std::os::unix::fs::{MetadataExt,PermissionsExt}; const WS:&str="ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5"; const LEASE:&str="wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let dir=tempfile::tempdir().unwrap(); let state=tempfile::tempdir().unwrap(); let mut h=resume_harness(dir.path().to_path_buf()).await; let service=Arc::new(WorkspaceService::compose(h.store.clone(),state.path()).unwrap()); Arc::get_mut(&mut h.manager).unwrap().workspace=Some(service);
+        let now=workspace_timestamp(now_iso8601()); let expires=WorkspaceInstant::parse(&now).unwrap().checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap()).unwrap(); let locator=format!("{WS}.g1"); let parent=state.path().join("workspace-roots"); let root=parent.join(&locator); std::fs::create_dir(&root).unwrap(); std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap(); let pm=std::fs::metadata(&parent).unwrap(); let rm=std::fs::metadata(&root).unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)").bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)").bind(WS).bind(&locator).bind(pm.dev().to_le_bytes().to_vec()).bind(pm.ino().to_le_bytes().to_vec()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store.append_run_message("run_1","user",Some("two"),&serde_json::json!([]),None,&now_iso8601()).await.unwrap(); let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); h.store.append_run_message("run_1","assistant",None,&calls,None,&now_iso8601()).await.unwrap(); let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
+        let run=h.store.get_run("run_1").await.unwrap().unwrap(); assert!(h.manager.tool_context_for(&run,"preflight").await.is_ok()); sqlx::raw_sql(&format!("CREATE TRIGGER lose_resume_authority AFTER INSERT ON run_messages WHEN NEW.run_id='run_1' AND NEW.role='tool' AND NEW.tool_call_id='call_provider_1' BEGIN UPDATE workspace_leases SET released_at='{now}' WHERE lease_id='{LEASE}'; END;")).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); h.manager.resume_run("run_1".into(),"apr_1".into()).await.unwrap(); assert_eq!(wait_terminal(&h.store,"run_1").await.status,RunStatus::Cancelled);
+        assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().len(),0); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
+    }
+
+    #[tokio::test]
+    async fn restored_session_approval_replays_its_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let now = now_iso8601();
+        h.store
+            .insert_session(&agent24_protocol::Session {
+                id: "sess_1".to_owned(),
+                title: "session".to_owned(),
+                channel: "desktop".to_owned(),
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
+        let mut run = run_in("run_1", RunStatus::AwaitingApproval);
+        run.session_id = Some("sess_1".to_owned());
+        h.store.insert_run(&run).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let mut approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            args.as_object().unwrap().clone(),
+        );
+        approval
+            .available_decisions
+            .insert(1, "approve_for_session".to_owned());
+        h.store.insert_approval(&approval).await.unwrap();
+
+        h.broker
+            .resolve("apr_1", decision("approve_for_session", None))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&h.store, "run_1").await.status,
+            RunStatus::Completed
+        );
+
+        let approvals_before = h.store.list_approvals(None).await.unwrap().len();
+        let verdict = h
+            .broker
+            .request(
+                ApprovalRequest {
+                    run_id: "probe",
+                    session_id: Some("sess_1"),
+                    schedule_id: None,
+                    tool_call_id: "tc_probe",
+                    tool: "shell_exec",
+                    kind: "exec",
+                    risk: RiskClass::Exec,
+                    standing_target: None,
+                    summary: "probe".to_owned(),
+                    payload: serde_json::Map::new(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+        assert_eq!(
+            h.store.list_approvals(None).await.unwrap().len(),
+            approvals_before
+        );
+    }
+
     /// A denied restored approval does not execute the tool: the reason goes
     /// back to the model and the run still completes (denial is not failure).
     #[tokio::test]
@@ -2986,9 +4220,11 @@ mod approval_tests {
         let run = Run {
             id: "run_1".to_owned(),
             session_id: None,
+            workspace_id: None,
             status: RunStatus::AwaitingApproval,
             input: RunInput {
                 prompt: "run echo".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },
@@ -3028,7 +4264,7 @@ mod approval_tests {
             standing_target: None,
             status: ApprovalStatus::Pending,
             decision: None,
-            expires_at: now_iso8601(),
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
             created_at: now_iso8601(),
             decided_at: None,
         };
@@ -3063,9 +4299,11 @@ mod approval_tests {
         Run {
             id: id.to_owned(),
             session_id: None,
+            workspace_id: None,
             status,
             input: RunInput {
                 prompt: "go".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },
@@ -3097,10 +4335,127 @@ mod approval_tests {
             standing_target: None,
             status: ApprovalStatus::Pending,
             decision: None,
-            expires_at: now_iso8601(),
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
             created_at: now_iso8601(),
             decided_at: None,
         }
+    }
+
+    #[test]
+    fn restored_decision_requires_offered_kind_and_matching_status() {
+        let mut approval = seed_approval("apr", "run", "tc", serde_json::Map::new());
+        approval.status = ApprovalStatus::Approved;
+        let session = decision("approve_for_session", None);
+        assert!(!restored_decision_is_consistent(&approval, &session));
+
+        approval
+            .available_decisions
+            .push("approve_for_session".to_owned());
+        assert!(restored_decision_is_consistent(&approval, &session));
+
+        approval.status = ApprovalStatus::Denied;
+        assert!(!restored_decision_is_consistent(&approval, &session));
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_prevents_expired_approval_rebroadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        h.store
+            .insert_run(&run_in("run_expired", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] });
+        h.store
+            .append_run_message(
+                "run_expired",
+                "user",
+                Some("go"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let calls = serde_json::json!([{
+            "id": "call_provider_expired",
+            "name": "shell_exec",
+            "arguments": args.to_string()
+        }]);
+        h.store
+            .append_run_message(
+                "run_expired",
+                "assistant",
+                None,
+                &calls,
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let mut approval = seed_approval(
+            "apr_expired",
+            "run_expired",
+            "tc_expired",
+            args.as_object().unwrap().clone(),
+        );
+        approval.expires_at = "2020-01-01T00:00:00Z".to_owned();
+        h.store.insert_approval(&approval).await.unwrap();
+
+        // Prove this fixture would be re-broadcast if startup restore ran
+        // before expiry reconciliation; otherwise the regression is vacuous.
+        assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (1, 0));
+        h.events.lock().unwrap().clear();
+
+        assert_eq!(
+            h.broker
+                .timeout_expired("2026-10-01T00:00:00Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (0, 0));
+        assert_eq!(
+            h.store
+                .get_approval("apr_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::TimedOut
+        );
+        let seen = h.events.lock().unwrap().clone();
+        assert!(seen.iter().any(|event| event == "approval.resolved"));
+        assert!(!seen.iter().any(|event| event == "approval.required"));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_approval_owned_by_another_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        h.store
+            .insert_run(&run_in("run_a", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        h.store
+            .insert_run(&run_in("run_b", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        let approval = seed_approval("apr_a", "run_a", "tc_a", serde_json::Map::new());
+        h.store.insert_approval(&approval).await.unwrap();
+
+        assert!(matches!(
+            h.manager
+                .resume_run("run_b".to_owned(), "apr_a".to_owned())
+                .await,
+            Err(AgentError::Store(StoreError::Conflict(message)))
+                if message == "approval does not belong to run"
+        ));
+        assert_eq!(
+            h.store.get_run("run_b").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        assert!(!h.manager.cancels.lock().await.contains_key("run_b"));
     }
 
     /// Startup restore sweep (H3): a restorable pending approval is re-broadcast
@@ -3161,7 +4516,7 @@ mod approval_tests {
             .await
             .unwrap();
 
-        let (restored, aborted) = h.manager.restore_pending_approvals().await;
+        let (restored, aborted) = h.manager.restore_pending_approvals().await.unwrap();
         assert_eq!((restored, aborted), (1, 1));
         // The restorable one is still pending and was re-announced.
         assert_eq!(
@@ -3188,6 +4543,288 @@ mod approval_tests {
                 .unwrap()
                 .status,
             ApprovalStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_recovery_cancels_only_tokenless_parked_runs_without_start_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        for id in ["run_tokenless", "run_live"] {
+            h.store
+                .insert_run(&run_in(id, RunStatus::AwaitingApproval))
+                .await
+                .unwrap();
+            let mut approval = seed_approval(
+                &format!("apr_{id}"),
+                id,
+                &format!("tc_{id}"),
+                serde_json::Map::new(),
+            );
+            approval.status = ApprovalStatus::TimedOut;
+            approval.decided_at = Some(now_iso8601());
+            h.store.insert_approval(&approval).await.unwrap();
+        }
+        h.manager
+            .cancels
+            .lock()
+            .await
+            .insert("run_live".to_owned(), CancellationToken::new());
+
+        assert_eq!(
+            h.manager.recover_timed_out_approval_runs().await.unwrap(),
+            1
+        );
+        assert_eq!(
+            h.store
+                .get_run("run_tokenless")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            h.store.get_run("run_live").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        let seen = h.events.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .filter(|event| event.as_str() == "run.cancelled")
+                .count(),
+            1
+        );
+        assert!(!seen.iter().any(|event| event.as_str() == "run.started"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_recovery_retries_a_failed_cancel_on_the_next_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        h.store
+            .insert_run(&run_in("run_retry", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        let mut approval =
+            seed_approval("apr_retry", "run_retry", "tc_retry", serde_json::Map::new());
+        approval.status = ApprovalStatus::TimedOut;
+        approval.decided_at = Some(now_iso8601());
+        h.store.insert_approval(&approval).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TRIGGER block_retry_cancel BEFORE UPDATE OF status ON runs
+             WHEN OLD.id='run_retry' AND NEW.status='cancelled'
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&h.store))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            h.manager.recover_timed_out_approval_runs().await.unwrap(),
+            0
+        );
+        assert_eq!(
+            h.store.get_run("run_retry").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            h.store.timed_out_approval_recovery_run_ids().await.unwrap(),
+            vec!["run_retry".to_owned()]
+        );
+
+        sqlx::query("DROP TRIGGER block_retry_cancel")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
+        assert_eq!(
+            h.manager.recover_timed_out_approval_runs().await.unwrap(),
+            1
+        );
+        assert_eq!(
+            h.store.get_run("run_retry").await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_sweep_aborts_bound_approval_without_fresh_authority() {
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WS).unwrap();
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(WS).bind(&now).bind(expires.as_str())
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .insert_session(&agent24_protocol::Session {
+                id: "sess_1".to_owned(),
+                title: "session".to_owned(),
+                channel: "desktop".to_owned(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        let input = RunInput {
+            prompt: "run echo".to_owned(),
+            workspace_id: Some(workspace_id),
+            model_override: None,
+            mode: RunMode::Normal,
+        };
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
+            .bind(WS).bind(serde_json::to_string(&input).unwrap())
+            .bind(serde_json::to_string(&zero_usage()).unwrap())
+            .bind(&now).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)")
+            .bind(LEASE).bind(WS).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] });
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        h.store
+            .insert_approval(&seed_approval(
+                "apr_1",
+                "run_1",
+                "tc_internal_1",
+                args.as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (0, 1));
+        assert_eq!(
+            h.store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Aborted
+        );
+        assert_eq!(
+            h.store.get_run("run_1").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        assert!(
+            !h.events
+                .lock()
+                .unwrap()
+                .contains(&"approval.required".to_owned())
+        );
+
+        let ended_at = WorkspaceInstant::parse(&workspace_timestamp(now_iso8601())).unwrap();
+        assert_eq!(
+            h.store
+                .sweep_workspace_orphan_runs(&ended_at)
+                .await
+                .unwrap(),
+            agent24_store::WorkspaceOrphanSweep { released_leases: 1 }
+        );
+        assert_eq!(
+            h.store.get_run("run_1").await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        let released: Option<String> =
+            sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?")
+                .bind(LEASE)
+                .fetch_one(agent24_store::test_hooks::pool(&h.store))
+                .await
+                .unwrap();
+        assert!(released.is_some());
+    }
+
+    #[tokio::test]
+    async fn restore_sweep_propagates_storage_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        sqlx::query("DROP TABLE approvals")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.manager.restore_pending_approvals().await,
+            Err(AgentError::Store(_))
+        ));
+
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        let input = RunInput {
+            prompt: "go".into(),
+            workspace_id: Some(agent24_protocol::WorkspaceId::parse(WS).unwrap()),
+            model_override: None,
+            mode: RunMode::Normal,
+        };
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO runs (id,workspace_id,status,input,usage,created_at) VALUES ('run_db',?,'awaiting_approval',?,?,?)")
+            .bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_db",
+                "user",
+                Some("go"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let args = serde_json::json!({"argv":["/bin/echo","hi"]});
+        let calls = serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":args.to_string()}]);
+        h.store
+            .append_run_message("run_db", "assistant", None, &calls, None, &now_iso8601())
+            .await
+            .unwrap();
+        h.store
+            .insert_approval(&seed_approval(
+                "apr_db",
+                "run_db",
+                "tc_internal_1",
+                args.as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE workspace_leases")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.manager.restore_pending_approvals().await,
+            Err(AgentError::Workspace(WorkspaceStoreError::Database))
+        ));
+        assert_eq!(
+            h.store
+                .get_approval("apr_db")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::Pending
         );
     }
 

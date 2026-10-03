@@ -11,7 +11,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -208,7 +208,7 @@ fn parse_json_object(
 /// tested against a synthetic environment without ever mutating the real
 /// process environment — `std::env::set_var` is `unsafe` and this crate
 /// forbids unsafe code everywhere, including in tests.
-fn filtered_env<I>(source: I) -> Vec<(String, String)>
+pub(crate) fn filtered_env<I>(source: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -224,6 +224,55 @@ fn kill_process_group_best_effort(pid: u32) {
     };
     if let Some(pid) = Pid::from_raw(raw) {
         let _ = kill_process_group(pid, Signal::Kill);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod timeout_test_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use tokio::sync::Notify;
+
+    struct Barrier {
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    fn barriers() -> &'static Mutex<HashMap<PathBuf, Barrier>> {
+        static BARRIERS: OnceLock<Mutex<HashMap<PathBuf, Barrier>>> = OnceLock::new();
+        BARRIERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn locked_barriers() -> MutexGuard<'static, HashMap<PathBuf, Barrier>> {
+        match barriers().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(crate) fn install(binary: &Path) -> (Arc<Notify>, Arc<Notify>) {
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let previous = locked_barriers().insert(
+            binary.to_path_buf(),
+            Barrier {
+                reached: Arc::clone(&reached),
+                resume: Arc::clone(&resume),
+            },
+        );
+        assert!(previous.is_none(), "duplicate runner timeout barrier");
+        (reached, resume)
+    }
+
+    pub(super) async fn pause_before_timeout(binary: &Path) {
+        let barrier = locked_barriers().remove(binary);
+        let Some(barrier) = barrier else {
+            return;
+        };
+        barrier.reached.notify_one();
+        barrier.resume.notified().await;
     }
 }
 
@@ -250,6 +299,43 @@ impl HyphaeRunner {
     /// hold it across several invocations, not just one.
     pub fn keystore_lock(&self) -> &KeystoreWriteLock {
         &self.keystore_lock
+    }
+
+    /// A new runner over the *same verified binary* (no re-verification,
+    /// no re-copy) but a different `home` — and therefore a different
+    /// `HOME`/cwd for every command it runs. COMM-2b's `import` flow
+    /// (`crate::import`) uses this to run `identity list` / `contact list` /
+    /// `storage outbox list` / `history inbox` against the staging HOME
+    /// before committing, and `identity create --nickname __verify` against
+    /// a one-off verify HOME (COMM-HYPHAE.md §4.1 steps 4–5) — all without
+    /// ever pointing the *real* runner (the one callers hold a shared
+    /// `Arc<HyphaeRunner>` to) at anything but the real home. The returned
+    /// runner gets its own, independent `KeystoreWriteLock`: it is only ever
+    /// used against a throwaway staging/verify HOME that nothing else can
+    /// reach, so there is no writer to serialize against.
+    pub(crate) fn with_home(&self, home: PathBuf) -> Self {
+        Self {
+            bin: self.bin.clone(),
+            home,
+            default_timeout: self.default_timeout,
+            keystore_lock: KeystoreWriteLock::default(),
+        }
+    }
+
+    /// The verified Hyphae binary's path. COMM-4a's daemon supervisor
+    /// spawns a long-running `hyphae daemon` child itself (not via
+    /// [`Self::run`], which is built around a single invocation whose
+    /// stdout/stderr are captured in full for envelope parsing) but must
+    /// exec the exact same verified copy.
+    pub fn bin_path(&self) -> &Path {
+        self.bin.path()
+    }
+
+    /// The verified binary's sha256, hex-encoded — recorded in the daemon
+    /// pid file (COMM-HYPHAE.md §2) so a future `agent24d` can at least log
+    /// which binary an orphaned daemon was running.
+    pub fn bin_sha256_hex(&self) -> String {
+        self.bin.sha256().to_hex()
     }
 
     /// Builds (but does not spawn) the child command for `inv`: absolute
@@ -318,6 +404,8 @@ impl HyphaeRunner {
         let mut cmd = self.command(&inv);
         let mut child = cmd.spawn().map_err(RunnerError::Spawn)?;
         let pid = child.id();
+        #[cfg(test)]
+        timeout_test_hook::pause_before_timeout(self.bin.path()).await;
         let password = inv.password;
 
         let wait = async move {

@@ -11,11 +11,12 @@ description = "COMM-1a/1b: Hyphae CLI invocation (hash-verified binary, stdin-on
 # `async fn`s on a `dyn`-safe-via-vtable trait object); matches the
 # `async-trait` version already used by agent24-agent/-domain/-tools.
 async-trait = "0.1"
-# COMM-2a: `router(CommState) -> axum::Router` (COMM-HYPHAE.md §3/§4). Same
-# minimal feature set as agent24-domain's own axum dependency — routing +
-# `Json` only, no `ws`/`multipart`/server-runtime features this crate never
-# uses (agent24d owns the actual `axum::serve`).
-axum = { version = "0.8", default-features = false, features = ["json"] }
+# COMM-2a/3: `router(CommState) -> axum::Router` (COMM-HYPHAE.md §3/§4). Same
+# minimal feature set as agent24-domain's own axum dependency plus `query`
+# (COMM-3's `GET /comm/history`/`GET /comm/outbox` use `Query<T>` for
+# `?as=&limit=`/`?failed_only=`) — no `ws`/`multipart`/server-runtime
+# features this crate never uses (agent24d owns the actual `axum::serve`).
+axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 base64 = "0.22"
 hex = "0.4"
 # COMM-2a: the very first identity's auto-generated password
@@ -42,7 +43,10 @@ keyring = { version = "3.6", default-features = false, features = [
     "tokio",
     "crypto-rust",
 ] }
-rustix = { version = "0.38", features = ["process"] }
+# COMM-2b's import flow (`import.rs`) non-blockingly `flock`s the source
+# `outbox.json.lock` for the duration of the file copy (COMM-HYPHAE.md
+# §4.1 step 2) — `fs` is rustix's gate for `rustix::fs::flock`.
+rustix = { version = "0.38", features = ["process", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
