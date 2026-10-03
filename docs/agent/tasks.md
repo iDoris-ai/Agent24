@@ -2,13 +2,14 @@
 
 ## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19 立，2026-09-28 更新）
 
-仓库里有四份路线图/进展文档，**以谁为准只有一个答案**：
+仓库里有多份路线图 / 进展 / 计划文档，**以谁为准只有一个答案**：
 
 | 文档 | 地位 |
 |---|---|
 | **本文件 `docs/agent/tasks.md`** | ✅ **权威**。当前在做什么、做到哪一步，以这里为准 |
 | [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md) | ✅ **权威**（配套，2026-09-23 起）。**ME-4 当前主线**的任务定义、技术规范（S1–S5）与验收标准 |
 | [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀（已收口）的任务定义与验收标准（§五「主链」T1–T14） |
+| [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) | ✅ **权威**（配套，2026-10-03 起）。按结构组件（内核、模型、记忆、Workspace、权限、领域 OS、第三方、通信、语音、发布、组织化、Web3）排列的里程碑路线、依赖与跨组件波次 |
 | [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) | ✅ **权威**（配套，2026-10-03 起）。Open Design 下一阶段 / 第三方工具接入 Workflow / OpenCreator 的里程碑定义与验收 |
 | [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
 | [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |
@@ -30,6 +31,25 @@
 | OD-M12 收尾与债务（#661 / #663、Workspace 管理界面、写回策略、跨平台与 Windows workspace、上游同步与 fork PR #4） | `BACKLOG` | 可与 TPI-W 并行 |
 | TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.0a–F11.3 |
 | OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `BACKLOG` | 依赖 TPI-W；OC-0 纯调研可提前 |
+
+## COMM（Hyphae 通信）台账（2026-10-03 立；任务定义见 [`../design/COMM-HYPHAE.md`](../design/COMM-HYPHAE.md) §8）
+
+| ID | 任务 | 状态 | 证据 |
+|---|---|---|---|
+| COMM-0 | 设计冻结 | `DONE` | `docs/design/COMM-HYPHAE.md` |
+| COMM-1a | `agent24-comm` crate + HyphaeRunner | `DONE` | `548ccae` |
+| COMM-1b | PasswordStore + KeystoreWriteLock | `DONE` | `607e89d` |
+| COMM-2a | 身份 / 联系人 / relay 路由 + CLI | `DONE` | `f1dbe1e`（#622） |
+| COMM-2b | 导入旧 `~/.hyphae` HOME | `DONE` | `d8dbd3b`（#635） |
+| COMM-3 | send / history / outbox 路由与 CLI | `DONE` | `af58621`（#627） |
+| COMM-4a | agent24d 监管 Hyphae daemon | `DONE` | `d5e8e51`（#626），修复 `a930f9c`、`ec2773e`（#645） |
+| COMM-4b | daemon 状态补全 relay_probe / catch_up | `DONE` | `9ed3549`（#633） |
+| COMM-5a | F4b 冻结（入站默认不触发 run） | `DONE` | `2fc383f`（#613）、`ce90b93`（#618） |
+| COMM-5b | §7 结构约束测试 | `BACKLOG` | 依赖（COMM-3、4a）已满足 |
+| COMM-6 | UI：身份 / 联系人 / relay / daemon 状态 / 导入向导 | `BACKLOG` | 依赖（COMM-2b、4b）已满足 |
+| COMM-7 | UI：收件历史 / outbox / 重试 + 双仓联调 | `BACKLOG` | 依赖 COMM-3、COMM-6 |
+| T01-E | 入站路径收口（Hyphae 侧，见 `HYPHAE-CLI-INTEGRATION.md`） | `BACKLOG` | 其后的入站高层授权与持久化待立项 |
+| DEP-C8 / C9 | Hyphae lock 升级 / 发布包加入 hyphae | `BACKLOG` | 见 [`../Deployment/TASKS.md`](../Deployment/TASKS.md) |
 
 ## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
 
@@ -285,6 +305,10 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 ---
 
 ## M1 —— 记忆成为产品（2026-08-23 规划；状态未改动，未重排）
+
+> ⚠️ **2026-10-03 更正：本节是 2026-08-23 的旧规划，已被取代。** M1 已按 `ab/m1-memory` 分支上的 `docs/agent/M1-PLAN-v2.md`（2026-10-01 冻结）重排，**M1 的执行状态以该分支的 M1 v2 台账与提交历史为准**（本文件对 M1 是例外）。
+> 截至 2026-10-03，已合入 `ab/m1-memory`：M1-T01、T02、T03、T04、T05、T06、T07a、T07、T09（PR #636–#652）；待做：T07.1（注入改为数据块）、T08、T10、T11，然后先吸收最新 main、再以 merge 落 main（见 [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) C3 P0）。
+> 旧编号 → 新编号对照：F1.1 / T1.1.1–T1.1.2（Authorizer 判定接缝）→ M1-T01；F1.2 / T1.2.1–T1.2.2（personal space 与迁移）→ M1-T02（+ T05 接线）；F1.3 / T1.3.1（会话写进 EventLog）→ M1-T03 / T04；T1.3.2（Condenser 取代 CanonicalSession 压缩）→ M1-T04；T1.3.3（崩溃重放）→ M1-T05。下方各条的 `READY` / `BACKLOG` 状态为历史快照，不再更新。
 
 ## F1.1 — 判定接缝（原 F8b）
 

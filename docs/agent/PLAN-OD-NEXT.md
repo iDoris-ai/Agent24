@@ -66,7 +66,7 @@
 | W.1 接入 Playbook | `docs/design/THIRD-PARTY-TOOL-INTEGRATION-PLAYBOOK.md`。内容：边界 ADR 模板（照 ADR-001）、fork + pin + 许可证（Apache-2.0 保留 NOTICE）检查清单、托管 / 桥 / 令牌 / workspace 四个接缝的选择题、E2E harness 模板、按切片落 main 的规则（ADR 随第一片进 main；"产品路径接线"单列验收） |
 | W.2 去 Creative 专名 | ADR：把 `Audience::CreativeRuntime`、`creative_attachment_id`、`CreativeCapabilityBroker`、`CreativeServeWeb` 泛化为按工具区分的形式（例如 `ToolRuntime{tool}` / `tool_attachment_id`），并给出迁移步骤；Open Design 作为第一个实例迁移过去 |
 | W.3 Harness 模板 | 基于 F11.5，把 harness 参数化（工具 fork SHA、启动方式、断言集），新工具只填配置 |
-| W.4 评估清单 | 接入前必答：对方是否自带 agent loop / 审批 / 记忆 / 调度（与 Agent24 的权威重叠时谁让位）；外部服务与数据出境（是否经 iDoris 脱敏）；许可证与商标；资源体积与打包 |
+| W.4 评估清单与验收门 | 接入前必答：对方是否自带 agent loop / 审批 / 记忆 / 调度（与 Agent24 的权威重叠时谁让位）；外部服务与数据出境——LLM 负载是否经 iDoris 脱敏（[COMPONENT-ROADMAP](COMPONENT-ROADMAP.md) C5 A-3a），**非 LLM 出站**（下载、生成服务、IM 等）是否由该工具进程自带启动断言（A-3b），并在 harness 中加反向测试（未声明的出站目标被拒）；许可证与商标；资源体积与打包 |
 
 ## 4. OC — OpenCreator 集成
 
@@ -86,7 +86,8 @@
 ## 5. 顺序与依赖
 
 ```
-OD-M11（产品路径生效） ──┬──▶ TPI-W（Playbook / 去专名 / harness 模板） ──▶ OC-0 → OC-1 → OC-2 → OC-3
+OD-M11（产品路径生效） ──┬──▶ TPI-W（Playbook / 去专名 / harness 模板） ──▶ OC-1 → OC-2 → OC-3
+                         │   （OC-0 纯调研无前置，可与 OD-M11 并行）
                          └──▶ OD-M12（收尾与债务，可与 TPI-W 并行）
 M1（记忆即产品，暂停中，恢复前提已满足）—— 与本线并行，互不阻塞
 ```
