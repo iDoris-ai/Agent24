@@ -26,9 +26,9 @@
 | 里程碑 | 状态 | 说明 |
 |---|---|---|
 | M10 Open Design 集成落地 main | `DONE` | #660 `ce861e4`（树 == integration `3ed7d38`），设计文档 #662；历史审计记录：[`../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md`](../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md) |
-| OD-M11 产品路径生效（路由级资源授权、capability 模式、CreativeRuntime、Creative 分区、ACP 绑定 workspace、托管器取舍、harness 回归化） | `READY` | 待 jason 拍板优先级与 F11.4 |
-| OD-M12 收尾与债务（#661 / #663、workspace 产品面、写回策略、跨平台冒烟、上游同步） | `BACKLOG` | 可与 TPI-W 并行 |
-| TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.0–F11.3 |
+| OD-M11 产品路径生效（F11.0a workspace 产品面、F11.0 路由级资源授权与高权限接口隔离、F11.1 capability 启动与 daemon 所有权、F11.2 broker / handoff / 吊销、F11.2b Creative 分区、F11.3 ACP 绑定 workspace、F11.4 托管器、F11.5 exact-SHA harness） | `READY` | 待 jason 拍板优先级与 F11.4 |
+| OD-M12 收尾与债务（#661 / #663、Workspace 管理界面、写回策略、跨平台与 Windows workspace、上游同步与 fork PR #4） | `BACKLOG` | 可与 TPI-W 并行 |
+| TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.0a–F11.3 |
 | OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `BACKLOG` | 依赖 TPI-W；OC-0 纯调研可提前 |
 
 ## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
@@ -81,7 +81,7 @@
 | ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `DONE` | #589 |
 | ME4-6.1.2 | Agent24 | 发布 v0.5.0 | 6.1.1 | `DONE` | [v0.5.0](https://github.com/iDoris-ai/Agent24/releases/tag/v0.5.0)，tag 于 f46194a（#589 合并提交），`agent24-0.5.0-macos-arm64.tar.gz` + `SHA256SUMS` |
 | ME4-6.1.3 | Mac mini | 干净机器只用发布物安装验收 | 6.1.2 | `DONE` | 2026-09-30 Mac mini 隔离 HOME：三包下载 + `shasum -c` 全 OK → `os install` ×2 → `daemon start` → `os list` 两者 `[mounted]`，15s 后稳态、`/api/v1/sin90/today` 200（输出见 progress.md） |
-| ME4-6.1.4 | 三仓 | 最终台账收口 PR（本轮最后一个 PR） | 6.1.3 | `IN_PROGRESS` | 本 PR + Cos72 T2.1.1 回填 |
+| ME4-6.1.4 | 三仓 | 最终台账收口 PR（本轮最后一个 PR） | 6.1.3 | `DONE` | #590 `2f4778d`（2026-10-03 回填状态） |
 
 ## ADR-032 / A3 台账（2026-09-26/27 立；jason 拍板插队线，不在 PLAN-ME4 主链上）
 
@@ -101,7 +101,7 @@
 | 发版前修复 | C1 A3 握手→命令竞态、FU-83 探针原子写、SDK fired 宽松解析 | `DONE` | #543（`a53e8c1`） |
 | 桌面 logo | 替换 Agent24 桌面端 logo 为 iDoris 像素风女孩 | `DONE` | #541（`32480fc`） |
 | 顶栏模型/耗时 | 顶栏真实默认模型 + 回复耗时后缀 + `model.call` 事件 + `model_call_timings` 计时表 + simple 调用关闭思考 | `DONE` | #544（`32072b0`） |
-| v0.4.0 发版 | 版本号 + CHANGELOG + README + 台账收尾 | `IN_PROGRESS` | 本 PR |
+| v0.4.0 发版 | 版本号 + CHANGELOG + README + 台账收尾 | `DONE` | tag `v0.4.0` → `bb1945d`（2026-10-03 回填状态） |
 
 **需要用户手动做**（不是 goal task）：给 `iDoris-ai/Sin90` 与 `MushroomDAO/Cos72` 的 main 开 ruleset（1 个审批 + dismiss stale）。
 
