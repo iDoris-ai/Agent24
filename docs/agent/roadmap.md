@@ -1,6 +1,13 @@
 # Agent24 Roadmap — Milestone → Feature
 
-## ▶️ 2026-09-23：当前在做 ME-4（不在本文档的 M1–M6 里）
+## 🧭 2026-10-03：Open Design 集成线 M10 已落地 → 下一阶段
+
+M10（Open Design × Agent24 集成）已于 2026-10-03 经 #660 落地 main（merge commit `ce861e4`），设计记录经 #662 补落。
+之后的里程碑 **OD-M11（产品路径生效）→ OD-M12（收尾与债务）→ TPI-W（第三方工具接入 Workflow）→ OC（OpenCreator 集成）**
+定义见 [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md)，状态见 [`tasks.md`](tasks.md)「Open Design / 第三方工具线台账」。
+M1（记忆即产品）的恢复前提「open-design 与 main 合并完成」已满足，与这条线并行、互不阻塞。
+
+## ✅ 2026-09-23 → v0.5.0：ME-4（已收口，历史记录；不在本文档的 M1–M6 里）
 
 ME-3 收口、T11 交付后，用户 2026-09-23 裁决下一轮 = **ME-4 外置 OS 的内核能力面**：
 调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → `agent24-os-sdk` / Cos72 最小样例（mytask）/ wire 文档 → **v0.5.0**。

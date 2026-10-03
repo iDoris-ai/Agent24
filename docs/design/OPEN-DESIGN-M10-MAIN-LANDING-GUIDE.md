@@ -1,6 +1,9 @@
 # Open Design M10 Main-Landing Guide
 
-Status: active M10 execution guide
+Status: **historical audit record** — M10 completed 2026-10-03 (#660, merge commit `ce861e4`; design docs #662).
+Kept as the record of how M10 was validated and landed on main, and which security constraints and release gates were completed.
+Next milestones: [`../agent/PLAN-OD-NEXT.md`](../agent/PLAN-OD-NEXT.md). Note: M10's completion criteria required the capability / workspace / runtime
+slices to be *present*; enabling them on the default Desktop product path is OD-M11.
 Date: 2026-10-02
 Target branch: `main`
 
