@@ -22,12 +22,7 @@ async fn main() {
             }
             // Prove the round-trip, not just discovery: actually call one.
             if let Some(t) = tools.iter().find(|t| t.info().name.ends_with("_echo")) {
-                let ctx = agent24_tools::ToolContext {
-                    run_id: "probe".into(),
-                    session_id: None,
-                    schedule_id: None,
-                    tool_call_id: "tc".into(),
-                };
+                let ctx = agent24_tools::ToolContext::legacy("probe", None, None, "tc");
                 let mut input = serde_json::Map::new();
                 input.insert("message".into(), serde_json::json!("hello from agent24"));
                 match t.call(&ctx, &input, &CancellationToken::new()).await {

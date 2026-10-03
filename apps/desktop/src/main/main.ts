@@ -1,6 +1,6 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, nativeImage, session, ipcMain, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
@@ -8,6 +8,14 @@ import { AgentEarEventBridge } from './agentear-events'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
+import type { CreativeViewBounds, CreativeViewResult } from '../shared/ipc-types'
+import {
+  CREATIVE_SESSION_PARTITION,
+  OPEN_DESIGN_PIN_VERSION,
+  CreativeServeWeb,
+  CreativeViewRequestFence,
+  classifyCreativeUrl,
+} from './creative-serve-web'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -46,6 +54,93 @@ let mainWin: BrowserWindow | null = null
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
+let creativeServeWeb: CreativeServeWeb | null = null
+let creativeView: WebContentsView | null = null
+let creativeOrigin: string | null = null
+const creativeViewFence = new CreativeViewRequestFence()
+
+function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
+  return {
+    x: Math.max(0, Math.round(bounds.x)),
+    y: Math.max(0, Math.round(bounds.y)),
+    width: Math.max(1, Math.round(bounds.width)),
+    height: Math.max(1, Math.round(bounds.height)),
+  }
+}
+
+function hideCreativeView(): void {
+  creativeViewFence.invalidate()
+  creativeOrigin = null
+  if (!creativeView) return
+  creativeView.setBounds({ x: 0, y: 0, width: 1, height: 1 })
+}
+
+async function showCreativeView(
+  bounds: CreativeViewBounds,
+  forceReload = false,
+  requestGeneration = creativeViewFence.begin(),
+): Promise<CreativeViewResult> {
+  const win = mainWin
+  if (!win || win.isDestroyed()) return { ok: false, error: 'Agent24 window is unavailable' }
+  if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
+
+  const service = creativeServeWeb
+  if (!service) return { ok: false, error: 'Open Design host is unavailable' }
+  const status = await service.start()
+  if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
+  if (status.state !== 'ready' || !status.origin) {
+    return { ok: false, error: status.error ?? 'Open Design did not become ready' }
+  }
+  creativeOrigin = status.origin
+
+  if (!creativeView || creativeView.webContents.isDestroyed()) {
+    creativeView = new WebContentsView({
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        partition: CREATIVE_SESSION_PARTITION,
+      },
+    })
+    win.contentView.addChildView(creativeView)
+    creativeView.webContents.setWindowOpenHandler(({ url }) => {
+      const disposition = creativeOrigin ? classifyCreativeUrl(url, creativeOrigin) : 'blocked'
+      // Preserve Open Design's existing desktop behavior: every HTTP(S)
+      // target=_blank/window.open goes to the system browser, including
+      // same-origin live-artifact preview URLs. Electron never gets a child
+      // window for this surface.
+      if (disposition === 'same-origin' || disposition === 'external-http') void shell.openExternal(url)
+      return { action: 'deny' }
+    })
+    creativeView.webContents.on('will-navigate', (event, url) => {
+      const disposition = creativeOrigin ? classifyCreativeUrl(url, creativeOrigin) : 'blocked'
+      if (disposition === 'same-origin') return
+      event.preventDefault()
+      if (disposition === 'external-http') void shell.openExternal(url)
+    })
+    creativeView.webContents.on('will-redirect', (event, url, _isInPlace, isMainFrame) => {
+      if (!isMainFrame) return
+      const disposition = creativeOrigin ? classifyCreativeUrl(url, creativeOrigin) : 'blocked'
+      if (disposition !== 'same-origin') event.preventDefault()
+    })
+  }
+
+  creativeView.setBounds(normalizedBounds(bounds))
+  const current = creativeView.webContents.getURL()
+  if (forceReload || classifyCreativeUrl(current, status.origin) !== 'same-origin') {
+    await creativeView.webContents.loadURL(status.origin)
+  }
+  return { ok: true, origin: status.origin }
+}
+
+async function restartCreativeView(bounds: CreativeViewBounds): Promise<CreativeViewResult> {
+  const requestGeneration = creativeViewFence.begin()
+  const service = creativeServeWeb
+  if (!service) return { ok: false, error: 'Open Design host is unavailable' }
+  await service.stop()
+  creativeOrigin = null
+  return showCreativeView(bounds, true, requestGeneration)
+}
 
 function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
@@ -104,6 +199,12 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.whenReady().then(() => {
+  creativeServeWeb = new CreativeServeWeb({
+    resourcesPath: process.resourcesPath,
+    stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
+    runtimeExecutable: process.execPath,
+    pinVersion: OPEN_DESIGN_PIN_VERSION,
+  })
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
   // in package.json normally takes effect).
@@ -135,6 +236,14 @@ app.whenReady().then(() => {
 
   registerIpcHandlers()
   mainWin = createMainWindow()
+  ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
+  ipcMain.handle(IpcChannels.CreativeRestart, (_event, bounds: CreativeViewBounds) => restartCreativeView(bounds))
+  ipcMain.handle(IpcChannels.CreativeBounds, (_event, bounds: CreativeViewBounds) => {
+    if (creativeViewFence.wantsVisible() && creativeOrigin && creativeView && !creativeView.webContents.isDestroyed()) {
+      creativeView.setBounds(normalizedBounds(bounds))
+    }
+  })
+  ipcMain.handle(IpcChannels.CreativeHide, () => hideCreativeView())
   agentEarBridge.start()
 
   // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice
@@ -233,6 +342,7 @@ app.on('will-quit', () => {
   agentEarBridge.stop()
   agentEarLog.stop()
   backendManager.stop()
+  void creativeServeWeb?.stop()
 })
 
 // window-all-closed fires only if tray is null (i.e., user chose Quit from

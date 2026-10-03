@@ -45,9 +45,21 @@ wholesale into Agent24 `main`.
 
 This distinction is important: development/recovery completion on the
 integration branch and controlled landing into `main` are separate tracks.
-The main-landing plan still starts with the smallest dependency-ready
-prototype/foundation slices and preserves patch/tree equivalence; it must not
-merge the long-lived integration branch wholesale.
+The historical main-landing plan below starts with the smallest
+dependency-ready prototype/foundation slices and preserves patch/tree
+equivalence.
+
+For the M10 closeout on 2026-10-02, the operator selected a stricter
+**main-first integration-candidate rehearsal** before the main repository
+attempts the final branch merge: merge the latest `main` into
+`integration/open-design-main-sync-wave20`, resolve/review all conflicts on
+the integration side, validate the candidate, prove latest `main` is an
+ancestor, and only then hand the candidate to the main-repository operator.
+This M10 procedure is documented in
+`OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md` and takes precedence over the older
+"never merge the integration branch wholesale" wording below for this specific
+validated final-candidate attempt. The small-PR conveyor remains the fallback
+for repairing any blocker exposed by that attempt.
 
 Current status claims in this document are snapshots, not merge authorization.
 Before acting on any numbered PR, verify its exact current base/head, CI, and

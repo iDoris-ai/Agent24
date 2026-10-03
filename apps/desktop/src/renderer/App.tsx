@@ -17,6 +17,7 @@ import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
+import CreativePage from './pages/Creative'
 import logoSidebar from './assets/logo-sidebar.png'
 
 // Static module route map — M2 will replace this with dynamic import()
@@ -33,6 +34,7 @@ type BuiltinPage =
   | 'schedules'
   | 'approvals'
   | 'voice'
+  | 'creative'
   | 'models'
   | 'settings'
   | 'modules-manager'
@@ -45,6 +47,7 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'schedules',       icon: '⏰', label: '调度' },
   { id: 'approvals',       icon: '🔐', label: '审批' },
   { id: 'voice',           icon: '🎙️', label: '语音' },
+  { id: 'creative',        icon: '🎨', label: 'Creative' },
   { id: 'models',          icon: '🤖', label: '模型' },
   { id: 'modules-manager', icon: '🧩', label: '模块管理' },
   { id: 'settings',        icon: '⚙️', label: '设置' },
@@ -53,7 +56,7 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
 const BUILTIN_TITLES: Record<BuiltinPage, string> = {
   chat: '对话', workbench: '工作台', runs: '运行任务',
   schedules: '定时调度', approvals: '待审批', voice: '语音',
-  models: '模型管理', 'modules-manager': '模块管理', settings: '设置',
+  creative: 'Creative', models: '模型管理', 'modules-manager': '模块管理', settings: '设置',
 }
 
 // FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
@@ -284,6 +287,7 @@ export function App(): JSX.Element {
         {page === 'schedules'        && <SchedulesPage />}
         {page === 'approvals'        && <ApprovalsPage />}
         {page === 'voice'            && <VoicePanel />}
+        {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {page === 'settings'         && <SettingsPage />}

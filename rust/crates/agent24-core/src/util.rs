@@ -29,6 +29,37 @@ pub fn now_iso8601() -> String {
     iso8601_at(epoch_secs())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockError {
+    BeforeUnixEpoch,
+    MillisOutOfRange,
+}
+
+impl std::fmt::Display for ClockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::BeforeUnixEpoch => "system clock is before the Unix epoch",
+            Self::MillisOutOfRange => "system clock milliseconds exceed u64",
+        })
+    }
+}
+
+impl std::error::Error for ClockError {}
+
+/// ISO 8601 UTC, millisecond precision. Clock faults fail closed.
+pub fn now_iso8601_millis() -> Result<String, ClockError> {
+    iso8601_millis_at(std::time::SystemTime::now())
+}
+
+pub fn iso8601_millis_at(time: std::time::SystemTime) -> Result<String, ClockError> {
+    let millis = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ClockError::BeforeUnixEpoch)?
+        .as_millis();
+    let millis = u64::try_from(millis).map_err(|_| ClockError::MillisOutOfRange)?;
+    Ok(iso8601_from_epoch_millis(millis))
+}
+
 /// ISO 8601 UTC timestamp `after` from now (e.g. approval expires_at).
 pub fn iso8601_after(after: std::time::Duration) -> String {
     iso8601_at(epoch_secs().saturating_add(after.as_secs()))
@@ -48,6 +79,15 @@ pub fn iso8601_before(before: std::time::Duration) -> String {
 /// without duplicating it or exposing the private `iso8601_at` directly.)
 pub fn iso8601_from_epoch_secs(secs: u64) -> String {
     iso8601_at(secs)
+}
+
+/// ISO 8601 UTC timestamp for an arbitrary epoch-millisecond value.
+pub fn iso8601_from_epoch_millis(millis: u64) -> String {
+    let secs = millis / 1000;
+    let fraction = millis % 1000;
+    let raw = iso8601_at(secs);
+    let prefix = raw.strip_suffix('Z').unwrap_or(&raw);
+    format!("{prefix}.{fraction:03}Z")
 }
 
 fn epoch_secs() -> u64 {
@@ -98,6 +138,23 @@ mod tests {
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn iso8601_millis_preserves_fractional_precision() {
+        assert_eq!(iso8601_from_epoch_millis(123), "1970-01-01T00:00:00.123Z");
+        let ts = now_iso8601_millis().unwrap();
+        assert_eq!(ts.len(), 24);
+        assert!(ts.ends_with('Z'));
+    }
+
+    #[test]
+    fn iso8601_millis_rejects_pre_epoch_clock() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_millis(1);
+        assert_eq!(
+            iso8601_millis_at(before_epoch),
+            Err(ClockError::BeforeUnixEpoch)
+        );
     }
 
     #[test]
