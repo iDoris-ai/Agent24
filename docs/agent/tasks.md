@@ -32,6 +32,25 @@
 | TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.0a–F11.3 |
 | OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `BACKLOG` | 依赖 TPI-W；OC-0 纯调研可提前 |
 
+## COMM（Hyphae 通信）台账（2026-10-03 立；任务定义见 [`../design/COMM-HYPHAE.md`](../design/COMM-HYPHAE.md) §8）
+
+| ID | 任务 | 状态 | 证据 |
+|---|---|---|---|
+| COMM-0 | 设计冻结 | `DONE` | `docs/design/COMM-HYPHAE.md` |
+| COMM-1a | `agent24-comm` crate + HyphaeRunner | `DONE` | `548ccae` |
+| COMM-1b | PasswordStore + KeystoreWriteLock | `DONE` | `607e89d` |
+| COMM-2a | 身份 / 联系人 / relay 路由 + CLI | `DONE` | `f1dbe1e`（#622） |
+| COMM-2b | 导入旧 `~/.hyphae` HOME | `DONE` | `d8dbd3b`（#635） |
+| COMM-3 | send / history / outbox 路由与 CLI | `DONE` | `af58621`（#627） |
+| COMM-4a | agent24d 监管 Hyphae daemon | `DONE` | `d5e8e51`（#626），修复 `a930f9c`、`ec2773e`（#645） |
+| COMM-4b | daemon 状态补全 relay_probe / catch_up | `DONE` | `9ed3549`（#633） |
+| COMM-5a | F4b 冻结（入站默认不触发 run） | `DONE` | `2fc383f`（#613）、`ce90b93`（#618） |
+| COMM-5b | §7 结构约束测试 | `READY` | — |
+| COMM-6 | UI：身份 / 联系人 / relay / daemon 状态 / 导入向导 | `READY` | — |
+| COMM-7 | UI：收件历史 / outbox / 重试 + 双仓联调 | `BACKLOG` | 依赖 COMM-3、COMM-6 |
+| T01-E | 入站路径收口（Hyphae 侧，见 `HYPHAE-CLI-INTEGRATION.md`） | `BACKLOG` | 其后的入站高层授权与持久化待立项 |
+| DEP-C8 / C9 | Hyphae lock 升级 / 发布包加入 hyphae | `BACKLOG` | 见 [`../Deployment/TASKS.md`](../Deployment/TASKS.md) |
+
 ## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
 
 > 定义/验收在 PLAN-ME4 §三；Sin90 侧 task 的定义与状态在 `iDoris-ai/Sin90` 的 `docs/agent/tasks.md`，这里只记**门**。

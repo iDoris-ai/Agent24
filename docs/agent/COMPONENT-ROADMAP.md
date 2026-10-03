@@ -45,7 +45,7 @@
 
 - **现状**：`ModelRouter` 按 `TaskProfile`（`Privacy × Complexity` → `Tier`）选 provider，`LocalOnly` 对远端 fail-closed ✅。但主对话、子 agent、REST 聊天都传 `TaskProfile::default()`，只有 Guardian 与模块推理回调会设置 `LocalOnly` 🟡。`from_env` 只构造 oMLX / Ollama；Agent24 内**没有出境脱敏代码**（已定由 iDoris 出口网关负责）。
 - **里程碑**（ID-* 见 [iDoris-integration-and-entry-router.md](../iDoris-integration-and-entry-router.md)，其建议顺序为 ID-1 → ID-2；P3–P5 见 [decision.md ADR-032](../decision.md)，冻结顺序为 P3 → P4 → P5）
-  1. **ID-1 任务画像生成**（无硬前置）：由入口路由（先规则版，再 Semantic Router 级小模型）为每个 run 生成 `TaskProfile`，替换主路径上的 `TaskProfile::default()`。📐 → 波次 A。需拍板：画像在 Agent24 侧生成，还是交给 iDoris 网关兜底（internal-AI docs/11 里程碑 1.2 的同一决断点）。
+  1. **ID-1 任务画像生成**（无技术依赖；但整组 ID-* 仍受源计划的「P4 门后、需用户批准开工」约束，波次 A 以门开启为条件）：由入口路由（先规则版，再 Semantic Router 级小模型）为每个 run 生成 `TaskProfile`，替换主路径上的 `TaskProfile::default()`。📐 → 波次 A。需拍板：画像在 Agent24 侧生成，还是交给 iDoris 网关兜底（internal-AI docs/11 里程碑 1.2 的同一决断点）。
   2. **ADR-032 P3 — 推理回调流式**（`_a24/model/stream`，目标首字 ≤ 3s）。📐 → 波次 A / B。
   3. **ID-2 = ADR-032 P4 — iDoris provider 接线**：`IDORIS_URL`，拆成 `idoris-local`（强制 `local_only`）与 `idoris-any`；iDoris 回报实际落点。按 ADR-032 顺序排在 P3 之后；若要先做 P4，需在 ADR-032 记录「执行顺序重排、不改编号」。**对接前先核对跨仓字段**（该提案已知与 iDoris 现状有出入）。📐 → 波次 B。
   4. **出境脱敏**：在 iDoris 出口网关实现（不在 Agent24 内实现）。顺序：**先冻结隐私法律 L-PRV（C5 A-3，波次 A）→ ID-2 / 脱敏实现 → 变异验收通过 → 才在默认路径启用**。📐 → 波次 B。
@@ -84,7 +84,10 @@
 - **里程碑**
   1. **A-1 = OD-M11 F11.0 / F11.1 / F11.2**：路由级资源授权与高权限接口隔离、Desktop 自有 capability daemon（无孤儿）、broker / handoff / 吊销。📐 → 波次 A。
   2. **A-2 = TPI-W W.2**：`CreativeRuntime` 等 Creative 专名泛化为按工具区分的 audience（如 `ToolRuntime{tool}`）。📐 → 波次 B。
-  3. **A-3 隐私法律 L-PRV**：把「出境必经 iDoris 网关脱敏」「`LocalOnly` 贯穿主路径」等写成法律并配变异测试（来源：internal-AI docs/06 建议）。**法律先于实现冻结**，是 C2 脱敏在默认路径启用的上线门；同时补 `docs/laws/EDITIONS.md`（SPEC-EDITIONS 的下一步）。📐 → 波次 A，作为波次 B 中 ID-2 / 出境脱敏在默认路径启用的前置。
+  3. **A-3 隐私法律 L-PRV**（法律先于实现冻结，配变异测试；来源：internal-AI docs/06、docs/10），分两类约束：
+     - **A-3a LLM 负载**：发往远端模型的内容必经 iDoris 出口网关脱敏、`LocalOnly` 贯穿主路径。是 C2 脱敏在默认路径启用的上线门。
+     - **A-3b 非 LLM 出站**：邮件、IM、`http_fetch`、MCP / 第三方工具的直接出网等不经 LLM 网关的出站，按 docs/10 由**各消费方进程**自带启动断言（egress guard）。Agent24 自身的出站工具需要实现它；第三方工具把它作为 TPI-W 的接入验收门（W.4 清单 + harness 断言）。
+     同时补 `docs/laws/EDITIONS.md`（SPEC-EDITIONS 的下一步）。📐 → A-3a / A-3b 的法律冻结在波次 A；A-3b 的 Agent24 侧实现与 TPI-W 验收门在波次 B。
   4. **A-4 记忆授权演进**：`Authorizer` 在 P1 细化操作类型，P3 加 module principal / delegation / `policy_epoch`（随 C3）。
   5. **A-5 ADR-032 P5**：gate 闭集执行动作扩展（排除 `builtin`）、proposal → 宿主确认 UI → 回执留档（随 C9）。
   6. **A-6 ME-6 模块签名**（sigstore keyless + 信任策略；签名只回答「谁写的」，不提供隔离）。📐 → 远期，需拍板。
@@ -109,7 +112,7 @@
   1. **OD-M11 产品路径生效** → 波次 A。
   2. **TPI-W 第三方工具接入 Workflow**（Playbook、去 Creative 专名、harness 模板、评估清单）→ 波次 B；**OD-M12 收尾**并行。
   3. **OC OpenCreator**：OC-0 调研（可提前，只做调研不写代码）→ OC-1 边界 ADR（先裁决：OpenCreator 自带 Codex 执行引擎，与「Agent24 是唯一 AI 控制面」重叠）→ OC-2 接入 → OC-3 E2E 落地。→ 波次 B / C。
-  4. **其它候选**：MediaBot 等外部工具接入时同样走 TPI-W；凡是出网生成（如 Open Design 默认云端生图）都要经出口策略。
+  4. **其它候选**：MediaBot 等外部工具接入时同样走 TPI-W；LLM 负载按 C5 A-3a 经 iDoris，非 LLM 出网（如 Open Design 默认云端生图、视频下载）按 A-3b 由该工具进程自带启动断言，并作为 TPI-W 验收项。
 - **依赖**：OD-M11 内部 F11.0a + F11.0 → F11.1 / F11.2 / F11.3；F11.5 ← F11.0a…F11.4（F11.4 与 F11.1–F11.3 的先后由 PLAN-OD-NEXT 决定，本文不推导）；TPI-W ← F11.0a–F11.3；OC-0 无前置（纯调研可提前）；OC-1 ← TPI-W（含 W.2 / W-3），并在 OC-1 中产出 W-4 设计；OC-2 实现 W-4；OC-3 ← OC-2。
 
 ### C8 通信（Hyphae）
@@ -162,8 +165,8 @@
 
 | 波次 | 主要内容 | 并行性说明 |
 |---|---|---|
-| **A（近期）** | C3 P0（M1 收尾并合回 main；F11 是否随 P0 待拍板）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）、DEP-C8 Hyphae lock 升级 · C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
-| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C8 T01-E 收口、DEP-C9 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P4 流式（= ADR-032 P3，A / B）→ A3 P3 提案闭环（= ADR-032 P5，在 P4 之后）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
+| **A（近期）** | C3 P0（M1 收尾并合回 main；F11 是否随 P0 待拍板）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）、DEP-C8 Hyphae lock 升级 · C5 A-3a / A-3b 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
+| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C5 A-3b Agent24 出站启动断言 + TPI-W 验收门 · C8 T01-E 收口、DEP-C9 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P4 流式（= ADR-032 P3，A / B）→ A3 P3 提案闭环（= ADR-032 P5，在 P4 之后）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
 | **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
 | 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
@@ -189,7 +192,7 @@ Windows: DEP-A7 设计冻结 + sidecar-host / ProcessKit 边界 ──▶ DEP-C2
 |---|---|---|
 | 4seas = Cos72 社区 OS 的一个实例，走 `agent24-os-proto` 契约（docs/06） | C6 O-3 / O-4 | 一致；O-3 依赖 C3 P0 |
 | C3 统一模型调度终态归 iDoris，16GB 节点过渡期由 Agent24 `ModelRouter` 承担（docs/03、docs/10） | C2 ID-2 / ID-1 | 一致；画像在哪一侧生成待拍板 |
-| 出境脱敏执行者归 iDoris 出口网关（2026-09-07 拍板） | C2 第 4 项、C5 A-3 | 一致；Agent24 侧只负责 `LocalOnly` 贯穿与法律 |
+| 出境脱敏执行者归 iDoris 出口网关（2026-09-07 拍板）；消费方进程与 Router 各自保留出网启动断言（docs/10） | C2 第 4 项、C5 A-3a / A-3b | 一致；Agent24 侧负责 `LocalOnly` 贯穿、隐私法律，以及自身非 LLM 出站的启动断言（A-3b） |
 | 新增隐私法律 L-PRV-1/2（docs/06） | C5 A-3 | 采纳，排波次 A（先于脱敏实现冻结） |
 | 记忆是 Agent24 的模块，避免与 MemPalace 重复建设（docs/05、BR-19） | C3 | 一致：记忆归 Agent24 C3 |
 | 旧组件主文档里的「Guardian 安全门禁」「三级路由」「21.5 万行」 | C2 / C5、§1 | 已在 internal-AI 主文档按代码改写：路由机制在、画像未生成；Guardian 可选。规模口径：2026-10-03 main 的 Rust 源码约 18.7 万行（不含独立测试文件约 16.4 万行）；internal-AI 引用的 64,885 行是 M10 落地前的旧统计 |
