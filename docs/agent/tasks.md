@@ -9,6 +9,7 @@
 | **本文件 `docs/agent/tasks.md`** | ✅ **权威**。当前在做什么、做到哪一步，以这里为准 |
 | [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md) | ✅ **权威**（配套，2026-09-23 起）。**ME-4 当前主线**的任务定义、技术规范（S1–S5）与验收标准 |
 | [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀（已收口）的任务定义与验收标准（§五「主链」T1–T14） |
+| [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) | ✅ **权威**（配套，2026-10-03 起）。按结构组件（内核、模型、记忆、Workspace、权限、领域 OS、第三方、通信、语音、发布、组织化、Web3）排列的里程碑路线、依赖与跨组件波次 |
 | [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) | ✅ **权威**（配套，2026-10-03 起）。Open Design 下一阶段 / 第三方工具接入 Workflow / OpenCreator 的里程碑定义与验收 |
 | [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
 | [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |

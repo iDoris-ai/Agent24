@@ -129,7 +129,7 @@
 
 | crate | 职责 | 关键约束 / 状态 |
 |---|---|---|
-| `agent24-models` | 模型网关：`ModelProvider` trait + OpenAI 兼容适配 + 有序注册表；`ModelRouter`（`router.rs`，M-D/D2）按 `TaskProfile`（`Privacy::{Any, LocalOnly}` × `Complexity::{Simple, Complex}`）在 `Tier::{Local, Remote, Lora}` 间选 provider，带健康/冷却 | `LocalOnly` 对远端 fail-closed（本地全挂也报错，不外发）。`ModelRouter::from_env` 今天只构造 oMLX 与 Ollama provider。**iDoris provider 📐**：ADR-032 已接受，P4 接线未做（无 `IDORIS_URL`） |
+| `agent24-models` | 模型网关：`ModelProvider` trait + OpenAI 兼容适配 + 有序注册表；`ModelRouter`（`router.rs`，M-D/D2）按 `TaskProfile`（`Privacy::{Any, LocalOnly}` × `Complexity::{Simple, Complex}`）在 `Tier::{Local, Remote, Lora}` 间选 provider，带健康/冷却 | `LocalOnly` 对远端 fail-closed（本地全挂也报错，不外发）。`ModelRouter::from_env` 今天只构造 oMLX 与 Ollama provider。**主对话、子 agent、REST 聊天都传 `TaskProfile::default()`**，只有 Guardian 与模块推理回调会设置 `LocalOnly`，任务画像生成 📐（ID-1）。Agent24 内没有出境脱敏代码（已定由 iDoris 出口网关负责）。**iDoris provider 📐**：ADR-032 已接受，P4 接线未做（无 `IDORIS_URL`） |
 | `agent24-tools` | 工具 trait + 注册表 + 内建工具（`http_fetch`、`fs_read`、`fs_write`、`shell_exec`） | 固定流水线：normalize → 能力白名单 → 审批门 → 超时执行；文件系统权限见 L2 的 workspace-bound / legacy 两条路径 |
 | `agent24-policy` | 审批 broker + 工具门；可选的 **Guardian**（`guardian.rs`，M-D/D3）：在人工审批前用 LocalOnly 本地模型给工具调用评风险 | fail-closed：超时即拒绝，取消即 aborted，store 行为权威，重复决策 409。Guardian **默认关闭**（`A24_GUARDIAN=1` 才开）：只有明确解析出 `low` 才自动批准，其余一律交给人；`exec` 默认始终要人审 |
 | `agent24-memory` | M-D 记忆：D1 的 `KvStore` + `CanonicalSession`，以及 artifact / assertion / condenser / consolidator / event / knowledge / retriever / vector / writer 等高层模块 | agent loop **已消费** D1 的 `KvStore` / `CanonicalSession`；event 层被领域 OS 的 memory 回调使用；**retriever / consolidator 等高层尚未被 agent loop 消费**（M1 的工作） |
@@ -289,6 +289,8 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 - 🟡 `agent24 acp` 不传 `workspace_id`，Open Design 的 run 不是 workspace-bound。
 - 🟡 `agent24-worker` 只有 Rust 侧 wire / client / mock，且无消费者；Python worker 服务端（D4b）尚未实现。
 - 📐 iDoris provider（ADR-032 P4）、推理回调流式（P3）。
+- 📐 任务画像生成（主路径目前总是默认 `TaskProfile`）；出境脱敏（归 iDoris 出口网关）。
+- 📐 Web3（AAStar）身份与结算：Agent24 中没有接线。
 - 📐 OpenAPI 由 Rust 生成（B4）。
 - workspace 只有 scratch 一种受信构造；写回、其它类型、并发策略未定。
 - M-D 高层（retriever / consolidator 等）尚未被 agent loop 消费；M1 暂停中。
@@ -297,6 +299,8 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 - Review 遗留：[#661](https://github.com/iDoris-ai/Agent24/issues/661)（Creative view）、[#663](https://github.com/iDoris-ai/Agent24/issues/663)（M10 叠加 PR 遗留）。
 
 ## 相关
+
+- **各结构组件的里程碑路线与依赖**：[agent/COMPONENT-ROADMAP.md](agent/COMPONENT-ROADMAP.md)
 
 - 内核架构与不可动摇的边界：[agent/architecture.md](agent/architecture.md)
 - 执行状态权威：[agent/tasks.md](agent/tasks.md)
