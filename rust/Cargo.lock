@@ -24,8 +24,10 @@ dependencies = [
  "agent24-protocol",
  "agent24-store",
  "agent24-tools",
+ "agent24-workspace",
  "async-trait",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -151,6 +153,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-os-cwd"
+version = "0.1.0"
+dependencies = [
+ "rustix 0.38.44",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "agent24-os-fd"
 version = "0.1.0"
 dependencies = [
@@ -232,6 +243,7 @@ dependencies = [
 name = "agent24-protocol"
 version = "0.5.1"
 dependencies = [
+ "chrono",
  "fs2",
  "hex",
  "schemars",
@@ -263,11 +275,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-sidecar-host"
+version = "0.1.0"
+dependencies = [
+ "agent24-sidecar-host-protocol",
+ "nix 0.31.3",
+ "processkit",
+ "rustix 1.1.4",
+ "tokio",
+]
+
+[[package]]
+name = "agent24-sidecar-host-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agent24-store"
 version = "0.5.1"
 dependencies = [
  "agent24-core",
  "agent24-protocol",
+ "chrono",
  "serde",
  "serde_json",
  "sha2",
@@ -283,6 +315,7 @@ name = "agent24-tools"
 version = "0.5.1"
 dependencies = [
  "agent24-protocol",
+ "agent24-workspace",
  "async-trait",
  "cap-std",
  "reqwest",
@@ -311,6 +344,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-workspace"
+version = "0.1.0"
+dependencies = [
+ "agent24-core",
+ "agent24-os-cwd",
+ "agent24-protocol",
+ "agent24-store",
+ "cap-std",
+ "rustix 0.38.44",
+ "sqlx",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "agent24d"
 version = "0.5.1"
 dependencies = [
@@ -329,6 +377,7 @@ dependencies = [
  "agent24-scheduler",
  "agent24-store",
  "agent24-tools",
+ "agent24-workspace",
  "async-trait",
  "axum",
  "base64",
@@ -965,6 +1014,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1181,6 +1236,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
 ]
 
 [[package]]
@@ -2064,6 +2133,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "mutants"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "add0ac067452ff1aca8c5002111bd6b1c895baee6e45fcbc44e0193aea17be56"
+
+[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2394,6 +2475,22 @@ dependencies = [
  "tokio",
  "tracing",
  "windows",
+]
+
+[[package]]
+name = "processkit"
+version = "3.3.4"
+source = "git+https://github.com/jhfnetboy/ProcessKit-rs.git?rev=60aa827db378daa5b1ec638f3b3fdaaf9c201560#60aa827db378daa5b1ec638f3b3fdaaf9c201560"
+dependencies = [
+ "async-trait",
+ "encoding_rs",
+ "libc",
+ "mutants",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3099,6 +3196,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3566,6 +3669,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -227,6 +227,55 @@ fn kill_process_group_best_effort(pid: u32) {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod timeout_test_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use tokio::sync::Notify;
+
+    struct Barrier {
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    fn barriers() -> &'static Mutex<HashMap<PathBuf, Barrier>> {
+        static BARRIERS: OnceLock<Mutex<HashMap<PathBuf, Barrier>>> = OnceLock::new();
+        BARRIERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn locked_barriers() -> MutexGuard<'static, HashMap<PathBuf, Barrier>> {
+        match barriers().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(crate) fn install(binary: &Path) -> (Arc<Notify>, Arc<Notify>) {
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let previous = locked_barriers().insert(
+            binary.to_path_buf(),
+            Barrier {
+                reached: Arc::clone(&reached),
+                resume: Arc::clone(&resume),
+            },
+        );
+        assert!(previous.is_none(), "duplicate runner timeout barrier");
+        (reached, resume)
+    }
+
+    pub(super) async fn pause_before_timeout(binary: &Path) {
+        let barrier = locked_barriers().remove(binary);
+        let Some(barrier) = barrier else {
+            return;
+        };
+        barrier.reached.notify_one();
+        barrier.resume.notified().await;
+    }
+}
+
 pub struct HyphaeRunner {
     bin: VerifiedBinary,
     home: PathBuf,
@@ -355,6 +404,8 @@ impl HyphaeRunner {
         let mut cmd = self.command(&inv);
         let mut child = cmd.spawn().map_err(RunnerError::Spawn)?;
         let pid = child.id();
+        #[cfg(test)]
+        timeout_test_hook::pause_before_timeout(self.bin.path()).await;
         let password = inv.password;
 
         let wait = async move {

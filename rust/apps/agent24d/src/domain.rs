@@ -186,6 +186,7 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     // against `crate::server::build_router_with_modules` the same way.
     "attached",
     "approvals",
+    "capabilities",
     "chat",
     // COMM-2a: `/api/v1/comm/*` (`crate::comm_routes::build`) is kernel code,
     // merged into `module_routes` by `server::serve` itself rather than

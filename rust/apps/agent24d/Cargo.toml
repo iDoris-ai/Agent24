@@ -24,6 +24,7 @@ async-trait = "0.1"
 base64 = "0.22"
 agent24-store = { path = "../../crates/agent24-store" }
 agent24-tools = { path = "../../crates/agent24-tools" }
+agent24-workspace = { path = "../../crates/agent24-workspace" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
@@ -41,10 +42,13 @@ serde_json = { workspace = true }
 # one malformed key/value pair to hide an unrelated, well-formed `module=`
 # key elsewhere in the same query string.
 form_urlencoded = "1"
+# Capability and attached-module token hashing are both production daemon
+# responsibilities; one shared dependency serves both paths.
+sha2 = "0.10"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync", "fs", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -58,14 +62,12 @@ agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 # by TWO independent callers of `geteuid()`: FU-92's fallback-directory
 # ownership check (server.rs `secure_fallback_dir`) and A3-2b's attach socket
 # same-UID peer check (`attach_listener.rs`, the same call
-# `agent24_os_proto::endpoint` already makes for A1's).
-rustix = { version = "0.38", features = ["fs", "process"] }
+# `agent24_os_proto::endpoint` already makes for A1's). "stdio" remains
+# required by the integration branch's inherited shutdown path.
+rustix = { version = "0.38", features = ["fs", "process", "stdio"] }
 # A3-2b (`attach_listener.rs`): `ENAMETOOLONG` for an actionable error when
 # `$HOME` makes the attach socket path exceed `sockaddr_un`'s limit.
 libc = "0.2"
-# A3-2a (`attached.rs`): sha256 of the token for `attached.json` (never the
-# plaintext, C1) — the daemon itself, not just its tests, needs this now.
-sha2 = "0.10"
 # A3-2a (`attached.rs`): the `model_access` field the shared, lenient
 # `agent24_os_proto::manifest::facts_from_yaml` does not read (ME4-S3 §4.4
 # only carries the three fields a MODULE needs); read directly rather than
