@@ -12,10 +12,15 @@
 | [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) | ✅ **权威**（配套，2026-10-03 起）。按结构组件（内核、模型、记忆、Workspace、权限、领域 OS、第三方、通信、语音、发布、组织化、Web3）排列的里程碑路线、依赖与跨组件波次 |
 | [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) | ✅ **权威**（配套，2026-10-03 起）。Open Design 下一阶段 / 第三方工具接入 Workflow / OpenCreator 的里程碑定义与验收 |
 | [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
-| [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |
+| [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ▶️ **M1 已恢复为当前主干**（2026-10-03）；M2–M6 仍是「未来要做什么」。M1 的任务定义与状态在 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md`（其中的 `[B]` 机器分工已被 2026-10-03 裁决取代：Agent24 全部在笔记本做，分支吸收 main 时一并改掉） |
 | [`../PLAN.md`](../PLAN.md) §六 Roadmap、[`../ROADMAP.md`](../ROADMAP.md) | ⛔ **已作废**。Rust 核心重写（ADR-026）之前的 Electron/Node.js 时代规划，仅供历史考古，**不要照它排期** |
 
-**当前状态（2026-10-03）**：ME-4 已随 **v0.5.0** 收口，**v0.5.1** 已发布（2026-10-01）；**M10 Open Design 集成**已于 2026-10-03 落地 main（见下方「Open Design / 第三方工具线台账」）。下一主干**待 jason 拍板**：OD-M11（[`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md)，`READY`）、M1 记忆恢复（恢复前提已满足）、COMM 后续。
+**当前状态（2026-10-03）**：ME-4 已随 **v0.5.0** 收口，**v0.5.1** 已发布（2026-10-01）；**M10 Open Design 集成**已于 2026-10-03 落地 main（见下方「Open Design / 第三方工具线台账」）。
+
+**jason 裁决（2026-10-03）**：
+- **主干 = M1 记忆即产品（C3 P0）**，在 `ab/m1-memory` 上继续，做完以 merge 落 main；之后按 `MEMORY-STRATEGY` 的 P1 → P2 → P3 推进（见 [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) §3）。
+- **Open Design 线在 M10 告一阶段**：OD-M11 / OD-M12 / TPI-W / OC 全部 `PAUSED`，不与 M1 并行；M10 遗留的安全缺口（capability 路由级授权未实现、Desktop / ACP 仍用全权 token、ACP 不传 `workspace_id`）照原样登记在 [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) §0，恢复时从 OD-M11 起步。F11.4 托管器取舍随之推迟到恢复时再定。
+- **并行线 = COMM（Hyphae）**，留在笔记本做：COMM-5b → COMM-6 → COMM-7、DEP-C8。
 
 **历史（2026-09-23 起的 ME-4 执行段，已收口）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
 定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
@@ -27,10 +32,10 @@
 | 里程碑 | 状态 | 说明 |
 |---|---|---|
 | M10 Open Design 集成落地 main | `DONE` | #660 `ce861e4`（树 == integration `3ed7d38`），设计文档 #662；历史审计记录：[`../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md`](../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md) |
-| OD-M11 产品路径生效（F11.0a workspace 产品面、F11.0 路由级资源授权与高权限接口隔离、F11.1 capability 启动与 daemon 所有权、F11.2 broker / handoff / 吊销、F11.2b Creative 分区、F11.3 ACP 绑定 workspace、F11.4 托管器、F11.5 exact-SHA harness） | `READY` | 待 jason 拍板优先级与 F11.4 |
-| OD-M12 收尾与债务（#661 / #663、Workspace 管理界面、写回策略、跨平台与 Windows workspace、上游同步与 fork PR #4） | `BACKLOG` | 可与 TPI-W 并行 |
-| TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.0a–F11.3 |
-| OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `BACKLOG` | 依赖 TPI-W；OC-0 纯调研可提前 |
+| OD-M11 产品路径生效（F11.0a workspace 产品面、F11.0 路由级资源授权与高权限接口隔离、F11.1 capability 启动与 daemon 所有权、F11.2 broker / handoff / 吊销、F11.2b Creative 分区、F11.3 ACP 绑定 workspace、F11.4 托管器、F11.5 exact-SHA harness） | `PAUSED` | 2026-10-03 jason 裁决：Open Design 线在 M10 告一阶段，先做 M1；恢复时从这里起步，F11.4 届时再定 |
+| OD-M12 收尾与债务（#661 / #663、Workspace 管理界面、写回策略、跨平台与 Windows workspace、上游同步与 fork PR #4） | `PAUSED` | 同上；恢复后可与 TPI-W 并行 |
+| TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `PAUSED` | 同上；依赖 OD-M11 F11.0a–F11.3 |
+| OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `PAUSED` | 同上；依赖 TPI-W |
 
 ## COMM（Hyphae 通信）台账（2026-10-03 立；任务定义见 [`../design/COMM-HYPHAE.md`](../design/COMM-HYPHAE.md) §8）
 
@@ -308,6 +313,7 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 
 > ⚠️ **2026-10-03 更正：本节是 2026-08-23 的旧规划，已被取代。** M1 已按 `ab/m1-memory` 分支上的 `docs/agent/M1-PLAN-v2.md`（2026-10-01 冻结）重排，**M1 的执行状态以该分支的 M1 v2 台账与提交历史为准**（本文件对 M1 是例外）。
 > 截至 2026-10-03，已合入 `ab/m1-memory`：M1-T01、T02、T03、T04、T05、T06、T07a、T07、T09（PR #636–#652）；待做：T07.1（注入改为数据块）、T08、T10、T11，然后先吸收最新 main、再以 merge 落 main（见 [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) C3 P0）。
+> **2026-10-03 恢复执行（jason 裁决：M1 为主干）**，顺序：① 先把 main（含 M10）合进 `ab/m1-memory` 并重跑全部 gate——T10 / T11 要改 OpenAPI 与桌面端，必须建在 M10 之后的代码上；② 笔记本两条并行：T07.1 → T08，T10 → T11（2026-10-03 起 B 机不再编译 Agent24，盘不够）；③ 笔记本真实 agent24d + 桌面端走一遍 M1 完成判据（记住 → 重启 → 召回 → 记忆页撤回 → 不再召回）；④ release PR `ab/m1-memory → main`。F11（`asserted_by`）**不随 P0，放 C3 P1**（jason 2026-10-03 裁决，见 COMPONENT-ROADMAP C11）。
 > 旧编号 → 新编号对照：F1.1 / T1.1.1–T1.1.2（Authorizer 判定接缝）→ M1-T01；F1.2 / T1.2.1–T1.2.2（personal space 与迁移）→ M1-T02（+ T05 接线）；F1.3 / T1.3.1（会话写进 EventLog）→ M1-T03 / T04；T1.3.2（Condenser 取代 CanonicalSession 压缩）→ M1-T04；T1.3.3（崩溃重放）→ M1-T05。下方各条的 `READY` / `BACKLOG` 状态为历史快照，不再更新。
 
 ## F1.1 — 判定接缝（原 F8b）

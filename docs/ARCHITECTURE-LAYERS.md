@@ -293,7 +293,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 - 📐 Web3（AAStar）身份与结算：Agent24 中没有接线。
 - 📐 OpenAPI 由 Rust 生成（B4）。
 - workspace 只有 scratch 一种受信构造；写回、其它类型、并发策略未定。
-- M-D 高层（retriever / consolidator 等）尚未被 agent loop 消费；M1 暂停中。
+- M-D 高层（retriever / consolidator 等）尚未被 main 上的 agent loop 消费；M1 已在 `ab/m1-memory` 恢复为当前主干（2026-10-03），完成后合回 main。
 - 📐 领域 OS 签名（ME-6）。
 - `docs/laws/` 目前只有上下文、记忆、审批三部法条。
 - Review 遗留：[#661](https://github.com/iDoris-ai/Agent24/issues/661)（Creative view）、[#663](https://github.com/iDoris-ai/Agent24/issues/663)（M10 叠加 PR 遗留）。

@@ -3,7 +3,7 @@
 > 立于 2026-10-03。本文回答：**每个核心结构组件现在到哪了、下一步做什么、在哪个里程碑完成、彼此怎么依赖。**
 > - 架构现状（各层是什么、状态标记 ✅ / 🟡 / 📐 的含义）见 [`../ARCHITECTURE-LAYERS.md`](../ARCHITECTURE-LAYERS.md)。
 > - 执行状态以 [`tasks.md`](tasks.md) 为准；各里程碑的详细定义在各自的计划文档（文中逐条链接）。
-> - **编号原则**：里程碑的**权威编号**沿用各计划文档（记忆的 P0–P5、Open Design 的 OD-M11 / F11.*、ADR-032 的 P3–P5、iDoris 的 ID-*、通信的 COMM-*、部署的 DEP-*、SPEC-002/B4 等）。本文另有的 K-* / W-* / A-* / O-* / W3-0 只是**组件视图别名**（便于按组件阅读），每个别名都写明它对应的源编号；**依赖关系一律以源编号表达**，别名不单独作为排序节点。跨组件的排期用 §3 的「波次」表达，**波次是建议，待 jason 拍板**。
+> - **编号原则**：里程碑的**权威编号**沿用各计划文档（记忆的 P0–P5、Open Design 的 OD-M11 / F11.*、ADR-032 的 P3–P5、iDoris 的 ID-*、通信的 COMM-*、部署的 DEP-*、SPEC-002/B4 等）。本文另有的 K-* / W-* / A-* / O-* / W3-0 只是**组件视图别名**（便于按组件阅读），每个别名都写明它对应的源编号；**依赖关系一律以源编号表达**，别名不单独作为排序节点。跨组件的排期以 §3 的「波次」表达，**以 2026-10-03 jason 裁决为准**，其中列出的个别开放项仍待拍板。
 > - 与 iDoris-Components（internal-AI）仓库的规划对齐情况见 §4。
 
 ---
@@ -22,7 +22,7 @@
 | C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1a…4b、COMM-5a 已交付；UI 与联调未做 |
 | C9 | 语音（AgentEar） | 附着模块（A3） | ✅ P0–P2（非流式单轮） |
 | C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；macOS 签名包被 Apple 账号阻塞 |
-| C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9 社区子集随 C3 P3；F9 其余与 F10 等第二个真实用户；F11 待拍板（P0 或 P1） |
+| C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9 社区子集随 C3 P3；F9 其余与 F10 等第二个真实用户；F11 随 C3 P1（2026-10-03 裁决） |
 | C12 | Web3 身份与结算（AAStar） | — | 📐 Agent24 代码中**尚无接线**，只在生态规划中 |
 
 ---
@@ -56,7 +56,7 @@
 ### C3 记忆
 
 - **现状**：main 上 agent loop 只用 D1 的 `KvStore` + `CanonicalSession`（有损摘要折叠）；M-D 高层库（EventLog、断言账本、检索、巩固等）已实现并有测试，但 main 上未接入。**M1 在 `ab/m1-memory` 分支已合入 T01–T07、T07a、T09**（PR #636–#652）；分支台账未同步，以提交历史为准。
-- **里程碑**（定义见 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md` 与 `docs/research/MEMORY-STRATEGY.md`；拍板记录见 `ab/m1-memory` 分支的 `docs/research/MEMORY-STRATEGY.md` §7）
+- **里程碑**（定义见 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md` 与 `docs/research/MEMORY-STRATEGY.md`；拍板记录见 `ab/m1-memory` 分支的 `docs/research/MEMORY-STRATEGY.md` §7；两份文档里的 `[B]`（Mac mini 执行）标记已被 2026-10-03 裁决取代，Agent24 全部在笔记本做）
   1. **P0 = M1 收尾**：T07.1（召回注入改为带标注的数据块）、T08（召回评测基线）、T10（记忆 REST + 总开关 + 来源展示）、T11（桌面「记忆」页）。然后**先把 main（含 M10 的 633 个提交）合进 `ab/m1-memory` 并重跑全部 gate，再以 merge 方式落 main**，吸取 M10「分支漂太久」的教训。📐 → 波次 A。
   2. **P1 个人记忆可控（M1.5）**：先出 ADR「原文生命周期内不丢 vs 用户清除权」；回执事件、双时态与用户 supersede、程序性偏好、导出、purge、无痕会话。📐 → 波次 B。
   3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
@@ -70,11 +70,11 @@
 
 - **现状**：受信构造只有 `orchestrator_scratch`（写回 external、串行、TTL 24h / 最长 7 天）；描述符钉住根、`fs_*` 路径约束、`shell_exec` 只钉 cwd（不是 OS 沙箱）🟡。仅 Unix；对外没有任何 workspace 路由；Open Design 的 run 不绑定 workspace。
 - **里程碑**
-  1. **W-1 = OD-M11 F11.0a / F11.3（产品面 + 绑定）**：scratch 的创建 / 恢复、host lease、续期 / 释放、cwd resolve 路由；Open Design 的 run 改为 workspace-bound。📐 → 波次 A（[PLAN-OD-NEXT](PLAN-OD-NEXT.md)）。
-  2. **W-2 = OD-M12 F12.2 / F12.4**：workspace 管理界面与 CLI；Windows 上的 workspace 权限实现（当前 `UnsupportedPlatform`）。📐 → 波次 B。Windows 部分是 Windows 上 **workspace-bound run** 的前置，**不是** v0.6 Windows 发布门槛（初版 Windows 走 legacy 路径）。
-  3. **W-3 第三方嵌入通用化（= TPI-W 中与 workspace 相关的部分）**：把「一个工具项目 ↔ 一个 workspace」的附着模型从 Open Design 专用（`creative_attachment_id`）泛化为 `tool_attachment`，并写进接入 Playbook：任何第三方工具都通过「一个 workspace + 一个限定该 workspace 的令牌」接入。📐 → 波次 B。
-  4. **W-4 OpenCreator 适配**（= OC-1 的设计内容、OC-2 的实现内容，不是 OC 的外部前置）：大媒体文件（视频、音频）的存放、配额与 TTL；外部服务的出境策略；可能需要新的 workspace 种类。📐 → 波次 C。
-  5. **W-5 写回与新种类**：`writeback_policy` 除 `external` 外的取值、写回审批、源码 checkout 类 workspace、并发策略（先 ADR = OD-M12 F12.3，再实现）。📐 → 波次 C。
+  1. **W-1 = OD-M11 F11.0a / F11.3（产品面 + 绑定）**：scratch 的创建 / 恢复、host lease、续期 / 释放、cwd resolve 路由；Open Design 的 run 改为 workspace-bound。📐 → ⏸️ 暂停（Open Design 线，原排波次 A）（[PLAN-OD-NEXT](PLAN-OD-NEXT.md)）。
+  2. **W-2 = OD-M12 F12.2 / F12.4**：workspace 管理界面与 CLI；Windows 上的 workspace 权限实现（当前 `UnsupportedPlatform`）。📐 → ⏸️ 暂停（Open Design 线，原排波次 B）。Windows 部分是 Windows 上 **workspace-bound run** 的前置，**不是** v0.6 Windows 发布门槛（初版 Windows 走 legacy 路径）。
+  3. **W-3 第三方嵌入通用化（= TPI-W 中与 workspace 相关的部分）**：把「一个工具项目 ↔ 一个 workspace」的附着模型从 Open Design 专用（`creative_attachment_id`）泛化为 `tool_attachment`，并写进接入 Playbook：任何第三方工具都通过「一个 workspace + 一个限定该 workspace 的令牌」接入。📐 → ⏸️ 暂停（Open Design 线，原排波次 B）。
+  4. **W-4 OpenCreator 适配**（= OC-1 的设计内容、OC-2 的实现内容，不是 OC 的外部前置）：大媒体文件（视频、音频）的存放、配额与 TTL；外部服务的出境策略；可能需要新的 workspace 种类。📐 → ⏸️ 暂停（Open Design 线，原排波次 C）。
+  5. **W-5 写回与新种类**：`writeback_policy` 除 `external` 外的取值、写回审批、源码 checkout 类 workspace、并发策略（先 ADR = OD-M12 F12.3，再实现）。📐 → ⏸️ 暂停（Open Design 线，原排波次 C）。
   6. **W-N 命名收敛**：给三个「Workspace」定不同的名字（例如 文件系统工作区 / 社区工作台 / 记忆作用域），在 ADR 与代码注释中统一。📐 → 随 W-3 一起做。
 - **依赖**（以源编号表达）：OD-M11 内部为 **F11.0a + F11.0 → F11.1 / F11.2 / F11.3**——W-1（F11.0a、F11.3）与 C5 A-1（F11.0、F11.1、F11.2）只是同一里程碑按组件的归属标签，互相交织，不能整体排先后；TPI-W ← F11.0a–F11.3；W-3 ⊂ TPI-W；W-4 由 OC-1 设计、OC-2 实现；Windows 上的 workspace-bound run ← W-2（F12.4），但它不是 C10 Windows 发布链的前置。
 
@@ -82,12 +82,12 @@
 
 - **现状**：fail-closed 审批 ✅；Guardian ✅（默认关闭）；模块侧能力句柄 ✅；外部客户端 capability：令牌基础设施 🟡，路由级资源授权 📐，产品路径仍是 legacy 全权 bearer；Desktop 通用 `backendProxy` 未做高权限接口隔离。法律：上下文、记忆、审批三部。
 - **里程碑**
-  1. **A-1 = OD-M11 F11.0 / F11.1 / F11.2**：路由级资源授权与高权限接口隔离、Desktop 自有 capability daemon（无孤儿）、broker / handoff / 吊销。📐 → 波次 A。
-  2. **A-2 = TPI-W W.2**：`CreativeRuntime` 等 Creative 专名泛化为按工具区分的 audience（如 `ToolRuntime{tool}`）。📐 → 波次 B。
+  1. **A-1 = OD-M11 F11.0 / F11.1 / F11.2**：路由级资源授权与高权限接口隔离、Desktop 自有 capability daemon（无孤儿）、broker / handoff / 吊销。📐 → ⏸️ 暂停（Open Design 线，原排波次 A）。
+  2. **A-2 = TPI-W W.2**：`CreativeRuntime` 等 Creative 专名泛化为按工具区分的 audience（如 `ToolRuntime{tool}`）。📐 → ⏸️ 暂停（Open Design 线，原排波次 B）。
   3. **A-3 隐私法律 L-PRV**（法律先于实现冻结，配变异测试；来源：internal-AI docs/06、docs/10），分两类约束：
      - **A-3a LLM 负载**：发往远端模型的内容必经 iDoris 出口网关脱敏、`LocalOnly` 贯穿主路径。是 C2 脱敏在默认路径启用的上线门。
      - **A-3b 非 LLM 出站**：邮件、IM、`http_fetch`、MCP / 第三方工具的直接出网等不经 LLM 网关的出站，按 docs/10 由**各消费方进程**自带启动断言（egress guard）。Agent24 自身的出站工具需要实现它；第三方工具把它作为 TPI-W 的接入验收门（W.4 清单 + harness 断言）。
-     同时补 `docs/laws/EDITIONS.md`（SPEC-EDITIONS 的下一步）。📐 → A-3a / A-3b 的法律冻结在波次 A；A-3b 的 Agent24 侧实现与 TPI-W 验收门在波次 B。
+     同时补 `docs/laws/EDITIONS.md`（SPEC-EDITIONS 的下一步）。📐 → A-3a / A-3b 的法律冻结在波次 A；A-3b 的 Agent24 侧实现在波次 B；TPI-W 验收门随 Open Design 线暂停。
   4. **A-4 记忆授权演进**：`Authorizer` 在 P1 细化操作类型，P3 加 module principal / delegation / `policy_epoch`（随 C3）。
   5. **A-5 ADR-032 P5**：gate 闭集执行动作扩展（排除 `builtin`）、proposal → 宿主确认 UI → 回执留档（随 C9）。
   6. **A-6 ME-6 模块签名**（sigstore keyless + 信任策略；签名只回答「谁写的」，不提供隔离）。📐 → 远期，需拍板。
@@ -109,9 +109,9 @@
 
 - **现状**：Open Design 现行路径 ✅（`CreativeServeWeb` + `agent24 acp`，legacy token，无 workspace 绑定）；目标形态组件 🟡；MCP ✅。M10 已完成（[落地指南](../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md)保留为历史审计记录）。
 - **里程碑**（定义见 [PLAN-OD-NEXT](PLAN-OD-NEXT.md)）
-  1. **OD-M11 产品路径生效** → 波次 A。
-  2. **TPI-W 第三方工具接入 Workflow**（Playbook、去 Creative 专名、harness 模板、评估清单）→ 波次 B；**OD-M12 收尾**并行。
-  3. **OC OpenCreator**：OC-0 调研（可提前，只做调研不写代码）→ OC-1 边界 ADR（先裁决：OpenCreator 自带 Codex 执行引擎，与「Agent24 是唯一 AI 控制面」重叠）→ OC-2 接入 → OC-3 E2E 落地。→ 波次 B / C。
+  1. **OD-M11 产品路径生效** → ⏸️ 暂停（Open Design 线，原排波次 A）。
+  2. **TPI-W 第三方工具接入 Workflow**（Playbook、去 Creative 专名、harness 模板、评估清单）→ ⏸️ 暂停（Open Design 线，原排波次 B）；**OD-M12 收尾**并行。
+  3. **OC OpenCreator**：OC-0 调研（可提前，只做调研不写代码）→ OC-1 边界 ADR（先裁决：OpenCreator 自带 Codex 执行引擎，与「Agent24 是唯一 AI 控制面」重叠）→ OC-2 接入 → OC-3 E2E 落地。→ ⏸️ 暂停（Open Design 线，原排波次 B / C）。
   4. **其它候选**：MediaBot 等外部工具接入时同样走 TPI-W；LLM 负载按 C5 A-3a 经 iDoris，非 LLM 出网（如 Open Design 默认云端生图、视频下载）按 A-3b 由该工具进程自带启动断言，并作为 TPI-W 验收项。
 - **依赖**：OD-M11 内部 F11.0a + F11.0 → F11.1 / F11.2 / F11.3；F11.5 ← F11.0a…F11.4（F11.4 与 F11.1–F11.3 的先后由 PLAN-OD-NEXT 决定，本文不推导）；TPI-W ← F11.0a–F11.3；OC-0 无前置（纯调研可提前）；OC-1 ← TPI-W（含 W.2 / W-3），并在 OC-1 中产出 W-4 设计；OC-2 实现 W-4；OC-3 ← OC-2。
 
@@ -151,7 +151,7 @@
 ### C11 组织化
 
 - **现状**：ADR-030 F8（所有权 = (组织, 空间)）✅。
-- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）；**F11**（`asserted_by` + 冲突断言）按 [SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) 应与 F2（记忆接进 agent loop）一起做；M1 已在分支上完成 F2 对应工作（T03 / T04）但没有带上 F11，**属于对规范的偏离**。**待拍板**：(a) 在 C3 P0 收尾时补 `asserted_by` 最小字段与约束；或 (b) 记录决策，把 F11 移入 C3 P1。**F9 的社区子集由 C3 P3 触发（波次 C）**；其余部分等第二个真实用户，不排期（[roadmap.md](roadmap.md) M3）。
+- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）；**F11**（`asserted_by` + 冲突断言）按 [SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) 应与 F2（记忆接进 agent loop）一起做；M1 已在分支上完成 F2 对应工作（T03 / T04）但没有带上 F11，**属于对规范的偏离**。**已裁决（jason 2026-10-03）**：选 (b)，F11 移入 C3 P1，作为对 SPEC-ORG-SPACE「F11 随 F2」的已记录偏离；P0 收尾不补 `asserted_by`。**F9 的社区子集由 C3 P3 触发（波次 C）**；其余部分等第二个真实用户，不排期（[roadmap.md](roadmap.md) M3）。
 - **不能等的前置**（[SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) §9）：① 共享空间的不可变 ID（随 C3 P3 定）；② 组织 / 空间是否跨库或跨地区（随 C3 P4 定）；③ agent loop 自身记忆归属迁到 personal space（= C3 P0 的 M1-T02 / T05，已在 `ab/m1-memory` 完成，合回 main 后生效）。
 
 ### C12 Web3 身份与结算（AAStar）
@@ -161,13 +161,17 @@
 
 ---
 
-## 3. 跨组件波次（建议，待 jason 拍板）
+## 3. 跨组件波次（2026-10-03 jason 裁决后）
+
+> **裁决（2026-10-03）**：主干 = **C3 P0（M1 收尾并合回 main）**；**C7 Open Design 线在 M10 告一阶段**，OD-M11（含 C4 W-1、C5 A-1）/ OD-M12 / TPI-W / OC 全部移入下表「暂停」行，不与 M1 并行，恢复时从 OD-M11 起步（F11.4 托管器届时再定）。并行线 = C8 COMM（笔记本）。波次 A 其余条目照常，但**不得挤占 M1 的评审与合并节奏**。F11 放入 C3 P1（2026-10-03 裁决）。仍待拍板：ID-1 何时开工（C2）。
+
 
 | 波次 | 主要内容 | 并行性说明 |
 |---|---|---|
-| **A（近期）** | C3 P0（M1 收尾并合回 main；F11 是否随 P0 待拍板）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）、DEP-C8 Hyphae lock 升级 · C5 A-3a / A-3b 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
-| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C5 A-3b Agent24 出站启动断言 + TPI-W 验收门 · C8 T01-E 收口、DEP-C9 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P4 流式（= ADR-032 P3，A / B）→ A3 P3 提案闭环（= ADR-032 P5，在 P4 之后）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
-| **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
+| **A（近期）** | **主干：C3 P0**（M1 收尾并合回 main；F11 不随 P0，放 P1）· **并行：C8** COMM-5b / 6（COMM-7 可延至 B）、DEP-C8 Hyphae lock 升级 · C5 A-3a / A-3b 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 与 COMM 都在笔记本（B 机 2026-10-03 起不再编译 Agent24）；其余条目只在不挤占 M1 时插入 |
+| **B（中期）** | C3 P1（含 C11 F11 `asserted_by`） · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C5 A-3b Agent24 出站启动断言 · C8 T01-E 收口、DEP-C9 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P4 流式（= ADR-032 P3，A / B）→ A3 P3 提案闭环（= ADR-032 P5，在 P4 之后）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | C3 P1 紧接 P0，是主干的下一站 |
+| **C（远期）** | C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
+| **暂停（Open Design 线，2026-10-03）** | C7 OD-M11（含 C4 W-1、C5 A-1）→ TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）→ OC-0…OC-3（含 C4 W-4）· C4 W-5 写回（OD-M12 F12.3）· C5 A-3b 的 TPI-W 验收门 | 恢复时按 [PLAN-OD-NEXT](PLAN-OD-NEXT.md) §5 的顺序整体排入；M10 遗留安全缺口见其 §0 |
 | 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
 **关键依赖链**（一眼看清）
