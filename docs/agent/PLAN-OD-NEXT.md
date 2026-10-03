@@ -42,7 +42,7 @@
 | F11.4 托管器 | 默认方案 (a)：把 Creative 托管迁到 `SidecarManager` + `agent24-sidecar-host`，兑现 ADR-004 冻结的所有权、generation fencing、健康检查 / 重启、整个进程树回收、退出无孤儿。若选 (b) 保留 `CreativeServeWeb`：必须写新 ADR，明确 supersede ADR-004 的哪些条款，并让 `CreativeServeWeb` 达到同等保证（现状只对直接子进程发 SIGTERM / SIGKILL，没有进程组 / Job、健康退避和整树回收） | ADR 已合入；打包 E2E 断言：Creative 重启 / 崩溃 / app 退出后无孤儿进程，旧代际的请求被栅栏挡住；落选的一方删除或在 ARCHITECTURE-LAYERS 明确标注"保留给 TPI" |
 | F11.5 验收 harness 回归化 | 把 M10 的 M4 exact-SHA harness（`refs/pull/654/head`）整理进 main，作为可重复运行的工作流，并覆盖 F11.0a–F11.4：authority 路由拒绝、Creative 分区隔离、父进程退出后无孤儿 daemon、handoff / revoke、ACP workspace 绑定、托管器单一所有权 | harness 在 main 上能按 SHA 手动触发并通过 |
 
-**依赖**：F11.0a 与 F11.0 是 F11.1–F11.3 的前提（否则开启 capability 模式后 Open Design 无法建会话）。**跨仓依赖**：ADR-005 要求 Open Design fork 给通用 `RuntimeContext` 增加 `conversationId`，并由 runtime adapter 据此定位 handoff；这部分在 `iDoris-ai/open-design-agent24` 实现，需要更新 exact-SHA pin，并补跨仓契约测试（F11.2 / F11.3）。和 M1（记忆）互不阻塞，可以并行。
+**依赖**：F11.0a 与 F11.0 是 F11.1–F11.3 的前提（否则开启 capability 模式后 Open Design 无法建会话）。**跨仓依赖**：ADR-005 要求 Open Design fork 给通用 `RuntimeContext` 增加 `conversationId`，并由 runtime adapter 据此定位 handoff；这部分在 `iDoris-ai/open-design-agent24` 实现，需要更新 exact-SHA pin，并补跨仓契约测试（F11.2 / F11.3）。Open Design 全线当前 `PAUSED`，不与 M1 并行（2026-10-03 裁决，见 §5）；恢复后仍按上述内部依赖顺序执行。
 
 **平台**：workspace-bound run 当前仅 Unix（Windows 上 `WorkspaceService` 不组合）。OD-M11 先在 macOS / Linux 生效；Windows 的 workspace 支持列入 OD-M12 F12.4。
 
