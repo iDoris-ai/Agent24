@@ -4396,6 +4396,7 @@ pub(crate) mod tests {
                 channel: "test".into(),
                 created_at: "2026-10-02T00:00:00Z".into(),
                 updated_at: "2026-10-02T00:00:00Z".into(),
+                workspace_id: None,
             })
             .await
             .unwrap();
@@ -4416,6 +4417,7 @@ pub(crate) mod tests {
                 prompt: "检查一下".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                workspace_id: None,
             })
             .await
             .unwrap();

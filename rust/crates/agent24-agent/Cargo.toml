@@ -25,7 +25,6 @@ tracing = "0.1"
 agent24-policy = { path = "../agent24-policy" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
