@@ -45,8 +45,8 @@
 | COMM-4a | agent24d 监管 Hyphae daemon | `DONE` | `d5e8e51`（#626），修复 `a930f9c`、`ec2773e`（#645） |
 | COMM-4b | daemon 状态补全 relay_probe / catch_up | `DONE` | `9ed3549`（#633） |
 | COMM-5a | F4b 冻结（入站默认不触发 run） | `DONE` | `2fc383f`（#613）、`ce90b93`（#618） |
-| COMM-5b | §7 结构约束测试 | `READY` | — |
-| COMM-6 | UI：身份 / 联系人 / relay / daemon 状态 / 导入向导 | `READY` | — |
+| COMM-5b | §7 结构约束测试 | `BACKLOG` | 依赖（COMM-3、4a）已满足 |
+| COMM-6 | UI：身份 / 联系人 / relay / daemon 状态 / 导入向导 | `BACKLOG` | 依赖（COMM-2b、4b）已满足 |
 | COMM-7 | UI：收件历史 / outbox / 重试 + 双仓联调 | `BACKLOG` | 依赖 COMM-3、COMM-6 |
 | T01-E | 入站路径收口（Hyphae 侧，见 `HYPHAE-CLI-INTEGRATION.md`） | `BACKLOG` | 其后的入站高层授权与持久化待立项 |
 | DEP-C8 / C9 | Hyphae lock 升级 / 发布包加入 hyphae | `BACKLOG` | 见 [`../Deployment/TASKS.md`](../Deployment/TASKS.md) |
