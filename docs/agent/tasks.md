@@ -14,7 +14,9 @@
 | [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |
 | [`../PLAN.md`](../PLAN.md) §六 Roadmap、[`../ROADMAP.md`](../ROADMAP.md) | ⛔ **已作废**。Rust 核心重写（ADR-026）之前的 Electron/Node.js 时代规划，仅供历史考古，**不要照它排期** |
 
-**当前执行（2026-09-23 起）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
+**当前状态（2026-10-03）**：ME-4 已随 **v0.5.0** 收口，**v0.5.1** 已发布（2026-10-01）；**M10 Open Design 集成**已于 2026-10-03 落地 main（见下方「Open Design / 第三方工具线台账」）。下一主干**待 jason 拍板**：OD-M11（[`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md)，`READY`）、M1 记忆恢复（恢复前提已满足）、COMM 后续。
+
+**历史（2026-09-23 起的 ME-4 执行段，已收口）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
 定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
 
 ## Open Design / 第三方工具线台账（2026-10-03 立）
