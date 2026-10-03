@@ -50,8 +50,8 @@
   3. **ID-2 = ADR-032 P4 — iDoris provider 接线**：`IDORIS_URL`，拆成 `idoris-local`（强制 `local_only`）与 `idoris-any`；iDoris 回报实际落点。按 ADR-032 顺序排在 P3 之后；若要先做 P4，需在 ADR-032 记录「执行顺序重排、不改编号」。**对接前先核对跨仓字段**（该提案已知与 iDoris 现状有出入）。📐 → 波次 B。
   4. **出境脱敏**：在 iDoris 出口网关实现（不在 Agent24 内实现）。顺序：**先冻结隐私法律 L-PRV（C5 A-3，波次 A）→ ID-2 / 脱敏实现 → 变异验收通过 → 才在默认路径启用**。📐 → 波次 B。
   5. **ID-3**（`X-iDoris-*` 头与 `LocalOnly` 贯穿主对话路径）、**ID-5**（经 iDoris 的危险动作复用 fail-closed 审批门）：依赖 ID-2。📐 → 波次 B。
-  6. **ID-4 跨平台推理后端**（Win / Linux 用 vLLM / llama.cpp / Ollama，依赖 ID-2），是 C10 Windows 发布的前置之一。📐 → 波次 B / C。**ID-6** 动态硬件推荐（依赖 ID-4）：低优先级、未排期。
-- **依赖**：ID-3 / ID-4 / ID-5 ← ID-2；ID-6 ← ID-4；ID-2 排在 ADR-032 P3 之后；默认路径启用脱敏 ← C5 A-3；C9 的流式体验 ← ADR-032 P3；C3 的 P2（本地向量 / 抽取）← 本地模型可用；C10 Windows ← ID-4。
+  6. **ID-4 跨平台推理后端**（Win / Linux 用 vLLM / llama.cpp / Ollama，依赖 ID-2）；它是 Windows 上更多推理后端的增强，**不是** v0.6 Windows 发布门槛（部署研究认为 Ollama 在 Windows 的代码路径已可用、主要缺实机验证）。📐 → 波次 B / C。**ID-6** 动态硬件推荐（依赖 ID-4）：低优先级、未排期。
+- **依赖**：ID-3 / ID-4 / ID-5 ← ID-2；ID-6 ← ID-4；ID-2 排在 ADR-032 P3 之后；默认路径启用脱敏 ← C5 A-3；C9 的流式体验 ← ADR-032 P3；C3 的 P2（本地向量 / 抽取）← 本地模型可用。
 
 ### C3 记忆
 
@@ -71,7 +71,7 @@
 - **现状**：受信构造只有 `orchestrator_scratch`（写回 external、串行、TTL 24h / 最长 7 天）；描述符钉住根、`fs_*` 路径约束、`shell_exec` 只钉 cwd（不是 OS 沙箱）🟡。仅 Unix；对外没有任何 workspace 路由；Open Design 的 run 不绑定 workspace。
 - **里程碑**
   1. **W-1 = OD-M11 F11.0a / F11.3（产品面 + 绑定）**：scratch 的创建 / 恢复、host lease、续期 / 释放、cwd resolve 路由；Open Design 的 run 改为 workspace-bound。📐 → 波次 A（[PLAN-OD-NEXT](PLAN-OD-NEXT.md)）。
-  2. **W-2 = OD-M12 F12.2 / F12.4**：workspace 管理界面与 CLI；Windows 上的 workspace 权限实现（当前 `UnsupportedPlatform`）。📐 → 波次 B；Windows 部分是 C10 Windows 发布的前置。
+  2. **W-2 = OD-M12 F12.2 / F12.4**：workspace 管理界面与 CLI；Windows 上的 workspace 权限实现（当前 `UnsupportedPlatform`）。📐 → 波次 B。Windows 部分是 Windows 上 **workspace-bound run** 的前置，**不是** v0.6 Windows 发布门槛（初版 Windows 走 legacy 路径）。
   3. **W-3 第三方嵌入通用化（= TPI-W 中与 workspace 相关的部分）**：把「一个工具项目 ↔ 一个 workspace」的附着模型从 Open Design 专用（`creative_attachment_id`）泛化为 `tool_attachment`，并写进接入 Playbook：任何第三方工具都通过「一个 workspace + 一个限定该 workspace 的令牌」接入。📐 → 波次 B。
   4. **W-4 OpenCreator 适配**（= OC-1 的设计内容、OC-2 的实现内容，不是 OC 的外部前置）：大媒体文件（视频、音频）的存放、配额与 TTL；外部服务的出境策略；可能需要新的 workspace 种类。📐 → 波次 C。
   5. **W-5 写回与新种类**：`writeback_policy` 除 `external` 外的取值、写回审批、源码 checkout 类 workspace、并发策略（先 ADR = OD-M12 F12.3，再实现）。📐 → 波次 C。
@@ -119,16 +119,18 @@
   1. **COMM-5b** 结构约束测试（依赖 allowlist 等）→ 波次 A。
   2. **COMM-6** UI：身份 / 联系人 / relay / daemon 状态 / 导入向导 → 波次 A。
   3. **COMM-7** UI：收件历史 / outbox / 重试 + 双仓联调 → 波次 A / B。
-  4. **入站授权收口（T01-E）**：入站执行统一走高层授权路径（与 C5 对齐），是四仓联调验收的前置。→ 波次 B。
+  4. **T01-E 收口**（[HYPHAE-CLI-INTEGRATION](../design/HYPHAE-CLI-INTEGRATION.md)）：冻结当前 F4b 白名单入站 gated-run 路径、不再扩展。→ 波次 B。
+  5. **收口后的入站高层授权与持久化**（待立项，责任仓 Agent24）：入站触发 run、request / run 持久化、能力授权（与 C5 对齐），是四仓联调验收（UI / T21 / T22）的前置。← T01-E。→ 波次 B / C。
   5. 升级 `hyphae.lock.json` 到含 daemon 锁的版本；发布包加入 `hyphae`（与 C10 配合）。
-- **依赖**：T01-E ← C5；O-4 渠道接入 ← COMM-7。
+- **依赖**：收口后的入站授权 ← T01-E、C5；O-4 渠道接入 ← COMM-7。
 
 ### C9 语音（AgentEar）
 
 - **现状**：A3 附着模块 P0–P2 ✅（非流式、单轮）。
 - **里程碑**（[ADR-032](../decision.md)、[A3 设计 §12](../design/A3-ATTACHED-MODULE.md)）
-  1. **P3 交互闭环**：proposal → 宿主确认 UI → gate 可执行集合 → 回执留档；回复文本展示。→ 波次 B（与 C5 A-5 同步）。
-  2. **流式**：依赖 C2 的 ADR-032 P3（`_a24/model/stream`）。→ 波次 B。
+  1. **A3 P3 交互闭环（= ADR-032 P5）**：proposal → 宿主确认 UI → gate 可执行集合 → 回执留档；回复文本展示。→ 波次 B（与 C5 A-5 同步）。
+     > 编号提示：A3 设计文档的 P3 / P4 与 ADR-032 的 P3 / P4 / P5 名同义异——A3 P3 = ADR-032 P5（提案闭环），A3 P4 = ADR-032 P3（流式）。
+  2. **A3 P4 流式（= ADR-032 P3）**：`_a24/model/stream`，见 C2。→ 波次 A / B。
   3. **多轮**：授予 `_a24/memory/private/*` 或宿主会话回调（依赖 C3 P1）。→ 波次 C。
   4. **语音摄入记忆** = C3 P5。
 - **依赖**：C2 P3、C3 P1、C5 A-5。
@@ -138,15 +140,15 @@
 - **现状**：v0.5.1 ✅：CLI 覆盖 macOS + Linux；Desktop 只发布 Linux，macOS dmg 等 DEP-B（v0.5.2）。DEP-A 全部完成。
 - **里程碑**（`docs/Deployment/`）
   1. **DEP-B v0.5.2 签名**（macOS dmg、CLI / 模块签名公证）：**BLOCKED**（Apple 账号申请中）。
-  2. **DEP-C Windows（v0.6）**：签名方式拍板、移植实现、发布。依赖 C4 W-2（Windows workspace）与 sidecar-host 的 ProcessKit 复用。→ 波次 B / C。
+  2. **DEP-C Windows（v0.6）**：签名方式拍板（DEP-C1）、移植实现（DEP-C2，前置为 DEP-A7 设计冻结与 sidecar-host / ProcessKit 边界）、发布（DEP-C3）。初版 Windows 走 legacy 文件权限与现有 Ollama 路径；Windows 上的 workspace-bound run（C4 W-2 / F12.4）与更多推理后端（C2 ID-4）是发布后的增强。→ 波次 B / C。
   3. **DEP-C0 自动更新**；**DEP-C4 / C5 / C6** 远程访问与移动端（MVP = PWA 遥控）。→ 波次 C。
   4. Desktop 本身的结构改造（自有 capability daemon、托管器）由 C7 OD-M11 承担。
-- **依赖**：Windows ← C4 W-2（F12.4）、C2 ID-4、sidecar-host 的 ProcessKit 复用。
+- **依赖**（以 [Deployment/TASKS.md](../Deployment/TASKS.md) 为准）：DEP-C2 ← DEP-A7、sidecar-host / ProcessKit 边界；DEP-C3 ← DEP-C1、DEP-C2。
 
 ### C11 组织化
 
 - **现状**：ADR-030 F8（所有权 = (组织, 空间)）✅。
-- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）→ F11（`asserted_by` + 冲突断言）。**F9 的社区子集由 C3 P3 触发（波次 C）**；其余部分等第二个真实用户，不排期（[roadmap.md](roadmap.md) M3）。
+- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）；**F11**（`asserted_by` + 冲突断言）按 [SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) 应与 F2（记忆接进 agent loop，即 M1 一线）一起做，不排在 F10 之后，可随 C3 P1 评估。**F9 的社区子集由 C3 P3 触发（波次 C）**；其余部分等第二个真实用户，不排期（[roadmap.md](roadmap.md) M3）。
 - **不能等的前置**（[SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) §9）：① 共享空间的不可变 ID（随 C3 P3 定）；② 组织 / 空间是否跨库或跨地区（随 C3 P4 定）；③ agent loop 自身记忆归属迁到 personal space（= C3 P0 的 M1-T02 / T05，已在 `ab/m1-memory` 完成，合回 main 后生效）。
 
 ### C12 Web3 身份与结算（AAStar）
@@ -161,7 +163,7 @@
 | 波次 | 主要内容 | 并行性说明 |
 |---|---|---|
 | **A（近期）** | C3 P0（M1 收尾并合回 main）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）· C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
-| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C9 P3 · C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
+| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C8 T01-E 收口 · C9 P3 · C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
 | **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
 | 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10 / F11（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
@@ -170,13 +172,12 @@
 ```
 OD-M11:  F11.0a + F11.0 ──▶ F11.1 / F11.2 / F11.3 ──▶ TPI-W（含 W-3、W.2）──▶ OC-1（设计 W-4）──▶ OC-2（实现 W-4）──▶ OC-3
                                                       └─ OD-M12 与 TPI-W 并行；OC-0 调研可提前
-记忆:    C3 P0（M1 合回 main）──▶ C1 K-1 ──▶ C3 P1 ──▶ C3 P2（含 K-4）/ P3（带出 C11 F9 社区子集）
+记忆:    C3 P0（M1 合回 main，交付 K-1）──▶ C3 P1 ──▶ C3 P2（含 K-4）/ P3（带出 C11 F9 社区子集）
          C3 P0 ──▶ C6 O-3（Cos72 M4）──▶ O-4（M5，4seas 实例）      （P3 与 O-3 协同设计）
 模型:    C2 ID-1 画像（无前置）；ADR-032 P3 ──▶ P4 = ID-2 ──▶ ID-3 / ID-4 / ID-5；ID-4 ──▶ ID-6
 隐私:    C5 A-3 法律冻结 ──▶ ID-2 / 出境脱敏（iDoris）──▶ 变异验收 ──▶ 默认路径启用
-Windows: C2 ID-2 ──▶ ID-4 ┐
-         C4 W-2（F12.4）──┼──▶ C10 Windows v0.6
-         ProcessKit 复用 ─┘
+Windows: DEP-A7 设计冻结 + sidecar-host / ProcessKit 边界 ──▶ DEP-C2 ──▶ DEP-C3（v0.6，legacy 路径）
+         发布后增强：C4 W-2（F12.4，Windows workspace-bound run）、C2 ID-4（更多推理后端）
 ```
 
 ---
