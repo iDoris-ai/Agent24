@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "https://github.com/nexu-io/open-design.git",
+    "tag": "open-design-v0.22.2",
+    "commit": "73953213a6fec2c8092e8e77d229a3074aa828a9",
+    "release_url": "https://github.com/nexu-io/open-design/releases/tag/open-design-v0.22.2",
+    "published_at": "2026-09-10T10:24:49Z"
+  },
+  "source_archive_observation": {
+    "downloaded_at": "2026-09-19",
+    "bytes": 163005656,
+    "sha256": "0c1c807c837245732afa9e04cc2db07e1f455e3a3f5c7a7a09556e3cbf4d6739",
+    "note": "Observed GitHub-generated tarball checksum. The commit SHA is authoritative; fork CI must produce and pin its own immutable build artifact checksums."
+  },
+  "agent24": {
+    "repository": "iDoris-ai/Agent24",
+    "baseline_commit": "69baf50d62e6e3db5ca41a8882d35deb45ea3454",
+    "workspace_contract": "a24.workspace.v1",
+    "acp_profile": "agent24.open-design.v1",
+    "desktop_host_contract": "agent24.creative-host.v1"
+  },
+  "policy": {
+    "automatic_upstream_updates": false,
+    "required_update_path": "reviewed upstream-sync PR with compatibility matrix and full contract/E2E suite",
+    "runtime_fallback_to_path": false
+  }
+}
