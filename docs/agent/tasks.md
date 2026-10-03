@@ -9,12 +9,25 @@
 | **本文件 `docs/agent/tasks.md`** | ✅ **权威**。当前在做什么、做到哪一步，以这里为准 |
 | [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md) | ✅ **权威**（配套，2026-09-23 起）。**ME-4 当前主线**的任务定义、技术规范（S1–S5）与验收标准 |
 | [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀（已收口）的任务定义与验收标准（§五「主链」T1–T14） |
+| [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) | ✅ **权威**（配套，2026-10-03 起）。Open Design 下一阶段 / 第三方工具接入 Workflow / OpenCreator 的里程碑定义与验收 |
 | [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
 | [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |
 | [`../PLAN.md`](../PLAN.md) §六 Roadmap、[`../ROADMAP.md`](../ROADMAP.md) | ⛔ **已作废**。Rust 核心重写（ADR-026）之前的 Electron/Node.js 时代规划，仅供历史考古，**不要照它排期** |
 
 **当前执行（2026-09-23 起）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
 定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
+
+## Open Design / 第三方工具线台账（2026-10-03 立）
+
+定义见 [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md)。
+
+| 里程碑 | 状态 | 说明 |
+|---|---|---|
+| M10 Open Design 集成落地 main | `DONE` | #660 `ce861e4`（树 == integration `3ed7d38`），设计文档 #662；历史审计记录：[`../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md`](../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md) |
+| OD-M11 产品路径生效（capability 模式、CreativeRuntime、ACP 绑定 workspace、托管器取舍、harness 回归化） | `READY` | 待 jason 拍板优先级与 F11.4 |
+| OD-M12 收尾与债务（#661 / #663、workspace 产品面、写回策略、跨平台冒烟、上游同步） | `BACKLOG` | 可与 TPI-W 并行 |
+| TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.1–F11.3 |
+| OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `BACKLOG` | 依赖 TPI-W；OC-0 纯调研可提前 |
 
 ## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
 
