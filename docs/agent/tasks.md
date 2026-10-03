@@ -287,6 +287,10 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 
 ## M1 —— 记忆成为产品（2026-08-23 规划；状态未改动，未重排）
 
+> ⚠️ **2026-10-03 更正：本节是 2026-08-23 的旧规划，已被取代。** M1 已按 `ab/m1-memory` 分支上的 `docs/agent/M1-PLAN-v2.md`（2026-10-01 冻结）重排，**M1 的执行状态以该分支的 M1 v2 台账与提交历史为准**（本文件对 M1 是例外）。
+> 截至 2026-10-03，已合入 `ab/m1-memory`：M1-T01、T02、T03、T04、T05、T06、T07a、T07、T09（PR #636–#652）；待做：T07.1（注入改为数据块）、T08、T10、T11，然后先吸收最新 main、再以 merge 落 main（见 [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) C3 P0）。
+> 旧编号 → 新编号对照：F1.1 / T1.1.1–T1.1.2（Authorizer 判定接缝）→ M1-T01；F1.2 / T1.2.1–T1.2.2（personal space 与迁移）→ M1-T02（+ T05 接线）；F1.3 / T1.3.1（会话写进 EventLog）→ M1-T03 / T04；T1.3.2（Condenser 取代 CanonicalSession 压缩）→ M1-T04；T1.3.3（崩溃重放）→ M1-T05。下方各条的 `READY` / `BACKLOG` 状态为历史快照，不再更新。
+
 ## F1.1 — 判定接缝（原 F8b）
 
 > 依赖 PR #140（F8）已合并。**若 #140 尚未合并，本 Feature 全部 task 保持 BACKLOG。**
