@@ -18,8 +18,9 @@
 
 | ADR 承诺 | 现状 |
 |---|---|
-| ADR-005：第三方只拿 `CreativeRuntime` 受限令牌，全权凭据不落盘 | 🟡 授权器、mint / 吊销、路由策略都在 main 上；但 daemon 默认 `legacy_single_token`，Desktop 以 `serve --port 0` 启动，`agent24 acp` 用的是 `daemon.json` 里的全权 bearer |
-| ADR-002：Open Design 的 run 绑定 scratch workspace | 🟡 workspace 服务在 main 上；但 `agent24 acp` 建 session / run 时 `workspace_id: None`，走 legacy 文件权限 |
+| ADR-005：第三方只拿 `CreativeRuntime` 受限令牌，全权凭据不落盘 | 🟡 令牌库、mint / 吊销、TTL / 代际、默认拒绝策略在 main 上；📐 **路由级资源授权未实现**：capability 模式下 `CreativeRuntime` 只能读 `GET /api/v1/models`，其余路由都要求宿主权限（`server.rs` 的 `required_operation`），durable 的 session / run 归属、事件过滤、broker / handoff 都还没有。另外 daemon 默认 `legacy_single_token`，Desktop 以 `serve --port 0` 启动，`agent24 acp` 用的是 `daemon.json` 里的全权 bearer |
+| ADR-002：Open Design 的 run 绑定 scratch workspace | 🟡 workspace 服务在 main 上（**仅 Unix**）；但 `agent24 acp` 建 session / run 时 `workspace_id: None`，走 legacy 文件权限 |
+| ADR-004：Creative 用按 workspace 派生的非持久 session 分区 | 📐 现为全局持久分区 `persist:agent24-creative` |
 | ADR-004：通用 `SidecarManager` + Rust `agent24-sidecar-host` 托管 | 🟡 两者都在 main 上；但 Desktop 用专门写的 `CreativeServeWeb` 拉起 Open Design |
 
 **教训**：M10 把"组件落地"和"产品路径生效"当成了同一件事来验收。从 OD-M11 起，每个里程碑都要把"**默认产品路径上可观察到的行为**"列为单独的验收项。
@@ -32,13 +33,17 @@
 
 | Feature | 内容 | 验收（必须在打包后的 Desktop 上可观察） |
 |---|---|---|
+| F11.0 路由级资源授权 | agent24d 按 ADR-005「Route/action/resource matrix」实现：从请求中提取 workspace / session / run 资源并校验；session / run 的 durable 归属（`channel=open_design`、属于令牌创建者）；事件 WS 按归属过滤并在每次发送前复验；审批只读脱敏状态；host 端的 broker 与 handoff 目录 | capability 模式下，`CreativeRuntime` 能且只能操作自己 workspace 内自己创建的 session / run；越权访问返回 403；有对抗测试覆盖 |
 | F11.1 capability 启动 | Desktop `BackendManager` 以 `--auth-mode capabilities --host-bootstrap-stdio` 拉起 daemon，经 ready pipe 接收 `ProductHost` 并只留在 main 进程内存；定义 legacy CLI / TUI 与 capability daemon 的共存策略（两种模式互斥，见 ADR-005「Auth modes」） | `daemon.json` 不含任何凭据；Desktop 全部现有功能回归通过；CLI 遇到 capability daemon 的行为符合文档 |
 | F11.2 Creative 附着与令牌 | 打开 Creative 时，宿主为 `{workspace, Open Design 项目}` 创建或恢复附着，按 ADR-005 向 host-private runtime 目录投递 `CreativeRuntime` 令牌；关闭 / 退出 / 代际变化时吊销 | E2E 断言：Open Design 侧进程拿不到 `ProductHost`；吊销后旧令牌被拒 |
+| F11.2b Creative 分区 | 把全局持久分区 `persist:agent24-creative` 改为按 app 实例 + workspace 派生的非持久分区，detach / 切换时清理 | E2E 断言：切换 workspace 后不残留上一 workspace 的 cookie / storage |
 | F11.3 ACP 绑定 workspace | `agent24 acp` 从 handoff 读取令牌和 `workspace_id`，创建 workspace-bound 的 session / run | E2E 断言：Open Design 发起的 run 带 `workspace_id`，文件工具只能落在该 workspace 根内；跨 workspace 访问被拒 |
 | F11.4 托管器取舍 | 二选一，写 ADR 记录：(a) 把 Creative 托管迁到 `SidecarManager` + `agent24-sidecar-host`；(b) 承认 `CreativeServeWeb` 为正式托管器，把 `SidecarManager` / sidecar-host 标为第二个工具时再用 | ADR 已合入；落选的一方要么删除，要么在 ARCHITECTURE-LAYERS 里明确标注"保留给 TPI"，不再处于"实现了但没人用"的状态 |
 | F11.5 验收 harness 回归化 | 把 M10 的 M4 exact-SHA harness（`refs/pull/654/head`）整理进 main，作为可重复运行的工作流，并加上 F11.1–F11.3 的断言 | harness 在 main 上能按 SHA 手动触发并通过 |
 
-**依赖**：无外部依赖；和 M1（记忆）互不阻塞，可以并行。
+**依赖**：F11.0 是 F11.1–F11.3 的前提（否则开启 capability 模式后 Open Design 无法建会话）。无外部依赖；和 M1（记忆）互不阻塞，可以并行。
+
+**平台**：workspace-bound run 当前仅 Unix（Windows 上 `WorkspaceService` 不组合）。OD-M11 先在 macOS / Linux 生效；Windows 的 workspace 支持列入 OD-M12 F12.4。
 
 ## 2. OD-M12 — 收尾与债务
 
@@ -47,13 +52,13 @@
 | F12.1 评审遗留 | #663 A 区 5 条（含 #277 闰秒测试假阳性、#284 编码后写失败的序列状态、#519 槽位复用退避）；#661 三条（bounds 时序回归测试、generation-aware bounds、bounds 上限） | issues #661 / #663 |
 | F12.2 Workspace 产品面 | 开放 `WorkspaceService` 面向产品的构造（宿主准入 / 租约），给出 workspace 列表 / 释放 / 续期的产品入口 | ADR-002、G1/G2 |
 | F12.3 写回策略 | 定义 `writeback_policy` 除 `external` 外的取值、写回审批与并发策略（写 ADR，不急于实现） | ADR-001 §7、ADR-002 |
-| F12.4 跨平台完整冒烟 | ADR-001 的 MVP 只要求 macOS 完整冒烟、Windows / Linux 构建与资源校验；补 Windows / Linux 的打包后 Creative 冒烟 | ADR-001「MVP 能力边界」 |
+| F12.4 跨平台 | ADR-001 的 MVP 只要求 macOS 完整冒烟、Windows / Linux 构建与资源校验：补 Windows / Linux 的打包后 Creative 冒烟；补 Windows 上的 workspace 权限实现（当前 `UnsupportedPlatform`） | ADR-001「MVP 能力边界」、`agent24-workspace` 非 Unix 分支 |
 | F12.5 上游同步节奏 | `iDoris-ai/open-design-agent24` fork 的 pin 升级流程（多久同步、谁审、跑哪些 gate） | ADR-001 §4 |
 | F12.6 架构文档维护 | ARCHITECTURE-LAYERS 的状态标记随 OD-M11 / M12 更新；internal-AI（iDoris-Components）的同步副本跟进 | 本次 |
 
 ## 3. TPI-W — 第三方开源工具接入 Workflow
 
-目标：把 M10 的经验沉淀成**可重复的流程**，让第二个工具（OpenCreator）不再走一遍 M10 的弯路。前置：OD-M11 的 F11.1–F11.3 完成，否则 workflow 里的"受限令牌 + workspace"一步没有可复用的实现。
+目标：把 M10 的经验沉淀成**可重复的流程**，让第二个工具（OpenCreator）不再走一遍 M10 的弯路。前置：OD-M11 的 F11.0–F11.3 完成，否则 workflow 里的"受限令牌 + workspace"一步没有可复用的实现。
 
 | Feature | 产出 |
 |---|---|

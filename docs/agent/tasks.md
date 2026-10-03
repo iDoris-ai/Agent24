@@ -24,9 +24,9 @@
 | 里程碑 | 状态 | 说明 |
 |---|---|---|
 | M10 Open Design 集成落地 main | `DONE` | #660 `ce861e4`（树 == integration `3ed7d38`），设计文档 #662；历史审计记录：[`../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md`](../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md) |
-| OD-M11 产品路径生效（capability 模式、CreativeRuntime、ACP 绑定 workspace、托管器取舍、harness 回归化） | `READY` | 待 jason 拍板优先级与 F11.4 |
+| OD-M11 产品路径生效（路由级资源授权、capability 模式、CreativeRuntime、Creative 分区、ACP 绑定 workspace、托管器取舍、harness 回归化） | `READY` | 待 jason 拍板优先级与 F11.4 |
 | OD-M12 收尾与债务（#661 / #663、workspace 产品面、写回策略、跨平台冒烟、上游同步） | `BACKLOG` | 可与 TPI-W 并行 |
-| TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.1–F11.3 |
+| TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `BACKLOG` | 依赖 OD-M11 F11.0–F11.3 |
 | OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `BACKLOG` | 依赖 TPI-W；OC-0 纯调研可提前 |
 
 ## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
