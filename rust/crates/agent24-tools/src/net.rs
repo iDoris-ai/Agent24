@@ -288,12 +288,7 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        ToolContext {
-            run_id: "run_test".to_owned(),
-            session_id: None,
-            schedule_id: None,
-            tool_call_id: "tc_test".to_owned(),
-        }
+        ToolContext::legacy("run_test", None, None, "tc_test")
     }
 
     #[test]

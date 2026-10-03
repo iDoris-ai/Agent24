@@ -23,9 +23,11 @@ fn run(id: &str) -> Run {
     Run {
         id: id.to_owned(),
         session_id: None,
+        workspace_id: None,
         status: RunStatus::Queued,
         input: RunInput {
             prompt: "hello".to_owned(),
+            workspace_id: None,
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
         },
@@ -64,6 +66,7 @@ async fn session_roundtrip() {
         id: "sess_1".to_owned(),
         title: "t".to_owned(),
         channel: "cli".to_owned(),
+        workspace_id: None,
         created_at: TS.to_owned(),
         updated_at: TS.to_owned(),
     };
@@ -650,6 +653,7 @@ async fn same_second_rows_come_back_in_a_defined_order() {
                 id: id.to_owned(),
                 title: "t".to_owned(),
                 channel: "cli".to_owned(),
+                workspace_id: None,
                 created_at: at.to_owned(),
                 updated_at: at.to_owned(),
             })

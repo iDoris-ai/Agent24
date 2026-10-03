@@ -717,6 +717,8 @@ export interface components {
              * @example nostr
              */
             channel: string;
+            /** @description Opaque workspace identity; null when unbound. */
+            workspace_id: string | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -727,6 +729,8 @@ export interface components {
             title: string;
             /** @default desktop */
             channel: string;
+            /** @description Omit/null for a legacy-compatible unbound session. */
+            workspace_id?: string | null;
         };
         /**
          * @description State machine (only legal transitions):
@@ -744,6 +748,8 @@ export interface components {
         RunMode: "normal" | "plan";
         RunInput: {
             prompt: string;
+            /** @description Explicit opaque workspace identity copied from the run request. */
+            workspace_id: string | null;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];
         };
@@ -754,6 +760,8 @@ export interface components {
             id: string;
             /** @description Null for transient runs (e.g. created by /chat) */
             session_id: string | null;
+            /** @description Opaque workspace identity; filesystem roots stay outside this public schema. */
+            workspace_id: string | null;
             status: components["schemas"]["RunStatus"];
             input: components["schemas"]["RunInput"];
             /** @description Present when status=completed */
@@ -773,6 +781,8 @@ export interface components {
         RunCreate: {
             /** @description Omit/null to create a transient run */
             session_id?: string | null;
+            /** @description Omit/null for legacy-compatible runs; admission is separate. */
+            workspace_id?: string | null;
             prompt: string;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];

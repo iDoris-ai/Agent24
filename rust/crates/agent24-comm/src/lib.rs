@@ -14,21 +14,33 @@
 //! password between agent24d restarts). COMM-2a adds `error` (the REST
 //! layer's closed error set, §4), `npub` (bech32 validity, G6), and `router`
 //! (`CommState` + `router(CommState) -> axum::Router`: identity / contact /
-//! relay). `~/.hyphae` import, send/history/outbox, and daemon supervision
-//! are later tasks (COMM-2b onward) and are intentionally not implemented
-//! here.
+//! relay). COMM-2b adds `import` (`~/.hyphae` import, §4.1): validates and
+//! locks the source, copies its six files into a staging HOME, verifies
+//! them (and the keystore password) against the real Hyphae CLI, then
+//! commits by renaming staging into place. Send/history/outbox and daemon
+//! supervision are later tasks (COMM-3 onward) and are intentionally not
+//! implemented here.
 
 pub mod binary;
+pub mod daemon;
 pub mod error;
+pub mod import;
 pub mod keystore_lock;
 pub mod npub;
 pub mod password;
 pub mod password_store;
+mod restart_policy;
 pub mod router;
 pub mod runner;
 
 pub use binary::{BinaryError, HyphaeLock, Sha256Digest, VerifiedBinary, current_platform};
+pub use daemon::{
+    CatchUpStatus, Ctx as DaemonCtx, DaemonShutdownOutcome, DaemonStartError, DaemonStatus,
+    HyphaeDaemonSupervisor, OrphanOutcome, READY_AFTER_DEFAULT, RelayProbeStatus, ShutdownLeader,
+    read_autostart, reap_orphan, stop_grace,
+};
 pub use error::CommError;
+pub use import::{ImportReport, ImportRequest, import};
 pub use keystore_lock::{KeystoreGuard, KeystoreWriteLock};
 pub use npub::is_valid_npub;
 pub use password::{PASSWORD_MAX, Password};

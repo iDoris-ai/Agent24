@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use agent24_models::router::ModelRouter;
 use agent24_protocol::Health;
+use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, Path, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -16,6 +17,13 @@ use axum::routing::{get, post};
 use rand::RngCore;
 use std::sync::Arc as StdArc;
 use tokio_util::sync::CancellationToken;
+
+fn workspace_recovery_instant_at(
+    time: std::time::SystemTime,
+) -> std::io::Result<agent24_store::WorkspaceInstant> {
+    let text = agent24_core::util::iso8601_millis_at(time).map_err(std::io::Error::other)?;
+    agent24_store::WorkspaceInstant::parse(&text).map_err(std::io::Error::other)
+}
 
 // A shutdown's budgets and deadlines — the HTTP drain's fixed 1.5s, the
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
@@ -26,6 +34,12 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct AppState {
     pub token: Arc<String>,
+    /// Legacy and capability authority are mutually exclusive. Tests and
+    /// existing callers continue to construct legacy state through
+    /// [`AppState::new`]; production capability mode replaces it before the
+    /// router is built.
+    pub auth_mode: AuthMode,
+    pub capabilities: Option<crate::capabilities::CapabilityStore>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -351,6 +365,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                 } = action;
                 let create = agent24_protocol::RunCreate {
                     session_id: session_id.clone(),
+                    workspace_id: None,
                     prompt: prompt.clone(),
                     model_override: model_override.clone(),
                     // Scheduled runs are unattended — plan mode needs a human
@@ -513,6 +528,7 @@ pub struct AppDeps {
     pub shutdown: Shutdown,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
+    pub workspace_service: Option<StdArc<agent24_workspace::WorkspaceService>>,
     pub mcp_servers: Vec<Arc<agent24_mcp::McpServer>>,
     /// Pre-loaded user overrides (H2). Injected rather than loaded here so
     /// tests can wire an empty or hand-built set.
@@ -538,6 +554,7 @@ impl AppState {
             shutdown,
             guardian,
             memory,
+            workspace_service,
             mcp_servers,
             risk_overrides,
             packages_root,
@@ -578,13 +595,14 @@ impl AppState {
                     &broker,
                 )))),
         );
-        let runs = agent24_agent::RunManager::with_memory(
+        let runs = agent24_agent::RunManager::with_memory_and_workspace(
             store.clone(),
             Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
             shutdown.token().clone(),
             memory,
+            workspace_service,
         );
         let sched_hub = events.clone();
         let deliverer = StdArc::new(crate::scheduler_deliver::ModuleDeliverer::new(
@@ -619,6 +637,8 @@ impl AppState {
         Self {
             risk_overrides,
             token: Arc::new(token),
+            auth_mode: AuthMode::LegacySingleToken,
+            capabilities: None,
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -657,6 +677,12 @@ impl AppState {
 }
 
 impl AppState {
+    fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
+        self.token = Arc::new(String::new());
+        self.auth_mode = AuthMode::Capabilities;
+        self.capabilities = Some(store);
+    }
+
     /// Re-read the override set after the user changed it.
     ///
     /// A failed reload leaves the previous snapshot in place rather than
@@ -703,6 +729,186 @@ async fn fallback() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
 }
 
+#[derive(serde::Deserialize)]
+struct MintCreativeBody {
+    workspace_id: String,
+    #[serde(alias = "attachment_id")]
+    creative_attachment_id: String,
+    #[serde(alias = "principal_id")]
+    creative_principal_id: String,
+    #[serde(alias = "sidecar_instance_id")]
+    sidecar_generation: String,
+    #[serde(default = "default_creative_ttl")]
+    ttl_seconds: u64,
+    #[serde(default)]
+    allowed_operations: Option<Vec<String>>,
+}
+
+const fn default_creative_ttl() -> u64 {
+    300
+}
+
+fn valid_scope_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
+    use crate::capabilities::Operation;
+    match operation {
+        Operation::ModelsAdmin => "models.admin",
+        Operation::WorkspaceCreate => "workspace.create",
+        Operation::WorkspaceRelease => "workspace.release",
+        Operation::HostLease => "host.lease",
+        Operation::ApprovalDecision => "approval.decision",
+        Operation::GrantManage => "grant.manage",
+        Operation::OverrideManage => "override.manage",
+        Operation::ScheduleManage => "schedule.manage",
+        Operation::ModuleAdmin => "module.admin",
+        Operation::CapabilityMint => "capability.mint",
+        Operation::CapabilityRevoke => "capability.revoke",
+        Operation::Shutdown => "shutdown",
+        Operation::ModelsRead => "models.read",
+        Operation::WorkspaceResolve => "workspace.resolve",
+        Operation::SessionCreate => "session.create",
+        Operation::SessionRead => "session.read",
+        Operation::SessionTranscript => "session.transcript",
+        Operation::RunCreate => "run.create",
+        Operation::RunRead => "run.read",
+        Operation::RunCancel => "run.cancel",
+        Operation::EventsRead => "events.read",
+        Operation::ApprovalStatusRead => "approval.status",
+    }
+}
+
+async fn mint_creative_capability(
+    State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
+    Json(body): Json<MintCreativeBody>,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Creative capabilities require capability auth mode",
+        );
+    };
+    let Some(Extension(authorization)) = authorization else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Host authority required",
+        );
+    };
+    if body.ttl_seconds == 0
+        || body.ttl_seconds > crate::capabilities::MAX_CREATIVE_TTL_SECONDS
+        || !valid_scope_id(&body.workspace_id)
+        || !valid_scope_id(&body.creative_attachment_id)
+        || !valid_scope_id(&body.creative_principal_id)
+        || !valid_scope_id(&body.sidecar_generation)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_capability_scope",
+            "Invalid capability scope or TTL",
+        );
+    }
+
+    let mut request = crate::capabilities::CreativeMintRequest::new(
+        body.workspace_id,
+        body.creative_attachment_id,
+        body.creative_principal_id,
+        body.sidecar_generation,
+        Duration::from_secs(body.ttl_seconds),
+        crate::capabilities::unix_now(),
+    );
+    if let Some(actions) = body.allowed_operations {
+        let allowlist = crate::capabilities::Operation::creative_allowlist();
+        let mut operations = Vec::with_capacity(actions.len());
+        for action in actions {
+            let Some(operation) = crate::capabilities::Operation::from_action(&action) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_capability_operation",
+                    "Unknown capability operation",
+                );
+            };
+            if !allowlist.contains(&operation) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_capability_operation",
+                    "Operation is not available to Creative runtimes",
+                );
+            }
+            operations.push(operation);
+        }
+        request = request.with_allowed_operations(operations);
+    }
+
+    let minted = match store.mint_creative_authorized(&authorization, request) {
+        Ok(minted) => minted,
+        Err(_) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Host authority required",
+            );
+        }
+    };
+    let (token, capability_id, claims) = minted.into_bearer_parts();
+    let allowed_operations = claims
+        .allowed_operations
+        .iter()
+        .copied()
+        .map(operation_name)
+        .collect::<Vec<_>>();
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "capability_id": capability_id,
+            "token": token,
+            "audience": "creative_runtime",
+            "workspace_id": claims.workspace_id,
+            "creative_attachment_id": claims.attachment_id,
+            "creative_principal_id": claims.principal_id,
+            "daemon_generation": claims.daemon_generation,
+            "host_generation": claims.host_generation,
+            "sidecar_generation": claims.sidecar_generation,
+            "created_at": claims.created_at,
+            "expires_at": claims.expires_at,
+            "allowed_operations": allowed_operations,
+        })),
+    )
+        .into_response()
+}
+
+async fn revoke_capability(
+    State(state): State<AppState>,
+    Path(capability_id): Path<String>,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Capability revocation requires capability auth mode",
+        );
+    };
+    if !valid_scope_id(&capability_id) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_capability_id",
+            "Invalid capability id",
+        );
+    }
+    // Deliberately do not expose whether the ID existed or was already
+    // revoked. The endpoint is idempotent and is not a capability oracle.
+    let _ = store.revoke_by_id(&capability_id);
+    Json(serde_json::json!({
+        "capability_id": capability_id,
+        "state": "revoked",
+    }))
+    .into_response()
+}
+
 /// Bearer-token gate for everything except `GET /api/v1/health`
 /// (SPEC-002 §4: health is the only unauthenticated endpoint — method
 /// included, so a future POST on the same path never silently bypasses auth).
@@ -719,24 +925,86 @@ async fn fallback() -> Response {
 /// This note lives beside the auth middleware rather than beside the proxy
 /// because the person adding such a header is reading this file
 /// (SPEC-ME3-OUT-OF-PROCESS §2.1).
-async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
+async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
     }
-    let authorized = req
+    let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()));
-    if authorized {
-        next.run(req).await
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match state.auth_mode {
+        AuthMode::LegacySingleToken => {
+            if bearer.is_some_and(|presented| {
+                constant_time_eq(presented.as_bytes(), state.token.as_bytes())
+            }) {
+                next.run(req).await
+            } else {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                )
+            }
+        }
+        AuthMode::Capabilities => {
+            let Some(store) = state.capabilities.as_ref() else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "host_authority_unavailable",
+                    "Capability authority unavailable",
+                );
+            };
+            let Some(bearer) = bearer else {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                );
+            };
+            let operation = required_operation(req.method(), req.uri().path());
+            match store.validate_bearer(
+                bearer,
+                operation,
+                &crate::capabilities::Resource::global(),
+                crate::capabilities::unix_now(),
+            ) {
+                Ok(authorization) => {
+                    req.extensions_mut().insert(authorization);
+                    next.run(req).await
+                }
+                Err(
+                    crate::capabilities::CapabilityError::OperationDenied
+                    | crate::capabilities::CapabilityError::ResourceDenied
+                    | crate::capabilities::CapabilityError::HostRequired,
+                ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
+                Err(_) => error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                ),
+            }
+        }
+    }
+}
+
+/// Capability policy is deliberately closed. Until durable workspace/session
+/// ownership lands, Creative can use only the global model catalogue. Every
+/// other existing or future route maps to a host-only operation by default.
+fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
+    use crate::capabilities::Operation;
+    if method == Method::GET && path == "/api/v1/models" {
+        Operation::ModelsRead
+    } else if method == Method::POST && path == "/api/v1/capabilities/creative" {
+        Operation::CapabilityMint
+    } else if method == Method::POST
+        && path.starts_with("/api/v1/capabilities/")
+        && path.ends_with("/revoke")
+    {
+        Operation::CapabilityRevoke
     } else {
-        error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        )
+        Operation::ModelsAdmin
     }
 }
 
@@ -770,6 +1038,14 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
+        .route(
+            "/api/v1/capabilities/creative",
+            post(mint_creative_capability),
+        )
+        .route(
+            "/api/v1/capabilities/{capability_id}/revoke",
+            post(revoke_capability),
+        )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
         .route(
@@ -936,11 +1212,80 @@ fn fill_attach_registry_and_recheck(
     }
 }
 
+const APPROVAL_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(10);
+
+fn spawn_approval_recovery_scan(
+    broker: Arc<agent24_policy::ApprovalBroker>,
+    runs: Arc<agent24_agent::RunManager>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_approval_recovery_scan_every(broker, runs, APPROVAL_RECOVERY_SCAN_INTERVAL, cancel)
+}
+
+fn spawn_approval_recovery_scan_every(
+    broker: Arc<agent24_policy::ApprovalBroker>,
+    runs: Arc<agent24_agent::RunManager>,
+    interval: Duration,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
+            let now = agent24_core::util::now_iso8601();
+            match broker.timeout_expired(&now).await {
+                Ok(expired) if expired > 0 => {
+                    tracing::warn!("timed out {expired} expired approval(s)");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!("expired approval scan failed; will retry: {err}");
+                }
+            }
+            match runs.recover_timed_out_approval_runs().await {
+                Ok(cancelled) if cancelled > 0 => {
+                    tracing::warn!(
+                        "cancelled {cancelled} token-less run(s) after approval timeout"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!("timed-out run recovery scan failed; will retry: {err}");
+                }
+            }
+        }
+    })
+}
+
 pub async fn serve(
     port: u16,
     ephemeral: bool,
+    auth_mode: AuthMode,
+    host_bootstrap_stdio: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
+    let (mut host_ready, parent_liveness) = match (auth_mode, host_bootstrap_stdio) {
+        (AuthMode::Capabilities, true) => {
+            let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
+            (Some(writer), Some(liveness))
+        }
+        (AuthMode::Capabilities, false) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "capability mode requires trusted host bootstrap stdio",
+            ));
+        }
+        (AuthMode::LegacySingleToken, false) => (None, None),
+        (AuthMode::LegacySingleToken, true) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host bootstrap stdio is valid only in capability mode",
+            ));
+        }
+    };
     // The shutdown controller, and the signals that request it, before
     // anything else: a SIGTERM during startup — which can take seconds (the
     // store, MCP servers, model probing) — runs this bounded shutdown rather
@@ -951,6 +1296,14 @@ pub async fn serve(
     let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
     let mut config_warnings = config_warnings;
     let shutdown = Shutdown::with_params(cancel.clone(), params);
+    if let Some(parent_liveness) = parent_liveness {
+        let parent_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            parent_liveness.closed().await;
+            parent_shutdown.request();
+            tracing::info!("trusted host bootstrap closed; shutting down capability daemon");
+        });
+    }
     // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
     // Registered HERE — before any module process can be started — and
     // synchronously: a SIGTERM arriving while packages start must run this
@@ -1067,7 +1420,22 @@ pub async fn serve(
         })
     };
 
-    let token = generate_token();
+    let daemon_generation = generate_token();
+    let (token, capability_store, product_host_token) = match auth_mode {
+        AuthMode::LegacySingleToken => (generate_token(), None, None),
+        AuthMode::Capabilities => {
+            let store = crate::capabilities::CapabilityStore::new(daemon_generation.clone());
+            let minted = store
+                .mint_product_host(
+                    generate_token(),
+                    Duration::from_secs(u64::MAX),
+                    crate::capabilities::unix_now(),
+                )
+                .map_err(std::io::Error::other)?;
+            let (bearer, _, _) = minted.into_bearer_parts();
+            (String::new(), Some(store), Some(bearer))
+        }
+    };
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
     let store = if ephemeral {
         Store::open_memory().await.map_err(std::io::Error::other)?
@@ -1177,6 +1545,17 @@ pub async fn serve(
     let state_dir = agent24_protocol::state_file::state_dir()
         .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
+    #[cfg(unix)]
+    let workspace_service = if ephemeral {
+        None
+    } else {
+        Some(StdArc::new(
+            agent24_workspace::WorkspaceService::compose(store.clone(), &state_dir)
+                .map_err(std::io::Error::other)?,
+        ))
+    };
+    #[cfg(not(unix))]
+    let workspace_service = None;
     let mut state = AppState::new(AppDeps {
         token: token.clone(),
         router,
@@ -1186,29 +1565,83 @@ pub async fn serve(
         shutdown: shutdown.clone(),
         guardian,
         memory,
+        workspace_service,
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    if let Some(capability_store) = capability_store {
+        state.enable_capability_auth(capability_store);
+    }
+
+    // M7 durable expiry recovery runs before durable-resume: a stale approval
+    // must become timed_out before anything can re-broadcast it or preflight its
+    // authority. The orphan sweeps below then own cancellation of its parked run.
+    let approval_now = agent24_core::util::now_iso8601();
+    let expired = state
+        .broker
+        .timeout_expired(&approval_now)
+        .await
+        .map_err(std::io::Error::other)?;
+    if expired > 0 {
+        tracing::warn!("timed out {expired} expired approval(s) during startup recovery");
+    }
+    let recovered_timeouts = state
+        .runs
+        .recover_timed_out_approval_runs()
+        .await
+        .map_err(std::io::Error::other)?;
+    if recovered_timeouts > 0 {
+        tracing::warn!(
+            "cancelled {recovered_timeouts} token-less run(s) after startup approval timeout"
+        );
+    }
 
     // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
     // orphan sweep: restore restorable parked approvals (re-broadcast + keep
     // pending) so their runs survive to be resumed when answered, and abort the
     // rest fail-closed. The orphan sweep then cancels every still-non-terminal
     // run whose approval did NOT survive — so the restore MUST come first.
-    let (restored, aborted) = state.runs.restore_pending_approvals().await;
+    let (restored, aborted) = state
+        .runs
+        .restore_pending_approvals()
+        .await
+        .map_err(std::io::Error::other)?;
     if restored > 0 || aborted > 0 {
         tracing::info!(
             "durable resume: {restored} approval(s) restored, {aborted} aborted from a previous process"
         );
     }
+    let now = agent24_core::util::now_iso8601();
     let orphans = state
         .store
-        .sweep_orphan_runs(&agent24_core::util::now_iso8601())
+        .sweep_orphan_runs(&now)
         .await
         .map_err(std::io::Error::other)?;
     if orphans > 0 {
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
     }
+    let workspace_now = workspace_recovery_instant_at(std::time::SystemTime::now())?;
+    let workspace_orphans = state
+        .store
+        .sweep_workspace_orphan_runs(&workspace_now)
+        .await
+        .map_err(std::io::Error::other)?;
+    if workspace_orphans.released_leases > 0 {
+        tracing::warn!(
+            "cancelled {} workspace-bound orphan run(s) from a previous process",
+            workspace_orphans.released_leases
+        );
+    }
+
+    // M7: approvals can outlive the task that originally armed their in-memory
+    // timeout. Keep durable expiry/recovery active for the daemon lifetime; a
+    // shutdown child token stops the loop cleanly, and each interval is also the
+    // retry mechanism for transient store or recovery-cancel failures.
+    spawn_approval_recovery_scan(
+        Arc::clone(&state.broker),
+        Arc::clone(&state.runs),
+        cancel.child_token(),
+    );
 
     // ME4-1.3.1 (design §3.2/§4.6, S1-6): the scheduler's tick loop AND
     // delivery pump are spawned AFTER `mount_all` returns, below — not here.
@@ -1352,6 +1785,18 @@ pub async fn serve(
         std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
     > = Arc::new(std::sync::OnceLock::new());
     let stopping_attach_registry = Arc::clone(&attach_registry_cell);
+    // COMM-4a: the Hyphae daemon supervisor (if comm_routes manages to
+    // build one) is, like the attach registry above, only known once
+    // `comm_routes::build` runs — AFTER this task is spawned. PR #626
+    // review, High #1: unlike the attach registry's plain `OnceLock`, this
+    // is a `CommDaemonSlot` — a lock `comm_routes::build_ready_state`
+    // registers into BEFORE any autostart attempt, synchronized with this
+    // same task's own `close()` below, so a shutdown that begins mid-`build`
+    // can never let an autostart spawn a Hyphae daemon nothing will ever be
+    // told to stop. See `comm_routes::CommDaemonSlot`'s own doc comment.
+    let comm_daemon_slot: Arc<crate::comm_routes::CommDaemonSlot> =
+        Arc::new(crate::comm_routes::CommDaemonSlot::new());
+    let stopping_comm_daemon = Arc::clone(&comm_daemon_slot);
     let stopping = tokio::spawn(async move {
         stop_shutdown.token().cancelled().await;
         // Whoever cancelled, the shutdown has begun: fixed here if nothing
@@ -1402,19 +1847,133 @@ pub async fn serve(
             }))
             .collect();
         let params = stop_shutdown.params();
-        if tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain))
-            .await
-            .is_err()
-        {
+        // COMM-4a §6.2 / PR #626 review, High #2: comm's stop shares the
+        // SAME absolute deadline every other out-of-process module's stop
+        // does, and runs CONCURRENTLY with them — it used to run
+        // sequentially, AFTER this `timeout_at` had already elapsed, under
+        // its own unvalidated ~5s-default grace (vs. SHUT-1b's validated
+        // 500ms default): a Hyphae daemon that ignored SIGTERM could then
+        // have `agent24d` hit the watchdog and exit before Hyphae was ever
+        // sent SIGKILL or a shutdown record was written for it.
+        // `HyphaeDaemonSupervisor::shutdown` queues its `Cmd::Shutdown`
+        // (channel `send`) before this `.await` ever starts waiting on the
+        // reply, so if the shared deadline is hit below, the actor task
+        // keeps running the stop (TERM, grace, KILL, reap) to completion on
+        // its own schedule regardless of whether anything here is still
+        // waiting on its result.
+        let comm_shutdown = async {
+            // PR #626 review, High #1: `close()`, not a plain read — see
+            // `CommDaemonSlot`'s doc comment; this is the one call that may
+            // ever close this slot. High #2: `deadlines.modules` is the
+            // SAME absolute instant the `timeout_at` below races this
+            // against, handed straight into the actor (not just this
+            // await) so an in-flight config-change restart's own stop of
+            // an OLD generation picks it up on its very next grace-loop
+            // poll, and nothing may spawn past it from here on.
+            match stopping_comm_daemon.close() {
+                Some(daemon) => Some(daemon.shutdown(deadlines.modules).await),
+                None => None,
+            }
+        };
+        let (supervisors_result, comm_result) = tokio::join!(
+            tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain)),
+            tokio::time::timeout_at(deadlines.modules, comm_shutdown),
+        );
+        if supervisors_result.is_err() {
             tracing::warn!(
                 "out-of-process modules were still stopping at the deadline; their supervisors \
                  were dropped (SIGKILL attempted, exit unconfirmed)"
             );
         }
-        let records: Vec<_> = tracked
+        let mut records: Vec<_> = tracked
             .iter()
             .map(|(name, reason, record)| (name.clone(), *reason, record.snapshot()))
             .collect();
+        // COMM-4a §6.2: comm's stop is folded into this same module-stop
+        // phase, recorded as `comm.hyphae` in `last-shutdown.json`'s
+        // `records[]`. `agent24-comm` never depends on
+        // `agent24-os-proto` (COMM-HYPHAE.md §7's zero-run boundary), so the
+        // translation from its own neutral `DaemonShutdownOutcome` into this
+        // crate's `StopRecord` happens here, not there.
+        match comm_result {
+            Ok(None) => {}
+            Ok(Some(outcome)) => {
+                let leader = outcome.leader.map(|l| match l {
+                    agent24_comm::ShutdownLeader::GoneBeforeTerm => {
+                        agent24_os_proto::stop_record::Leader::GoneBeforeTerm
+                    }
+                    agent24_comm::ShutdownLeader::ExitedInGrace => {
+                        agent24_os_proto::stop_record::Leader::ExitedInGrace
+                    }
+                    agent24_comm::ShutdownLeader::KilledAfterGrace => {
+                        agent24_os_proto::stop_record::Leader::KilledAfterGrace
+                    }
+                });
+                // `StopRecord` has two private fields (`drain_began`,
+                // `abandoning`) not meant for a caller outside
+                // `agent24-os-proto` to set, so `..Default::default()` is
+                // unavailable here — plain field assignment on a
+                // `Default::default()` value only touches the public ones
+                // this comm translation actually has an opinion about.
+                let mut record = agent24_os_proto::stop_record::StopRecord::default();
+                record.process = Some(if outcome.had_process {
+                    agent24_os_proto::stop_record::ProcessAtStop::Running
+                } else {
+                    agent24_os_proto::stop_record::ProcessAtStop::None
+                });
+                record.leader = leader;
+                // PR #642 review round 3, Medium #1: `group` now comes
+                // straight from `kill_group_gracefully`'s own final
+                // post-KILL probe (`group_confirmed_gone`), not from
+                // inferring it off how the LEADER alone ended. The previous
+                // version recorded `Gone` for ANY leader outcome other than
+                // `KilledAfterGrace` — including `ExitedInGrace`, where the
+                // leader exiting on TERM says nothing about whether a
+                // helper the leader left behind (still `Ok`/`EPERM` after
+                // its own SIGKILL and the bounded post-KILL probe) was ever
+                // actually confirmed gone. `Failed` (not `KillAttempted`,
+                // which `stop_record.rs` reserves for a stop that was
+                // dropped/cut off before ever reaching this probe) is the
+                // correct fact here: this call always ran to completion and
+                // always sent the KILL — it just could not confirm the
+                // group empty afterwards.
+                record.group = outcome.group_confirmed_gone.map(|confirmed| {
+                    if confirmed {
+                        agent24_os_proto::stop_record::GroupEnd::Gone
+                    } else {
+                        agent24_os_proto::stop_record::GroupEnd::Failed
+                    }
+                });
+                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
+                records.push((
+                    "comm.hyphae".to_owned(),
+                    crate::lifecycle::Reason::Shutdown,
+                    record,
+                ));
+            }
+            Err(_) => {
+                // The shared deadline was hit before comm's own stop
+                // replied. Its process group is still being cleaned up on
+                // the actor's own task either way (see the comment above) —
+                // this only means the OUTCOME could not be confirmed in
+                // time to record accurately, so the record says exactly
+                // that rather than guessing `Gone`.
+                tracing::warn!(
+                    "comm: the hyphae daemon's stop did not complete by the shared modules \
+                     deadline; its process group is still being cleaned up on the \
+                     supervisor's own task, but the outcome could not be confirmed in time \
+                     to record"
+                );
+                let mut record = agent24_os_proto::stop_record::StopRecord::default();
+                record.process = Some(agent24_os_proto::stop_record::ProcessAtStop::Running);
+                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::CutOff);
+                records.push((
+                    "comm.hyphae".to_owned(),
+                    crate::lifecycle::Reason::Shutdown,
+                    record,
+                ));
+            }
+        }
         let summary = crate::lifecycle::Summary::new(
             marker
                 .as_ref()
@@ -1707,7 +2266,13 @@ pub async fn serve(
     // kernel auth exactly like every other module route, and so the wiring
     // itself lives in its own file (`comm_routes.rs`); see that file's own
     // doc comment for the `RESERVED_KERNEL_SEGMENTS` gap this leaves.
-    let comm_router = crate::comm_routes::build(&state_dir).await;
+    // PR #626 review, High #1: `build` now registers the supervisor it
+    // creates into `comm_daemon_slot` ITSELF, synchronized with the
+    // `stopping` task's own `close()` — no more racing a `set()` here
+    // after the fact against a shutdown that may have already decided
+    // there was nothing to stop.
+    let comm_router =
+        crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
@@ -1725,23 +2290,32 @@ pub async fn serve(
         return Ok(());
     }
 
-    // SPEC-002 §4 ready line: parsers scan stdout for the first type=="ready"
-    // JSON line. stdout carries nothing else (logs go to stderr).
+    // SPEC-002 §4 ready line: legacy parsers scan stdout; capability mode first
+    // proves stdin/stdout are parent-owned pipes and binds lifetime to stdin.
+    // stdout carries nothing else in either mode (logs go to stderr).
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
-    if !ephemeral
-        && let Err(err) =
-            agent24_protocol::state_file::write(&agent24_protocol::state_file::DaemonState {
-                port: local.port(),
-                token: token.clone(),
-                pid: daemon_pid,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                generation: String::new(),
-                auth_mode: agent24_protocol::state_file::AuthMode::LegacySingleToken,
-            })
-    {
-        tracing::warn!("could not write daemon state file: {err}");
+    if !ephemeral {
+        let discovery = match auth_mode {
+            AuthMode::LegacySingleToken => agent24_protocol::state_file::DaemonState::new_legacy(
+                local.port(),
+                token.clone(),
+                daemon_pid,
+                env!("CARGO_PKG_VERSION"),
+                daemon_generation.clone(),
+            ),
+            AuthMode::Capabilities => agent24_protocol::state_file::DaemonState::new_capabilities(
+                local.port(),
+                daemon_pid,
+                env!("CARGO_PKG_VERSION"),
+                daemon_generation.clone(),
+            ),
+        }
+        .map_err(std::io::Error::other)?;
+        if let Err(err) = agent24_protocol::state_file::write(&discovery) {
+            tracing::warn!("could not write daemon state file: {err}");
+        }
     }
 
     // The state file is written; now readiness and a shutdown request race
@@ -1761,15 +2335,50 @@ pub async fn serve(
         .await;
         return Ok(());
     }
-    println!(
-        "{}",
-        serde_json::json!({
+    let ready = match auth_mode {
+        AuthMode::LegacySingleToken => serde_json::json!({
             "type": "ready",
             "port": local.port(),
             "token": token,
+            "auth_mode": "legacy_single_token",
+            "generation": daemon_generation,
             "version": env!("CARGO_PKG_VERSION"),
-        })
-    );
+        }),
+        AuthMode::Capabilities => {
+            let product_host_token = product_host_token.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its host credential",
+                )
+            })?;
+            serde_json::json!({
+                "type": "ready",
+                "port": local.port(),
+                // This secret crosses only the inherited ready pipe to the
+                // spawning trusted host. It is never written to daemon.json.
+                "product_host_token": product_host_token,
+                "auth_mode": "capabilities",
+                "generation": daemon_generation,
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+        }
+    };
+    match auth_mode {
+        AuthMode::LegacySingleToken => println!("{ready}"),
+        AuthMode::Capabilities => {
+            let host_ready = host_ready.as_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its private ready pipe",
+                )
+            })?;
+            host_ready.send(&ready).await?;
+        }
+    }
+    // In capability mode `ready` is the only temporary owner of the raw host
+    // bearer after the private write completes. Do not retain it for daemon
+    // lifetime; the authority store keeps only its digest.
+    drop(ready);
 
     let graceful_cancel = cancel.clone();
     let server = axum::serve(listener, router)
@@ -1812,6 +2421,26 @@ pub async fn serve(
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
     }
     result
+}
+
+/// Capability mode requires the trusted host-bootstrap transport; the route
+/// middleware maps every request before accepting its bearer.
+fn validate_auth_startup(
+    auth_mode: AuthMode,
+    host_bootstrap_stdio: bool,
+) -> Result<(), std::io::Error> {
+    match (auth_mode, host_bootstrap_stdio) {
+        (AuthMode::Capabilities, true) => Ok(()),
+        (AuthMode::Capabilities, false) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "capability mode requires trusted host bootstrap stdio",
+        )),
+        (AuthMode::LegacySingleToken, true) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host bootstrap stdio is valid only in capability mode",
+        )),
+        (AuthMode::LegacySingleToken, false) => Ok(()),
+    }
 }
 
 /// FU-92 follow-up (security hardening): verify — or, if absent, create — the
@@ -2157,6 +2786,13 @@ fn with_discovered(
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    #[test]
+    fn workspace_recovery_clock_preserves_fractional_millis() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_900);
+        let instant = super::workspace_recovery_instant_at(now).unwrap();
+        assert_eq!(instant.as_str(), "1970-01-01T00:00:01.900Z");
+    }
+
     // ---- ME4-4.2.2b2 H1 (Opus review round on top of `bb6fb0e`) -------------
 
     /// A real end-to-end daemon test
@@ -2477,6 +3113,7 @@ pub(crate) mod tests {
             shutdown: Shutdown::new(CancellationToken::new()),
             guardian,
             memory: None,
+            workspace_service: None,
             mcp_servers: Vec::new(),
             risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
                 Vec::new(),
@@ -2523,6 +3160,40 @@ pub(crate) mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn capability_state() -> (AppState, String, String) {
+        let mut state = state().await;
+        let now = crate::capabilities::unix_now();
+        let store = crate::capabilities::CapabilityStore::new("daemon-test");
+        let host = store
+            .mint_product_host("host-test", Duration::from_secs(3_600), now)
+            .unwrap();
+        let (host_bearer, _, _) = host.into_bearer_parts();
+        let host_authorization = store
+            .validate_bearer(
+                &host_bearer,
+                crate::capabilities::Operation::ModelsRead,
+                &crate::capabilities::Resource::global(),
+                now,
+            )
+            .unwrap();
+        let creative = store
+            .mint_creative_authorized(
+                &host_authorization,
+                crate::capabilities::CreativeMintRequest::new(
+                    "workspace-test",
+                    "attachment-test",
+                    "principal-test",
+                    "sidecar-test",
+                    Duration::from_secs(300),
+                    now,
+                ),
+            )
+            .unwrap();
+        let (creative_bearer, _, _) = creative.into_bearer_parts();
+        state.enable_capability_auth(store);
+        (state, host_bearer, creative_bearer)
+    }
+
     #[tokio::test]
     async fn health_needs_no_token() {
         let res = build_router(state().await)
@@ -2539,6 +3210,107 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[test]
+    fn capability_startup_requires_the_trusted_host_bootstrap_transport() {
+        assert!(validate_auth_startup(AuthMode::Capabilities, true).is_ok());
+        let err = validate_auth_startup(AuthMode::Capabilities, false)
+            .expect_err("capability startup without private host pipes");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn capability_state_does_not_accept_the_empty_legacy_sentinel() {
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(crate::capabilities::CapabilityStore::new(
+            "capability-generation".to_owned(),
+        ));
+
+        let res = build_router(capability_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(res).await["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn creative_bearer_can_read_models_but_not_the_closed_default_route() {
+        let store = crate::capabilities::CapabilityStore::new("capability-generation");
+        let host = store
+            .mint_product_host(
+                "host-generation",
+                Duration::from_secs(60),
+                crate::capabilities::unix_now(),
+            )
+            .unwrap();
+        let creative = store
+            .mint_creative(
+                host.token(),
+                crate::capabilities::CreativeMintRequest::new(
+                    "workspace",
+                    "attachment",
+                    "principal",
+                    "sidecar-generation",
+                    Duration::from_secs(60),
+                    crate::capabilities::unix_now(),
+                ),
+            )
+            .unwrap();
+        let (creative_bearer, _, _) = creative.into_bearer_parts();
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(store);
+        let router = build_router(capability_state);
+
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+
+        let default_route = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_route.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(default_route).await["error"]["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn legacy_state_still_accepts_its_bearer_token() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2800,6 +3572,203 @@ pub(crate) mod tests {
         assert_eq!(json["error"]["code"], "not_found");
     }
 
+    #[tokio::test]
+    async fn creative_is_default_denied_except_for_models() {
+        let (state, _, creative) = capability_state().await;
+        let router = build_router(state);
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+
+        for (method, path) in [
+            ("POST", "/api/v1/chat"),
+            ("GET", "/api/v1/sessions"),
+            ("POST", "/api/v1/runs"),
+            ("GET", "/api/v1/events"),
+            ("GET", "/api/v1/approvals"),
+            ("GET", "/api/v1/tools"),
+            ("POST", "/api/v1/shutdown"),
+            ("GET", "/api/v1/future-unregistered-route"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_routes_are_host_only_in_capability_mode() {
+        let (state, host, creative) = capability_state().await;
+        let router = Router::new()
+            .fallback(|| async { StatusCode::NO_CONTENT })
+            .layer(middleware::from_fn_with_state(state, auth));
+
+        for (method, path) in [
+            (Method::GET, "/api/v1/attached"),
+            (Method::POST, "/api/v1/attached"),
+            (Method::PATCH, "/api/v1/attached/agentear"),
+            (Method::DELETE, "/api/v1/attached/agentear"),
+        ] {
+            let unauthenticated = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                unauthenticated.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+            assert_eq!(
+                body_json(unauthenticated).await["error"]["code"],
+                "unauthorized"
+            );
+
+            let creative_denied = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                creative_denied.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+            assert_eq!(
+                body_json(creative_denied).await["error"]["code"],
+                "forbidden"
+            );
+
+            let host_allowed = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                host_allowed.status(),
+                StatusCode::NO_CONTENT,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_can_mint_and_idempotently_revoke_creative_authority() {
+        let (state, host, existing_creative) = capability_state().await;
+        let router = build_router(state);
+
+        let creative_mint_attempt = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/capabilities/creative")
+                    .header("Authorization", format!("Bearer {existing_creative}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(creative_mint_attempt.status(), StatusCode::FORBIDDEN);
+
+        let minted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/capabilities/creative")
+                    .header("Authorization", format!("Bearer {host}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspace_id": "workspace-new",
+                            "creative_attachment_id": "attachment-new",
+                            "creative_principal_id": "principal-new",
+                            "sidecar_generation": "sidecar-new",
+                            "ttl_seconds": 60,
+                            "allowed_operations": ["models.read"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(minted.status(), StatusCode::CREATED);
+        let minted = body_json(minted).await;
+        let id = minted["capability_id"].as_str().unwrap();
+        let token = minted["token"].as_str().unwrap();
+
+        for _ in 0..2 {
+            let revoked = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/capabilities/{id}/revoke"))
+                        .header("Authorization", format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(revoked.status(), StatusCode::OK);
+            assert_eq!(body_json(revoked).await["state"], "revoked");
+        }
+
+        let rejected = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn token_is_32_bytes_hex_and_unique() {
         let a = generate_token();
@@ -2822,6 +3791,117 @@ pub(crate) mod tests {
         assert!(guardian_enabled(Some("true")));
         assert!(guardian_enabled(Some("TRUE")));
         assert!(guardian_enabled(Some(" 1 ")));
+    }
+
+    #[tokio::test]
+    async fn approval_recovery_scan_expires_tokenless_run_and_stops_with_shutdown() {
+        let state = state().await;
+        seed_run(&state.store, "run_expired").await;
+        sqlx::query("UPDATE runs SET status='awaiting_approval' WHERE id='run_expired'")
+            .execute(agent24_store::test_hooks::pool(&state.store))
+            .await
+            .unwrap();
+        state
+            .store
+            .insert_approval(&agent24_protocol::Approval {
+                id: "apr_expired".to_owned(),
+                run_id: "run_expired".to_owned(),
+                tool_call_id: "tc_expired".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "expired".to_owned(),
+                payload: serde_json::Map::new(),
+                available_decisions: vec!["approve".to_owned()],
+                standing_target: None,
+                status: agent24_protocol::ApprovalStatus::Pending,
+                decision: None,
+                expires_at: "2020-01-01T00:00:00Z".to_owned(),
+                created_at: "2019-12-31T23:59:00Z".to_owned(),
+                decided_at: None,
+            })
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let task = spawn_approval_recovery_scan_every(
+            Arc::clone(&state.broker),
+            Arc::clone(&state.runs),
+            Duration::from_millis(10),
+            cancel.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .store
+                    .get_run("run_expired")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == agent24_protocol::RunStatus::Cancelled
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovery scan should cancel the parked run");
+
+        assert_eq!(
+            state
+                .store
+                .get_approval("apr_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            agent24_protocol::ApprovalStatus::TimedOut
+        );
+        assert_eq!(
+            state
+                .store
+                .get_run("run_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            agent24_protocol::RunStatus::Cancelled
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown should stop the recovery scan")
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_recovers_timed_out_runs_before_strict_workspace_orphan_sweep() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let timeout = body
+            .find(".timeout_expired(&approval_now)")
+            .expect("startup must time out expired approvals");
+        let recovery = body
+            .find(".recover_timed_out_approval_runs()")
+            .expect("startup must recover token-less timed-out runs");
+        let restore = body
+            .find(".restore_pending_approvals()")
+            .expect("startup must restore durable pending approvals");
+        let legacy_orphans = body
+            .find(".sweep_orphan_runs(&now)")
+            .expect("startup must sweep legacy orphans");
+        let workspace_orphans = body
+            .find(".sweep_workspace_orphan_runs(&workspace_now)")
+            .expect("startup must sweep workspace orphans");
+        assert!(
+            timeout < recovery
+                && recovery < restore
+                && restore < legacy_orphans
+                && legacy_orphans < workspace_orphans,
+            "startup order must be timeout -> timed-out recovery -> durable restore -> legacy orphan -> workspace orphan"
+        );
     }
 
     #[test]
@@ -2848,9 +3928,11 @@ pub(crate) mod tests {
             .insert_run(&agent24_protocol::Run {
                 id: id.to_owned(),
                 session_id: None,
+                workspace_id: None,
                 status: agent24_protocol::RunStatus::Running,
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
+                    workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                 },

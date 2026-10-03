@@ -125,7 +125,12 @@ impl HyphaeLock {
 
 /// A Hyphae binary whose bytes have been verified against an expected
 /// sha256. The only way to construct one is [`VerifiedBinary::install`].
-#[derive(Debug)]
+/// `Clone` is cheap (a `PathBuf` plus a 32-byte digest) and is used by
+/// COMM-2b's `import` flow (`runner::HyphaeRunner::with_home`) to point a
+/// second, throwaway [`crate::runner::HyphaeRunner`] at the same verified
+/// binary but a different `HOME` (the import staging/verify directories)
+/// without re-verifying or re-copying anything.
+#[derive(Debug, Clone)]
 pub struct VerifiedBinary {
     path: PathBuf,
     sha256: Sha256Digest,

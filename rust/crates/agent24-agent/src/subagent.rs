@@ -283,12 +283,7 @@ impl ExplorerSubagent {
             Err(_) if call.arguments.trim().is_empty() => Map::new(),
             Err(err) => return Ok(format!("tool error: arguments are not valid JSON: {err}")),
         };
-        let sub_ctx = ToolContext {
-            run_id: ctx.run_id.clone(),
-            session_id: None,
-            schedule_id: None,
-            tool_call_id: format!("{}_explore", ctx.tool_call_id),
-        };
+        let sub_ctx = ctx.derived(None, None, format!("{}_explore", ctx.tool_call_id()));
         match tools.dispatch(&call.name, &sub_ctx, &input, cancel).await {
             Ok(output) => Ok(output),
             Err(ToolError::Cancelled) => Err(ToolError::Cancelled),
@@ -362,12 +357,7 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        ToolContext {
-            run_id: "run_1".to_owned(),
-            session_id: Some("sess_1".to_owned()),
-            schedule_id: None,
-            tool_call_id: "tc_1".to_owned(),
-        }
+        ToolContext::legacy("run_1", Some("sess_1".to_owned()), None, "tc_1")
     }
 
     fn explorer(provider: Arc<Scripted>, workspace: std::path::PathBuf) -> ExplorerSubagent {

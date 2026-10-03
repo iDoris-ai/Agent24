@@ -67,6 +67,8 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 | DEP-C5 | 移动端设计：**MVP 是 PWA**（由 daemon 或桌面端提供，经 tailscale 访问）；原生外壳（Capacitor 或 RN）排在之后，renderer 需要把 `window.agent24.*` 抽象成可替换的传输层 | C4 | Opus 设计 | M | `BACKLOG` |
 | DEP-C6 | 移动端实现（先 PWA；上架应用商店另行立项） | C5 | Sonnet | L | `BACKLOG` |
 | DEP-C7 | 重新评估 cargo-dist、`curl \| sh` 安装脚本、Homebrew tap（tap 仓库和 PAT 需要用户动手） | 有需求时 | Opus | S | `BACKLOG` |
+| DEP-C8 | Hyphae lock 升级：把 `rust/crates/agent24-comm/hyphae.lock.json` 升到含 daemon 锁（`.hyphae/daemon.lock`）的 Hyphae 版本（#104 之后），通过 Hyphae lock verify（来源：`docs/design/COMM-HYPHAE.md` §9 G3） | — | Sonnet | S | `BACKLOG` |
+| DEP-C9 | 发布包加入 `hyphae` 二进制（macOS / Linux），打包后在干净机器上验证 `agent24 comm` 可用（来源：`COMM-HYPHAE.md` §9 R4） | C8 | Sonnet | S | `BACKLOG` |
 
 **验收标准**
 - **C2**：`windows-latest` 上 Rust 全量测试通过；在 Windows 上 Sin90 能挂载，并能收到调度回调。

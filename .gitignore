@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+apps/desktop/.open-design-resources/
 .vite/
 .turbo/
 coverage/

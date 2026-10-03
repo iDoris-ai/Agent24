@@ -1,0 +1,1296 @@
+//! POSIX lifecycle ownership primitives.
+
+use crate::target::{ExitObservation, TreeObservation};
+use nix::{
+    errno::Errno,
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
+use std::os::unix::process::CommandExt;
+use std::{
+    ffi::OsString,
+    io,
+    path::PathBuf,
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
+
+/// Polling bounds are deliberately finite: stop must report an unconfirmed
+/// generation rather than make its caller hang forever on a stuck process.
+const LEADER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const GROUP_EMPTY_TIMEOUT: Duration = Duration::from_secs(5);
+const EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Inputs for one helper generation. The owner, not the caller, chooses the
+/// process group: the child becomes the group leader before it can exec.
+#[derive(Clone)]
+pub struct LaunchSpec {
+    executable: PathBuf,
+    cwd: PathBuf,
+    argv: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
+}
+
+impl std::fmt::Debug for LaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchSpec")
+            .field("executable", &"<redacted>")
+            .field("cwd", &"<redacted>")
+            .field("argv_count", &self.argv.len())
+            .field("env_count", &self.env.len())
+            .finish()
+    }
+}
+
+impl LaunchSpec {
+    pub fn new(executable: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+            cwd: cwd.into(),
+            argv: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    pub fn arg(mut self, value: impl Into<OsString>) -> Self {
+        self.argv.push(value.into());
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Running,
+    TerminationRequested,
+    ForceKillRequested,
+    LeaderReaped,
+    Reaped,
+}
+
+/// A stop could not establish ownership-safe completion within its bound.
+#[derive(Debug)]
+pub enum StopError {
+    /// The requested operation is not valid for this lifecycle phase.
+    InvalidState(&'static str),
+    /// The caller may retry while this generation remains owned.
+    Retryable {
+        operation: &'static str,
+        source: io::Error,
+    },
+    /// The leader was handled, but the group was not confirmed empty.
+    Unconfirmed {
+        operation: &'static str,
+        source: io::Error,
+    },
+}
+
+impl std::fmt::Display for StopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidState(message) => f.write_str(message),
+            Self::Retryable { operation, source } => write!(f, "{operation}: {source}"),
+            Self::Unconfirmed { operation, source } => write!(f, "{operation}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for StopError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Retryable { source, .. } | Self::Unconfirmed { source, .. } => Some(source),
+            Self::InvalidState(_) => None,
+        }
+    }
+}
+
+/// The sole owner of one helper generation and its process group.
+///
+/// `Child` stays held, and therefore unreaped, until [`Self::reap_after_stop`]
+/// is called. This keeps the leader's PID/PGID reserved while a stop sequence
+/// is deciding whether graceful termination was sufficient.
+#[derive(Debug)]
+pub struct OwnedGeneration {
+    child: Option<Child>,
+    group: Pid,
+    phase: Phase,
+    status: Option<ExitStatus>,
+    permit: Option<GenerationPermit>,
+}
+
+/// The only handles through which the actor may communicate with its child.
+#[derive(Debug)]
+pub struct OwnedPipes {
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+    pub stderr: ChildStderr,
+}
+
+#[allow(dead_code)]
+impl OwnedGeneration {
+    pub fn launch(spec: LaunchSpec) -> io::Result<Self> {
+        if !spec.executable.is_absolute() || !spec.cwd.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "launch paths must be absolute",
+            ));
+        }
+        let mut command = Command::new(spec.executable);
+        command
+            .current_dir(spec.cwd)
+            .args(spec.argv)
+            .env_clear()
+            .envs(spec.env);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.process_group(0);
+        let reaper = global_reaper();
+        // Start the permanent worker and reserve the single generation slot
+        // before creating a process. This makes the one-host/one-generation
+        // rule a property of this type, rather than a promise to callers.
+        reaper.start()?;
+        let permit = reaper.reserve()?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                drop(permit);
+                return Err(error);
+            }
+        };
+        let leader = match i32::try_from(child.id()) {
+            Ok(leader) => leader,
+            Err(_) => {
+                // This cannot happen on a conforming POSIX host, but retain
+                // ownership if it does: terminate and reap before returning
+                // the initialization error and releasing the permit.
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(permit);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "child pid does not fit POSIX pid_t",
+                ));
+            }
+        };
+        Ok(Self {
+            child: Some(child),
+            group: Pid::from_raw(leader),
+            phase: Phase::Running,
+            status: None,
+            permit: Some(permit),
+        })
+    }
+
+    /// Transfers all three child pipes exactly once.
+    pub fn take_pipes(&mut self) -> io::Result<OwnedPipes> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| invalid_state("generation no longer owns its child"))?;
+        match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+            (Some(stdin), Some(stdout), Some(stderr)) => Ok(OwnedPipes {
+                stdin,
+                stdout,
+                stderr,
+            }),
+            _ => Err(invalid_state("child pipes have already been taken")),
+        }
+    }
+
+    /// Observes exit without reaping the leader or releasing ownership.
+    pub fn leader_exited(&self) -> io::Result<bool> {
+        Ok(matches!(
+            self.observe_exit()?,
+            ExitObservation::Exited { .. }
+        ))
+    }
+
+    /// Observes exit without changing lifecycle ownership or consuming the
+    /// leader. Active phases use one nonblocking WNOWAIT query; reaped phases
+    /// read the status cached by `reap_after_stop`.
+    pub(crate) fn observe_exit(&self) -> io::Result<ExitObservation> {
+        match self.phase {
+            Phase::Running | Phase::TerminationRequested | Phase::ForceKillRequested => {
+                self.observe_exit_wnowait()
+            }
+            Phase::LeaderReaped | Phase::Reaped => self
+                .status
+                .as_ref()
+                .map(|status| ExitObservation::Exited {
+                    code: status.code(),
+                })
+                .ok_or_else(|| invalid_state("reaped generation has no exit status")),
+        }
+    }
+
+    pub fn terminate(&mut self) -> io::Result<()> {
+        match self.phase {
+            Phase::Running => self.signal(Signal::SIGTERM, Phase::TerminationRequested),
+            Phase::TerminationRequested | Phase::ForceKillRequested | Phase::LeaderReaped => Ok(()),
+            Phase::Reaped => Err(invalid_state("generation has been reaped")),
+        }
+    }
+
+    pub fn force_kill(&mut self) -> io::Result<()> {
+        match self.phase {
+            Phase::Running | Phase::TerminationRequested => {
+                self.signal(Signal::SIGKILL, Phase::ForceKillRequested)
+            }
+            // A force-kill request is idempotent. In particular, a later
+            // terminate call cannot regress this phase or send SIGTERM.
+            Phase::ForceKillRequested | Phase::LeaderReaped => Ok(()),
+            Phase::Reaped => Err(invalid_state("generation has been reaped")),
+        }
+    }
+
+    /// Performs one nonblocking leader-reap or process-group probe.
+    pub(crate) fn reap_step(&mut self) -> io::Result<TreeObservation> {
+        self.reap_step_with(|child| child.try_wait(), |group| killpg(group, None))
+    }
+
+    fn reap_step_with<W, P>(&mut self, wait: W, probe: P) -> io::Result<TreeObservation>
+    where
+        W: FnOnce(&mut Child) -> io::Result<Option<ExitStatus>>,
+        P: FnOnce(Pid) -> Result<(), Errno>,
+    {
+        match self.phase {
+            Phase::Running | Phase::TerminationRequested => {
+                Err(invalid_state("generation has not been force-killed"))
+            }
+            Phase::ForceKillRequested => {
+                let child = self.child.as_mut().ok_or_else(|| {
+                    io::Error::other("force-killed generation has no owned child")
+                })?;
+                match wait(child)? {
+                    None => Ok(TreeObservation::Present),
+                    Some(status) => {
+                        self.child = None;
+                        self.status = Some(status);
+                        self.phase = Phase::LeaderReaped;
+                        self.probe_reap_step(probe)
+                    }
+                }
+            }
+            Phase::LeaderReaped => self.probe_reap_step(probe),
+            Phase::Reaped => Ok(TreeObservation::ConfirmedEmpty),
+        }
+    }
+
+    fn probe_reap_step<P>(&mut self, probe: P) -> io::Result<TreeObservation>
+    where
+        P: FnOnce(Pid) -> Result<(), Errno>,
+    {
+        match probe(self.group) {
+            Err(Errno::ESRCH) => {
+                self.phase = Phase::Reaped;
+                self.permit.take();
+                Ok(TreeObservation::ConfirmedEmpty)
+            }
+            Ok(()) | Err(Errno::EPERM) => Ok(TreeObservation::Present),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    /// Reap only after a force-kill attempt, so descendants cannot outlive the
+    /// generation merely because its leader handled SIGTERM and exited.
+    pub fn reap_after_stop(&mut self) -> Result<ExitStatus, StopError> {
+        if matches!(self.phase, Phase::Reaped) {
+            self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+            self.permit.take();
+            return self.status.ok_or(StopError::Unconfirmed {
+                operation: "reap",
+                source: io::Error::other("reaped generation has no exit status"),
+            });
+        }
+        if matches!(self.phase, Phase::LeaderReaped) {
+            self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+            self.phase = Phase::Reaped;
+            self.permit.take();
+            return self.status.ok_or(StopError::Unconfirmed {
+                operation: "reap",
+                source: io::Error::other("reaped generation has no exit status"),
+            });
+        }
+        if !matches!(self.phase, Phase::ForceKillRequested) {
+            return Err(StopError::InvalidState(
+                "generation has not been force-killed",
+            ));
+        }
+
+        // WNOWAIT pins the leader's PID/PGID while the mandatory group kill is
+        // being settled. A timeout is returned to the owner for retry; it is
+        // never converted into a successful stop.
+        if !self.wait_for_leader_exit(LEADER_EXIT_TIMEOUT)? {
+            return Err(StopError::Unconfirmed {
+                operation: "leader exit",
+                source: timeout_error("leader did not exit after SIGKILL"),
+            });
+        }
+        let status = self.reap_bounded(LEADER_EXIT_TIMEOUT)?;
+        self.status = Some(status);
+        // Keep a distinct state while group confirmation is pending. If the
+        // bounded confirmation fails, Drop must transfer the permit to a
+        // group-only retry job rather than releasing it with descendants
+        // still owned by this generation.
+        self.phase = Phase::LeaderReaped;
+        self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+        self.phase = Phase::Reaped;
+        // The permit is released only after both exact-child reaping and
+        // process-group emptiness have been confirmed.
+        self.permit.take();
+        Ok(status)
+    }
+
+    fn signal(&mut self, signal: Signal, next: Phase) -> io::Result<()> {
+        if self.phase == Phase::Reaped {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "generation has been reaped",
+            ));
+        }
+        let result = killpg(self.group, signal);
+        let observation = if result == Err(Errno::EPERM) {
+            self.observe_exit()
+        } else {
+            Ok(ExitObservation::Running)
+        };
+        self.apply_signal_result(
+            result,
+            next,
+            cfg!(target_os = "macos") && signal == Signal::SIGKILL,
+            observation,
+        )?;
+        Ok(())
+    }
+
+    fn apply_signal_result(
+        &mut self,
+        result: Result<(), Errno>,
+        next: Phase,
+        darwin: bool,
+        observation: io::Result<ExitObservation>,
+    ) -> io::Result<()> {
+        signal_accepted(result, darwin, || observation)?;
+        self.phase = next;
+        Ok(())
+    }
+
+    fn observe_exit_wnowait(&self) -> io::Result<ExitObservation> {
+        use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
+        let pid = RustixPid::from_raw(self.group.as_raw())
+            .ok_or_else(|| io::Error::other("invalid owned process-group id"))?;
+        let flags = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        match waitid(WaitId::Pid(pid), flags) {
+            Ok(Some(status)) if status.exited() => Ok(ExitObservation::Exited {
+                code: status.exit_status(),
+            }),
+            Ok(Some(status)) if status.killed() || status.dumped() => {
+                Ok(ExitObservation::Exited { code: None })
+            }
+            Ok(_) => Ok(ExitObservation::Running),
+            Err(error) if error == rustix::io::Errno::INTR => Ok(ExitObservation::Running),
+            Err(error) => Err(io::Error::from_raw_os_error(error.raw_os_error())),
+        }
+    }
+
+    fn wait_for_leader_exit(&self, limit: Duration) -> Result<bool, StopError> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match self.leader_exited() {
+                Ok(true) => return Ok(true),
+                Ok(false) if Instant::now() < deadline => std::thread::sleep(EXIT_POLL),
+                Ok(false) => return Ok(false),
+                Err(source) => {
+                    return Err(StopError::Retryable {
+                        operation: "observe leader exit",
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    fn reap_bounded(&mut self, limit: Duration) -> Result<ExitStatus, StopError> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match self
+                .child
+                .as_mut()
+                .ok_or_else(|| StopError::Retryable {
+                    operation: "reap leader",
+                    source: io::Error::other("owned child handle is missing"),
+                })?
+                .try_wait()
+            {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    return Ok(status);
+                }
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(EXIT_POLL),
+                Ok(None) => {
+                    return Err(StopError::Retryable {
+                        operation: "reap leader",
+                        source: timeout_error("leader exit was observed but reap did not complete"),
+                    });
+                }
+                Err(source) => {
+                    return Err(StopError::Retryable {
+                        operation: "reap leader",
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    fn confirm_group_empty(&self, limit: Duration) -> Result<(), StopError> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match killpg(self.group, None) {
+                Err(Errno::ESRCH) => return Ok(()),
+                Ok(()) | Err(Errno::EPERM) if Instant::now() < deadline => {
+                    std::thread::sleep(EXIT_POLL)
+                }
+                Ok(()) | Err(Errno::EPERM) => {
+                    return Err(StopError::Unconfirmed {
+                        operation: "confirm group empty",
+                        source: timeout_error("process group still has members"),
+                    });
+                }
+                Err(error) => {
+                    return Err(StopError::Retryable {
+                        operation: "probe group",
+                        source: io::Error::from_raw_os_error(error as i32),
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for OwnedGeneration {
+    fn drop(&mut self) {
+        if self.phase != Phase::Reaped {
+            // Drop is deliberately non-blocking. Child::wait here used to
+            // hang the host forever on an uninterruptible process; ownership
+            // is reported as unconfirmed by the next explicit stop attempt.
+            // Reuse the ownership-safe signal path so macOS EPERM is only
+            // accepted after WNOWAIT confirms this leader has exited.
+            if self.phase != Phase::LeaderReaped {
+                let _ = self.signal(Signal::SIGKILL, Phase::ForceKillRequested);
+            }
+            let child = self.child.take();
+            let child_reaped = match (self.phase, child.is_some()) {
+                (Phase::LeaderReaped, false) => true,
+                (_, true) => false,
+                // A live generation cannot lose its exact Child without
+                // first becoming LeaderReaped; abort before that Child could
+                // be silently discarded.
+                _ => std::process::abort(),
+            };
+            let permit = match self.permit.take() {
+                Some(permit) => permit,
+                None => {
+                    // This is an internal invariant violation: a live
+                    // child can only exist while its generation permit is
+                    // held. Abort before `Child` is dropped, so the host
+                    // cannot silently leak an unreaped process.
+                    std::process::abort();
+                }
+            };
+            let job = ReapJob {
+                child,
+                group: self.group,
+                _permit: permit,
+                child_reaped,
+            };
+            if let Err(job) = global_reaper().enqueue(job) {
+                // The permit makes this impossible in a valid state. Do not
+                // drop the exact Child if corruption ever violates that
+                // invariant: abort while it is still owned.
+                let _ = job;
+                std::process::abort();
+            }
+        }
+    }
+}
+
+struct ReapJob {
+    child: Option<Child>,
+    group: Pid,
+    _permit: GenerationPermit,
+    child_reaped: bool,
+}
+
+impl ReapJob {
+    /// Return `true` only after the exact leader has been reaped and its
+    /// process group is confirmed empty. Errors retain the Child for retry.
+    fn reap_once(&mut self) -> bool {
+        if !self.child_reaped {
+            match self.child.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_status)) => self.child_reaped = true,
+                    Ok(None) | Err(_) => return false,
+                },
+                None => return false,
+            }
+        }
+        group_is_empty(self.group)
+    }
+}
+
+struct GenerationPermit {
+    reaper: Arc<Reaper>,
+}
+
+impl std::fmt::Debug for GenerationPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationPermit").finish_non_exhaustive()
+    }
+}
+
+impl Drop for GenerationPermit {
+    fn drop(&mut self) {
+        let mut state = recover_lock(self.reaper.state.lock());
+        // A permit is the authoritative active-generation bit. The slot may
+        // already be empty because the worker owns the job, so only this bit
+        // is cleared here.
+        state.permit_held = false;
+        self.reaper.available.notify_all();
+    }
+}
+
+struct ReaperState {
+    /// Exactly one generation may hold this permit. It remains held while a
+    /// dropped child's job is owned by the worker.
+    permit_held: bool,
+    /// Permanent single-slot handoff. There is deliberately no queue: a
+    /// second job cannot exist while the permit is held.
+    slot: Option<ReapJob>,
+    worker_started: bool,
+}
+
+struct Reaper {
+    state: Mutex<ReaperState>,
+    available: Condvar,
+}
+
+impl Reaper {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ReaperState {
+                permit_held: false,
+                slot: None,
+                worker_started: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn start(self: &Arc<Self>) -> io::Result<()> {
+        let mut state = recover_lock(self.state.lock());
+        if state.worker_started {
+            return Ok(());
+        }
+        // Keep the state lock through spawn so a concurrent launcher cannot
+        // observe a worker that is merely starting and reserve a child before
+        // thread creation has succeeded.
+        state.worker_started = true;
+        let worker = Arc::clone(self);
+        if let Err(error) = thread::Builder::new()
+            .name("agent24-sidecar-reaper".to_owned())
+            .spawn(move || worker.run())
+        {
+            state.worker_started = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reserve(self: &Arc<Self>) -> io::Result<GenerationPermit> {
+        let mut state = recover_lock(self.state.lock());
+        if state.permit_held || state.slot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another sidecar generation is still owned",
+            ));
+        }
+        state.permit_held = true;
+        Ok(GenerationPermit {
+            reaper: Arc::clone(self),
+        })
+    }
+
+    fn enqueue(self: &Arc<Self>, job: ReapJob) -> Result<(), ReapJob> {
+        let mut state = recover_lock(self.state.lock());
+        if state.slot.is_some() || !state.permit_held {
+            return Err(job);
+        }
+        state.slot = Some(job);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn run(self: Arc<Self>) {
+        self.run_loop();
+    }
+
+    fn run_loop(&self) {
+        loop {
+            let mut job = {
+                let mut state = recover_lock(self.state.lock());
+                while state.slot.is_none() {
+                    state = recover_lock(self.available.wait(state));
+                }
+                // The mutex is released before any wait/retry operation on
+                // the child, so launches and the worker handoff never block
+                // behind a stuck process.
+                match state.slot.take() {
+                    Some(job) => job,
+                    None => continue,
+                }
+            };
+            while !job.reap_once() {
+                thread::sleep(EXIT_POLL);
+            }
+            // Dropping the job releases the permit only after exact-child
+            // reaping and group-empty confirmation have both succeeded.
+        }
+    }
+}
+
+fn recover_lock<T>(result: std::sync::LockResult<T>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn global_reaper() -> Arc<Reaper> {
+    REAPER.get_or_init(|| Arc::new(Reaper::new())).clone()
+}
+
+static REAPER: OnceLock<Arc<Reaper>> = OnceLock::new();
+
+fn invalid_state(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn timeout_error(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
+/// Darwin can reject a signal to an all-zombie process group with `EPERM`
+/// before the exact leader's exit is visible through WNOWAIT. That narrow
+/// window is a pending force request, not a permission failure: retaining the
+/// child and permit lets the actor retry without risking PID/PGID reuse.
+fn signal_accepted<O>(result: Result<(), Errno>, darwin: bool, observe: O) -> io::Result<()>
+where
+    O: FnOnce() -> io::Result<ExitObservation>,
+{
+    match result {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(Errno::EPERM) => match observe()? {
+            ExitObservation::Exited { .. } => Ok(()),
+            ExitObservation::Running if darwin => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            ExitObservation::Running => Err(io::Error::from_raw_os_error(Errno::EPERM as i32)),
+        },
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
+fn group_is_empty(group: Pid) -> bool {
+    matches!(killpg(group, None), Err(Errno::ESRCH))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = match TEST_LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Dropping an owned generation can hand its final reap to the
+        // long-lived worker. Serializing tests prevents overlapping owners,
+        // but the previous test may release this mutex before that async reap
+        // has released the global generation permit. Start every serialized
+        // fixture from an idle owner boundary so one delayed macOS reap cannot
+        // cascade into unrelated WouldBlock failures.
+        wait_for_reaper_idle();
+        guard
+    }
+
+    pub(crate) fn wait_for_reaper_idle() {
+        // macOS CI can retain an exited process group for several seconds
+        // before the background reaper can observe that it is empty.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match global_reaper().reserve() {
+                Ok(permit) => {
+                    drop(permit);
+                    return;
+                }
+                Err(_) if Instant::now() < deadline => thread::sleep(EXIT_POLL),
+                Err(error) => panic!("reaper did not become idle: {error}"),
+            }
+        }
+    }
+
+    fn force_kill_eventually(generation: &mut OwnedGeneration) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match generation.force_kill() {
+                Ok(()) => return,
+                Err(error)
+                    if cfg!(target_os = "macos")
+                        && error.kind() == io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(EXIT_POLL);
+                }
+                Err(error) => panic!("force kill was not accepted: {error}"),
+            }
+        }
+    }
+
+    fn sleeping_generation() -> OwnedGeneration {
+        match OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30")) {
+            Ok(generation) => generation,
+            Err(error) => panic!("spawn /bin/sh: {error}"),
+        }
+    }
+
+    fn exiting_generation() -> OwnedGeneration {
+        match OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0")) {
+            Ok(generation) => generation,
+            Err(error) => panic!("spawn /bin/sh: {error}"),
+        }
+    }
+
+    #[test]
+    fn launch_debug_redacts_paths_arguments_and_environment() {
+        let spec = LaunchSpec::new("/secret/program", "/secret/cwd")
+            .arg("secret-argument")
+            .env("SECRET_KEY", "secret-value");
+        let debug = format!("{spec:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("argv_count: 1"));
+        assert!(debug.contains("env_count: 1"));
+    }
+
+    #[test]
+    fn child_pipes_are_owned_and_transferred_exactly_once() {
+        let _test_guard = test_lock();
+        let mut generation = OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/")
+                .arg("-c")
+                .arg("read line; printf 'out:%s' \"$line\"; printf 'err:%s' \"$line\" >&2"),
+        )
+        .unwrap_or_else(|error| panic!("spawn /bin/sh: {error}"));
+        let pipes = generation
+            .take_pipes()
+            .unwrap_or_else(|error| panic!("take pipes: {error}"));
+        assert!(generation.take_pipes().is_err());
+        let OwnedPipes {
+            mut stdin,
+            mut stdout,
+            mut stderr,
+        } = pipes;
+        stdin
+            .write_all(b"hello\n")
+            .unwrap_or_else(|error| panic!("write stdin: {error}"));
+        drop(stdin);
+        let mut stdout_text = String::new();
+        let mut stderr_text = String::new();
+        stdout
+            .read_to_string(&mut stdout_text)
+            .unwrap_or_else(|error| panic!("read stdout: {error}"));
+        stderr
+            .read_to_string(&mut stderr_text)
+            .unwrap_or_else(|error| panic!("read stderr: {error}"));
+        assert_eq!(stdout_text, "out:hello");
+        assert_eq!(stderr_text, "err:hello");
+        assert!(matches!(
+            generation.wait_for_leader_exit(Duration::from_secs(1)),
+            Ok(true)
+        ));
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
+    }
+
+    #[test]
+    fn graceful_stop_keeps_leader_owned_until_reap() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        assert!(generation.reap_after_stop().is_err());
+        assert!(generation.terminate().is_ok());
+        assert!(generation.reap_after_stop().is_err());
+        force_kill_eventually(&mut generation);
+        let status = match generation.reap_after_stop() {
+            Ok(status) => status,
+            Err(error) => panic!("reap leader: {error}"),
+        };
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn force_kill_is_limited_to_the_owned_group() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        assert!(generation.force_kill().is_ok());
+        let status = match generation.reap_after_stop() {
+            Ok(status) => status,
+            Err(error) => panic!("reap leader: {error}"),
+        };
+        assert!(!status.success());
+        assert!(generation.force_kill().is_err());
+    }
+
+    #[test]
+    fn a_second_launch_is_rejected_until_the_owned_generation_is_reaped() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        let second =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0"));
+        assert!(matches!(second, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
+        let replacement = match OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0"),
+        ) {
+            Ok(generation) => generation,
+            Err(error) => panic!("permit was not released after ownership-safe stop: {error}"),
+        };
+        let mut replacement = replacement;
+        assert!(replacement.force_kill().is_ok());
+        assert!(replacement.reap_after_stop().is_ok());
+    }
+
+    #[test]
+    fn dropped_leader_reap_retry_keeps_permit_until_group_is_empty() {
+        let _test_guard = test_lock();
+        let mut generation = OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/")
+                .arg("-c")
+                .arg("sleep 30 & exit 0"),
+        )
+        .unwrap_or_else(|error| panic!("spawn /bin/sh: {error}"));
+        assert!(matches!(
+            generation.wait_for_leader_exit(Duration::from_secs(1)),
+            Ok(true)
+        ));
+        let status = generation
+            .reap_bounded(Duration::from_secs(1))
+            .unwrap_or_else(|error| panic!("reap leader: {error}"));
+        let group = generation.group;
+        generation.status = Some(status);
+        generation.phase = Phase::LeaderReaped;
+        drop(generation);
+
+        let second =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0"));
+        assert!(matches!(second, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        let _ = killpg(group, Signal::SIGKILL);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn phase_transitions_are_monotonic_and_idempotent() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        assert!(generation.terminate().is_ok());
+        assert!(generation.terminate().is_ok());
+        force_kill_eventually(&mut generation);
+        assert!(generation.force_kill().is_ok());
+        // A force-kill request is terminal for signalling; terminate must not
+        // regress it or send SIGTERM after SIGKILL.
+        assert!(generation.terminate().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
+        assert!(generation.terminate().is_err());
+    }
+
+    #[test]
+    fn drop_does_not_wait_for_the_child() {
+        let _test_guard = test_lock();
+        let started = std::time::Instant::now();
+        let generation = sleeping_generation();
+        drop(generation);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "Drop unexpectedly waited for the child"
+        );
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn drop_is_reaped_by_the_long_lived_global_worker() {
+        let _test_guard = test_lock();
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        let generation = sleeping_generation();
+        let pid = match generation.child.as_ref() {
+            Some(child) => child.id(),
+            None => panic!("generation lost its child before drop"),
+        };
+        let started = Instant::now();
+        drop(generation);
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let pid = match i32::try_from(pid).ok().and_then(Pid::from_raw) {
+            Some(pid) => pid,
+            None => panic!("child pid does not fit POSIX pid_t"),
+        };
+        let flags = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match waitid(WaitId::Pid(pid), flags) {
+                Err(error) if error == rustix::io::Errno::CHILD => break,
+                Err(error) if error == rustix::io::Errno::INTR => {}
+                Ok(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(_) => panic!("global worker did not reap child before deadline"),
+                Err(error) => panic!("waitid: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn exited_leader_is_confirmed_before_group_kill_and_reap() {
+        let _test_guard = test_lock();
+        let mut generation = exiting_generation();
+        assert!(matches!(
+            generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
+            Ok(true)
+        ));
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn observe_exit_reports_running_exit_code_and_preserves_wnowait() {
+        use crate::target::ExitObservation;
+        use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
+
+        let _test_guard = test_lock();
+        let mut running = sleeping_generation();
+        assert_eq!(
+            running.observe_exit().expect("observe running"),
+            ExitObservation::Running
+        );
+        running.force_kill().expect("force running child");
+        running.reap_after_stop().expect("reap running child");
+
+        let mut generation =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 7"))
+                .expect("spawn /bin/sh");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match generation.observe_exit().expect("observe exit") {
+                ExitObservation::Exited { code } => {
+                    assert_eq!(code, Some(7));
+                    break;
+                }
+                ExitObservation::Running if Instant::now() < deadline => thread::sleep(EXIT_POLL),
+                ExitObservation::Running => panic!("exit was not observed before deadline"),
+            }
+        }
+        assert_eq!(
+            generation.observe_exit().expect("repeat observation"),
+            ExitObservation::Exited { code: Some(7) }
+        );
+        let pid = RustixPid::from_raw(generation.group.as_raw()).expect("child pid");
+        assert!(
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .expect("direct WNOWAIT control")
+            .is_some()
+        );
+        generation.force_kill().expect("force exited child");
+        let status = generation.reap_after_stop().expect("reap exited child");
+        assert_eq!(
+            generation.observe_exit().expect("cached observation"),
+            ExitObservation::Exited {
+                code: status.code()
+            }
+        );
+        assert!(
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn observe_exit_reports_signal_without_signal_code() {
+        use crate::target::ExitObservation;
+
+        let _test_guard = test_lock();
+        let mut generation = OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/")
+                .arg("-c")
+                .arg("kill -TERM $$"),
+        )
+        .expect("spawn /bin/sh");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match generation.observe_exit().expect("observe signal exit") {
+                ExitObservation::Exited { code } => {
+                    assert_eq!(code, None);
+                    break;
+                }
+                ExitObservation::Running if Instant::now() < deadline => thread::sleep(EXIT_POLL),
+                ExitObservation::Running => panic!("signal exit was not observed"),
+            }
+        }
+        assert_eq!(
+            generation
+                .observe_exit()
+                .expect("repeat signal observation"),
+            ExitObservation::Exited { code: None }
+        );
+        generation.force_kill().expect("force signal-exited child");
+        generation
+            .reap_after_stop()
+            .expect("reap signal-exited child");
+    }
+
+    #[test]
+    fn reap_step_waits_at_most_once_and_does_not_probe_before_reap() {
+        use crate::target::TreeObservation;
+        use std::cell::Cell;
+
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        generation
+            .force_kill()
+            .unwrap_or_else(|error| panic!("force: {error}"));
+        let waits = Cell::new(0);
+        let probes = Cell::new(0);
+        assert_eq!(
+            generation
+                .reap_step_with(
+                    |_| {
+                        waits.set(waits.get() + 1);
+                        Ok(None)
+                    },
+                    |_| {
+                        probes.set(probes.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap_or_else(|error| panic!("reap step: {error}")),
+            TreeObservation::Present
+        );
+        assert_eq!(waits.get(), 1);
+        assert_eq!(probes.get(), 0);
+        assert!(generation.child.is_some());
+        assert!(global_reaper().reserve().is_err());
+        assert!(
+            generation
+                .reap_step_with(
+                    |_| Err(io::Error::other("try_wait failed")),
+                    |_| panic!("probe must not run after try_wait error"),
+                )
+                .is_err()
+        );
+        assert_eq!(generation.phase, Phase::ForceKillRequested);
+        assert!(global_reaper().reserve().is_err());
+        drop(generation);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn reap_step_reaps_before_probe_and_retry_skips_wait() {
+        use crate::target::TreeObservation;
+
+        let _test_guard = test_lock();
+        let mut generation = exiting_generation();
+        let exited = generation.wait_for_leader_exit(Duration::from_secs(1));
+        assert!(matches!(exited, Ok(true)));
+        assert!(generation.force_kill().is_ok());
+        let probes = std::cell::Cell::new(0);
+        assert!(
+            generation
+                .reap_step_with(
+                    |child| child.try_wait(),
+                    |_| {
+                        probes.set(probes.get() + 1);
+                        Err(Errno::EIO)
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(generation.phase, Phase::LeaderReaped);
+        assert!(generation.child.is_none());
+        assert!(generation.status.is_some());
+        assert_eq!(probes.get(), 1);
+        assert_eq!(
+            generation
+                .reap_step_with(
+                    |_| panic!("retry must not wait again"),
+                    |_| Err(Errno::ESRCH),
+                )
+                .unwrap_or_else(|error| panic!("retry reap step: {error}")),
+            TreeObservation::ConfirmedEmpty
+        );
+        assert_eq!(generation.phase, Phase::Reaped);
+        assert!(global_reaper().reserve().is_ok());
+    }
+
+    #[test]
+    fn reap_step_probe_matrix_and_reaped_cache() {
+        use crate::target::TreeObservation;
+
+        let _test_guard = test_lock();
+        for result in [Ok(()), Err(Errno::EPERM), Err(Errno::EIO)] {
+            let mut generation = exiting_generation();
+            assert!(matches!(
+                generation.wait_for_leader_exit(Duration::from_secs(1)),
+                Ok(true)
+            ));
+            generation
+                .force_kill()
+                .unwrap_or_else(|error| panic!("force: {error}"));
+            let step = generation.reap_step_with(|child| child.try_wait(), |_| result);
+            match result {
+                Ok(()) | Err(Errno::EPERM) => assert_eq!(
+                    step.unwrap_or_else(|error| panic!("probe: {error}")),
+                    TreeObservation::Present
+                ),
+                Err(Errno::EIO) => assert!(step.is_err()),
+                Err(_) => unreachable!(),
+            }
+            assert!(global_reaper().reserve().is_err());
+            assert!(
+                generation
+                    .reap_step_with(
+                        |_| panic!("probe retry must not wait"),
+                        |_| Err(Errno::ESRCH),
+                    )
+                    .is_ok()
+            );
+        }
+
+        let mut generation = exiting_generation();
+        assert!(matches!(
+            generation.wait_for_leader_exit(Duration::from_secs(1)),
+            Ok(true)
+        ));
+        generation
+            .force_kill()
+            .unwrap_or_else(|error| panic!("force: {error}"));
+        assert_eq!(
+            generation
+                .reap_step_with(|child| child.try_wait(), |_| Err(Errno::ESRCH))
+                .unwrap_or_else(|error| panic!("reap: {error}")),
+            TreeObservation::ConfirmedEmpty
+        );
+        assert_eq!(
+            generation
+                .reap_step_with(
+                    |_| panic!("reaped state must not wait"),
+                    |_| panic!("reaped state must not probe"),
+                )
+                .unwrap_or_else(|error| panic!("cached observation: {error}")),
+            TreeObservation::ConfirmedEmpty
+        );
+    }
+
+    #[test]
+    fn injected_darwin_eperm_pending_retains_owner_then_succeeds() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        let error = match generation.apply_signal_result(
+            Err(Errno::EPERM),
+            Phase::ForceKillRequested,
+            true,
+            Ok(ExitObservation::Running),
+        ) {
+            Ok(()) => panic!("Darwin pending force must retry"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::WouldBlock,
+            "Darwin pending force must be distinguishable from permission denial"
+        );
+        assert_eq!(generation.phase, Phase::Running);
+        assert!(generation.child.is_some());
+        assert!(generation.permit.is_some());
+        assert!(global_reaper().reserve().is_err());
+
+        generation
+            .apply_signal_result(
+                Ok(()),
+                Phase::ForceKillRequested,
+                true,
+                Ok(ExitObservation::Running),
+            )
+            .unwrap_or_else(|error| panic!("injected force success: {error}"));
+        assert_eq!(generation.phase, Phase::ForceKillRequested);
+        assert!(generation.child.is_some());
+        assert!(generation.permit.is_some());
+        drop(generation);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn injected_darwin_eperm_after_exit_advances_force_phase() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        generation
+            .apply_signal_result(
+                Err(Errno::EPERM),
+                Phase::ForceKillRequested,
+                true,
+                Ok(ExitObservation::Exited { code: None }),
+            )
+            .unwrap_or_else(|error| panic!("exited leader must accept EPERM: {error}"));
+        assert_eq!(generation.phase, Phase::ForceKillRequested);
+        assert!(generation.child.is_some());
+        assert!(generation.permit.is_some());
+        drop(generation);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn injected_non_darwin_eperm_remains_permission_denied() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        let error = match generation.apply_signal_result(
+            Err(Errno::EPERM),
+            Phase::ForceKillRequested,
+            false,
+            Ok(ExitObservation::Running),
+        ) {
+            Ok(()) => panic!("non-Darwin EPERM must remain a failure"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(generation.phase, Phase::Running);
+        drop(generation);
+        wait_for_reaper_idle();
+    }
+}
