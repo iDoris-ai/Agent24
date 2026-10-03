@@ -116,7 +116,7 @@
   - 保留（retention）；
   - legacy recovery holds；
   - run 的 workspace 准入与终止。
-- **workspace**：`WorkspaceService`（`rust/crates/agent24-workspace/src/service.rs`）把持久化的根目录证据和**用文件描述符钉住的真实目录**组合起来，签发进程内的 `WorkspaceHandle`。**当前仅 Unix**：Unix 上非 ephemeral 的 daemon 启动时组合它；非 Unix（Windows）上 daemon 不组合 `WorkspaceService`，相关调用返回 `UnsupportedPlatform`，workspace-bound run 不可用，只有 legacy 路径。
+- **workspace**：`WorkspaceService`（`rust/crates/agent24-workspace/src/service.rs`）把持久化的根目录证据和**用文件描述符钉住的真实目录**组合起来，签发进程内的 `WorkspaceHandle`。**当前仅 Unix**：Unix 上非 ephemeral 的 daemon 启动时组合它；非 Unix（Windows）上 daemon 不组合 `WorkspaceService`（crate 的非 Unix 实现直接返回 `UnsupportedPlatform`；产品 API 因 service 未组合返回 `503 workspace_unavailable`），workspace-bound run 不可用，只有 legacy 路径。
   - **workspace-bound run**（带 `workspace_id`）：`fs_read` / `fs_write` / `shell_exec` 经 `WorkspaceHandle` 解析，每次需要时重新校验 run / 租约 / workspace 事实。
   - **legacy run**（不带 `workspace_id`，今天的默认情况）：工具上下文是 `ToolContext::legacy`，文件工具退回到工具自身配置的 allowlist 根目录，shell 退回到配置的 `workdir`。
 - **os-cwd**（Unix-only）：只在 fork 之后、exec 之前做 `fchdir(2)`，让子进程 cwd 就是被钉住的目录。
@@ -148,7 +148,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 内核运行时的组合根：
 
-- **对外 API**：v1 REST + WS（runs、sessions、approvals、workspaces、comm、os、attached…）。
+- **对外 API**：v1 REST + WS（runs、sessions、approvals、comm、os、attached…）。workspace 目前**没有**对外 REST 路由（产品构造、host lease、resolve 都未开放），只能经内部 run 准入路径使用。
 - **鉴权模式**：
   - 默认 `legacy_single_token` ✅：生成一个全权 bearer，写进 `~/.agent24/daemon.json`。Desktop（`BackendManager` 以 `serve --port 0` 启动）和 CLI 今天都走这条路径。
   - `capabilities` 🟡：需要 `--auth-mode capabilities --host-bootstrap-stdio` 启动；`daemon.json` 不含凭据，`ProductHost` 只经私有 ready pipe 交给宿主父进程。已实现：令牌库、`CreativeRuntime` 的 mint / 吊销（claims 含 workspace / attachment / principal）、TTL 与代际、**默认拒绝**的路由策略（`src/capabilities/`、`server.rs` 的 `required_operation`）。**尚未实现**（📐，见 [ADR-005](open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md)）：从请求中提取 workspace / session / run 资源并校验、durable 的 session / run 归属、事件过滤与每次发送前复验、broker / handoff。因此在 capability 模式下 `CreativeRuntime` 目前只能读全局模型目录（`GET /api/v1/models`），其余路由一律要求宿主权限。Desktop 与 `agent24 acp` 都未使用该模式；CLI 遇到 capability 模式的 daemon 会报错 `host authority unavailable`（内部常量 `HOST_AUTHORITY_UNAVAILABLE`）。
@@ -282,6 +282,8 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 - 📐 capability 的路由级资源授权（workspace / session / run 资源提取与校验）、durable 归属、事件过滤与复验、broker / handoff。
 - 📐 Creative 的按 workspace 非持久 session 分区（现为全局持久分区）。
 - 🟡 workspace-bound run 仅 Unix；Windows 上只有 legacy 路径。
+- 📐 workspace 的产品构造、host lease、续期 / 释放、resolve 等对外路由未开放（`WorkspaceService` 的产品构造按代码注释仍关闭）。
+- 🟡 Desktop `BackendManager` 会复用任意健康的已发现 daemon（含 capability 模式），与 ADR-005 要求的"Desktop 必须自己拉起并拥有 capability daemon"不一致。
 - 🟡 进程内 DomainModule 挂载缝已实现，但当前没有生产内置模块。
 - 🟡 `SidecarManager` 与 `agent24-sidecar-host` 未接入 Desktop；Open Design 由 `CreativeServeWeb` 托管。
 - 🟡 `agent24 acp` 不传 `workspace_id`，Open Design 的 run 不是 workspace-bound。
