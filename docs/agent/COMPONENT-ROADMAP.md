@@ -56,7 +56,7 @@
 ### C3 记忆
 
 - **现状**：main 上 agent loop 只用 D1 的 `KvStore` + `CanonicalSession`（有损摘要折叠）；M-D 高层库（EventLog、断言账本、检索、巩固等）已实现并有测试，但 main 上未接入。**M1 在 `ab/m1-memory` 分支已合入 T01–T07、T07a、T09**（PR #636–#652）；分支台账未同步，以提交历史为准。
-- **里程碑**（定义见 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md` 与 `docs/research/MEMORY-STRATEGY.md`；拍板见 [`roadmap.md`](roadmap.md) 2026-10-02 记录）
+- **里程碑**（定义见 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md` 与 `docs/research/MEMORY-STRATEGY.md`；拍板记录见 `ab/m1-memory` 分支的 `docs/research/MEMORY-STRATEGY.md` §7）
   1. **P0 = M1 收尾**：T07.1（召回注入改为带标注的数据块）、T08（召回评测基线）、T10（记忆 REST + 总开关 + 来源展示）、T11（桌面「记忆」页）。然后**先把 main（含 M10 的 633 个提交）合进 `ab/m1-memory` 并重跑全部 gate，再以 merge 方式落 main**，吸取 M10「分支漂太久」的教训。📐 → 波次 A。
   2. **P1 个人记忆可控（M1.5）**：先出 ADR「原文生命周期内不丢 vs 用户清除权」；回执事件、双时态与用户 supersede、程序性偏好、导出、purge、无痕会话。📐 → 波次 B。
   3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
