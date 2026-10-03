@@ -117,7 +117,7 @@
   - legacy recovery holds；
   - run 的 workspace 准入与终止。
 - **workspace**：`WorkspaceService`（`rust/crates/agent24-workspace/src/service.rs`）把持久化的根目录证据和**用文件描述符钉住的真实目录**组合起来，签发进程内的 `WorkspaceHandle`。**当前仅 Unix**：Unix 上非 ephemeral 的 daemon 启动时组合它；非 Unix（Windows）上 daemon 不组合 `WorkspaceService`（crate 的非 Unix 实现直接返回 `UnsupportedPlatform`；产品 API 因 service 未组合返回 `503 workspace_unavailable`），workspace-bound run 不可用，只有 legacy 路径。
-  - **workspace-bound run**（带 `workspace_id`）：`fs_read` / `fs_write` / `shell_exec` 经 `WorkspaceHandle` 解析，每次需要时重新校验 run / 租约 / workspace 事实。
+  - **workspace-bound run**（带 `workspace_id`）：`fs_read` / `fs_write` 的路径经 `WorkspaceHandle` 在钉住的根内解析；`shell_exec` **只**把子进程 cwd 钉在 workspace 根并照常走审批，**不是 OS 沙箱**，命令本身仍可访问根目录之外（ADR-002）。每次需要时重新校验 run / 租约 / workspace 事实。
   - **legacy run**（不带 `workspace_id`，今天的默认情况）：工具上下文是 `ToolContext::legacy`，文件工具退回到工具自身配置的 allowlist 根目录，shell 退回到配置的 `workdir`。
 - **os-cwd**（Unix-only）：只在 fork 之后、exec 之前做 `fchdir(2)`，让子进程 cwd 就是被钉住的目录。
 
@@ -232,7 +232,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
    - 🟡 / 📐 目标：capability 模式，全权 `ProductHost` 不落盘，第三方只拿限定 workspace、短 TTL、可吊销的令牌（基础设施已实现，路由级资源授权未实现）。
 3. **审批边界** ✅：所有工具（内建、MCP、模块触发）走同一条 fail-closed 审批流水线；第三方的 "permission response" 不是授权凭据。
 4. **文件系统边界**：
-   - ✅ workspace-bound run（仅 Unix）：路径在描述符钉住的根内解析，子进程 cwd 用 `fchdir` 钉住；
+   - 🟡 workspace-bound run（仅 Unix；运行时准入、handle、工具接线已实现，但默认 Desktop / ACP 路径还不可达）：`fs_read` / `fs_write` 的路径在描述符钉住的根内解析；`shell_exec` 只用 `fchdir` 钉住 cwd，不是 OS 沙箱；
    - legacy run：靠工具 allowlist 与 `workdir`。
 5. **unsafe 边界** ✅：生产代码只有两处人工审计过的窄 `unsafe`：
    - `os-cwd`：post-fork 的 `fchdir`；
