@@ -19,7 +19,7 @@
 | C5 | 权限、能力与法律 | `agent24-policy`、`agent24d/capabilities`、`docs/laws/` | 审批 ✅、Guardian ✅（可选）；capability 🟡；法律三部 |
 | C6 | 领域 OS 生态 | `os-proto` / `os-fd` / `os-packages` / `os-sdk`；Sin90、Cos72 外仓 | ✅ ME-3 / ME-4 已交付（v0.5.0）；进程内模块缝 🟡 无实例 |
 | C7 | 第三方工具集成 | Desktop `CreativeServeWeb`、`agent24 acp`、`agent24-sidecar-host`、`agent24-mcp` | Open Design 现行路径 ✅；目标形态 🟡/📐；MCP ✅ |
-| C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1…4b 已交付；UI 与联调未做 |
+| C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1a…4b、COMM-5a 已交付；UI 与联调未做 |
 | C9 | 语音（AgentEar） | 附着模块（A3） | ✅ P0–P2（非流式单轮） |
 | C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；macOS 签名包被 Apple 账号阻塞 |
 | C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9–F11 等第二个真实用户 |
@@ -60,7 +60,7 @@
   1. **P0 = M1 收尾**：T07.1（召回注入改为带标注的数据块）、T08（召回评测基线）、T10（记忆 REST + 总开关 + 来源展示）、T11（桌面「记忆」页）。然后**先把 main（含 M10 的 633 个提交）合进 `ab/m1-memory` 并重跑全部 gate，再以 merge 方式落 main**，吸取 M10「分支漂太久」的教训。📐 → 波次 A。
   2. **P1 个人记忆可控（M1.5）**：先出 ADR「原文生命周期内不丢 vs 用户清除权」；回执事件、双时态与用户 supersede、程序性偏好、导出、purge、无痕会话。📐 → 波次 B。
   3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
-  4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**。授权模型归 C11：**P3 触发并交付 F9 的社区子集**（spaces + grants + 交集判定 + 审计事件，契约由 C11 定义）；F9 的其余部分（groups、企业场景）以及 F10 / F11 仍等第二个真实用户。
+  4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**。授权模型归 C11：**P3 触发并交付 F9 的社区子集**（spaces + grants + 交集判定 + 审计事件，契约由 C11 定义），并与 C6 O-2b（scoped memory 回调）同批交付；F9 的其余部分（groups、企业场景）以及 F10 / F11 仍等第二个真实用户。
   5. **P4 企业治理** / **P5 高级记忆**（时态图、巩固 / 反思、**AgentEar 语音摄入**）。📐 → 远期。
 - **依赖**：C1 K-1 ← P0；C6 O-3（Cos72 M4）← P0（roadmap 明写「依赖 M1 全部完成」）；P1 ← P0；P2 ← P1（K-4 ⊂ P2）；P3 ← P1，并带出 C11 F9 社区子集；C9 语音摄入 ← P1 的事件 schema。
 
@@ -84,7 +84,7 @@
 - **里程碑**
   1. **A-1 = OD-M11 F11.0 / F11.1 / F11.2**：路由级资源授权与高权限接口隔离、Desktop 自有 capability daemon（无孤儿）、broker / handoff / 吊销。📐 → 波次 A。
   2. **A-2 = TPI-W W.2**：`CreativeRuntime` 等 Creative 专名泛化为按工具区分的 audience（如 `ToolRuntime{tool}`）。📐 → 波次 B。
-  3. **A-3 隐私法律 L-PRV**：把「出境必经 iDoris 网关脱敏」「`LocalOnly` 贯穿主路径」等写成法律并配变异测试（来源：internal-AI docs/06 建议）。**法律先于实现冻结**，是 C2 脱敏在默认路径启用的上线门；同时补 `docs/laws/EDITIONS.md`（SPEC-EDITIONS 的下一步）。📐 → 波次 A（与 ID-2 同批）。
+  3. **A-3 隐私法律 L-PRV**：把「出境必经 iDoris 网关脱敏」「`LocalOnly` 贯穿主路径」等写成法律并配变异测试（来源：internal-AI docs/06 建议）。**法律先于实现冻结**，是 C2 脱敏在默认路径启用的上线门；同时补 `docs/laws/EDITIONS.md`（SPEC-EDITIONS 的下一步）。📐 → 波次 A，作为波次 B 中 ID-2 / 出境脱敏在默认路径启用的前置。
   4. **A-4 记忆授权演进**：`Authorizer` 在 P1 细化操作类型，P3 加 module principal / delegation / `policy_epoch`（随 C3）。
   5. **A-5 ADR-032 P5**：gate 闭集执行动作扩展（排除 `builtin`）、proposal → 宿主确认 UI → 回执留档（随 C9）。
   6. **A-6 ME-6 模块签名**（sigstore keyless + 信任策略；签名只回答「谁写的」，不提供隔离）。📐 → 远期，需拍板。
@@ -96,11 +96,11 @@
 - **里程碑**（[PLAN-ME4](PLAN-ME4-OS-CAPABILITIES.md)「不在本轮」、[roadmap.md](roadmap.md) M4 / M5）
   1. **O-1 ME-4 收尾债**：Codex 补审债（ME4-CODEX-DEBT）、FU-104（Node 参考模块补 scheduler / model / approval 演示）。📐 → 波次 A。
   2. **O-2a 模块受众与挂载策略**：manifest 加 `audience` 字段，解决「哪些模块互为替代」今天说不出来的问题（PLAN-OOP §七 的角色场景 OS 决策）。📐 → 波次 B。
-  3. **O-2b `_a24/memory/scoped/*`**：依赖 C3 M1 personal-space 收口与 C11 F9（[SPEC-ME3](../specs/SPEC-ME3-OUT-OF-PROCESS.md) 已把 scoped / shared-space 语义推迟到 F8c / F9），随 F9 排期。**`Policy` 回调**：未排期，出现稳定消费者再启动。
+  3. **O-2b `_a24/memory/scoped/*`**：领域 OS（如 Cos72）读写共享空间记忆的回调。依赖 C3 M1 personal-space 收口与 C11 F9（[SPEC-ME3](../specs/SPEC-ME3-OUT-OF-PROCESS.md) 已把 scoped / shared-space 语义推迟到 F8c / F9）。**与 C3 P3、F9 社区子集同批交付**（波次 C），因为 P3「对接 Cos72」需要它。**`Policy` 回调**：未排期，出现稳定消费者再启动。
   4. **O-3 Cos72 Workspace 底座（roadmap M4）**：`CosEntity` 双向图、统一查询面、事件落底座、`workspace.search/get/link` 工具。依赖 C3 P0。📐 → 波次 C。internal-AI 规划把 4seas 定位为 Cos72 的一个实例，O-3 / O-4 是它的前置。
   5. **O-4 Cos72 三件套（roadmap M5）**：myshop、myvote、渠道接入（复用微信 / Nostr），含 Skill 分发 SD-1…4。📐 → 波次 C 之后。
   6. **O-5 签名** = C5 A-6。
-- **依赖**：O-3 ← C3 P0（与 C3 P3 协同设计）；O-4 ← O-3、C8 COMM-7（渠道）；O-2b ← C11 F9。
+- **依赖**：O-3 ← C3 P0（与 C3 P3 协同设计）；O-4 ← O-3、C8 COMM-7（渠道）；O-2b ← F9 社区子集，与 C3 P3 同批。
 
 ### C7 第三方工具集成
 
@@ -114,7 +114,7 @@
 
 ### C8 通信（Hyphae）
 
-- **现状**：`agent24-comm` 的身份、联系人、relay、导入、daemon 监管、send / history / outbox、状态探针 ✅（COMM-1a…4b）。
+- **现状**：`agent24-comm` 的身份、联系人、relay、导入、daemon 监管、send / history / outbox、状态探针 ✅（COMM-1a…4b），F4b 冻结 COMM-5a ✅。
 - **里程碑**（[COMM-HYPHAE](../design/COMM-HYPHAE.md) §8）
   1. **COMM-5b** 结构约束测试（依赖 allowlist 等）→ 波次 A。
   2. **COMM-6** UI：身份 / 联系人 / relay / daemon 状态 / 导入向导 → 波次 A。
@@ -162,8 +162,8 @@
 |---|---|---|
 | **A（近期）** | C3 P0（M1 收尾并合回 main）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）· C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
 | **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C9 P3 · C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
-| **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3 + C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
-| 未排期 | C11 F9–F11（等第二个用户）及依赖它的 C6 O-2b · Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
+| **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
+| 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10 / F11（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
 **关键依赖链**（一眼看清）
 
