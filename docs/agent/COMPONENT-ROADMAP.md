@@ -21,7 +21,7 @@
 | C7 | 第三方工具集成 | Desktop `CreativeServeWeb`、`agent24 acp`、`agent24-sidecar-host`、`agent24-mcp` | Open Design 现行路径 ✅；目标形态 🟡/📐；MCP ✅ |
 | C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1…4b 已交付；UI 与联调未做 |
 | C9 | 语音（AgentEar） | 附着模块（A3） | ✅ P0–P2（非流式单轮） |
-| C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1（macOS + Linux）；签名被 Apple 账号阻塞 |
+| C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；macOS 签名包被 Apple 账号阻塞 |
 | C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9–F11 等第二个真实用户 |
 | C12 | Web3 身份与结算（AAStar） | — | 📐 Agent24 代码中**尚无接线**，只在生态规划中 |
 
@@ -38,20 +38,20 @@
   1. **K-1 记忆接线**：agent loop 改用 `SessionLog`，并在 run 前召回注入。由 C3 的 M1/P0 交付（已在 `ab/m1-memory` 完成 T03–T07），合回 main 后 ✅。
   2. **K-2 审计字段约束**：`append_audit` 目前接受任意 JSON，需要加字段白名单 / 黑名单，防止 prompt 等敏感内容被永久写进哈希链（来源：internal-AI 代码审计 R13）。📐 → 波次 A。
   3. **K-3 = SPEC-002/B4**：OpenAPI 改为由 Rust 类型生成，CI 零漂移（[SPEC-002](../specs/SPEC-002-protocol.md)）。📐 → 波次 B，无依赖，可随时插入。
-  4. **K-4 ML Worker**：Python worker 服务端（SPEC-MEMORY D4b）与 `agent24-worker` 的第一个消费者（嵌入 / 转写）。📐 → 随 C3 的 P2。
-- **依赖**：K-1 ← C3 P0；K-4 ← C3 P2。
+  4. **K-4 ML Worker（⊂ C3 P2）**：Python worker 服务端（[docs/specs/TASKS.md](../specs/TASKS.md) D4b，等真实消费者）作为 P2 的一部分交付：K-4a worker 服务端 → P2 向量召回接线 → K-4b 首个消费者验收。📐 → 随 C3 P2。
+- **依赖**：K-1 ← C3 P0；K-4 不单独排序，属于 C3 P2。
 
 ### C2 模型网关与路由
 
 - **现状**：`ModelRouter` 按 `TaskProfile`（`Privacy × Complexity` → `Tier`）选 provider，`LocalOnly` 对远端 fail-closed ✅。但主对话、子 agent、REST 聊天都传 `TaskProfile::default()`，只有 Guardian 与模块推理回调会设置 `LocalOnly` 🟡。`from_env` 只构造 oMLX / Ollama；Agent24 内**没有出境脱敏代码**（已定由 iDoris 出口网关负责）。
-- **里程碑**（ID-* 见 [iDoris-integration-and-entry-router.md](../iDoris-integration-and-entry-router.md)，P3–P5 见 [decision.md ADR-032](../decision.md)）
-  1. **ID-2 / ADR-032 P4 — iDoris provider 接线**：`IDORIS_URL`，拆成 `idoris-local`（强制 `local_only`）与 `idoris-any`；iDoris 回报实际落点。📐 → 波次 A。**对接前先核对跨仓字段**（该提案已知与 iDoris 现状有出入）。
-  2. **ID-1 + ID-3 — 任务画像生成**：由入口路由（Semantic Router 级小模型或先用规则版）为每个 run 生成 `TaskProfile`，并让 `X-iDoris-*` 头与 `LocalOnly` 贯穿主对话路径。📐 → 波次 A / B。需拍板：画像在 Agent24 侧生成，还是交给 iDoris 网关兜底（internal-AI docs/11 里程碑 1.2 的同一个决断点）。
-  3. **ADR-032 P3 — 推理回调流式**（`_a24/model/stream`，目标首字 ≤ 3s）。📐 → 波次 B。
-  4. **出境脱敏**：在 iDoris 出口网关实现（不在 Agent24 内实现）。顺序：**先冻结隐私法律 L-PRV（C5 A-3）→ ID-2 / 脱敏实现 → 变异验收通过 → 才在默认路径启用**。📐 → 波次 A / B。
-  5. **ID-5 经 iDoris 的危险动作复用审批门**：验证经 iDoris 路径发起的危险动作同样走 Agent24 的 fail-closed 审批（依赖 ID-2，优先级中）。📐 → 波次 B。
-  6. **ID-4 跨平台推理后端**（Win / Linux 用 vLLM / llama.cpp / Ollama，依赖 ID-2），是 C10 Windows 发布的前置之一；**ID-6** 动态硬件推荐：低优先级、未排期。
-- **依赖**：ID-1 / ID-3 / ID-4 / ID-5 ← ID-2；默认路径启用脱敏 ← C5 A-3（法律先行）；C9 的流式体验 ← ADR-032 P3；C3 的 P2（本地向量 / 抽取）← 本地模型可用；C10 Windows ← ID-4。
+- **里程碑**（ID-* 见 [iDoris-integration-and-entry-router.md](../iDoris-integration-and-entry-router.md)，其建议顺序为 ID-1 → ID-2；P3–P5 见 [decision.md ADR-032](../decision.md)，冻结顺序为 P3 → P4 → P5）
+  1. **ID-1 任务画像生成**（无硬前置）：由入口路由（先规则版，再 Semantic Router 级小模型）为每个 run 生成 `TaskProfile`，替换主路径上的 `TaskProfile::default()`。📐 → 波次 A。需拍板：画像在 Agent24 侧生成，还是交给 iDoris 网关兜底（internal-AI docs/11 里程碑 1.2 的同一决断点）。
+  2. **ADR-032 P3 — 推理回调流式**（`_a24/model/stream`，目标首字 ≤ 3s）。📐 → 波次 A / B。
+  3. **ID-2 = ADR-032 P4 — iDoris provider 接线**：`IDORIS_URL`，拆成 `idoris-local`（强制 `local_only`）与 `idoris-any`；iDoris 回报实际落点。按 ADR-032 顺序排在 P3 之后；若要先做 P4，需在 ADR-032 记录「执行顺序重排、不改编号」。**对接前先核对跨仓字段**（该提案已知与 iDoris 现状有出入）。📐 → 波次 B。
+  4. **出境脱敏**：在 iDoris 出口网关实现（不在 Agent24 内实现）。顺序：**先冻结隐私法律 L-PRV（C5 A-3，波次 A）→ ID-2 / 脱敏实现 → 变异验收通过 → 才在默认路径启用**。📐 → 波次 B。
+  5. **ID-3**（`X-iDoris-*` 头与 `LocalOnly` 贯穿主对话路径）、**ID-5**（经 iDoris 的危险动作复用 fail-closed 审批门）：依赖 ID-2。📐 → 波次 B。
+  6. **ID-4 跨平台推理后端**（Win / Linux 用 vLLM / llama.cpp / Ollama，依赖 ID-2），是 C10 Windows 发布的前置之一。📐 → 波次 B / C。**ID-6** 动态硬件推荐（依赖 ID-4）：低优先级、未排期。
+- **依赖**：ID-3 / ID-4 / ID-5 ← ID-2；ID-6 ← ID-4；ID-2 排在 ADR-032 P3 之后；默认路径启用脱敏 ← C5 A-3；C9 的流式体验 ← ADR-032 P3；C3 的 P2（本地向量 / 抽取）← 本地模型可用；C10 Windows ← ID-4。
 
 ### C3 记忆
 
@@ -59,10 +59,10 @@
 - **里程碑**（定义见 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md` 与 `docs/research/MEMORY-STRATEGY.md`；拍板见 [`roadmap.md`](roadmap.md) 2026-10-02 记录）
   1. **P0 = M1 收尾**：T07.1（召回注入改为带标注的数据块）、T08（召回评测基线）、T10（记忆 REST + 总开关 + 来源展示）、T11（桌面「记忆」页）。然后**先把 main（含 M10 的 633 个提交）合进 `ab/m1-memory` 并重跑全部 gate，再以 merge 方式落 main**，吸取 M10「分支漂太久」的教训。📐 → 波次 A。
   2. **P1 个人记忆可控（M1.5）**：先出 ADR「原文生命周期内不丢 vs 用户清除权」；回执事件、双时态与用户 supersede、程序性偏好、导出、purge、无痕会话。📐 → 波次 B。
-  3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例。📐 → 波次 B / C（依赖 C1 K-4、C2 本地模型）。
-  4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**、与 C11 F9 **共享授权模型**；二者都不是 P3 的硬前置。
+  3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
+  4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**。授权模型归 C11：**P3 触发并交付 F9 的社区子集**（spaces + grants + 交集判定 + 审计事件，契约由 C11 定义）；F9 的其余部分（groups、企业场景）以及 F10 / F11 仍等第二个真实用户。
   5. **P4 企业治理** / **P5 高级记忆**（时态图、巩固 / 反思、**AgentEar 语音摄入**）。📐 → 远期。
-- **依赖**：C1 K-1 ← P0；C6 O-3（Cos72 M4）← P0（roadmap 明写「依赖 M1 全部完成」）；P1 ← P0；P2 ← P1、C1 K-4；P3 ← P1；C9 语音摄入 ← P1 的事件 schema。
+- **依赖**：C1 K-1 ← P0；C6 O-3（Cos72 M4）← P0（roadmap 明写「依赖 M1 全部完成」）；P1 ← P0；P2 ← P1（K-4 ⊂ P2）；P3 ← P1，并带出 C11 F9 社区子集；C9 语音摄入 ← P1 的事件 schema。
 
 ### C4 Workspace（文件系统工作区）
 
@@ -135,7 +135,7 @@
 
 ### C10 桌面、CLI 与发布
 
-- **现状**：v0.5.1（macOS + Linux）✅；DEP-A 全部完成。
+- **现状**：v0.5.1 ✅：CLI 覆盖 macOS + Linux；Desktop 只发布 Linux，macOS dmg 等 DEP-B（v0.5.2）。DEP-A 全部完成。
 - **里程碑**（`docs/Deployment/`）
   1. **DEP-B v0.5.2 签名**（macOS dmg、CLI / 模块签名公证）：**BLOCKED**（Apple 账号申请中）。
   2. **DEP-C Windows（v0.6）**：签名方式拍板、移植实现、发布。依赖 C4 W-2（Windows workspace）与 sidecar-host 的 ProcessKit 复用。→ 波次 B / C。
@@ -146,7 +146,7 @@
 ### C11 组织化
 
 - **现状**：ADR-030 F8（所有权 = (组织, 空间)）✅。
-- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）→ F11（`asserted_by` + 冲突断言）。**等第二个真实用户，不排期**（[roadmap.md](roadmap.md) M3）。
+- **里程碑**：F9（grants + groups + 交集判定 + 审计事件）→ F10（持久化作用域 Workspace）→ F11（`asserted_by` + 冲突断言）。**F9 的社区子集由 C3 P3 触发（波次 C）**；其余部分等第二个真实用户，不排期（[roadmap.md](roadmap.md) M3）。
 - **不能等的前置**（[SPEC-ORG-SPACE](../specs/SPEC-ORG-SPACE.md) §9）：① 共享空间的不可变 ID（随 C3 P3 定）；② 组织 / 空间是否跨库或跨地区（随 C3 P4 定）；③ agent loop 自身记忆归属迁到 personal space（= C3 P0 的 M1-T02 / T05，已在 `ab/m1-memory` 完成，合回 main 后生效）。
 
 ### C12 Web3 身份与结算（AAStar）
@@ -160,8 +160,8 @@
 
 | 波次 | 主要内容 | 并行性说明 |
 |---|---|---|
-| **A（近期）** | C3 P0（M1 收尾并合回 main）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）· C5 A-3 隐私法律冻结 + C2 ID-2（iDoris provider）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
-| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0 / OC-1 · C3 P1 · C2 ID-1 / ID-3 画像、ID-5、ADR-032 P3 流式 · C9 P3 · C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
+| **A（近期）** | C3 P0（M1 收尾并合回 main）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）· C5 A-3 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
+| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C9 P3 · C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
 | **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3 + C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
 | 未排期 | C11 F9–F11（等第二个用户）及依赖它的 C6 O-2b · Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
@@ -170,9 +170,10 @@
 ```
 OD-M11:  F11.0a + F11.0 ──▶ F11.1 / F11.2 / F11.3 ──▶ TPI-W（含 W-3、W.2）──▶ OC-1（设计 W-4）──▶ OC-2（实现 W-4）──▶ OC-3
                                                       └─ OD-M12 与 TPI-W 并行；OC-0 调研可提前
-记忆:    C3 P0（M1 合回 main）──▶ C1 K-1 ──▶ C3 P1 ──▶ C3 P2 / P3
+记忆:    C3 P0（M1 合回 main）──▶ C1 K-1 ──▶ C3 P1 ──▶ C3 P2（含 K-4）/ P3（带出 C11 F9 社区子集）
          C3 P0 ──▶ C6 O-3（Cos72 M4）──▶ O-4（M5，4seas 实例）      （P3 与 O-3 协同设计）
-隐私:    C5 A-3 法律冻结 ──▶ C2 ID-2 / 出境脱敏（iDoris）──▶ 变异验收 ──▶ 默认路径启用 ──▶ ID-1 / ID-3 画像贯穿主路径
+模型:    C2 ID-1 画像（无前置）；ADR-032 P3 ──▶ P4 = ID-2 ──▶ ID-3 / ID-4 / ID-5；ID-4 ──▶ ID-6
+隐私:    C5 A-3 法律冻结 ──▶ ID-2 / 出境脱敏（iDoris）──▶ 变异验收 ──▶ 默认路径启用
 Windows: C2 ID-2 ──▶ ID-4 ┐
          C4 W-2（F12.4）──┼──▶ C10 Windows v0.6
          ProcessKit 复用 ─┘
@@ -187,7 +188,7 @@ Windows: C2 ID-2 ──▶ ID-4 ┐
 | 4seas = Cos72 社区 OS 的一个实例，走 `agent24-os-proto` 契约（docs/06） | C6 O-3 / O-4 | 一致；O-3 依赖 C3 P0 |
 | C3 统一模型调度终态归 iDoris，16GB 节点过渡期由 Agent24 `ModelRouter` 承担（docs/03、docs/10） | C2 ID-2 / ID-1 | 一致；画像在哪一侧生成待拍板 |
 | 出境脱敏执行者归 iDoris 出口网关（2026-09-07 拍板） | C2 第 4 项、C5 A-3 | 一致；Agent24 侧只负责 `LocalOnly` 贯穿与法律 |
-| 新增隐私法律 L-PRV-1/2（docs/06） | C5 A-3 | 采纳，排波次 B |
+| 新增隐私法律 L-PRV-1/2（docs/06） | C5 A-3 | 采纳，排波次 A（先于脱敏实现冻结） |
 | 记忆是 Agent24 的模块，避免与 MemPalace 重复建设（docs/05、BR-19） | C3 | 一致：记忆归 Agent24 C3 |
 | 旧组件主文档里的「Guardian 安全门禁」「三级路由」「21.5 万行」 | C2 / C5、§1 | 已在 internal-AI 主文档按代码改写：路由机制在、画像未生成；Guardian 可选。规模口径：2026-10-03 main 的 Rust 源码约 18.7 万行（不含独立测试文件约 16.4 万行）；internal-AI 引用的 64,885 行是 M10 落地前的旧统计 |
 | README 把 Web3（AAStar）写成已上线支柱 | C12 | **不一致**：Agent24 无接线，应改为「规划中」 |
