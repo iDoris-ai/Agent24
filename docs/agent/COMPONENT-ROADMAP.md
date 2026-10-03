@@ -161,13 +161,17 @@
 
 ---
 
-## 3. 跨组件波次（建议，待 jason 拍板）
+## 3. 跨组件波次（2026-10-03 jason 裁决后）
+
+> **裁决（2026-10-03）**：主干 = **C3 P0（M1 收尾并合回 main）**；**C7 Open Design 线在 M10 告一阶段**，OD-M11（含 C4 W-1、C5 A-1）/ OD-M12 / TPI-W / OC 全部移入下表「暂停」行，不与 M1 并行，恢复时从 OD-M11 起步（F11.4 托管器届时再定）。并行线 = C8 COMM（笔记本）。波次 A 其余条目照常，但**不得挤占 M1 的评审与合并节奏**。仍待拍板：F11 随 P0 还是 P1（C11）、ID-1 何时开工（C2）。
+
 
 | 波次 | 主要内容 | 并行性说明 |
 |---|---|---|
-| **A（近期）** | C3 P0（M1 收尾并合回 main；F11 是否随 P0 待拍板）· C7 OD-M11（含 C4 W-1、C5 A-1）· C8 COMM-5b / 6（COMM-7 可延至 B）、DEP-C8 Hyphae lock 升级 · C5 A-3a / A-3b 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 走 B 机 / Codex 线，OD-M11 走本机，互不阻塞（[PLAN-OD-NEXT §5](PLAN-OD-NEXT.md)） |
-| **B（中期）** | C7 TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）· C7 OC-0（可提前）/ OC-1 · C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C5 A-3b Agent24 出站启动断言 + TPI-W 验收门 · C8 T01-E 收口、DEP-C9 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P4 流式（= ADR-032 P3，A / B）→ A3 P3 提案闭环（= ADR-032 P5，在 P4 之后）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | TPI-W 只依赖 OD-M11 的 F11.0a–F11.3 |
-| **C（远期）** | C7 OC-2 / OC-3（含 C4 W-4）· C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
+| **A（近期）** | **主干：C3 P0**（M1 收尾并合回 main；F11 是否随 P0 待拍板）· **并行：C8** COMM-5b / 6（COMM-7 可延至 B）、DEP-C8 Hyphae lock 升级 · C5 A-3a / A-3b 隐私法律冻结 · C2 ID-1 画像（规则版）+ ADR-032 P3 流式（可延至 B）· C1 K-2 审计约束 · C6 O-1 收尾债 · C10 DEP-B（等账号） | M1 与 COMM 都在笔记本（B 机 2026-10-03 起不再编译 Agent24）；其余条目只在不挤占 M1 时插入 |
+| **B（中期）** | C3 P1 · C2 ID-2 iDoris provider + 出境脱敏、ID-3、ID-5、ID-4（B / C）· C5 A-3b Agent24 出站启动断言 + TPI-W 验收门 · C8 T01-E 收口、DEP-C9 发布包含 hyphae · 收口后的入站授权（B / C）· C9 A3 P4 流式（= ADR-032 P3，A / B）→ A3 P3 提案闭环（= ADR-032 P5，在 P4 之后）· C6 O-2a · C1 K-3（SPEC-002/B4）· C10 Windows（v0.6，可能延至 C） | C3 P1 紧接 P0，是主干的下一站 |
+| **C（远期）** | C3 P2 / P3（含 C11 F9 社区子集 + C6 O-2b）+ C6 Cos72 M4 / M5（4seas 实例）· C4 W-5 写回 · C9 多轮 · C10 自动更新 / 远程 / 移动 · C5 A-6 签名 | Cos72 M4 依赖 C3 P0，并与 P3 同步设计 |
+| **暂停（Open Design 线，2026-10-03）** | C7 OD-M11（含 C4 W-1、C5 A-1）→ TPI-W + OD-M12（含 C4 W-2 / W-3、C5 A-2）→ OC-0…OC-3（含 C4 W-4） | 恢复时按 [PLAN-OD-NEXT](PLAN-OD-NEXT.md) §5 的顺序整体排入；M10 遗留安全缺口见其 §0 |
 | 未排期 | C11 F9 其余（groups、团队 / 企业）与 F10（等第二个用户）· Policy 回调 · C12 W3-0 · C3 P4 / P5 · C2 ID-6 | |
 
 **关键依赖链**（一眼看清）
