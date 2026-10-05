@@ -679,7 +679,23 @@ jobs:
           }
           ELECTRON_BINARY="$(find apps/desktop/node_modules/electron/dist -maxdepth 1 -iname 'Electron.app' -print -quit)/Contents/MacOS/Electron"
           assert_arch "Agent24's node_modules/electron" "$ELECTRON_BINARY"
+          # Packages like node-pty ship PREBUILT .node files for every
+          # platform+arch they support (prebuilds/<platform>-<arch>/*.node)
+          # — resolved dynamically at require() time, so only ONE of them
+          # is ever actually loaded on this runner. A blanket "every .node
+          # file must match this arch" check is simply wrong for those —
+          # real run, 2026-10-06: it failed on node-pty's own
+          # prebuilds/win32-arm64/pty.node (a Windows DLL, intentionally
+          # shipped, never loaded on mac). Skip any .node sitting in a
+          # prebuilds/<platform>-<arch>/ directory whose own name doesn't
+          # match darwin-${{ matrix.arch }} — those are a DIFFERENT
+          # package's deliberate multi-platform packaging, not this
+          # build's output.
           while IFS= read -r -d '' node_file; do
+            case "$node_file" in
+              */prebuilds/darwin-${{ matrix.arch }}/*) ;;
+              */prebuilds/*) continue ;;
+            esac
             assert_arch "native module $node_file" "$node_file"
           done < <(find apps/desktop/.open-design-resources -name '*.node' -print0)
 
