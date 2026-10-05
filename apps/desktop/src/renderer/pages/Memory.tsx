@@ -25,6 +25,9 @@ export default function MemoryPage() {
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [enabled, setEnabled] = useState<boolean | null>(null)
   const [settingsError, setSettingsError] = useState<string | null>(null)
+  // Review Low: disabled while a PUT is in flight, so a slow request cannot
+  // be fired twice by an impatient double-click.
+  const [togglePending, setTogglePending] = useState(false)
 
   // Monotonic request token: only the latest list refresh may land, same
   // pattern as Schedules.tsx (review C7) — a slow/superseded fetch must not
@@ -48,7 +51,11 @@ export default function MemoryPage() {
   }, [])
 
   useEffect(() => {
-    refresh(query)
+    // Review Low: ~250ms debounce — a fresh GET per keystroke is wasted work
+    // the user never sees (superseded by the next keystroke's request
+    // anyway, via `reqSeq`'s own staleness check).
+    const timer = setTimeout(() => refresh(query), 250)
+    return () => clearTimeout(timer)
   }, [query, refresh])
 
   useEffect(() => {
@@ -58,14 +65,17 @@ export default function MemoryPage() {
   }, [])
 
   const onTogglePause = async () => {
-    if (enabled === null) return
+    if (enabled === null || togglePending) return
     const next = !enabled
+    setTogglePending(true)
     try {
       const s = await putMemorySettings(next)
       setEnabled(s.enabled)
       setSettingsError(null)
     } catch (e: unknown) {
       setSettingsError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setTogglePending(false)
     }
   }
 
@@ -73,6 +83,13 @@ export default function MemoryPage() {
     try {
       await forgetMemoryAssertion(id)
       setAssertions((prev) => prev.filter((a) => a.id !== id))
+      // Review M3: a GET issued before this retract (e.g. an earlier
+      // search keystroke) may still be in flight. Bump the request token
+      // so its stale, pre-retract result is discarded when it lands
+      // instead of overwriting the filter above, then ask for a fresh
+      // list to re-sync with the server.
+      reqSeq.current += 1
+      refresh(query)
       setConfirmingId(null)
       setNotice('已撤回')
       setError(null)
@@ -108,14 +125,18 @@ export default function MemoryPage() {
         </div>
         <button
           role="switch"
-          aria-checked={enabled === true}
+          // Review H4: this switch's label and meaning are "暂停记忆" — checked
+          // means PAUSED is on, i.e. `enabled === false`. `enabled === true`
+          // (the earlier version) had it backwards: a screen reader would
+          // have announced "暂停记忆: checked" while memory was actually ON.
+          aria-checked={enabled === false}
           aria-label="暂停记忆"
           className={`btn${enabled === false ? ' btn-primary' : ''}`}
           style={{ fontSize: 12 }}
-          disabled={enabled === null}
+          disabled={enabled === null || togglePending}
           onClick={onTogglePause}
         >
-          {enabled === null ? '…' : enabled ? '开启' : '已暂停'}
+          {enabled === null ? '…' : enabled ? '未暂停' : '已暂停'}
         </button>
       </div>
       {settingsError && (
@@ -144,8 +165,15 @@ export default function MemoryPage() {
       {error && <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{error}</div>}
       {notice && <div style={{ color: '#4caf50', fontSize: 12, marginBottom: 8 }}>{notice}</div>}
 
-      {assertions.length === 0 &&
-        (query.trim() === '' ? (
+      {/* Review Low: never show an empty-state copy while `error` is set —
+          an empty list because the load FAILED is not the same fact as an
+          empty list because there is truly nothing there, and the former
+          must not be mistaken for the latter. */}
+      {!error &&
+        assertions.length === 0 &&
+        (enabled === false ? (
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>记忆已暂停</div>
+        ) : query.trim() === '' ? (
           <div style={{ fontSize: 12, color: 'var(--muted)' }}>说『记住……』让我记住</div>
         ) : (
           <div style={{ fontSize: 12, color: 'var(--muted)' }}>没有匹配的记忆</div>
