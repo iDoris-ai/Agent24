@@ -126,10 +126,10 @@ export default function CreativePage(): JSX.Element {
         if (cancelled) return
         if (result.ok) { setError(null); return }
         if (result.needsDownload) { setNeedsDownloadSize(result.size ?? 0); return }
-        setError(result.error ?? 'Open Design failed to start')
+        setError(result.error ?? 'iDoris Design 启动失败')
       },
       (reason) => {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Open Design failed to start')
+        if (!cancelled) setError(reason instanceof Error ? reason.message : 'iDoris Design 启动失败')
       },
     )
 
@@ -148,9 +148,9 @@ export default function CreativePage(): JSX.Element {
     setRestarting(true)
     try {
       const result = await window.agent24.creativeRestart(rectOf(host))
-      setError(result.ok ? null : (result.error ?? 'Open Design failed to restart'))
+      setError(result.ok ? null : (result.error ?? 'iDoris Design 启动失败'))
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Open Design failed to restart')
+      setError(reason instanceof Error ? reason.message : 'iDoris Design 启动失败')
     } finally {
       setRestarting(false)
     }
@@ -168,9 +168,9 @@ export default function CreativePage(): JSX.Element {
       {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} />}
       {tryCreative && error && (
         <div className="creative-error">
-          <div>Open Design unavailable: {error}</div>
+          <div>iDoris Design 暂不可用：{error}</div>
           <button className="btn btn-primary" type="button" disabled={restarting} onClick={() => void restart()}>
-            {restarting ? 'Restarting…' : 'Retry Open Design'}
+            {restarting ? '正在启动 iDoris Design…' : '重试'}
           </button>
         </div>
       )}

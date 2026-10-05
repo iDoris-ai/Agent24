@@ -250,7 +250,14 @@ export function verifyComponentContract(root: string, expectedVersion: string): 
  * directory during `tar -x` itself, before any of our verification code
  * runs. Reject the whole tarball before extracting anything. */
 async function assertSafeTarMembers(tarBinary: string, tarballPath: string): Promise<void> {
-  const { stdout } = await execFileAsync(tarBinary, ['-tzf', tarballPath])
+  // Real-app verification (2026-10-05, mac darwin-arm64 closed loop) hit
+  // Node's default 1MB execFile stdout buffer here: the real
+  // open-design-web-standalone/node_modules tree alone lists tens of
+  // thousands of members, so `tar -tzf`'s output routinely exceeds 1MB on a
+  // real build — the unit tests' tiny fixture tarballs never did. 64MB
+  // matches the maxBuffer already used elsewhere in this pipeline
+  // (stage-open-design-resources.mjs / prepare-open-design-linux-resources.mjs).
+  const { stdout } = await execFileAsync(tarBinary, ['-tzf', tarballPath], { maxBuffer: 64 * 1024 * 1024 })
   for (const rawName of stdout.split('\n').map((line) => line.trim()).filter(Boolean)) {
     const name = rawName.endsWith('/') ? rawName.slice(0, -1) : rawName
     if (name.startsWith('/') || name.split('/').includes('..')) {
@@ -399,7 +406,7 @@ export class OpenDesignComponentInstaller {
       this.setStatus({ state: 'verifying' })
       await assertSafeTarMembers(this.tarBinary, tarballPath)
       fs.mkdirSync(partialDir, { recursive: true })
-      await execFileAsync(this.tarBinary, ['-xzf', tarballPath, '--no-same-owner', '-C', partialDir])
+      await execFileAsync(this.tarBinary, ['-xzf', tarballPath, '--no-same-owner', '-C', partialDir], { maxBuffer: 64 * 1024 * 1024 })
       verifyComponentContract(partialDir, manifest.version)
       fs.writeFileSync(path.join(partialDir, COMPONENT_MARKER_FILE), JSON.stringify({ sha256: manifest.sha256 }))
 

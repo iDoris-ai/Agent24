@@ -338,6 +338,36 @@ describe('OpenDesignComponentInstaller', () => {
     expect(leftovers).toEqual([])
   })
 
+  it('installs a tarball whose `tar -tzf` member listing exceeds 1MB (real-app regression, 2026-10-05)', { timeout: 40_000 }, async () => {
+    // Found via a real local-server closed-loop test against an actual mac
+    // tools-pack build: the real open-design-web-standalone/node_modules
+    // tree alone lists tens of thousands of members, so `tar -tzf`'s stdout
+    // routinely exceeds Node's default 1MB execFile buffer — the install
+    // failed with "iDoris Design 组件下载失败： stdout maxBuffer length
+    // exceeded" in the actual packaged app. This fixture reproduces that at
+    // a much smaller (but still >1MB-of-listing) scale so the test suite
+    // stays fast.
+    const stage = seedTreeFor('a24-od-stage-manymembers-')
+    const manyFilesDir = path.join(stage, 'open-design', 'many')
+    fs.mkdirSync(manyFilesDir, { recursive: true })
+    // Padded (long) filenames so 8000 entries' `tar -tzf` listing clears 1MB
+    // (measured ~1.46MB for this exact fixture) without needing tens of
+    // thousands of files, which would make the test slow.
+    const pad = 'x'.repeat(150)
+    for (let i = 0; i < 8000; i += 1) {
+      fs.writeFileSync(path.join(manyFilesDir, `file-${String(i).padStart(5, '0')}-${pad}.txt`), '')
+    }
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-manymembers-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+  })
+
   it('rejects a wrong sha256 and leaves nothing behind', async () => {
     const stage = seedTreeFor('a24-od-stage-badsha-')
     const tarPath = buildTarball(stage)

@@ -72,7 +72,7 @@ describe('CreativePage', () => {
     })
 
     await waitFor(() => expect(queryByText(/daemon unavailable/)).not.toBeNull())
-    fireEvent.click(getByRole('button', { name: 'Retry Open Design' }))
+    fireEvent.click(getByRole('button', { name: '重试' }))
 
     await waitFor(() => expect(creativeRestart).toHaveBeenCalledWith({ x: 220, y: 50, width: 900, height: 650 }))
     await waitFor(() => expect(queryByText(/daemon unavailable/)).toBeNull())
@@ -83,7 +83,7 @@ describe('CreativePage', () => {
     const { queryByText, getByRole } = render(<CreativePage />)
 
     await waitFor(() => expect(queryByText(/launch IPC failed/)).not.toBeNull())
-    expect(getByRole('button', { name: 'Retry Open Design' })).toBeTruthy()
+    expect(getByRole('button', { name: '重试' })).toBeTruthy()
   })
 })
 
@@ -107,8 +107,10 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     render(<CreativePage />)
 
     await waitFor(() => expect(creativeShow).toHaveBeenCalled())
-    expect(screen.queryByText(/iDoris Design/)).toBeNull()
-    expect(screen.queryByText(/Open Design unavailable/)).toBeNull()
+    // Dev mode succeeded via CreativeServeWeb's checkout fallback — no
+    // download card and no error banner at all.
+    expect(screen.queryByText(/暂不可用/)).toBeNull()
+    expect(screen.queryByRole('button', { name: '下载' })).toBeNull()
   })
 
   it('H1: unavailable + creativeShow reports needsDownload -> shows the not-installed download card', async () => {
@@ -125,8 +127,10 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     creativeShow.mockResolvedValue({ ok: false, error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design' })
     render(<CreativePage />)
 
-    expect(await screen.findByText(/Open Design runtime not found/)).toBeTruthy()
-    expect(screen.queryByText(/iDoris Design/)).toBeNull()
+    expect(await screen.findByText(/iDoris Design 暂不可用：Open Design runtime not found/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: '重试' })).toBeTruthy()
+    // The download card (not the generic error banner) is what owns "下载".
+    expect(screen.queryByRole('button', { name: '下载' })).toBeNull()
   })
 
   it('drives download -> install click -> progress -> installed, then starts Creative', async () => {
