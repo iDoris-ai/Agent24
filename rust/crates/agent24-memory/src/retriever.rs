@@ -171,7 +171,75 @@ fn to_match_query(query: &str) -> Option<String> {
     to_match_query_with(query, " ")
 }
 
+/// M1-T07.2 (review #675): English stop-words AND the ledger's own metadata
+/// words. Every assertion's `subject`/`predicate` columns are indexed
+/// alongside `object` (`retriever.rs` module doc), and in production those
+/// columns are literally `"user"` / `"said_to_remember"` (split by the FTS
+/// tokenizer into `said`/`to`/`remember`) for EVERY row — so an OR query
+/// containing any of these words would spuriously match the entire corpus.
+/// OR-mode only: AND (`search`) already requires every term, so a stray
+/// `"my"` there just yields zero hits rather than over-matching.
+const OR_MODE_NOISE_WORDS: &[&str] = &[
+    "to", "is", "the", "a", "an", "of", "in", "on", "for", "my", "i", "me", "you", "what", "how",
+    "why", "are", "do", "does", "can", "please", "user", "said", "remember", "and", "with", "it",
+    "that", "this", "be", "at", "or", "as", "by", "from",
+    // Review #675 Low: splitting on punctuation strands a bare possessive
+    // `'s`/apostrophe-t as a 1-letter term ("dog's" -> "dog", "s"; "don't"
+    // -> "don", "t") — neither carries any topic signal on its own.
+    "s", "t",
+];
+
+/// M1-T07.2 round 2 (review #675 M2): a SINGLE stray function/particle
+/// character (a bigram of length 1, from an isolated one-char Han run —
+/// e.g. the trailing "吗" in "你用Rust吗") carries no content on its own;
+/// unlike a 2-char bigram, there is no word it could be a syllable of.
+const CJK_FUNCTION_CHARS: &str = "我你他她它们的吗呢吧啊么什哪怎这那";
+
+/// M1-T07.2 round 2 (review #675 M2): explicit generic CJK question/
+/// possessive bigrams, NOT a character-class rule. Round 1 used
+/// `chars().any(|ch| CJK_FUNCTION_CHARS.contains(ch))`, which also deleted
+/// real two-character WORDS that merely CONTAIN one of those characters as
+/// one syllable — "吗啡" (morphine; contains 吗), "酒吧" (bar; contains
+/// 吧), "他人" (other people; contains 他) all got silently dropped, and
+/// "吗啡" is safety-relevant (a forgotten allergy going unrecalled). A
+/// `chars().all(...)` character-class rule does not have that bug, but
+/// re-opens the ORIGINAL over-matching problem it was supposed to fix: in
+/// "我对什么过敏" the bigram "我对" has one function char (我) and one
+/// content char (对) and would SURVIVE an `all()` rule, exactly the kind of
+/// generic "我对/我的/我在…" prefix that spuriously OR-matches almost every
+/// personal assertion regardless of topic. An explicit set of the actual
+/// generic bigrams observed to cause that over-matching is the precise
+/// middle ground: it cannot touch "吗啡"/"酒吧"/"他人" (none of those are
+/// in this list), and it still drops "我对"/"什么"/etc. Two-character
+/// overlap ARTIFACTS the bigram tokenizer produces at the seam between a
+/// stopword and the next real word (e.g. "对什", "么过" inside "我对什么
+/// 过敏") are deliberately left un-filtered rather than guessed at: they
+/// are specific to one exact character sequence, essentially never recur
+/// as a substring of unrelated content, and so are harmless noise rather
+/// than a real over-matching vector — unlike "我对" itself, which recurs
+/// in front of every "我对X" assertion.
+const CJK_STOPWORD_BIGRAMS: &[&str] = &[
+    "我的", "我对", "我在", "我是", "我有", "我养", "你的", "你在", "你是", "他的", "她的", "它的",
+    "什么", "怎么", "哪里", "哪个", "这个", "那个", "这是", "那是", "是什", "么样",
+];
+
+fn is_or_mode_noise_term(term: &str) -> bool {
+    let lower = term.to_lowercase();
+    OR_MODE_NOISE_WORDS.contains(&lower.as_str())
+}
+
+fn is_function_only_bigram(bigram: &str) -> bool {
+    let mut chars = bigram.chars();
+    match (chars.next(), chars.next()) {
+        // A lone function/particle character.
+        (Some(only), None) => CJK_FUNCTION_CHARS.contains(only),
+        // An explicit generic stopword bigram.
+        _ => CJK_STOPWORD_BIGRAMS.contains(&bigram),
+    }
+}
+
 fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
+    let or_mode = joiner == " OR ";
     let cjk = cjk_bigrams(query);
     let terms: Vec<String> = query
         .split(|ch: char| !ch.is_alphanumeric())
@@ -179,13 +247,17 @@ fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
         .flat_map(|term| {
             // Keep the full mixed token for unicode61 matches. Only OR recall
             // also extracts words like Rust from 你用Rust吗; AND stays unchanged.
-            let expand_mixed = joiner == " OR " && term.chars().any(is_han);
+            let expand_mixed = or_mode && term.chars().any(is_han);
             std::iter::once(term).chain(
                 term.split(is_han)
                     .filter(move |word| expand_mixed && !word.is_empty()),
             )
         })
-        .chain(cjk.split_whitespace())
+        .filter(|term| !or_mode || !is_or_mode_noise_term(term))
+        .chain(
+            cjk.split_whitespace()
+                .filter(|bigram| !or_mode || !is_function_only_bigram(bigram)),
+        )
         .map(|term| format!("\"{term}\""))
         .collect();
     if terms.is_empty() {
@@ -588,10 +660,16 @@ mod tests {
 
     #[test]
     fn only_or_queries_extract_non_han_words_from_mixed_terms() {
+        // M1-T07.2 round 2 (review #675): "吗" alone is a lone question
+        // particle (dropped); "你用" is NOT a stopword bigram (neither
+        // character is purely functional once paired, and it is not in the
+        // explicit list), so it survives alongside the mixed term and the
+        // extracted "Rust".
         assert_eq!(
             to_match_query_with("你用Rust吗", " OR "),
-            Some("\"你用Rust吗\" OR \"Rust\" OR \"你用\" OR \"吗\"".into())
+            Some("\"你用Rust吗\" OR \"Rust\" OR \"你用\"".into())
         );
+        // AND mode (`search`) is untouched by the T07.2 filter.
         assert_eq!(
             to_match_query("你用Rust吗"),
             Some("\"你用Rust吗\" \"你用\" \"吗\"".into())
@@ -600,6 +678,67 @@ mod tests {
             to_match_query_with("Rust B12", " OR "),
             Some("\"Rust\" OR \"B12\"".into())
         );
+    }
+
+    #[test]
+    fn or_mode_drops_english_stopwords_and_the_ledgers_own_metadata_words() {
+        // M1-T07.2: every production assertion's subject/predicate are
+        // literally "user"/"said_to_remember" (split by the tokenizer into
+        // said/to/remember) — an OR query made only of those words, or of
+        // generic English stopwords, must not survive to the FTS MATCH
+        // expression, or it would spuriously match the entire corpus
+        // regardless of topic.
+        assert_eq!(to_match_query_with("what is my", " OR "), None);
+        assert_eq!(to_match_query_with("user said remember", " OR "), None);
+        assert_eq!(
+            to_match_query_with("to the a an of in on for", " OR "),
+            None
+        );
+        // A real content word survives alongside filtered noise.
+        assert_eq!(
+            to_match_query_with("what is Rust for", " OR "),
+            Some("\"Rust\"".into())
+        );
+    }
+
+    #[test]
+    fn or_mode_drops_the_review_round_2_low_stopwords_and_stray_apostrophe_letters() {
+        // Review #675 Low: and/with/it/that/this/be/at/or/as/by/from, plus
+        // the single letters a possessive/contraction apostrophe strands
+        // ("dog's" -> "dog"/"s"; "don't" -> "don"/"t") once punctuation is
+        // split on. Neither "s" nor "t" carries any topic signal alone.
+        assert_eq!(
+            to_match_query_with("and with it that this be at or as by from", " OR "),
+            None
+        );
+        assert_eq!(
+            to_match_query_with("what is my dog's name", " OR "),
+            Some("\"dog\" OR \"name\"".into())
+        );
+    }
+
+    #[test]
+    fn or_mode_drops_explicit_stopword_bigrams_but_keeps_content_bigrams() {
+        // "我对什么过敏" ("what am I allergic to?"): "我对"/"什么" are
+        // explicit stopword bigrams and must not survive OR mode; "对什"/
+        // "么过" are harmless seam artifacts (see `CJK_STOPWORD_BIGRAMS`'s
+        // doc comment) that are left in; "过敏" ("allergy") is the real
+        // content bigram and must survive.
+        assert_eq!(
+            to_match_query_with("我对什么过敏？", " OR "),
+            Some("\"对什\" OR \"么过\" OR \"过敏\"".into())
+        );
+    }
+
+    #[test]
+    fn or_mode_keeps_two_character_words_that_merely_contain_a_function_character() {
+        // M1-T07.2 round 2 (review #675 M2): the real safety-relevant bug
+        // round 1's `any()` rule caused. None of these is in
+        // `CJK_STOPWORD_BIGRAMS`, so none is dropped even though each
+        // contains one `CJK_FUNCTION_CHARS` character as a syllable.
+        assert_eq!(to_match_query_with("吗啡", " OR "), Some("\"吗啡\"".into()));
+        assert_eq!(to_match_query_with("酒吧", " OR "), Some("\"酒吧\"".into()));
+        assert_eq!(to_match_query_with("他人", " OR "), Some("\"他人\"".into()));
     }
 
     #[test]
@@ -746,5 +885,78 @@ mod tests {
         );
         assert_eq!(to_match_query(""), None);
         assert_eq!(to_match_query("*()\""), None);
+    }
+
+    #[tokio::test]
+    async fn or_mode_recalls_every_matching_assertion_even_when_half_the_owners_corpus_shares_the_topic()
+     {
+        // Regression (PR-Daemon review on #675, SQL-probed): a bm25 floor
+        // was tried in a prior round of this PR to reject "noise" OR
+        // matches, reasoning that FTS5 clamps idf to a tiny positive value
+        // once a term is common. That reasoning was backwards for a
+        // REAL owner's corpus: SQLite's bm25 clamps idf to that same tiny
+        // value whenever a term appears in MORE THAN HALF of the matching
+        // documents — which a real personal topic (here: 3 of this
+        // owner's 6 assertions are about allergies) does completely
+        // legitimately. The floor silently turned a real 3-hit recall into
+        // zero hits. There is no floor anymore; this just pins the correct
+        // behavior directly.
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        for (id, text) in [
+            ("peanut", "我对花生过敏"),
+            ("seafood", "我对海鲜过敏"),
+            ("dust", "我对尘螨过敏"),
+            ("job", "我在字节跳动工作"),
+            ("pet", "我养了一只猫"),
+            ("color", "我最喜欢蓝色"),
+        ] {
+            l.assert(&a(id, "u-common-topic", "user", json!(text)))
+                .await
+                .unwrap();
+        }
+        let hits = r
+            .search_any("我对什么过敏？", "u-common-topic", 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.assertion.id.as_str()).collect();
+        assert!(ids.contains(&"peanut"), "{ids:?}");
+        assert!(ids.contains(&"seafood"), "{ids:?}");
+        assert!(ids.contains(&"dust"), "{ids:?}");
+        assert_eq!(
+            ids.len(),
+            3,
+            "the 3 unrelated assertions must not match: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn or_mode_recall_is_not_suppressed_by_an_unrelated_owners_bulk_of_the_same_topic() {
+        // Regression (PR-Daemon review on #675): `mem_assertions_fts` is ONE
+        // shared virtual table across ALL owners — bm25's idf is computed
+        // over the WHOLE table, not scoped per owner. A floor keyed on
+        // "is this term common" would let owner B's bulk data about an
+        // unrelated topic push owner A's OWN real match below the floor,
+        // even though `scope_owner` already isolates the RESULT rows
+        // correctly. Pins that owner A's recall is unaffected by how much
+        // unrelated same-topic data owner B has.
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        l.assert(&a("a1", "owner-a", "user", json!("我对花生过敏")))
+            .await
+            .unwrap();
+        for i in 0..50 {
+            l.assert(&a(
+                &format!("b-{i}"),
+                "owner-b",
+                "user",
+                json!(format!("我对花生过敏第{i}条")),
+            ))
+            .await
+            .unwrap();
+        }
+        let hits = r.search_any("我对什么过敏？", "owner-a", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].assertion.id, "a1");
     }
 }

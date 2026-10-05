@@ -1079,6 +1079,67 @@ impl Store {
         Ok(())
     }
 
+    /// Append several messages to a run's durable thread in ONE transaction
+    /// (M1-T07.1 M3): all rows land or none do — the caller's fail-closed
+    /// contract (abort the run rather than resume from a partially persisted
+    /// snapshot) needs this to be a single atomic unit, not N independent
+    /// single-row appends that could succeed-then-fail partway through.
+    /// `seq` is still assigned per row as `MAX(seq)+1`, computed against the
+    /// SAME transaction, so sequential rows see each prior row's seq.
+    /// A no-op (not even an empty transaction) for an empty slice.
+    pub async fn append_run_messages_tx(
+        &self,
+        run_id: &str,
+        messages: &[PendingRunMessage],
+        now: &str,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        for msg in messages {
+            let tool_calls_json = serde_json::to_string(&msg.tool_calls)?;
+            sqlx::query(
+                "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, tool_call_id, created_at) \
+                 VALUES (?, (SELECT COALESCE(MAX(seq), -1) + 1 FROM run_messages WHERE run_id = ?), ?, ?, ?, ?, ?)",
+            )
+            .bind(run_id)
+            .bind(run_id)
+            .bind(&msg.role)
+            .bind(msg.content.as_deref())
+            .bind(&tool_calls_json)
+            .bind(msg.tool_call_id.as_deref())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete a contiguous `seq` range from a run's thread (M1-T07.1 M3: the
+    /// growth-control half — once a run is confirmed terminal, the copy of
+    /// the session's PRIOR context inside its own `run_messages` is pure
+    /// duplication of what `SessionLog` already holds durably, so it is
+    /// reclaimed to keep this table from growing O(session length) on every
+    /// single turn of a long session. Best-effort by design: callers log and
+    /// continue on error rather than fail an already-terminal run over
+    /// housekeeping.
+    pub async fn delete_run_message_range(
+        &self,
+        run_id: &str,
+        start_seq: i64,
+        end_seq: i64,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM run_messages WHERE run_id = ? AND seq BETWEEN ? AND ?")
+            .bind(run_id)
+            .bind(start_seq)
+            .bind(end_seq)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     /// The full per-run thread in append order. Empty for a run that never
     /// reached its first persisted message (or one from before this table).
     pub async fn list_run_messages(&self, run_id: &str) -> Result<Vec<RunMessage>> {
@@ -1213,6 +1274,17 @@ pub struct RunMessage {
     pub tool_calls: Value,
     pub tool_call_id: Option<String>,
     pub created_at: String,
+}
+
+/// One row of a batch write to [`Store::append_run_messages_tx`]. The same
+/// shape as [`RunMessage`] minus `run_id`/`seq`/`created_at`, which the store
+/// assigns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingRunMessage {
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_calls: Value,
+    pub tool_call_id: Option<String>,
 }
 
 /// One stored user rule.
@@ -1535,6 +1607,124 @@ mod tests {
         assert_eq!(
             store.timed_out_approval_recovery_run_ids().await.unwrap(),
             vec!["run_1".to_owned()]
+        );
+    }
+
+    async fn minimal_run(store: &Store, run_id: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at)
+             VALUES (?, 'queued', '{}', '{}', '2026-07-24T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    fn pending(role: &str, content: &str) -> PendingRunMessage {
+        PendingRunMessage {
+            role: role.to_owned(),
+            content: Some(content.to_owned()),
+            tool_calls: Value::Array(vec![]),
+            tool_call_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn append_run_messages_tx_assigns_sequential_seq_in_order() {
+        // M1-T07.1 M3 (review #674): the whole point of the batch write is
+        // ordering + atomicity, not just "several single appends in a
+        // loop" — seq must come out 0, 1, 2 in the SAME order passed in.
+        let store = Store::open_memory().await.unwrap();
+        minimal_run(&store, "run_x").await;
+        store
+            .append_run_messages_tx(
+                "run_x",
+                &[
+                    pending("user", "a"),
+                    pending("assistant", "b"),
+                    pending("user", "c"),
+                ],
+                "2026-07-24T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let thread = store.list_run_messages("run_x").await.unwrap();
+        assert_eq!(
+            thread
+                .iter()
+                .map(|m| (m.seq, m.role.as_str(), m.content.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "user", Some("a")),
+                (1, "assistant", Some("b")),
+                (2, "user", Some("c")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_run_messages_tx_is_all_or_nothing() {
+        // A failure partway through the batch must leave NOTHING behind —
+        // the fail-closed contract the caller relies on (a partial snapshot
+        // would be worse than none: it would resume-reconstruct as if that
+        // partial prefix were the complete first-call input).
+        let store = Store::open_memory().await.unwrap();
+        minimal_run(&store, "run_y").await;
+        sqlx::query(
+            "CREATE TRIGGER reject_b BEFORE INSERT ON run_messages \
+             WHEN NEW.content = 'b' \
+             BEGIN SELECT RAISE(FAIL, 'injected failure'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let err = store
+            .append_run_messages_tx(
+                "run_y",
+                &[pending("user", "a"), pending("assistant", "b")],
+                "2026-07-24T00:00:00Z",
+            )
+            .await;
+        assert!(err.is_err());
+        assert!(store.list_run_messages("run_y").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_run_messages_tx_on_an_empty_slice_is_a_true_no_op() {
+        let store = Store::open_memory().await.unwrap();
+        minimal_run(&store, "run_z").await;
+        store
+            .append_run_messages_tx("run_z", &[], "2026-07-24T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(store.list_run_messages("run_z").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_run_message_range_removes_only_that_range() {
+        let store = Store::open_memory().await.unwrap();
+        minimal_run(&store, "run_w").await;
+        store
+            .append_run_messages_tx(
+                "run_w",
+                &[
+                    pending("user", "a"),
+                    pending("assistant", "b"),
+                    pending("user", "c"),
+                ],
+                "2026-07-24T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        store.delete_run_message_range("run_w", 1, 1).await.unwrap();
+        let thread = store.list_run_messages("run_w").await.unwrap();
+        assert_eq!(
+            thread
+                .iter()
+                .map(|m| m.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("a"), Some("c")]
         );
     }
 }
