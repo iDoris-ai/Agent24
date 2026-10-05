@@ -312,7 +312,16 @@ jobs:
           set -euo pipefail
           APPIMAGE_ROOT="$RUNNER_TEMP/desktop-package-verify/appimage/squashfs-root"
           test -d "$APPIMAGE_ROOT"
-          RUNTIME_EXECUTABLE="$(readlink -f "$APPIMAGE_ROOT/AppRun")"
+          # AppRun is electron-builder's own generated wrapper SCRIPT (not a
+          # symlink to the binary — real run, 2026-10-05: it failed with
+          # "/agent24-desktop: No such file or directory" because it
+          # resolves its own binary's location relative to $APPDIR, which
+          # is only set when actually launched through the AppImage FUSE
+          # mount, not when run directly from this extracted squashfs-root).
+          # The real binary sits at the top of squashfs-root, named after
+          # package.json's build.linux.executableName.
+          EXECUTABLE_NAME="$(jq -r '.build.linux.executableName' package.json)"
+          RUNTIME_EXECUTABLE="$APPIMAGE_ROOT/$EXECUTABLE_NAME"
           test -x "$RUNTIME_EXECUTABLE"
           A24_SMOKE_RUNTIME_EXECUTABLE="$RUNTIME_EXECUTABLE" node scripts/ci-on-demand-smoke.mjs
 
@@ -594,10 +603,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          APP="$(find release -maxdepth 2 -name '*.app' -print -quit)"
+          APP="$(realpath "$(find release -maxdepth 2 -name '*.app' -print -quit)")"
           test -n "$APP"
           codesign --force --deep --sign - "$APP"
           codesign -dv "$APP"
+          # Absolute: M2's smoke-test step below reads this from a
+          # DIFFERENT working directory context and requires an absolute
+          # path (a relative one broke CI — 2026-10-05 real run).
           echo "A24_SIGNED_APP_PATH=$APP" >> "$GITHUB_ENV"
 
       - name: 'electron-builder (macOS: pack the SIGNED .app into a dmg)'
