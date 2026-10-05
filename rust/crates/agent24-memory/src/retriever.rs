@@ -238,33 +238,6 @@ fn is_function_only_bigram(bigram: &str) -> bool {
     }
 }
 
-/// M1-T07.2 round 2 (review #675 M1): the second safety net — an OR hit
-/// whose bm25 relevance (negated, higher = better) does not clear this
-/// floor is dropped even though it matched a term.
-///
-/// Round 1 used `0.0`, reasoning that FTS5's bm25 is corpus-size-dependent
-/// and a genuine match in a tiny test fixture can score as low as `1e-6`.
-/// Review's correction: `0.0` is DEAD CODE — FTS5 clamps a non-positive idf
-/// to a small positive floor (empirically ~`1e-6`) rather than ever letting
-/// bm25 go to zero or negative, so a negated score is ALWAYS strictly
-/// positive and `score > 0.0` never actually rejects anything. The real
-/// signal is relative, not absolute-but-corpus-size-blind: in a small
-/// corpus a genuine match ALSO lands near that same `~1e-6` clamp (not
-/// enough documents for idf to separate "common" from "rare"), so `1e-3`
-/// would wrongly reject it (round 1's own failure mode); once the owner's
-/// corpus is large enough for idf to be meaningful, a genuine match scores
-/// far above the clamp (empirically into the low single digits) while a
-/// pure noise/filler-word match stays pinned near the clamp. So: only
-/// enable the `1e-3` floor once this owner has at least
-/// [`OR_MODE_MIN_SCORE_ACTIVATION_COUNT`] assertions; below that, the floor
-/// is disabled (`f32::MIN`) rather than risk rejecting a real but
-/// small-corpus match the way round 1's blanket floor would have.
-const OR_MODE_MIN_SCORE: f32 = 1e-3;
-/// See [`OR_MODE_MIN_SCORE`]. Chosen as the review's own number, which is
-/// also the smallest size at which this codebase's other fixtures (`eval_m1`
-/// seeds ~24 assertions per owner) already sit comfortably above it.
-const OR_MODE_MIN_SCORE_ACTIVATION_COUNT: i64 = 5;
-
 fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
     let or_mode = joiner == " OR ";
     let cjk = cjk_bigrams(query);
@@ -335,31 +308,6 @@ impl FtsRetriever {
         .fetch_all(&self.pool)
         .await?;
 
-        // M1-T07.2 round 2: a second, independent safety net for OR mode
-        // specifically — on top of the noise-word/function-bigram filtering
-        // above, a hit whose bm25 relevance is near the FTS5 idf clamp (an
-        // incidental, barely-there overlap that survived term filtering
-        // anyway) is dropped rather than returned, but ONLY once this
-        // owner's corpus is large enough for that clamp to be a meaningful
-        // "this term matches almost everything" signal (see
-        // `OR_MODE_MIN_SCORE`'s doc comment) — otherwise a real match in a
-        // small corpus would score at the same clamp and get wrongly
-        // rejected. AND mode (`search`) is untouched either way: requiring
-        // every term already bounds how weak a match can be.
-        let min_score = if joiner == " OR " {
-            let owner_assertion_count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM mem_assertions WHERE scope_owner = ?")
-                    .bind(owner)
-                    .fetch_one(&self.pool)
-                    .await?;
-            if owner_assertion_count >= OR_MODE_MIN_SCORE_ACTIVATION_COUNT {
-                OR_MODE_MIN_SCORE
-            } else {
-                f32::MIN
-            }
-        } else {
-            f32::MIN
-        };
         rows.iter()
             .map(|r| {
                 Ok(SearchHit {
@@ -367,12 +315,7 @@ impl FtsRetriever {
                     score: r.get::<f64, _>("score") as f32,
                 })
             })
-            .collect::<Result<Vec<_>>>()
-            .map(|hits| {
-                hits.into_iter()
-                    .filter(|hit| hit.score > min_score)
-                    .collect()
-            })
+            .collect()
     }
 }
 
@@ -945,57 +888,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn or_mode_min_score_floor_activates_once_the_owner_has_enough_assertions() {
-        // M1-T07.2 round 2 (review #675 M1): 5 assertions sharing "喜欢"
-        // ("like") as a near-universal filler word, one of which ALSO
-        // names a specific, rare topic. Once this owner's corpus reaches
-        // the activation count, FTS5's idf for "喜欢" (it matches every
-        // row) clamps to a near-zero value and the floor rejects it —
-        // while "红色" (matches exactly one row) scores far above the
-        // floor and survives.
+    async fn or_mode_recalls_every_matching_assertion_even_when_half_the_owners_corpus_shares_the_topic()
+     {
+        // Regression (PR-Daemon review on #675, SQL-probed): a bm25 floor
+        // was tried in a prior round of this PR to reject "noise" OR
+        // matches, reasoning that FTS5 clamps idf to a tiny positive value
+        // once a term is common. That reasoning was backwards for a
+        // REAL owner's corpus: SQLite's bm25 clamps idf to that same tiny
+        // value whenever a term appears in MORE THAN HALF of the matching
+        // documents — which a real personal topic (here: 3 of this
+        // owner's 6 assertions are about allergies) does completely
+        // legitimately. The floor silently turned a real 3-hit recall into
+        // zero hits. There is no floor anymore; this just pins the correct
+        // behavior directly.
         let (kv, r) = fixture().await;
         let l = kv.assertions();
-        for (i, topic) in ["苹果", "香蕉", "葡萄", "西瓜", "红色"]
-            .into_iter()
-            .enumerate()
-        {
+        for (id, text) in [
+            ("peanut", "我对花生过敏"),
+            ("seafood", "我对海鲜过敏"),
+            ("dust", "我对尘螨过敏"),
+            ("job", "我在字节跳动工作"),
+            ("pet", "我养了一只猫"),
+            ("color", "我最喜欢蓝色"),
+        ] {
+            l.assert(&a(id, "u-common-topic", "user", json!(text)))
+                .await
+                .unwrap();
+        }
+        let hits = r
+            .search_any("我对什么过敏？", "u-common-topic", 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.assertion.id.as_str()).collect();
+        assert!(ids.contains(&"peanut"), "{ids:?}");
+        assert!(ids.contains(&"seafood"), "{ids:?}");
+        assert!(ids.contains(&"dust"), "{ids:?}");
+        assert_eq!(
+            ids.len(),
+            3,
+            "the 3 unrelated assertions must not match: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn or_mode_recall_is_not_suppressed_by_an_unrelated_owners_bulk_of_the_same_topic() {
+        // Regression (PR-Daemon review on #675): `mem_assertions_fts` is ONE
+        // shared virtual table across ALL owners — bm25's idf is computed
+        // over the WHOLE table, not scoped per owner. A floor keyed on
+        // "is this term common" would let owner B's bulk data about an
+        // unrelated topic push owner A's OWN real match below the floor,
+        // even though `scope_owner` already isolates the RESULT rows
+        // correctly. Pins that owner A's recall is unaffected by how much
+        // unrelated same-topic data owner B has.
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        l.assert(&a("a1", "owner-a", "user", json!("我对花生过敏")))
+            .await
+            .unwrap();
+        for i in 0..50 {
             l.assert(&a(
-                &format!("fav-{i}"),
-                "u-floor",
+                &format!("b-{i}"),
+                "owner-b",
                 "user",
-                json!(format!("我喜欢{topic}")),
+                json!(format!("我对花生过敏第{i}条")),
             ))
             .await
             .unwrap();
         }
-        assert!(
-            r.search_any("喜欢", "u-floor", 10)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a filler word matching every row in a large-enough corpus must be rejected by the floor"
-        );
-        let hits = r.search_any("红色", "u-floor", 10).await.unwrap();
+        let hits = r.search_any("我对什么过敏？", "owner-a", 10).await.unwrap();
         assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].assertion.id, "fav-4");
-    }
-
-    #[tokio::test]
-    async fn or_mode_min_score_floor_is_disabled_below_the_activation_count() {
-        // Negative control for the test above: with only 2 assertions for
-        // this owner (below `OR_MODE_MIN_SCORE_ACTIVATION_COUNT`), the SAME
-        // filler-word query must NOT be rejected — there are not enough
-        // documents for idf to tell "common filler" apart from "rare
-        // topic", so the floor would reject a perfectly real match.
-        let (kv, r) = fixture().await;
-        let l = kv.assertions();
-        l.assert(&a("a1", "u-small", "user", json!("我喜欢苹果")))
-            .await
-            .unwrap();
-        l.assert(&a("a2", "u-small", "user", json!("我喜欢香蕉")))
-            .await
-            .unwrap();
-        let hits = r.search_any("喜欢", "u-small", 10).await.unwrap();
-        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].assertion.id, "a1");
     }
 }
