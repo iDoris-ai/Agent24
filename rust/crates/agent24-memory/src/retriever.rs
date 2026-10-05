@@ -181,17 +181,47 @@ fn to_match_query(query: &str) -> Option<String> {
 /// `"my"` there just yields zero hits rather than over-matching.
 const OR_MODE_NOISE_WORDS: &[&str] = &[
     "to", "is", "the", "a", "an", "of", "in", "on", "for", "my", "i", "me", "you", "what", "how",
-    "why", "are", "do", "does", "can", "please", "user", "said", "remember",
+    "why", "are", "do", "does", "can", "please", "user", "said", "remember", "and", "with", "it",
+    "that", "this", "be", "at", "or", "as", "by", "from",
+    // Review #675 Low: splitting on punctuation strands a bare possessive
+    // `'s`/apostrophe-t as a 1-letter term ("dog's" -> "dog", "s"; "don't"
+    // -> "don", "t") — neither carries any topic signal on its own.
+    "s", "t",
 ];
 
-/// M1-T07.2: CJK bigrams made of pronouns/function characters carry almost
-/// no topic signal ("我的"/"你吗"/"这什么"…) and are exactly what let a
-/// generic "我的X是什么" question OR-match every CJK assertion regardless of
-/// topic. Deliberately narrow: only these characters, and NOT "了"/"在" —
-/// widening this list to other real content characters would start
-/// silently dropping real recall, which is worse than the over-matching
-/// this filter fixes.
+/// M1-T07.2 round 2 (review #675 M2): a SINGLE stray function/particle
+/// character (a bigram of length 1, from an isolated one-char Han run —
+/// e.g. the trailing "吗" in "你用Rust吗") carries no content on its own;
+/// unlike a 2-char bigram, there is no word it could be a syllable of.
 const CJK_FUNCTION_CHARS: &str = "我你他她它们的吗呢吧啊么什哪怎这那";
+
+/// M1-T07.2 round 2 (review #675 M2): explicit generic CJK question/
+/// possessive bigrams, NOT a character-class rule. Round 1 used
+/// `chars().any(|ch| CJK_FUNCTION_CHARS.contains(ch))`, which also deleted
+/// real two-character WORDS that merely CONTAIN one of those characters as
+/// one syllable — "吗啡" (morphine; contains 吗), "酒吧" (bar; contains
+/// 吧), "他人" (other people; contains 他) all got silently dropped, and
+/// "吗啡" is safety-relevant (a forgotten allergy going unrecalled). A
+/// `chars().all(...)` character-class rule does not have that bug, but
+/// re-opens the ORIGINAL over-matching problem it was supposed to fix: in
+/// "我对什么过敏" the bigram "我对" has one function char (我) and one
+/// content char (对) and would SURVIVE an `all()` rule, exactly the kind of
+/// generic "我对/我的/我在…" prefix that spuriously OR-matches almost every
+/// personal assertion regardless of topic. An explicit set of the actual
+/// generic bigrams observed to cause that over-matching is the precise
+/// middle ground: it cannot touch "吗啡"/"酒吧"/"他人" (none of those are
+/// in this list), and it still drops "我对"/"什么"/etc. Two-character
+/// overlap ARTIFACTS the bigram tokenizer produces at the seam between a
+/// stopword and the next real word (e.g. "对什", "么过" inside "我对什么
+/// 过敏") are deliberately left un-filtered rather than guessed at: they
+/// are specific to one exact character sequence, essentially never recur
+/// as a substring of unrelated content, and so are harmless noise rather
+/// than a real over-matching vector — unlike "我对" itself, which recurs
+/// in front of every "我对X" assertion.
+const CJK_STOPWORD_BIGRAMS: &[&str] = &[
+    "我的", "我对", "我在", "我是", "我有", "我养", "你的", "你在", "你是", "他的", "她的", "它的",
+    "什么", "怎么", "哪里", "哪个", "这个", "那个", "这是", "那是", "是什", "么样",
+];
 
 fn is_or_mode_noise_term(term: &str) -> bool {
     let lower = term.to_lowercase();
@@ -199,26 +229,41 @@ fn is_or_mode_noise_term(term: &str) -> bool {
 }
 
 fn is_function_only_bigram(bigram: &str) -> bool {
-    bigram.chars().any(|ch| CJK_FUNCTION_CHARS.contains(ch))
+    let mut chars = bigram.chars();
+    match (chars.next(), chars.next()) {
+        // A lone function/particle character.
+        (Some(only), None) => CJK_FUNCTION_CHARS.contains(only),
+        // An explicit generic stopword bigram.
+        _ => CJK_STOPWORD_BIGRAMS.contains(&bigram),
+    }
 }
 
-/// M1-T07.2: the second safety net — an OR hit whose bm25 relevance (negated,
-/// higher = better, see [`FtsRetriever::search_mode`]) does not clear this
+/// M1-T07.2 round 2 (review #675 M1): the second safety net — an OR hit
+/// whose bm25 relevance (negated, higher = better) does not clear this
 /// floor is dropped even though it matched a term.
 ///
-/// Calibrated empirically, NOT set to the review's illustrative "如 score >
-/// 1e-3": SQLite FTS5's bm25 is corpus-size-dependent (idf over however many
-/// rows this owner's partition currently has), and in this codebase's small
-/// test fixtures a genuine, single-term, exact OR/AND match commonly scores
-/// around `1e-6` — `1e-3` is a THOUSAND TIMES stricter than that and silently
-/// turned real hits into empty results (`search_finds_a_matching_assertion`,
-/// `cjk_search_matches_terms_and_full_question`, and three more existing
-/// tests all failed against it; this was caught by actually running the
-/// suite, not by inspection). `0.0` keeps the only floor that is actually
-/// corpus-size-independent and well-defined regardless of scale: reject a
-/// non-positive score (the document provided literally no information),
-/// never a positive-but-small one.
-const OR_MODE_MIN_SCORE: f32 = 0.0;
+/// Round 1 used `0.0`, reasoning that FTS5's bm25 is corpus-size-dependent
+/// and a genuine match in a tiny test fixture can score as low as `1e-6`.
+/// Review's correction: `0.0` is DEAD CODE — FTS5 clamps a non-positive idf
+/// to a small positive floor (empirically ~`1e-6`) rather than ever letting
+/// bm25 go to zero or negative, so a negated score is ALWAYS strictly
+/// positive and `score > 0.0` never actually rejects anything. The real
+/// signal is relative, not absolute-but-corpus-size-blind: in a small
+/// corpus a genuine match ALSO lands near that same `~1e-6` clamp (not
+/// enough documents for idf to separate "common" from "rare"), so `1e-3`
+/// would wrongly reject it (round 1's own failure mode); once the owner's
+/// corpus is large enough for idf to be meaningful, a genuine match scores
+/// far above the clamp (empirically into the low single digits) while a
+/// pure noise/filler-word match stays pinned near the clamp. So: only
+/// enable the `1e-3` floor once this owner has at least
+/// [`OR_MODE_MIN_SCORE_ACTIVATION_COUNT`] assertions; below that, the floor
+/// is disabled (`f32::MIN`) rather than risk rejecting a real but
+/// small-corpus match the way round 1's blanket floor would have.
+const OR_MODE_MIN_SCORE: f32 = 1e-3;
+/// See [`OR_MODE_MIN_SCORE`]. Chosen as the review's own number, which is
+/// also the smallest size at which this codebase's other fixtures (`eval_m1`
+/// seeds ~24 assertions per owner) already sit comfortably above it.
+const OR_MODE_MIN_SCORE_ACTIVATION_COUNT: i64 = 5;
 
 fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
     let or_mode = joiner == " OR ";
@@ -290,14 +335,28 @@ impl FtsRetriever {
         .fetch_all(&self.pool)
         .await?;
 
-        // M1-T07.2: a second, independent safety net for OR mode specifically
-        // — on top of the noise-word/function-bigram filtering above, a hit
-        // whose bm25 relevance is near-zero (an incidental, barely-there
-        // overlap that survived term filtering anyway) is dropped rather
-        // than returned. AND mode (`search`) is untouched: requiring every
-        // term already bounds how weak a match can be.
+        // M1-T07.2 round 2: a second, independent safety net for OR mode
+        // specifically — on top of the noise-word/function-bigram filtering
+        // above, a hit whose bm25 relevance is near the FTS5 idf clamp (an
+        // incidental, barely-there overlap that survived term filtering
+        // anyway) is dropped rather than returned, but ONLY once this
+        // owner's corpus is large enough for that clamp to be a meaningful
+        // "this term matches almost everything" signal (see
+        // `OR_MODE_MIN_SCORE`'s doc comment) — otherwise a real match in a
+        // small corpus would score at the same clamp and get wrongly
+        // rejected. AND mode (`search`) is untouched either way: requiring
+        // every term already bounds how weak a match can be.
         let min_score = if joiner == " OR " {
-            OR_MODE_MIN_SCORE
+            let owner_assertion_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM mem_assertions WHERE scope_owner = ?")
+                    .bind(owner)
+                    .fetch_one(&self.pool)
+                    .await?;
+            if owner_assertion_count >= OR_MODE_MIN_SCORE_ACTIVATION_COUNT {
+                OR_MODE_MIN_SCORE
+            } else {
+                f32::MIN
+            }
         } else {
             f32::MIN
         };
@@ -658,13 +717,14 @@ mod tests {
 
     #[test]
     fn only_or_queries_extract_non_han_words_from_mixed_terms() {
-        // M1-T07.2 (review #675): the CJK bigrams "你用"/"吗" both contain a
-        // pronoun/question-particle character, so OR mode drops them — the
-        // mixed term itself and the extracted "Rust" survive (neither is a
-        // function bigram or a noise word).
+        // M1-T07.2 round 2 (review #675): "吗" alone is a lone question
+        // particle (dropped); "你用" is NOT a stopword bigram (neither
+        // character is purely functional once paired, and it is not in the
+        // explicit list), so it survives alongside the mixed term and the
+        // extracted "Rust".
         assert_eq!(
             to_match_query_with("你用Rust吗", " OR "),
-            Some("\"你用Rust吗\" OR \"Rust\"".into())
+            Some("\"你用Rust吗\" OR \"Rust\" OR \"你用\"".into())
         );
         // AND mode (`search`) is untouched by the T07.2 filter.
         assert_eq!(
@@ -699,14 +759,43 @@ mod tests {
     }
 
     #[test]
-    fn or_mode_drops_pure_function_bigrams_but_keeps_content_bigrams() {
-        // "我对什么过敏" ("what am I allergic to?"): every bigram except
-        // "过敏" ("allergy") is built from pronoun/question-particle
-        // characters and must not survive OR mode.
+    fn or_mode_drops_the_review_round_2_low_stopwords_and_stray_apostrophe_letters() {
+        // Review #675 Low: and/with/it/that/this/be/at/or/as/by/from, plus
+        // the single letters a possessive/contraction apostrophe strands
+        // ("dog's" -> "dog"/"s"; "don't" -> "don"/"t") once punctuation is
+        // split on. Neither "s" nor "t" carries any topic signal alone.
+        assert_eq!(
+            to_match_query_with("and with it that this be at or as by from", " OR "),
+            None
+        );
+        assert_eq!(
+            to_match_query_with("what is my dog's name", " OR "),
+            Some("\"dog\" OR \"name\"".into())
+        );
+    }
+
+    #[test]
+    fn or_mode_drops_explicit_stopword_bigrams_but_keeps_content_bigrams() {
+        // "我对什么过敏" ("what am I allergic to?"): "我对"/"什么" are
+        // explicit stopword bigrams and must not survive OR mode; "对什"/
+        // "么过" are harmless seam artifacts (see `CJK_STOPWORD_BIGRAMS`'s
+        // doc comment) that are left in; "过敏" ("allergy") is the real
+        // content bigram and must survive.
         assert_eq!(
             to_match_query_with("我对什么过敏？", " OR "),
-            Some("\"过敏\"".into())
+            Some("\"对什\" OR \"么过\" OR \"过敏\"".into())
         );
+    }
+
+    #[test]
+    fn or_mode_keeps_two_character_words_that_merely_contain_a_function_character() {
+        // M1-T07.2 round 2 (review #675 M2): the real safety-relevant bug
+        // round 1's `any()` rule caused. None of these is in
+        // `CJK_STOPWORD_BIGRAMS`, so none is dropped even though each
+        // contains one `CJK_FUNCTION_CHARS` character as a syllable.
+        assert_eq!(to_match_query_with("吗啡", " OR "), Some("\"吗啡\"".into()));
+        assert_eq!(to_match_query_with("酒吧", " OR "), Some("\"酒吧\"".into()));
+        assert_eq!(to_match_query_with("他人", " OR "), Some("\"他人\"".into()));
     }
 
     #[test]
@@ -853,5 +942,60 @@ mod tests {
         );
         assert_eq!(to_match_query(""), None);
         assert_eq!(to_match_query("*()\""), None);
+    }
+
+    #[tokio::test]
+    async fn or_mode_min_score_floor_activates_once_the_owner_has_enough_assertions() {
+        // M1-T07.2 round 2 (review #675 M1): 5 assertions sharing "喜欢"
+        // ("like") as a near-universal filler word, one of which ALSO
+        // names a specific, rare topic. Once this owner's corpus reaches
+        // the activation count, FTS5's idf for "喜欢" (it matches every
+        // row) clamps to a near-zero value and the floor rejects it —
+        // while "红色" (matches exactly one row) scores far above the
+        // floor and survives.
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        for (i, topic) in ["苹果", "香蕉", "葡萄", "西瓜", "红色"]
+            .into_iter()
+            .enumerate()
+        {
+            l.assert(&a(
+                &format!("fav-{i}"),
+                "u-floor",
+                "user",
+                json!(format!("我喜欢{topic}")),
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            r.search_any("喜欢", "u-floor", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a filler word matching every row in a large-enough corpus must be rejected by the floor"
+        );
+        let hits = r.search_any("红色", "u-floor", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].assertion.id, "fav-4");
+    }
+
+    #[tokio::test]
+    async fn or_mode_min_score_floor_is_disabled_below_the_activation_count() {
+        // Negative control for the test above: with only 2 assertions for
+        // this owner (below `OR_MODE_MIN_SCORE_ACTIVATION_COUNT`), the SAME
+        // filler-word query must NOT be rejected — there are not enough
+        // documents for idf to tell "common filler" apart from "rare
+        // topic", so the floor would reject a perfectly real match.
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        l.assert(&a("a1", "u-small", "user", json!("我喜欢苹果")))
+            .await
+            .unwrap();
+        l.assert(&a("a2", "u-small", "user", json!("我喜欢香蕉")))
+            .await
+            .unwrap();
+        let hits = r.search_any("喜欢", "u-small", 10).await.unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
     }
 }

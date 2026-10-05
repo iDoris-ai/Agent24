@@ -27,6 +27,15 @@
 //!   un-fixed by this change is still possible there);
 //! - Hit@5 over the original 14 answerable cases is a HARD GATE (>= 13/14).
 //!
+//! Review round 2 (#675) added 2 more cases, `cjk_safety_bigram`, kept OUT
+//! of the 14-case Hit@5 ratio above (which is calibrated to that original
+//! count) and instead given their OWN hard gate (both must hit): these
+//! exist specifically to catch the regression `retriever.rs`'s CJK bigram
+//! filter had at one point, where a real two-character word that merely
+//! CONTAINS a pronoun/particle character as one syllable ("吗啡"/morphine
+//! contains 吗) was silently dropped — a safety-relevant miss (a forgotten
+//! allergy), not just a precision one.
+//!
 //! Everything else (Hit@1, All-evidence@5, distractor precision, the
 //! original Chinese no-answer injection rate) stays record-only per the base
 //! spec. Run: `cargo test -p agent24-memory eval_m1 -- --nocapture`.
@@ -154,6 +163,11 @@ const FIXTURES: &[Fixture] = &[
     f("d3-cousin-job", OWNER, "我表哥在字节跳动工作"),
     f("d4-neighbor-birthday", OWNER, "我邻居的生日是三月十六日"),
     f("d5-no-travel", OWNER, "我去年没去旅行"),
+    // 2 CJK safety bigrams (review #675 round 2 M2): real two-character
+    // words that merely CONTAIN a pronoun/particle character as a
+    // syllable — must still be recalled.
+    f("safety-morphine", OWNER, "我对吗啡过敏"),
+    f("safety-bar", OWNER, "附近那家酒吧很吵"),
 ];
 
 fn candidate(id: &str, owner: &str, object: &str) -> Candidate {
@@ -243,6 +257,10 @@ fn cases() -> Vec<EvalCase> {
         EvalCase { id: "en4-quantum", category: "no_answer_english_neutral", query: "解释一下量子计算", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
         EvalCase { id: "en5-dinner", category: "no_answer_english_neutral", query: "我在想晚饭吃什么", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
         EvalCase { id: "en6-proposal", category: "no_answer_english_neutral", query: "我对这个方案有意见", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        // M1-T07.2 round 2 (review #675 M2): must be recalled — regression
+        // cases for the "contains a function character" over-filtering bug.
+        EvalCase { id: "safety-morphine", category: "cjk_safety_bigram", query: "我对吗啡过敏吗？", expected_ids: &["safety-morphine"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "safety-bar", category: "cjk_safety_bigram", query: "附近有什么酒吧？", expected_ids: &["safety-bar"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
     ]
 }
 
@@ -261,6 +279,8 @@ struct Metrics {
     distractor_leaks: usize,
     cases_with_security_forbidden: usize,
     security_leaks: usize,
+    cjk_safety_total: usize,
+    cjk_safety_hits: usize,
 }
 
 fn pct(n: usize, of: usize) -> String {
@@ -329,6 +349,12 @@ async fn eval_m1() {
                     metrics.no_answer_with_any_hit += 1;
                 }
             }
+        } else if case.category == "cjk_safety_bigram" {
+            // Kept OUT of `answerable`/Hit@5 — that ratio is calibrated to
+            // the ORIGINAL 14 cases (review round 1); these 2 get their own
+            // gate instead (both must hit, see below).
+            metrics.cjk_safety_total += 1;
+            metrics.cjk_safety_hits += usize::from(hit_at_5);
         } else {
             metrics.answerable += 1;
             metrics.hit_at_1 += usize::from(hit_at_1);
@@ -408,6 +434,12 @@ async fn eval_m1() {
             metrics.cases_with_security_forbidden
         )
     );
+    println!(
+        "CJK safety-bigram Hit@5 (HARD GATE = 100%): {}/{} ({})",
+        metrics.cjk_safety_hits,
+        metrics.cjk_safety_total,
+        pct(metrics.cjk_safety_hits, metrics.cjk_safety_total)
+    );
 
     assert_eq!(
         metrics.security_leaks, 0,
@@ -423,5 +455,10 @@ async fn eval_m1() {
         metrics.answerable,
         metrics.hit_at_5,
         metrics.answerable
+    );
+    assert_eq!(
+        metrics.cjk_safety_hits, metrics.cjk_safety_total,
+        "every CJK safety-bigram case (a real word that merely contains a \
+         pronoun/particle character) must be recalled (M1-T07.2 round 2 M2)"
     );
 }

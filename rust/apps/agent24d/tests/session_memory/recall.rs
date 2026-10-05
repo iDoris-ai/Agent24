@@ -543,6 +543,25 @@ async fn recall_budget_zero_one_item_and_default_top_five_match_audit_ids() {
             )
             .await;
         }
+        // M1-T07.2 round 2: pad this owner's corpus with unrelated filler so
+        // "过敏" is NOT a near-universal term across this owner's
+        // assertions. Measured empirically: with only 6 total rows (100%
+        // containing "过敏"), its bm25 idf clamps to the same near-zero
+        // value a true noise word gets and `retriever.rs`'s size-gated
+        // floor (which activates once an owner has >=5 assertions — this
+        // owner already clears that) wrongly treats the real "过敏" match
+        // as noise; diluting down to roughly 1-in-6 gives "过敏" a real,
+        // far-above-the-floor score (~1.6, matching review's own
+        // "real hit ~2.77" order of magnitude).
+        for i in 0..30 {
+            add_fact(
+                &kv,
+                &owner,
+                &format!("filler-{i}"),
+                &format!("今天天气不错第{i}条"),
+            )
+            .await;
+        }
         let prompt = "我对什么过敏？";
         let hits = kv.retriever().search_any(prompt, &owner, 5).await.unwrap();
         assert_eq!(hits.len(), 5);
