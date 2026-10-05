@@ -17,7 +17,7 @@ mod retain;
 pub mod self_wake;
 mod session_memory;
 pub mod subagent;
-pub use session_memory::SessionMemory;
+pub use session_memory::{RECALL_PREFIX, SessionMemory};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1164,37 +1164,48 @@ impl RunManager {
             self.finish_cancelled(&run_id).await;
             return;
         };
-        let mut messages = Vec::with_capacity(prior_context.len() + 2);
+        // M1-T07.1: the FULL first-call input — recall block, then the
+        // session's prior (compacted) context, then this run's prompt — is the
+        // immutable snapshot a restart-time resume must reproduce. It is
+        // persisted to the durable run thread BEFORE the model is ever called,
+        // in order, and fail-closed: if any message fails to persist, the run
+        // never reaches the provider, because `drive_resume` only has
+        // `thread_to_messages(&thread)` to rebuild from — a partially
+        // persisted snapshot would silently resume with less context than the
+        // first call saw.
+        let mut snapshot = Vec::with_capacity(prior_context.len() + 2);
+        let mut recalled_ids = None;
         if let Some((recalled, ids)) = recall {
-            // Keep the exact recalled context in the durable run thread so an
-            // approval resume reconstructs it without issuing another recall.
-            if let Err(err) = self.persist_message(&run_id, &recalled).await {
+            recalled_ids = Some(ids);
+            snapshot.push(recalled);
+        }
+        snapshot.extend(prior_context);
+        snapshot.push(Msg::user(run.input.prompt.clone()));
+        for msg in &snapshot {
+            if let Err(err) = self.persist_message(&run_id, msg).await {
                 self.finish_failed(
                     &run_id,
                     "memory_snapshot_persist_failed",
-                    &format!("failed to persist recalled memory snapshot: {err}"),
+                    &format!("failed to persist run input snapshot: {err}"),
                 )
                 .await;
                 return;
             }
+        }
+        // The audit event names exactly the ids that made it into the
+        // now-durable snapshot — emitted only once the snapshot is safely on
+        // disk, matching the fail-closed contract above.
+        if let Some(ids) = recalled_ids {
             tracing::info!(run_id = %run_id, ids = ?ids, "memory recalled");
             self.sink
                 .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
                     run_id: run_id.clone(),
                     ids,
                 }));
-            messages.push(recalled);
         }
-        messages.extend(prior_context);
-        // Persist this run's opening user turn to the durable thread (H3). Prior
-        // session context is not copied into the run thread; the recall snapshot
-        // above and this run's own tail are persisted for approval resume.
-        let user_msg = Msg::user(run.input.prompt.clone());
-        let _ = self.persist_message(&run_id, &user_msg).await;
-        messages.push(user_msg);
         // H8: a fresh plan-mode run starts read-only; a Normal run never is.
         let plan_mode = matches!(run.input.mode, RunMode::Plan);
-        self.run_loop(run, messages, plan_mode, cancel).await;
+        self.run_loop(run, snapshot, plan_mode, cancel).await;
     }
 
     /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
