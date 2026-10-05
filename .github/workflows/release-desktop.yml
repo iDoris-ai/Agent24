@@ -568,7 +568,20 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
+      # Owner decision 2026-10-06 (DEP-A13): explicit, belt-and-suspenders
+      # arch pin for this step. The REAL root cause of a prior mac x64
+      # native-module architecture mismatch here was a stray repo-root
+      # .npmrc hardcoding `arch=arm64` (removed — see that commit), which
+      # silently overrode electron's own install.js's `npm_config_arch ||
+      # process.arch` fallback on every platform. Pinning npm_config_arch/
+      # npm_config_platform explicitly here, derived from matrix.arch
+      # rather than ambient process.arch detection, means this step no
+      # longer depends on nothing-else-having-gone-wrong to pick the right
+      # Electron binary for THIS runner.
       - name: Install dependencies
+        env:
+          npm_config_arch: ${{ matrix.arch }}
+          npm_config_platform: darwin
         run: pnpm install --frozen-lockfile
 
       - name: Rust toolchain
@@ -614,7 +627,44 @@ jobs:
       - name: Rebuild Open Design native modules for Agent24 Electron
         env:
           A24_OPEN_DESIGN_SOURCE_DIR: ${{ github.workspace }}/open-design
+          # Same reasoning as "Install dependencies" above: pin explicitly
+          # from matrix.arch rather than trusting ambient process.arch/
+          # npm_config_arch detection to already be correct.
+          A24_ELECTRON_ARCH: ${{ matrix.arch }}
+          A24_ELECTRON_PLATFORM: darwin
         run: pnpm --filter @agent24/desktop rebuild:open-design-native
+
+      # Owner decision 2026-10-06 (DEP-A13): the actual bug this caught —
+      # Agent24's own node_modules/electron binary silently downloaded as
+      # the WRONG architecture (root cause: the stray .npmrc above) —
+      # showed up as a cryptic "spawn Unknown system error -86" deep
+      # inside rebuild-open-design-native.mjs's own runtime probe, not as
+      # a clear, named assertion failure. Explicit file/lipo -archs checks
+      # here (mirroring the existing agent24d self-check above) turn that
+      # into an immediate, readable failure instead, for every .node
+      # addon AND the Electron binary itself — not just the one the probe
+      # happened to touch.
+      - name: Self-check — Electron + native module architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          assert_arch() {
+            local label="$1" path="$2"
+            test -e "$path" || { echo "::error::$label is missing: $path"; exit 1; }
+            file "$path"
+            local archs
+            archs="$(lipo -archs "$path" 2>/dev/null || file "$path")"
+            echo "$label archs: $archs"
+            case "${{ matrix.arch }}" in
+              arm64) echo "$archs" | grep -qw -e arm64 -e arm64e ;;
+              x64)   echo "$archs" | grep -qw -e x86_64 -e x86_64h ;;
+            esac
+          }
+          ELECTRON_BINARY="$(find apps/desktop/node_modules/electron/dist -maxdepth 1 -iname 'Electron.app' -print -quit)/Contents/MacOS/Electron"
+          assert_arch "Agent24's node_modules/electron" "$ELECTRON_BINARY"
+          while IFS= read -r -d '' node_file; do
+            assert_arch "native module $node_file" "$node_file"
+          done < <(find apps/desktop/.open-design-resources -name '*.node' -print0)
 
       - name: Resolve app version (for the component manifest's download URL)
         id: ver
@@ -697,6 +747,20 @@ jobs:
           # mounted from the dmg is the one that was signed, not a stale or
           # tampered copy sealed in by a build step that ran out of order.
           codesign --verify --deep --strict "$APP"
+
+          # Owner decision 2026-10-06 (DEP-A13): the final, end-to-end proof
+          # that what's actually SHIPPED in this dmg is the right
+          # architecture — not just the pre-packaging checks earlier in
+          # this job (which could in principle pass while electron-builder
+          # still bundled something else).
+          MAIN_EXECUTABLE="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          file "$MAIN_EXECUTABLE"
+          archs="$(lipo -archs "$MAIN_EXECUTABLE")"
+          echo "shipped Electron binary archs: $archs"
+          case "${{ matrix.arch }}" in
+            arm64) echo "$archs" | grep -qw -e arm64 -e arm64e ;;
+            x64)   echo "$archs" | grep -qw -e x86_64 -e x86_64h ;;
+          esac
 
           RESOURCES="$APP/Contents/Resources"
           test ! -e "$RESOURCES/open-design"
