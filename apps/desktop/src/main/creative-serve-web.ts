@@ -49,7 +49,15 @@ const DEFAULT_READY_TIMEOUT_MS = 15_000
 const CHECKOUT_STOP_TIMEOUT_MS = 5_000
 const HEADLESS_STOP_TIMEOUT_MS = 60_000
 export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
-const AGENT24_HEADLESS_PROTOCOL = 1
+// v2 (Opus review of #670, 2026-10-05): the fork's agent24-headless.cjs now
+// accepts an explicit resourceSafeBase (fork PR iDoris-ai/open-design-
+// agent24#7, not yet merged/pinned — see the on-demand branch below for why
+// this constant is bumped here ahead of that pin update). NOTE: this makes
+// the on-demand path incompatible with the CURRENTLY pinned fork commit
+// (still protocol v1) until the fork PR merges and OPEN_DESIGN_SHA is
+// re-pinned — intentional per review instruction ("pin 暂不改...先写好代码与
+// 测试"), not an oversight.
+const AGENT24_HEADLESS_PROTOCOL = 2
 
 export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'
 
@@ -114,7 +122,7 @@ function canonicalHeadlessOrigin(raw: unknown, field: string): string {
 
 export interface Agent24HeadlessReady {
   type: 'ready'
-  protocol: 1
+  protocol: 2
   instanceId: string
   pinVersion: string
   webOrigin: string
@@ -201,44 +209,6 @@ export function resolveAgent24HeadlessLauncher(resourcesPath?: string): string |
   return fs.existsSync(entry) ? entry : null
 }
 
-export const ON_DEMAND_COMPONENT_LINK_NAME = '.agent24-open-design-component'
-
-/**
- * Real-app closed-loop finding (2026-10-05, mac darwin-arm64): the Open
- * Design fork's own `agent24-headless.cjs` launcher (apps/packaged/src/
- * agent24-headless.ts, `assertAgent24ResourceRoot`) rejects any
- * `resourceRoot` that is not textually under a "safe base" it derives from
- * `runtimeExecutable`'s own location — `<App>.app/Contents/Resources` on
- * mac, `<executableDir>/resources` elsewhere. That assumption predates the
- * on-demand component (owner decision 2026-10-05): the installed component
- * now lives OUTSIDE the app bundle, under
- * `~/.agent24/components/open-design/<hash>/`, which fails that check
- * outright — confirmed by actually running the real launcher against a real
- * installed component, not just unit tests (which mock the launcher and
- * never exercise this fork-side validation). We do not patch the fork
- * (project convention: no changes to the Open Design line's own design) —
- * instead a symlink inside the app's own resources directory, named
- * `.agent24-open-design-component`, points at the installed component dir.
- * `path.relative`/`path.join` are lexical (string-only, no filesystem
- * access), so the fork's check sees a path "under" its safe base and
- * passes; the OS transparently follows the symlink for every actual file
- * access. This affects every platform whose on-demand component installs
- * outside the app bundle (Linux's AppImage/deb layout has the same "sibling
- * resources dir" assumption), not just mac — so the fix lives here, in the
- * platform-agnostic CreativeServeWeb, not in a mac-only script.
- */
-export function ensureOnDemandComponentLink(appResourcesPath: string, componentDir: string): string {
-  const linkPath = path.join(appResourcesPath, ON_DEMAND_COMPONENT_LINK_NAME)
-  const existingTarget = fs.lstatSync(linkPath, { throwIfNoEntry: false })?.isSymbolicLink()
-    ? fs.readlinkSync(linkPath)
-    : null
-  if (existingTarget !== componentDir) {
-    fs.rmSync(linkPath, { force: true, recursive: true })
-    fs.symlinkSync(componentDir, linkPath, 'dir')
-  }
-  return linkPath
-}
-
 export function creativeChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // A24_* belongs to the Agent24 host authority/bootstrap namespace. The
   // desktop may consume A24_OPEN_DESIGN_* to choose how to launch Creative,
@@ -307,22 +277,25 @@ export class CreativeServeWeb {
     if (!explicitCheckout && this.options.component) {
       const componentStatus = this.options.component.status()
       if (componentStatus.state === 'installed' && componentStatus.dir) {
-        // See ensureOnDemandComponentLink's doc comment: the fork's own
-        // launcher rejects a resourceRoot outside the app bundle's own
-        // resources dir, so we present the installed (external) component
-        // through a symlink inside it instead of using componentStatus.dir
-        // directly.
-        if (!this.options.resourcesPath) {
-          this.current = {
-            state: 'failed',
-            error: 'Open Design on-demand component requires a packaged resourcesPath to link into',
-          }
-          return this.status()
-        }
-        const linkedResourcesPath = ensureOnDemandComponentLink(this.options.resourcesPath, componentStatus.dir)
-        const installedHeadlessEntry = resolveAgent24HeadlessLauncher(linkedResourcesPath)
+        const installedHeadlessEntry = resolveAgent24HeadlessLauncher(componentStatus.dir)
         if (installedHeadlessEntry) {
-          return this.startPackagedHeadless(installedHeadlessEntry, environment, linkedResourcesPath)
+          // C1 (Opus review of #670, 2026-10-05): a symlink written at
+          // runtime into the app's own resourcesPath used to stand in for
+          // this — EROFS on a read-only AppImage FUSE mount, EACCES on a
+          // root-owned deb /opt install, breaks a signed mac bundle, and
+          // races across multiple users on the same machine. The real fix
+          // is fork-side (iDoris-ai/open-design-agent24#7, not yet merged):
+          // agent24-headless.cjs now accepts an explicit resourceSafeBase
+          // instead of always deriving it from runtimeExecutable's own
+          // location. We never touch resourcesPath for the on-demand case
+          // at all now — resourceSafeBase is just componentStatus.dir's own
+          // realpath (it must equal its own realpath: the fork's new check
+          // rejects a resourceSafeBase that is itself reached through a
+          // symlink, by design — see OpenDesignComponentInstaller, which
+          // installs with mode 0700 so this directory's ownership/
+          // writability already satisfies the fork's POSIX check).
+          const resourceSafeBase = fs.realpathSync(componentStatus.dir)
+          return this.startPackagedHeadless(installedHeadlessEntry, environment, componentStatus.dir, resourceSafeBase)
         }
         // Installed-but-missing-launcher (e.g. the dir was deleted after the
         // installer last validated it): surface needs-download so the
@@ -411,6 +384,11 @@ export class CreativeServeWeb {
     headlessEntry: string,
     environment: NodeJS.ProcessEnv,
     baseResourcesPath: string | undefined,
+    /** v2-only (see the on-demand branch above): an explicit, pre-realpath'd
+     * trust root for resourceRoot. Omitted for the legacy bundled-resources
+     * path, which keeps relying on the fork's v1 runtimeExecutable-derived
+     * default. */
+    resourceSafeBase?: string,
   ): Promise<CreativeServeWebStatus> {
     const resourcesPath = baseResourcesPath
     const stateRoot = this.options.stateRoot
@@ -442,6 +420,7 @@ export class CreativeServeWeb {
       dataRoot,
       runtimeRoot,
       runtimeExecutable,
+      ...(resourceSafeBase ? { resourceSafeBase } : {}),
     })}\n`, { encoding: 'utf8', mode: 0o600 })
     fs.chmodSync(configPath, 0o600)
 

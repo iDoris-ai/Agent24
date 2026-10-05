@@ -1,10 +1,12 @@
 import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -16,6 +18,15 @@ import {
   verifyComponentContract,
   type OpenDesignComponentManifest,
 } from './open-design-component'
+
+// This file does real tar/spawn/HTTP round trips (building fixture
+// tarballs, running `tar`, serving them over a local server) rather than
+// pure in-process unit work — comfortably under 2s each in isolation, but
+// the default 5s test timeout is tight under concurrent machine load (CI
+// and shared dev boxes alike). 15s leaves plenty of margin while still
+// catching a genuine hang (see the explicit M5/H2 abort tests, which prove
+// a real hang is caught well before this).
+vi.setConfig({ testTimeout: 30_000 })
 
 const tempDirs: string[] = []
 const servers: http.Server[] = []
@@ -58,21 +69,62 @@ function buildTarball(stageDir: string): string {
   return tarPath
 }
 
-/** Builds a tarball that is otherwise valid but also carries one member
- * renamed (via tar's own `-s`/transform option, portable across GNU tar and
- * macOS's bsdtar) to a path-traversal name — exercises the pre-extraction
+/** H1 (review finding, 2026-10-05): the previous version of this fixture
+ * relied on tar's own `-s`/transform option to rename a member onto a
+ * path-traversal name. That option's syntax (and whether it's honored at
+ * all for a plain-looking name with no special characters) differs between
+ * GNU tar and macOS's bsdtar — so the fixture could silently stop
+ * constructing the hostile entry it claims to, leaving the test "passing"
+ * for the wrong reason. Building the ustar header by hand removes that
+ * doubt entirely: the byte layout below is unambiguous, and the test
+ * verifies the archive actually contains the `..` member before ever
+ * calling the installer. */
+function ustarHeader(name: string, size: number, typeflag: '0' | '5'): Buffer {
+  const header = Buffer.alloc(512)
+  header.write(name, 0, 'utf8')
+  header.write('0000644\0', 100, 8, 'utf8') // mode
+  header.write('0000000\0', 108, 8, 'utf8') // uid
+  header.write('0000000\0', 116, 8, 'utf8') // gid
+  header.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 12, 'utf8') // size
+  header.write(`${Math.floor(Date.now() / 1000).toString(8).padStart(11, '0')}\0`, 136, 12, 'utf8') // mtime
+  header.write(typeflag, 156, 1, 'utf8')
+  header.write('ustar\0', 257, 6, 'utf8') // magic
+  header.write('00', 263, 2, 'utf8') // version
+  header.fill(0x20, 148, 156) // checksum field blanked to spaces while summing
+  let sum = 0
+  for (let i = 0; i < 512; i++) sum += header[i]!
+  header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'utf8')
+  return header
+}
+
+function ustarFileEntry(name: string, content: string): Buffer {
+  const data = Buffer.from(content, 'utf8')
+  const paddedSize = Math.ceil(data.length / 512) * 512 || 512
+  const body = Buffer.alloc(paddedSize)
+  data.copy(body)
+  return Buffer.concat([ustarHeader(name, data.length, '0'), data.length === 0 ? Buffer.alloc(0) : body])
+}
+
+/** Builds a minimal, hand-constructed ustar archive containing exactly one
+ * member whose path contains `..` — exercises the pre-extraction
  * `tar -tzf` safety check (hardening on top of the post-extraction symlink
- * walk, which only inspects symlinks, not regular-file path traversal). */
+ * walk, which only inspects symlinks, not regular-file path traversal).
+ * Rejection must happen from the listing alone, before any of the other
+ * (valid) members would matter, so this archive doesn't need to mirror a
+ * full installable tree. */
 function buildTarballWithTraversalEntry(stageDir: string): string {
-  const extraDir = tmpDir('a24-od-traversal-extra-')
-  fs.writeFileSync(path.join(extraDir, 'evil.txt'), 'nope')
-  const tarPath = path.join(path.dirname(stageDir), `${path.basename(stageDir)}-traversal.tar.gz`)
-  execFileSync('tar', [
-    '-czf', tarPath,
-    '-s', '#^evil.txt$#../../escape.txt#',
-    '-C', stageDir, 'app', 'open-design', 'open-design-web-standalone',
-    '-C', extraDir, 'evil.txt',
+  const traversalMemberName = 'open-design/../../escape.txt'
+  const tar = Buffer.concat([
+    ustarFileEntry(traversalMemberName, 'nope'),
+    Buffer.alloc(1024), // two 512-byte zero blocks terminate a tar archive
   ])
+  // Sanity-check our own fixture: if this ever stopped containing a literal
+  // ".." path segment, the test below would pass for the wrong reason.
+  if (!tar.toString('latin1').includes(traversalMemberName)) {
+    throw new Error('test fixture bug: hand-built ustar archive is missing its traversal member')
+  }
+  const tarPath = path.join(path.dirname(stageDir), `${path.basename(stageDir)}-traversal.tar.gz`)
+  fs.writeFileSync(tarPath, zlib.gzipSync(tar))
   tempDirs.push(tarPath)
   return tarPath
 }
@@ -427,6 +479,13 @@ describe('OpenDesignComponentInstaller', () => {
   it('hardening: rejects a tarball member whose path contains ".." before extracting anything', async () => {
     const stage = seedTreeFor('a24-od-stage-traversal-')
     const tarPath = buildTarballWithTraversalEntry(stage)
+    // H1 (review finding, 2026-10-05): confirm, via the real `tar` binary —
+    // not just our own fixture's internal byte check — that this archive
+    // really does list a ".." member. Otherwise a future regression in
+    // ustarFileEntry/ustarHeader could silently produce an empty-but-valid
+    // archive that the installer accepts for the wrong reason.
+    const listing = execFileSync('tar', ['-tzf', tarPath], { encoding: 'utf8' })
+    expect(listing.split('\n').some((line) => line.trim().split('/').includes('..'))).toBe(true)
     const { manifest } = manifestFor(tarPath)
     const { url } = await startServer(tarPath)
     manifest.url = httpsManifestUrl(url)
@@ -594,5 +653,43 @@ describe('OpenDesignComponentInstaller', () => {
     expect(result.state).toBe('failed')
     expect(result.error).toContain('test aborted it')
     expect(fs.readdirSync(componentsRoot)).toEqual([])
+  })
+
+  it('H2: a write-stream error during backpressure fails promptly (does not hang forever) and is retryable', async () => {
+    // Before the fix, `await file.once('drain', ...)` had no way to learn
+    // that the stream had already errored (the no-op 'error' listener
+    // swallowed it) — install() would hang forever instead of settling. A
+    // fake write stream whose write() always reports backpressure, then
+    // errors, reproduces this deterministically without needing to actually
+    // stress a real fs write queue.
+    const stage = seedTreeFor('a24-od-stage-backpressure-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+    const componentsRoot = tmpDir('a24-od-root-backpressure-')
+
+    class FakeWriteStream extends EventEmitter {
+      write = vi.fn((_chunk: Buffer) => false) // always signal backpressure
+      end = vi.fn((cb?: (error?: unknown) => void) => cb?.())
+      close = vi.fn((cb?: () => void) => cb?.())
+    }
+    const fakeStream = new FakeWriteStream()
+    const createWriteStreamSpy = vi.spyOn(fs, 'createWriteStream').mockReturnValue(fakeStream as never)
+
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const pending = installer.install()
+    await vi.waitFor(() => expect(fakeStream.write).toHaveBeenCalled())
+    fakeStream.emit('error', new Error('simulated disk write failure'))
+
+    const result = await pending
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('simulated disk write failure')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+
+    // Retryable: a fresh install() with the real fs restored succeeds.
+    createWriteStreamSpy.mockRestore()
+    const retried = await installer.install()
+    expect(retried.state).toBe('installed')
   })
 })

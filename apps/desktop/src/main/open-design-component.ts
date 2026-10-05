@@ -44,10 +44,12 @@
 // only inspects symlinks, not regular-file path traversal).
 
 import crypto from 'node:crypto'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { once } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import readline from 'node:readline'
 import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
 
@@ -250,19 +252,49 @@ export function verifyComponentContract(root: string, expectedVersion: string): 
  * directory during `tar -x` itself, before any of our verification code
  * runs. Reject the whole tarball before extracting anything. */
 async function assertSafeTarMembers(tarBinary: string, tarballPath: string): Promise<void> {
-  // Real-app verification (2026-10-05, mac darwin-arm64 closed loop) hit
-  // Node's default 1MB execFile stdout buffer here: the real
-  // open-design-web-standalone/node_modules tree alone lists tens of
-  // thousands of members, so `tar -tzf`'s output routinely exceeds 1MB on a
-  // real build — the unit tests' tiny fixture tarballs never did. 64MB
-  // matches the maxBuffer already used elsewhere in this pipeline
-  // (stage-open-design-resources.mjs / prepare-open-design-linux-resources.mjs).
-  const { stdout } = await execFileAsync(tarBinary, ['-tzf', tarballPath], { maxBuffer: 64 * 1024 * 1024 })
-  for (const rawName of stdout.split('\n').map((line) => line.trim()).filter(Boolean)) {
-    const name = rawName.endsWith('/') ? rawName.slice(0, -1) : rawName
-    if (name.startsWith('/') || name.split('/').includes('..')) {
-      throw new Error(`Open Design component tarball contains an unsafe path entry: ${rawName}`)
+  // M1 (review finding, 2026-10-05): this used to buffer the whole listing
+  // via execFileAsync with a fixed maxBuffer. Real-app verification already
+  // showed a real open-design-web-standalone/node_modules tree can exceed
+  // 1MB of listing text — but a FIXED ceiling (we had raised it to 64MB) is
+  // never actually safe against an arbitrarily large (or maliciously
+  // padded) tarball; it only moves the failure threshold. spawn + readline
+  // processes the listing one line at a time and never holds more than a
+  // single line in memory.
+  const child = spawn(tarBinary, ['-tzf', tarballPath], { stdio: ['ignore', 'pipe', 'pipe'] })
+  // Register the 'exit' listener BEFORE draining stdout below. `tar -tzf`
+  // on a small tarball can exit before the readline loop over stdout even
+  // finishes draining — 'exit' only fires once per process lifetime, so a
+  // listener attached after the loop can miss an event that already fired,
+  // and `await`ing it then hangs forever. once() queues immediately and
+  // resolves whenever the event lands, so there is no ordering race.
+  const exitPromise = once(child, 'exit') as Promise<[number | null, NodeJS.Signals | null]>
+  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+  let stderr = ''
+  child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-4_000) })
+
+  let unsafeEntry: string | null = null
+  try {
+    for await (const rawLine of rl) {
+      const line = rawLine.trim()
+      if (!line) continue
+      const name = line.endsWith('/') ? line.slice(0, -1) : line
+      if (name.startsWith('/') || name.split('/').includes('..')) {
+        unsafeEntry = line
+        break
+      }
     }
+  } finally {
+    rl.close()
+  }
+
+  if (unsafeEntry) {
+    child.kill()
+    throw new Error(`Open Design component tarball contains an unsafe path entry: ${unsafeEntry}`)
+  }
+
+  const [exitCode] = await exitPromise
+  if (exitCode !== 0) {
+    throw new Error(`Open Design component tarball listing failed (tar -tzf exit ${exitCode}): ${stderr.trim()}`)
   }
 }
 
@@ -405,7 +437,13 @@ export class OpenDesignComponentInstaller {
 
       this.setStatus({ state: 'verifying' })
       await assertSafeTarMembers(this.tarBinary, tarballPath)
-      fs.mkdirSync(partialDir, { recursive: true })
+      // C1 (Opus review of #670, 2026-10-05): the fork's new explicit
+      // resourceSafeBase check (iDoris-ai/open-design-agent24#7) requires
+      // this directory to be owned by the current user with group/other
+      // write bits cleared. 0700 (owner rwx only) satisfies that with room
+      // to spare — nothing but this process should be able to read or
+      // write the on-demand component once it's installed.
+      fs.mkdirSync(partialDir, { recursive: true, mode: 0o700 })
       await execFileAsync(this.tarBinary, ['-xzf', tarballPath, '--no-same-owner', '-C', partialDir], { maxBuffer: 64 * 1024 * 1024 })
       verifyComponentContract(partialDir, manifest.version)
       fs.writeFileSync(path.join(partialDir, COMPONENT_MARKER_FILE), JSON.stringify({ sha256: manifest.sha256 }))
@@ -413,6 +451,7 @@ export class OpenDesignComponentInstaller {
       const finalDir = openDesignComponentInstallDir(this.componentsRoot, manifest)
       fs.rmSync(finalDir, { recursive: true, force: true })
       fs.renameSync(partialDir, finalDir)
+      fs.chmodSync(finalDir, 0o700)
       this.setStatus({ state: 'installed', dir: finalDir })
       return this.status()
     } catch (error) {
@@ -476,12 +515,18 @@ export class OpenDesignComponentInstaller {
     let received = 0
     let lastEmit = 0
     const file = fs.createWriteStream(destination)
-    // We handle every failure ourselves (via the catch below and the
-    // caller's try/catch); without this, a stray write/close error after we
-    // have already moved on would surface as an unhandled 'error' event and
-    // crash the process (Node's EventEmitter default for a listener-less
-    // 'error' emission).
-    file.on('error', () => {})
+    // H2 (review finding, 2026-10-05): a write error while we're `await`ing
+    // 'drain' used to hang installOnce() forever — the no-op 'error'
+    // listener below swallowed it, and a stream that has errored never
+    // emits 'drain'. Aborting the shared controller on a write error means
+    // every `events.once(..., { signal: controller.signal })` wait below
+    // (and the in-flight fetch) rejects/cancels promptly instead of
+    // hanging; the listener itself still has to exist so the 'error' event
+    // never surfaces as an unhandled EventEmitter error and crashes the
+    // process.
+    file.on('error', (error) => {
+      if (!controller.signal.aborted) controller.abort(error)
+    })
     const nodeStream = Readable.fromWeb(response.body as never)
 
     try {
@@ -493,7 +538,17 @@ export class OpenDesignComponentInstaller {
           throw new Error('Open Design component download exceeded the manifest-declared size')
         }
         hash.update(chunk)
-        if (!file.write(chunk)) await new Promise<void>((resolve) => file.once('drain', () => resolve()))
+        if (!file.write(chunk)) {
+          try {
+            await once(file, 'drain', { signal: controller.signal })
+          } catch (error) {
+            // `events.once(..., { signal })` rejects with a generic
+            // AbortError ("The operation was aborted"), losing WHY we
+            // aborted (e.g. the file's own 'error' listener above). Surface
+            // the real reason when we have one.
+            throw controller.signal.reason instanceof Error ? controller.signal.reason : error
+          }
+        }
         const now = Date.now()
         if (received === manifest.size || now - lastEmit >= PROGRESS_THROTTLE_MS) {
           this.setStatus({ state: 'downloading', received, total: manifest.size })
