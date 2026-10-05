@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -49,15 +50,37 @@ function checkout(): string {
   return materializeCheckout(root)
 }
 
+// M4 (Opus re-review, 2026-10-06): the four launcher entry files and a
+// matching integrity marker — mirrors exactly what
+// OpenDesignComponentInstaller.installOnce actually writes at install
+// time (see ENTRY_FILES_FOR_INTEGRITY_CHECK / verifyEntryFileIntegrity in
+// open-design-component.ts), since creative-serve-web.ts's on-demand path
+// now spot-checks this marker before every launch.
+const ENTRY_RELATIVE_PATHS = [
+  'app/prebundled/agent24-headless.cjs',
+  'app/prebundled/daemon/daemon-cli.mjs',
+  'app/prebundled/daemon/daemon-sidecar.mjs',
+  'app/prebundled/web-sidecar.mjs',
+] as const
+
 function packagedHeadlessRuntime(): { resources: string; stateRoot: string; runtimeExecutable: string } {
   const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-headless-'))
   tempDirs.push(root)
   const resources = path.join(root, 'resources')
   const stateRoot = path.join(root, 'state')
   const runtimeExecutable = path.join(root, 'Agent24')
-  fs.mkdirSync(path.join(resources, 'app', 'prebundled'), { recursive: true })
+  fs.mkdirSync(path.join(resources, 'app', 'prebundled', 'daemon'), { recursive: true })
   fs.mkdirSync(path.join(resources, 'open-design'), { recursive: true })
-  fs.writeFileSync(path.join(resources, 'app', 'prebundled', 'agent24-headless.cjs'), '')
+  const entrySha256: Record<string, string> = {}
+  for (const relative of ENTRY_RELATIVE_PATHS) {
+    const content = `// fixture: ${relative}\n`
+    fs.writeFileSync(path.join(resources, relative), content)
+    entrySha256[relative] = crypto.createHash('sha256').update(content).digest('hex')
+  }
+  fs.writeFileSync(
+    path.join(resources, '.agent24-component.json'),
+    JSON.stringify({ sha256: 'fixture-tarball-sha256', entrySha256 }),
+  )
   fs.writeFileSync(runtimeExecutable, '')
   return { resources, stateRoot, runtimeExecutable }
 }
