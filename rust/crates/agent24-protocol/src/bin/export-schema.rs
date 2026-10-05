@@ -14,6 +14,7 @@ use agent24_protocol::Event;
 // utoipa.
 const FORCE_REQUIRED: &[(&str, &[&str])] = &[
     ("RunStartedPayload", &["session_id", "schedule_id"]),
+    ("MemoryWriteSkippedPayload", &["session_id"]),
     ("ToolCompletedPayload", &["output_summary"]),
     ("Approval", &["decision", "decided_at", "standing_target"]),
     // T7b/ME-3e: `target`/`decided_at` are always present, value `null`

@@ -50,6 +50,12 @@ pub enum EventBody {
     RunCompleted(RunCompletedPayload),
     #[serde(rename = "memory.write_failed")]
     MemoryWriteFailed(MemoryWriteFailedPayload),
+    /// M1-T10 review H1: emitted at run start instead of silently dropping an
+    /// explicit "记住……" while personal memory is paused — the model is ALSO
+    /// told (a data notice injected alongside recall), so it does not tell
+    /// the user it remembered something it did not.
+    #[serde(rename = "memory.write_skipped")]
+    MemoryWriteSkipped(MemoryWriteSkippedPayload),
     #[serde(rename = "memory.recalled")]
     MemoryRecalled(MemoryRecalledPayload),
     #[serde(rename = "run.failed")]
@@ -121,6 +127,7 @@ impl EventBody {
             EventBody::RunCompleted(_) => "run.completed",
             EventBody::RunFailed(_) => "run.failed",
             EventBody::MemoryWriteFailed(_) => "memory.write_failed",
+            EventBody::MemoryWriteSkipped(_) => "memory.write_skipped",
             EventBody::MemoryRecalled(_) => "memory.recalled",
             EventBody::RunCancelled(_) => "run.cancelled",
             EventBody::ToolStarted(_) => "tool.started",
@@ -216,6 +223,15 @@ pub struct RunOutputPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryWriteFailedPayload {
     pub session_id: String,
+    pub reason: String,
+}
+
+/// M1-T10 review H1: `reason` is an open enum (today only `"paused"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryWriteSkippedPayload {
+    pub run_id: String,
+    /// Null for transient (session-less) runs, same as `RunStartedPayload`.
+    pub session_id: Option<String>,
     pub reason: String,
 }
 

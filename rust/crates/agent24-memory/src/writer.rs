@@ -235,6 +235,29 @@ impl WriteGate {
         // Do this under the write lock so a concurrent withdrawal cannot race
         // the check; every other primary-key collision remains an error.
         if verdict == "commit" && c.origin.trust == Trust::UserSaid && c.explicit_remember {
+            // M1-T10 review M2: the personal-memory pause switch, re-checked
+            // HERE inside the same `BEGIN IMMEDIATE` transaction the write
+            // itself lands in — not just once, earlier, outside any
+            // transaction (`agent24_agent::retain::persist`'s old early
+            // check) — so a concurrent PUT disabling it cannot land between
+            // "checked enabled" and "committed" (the same TOCTOU shape the
+            // comment above already closes for a concurrent withdrawal).
+            // Mirrors `KvStore::memory_enabled`'s own default-enabled
+            // reading, against the SAME `kv` row, through this transaction.
+            let settings_row: Option<String> =
+                sqlx::query_scalar("SELECT value FROM kv WHERE namespace = ? AND key = ?")
+                    .bind(crate::MEMORY_SETTINGS_NAMESPACE)
+                    .bind(&c.scope.owner)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let enabled = settings_row
+                .and_then(|v| serde_json::from_str::<crate::MemorySettings>(&v).ok())
+                .is_none_or(|s| s.enabled);
+            if !enabled {
+                tx.rollback().await?;
+                return Ok(());
+            }
+
             let existing = sqlx::query(
                 "SELECT scope_owner, scope, subject, predicate, object, qualified,
                         valid_from, valid_to, recorded_from, recorded_to, evidence
@@ -249,11 +272,15 @@ impl WriteGate {
                 let now = now_iso8601();
                 let expected_scope = serde_json::to_string(&c.scope)?;
                 let expected_object = serde_json::to_string(&c.object)?;
-                let matching = row.get::<String, _>("scope_owner") == c.scope.owner
+                // Same (owner, scope, subject, predicate, object) the id is
+                // deterministic on — independent of whether the row is
+                // currently active or retracted.
+                let content_matches = row.get::<String, _>("scope_owner") == c.scope.owner
                     && row.get::<String, _>("scope") == expected_scope
                     && row.get::<String, _>("subject") == c.subject
                     && row.get::<String, _>("predicate") == c.predicate
-                    && row.get::<String, _>("object") == expected_object
+                    && row.get::<String, _>("object") == expected_object;
+                let matching = content_matches
                     && row.get::<i64, _>("qualified") == 1
                     && row.get::<String, _>("valid_from") <= now
                     && row
@@ -311,6 +338,50 @@ impl WriteGate {
                         }
                     }
                 }
+
+                // Review H3: the user explicitly asked to remember the SAME
+                // statement again after retracting it. The id is
+                // deterministic on (owner, object), so re-asserting
+                // identical text always lands on this exact row — without
+                // this branch that re-assert is a permanent `Conflict` and
+                // the statement can never be remembered again. Reactivate in
+                // place (clear `recorded_to`, replace evidence with this
+                // remember's) rather than erroring; audited by its own
+                // `assertion.reasserted` event (the mirror of `forget`'s
+                // `assertion.retracted`), not a second `mem.write_decision` —
+                // this is a state transition on an existing belief, not a
+                // fresh write-gate verdict.
+                let recorded_to: Option<String> = row.get("recorded_to");
+                if content_matches && recorded_to.is_some() {
+                    sqlx::query(
+                        "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, qualified = 1
+                         WHERE id = ?",
+                    )
+                    .bind(serde_json::to_string(&c.evidence)?)
+                    .bind(&c.id)
+                    .execute(&mut *tx)
+                    .await?;
+                    let reassert_id = format!(
+                        "reassert-{}-{}",
+                        c.id,
+                        &checksum(&format!("{now}|{:?}", c.evidence))[..16]
+                    );
+                    let mut reassert = MemEvent::new(
+                        reassert_id,
+                        c.scope.clone(),
+                        "assertion.reasserted",
+                        serde_json::json!({ "assertion_id": c.id, "evidence": c.evidence }),
+                        Origin {
+                            source: "write_gate".to_owned(),
+                            trust: Trust::System,
+                        },
+                    );
+                    reassert.at = now;
+                    EventLog::append_tx(&mut tx, &reassert).await?;
+                    tx.commit().await?;
+                    return Ok(());
+                }
+
                 return Err(MemoryError::Conflict(format!(
                     "assertion id {:?} already exists without matching current content, evidence, or commit audit",
                     c.id
@@ -577,6 +648,44 @@ mod tests {
             2,
             "two decisions, two audits"
         );
+    }
+
+    #[tokio::test]
+    async fn retracting_then_re_remembering_the_same_statement_reactivates_it() {
+        // Review H3: the explicit-remember id is deterministic on (owner,
+        // object), so retracting it and then saying the IDENTICAL thing
+        // again lands on the exact same row. Before this fix that was a
+        // permanent `Conflict` — negative control: swap the H3 branch back
+        // to only `return Err(Conflict)` and this goes red on `propose`
+        // returning an `Err` instead of `Committed`.
+        let (kv, g) = gate().await;
+        let candidate = || cand("c1", "u1", "sky", Trust::UserSaid).remember();
+        g.propose(vec![candidate()]).await.unwrap();
+        assert_eq!(recall(&kv, "u1").await.len(), 1);
+
+        kv.forget("u1", "c1", &now_iso8601()).await.unwrap();
+        assert!(
+            recall(&kv, "u1").await.is_empty(),
+            "retracted — no longer recalled"
+        );
+
+        let d = g.propose(vec![candidate()]).await.unwrap();
+        assert_eq!(d, vec![WriteDecision::Committed("c1".into())]);
+        assert_eq!(
+            recall(&kv, "u1").await.len(),
+            1,
+            "re-asserting the same statement must bring it back"
+        );
+
+        let reasserted = kv
+            .events()
+            .scan(&EventQuery::owner("u1"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event.kind == "assertion.reasserted")
+            .count();
+        assert_eq!(reasserted, 1, "the reactivation is audited exactly once");
     }
 
     #[tokio::test]
