@@ -199,6 +199,9 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "comm",
     "events",
     "health",
+    // M1-T10: `/api/v1/memory/assertions`, `/api/v1/memory/assertions/{id}`,
+    // `/api/v1/memory/settings` — the personal-memory REST surface.
+    "memory",
     // T7b/ME-3e: `/api/v1/module-approvals`.
     "module-approvals",
     "models",

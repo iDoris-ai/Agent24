@@ -38,6 +38,12 @@ pub(super) async fn persist(
     if origin.trust != Trust::UserSaid {
         return Ok(());
     }
+    // M1-T10: the personal-memory pause switch is a single early check, right
+    // here at the retain (explicit "remember...") entry point — paused means
+    // no new writes, before the candidate is even built.
+    if !kv.memory_enabled(owner).await? {
+        return Ok(());
+    }
     let id = checksum(&format!("{owner}{object}"));
     let candidate = Candidate::new(
         id,
@@ -112,5 +118,52 @@ mod tests {
             .await
             .unwrap();
         assert!(beliefs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn paused_memory_rejects_a_new_write() {
+        let kv = KvStore::open_memory().await.unwrap();
+        kv.set_memory_enabled("owner", false).await.unwrap();
+        persist(
+            &kv,
+            "owner",
+            "I am allergic to peanuts",
+            "event-1".into(),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+        .await
+        .unwrap();
+
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner("owner"))
+            .await
+            .unwrap();
+        assert!(beliefs.is_empty(), "paused memory must reject the write");
+
+        // Negative control: the SAME statement, for an owner who never
+        // paused, is written — proving the gate (not something else) is what
+        // rejected the paused owner's write above.
+        persist(
+            &kv,
+            "owner2",
+            "I am allergic to peanuts",
+            "event-2".into(),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+        .await
+        .unwrap();
+        let beliefs2 = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner("owner2"))
+            .await
+            .unwrap();
+        assert_eq!(beliefs2.len(), 1, "an un-paused owner's write still lands");
     }
 }

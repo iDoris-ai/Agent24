@@ -29,6 +29,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use agent24_core::util::now_iso8601;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -244,6 +245,17 @@ fn os_partition_row(r: &sqlx::sqlite::SqliteRow) -> OsPartitionRow {
     }
 }
 
+/// M1-T10: the `kv` namespace [`KvStore::memory_enabled`]/[`KvStore::set_memory_enabled`]
+/// store the personal-memory switch under, keyed by owner.
+pub const MEMORY_SETTINGS_NAMESPACE: &str = "memory_settings";
+
+/// `owner`'s persistent personal-memory switch (M1-T10). Round-tripped
+/// through the generic `kv` table via [`KvStore::fetch`]/[`KvStore::put`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySettings {
+    pub enabled: bool,
+}
+
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
 #[derive(Clone)]
 pub struct KvStore {
@@ -378,6 +390,34 @@ impl KvStore {
     /// Retract an assertion and append its event in the same transaction.
     pub async fn forget(&self, owner: &str, id: &str, at: &str) -> Result<assertion::Forget> {
         assertion::forget(&self.pool, owner, id, at).await
+    }
+
+    /// M1-T10: `owner`'s persistent personal-memory switch. `Ok(true)` (the
+    /// default) when the owner has never set one — a fresh owner's memory is
+    /// ON, never silently paused. Stored in the generic `kv` table (namespace
+    /// [`MEMORY_SETTINGS_NAMESPACE`]), so it survives a daemon restart the
+    /// same way every other `kv` row does.
+    pub async fn memory_enabled(&self, owner: &str) -> Result<bool> {
+        Ok(self
+            .fetch::<MemorySettings>(MEMORY_SETTINGS_NAMESPACE, owner)
+            .await?
+            .is_none_or(|s| s.enabled))
+    }
+
+    /// Set `owner`'s persistent personal-memory switch (M1-T10). Turning it
+    /// off stops new writes and cross-session recall from the moment this
+    /// returns — the two gates that check it are `agent24_agent::retain::persist`
+    /// (writes) and `agent24_agent::SessionMemory::recall` (cross-session
+    /// recall), neither of which lives in this crate — but never touches
+    /// existing assertions: the switch is a gate on future reads/writes, not
+    /// a purge.
+    pub async fn set_memory_enabled(&self, owner: &str, enabled: bool) -> Result<()> {
+        self.put(
+            MEMORY_SETTINGS_NAMESPACE,
+            owner,
+            &MemorySettings { enabled },
+        )
+        .await
     }
 
     /// An [`retriever::FtsRetriever`] over the SAME database file — MD-3b's
@@ -2167,6 +2207,27 @@ mod tests {
             Some(prefs)
         );
         assert_eq!(kv.fetch::<Prefs>("cfg", "nope").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn memory_enabled_defaults_true_and_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("a24mem-settings-{}", std::process::id()));
+        let path = dir.join("mem.db");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Negative control: a fresh owner who never touched the switch is ON.
+        {
+            let kv = KvStore::open(&path).await.unwrap();
+            assert!(kv.memory_enabled("alice").await.unwrap());
+            kv.set_memory_enabled("alice", false).await.unwrap();
+            assert!(!kv.memory_enabled("alice").await.unwrap());
+            // Untouched owners stay unaffected by another owner's switch.
+            assert!(kv.memory_enabled("bob").await.unwrap());
+        }
+        // Still off after a simulated daemon restart (fresh pool, same file).
+        let reopened = KvStore::open(&path).await.unwrap();
+        assert!(!reopened.memory_enabled("alice").await.unwrap());
+        assert!(reopened.memory_enabled("bob").await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
