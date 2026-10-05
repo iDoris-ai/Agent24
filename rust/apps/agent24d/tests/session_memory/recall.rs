@@ -252,6 +252,49 @@ async fn unrelated_question_does_not_inject_memory() {
     );
 }
 
+#[tokio::test]
+async fn english_and_neutral_chinese_questions_do_not_inject_memory() {
+    // M1-T07.2 (review #675): every assertion's subject/predicate are
+    // literally "user"/"said_to_remember" in production. Before the
+    // OR-mode stop-word + function-bigram filter, an unrelated English
+    // question sharing a word like "to" or "my" — or a generic Chinese
+    // "我的/我在/我对" question sharing only a pronoun — would have
+    // spuriously recalled this personal fact through the full recall()
+    // pipeline (not just the raw retriever call the unit tests cover).
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let org = OrgId::from_store(kv.ensure_org_for_user(LOCAL_USER).await.unwrap());
+    let personal = partition_key(&org, &SpaceId::personal(LOCAL_USER));
+    add_fact(&kv, &personal, "peanut-personal", "我对花生过敏").await;
+
+    for prompt in [
+        "how to write a for loop in python",
+        "fix the bug in my code",
+        "what is the capital of France",
+        "解释一下量子计算",
+        "我在想晚饭吃什么",
+    ] {
+        let provider = Arc::new(Provider::default());
+        let state = app(kv.clone(), dir.path(), provider.clone()).await;
+        let mut events = state.events.subscribe();
+
+        run(&state, prompt).await;
+
+        assert!(
+            recalled_text(provider.received.lock().unwrap().last().unwrap()).is_empty(),
+            "prompt {prompt:?} must not recall anything"
+        );
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).all(|(_, body)| serde_json::to_value(
+                body
+            )
+            .unwrap()["type"]
+                != "memory.recalled"),
+            "prompt {prompt:?} must not emit memory.recalled"
+        );
+    }
+}
+
 #[test]
 fn recalled_context_survives_approval_wait_and_daemon_restart() {
     let dir = tempfile::tempdir().unwrap();
