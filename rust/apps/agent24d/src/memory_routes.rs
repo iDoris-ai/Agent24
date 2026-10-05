@@ -60,8 +60,12 @@ fn memory_unavailable() -> Response {
     )
 }
 
-/// At most one `q`, at most one `limit` (a positive integer) — anything else
-/// is a 400, not a best-effort guess.
+/// `q` at most once, `limit` at most once and a positive integer — a
+/// VIOLATION of either is a 400, not a best-effort guess (duplicate `q`
+/// silently picking the last one, or a bad `limit` silently falling back to
+/// a default). Review R1/clestons: this deliberately does NOT reject an
+/// unrecognized query key — standard REST permissiveness, not a bug; the
+/// line above is about `q`/`limit`'s own values, not about the key set.
 fn parse_list_query(raw: Option<&str>) -> Result<(Option<String>, Option<usize>), &'static str> {
     let mut q: Option<String> = None;
     let mut limit: Option<usize> = None;
