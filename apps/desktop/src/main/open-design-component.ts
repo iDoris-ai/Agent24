@@ -66,6 +66,23 @@ const REQUIRED_FILES = [
   'app/prebundled/daemon/daemon-sidecar.mjs',
   'app/prebundled/web-sidecar.mjs',
 ]
+/** M4 (Opus re-review of the fork PR, 2026-10-06): "self-checking is not a
+ * boundary" — the fork process checking its own resourceSafeBase chain
+ * from inside itself happens AFTER this process already decided to spawn
+ * it. The actual boundary has to be enforced by this host, before spawn:
+ * record the sha256 of exactly the files the headless launcher will
+ * execute at install time (this installer, right after extraction —
+ * before the tree is made read-only below), so creative-serve-web.ts can
+ * spot-check them again immediately before every launch. Deliberately a
+ * SUBSET of REQUIRED_FILES — these four are the ones that actually run as
+ * code; app/package.json and the two .mjs files that exist only to
+ * satisfy the contract check are not. */
+const ENTRY_FILES_FOR_INTEGRITY_CHECK = [
+  'app/prebundled/agent24-headless.cjs',
+  'app/prebundled/daemon/daemon-cli.mjs',
+  'app/prebundled/daemon/daemon-sidecar.mjs',
+  'app/prebundled/web-sidecar.mjs',
+] as const
 const DOWNLOAD_IDLE_TIMEOUT_MS = 30_000
 const PROGRESS_THROTTLE_MS = 100
 const MAX_REDIRECT_HOPS = 10
@@ -153,6 +170,13 @@ export function loadOpenDesignComponentManifest(resourcesPath?: string): OpenDes
   }
 }
 
+/** Not a frozen module-level constant — reads os.homedir() fresh every
+ * call, matching the constructor's own (pre-existing) behavior of
+ * resolving it at construction time rather than at module load. */
+function defaultComponentsRoot(): string {
+  return path.join(os.homedir(), '.agent24', 'components', 'open-design')
+}
+
 export function openDesignComponentInstallDir(componentsRoot: string, manifest: OpenDesignComponentManifest): string {
   return path.join(componentsRoot, `${manifest.odSha.slice(0, 7)}-${manifest.platform}-${manifest.arch}`)
 }
@@ -174,6 +198,153 @@ export function quickValidateInstalledComponent(dir: string, expectedSha256: str
     return marker.sha256 === expectedSha256
   } catch {
     return false
+  }
+}
+
+interface ComponentMarker {
+  sha256: string
+  entrySha256: Record<string, string>
+}
+
+function sha256OfFile(filePath: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
+}
+
+function readComponentMarker(dir: string): ComponentMarker | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(dir, COMPONENT_MARKER_FILE), 'utf8')) as Partial<ComponentMarker>
+    if (typeof parsed.sha256 !== 'string' || parsed.entrySha256 == null || typeof parsed.entrySha256 !== 'object') return null
+    return { sha256: parsed.sha256, entrySha256: parsed.entrySha256 as Record<string, string> }
+  } catch {
+    return null
+  }
+}
+
+/** M4 (Opus re-review, 2026-10-06): re-hashes the launcher entry files
+ * under `dir` and compares against the marker this installer wrote at
+ * install time (right after extraction, before the tree below is made
+ * read-only). Intended to be called by creative-serve-web.ts immediately
+ * before every launch — independent of, and in addition to, the read-only
+ * permission bits makeInstalledTreeReadOnly sets: permissions stop a
+ * normal process from writing here at all, but this spot-check still
+ * catches anything that managed to change the content anyway (e.g. a
+ * privileged process, or a bug elsewhere in this installer) without
+ * trusting mode bits alone. */
+export function verifyEntryFileIntegrity(dir: string): void {
+  const marker = readComponentMarker(dir)
+  if (marker == null) throw new Error('Open Design component is missing its integrity marker')
+  for (const relative of ENTRY_FILES_FOR_INTEGRITY_CHECK) {
+    const expected = marker.entrySha256[relative]
+    if (typeof expected !== 'string' || expected.length === 0) {
+      throw new Error(`Open Design component integrity marker is missing a hash for ${relative}`)
+    }
+    const actual = sha256OfFile(path.join(dir, relative))
+    if (actual !== expected) {
+      throw new Error(`Open Design component entry file changed after install: ${relative}`)
+    }
+  }
+}
+
+// M1 (Opus re-review, 2026-10-06): sticky-bit directories (e.g. /tmp, mode
+// 1777) are the standard safe exception to "group/other writable" — see
+// the matching fork-side comment (iDoris-ai/open-design-agent24#7,
+// apps/packaged/src/agent24-headless.ts) for the full reasoning; kept
+// identical here so the host and the launcher agree on what "safe" means.
+function hasUnsafeAncestorWriteBits(mode: number): boolean {
+  if ((mode & 0o1000) !== 0) return false
+  return (mode & 0o022) !== 0
+}
+
+function ancestorOwnerIsTrusted(uid: number): boolean {
+  return uid === process.getuid!() || uid === 0
+}
+
+function chainFromAncestor(ancestor: string, target: string): string[] {
+  const rel = path.relative(ancestor, target)
+  if (rel === '') return [ancestor]
+  const segments = rel.split(path.sep).filter((segment) => segment.length > 0)
+  const chain = [ancestor]
+  let acc = ancestor
+  for (const segment of segments) {
+    acc = path.join(acc, segment)
+    chain.push(acc)
+  }
+  return chain
+}
+
+function rootToTargetChain(target: string): string[] {
+  const segments = target.split(path.sep).filter((segment) => segment.length > 0)
+  const chain: string[] = []
+  let acc = ''
+  for (const segment of segments) {
+    acc = `${acc}${path.sep}${segment}`
+    chain.push(acc)
+  }
+  return chain
+}
+
+/** M1/M4 ("self-checking is not a boundary", Opus re-review of
+ * iDoris-ai/open-design-agent24#7, 2026-10-06): the fork's own
+ * ancestor-chain check runs INSIDE the already-spawned headless launcher
+ * process — strictly later than THIS process (creative-serve-web.ts)
+ * deciding to spawn it at all. This is the same check (ownership + no
+ * unsafe group/other write bits, sticky-bit excepted, walked from $HOME
+ * down to resourceSafeBase), run by the host, before spawn — defense in
+ * depth, not a replacement for the fork's own check. POSIX-only: Windows
+ * has no uid/mode-writable-bits model here, matching the fork's own
+ * win32 fail-closed behavior for an explicit resourceSafeBase. */
+export function assertResourceSafeBaseAncestryIsSafe(safeBase: string): void {
+  if (typeof process.getuid !== 'function') return
+  const home = os.homedir()
+  const relativeToHome = path.relative(home, safeBase)
+  const underHome = relativeToHome === '' || (!relativeToHome.startsWith('..') && !path.isAbsolute(relativeToHome))
+  const chain = underHome ? chainFromAncestor(home, safeBase) : rootToTargetChain(safeBase)
+  for (const target of chain) {
+    const info = fs.lstatSync(target)
+    if (!ancestorOwnerIsTrusted(info.uid)) {
+      throw new Error(`Open Design resourceSafeBase ancestor is not owned by the current user or root: ${target}`)
+    }
+    if (hasUnsafeAncestorWriteBits(info.mode)) {
+      throw new Error(`Open Design resourceSafeBase ancestor is group- or other-writable without the sticky bit: ${target}`)
+    }
+  }
+}
+
+/** M4: after a successful install, nothing should be able to modify the
+ * installed tree's content again short of deleting and reinstalling it —
+ * chmod every directory to 0500 (owner read+execute, no write — not even
+ * for the owner) and every file to 0444 (owner/group/other read-only).
+ * Bottom-up (children before their parent) so this process's own
+ * traversal never needs write access to a directory it just locked down;
+ * chmod itself only needs ownership of the target, never write permission
+ * on its parent. Symlinks are left untouched — verifyComponentContract's
+ * own symlink walk (run just before this, via the caller) already proved
+ * every one of them resolves inside the installed tree. */
+function makeInstalledTreeReadOnly(root: string): void {
+  const stat = fs.lstatSync(root)
+  if (stat.isSymbolicLink()) return
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(root)) makeInstalledTreeReadOnly(path.join(root, entry))
+    fs.chmodSync(root, 0o500)
+  } else if (stat.isFile()) {
+    fs.chmodSync(root, 0o444)
+  }
+}
+
+/** Counterpart to makeInstalledTreeReadOnly, needed before this installer
+ * can remove an OLD install at the same dir to make room for a re-install
+ * (manifest/version upgrade at the same odSha/platform/arch) — deleting a
+ * directory entry needs write on its PARENT, which 0500 deliberately
+ * removed. Top-down (parent before children) is fine either way here:
+ * 0500 already permits readdir/traversal, this just restores write too. */
+function makeInstalledTreeWritableForRemoval(root: string): void {
+  const stat = fs.lstatSync(root, { throwIfNoEntry: false })
+  if (stat == null || stat.isSymbolicLink()) return
+  if (stat.isDirectory()) {
+    fs.chmodSync(root, 0o700)
+    for (const entry of fs.readdirSync(root)) makeInstalledTreeWritableForRemoval(path.join(root, entry))
+  } else if (stat.isFile()) {
+    fs.chmodSync(root, 0o600)
   }
 }
 
@@ -353,7 +524,7 @@ export class OpenDesignComponentInstaller {
     } else {
       this.manifest = loaded
     }
-    this.componentsRoot = options.componentsRoot ?? path.join(os.homedir(), '.agent24', 'components', 'open-design')
+    this.componentsRoot = options.componentsRoot ?? defaultComponentsRoot()
     this.tarBinary = options.tarBinary ?? 'tar'
     this.fetchFn = fetchFn
     this.allowedHosts = new Set(options.allowedHosts ?? DEFAULT_ALLOWED_DOWNLOAD_HOSTS)
@@ -423,7 +594,31 @@ export class OpenDesignComponentInstaller {
       return this.status()
     }
 
-    fs.mkdirSync(this.componentsRoot, { recursive: true })
+    // M1 (Opus re-review, 2026-10-06): the fork's explicit resourceSafeBase
+    // check (iDoris-ai/open-design-agent24#7) walks the full ancestor chain
+    // from $HOME down to the safe base, rejecting any level that isn't
+    // owned by the current user or is group/other-writable. Explicitly
+    // create AND chmod both ~/.agent24/components and its open-design
+    // subdirectory (this.componentsRoot) as 0700 — not just the leaf
+    // install dir below — rather than relying on mkdirSync's `mode` option
+    // alone (not guaranteed to apply to every intermediate directory it
+    // creates) or on whatever a prior run or the host's umask already left
+    // in place.
+    //
+    // Only reach up to componentsRoot's PARENT when componentsRoot is the
+    // real default (~/.agent24/components/open-design) — this installer
+    // only actually owns that one specific directory tree. A test (or any
+    // future caller) that overrides componentsRoot to some unrelated
+    // standalone location must never have THIS installer start chmod'ing
+    // that override's parent, which could be anything up to a shared
+    // system temp directory it has no business touching.
+    if (this.componentsRoot === defaultComponentsRoot()) {
+      const componentsRootParent = path.dirname(this.componentsRoot)
+      fs.mkdirSync(componentsRootParent, { recursive: true, mode: 0o700 })
+      fs.chmodSync(componentsRootParent, 0o700)
+    }
+    fs.mkdirSync(this.componentsRoot, { recursive: true, mode: 0o700 })
+    fs.chmodSync(this.componentsRoot, 0o700)
     cleanupStalePartials(this.componentsRoot)
     const token = crypto.randomBytes(6).toString('hex')
     const partialDir = path.join(this.componentsRoot, `.partial-${token}`)
@@ -446,12 +641,27 @@ export class OpenDesignComponentInstaller {
       fs.mkdirSync(partialDir, { recursive: true, mode: 0o700 })
       await execFileAsync(this.tarBinary, ['-xzf', tarballPath, '--no-same-owner', '-C', partialDir], { maxBuffer: 64 * 1024 * 1024 })
       verifyComponentContract(partialDir, manifest.version)
-      fs.writeFileSync(path.join(partialDir, COMPONENT_MARKER_FILE), JSON.stringify({ sha256: manifest.sha256 }))
+      // M4: record the entry files' content hashes now, while they're
+      // still known-good (just extracted + contract-verified), so
+      // creative-serve-web.ts can spot-check them again right before every
+      // launch — see verifyEntryFileIntegrity's own doc comment.
+      const entrySha256 = Object.fromEntries(
+        ENTRY_FILES_FOR_INTEGRITY_CHECK.map((relative) => [relative, sha256OfFile(path.join(partialDir, relative))]),
+      )
+      fs.writeFileSync(path.join(partialDir, COMPONENT_MARKER_FILE), JSON.stringify({ sha256: manifest.sha256, entrySha256 }))
 
       const finalDir = openDesignComponentInstallDir(this.componentsRoot, manifest)
+      // M4: an OLD install at this exact path (a re-install / upgrade) was
+      // made read-only below the last time install() succeeded — restore
+      // write access before removing it. A no-op (throwIfNoEntry guards
+      // inside) when there's nothing here yet.
+      makeInstalledTreeWritableForRemoval(finalDir)
       fs.rmSync(finalDir, { recursive: true, force: true })
       fs.renameSync(partialDir, finalDir)
-      fs.chmodSync(finalDir, 0o700)
+      // M4: lock the whole tree read-only now that it's in its final
+      // location — nothing (including this process) can change its
+      // content again short of deleting and reinstalling it.
+      makeInstalledTreeReadOnly(finalDir)
       this.setStatus({ state: 'installed', dir: finalDir })
       return this.status()
     } catch (error) {

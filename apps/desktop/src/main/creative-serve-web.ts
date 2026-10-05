@@ -3,6 +3,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { Readable } from 'node:stream'
 
+import { assertResourceSafeBaseAncestryIsSafe, verifyEntryFileIntegrity } from './open-design-component'
+
 export type CreativeServeWebState = 'stopped' | 'starting' | 'ready' | 'failed' | 'needs-download'
 
 export interface CreativeServeWebStatus {
@@ -295,6 +297,22 @@ export class CreativeServeWeb {
           // installs with mode 0700 so this directory's ownership/
           // writability already satisfies the fork's POSIX check).
           const resourceSafeBase = fs.realpathSync(componentStatus.dir)
+          // M1/M4 ("self-checking is not a boundary", Opus re-review of the
+          // fork PR, 2026-10-06): verify BEFORE spawning anything, not just
+          // trust the fork's own (later, post-spawn) self-check — the
+          // ancestor-chain ownership/mode walk (M1) and the installed
+          // entry files' content hashes against the marker recorded at
+          // install time (M4). Both throw with a clear message on failure;
+          // caught here and surfaced as a normal 'failed' status rather
+          // than an uncaught exception, same as every other failure path
+          // in this method.
+          try {
+            assertResourceSafeBaseAncestryIsSafe(resourceSafeBase)
+            verifyEntryFileIntegrity(componentStatus.dir)
+          } catch (error) {
+            this.current = { state: 'failed', error: error instanceof Error ? error.message : String(error) }
+            return this.status()
+          }
           return this.startPackagedHeadless(installedHeadlessEntry, environment, componentStatus.dir, resourceSafeBase)
         }
         // Installed-but-missing-launcher (e.g. the dir was deleted after the

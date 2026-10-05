@@ -14,8 +14,10 @@ import {
   loadOpenDesignComponentManifest,
   openDesignComponentInstallDir,
   parseOpenDesignComponentManifest,
+  assertResourceSafeBaseAncestryIsSafe,
   quickValidateInstalledComponent,
   verifyComponentContract,
+  verifyEntryFileIntegrity,
   type OpenDesignComponentManifest,
 } from './open-design-component'
 
@@ -31,9 +33,32 @@ vi.setConfig({ testTimeout: 30_000 })
 const tempDirs: string[] = []
 const servers: http.Server[] = []
 
+// M4 (Opus re-review, 2026-10-05): a successful install now chmod's the
+// whole installed tree read-only (0500 dirs / 0444 files) — a plain
+// fs.rmSync can no longer remove it (ENOTEMPTY: deleting a directory entry
+// needs write on its PARENT, which 0500 deliberately removed). Restore
+// write access bottom-up before removing, mirroring what the installer
+// itself does before a re-install (makeInstalledTreeWritableForRemoval in
+// the source file).
+function restoreWritableRecursive(root: string): void {
+  const stat = fs.lstatSync(root, { throwIfNoEntry: false })
+  if (stat == null || stat.isSymbolicLink()) return
+  if (stat.isDirectory()) {
+    fs.chmodSync(root, 0o700)
+    for (const entry of fs.readdirSync(root)) restoreWritableRecursive(path.join(root, entry))
+  } else if (stat.isFile()) {
+    fs.chmodSync(root, 0o600)
+  }
+}
+
+function rmTreeEvenIfReadOnly(root: string): void {
+  restoreWritableRecursive(root)
+  fs.rmSync(root, { recursive: true, force: true })
+}
+
 afterEach(async () => {
   for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve))
-  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
+  for (const dir of tempDirs.splice(0)) rmTreeEvenIfReadOnly(dir)
   vi.restoreAllMocks()
 })
 
@@ -397,6 +422,152 @@ describe('OpenDesignComponentInstaller', () => {
     // No leftover partial directories/files.
     const leftovers = fs.readdirSync(componentsRoot).filter((name) => name.startsWith('.partial-'))
     expect(leftovers).toEqual([])
+  })
+
+  it('M4 (Opus re-review, 2026-10-06): the installed tree is read-only (dirs 0500, files 0444) and verifyEntryFileIntegrity passes on it', async () => {
+    const stage = seedTreeFor('a24-od-stage-readonly-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-readonly-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+    const dir = (result as { dir: string }).dir
+
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o500)
+    expect(fs.statSync(path.join(dir, 'app')).mode & 0o777).toBe(0o500)
+    expect(fs.statSync(path.join(dir, 'app', 'prebundled', 'agent24-headless.cjs')).mode & 0o777).toBe(0o444)
+    expect(fs.statSync(path.join(dir, '.agent24-component.json')).mode & 0o777).toBe(0o444)
+
+    // Nothing — not even this process — can write into it anymore.
+    expect(() => fs.writeFileSync(path.join(dir, 'app', 'prebundled', 'agent24-headless.cjs'), 'tampered')).toThrow()
+
+    expect(() => verifyEntryFileIntegrity(dir)).not.toThrow()
+  })
+
+  it('M4: verifyEntryFileIntegrity rejects an entry file whose content changed after install', async () => {
+    const stage = seedTreeFor('a24-od-stage-tamper-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-tamper-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+    const dir = (result as { dir: string }).dir
+
+    // Simulate tampering (e.g. by a privileged process) bypassing the
+    // read-only mode bits entirely: restore write access first, same as
+    // the installer's own pre-reinstall helper would, then swap the file.
+    const target = path.join(dir, 'app', 'prebundled', 'daemon', 'daemon-cli.mjs')
+    fs.chmodSync(path.dirname(target), 0o700)
+    fs.chmodSync(target, 0o600)
+    fs.writeFileSync(target, 'tampered-after-install')
+
+    expect(() => verifyEntryFileIntegrity(dir)).toThrow(/entry file changed after install/)
+  })
+
+  it('M4: re-installing over an existing (read-only) install dir succeeds', async () => {
+    const stage = seedTreeFor('a24-od-stage-reinstall-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-reinstall-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const first = await installer.install()
+    expect(first.state).toBe('installed')
+
+    // A second install() while already installed() is a no-op short
+    // circuit (see install()'s own early return) — construct a FRESH
+    // installer against the same componentsRoot/manifest to force a real
+    // re-install over the now-read-only directory from the first one.
+    const second = await new OpenDesignComponentInstaller(
+      { manifest, componentsRoot, allowedHosts: ['127.0.0.1'] },
+      localFetch,
+    ).install()
+    expect(second).toEqual(first)
+  })
+
+  it('M1 (Opus re-review, 2026-10-06): the real default componentsRoot path (~/.agent24/components and its open-design subdirectory) is created and chmod\'d 0700', async () => {
+    const stage = seedTreeFor('a24-od-stage-default-root-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const fakeHome = tmpDir('a24-od-fake-home-')
+    const previousHome = process.env.HOME
+    process.env.HOME = fakeHome
+    try {
+      // No componentsRoot override — exercises the REAL default path
+      // derivation (os.homedir() + '.agent24/components/open-design').
+      const installer = new OpenDesignComponentInstaller({ manifest, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+
+      const componentsDir = path.join(fakeHome, '.agent24', 'components')
+      const openDesignDir = path.join(componentsDir, 'open-design')
+      expect(fs.statSync(componentsDir).mode & 0o777).toBe(0o700)
+      expect(fs.statSync(openDesignDir).mode & 0o777).toBe(0o700)
+    } finally {
+      process.env.HOME = previousHome
+    }
+  })
+
+  describe('assertResourceSafeBaseAncestryIsSafe (M1, Opus re-review, 2026-10-06)', () => {
+    it('accepts a short, fully-owned, non-writable ancestor chain', () => {
+      const fakeHome = tmpDir('a24-ancestry-home-ok-')
+      const safeBase = path.join(fakeHome, '.agent24', 'components', 'open-design', 'abc1234-darwin-arm64')
+      fs.mkdirSync(safeBase, { recursive: true, mode: 0o700 })
+      const previousHome = process.env.HOME
+      process.env.HOME = fakeHome
+      try {
+        expect(() => assertResourceSafeBaseAncestryIsSafe(safeBase)).not.toThrow()
+      } finally {
+        process.env.HOME = previousHome
+      }
+    })
+
+    it('rejects when an intermediate ancestor directory is group/other-writable without the sticky bit', () => {
+      if (typeof process.getuid !== 'function') return // POSIX-only check
+      const fakeHome = tmpDir('a24-ancestry-home-bad-')
+      const agent24Dir = path.join(fakeHome, '.agent24')
+      const safeBase = path.join(agent24Dir, 'components', 'open-design', 'abc1234-darwin-arm64')
+      fs.mkdirSync(safeBase, { recursive: true, mode: 0o700 })
+      fs.chmodSync(agent24Dir, 0o777) // no sticky bit — unsafe
+      const previousHome = process.env.HOME
+      process.env.HOME = fakeHome
+      try {
+        expect(() => assertResourceSafeBaseAncestryIsSafe(safeBase)).toThrow(/group- or other-writable/)
+      } finally {
+        fs.chmodSync(agent24Dir, 0o700) // restore before tmpDir cleanup
+        process.env.HOME = previousHome
+      }
+    })
+
+    it('accepts a world-writable intermediate ancestor ONLY when the sticky bit is set', () => {
+      if (typeof process.getuid !== 'function') return // POSIX-only check
+      const fakeHome = tmpDir('a24-ancestry-home-sticky-')
+      const agent24Dir = path.join(fakeHome, '.agent24')
+      const safeBase = path.join(agent24Dir, 'components', 'open-design', 'abc1234-darwin-arm64')
+      fs.mkdirSync(safeBase, { recursive: true, mode: 0o700 })
+      fs.chmodSync(agent24Dir, 0o1777) // world-writable but sticky — safe
+      const previousHome = process.env.HOME
+      process.env.HOME = fakeHome
+      try {
+        expect(() => assertResourceSafeBaseAncestryIsSafe(safeBase)).not.toThrow()
+      } finally {
+        fs.chmodSync(agent24Dir, 0o700)
+        process.env.HOME = previousHome
+      }
+    })
   })
 
   it('installs a tarball whose `tar -tzf` member listing exceeds 1MB (real-app regression, 2026-10-05)', { timeout: 40_000 }, async () => {
