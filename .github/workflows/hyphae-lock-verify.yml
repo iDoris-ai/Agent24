@@ -52,13 +52,27 @@ jobs:
           LOCK=agent24/rust/crates/agent24-comm/hyphae.lock.json
           SOURCE_SHA=$(jq -r '.source_sha' "$LOCK")
           EXPECTED=$(jq -r '.binaries["linux-x64"]' "$LOCK")
+          LOCK_GO=$(jq -r '.go' "$LOCK")
           RECIPE=$(jq -r '.recipe' "$LOCK")
-          if [ -z "$SOURCE_SHA" ] || [ "$SOURCE_SHA" = "null" ]; then
-            echo "::error::hyphae.lock.json has no source_sha"
+          if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::hyphae.lock.json source_sha must be a full 40-character commit SHA"
+            exit 1
+          fi
+          if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::hyphae.lock.json has no valid linux-x64 sha256"
+            exit 1
+          fi
+          if ! printf '%s' "$LOCK_GO" | grep -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::hyphae.lock.json has invalid go version: $LOCK_GO"
+            exit 1
+          fi
+          if ! printf '%s' "$RECIPE" | grep -Fq "GOTOOLCHAIN=$LOCK_GO "; then
+            echo "::error::recipe does not pin GOTOOLCHAIN to the lock's go version ($LOCK_GO)"
             exit 1
           fi
           {
             echo "source_sha=$SOURCE_SHA"
+            echo "go_version=${LOCK_GO#go}"
             echo "expected=$EXPECTED"
             echo "recipe<<HYPHAE_RECIPE_EOF"
             echo "$RECIPE"
@@ -74,12 +88,12 @@ jobs:
           path: hyphae-src
           submodules: false
 
-      # Bootstrap toolchain only: the recipe's own `GOTOOLCHAIN=...` prefix
-      # pins and auto-fetches the exact Go version the lock requires.
-      - name: Setup Go
+      # Install the exact Go version declared in the lock; the recipe also
+      # carries the matching GOTOOLCHAIN pin as a second check.
+      - name: Setup locked Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
-          go-version: 'stable'
+          go-version: ${{ steps.lock.outputs.go_version }}
 
       - name: Build linux-x64 per the locked recipe
         working-directory: hyphae-src
