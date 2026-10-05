@@ -133,14 +133,23 @@ function httpsManifestUrl(httpUrl: string): string {
 const localFetch: typeof fetch = (input, init) =>
   fetch(String(input).replace(/^https:/, 'http:'), init)
 
+// CI finding (2026-10-05): this used to hardcode platform:'darwin'/
+// arch:'arm64'. OpenDesignComponentInstaller's L2 check compares the
+// manifest's platform/arch against the REAL process.platform/process.arch
+// whenever a test doesn't inject an explicit override (most of this file
+// doesn't — only the dedicated L2 test below does) — so on a Linux CI
+// runner, every one of those installers rejected the hardcoded-darwin
+// fixture as a platform mismatch and reported `unavailable` instead of
+// `not-installed`/`installed`. Defaulting to the actual host's
+// platform/arch here makes every other test in this file host-independent.
 function manifestFor(tarPath: string, overrides: Partial<OpenDesignComponentManifest> = {}): { manifest: OpenDesignComponentManifest; sha256: string; size: number } {
   const bytes = fs.readFileSync(tarPath)
   const sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
   const manifest: OpenDesignComponentManifest = {
     version: '0.22.2',
     odSha: 'f84ff89656143b5fa3fe8f0891b7f2bf38769d9f',
-    platform: 'darwin',
-    arch: 'arm64',
+    platform: process.platform,
+    arch: process.arch,
     url: 'https://example.invalid/placeholder.tar.gz',
     sha256,
     size: bytes.length,
