@@ -486,6 +486,46 @@ describe('CreativeServeWeb', () => {
     await service.stop()
   })
 
+  it('M2 closed-loop finding (2026-10-05): resourceRoot and resourceSafeBase are anchored to the same base even when the installed component dir is reached through a symlink', async () => {
+    // Caught by actually running the real packaged Electron binary against
+    // the real installer (apps/desktop/scripts/ci-on-demand-smoke.mjs) on
+    // macOS, where tmp dirs route through /tmp -> /private/tmp: with
+    // resourceRoot built from the raw (symlinked) dir while
+    // resourceSafeBase used fs.realpathSync, the fork's own v2 check
+    // (plain path.relative — see iDoris-ai/open-design-agent24#7) saw the
+    // two disagree and rejected every on-demand launch. Reproduced here
+    // without touching the real filesystem's /tmp — a plain in-tree
+    // symlink hits the same code path.
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const componentDirLink = path.join(path.dirname(componentDir), 'component-via-symlink')
+    fs.symlinkSync(componentDir, componentDirLink)
+    tempDirs.push(componentDirLink)
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDirLink }) },
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    const realBase = fs.realpathSync(componentDir)
+    const configPath = path.join(stateRoot, 'agent24-headless.json')
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toMatchObject({
+      resourceRoot: path.join(realBase, 'open-design'),
+      resourceSafeBase: realBase,
+    })
+    await service.stop()
+  })
+
   it('does not consult the on-demand component accessor when an explicit dev checkout is set', async () => {
     const root = checkout()
     const statusFn = vi.fn(() => ({ state: 'not-installed' as const, size: 1 }))

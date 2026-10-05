@@ -407,7 +407,21 @@ export class CreativeServeWeb {
       return this.status()
     }
 
-    const resourceRoot = path.join(resourcesPath, 'open-design')
+    // M2 closed-loop finding (2026-10-05): resourceRoot must be built from
+    // the SAME base as resourceSafeBase when one is given. The fork's own
+    // v2 check (isUnderSafeBase) does a plain path.relative(safeBase,
+    // resourceRoot) string comparison — it never realpath()s resourceRoot
+    // itself, only resourceSafeBase. Building resourceRoot from the raw,
+    // un-realpath'd resourcesPath while resourceSafeBase is already
+    // fs.realpathSync'd (see the on-demand branch above) means the two
+    // would silently disagree on ANY system where the installed
+    // component's path traverses a symlink (observed locally on macOS's
+    // /var/folders tmp mount; a real ~/.agent24/... path is not usually
+    // symlinked, but nothing guarantees that on every host) — the real
+    // headless launcher would then reject every on-demand launch with
+    // "resourceRoot must be under resourceSafeBase". Anchoring both to the
+    // identical resolved base removes the mismatch unconditionally.
+    const resourceRoot = path.join(resourceSafeBase ?? resourcesPath, 'open-design')
     const dataRoot = path.join(stateRoot, 'data')
     const runtimeRoot = path.join(stateRoot, 'runtime')
     const configPath = path.join(stateRoot, 'agent24-headless.json')
