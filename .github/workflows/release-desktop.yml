@@ -185,22 +185,35 @@ jobs:
       #     only by a debugger/devtools that explicitly asks for them,
       #     which nothing in this packaged, headless pipeline does.
       #     Measured on a real build: 377MB of these alone.
-      #   - app/node_modules/@open-design/web's own {.next,src,public}:
-      #     this package is only present in app/node_modules because the
-      #     fork's own assembly step installs EVERY internal workspace
+      #   - app/node_modules/{@open-design/web,next,@next,openai,react,
+      #     react-dom}: Agent24's OWN prepare-open-design-linux-resources.mjs
+      #     imports WIN_PREBUNDLE_POLICIES from the fork's
+      #     tools/pack/src/win/prebundle.ts (Linux and Windows share the
+      #     same esbuild bundling policy there) to build every one of the
+      #     prebundled daemon-cli/daemon-sidecar/web-sidecar/packaged-main
+      #     entries — and that EXACT policy's forbiddenInputs for every one
+      #     of those entries lists "/apps/web/", "/node_modules/
+      #     @open-design/web/", "/node_modules/next/", "/node_modules/
+      #     openai/", "/node_modules/react/", and "/node_modules/
+      #     react-dom/". assertMetafile (called right after each esbuild
+      #     pass, in that same prep script) already FAILS THE BUILD if any
+      #     of these ever shows up as an input — so a build that succeeded
+      #     (this one just did) is itself the proof nothing prebundled
+      #     references them. @next is next's own native SWC compiler,
+      #     needed by nothing once next itself is unreferenced. These
+      #     packages are only present in app/node_modules at all because
+      #     the fork's own assembly step installs EVERY internal workspace
       #     package as a dependency of the packaged app regardless of
-      #     whether anything actually requires it at runtime — and
-      #     nothing does here. Confirmed by the fork's OWN prebundle
-      #     policy (MAC_STANDALONE_PREBUNDLE_EXCLUDED_INTERNAL_PACKAGES /
-      #     MAC_PREBUNDLE_POLICIES's forbiddenInputs in
-      #     tools/pack/src/mac/prebundle.ts) explicitly asserting the
-      #     prebundled daemon/web-sidecar entries never reference
-      #     "/apps/web/" or "/node_modules/next/" as an input at all — the
-      #     real, served web app is the SEPARATE, already self-contained
-      #     open-design-web-standalone/ tree produced independently by
-      #     stage-open-design-resources.mjs, not this copy.
-      # package.json, dist/, LICENSE, and next.config.ts are left alone —
-      # keeping anything we haven't specifically confirmed as dead weight.
+      #     whether the prebundled runtime ever touches it. The real,
+      #     served web app is the SEPARATE, already self-contained
+      #     open-design-web-standalone/ tree stage-open-design-resources.mjs
+      #     produces independently — not any of this.
+      # Left alone: everything else, including other sizeable packages
+      # (mermaid, @excalidraw, three, jspdf, lucide-react, ...) that are
+      # NOT individually named in that forbidden-inputs list — they are
+      # presumably @open-design/web's own transitive frontend deps too, but
+      # proving that would mean tracing whether anything ELSE in
+      # app/node_modules also depends on them, which this round didn't do.
       - name: Prune non-runtime files from the staged Open Design resource tree
         shell: bash
         run: |
@@ -209,9 +222,12 @@ jobs:
           BEFORE="$(du -sh "$STAGE" | cut -f1)"
           find "$STAGE" -name '*.map' -delete
           rm -rf \
-            "$STAGE/app/node_modules/@open-design/web/.next" \
-            "$STAGE/app/node_modules/@open-design/web/src" \
-            "$STAGE/app/node_modules/@open-design/web/public"
+            "$STAGE/app/node_modules/@open-design/web" \
+            "$STAGE/app/node_modules/next" \
+            "$STAGE/app/node_modules/@next" \
+            "$STAGE/app/node_modules/openai" \
+            "$STAGE/app/node_modules/react" \
+            "$STAGE/app/node_modules/react-dom"
           AFTER="$(du -sh "$STAGE" | cut -f1)"
           echo "staged Open Design resource tree: $BEFORE -> $AFTER"
 
