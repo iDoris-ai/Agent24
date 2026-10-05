@@ -22,7 +22,13 @@ name: Release Desktop (Linux + macOS)
 # exact Open Design mac resource base" step below is the mac analogue of the
 # Linux job's equivalent step, pointed at `Contents/Resources` instead of a
 # Linux `--to dir` output — no new Agent24-side resource-assembly script was
-# needed.
+# needed. Verified against a real build, not just unit tests: the real
+# pipeline also needed two runtime fixes in src/main/{open-design-component,
+# creative-serve-web}.ts (a tar listing exceeding Node's default execFile
+# buffer, and a symlink so the Open Design fork's own launcher — which
+# expects resourceRoot inside the app bundle — accepts the on-demand
+# component's install directory outside it); both already landed via PR #670
+# and apply to Linux too, not just mac.
 #
 # Same tag filter as release.yml — see that file's header comment for why
 # `v[0-9]+.[0-9]+.[0-9]+` doesn't match `agent24-os-sdk-v9.9.9` / `v0.4.0-m4`.
