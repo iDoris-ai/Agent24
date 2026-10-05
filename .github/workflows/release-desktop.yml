@@ -92,6 +92,23 @@ jobs:
 
       - name: Build exact Open Design Linux resource base
         shell: bash
+        env:
+          # Owner decision 2026-10-06 (DEP-A13): the fork's Linux assembly
+          # step (tools/pack/src/linux.ts's runProductionInstall) defaults
+          # to a plain `npm install --omit=dev`, which materializes a real,
+          # byte-duplicated copy of every dependency shared across the 16
+          # internal workspace packages it assembles (next/react/openai
+          # etc. each ended up with several full copies) — measured at
+          # 814MB shipped vs mac's 276MB for the exact same content. The
+          # fork ALREADY supports routing this through pnpm itself
+          # (`--config.node-linker=hoisted`, which still hard-links every
+          # hoisted file back to pnpm's single content-addressable store
+          # copy instead of duplicating bytes) via this env var — it was
+          # built for the fork's own containerized Docker build, but
+          # nothing about it requires a container; pnpm is already
+          # corepack-activated on this runner by the time this step reaches
+          # the tools-pack invocation below.
+          OD_TOOLS_PACK_PNPM_BIN: pnpm
         run: |
           set -euo pipefail
           test "$(git -C open-design rev-parse HEAD)" = "$OPEN_DESIGN_SHA"
@@ -157,6 +174,45 @@ jobs:
 
       - name: Stage exact Open Design Creative resources
         run: pnpm --filter @agent24/desktop stage:open-design
+
+      # Owner decision 2026-10-06 (DEP-A13): prune files from the staged
+      # tree that are PROVABLY never loaded at runtime — conservative on
+      # purpose (only categories we can actually justify, not everything
+      # that LOOKS prunable):
+      #   - "**/*.map" (source maps): Node's module loader never reads a
+      #     .map file to execute the matching .js — these are consulted
+      #     only by a debugger/devtools that explicitly asks for them,
+      #     which nothing in this packaged, headless pipeline does.
+      #     Measured on a real build: 377MB of these alone.
+      #   - app/node_modules/@open-design/web's own {.next,src,public}:
+      #     this package is only present in app/node_modules because the
+      #     fork's own assembly step installs EVERY internal workspace
+      #     package as a dependency of the packaged app regardless of
+      #     whether anything actually requires it at runtime — and
+      #     nothing does here. Confirmed by the fork's OWN prebundle
+      #     policy (MAC_STANDALONE_PREBUNDLE_EXCLUDED_INTERNAL_PACKAGES /
+      #     MAC_PREBUNDLE_POLICIES's forbiddenInputs in
+      #     tools/pack/src/mac/prebundle.ts) explicitly asserting the
+      #     prebundled daemon/web-sidecar entries never reference
+      #     "/apps/web/" or "/node_modules/next/" as an input at all — the
+      #     real, served web app is the SEPARATE, already self-contained
+      #     open-design-web-standalone/ tree produced independently by
+      #     stage-open-design-resources.mjs, not this copy.
+      # package.json, dist/, LICENSE, and next.config.ts are left alone —
+      # keeping anything we haven't specifically confirmed as dead weight.
+      - name: Prune non-runtime files from the staged Open Design resource tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="apps/desktop/.open-design-resources"
+          BEFORE="$(du -sh "$STAGE" | cut -f1)"
+          find "$STAGE" -name '*.map' -delete
+          rm -rf \
+            "$STAGE/app/node_modules/@open-design/web/.next" \
+            "$STAGE/app/node_modules/@open-design/web/src" \
+            "$STAGE/app/node_modules/@open-design/web/public"
+          AFTER="$(du -sh "$STAGE" | cut -f1)"
+          echo "staged Open Design resource tree: $BEFORE -> $AFTER"
 
       - name: Rebuild Open Design native modules for Agent24 Electron
         env:
