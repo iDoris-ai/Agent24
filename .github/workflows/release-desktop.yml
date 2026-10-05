@@ -92,23 +92,24 @@ jobs:
 
       - name: Build exact Open Design Linux resource base
         shell: bash
-        env:
-          # Owner decision 2026-10-06 (DEP-A13): the fork's Linux assembly
-          # step (tools/pack/src/linux.ts's runProductionInstall) defaults
-          # to a plain `npm install --omit=dev`, which materializes a real,
-          # byte-duplicated copy of every dependency shared across the 16
-          # internal workspace packages it assembles (next/react/openai
-          # etc. each ended up with several full copies) — measured at
-          # 814MB shipped vs mac's 276MB for the exact same content. The
-          # fork ALREADY supports routing this through pnpm itself
-          # (`--config.node-linker=hoisted`, which still hard-links every
-          # hoisted file back to pnpm's single content-addressable store
-          # copy instead of duplicating bytes) via this env var — it was
-          # built for the fork's own containerized Docker build, but
-          # nothing about it requires a container; pnpm is already
-          # corepack-activated on this runner by the time this step reaches
-          # the tools-pack invocation below.
-          OD_TOOLS_PACK_PNPM_BIN: pnpm
+        # Owner decision 2026-10-06 (DEP-A13): tried routing this through
+        # the fork's own pnpm-hoisted install path
+        # (OD_TOOLS_PACK_PNPM_BIN=pnpm, --config.node-linker=hoisted) to
+        # dedupe the 814MB-vs-mac's-276MB duplication — real CI run showed
+        # this is NOT a drop-in swap: `pnpm pack`, unlike what this
+        # assembled app's package.json declares, rewrites each internal
+        # package's OWN cross-references to its 15 siblings from
+        # `workspace:*` into a normal semver range at pack time, but this
+        # outer package.json only lists those siblings as top-level `file:`
+        # deps — pnpm doesn't connect the two and tries to resolve the
+        # semver-range reference against the real npm registry instead
+        # (`ERR_PNPM_FETCH_404` for `@open-design/release` and similar —
+        # these packages are private/unpublished, so every one 404s).
+        # npm's own resolver apparently tolerates this doubled-up
+        # file+semver shape without erroring (that's why the ORIGINAL
+        # `npm install --omit=dev` default already works); pnpm's does not.
+        # Reverted to the default; the file-pruning step below is the
+        # actual, working size reduction for this round.
         run: |
           set -euo pipefail
           test "$(git -C open-design rev-parse HEAD)" = "$OPEN_DESIGN_SHA"
