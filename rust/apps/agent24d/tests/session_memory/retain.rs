@@ -123,7 +123,16 @@ async fn audit_id_conflict_does_not_report_a_failed_remember_as_success() {
 }
 
 #[tokio::test]
-async fn repeating_a_withdrawn_remember_is_observable_and_does_not_revive_it() {
+async fn repeating_a_withdrawn_remember_revives_it_review_h3() {
+    // M1-T10 review H3: this used to be named `…_does_not_revive_it` and
+    // asserted exactly the opposite — a withdrawn explicit-remember repeated
+    // verbatim stayed withdrawn forever (the deterministic id collided with
+    // the closed row, and `persist` surfaced that collision as a
+    // `memory.write_failed`). That meant retracting a statement and then
+    // saying the identical sentence again could NEVER be remembered again.
+    // Review H3 deliberately changes this: an identical re-assert
+    // REACTIVATES the existing row (new evidence, no error, no
+    // `memory.write_failed`) instead of colliding with it.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("memory.db");
     let kv = KvStore::open(&db).await.unwrap();
@@ -169,26 +178,42 @@ async fn repeating_a_withdrawn_remember_is_observable_and_does_not_revive_it() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        after, before,
-        "retry must preserve withdrawn row and evidence"
+    assert_ne!(
+        after.0, before.0,
+        "the reactivation must replace evidence with this new turn's"
+    );
+    assert!(
+        after.1.is_none(),
+        "the reactivation must clear recorded_to — current again"
     );
     assert_eq!(rows, 1, "retry must not create another ledger row");
-    assert!(beliefs(&kv, &owner, true).await.is_empty());
-    let retractions = kv.events().scan(&EventQuery::owner(&owner)).await.unwrap();
     assert_eq!(
-        retractions
+        beliefs(&kv, &owner, false).await.len(),
+        1,
+        "re-asserting the identical statement must revive it into recall"
+    );
+    let all_events = kv.events().scan(&EventQuery::owner(&owner)).await.unwrap();
+    assert_eq!(
+        all_events
             .iter()
             .filter(|e| e.event.kind == "assertion.retracted")
             .count(),
         1,
-        "the original assertion remains represented by its retraction event"
+        "the original retraction event remains represented, not erased"
+    );
+    assert_eq!(
+        all_events
+            .iter()
+            .filter(|e| e.event.kind == "assertion.reasserted")
+            .count(),
+        1,
+        "the reactivation is itself audited exactly once"
     );
     let memory_write_failed = std::iter::from_fn(|| events.try_recv().ok())
         .any(|(_, body)| matches!(body, EventBody::MemoryWriteFailed(_)));
     assert!(
-        memory_write_failed,
-        "withdrawn duplicate must be observable"
+        !memory_write_failed,
+        "reviving an identical statement must NOT be reported as a write failure"
     );
     let messages = kv
         .events()
@@ -202,7 +227,7 @@ async fn repeating_a_withdrawn_remember_is_observable_and_does_not_revive_it() {
     assert_eq!(
         *provider.summaries.lock().unwrap(),
         1,
-        "the retry turn must still run healthy compaction after Retain fails"
+        "the retry turn must still run healthy compaction"
     );
     let view = kv.session_log().load_view(&owner, SESSION).await.unwrap();
     assert_eq!(view.summary.as_deref(), Some("summary-1"));

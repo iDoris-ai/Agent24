@@ -11,6 +11,13 @@ use serde_json::json;
 /// Put a phrase before its shorter prefix so the more specific form wins.
 const REMEMBER_PREFIXES: &[&str] = &["请记住", "remember that ", "记住", "remember "];
 
+/// M1-T10 review H1: injected alongside recall, at run start, when
+/// [`explicit_remember`] matches the prompt but personal memory is paused —
+/// so the model does not go on to tell the user it remembered something it
+/// did not. The actual write is independently gated too ([`persist`]'s own
+/// early check): this is belt-and-braces, not the only thing stopping it.
+pub(super) const PAUSED_WRITE_NOTICE: &str = "记忆已暂停：本条不会被记住，请如实告知用户";
+
 /// Return only the user's explicitly requested text. The model response is not
 /// an input to this parser.
 pub(super) fn explicit_remember(prompt: &str) -> Option<&str> {
@@ -38,12 +45,15 @@ pub(super) async fn persist(
     if origin.trust != Trust::UserSaid {
         return Ok(());
     }
-    // M1-T10: the personal-memory pause switch is a single early check, right
-    // here at the retain (explicit "remember...") entry point — paused means
-    // no new writes, before the candidate is even built.
-    if !kv.memory_enabled(owner).await? {
-        return Ok(());
-    }
+    // M1-T10 review M2: the personal-memory pause switch used to be checked
+    // HERE, before the candidate was even built — outside any transaction,
+    // so a PUT disabling memory between this check and the write landing
+    // could still let the write through (TOCTOU). The check now lives
+    // inside `WriteGate::commit_with_audit`'s own `BEGIN IMMEDIATE`
+    // transaction (`agent24_memory::writer`), atomic with the write it
+    // gates — this is still the retain entry point's only call into the
+    // write path, so the gate is still "one early check at retain", just
+    // one transaction deeper.
     let id = checksum(&format!("{owner}{object}"));
     let candidate = Candidate::new(
         id,

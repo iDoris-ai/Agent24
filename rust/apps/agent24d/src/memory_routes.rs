@@ -39,7 +39,11 @@ const MAX_LIST_LIMIT: usize = 200;
 /// being asked for.
 fn memory_ctx(state: &AppState) -> Option<(KvStore, String)> {
     match (state.memory_kv.clone(), state.memory_owner.clone()) {
-        (Some(kv), Some(owner)) => Some((kv, owner)),
+        // An empty owner is treated the same as "no memory": every store
+        // call below is owner-scoped SQL, and a blank owner is not a real
+        // partition to scope anything to (review Low — belt-and-braces;
+        // `AppState::new` never actually produces one today).
+        (Some(kv), Some(owner)) if !owner.trim().is_empty() => Some((kv, owner)),
         _ => None,
     }
 }
@@ -70,10 +74,15 @@ fn parse_list_query(raw: Option<&str>) -> Result<(Option<String>, Option<usize>)
             if limit.is_some() {
                 return Err("at most one limit query parameter is allowed");
             }
-            limit = Some(
-                v.parse::<usize>()
-                    .map_err(|_| "limit must be a positive integer")?,
-            );
+            let parsed: usize = v.parse().map_err(|_| "limit must be a positive integer")?;
+            if parsed == 0 {
+                // Rejected, not silently clamped up to 1 (review Low) — `0`
+                // reads as "give me nothing", and a caller who meant that
+                // should see it rejected, not get back `limit=1`'s worth of
+                // rows instead.
+                return Err("limit must be a positive integer");
+            }
+            limit = Some(parsed);
         }
     }
     Ok((q, limit))
@@ -247,10 +256,21 @@ pub struct PutMemorySettingsBody {
 /// survives a daemon restart (it is a row in the same `memory.db`).
 pub async fn put_memory_settings(
     State(state): State<AppState>,
-    Json(body): Json<PutMemorySettingsBody>,
+    // `Result<Json<_>, JsonRejection>` rather than a bare `Json<_>` (review
+    // Low): a bare `Json<_>` extractor failure never reaches this body at
+    // all — axum answers with ITS OWN plain-text rejection, bypassing the
+    // `{error:{code,message}}` envelope every other 4xx on this surface
+    // uses. This puts malformed-body handling back under that envelope.
+    body: Result<Json<PutMemorySettingsBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Some((kv, owner)) = memory_ctx(&state) else {
         return memory_unavailable();
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(err) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &err.to_string());
+        }
     };
     match kv.set_memory_enabled(&owner, body.enabled).await {
         Ok(()) => Json(json!({ "enabled": body.enabled })).into_response(),
@@ -283,6 +303,7 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
 
     async fn body_json(r: Response) -> (StatusCode, Value) {
         let status = r.status();
@@ -351,7 +372,7 @@ mod tests {
         assert_eq!(
             put_memory_settings(
                 State(state.clone()),
-                Json(PutMemorySettingsBody { enabled: false })
+                Ok(Json(PutMemorySettingsBody { enabled: false }))
             )
             .await
             .status(),
@@ -385,7 +406,7 @@ mod tests {
         let (status, body) = body_json(
             put_memory_settings(
                 State(state.clone()),
-                Json(PutMemorySettingsBody { enabled: false }),
+                Ok(Json(PutMemorySettingsBody { enabled: false })),
             )
             .await,
         )
@@ -395,6 +416,37 @@ mod tests {
 
         let (_, body) = body_json(get_memory_settings(State(state.clone())).await).await;
         assert_eq!(body["enabled"], false, "the PUT must have persisted");
+    }
+
+    fn router(state: AppState) -> axum::Router {
+        crate::server::build_router_with_modules(state, axum::Router::new())
+    }
+
+    #[tokio::test]
+    async fn put_settings_with_a_malformed_body_uses_the_error_envelope_review_low() {
+        let (state, _kv) = state_with_memory("owner-bad-body").await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/memory/settings")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not valid json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Review Low: NOT axum's own bare-text rejection body — the same
+        // `{error:{code,message}}` envelope as every other 4xx here.
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(body["error"]["message"].as_str().is_some());
     }
 
     // ── list / search ────────────────────────────────────────────────────
@@ -511,6 +563,13 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
+        // review Low: `limit=0` is rejected, not silently clamped to 1.
+        assert_eq!(
+            list_assertions(State(state.clone()), RawQuery(Some("limit=0".to_owned())))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             list_assertions(State(state.clone()), RawQuery(Some("q=a&q=b".to_owned())))
                 .await
@@ -535,7 +594,17 @@ mod tests {
     #[tokio::test]
     async fn delete_is_forgotten_then_already_forgotten_then_not_found() {
         let (state, kv) = state_with_memory("owner-del").await;
-        add_assertion(&kv, "owner-del", "a1", "s", "v", vec![]).await;
+        // Non-empty evidence — see `list_with_q_filters_via_search_any`'s
+        // comment: without it the row is an unqualified "hold" that was
+        // never in the default list to begin with, which would make the
+        // "drops out of the list" assertion below pass for the wrong reason
+        // (review M1).
+        add_assertion(&kv, "owner-del", "a1", "s", "v", vec!["ev-a1".into()]).await;
+
+        // It is actually IN the list before retracting it.
+        let (_, before) =
+            body_json(list_assertions(State(state.clone()), RawQuery(None)).await).await;
+        assert_eq!(before["assertions"].as_array().unwrap().len(), 1);
 
         assert_eq!(
             delete_assertion(State(state.clone()), Path("a1".to_owned()))
@@ -646,17 +715,22 @@ mod tests {
         let memory = agent24_agent::SessionMemory::new(kv, summarizer).with_owner(owner.to_owned());
         let store = Store::open(&dir.join("agent24.db")).await.unwrap();
         for id in [E2E_WRITE_SESSION, E2E_ASK_SESSION] {
-            store
-                .insert_session(&Session {
-                    workspace_id: None,
-                    id: id.into(),
-                    title: String::new(),
-                    channel: "test".into(),
-                    created_at: "2026-10-01T00:00:00Z".into(),
-                    updated_at: "2026-10-01T00:00:00Z".into(),
-                })
-                .await
-                .unwrap();
+            // Idempotent: the restart test reopens a second `e2e_app` over
+            // the SAME `agent24.db`, so a plain INSERT here would conflict
+            // on the second call.
+            if store.get_session(id).await.unwrap().is_none() {
+                store
+                    .insert_session(&Session {
+                        workspace_id: None,
+                        id: id.into(),
+                        title: String::new(),
+                        channel: "test".into(),
+                        created_at: "2026-10-01T00:00:00Z".into(),
+                        updated_at: "2026-10-01T00:00:00Z".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
         }
         AppState::new(crate::server::AppDeps {
             token: "test".into(),
@@ -766,43 +840,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_pause_blocks_write_and_recall_and_survives_restart() {
+    async fn rest_pause_blocks_the_write_and_tells_the_model_review_h1() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+        let owner = "memrest-e2e-write-pause-owner";
+        let provider = StdArc::new(RecordingProvider::default());
+        let state = e2e_app(kv.clone(), dir.path(), provider.clone(), owner).await;
+
+        let put = put_memory_settings(
+            State(state.clone()),
+            Ok(Json(PutMemorySettingsBody { enabled: false })),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let mut events = state.events.subscribe();
+        run_in_session(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
+
+        // H1: no new assertion — the write gate still independently refuses it.
+        let rows = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner(owner))
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "paused memory must reject the write");
+
+        // H1: the MODEL was told, so it cannot claim to have remembered it.
+        // Content-only check (no role/prefix assumption — T07.1 may reshape
+        // how this is framed).
+        assert!(
+            last_messages_mention(&provider, "记忆已暂停"),
+            "the model must be told memory is paused for this prompt"
+        );
+
+        // H1: `memory.write_skipped{reason:"paused"}` was emitted.
+        let skipped: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|(_, body)| serde_json::to_value(body).unwrap())
+            .filter(|body| body["type"] == "memory.write_skipped")
+            .collect();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["payload"]["reason"], "paused");
+
+        // Negative control: the SAME prompt, enabled, both writes AND does
+        // not emit the skip notice/event — proving the pause (not something
+        // else) is what the above depended on.
+        put_memory_settings(
+            State(state.clone()),
+            Ok(Json(PutMemorySettingsBody { enabled: true })),
+        )
+        .await;
+        let mut events2 = state.events.subscribe();
+        run_in_session(&state, E2E_WRITE_SESSION, "记住我喜欢咖啡").await;
+        let rows2 = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner(owner))
+            .await
+            .unwrap();
+        assert_eq!(rows2.len(), 1, "un-paused write lands");
+        assert!(!last_messages_mention(&provider, "记忆已暂停"));
+        assert!(
+            std::iter::from_fn(|| events2.try_recv().ok())
+                .map(|(_, body)| serde_json::to_value(body).unwrap())
+                .all(|body| body["type"] != "memory.write_skipped")
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_pause_blocks_recall_and_survives_restart_review_h2() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("memory.db");
-        let owner = "memrest-e2e-pause-owner";
+        let owner = "memrest-e2e-recall-pause-owner";
         {
             let kv = KvStore::open(&db).await.unwrap();
             let provider = StdArc::new(RecordingProvider::default());
             let state = e2e_app(kv.clone(), dir.path(), provider.clone(), owner).await;
 
+            // Enabled by default — write while on.
+            run_in_session(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
+            assert_eq!(
+                kv.assertions()
+                    .beliefs_as_of(&BeliefQuery::owner(owner))
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+
+            // Positive control: a DIFFERENT session's full question recalls
+            // it while memory is on.
+            run_in_session(&state, E2E_ASK_SESSION, "你好").await;
+            run_in_session(&state, E2E_ASK_SESSION, "我对什么过敏？").await;
+            assert!(
+                last_messages_mention(&provider, "花生过敏"),
+                "must be recalled while enabled"
+            );
+
+            // Disable.
             let put = put_memory_settings(
                 State(state.clone()),
-                Json(PutMemorySettingsBody { enabled: false }),
+                Ok(Json(PutMemorySettingsBody { enabled: false })),
             )
             .await;
             assert_eq!(put.status(), StatusCode::OK);
 
-            run_in_session(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
-            let rows = kv
-                .assertions()
-                .beliefs_as_of(&BeliefQuery::owner(owner))
-                .await
-                .unwrap();
-            assert!(rows.is_empty(), "paused memory must reject the write");
-
+            // H2: the SAME still-existing assertion is no longer recalled.
+            // Negative control for the gate itself: removing `SessionMemory::
+            // recall`'s early pause check makes this assertion red (the
+            // assertion is still in the ledger and `search_any` would still
+            // match it) — it is the gate, not an absent fact, that is being
+            // tested.
             run_in_session(&state, E2E_ASK_SESSION, "你好").await;
             run_in_session(&state, E2E_ASK_SESSION, "我对什么过敏？").await;
             assert!(
                 !last_messages_mention(&provider, "花生过敏"),
-                "paused memory must not recall anything (nothing was written to recall)"
+                "paused — must not recall even though the assertion still exists"
+            );
+            assert_eq!(
+                kv.assertions()
+                    .beliefs_as_of(&BeliefQuery::owner(owner))
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "pausing recall must not have deleted the existing assertion"
             );
         }
 
-        // Simulate a daemon restart: fresh KvStore over the same file.
-        let reopened = KvStore::open(&db).await.unwrap();
+        // Simulate a daemon restart: a brand-new KvStore + AppState over the
+        // SAME file.
+        let kv2 = KvStore::open(&db).await.unwrap();
         assert!(
-            !reopened.memory_enabled(owner).await.unwrap(),
-            "the pause must survive a daemon restart"
+            !kv2.memory_enabled(owner).await.unwrap(),
+            "the pause survives a daemon restart"
+        );
+        let provider2 = StdArc::new(RecordingProvider::default());
+        let state2 = e2e_app(kv2.clone(), dir.path(), provider2.clone(), owner).await;
+        run_in_session(&state2, E2E_ASK_SESSION, "你好").await;
+        run_in_session(&state2, E2E_ASK_SESSION, "我对什么过敏？").await;
+        assert!(
+            !last_messages_mention(&provider2, "花生过敏"),
+            "still paused after a simulated restart — recall must not resume"
         );
     }
 }

@@ -31,9 +31,10 @@ use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
     Approval, ApprovalStatus, Decision, ErrorBody, EventBody, MemoryRecalledPayload,
-    ModelDeltaPayload, RiskClass, Run, RunCancelledPayload, RunCompletedPayload, RunCreate,
-    RunFailedPayload, RunInput, RunMode, RunOutputPayload, RunStartedPayload, RunStatus, ToolCall,
-    ToolCallStatus, ToolCompletedPayload, ToolCompletedStatus, ToolStartedPayload, Usage,
+    MemoryWriteSkippedPayload, ModelDeltaPayload, RiskClass, Run, RunCancelledPayload,
+    RunCompletedPayload, RunCreate, RunFailedPayload, RunInput, RunMode, RunOutputPayload,
+    RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
+    ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{
     RunAdmission, RunAdmissionDenial, RunMessage, RunPatch, RunTerminalTransition, Store,
@@ -853,6 +854,14 @@ impl RunManager {
                 "approval does not belong to run".to_owned(),
             )));
         }
+        // M1-T10 review M2: resume reconstructs from this PERSISTED thread
+        // only — it never re-calls `memory.recall` or re-checks the pause
+        // switch. The recalled-context snapshot and the paused-write notice
+        // (`execute`, both persisted at run start) are already in here if
+        // this run had either; the personal-memory pause switch therefore
+        // only takes effect for a NEWLY STARTED run, never for one being
+        // resumed after an approval wait — same rule a schema/doc change
+        // under this switch's own PUT states.
         let thread = self.store.list_run_messages(&run_id).await?;
 
         // Register the cancel token BEFORE spawning, and refuse if one already
@@ -1153,6 +1162,29 @@ impl RunManager {
             None
         };
 
+        // M1-T10 review H1: at run start, if this prompt is an explicit
+        // "记住……" and personal memory is currently paused, tell the MODEL
+        // so it does not go on to claim it remembered something it did not
+        // — `retain::persist`'s own early check (the actual write gate)
+        // makes the identical decision later; this surfaces that decision
+        // to the model NOW instead of leaving it to discover the absence on
+        // its own. A pause-check failure is treated as "enabled" (fail
+        // open on the NOTICE only — the real write gate inside `persist`
+        // fails closed independently; this is belt-and-braces, not load-
+        // bearing).
+        let write_skipped = match self.memory.as_ref() {
+            Some(memory) if retain::explicit_remember(&run.input.prompt).is_some() => {
+                match memory.kv().memory_enabled(memory.owner()).await {
+                    Ok(enabled) => !enabled,
+                    Err(err) => {
+                        tracing::warn!(run_id = %run_id, error = %err, "memory pause check failed; assuming enabled");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+
         // D1: a session's prior (compacted) context precedes this turn, so a
         // session actually remembers. Empty when memory is off or session-less.
         // A cancel while waiting on a concurrent run's session lock ends the run
@@ -1184,6 +1216,30 @@ impl RunManager {
                     ids,
                 }));
             messages.push(recalled);
+        }
+        if write_skipped {
+            // Persisted into the run thread for the SAME reason the recall
+            // snapshot above is: an approval resume (M2) reconstructs this
+            // run's messages from that thread, not by re-deciding anything —
+            // the pause switch may since have changed, but what THIS run
+            // told the model at its start must not.
+            let notice = Msg::system(retain::PAUSED_WRITE_NOTICE);
+            if let Err(err) = self.persist_message(&run_id, &notice).await {
+                self.finish_failed(
+                    &run_id,
+                    "memory_snapshot_persist_failed",
+                    &format!("failed to persist the paused-write notice: {err}"),
+                )
+                .await;
+                return;
+            }
+            self.sink
+                .emit(EventBody::MemoryWriteSkipped(MemoryWriteSkippedPayload {
+                    run_id: run_id.clone(),
+                    session_id: run.session_id.clone(),
+                    reason: "paused".to_owned(),
+                }));
+            messages.push(notice);
         }
         messages.extend(prior_context);
         // Persist this run's opening user turn to the durable thread (H3). Prior

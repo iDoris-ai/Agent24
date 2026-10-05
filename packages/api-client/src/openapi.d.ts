@@ -571,7 +571,7 @@ export interface paths {
         get: operations["getMemorySettings"];
         /**
          * Set the personal-memory pause switch
-         * @description Turning it off stops new writes and cross-session recall from the moment this returns; existing assertions are kept, and the setting survives a daemon restart.
+         * @description Turning it off stops new writes and cross-session recall for any NEWLY STARTED run from the moment this returns; existing assertions are kept, and the setting survives a daemon restart. Does not affect a run that is already resuming from an approval wait — that run replays its own already-persisted messages (which captured whatever this switch said at the moment IT started) rather than re-deciding anything against the current value of this switch.
          */
         put: operations["putMemorySettings"];
         post?: never;
@@ -2279,6 +2279,7 @@ export interface operations {
         parameters: {
             query?: {
                 q?: string;
+                /** @description Default 20 if omitted. Capped at 200 regardless of what is asked for. `0` (or anything else that is not a positive integer) is a 400, not silently clamped up to 1. */
                 limit?: number;
             };
             header?: never;
@@ -2405,6 +2406,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemorySettings"];
+                };
+            };
+            /** @description Malformed request body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Personal memory is not available on this daemon */

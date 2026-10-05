@@ -937,9 +937,15 @@ paths:
         - name: limit
           in: query
           required: false
+          description: >-
+            Default 20 if omitted. Capped at 200 regardless of what is asked
+            for. `0` (or anything else that is not a positive integer) is a
+            400, not silently clamped up to 1.
           schema:
             type: integer
             minimum: 1
+            maximum: 200
+            default: 20
       responses:
         "200":
           description: Assertion list
@@ -1025,9 +1031,13 @@ paths:
       tags: [memory]
       summary: Set the personal-memory pause switch
       description: >-
-        Turning it off stops new writes and cross-session recall from the
-        moment this returns; existing assertions are kept, and the setting
-        survives a daemon restart.
+        Turning it off stops new writes and cross-session recall for any
+        NEWLY STARTED run from the moment this returns; existing assertions
+        are kept, and the setting survives a daemon restart. Does not affect
+        a run that is already resuming from an approval wait — that run
+        replays its own already-persisted messages (which captured whatever
+        this switch said at the moment IT started) rather than re-deciding
+        anything against the current value of this switch.
       requestBody:
         required: true
         content:
@@ -1041,6 +1051,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MemorySettings"
+        "400":
+          description: Malformed request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           description: Personal memory is not available on this daemon
           content:

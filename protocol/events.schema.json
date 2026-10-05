@@ -102,6 +102,23 @@
       ]
     },
     {
+      "description": "M1-T10 review H1: emitted at run start instead of silently dropping an\nexplicit \"记住……\" while personal memory is paused — the model is ALSO\ntold (a data notice injected alongside recall), so it does not tell\nthe user it remembered something it did not.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/MemoryWriteSkippedPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "memory.write_skipped"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "payload": {
@@ -534,6 +551,30 @@
       "required": [
         "session_id",
         "reason"
+      ]
+    },
+    "MemoryWriteSkippedPayload": {
+      "description": "M1-T10 review H1: `reason` is an open enum (today only `\"paused\"`).",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Null for transient (session-less) runs, same as `RunStartedPayload`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "run_id",
+        "reason",
+        "session_id"
       ]
     },
     "ModelCallPayload": {
