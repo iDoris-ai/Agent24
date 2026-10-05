@@ -343,9 +343,19 @@ fn prune_stale_recall_message(msg: Msg, active: &std::collections::HashSet<Strin
     if msg.role != "user" || !content.starts_with(RECALL_PREFIX) {
         return Some(msg);
     }
-    let body = content.strip_suffix(RECALL_END_MARKER)?;
+    // Round 2 ②: a message that starts with the header but does NOT end
+    // with the marker is not a real recall block (it is left untouched,
+    // not dropped) — a real one always has this exact shape; only a
+    // malformed/foreign message fails this, and the fail-safe direction
+    // for something we cannot parse as a recall block is to PRESERVE it,
+    // never silently delete it.
+    let Some(body) = content.strip_suffix(RECALL_END_MARKER) else {
+        return Some(msg);
+    };
     let mut parts = body.split("\n- [id=");
-    let header = parts.next()?;
+    let Some(header) = parts.next() else {
+        return Some(msg);
+    };
     let mut kept = String::from(header);
     let mut any = false;
     for entry in parts {
@@ -1027,34 +1037,15 @@ impl RunManager {
         }
 
         // 3. Reconstruct the conversation and return the run to Running.
+        // M1-T07.1 M4 (review #674 round 2 ③): re-validating the recall
+        // block used to happen ONLY here, which misses the common case of
+        // an approval answered while the daemon is still running (the task
+        // stays live and never goes through `drive_resume` at all — see
+        // the in-memory `ApprovalBroker` wake-up path). That check now
+        // lives in `run_loop` itself, re-run fresh every iteration
+        // regardless of how this call got here, so this reconstruction
+        // stays a plain, unmodified replay of the persisted thread.
         let mut messages = thread_to_messages(&thread);
-        // M1-T07.1 M4: the persisted recall block was captured at the run's
-        // FIRST model call and may now name an id the owner has since
-        // forgotten (retracted/superseded) — strip those lines, or drop the
-        // whole block if the re-validation itself fails, before it ever
-        // reaches the provider again.
-        if let Some(memory) = self.memory.as_ref() {
-            match memory.active_ids().await {
-                Ok(active) => {
-                    messages = messages
-                        .into_iter()
-                        .filter_map(|msg| prune_stale_recall_message(msg, &active))
-                        .collect();
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "run {run_id}: resume could not re-validate recalled memory; dropping any recall block: {err}"
-                    );
-                    messages.retain(|msg| {
-                        !(msg.role == "user"
-                            && msg
-                                .content
-                                .as_deref()
-                                .is_some_and(|c| c.starts_with(RECALL_PREFIX)))
-                    });
-                }
-            }
-        }
         if let Err(err) = self
             .store
             .transition_run(&run_id, RunStatus::Running, RunPatch::default())
@@ -1390,6 +1381,66 @@ impl RunManager {
         }
     }
 
+    /// M1-T07.1 M4 (review #674 round 2 ③): builds the SAME shape
+    /// `normalize_for_provider` always built, but first re-validates the
+    /// recall block — if any — against the CURRENT ledger. Called fresh on
+    /// EVERY iteration of [`Self::run_loop`], so this is the ONE place that
+    /// covers all three ways a recall block can go stale before the model
+    /// sees it again: a cold-restart resume (`drive_resume` rebuilding from
+    /// `thread_to_messages`), an approval answered while the run is still
+    /// parked in the SAME process (the in-memory broker wakes the task
+    /// directly — no `drive_resume` involved at all), and — in principle —
+    /// a very slow approval wait spanning multiple loop iterations. Never
+    /// mutates `messages` itself, only the copy returned for this request.
+    ///
+    /// Round 2 ②: only `messages[0]` is ever treated as a candidate recall
+    /// block — a POSITION check, not a content-prefix scan over the whole
+    /// thread. The snapshot (`execute`) always puts the recall message (if
+    /// any) first, so this is exactly where it would be; scanning every
+    /// message for a `RECALL_PREFIX` match would also treat a bound run's
+    /// own prompt as a recall block if an adversarial user typed text that
+    /// happened to start with that exact prefix.
+    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Vec<Msg> {
+        let Some(memory) = self.memory.as_ref() else {
+            return normalize_for_provider(messages);
+        };
+        let Some(first) = messages.first() else {
+            return normalize_for_provider(messages);
+        };
+        // Round 2 ②: require BOTH the header AND the end marker, not just
+        // the prefix — a real recall block always has this exact shape, so
+        // this is still unambiguous, but it closes the (already-vanishing,
+        // position-0-only) case of a context-free run's very first turn
+        // happening to be the user's OWN prompt and that prompt merely
+        // STARTING WITH the same prefix text without the matching suffix:
+        // such a message is left alone rather than risk getting dropped by
+        // `prune_stale_recall_message` failing to parse it as a real block.
+        if first.role != "user"
+            || !first
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(RECALL_PREFIX) && c.ends_with(RECALL_END_MARKER))
+        {
+            return normalize_for_provider(messages);
+        }
+        let mut rebuilt = messages.to_vec();
+        match memory.active_ids().await {
+            Ok(active) => match prune_stale_recall_message(first.clone(), &active) {
+                Some(pruned) => rebuilt[0] = pruned,
+                None => {
+                    rebuilt.remove(0);
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    "run {run_id}: could not re-validate recalled memory; dropping the recall block for this request: {err}"
+                );
+                rebuilt.remove(0);
+            }
+        }
+        normalize_for_provider(&rebuilt)
+    }
+
     /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
     /// a resumed one ([`resume_run`]): each builds the `messages` prefix its own
     /// way (fresh: prior context + prompt; resumed: reconstructed thread + the
@@ -1409,11 +1460,12 @@ impl RunManager {
             // Recomputed each turn: in plan mode only the read-only subset plus
             // `propose_plan` is offered; the instant a plan is approved
             // `plan_mode` flips false and the full set is advertised (H8).
-            // H1: `messages` itself (the persisted/growing thread) is sent
-            // through `normalize_for_provider` fresh each iteration — a
-            // request-only reshape, never applied to `messages` itself.
+            // H1/M4: `messages` itself (the persisted/growing thread) is
+            // re-validated against the CURRENT ledger and reshaped fresh
+            // every iteration via `request_messages_for` — request-only,
+            // never applied back to `messages` itself.
             let request = CompletionRequest {
-                messages: normalize_for_provider(&messages),
+                messages: self.request_messages_for(&messages, &run_id).await,
                 model: run.input.model_override.clone(),
                 tools: self.tool_specs_for(plan_mode),
                 response_format: None,
@@ -2185,6 +2237,18 @@ pub(crate) mod tests {
     #[test]
     fn prune_stale_recall_message_never_touches_an_ordinary_message() {
         let msg = Msg::user("我对什么过敏？");
+        let active = std::collections::HashSet::new();
+        assert_eq!(prune_stale_recall_message(msg.clone(), &active), Some(msg));
+    }
+
+    #[test]
+    fn prune_stale_recall_message_preserves_rather_than_drops_a_malformed_lookalike() {
+        // Round 2 ②: a message that starts with the exact recall header but
+        // does NOT end with the end marker is not a real recall block — the
+        // OLD `?`-propagating code would have silently DELETED such a
+        // message (treating "cannot parse" as "fully stale, drop it");
+        // fail-safe here means PRESERVE what we cannot confidently parse.
+        let msg = Msg::user(format!("{RECALL_PREFIX}... but not a real block"));
         let active = std::collections::HashSet::new();
         assert_eq!(prune_stale_recall_message(msg.clone(), &active), Some(msg));
     }
