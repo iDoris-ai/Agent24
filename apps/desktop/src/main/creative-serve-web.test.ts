@@ -8,12 +8,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CreativeServeWeb,
   CreativeViewRequestFence,
-  ON_DEMAND_COMPONENT_LINK_NAME,
   OPEN_DESIGN_PIN_VERSION,
   canonicalCreativeOrigin,
   classifyCreativeUrl,
   creativeChildEnvironment,
-  ensureOnDemandComponentLink,
   parseAgent24HeadlessReady,
   resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
@@ -66,7 +64,7 @@ function packagedHeadlessRuntime(): { resources: string; stateRoot: string; runt
 
 function headlessReady(ownerPid: number, webPort: number, daemonPort: number, instanceId = 'creative-1') {
   return {
-    type: 'ready', protocol: 1, instanceId, pinVersion: OPEN_DESIGN_PIN_VERSION,
+    type: 'ready', protocol: 2, instanceId, pinVersion: OPEN_DESIGN_PIN_VERSION,
     webOrigin: `http://127.0.0.1:${webPort}`, daemonOrigin: `http://127.0.0.1:${daemonPort}`,
     ownership: { ownerPid, kind: 'process-tree' },
   }
@@ -150,29 +148,6 @@ describe('CreativeServeWeb', () => {
       path.join(resources, 'app', 'prebundled', 'agent24-headless.cjs'),
     )
     expect(resolveAgent24HeadlessLauncher(path.join(resources, 'missing'))).toBeNull()
-  })
-
-  it('ensureOnDemandComponentLink creates, reuses, and idempotently re-links the on-demand symlink', () => {
-    const appResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-resources-'))
-    tempDirs.push(appResources)
-    const componentA = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-component-a-'))
-    tempDirs.push(componentA)
-    const componentB = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-component-b-'))
-    tempDirs.push(componentB)
-
-    const linkPath = ensureOnDemandComponentLink(appResources, componentA)
-    expect(linkPath).toBe(path.join(appResources, ON_DEMAND_COMPONENT_LINK_NAME))
-    expect(fs.readlinkSync(linkPath)).toBe(componentA)
-
-    // Re-linking to the same target is a cheap no-op (no churn every call).
-    const statBefore = fs.lstatSync(linkPath)
-    ensureOnDemandComponentLink(appResources, componentA)
-    const statAfter = fs.lstatSync(linkPath)
-    expect(statAfter.ino).toBe(statBefore.ino)
-
-    // An ABI bump / reinstall to a new hash dir re-points the link.
-    ensureOnDemandComponentLink(appResources, componentB)
-    expect(fs.readlinkSync(linkPath)).toBe(componentB)
   })
 
   it('validates the exact headless readiness contract', () => {
@@ -295,12 +270,14 @@ describe('CreativeServeWeb', () => {
       }),
     )
     expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual({
-      protocol: 1,
+      protocol: 2,
       pinVersion: OPEN_DESIGN_PIN_VERSION,
       resourceRoot: path.join(resources, 'open-design'),
       dataRoot: path.join(stateRoot, 'data'),
       runtimeRoot: path.join(stateRoot, 'runtime'),
       runtimeExecutable,
+      // Legacy bundled-resources path: no resourceSafeBase (the fork's v1
+      // runtimeExecutable-derived default still applies).
     })
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready')
     await service.stop()
@@ -445,22 +422,19 @@ describe('CreativeServeWeb', () => {
     await expect(service.start()).resolves.toEqual({ state: 'needs-download', size: 123_456_789 })
   })
 
-  it('uses a symlink inside resourcesPath (not the installed component dir directly) once the on-demand component is installed', async () => {
-    // Real-app finding (2026-10-05): the fork's own agent24-headless.cjs
-    // rejects a resourceRoot outside the app's own resources dir (see
-    // ensureOnDemandComponentLink's doc comment) — confirmed by actually
-    // running the real launcher. This test locks in the symlink workaround:
-    // the spawned entry/cwd must be reached THROUGH resourcesPath, not the
-    // raw external componentDir.
+  it('C1 (Opus review of #670, 2026-10-05): uses the installed component dir directly, with its realpath as resourceSafeBase — no symlink, no write into resourcesPath', async () => {
+    // The previous fix wrote a symlink into the app's own resourcesPath at
+    // runtime (EROFS on a read-only AppImage mount, EACCES on a root-owned
+    // deb /opt install, breaks a signed mac bundle). The real fix is
+    // fork-side (iDoris-ai/open-design-agent24#7, protocol v2's explicit
+    // resourceSafeBase) — this process never writes into resourcesPath for
+    // the on-demand case at all now.
     const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
-    const appResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
-    tempDirs.push(appResources)
     const child = new FakeChild()
     const spawnFn = vi.fn(() => child as unknown as ChildProcess)
     const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
     const service = new CreativeServeWeb(
       {
-        resourcesPath: appResources,
         stateRoot,
         runtimeExecutable,
         readyTimeoutMs: 500,
@@ -473,27 +447,43 @@ describe('CreativeServeWeb', () => {
     const starting = service.start()
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
     await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
-    const linkedResourcesPath = path.join(appResources, ON_DEMAND_COMPONENT_LINK_NAME)
-    expect(fs.readlinkSync(linkedResourcesPath)).toBe(componentDir)
     expect(spawnFn).toHaveBeenCalledWith(
       runtimeExecutable,
-      [path.join(linkedResourcesPath, 'app', 'prebundled', 'agent24-headless.cjs'), '--config', path.join(stateRoot, 'agent24-headless.json')],
-      expect.objectContaining({ cwd: linkedResourcesPath }),
+      [path.join(componentDir, 'app', 'prebundled', 'agent24-headless.cjs'), '--config', path.join(stateRoot, 'agent24-headless.json')],
+      expect.objectContaining({ cwd: componentDir }),
     )
+    const configPath = path.join(stateRoot, 'agent24-headless.json')
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toMatchObject({
+      protocol: 2,
+      resourceSafeBase: fs.realpathSync(componentDir),
+    })
     await service.stop()
   })
 
-  it('H1 regression guard: fails clearly (not a throw) when the on-demand component is installed but resourcesPath is unset', async () => {
+  it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {
+    // Stands in for "resourcesPath is read-only" (a real-only-readable
+    // AppImage FUSE mount, a root-owned deb /opt install, a signed mac
+    // bundle): if the code never touches resourcesPath, it doesn't matter
+    // whether that path exists, is writable, or is set at all.
     const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
-    const service = new CreativeServeWeb({
-      stateRoot,
-      runtimeExecutable,
-      component: { status: () => ({ state: 'installed', dir: componentDir }) },
-    })
-    await expect(service.start()).resolves.toEqual({
-      state: 'failed',
-      error: 'Open Design on-demand component requires a packaged resourcesPath to link into',
-    })
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+        // resourcesPath intentionally omitted.
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    await service.stop()
   })
 
   it('does not consult the on-demand component accessor when an explicit dev checkout is set', async () => {
