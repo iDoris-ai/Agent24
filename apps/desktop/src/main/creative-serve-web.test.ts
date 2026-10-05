@@ -469,6 +469,82 @@ describe('CreativeServeWeb', () => {
     await service.stop()
   })
 
+  it('H1: falls back to the packaged dev checkout (resourcesPath/open-design) when the component is unavailable', async () => {
+    // Before the fix, `component.status().state === 'unavailable'` (no
+    // baked manifest — a dev/unreleased build) short-circuited straight to
+    // `needs-download` and never even tried resolveOpenDesignCheckout, so a
+    // dev build with a real packaged `resources/open-design` checkout (no
+    // env var needed) regressed to "needs download" instead of just working.
+    const resources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-resources-'))
+    tempDirs.push(resources)
+    materializeCheckout(path.join(resources, 'open-design'))
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        resourcesPath: resources,
+        port: 17456,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'unavailable', reason: 'no manifest baked' }) },
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write('[od] listening on http://127.0.0.1:17456 (headless)\n')
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(spawnFn).toHaveBeenCalledWith(
+      'node',
+      expect.arrayContaining(['daemon', 'start', '--serve-web']),
+      expect.objectContaining({ cwd: path.join(resources, 'open-design') }),
+    )
+    await service.stop()
+  })
+
+  it('H1: unavailable with no dev checkout available either still fails clearly (does not become needs-download)', async () => {
+    // Same `unavailable` component status as above, but with no packaged
+    // dev checkout to fall back to — must reproduce the exact pre-existing
+    // "Open Design runtime not found" failure, not a download prompt for a
+    // component this build never baked a manifest for.
+    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+    tempDirs.push(emptyResources)
+    const service = new CreativeServeWeb({
+      resourcesPath: emptyResources,
+      component: { status: () => ({ state: 'unavailable', reason: 'no manifest baked' }) },
+    })
+
+    await expect(service.start()).resolves.toEqual({
+      state: 'failed',
+      error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design',
+    })
+  })
+
+  it('H1: needs-download (not the dev fallback) when the component truly is not-installed/downloading/failed', async () => {
+    for (const state of ['not-installed', 'downloading', 'verifying', 'failed'] as const) {
+      const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+      tempDirs.push(emptyResources)
+      const service = new CreativeServeWeb({
+        resourcesPath: emptyResources,
+        component: { status: () => ({ state, size: 42 }) },
+      })
+      await expect(service.start(), state).resolves.toEqual({ state: 'needs-download', size: 42 })
+    }
+  })
+
+  it('H1: needs-download when the installed dir exists per the accessor but the launcher file is actually missing', async () => {
+    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+    tempDirs.push(emptyResources)
+    const deletedComponentDir = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-deleted-component-'))
+    fs.rmSync(deletedComponentDir, { recursive: true, force: true }) // the accessor still claims this dir is "installed"
+    const service = new CreativeServeWeb({
+      resourcesPath: emptyResources,
+      component: { status: () => ({ state: 'installed', dir: deletedComponentDir }) },
+    })
+    await expect(service.start()).resolves.toEqual({ state: 'needs-download', size: undefined })
+  })
+
   it('fails clearly when the daemon build is missing', async () => {
     const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-'))
     tempDirs.push(root)

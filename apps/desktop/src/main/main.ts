@@ -208,13 +208,25 @@ app.whenReady().then(() => {
   // open-design-component.ts) instead of being bundled in the installer.
   // CreativeServeWeb only ever reads this accessor's current status — it
   // never triggers a download itself.
-  openDesignComponent = new OpenDesignComponentInstaller({ resourcesPath: process.resourcesPath })
+  //
+  // PR #670 review (L1): the installer's own manifest loading already
+  // degrades a corrupt baked manifest to `unavailable` instead of throwing,
+  // but this constructor call is still wrapped — nothing here runs inside a
+  // try/catch of its own caller (`app.whenReady().then()`), and an uncaught
+  // throw at this point would have skipped registering every IPC handler
+  // below it, not just the Open Design ones.
+  try {
+    openDesignComponent = new OpenDesignComponentInstaller({ resourcesPath: process.resourcesPath })
+  } catch (error) {
+    console.error('[main] failed to construct the Open Design component installer', error)
+    openDesignComponent = null
+  }
   creativeServeWeb = new CreativeServeWeb({
     resourcesPath: process.resourcesPath,
     stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
     runtimeExecutable: process.execPath,
     pinVersion: OPEN_DESIGN_PIN_VERSION,
-    component: openDesignComponent,
+    component: openDesignComponent ?? undefined,
   })
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
@@ -355,6 +367,9 @@ function refreshTray(): void {
 
 app.on('before-quit', () => {
   isQuitting = true
+  // M5: cancel an in-flight Open Design component download rather than
+  // leaving it (and its partial files) orphaned past app exit.
+  openDesignComponent?.abort('Agent24 is quitting')
 })
 
 app.on('will-quit', () => {

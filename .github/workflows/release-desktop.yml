@@ -171,11 +171,17 @@ jobs:
             echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Pack the Open Design on-demand component (tarball + manifest)
+      # PR #670 review (C1): the tarball MUST NOT live in the same directory
+      # electron-builder's extraResources bakes into the app
+      # (.open-design-component/) — only the manifest belongs there. The
+      # tarball goes to a separate .open-design-component-dist/ that nothing
+      # in package.json's `build` config ever references.
+      - name: Pack the Open Design on-demand component (tarball + manifest, in separate dirs)
         working-directory: apps/desktop
         env:
           A24_OD_STAGE_DIR: ${{ github.workspace }}/apps/desktop/.open-design-resources
           A24_OD_PACK_OUT_DIR: ${{ github.workspace }}/apps/desktop/.open-design-component
+          A24_OD_TARBALL_OUT_DIR: ${{ github.workspace }}/apps/desktop/.open-design-component-dist
           A24_OD_APP_VERSION: ${{ steps.ver.outputs.version }}
           A24_OD_REPOSITORY: ${{ github.repository }}
           A24_OD_PLATFORM: linux
@@ -217,17 +223,40 @@ jobs:
             test ! -e "$resources/app"
             test ! -e "$resources/open-design"
             test ! -e "$resources/open-design-web-standalone"
+            # C1: the manifest dir must hold ONLY the manifest — no tarball
+            # anywhere under resources/ (the actual bug this PR had: packing
+            # the tarball into the same dir extraResources bundles).
+            if find "$resources" -maxdepth 1 -name '*.tar.gz' -print | grep -q .; then
+              echo "::error::found a .tar.gz bundled inside $resources — the on-demand component must never ship inside the installer"
+              find "$resources" -maxdepth 1 -name '*.tar.gz'
+              exit 1
+            fi
           }
 
           verify_on_demand_only "$VERIFY_ROOT/appimage/squashfs-root"
           verify_on_demand_only "$VERIFY_ROOT/deb"
+
+          # Size caps: catch a future regression that re-bundles Open Design
+          # (or anything else large) long before someone has to notice a
+          # 900MB AppImage by eye. 250MB is comfortably above today's
+          # ~146MB/~101MB on-demand-split baseline with headroom for normal
+          # dependency growth.
+          MAX_INSTALLER_BYTES=$((250 * 1024 * 1024))
+          for installer in "$APPIMAGE" "$DEB"; do
+            size="$(stat -c%s "$installer" 2>/dev/null || stat -f%z "$installer")"
+            echo "$(basename "$installer"): $size bytes"
+            if [ "$size" -gt "$MAX_INSTALLER_BYTES" ]; then
+              echo "::error::$(basename "$installer") is $size bytes, over the $MAX_INSTALLER_BYTES byte cap — Open Design (or something else large) may have been re-bundled"
+              exit 1
+            fi
+          done
 
       - name: Smoke test — Open Design component tarball extracts and passes the staging contract
         working-directory: apps/desktop
         shell: bash
         run: |
           set -euo pipefail
-          TARBALL="$(ls .open-design-component/open-design-*.tar.gz)"
+          TARBALL="$(ls .open-design-component-dist/open-design-*.tar.gz)"
           EXTRACT="$RUNNER_TEMP/od-component-smoke"
           rm -rf "$EXTRACT"
           mkdir -p "$EXTRACT"
@@ -254,9 +283,9 @@ jobs:
         working-directory: apps/desktop
         run: |
           set -euo pipefail
-          ls -la release/*.AppImage release/*.deb .open-design-component/open-design-*.tar.gz
+          ls -la release/*.AppImage release/*.deb .open-design-component-dist/open-design-*.tar.gz
           echo "--- sizes ---"
-          du -h release/*.AppImage release/*.deb .open-design-component/open-design-*.tar.gz
+          du -h release/*.AppImage release/*.deb .open-design-component-dist/open-design-*.tar.gz
 
       - name: Install xvfb (for the AppImage smoke test)
         run: |
@@ -346,7 +375,7 @@ jobs:
         # apps/desktop/release/ here is what keeps the publish job's
         # `dist/*.AppImage dist/*.deb dist/open-design-*.tar.gz` flat globs
         # working, same as before this tarball existed.
-        run: cp apps/desktop/.open-design-component/open-design-*.tar.gz apps/desktop/release/
+        run: cp apps/desktop/.open-design-component-dist/open-design-*.tar.gz apps/desktop/release/
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

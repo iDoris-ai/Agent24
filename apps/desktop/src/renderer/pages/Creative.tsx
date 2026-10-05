@@ -11,10 +11,18 @@ function formatMb(bytes: number | undefined): string {
   return Math.max(1, Math.round(bytes / (1024 * 1024))).toString()
 }
 
+const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'verifying', 'failed'])
+
 /** The on-demand iDoris Design component card — shown instead of the Creative
  * WebContentsView whenever the component isn't installed yet. User-facing
  * copy says "iDoris Design" (the fork's own branding); internal identifiers,
- * directory names, and the tarball itself stay "open-design". */
+ * directory names, and the tarball itself stay "open-design".
+ *
+ * PR #670 review (H1): `status` here is NEVER `installed` or `unavailable` —
+ * see CreativePage below for why: both of those states attempt
+ * `creativeShow` directly (possibly via a dev checkout CreativeServeWeb
+ * knows about but this card doesn't), and only its `needsDownload` result
+ * (synthesized back into a `not-installed`-shaped status) routes here. */
 function ComponentCard({
   status,
   onInstall,
@@ -22,17 +30,6 @@ function ComponentCard({
   status: OpenDesignComponentStatusResult
   onInstall: () => void
 }): JSX.Element {
-  if (status.state === 'unavailable') {
-    return (
-      <div className="creative-download">
-        <div>此构建未附带 iDoris Design 组件下载信息</div>
-        <div className="creative-download-hint">
-          开发模式：设置环境变量 A24_OPEN_DESIGN_DIR 指向本地 Open Design 检出目录即可直接使用。
-        </div>
-      </div>
-    )
-  }
-
   if (status.state === 'downloading') {
     const total = status.total ?? 0
     const received = status.received ?? 0
@@ -63,7 +60,7 @@ function ComponentCard({
     )
   }
 
-  // 'not-installed'
+  // 'not-installed' (also the synthesized shape for a needs-download result)
   return (
     <div className="creative-download">
       <div>Design 需要额外下载 iDoris Design 组件（约 {formatMb(status.size)} MB），下载完成后即可使用。</div>
@@ -77,18 +74,29 @@ export default function CreativePage(): JSX.Element {
   const [error, setError] = useState<string | null>(null)
   const [restarting, setRestarting] = useState(false)
   const [component, setComponent] = useState<OpenDesignComponentStatusResult>({ state: 'not-installed' })
+  // PR #670 review (H1): set once `creativeShow` itself reports
+  // `needsDownload` — this is the ONLY thing that puts up the download card
+  // for a component snapshot of `installed` or `unavailable`, because only
+  // CreativeServeWeb (not this page, not the component installer) knows
+  // whether a dev checkout makes the download unnecessary.
+  const [needsDownloadSize, setNeedsDownloadSize] = useState<number | undefined>(undefined)
+
+  const applyComponentStatus = (status: OpenDesignComponentStatusResult): void => {
+    setComponent(status)
+    if (status.state === 'installed') setNeedsDownloadSize(undefined)
+  }
 
   const installComponent = (): void => {
-    void window.agent24.openDesignComponentInstall().then(setComponent)
+    void window.agent24.openDesignComponentInstall().then(applyComponentStatus)
   }
 
   useEffect(() => {
     let cancelled = false
     void window.agent24.openDesignComponentStatus().then((status) => {
-      if (!cancelled) setComponent(status)
+      if (!cancelled) applyComponentStatus(status)
     })
     const unsubscribe = window.agent24.onOpenDesignComponentProgress((status) => {
-      if (!cancelled) setComponent(status)
+      if (!cancelled) applyComponentStatus(status)
     })
     return () => {
       cancelled = true
@@ -96,11 +104,15 @@ export default function CreativePage(): JSX.Element {
     }
   }, [])
 
-  const installed = component.state === 'installed'
+  const showDownloadCard = needsDownloadSize !== undefined || DOWNLOAD_FLOW_STATES.has(component.state)
+  // Try Creative whenever we're NOT showing the download/verify/failed card
+  // — i.e. for `installed` and `unavailable`. CreativeServeWeb (not this
+  // page) decides whether `unavailable` still works via a dev checkout.
+  const tryCreative = !showDownloadCard
 
   useEffect(() => {
     const host = hostRef.current
-    if (!host || !installed) return
+    if (!host || !tryCreative) return
 
     let cancelled = false
     const syncBounds = () => {
@@ -112,7 +124,9 @@ export default function CreativePage(): JSX.Element {
     void window.agent24.creativeShow(rectOf(host)).then(
       (result) => {
         if (cancelled) return
-        if (!result.ok && !result.needsDownload) setError(result.error ?? 'Open Design failed to start')
+        if (result.ok) { setError(null); return }
+        if (result.needsDownload) { setNeedsDownloadSize(result.size ?? 0); return }
+        setError(result.error ?? 'Open Design failed to start')
       },
       (reason) => {
         if (!cancelled) setError(reason instanceof Error ? reason.message : 'Open Design failed to start')
@@ -126,7 +140,7 @@ export default function CreativePage(): JSX.Element {
       window.removeEventListener('resize', syncBounds)
       void window.agent24.creativeHide()
     }
-  }, [installed])
+  }, [tryCreative])
 
   const restart = async (): Promise<void> => {
     const host = hostRef.current
@@ -142,10 +156,17 @@ export default function CreativePage(): JSX.Element {
     }
   }
 
+  // When `showDownloadCard` is true only because of `needsDownloadSize` (the
+  // component snapshot itself was `installed`/`unavailable`, both stale by
+  // definition here), synthesize a `not-installed`-shaped status for the card.
+  const cardStatus: OpenDesignComponentStatusResult = DOWNLOAD_FLOW_STATES.has(component.state)
+    ? component
+    : { state: 'not-installed', size: needsDownloadSize }
+
   return (
     <div ref={hostRef} className="creative-host">
-      {!installed && <ComponentCard status={component} onInstall={installComponent} />}
-      {installed && error && (
+      {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} />}
+      {tryCreative && error && (
         <div className="creative-error">
           <div>Open Design unavailable: {error}</div>
           <button className="btn btn-primary" type="button" disabled={restarting} onClick={() => void restart()}>
