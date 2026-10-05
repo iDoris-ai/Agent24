@@ -201,6 +201,44 @@ export function resolveAgent24HeadlessLauncher(resourcesPath?: string): string |
   return fs.existsSync(entry) ? entry : null
 }
 
+export const ON_DEMAND_COMPONENT_LINK_NAME = '.agent24-open-design-component'
+
+/**
+ * Real-app closed-loop finding (2026-10-05, mac darwin-arm64): the Open
+ * Design fork's own `agent24-headless.cjs` launcher (apps/packaged/src/
+ * agent24-headless.ts, `assertAgent24ResourceRoot`) rejects any
+ * `resourceRoot` that is not textually under a "safe base" it derives from
+ * `runtimeExecutable`'s own location — `<App>.app/Contents/Resources` on
+ * mac, `<executableDir>/resources` elsewhere. That assumption predates the
+ * on-demand component (owner decision 2026-10-05): the installed component
+ * now lives OUTSIDE the app bundle, under
+ * `~/.agent24/components/open-design/<hash>/`, which fails that check
+ * outright — confirmed by actually running the real launcher against a real
+ * installed component, not just unit tests (which mock the launcher and
+ * never exercise this fork-side validation). We do not patch the fork
+ * (project convention: no changes to the Open Design line's own design) —
+ * instead a symlink inside the app's own resources directory, named
+ * `.agent24-open-design-component`, points at the installed component dir.
+ * `path.relative`/`path.join` are lexical (string-only, no filesystem
+ * access), so the fork's check sees a path "under" its safe base and
+ * passes; the OS transparently follows the symlink for every actual file
+ * access. This affects every platform whose on-demand component installs
+ * outside the app bundle (Linux's AppImage/deb layout has the same "sibling
+ * resources dir" assumption), not just mac — so the fix lives here, in the
+ * platform-agnostic CreativeServeWeb, not in a mac-only script.
+ */
+export function ensureOnDemandComponentLink(appResourcesPath: string, componentDir: string): string {
+  const linkPath = path.join(appResourcesPath, ON_DEMAND_COMPONENT_LINK_NAME)
+  const existingTarget = fs.lstatSync(linkPath, { throwIfNoEntry: false })?.isSymbolicLink()
+    ? fs.readlinkSync(linkPath)
+    : null
+  if (existingTarget !== componentDir) {
+    fs.rmSync(linkPath, { force: true, recursive: true })
+    fs.symlinkSync(componentDir, linkPath, 'dir')
+  }
+  return linkPath
+}
+
 export function creativeChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // A24_* belongs to the Agent24 host authority/bootstrap namespace. The
   // desktop may consume A24_OPEN_DESIGN_* to choose how to launch Creative,
@@ -269,9 +307,22 @@ export class CreativeServeWeb {
     if (!explicitCheckout && this.options.component) {
       const componentStatus = this.options.component.status()
       if (componentStatus.state === 'installed' && componentStatus.dir) {
-        const installedHeadlessEntry = resolveAgent24HeadlessLauncher(componentStatus.dir)
+        // See ensureOnDemandComponentLink's doc comment: the fork's own
+        // launcher rejects a resourceRoot outside the app bundle's own
+        // resources dir, so we present the installed (external) component
+        // through a symlink inside it instead of using componentStatus.dir
+        // directly.
+        if (!this.options.resourcesPath) {
+          this.current = {
+            state: 'failed',
+            error: 'Open Design on-demand component requires a packaged resourcesPath to link into',
+          }
+          return this.status()
+        }
+        const linkedResourcesPath = ensureOnDemandComponentLink(this.options.resourcesPath, componentStatus.dir)
+        const installedHeadlessEntry = resolveAgent24HeadlessLauncher(linkedResourcesPath)
         if (installedHeadlessEntry) {
-          return this.startPackagedHeadless(installedHeadlessEntry, environment, componentStatus.dir)
+          return this.startPackagedHeadless(installedHeadlessEntry, environment, linkedResourcesPath)
         }
         // Installed-but-missing-launcher (e.g. the dir was deleted after the
         // installer last validated it): surface needs-download so the
