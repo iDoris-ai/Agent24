@@ -258,6 +258,14 @@ export class CreativeServeWeb {
 
     // On-demand path (owner decision 2026-10-05): the installer owns whether
     // the component is present; this file never downloads anything itself.
+    //
+    // PR #670 review (H1): `unavailable` means the installer has no baked
+    // manifest at all (a dev/unreleased build) — it does NOT mean "no Open
+    // Design available". Such a build must still fall through to the
+    // original resolveOpenDesignCheckout sibling-checkout discovery below
+    // (dev convenience, no env var required). Only `not-installed` /
+    // `downloading` / `verifying` / `failed` — i.e. a real baked manifest
+    // that isn't installed yet — short-circuits to `needs-download` here.
     if (!explicitCheckout && this.options.component) {
       const componentStatus = this.options.component.status()
       if (componentStatus.state === 'installed' && componentStatus.dir) {
@@ -265,9 +273,17 @@ export class CreativeServeWeb {
         if (installedHeadlessEntry) {
           return this.startPackagedHeadless(installedHeadlessEntry, environment, componentStatus.dir)
         }
+        // Installed-but-missing-launcher (e.g. the dir was deleted after the
+        // installer last validated it): surface needs-download so the
+        // renderer's existing "下载" button doubles as "重新下载", same as
+        // the not-installed/failed branch below.
+        this.current = { state: 'needs-download', size: undefined }
+        return this.status()
       }
-      this.current = { state: 'needs-download', size: componentStatus.size }
-      return this.status()
+      if (componentStatus.state !== 'unavailable') {
+        this.current = { state: 'needs-download', size: componentStatus.size }
+        return this.status()
+      }
     }
 
     const checkoutDir = explicitCheckout

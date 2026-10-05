@@ -3,6 +3,7 @@ dist/
 release/
 apps/desktop/.open-design-resources/
 apps/desktop/.open-design-component/
+apps/desktop/.open-design-component-dist/
 .vite/
 .turbo/
 coverage/

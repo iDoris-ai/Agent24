@@ -97,12 +97,36 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     expect(creativeShow).not.toHaveBeenCalled()
   })
 
-  it('shows the unavailable message with the dev hint for an unreleased build', async () => {
+  // PR #670 review (H1): `unavailable` (no baked manifest, e.g. a dev
+  // build) must still attempt `creativeShow` — CreativeServeWeb, not this
+  // page, knows whether a dev checkout (A24_OPEN_DESIGN_DIR / sibling
+  // checkout) makes the component unnecessary. Only `creativeShow`'s own
+  // `needsDownload` result puts up the download card.
+  it('H1 (dev mode): unavailable + creativeShow succeeds -> no card, no error, Creative starts', async () => {
     openDesignComponentStatus.mockResolvedValue({ state: 'unavailable', reason: 'no manifest baked' })
     render(<CreativePage />)
 
-    expect(await screen.findByText('此构建未附带 iDoris Design 组件下载信息')).toBeTruthy()
-    expect(screen.getByText(/A24_OPEN_DESIGN_DIR/)).toBeTruthy()
+    await waitFor(() => expect(creativeShow).toHaveBeenCalled())
+    expect(screen.queryByText(/iDoris Design/)).toBeNull()
+    expect(screen.queryByText(/Open Design unavailable/)).toBeNull()
+  })
+
+  it('H1: unavailable + creativeShow reports needsDownload -> shows the not-installed download card', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'unavailable', reason: 'no manifest baked' })
+    creativeShow.mockResolvedValue({ ok: false, needsDownload: true, size: 20 * 1024 * 1024 })
+    render(<CreativePage />)
+
+    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 20 MB）/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: '下载' })).toBeTruthy()
+  })
+
+  it('H1: unavailable + creativeShow fails with a plain error -> shows the generic error banner, not a component card', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'unavailable', reason: 'no manifest baked' })
+    creativeShow.mockResolvedValue({ ok: false, error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design' })
+    render(<CreativePage />)
+
+    expect(await screen.findByText(/Open Design runtime not found/)).toBeTruthy()
+    expect(screen.queryByText(/iDoris Design/)).toBeNull()
   })
 
   it('drives download -> install click -> progress -> installed, then starts Creative', async () => {
