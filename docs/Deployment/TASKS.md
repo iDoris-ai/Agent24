@@ -12,7 +12,9 @@
 
 ## 阶段 A：现在就能做（无外部依赖）→ v0.5.1
 
-v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只发 Linux（AppImage + deb）。**macOS dmg 不在本版发布**，因为未签名的 dmg 在 Sequoia 上打开很麻烦，留到 v0.5.2 签名后再发。
+v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只发 Linux（AppImage + deb）。
+**v0.5.1 当时的计划是 macOS dmg 留到 v0.5.2 签名后再发——这条已被 Owner 2026-10-05 的裁决推翻**：
+未签名不是不发 dmg 的理由，见下面 DEP-A9/DEP-B2 和阶段 B 的说明。
 
 | ID | 任务 | 依赖 | 执行 | 规模 | 状态 |
 |---|---|---|---|---|---|
@@ -24,6 +26,7 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 | DEP-A7 | Windows 移植设计：`docs/design/WINDOWS-PORT.md`。候选方案对比：Windows AF_UNIX + 句柄继承 / 命名管道 / 回环 + token；复用 sidecar-host ProcessKit；给出所有 Unix 专有代码的处置清单（20 个文件 + proxy.rs + `state_dir` 的 HOME + `command-fds`/`close_fds` + `same_device`）；分阶段计划。摸底用 **`windows-latest` 上 `workflow_dispatch` 触发的 `cargo check --workspace --keep-going`** | — | Opus 设计 + Sonnet 摸底 | M | `DONE`（#610、#611） |
 | DEP-A8 | v0.5.1 清单与发布：`docs/RELEASE-CHECKLIST-v0.5.1.md` 冻结命名；打 tag 触发 A3/A6；干净机器验收 | A1, A3–A6 | Opus 清单 + Sonnet | M | `DONE`（#624；tag `v0.5.1`@4fb5a89，Sin90 `v0.5.1`@030ae09，Cos72 `v0.1.1`@51187da；验收见 `docs/RELEASE-CHECKLIST-v0.5.1.md` 末节） |
 | DEP-A9 | Owner 裁决（2026-10-05）：Open Design 改为按需下载组件，不再打进安装包（曾把 AppImage 从 146MB 顶到 934MB、deb 从 101MB 顶到 622MB）。`pack-open-design-component.mjs` 产出 tarball + 校验 manifest；`open-design-component.ts` 是运行时安装器（下载/校验 sha256/解压/校验 contract/原子落地到 `~/.agent24/components/open-design/`）；`CreativeServeWeb` 消费已安装目录，未安装时报 `needs-download`；Design 页首次点开才提示下载 | A6 | Sonnet | M | 见 PR（本次） |
+| DEP-A10 | macOS 版 Open Design 按需组件（跟进 A9，暂未实现）：摸底结论——fork 的 `@open-design/tools-pack` `mac <action>` 子命令**没有** `--to dir` 这个 target（`TO_HELP_BY_PLATFORM.mac` 只有 `all\|app\|dmg\|zip`，不像 linux 有 `all\|appimage\|dir`），`packMac()` 的 `resourceRoot` 只是 `resources/open-design` 一棵树（不是 Agent24 需要的 `app/ open-design/ open-design-web-standalone/` 三棵树），需要新写一个类似 `prepare-open-design-linux-resources.mjs` 的 mac 版脚本才能产出同构的 tarball。在此之前 macOS dmg 里 Design 页会报 `unavailable` | A9 | Sonnet | M | `BACKLOG` |
 
 原来的 DEP-A2（Linux 黑盒）**已删除**：`a3_2b` / `a3_3` 黑盒没有标 `#[ignore]`，现有 ubuntu CI 每次都在跑，重做一遍证伪不了任何东西。真正的新内容是「Sin90/Cos72 真实二进制在 Linux 上挂载」，已并入 A4 和 A8 的验收。
 
@@ -42,17 +45,28 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
   - AppImage 需要 libfuse2 或 `--appimage-extract-and-run` / `--no-sandbox`；
   - `agent24 service` 仅支持 macOS。
 
-## 阶段 B：Apple 开发者账号到位后 → v0.5.2（只做签名）
+## 阶段 B：Apple 开发者账号到位后 → v0.5.2（签名 + 公证）
+
+> **Owner 裁决（2026-10-05）**：没有 Apple 开发者账号不是不发 dmg 的理由。DEP-B2 拆成两半——
+> **未签名 dmg 现在就发**（见下面「DEP-B2a（已实现）」，走 `release-desktop.yml` 新增的
+> `build-macos` job，`CSC_IDENTITY_AUTO_DISCOVERY=false` + ad-hoc `codesign --force --deep
+> --sign -`，首次打开走右键「打开」或 `xattr -dr com.apple.quarantine`）；**只有 notarytool
+> 公证**这一步仍然卡账号（见 DEP-B2b）。
 
 | ID | 任务 | 依赖 | 执行 | 规模 | 状态 |
 |---|---|---|---|---|---|
 | DEP-B1 | 证书与密钥：导出 Developer ID Application 证书（p12）和 App Store Connect API key，存入仓库 Secrets | 账号 | **用户** | S | `BLOCKED`（账号申请中） |
-| DEP-B2 | macOS 桌面端 dmg：在 arm64 和 Intel runner 上分别构建；开启 hardened runtime + entitlements；在 `mac.binaries` 里显式列出 `agent24d`；notarytool 公证 + staple | B1, A5 | Sonnet | M | `BLOCKED` |
+| DEP-B2a | 未签名 macOS dmg：`release-desktop.yml` 新增 `build-macos` job（`macos-14` arm64 + `macos-15-intel` x64 矩阵），`electron-builder --mac dmg` + `CSC_IDENTITY_AUTO_DISCOVERY=false`，ad-hoc 签名让 app 能在本机架构启动；冒烟挂载 dmg 校验 `codesign -dv`、跑内置 `agent24d`、`/health`、断言包内没有 `open-design` 树（Open Design 在 mac 上还是按需组件，见 A10） | A5, A9 | Sonnet | M | `DONE`（本次 PR，本机 arm64 实测：144MB dmg，启动+health 200） |
+| DEP-B2b | notarytool 公证 + staple：开启 hardened runtime + entitlements；`mac.binaries` 显式列出 `agent24d` | B1, B2a | Sonnet | M | `BLOCKED`（账号） |
 | DEP-B3 | CLI 和模块二进制签名 + 公证：`agent24`/`agent24d`、`bin/sin90`、`bin/cos72` 用 codesign 签名，打成 zip 送公证，接入 A3/A4 的流水线 | B1, A3, A4 | Sonnet | M | `BLOCKED` |
-| DEP-B5 | v0.5.2 发布：签名的 dmg 和 CLI；用**浏览器下载**（带 quarantine 标记）做干净机器验收 | B2, B3 | Opus + Sonnet | S | `BLOCKED` |
+| DEP-B5 | v0.5.2 发布：**公证**的 dmg 和 CLI；用**浏览器下载**（带 quarantine 标记）做干净机器验收 | B2b, B3 | Opus + Sonnet | S | `BLOCKED` |
 
 **验收标准**
-- **B2**：`spctl -a -vv Agent24.app` 输出 `accepted` 且 `source=Notarized Developer ID`；`codesign --verify --deep --strict` 通过；`codesign -dv` 能看到嵌套的 `agent24d` 已签名，且开启了 hardened runtime；`lipo -archs` 与 dmg 的架构一致。
+- **B2a**（已验证，本次 PR）：本机 arm64 `electron-builder --mac dmg` + ad-hoc 签名；`codesign -dv`
+  显示 `Signature=adhoc`；挂载 dmg 后打开 app，内置 `agent24d` 的 `/api/v1/health` 返回
+  200；`Contents/Resources` 下没有 `open-design`/`open-design-web-standalone`。CI 侧 x64
+  （`macos-15-intel`）跑法相同，尚未在真实 CI 上跑过（见 PR 风险说明）。
+- **B2b**：`spctl -a -vv Agent24.app` 输出 `accepted` 且 `source=Notarized Developer ID`；`codesign --verify --deep --strict` 通过；`codesign -dv` 能看到嵌套的 `agent24d` 已签名，且开启了 hardened runtime；`lipo -archs` 与 dmg 的架构一致。
 - **B3**：用 Safari 下载 → Finder 双击解压 → 在终端执行 `agent24 --version`，不出现 Gatekeeper 拦截；daemon 能拉起模块并挂载。另用 `tar` 解压的方式再测一遍，记录 quarantine 行为。
 - **B5**：在干净机器上浏览器下载 dmg，双击后首次打开，不出现「无法验证开发者」或「已损坏」。
 
@@ -60,7 +74,7 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 
 | ID | 任务 | 依赖 | 执行 | 规模 | 状态 |
 |---|---|---|---|---|---|
-| DEP-B4→C0 | 自动更新：electron-updater，需要 mac `zip` 目标；用 fork 或 prerelease 通道验证，不污染正式更新通道 | B2 | Sonnet | M | `BLOCKED` |
+| DEP-B4→C0 | 自动更新：electron-updater，需要 mac `zip` 目标；用 fork 或 prerelease 通道验证，不污染正式更新通道 | B2b | Sonnet | M | `BLOCKED` |
 | DEP-C1 | Windows 签名方式：jason 核实能否申请 Azure Trusted Signing（Artifact Signing），不能就改买 OV/EV 证书 | 用户决策与费用 | **用户** | S | `BLOCKED` |
 | DEP-C2 | Windows 移植实现：按 A7 冻结的设计分片实现；CI 加 `windows-latest` | A7 冻结；sidecar-host 线的落地情况 | Sonnet（分片） | L | `BLOCKED` |
 | DEP-C3 | Windows 发布：release.yml 加 `x86_64-pc-windows-msvc`；桌面端出 NSIS 安装包并签名 → v0.6 | C1, C2 | Sonnet | M | `BLOCKED` |

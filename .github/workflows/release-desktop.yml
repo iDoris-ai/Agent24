@@ -1,10 +1,23 @@
-name: Release Desktop (Linux)
+name: Release Desktop (Linux + macOS)
 
 # DEP-A6: desktop Linux packages (AppImage + deb), built on top of DEP-A3's
-# CLI release pipeline (release.yml, #608/#609). This workflow never creates
-# the GitHub Release itself (M5 in docs/Deployment/TASKS.md — A3 owns Release
-# creation, A6 only appends assets to the same tag) and never touches the
-# SHA256SUMS file A3 produces (writes its own SHA256SUMS-desktop instead).
+# CLI release pipeline (release.yml, #608/#609). DEP-B2 (owner decision
+# 2026-10-05: ship a normal UNSIGNED macOS dmg now — no Apple Developer
+# account is not a reason to wait) adds the macOS job below. This workflow
+# never creates the GitHub Release itself (M5 in docs/Deployment/TASKS.md —
+# A3 owns Release creation, this workflow only appends assets to the same
+# tag) and never touches the SHA256SUMS file A3 produces (writes its own
+# SHA256SUMS-desktop instead).
+#
+# macOS note: the Open Design on-demand component (DEP-A9) is Linux-only for
+# now — tools-pack's `mac <action>` CLI has no `--to dir` target (only
+# `all|app|dmg|zip`, see tools-pack/src/index.ts's TO_HELP_BY_PLATFORM),
+# unlike linux's `all|appimage|dir`, so there is no drop-in equivalent of
+# prepare-open-design-linux-resources.mjs's loose `resources/{app,open-design,
+# open-design-web-standalone}` tree on mac yet. The macOS dmg ships with no
+# Open Design component manifest baked in — the Design page correctly reports
+# `unavailable` there until a mac resource-tree script is written (tracked as
+# DEP-A10 in docs/Deployment/TASKS.md). This does not block the dmg itself.
 #
 # Same tag filter as release.yml — see that file's header comment for why
 # `v[0-9]+.[0-9]+.[0-9]+` doesn't match `agent24-os-sdk-v9.9.9` / `v0.4.0-m4`.
@@ -346,27 +359,182 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-macos:
+    name: Build + smoke test (macOS ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          # Current standard Intel macOS runner label (same source as
+          # release.yml's comment, fetched 2026-10-01): macos-13 is retired.
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Setup Agent24 pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
+        with:
+          version: 9.12.0
+
+      - name: Setup Node.js for Agent24
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-desktop-macos-${{ matrix.arch }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
+      - name: Build agent24d (release)
+        working-directory: rust
+        run: cargo build --release --bin agent24d
+
+      - name: Self-check — binary architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          file rust/target/release/agent24d
+          archs="$(lipo -archs rust/target/release/agent24d)"
+          echo "archs: $archs"
+          case "${{ matrix.arch }}" in
+            arm64) echo "$archs" | grep -qw arm64 ;;
+            x64)   echo "$archs" | grep -qw x86_64 ;;
+          esac
+
+      - name: Build node-daemon
+        run: pnpm --filter @agent24/node-daemon build
+
+      - name: Build desktop renderer + electron main
+        # Also guarantees .open-design-component/ exists (ensure-open-design-
+        # component-dir.mjs, chained into this script) — macOS doesn't pack an
+        # Open Design component manifest yet (see this file's header comment /
+        # DEP-A10), so the app ships with the Design page reporting
+        # `unavailable`, same as any dev build that skips pack:open-design.
+        run: pnpm --filter @agent24/desktop build
+
+      - name: 'electron-builder (macOS dmg, unsigned)'
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --mac dmg
+
+      - name: Ad-hoc sign the .app so it launches on this architecture
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find release -maxdepth 2 -name '*.app' -print -quit)"
+          test -n "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign -dv "$APP"
+
+      - name: Smoke test — mount dmg, check codesign, run bundled agent24d, /health is 200, no Open Design trees
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG="$(ls release/*.dmg)"
+          MOUNT_ROOT="$RUNNER_TEMP/a24-dmg-mount"
+          mkdir -p "$MOUNT_ROOT"
+          hdiutil attach "$DMG" -mountpoint "$MOUNT_ROOT" -nobrowse -quiet
+          trap 'hdiutil detach "$MOUNT_ROOT" -quiet || true' EXIT
+
+          APP="$(find "$MOUNT_ROOT" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP"
+          codesign -dv "$APP" 2>&1 | tee "$RUNNER_TEMP/codesign.log"
+          grep -q 'Signature=adhoc' "$RUNNER_TEMP/codesign.log"
+
+          RESOURCES="$APP/Contents/Resources"
+          test ! -e "$RESOURCES/open-design"
+          test ! -e "$RESOURCES/open-design-web-standalone"
+
+          AGENT24D="$RESOURCES/backend/agent24d"
+          test -x "$AGENT24D"
+          SMOKE_HOME="$RUNNER_TEMP/a-b2-smoke-home"
+          rm -rf "$SMOKE_HOME"
+          mkdir -p "$SMOKE_HOME"
+          HOME="$SMOKE_HOME" "$AGENT24D" serve --port 0 &
+          AGENT_PID=$!
+
+          STATE="$SMOKE_HOME/.agent24/daemon.json"
+          for _ in $(seq 1 60); do
+            [ -f "$STATE" ] && break
+            sleep 1
+          done
+          if [ ! -f "$STATE" ]; then
+            echo "::error::daemon.json did not appear under \$HOME/.agent24 within 60s"
+            kill "$AGENT_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "daemon.json:"; cat "$STATE"
+
+          PORT="$(jq -r '.port' "$STATE")"
+          BODY="$RUNNER_TEMP/health.json"
+          STATUS="$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/health")"
+          echo "health status: $STATUS body: $(cat "$BODY")"
+          kill "$AGENT_PID" 2>/dev/null || true
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::health check returned $STATUS instead of 200"
+            exit 1
+          fi
+
+      - name: Report dmg size
+        working-directory: apps/desktop/release
+        run: |
+          set -euo pipefail
+          ls -la -- *.dmg
+          du -h -- *.dmg
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: desktop-macos-${{ matrix.arch }}
+          path: apps/desktop/release/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Append to Release
-    needs: build
+    needs: [build, build-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
+      - name: Download artifacts (Linux + both macOS architectures)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          name: desktop-linux-x64
+          pattern: desktop-*
           path: dist
+          merge-multiple: true
 
       - name: Checksums (separate file — A3 owns SHA256SUMS)
         working-directory: dist
         run: |
           set -euo pipefail
           ls -la
-          shasum -a 256 -- *.AppImage *.deb open-design-*.tar.gz > SHA256SUMS-desktop
+          shasum -a 256 -- *.AppImage *.deb *.dmg open-design-*.tar.gz > SHA256SUMS-desktop
           cat SHA256SUMS-desktop
           shasum -a 256 -c SHA256SUMS-desktop
 
@@ -400,5 +568,5 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           gh release upload "$TAG" \
-            dist/*.AppImage dist/*.deb dist/open-design-*.tar.gz dist/SHA256SUMS-desktop \
+            dist/*.AppImage dist/*.deb dist/*.dmg dist/open-design-*.tar.gz dist/SHA256SUMS-desktop \
             --clobber

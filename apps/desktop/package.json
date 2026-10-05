@@ -94,6 +94,9 @@
         }
       ]
     },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
     "win": {
       "target": [
         "nsis"
