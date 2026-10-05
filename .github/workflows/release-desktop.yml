@@ -9,15 +9,20 @@ name: Release Desktop (Linux + macOS)
 # tag) and never touches the SHA256SUMS file A3 produces (writes its own
 # SHA256SUMS-desktop instead).
 #
-# macOS note: the Open Design on-demand component (DEP-A9) is Linux-only for
-# now — tools-pack's `mac <action>` CLI has no `--to dir` target (only
-# `all|app|dmg|zip`, see tools-pack/src/index.ts's TO_HELP_BY_PLATFORM),
-# unlike linux's `all|appimage|dir`, so there is no drop-in equivalent of
-# prepare-open-design-linux-resources.mjs's loose `resources/{app,open-design,
-# open-design-web-standalone}` tree on mac yet. The macOS dmg ships with no
-# Open Design component manifest baked in — the Design page correctly reports
-# `unavailable` there until a mac resource-tree script is written (tracked as
-# DEP-A10 in docs/Deployment/TASKS.md). This does not block the dmg itself.
+# macOS note (DEP-A10): the Open Design on-demand component also ships for
+# macOS, reusing stage:open-design / rebuild:open-design-native / pack:open-
+# design completely unmodified. tools-pack's `mac <action>` CLI has no `--to
+# dir` target (only `all|app|dmg|zip`, see tools-pack/src/index.ts's
+# TO_HELP_BY_PLATFORM) — but `--to app` (which maps to electron-builder's
+# `dir` target under the hood) already produces the exact `app/ open-design/
+# open-design-web-standalone/` layout those scripts expect: electron-builder's
+# own `afterPack` hook copies the Next standalone web output into
+# `open-design-web-standalone` for mac the same way it does for win, and
+# `asar: false` keeps `app/` a loose, inspectable directory. So the "Build
+# exact Open Design mac resource base" step below is the mac analogue of the
+# Linux job's equivalent step, pointed at `Contents/Resources` instead of a
+# Linux `--to dir` output — no new Agent24-side resource-assembly script was
+# needed.
 #
 # Same tag filter as release.yml — see that file's header comment for why
 # `v[0-9]+.[0-9]+.[0-9]+` doesn't match `agent24-os-sdk-v9.9.9` / `v0.4.0-m4`.
@@ -408,6 +413,53 @@ jobs:
         with:
           submodules: false
 
+      # DEP-A10: mac DOES get an on-demand Open Design component after all —
+      # research (see this file's header comment) found that tools-pack's
+      # `mac build --to app` target already produces the exact
+      # `app/ open-design/ open-design-web-standalone/` layout Agent24's
+      # EXISTING stage/rebuild/pack scripts expect (electron-builder's own
+      # `afterPack` hook copies the Next standalone web output into
+      # `open-design-web-standalone` for mac too, same as it does for win —
+      # `asar: false` keeps `app/` a loose, inspectable directory). So this
+      # reuses stage:open-design / rebuild:open-design-native / pack:open-
+      # design completely unmodified, just pointed at the mac build's
+      # Contents/Resources directory instead of a Linux `--to dir` output.
+      - name: Checkout exact reviewed Open Design fork
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          repository: iDoris-ai/open-design-agent24
+          ref: ${{ env.OPEN_DESIGN_SHA }}
+          path: open-design
+
+      - name: Setup Node.js for Open Design
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Build exact Open Design mac resource base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C open-design rev-parse HEAD)" = "$OPEN_DESIGN_SHA"
+          corepack enable
+          corepack prepare pnpm@10.33.2 --activate
+          (
+            cd open-design
+            pnpm install --frozen-lockfile
+            pnpm --filter @open-design/tools-pack dev mac build \
+              --to app \
+              --portable \
+              --namespace agent24-release \
+              --dir "$RUNNER_TEMP/open-design-pack" \
+              --json > "$RUNNER_TEMP/open-design-pack.json"
+          )
+          cat "$RUNNER_TEMP/open-design-pack.json"
+          RESOURCE_PACKAGE="$(find "$RUNNER_TEMP/open-design-pack" -type f -path '*/Contents/Resources/app/package.json' -print -quit)"
+          test -n "$RESOURCE_PACKAGE"
+          RESOURCE_DIR="$(dirname "$(dirname "$RESOURCE_PACKAGE")")"
+          echo "A24_OPEN_DESIGN_RESOURCES_DIR=$RESOURCE_DIR" >> "$GITHUB_ENV"
+
       - name: Setup Agent24 pnpm
         uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
         with:
@@ -454,12 +506,41 @@ jobs:
         run: pnpm --filter @agent24/node-daemon build
 
       - name: Build desktop renderer + electron main
-        # Also guarantees .open-design-component/ exists (ensure-open-design-
-        # component-dir.mjs, chained into this script) — macOS doesn't pack an
-        # Open Design component manifest yet (see this file's header comment /
-        # DEP-A10), so the app ships with the Design page reporting
-        # `unavailable`, same as any dev build that skips pack:open-design.
+        # ensure-open-design-component-dir.mjs (chained into this script)
+        # guarantees .open-design-component/ exists even before the pack
+        # step below runs, same as the Linux job.
         run: pnpm --filter @agent24/desktop build
+
+      - name: Stage exact Open Design Creative resources
+        run: pnpm --filter @agent24/desktop stage:open-design
+
+      - name: Rebuild Open Design native modules for Agent24 Electron
+        env:
+          A24_OPEN_DESIGN_SOURCE_DIR: ${{ github.workspace }}/open-design
+        run: pnpm --filter @agent24/desktop rebuild:open-design-native
+
+      - name: Resolve app version (for the component manifest's download URL)
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack the Open Design on-demand component (tarball + manifest, in separate dirs)
+        working-directory: apps/desktop
+        env:
+          A24_OD_STAGE_DIR: ${{ github.workspace }}/apps/desktop/.open-design-resources
+          A24_OD_PACK_OUT_DIR: ${{ github.workspace }}/apps/desktop/.open-design-component
+          A24_OD_TARBALL_OUT_DIR: ${{ github.workspace }}/apps/desktop/.open-design-component-dist
+          A24_OD_APP_VERSION: ${{ steps.ver.outputs.version }}
+          A24_OD_REPOSITORY: ${{ github.repository }}
+          A24_OD_PLATFORM: darwin
+          A24_OD_ARCH: ${{ matrix.arch }}
+        run: pnpm pack:open-design
 
       - name: 'electron-builder (macOS dmg, unsigned)'
         working-directory: apps/desktop
@@ -496,6 +577,26 @@ jobs:
           RESOURCES="$APP/Contents/Resources"
           test ! -e "$RESOURCES/open-design"
           test ! -e "$RESOURCES/open-design-web-standalone"
+          test ! -e "$RESOURCES/app"
+          if find "$RESOURCES" -maxdepth 1 -name '*.tar.gz' -print | grep -q .; then
+            echo "::error::found a .tar.gz bundled inside $RESOURCES — the on-demand component must never ship inside the installer"
+            exit 1
+          fi
+
+          MANIFEST="$RESOURCES/open-design-component.json"
+          test -f "$MANIFEST"
+          test "$(jq -r '.version' "$MANIFEST")" = "0.22.2"
+          test "$(jq -r '.odSha' "$MANIFEST")" = "$OPEN_DESIGN_SHA"
+          test "$(jq -r '.platform' "$MANIFEST")" = "darwin"
+          test "$(jq -r '.arch' "$MANIFEST")" = "${{ matrix.arch }}"
+
+          MAX_INSTALLER_BYTES=$((250 * 1024 * 1024))
+          DMG_SIZE="$(stat -f%z "$DMG")"
+          echo "$(basename "$DMG"): $DMG_SIZE bytes"
+          if [ "$DMG_SIZE" -gt "$MAX_INSTALLER_BYTES" ]; then
+            echo "::error::$(basename "$DMG") is $DMG_SIZE bytes, over the $MAX_INSTALLER_BYTES byte cap — Open Design (or something else large) may have been re-bundled"
+            exit 1
+          fi
 
           AGENT24D="$RESOURCES/backend/agent24d"
           test -x "$AGENT24D"
@@ -527,18 +628,54 @@ jobs:
             exit 1
           fi
 
-      - name: Report dmg size
-        working-directory: apps/desktop/release
+      - name: Smoke test — Open Design darwin component tarball extracts and passes the staging contract
+        working-directory: apps/desktop
+        shell: bash
         run: |
           set -euo pipefail
-          ls -la -- *.dmg
-          du -h -- *.dmg
+          TARBALL="$(ls .open-design-component-dist/open-design-*.tar.gz)"
+          EXTRACT="$RUNNER_TEMP/od-component-smoke"
+          rm -rf "$EXTRACT"
+          mkdir -p "$EXTRACT"
+          tar -xzf "$TARBALL" -C "$EXTRACT"
+          test -d "$EXTRACT/app"
+          test -d "$EXTRACT/open-design"
+          test -d "$EXTRACT/open-design-web-standalone"
+          test "$(jq -r '.version' "$EXTRACT/app/package.json")" = "0.22.2"
+          for relative in \
+            app/prebundled/agent24-headless.cjs \
+            app/prebundled/agent24-headless.mjs \
+            app/prebundled/daemon/daemon-cli.mjs \
+            app/prebundled/daemon/daemon-sidecar.mjs \
+            app/prebundled/web-sidecar.mjs; do
+            test -f "$EXTRACT/$relative"
+          done
+          if find "$EXTRACT" -type l -lname '/*' | grep -q .; then
+            echo "::error::Open Design darwin component tarball contains an absolute symlink"
+            find "$EXTRACT" -type l -lname '/*'
+            exit 1
+          fi
+
+      - name: Report dmg + Open Design tarball sizes
+        working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          ls -la release/*.dmg .open-design-component-dist/open-design-*.tar.gz
+          echo "--- sizes ---"
+          du -h release/*.dmg .open-design-component-dist/open-design-*.tar.gz
+
+      - name: Copy the Open Design component tarball next to the dmg
+        # Same reasoning as the Linux job: upload-artifact flattens
+        # multi-path uploads relative to their greatest common ancestor.
+        run: cp apps/desktop/.open-design-component-dist/open-design-*.tar.gz apps/desktop/release/
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: desktop-macos-${{ matrix.arch }}
-          path: apps/desktop/release/*.dmg
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/open-design-*.tar.gz
           if-no-files-found: error
           retention-days: 14
 
