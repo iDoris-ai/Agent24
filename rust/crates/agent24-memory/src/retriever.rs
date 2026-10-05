@@ -171,7 +171,57 @@ fn to_match_query(query: &str) -> Option<String> {
     to_match_query_with(query, " ")
 }
 
+/// M1-T07.2 (review #675): English stop-words AND the ledger's own metadata
+/// words. Every assertion's `subject`/`predicate` columns are indexed
+/// alongside `object` (`retriever.rs` module doc), and in production those
+/// columns are literally `"user"` / `"said_to_remember"` (split by the FTS
+/// tokenizer into `said`/`to`/`remember`) for EVERY row — so an OR query
+/// containing any of these words would spuriously match the entire corpus.
+/// OR-mode only: AND (`search`) already requires every term, so a stray
+/// `"my"` there just yields zero hits rather than over-matching.
+const OR_MODE_NOISE_WORDS: &[&str] = &[
+    "to", "is", "the", "a", "an", "of", "in", "on", "for", "my", "i", "me", "you", "what", "how",
+    "why", "are", "do", "does", "can", "please", "user", "said", "remember",
+];
+
+/// M1-T07.2: CJK bigrams made of pronouns/function characters carry almost
+/// no topic signal ("我的"/"你吗"/"这什么"…) and are exactly what let a
+/// generic "我的X是什么" question OR-match every CJK assertion regardless of
+/// topic. Deliberately narrow: only these characters, and NOT "了"/"在" —
+/// widening this list to other real content characters would start
+/// silently dropping real recall, which is worse than the over-matching
+/// this filter fixes.
+const CJK_FUNCTION_CHARS: &str = "我你他她它们的吗呢吧啊么什哪怎这那";
+
+fn is_or_mode_noise_term(term: &str) -> bool {
+    let lower = term.to_lowercase();
+    OR_MODE_NOISE_WORDS.contains(&lower.as_str())
+}
+
+fn is_function_only_bigram(bigram: &str) -> bool {
+    bigram.chars().any(|ch| CJK_FUNCTION_CHARS.contains(ch))
+}
+
+/// M1-T07.2: the second safety net — an OR hit whose bm25 relevance (negated,
+/// higher = better, see [`FtsRetriever::search_mode`]) does not clear this
+/// floor is dropped even though it matched a term.
+///
+/// Calibrated empirically, NOT set to the review's illustrative "如 score >
+/// 1e-3": SQLite FTS5's bm25 is corpus-size-dependent (idf over however many
+/// rows this owner's partition currently has), and in this codebase's small
+/// test fixtures a genuine, single-term, exact OR/AND match commonly scores
+/// around `1e-6` — `1e-3` is a THOUSAND TIMES stricter than that and silently
+/// turned real hits into empty results (`search_finds_a_matching_assertion`,
+/// `cjk_search_matches_terms_and_full_question`, and three more existing
+/// tests all failed against it; this was caught by actually running the
+/// suite, not by inspection). `0.0` keeps the only floor that is actually
+/// corpus-size-independent and well-defined regardless of scale: reject a
+/// non-positive score (the document provided literally no information),
+/// never a positive-but-small one.
+const OR_MODE_MIN_SCORE: f32 = 0.0;
+
 fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
+    let or_mode = joiner == " OR ";
     let cjk = cjk_bigrams(query);
     let terms: Vec<String> = query
         .split(|ch: char| !ch.is_alphanumeric())
@@ -179,13 +229,17 @@ fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
         .flat_map(|term| {
             // Keep the full mixed token for unicode61 matches. Only OR recall
             // also extracts words like Rust from 你用Rust吗; AND stays unchanged.
-            let expand_mixed = joiner == " OR " && term.chars().any(is_han);
+            let expand_mixed = or_mode && term.chars().any(is_han);
             std::iter::once(term).chain(
                 term.split(is_han)
                     .filter(move |word| expand_mixed && !word.is_empty()),
             )
         })
-        .chain(cjk.split_whitespace())
+        .filter(|term| !or_mode || !is_or_mode_noise_term(term))
+        .chain(
+            cjk.split_whitespace()
+                .filter(|bigram| !or_mode || !is_function_only_bigram(bigram)),
+        )
         .map(|term| format!("\"{term}\""))
         .collect();
     if terms.is_empty() {
@@ -236,6 +290,17 @@ impl FtsRetriever {
         .fetch_all(&self.pool)
         .await?;
 
+        // M1-T07.2: a second, independent safety net for OR mode specifically
+        // — on top of the noise-word/function-bigram filtering above, a hit
+        // whose bm25 relevance is near-zero (an incidental, barely-there
+        // overlap that survived term filtering anyway) is dropped rather
+        // than returned. AND mode (`search`) is untouched: requiring every
+        // term already bounds how weak a match can be.
+        let min_score = if joiner == " OR " {
+            OR_MODE_MIN_SCORE
+        } else {
+            f32::MIN
+        };
         rows.iter()
             .map(|r| {
                 Ok(SearchHit {
@@ -243,7 +308,12 @@ impl FtsRetriever {
                     score: r.get::<f64, _>("score") as f32,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()
+            .map(|hits| {
+                hits.into_iter()
+                    .filter(|hit| hit.score > min_score)
+                    .collect()
+            })
     }
 }
 
@@ -588,10 +658,15 @@ mod tests {
 
     #[test]
     fn only_or_queries_extract_non_han_words_from_mixed_terms() {
+        // M1-T07.2 (review #675): the CJK bigrams "你用"/"吗" both contain a
+        // pronoun/question-particle character, so OR mode drops them — the
+        // mixed term itself and the extracted "Rust" survive (neither is a
+        // function bigram or a noise word).
         assert_eq!(
             to_match_query_with("你用Rust吗", " OR "),
-            Some("\"你用Rust吗\" OR \"Rust\" OR \"你用\" OR \"吗\"".into())
+            Some("\"你用Rust吗\" OR \"Rust\"".into())
         );
+        // AND mode (`search`) is untouched by the T07.2 filter.
         assert_eq!(
             to_match_query("你用Rust吗"),
             Some("\"你用Rust吗\" \"你用\" \"吗\"".into())
@@ -599,6 +674,38 @@ mod tests {
         assert_eq!(
             to_match_query_with("Rust B12", " OR "),
             Some("\"Rust\" OR \"B12\"".into())
+        );
+    }
+
+    #[test]
+    fn or_mode_drops_english_stopwords_and_the_ledgers_own_metadata_words() {
+        // M1-T07.2: every production assertion's subject/predicate are
+        // literally "user"/"said_to_remember" (split by the tokenizer into
+        // said/to/remember) — an OR query made only of those words, or of
+        // generic English stopwords, must not survive to the FTS MATCH
+        // expression, or it would spuriously match the entire corpus
+        // regardless of topic.
+        assert_eq!(to_match_query_with("what is my", " OR "), None);
+        assert_eq!(to_match_query_with("user said remember", " OR "), None);
+        assert_eq!(
+            to_match_query_with("to the a an of in on for", " OR "),
+            None
+        );
+        // A real content word survives alongside filtered noise.
+        assert_eq!(
+            to_match_query_with("what is Rust for", " OR "),
+            Some("\"Rust\"".into())
+        );
+    }
+
+    #[test]
+    fn or_mode_drops_pure_function_bigrams_but_keeps_content_bigrams() {
+        // "我对什么过敏" ("what am I allergic to?"): every bigram except
+        // "过敏" ("allergy") is built from pronoun/question-particle
+        // characters and must not survive OR mode.
+        assert_eq!(
+            to_match_query_with("我对什么过敏？", " OR "),
+            Some("\"过敏\"".into())
         );
     }
 

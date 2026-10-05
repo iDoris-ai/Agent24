@@ -1,50 +1,73 @@
-//! M1-T08: a small, mostly-Chinese, hand-written recall-eval baseline over
-//! [`crate::retriever::FtsRetriever::search_any`] — the retriever M1's `recall`
-//! (M1-T07/T07.1) actually calls. This is NOT the LongMemEval replay+condense
-//! harness in [`crate::eval`] (that one measures a different pipeline: message
-//! history → condenser view). `docs/research/MEMORY-STRATEGY.md` §4.1 T08 row:
-//! ≤20 hand-written cases, layered, plus ≥5 distractor assertions; **record
-//! only, no gate**.
+//! M1-T08 + M1-T07.2: a small, mostly-Chinese, hand-written recall-eval
+//! baseline over [`crate::retriever::FtsRetriever::search_any`] — the
+//! retriever M1's `recall` (M1-T07/T07.1) actually calls. This is NOT the
+//! LongMemEval replay+condense harness in [`crate::eval`] (that one measures
+//! a different pipeline: message history → condenser view).
+//! `docs/research/MEMORY-STRATEGY.md` §4.1 T08 row: hand-written cases,
+//! layered, plus distractor assertions.
 //!
-//! Layering (exactly 20 cases):
-//! - 4 single-fact
-//! - 3 cross-session/multi-fact (2+ assertions make up one correct answer)
-//! - 3 time expressions
-//! - 3 update/retract lifecycle (hard owner-isolation/retract GATES live in
-//!   T07/T09/T10's own tests — this module only records the recall metrics)
-//! - 3 no-answer/literal distractors
-//! - 2 source trust (qualified vs. an unqualified candidate)
-//! - 2 owner isolation
+//! Review (#675) raised the corpus to production shape and added real gates
+//! on top of the base "record only" spec:
+//! - every fixture is written through [`crate::writer::WriteGate`] with
+//!   subject `"user"` / predicate `"said_to_remember"` — the SAME shape
+//!   `agent24-agent::retain::persist` uses in production (not the synthetic
+//!   subject/predicate the first version of this file used), except the two
+//!   supersede pairs, which need the raw [`crate::assertion::AssertionStore`]
+//!   API because `WriteGate` has no supersede path yet (M1 scope, per the
+//!   plan: "每次记住都是独立断言，撤回靠 T09");
+//! - `forbidden_ids` is split into `security_forbidden_ids` (cross-owner,
+//!   superseded, retracted, or unqualified — a leak here is a correctness
+//!   bug, HARD GATE, must be 0) and `distractor_forbidden_ids` (same-owner
+//!   adversarial text that merely shares vocabulary — a precision issue,
+//!   record only);
+//! - 6 English/neutral no-answer prompts were added specifically to prove
+//!   the M1-T07.2 stopword/function-word filter (see `retriever.rs`); their
+//!   injection rate is a HARD GATE (must be 0), while the original 3
+//!   Chinese no-answer cases stay record-only (residual lexical imprecision
+//!   un-fixed by this change is still possible there);
+//! - Hit@5 over the original 14 answerable cases is a HARD GATE (>= 13/14).
 //!
-//! Run: `cargo test -p agent24-memory eval_m1 -- --nocapture`.
+//! Everything else (Hit@1, All-evidence@5, distractor precision, the
+//! original Chinese no-answer injection rate) stays record-only per the base
+//! spec. Run: `cargo test -p agent24-memory eval_m1 -- --nocapture`.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::KvStore;
 use crate::assertion::{Assertion, AssertionStore};
-use crate::event::Scope;
+use crate::event::{Origin, Scope, Trust};
+use crate::writer::{Candidate, MemoryWriter};
 use serde_json::json;
 
 const OWNER: &str = "m1-eval-owner";
 const OTHER_OWNER: &str = "m1-eval-other-owner";
 const TOP_K: usize = 5;
+/// `forget`/supersede effective time: must be in the PAST relative to test
+/// execution — `beliefs_as_of`/`search_any`'s active-row semantics are
+/// bi-temporal, so a FUTURE timestamp would not have taken effect yet (a
+/// trap this eval fell into once already, see `agent24-agent`'s recall.rs
+/// M4 test for the same lesson).
+const PAST: &str = "2000-01-01T00:00:00Z";
 
 /// One hand-written case. `expected_ids` are the assertion id(s) that make up
-/// the correct answer (empty for a no-answer case). `forbidden_ids` are ids
-/// that must never appear among the top-K hits for THIS query — a cross-owner
-/// fact, a superseded/retracted id, or an adversarial same-owner distractor
-/// that shares vocabulary with the query but answers nothing above.
+/// the correct answer (empty for a no-answer case).
 struct EvalCase {
     id: &'static str,
     category: &'static str,
     query: &'static str,
     expected_ids: &'static [&'static str],
-    forbidden_ids: &'static [&'static str],
+    /// MUST never appear in the top-K hits for this query, corpus-wide: a
+    /// cross-owner fact, a superseded/retracted id, or an unqualified
+    /// candidate. A leak here is a correctness bug (hard gate).
+    security_forbidden_ids: &'static [&'static str],
+    /// Same-owner adversarial text that shares vocabulary with the query but
+    /// answers nothing — a precision issue, not a safety one (record only).
+    distractor_forbidden_ids: &'static [&'static str],
 }
 
-/// The ≥5 distractor assertions MEMORY-STRATEGY §4.1 T08 requires, called out
-/// by id so the eval can assert the corpus actually contains them.
+/// The distractor assertions MEMORY-STRATEGY §4.1 T08 requires (>=5), called
+/// out by id so the eval can assert the corpus actually contains them.
 const DISTRACTOR_IDS: &[&str] = &[
     "d1-colleague-allergy",
     "d2-friend-dog",
@@ -53,26 +76,25 @@ const DISTRACTOR_IDS: &[&str] = &[
     "d5-no-travel",
 ];
 
-fn a(id: &str, owner: &str, object: &str) -> Assertion {
-    Assertion::new(
-        id,
-        Scope::owner(owner),
-        "user",
-        "said",
-        json!(object),
-        vec![format!("ev-{id}")],
-    )
+/// How one fixture row is written — see the module doc for why supersede
+/// needs the raw ledger API instead of `WriteGate`.
+enum Write {
+    /// `WriteGate` with `Trust::UserSaid` + `remember()` → `Committed`
+    /// (qualified, in default recall) — the production "记住…" path.
+    Qualified,
+    /// `WriteGate` with `Trust::UserSaid`, no `remember()` → `Held`
+    /// (unqualified candidate, out of default recall by policy).
+    Candidate,
+    /// Raw `AssertionLedger::assert` with `supersedes` set to the given id,
+    /// closing that id's `recorded_to` in the same write.
+    Supersedes(&'static str),
 }
 
-/// One row of the fixture table [`FIXTURES`] seeds. `qualified=false` makes an
-/// unconfirmed candidate (source-trust pair); `supersedes` closes that id's
-/// `recorded_to` in the SAME write (update lifecycle pair).
 struct Fixture {
     id: &'static str,
     owner: &'static str,
     object: &'static str,
-    qualified: bool,
-    supersedes: Option<&'static str>,
+    write: Write,
 }
 
 const fn f(id: &'static str, owner: &'static str, object: &'static str) -> Fixture {
@@ -80,16 +102,15 @@ const fn f(id: &'static str, owner: &'static str, object: &'static str) -> Fixtu
         id,
         owner,
         object,
-        qualified: true,
-        supersedes: None,
+        write: Write::Qualified,
     }
 }
 
 /// Every case's supporting fact, the lifecycle old/new rows, the source-trust
 /// qualified/candidate pairs, the cross-owner isolation facts, and the
 /// distractors — all under [`OWNER`] except the two isolation facts, which
-/// live under [`OTHER_OWNER`] on purpose. `u3-rabbit` is retracted separately
-/// in [`seed`] (retract is a distinct write, not a fixture row).
+/// live under [`OTHER_OWNER`] on purpose. `u3-rabbit` is retracted
+/// separately in [`seed`] (retract is a distinct write, not a fixture row).
 #[rustfmt::skip]
 const FIXTURES: &[Fixture] = &[
     // 4 single-fact.
@@ -111,23 +132,23 @@ const FIXTURES: &[Fixture] = &[
     // 3 update/retract lifecycle: old row superseded or retracted, never
     // leaking into recall even though it is lexically close to the query.
     f("u1-old", OWNER, "我以前住在北京"),
-    Fixture { supersedes: Some("u1-old"), ..f("u1-new", OWNER, "我现在住在杭州") },
+    Fixture { write: Write::Supersedes("u1-old"), ..f("u1-new", OWNER, "我现在住在杭州") },
     f("u2-old", OWNER, "我的手机号是13800001111"),
-    Fixture { supersedes: Some("u2-old"), ..f("u2-new", OWNER, "我的手机号是13900002222") },
+    Fixture { write: Write::Supersedes("u2-old"), ..f("u2-new", OWNER, "我的手机号是13900002222") },
     f("u3-rabbit", OWNER, "我养过一只兔子"),
     // 2 source trust: a qualified belief vs. an unqualified candidate that
     // must stay out of default recall (same `qualified` gate `search_any`'s
     // SQL already applies).
     f("st1-vege-qualified", OWNER, "我是素食主义者"),
-    Fixture { qualified: false, ..f("st1-vege-candidate", OWNER, "可能是素食主义者") },
+    Fixture { write: Write::Candidate, ..f("st1-vege-candidate", OWNER, "可能是素食主义者") },
     f("st2-spicy-qualified", OWNER, "我不吃辣"),
-    Fixture { qualified: false, ..f("st2-spicy-candidate", OWNER, "可能不吃辣") },
+    Fixture { write: Write::Candidate, ..f("st2-spicy-candidate", OWNER, "可能不吃辣") },
     // 2 owner isolation: these two facts live under a DIFFERENT owner and
     // must never surface for OWNER's queries.
     f("iso1-lawyer", OTHER_OWNER, "我的律师叫王芳"),
     f("iso2-passport", OTHER_OWNER, "我的护照号码是G12345678"),
-    // >=5 distractors: same owner, adversarially close in VOCABULARY to a
-    // real case's query, but never the correct answer to anything above.
+    // Distractors: same owner, adversarially close in VOCABULARY to a real
+    // case's query, but never the correct answer to anything above.
     f("d1-colleague-allergy", OWNER, "我同事对海鲜过敏"),
     f("d2-friend-dog", OWNER, "我朋友家的狗叫大黄"),
     f("d3-cousin-job", OWNER, "我表哥在字节跳动工作"),
@@ -135,15 +156,55 @@ const FIXTURES: &[Fixture] = &[
     f("d5-no-travel", OWNER, "我去年没去旅行"),
 ];
 
+fn candidate(id: &str, owner: &str, object: &str) -> Candidate {
+    Candidate::new(
+        id,
+        Scope::owner(owner),
+        "user",
+        "said_to_remember",
+        json!(object),
+        Origin {
+            source: "eval-m1-fixture".to_owned(),
+            trust: Trust::UserSaid,
+        },
+    )
+    .with_evidence(vec![format!("ev-{id}")])
+}
+
 async fn seed(store: &KvStore) {
-    let l = store.assertions();
-    for fixture in FIXTURES {
-        let mut assertion = a(fixture.id, fixture.owner, fixture.object);
-        assertion.qualified = fixture.qualified;
-        assertion.supersedes = fixture.supersedes.map(str::to_owned);
-        l.assert(&assertion).await.unwrap();
+    let gate = store.write_gate();
+    let ledger = store.assertions();
+    for fx in FIXTURES {
+        match fx.write {
+            Write::Qualified => {
+                gate.propose(vec![candidate(fx.id, fx.owner, fx.object).remember()])
+                    .await
+                    .unwrap();
+            }
+            Write::Candidate => {
+                // No `.remember()`: `Trust::UserSaid` without it stays
+                // `Held` by policy — exactly how a non-"记住…" statement
+                // from the user is handled in production.
+                gate.propose(vec![candidate(fx.id, fx.owner, fx.object)])
+                    .await
+                    .unwrap();
+            }
+            Write::Supersedes(old) => {
+                let mut assertion = Assertion::new(
+                    fx.id,
+                    Scope::owner(fx.owner),
+                    "user",
+                    "said_to_remember",
+                    json!(fx.object),
+                    vec![format!("ev-{}", fx.id)],
+                );
+                assertion.supersedes = Some(old.to_owned());
+                ledger.assert(&assertion).await.unwrap();
+            }
+        }
     }
-    l.retract(&"u3-rabbit".to_owned(), OWNER, "2030-01-01T00:00:00Z")
+    ledger
+        .retract(&"u3-rabbit".to_owned(), OWNER, PAST)
         .await
         .unwrap();
 }
@@ -151,26 +212,37 @@ async fn seed(store: &KvStore) {
 #[rustfmt::skip]
 fn cases() -> Vec<EvalCase> {
     vec![
-        EvalCase { id: "f1-peanut", category: "single_fact", query: "我对什么过敏？", expected_ids: &["f1-peanut"], forbidden_ids: &["d1-colleague-allergy"] },
-        EvalCase { id: "f2-dog", category: "single_fact", query: "我家狗叫什么名字？", expected_ids: &["f2-dog"], forbidden_ids: &["d2-friend-dog"] },
-        EvalCase { id: "f3-job", category: "single_fact", query: "我在哪家公司工作？", expected_ids: &["f3-job"], forbidden_ids: &["d3-cousin-job"] },
-        EvalCase { id: "f4-color", category: "single_fact", query: "我最喜欢什么颜色？", expected_ids: &["f4-color"], forbidden_ids: &[] },
-        EvalCase { id: "m1-pets", category: "cross_session_multi_fact", query: "我养了哪些宠物？", expected_ids: &["m1-cat", "m1-parrot"], forbidden_ids: &["u3-rabbit"] },
-        EvalCase { id: "m2-brother", category: "cross_session_multi_fact", query: "我哥哥的情况是什么？", expected_ids: &["m2-brother-name", "m2-brother-job"], forbidden_ids: &[] },
-        EvalCase { id: "m3-travel", category: "cross_session_multi_fact", query: "我去年去了哪些城市旅行？", expected_ids: &["m3-tokyo", "m3-kyoto"], forbidden_ids: &["d5-no-travel"] },
-        EvalCase { id: "t1-meeting", category: "time_expression", query: "我下周三有什么安排？", expected_ids: &["t1-meeting"], forbidden_ids: &[] },
-        EvalCase { id: "t2-birthday", category: "time_expression", query: "我的生日是哪天？", expected_ids: &["t2-birthday"], forbidden_ids: &["d4-neighbor-birthday"] },
-        EvalCase { id: "t3-deadline", category: "time_expression", query: "这个月底我要做什么？", expected_ids: &["t3-deadline"], forbidden_ids: &[] },
-        EvalCase { id: "u1-address", category: "update_retract_lifecycle", query: "我现在住在哪里？", expected_ids: &["u1-new"], forbidden_ids: &["u1-old"] },
-        EvalCase { id: "u2-phone", category: "update_retract_lifecycle", query: "我的手机号是多少？", expected_ids: &["u2-new"], forbidden_ids: &["u2-old"] },
-        EvalCase { id: "u3-rabbit-retracted", category: "update_retract_lifecycle", query: "我养过兔子吗？", expected_ids: &[], forbidden_ids: &["u3-rabbit"] },
-        EvalCase { id: "n1-turtle", category: "no_answer_distractor", query: "我养过乌龟吗？", expected_ids: &[], forbidden_ids: &[] },
-        EvalCase { id: "n2-paris", category: "no_answer_distractor", query: "我去过巴黎吗？", expected_ids: &[], forbidden_ids: &[] },
-        EvalCase { id: "n3-car", category: "no_answer_distractor", query: "我的车是什么牌子？", expected_ids: &[], forbidden_ids: &[] },
-        EvalCase { id: "st1-vege", category: "source_trust", query: "我是素食主义者吗？", expected_ids: &["st1-vege-qualified"], forbidden_ids: &["st1-vege-candidate"] },
-        EvalCase { id: "st2-spicy", category: "source_trust", query: "我吃辣吗？", expected_ids: &["st2-spicy-qualified"], forbidden_ids: &["st2-spicy-candidate"] },
-        EvalCase { id: "iso1-lawyer", category: "owner_isolation", query: "我的律师叫什么名字？", expected_ids: &[], forbidden_ids: &["iso1-lawyer"] },
-        EvalCase { id: "iso2-passport", category: "owner_isolation", query: "我的护照号码是多少？", expected_ids: &[], forbidden_ids: &["iso2-passport"] },
+        EvalCase { id: "f1-peanut", category: "single_fact", query: "我对什么过敏？", expected_ids: &["f1-peanut"], security_forbidden_ids: &[], distractor_forbidden_ids: &["d1-colleague-allergy"] },
+        EvalCase { id: "f2-dog", category: "single_fact", query: "我家狗叫什么名字？", expected_ids: &["f2-dog"], security_forbidden_ids: &[], distractor_forbidden_ids: &["d2-friend-dog"] },
+        EvalCase { id: "f3-job", category: "single_fact", query: "我在哪家公司工作？", expected_ids: &["f3-job"], security_forbidden_ids: &[], distractor_forbidden_ids: &["d3-cousin-job"] },
+        EvalCase { id: "f4-color", category: "single_fact", query: "我最喜欢什么颜色？", expected_ids: &["f4-color"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "m1-pets", category: "cross_session_multi_fact", query: "我养了哪些宠物？", expected_ids: &["m1-cat", "m1-parrot"], security_forbidden_ids: &["u3-rabbit"], distractor_forbidden_ids: &[] },
+        EvalCase { id: "m2-brother", category: "cross_session_multi_fact", query: "我哥哥的情况是什么？", expected_ids: &["m2-brother-name", "m2-brother-job"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "m3-travel", category: "cross_session_multi_fact", query: "我去年去了哪些城市旅行？", expected_ids: &["m3-tokyo", "m3-kyoto"], security_forbidden_ids: &[], distractor_forbidden_ids: &["d5-no-travel"] },
+        EvalCase { id: "t1-meeting", category: "time_expression", query: "我下周三有什么安排？", expected_ids: &["t1-meeting"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "t2-birthday", category: "time_expression", query: "我的生日是哪天？", expected_ids: &["t2-birthday"], security_forbidden_ids: &[], distractor_forbidden_ids: &["d4-neighbor-birthday"] },
+        EvalCase { id: "t3-deadline", category: "time_expression", query: "这个月底我要做什么？", expected_ids: &["t3-deadline"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "u1-address", category: "update_retract_lifecycle", query: "我现在住在哪里？", expected_ids: &["u1-new"], security_forbidden_ids: &["u1-old"], distractor_forbidden_ids: &[] },
+        EvalCase { id: "u2-phone", category: "update_retract_lifecycle", query: "我的手机号是多少？", expected_ids: &["u2-new"], security_forbidden_ids: &["u2-old"], distractor_forbidden_ids: &[] },
+        EvalCase { id: "u3-rabbit-retracted", category: "update_retract_lifecycle", query: "我养过兔子吗？", expected_ids: &[], security_forbidden_ids: &["u3-rabbit"], distractor_forbidden_ids: &[] },
+        EvalCase { id: "n1-turtle", category: "no_answer_distractor", query: "我养过乌龟吗？", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "n2-paris", category: "no_answer_distractor", query: "我去过巴黎吗？", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "n3-car", category: "no_answer_distractor", query: "我的车是什么牌子？", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "st1-vege", category: "source_trust", query: "我是素食主义者吗？", expected_ids: &["st1-vege-qualified"], security_forbidden_ids: &["st1-vege-candidate"], distractor_forbidden_ids: &[] },
+        EvalCase { id: "st2-spicy", category: "source_trust", query: "我吃辣吗？", expected_ids: &["st2-spicy-qualified"], security_forbidden_ids: &["st2-spicy-candidate"], distractor_forbidden_ids: &[] },
+        EvalCase { id: "iso1-lawyer", category: "owner_isolation", query: "我的律师叫什么名字？", expected_ids: &[], security_forbidden_ids: &["iso1-lawyer"], distractor_forbidden_ids: &[] },
+        EvalCase { id: "iso2-passport", category: "owner_isolation", query: "我的护照号码是多少？", expected_ids: &[], security_forbidden_ids: &["iso2-passport"], distractor_forbidden_ids: &[] },
+        // M1-T07.2 (review #675): 6 English/neutral prompts that must inject
+        // NOTHING — every fixture's subject/predicate is "user"/
+        // "said_to_remember", so without filtering English stopwords + the
+        // metadata words themselves, "to" (from "said_to_remember") or "my"/
+        // "what" would spuriously OR-match every single fixture. Hard gate.
+        EvalCase { id: "en1-python-loop", category: "no_answer_english_neutral", query: "how to write a for loop in python", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "en2-fix-bug", category: "no_answer_english_neutral", query: "fix the bug in my code", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "en3-capital", category: "no_answer_english_neutral", query: "what is the capital of France", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "en4-quantum", category: "no_answer_english_neutral", query: "解释一下量子计算", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "en5-dinner", category: "no_answer_english_neutral", query: "我在想晚饭吃什么", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "en6-proposal", category: "no_answer_english_neutral", query: "我对这个方案有意见", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
     ]
 }
 
@@ -183,8 +255,12 @@ struct Metrics {
     all_evidence_at_5: usize,
     no_answer: usize,
     no_answer_with_any_hit: usize,
-    cases_with_forbidden: usize,
-    forbidden_leaks: usize,
+    no_answer_en: usize,
+    no_answer_en_with_any_hit: usize,
+    cases_with_distractor: usize,
+    distractor_leaks: usize,
+    cases_with_security_forbidden: usize,
+    security_leaks: usize,
 }
 
 fn pct(n: usize, of: usize) -> String {
@@ -199,8 +275,8 @@ fn pct(n: usize, of: usize) -> String {
 async fn eval_m1() {
     let cases = cases();
     assert!(
-        (15..=20).contains(&cases.len()),
-        "M1-T08 caps the eval corpus at <=20 cases and asks for >=15: got {}",
+        cases.len() >= 15,
+        "M1-T08 asks for >=15 hand-written cases: got {}",
         cases.len()
     );
     assert!(
@@ -213,7 +289,7 @@ async fn eval_m1() {
     let retriever = store.retriever();
 
     let mut metrics = Metrics::default();
-    println!("—— M1-T08 recall eval baseline (search_any, top_{TOP_K}) ——");
+    println!("—— M1-T08 + T07.2 recall eval baseline (search_any, top_{TOP_K}) ——");
     for case in &cases {
         let hits = retriever
             .search_any(case.query, OWNER, TOP_K)
@@ -230,16 +306,28 @@ async fn eval_m1() {
                 .expected_ids
                 .iter()
                 .all(|expected| hit_ids.contains(expected));
-        let leaked: Vec<&&str> = case
-            .forbidden_ids
+        let security_leaked: Vec<&&str> = case
+            .security_forbidden_ids
+            .iter()
+            .filter(|forbidden| hit_ids.contains(&**forbidden))
+            .collect();
+        let distractor_leaked: Vec<&&str> = case
+            .distractor_forbidden_ids
             .iter()
             .filter(|forbidden| hit_ids.contains(&**forbidden))
             .collect();
 
         if case.expected_ids.is_empty() {
-            metrics.no_answer += 1;
-            if !hit_ids.is_empty() {
-                metrics.no_answer_with_any_hit += 1;
+            if case.category == "no_answer_english_neutral" {
+                metrics.no_answer_en += 1;
+                if !hit_ids.is_empty() {
+                    metrics.no_answer_en_with_any_hit += 1;
+                }
+            } else {
+                metrics.no_answer += 1;
+                if !hit_ids.is_empty() {
+                    metrics.no_answer_with_any_hit += 1;
+                }
             }
         } else {
             metrics.answerable += 1;
@@ -250,13 +338,17 @@ async fn eval_m1() {
                 metrics.all_evidence_at_5 += usize::from(all_evidence);
             }
         }
-        if !case.forbidden_ids.is_empty() {
-            metrics.cases_with_forbidden += 1;
-            metrics.forbidden_leaks += usize::from(!leaked.is_empty());
+        if !case.security_forbidden_ids.is_empty() {
+            metrics.cases_with_security_forbidden += 1;
+            metrics.security_leaks += usize::from(!security_leaked.is_empty());
+        }
+        if !case.distractor_forbidden_ids.is_empty() {
+            metrics.cases_with_distractor += 1;
+            metrics.distractor_leaks += usize::from(!distractor_leaked.is_empty());
         }
 
         println!(
-            "[{cat}] {id}: query={q:?} hits={hits:?} expected={exp:?} hit@1={h1} hit@5={h5} leaked_forbidden={leaked:?}",
+            "[{cat}] {id}: query={q:?} hits={hits:?} expected={exp:?} hit@1={h1} hit@5={h5} security_leak={sl:?} distractor_leak={dl:?}",
             cat = case.category,
             id = case.id,
             q = case.query,
@@ -264,39 +356,72 @@ async fn eval_m1() {
             exp = case.expected_ids,
             h1 = hit_at_1,
             h5 = hit_at_5,
-            leaked = leaked,
+            sl = security_leaked,
+            dl = distractor_leaked,
         );
     }
 
-    println!("—— summary (record only, no gate) ——");
+    println!("—— summary ——");
     println!(
-        "Hit@1: {}/{} ({})",
+        "Hit@1 (record only): {}/{} ({})",
         metrics.hit_at_1,
         metrics.answerable,
         pct(metrics.hit_at_1, metrics.answerable)
     );
     println!(
-        "Hit@5: {}/{} ({})",
+        "Hit@5 (HARD GATE >= 13/{}): {}/{} ({})",
+        metrics.answerable,
         metrics.hit_at_5,
         metrics.answerable,
         pct(metrics.hit_at_5, metrics.answerable)
     );
     println!(
-        "All-evidence@5: {}/{} ({})",
+        "All-evidence@5 (record only): {}/{} ({})",
         metrics.all_evidence_at_5,
         metrics.multi_evidence,
         pct(metrics.all_evidence_at_5, metrics.multi_evidence)
     );
     println!(
-        "irrelevant-injection rate (no-answer cases returning >=1 hit): {}/{} ({})",
+        "irrelevant-injection rate, Chinese no-answer (record only): {}/{} ({})",
         metrics.no_answer_with_any_hit,
         metrics.no_answer,
         pct(metrics.no_answer_with_any_hit, metrics.no_answer)
     );
     println!(
-        "forbidden-ID leak rate: {}/{} ({})",
-        metrics.forbidden_leaks,
-        metrics.cases_with_forbidden,
-        pct(metrics.forbidden_leaks, metrics.cases_with_forbidden)
+        "irrelevant-injection rate, English/neutral no-answer (HARD GATE = 0): {}/{} ({})",
+        metrics.no_answer_en_with_any_hit,
+        metrics.no_answer_en,
+        pct(metrics.no_answer_en_with_any_hit, metrics.no_answer_en)
+    );
+    println!(
+        "distractor-precision leak rate (record only): {}/{} ({})",
+        metrics.distractor_leaks,
+        metrics.cases_with_distractor,
+        pct(metrics.distractor_leaks, metrics.cases_with_distractor)
+    );
+    println!(
+        "security-forbidden-ID leak rate (HARD GATE = 0): {}/{} ({})",
+        metrics.security_leaks,
+        metrics.cases_with_security_forbidden,
+        pct(
+            metrics.security_leaks,
+            metrics.cases_with_security_forbidden
+        )
+    );
+
+    assert_eq!(
+        metrics.security_leaks, 0,
+        "security leak (cross-owner / superseded / retracted / unqualified) must be zero"
+    );
+    assert_eq!(
+        metrics.no_answer_en_with_any_hit, 0,
+        "an English/neutral no-answer prompt must never inject a memory (M1-T07.2)"
+    );
+    assert!(
+        metrics.hit_at_5 * 14 >= 13 * metrics.answerable,
+        "Hit@5 must be >= 13/14 of the {} answerable cases: got {}/{}",
+        metrics.answerable,
+        metrics.hit_at_5,
+        metrics.answerable
     );
 }
