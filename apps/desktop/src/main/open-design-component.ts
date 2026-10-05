@@ -325,9 +325,18 @@ function makeInstalledTreeReadOnly(root: string): void {
   if (stat.isSymbolicLink()) return
   if (stat.isDirectory()) {
     for (const entry of fs.readdirSync(root)) makeInstalledTreeReadOnly(path.join(root, entry))
-    fs.chmodSync(root, 0o500)
+    // Codex re-review (2026-10-06): hardcoding 0o500/0o444 here stripped
+    // the EXECUTE bit from every file, including ones that legitimately
+    // need it — e.g. @ffmpeg-installer's bundled ffmpeg binary, which the
+    // fork's own daemon spawns directly (spawn(ffmpegInstaller.path)).
+    // That made video export / cover-image generation fail with EACCES
+    // the moment the tree went read-only, reproduced for real. Clear only
+    // the write bits (owner/group/other) and keep whatever read/execute
+    // bits tar extraction already set — "read-only" should mean exactly
+    // that, not "read-only AND non-executable".
+    fs.chmodSync(root, (stat.mode & 0o777) & ~0o222)
   } else if (stat.isFile()) {
-    fs.chmodSync(root, 0o444)
+    fs.chmodSync(root, (stat.mode & 0o777) & ~0o222)
   }
 }
 

@@ -8,7 +8,7 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-export const OPEN_DESIGN_SHA = 'f84ff89656143b5fa3fe8f0891b7f2bf38769d9f'
+export const OPEN_DESIGN_SHA = '34bc2ba810cf894daff6a7c1736d1cef6c7726b1'
 export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
 
 function requireAbsolutePath(value, label) {

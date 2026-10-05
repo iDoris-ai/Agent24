@@ -438,7 +438,15 @@ describe('OpenDesignComponentInstaller', () => {
     const dir = (result as { dir: string }).dir
 
     expect(fs.statSync(dir).mode & 0o777).toBe(0o500)
-    expect(fs.statSync(path.join(dir, 'app')).mode & 0o777).toBe(0o500)
+    // Codex re-review (2026-10-06): makeInstalledTreeReadOnly clears only
+    // write bits now, keeping whatever read/execute bits tar extraction
+    // already set — NOT a hardcoded 0o500/0o444. `app/` was extracted
+    // with the default 0o755 a plain fs.mkdirSync (no explicit mode) in
+    // seedValidTree produces, so clearing its write bits lands on 0o555
+    // (r-xr-xr-x), not 0o500 — `dir` itself stays 0o500 only because
+    // installOnce explicitly created partialDir with mode 0o700 to begin
+    // with (0o700 minus write bits is still 0o500).
+    expect(fs.statSync(path.join(dir, 'app')).mode & 0o777).toBe(0o555)
     expect(fs.statSync(path.join(dir, 'app', 'prebundled', 'agent24-headless.cjs')).mode & 0o777).toBe(0o444)
     expect(fs.statSync(path.join(dir, '.agent24-component.json')).mode & 0o777).toBe(0o444)
 
@@ -446,6 +454,39 @@ describe('OpenDesignComponentInstaller', () => {
     expect(() => fs.writeFileSync(path.join(dir, 'app', 'prebundled', 'agent24-headless.cjs'), 'tampered')).toThrow()
 
     expect(() => verifyEntryFileIntegrity(dir)).not.toThrow()
+  })
+
+  it('M4 (Codex re-review, 2026-10-06): a bundled executable (e.g. @ffmpeg-installer/ffmpeg) stays executable after the installed tree is made read-only', async () => {
+    // Real bug, reproduced for real: the installer used to hardcode
+    // files to mode 0o444 — read-only AND non-executable. The fork's own
+    // daemon spawns bundled binaries like @ffmpeg-installer/ffmpeg's
+    // `ffmpeg` directly (spawn(ffmpegInstaller.path)); stripping +x broke
+    // that with EACCES the moment install() finished. This test proves
+    // the fix with a REAL spawn of a REAL executable fixture, not just a
+    // mode-bits assertion.
+    const stage = seedTreeFor('a24-od-stage-executable-')
+    const binDir = path.join(stage, 'app', 'node_modules', '@ffmpeg-installer', 'ffmpeg')
+    fs.mkdirSync(binDir, { recursive: true })
+    const fixtureBinary = path.join(binDir, 'ffmpeg')
+    fs.writeFileSync(fixtureBinary, '#!/bin/sh\necho fixture-ffmpeg-ok\n')
+    fs.chmodSync(fixtureBinary, 0o755)
+
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-executable-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+    const dir = (result as { dir: string }).dir
+
+    const installedBinary = path.join(dir, 'app', 'node_modules', '@ffmpeg-installer', 'ffmpeg', 'ffmpeg')
+    // Read-only (no write bit), but still executable.
+    expect(fs.statSync(installedBinary).mode & 0o777).toBe(0o555)
+    const output = execFileSync(installedBinary, [], { encoding: 'utf8' })
+    expect(output.trim()).toBe('fixture-ffmpeg-ok')
   })
 
   it('M4: verifyEntryFileIntegrity rejects an entry file whose content changed after install', async () => {

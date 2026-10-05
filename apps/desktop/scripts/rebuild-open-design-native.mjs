@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
-const OPEN_DESIGN_SHA = 'f84ff89656143b5fa3fe8f0891b7f2bf38769d9f'
+const OPEN_DESIGN_SHA = '34bc2ba810cf894daff6a7c1736d1cef6c7726b1'
 const BETTER_SQLITE3_VERSION = '12.10.0'
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const desktopRoot = path.resolve(scriptDir, '..')
