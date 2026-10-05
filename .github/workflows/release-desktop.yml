@@ -237,9 +237,13 @@ jobs:
             # C1: the manifest dir must hold ONLY the manifest — no tarball
             # anywhere under resources/ (the actual bug this PR had: packing
             # the tarball into the same dir extraResources bundles).
-            if find "$resources" -maxdepth 1 -name '*.tar.gz' -print | grep -q .; then
+            # L1 (review finding, 2026-10-05): no -maxdepth here — a tarball
+            # nested a level or two down (e.g. under resources/app/) would
+            # have been just as real a regression and the old -maxdepth 1
+            # silently never looked for it.
+            if find "$resources" -name '*.tar.gz' -print | grep -q .; then
               echo "::error::found a .tar.gz bundled inside $resources — the on-demand component must never ship inside the installer"
-              find "$resources" -maxdepth 1 -name '*.tar.gz'
+              find "$resources" -name '*.tar.gz'
               exit 1
             fi
           }
@@ -289,6 +293,28 @@ jobs:
             find "$EXTRACT" -type l -lname '/*'
             exit 1
           fi
+
+      # M2 (review finding, 2026-10-05): every check above only proves the
+      # shipped tarball LOOKS right — nothing before this point ever
+      # actually installs it through the real installer into the real
+      # default ~/.agent24/components/open-design/ and launches it through
+      # the real packaged Electron binary. See scripts/ci-on-demand-
+      # smoke.mjs's own header comment for exactly what this does and does
+      # not prove (short version: it proves Agent24's own on-demand runtime
+      # integration end to end; it stands in for the fork's own
+      # agent24-headless.cjs with a local fixture launcher because the
+      # officially pinned Open Design commit doesn't speak protocol v2 yet
+      # — that's covered by the fork PR's own test suite instead).
+      - name: 'M2: on-demand install (real installer, real default dir) -> real packaged launch -> /api/ready'
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPIMAGE_ROOT="$RUNNER_TEMP/desktop-package-verify/appimage/squashfs-root"
+          test -d "$APPIMAGE_ROOT"
+          RUNTIME_EXECUTABLE="$(readlink -f "$APPIMAGE_ROOT/AppRun")"
+          test -x "$RUNTIME_EXECUTABLE"
+          A24_SMOKE_RUNTIME_EXECUTABLE="$RUNTIME_EXECUTABLE" node scripts/ci-on-demand-smoke.mjs
 
       - name: List packaged artifacts (installer size reduction vs. the previous bundled build)
         working-directory: apps/desktop
@@ -548,11 +574,20 @@ jobs:
           A24_OD_ARCH: ${{ matrix.arch }}
         run: pnpm pack:open-design
 
-      - name: 'electron-builder (macOS dmg, unsigned)'
+      # H3 (review finding, 2026-10-05): the previous order built the dmg
+      # FIRST (`--mac dmg`) and only ad-hoc signed the leftover unpacked
+      # .app in release/mac* AFTER — a copy that was never the one sealed
+      # into the dmg. Whatever signature (or lack of one) electron-builder's
+      # own packaging already produced is what actually shipped; the manual
+      # signing step below ran too late to change it. Correct order: build
+      # the unpacked .app only (`--mac dir`), sign THAT, then pack the
+      # already-signed app into a dmg via `--prepackaged` (which does not
+      # rebuild the app — it just wraps the given, already-signed, bundle).
+      - name: 'electron-builder (macOS: build unsigned .app, dir target only)'
         working-directory: apps/desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: pnpm exec electron-builder --mac dmg
+        run: pnpm exec electron-builder --mac dir
 
       - name: Ad-hoc sign the .app so it launches on this architecture
         working-directory: apps/desktop
@@ -563,6 +598,13 @@ jobs:
           test -n "$APP"
           codesign --force --deep --sign - "$APP"
           codesign -dv "$APP"
+          echo "A24_SIGNED_APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: 'electron-builder (macOS: pack the SIGNED .app into a dmg)'
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --prepackaged "$A24_SIGNED_APP_PATH" --mac dmg
 
       - name: Smoke test — mount dmg, check codesign, run bundled agent24d, /health is 200, no Open Design trees
         working-directory: apps/desktop
@@ -579,12 +621,22 @@ jobs:
           test -n "$APP"
           codesign -dv "$APP" 2>&1 | tee "$RUNNER_TEMP/codesign.log"
           grep -q 'Signature=adhoc' "$RUNNER_TEMP/codesign.log"
+          # H3 (review finding, 2026-10-05): -dv only prints whatever
+          # signature metadata is embedded; it does not check that the
+          # signature actually matches the bundle's current on-disk
+          # contents. --verify re-hashes everything the signature covers
+          # and fails loudly on any mismatch — the real proof that the app
+          # mounted from the dmg is the one that was signed, not a stale or
+          # tampered copy sealed in by a build step that ran out of order.
+          codesign --verify --deep --strict "$APP"
 
           RESOURCES="$APP/Contents/Resources"
           test ! -e "$RESOURCES/open-design"
           test ! -e "$RESOURCES/open-design-web-standalone"
           test ! -e "$RESOURCES/app"
-          if find "$RESOURCES" -maxdepth 1 -name '*.tar.gz' -print | grep -q .; then
+          # L1 (review finding, 2026-10-05): no -maxdepth here either — see
+          # the matching Linux-job comment above.
+          if find "$RESOURCES" -name '*.tar.gz' -print | grep -q .; then
             echo "::error::found a .tar.gz bundled inside $RESOURCES — the on-demand component must never ship inside the installer"
             exit 1
           fi
@@ -661,6 +713,22 @@ jobs:
             find "$EXTRACT" -type l -lname '/*'
             exit 1
           fi
+
+      # M2 (review finding, 2026-10-05): see the matching Linux-job comment
+      # above for what this does and does not prove. Reuses the already-
+      # signed .app from the "Ad-hoc sign" step directly (its own env var,
+      # not the dmg-mounted copy — that one gets unmounted by that step's
+      # own EXIT trap before this step runs; its signature is already
+      # proven by the codesign --verify smoke test above).
+      - name: 'M2: on-demand install (real installer, real default dir) -> real packaged launch -> /api/ready'
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${A24_SIGNED_APP_PATH:-}"
+          RUNTIME_EXECUTABLE="$(find "$A24_SIGNED_APP_PATH/Contents/MacOS" -maxdepth 1 -type f -print -quit)"
+          test -x "$RUNTIME_EXECUTABLE"
+          A24_SMOKE_RUNTIME_EXECUTABLE="$RUNTIME_EXECUTABLE" node scripts/ci-on-demand-smoke.mjs
 
       - name: Report dmg + Open Design tarball sizes
         working-directory: apps/desktop
