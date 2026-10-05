@@ -17,7 +17,7 @@ mod retain;
 pub mod self_wake;
 mod session_memory;
 pub mod subagent;
-pub use session_memory::SessionMemory;
+pub use session_memory::{RECALL_END_MARKER, RECALL_PREFIX, SessionMemory};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -276,6 +276,104 @@ fn thread_to_messages(thread: &[RunMessage]) -> Vec<Msg> {
             tool_call_id: m.tool_call_id.clone(),
         })
         .collect()
+}
+
+/// Request-only message normalization (M1-T07.1 H1 fix). The persisted
+/// snapshot (recall block, then the session's prior context, then this
+/// turn's prompt) can legally contain `system` anywhere — a compaction
+/// summary is itself injected as `system` — and, when there is no prior
+/// context, two adjacent `user` turns (the recall block immediately followed
+/// by this run's own prompt). Several HF-strict chat templates (the
+/// Gemma/Mistral family) reject that shape outright ("roles must alternate"
+/// / system must lead). This NEVER touches the persisted thread or the
+/// snapshot fail-closed contract — it only reshapes what is SENT to the
+/// provider on THIS call, rebuilt fresh from `messages` every iteration of
+/// [`RunManager::run_loop`]:
+/// 1. every `system` message is pulled out and merged into ONE, placed first
+///    (dropped entirely if there were none);
+/// 2. the remaining messages keep their relative order; adjacent `user`
+///    turns (now possibly newly adjacent, since removing an in-between
+///    `system` message can create a fresh adjacency) are merged with `\n\n`.
+fn normalize_for_provider(messages: &[Msg]) -> Vec<Msg> {
+    let mut system_parts = Vec::new();
+    let mut rest = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if msg.role == "system" {
+            if let Some(content) = &msg.content {
+                system_parts.push(content.clone());
+            }
+        } else {
+            rest.push(msg.clone());
+        }
+    }
+    let mut normalized = Vec::with_capacity(rest.len() + 1);
+    if !system_parts.is_empty() {
+        normalized.push(Msg::system(system_parts.join("\n\n")));
+    }
+    for msg in rest {
+        if msg.role == "user"
+            && let Some(last) = normalized.last_mut()
+            && last.role == "user"
+        {
+            last.content = Some(match (last.content.take(), msg.content) {
+                (Some(a), Some(b)) => format!("{a}\n\n{b}"),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => String::new(),
+            });
+            continue;
+        }
+        normalized.push(msg);
+    }
+    normalized
+}
+
+/// M1-T07.1 M4: a resumed thread's recall message was captured at the run's
+/// FIRST model call and may now name an id the owner has since retracted or
+/// superseded — resume must never resurrect a forgotten fact. Re-validates
+/// every `id=` against `active` and keeps only the still-active lines,
+/// rebuilding the block's header + end marker around them; drops the whole
+/// message if nothing survives. A block this parser cannot make sense of
+/// (missing the end marker, no `id=` tokens) is dropped outright — treated
+/// as unverifiable, not trusted by default.
+fn prune_stale_recall_message(msg: Msg, active: &std::collections::HashSet<String>) -> Option<Msg> {
+    let Some(content) = msg.content.as_deref() else {
+        return Some(msg);
+    };
+    if msg.role != "user" || !content.starts_with(RECALL_PREFIX) {
+        return Some(msg);
+    }
+    // Round 2 ②: a message that starts with the header but does NOT end
+    // with the marker is not a real recall block (it is left untouched,
+    // not dropped) — a real one always has this exact shape; only a
+    // malformed/foreign message fails this, and the fail-safe direction
+    // for something we cannot parse as a recall block is to PRESERVE it,
+    // never silently delete it.
+    let Some(body) = content.strip_suffix(RECALL_END_MARKER) else {
+        return Some(msg);
+    };
+    let mut parts = body.split("\n- [id=");
+    let Some(header) = parts.next() else {
+        return Some(msg);
+    };
+    let mut kept = String::from(header);
+    let mut any = false;
+    for entry in parts {
+        let Some(space) = entry.find(' ') else {
+            continue;
+        };
+        if active.contains(&entry[..space]) {
+            kept.push_str("\n- [id=");
+            kept.push_str(entry);
+            any = true;
+        }
+    }
+    if any {
+        kept.push_str(RECALL_END_MARKER);
+        Some(Msg::user(kept))
+    } else {
+        None
+    }
 }
 
 /// The still-unanswered tool calls of the reconstructed thread's LAST
@@ -939,6 +1037,14 @@ impl RunManager {
         }
 
         // 3. Reconstruct the conversation and return the run to Running.
+        // M1-T07.1 M4 (review #674 round 2 ③): re-validating the recall
+        // block used to happen ONLY here, which misses the common case of
+        // an approval answered while the daemon is still running (the task
+        // stays live and never goes through `drive_resume` at all — see
+        // the in-memory `ApprovalBroker` wake-up path). That check now
+        // lives in `run_loop` itself, re-run fresh every iteration
+        // regardless of how this call got here, so this reconstruction
+        // stays a plain, unmodified replay of the persisted thread.
         let mut messages = thread_to_messages(&thread);
         if let Err(err) = self
             .store
@@ -1164,37 +1270,175 @@ impl RunManager {
             self.finish_cancelled(&run_id).await;
             return;
         };
-        let mut messages = Vec::with_capacity(prior_context.len() + 2);
+        // M1-T07.1: the FULL first-call input — recall block, then the
+        // session's prior (compacted) context, then this run's prompt — is the
+        // immutable snapshot a restart-time resume must reproduce. It is
+        // persisted to the durable run thread BEFORE the model is ever called,
+        // in order, and fail-closed: if any message fails to persist, the run
+        // never reaches the provider, because `drive_resume` only has
+        // `thread_to_messages(&thread)` to rebuild from — a partially
+        // persisted snapshot would silently resume with less context than the
+        // first call saw. M3: the write itself is now ONE transaction
+        // (`append_run_messages_tx`), not N independent single-row appends —
+        // a mid-batch failure must leave NOTHING behind, not an unpredictable
+        // prefix, which is what fail-closed actually requires.
+        let prior_context_len = prior_context.len();
+        let mut snapshot = Vec::with_capacity(prior_context_len + 2);
+        let mut recalled_ids = None;
         if let Some((recalled, ids)) = recall {
-            // Keep the exact recalled context in the durable run thread so an
-            // approval resume reconstructs it without issuing another recall.
-            if let Err(err) = self.persist_message(&run_id, &recalled).await {
-                self.finish_failed(
-                    &run_id,
-                    "memory_snapshot_persist_failed",
-                    &format!("failed to persist recalled memory snapshot: {err}"),
-                )
-                .await;
-                return;
-            }
+            recalled_ids = Some(ids);
+            snapshot.push(recalled);
+        }
+        // M3 growth control: the seq range `prior_context` will occupy in
+        // THIS run's own `run_messages`, so it can be reclaimed once the run
+        // is confirmed terminal (see the cleanup call after `run_loop`
+        // below) — those rows are a pure duplicate of what `SessionLog`
+        // already holds, not unique to this run.
+        let prior_context_range = (!prior_context.is_empty()).then(|| {
+            let start = snapshot.len() as i64;
+            (start, start + prior_context_len as i64 - 1)
+        });
+        snapshot.extend(prior_context);
+        snapshot.push(Msg::user(run.input.prompt.clone()));
+        let pending: Vec<agent24_store::PendingRunMessage> = snapshot
+            .iter()
+            .map(|msg| agent24_store::PendingRunMessage {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                tool_calls: serde_json::to_value(&msg.tool_calls)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                tool_call_id: msg.tool_call_id.clone(),
+            })
+            .collect();
+        if let Err(err) = self
+            .store
+            .append_run_messages_tx(&run_id, &pending, &now_iso8601())
+            .await
+        {
+            self.finish_failed(
+                &run_id,
+                "memory_snapshot_persist_failed",
+                &format!("failed to persist run input snapshot: {err}"),
+            )
+            .await;
+            return;
+        }
+        // The audit event names exactly the ids that made it into the
+        // now-durable snapshot — emitted only once the snapshot is safely on
+        // disk, matching the fail-closed contract above.
+        if let Some(ids) = recalled_ids {
             tracing::info!(run_id = %run_id, ids = ?ids, "memory recalled");
             self.sink
                 .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
                     run_id: run_id.clone(),
                     ids,
                 }));
-            messages.push(recalled);
         }
-        messages.extend(prior_context);
-        // Persist this run's opening user turn to the durable thread (H3). Prior
-        // session context is not copied into the run thread; the recall snapshot
-        // above and this run's own tail are persisted for approval resume.
-        let user_msg = Msg::user(run.input.prompt.clone());
-        let _ = self.persist_message(&run_id, &user_msg).await;
-        messages.push(user_msg);
         // H8: a fresh plan-mode run starts read-only; a Normal run never is.
         let plan_mode = matches!(run.input.mode, RunMode::Plan);
-        self.run_loop(run, messages, plan_mode, cancel).await;
+        self.run_loop(run, snapshot, plan_mode, cancel).await;
+        // M3 growth control, chosen approach: reclaim the prior-context copy
+        // ONLY along the path that never parked for approval (`run_loop`
+        // only returns here once this SAME invocation reached a terminal
+        // state OR parked; we re-check the row to tell which). A run that
+        // DID park keeps its full thread until it is later driven to
+        // completion by `drive_resume` — which does not repeat this cleanup,
+        // since the seq range is only known here, in this call's own stack.
+        // Rejected alternative ("only persist for a run that may need
+        // approval"): undecidable in advance — nothing knows a tool call
+        // will need approval before the model actually asks for one, so the
+        // fail-closed write above must always happen. The accepted gap this
+        // leaves: a run parked when the daemon restarts, then resumed to
+        // completion in a LATER process, never gets this cleanup (the range
+        // lived only in this now-gone task's stack) — its prior-context rows
+        // persist for that run's lifetime. Parked runs are the sparse case
+        // and are bounded by "how many are currently awaiting a human", so
+        // this is accepted rather than adding cross-restart persisted state
+        // for a Medium-severity growth concern. Also EVENTUAL, not atomic
+        // with the terminal transition above: this cleanup runs in its own
+        // subsequent await on the SAME task, after the run is ALREADY
+        // observable as Completed/Failed/Cancelled through the store row —
+        // an external reader that queries `list_run_messages` in the
+        // instant right after observing the terminal status can still see
+        // the un-cleaned thread. Acceptable for housekeeping; a caller that
+        // needs the final, pruned shape synchronously with "terminal" would
+        // need the cleanup moved inside the SAME transaction as that
+        // transition, which this PR does not do.
+        if let Some((start, end)) = prior_context_range
+            && let Ok(Some(final_run)) = self.store.get_run(&run_id).await
+            && matches!(
+                final_run.status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            )
+            && let Err(err) = self
+                .store
+                .delete_run_message_range(&run_id, start, end)
+                .await
+        {
+            tracing::warn!(
+                "run {run_id}: prior-context cleanup failed (non-fatal, thread still correct): {err}"
+            );
+        }
+    }
+
+    /// M1-T07.1 M4 (review #674 round 2 ③): builds the SAME shape
+    /// `normalize_for_provider` always built, but first re-validates the
+    /// recall block — if any — against the CURRENT ledger. Called fresh on
+    /// EVERY iteration of [`Self::run_loop`], so this is the ONE place that
+    /// covers all three ways a recall block can go stale before the model
+    /// sees it again: a cold-restart resume (`drive_resume` rebuilding from
+    /// `thread_to_messages`), an approval answered while the run is still
+    /// parked in the SAME process (the in-memory broker wakes the task
+    /// directly — no `drive_resume` involved at all), and — in principle —
+    /// a very slow approval wait spanning multiple loop iterations. Never
+    /// mutates `messages` itself, only the copy returned for this request.
+    ///
+    /// Round 2 ②: only `messages[0]` is ever treated as a candidate recall
+    /// block — a POSITION check, not a content-prefix scan over the whole
+    /// thread. The snapshot (`execute`) always puts the recall message (if
+    /// any) first, so this is exactly where it would be; scanning every
+    /// message for a `RECALL_PREFIX` match would also treat a bound run's
+    /// own prompt as a recall block if an adversarial user typed text that
+    /// happened to start with that exact prefix.
+    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Vec<Msg> {
+        let Some(memory) = self.memory.as_ref() else {
+            return normalize_for_provider(messages);
+        };
+        let Some(first) = messages.first() else {
+            return normalize_for_provider(messages);
+        };
+        // Round 2 ②: require BOTH the header AND the end marker, not just
+        // the prefix — a real recall block always has this exact shape, so
+        // this is still unambiguous, but it closes the (already-vanishing,
+        // position-0-only) case of a context-free run's very first turn
+        // happening to be the user's OWN prompt and that prompt merely
+        // STARTING WITH the same prefix text without the matching suffix:
+        // such a message is left alone rather than risk getting dropped by
+        // `prune_stale_recall_message` failing to parse it as a real block.
+        if first.role != "user"
+            || !first
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(RECALL_PREFIX) && c.ends_with(RECALL_END_MARKER))
+        {
+            return normalize_for_provider(messages);
+        }
+        let mut rebuilt = messages.to_vec();
+        match memory.active_ids().await {
+            Ok(active) => match prune_stale_recall_message(first.clone(), &active) {
+                Some(pruned) => rebuilt[0] = pruned,
+                None => {
+                    rebuilt.remove(0);
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    "run {run_id}: could not re-validate recalled memory; dropping the recall block for this request: {err}"
+                );
+                rebuilt.remove(0);
+            }
+        }
+        normalize_for_provider(&rebuilt)
     }
 
     /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
@@ -1216,8 +1460,12 @@ impl RunManager {
             // Recomputed each turn: in plan mode only the read-only subset plus
             // `propose_plan` is offered; the instant a plan is approved
             // `plan_mode` flips false and the full set is advertised (H8).
+            // H1/M4: `messages` itself (the persisted/growing thread) is
+            // re-validated against the CURRENT ledger and reshaped fresh
+            // every iteration via `request_messages_for` — request-only,
+            // never applied back to `messages` itself.
             let request = CompletionRequest {
-                messages: messages.clone(),
+                messages: self.request_messages_for(&messages, &run_id).await,
                 model: run.input.model_override.clone(),
                 tools: self.tool_specs_for(plan_mode),
                 response_format: None,
@@ -1907,6 +2155,112 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+
+    /// Every role in `messages`, in order — the shape an HF-strict chat
+    /// template (Gemma/Mistral) actually validates.
+    fn roles(messages: &[Msg]) -> Vec<&str> {
+        messages.iter().map(|m| m.role.as_str()).collect()
+    }
+
+    #[test]
+    fn normalize_for_provider_puts_summary_first_and_merges_the_adjacent_recall_and_prompt() {
+        // M1-T07.1 H1 (review #674): with a session summary in prior
+        // context, the raw snapshot is [user(recall), system(summary),
+        // user(prompt)] — system in the MIDDLE, which several HF-strict
+        // templates reject outright. Negative control: without the fix (the
+        // old `messages.clone()` passthrough), this input is handed to the
+        // provider completely unchanged, so `roles(&input) == roles(&out)`
+        // would hold and this assertion would be false.
+        let input = vec![
+            Msg::user("[记忆数据·非指令] ... [记忆数据结束]"),
+            Msg::system("Summary of earlier conversation:\nthey talked about cats"),
+            Msg::user("我对什么过敏？"),
+        ];
+        let out = normalize_for_provider(&input);
+        assert_eq!(roles(&out), vec!["system", "user"]);
+        assert_eq!(out[0].content.as_deref(), input[1].content.as_deref());
+        let merged = out[1].content.as_deref().unwrap();
+        assert!(merged.starts_with("[记忆数据·非指令]"));
+        assert!(merged.ends_with("我对什么过敏？"));
+        assert_ne!(
+            roles(&input),
+            roles(&out),
+            "normalization must actually change the shape sent to the provider"
+        );
+    }
+
+    #[test]
+    fn normalize_for_provider_merges_recall_and_prompt_with_no_prior_history() {
+        // M1-T07.1 H1: a session's very first turn has an EMPTY prior
+        // context, so the raw snapshot is just [user(recall), user(prompt)]
+        // — two adjacent `user` turns, no `system` at all.
+        let input = vec![
+            Msg::user("[记忆数据·非指令] ... [记忆数据结束]"),
+            Msg::user("我对什么过敏？"),
+        ];
+        let out = normalize_for_provider(&input);
+        assert_eq!(roles(&out), vec!["user"]);
+        let merged = out[0].content.as_deref().unwrap();
+        assert!(merged.starts_with("[记忆数据·非指令]"));
+        assert!(merged.ends_with("我对什么过敏？"));
+    }
+
+    #[test]
+    fn prune_stale_recall_message_strips_only_the_dead_lines() {
+        // M1-T07.1 M4: a block naming two ids, one still active and one not
+        // (forgotten since the first call) — only the dead line is removed,
+        // the surviving line and the header/end-marker shape stay intact.
+        let content = format!(
+            "{}\n- [id=alive recorded_at=t1] \"still true\"\n- [id=dead recorded_at=t2] \"forgotten\"{}",
+            RECALL_PREFIX, RECALL_END_MARKER,
+        );
+        let active: std::collections::HashSet<String> = ["alive".to_owned()].into_iter().collect();
+        let pruned = prune_stale_recall_message(Msg::user(content), &active).unwrap();
+        let text = pruned.content.unwrap();
+        assert!(text.contains("alive"));
+        assert!(text.contains("still true"));
+        assert!(!text.contains("dead"), "{text}");
+        assert!(!text.contains("forgotten"), "{text}");
+        assert!(text.ends_with(RECALL_END_MARKER));
+    }
+
+    #[test]
+    fn prune_stale_recall_message_drops_the_whole_block_once_every_id_is_dead() {
+        let content = format!(
+            "{}\n- [id=dead recorded_at=t1] \"forgotten\"{}",
+            RECALL_PREFIX, RECALL_END_MARKER,
+        );
+        let active = std::collections::HashSet::new();
+        assert!(prune_stale_recall_message(Msg::user(content), &active).is_none());
+    }
+
+    #[test]
+    fn prune_stale_recall_message_never_touches_an_ordinary_message() {
+        let msg = Msg::user("我对什么过敏？");
+        let active = std::collections::HashSet::new();
+        assert_eq!(prune_stale_recall_message(msg.clone(), &active), Some(msg));
+    }
+
+    #[test]
+    fn prune_stale_recall_message_preserves_rather_than_drops_a_malformed_lookalike() {
+        // Round 2 ②: a message that starts with the exact recall header but
+        // does NOT end with the end marker is not a real recall block — the
+        // OLD `?`-propagating code would have silently DELETED such a
+        // message (treating "cannot parse" as "fully stale, drop it");
+        // fail-safe here means PRESERVE what we cannot confidently parse.
+        let msg = Msg::user(format!("{RECALL_PREFIX}... but not a real block"));
+        let active = std::collections::HashSet::new();
+        assert_eq!(prune_stale_recall_message(msg.clone(), &active), Some(msg));
+    }
+
+    #[test]
+    fn normalize_for_provider_leaves_an_already_alternating_thread_untouched() {
+        // The common tool-calling tail (assistant → tool → assistant) never
+        // has two adjacent same-role turns, so normalization must be a
+        // structural no-op there — only the snapshot PREFIX ever needs it.
+        let input = vec![Msg::user("hi"), Msg::assistant(Some("ok".into()), vec![])];
+        assert_eq!(normalize_for_provider(&input), input);
+    }
 
     #[test]
     fn workspace_agent_clock_preserves_fractional_millis() {
@@ -2872,6 +3226,83 @@ pub(crate) mod tests {
         assert!(texts.contains(&"first question"), "{texts:?}");
         assert!(texts.contains(&"pong"), "{texts:?}");
         assert_eq!(texts.last(), Some(&"second question"));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_never_parks_sheds_its_copy_of_prior_context_once_terminal() {
+        // M1-T07.1 M3 (growth control, review #674): the snapshot persists a
+        // COPY of the session's prior context into every run's own
+        // `run_messages` row set, so a long session would otherwise grow
+        // that table ~O(session length) on every single turn. Once a run
+        // that never parked for approval reaches a terminal state, its copy
+        // of prior context — pure duplication of what `SessionLog` already
+        // holds — is reclaimed; its OWN prompt/answer stay.
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_shed").await;
+
+        let run1 = manager
+            .start_run(RunCreate {
+                session_id: Some("sess_shed".to_owned()),
+                workspace_id: None,
+                prompt: "first question".to_owned(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        let run1 = wait_terminal(&store, &run1.id).await;
+        assert_eq!(run1.status, RunStatus::Completed);
+        // Run 1 had no prior context of its own (first turn in the
+        // session) — nothing to shed, its own thread is untouched.
+        let thread1 = store.list_run_messages(&run1.id).await.unwrap();
+        assert_eq!(
+            thread1.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+
+        let run2 = manager
+            .start_run(RunCreate {
+                session_id: Some("sess_shed".to_owned()),
+                workspace_id: None,
+                prompt: "second question".to_owned(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        let run2 = wait_terminal(&store, &run2.id).await;
+        assert_eq!(run2.status, RunStatus::Completed);
+        // The cleanup runs in `execute()`'s OWN task, AFTER `run_loop`
+        // returns and AFTER the terminal transition is already visible — it
+        // is eventual, not atomic with "status == Completed". Poll instead
+        // of reading the thread the instant the status flips.
+        let thread2 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = store.list_run_messages(&run2.id).await.unwrap();
+                if thread.len() == 2 {
+                    break thread;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prior-context cleanup should land shortly after completion");
+        // Run 2's copy of run 1's exchange ("first question"/"pong") is
+        // gone; its OWN prompt and answer remain. Both turns' assistant
+        // reply is literally "pong" (same mock provider), so the shape
+        // (exactly 2 rows, not 4) is the real proof — "first question" is
+        // the one string unique to run 1's copy.
+        let texts: Vec<_> = thread2.iter().filter_map(|m| m.content.clone()).collect();
+        assert!(!texts.contains(&"first question".to_owned()), "{texts:?}");
+        assert_eq!(texts, vec!["second question", "pong"]);
+        assert_eq!(
+            thread2.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "assistant"],
+            "{thread2:?}"
+        );
     }
 
     #[tokio::test]
