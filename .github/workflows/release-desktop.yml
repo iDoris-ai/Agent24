@@ -25,9 +25,12 @@ on:
   pull_request:
     paths:
       - '.github/workflows/release-desktop.yml'
+      - 'apps/desktop/package.json'
       - 'apps/desktop/scripts/prepare-open-design-linux-resources.mjs'
       - 'apps/desktop/scripts/rebuild-open-design-native.mjs'
       - 'apps/desktop/scripts/stage-open-design-resources.mjs'
+      - 'apps/desktop/scripts/pack-open-design-component.mjs'
+      - 'apps/desktop/scripts/ensure-open-design-component-dir.mjs'
 
 permissions:
   contents: read
@@ -136,10 +139,40 @@ jobs:
           A24_OPEN_DESIGN_SOURCE_DIR: ${{ github.workspace }}/open-design
         run: pnpm --filter @agent24/desktop rebuild:open-design-native
 
+      # Owner decision 2026-10-05: Open Design must NOT be bundled in the
+      # installer (it alone grew the AppImage from 146MB to 934MB, the deb
+      # from 101MB to 622MB). This packs the staged+rebuilt tree from the
+      # steps above into a downloadable asset and bakes only a small
+      # manifest (open-design-component.json) into the app via
+      # extraResources — see apps/desktop/src/main/open-design-component.ts,
+      # the runtime installer that downloads it on first use of the Design
+      # page.
+      - name: Resolve app version (for the component manifest's download URL)
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack the Open Design on-demand component (tarball + manifest)
+        working-directory: apps/desktop
+        env:
+          A24_OD_STAGE_DIR: ${{ github.workspace }}/apps/desktop/.open-design-resources
+          A24_OD_PACK_OUT_DIR: ${{ github.workspace }}/apps/desktop/.open-design-component
+          A24_OD_APP_VERSION: ${{ steps.ver.outputs.version }}
+          A24_OD_REPOSITORY: ${{ github.repository }}
+          A24_OD_PLATFORM: linux
+          A24_OD_ARCH: x64
+        run: pnpm pack:open-design
+
       - name: 'electron-builder (Linux: AppImage + deb)'
         run: pnpm --filter @agent24/desktop exec electron-builder --linux AppImage deb
 
-      - name: Verify packaged Creative resources in AppImage + deb
+      - name: Verify Open Design is NOT bundled — only the component manifest is
         working-directory: apps/desktop
         shell: bash
         run: |
@@ -157,30 +190,60 @@ jobs:
           )
           dpkg-deb -x "$DEB" "$VERIFY_ROOT/deb"
 
-          verify_creative_resources() {
+          verify_on_demand_only() {
             local package_root="$1"
-            local package_json
-            package_json="$(find "$package_root" -type f -path '*/resources/app/package.json' -print -quit)"
-            test -n "$package_json"
+            local manifest
+            manifest="$(find "$package_root" -type f -path '*/resources/open-design-component.json' -print -quit)"
+            test -n "$manifest"
+            test "$(jq -r '.version' "$manifest")" = "0.22.2"
+            test "$(jq -r '.odSha' "$manifest")" = "$OPEN_DESIGN_SHA"
+            test "$(jq -r '.platform' "$manifest")" = "linux"
+            test "$(jq -r '.arch' "$manifest")" = "x64"
             local resources
-            resources="$(dirname "$(dirname "$package_json")")"
-            test "$(jq -r '.version' "$package_json")" = "0.22.2"
-            test -f "$resources/app/prebundled/agent24-headless.cjs"
-            test -f "$resources/app/prebundled/agent24-headless.mjs"
-            test -f "$resources/app/prebundled/daemon/daemon-cli.mjs"
-            test -f "$resources/app/prebundled/daemon/daemon-sidecar.mjs"
-            test -f "$resources/app/prebundled/web-sidecar.mjs"
-            test -d "$resources/open-design"
-            test -f "$resources/open-design-web-standalone/apps/web/server.js" || \
-              test -f "$resources/open-design-web-standalone/server.js"
+            resources="$(dirname "$manifest")"
+            test ! -e "$resources/app"
+            test ! -e "$resources/open-design"
+            test ! -e "$resources/open-design-web-standalone"
           }
 
-          verify_creative_resources "$VERIFY_ROOT/appimage/squashfs-root"
-          verify_creative_resources "$VERIFY_ROOT/deb"
+          verify_on_demand_only "$VERIFY_ROOT/appimage/squashfs-root"
+          verify_on_demand_only "$VERIFY_ROOT/deb"
 
-      - name: List packaged artifacts
-        working-directory: apps/desktop/release
-        run: ls -la
+      - name: Smoke test — Open Design component tarball extracts and passes the staging contract
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="$(ls .open-design-component/open-design-*.tar.gz)"
+          EXTRACT="$RUNNER_TEMP/od-component-smoke"
+          rm -rf "$EXTRACT"
+          mkdir -p "$EXTRACT"
+          tar -xzf "$TARBALL" -C "$EXTRACT"
+          test -d "$EXTRACT/app"
+          test -d "$EXTRACT/open-design"
+          test -d "$EXTRACT/open-design-web-standalone"
+          test "$(jq -r '.version' "$EXTRACT/app/package.json")" = "0.22.2"
+          for relative in \
+            app/prebundled/agent24-headless.cjs \
+            app/prebundled/agent24-headless.mjs \
+            app/prebundled/daemon/daemon-cli.mjs \
+            app/prebundled/daemon/daemon-sidecar.mjs \
+            app/prebundled/web-sidecar.mjs; do
+            test -f "$EXTRACT/$relative"
+          done
+          if find "$EXTRACT" -type l -lname '/*' | grep -q .; then
+            echo "::error::Open Design component tarball contains an absolute symlink"
+            find "$EXTRACT" -type l -lname '/*'
+            exit 1
+          fi
+
+      - name: List packaged artifacts (installer size reduction vs. the previous bundled build)
+        working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          ls -la release/*.AppImage release/*.deb .open-design-component/open-design-*.tar.gz
+          echo "--- sizes ---"
+          du -h release/*.AppImage release/*.deb .open-design-component/open-design-*.tar.gz
 
       - name: Install xvfb (for the AppImage smoke test)
         run: |
@@ -264,6 +327,14 @@ jobs:
           fi
           sudo dpkg -r "$PKG"
 
+      - name: Copy the Open Design component tarball next to the installers
+        # upload-artifact flattens multi-path uploads relative to their
+        # greatest common ancestor — keeping everything under
+        # apps/desktop/release/ here is what keeps the publish job's
+        # `dist/*.AppImage dist/*.deb dist/open-design-*.tar.gz` flat globs
+        # working, same as before this tarball existed.
+        run: cp apps/desktop/.open-design-component/open-design-*.tar.gz apps/desktop/release/
+
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -271,6 +342,7 @@ jobs:
           path: |
             apps/desktop/release/*.AppImage
             apps/desktop/release/*.deb
+            apps/desktop/release/open-design-*.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -294,7 +366,7 @@ jobs:
         run: |
           set -euo pipefail
           ls -la
-          shasum -a 256 -- *.AppImage *.deb > SHA256SUMS-desktop
+          shasum -a 256 -- *.AppImage *.deb open-design-*.tar.gz > SHA256SUMS-desktop
           cat SHA256SUMS-desktop
           shasum -a 256 -c SHA256SUMS-desktop
 
@@ -328,5 +400,5 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           gh release upload "$TAG" \
-            dist/*.AppImage dist/*.deb dist/SHA256SUMS-desktop \
+            dist/*.AppImage dist/*.deb dist/open-design-*.tar.gz dist/SHA256SUMS-desktop \
             --clobber

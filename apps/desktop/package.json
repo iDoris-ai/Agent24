@@ -13,15 +13,17 @@
     "dev": "concurrently --kill-others-on-fail \"pnpm dev:vite\" \"pnpm dev:electron\"",
     "dev:vite": "vite",
     "dev:electron": "wait-on http://localhost:5173 && node scripts/dev-prepare-backend.mjs && pnpm --filter @agent24/node-daemon build && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
-    "build": "vite build && tsc -p tsconfig.electron.json",
+    "build": "vite build && tsc -p tsconfig.electron.json && node scripts/ensure-open-design-component-dir.mjs",
     "build:rust:debug": "cargo build -p agent24d --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
     "stage:open-design": "node scripts/stage-open-design-resources.mjs",
     "rebuild:open-design-native": "node scripts/rebuild-open-design-native.mjs",
+    "pack:open-design": "node scripts/pack-open-design-component.mjs",
     "test:stage-open-design": "node --test scripts/stage-open-design-resources.test.mjs",
-    "build:mac": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && pnpm rebuild:open-design-native && electron-builder --mac",
-    "build:win": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && pnpm rebuild:open-design-native && electron-builder --win",
-    "build:linux": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && pnpm rebuild:open-design-native && electron-builder --linux",
+    "test:pack-open-design": "node --test scripts/pack-open-design-component.test.mjs",
+    "build:mac": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --mac",
+    "build:win": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --win",
+    "build:linux": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --linux",
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -72,7 +74,7 @@
         ]
       },
       {
-        "from": ".open-design-resources",
+        "from": ".open-design-component",
         "to": ".",
         "filter": [
           "**/*"

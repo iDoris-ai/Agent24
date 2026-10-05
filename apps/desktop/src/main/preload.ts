@@ -17,6 +17,7 @@ import {
   type ModuleInstallResult,
   type ModuleUninstallResult,
   type ModelCallEnvelope,
+  type OpenDesignComponentStatusResult,
   type OmlxDetectResult,
   type OmlxModelsResult,
   type OmlxStartResult,
@@ -40,6 +41,15 @@ const api = {
     ipcRenderer.invoke(IpcChannels.CreativeBounds, bounds),
   creativeHide: (): Promise<void> =>
     ipcRenderer.invoke(IpcChannels.CreativeHide),
+  openDesignComponentStatus: (): Promise<OpenDesignComponentStatusResult> =>
+    ipcRenderer.invoke(IpcChannels.OpenDesignComponentStatus),
+  openDesignComponentInstall: (): Promise<OpenDesignComponentStatusResult> =>
+    ipcRenderer.invoke(IpcChannels.OpenDesignComponentInstall),
+  onOpenDesignComponentProgress: (cb: (status: OpenDesignComponentStatusResult) => void): (() => void) => {
+    const listener = (_event: unknown, status: OpenDesignComponentStatusResult): void => cb(status)
+    ipcRenderer.on(IpcChannels.OpenDesignComponentProgress, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.OpenDesignComponentProgress, listener)
+  },
   omlxDetect: (): Promise<OmlxDetectResult | null> =>
     ipcRenderer.invoke(IpcChannels.OmlxDetect),
   omlxModels: (url: string, apiKey: string): Promise<OmlxModelsResult> =>

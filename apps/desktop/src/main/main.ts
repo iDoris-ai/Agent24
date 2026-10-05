@@ -16,6 +16,7 @@ import {
   CreativeViewRequestFence,
   classifyCreativeUrl,
 } from './creative-serve-web'
+import { OpenDesignComponentInstaller } from './open-design-component'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -55,6 +56,7 @@ let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
 let creativeServeWeb: CreativeServeWeb | null = null
+let openDesignComponent: OpenDesignComponentInstaller | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
@@ -88,6 +90,9 @@ async function showCreativeView(
   if (!service) return { ok: false, error: 'Open Design host is unavailable' }
   const status = await service.start()
   if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
+  if (status.state === 'needs-download') {
+    return { ok: false, needsDownload: true, size: status.size }
+  }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
   }
@@ -199,11 +204,17 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.whenReady().then(() => {
+  // Owner decision 2026-10-05: Open Design is downloaded on demand (see
+  // open-design-component.ts) instead of being bundled in the installer.
+  // CreativeServeWeb only ever reads this accessor's current status — it
+  // never triggers a download itself.
+  openDesignComponent = new OpenDesignComponentInstaller({ resourcesPath: process.resourcesPath })
   creativeServeWeb = new CreativeServeWeb({
     resourcesPath: process.resourcesPath,
     stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
     runtimeExecutable: process.execPath,
     pinVersion: OPEN_DESIGN_PIN_VERSION,
+    component: openDesignComponent,
   })
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
@@ -244,6 +255,15 @@ app.whenReady().then(() => {
     }
   })
   ipcMain.handle(IpcChannels.CreativeHide, () => hideCreativeView())
+  ipcMain.handle(IpcChannels.OpenDesignComponentStatus, () => openDesignComponent?.status()
+    ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' })
+  ipcMain.handle(IpcChannels.OpenDesignComponentInstall, () => openDesignComponent?.install()
+    ?? Promise.resolve({ state: 'unavailable', reason: 'Open Design component installer is unavailable' }))
+  openDesignComponent?.onProgress((status) => {
+    if (mainWin && !mainWin.isDestroyed()) {
+      mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)
+    }
+  })
   agentEarBridge.start()
 
   // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice

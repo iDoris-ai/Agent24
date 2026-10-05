@@ -409,6 +409,66 @@ describe('CreativeServeWeb', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGTERM')
   })
 
+  it('reports needs-download with the manifest size when the on-demand component is not installed', async () => {
+    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+    tempDirs.push(emptyResources)
+    const service = new CreativeServeWeb({
+      resourcesPath: emptyResources,
+      component: { status: () => ({ state: 'not-installed', size: 123_456_789 }) },
+    })
+
+    await expect(service.start()).resolves.toEqual({ state: 'needs-download', size: 123_456_789 })
+  })
+
+  it('uses the installed component dir (not resourcesPath) once the on-demand component is installed', async () => {
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+    tempDirs.push(emptyResources)
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        resourcesPath: emptyResources,
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(spawnFn).toHaveBeenCalledWith(
+      runtimeExecutable,
+      [path.join(componentDir, 'app', 'prebundled', 'agent24-headless.cjs'), '--config', path.join(stateRoot, 'agent24-headless.json')],
+      expect.objectContaining({ cwd: componentDir }),
+    )
+    await service.stop()
+  })
+
+  it('does not consult the on-demand component accessor when an explicit dev checkout is set', async () => {
+    const root = checkout()
+    const statusFn = vi.fn(() => ({ state: 'not-installed' as const, size: 1 }))
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      { checkoutDir: root, port: 17456, readyTimeoutMs: 500, component: { status: statusFn } },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write('[od] listening on http://127.0.0.1:17456 (headless)\n')
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(statusFn).not.toHaveBeenCalled()
+    await service.stop()
+  })
+
   it('fails clearly when the daemon build is missing', async () => {
     const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-'))
     tempDirs.push(root)

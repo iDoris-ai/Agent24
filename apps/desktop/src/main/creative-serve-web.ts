@@ -3,12 +3,24 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { Readable } from 'node:stream'
 
-export type CreativeServeWebState = 'stopped' | 'starting' | 'ready' | 'failed'
+export type CreativeServeWebState = 'stopped' | 'starting' | 'ready' | 'failed' | 'needs-download'
 
 export interface CreativeServeWebStatus {
   state: CreativeServeWebState
   origin?: string
   error?: string
+  /** Set when state === 'needs-download': the Open Design component's
+   * declared download size, surfaced from the baked manifest, so the
+   * renderer can show "~N MB" without a round trip of its own. */
+  size?: number
+}
+
+/** The subset of OpenDesignComponentInstaller's surface CreativeServeWeb
+ * needs — kept narrow and duck-typed here so this file never imports
+ * Electron-coupled installer wiring directly (keeps the existing unit tests
+ * free of filesystem/network fixtures unless they opt in). */
+export interface OpenDesignComponentAccessor {
+  status(): { state: string; dir?: string; size?: number }
 }
 
 export interface CreativeServeWebOptions {
@@ -21,6 +33,11 @@ export interface CreativeServeWebOptions {
   nodeBinary?: string
   port?: number
   readyTimeoutMs?: number
+  /** On-demand Open Design component (owner decision 2026-10-05: no longer
+   * bundled in the installer). When set and no explicit dev checkout/legacy
+   * bundled resources are found, CreativeServeWeb consults this instead of
+   * `resourcesPath` to locate the headless launcher + resource root. */
+  component?: OpenDesignComponentAccessor
 }
 
 type SpawnFn = typeof spawn
@@ -231,10 +248,27 @@ export class CreativeServeWeb {
   private async startOnce(): Promise<CreativeServeWebStatus> {
     const environment = this.options.environment ?? process.env
     const explicitCheckout = this.options.checkoutDir ?? environment.A24_OPEN_DESIGN_DIR?.trim()
+    // Legacy path: a build that still bundles the Open Design trees directly
+    // under resourcesPath (kept for back-compat / tests that pass a fully
+    // staged resourcesPath without a component accessor).
     const headlessEntry = explicitCheckout
       ? null
       : resolveAgent24HeadlessLauncher(this.options.resourcesPath)
-    if (headlessEntry) return this.startPackagedHeadless(headlessEntry, environment)
+    if (headlessEntry) return this.startPackagedHeadless(headlessEntry, environment, this.options.resourcesPath)
+
+    // On-demand path (owner decision 2026-10-05): the installer owns whether
+    // the component is present; this file never downloads anything itself.
+    if (!explicitCheckout && this.options.component) {
+      const componentStatus = this.options.component.status()
+      if (componentStatus.state === 'installed' && componentStatus.dir) {
+        const installedHeadlessEntry = resolveAgent24HeadlessLauncher(componentStatus.dir)
+        if (installedHeadlessEntry) {
+          return this.startPackagedHeadless(installedHeadlessEntry, environment, componentStatus.dir)
+        }
+      }
+      this.current = { state: 'needs-download', size: componentStatus.size }
+      return this.status()
+    }
 
     const checkoutDir = explicitCheckout
       ?? resolveOpenDesignCheckout(process.cwd(), environment, this.options.resourcesPath)
@@ -309,8 +343,9 @@ export class CreativeServeWeb {
   private async startPackagedHeadless(
     headlessEntry: string,
     environment: NodeJS.ProcessEnv,
+    baseResourcesPath: string | undefined,
   ): Promise<CreativeServeWebStatus> {
-    const resourcesPath = this.options.resourcesPath
+    const resourcesPath = baseResourcesPath
     const stateRoot = this.options.stateRoot
     const runtimeExecutable = this.options.runtimeExecutable
     const pinVersion = this.options.pinVersion ?? OPEN_DESIGN_PIN_VERSION
