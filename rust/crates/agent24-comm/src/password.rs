@@ -8,7 +8,7 @@
 //! immediately.
 
 use base64::Engine;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::runner::RunnerError;
 
@@ -21,11 +21,19 @@ impl Password {
     /// Accepts `1..=PASSWORD_MAX` bytes. Hyphae itself requires a non-empty
     /// password, so the empty case is rejected here too rather than being
     /// passed through only to fail downstream with a less specific error.
-    pub fn new(bytes: Vec<u8>) -> Result<Self, RunnerError> {
+    pub fn new(mut bytes: Vec<u8>) -> Result<Self, RunnerError> {
         if bytes.is_empty() || bytes.len() > PASSWORD_MAX {
-            return Err(RunnerError::PasswordLength(bytes.len()));
+            let len = bytes.len();
+            bytes.zeroize();
+            return Err(RunnerError::PasswordLength(len));
         }
         Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    /// Makes a short-lived, zero-on-drop copy for a subprocess while the
+    /// original remains available for a subsequent verified registration.
+    pub(crate) fn duplicate(&self) -> Self {
+        Self(Zeroizing::new(self.0.to_vec()))
     }
 
     /// A freshly generated password: `random32` base64url-(no padding)

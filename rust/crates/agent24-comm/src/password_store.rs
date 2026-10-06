@@ -20,9 +20,11 @@
 //! either backend.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use base64::Engine;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use crate::password::Password;
 
@@ -108,6 +110,19 @@ pub trait PasswordStore: Send + Sync {
     /// Replaces any existing entry for `account` (COMM-HYPHAE.md: "「remember」
     /// 要能替换掉已有的条目").
     async fn put(&self, account: &Account, password: &Password) -> Result<(), StoreError>;
+    /// Registers a password that has already been verified by Hyphae.
+    /// The return value reports whether it is durable across daemon restarts.
+    /// Stores that only keep process-local state deliberately report false.
+    async fn register_verified(
+        &self,
+        _account: &Account,
+        _password: &Password,
+        _remember: bool,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "verified password registration is unsupported".to_owned(),
+        ))
+    }
     /// `get(from)` → `put(to, _)` → `delete(from)`. If `get` or `put` fails,
     /// nothing has moved: `from`'s entry (if any) is untouched. If the
     /// trailing `delete` fails, `to` has *already* been written correctly —
@@ -123,8 +138,8 @@ pub trait PasswordStore: Send + Sync {
     async fn delete(&self, account: &Account) -> Result<(), StoreError>;
 }
 
-fn encode_password(password: &Password) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password.as_bytes())
+fn encode_password(password: &Password) -> Zeroizing<String> {
+    Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password.as_bytes()))
 }
 
 fn decode_password(encoded: &str) -> Result<Password, StoreError> {
@@ -144,7 +159,7 @@ fn decode_password(encoded: &str) -> Result<Password, StoreError> {
 /// `KeyringPasswordStore`'s behalf).
 #[derive(Default)]
 pub struct MemoryPasswordStore {
-    entries: Mutex<HashMap<String, String>>,
+    entries: Mutex<HashMap<String, Zeroizing<String>>>,
 }
 
 impl MemoryPasswordStore {
@@ -181,6 +196,18 @@ impl PasswordStore for MemoryPasswordStore {
         Ok(())
     }
 
+    async fn register_verified(
+        &self,
+        account: &Account,
+        password: &Password,
+        _remember: bool,
+    ) -> Result<bool, StoreError> {
+        self.put(account, password).await?;
+        // A MemoryPasswordStore never claims durable persistence, even when
+        // callers pass --remember.
+        Ok(false)
+    }
+
     async fn delete(&self, account: &Account) -> Result<(), StoreError> {
         let mut entries = self.entries.lock().await;
         match entries.remove(account.as_key()) {
@@ -198,14 +225,62 @@ impl PasswordStore for MemoryPasswordStore {
 /// Every call runs on a blocking-pool thread (`tokio::task::spawn_blocking`)
 /// since the `keyring` crate's `Entry` API is synchronous regardless of
 /// backend.
-#[derive(Debug, Default)]
 pub struct KeyringPasswordStore {
-    _private: (),
+    session: Mutex<HashMap<String, Zeroizing<String>>>,
+    backend: Arc<dyn CredentialBackend>,
 }
 
 impl KeyringPasswordStore {
     pub fn new() -> Self {
-        Self { _private: () }
+        Self::with_backend(Arc::new(OsCredentialBackend))
+    }
+
+    fn with_backend(backend: Arc<dyn CredentialBackend>) -> Self {
+        Self {
+            session: Mutex::new(HashMap::new()),
+            backend,
+        }
+    }
+}
+
+impl std::fmt::Debug for KeyringPasswordStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyringPasswordStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for KeyringPasswordStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+trait CredentialBackend: Send + Sync {
+    fn get(&self, account: &str) -> Result<Zeroizing<String>, StoreError>;
+    fn set(&self, account: &str, encoded: &str) -> Result<(), StoreError>;
+    fn delete(&self, account: &str) -> Result<(), StoreError>;
+}
+
+struct OsCredentialBackend;
+
+impl CredentialBackend for OsCredentialBackend {
+    fn get(&self, account: &str) -> Result<Zeroizing<String>, StoreError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(map_keyring_error)?;
+        entry
+            .get_password()
+            .map(Zeroizing::new)
+            .map_err(map_keyring_error)
+    }
+
+    fn set(&self, account: &str, encoded: &str) -> Result<(), StoreError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(map_keyring_error)?;
+        entry.set_password(encoded).map_err(map_keyring_error)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), StoreError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(map_keyring_error)?;
+        entry.delete_credential().map_err(map_keyring_error)
     }
 }
 
@@ -241,34 +316,72 @@ where
 impl PasswordStore for KeyringPasswordStore {
     async fn get(&self, account: &Account) -> Result<Password, StoreError> {
         let key = account.as_key().to_string();
-        run_blocking(move || {
-            let entry = keyring::Entry::new(KEYRING_SERVICE, &key).map_err(map_keyring_error)?;
-            let encoded = entry.get_password().map_err(map_keyring_error)?;
+        let session = self.session.lock().await;
+        if let Some(encoded) = session.get(&key) {
+            return decode_password(encoded);
+        }
+        let backend = Arc::clone(&self.backend);
+        let result = run_blocking(move || {
+            let encoded = backend.get(&key)?;
             decode_password(&encoded)
         })
-        .await
+        .await;
+        drop(session);
+        result
     }
 
     async fn put(&self, account: &Account, password: &Password) -> Result<(), StoreError> {
         let key = account.as_key().to_string();
         let encoded = encode_password(password);
-        run_blocking(move || {
-            let entry = keyring::Entry::new(KEYRING_SERVICE, &key).map_err(map_keyring_error)?;
-            // `set_password` overwrites any existing entry for this
-            // (service, account) pair — this is how "remember" replaces an
-            // existing entry (COMM-HYPHAE.md).
-            entry.set_password(&encoded).map_err(map_keyring_error)
-        })
-        .await
+        let backend = Arc::clone(&self.backend);
+        let backend_key = key.clone();
+        run_blocking(move || backend.set(&backend_key, &encoded)).await?;
+        self.session.lock().await.remove(&key);
+        Ok(())
+    }
+
+    async fn register_verified(
+        &self,
+        account: &Account,
+        password: &Password,
+        remember: bool,
+    ) -> Result<bool, StoreError> {
+        let key = account.as_key().to_string();
+        let encoded = encode_password(password);
+        if remember {
+            // Serialize against session reads/writes. Preserve the old
+            // session credential until durable storage succeeds; a failed
+            // explicit remember must not replace it with the new input.
+            let mut session = self.session.lock().await;
+            let backend = Arc::clone(&self.backend);
+            run_blocking({
+                let key = key.clone();
+                move || backend.set(&key, &encoded)
+            })
+            .await?;
+            session.remove(&key);
+            Ok(true)
+        } else {
+            self.session.lock().await.insert(key, encoded);
+            Ok(false)
+        }
     }
 
     async fn delete(&self, account: &Account) -> Result<(), StoreError> {
         let key = account.as_key().to_string();
-        run_blocking(move || {
-            let entry = keyring::Entry::new(KEYRING_SERVICE, &key).map_err(map_keyring_error)?;
-            entry.delete_credential().map_err(map_keyring_error)
+        let mut session = self.session.lock().await;
+        let had_session = session.remove(&key).is_some();
+        let backend = Arc::clone(&self.backend);
+        let result = run_blocking({
+            let key = key.clone();
+            move || backend.delete(&key)
         })
-        .await
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(StoreError::NotFound) if had_session => Ok(()),
+            other => other,
+        }
     }
 }
 
@@ -277,9 +390,87 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn pw(s: &str) -> Password {
         Password::new(s.as_bytes().to_vec()).unwrap()
+    }
+
+    #[derive(Default)]
+    struct PutOnlyStore {
+        puts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PasswordStore for PutOnlyStore {
+        async fn get(&self, _account: &Account) -> Result<Password, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn put(&self, _account: &Account, _password: &Password) -> Result<(), StoreError> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn delete(&self, _account: &Account) -> Result<(), StoreError> {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_verified_registration_fails_closed_without_put() {
+        let store = PutOnlyStore::default();
+        let result = store
+            .register_verified(&Account::from_salt("salt"), &pw("verified"), false)
+            .await;
+        assert!(matches!(result, Err(StoreError::Unavailable(_))));
+        assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Default)]
+    struct TestCredentialBackend {
+        entries: std::sync::Mutex<HashMap<String, String>>,
+        writes: AtomicUsize,
+        fail_set: AtomicBool,
+        fail_delete: AtomicBool,
+    }
+
+    impl CredentialBackend for TestCredentialBackend {
+        fn get(&self, account: &str) -> Result<Zeroizing<String>, StoreError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(account)
+                .cloned()
+                .map(Zeroizing::new)
+                .ok_or(StoreError::NotFound)
+        }
+
+        fn set(&self, account: &str, encoded: &str) -> Result<(), StoreError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_set.load(Ordering::SeqCst) {
+                return Err(StoreError::Unavailable("injected set failure".to_owned()));
+            }
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(account.to_owned(), encoded.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> Result<(), StoreError> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "injected delete failure".to_owned(),
+                ));
+            }
+            self.entries
+                .lock()
+                .unwrap()
+                .remove(account)
+                .map(drop)
+                .ok_or(StoreError::NotFound)
+        }
     }
 
     // ---- Account --------------------------------------------------------
@@ -359,6 +550,175 @@ mod tests {
         store.put(&account, &pw("second")).await.unwrap();
         let got = store.get(&account).await.unwrap();
         assert_eq!(got.as_bytes(), b"second");
+    }
+
+    #[tokio::test]
+    async fn memory_store_register_verified_never_claims_remembered() {
+        let store = MemoryPasswordStore::new();
+        let account = Account::from_salt("salt");
+        assert!(
+            !store
+                .register_verified(&account, &pw("verified"), true)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get(&account).await.unwrap().as_bytes(), b"verified");
+    }
+
+    #[tokio::test]
+    async fn keyring_unlock_without_remember_uses_only_session_overlay() {
+        let backend = Arc::new(TestCredentialBackend::default());
+        let store =
+            KeyringPasswordStore::with_backend(Arc::clone(&backend) as Arc<dyn CredentialBackend>);
+        let account = Account::from_salt("salt");
+
+        assert!(
+            !store
+                .register_verified(&account, &pw("session-only"), false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.get(&account).await.unwrap().as_bytes(),
+            b"session-only"
+        );
+        assert!(backend.entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keyring_session_overlay_replaces_previous_and_is_not_in_a_fresh_store() {
+        let backend = Arc::new(TestCredentialBackend::default());
+        let store =
+            KeyringPasswordStore::with_backend(Arc::clone(&backend) as Arc<dyn CredentialBackend>);
+        let account = Account::from_salt("salt");
+        store
+            .register_verified(&account, &pw("first"), false)
+            .await
+            .unwrap();
+        store
+            .register_verified(&account, &pw("replacement"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(&account).await.unwrap().as_bytes(),
+            b"replacement"
+        );
+        let fresh =
+            KeyringPasswordStore::with_backend(Arc::clone(&backend) as Arc<dyn CredentialBackend>);
+        assert!(matches!(
+            fresh.get(&account).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyring_delete_clears_session_when_backend_has_no_entry() {
+        let backend = Arc::new(TestCredentialBackend::default());
+        let store = KeyringPasswordStore::with_backend(backend as Arc<dyn CredentialBackend>);
+        let account = Account::from_salt("salt");
+        store
+            .register_verified(&account, &pw("session-only"), false)
+            .await
+            .unwrap();
+
+        store.delete(&account).await.unwrap();
+
+        assert!(matches!(
+            store.get(&account).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyring_delete_clears_session_but_surfaces_backend_unavailable() {
+        let backend = Arc::new(TestCredentialBackend::default());
+        let store =
+            KeyringPasswordStore::with_backend(Arc::clone(&backend) as Arc<dyn CredentialBackend>);
+        let account = Account::from_salt("salt");
+        store
+            .register_verified(&account, &pw("session-only"), false)
+            .await
+            .unwrap();
+        backend.fail_delete.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            store.delete(&account).await,
+            Err(StoreError::Unavailable(_))
+        ));
+        assert!(matches!(
+            store.get(&account).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyring_failed_persistent_replacement_preserves_existing_backend_value() {
+        let backend = Arc::new(TestCredentialBackend::default());
+        let store =
+            KeyringPasswordStore::with_backend(Arc::clone(&backend) as Arc<dyn CredentialBackend>);
+        let account = Account::from_salt("salt");
+        store
+            .register_verified(&account, &pw("existing"), true)
+            .await
+            .unwrap();
+        backend.fail_set.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            store
+                .register_verified(&account, &pw("replacement"), true)
+                .await,
+            Err(StoreError::Unavailable(_))
+        ));
+        assert_eq!(store.get(&account).await.unwrap().as_bytes(), b"existing");
+    }
+
+    #[tokio::test]
+    async fn keyring_unlock_with_remember_persists_and_reads_from_backend() {
+        let backend = Arc::new(TestCredentialBackend::default());
+        let store =
+            KeyringPasswordStore::with_backend(Arc::clone(&backend) as Arc<dyn CredentialBackend>);
+        let account = Account::from_salt("salt");
+
+        assert!(
+            store
+                .register_verified(&account, &pw("remembered"), true)
+                .await
+                .unwrap()
+        );
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(store.get(&account).await.unwrap().as_bytes(), b"remembered");
+    }
+
+    #[tokio::test]
+    async fn keyring_remember_failure_preserves_old_session_without_replacing_it() {
+        let backend = Arc::new(TestCredentialBackend::default());
+        backend.fail_set.store(true, Ordering::SeqCst);
+        let store =
+            KeyringPasswordStore::with_backend(Arc::clone(&backend) as Arc<dyn CredentialBackend>);
+        let account = Account::from_salt("salt");
+        store
+            .register_verified(&account, &pw("earlier-session"), false)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .register_verified(&account, &pw("not-fallback"), true)
+                .await,
+            Err(StoreError::Unavailable(_))
+        ));
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get(&account).await.unwrap().as_bytes(),
+            b"earlier-session"
+        );
+        let fresh = KeyringPasswordStore::with_backend(backend as Arc<dyn CredentialBackend>);
+        assert!(matches!(
+            fresh.get(&account).await,
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[tokio::test]
