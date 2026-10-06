@@ -2,8 +2,8 @@
 
 > **Owner:** David Xu  
 > **Project:** Agent24 / iDoris OfficeSuite  
-> **Status:** Working baseline  
-> **Updated:** 2026-10-05
+> **Status:** Working baseline — revised after review (scope/ownership baseline; contracts and acceptance being completed before implementation)  
+> **Updated:** 2026-10-06
 
 ## 1. Purpose
 
@@ -12,6 +12,16 @@ This document is the top-level planning and collaboration framework for the **Do
 It is intended to be the stable entry point for later GitHub Issues, Projects, milestones, ADRs, implementation PRs, progress tracking, dependency management, and team communication.
 
 This document deliberately focuses on David's scope. Related systems are described only where they are dependencies or integration boundaries.
+
+**How to read this revision.** The 2026-10-05 review concluded that the framework is a sound scope, ownership and collaboration baseline, but not yet an executable, acceptable development plan. This revision keeps the framework and adds:
+
+- three parallel workstreams instead of a serial Workspace → KB → Documenting chain (§12, §14);
+- a DocumentService contract skeleton and Agent24 default registration (§10);
+- a knowledge-context ON/OFF policy (§9);
+- cross-scenario behavioural constraints derived from the 13 T005 scenarios (§11);
+- first vertical slices (§15) and release hard gates (§18).
+
+Items not yet agreed by the team are marked **proposed** or **TBD**.
 
 ## 2. Product Positioning
 
@@ -56,7 +66,7 @@ David's primary scope is the **Documenting business capability**, including:
 
 - document business semantics;
 - document identity and revision semantics;
-- document atomic operations;
+- document atomic operations and the DocumentService contract (§10);
 - Agent24 capability/kernel integration for document operations;
 - import/read/process/edit/review/render/export user flows;
 - document-side source and citation UX;
@@ -65,6 +75,8 @@ David's primary scope is the **Documenting business capability**, including:
 - end-to-end document acceptance tests.
 
 The scope must not be reduced to a frontend page.
+
+Temporary Workspace / WeKnora integration work is tracked separately in §12 with its own scope and exit conditions. It does not extend this list.
 
 ### 4.2 Capability map
 
@@ -87,6 +99,8 @@ T005 groups the problem into A1–A12. These are capability groups, not necessar
 
 The largest Documenting-specific gaps are expected around **A2 and A6–A11**, rather than RAG itself.
 
+Listing a capability group here is **not** acceptance coverage. Every group is currently framework-level; acceptance is defined only through the contract (§10), constraints (§11), slices (§15) and gates (§18).
+
 ## 5. Explicit Non-Scope / Ownership Boundaries
 
 ### KnowledgeBase / MediaBase
@@ -99,7 +113,7 @@ The KB/Media provider owns or supplies the agreed lower-level capabilities such 
 - retrieval/RAG/reranking;
 - source/citation data;
 - knowledge-side ACL enforcement;
-- media processing and storage semantics.
+- media processing and storage semantics (including meeting audio/video transcription).
 
 Current planning uses **WeKnora** as the Knowledge Workspace / KB baseline. Documenting should consume this capability rather than create a second private knowledge store.
 
@@ -115,13 +129,14 @@ Agent24 owns:
 - cancellation/retry;
 - tool execution;
 - model orchestration;
-- audit/control-plane responsibilities.
+- audit/control-plane responsibilities;
+- the actual execution of external side effects (send, submit, pay, share).
 
 Documenting must not create a second Agent loop, authentication system, approval engine, or generic workflow engine.
 
 ### Workspace
 
-Workspace composes multi-step application workflows. It may consume Documenting, but Workspace is **not a prerequisite for Documenting to exist**.
+Workspace composes multi-step application workflows. It may consume Documenting, but Workspace is **not a prerequisite for Documenting to exist**, and Documenting delivery is not gated on the generic Workspace host (§12).
 
 ### Spreadsheet / Creative / Connectors
 
@@ -154,6 +169,7 @@ A useful responsibility model is:
        WeKnora                Document engine
  parse / search / RAG          edit / render
  citation / knowledge            export
+   (optional per §9)
 ```
 
 WeKnora can provide knowledge operations to Documenting while also being exposed as a full Knowledge Workspace through the generic Workspace host. These are two different product entry paths over related knowledge.
@@ -177,6 +193,17 @@ The product must be able to report that revision 4 exists while search still ref
 
 A stable mapping is required between document identity/revision and KB backend identity/version.
 
+### 7.1 Artifact ↔ input binding (proposed)
+
+Every produced artifact (draft, export, delivery package) records the exact revisions of every input it was produced from, including:
+
+- source documents and attachments;
+- templates and their version;
+- policies or reference material used;
+- the review baseline and the approved revision.
+
+A delivery package must bind to the approved revision, not to “latest”. If any bound input changes after approval, the package is stale and must be re-approved.
+
 ## 8. Citation Boundary
 
 WeKnora / KB should provide evidence metadata such as resource, revision, source and verifiable location.
@@ -191,40 +218,94 @@ Documenting is responsible for making that evidence useful in the document workf
 
 **Never fabricate a page or source location.**
 
-## 9. Current Prerequisite Engineering Work
+For extraction and comparison outputs (tables, field lists, figures), provenance is required **per value**, not only per paragraph or per answer. A value without a verifiable source is shown as unsourced, not silently trusted.
 
-David has also been asked to work on a prerequisite Agent24 integration path:
+## 9. Knowledge Context ON/OFF (proposed)
 
-> **Generic Workspace → preserve OpenDesign → load WeKnora**
+Knowledge (KB/WeKnora) is a dependency of some Documenting operations, not of Documenting as a whole.
 
-This is important enabling work, but it does **not** redefine David as the long-term owner of all Workspace, WeKnora, KB or Media responsibilities.
+### 9.1 Operation classes
 
-### 9.1 Target Workspace architecture
+| Class | Examples | Behaviour when knowledge is OFF or unavailable |
+|---|---|---|
+| Knowledge-free | import, open/render, local text read, edit, diff, revision, preflight, export | Works normally. |
+| Knowledge-optional | summarize/extract/translate a given document, draft from given material | Runs on the explicitly provided documents only, and says that no KB context was used. |
+| Knowledge-required | search across a corpus, cross-document QA, “find the latest policy” | Pauses with an explicit `knowledge_disabled` / `knowledge_unavailable` state. Never silently degrades into an answer without evidence. |
+
+### 9.2 Assembly rules
+
+- The same policy applies to every entry point: direct Agent24 call, Assistant, UI and Workspace. No entry point may bypass it.
+- The default (ON/OFF) and who may change it are Agent24 policy, set per org/workspace and overridable per task within that policy. The final default is **TBD** (§17).
+- The task result records whether knowledge was used, which resources/revisions were consulted, and the index state at the time (§7).
+
+## 10. DocumentService Contract & Agent24 Default Registration (proposed skeleton)
+
+“Capability integration” is not sufficient as a deliverable. Phase 1 (§14) must produce this contract as a reviewed ADR before implementation of the operations it covers.
+
+### 10.1 Operations (initial list)
+
+| Operation | Risk class | Knowledge class |
+|---|---|---|
+| `document.import` / `document.get` / `document.list` | read / create-record | free |
+| `document.render` / `document.read_range` | read | free |
+| `document.search` | read | required |
+| `document.ask` / `summarize` / `extract` / `compare` / `translate` | read | optional or required |
+| `document.draft.create` | mutate-draft | optional |
+| `document.change.propose` | mutate-draft | optional |
+| `document.change.review` (accept/reject) | commit | free |
+| `document.revision.commit` / `list` / `restore` | commit | free |
+| `document.preflight` | read | free |
+| `document.export` | create-artifact | free |
+| `document.package.assemble` | create-artifact | free |
+| `document.delivery.prepare` | handoff (side effect executed by Agent24) | free |
+
+### 10.2 Per-operation contract fields
+
+Every operation must specify:
+
+- **inputs / outputs**, including document id and revision;
+- **identity source** — always the Agent24 trusted caller context, never model-supplied arguments;
+- **risk class** and whether Agent24 approval is required;
+- **concurrency** — mutating operations require `base_revision`; a mismatch returns `revision_conflict` rather than overwriting;
+- **typed errors** — at least `unsupported_format`, `parse_failed`, `partial_parse`, `knowledge_disabled`, `knowledge_unavailable`, `stale_index`, `revision_conflict`, `permission_denied`, `cancelled`;
+- **job semantics** — long-running operations return a job id with status, progress, cancellation and resume/retry behaviour;
+- **idempotency** — commit, artifact and handoff operations accept an idempotency key, so a retry never duplicates a revision, package or delivery.
+
+### 10.3 Default registration
+
+- Documenting registers with Agent24 as a default capability at startup, without loading Sin90/Cos72, a Workspace or a UI.
+- Agent24 can discover the operations, their risk classes and their availability (for example engine present, knowledge ON/OFF and healthy).
+- UI, Assistant and Workspace call the same registered operations. A bespoke demo-UI path does not count as integration.
+
+## 11. Cross-Scenario Behavioural Constraints (proposed)
+
+These constraints come from the gaps found across the 13 T005 scenarios (S01–S13, Appendix A). They apply to every operation and slice, not to one scenario.
+
+1. **Faithfulness — never guess or inflate.** Do not guess identity or personal data. Polishing must not alter facts. Unconfirmed commitments stay marked “to be confirmed”. Do not widen promises beyond approved material. A missing value is empty, never zero. Negations, deadlines and amounts must be preserved exactly.
+2. **Prepare ≠ execute.** Prepared, approved, submitted, sent and paid are distinct, visible states. Documenting may reach “prepared”. Execution goes through Agent24/connectors and returns a receipt or failure state.
+3. **Pinned versions.** Templates, policies, review baselines and approved revisions are pinned (§7.1). Outputs never float to “latest”.
+4. **Per-value provenance.** Extracted fields, table cells and attachment numbering trace to a source location, or are explicitly unsourced (§8).
+5. **Recipients and receipts.** Delivery targets are exact and confirmed. Every delivery has a receipt or an explicit failure state. Batch-edit permission does not imply bulk-send permission.
+6. **Separated authority.** Edit vs approve, prepare vs approve vs pay, and delete of a sole original each require distinct permissions, enforced by Agent24.
+7. **Declared non-support.** Unaligned, unparsed or unsupported regions (for example interactive vs flat PDF fields, or complex layout) are shown explicitly and are never covered by a confident output.
+8. **Gold-standard evaluation.** Critical fields (deadlines, negations, amounts, dates, IDs) are evaluated against labelled samples, not by impression.
+9. **Batch isolation.** In batch operations each item is isolated: no cross-recipient content leakage, per-item preview, and partial failure/retry without duplicating completed items.
+
+## 12. Workstreams & Ownership
+
+The previous plan made the generic Workspace host (former Phase A) and the Knowledge Workspace (former Phase B) **serial prerequisites** of Documenting. In practice that would turn David into the de facto owner of Workspace and KB, regardless of any disclaimer. This revision replaces the serial chain with three workstreams.
 
 ```text
-                 Agent24
-                    |
-           Generic Workspace Host
-          /          |           \
-         v           v            v
-  OpenDesign      WeKnora     OpenCreator
-    Adapter        Adapter       Adapter
-       |             |             |
-       v             v             v
- OpenDesign       WeKnora      OpenCreator
+Line D  Documenting core   D1 → D2 → D3 → D4          owner: David Xu
+Line W  Workspace integration (scoped, time-boxed)    owner: TBD; David's share explicit
+Line K  KB service dependency (per operation)         owner: KB/Knowledge team
 ```
 
-Application-specific behavior belongs in adapters. The generic host should not accumulate application-specific dispatch such as `if app == WeKnora`.
+- **Line D** does not wait for Line W. Knowledge-free operations (§9.1) do not wait for Line K.
+- **Line W** covers the generic Workspace host, the OD compatibility adapter and the WeKnora Workspace entry. Any part assigned to David is listed explicitly with an exit condition (a handover owner and date). It is not added to §4.1.
+- **Line K** is consumed through an agreed service contract (ingest/status, search, source, citation, ACL, revision mapping). Documenting depends on it per operation (§14). It does not own or operate it.
 
-### 9.2 Prerequisite implementation sequence
-
-1. **Establish OD baseline** — build/run current Agent24 and record the real OpenDesign golden paths.
-2. **Define generic Workspace contract** — manifest, instance, adapter, call context, result and events.
-3. **Wrap OD through a compatibility adapter** — prove old and new paths are behaviorally equivalent.
-4. **Integrate WeKnora** — initially prefer trusted adapter → WeKnora REST rather than assuming current Agent24 can directly consume WeKnora HTTP MCP.
-5. **Keep WeKnora as an independent upstream-tracking fork** — minimize changes to its core knowledge algorithms.
-
-## 10. WeKnora Fork Principle
+## 13. WeKnora Fork Principle
 
 The planned fork should continuously track Tencent upstream while keeping iDoris-specific changes thin.
 
@@ -248,119 +329,119 @@ Avoid unnecessary forks of:
 
 If satisfying requirements requires sustained invasive changes to those areas, treat that as architecture evidence and reassess rather than silently turning a thin fork into a divergent product.
 
-## 11. High-Level Delivery Path
+Ownership of the fork follows Line K/Line W (§12), not Line D.
 
-This is a dependency-oriented framework, **not yet a sprint schedule**.
+## 14. Delivery Path
 
-### Phase A — Workspace foundation (prerequisite)
+This is a dependency-oriented framework, **not yet a sprint schedule**. Each phase lists what it needs from the other lines.
 
-**Goal:** establish a reusable Agent24 Workspace host without regressing OD.
+### Line D — Documenting core (owner: David)
 
-**Deliverables:**
+**D1 — Foundation**
 
-- reproducible OD baseline/golden paths;
-- generic Workspace contract;
-- registry/host path;
-- OD compatibility adapter;
-- OD regression evidence;
-- migration/rollback path.
-
-### Phase B — Knowledge Workspace (prerequisite/dependency)
-
-**Goal:** Agent24 can safely load and call the selected WeKnora fork.
-
-**Deliverables relevant to Documenting:**
-
-- upstream-tracking WeKnora fork;
-- WeKnora adapter;
-- Knowledge Workspace entry;
-- search/source integration;
-- citation preservation;
-- identity/scope mapping;
-- explicit health/capability states.
-
-Long-term ownership of all WeKnora/KB operations is not implied by this phase.
-
-### Phase C — Documenting foundation
-
-**Goal:** Documenting exists as an Agent24-default callable business capability.
-
-**Deliverables:**
-
-- Document capability contract;
-- stable document identity;
-- revision semantics;
-- source/artifact model;
+- DocumentService contract ADR (§10) and Agent24 default registration;
+- stable document identity and revision semantics;
+- source/artifact model with input binding (§7.1);
 - read/render boundary;
-- WeKnora resource/revision mapping;
-- Agent24 capability registration/integration;
-- baseline acceptance fixtures.
+- knowledge ON/OFF policy (§9);
+- baseline acceptance fixtures and sample set (§18.2).
 
-### Phase D — Read & understand
+Needs: Agent24 registration, trusted caller context, and decisions §17 #1–#2. Does **not** need Line W or Line K.
 
-**Goal:** a user or Agent can reliably consume real documents.
+**D2 — Read & understand**
 
-**Deliverables:**
-
-- import/read path;
-- preview/navigation;
-- search and exact source jump;
+- import/read path, preview/navigation;
 - selected summarize/extract/translate/compare operations;
-- citation UX;
-- visible parse/index/error states.
+- citation UX, exact source jump, visible parse/index/error states.
 
-### Phase E — Edit & review
+Needs: Line K only for search, cross-document QA and KB-backed citation. Single-document operations run without it.
 
-**Goal:** AI output becomes reviewable document change rather than untracked generated text.
+**D3 — Edit & review**
 
-**Deliverables:**
+- draft creation, targeted edits, undo or equivalent safe revision behaviour;
+- diff, accept/reject, conflict detection, creation of a new revision;
+- suggestion ownership, separation of comments from body text, and edit/approve separation.
 
-- draft creation;
-- targeted edits;
-- undo or equivalent safe revision behavior;
-- diff;
-- accept/reject;
-- conflict detection;
-- creation of a new revision.
+Needs: document engine decision (§17 #6), Agent24 approval.
 
-### Phase F — Render & deliver
+**D4 — Render & deliver**
 
-**Goal:** the result is a real deliverable document.
+- layout preview, preflight checks, selected fixed/editable exports, conversion warnings;
+- reopen/visual validation, hidden-content cleanup;
+- attachment/package assembly bound to the approved revision;
+- controlled delivery handoff to Agent24/connectors with receipt.
 
-**Deliverables:**
+Needs: Agent24/connectors for execution and receipts.
 
-- layout preview;
-- preflight checks;
-- selected fixed/editable exports;
-- conversion warnings;
-- reopen/visual validation;
-- attachment/package assembly where required;
-- controlled delivery handoff to Agent24/connectors.
+### Line W — Workspace integration (formerly Phase A + Workspace part of Phase B)
 
-## 12. Dependencies and Team Inputs
+Reproducible OD baseline and golden paths → generic Workspace contract → OD compatibility adapter with regression evidence and a rollback path → WeKnora Workspace entry. Start with a trusted adapter calling WeKnora REST, rather than assuming Agent24 can consume WeKnora HTTP MCP directly.
 
-| Dependency | Needed by Documenting | Owner boundary |
+### Line K — KB service (formerly the service part of Phase B)
+
+Upstream-tracking WeKnora fork, adapter/service contract, search/source integration, citation preservation, identity/scope mapping, explicit health/capability states, and document ↔ KB revision mapping (§7).
+
+## 15. First Vertical Slices (proposed)
+
+The first end-to-end acceptance is two vertical slices, not the whole capability map.
+
+| Slice | Intent | Candidate scenarios | Key constraints (§11) |
+|---|---|---|---|
+| **V1 收件看懂 — Receive & understand** | Receive material, understand it with evidence, keep a recoverable result | S01, S06 (reading part) | 1, 4, 7, 8 |
+| **V2 日常成稿 — Everyday drafting** | Produce a usable document from material/template, review it, export it | S03, S08 | 1, 3, 7 |
+
+- **Form filling (S02)** is not in the first slices. Before it is promised, the supported form types and the manual-completion path for unsupported ones must be declared.
+- If only one slice ships first, it is called “first slice”. It must not be described as covering the T005 first-release recommendation.
+- The scenario mapping above is **TBD — to confirm with reviewer**.
+
+## 16. Dependencies and Team Inputs
+
+| Dependency | Needed by Documenting | Needed from phase | Owner |
+|---|---|---|---|
+| Agent24 Core | capability registration, trusted caller context, permissions, approvals, run/cancel/model/tool access | D1 | Agent24 |
+| WeKnora / KB | ingest/status, search, source, citation, ACL, revision mapping | D2 (knowledge ops only) | KB/Knowledge |
+| Document engine | rendering, structured edit, layout, revision-safe mutation, export | D1 (render), D3–D4 | TBD / Documenting integration |
+| OpenDesign/OpenCreator | context/artifact/run/cancel handoff | Line W | Workspace/Creative |
+| Connectors | actual email/Drive/filesystem/business-system action + receipt | D4 | connector/Agent24 |
+| Media | transcription for meeting material (S07) | later | Media |
+| Product samples | representative real workflows and sanitized files (§18.2) | D1 | team/product |
+
+## 17. Open Decisions
+
+These are intentionally **TBD** and must not be silently frozen by implementation convenience. Each lists the phase it blocks.
+
+| # | Decision | Blocks |
 |---|---|---|
-| Agent24 Core | capability registration, trusted caller context, permissions, approvals, run/cancel/model/tool access | Agent24 |
-| WeKnora / KB | ingest/status, search, source, citation, ACL, revision mapping, context where applicable | KB/Knowledge |
-| Document engine | rendering, structured edit, layout, revision-safe mutation, export | TBD / Documenting integration |
-| OpenDesign/OpenCreator | context/artifact/run/cancel handoff | Workspace/Creative |
-| Connectors | actual email/Drive/filesystem/business-system action + receipt | connector/Agent24 |
-| Product samples | representative real workflows and sanitized files | team/product |
+| 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? | D1 |
+| 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | D1 |
+| 3 | **DOCX fidelity level** — basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. | D3–D4 |
+| 4 | **PDF scope** — reading, OCR, form filling (interactive vs flat overlay), page operations and true content editing are separate capabilities. | D2, form slice |
+| 5 | **Collaboration depth** — single-user, async review, multi-user revision or real-time co-editing. | D3 |
+| 6 | **Document engine/editor choice** — follows representative tasks, not the other way round. | D3 |
+| 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). | D1 fixtures |
+| 8 | **Knowledge default** — default ON or OFF, and who may change it (§9.2). | D1 |
+| 9 | **Line W assignment** — which parts are David's, the handover owner and the exit date (§12). | Line W start |
+| 10 | **Roadmap conflicts** — how conflicts between this plan and existing Agent24/T006 roadmaps are resolved and recorded. | planning |
 
-## 13. Open Decisions
+## 18. Release Hard Gates & Test Samples
 
-These are intentionally **TBD** and must not be silently frozen by implementation convenience.
+### 18.1 Hard gates (a slice cannot be called released without these)
 
-1. **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system?
-2. **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters?
-3. **DOCX fidelity level** — basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip fidelity.
-4. **PDF scope** — reading, OCR, form filling, page overlay, page operations and true content editing are separate capabilities.
-5. **Collaboration depth** — single-user, async review, multi-user revision or real-time co-editing.
-6. **Document engine/editor choice** — should follow representative document tasks, not precede them.
-7. **First P0 workflow** — which real document task becomes the first end-to-end acceptance path?
+- Chinese and multilingual content (mixed scripts, vertical/CJK layout where in scope) passes read, edit and export.
+- The format fidelity matrix for the declared formats passes reopen and visual checks.
+- Hidden content (comments, tracked changes, metadata, hidden text, old template residue such as names, dates and headers) is cleaned or reported before export/delivery.
+- Attachment versions and recipients in a package match the approved revision and confirmed targets.
+- Batch isolation holds (§11.9).
+- Permission revoked mid-task, cancellation and network loss leave a consistent state: no half-committed revision and no duplicated delivery.
+- Knowledge OFF/unavailable behaves as in §9.1.
 
-## 14. Progress-Control Framework
+### 18.2 Sample set
+
+- Sanitized, representative documents per slice, including bad cases: scans, mixed language, complex tables, same-name different versions, and duplicates.
+- Gold labels for critical fields (§11.8).
+- Each sample pinned and versioned with the fixtures.
+
+## 19. Progress-Control Framework
 
 GitHub Project should track execution; this document remains the stable design/ownership baseline.
 
@@ -372,58 +453,91 @@ Research → Contract → Prototype → Integrated → Tested → Released
 
 Recommended issue dimensions:
 
+- **Line:** D / W / K
 - **Area:** workspace / knowledge / document-core / read / ai-action / edit / review / render / export / integration
 - **Dependency:** agent24 / weknora / opendesign / opencreator / kb-media / connector
 - **Priority:** P0 / P1 / Later
 - **State:** planned / in-progress / blocked / review / done
 
-Every implementation issue should link back to the relevant section of this document and identify its external dependencies explicitly.
+Every implementation issue should link back to the relevant section of this document and identify its external dependencies and owner explicitly.
 
-## 15. Definition of Done
+## 20. Definition of Done
 
 Documenting is not “done” because a UI exists or an LLM can answer questions about a PDF.
 
-For an agreed P0 document workflow, completion requires evidence that:
+For an agreed slice (§15), completion requires evidence that:
 
 - the original/source document is preserved or reliably referenced;
 - document identity and revision are stable;
 - the selected document can be opened and navigated;
-- AI-derived facts can be checked against evidence;
+- AI-derived facts can be checked against evidence, per value where applicable;
 - unsupported/failed parsing is visible rather than hidden;
 - edits are reviewable and do not silently overwrite a changed baseline;
 - a new revision can be saved and recovered;
+- artifacts record and honour their pinned inputs (§7.1);
 - selected export formats actually reopen and pass the agreed fidelity checks;
 - KB indexing state is distinguishable from document-save state;
-- permission and delivery actions respect Agent24 control;
+- knowledge OFF/unavailable behaviour matches §9;
+- permission and delivery actions respect Agent24 control, and prepare/execute states are distinct;
 - failure/retry does not duplicate destructive or delivery side effects;
+- the cross-scenario constraints (§11) relevant to the slice are tested;
+- the release hard gates (§18.1) pass;
 - the workflow works through Agent24 capability integration, not only through a bespoke demo UI.
 
-## 16. Source Baseline
+## 21. Source Baseline
 
 This working baseline is derived from the current project direction and the following design/research sources:
 
 - iDoris product / OfficeSuite positioning;
-- T005 Documenting report;
-- T005 user scenarios & atomic capabilities;
-- T005 David Xu handoff;
-- T005 Agent24 kernel integration study;
-- T006 Document ↔ KnowledgeBase/MediaBase service boundaries;
-- T006 WeKnora Workspace development plan;
+- T005 Documenting report, user scenarios & atomic capabilities, David Xu handoff, Agent24 kernel integration study;
+- T006 Document ↔ KnowledgeBase/MediaBase service boundaries and WeKnora Workspace development plan;
+- T007 Assistant and T008 Media roadmap (for boundaries);
 - Agent24 current architecture/ADR/code observations;
-- WeKnora upstream capability documentation.
+- WeKnora upstream capability documentation;
+- the 2026-10-05 applicability review of this document.
 
-Where these sources contain research proposals rather than approved engineering decisions, this document keeps the corresponding item marked **proposed** or **TBD**.
+Pinned references:
+
+| Source | Ref |
+|---|---|
+| Agent24 design (reviewed version) | `iDoris-ai/Agent24` `bb76d8d3221516cac0fb3e4af2185dc5c627f753` (branch `docs/documenting-design`) |
+| Agent24 source baseline | `54cec44a7410532e8a864ea90860f2d442c06ba2` |
+| Research baseline (T001–T008) | `jhfnetboy/researcher` `9e374e1d8cd5b3415a1c5ee81029eb5aef187fde` |
+
+Where these sources contain research proposals rather than approved engineering decisions, this document keeps the corresponding item marked **proposed** or **TBD**. Historical implementation observations in research documents are not treated as current run results.
+
+## 22. Immediate Next Checkpoint
+
+Before implementation, and before converting this framework into a detailed GitHub Project plan, confirm:
+
+1. decisions §17 #1, #2, #7, #8, which block D1;
+2. Line W assignment, handover owner and exit (§17 #9);
+3. the KB/WeKnora test endpoint and the Line K service contract owner;
+4. the sanitized sample set and gold labels for V1/V2 (§18.2);
+5. review of the DocumentService contract skeleton (§10) as an ADR draft.
+
+Allowed before these are confirmed: baseline verification, sample preparation, contract/capability probing, and small independent PoCs. Not allowed: committing to “complete Documenting delivered”, multi-user secure rollout, or fixed timelines.
+
+After confirmation, create milestones/issues from §12–§19 rather than expanding scope directly in implementation PRs.
 
 ---
 
-## 17. Immediate Next Checkpoint
+## Appendix A — Scenario Traceability (S01–S13)
 
-Before converting this framework into a detailed GitHub Project plan, confirm:
+All 13 scenarios are currently **partial**: the direction is present, but acceptance is not yet defined. The table records where each gap is now addressed. Closing a row requires a test in the slice or a gate that uses it.
 
-1. the current Agent24 branch/build/run baseline and OD golden path;
-2. which subset of the Generic Workspace / WeKnora prerequisite work is assigned to David;
-3. the actual KB/WeKnora test endpoint and responsibility boundary;
-4. one representative P0 Documenting workflow and sanitized sample documents;
-5. the initial Documenting ↔ Agent24 ↔ KB contract assumptions.
-
-After these are confirmed, create milestones/issues from Sections 11–14 rather than expanding scope directly in implementation PRs.
+| ID | Scenario | Gaps to close | Addressed by |
+|---|---|---|---|
+| S01 | Understand a notice/instructions | deadline/negation/amount gold labels, missing/conflict hints, saved result list, check against original page | §8, §11.1/4/8, V1 |
+| S02 | Application/registration/repair forms | interactive vs flat PDF, ask for missing fields, never guess identity, checkbox/length/overlap, required attachments, signing handoff, prepare vs submit | §11.1/2/7, §15 (deferred), §17 #4 |
+| S03 | CV / intro / cover letter | purpose and audience, template choice, verify real experience and contacts, facts unchanged by polishing | §11.1/3, V2 |
+| S04 | Archive receipts/manuals/warranties | reversible classify/rename, same-name versions and duplicates, never delete a sole original, find by purchase fields, delete permission | §7.1, §11.6, §18.2 |
+| S05 | Compare two versions | fixed inputs, paragraph/page alignment, separate text/number/format diffs, unaligned regions not guaranteed; edit diff ≠ cross-format compare | §10.1, §11.7 |
+| S06 | Admin intake with many attachments | source access scope, existing reply versions, per-attachment list, exact recipients, receipt/failure, archive link | §11.2/5, V1, D4 |
+| S07 | Meeting material & minutes | decision/discussion/open items, owner and date evidence, unconfirmed stays pending, attachment trace; transcription by Media | §5, §11.1/4, §16 |
+| S08 | Template-based drafting | template version and replaceable-field whitelist, residue check, tables, editable + publish dual output | §7.1, §11.3, §18.1, V2 |
+| S09 | Sales/support material response | approved material only, quote/exception check, no widened promises, package bound to approved version and recipient | §7.1, §11.1/2/5 |
+| S10 | Supplier material summary | field schema, multi-row headers, currency/tax/unit/validity, empty ≠ zero, non-comparable items, per-value source, structured export | §8, §11.1/4, spreadsheet boundary §5 |
+| S11 | Expense statement & receipt pack | duplicate receipts, amount/date gold labels, number ↔ attachment mapping, calculation handoff, prepare/approve/pay separation, finance data scope | §11.2/4/6/8 |
+| S12 | Personalized onboarding material | per-person binding, pinned template/policy, per-recipient isolation and preview, partial failure/retry, batch edit ≠ bulk send | §7.1, §11.3/5/9 |
+| S13 | Collaborative report revision | suggestion ownership, comments vs body, edit/approve separation, pinned review baseline and approved version, DOCX revision support scope | D3, §11.3/6, §17 #3/#5 |
