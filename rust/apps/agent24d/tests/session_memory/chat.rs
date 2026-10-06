@@ -66,6 +66,9 @@ async fn explicit_remember_over_chat_stores_a_qualified_assertion() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(!body["message"]["content"].as_str().unwrap().is_empty());
+    // M1-T14: a deterministic receipt — set by the daemon, not read off the
+    // model's own reply text.
+    assert_eq!(body["memory_receipt"], json!("saved"));
     let owner = personal_owner(&kv).await;
     let rows = kv
         .assertions()
@@ -88,9 +91,15 @@ async fn a_later_chat_in_a_different_session_recalls_the_same_owners_fact() {
 
     post_chat_with(&state, Some("chat-session-s1"), "记住我对花生过敏").await;
 
-    let (status, _body) = post_chat_with(&state, Some("chat-session-s2"), "我对什么过敏？").await;
+    let (status, body) = post_chat_with(&state, Some("chat-session-s2"), "我对什么过敏？").await;
 
     assert_eq!(status, StatusCode::OK);
+    // M1-T14: a plain question is not an explicit remember — no receipt at
+    // all, even though this call does have a session_id.
+    assert!(
+        body.get("memory_receipt").is_none(),
+        "a non-remember prompt must carry no memory_receipt: {body:?}"
+    );
     assert!(
         last_messages_mention(&provider, "花生"),
         "the provider request for session s2 must carry the recalled fact"
@@ -123,6 +132,9 @@ async fn paused_memory_skips_the_store_and_tells_the_model_so_over_chat() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(!body["message"]["content"].as_str().unwrap().is_empty());
+    // M1-T14: the client must learn this from the field, not from whatever
+    // the model said after reading the "记忆已暂停" system notice.
+    assert_eq!(body["memory_receipt"], json!("paused_not_saved"));
     assert!(
         kv.assertions()
             .beliefs_as_of(&BeliefQuery::owner(&owner))
@@ -150,7 +162,13 @@ async fn chat_without_a_session_id_neither_recalls_nor_stores() {
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider.clone()).await;
 
-    post_chat_with(&state, None, "记住我对花生过敏").await;
+    let (_status, remember_body) = post_chat_with(&state, None, "记住我对花生过敏").await;
+    // M1-T14: no session_id means no memory subsystem in play at all — even
+    // though the text IS an explicit remember, there is no receipt to give.
+    assert!(
+        remember_body.get("memory_receipt").is_none(),
+        "no session_id must mean no memory_receipt either: {remember_body:?}"
+    );
 
     let owner = personal_owner(&kv).await;
     assert!(
@@ -218,6 +236,9 @@ async fn a_retain_failure_still_returns_200_with_content() {
         "a retain failure must never drop the already-computed chat response"
     );
     assert!(!body["message"]["content"].as_str().unwrap().is_empty());
+    // M1-T14: the write failed (forced above), memory was NOT paused — the
+    // receipt must say `failed`, not silently look like `saved`.
+    assert_eq!(body["memory_receipt"], json!("failed"));
     assert!(
         kv.assertions()
             .beliefs_as_of(&BeliefQuery::owner(&owner))
