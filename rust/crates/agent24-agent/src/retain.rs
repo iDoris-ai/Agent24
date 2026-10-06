@@ -26,10 +26,51 @@ use serde_json::json;
 /// early check): this is belt-and-braces, not the only thing stopping it.
 pub(super) const PAUSED_WRITE_NOTICE: &str = "记忆已暂停：本条不会被记住，请如实告知用户";
 
+/// Check if the extracted content looks like a question sentence (should be rejected).
+/// Returns true if content ends with question particles/marks or starts with 了.
+fn is_question_sentence(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    // Check if ends with question particles or marks
+    if trimmed.ends_with('吗')
+        || trimmed.ends_with('么')
+        || trimmed.ends_with('呢')
+        || trimmed.ends_with('？')
+        || trimmed.ends_with('?')
+    {
+        return true;
+    }
+
+    // Check if ends with sentence-final negation/doubt phrases
+    if trimmed.ends_with("了吗")
+        || trimmed.ends_with("了没")
+        || trimmed.ends_with("了没有")
+        || trimmed.ends_with("没有")
+    {
+        return true;
+    }
+
+    // Check if content starts with 了 (e.g., after verb stripping)
+    if trimmed.starts_with('了') {
+        return true;
+    }
+
+    false
+}
+
 /// Return only the user's explicitly requested text. The model response is not
 /// an input to this parser.
 pub(super) fn explicit_remember(prompt: &str) -> Option<&str> {
-    const ADDRESS_PREFIXES_CN: &[&str] = &["请你", "麻烦你", "帮我", "请", "麻烦", "你"];
+    const ADDRESS_PREFIXES_CN: &[&str] = &[
+        "你帮我",
+        "请帮我",
+        "请你",
+        "麻烦你",
+        "帮我",
+        "请",
+        "麻烦",
+        "你",
+    ];
     const REMEMBER_VERBS_CN: &[&str] = &["记一下", "记住", "记好", "记着"];
     const SEPARATORS: &[char] = &[' ', '　', '，', ',', '：', ':', '、'];
     const END_PUNCT: &[char] = &['。', '.', '！', '!'];
@@ -67,9 +108,11 @@ pub(super) fn explicit_remember(prompt: &str) -> Option<&str> {
     // Try to match Chinese remember verbs
     for verb in REMEMBER_VERBS_CN {
         if let Some(after_verb) = remaining.strip_prefix(verb) {
-            // Check if the verb is followed by 了, 吗, or 没
-            if let Some(first_char) = after_verb.chars().next()
-                && (first_char == '了' || first_char == '吗' || first_char == '没')
+            // Check if the verb is immediately followed by 了 or 吗 (these are questions)
+            // Also skip if followed by 没 but NOT 没有 (e.g., "记住没" is question, but "记住没有..." is content)
+            if after_verb.starts_with("了")
+                || after_verb.starts_with("吗")
+                || (after_verb.starts_with("没") && !after_verb.starts_with("没有"))
             {
                 continue;
             }
@@ -80,6 +123,10 @@ pub(super) fn explicit_remember(prompt: &str) -> Option<&str> {
             if !body.is_empty() {
                 let body = body.trim_end_matches(END_PUNCT);
                 if !body.is_empty() {
+                    // Reject if it looks like a question sentence
+                    if is_question_sentence(body) {
+                        return None;
+                    }
                     return Some(body);
                 }
             }
@@ -93,6 +140,10 @@ pub(super) fn explicit_remember(prompt: &str) -> Option<&str> {
         if !body.is_empty() {
             let body = body.trim_end_matches(END_PUNCT);
             if !body.is_empty() {
+                // Reject if it looks like a question sentence
+                if is_question_sentence(body) {
+                    return None;
+                }
                 return Some(body);
             }
         }
@@ -105,6 +156,10 @@ pub(super) fn explicit_remember(prompt: &str) -> Option<&str> {
         if !body.is_empty() {
             let body = body.trim_end_matches(END_PUNCT);
             if !body.is_empty() {
+                // Reject if it looks like a question sentence
+                if is_question_sentence(body) {
+                    return None;
+                }
                 return Some(body);
             }
         }
@@ -205,7 +260,16 @@ mod tests {
             ("帮我记一下 明天下午三点开会", Some("明天下午三点开会")),
             ("麻烦记住我不吃辣", Some("我不吃辣")),
             ("Please remember that my dog is Max", Some("my dog is Max")),
-            // New negative cases
+            ("记住没有人会来接你", Some("没有人会来接你")),
+            ("你帮我记住我不吃香菜", Some("我不吃香菜")),
+            ("请帮我记住下周二开会", Some("下周二开会")),
+            // Negative cases: questions should NOT be remembered
+            ("你记住我吗", None),
+            ("你记住这件事吗", None),
+            ("你记住他的名字了吗", None),
+            ("记住了没有", None),
+            ("你记住了吗？", None),
+            // More question cases
             ("你还记得我对什么过敏吗", None),
             ("我记住了", None),
             ("记住了吗", None),
