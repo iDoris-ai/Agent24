@@ -18,6 +18,7 @@ import SchedulesPage from './pages/Schedules'
 import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
 import CreativePage from './pages/Creative'
+import MemoryPage from './pages/Memory'
 import logoSidebar from './assets/logo-sidebar.png'
 
 // Static module route map — M2 will replace this with dynamic import()
@@ -36,6 +37,7 @@ type BuiltinPage =
   | 'voice'
   | 'creative'
   | 'models'
+  | 'memory'
   | 'settings'
   | 'modules-manager'
 type Page = BuiltinPage | string  // string = module route
@@ -50,13 +52,16 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'creative',        icon: '🎨', label: 'Creative' },
   { id: 'models',          icon: '🤖', label: '模型' },
   { id: 'modules-manager', icon: '🧩', label: '模块管理' },
+  // M1-T11: 记忆页紧挨设置，和它共享"这是你对 Agent24 的控制面"这同一个位置。
+  { id: 'memory',          icon: '🧠', label: '记忆' },
   { id: 'settings',        icon: '⚙️', label: '设置' },
 ]
 
 const BUILTIN_TITLES: Record<BuiltinPage, string> = {
   chat: '对话', workbench: '工作台', runs: '运行任务',
   schedules: '定时调度', approvals: '待审批', voice: '语音',
-  creative: 'Creative', models: '模型管理', 'modules-manager': '模块管理', settings: '设置',
+  creative: 'Creative', models: '模型管理', 'modules-manager': '模块管理',
+  memory: '记忆', settings: '设置',
 }
 
 // FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
@@ -290,6 +295,7 @@ export function App(): JSX.Element {
         {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
+        {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage />}
         {/* Module UI pages — static map in M1, dynamic import() in M2 */}
         {moduleNavItems.map((m) => {

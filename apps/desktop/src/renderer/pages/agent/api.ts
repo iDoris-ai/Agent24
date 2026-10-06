@@ -2,6 +2,8 @@
 // endpoints (runs / schedules / approvals). The renderer is sandboxed, so
 // every call goes through the IPC proxy — never a direct fetch.
 
+import type { components } from '@agent24/api-client'
+
 export type RunStatus =
   | 'queued'
   | 'running'
@@ -234,4 +236,47 @@ export const setOsModuleEnabled = async (name: string, enabled: boolean): Promis
   })
   if (!res.ok) throw new Error(errorMessage(res))
   return res.data as DomainOsList
+}
+
+// ── M1-T10/T11: personal memory (generated api-client types) ───────────────
+// Mirrors `rust/apps/agent24d/src/memory_routes.rs`'s `MemoryAssertion`/
+// `MemorySettings` JSON exactly (`protocol/openapi.yaml`); using the
+// generated schema types directly, rather than hand-rolled duplicates, so
+// drift is a type error.
+
+export type MemoryAssertion = components['schemas']['MemoryAssertion']
+export type MemorySettings = components['schemas']['MemorySettings']
+
+export const listMemoryAssertions = async (q?: string): Promise<MemoryAssertion[]> => {
+  const query = q && q.trim() !== '' ? `?q=${encodeURIComponent(q.trim())}` : ''
+  const res = await window.agent24.backendProxy({
+    method: 'GET',
+    path: `/api/v1/memory/assertions${query}`,
+  })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return (res.data as { assertions: MemoryAssertion[] }).assertions
+}
+
+export const forgetMemoryAssertion = async (id: string): Promise<void> => {
+  const res = await window.agent24.backendProxy({
+    method: 'DELETE',
+    path: `/api/v1/memory/assertions/${encodeURIComponent(id)}`,
+  })
+  if (!res.ok) throw new Error(errorMessage(res))
+}
+
+export const getMemorySettings = async (): Promise<MemorySettings> => {
+  const res = await window.agent24.backendProxy({ method: 'GET', path: '/api/v1/memory/settings' })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return res.data as MemorySettings
+}
+
+export const putMemorySettings = async (enabled: boolean): Promise<MemorySettings> => {
+  const res = await window.agent24.backendProxy({
+    method: 'PUT',
+    path: '/api/v1/memory/settings',
+    body: { enabled },
+  })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return res.data as MemorySettings
 }
