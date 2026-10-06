@@ -16,6 +16,7 @@ import {
   CreativeViewRequestFence,
   classifyCreativeUrl,
 } from './creative-serve-web'
+import { OpenDesignComponentInstaller } from './open-design-component'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -55,6 +56,7 @@ let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
 let creativeServeWeb: CreativeServeWeb | null = null
+let openDesignComponent: OpenDesignComponentInstaller | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
@@ -88,6 +90,9 @@ async function showCreativeView(
   if (!service) return { ok: false, error: 'Open Design host is unavailable' }
   const status = await service.start()
   if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
+  if (status.state === 'needs-download') {
+    return { ok: false, needsDownload: true, size: status.size }
+  }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
   }
@@ -199,11 +204,29 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.whenReady().then(() => {
+  // Owner decision 2026-10-05: Open Design is downloaded on demand (see
+  // open-design-component.ts) instead of being bundled in the installer.
+  // CreativeServeWeb only ever reads this accessor's current status — it
+  // never triggers a download itself.
+  //
+  // PR #670 review (L1): the installer's own manifest loading already
+  // degrades a corrupt baked manifest to `unavailable` instead of throwing,
+  // but this constructor call is still wrapped — nothing here runs inside a
+  // try/catch of its own caller (`app.whenReady().then()`), and an uncaught
+  // throw at this point would have skipped registering every IPC handler
+  // below it, not just the Open Design ones.
+  try {
+    openDesignComponent = new OpenDesignComponentInstaller({ resourcesPath: process.resourcesPath })
+  } catch (error) {
+    console.error('[main] failed to construct the Open Design component installer', error)
+    openDesignComponent = null
+  }
   creativeServeWeb = new CreativeServeWeb({
     resourcesPath: process.resourcesPath,
     stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
     runtimeExecutable: process.execPath,
     pinVersion: OPEN_DESIGN_PIN_VERSION,
+    component: openDesignComponent ?? undefined,
   })
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
@@ -244,6 +267,15 @@ app.whenReady().then(() => {
     }
   })
   ipcMain.handle(IpcChannels.CreativeHide, () => hideCreativeView())
+  ipcMain.handle(IpcChannels.OpenDesignComponentStatus, () => openDesignComponent?.status()
+    ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' })
+  ipcMain.handle(IpcChannels.OpenDesignComponentInstall, () => openDesignComponent?.install()
+    ?? Promise.resolve({ state: 'unavailable', reason: 'Open Design component installer is unavailable' }))
+  openDesignComponent?.onProgress((status) => {
+    if (mainWin && !mainWin.isDestroyed()) {
+      mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)
+    }
+  })
   agentEarBridge.start()
 
   // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice
@@ -335,6 +367,9 @@ function refreshTray(): void {
 
 app.on('before-quit', () => {
   isQuitting = true
+  // M5: cancel an in-flight Open Design component download rather than
+  // leaving it (and its partial files) orphaned past app exit.
+  openDesignComponent?.abort('Agent24 is quitting')
 })
 
 app.on('will-quit', () => {

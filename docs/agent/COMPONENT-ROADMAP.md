@@ -18,7 +18,7 @@
 | C4 | Workspace（文件系统工作区） | `agent24-workspace` / `store` / `os-cwd` | 🟡 仅 Unix、无对外路由、Open Design 未绑定 |
 | C5 | 权限、能力与法律 | `agent24-policy`、`agent24d/capabilities`、`docs/laws/` | 审批 ✅、Guardian ✅（可选）；capability 🟡；法律三部 |
 | C6 | 领域 OS 生态 | `os-proto` / `os-fd` / `os-packages` / `os-sdk`；Sin90、Cos72 外仓 | ✅ ME-3 / ME-4 已交付（v0.5.0）；进程内模块缝 🟡 无实例 |
-| C7 | 第三方工具集成 | Desktop `CreativeServeWeb`、`agent24 acp`、`agent24-sidecar-host`、`agent24-mcp` | Open Design 现行路径 ✅；目标形态 🟡/📐；MCP ✅ |
+| C7 | 第三方工具集成 | Desktop `CreativeServeWeb`、`agent24 acp`、`agent24-sidecar-host`、`agent24-mcp` | Open Design 现行路径 ✅；按需下载组件（不再打进安装包，见 `open-design-component.ts`）✅；目标形态 🟡/📐；MCP ✅ |
 | C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1a…4b、COMM-5a 已交付；UI 与联调未做 |
 | C9 | 语音（AgentEar） | 附着模块（A3） | ✅ P0–P2（非流式单轮） |
 | C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；macOS 签名包被 Apple 账号阻塞 |

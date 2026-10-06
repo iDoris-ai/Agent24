@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -49,22 +50,44 @@ function checkout(): string {
   return materializeCheckout(root)
 }
 
+// M4 (Opus re-review, 2026-10-06): the four launcher entry files and a
+// matching integrity marker — mirrors exactly what
+// OpenDesignComponentInstaller.installOnce actually writes at install
+// time (see ENTRY_FILES_FOR_INTEGRITY_CHECK / verifyEntryFileIntegrity in
+// open-design-component.ts), since creative-serve-web.ts's on-demand path
+// now spot-checks this marker before every launch.
+const ENTRY_RELATIVE_PATHS = [
+  'app/prebundled/agent24-headless.cjs',
+  'app/prebundled/daemon/daemon-cli.mjs',
+  'app/prebundled/daemon/daemon-sidecar.mjs',
+  'app/prebundled/web-sidecar.mjs',
+] as const
+
 function packagedHeadlessRuntime(): { resources: string; stateRoot: string; runtimeExecutable: string } {
   const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-headless-'))
   tempDirs.push(root)
   const resources = path.join(root, 'resources')
   const stateRoot = path.join(root, 'state')
   const runtimeExecutable = path.join(root, 'Agent24')
-  fs.mkdirSync(path.join(resources, 'app', 'prebundled'), { recursive: true })
+  fs.mkdirSync(path.join(resources, 'app', 'prebundled', 'daemon'), { recursive: true })
   fs.mkdirSync(path.join(resources, 'open-design'), { recursive: true })
-  fs.writeFileSync(path.join(resources, 'app', 'prebundled', 'agent24-headless.cjs'), '')
+  const entrySha256: Record<string, string> = {}
+  for (const relative of ENTRY_RELATIVE_PATHS) {
+    const content = `// fixture: ${relative}\n`
+    fs.writeFileSync(path.join(resources, relative), content)
+    entrySha256[relative] = crypto.createHash('sha256').update(content).digest('hex')
+  }
+  fs.writeFileSync(
+    path.join(resources, '.agent24-component.json'),
+    JSON.stringify({ sha256: 'fixture-tarball-sha256', entrySha256 }),
+  )
   fs.writeFileSync(runtimeExecutable, '')
   return { resources, stateRoot, runtimeExecutable }
 }
 
 function headlessReady(ownerPid: number, webPort: number, daemonPort: number, instanceId = 'creative-1') {
   return {
-    type: 'ready', protocol: 1, instanceId, pinVersion: OPEN_DESIGN_PIN_VERSION,
+    type: 'ready', protocol: 2, instanceId, pinVersion: OPEN_DESIGN_PIN_VERSION,
     webOrigin: `http://127.0.0.1:${webPort}`, daemonOrigin: `http://127.0.0.1:${daemonPort}`,
     ownership: { ownerPid, kind: 'process-tree' },
   }
@@ -270,12 +293,14 @@ describe('CreativeServeWeb', () => {
       }),
     )
     expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual({
-      protocol: 1,
+      protocol: 2,
       pinVersion: OPEN_DESIGN_PIN_VERSION,
       resourceRoot: path.join(resources, 'open-design'),
       dataRoot: path.join(stateRoot, 'data'),
       runtimeRoot: path.join(stateRoot, 'runtime'),
       runtimeExecutable,
+      // Legacy bundled-resources path: no resourceSafeBase (the fork's v1
+      // runtimeExecutable-derived default still applies).
     })
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready')
     await service.stop()
@@ -407,6 +432,216 @@ describe('CreativeServeWeb', () => {
     })
     expect(fetchFn).not.toHaveBeenCalled()
     expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('reports needs-download with the manifest size when the on-demand component is not installed', async () => {
+    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+    tempDirs.push(emptyResources)
+    const service = new CreativeServeWeb({
+      resourcesPath: emptyResources,
+      component: { status: () => ({ state: 'not-installed', size: 123_456_789 }) },
+    })
+
+    await expect(service.start()).resolves.toEqual({ state: 'needs-download', size: 123_456_789 })
+  })
+
+  it('C1 (Opus review of #670, 2026-10-05): uses the installed component dir directly, with its realpath as resourceSafeBase — no symlink, no write into resourcesPath', async () => {
+    // The previous fix wrote a symlink into the app's own resourcesPath at
+    // runtime (EROFS on a read-only AppImage mount, EACCES on a root-owned
+    // deb /opt install, breaks a signed mac bundle). The real fix is
+    // fork-side (iDoris-ai/open-design-agent24#7, protocol v2's explicit
+    // resourceSafeBase) — this process never writes into resourcesPath for
+    // the on-demand case at all now.
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(spawnFn).toHaveBeenCalledWith(
+      runtimeExecutable,
+      [path.join(componentDir, 'app', 'prebundled', 'agent24-headless.cjs'), '--config', path.join(stateRoot, 'agent24-headless.json')],
+      expect.objectContaining({ cwd: componentDir }),
+    )
+    const configPath = path.join(stateRoot, 'agent24-headless.json')
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toMatchObject({
+      protocol: 2,
+      resourceSafeBase: fs.realpathSync(componentDir),
+    })
+    await service.stop()
+  })
+
+  it('C1: Design still starts when resourcesPath is unset entirely (proves no dependency on a writable — or any — app resources dir for the on-demand path)', async () => {
+    // Stands in for "resourcesPath is read-only" (a real-only-readable
+    // AppImage FUSE mount, a root-owned deb /opt install, a signed mac
+    // bundle): if the code never touches resourcesPath, it doesn't matter
+    // whether that path exists, is writable, or is set at all.
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDir }) },
+        // resourcesPath intentionally omitted.
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    await service.stop()
+  })
+
+  it('M2 closed-loop finding (2026-10-05): resourceRoot and resourceSafeBase are anchored to the same base even when the installed component dir is reached through a symlink', async () => {
+    // Caught by actually running the real packaged Electron binary against
+    // the real installer (apps/desktop/scripts/ci-on-demand-smoke.mjs) on
+    // macOS, where tmp dirs route through /tmp -> /private/tmp: with
+    // resourceRoot built from the raw (symlinked) dir while
+    // resourceSafeBase used fs.realpathSync, the fork's own v2 check
+    // (plain path.relative — see iDoris-ai/open-design-agent24#7) saw the
+    // two disagree and rejected every on-demand launch. Reproduced here
+    // without touching the real filesystem's /tmp — a plain in-tree
+    // symlink hits the same code path.
+    const { resources: componentDir, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const componentDirLink = path.join(path.dirname(componentDir), 'component-via-symlink')
+    fs.symlinkSync(componentDir, componentDirLink)
+    tempDirs.push(componentDirLink)
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'installed', dir: componentDirLink }) },
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    const realBase = fs.realpathSync(componentDir)
+    const configPath = path.join(stateRoot, 'agent24-headless.json')
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toMatchObject({
+      resourceRoot: path.join(realBase, 'open-design'),
+      resourceSafeBase: realBase,
+    })
+    await service.stop()
+  })
+
+  it('does not consult the on-demand component accessor when an explicit dev checkout is set', async () => {
+    const root = checkout()
+    const statusFn = vi.fn(() => ({ state: 'not-installed' as const, size: 1 }))
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      { checkoutDir: root, port: 17456, readyTimeoutMs: 500, component: { status: statusFn } },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write('[od] listening on http://127.0.0.1:17456 (headless)\n')
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(statusFn).not.toHaveBeenCalled()
+    await service.stop()
+  })
+
+  it('H1: falls back to the packaged dev checkout (resourcesPath/open-design) when the component is unavailable', async () => {
+    // Before the fix, `component.status().state === 'unavailable'` (no
+    // baked manifest — a dev/unreleased build) short-circuited straight to
+    // `needs-download` and never even tried resolveOpenDesignCheckout, so a
+    // dev build with a real packaged `resources/open-design` checkout (no
+    // env var needed) regressed to "needs download" instead of just working.
+    const resources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-resources-'))
+    tempDirs.push(resources)
+    materializeCheckout(path.join(resources, 'open-design'))
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        resourcesPath: resources,
+        port: 17456,
+        readyTimeoutMs: 500,
+        component: { status: () => ({ state: 'unavailable', reason: 'no manifest baked' }) },
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write('[od] listening on http://127.0.0.1:17456 (headless)\n')
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    expect(spawnFn).toHaveBeenCalledWith(
+      'node',
+      expect.arrayContaining(['daemon', 'start', '--serve-web']),
+      expect.objectContaining({ cwd: path.join(resources, 'open-design') }),
+    )
+    await service.stop()
+  })
+
+  it('H1: unavailable with no dev checkout available either still fails clearly (does not become needs-download)', async () => {
+    // Same `unavailable` component status as above, but with no packaged
+    // dev checkout to fall back to — must reproduce the exact pre-existing
+    // "Open Design runtime not found" failure, not a download prompt for a
+    // component this build never baked a manifest for.
+    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+    tempDirs.push(emptyResources)
+    const service = new CreativeServeWeb({
+      resourcesPath: emptyResources,
+      component: { status: () => ({ state: 'unavailable', reason: 'no manifest baked' }) },
+    })
+
+    await expect(service.start()).resolves.toEqual({
+      state: 'failed',
+      error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design',
+    })
+  })
+
+  it('H1: needs-download (not the dev fallback) when the component truly is not-installed/downloading/failed', async () => {
+    for (const state of ['not-installed', 'downloading', 'verifying', 'failed'] as const) {
+      const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+      tempDirs.push(emptyResources)
+      const service = new CreativeServeWeb({
+        resourcesPath: emptyResources,
+        component: { status: () => ({ state, size: 42 }) },
+      })
+      await expect(service.start(), state).resolves.toEqual({ state: 'needs-download', size: 42 })
+    }
+  })
+
+  it('H1: needs-download when the installed dir exists per the accessor but the launcher file is actually missing', async () => {
+    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
+    tempDirs.push(emptyResources)
+    const deletedComponentDir = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-deleted-component-'))
+    fs.rmSync(deletedComponentDir, { recursive: true, force: true }) // the accessor still claims this dir is "installed"
+    const service = new CreativeServeWeb({
+      resourcesPath: emptyResources,
+      component: { status: () => ({ state: 'installed', dir: deletedComponentDir }) },
+    })
+    await expect(service.start()).resolves.toEqual({ state: 'needs-download', size: undefined })
   })
 
   it('fails clearly when the daemon build is missing', async () => {
