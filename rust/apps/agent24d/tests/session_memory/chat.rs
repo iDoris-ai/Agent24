@@ -251,3 +251,106 @@ async fn a_retain_failure_still_returns_200_with_content() {
         .any(|(_, body)| matches!(body, EventBody::MemoryWriteFailed(_)));
     assert!(write_failed, "memory.write_failed must be observable");
 }
+
+/// fix683 (PR #683 review): `memory_receipt` used to be derived from TWO
+/// different moments — `explicit_remember_state`, snapshotted BEFORE the
+/// model call, plus a bare success/failure bool that could not tell "really
+/// committed" apart from "rolled back because paused" (both returned
+/// `Ok(())` all the way up). If personal memory is toggled OFF while the
+/// model is still generating, the pre-call snapshot still says Active, but
+/// the write-gate's own pause re-check (inside its `BEGIN IMMEDIATE`
+/// transaction) rolls the commit back. Before this fix, the receipt said
+/// `"saved"` while zero rows were actually written — the exact "told the
+/// user it remembered something it did not" failure this PR exists to
+/// close. `Provider::pause_toggle` fires the toggle from inside `complete()`,
+/// i.e. strictly between the prelude snapshot and the post-answer commit,
+/// so this reproduces the race deterministically rather than relying on
+/// wall-clock timing.
+#[tokio::test]
+async fn pause_toggled_off_during_the_model_call_reports_paused_not_saved_with_zero_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider.clone()).await;
+    ensure_session(&state, "chat-session-race-off").await;
+    let owner = personal_owner(&kv).await;
+    // Active at prelude time: `chat_memory_prelude` must see Active and must
+    // NOT inject the paused notice.
+    assert!(kv.memory_enabled(&owner).await.unwrap());
+    *provider.pause_toggle.lock().unwrap() = Some((kv.clone(), owner.clone(), false));
+
+    let (status, body) =
+        post_chat_with(&state, Some("chat-session-race-off"), "记住我对花生过敏").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["message"]["content"].as_str().unwrap().is_empty());
+    // On the pre-fix head this asserts `"saved"` — the write-gate's pause
+    // rollback and its real commit both returned `Ok(())`, and the receipt
+    // was built from the pre-call `ExplicitRememberState::Active` snapshot,
+    // not from what actually happened to the transaction.
+    assert_eq!(
+        body["memory_receipt"],
+        json!("paused_not_saved"),
+        "the receipt must reflect the LIVE commit-time pause, not the pre-call snapshot"
+    );
+    assert!(
+        kv.assertions()
+            .beliefs_as_of(&BeliefQuery::owner(&owner))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a receipt of paused_not_saved must mean zero rows were actually written"
+    );
+}
+
+/// fix683 (PR #683 review), the mirror-image race: personal memory is
+/// PAUSED at prelude time (so the model is told about it and
+/// `ExplicitRememberState::Paused` is snapshotted), but gets RE-ENABLED
+/// while the model is still generating. The write-gate's pause re-check
+/// then finds memory active and actually commits the assertion — but
+/// before this fix the receipt was built from the stale `Paused` snapshot
+/// and reported `"paused_not_saved"` even though the row was really
+/// written. From a privacy standpoint this direction is worse: the user is
+/// told nothing was remembered when something was.
+#[tokio::test]
+async fn pause_toggled_on_during_the_model_call_reports_saved_with_a_real_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider.clone()).await;
+    ensure_session(&state, "chat-session-race-on").await;
+    let owner = personal_owner(&kv).await;
+    kv.set_memory_enabled(&owner, false).await.unwrap();
+    *provider.pause_toggle.lock().unwrap() = Some((kv.clone(), owner.clone(), true));
+
+    let (status, body) =
+        post_chat_with(&state, Some("chat-session-race-on"), "记住我对花生过敏").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["message"]["content"].as_str().unwrap().is_empty());
+    // chat_memory_prelude saw Paused and told the model so, same as the
+    // simple paused test above.
+    assert!(
+        last_messages_mention(&provider, "记忆已暂停"),
+        "the prelude snapshot was Paused, so the model must still have been told"
+    );
+    // On the pre-fix head this asserts `"paused_not_saved"` — the receipt
+    // was built from that stale prelude snapshot instead of the write-
+    // gate's live, commit-time pause re-check.
+    assert_eq!(
+        body["memory_receipt"],
+        json!("saved"),
+        "the receipt must reflect the LIVE commit-time state, not the stale paused snapshot"
+    );
+    let rows = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a receipt of saved must mean the assertion was actually committed"
+    );
+    assert_eq!(rows[0].object, json!("我对花生过敏"));
+}

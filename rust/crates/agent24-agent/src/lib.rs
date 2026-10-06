@@ -75,6 +75,29 @@ pub enum ExplicitRememberState {
     Active,
 }
 
+/// fix683 (PR #683 review): the LIVE result of [`RunManager::remember_exchange`]
+/// / [`RunManager::chat_remember_turn`] — a tri-state (four-state, counting
+/// failure) replacing the old bare `bool`, which could only say
+/// "write_gate didn't error", not "paused" vs "committed". `/api/v1/chat`'s
+/// `memory_receipt` must be built from THIS, never from the pre-model-call
+/// [`ExplicitRememberState`] snapshot — personal memory can be paused or
+/// un-paused while the model is still generating, after that snapshot was
+/// taken but before this turn's write actually runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryWriteOutcome {
+    /// The turn's explicit-remember assertion is durably persisted.
+    Saved,
+    /// Personal memory was paused at the moment of commit; nothing was
+    /// persisted for this turn's explicit remember.
+    SkippedPaused,
+    /// The write-gate (or the session append it depends on) reported an
+    /// error.
+    Failed,
+    /// There was nothing to write: no configured memory, no session, the
+    /// prompt was not an explicit remember, or the origin was untrusted.
+    NotApplicable,
+}
+
 /// H8: the reserved tool name the model calls to submit a plan for approval.
 /// Handled by the loop itself (not the registry), so it is never dispatchable
 /// as an ordinary tool.
@@ -610,22 +633,25 @@ impl RunManager {
 
     /// Commit the original exchange before best-effort compaction. Memory
     /// failures are observable but never fail an already-answered run.
-    /// Returns `true` when the write succeeded (or there was nothing to
-    /// write — no configured memory, or no session), `false` when
-    /// `memory.remember` itself reported an error. M1-T14: the chat surface
-    /// uses this to tell a `saved` receipt apart from a `failed` one.
+    /// fix683: returns the LIVE [`MemoryWriteOutcome`] — Saved/SkippedPaused/
+    /// Failed/NotApplicable — instead of the old bare `bool`, which collapsed
+    /// "committed" and "paused rollback" into the same `true`. M1-T14: the
+    /// chat surface uses this (and ONLY this, never the pre-call pause
+    /// snapshot) to build a deterministic `memory_receipt`.
     async fn remember_exchange(
         &self,
         session_id: Option<&str>,
         prompt: &str,
         answer: &str,
         prompt_origin: Origin,
-    ) -> bool {
+    ) -> MemoryWriteOutcome {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
-            return true;
+            return MemoryWriteOutcome::NotApplicable;
         };
         match memory.remember(sid, prompt, answer, prompt_origin).await {
-            Ok(()) => true,
+            Ok(retain::RetainOutcome::Saved) => MemoryWriteOutcome::Saved,
+            Ok(retain::RetainOutcome::SkippedPaused) => MemoryWriteOutcome::SkippedPaused,
+            Ok(retain::RetainOutcome::NotApplicable) => MemoryWriteOutcome::NotApplicable,
             Err(err) => {
                 let reason = err.to_string();
                 tracing::error!(session_id = sid, %reason, "session memory write failed");
@@ -635,7 +661,7 @@ impl RunManager {
                         reason,
                     },
                 ));
-                false
+                MemoryWriteOutcome::Failed
             }
         }
     }
@@ -715,8 +741,13 @@ impl RunManager {
     /// from model/scheduler-originated text. Retain/log failures emit
     /// `memory.write_failed` and otherwise never propagate — the chat
     /// response the caller already has must still reach its client. Returns
-    /// whether the write succeeded — see [`RunManager::remember_exchange`].
-    pub async fn chat_remember_turn(&self, session_id: &str, prompt: &str, answer: &str) -> bool {
+    /// the LIVE [`MemoryWriteOutcome`] — see [`RunManager::remember_exchange`].
+    pub async fn chat_remember_turn(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        answer: &str,
+    ) -> MemoryWriteOutcome {
         self.remember_exchange(
             Some(session_id),
             prompt,

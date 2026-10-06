@@ -26,6 +26,14 @@ struct Provider {
     summaries: Mutex<usize>,
     fail_summaries: bool,
     answer: Option<String>,
+    /// fix683 (PR #683 review, chat.rs race tests): fires exactly once,
+    /// from inside `complete()` — i.e. WHILE the model call that
+    /// `chat_memory_prelude`'s pause snapshot already ran ahead of is still
+    /// in flight — to flip the personal-memory pause switch mid-turn. This
+    /// is how the two race tests put the prelude snapshot and the
+    /// commit-time pause state on opposite sides of the toggle without any
+    /// real wall-clock race.
+    pause_toggle: Mutex<Option<(KvStore, String, bool)>>,
 }
 
 #[async_trait::async_trait]
@@ -39,6 +47,15 @@ impl ModelProvider for Provider {
         req: &CompletionRequest,
         _: &CancellationToken,
     ) -> Result<CompletionResponse, ModelError> {
+        // fix683: toggle pause HERE, between `chat_memory_prelude`'s snapshot
+        // (already taken before this call started) and `chat_remember_turn`'s
+        // commit (which runs after this call returns) — exactly the window
+        // PR #683 review flagged as reachable in ordinary use once ChatPage
+        // stays mounted across navigation.
+        let toggle = self.pause_toggle.lock().unwrap().take();
+        if let Some((kv, owner, enabled)) = toggle {
+            kv.set_memory_enabled(&owner, enabled).await.unwrap();
+        }
         let summary = req
             .messages
             .first()

@@ -610,24 +610,33 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
             // memory. A log/retain failure is observed (`memory.write_failed`,
             // emitted by the reused code path) but never drops this already-
             // computed response.
-            // M1-T14: `explicit_remember_state` (computed before the model
-            // call) tells "not an explicit remember" apart from "paused" —
-            // the write's own success/failure (from THIS call) tells
-            // "saved" apart from "failed". A client reads `memory_receipt`
-            // instead of the model's prose for this.
+            // fix683 (PR #683 review): `explicit_remember_state` is a
+            // snapshot taken BEFORE the model call — personal memory can be
+            // paused or un-paused by the time the write below actually
+            // commits (ChatPage now stays mounted, so the memory page is
+            // reachable mid-generation). It must therefore decide ONLY
+            // whether this field is present at all (same deterministic
+            // `explicit_remember(prompt)` match the write path uses on the
+            // same prompt text, so its Some/None agrees with the live
+            // outcome's NotApplicable/not). The saved/paused_not_saved/failed
+            // verdict comes exclusively from `chat_remember_turn`'s LIVE
+            // result, computed at commit time inside the write transaction.
             let memory_receipt = if let (Some(sid), Some(prompt)) =
                 (chat.session_id.as_deref(), latest_user_message.as_deref())
             {
-                let write_ok = state.runs.chat_remember_turn(sid, prompt, &text).await;
-                explicit_remember_state.map(|remember_state| match remember_state {
-                    agent24_agent::ExplicitRememberState::Paused => MemoryReceipt::PausedNotSaved,
-                    agent24_agent::ExplicitRememberState::Active => {
-                        if write_ok {
-                            MemoryReceipt::Saved
-                        } else {
-                            MemoryReceipt::Failed
-                        }
+                let outcome = state.runs.chat_remember_turn(sid, prompt, &text).await;
+                explicit_remember_state.and(match outcome {
+                    agent24_agent::MemoryWriteOutcome::Saved => Some(MemoryReceipt::Saved),
+                    agent24_agent::MemoryWriteOutcome::SkippedPaused => {
+                        Some(MemoryReceipt::PausedNotSaved)
                     }
+                    agent24_agent::MemoryWriteOutcome::Failed => Some(MemoryReceipt::Failed),
+                    // Unreachable in practice when `explicit_remember_state`
+                    // is `Some`: both snapshots run the same pure
+                    // `explicit_remember(prompt)` match on the same prompt.
+                    // Falls back to "no receipt" rather than fabricating
+                    // saved/paused — never lies about a non-write.
+                    agent24_agent::MemoryWriteOutcome::NotApplicable => None,
                 })
             } else {
                 None
