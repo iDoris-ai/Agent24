@@ -1,0 +1,30 @@
+.comm-page { display: flex; flex-direction: column; gap: 16px; }
+.comm-heading, .comm-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.comm-heading h1 { margin: 0 0 4px; font-size: 22px; }
+.comm-heading p, .comm-muted { color: var(--muted); font-size: 13px; }
+.comm-heading p { margin: 0; }
+.comm-card { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 16px; }
+.comm-card h2 { margin: 0 0 12px; font-size: 16px; }
+.comm-card h3 { margin: 0 0 8px; font-size: 14px; }
+.comm-card p { margin: 6px 0; }
+.comm-table-wrap { overflow-x: auto; }
+.comm-card table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.comm-card th, .comm-card td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); }
+.comm-card th { color: var(--muted); font-weight: 500; }
+.comm-key { max-width: 420px; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.comm-status-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.comm-status-item { min-width: 0; border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.comm-status-item .comm-muted { overflow-wrap: anywhere; }
+.comm-state { display: inline-block; border-radius: 999px; padding: 3px 9px; background: var(--surface-2, rgba(128,128,128,.16)); }
+.comm-state-running { color: var(--success, #42b883); }
+.comm-actions { display: flex; gap: 8px; margin-top: 14px; }
+.comm-unlock { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.comm-unlock label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.comm-unlock label:first-child { flex: 1 1 260px; }
+.comm-unlock input[type="password"] { min-width: 220px; padding: 8px; }
+.comm-unlock .comm-checkbox { flex-direction: row; align-items: center; }
+.comm-alert, .comm-notice { border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.comm-alert { color: var(--danger, #d94f4f); background: rgba(217,79,79,.1); }
+.comm-notice { color: var(--success, #42b883); background: rgba(66,184,131,.1); }
+.comm-fresh-indicator { color: var(--muted); font-size: 12px; }
+@media (max-width: 760px) { .comm-status-grid { grid-template-columns: 1fr; } }
