@@ -663,6 +663,7 @@ async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> 
             content: message,
         }],
         model,
+        session_id: None,
     };
     let result = bearer(&ep, client().post(format!("{}/api/v1/chat", ep.base)))
         .timeout(Duration::from_secs(180))

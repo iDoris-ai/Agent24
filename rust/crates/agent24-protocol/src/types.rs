@@ -283,6 +283,14 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub model: Option<String>,
+    /// M1-T12: opt-in session id for D1 personal memory on the stateless chat
+    /// surface. `None` (the default) keeps `/api/v1/chat` byte-for-byte
+    /// unchanged — no recall, no write. When set, the daemon reuses the SAME
+    /// `SessionMemory` recall/retain machinery the agent loop (`/api/v1/runs`)
+    /// uses, keyed by this id. The owner is always the daemon-injected
+    /// personal-memory owner — never taken from the request.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

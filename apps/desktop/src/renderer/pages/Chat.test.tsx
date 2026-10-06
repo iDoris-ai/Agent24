@@ -43,6 +43,43 @@ describe('ChatPage', () => {
     )
   })
 
+  // M1-T12: every `/api/v1/chat` call carries this conversation's session_id
+  // (a daemon-side D1 memory key), and it stays the SAME across multiple
+  // sends within one mounted conversation but differs across conversations
+  // (a fresh mount of the page).
+  it('sends a stable session_id with every call, and a fresh one per conversation', async () => {
+    mockBackendProxy.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { message: { content: 'ack' } },
+    })
+
+    const { unmount } = render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'first' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(1))
+
+    fireEvent.change(textarea, { target: { value: 'second' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(2))
+
+    const firstCallBody = mockBackendProxy.mock.calls[0][0].body
+    const secondCallBody = mockBackendProxy.mock.calls[1][0].body
+    expect(firstCallBody.session_id).toBeTruthy()
+    expect(secondCallBody.session_id).toBe(firstCallBody.session_id)
+
+    unmount()
+    mockBackendProxy.mockClear()
+    render(<ChatPage />)
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'third' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(1))
+    const thirdCallBody = mockBackendProxy.mock.calls[0][0].body
+    expect(thirdCallBody.session_id).toBeTruthy()
+    expect(thirdCallBody.session_id).not.toBe(firstCallBody.session_id)
+  })
+
   // Review M3: `/api/v1/chat` now reports the server-measured model_id/tier
   // for the call that actually served it — the suffix shows THAT, never a
   // guessed/default name.

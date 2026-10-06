@@ -18,10 +18,24 @@ const SUGGESTIONS = [
   '翻译成英文',
 ]
 
+// M1-T12: one id per conversation, sent as `session_id` on every
+// `/api/v1/chat` call so the daemon can key D1 personal-memory recall/retain
+// to this thread. Mirrors `genCommandId` (voice/api.ts): a counter-based,
+// monotonic-enough generator rather than `crypto.randomUUID`, so it never
+// depends on that being available in every renderer/test environment.
+let chatSessionIdCounter = 0
+export function genChatSessionId(): string {
+  chatSessionIdCounter += 1
+  return `chat_${Date.now().toString(36)}_${chatSessionIdCounter}_${Math.random().toString(36).slice(2, 8)}`
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  // New conversation (a fresh mount of this page) gets a new id — never
+  // regenerated for the lifetime of this component instance.
+  const [sessionId] = useState(() => genChatSessionId())
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -50,6 +64,7 @@ export default function ChatPage() {
         path: '/api/v1/chat',
         body: {
           messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
+          session_id: sessionId,
         },
       })
       if (!res.ok) {

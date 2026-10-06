@@ -313,6 +313,9 @@ async fn restart_and_replay(fail_summaries: bool) {
 #[path = "retain.rs"]
 mod retain;
 
+#[path = "chat.rs"]
+mod chat;
+
 #[tokio::test]
 async fn successful_compaction_replays_every_original_message_after_daemon_restart() {
     restart_and_replay(false).await;
