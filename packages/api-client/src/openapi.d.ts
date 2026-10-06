@@ -756,6 +756,8 @@ export interface components {
             messages: components["schemas"]["ChatMessage"][];
             /** @description Model id override; null/omitted = daemon default */
             model?: string | null;
+            /** @description M1-T12: opt-in session id for D1 personal memory. Omitted/null keeps this endpoint stateless (no recall, no write) — the exact prior behaviour. When set, the daemon reuses the same SessionMemory recall/retain machinery the agent loop (/runs) uses, keyed by this id; the memory owner is always the daemon's own configured personal-memory owner, never taken from the request. */
+            session_id?: string | null;
         };
         ChatResponse: {
             message: components["schemas"]["ChatMessage"];

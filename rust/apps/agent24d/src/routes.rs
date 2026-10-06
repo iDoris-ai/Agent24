@@ -482,32 +482,63 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         }
     };
 
+    // M1-T12: the latest user turn is what SessionMemory recall/retain both
+    // key on (same as a run's `run.input.prompt`) — found before the run_id
+    // exists so a session-less request pays none of this.
+    let latest_user_message = chat
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone());
+    // Run_id generated up-front (not after the memory prelude below) so the
+    // SAME id tags `memory.recalled`/`memory.write_skipped` as tags
+    // `run.started` — a transient run, session_id null unless the caller
+    // opted into memory (SPEC-002 §2).
+    let run_id = format!("run_{}", agent24_core::util::ulid());
+    let base_messages: Vec<agent24_models::Msg> = chat
+        .messages
+        .iter()
+        .map(|m| agent24_models::Msg {
+            role: m.role.clone(),
+            content: Some(m.content.clone()),
+            tool_calls: vec![],
+            tool_call_id: None,
+        })
+        .collect();
+    // Without `session_id` the message list is untouched — byte-for-byte
+    // the same request this endpoint always sent. With it, reuse the SAME
+    // SessionMemory recall/pause-notice machinery the agent loop uses
+    // (`RunManager::chat_memory_prelude`, not duplicated here) and the SAME
+    // `normalize_for_provider` ordering rules (system first, merge adjacent
+    // `user` turns) the run loop's first call applies.
+    let messages = match (chat.session_id.as_deref(), latest_user_message.as_deref()) {
+        (Some(sid), Some(prompt)) => {
+            let prelude = state
+                .runs
+                .chat_memory_prelude(&run_id, Some(sid), prompt)
+                .await;
+            let combined: Vec<agent24_models::Msg> =
+                prelude.into_iter().chain(base_messages.clone()).collect();
+            agent24_agent::normalize_for_provider(&combined)
+        }
+        _ => base_messages,
+    };
     let request = CompletionRequest {
         // /chat is the plain conversational surface — no tools offered here;
         // tool-using work goes through /runs (the agent loop)
-        messages: chat
-            .messages
-            .iter()
-            .map(|m| agent24_models::Msg {
-                role: m.role.clone(),
-                content: Some(m.content.clone()),
-                tool_calls: vec![],
-                tool_call_id: None,
-            })
-            .collect(),
+        messages,
         model: chat.model,
         tools: vec![],
         response_format: None,
         max_tokens: None,
         disable_thinking: false,
     };
-    // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
-    let run_id = format!("run_{}", agent24_core::util::ulid());
     state
         .events
         .broadcast(EventBody::RunStarted(RunStartedPayload {
             run_id: run_id.clone(),
-            session_id: None,
+            session_id: chat.session_id.clone(),
             schedule_id: None,
         }));
 
@@ -568,6 +599,17 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     run_id: run_id.clone(),
                     text: text.clone(),
                 }));
+            // M1-T12: commit this turn to the SAME SessionLog + retain path
+            // the agent loop uses (`RunManager::chat_remember_turn`, reusing
+            // `remember_exchange` as-is) — only when the caller opted into
+            // memory. A log/retain failure is observed (`memory.write_failed`,
+            // emitted by the reused code path) but never drops this already-
+            // computed response.
+            if let (Some(sid), Some(prompt)) =
+                (chat.session_id.as_deref(), latest_user_message.as_deref())
+            {
+                state.runs.chat_remember_turn(sid, prompt, &text).await;
+            }
             state
                 .events
                 .broadcast(EventBody::RunCompleted(RunCompletedPayload {

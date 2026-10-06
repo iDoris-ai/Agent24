@@ -295,7 +295,7 @@ fn thread_to_messages(thread: &[RunMessage]) -> Vec<Msg> {
 /// 2. the remaining messages keep their relative order; adjacent `user`
 ///    turns (now possibly newly adjacent, since removing an in-between
 ///    `system` message can create a fresh adjacency) are merged with `\n\n`.
-fn normalize_for_provider(messages: &[Msg]) -> Vec<Msg> {
+pub fn normalize_for_provider(messages: &[Msg]) -> Vec<Msg> {
     let mut system_parts = Vec::new();
     let mut rest = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -613,6 +613,84 @@ impl RunManager {
                 },
             ));
         }
+    }
+
+    /// M1-T12: the SAME recall + pause-notice decision `drive_new` makes at
+    /// run start (above), reused for the stateless `/api/v1/chat` surface
+    /// instead of duplicated there. Returns the messages to prepend — a
+    /// recall data block (if anything was found) followed by the paused
+    /// write notice (if this prompt is an explicit remember and memory is
+    /// paused) — in the SAME order `drive_new`'s snapshot uses, so a caller
+    /// that runs this through [`normalize_for_provider`] gets byte-identical
+    /// ordering rules (system merged first, adjacent `user` turns merged).
+    /// `run_id` is only used to tag the `memory.recalled`/`memory.write_skipped`
+    /// events — this never touches the run/store tables `drive_new` does.
+    /// Empty when there is no configured memory (`self.memory` is `None`).
+    pub async fn chat_memory_prelude(
+        &self,
+        run_id: &str,
+        session_id: Option<&str>,
+        prompt: &str,
+    ) -> Vec<Msg> {
+        let Some(memory) = self.memory.as_ref() else {
+            return Vec::new();
+        };
+        let mut prelude = Vec::new();
+        match memory.recall(prompt).await {
+            Ok(Some((msg, ids))) => {
+                self.sink
+                    .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
+                        run_id: run_id.to_owned(),
+                        ids,
+                    }));
+                prelude.push(msg);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(run_id = %run_id, error = %err, "chat memory recall failed");
+            }
+        }
+        if retain::explicit_remember(prompt).is_some() {
+            let paused = match memory.kv().memory_enabled(memory.owner()).await {
+                Ok(enabled) => !enabled,
+                Err(err) => {
+                    tracing::warn!(run_id = %run_id, error = %err, "chat memory pause check failed; assuming enabled");
+                    false
+                }
+            };
+            if paused {
+                self.sink
+                    .emit(EventBody::MemoryWriteSkipped(MemoryWriteSkippedPayload {
+                        run_id: run_id.to_owned(),
+                        session_id: session_id.map(str::to_owned),
+                        reason: "paused".to_owned(),
+                    }));
+                prelude.push(Msg::system(retain::PAUSED_WRITE_NOTICE));
+            }
+        }
+        prelude
+    }
+
+    /// M1-T12: the SAME post-answer commit `drive_new`'s run loop performs
+    /// (`remember_exchange`, used as-is — not duplicated), exposed for the
+    /// `/api/v1/chat` surface. `source: "chat"` distinguishes this turn's
+    /// provenance from the agent loop's `"agent_loop"` in the audit trail;
+    /// trust is `UserSaid` for the same reason `drive_new`'s non-scheduled
+    /// branch uses it — this prompt came directly from the chat caller, not
+    /// from model/scheduler-originated text. Retain/log failures emit
+    /// `memory.write_failed` and otherwise never propagate — the chat
+    /// response the caller already has must still reach its client.
+    pub async fn chat_remember_turn(&self, session_id: &str, prompt: &str, answer: &str) {
+        self.remember_exchange(
+            Some(session_id),
+            prompt,
+            answer,
+            Origin {
+                source: "chat".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+        .await;
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
