@@ -15,6 +15,7 @@ This document deliberately focuses on David's scope. Related systems are describ
 
 **How to read this revision.** The 2026-10-05 review concluded that the framework is a sound scope, ownership and collaboration baseline, but not yet an executable, acceptable development plan. This revision keeps the framework and adds:
 
+- the product form: a first-party built-in Agent24 feature with kernel tools, a native UI and replaceable engines, not loaded through a Workspace (§2.1–§2.3);
 - three parallel workstreams instead of a serial Workspace → KB → Documenting chain (§12, §14);
 - a DocumentService contract skeleton and Agent24 default registration (§10);
 - a knowledge-context ON/OFF policy (§9);
@@ -41,6 +42,50 @@ Receive → Read → Understand → Create/Edit → Review → Deliver → Versi
 
 The product is **not** defined by RAG, a vector database, or six AI buttons. Those are supporting capabilities inside a larger document workflow.
 
+### 2.1 Product form
+
+**Adopted direction (2026-10-06):**
+
+> Documenting is a first-party, default document feature of Agent24. It consists of kernel document tools, a native document UI, and replaceable processing engines. The first release is developed in the Agent24 repository and merged to main. It does not depend on the generic Workspace. Whether to adopt a standalone editing application is decided separately, based on reuse benefit.
+
+What this means in practice:
+
+- **Built-in, same repo.** Development happens on an Agent24 feature branch and merges into `main`. Documenting is not a separate app that users install, log into or manage.
+- **Three deliverable parts:**
+  1. **Document capability** — read, parse, create, edit, review, save revisions, export, with tests. Implemented as Rust kernel document tools registered with Agent24 (§10).
+  2. **Document UI** — native Electron/React/TypeScript pages: file list, preview/edit, change diff, revision and export entry points.
+  3. **Engine adapters** — reuse existing editing, OCR and conversion engines behind adapters. Documenting does not build an Office suite from scratch.
+- **Process model is not product shape.** OCR, conversion and similar jobs may run in separate background processes. That is a runtime choice only. Likewise, “DocumentService” (§10) is an interface boundary, not a requirement for separate deployment.
+- **One library.** The document page connects to the unified material/knowledge library (§5, §7) instead of creating another store.
+
+Still open: the editor and content model (§17 #2, #3, #6). The direction above fixes the form, not those choices.
+
+### 2.2 Two entry paths, one capability
+
+Both paths call the **same** registered document operations. Neither is a privileged shortcut.
+
+**A. Menu → native document page** (recommended interaction, not yet implemented):
+
+1. The user clicks **Documents** in the left navigation. Agent24's own document page opens on the right, with recent files, import and new.
+2. The user selects a file, and a preview or editor opens. Scanned material shows the original plus recognition status. Formats that cannot be edited say so explicitly.
+3. The user edits directly, or selects a passage and asks e.g. “rewrite this”. Agent24 calls the document operations and produces a change proposal.
+4. The user reviews the diff and accepts or rejects it. The result is saved as a new revision, and the original revision is kept.
+5. The user clicks **Export**. Preflight runs, then a PDF or a supported editable format is produced. Sending it to someone is a separate action that needs confirmation (§11.2).
+
+**B. Conversation → agent tools** (no menu click):
+
+- In chat, the user says e.g. “read this file and extract the deadlines”. The agent calls the document tools directly.
+- When viewing or review is needed, the agent opens the corresponding file in the document page.
+
+### 2.3 Terminology: “Workspace”
+
+Agent24 uses “workspace” for two different things. In this document:
+
+- **Product Workspace** — a complete external application hosted inside Agent24 (managed sidecar + isolated view), such as Open Design as the Creative Workspace or WeKnora as the Knowledge Workspace. See `docs/open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md`. **Documenting is not a product Workspace.** Having a UI does not make something a Workspace.
+- **Kernel workspace (`a24.workspace.v1`)** — a registered, pinned scratch directory that a run is bound to (`ADR-002-WORKSPACE-CONTRACT.md`). Documenting may use it for temporary drafts and export files like any other kernel consumer. That is normal kernel usage, not a Workspace dependency.
+
+A product Workspace becomes relevant to Documenting only if the team later adopts a full external document-editing application (§17 #11). Even then, the base document tools must remain callable by the agent without that application being open.
+
 ## 3. Mission
 
 Documenting should enable Agent24 to reliably:
@@ -62,7 +107,7 @@ A successful LLM response is **not** by itself a successful document operation. 
 
 ### 4.1 David Xu primary responsibility
 
-David's primary scope is the **Documenting business capability**, including:
+David's primary scope is the **Documenting business capability**, delivered as the three parts in §2.1 (kernel document tools, native document UI, engine adapters), including:
 
 - document business semantics;
 - document identity and revision semantics;
@@ -136,7 +181,7 @@ Documenting must not create a second Agent loop, authentication system, approval
 
 ### Workspace
 
-Workspace composes multi-step application workflows. It may consume Documenting, but Workspace is **not a prerequisite for Documenting to exist**, and Documenting delivery is not gated on the generic Workspace host (§12).
+A product Workspace (§2.3) hosts an external application and may compose multi-step application workflows. It may consume Documenting, but Workspace is **not a prerequisite for Documenting to exist**. Documenting is not loaded through a Workspace, and its delivery is not gated on the generic Workspace host (§12). Generic Workspace work is separate platform work.
 
 ### Spreadsheet / Creative / Connectors
 
@@ -155,11 +200,14 @@ A useful responsibility model is:
 > **WeKnora:** What knowledge exists in the documents?
 
 ```text
+   Chat / Agent            Documents page (native UI)
+          \                      /
+           v                    v
                     Agent24
        identity / permission / agent / approval
                        |
                        v
-                 Documenting
+          Documenting (kernel tools)
      read / create / edit / review / version
           render / export / package
                        |
@@ -301,8 +349,8 @@ Line W  Workspace integration (scoped, time-boxed)    owner: TBD; David's share 
 Line K  KB service dependency (per operation)         owner: KB/Knowledge team
 ```
 
-- **Line D** does not wait for Line W. Knowledge-free operations (§9.1) do not wait for Line K.
-- **Line W** covers the generic Workspace host, the OD compatibility adapter and the WeKnora Workspace entry. Any part assigned to David is listed explicitly with an exit condition (a handover owner and date). It is not added to §4.1.
+- **Line D** is David's mainline: getting ordinary users' document tasks working end to end. It does not wait for Line W. Knowledge-free operations (§9.1) do not wait for Line K.
+- **Line W** is independent platform work, not a prerequisite for Line D. It covers the generic Workspace host, the OD compatibility adapter and the WeKnora Workspace entry. Documenting is not delivered through it (§2.3). Any part temporarily assigned to David is listed explicitly with an exit condition (a handover owner and date). It is not added to §4.1.
 - **Line K** is consumed through an agreed service contract (ingest/status, search, source, citation, ACL, revision mapping). Documenting depends on it per operation (§14). It does not own or operate it.
 
 ## 13. WeKnora Fork Principle
@@ -339,7 +387,9 @@ This is a dependency-oriented framework, **not yet a sprint schedule**. Each pha
 
 **D1 — Foundation**
 
+- feature branch in Agent24 with Rust kernel document tools and a TS document page skeleton (§2.1);
 - DocumentService contract ADR (§10) and Agent24 default registration;
+- **Documents** navigation entry and the conversation entry path, both calling the same operations (§2.2);
 - stable document identity and revision semantics;
 - source/artifact model with input binding (§7.1);
 - read/render boundary;
@@ -350,7 +400,7 @@ Needs: Agent24 registration, trusted caller context, and decisions §17 #1–#2.
 
 **D2 — Read & understand**
 
-- import/read path, preview/navigation;
+- import/read path; document page with recent files, import and new; preview/navigation, including original + recognition status for scans;
 - selected summarize/extract/translate/compare operations;
 - citation UX, exact source jump, visible parse/index/error states.
 
@@ -375,7 +425,7 @@ Needs: Agent24/connectors for execution and receipts.
 
 ### Line W — Workspace integration (formerly Phase A + Workspace part of Phase B)
 
-Reproducible OD baseline and golden paths → generic Workspace contract → OD compatibility adapter with regression evidence and a rollback path → WeKnora Workspace entry. Start with a trusted adapter calling WeKnora REST, rather than assuming Agent24 can consume WeKnora HTTP MCP directly.
+Independent platform work; not on Documenting's critical path. Reproducible OD baseline and golden paths → generic Workspace contract → OD compatibility adapter with regression evidence and a rollback path → WeKnora Workspace entry. Start with a trusted adapter calling WeKnora REST, rather than assuming Agent24 can consume WeKnora HTTP MCP directly.
 
 ### Line K — KB service (formerly the service part of Phase B)
 
@@ -400,7 +450,8 @@ The first end-to-end acceptance is two vertical slices, not the whole capability
 |---|---|---|---|
 | Agent24 Core | capability registration, trusted caller context, permissions, approvals, run/cancel/model/tool access | D1 | Agent24 |
 | WeKnora / KB | ingest/status, search, source, citation, ACL, revision mapping | D2 (knowledge ops only) | KB/Knowledge |
-| Document engine | rendering, structured edit, layout, revision-safe mutation, export | D1 (render), D3–D4 | TBD / Documenting integration |
+| Document engines (edit / OCR / conversion) | rendering, structured edit, layout, revision-safe mutation, OCR, export — reused existing engines behind adapters (§2.1) | D1 (render), D3–D4 | engine choice TBD; adapters owned by Documenting |
+| Agent24 desktop shell | navigation entry, native page hosting, open-file-from-chat | D1 | Agent24 desktop |
 | OpenDesign/OpenCreator | context/artifact/run/cancel handoff | Line W | Workspace/Creative |
 | Connectors | actual email/Drive/filesystem/business-system action + receipt | D4 | connector/Agent24 |
 | Media | transcription for meeting material (S07) | later | Media |
@@ -420,8 +471,9 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 | 6 | **Document engine/editor choice** — follows representative tasks, not the other way round. | D3 |
 | 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). | D1 fixtures |
 | 8 | **Knowledge default** — default ON or OFF, and who may change it (§9.2). | D1 |
-| 9 | **Line W assignment** — which parts are David's, the handover owner and the exit date (§12). | Line W start |
+| 9 | **Line W assignment** — which parts, if any, are temporarily David's, the handover owner and the exit date (§12). | Line W start (not Line D) |
 | 10 | **Roadmap conflicts** — how conflicts between this plan and existing Agent24/T006 roadmaps are resolved and recorded. | planning |
+| 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). | D3 engine choice |
 
 ## 18. Release Hard Gates & Test Samples
 
@@ -494,7 +546,9 @@ This working baseline is derived from the current project direction and the foll
 - T007 Assistant and T008 Media roadmap (for boundaries);
 - Agent24 current architecture/ADR/code observations;
 - WeKnora upstream capability documentation;
-- the 2026-10-05 applicability review of this document.
+- the 2026-10-05 applicability review of this document;
+- the 2026-10-06 product-form clarification with the design repository (§2.1–§2.3);
+- Agent24 `docs/open-design-workspace/design/ADR-001` and `ADR-002` (Workspace terminology).
 
 Pinned references:
 
@@ -511,7 +565,7 @@ Where these sources contain research proposals rather than approved engineering 
 Before implementation, and before converting this framework into a detailed GitHub Project plan, confirm:
 
 1. decisions §17 #1, #2, #7, #8, which block D1;
-2. Line W assignment, handover owner and exit (§17 #9);
+2. generic Workspace is tracked as independent platform work with its own owner, and any temporary David assignment has an exit (§17 #9);
 3. the KB/WeKnora test endpoint and the Line K service contract owner;
 4. the sanitized sample set and gold labels for V1/V2 (§18.2);
 5. review of the DocumentService contract skeleton (§10) as an ADR draft.
