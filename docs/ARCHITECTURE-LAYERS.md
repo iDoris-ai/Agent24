@@ -181,6 +181,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 | 方面 | 现行产品路径 ✅ | 目标形态（ADR-004/005）🟡 |
 |---|---|---|
 | 进程托管 | Electron main 的 `CreativeServeWeb` 直接拉起：checkout 模式 `node … od.mjs`，打包模式拉起 headless launcher | 通用 `SidecarManager`（TS）+ `agent24-sidecar-host`（Rust，Windows Job Object / POSIX 进程组归属与回收） |
+| 分发（2026-10-05 裁决） | **不再打进安装包**（曾把 AppImage 从 146MB 顶到 934MB、deb 从 101MB 顶到 622MB）；电子打包只带一个小 manifest，首次点开 Design 页时由 `open-design-component.ts` 按需下载、校验 sha256、解压、再启动 | 同左 |
 | 界面 | Creative 页是 `WebContentsView`，使用**全局持久**的 session 分区 `persist:agent24-creative`，带同源导航拦截和请求代际栅栏 | 按 app 实例 + workspace 派生的**非持久**分区，detach / 切换时清除 cookie、localStorage、cache、service worker（ADR-004） |
 | 运行时协议 | Open Design 每个会话拉起 `agent24 acp`，把 ACP 会话/提示映射成 REST/WS run，执行仍在 agent24d | 同左 |
 | 凭据 | `agent24 acp` 使用 daemon.json 里的 legacy 全权 bearer | daemon 以 capability 模式运行，Open Design / ACP 只拿 `CreativeRuntime` 受限令牌；需先实现路由级资源授权、durable 归属、事件过滤、broker / handoff |
@@ -293,7 +294,7 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 - 📐 Web3（AAStar）身份与结算：Agent24 中没有接线。
 - 📐 OpenAPI 由 Rust 生成（B4）。
 - workspace 只有 scratch 一种受信构造；写回、其它类型、并发策略未定。
-- M-D 高层（retriever / consolidator 等）尚未被 agent loop 消费；M1 暂停中。
+- M-D 高层（retriever / consolidator 等）尚未被 main 上的 agent loop 消费；M1 已在 `ab/m1-memory` 恢复为当前主干（2026-10-03），完成后合回 main。
 - 📐 领域 OS 签名（ME-6）。
 - `docs/laws/` 目前只有上下文、记忆、审批三部法条。
 - Review 遗留：[#661](https://github.com/iDoris-ai/Agent24/issues/661)（Creative view）、[#663](https://github.com/iDoris-ai/Agent24/issues/663)（M10 叠加 PR 遗留）。

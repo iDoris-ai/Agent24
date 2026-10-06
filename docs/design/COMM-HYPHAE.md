@@ -198,7 +198,7 @@ Agent24 现有的 token 鉴权照常适用。响应格式与 Hyphae 一致：`{o
 | `GET /comm/daemon` | — | §5.2 | 无 |
 | `POST /comm/daemon/start` · `/stop` | — | 同上 | §6 |
 | `POST /comm/import` | `{from, confirm:true, password?, dry_run?}` | `{identities,contacts,outbox,db_files}` | §4.1 |
-| `POST /comm/unlock` | `{password, remember?}` | `{unlocked, remembered}` | 不调 Hyphae；`remember=true` 时写入或替换钥匙串条目（M4） |
+| `POST /comm/unlock` | 严格 `{password, remember?}`；remember 缺省 false | `{unlocked, remembered}` | 用真实 `identity check-password --password-stdin` 校验；`remember=true` 写入或替换钥匙串，false 仅保存在进程内 overlay（M4） |
 
 - `from` / `as` 缺省时，取 `identity list` 中 `default:true` 的那一项。
 - **已删除的路由**：`GET /comm/inbox`（M12）、`GET /comm/history?with=`。删后者是因为 `history conversation` 在基线版本不输出 JSON（H1、G7）。
@@ -332,7 +332,9 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
   4. 读出新的 salt，`rename(Pending → Salt)`。
   - create 失败时删除 Pending 条目；
   - agent24d 启动时，残留的 Pending 条目只记日志、不使用。
-- **L2 仅内存**：钥匙串不可用时状态为 `locked{keychain_unavailable}`。用户执行 `agent24 comm unlock` 交出口令，口令只保存在 `Zeroizing` 内存中；agent24d 重启后回到 `locked`。加 `--remember` 时写入或替换钥匙串条目，用于钥匙串恢复之后，或修改过口令之后。
+- **L2 解锁**：`POST /comm/unlock` 继承 `/api/v1/comm/*` bearer 鉴权，只接受 `{password,remember?}`（无额外字段；remember 缺省 false），口令是 UTF-8 的 1..=4096 字节。先用真实 Hyphae `identity check-password --password-stdin` 检查；只有成功 envelope 中 `encrypted:true`、`valid:true` 且复核 keystore salt 未变化后，才按 `Account::from_salt` 注册口令。该命令只读，不启动 daemon。
+- `remember=false` 时，`KeyringPasswordStore` 将已验证口令放入 Zeroizing session overlay，不写 OS 钥匙串；所有共享同一个 store `Arc` 的调用方（含 daemon supervisor）都能读取。agent24d 重启后回到 locked。`remember=true` 必须成功写入 OS 钥匙串才返回 remembered；写入失败返回 `locked{keychain_unavailable}`，不以内存 overlay 代替。`MemoryPasswordStore` 永远返回 `remembered:false`。
+- CLI：`agent24 comm unlock [--remember]` 从 stdin 读一行，TTY 输入关闭本地回显；只去掉一个 LF 或 CRLF，不 trim 其他空白。口令不通过参数、环境变量或配置传递。应用自有口令缓冲区在失效、成功和错误路径均尽力 zeroize。
 - **不提供**：systemd 凭据（M12 砍掉）、明文口令文件、通过环境变量或 config 传口令。降级不会自动发生。
 - **显式降级开关**：`A24_COMM_PASSWORD_STORE` 环境变量可选 `keyring`（默认，未设置时也是这个）或 `memory`（改用纯内存的 `MemoryPasswordStore`，口令不持久、daemon 重启即丢，仅用于隔离环境下的测试/联调，启动时打 warn）；其他值不会被悄悄当作 `keyring` 或 `memory`，daemon 照常启动但 comm 路由一律答 `not_configured`，data 里带上具体原因。
 

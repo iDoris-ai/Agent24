@@ -23,6 +23,7 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 | DEP-A6 | 桌面端 Linux 构建：新增 `release-desktop.yml`，在 `ubuntu-22.04` 上出 AppImage + deb，**把附件追加到 A3 创建的 Release 上**（不自行创建 Release）；冒烟测试用 xvfb 加 `--appimage-extract-and-run`，并检查 sidecar 的 `LD_LIBRARY_PATH` 污染；同时补 deb 目标配置 | — | Sonnet | M | `DONE`（#617） |
 | DEP-A7 | Windows 移植设计：`docs/design/WINDOWS-PORT.md`。候选方案对比：Windows AF_UNIX + 句柄继承 / 命名管道 / 回环 + token；复用 sidecar-host ProcessKit；给出所有 Unix 专有代码的处置清单（20 个文件 + proxy.rs + `state_dir` 的 HOME + `command-fds`/`close_fds` + `same_device`）；分阶段计划。摸底用 **`windows-latest` 上 `workflow_dispatch` 触发的 `cargo check --workspace --keep-going`** | — | Opus 设计 + Sonnet 摸底 | M | `DONE`（#610、#611） |
 | DEP-A8 | v0.5.1 清单与发布：`docs/RELEASE-CHECKLIST-v0.5.1.md` 冻结命名；打 tag 触发 A3/A6；干净机器验收 | A1, A3–A6 | Opus 清单 + Sonnet | M | `DONE`（#624；tag `v0.5.1`@4fb5a89，Sin90 `v0.5.1`@030ae09，Cos72 `v0.1.1`@51187da；验收见 `docs/RELEASE-CHECKLIST-v0.5.1.md` 末节） |
+| DEP-A9 | Owner 裁决（2026-10-05）：Open Design 改为按需下载组件，不再打进安装包（曾把 AppImage 从 146MB 顶到 934MB、deb 从 101MB 顶到 622MB）。`pack-open-design-component.mjs` 产出 tarball + 校验 manifest；`open-design-component.ts` 是运行时安装器（下载/校验 sha256/解压/校验 contract/原子落地到 `~/.agent24/components/open-design/`）；`CreativeServeWeb` 消费已安装目录，未安装时报 `needs-download`；Design 页首次点开才提示下载 | A6 | Sonnet | M | 见 PR（本次） |
 
 原来的 DEP-A2（Linux 黑盒）**已删除**：`a3_2b` / `a3_3` 黑盒没有标 `#[ignore]`，现有 ubuntu CI 每次都在跑，重做一遍证伪不了任何东西。真正的新内容是「Sin90/Cos72 真实二进制在 Linux 上挂载」，已并入 A4 和 A8 的验收。
 

@@ -1,0 +1,907 @@
+import { execFileSync } from 'node:child_process'
+import crypto from 'node:crypto'
+import { EventEmitter } from 'node:events'
+import fs from 'node:fs'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
+import zlib from 'node:zlib'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  OpenDesignComponentInstaller,
+  loadOpenDesignComponentManifest,
+  openDesignComponentInstallDir,
+  parseOpenDesignComponentManifest,
+  assertResourceSafeBaseAncestryIsSafe,
+  quickValidateInstalledComponent,
+  verifyComponentContract,
+  verifyEntryFileIntegrity,
+  type OpenDesignComponentManifest,
+} from './open-design-component'
+
+// This file does real tar/spawn/HTTP round trips (building fixture
+// tarballs, running `tar`, serving them over a local server) rather than
+// pure in-process unit work — comfortably under 2s each in isolation, but
+// the default 5s test timeout is tight under concurrent machine load (CI
+// and shared dev boxes alike). 15s leaves plenty of margin while still
+// catching a genuine hang (see the explicit M5/H2 abort tests, which prove
+// a real hang is caught well before this).
+vi.setConfig({ testTimeout: 30_000 })
+
+const tempDirs: string[] = []
+const servers: http.Server[] = []
+
+// M4 (Opus re-review, 2026-10-05): a successful install now chmod's the
+// whole installed tree read-only (0500 dirs / 0444 files) — a plain
+// fs.rmSync can no longer remove it (ENOTEMPTY: deleting a directory entry
+// needs write on its PARENT, which 0500 deliberately removed). Restore
+// write access bottom-up before removing, mirroring what the installer
+// itself does before a re-install (makeInstalledTreeWritableForRemoval in
+// the source file).
+function restoreWritableRecursive(root: string): void {
+  const stat = fs.lstatSync(root, { throwIfNoEntry: false })
+  if (stat == null || stat.isSymbolicLink()) return
+  if (stat.isDirectory()) {
+    fs.chmodSync(root, 0o700)
+    for (const entry of fs.readdirSync(root)) restoreWritableRecursive(path.join(root, entry))
+  } else if (stat.isFile()) {
+    fs.chmodSync(root, 0o600)
+  }
+}
+
+function rmTreeEvenIfReadOnly(root: string): void {
+  restoreWritableRecursive(root)
+  fs.rmSync(root, { recursive: true, force: true })
+}
+
+afterEach(async () => {
+  for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve))
+  for (const dir of tempDirs.splice(0)) rmTreeEvenIfReadOnly(dir)
+  vi.restoreAllMocks()
+})
+
+function tmpDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  tempDirs.push(dir)
+  return dir
+}
+
+function seedValidTree(root: string): void {
+  for (const relative of ['app/prebundled/daemon', 'open-design', 'open-design-web-standalone']) {
+    fs.mkdirSync(path.join(root, relative), { recursive: true })
+  }
+  fs.writeFileSync(path.join(root, 'app/package.json'), JSON.stringify({ version: '0.22.2' }))
+  for (const relative of [
+    'app/prebundled/agent24-headless.cjs',
+    'app/prebundled/agent24-headless.mjs',
+    'app/prebundled/daemon/daemon-cli.mjs',
+    'app/prebundled/daemon/daemon-sidecar.mjs',
+    'app/prebundled/web-sidecar.mjs',
+  ]) fs.writeFileSync(path.join(root, relative), '')
+  fs.writeFileSync(path.join(root, 'open-design-web-standalone/server.js'), '')
+}
+
+function writeMarker(dir: string, sha256: string): void {
+  fs.writeFileSync(path.join(dir, '.agent24-component.json'), JSON.stringify({ sha256 }))
+}
+
+function buildTarball(stageDir: string): string {
+  const tarPath = path.join(path.dirname(stageDir), `${path.basename(stageDir)}.tar.gz`)
+  execFileSync('tar', ['-czf', tarPath, '-C', stageDir, 'app', 'open-design', 'open-design-web-standalone'])
+  tempDirs.push(tarPath)
+  return tarPath
+}
+
+/** H1 (review finding, 2026-10-05): the previous version of this fixture
+ * relied on tar's own `-s`/transform option to rename a member onto a
+ * path-traversal name. That option's syntax (and whether it's honored at
+ * all for a plain-looking name with no special characters) differs between
+ * GNU tar and macOS's bsdtar — so the fixture could silently stop
+ * constructing the hostile entry it claims to, leaving the test "passing"
+ * for the wrong reason. Building the ustar header by hand removes that
+ * doubt entirely: the byte layout below is unambiguous, and the test
+ * verifies the archive actually contains the `..` member before ever
+ * calling the installer. */
+function ustarHeader(name: string, size: number, typeflag: '0' | '5'): Buffer {
+  const header = Buffer.alloc(512)
+  header.write(name, 0, 'utf8')
+  header.write('0000644\0', 100, 8, 'utf8') // mode
+  header.write('0000000\0', 108, 8, 'utf8') // uid
+  header.write('0000000\0', 116, 8, 'utf8') // gid
+  header.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 12, 'utf8') // size
+  header.write(`${Math.floor(Date.now() / 1000).toString(8).padStart(11, '0')}\0`, 136, 12, 'utf8') // mtime
+  header.write(typeflag, 156, 1, 'utf8')
+  header.write('ustar\0', 257, 6, 'utf8') // magic
+  header.write('00', 263, 2, 'utf8') // version
+  header.fill(0x20, 148, 156) // checksum field blanked to spaces while summing
+  let sum = 0
+  for (let i = 0; i < 512; i++) sum += header[i]!
+  header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'utf8')
+  return header
+}
+
+function ustarFileEntry(name: string, content: string): Buffer {
+  const data = Buffer.from(content, 'utf8')
+  const paddedSize = Math.ceil(data.length / 512) * 512 || 512
+  const body = Buffer.alloc(paddedSize)
+  data.copy(body)
+  return Buffer.concat([ustarHeader(name, data.length, '0'), data.length === 0 ? Buffer.alloc(0) : body])
+}
+
+/** Builds a minimal, hand-constructed ustar archive containing exactly one
+ * member whose path contains `..` — exercises the pre-extraction
+ * `tar -tzf` safety check (hardening on top of the post-extraction symlink
+ * walk, which only inspects symlinks, not regular-file path traversal).
+ * Rejection must happen from the listing alone, before any of the other
+ * (valid) members would matter, so this archive doesn't need to mirror a
+ * full installable tree. */
+function buildTarballWithTraversalEntry(stageDir: string): string {
+  const traversalMemberName = 'open-design/../../escape.txt'
+  const tar = Buffer.concat([
+    ustarFileEntry(traversalMemberName, 'nope'),
+    Buffer.alloc(1024), // two 512-byte zero blocks terminate a tar archive
+  ])
+  // Sanity-check our own fixture: if this ever stopped containing a literal
+  // ".." path segment, the test below would pass for the wrong reason.
+  if (!tar.toString('latin1').includes(traversalMemberName)) {
+    throw new Error('test fixture bug: hand-built ustar archive is missing its traversal member')
+  }
+  const tarPath = path.join(path.dirname(stageDir), `${path.basename(stageDir)}-traversal.tar.gz`)
+  fs.writeFileSync(tarPath, zlib.gzipSync(tar))
+  tempDirs.push(tarPath)
+  return tarPath
+}
+
+function seedTreeFor(prefix: string): string {
+  const root = tmpDir(prefix)
+  seedValidTree(root)
+  return root
+}
+
+async function startServer(filePath: string, onRequest?: () => void): Promise<{ url: string; requestCount: () => number }> {
+  let requestCount = 0
+  const server = http.createServer((_req, res) => {
+    requestCount += 1
+    onRequest?.()
+    const body = fs.readFileSync(filePath)
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(body.length) })
+    res.end(body)
+  })
+  servers.push(server)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address() as AddressInfo
+  return { url: `http://127.0.0.1:${port}/asset.tar.gz`, requestCount: () => requestCount }
+}
+
+/** Server that 302-redirects `/redirect` to `/asset.tar.gz` on the same
+ * host/port (for the L3 manual-redirect-following tests), or to an
+ * arbitrary `Location` override when provided. */
+async function startRedirectingServer(filePath: string, locationOverride?: (selfOrigin: string) => string): Promise<{ url: string }> {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/redirect') {
+      const { port: selfPort } = server.address() as AddressInfo
+      const location = locationOverride
+        ? locationOverride(`http://127.0.0.1:${selfPort}`)
+        : `https://127.0.0.1:${selfPort}/asset.tar.gz`
+      res.writeHead(302, { Location: location })
+      res.end()
+      return
+    }
+    const body = fs.readFileSync(filePath)
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(body.length) })
+    res.end(body)
+  })
+  servers.push(server)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address() as AddressInfo
+  return { url: `http://127.0.0.1:${port}/redirect` }
+}
+
+// The manifest URL must declare https:// (production enforces it before any
+// network call). The fetchFn below simulates "this would be objects.
+// githubusercontent.com over TLS in prod" by rewriting back to the local
+// plaintext fixture server — a normal shim for testing an https-only guard
+// without standing up real TLS.
+function httpsManifestUrl(httpUrl: string): string {
+  return httpUrl.replace(/^http:/, 'https:')
+}
+const localFetch: typeof fetch = (input, init) =>
+  fetch(String(input).replace(/^https:/, 'http:'), init)
+
+// CI finding (2026-10-05): this used to hardcode platform:'darwin'/
+// arch:'arm64'. OpenDesignComponentInstaller's L2 check compares the
+// manifest's platform/arch against the REAL process.platform/process.arch
+// whenever a test doesn't inject an explicit override (most of this file
+// doesn't — only the dedicated L2 test below does) — so on a Linux CI
+// runner, every one of those installers rejected the hardcoded-darwin
+// fixture as a platform mismatch and reported `unavailable` instead of
+// `not-installed`/`installed`. Defaulting to the actual host's
+// platform/arch here makes every other test in this file host-independent.
+function manifestFor(tarPath: string, overrides: Partial<OpenDesignComponentManifest> = {}): { manifest: OpenDesignComponentManifest; sha256: string; size: number } {
+  const bytes = fs.readFileSync(tarPath)
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
+  const manifest: OpenDesignComponentManifest = {
+    version: '0.22.2',
+    odSha: 'f84ff89656143b5fa3fe8f0891b7f2bf38769d9f',
+    platform: process.platform,
+    arch: process.arch,
+    url: 'https://example.invalid/placeholder.tar.gz',
+    sha256,
+    size: bytes.length,
+    ...overrides,
+  }
+  return { manifest, sha256, size: bytes.length }
+}
+
+describe('open-design-component manifest parsing', () => {
+  it('round-trips a well-formed manifest file', () => {
+    const resources = tmpDir('a24-od-manifest-')
+    const manifest: OpenDesignComponentManifest = {
+      version: '0.22.2',
+      odSha: 'f84ff89656143b5fa3fe8f0891b7f2bf38769d9f',
+      platform: 'linux',
+      arch: 'x64',
+      url: 'https://github.com/iDoris-ai/Agent24/releases/download/v0.6.0/open-design-0.22.2-f84ff89-linux-x64-abc123456789.tar.gz',
+      sha256: 'a'.repeat(64),
+      size: 123,
+    }
+    fs.writeFileSync(path.join(resources, 'open-design-component.json'), JSON.stringify(manifest))
+    expect(loadOpenDesignComponentManifest(resources)).toEqual(manifest)
+  })
+
+  it('returns null (unavailable) when no manifest was baked', () => {
+    const resources = tmpDir('a24-od-manifest-missing-')
+    expect(loadOpenDesignComponentManifest(resources)).toBeNull()
+    expect(loadOpenDesignComponentManifest(undefined)).toBeNull()
+  })
+
+  it('rejects a malformed manifest', () => {
+    expect(() => parseOpenDesignComponentManifest({ version: '0.22.2' })).toThrow('odSha')
+    expect(() => parseOpenDesignComponentManifest({
+      version: '0.22.2', odSha: 'f84ff89656143b5fa3fe8f0891b7f2bf38769d9f', platform: 'linux', arch: 'x64',
+      url: 'https://x', sha256: 'not-a-hash', size: 1,
+    })).toThrow('sha256')
+  })
+
+  it('L1: degrades a corrupt (truncated/unparsable) baked manifest to null instead of throwing', () => {
+    const resources = tmpDir('a24-od-manifest-corrupt-')
+    fs.writeFileSync(path.join(resources, 'open-design-component.json'), '{ this is not json')
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(() => loadOpenDesignComponentManifest(resources)).not.toThrow()
+    expect(loadOpenDesignComponentManifest(resources)).toBeNull()
+  })
+})
+
+describe('verifyComponentContract', () => {
+  it('accepts a valid extracted tree', () => {
+    const root = tmpDir('a24-od-contract-valid-')
+    seedValidTree(root)
+    expect(() => verifyComponentContract(root, '0.22.2')).not.toThrow()
+  })
+
+  it('M1: accepts a legitimate relative symlink when root is reached through a symlink (os.tmpdir() is one on macOS)', () => {
+    const root = tmpDir('a24-od-contract-tmpdir-symlink-')
+    seedValidTree(root)
+    fs.writeFileSync(path.join(root, 'open-design/target.txt'), 'ok')
+    fs.symlinkSync('target.txt', path.join(root, 'open-design/link.txt'))
+    expect(() => verifyComponentContract(root, '0.22.2')).not.toThrow()
+    expect(fs.readlinkSync(path.join(root, 'open-design/link.txt'))).toBe('target.txt')
+  })
+
+  it('rejects a version mismatch', () => {
+    const root = tmpDir('a24-od-contract-version-')
+    seedValidTree(root)
+    expect(() => verifyComponentContract(root, '9.9.9')).toThrow('version mismatch')
+  })
+
+  it('rejects an absolute symlink', () => {
+    const root = tmpDir('a24-od-contract-abs-link-')
+    seedValidTree(root)
+    fs.symlinkSync('/etc/passwd', path.join(root, 'open-design/escape'))
+    expect(() => verifyComponentContract(root, '0.22.2')).toThrow('absolute symlink')
+  })
+
+  it('rejects a symlink that resolves outside the resource trees', () => {
+    const root = tmpDir('a24-od-contract-escape-')
+    seedValidTree(root)
+    fs.writeFileSync(path.join(root, 'outside.txt'), 'nope')
+    fs.symlinkSync('../outside.txt', path.join(root, 'open-design/escape'))
+    expect(() => verifyComponentContract(root, '0.22.2')).toThrow('escapes')
+  })
+
+  it('M1: rejects a symlink whose immediate target is itself another symlink ("crosses another symlink")', () => {
+    const root = tmpDir('a24-od-contract-chain-')
+    seedValidTree(root)
+    fs.mkdirSync(path.join(root, 'open-design/real'))
+    fs.writeFileSync(path.join(root, 'open-design/real/target.txt'), 'ok')
+    fs.symlinkSync('real', path.join(root, 'open-design/alias'))
+    fs.symlinkSync('alias/target.txt', path.join(root, 'open-design/link.txt'))
+    expect(() => verifyComponentContract(root, '0.22.2')).toThrow('crosses another symlink')
+  })
+
+  it('quickValidateInstalledComponent checks required files AND the marker sha256 (H2)', () => {
+    const root = tmpDir('a24-od-quick-')
+    expect(quickValidateInstalledComponent(root, 'a'.repeat(64))).toBe(false)
+    seedValidTree(root)
+    expect(quickValidateInstalledComponent(root, 'a'.repeat(64))).toBe(false) // no marker yet
+    writeMarker(root, 'a'.repeat(64))
+    expect(quickValidateInstalledComponent(root, 'a'.repeat(64))).toBe(true)
+    expect(quickValidateInstalledComponent(root, 'b'.repeat(64))).toBe(false) // sha changed (ABI bump)
+  })
+})
+
+describe('OpenDesignComponentInstaller', () => {
+  it('reports unavailable when no manifest is baked (dev / unreleased build)', () => {
+    const installer = new OpenDesignComponentInstaller({ manifest: null })
+    expect(installer.status()).toEqual({
+      state: 'unavailable',
+      reason: 'This build does not bundle an Open Design component manifest',
+    })
+  })
+
+  it('L2: treats a manifest built for a different platform/arch as unavailable', () => {
+    const { manifest } = manifestFor(buildTarball(seedTreeFor('a24-od-stage-abimismatch-')), { platform: 'win32', arch: 'x64' })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const installer = new OpenDesignComponentInstaller({ manifest, platform: 'darwin', arch: 'arm64' })
+    expect(installer.status()).toEqual({
+      state: 'unavailable',
+      reason: 'This build does not bundle an Open Design component manifest',
+    })
+  })
+
+  it('reports installed immediately when the component is already present, valid, and the marker sha256 matches', () => {
+    const componentsRoot = tmpDir('a24-od-root-')
+    const { manifest } = manifestFor(buildTarball(seedTreeFor('a24-od-stage-already-')))
+    const dir = openDesignComponentInstallDir(componentsRoot, manifest)
+    fs.mkdirSync(dir, { recursive: true })
+    seedValidTree(dir)
+    writeMarker(dir, manifest.sha256)
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot })
+    expect(installer.status()).toEqual({ state: 'installed', dir })
+  })
+
+  it('H2: demotes a stale install (marker sha256 mismatch, e.g. an Electron ABI bump) to not-installed', () => {
+    const componentsRoot = tmpDir('a24-od-root-stale-')
+    const { manifest } = manifestFor(buildTarball(seedTreeFor('a24-od-stage-stale-')))
+    const dir = openDesignComponentInstallDir(componentsRoot, manifest)
+    fs.mkdirSync(dir, { recursive: true })
+    seedValidTree(dir)
+    writeMarker(dir, 'f'.repeat(64)) // some other, older content's sha256
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot })
+    expect(installer.status()).toEqual({ state: 'not-installed', size: manifest.size })
+  })
+
+  it('H2: a previously-installed dir deleted out from under the installer self-heals to not-installed on status()', () => {
+    const componentsRoot = tmpDir('a24-od-root-deleted-')
+    const { manifest } = manifestFor(buildTarball(seedTreeFor('a24-od-stage-deleted-')))
+    const dir = openDesignComponentInstallDir(componentsRoot, manifest)
+    fs.mkdirSync(dir, { recursive: true })
+    seedValidTree(dir)
+    writeMarker(dir, manifest.sha256)
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot })
+    expect(installer.status().state).toBe('installed')
+
+    fs.rmSync(dir, { recursive: true, force: true })
+    expect(installer.status()).toEqual({ state: 'not-installed', size: manifest.size })
+  })
+
+  it('M2: sweeps stale .partial-* leftovers from a crashed previous run at construction', () => {
+    const componentsRoot = tmpDir('a24-od-root-partials-')
+    fs.mkdirSync(path.join(componentsRoot, '.partial-deadbeef'), { recursive: true })
+    fs.writeFileSync(path.join(componentsRoot, '.partial-deadbeef.tar.gz'), '')
+    const { manifest } = manifestFor(buildTarball(seedTreeFor('a24-od-stage-partials-')))
+    // eslint-disable-next-line no-new
+    new OpenDesignComponentInstaller({ manifest, componentsRoot })
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+  })
+
+  it('downloads, verifies, and installs a good tarball', async () => {
+    const stage = seedTreeFor('a24-od-stage-good-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-good-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    expect(installer.status()).toEqual({ state: 'not-installed', size: manifest.size })
+
+    const progressStates: string[] = []
+    installer.onProgress((status) => progressStates.push(status.state))
+
+    const result = await installer.install()
+    const expectedDir = openDesignComponentInstallDir(componentsRoot, manifest)
+    expect(result).toEqual({ state: 'installed', dir: expectedDir })
+    expect(quickValidateInstalledComponent(expectedDir, manifest.sha256)).toBe(true)
+    expect(progressStates).toContain('downloading')
+    expect(progressStates).toContain('verifying')
+    expect(progressStates[progressStates.length - 1]).toBe('installed')
+
+    // No leftover partial directories/files.
+    const leftovers = fs.readdirSync(componentsRoot).filter((name) => name.startsWith('.partial-'))
+    expect(leftovers).toEqual([])
+  })
+
+  it('M4 (Opus re-review, 2026-10-06): the installed tree is read-only (dirs 0500, files 0444) and verifyEntryFileIntegrity passes on it', async () => {
+    const stage = seedTreeFor('a24-od-stage-readonly-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-readonly-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+    const dir = (result as { dir: string }).dir
+
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o500)
+    // Codex re-review (2026-10-06): makeInstalledTreeReadOnly clears only
+    // write bits now, keeping whatever read/execute bits tar extraction
+    // already set — NOT a hardcoded 0o500/0o444. `app/` was extracted
+    // with the default 0o755 a plain fs.mkdirSync (no explicit mode) in
+    // seedValidTree produces, so clearing its write bits lands on 0o555
+    // (r-xr-xr-x), not 0o500 — `dir` itself stays 0o500 only because
+    // installOnce explicitly created partialDir with mode 0o700 to begin
+    // with (0o700 minus write bits is still 0o500).
+    expect(fs.statSync(path.join(dir, 'app')).mode & 0o777).toBe(0o555)
+    expect(fs.statSync(path.join(dir, 'app', 'prebundled', 'agent24-headless.cjs')).mode & 0o777).toBe(0o444)
+    expect(fs.statSync(path.join(dir, '.agent24-component.json')).mode & 0o777).toBe(0o444)
+
+    // Nothing — not even this process — can write into it anymore.
+    expect(() => fs.writeFileSync(path.join(dir, 'app', 'prebundled', 'agent24-headless.cjs'), 'tampered')).toThrow()
+
+    expect(() => verifyEntryFileIntegrity(dir)).not.toThrow()
+  })
+
+  it('M4 (Codex re-review, 2026-10-06): a bundled executable (e.g. @ffmpeg-installer/ffmpeg) stays executable after the installed tree is made read-only', async () => {
+    // Real bug, reproduced for real: the installer used to hardcode
+    // files to mode 0o444 — read-only AND non-executable. The fork's own
+    // daemon spawns bundled binaries like @ffmpeg-installer/ffmpeg's
+    // `ffmpeg` directly (spawn(ffmpegInstaller.path)); stripping +x broke
+    // that with EACCES the moment install() finished. This test proves
+    // the fix with a REAL spawn of a REAL executable fixture, not just a
+    // mode-bits assertion.
+    const stage = seedTreeFor('a24-od-stage-executable-')
+    const binDir = path.join(stage, 'app', 'node_modules', '@ffmpeg-installer', 'ffmpeg')
+    fs.mkdirSync(binDir, { recursive: true })
+    const fixtureBinary = path.join(binDir, 'ffmpeg')
+    fs.writeFileSync(fixtureBinary, '#!/bin/sh\necho fixture-ffmpeg-ok\n')
+    fs.chmodSync(fixtureBinary, 0o755)
+
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-executable-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+    const dir = (result as { dir: string }).dir
+
+    const installedBinary = path.join(dir, 'app', 'node_modules', '@ffmpeg-installer', 'ffmpeg', 'ffmpeg')
+    // Read-only (no write bit), but still executable.
+    expect(fs.statSync(installedBinary).mode & 0o777).toBe(0o555)
+    const output = execFileSync(installedBinary, [], { encoding: 'utf8' })
+    expect(output.trim()).toBe('fixture-ffmpeg-ok')
+  })
+
+  it('M4: verifyEntryFileIntegrity rejects an entry file whose content changed after install', async () => {
+    const stage = seedTreeFor('a24-od-stage-tamper-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-tamper-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+    const dir = (result as { dir: string }).dir
+
+    // Simulate tampering (e.g. by a privileged process) bypassing the
+    // read-only mode bits entirely: restore write access first, same as
+    // the installer's own pre-reinstall helper would, then swap the file.
+    const target = path.join(dir, 'app', 'prebundled', 'daemon', 'daemon-cli.mjs')
+    fs.chmodSync(path.dirname(target), 0o700)
+    fs.chmodSync(target, 0o600)
+    fs.writeFileSync(target, 'tampered-after-install')
+
+    expect(() => verifyEntryFileIntegrity(dir)).toThrow(/entry file changed after install/)
+  })
+
+  it('M4: re-installing over an existing (read-only) install dir succeeds', async () => {
+    const stage = seedTreeFor('a24-od-stage-reinstall-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-reinstall-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const first = await installer.install()
+    expect(first.state).toBe('installed')
+
+    // A second install() while already installed() is a no-op short
+    // circuit (see install()'s own early return) — construct a FRESH
+    // installer against the same componentsRoot/manifest to force a real
+    // re-install over the now-read-only directory from the first one.
+    const second = await new OpenDesignComponentInstaller(
+      { manifest, componentsRoot, allowedHosts: ['127.0.0.1'] },
+      localFetch,
+    ).install()
+    expect(second).toEqual(first)
+  })
+
+  it('M1 (Opus re-review, 2026-10-06): the real default componentsRoot path (~/.agent24/components and its open-design subdirectory) is created and chmod\'d 0700', async () => {
+    const stage = seedTreeFor('a24-od-stage-default-root-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const fakeHome = tmpDir('a24-od-fake-home-')
+    const previousHome = process.env.HOME
+    process.env.HOME = fakeHome
+    try {
+      // No componentsRoot override — exercises the REAL default path
+      // derivation (os.homedir() + '.agent24/components/open-design').
+      const installer = new OpenDesignComponentInstaller({ manifest, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+
+      const componentsDir = path.join(fakeHome, '.agent24', 'components')
+      const openDesignDir = path.join(componentsDir, 'open-design')
+      expect(fs.statSync(componentsDir).mode & 0o777).toBe(0o700)
+      expect(fs.statSync(openDesignDir).mode & 0o777).toBe(0o700)
+    } finally {
+      process.env.HOME = previousHome
+    }
+  })
+
+  describe('assertResourceSafeBaseAncestryIsSafe (M1, Opus re-review, 2026-10-06)', () => {
+    it('accepts a short, fully-owned, non-writable ancestor chain', () => {
+      const fakeHome = tmpDir('a24-ancestry-home-ok-')
+      const safeBase = path.join(fakeHome, '.agent24', 'components', 'open-design', 'abc1234-darwin-arm64')
+      fs.mkdirSync(safeBase, { recursive: true, mode: 0o700 })
+      const previousHome = process.env.HOME
+      process.env.HOME = fakeHome
+      try {
+        expect(() => assertResourceSafeBaseAncestryIsSafe(safeBase)).not.toThrow()
+      } finally {
+        process.env.HOME = previousHome
+      }
+    })
+
+    it('rejects when an intermediate ancestor directory is group/other-writable without the sticky bit', () => {
+      if (typeof process.getuid !== 'function') return // POSIX-only check
+      const fakeHome = tmpDir('a24-ancestry-home-bad-')
+      const agent24Dir = path.join(fakeHome, '.agent24')
+      const safeBase = path.join(agent24Dir, 'components', 'open-design', 'abc1234-darwin-arm64')
+      fs.mkdirSync(safeBase, { recursive: true, mode: 0o700 })
+      fs.chmodSync(agent24Dir, 0o777) // no sticky bit — unsafe
+      const previousHome = process.env.HOME
+      process.env.HOME = fakeHome
+      try {
+        expect(() => assertResourceSafeBaseAncestryIsSafe(safeBase)).toThrow(/group- or other-writable/)
+      } finally {
+        fs.chmodSync(agent24Dir, 0o700) // restore before tmpDir cleanup
+        process.env.HOME = previousHome
+      }
+    })
+
+    it('accepts a world-writable intermediate ancestor ONLY when the sticky bit is set', () => {
+      if (typeof process.getuid !== 'function') return // POSIX-only check
+      const fakeHome = tmpDir('a24-ancestry-home-sticky-')
+      const agent24Dir = path.join(fakeHome, '.agent24')
+      const safeBase = path.join(agent24Dir, 'components', 'open-design', 'abc1234-darwin-arm64')
+      fs.mkdirSync(safeBase, { recursive: true, mode: 0o700 })
+      fs.chmodSync(agent24Dir, 0o1777) // world-writable but sticky — safe
+      const previousHome = process.env.HOME
+      process.env.HOME = fakeHome
+      try {
+        expect(() => assertResourceSafeBaseAncestryIsSafe(safeBase)).not.toThrow()
+      } finally {
+        fs.chmodSync(agent24Dir, 0o700)
+        process.env.HOME = previousHome
+      }
+    })
+  })
+
+  it('installs a tarball whose `tar -tzf` member listing exceeds 1MB (real-app regression, 2026-10-05)', { timeout: 40_000 }, async () => {
+    // Found via a real local-server closed-loop test against an actual mac
+    // tools-pack build: the real open-design-web-standalone/node_modules
+    // tree alone lists tens of thousands of members, so `tar -tzf`'s stdout
+    // routinely exceeds Node's default 1MB execFile buffer — the install
+    // failed with "iDoris Design 组件下载失败： stdout maxBuffer length
+    // exceeded" in the actual packaged app. This fixture reproduces that at
+    // a much smaller (but still >1MB-of-listing) scale so the test suite
+    // stays fast.
+    const stage = seedTreeFor('a24-od-stage-manymembers-')
+    const manyFilesDir = path.join(stage, 'open-design', 'many')
+    fs.mkdirSync(manyFilesDir, { recursive: true })
+    // Padded (long) filenames so 8000 entries' `tar -tzf` listing clears 1MB
+    // (measured ~1.46MB for this exact fixture) without needing tens of
+    // thousands of files, which would make the test slow.
+    const pad = 'x'.repeat(150)
+    for (let i = 0; i < 8000; i += 1) {
+      fs.writeFileSync(path.join(manyFilesDir, `file-${String(i).padStart(5, '0')}-${pad}.txt`), '')
+    }
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-manymembers-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+  })
+
+  it('rejects a wrong sha256 and leaves nothing behind', async () => {
+    const stage = seedTreeFor('a24-od-stage-badsha-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { sha256: 'b'.repeat(64) })
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-badsha-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('sha256 mismatch')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+  })
+
+  it('aborts a download that exceeds the manifest-declared size', async () => {
+    const stage = seedTreeFor('a24-od-stage-oversize-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { size: 10 })
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-oversize-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('exceeded the manifest-declared size')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+  })
+
+  it('rejects a tarball containing a symlink that escapes the resource trees', async () => {
+    const stage = seedTreeFor('a24-od-stage-escape-')
+    // An absolute symlink target is unambiguously forbidden regardless of extraction layout.
+    fs.symlinkSync('/etc/passwd', path.join(stage, 'open-design/escape'))
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-escape-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('absolute symlink')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+  })
+
+  it('hardening: rejects a tarball member whose path contains ".." before extracting anything', async () => {
+    const stage = seedTreeFor('a24-od-stage-traversal-')
+    const tarPath = buildTarballWithTraversalEntry(stage)
+    // H1 (review finding, 2026-10-05): confirm, via the real `tar` binary —
+    // not just our own fixture's internal byte check — that this archive
+    // really does list a ".." member. Otherwise a future regression in
+    // ustarFileEntry/ustarHeader could silently produce an empty-but-valid
+    // archive that the installer accepts for the wrong reason.
+    const listing = execFileSync('tar', ['-tzf', tarPath], { encoding: 'utf8' })
+    expect(listing.split('\n').some((line) => line.trim().split('/').includes('..'))).toBe(true)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-traversal-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('unsafe path entry')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+  })
+
+  it('shares a single in-flight download across concurrent install() calls', async () => {
+    const stage = seedTreeFor('a24-od-stage-concurrent-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url, requestCount } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-concurrent-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const [first, second] = await Promise.all([installer.install(), installer.install()])
+    expect(first).toEqual(second)
+    expect(first.state).toBe('installed')
+    expect(requestCount()).toBe(1)
+  })
+
+  it('rejects a non-https manifest URL before making any network call', async () => {
+    const stage = seedTreeFor('a24-od-stage-insecure-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath, { url: 'http://example.invalid/asset.tar.gz' })
+    const componentsRoot = tmpDir('a24-od-root-insecure-')
+    let called = false
+    const trackedFetch: typeof fetch = (...args) => { called = true; return localFetch(...args) }
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, trackedFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('HTTPS')
+    expect(called).toBe(false)
+  })
+
+  it('L3: rejects a host that is not on the (real, default) allowlist before any network call', async () => {
+    const stage = seedTreeFor('a24-od-stage-disallowed-host-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url) // https://127.0.0.1:<port>/asset.tar.gz — not allow-listed by default
+
+    const componentsRoot = tmpDir('a24-od-root-disallowed-host-')
+    let called = false
+    const trackedFetch: typeof fetch = (...args) => { called = true; return localFetch(...args) }
+    // No `allowedHosts` override here — exercises the real production default.
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot }, trackedFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('not allow-listed')
+    expect(called).toBe(false)
+  })
+
+  it('L3: follows an allow-listed https redirect hop before downloading', async () => {
+    const stage = seedTreeFor('a24-od-stage-redirect-ok-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startRedirectingServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-redirect-ok-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('installed')
+  })
+
+  it('L3: rejects a redirect to a non-HTTPS target', async () => {
+    const stage = seedTreeFor('a24-od-stage-redirect-http-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startRedirectingServer(tarPath, () => 'http://127.0.0.1:9/asset.tar.gz')
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-redirect-http-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('HTTPS')
+  })
+
+  it('L3: rejects a redirect to a disallowed host', async () => {
+    const stage = seedTreeFor('a24-od-stage-redirect-host-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startRedirectingServer(tarPath, () => 'https://evil.example/asset.tar.gz')
+    manifest.url = httpsManifestUrl(url)
+
+    const componentsRoot = tmpDir('a24-od-root-redirect-host-')
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('not allow-listed')
+  })
+
+  it('M5: idle-timeout aborts a stalled download and leaves it retryable', async () => {
+    const stage = seedTreeFor('a24-od-stage-idle-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const bytes = fs.readFileSync(tarPath)
+
+    let hangRequest = true
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+      if (hangRequest) {
+        // Write a prefix, then just never send the rest for this request —
+        // the installer's idle timer (set very small below) must fire.
+        res.write(bytes.subarray(0, 1))
+        return
+      }
+      res.end(bytes)
+    })
+    servers.push(server)
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as AddressInfo
+    manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+    const componentsRoot = tmpDir('a24-od-root-idle-')
+    const installer = new OpenDesignComponentInstaller(
+      { manifest, componentsRoot, allowedHosts: ['127.0.0.1'], idleTimeoutMs: 50 },
+      localFetch,
+    )
+    const result = await installer.install()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('idle-timed-out')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+
+    // Retryable: a fresh install() against a server that now responds fully succeeds.
+    hangRequest = false
+    const retried = await installer.install()
+    expect(retried.state).toBe('installed')
+  })
+
+  it('M5: abort() cancels an in-flight install and leaves it retryable', async () => {
+    const stage = seedTreeFor('a24-od-stage-abort-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const bytes = fs.readFileSync(tarPath)
+
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+      // Write one byte, then just hold the connection open — the test only
+      // needs the download to be observably in flight before calling abort().
+      res.write(bytes.subarray(0, 1))
+    })
+    servers.push(server)
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as AddressInfo
+    manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+    const componentsRoot = tmpDir('a24-od-root-abort-')
+    const installer = new OpenDesignComponentInstaller(
+      { manifest, componentsRoot, allowedHosts: ['127.0.0.1'] },
+      localFetch,
+    )
+    const pending = installer.install()
+    await vi.waitFor(() => expect(installer.status().state).toBe('downloading'))
+    installer.abort('test aborted it')
+    const result = await pending
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('test aborted it')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+  })
+
+  it('H2: a write-stream error during backpressure fails promptly (does not hang forever) and is retryable', async () => {
+    // Before the fix, `await file.once('drain', ...)` had no way to learn
+    // that the stream had already errored (the no-op 'error' listener
+    // swallowed it) — install() would hang forever instead of settling. A
+    // fake write stream whose write() always reports backpressure, then
+    // errors, reproduces this deterministically without needing to actually
+    // stress a real fs write queue.
+    const stage = seedTreeFor('a24-od-stage-backpressure-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+    const componentsRoot = tmpDir('a24-od-root-backpressure-')
+
+    class FakeWriteStream extends EventEmitter {
+      write = vi.fn((_chunk: Buffer) => false) // always signal backpressure
+      end = vi.fn((cb?: (error?: unknown) => void) => cb?.())
+      close = vi.fn((cb?: () => void) => cb?.())
+    }
+    const fakeStream = new FakeWriteStream()
+    const createWriteStreamSpy = vi.spyOn(fs, 'createWriteStream').mockReturnValue(fakeStream as never)
+
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const pending = installer.install()
+    await vi.waitFor(() => expect(fakeStream.write).toHaveBeenCalled())
+    fakeStream.emit('error', new Error('simulated disk write failure'))
+
+    const result = await pending
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('simulated disk write failure')
+    expect(fs.readdirSync(componentsRoot)).toEqual([])
+
+    // Retryable: a fresh install() with the real fs restored succeeds.
+    createWriteStreamSpy.mockRestore()
+    const retried = await installer.install()
+    expect(retried.state).toBe('installed')
+  })
+})

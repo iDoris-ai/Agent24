@@ -42,7 +42,7 @@
 | F11.4 托管器 | 默认方案 (a)：把 Creative 托管迁到 `SidecarManager` + `agent24-sidecar-host`，兑现 ADR-004 冻结的所有权、generation fencing、健康检查 / 重启、整个进程树回收、退出无孤儿。若选 (b) 保留 `CreativeServeWeb`：必须写新 ADR，明确 supersede ADR-004 的哪些条款，并让 `CreativeServeWeb` 达到同等保证（现状只对直接子进程发 SIGTERM / SIGKILL，没有进程组 / Job、健康退避和整树回收） | ADR 已合入；打包 E2E 断言：Creative 重启 / 崩溃 / app 退出后无孤儿进程，旧代际的请求被栅栏挡住；落选的一方删除或在 ARCHITECTURE-LAYERS 明确标注"保留给 TPI" |
 | F11.5 验收 harness 回归化 | 把 M10 的 M4 exact-SHA harness（`refs/pull/654/head`）整理进 main，作为可重复运行的工作流，并覆盖 F11.0a–F11.4：authority 路由拒绝、Creative 分区隔离、父进程退出后无孤儿 daemon、handoff / revoke、ACP workspace 绑定、托管器单一所有权 | harness 在 main 上能按 SHA 手动触发并通过 |
 
-**依赖**：F11.0a 与 F11.0 是 F11.1–F11.3 的前提（否则开启 capability 模式后 Open Design 无法建会话）。**跨仓依赖**：ADR-005 要求 Open Design fork 给通用 `RuntimeContext` 增加 `conversationId`，并由 runtime adapter 据此定位 handoff；这部分在 `iDoris-ai/open-design-agent24` 实现，需要更新 exact-SHA pin，并补跨仓契约测试（F11.2 / F11.3）。和 M1（记忆）互不阻塞，可以并行。
+**依赖**：F11.0a 与 F11.0 是 F11.1–F11.3 的前提（否则开启 capability 模式后 Open Design 无法建会话）。**跨仓依赖**：ADR-005 要求 Open Design fork 给通用 `RuntimeContext` 增加 `conversationId`，并由 runtime adapter 据此定位 handoff；这部分在 `iDoris-ai/open-design-agent24` 实现，需要更新 exact-SHA pin，并补跨仓契约测试（F11.2 / F11.3）。Open Design 全线当前 `PAUSED`，不与 M1 并行（2026-10-03 裁决，见 §5）；恢复后仍按上述内部依赖顺序执行。
 
 **平台**：workspace-bound run 当前仅 Unix（Windows 上 `WorkspaceService` 不组合）。OD-M11 先在 macOS / Linux 生效；Windows 的 workspace 支持列入 OD-M12 F12.4。
 
@@ -89,10 +89,6 @@
 OD-M11（产品路径生效） ──┬──▶ TPI-W（Playbook / 去专名 / harness 模板） ──▶ OC-1 → OC-2 → OC-3
                          │   （OC-0 纯调研无前置，可与 OD-M11 并行）
                          └──▶ OD-M12（收尾与债务，可与 TPI-W 并行）
-M1（记忆即产品，暂停中，恢复前提已满足）—— 与本线并行，互不阻塞
 ```
 
-**待 jason 拍板**：
-1. OD-M11 与 M1 的优先级（建议并行，M1 走 B 机 / Codex 线，OD-M11 走本机）。
-2. F11.4 托管器取舍（a 或 b）。
-3. OC-0 是否可以提前启动做纯调研（不写代码），与 OD-M11 并行。
+**jason 裁决（2026-10-03）**：Open Design 线**在 M10 告一阶段**。本文全部里程碑（OD-M11 / OD-M12 / TPI-W / OC，含 OC-0 调研）状态为 `PAUSED`，**不与 M1 并行**；主干先做 M1（记忆即产品）。恢复时从 OD-M11 起步，F11.4 托管器取舍届时再定。§0 列出的「产品路径尚未生效」缺口在恢复前一直成立：当前 Desktop 里的 Open Design 是**演示形态**（全权 token、无 workspace 绑定），不能当作第三方隔离已生效来对外描述。
