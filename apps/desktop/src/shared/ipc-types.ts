@@ -11,6 +11,14 @@ export const IpcChannels = {
   CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',
   CreativeHide: 'creative:hide',
+  // Owner decision 2026-10-05: Open Design ships as an on-demand component,
+  // not bundled in the installer. These channels manage its lifecycle
+  // (download + verify + install) independently of CreativeServeWeb, which
+  // only starts the already-installed component.
+  OpenDesignComponentStatus: 'open-design-component:status',
+  OpenDesignComponentInstall: 'open-design-component:install',
+  // Push channel only (main -> renderer), mirrors AgentEarEvent's pattern.
+  OpenDesignComponentProgress: 'open-design-component:progress',
   OmlxDetect: 'omlx:detect',
   OmlxModels: 'omlx:models',
   OmlxStart: 'omlx:start',
@@ -71,6 +79,24 @@ export interface CreativeViewResult {
   ok: boolean
   origin?: string
   error?: string
+  /** Set instead of a generic error when the on-demand Open Design
+   * component is not installed yet — the renderer should show the download
+   * card (driven by the OpenDesignComponent* IPC) rather than an error. */
+  needsDownload?: boolean
+  size?: number
+}
+
+/** Mirrors main/open-design-component.ts's `OpenDesignComponentStatus` —
+ * duplicated here (not imported) because this file is the main/renderer
+ * boundary and must stay free of main-process-only modules. */
+export interface OpenDesignComponentStatusResult {
+  state: 'not-installed' | 'downloading' | 'verifying' | 'installed' | 'failed' | 'unavailable'
+  received?: number
+  total?: number
+  size?: number
+  dir?: string
+  error?: string
+  reason?: string
 }
 
 export interface OmlxDetectResult {

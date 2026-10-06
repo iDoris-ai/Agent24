@@ -1,0 +1,12 @@
+{
+  "source": "iDoris-ai/Agent-Speaker tests/contracts/testdata/public-query-fixtures.json",
+  "source_sha256": "5139728518dc0be5db28eb9f5a3cb40198874d0d7a27fa57e9d232731f731a72",
+  "samples": [
+    {"category":"plain","content":"plain text round2 zero-run probe"},
+    {"category":"kind-30078","kind":30078,"content":"{\"version\":\"f4/1\",\"intent\":\"ask\",\"thread_id\":\"00000000-0000-4000-8000-000000000001\"}"},
+    {"category":"query","content":"{\"protocol\":\"hyphae-behavior/1\",\"type\":\"query\",\"issued_at\":100,\"expires_at\":200,\"request_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"to\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"payload\":{\"scope\":\"profile\"}}"},
+    {"category":"response","content":"{\"protocol\":\"hyphae-behavior/1\",\"type\":\"response\",\"issued_at\":101,\"request_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"to\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"request_event\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"payload\":{\"outcome\":\"ok\",\"scope\":\"profile\",\"declaration_event\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"declaration_issued_at\":90,\"declaration_expires_at\":190,\"data\":{\"mode\":\"simple\",\"name\":\"A\"}}}"},
+    {"category":"receipt","kind":30078,"content":"{\"version\":\"f4/1\",\"intent\":\"ack\",\"thread_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"working\"}"},
+    {"category":"canary","content":"a24-liveness-canary 00000000-0000-4000-8000-000000000002"}
+  ]
+}

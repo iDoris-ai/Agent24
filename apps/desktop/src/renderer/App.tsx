@@ -49,7 +49,7 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'schedules',       icon: '⏰', label: '调度' },
   { id: 'approvals',       icon: '🔐', label: '审批' },
   { id: 'voice',           icon: '🎙️', label: '语音' },
-  { id: 'creative',        icon: '🎨', label: 'Creative' },
+  { id: 'creative',        icon: '🎨', label: 'Design' },
   { id: 'models',          icon: '🤖', label: '模型' },
   { id: 'modules-manager', icon: '🧩', label: '模块管理' },
   // M1-T11: 记忆页紧挨设置，和它共享"这是你对 Agent24 的控制面"这同一个位置。
@@ -60,7 +60,7 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
 const BUILTIN_TITLES: Record<BuiltinPage, string> = {
   chat: '对话', workbench: '工作台', runs: '运行任务',
   schedules: '定时调度', approvals: '待审批', voice: '语音',
-  creative: 'Creative', models: '模型管理', 'modules-manager': '模块管理',
+  creative: 'Design', models: '模型管理', 'modules-manager': '模块管理',
   memory: '记忆', settings: '设置',
 }
 

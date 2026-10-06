@@ -20,10 +20,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # user types (Codex 挑战 Medium #6) via `tcgetattr`/`tcsetattr` — the same
 # crate `agent24-comm` already uses for its own fd-level checks, so no new
 # dependency family.
-rustix = { version = "0.38", features = ["termios"] }
+rustix = { version = "0.38", features = ["pty", "termios"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "io-std", "sync"] }
+zeroize = "1"
 # TUI (C6)
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

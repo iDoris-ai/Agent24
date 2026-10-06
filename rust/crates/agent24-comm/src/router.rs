@@ -21,10 +21,12 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::daemon::RelayProbeStatus;
 use crate::error::{CommError, map_envelope_failure, map_runner_error, map_store_error};
@@ -157,6 +159,7 @@ pub fn router(state: CommState) -> Router {
     Router::new()
         .route("/identity", get(list_identity).post(create_identity))
         .route("/identity/default", post(use_identity))
+        .route("/unlock", post(unlock))
         .route("/contact", get(list_contact).post(add_contact))
         .route("/relay", get(list_relay).put(set_relay))
         .route("/relay/probe", post(probe_relay))
@@ -616,6 +619,94 @@ async fn use_identity(
         daemon.on_config_changed().await;
     }
     envelope_response(envelope)
+}
+
+struct UnlockSecret(Zeroizing<String>);
+
+impl<'de> serde::Deserialize<'de> for UnlockSecret {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnlockReq {
+    password: UnlockSecret,
+    #[serde(default)]
+    remember: bool,
+}
+
+/// `POST /comm/unlock` verifies the supplied password with Hyphae's real,
+/// read-only `identity check-password --password-stdin` before registering it
+/// under the current keystore salt. No daemon or mutating Hyphae command is
+/// involved.
+async fn unlock(
+    State(state): State<CommState>,
+    payload: Result<Json<UnlockReq>, JsonRejection>,
+) -> CommResult {
+    let Json(req) = payload.map_err(|_| CommError::Invalid("invalid unlock request".to_owned()))?;
+    let (runner, password_store, home) = state.require_ready()?;
+    let password = Password::new(req.password.0.as_bytes().to_vec())
+        .map_err(|e| CommError::Invalid(e.to_string()))?;
+    let remember = req.remember;
+
+    // Serialize against in-process identity creation/import and hold the
+    // account stable until verification and registration have completed.
+    let _guard = runner.keystore_lock().acquire().await;
+    let account = resolve_account(home)
+        .await?
+        .ok_or_else(|| CommError::NotConfigured("no keystore exists yet".to_owned()))?;
+
+    let envelope = runner
+        .run(Invocation {
+            args: vec!["identity".into(), "check-password".into()],
+            password: Some(password.duplicate()),
+            timeout: None,
+        })
+        .await
+        .map_err(map_runner_error)?;
+    match envelope {
+        Envelope::Ok { data }
+            if data.get("encrypted").and_then(Value::as_bool) == Some(true)
+                && data.get("valid").and_then(Value::as_bool) == Some(true) => {}
+        Envelope::Ok { .. } => {
+            return Err(CommError::Upstream(
+                "Hyphae check-password returned an invalid success envelope".to_owned(),
+            ));
+        }
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => return Err(map_envelope_failure(&error, &message, data)),
+    }
+
+    let verified_account = resolve_account(home).await?.ok_or_else(|| {
+        CommError::Conflict(
+            "keystore changed during password verification".to_owned(),
+            None,
+        )
+    })?;
+    if verified_account != account {
+        return Err(CommError::Conflict(
+            "keystore changed during password verification".to_owned(),
+            None,
+        ));
+    }
+
+    let remembered = password_store
+        .register_verified(&verified_account, &password, remember)
+        .await
+        .map_err(map_store_error)?;
+    Ok(Json(json!({"ok": true, "data": {
+        "unlocked": true,
+        "remembered": remembered,
+    }})))
 }
 
 // ---------------------------------------------------------------------
@@ -1541,6 +1632,212 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::LOCKED);
         assert_eq!(body["error"], "locked");
+    }
+
+    async fn write_unlock_keystore(home: &Path, salt: &str) {
+        let hyphae = home.join(".hyphae");
+        tokio::fs::create_dir_all(&hyphae).await.unwrap();
+        tokio::fs::write(
+            hyphae.join("keystore.json"),
+            serde_json::to_vec(&json!({"salt": salt})).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unlock_checks_real_command_registers_memory_session_and_needs_no_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        write_unlock_keystore(&home, "salt-before").await;
+        let script = "#!/bin/sh\n[ \"$1 $2 $3\" = \"identity check-password --password-stdin\" ] || exit 90\ncat >/dev/null\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"encrypted\":true,\"valid\":true}}'\n";
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let account = Account::from_salt("salt-before");
+        let state = CommState::ready(runner, store.clone(), home);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/unlock",
+            Some(json!({"password":"verified-pass"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["unlocked"], true);
+        assert_eq!(body["data"]["remembered"], false);
+        assert_eq!(
+            store.get(&account).await.unwrap().as_bytes(),
+            b"verified-pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlock_maps_auth_error_to_locked_without_registering_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        write_unlock_keystore(&home, "salt-auth").await;
+        let script = "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"ok\":false,\"error\":\"auth_error\",\"message\":\"password verification failed\"}' >&2\nexit 3\n";
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let account = Account::from_salt("salt-auth");
+        let state = CommState::ready(runner, store.clone(), home);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/unlock",
+            Some(json!({"password":"wrong"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::LOCKED, "{body:?}");
+        assert_eq!(body["error"], "locked");
+        assert!(matches!(
+            store.get(&account).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unlock_rechecks_salt_before_registering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        write_unlock_keystore(&home, "salt-before").await;
+        let script = format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{{\"salt\":\"salt-after\"}}' > '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"encrypted\":true,\"valid\":true}}}}'\n",
+            home.join(".hyphae").join("keystore.json").display()
+        );
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let previous = Account::from_salt("salt-before");
+        let current = Account::from_salt("salt-after");
+        let state = CommState::ready(runner, store.clone(), home);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/unlock",
+            Some(json!({"password":"verified-pass"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert!(matches!(
+            store.get(&previous).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get(&current).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unlock_rejects_invalid_password_length_before_invoking_hyphae() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        write_unlock_keystore(&home, "salt-invalid").await;
+        let marker = tmp.path().join("invoked");
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"encrypted\":true,\"valid\":true}}}}'\n",
+            marker.display()
+        );
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let state = CommState::ready(runner, Arc::new(MemoryPasswordStore::new()), home);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/unlock",
+            Some(json!({"password":""})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid");
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn unlock_rejects_success_envelope_without_true_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        write_unlock_keystore(&home, "salt-flags").await;
+        let script = "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"encrypted\":true,\"valid\":false}}'\n";
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let account = Account::from_salt("salt-flags");
+        let state = CommState::ready(runner, store.clone(), home);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/unlock",
+            Some(json!({"password":"candidate"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["error"], "upstream");
+        assert!(matches!(
+            store.get(&account).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unlock_json_rejections_are_fixed_invalid_responses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state =
+            ready_state_with_script(tmp.path(), "#!/bin/sh\necho should-not-run >&2\nexit 4\n")
+                .await;
+        for body in [
+            r#"{"password":"candidate","extra":true}"#,
+            r#"{"password":42}"#,
+            r#"{"remember":true}"#,
+            r#"{"password":"candidate","remember":"yes"}"#,
+            r#"{"password":"candidate""#,
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+            assert_eq!(body["error"], "invalid");
+            assert_eq!(body["message"], "invalid unlock request");
+            assert!(!body.to_string().contains("candidate"));
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/unlock")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; 2 * 1024 * 1024 + 1]))
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "invalid");
+        assert_eq!(body["message"], "invalid unlock request");
     }
 
     #[tokio::test]

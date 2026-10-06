@@ -5,6 +5,7 @@
 //! - Standalone: no daemon found → spawn an ephemeral agent24d for this
 //!   invocation and terminate it afterwards
 
+use std::io::BufRead;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -17,6 +18,7 @@ use agent24_protocol::{
 };
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
 mod service;
@@ -225,6 +227,12 @@ enum CommAction {
         /// HOME.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Verify and temporarily unlock the encrypted Hyphae keystore
+    Unlock {
+        /// Also persist the verified password in the OS keychain
+        #[arg(long)]
+        remember: bool,
     },
     /// Manage the Hyphae daemon `agent24d` supervises (COMM-4a)
     Daemon {
@@ -1010,7 +1018,9 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     // `send`/`outbox retry` can take up to `5s × 8 relays + 10s = 50s`
     // server-side (COMM-HYPHAE.md §3); give those two a generous timeout too
     // rather than the default 15s.
-    let timeout = if matches!(action, CommAction::Import { .. }) {
+    let timeout = if matches!(action, CommAction::Unlock { .. }) {
+        Duration::from_secs(30)
+    } else if matches!(action, CommAction::Import { .. }) {
         Duration::from_secs(120)
     } else if matches!(
         action,
@@ -1036,8 +1046,19 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 Some(serde_json::json!({
                     "from": from.to_string_lossy(),
                     "confirm": yes,
-                    "password": password,
+                    "password": password.as_deref(),
                     "dry_run": dry_run,
+                })),
+            )
+        }
+        CommAction::Unlock { remember } => {
+            let password = read_password_from_stdin()?;
+            (
+                reqwest::Method::POST,
+                "/api/v1/comm/unlock".to_owned(),
+                Some(serde_json::json!({
+                    "password": password.as_str(),
+                    "remember": remember,
                 })),
             )
         }
@@ -1158,15 +1179,18 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
             ),
         },
     };
+    let mut body = CommRequestBody(body);
 
     let ep = connect().await.map_err(|e| {
         format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
     })?;
     let mut req = bearer(&ep, client().request(method, format!("{}{path}", ep.base)));
-    if let Some(body) = &body {
+    if let Some(body) = &body.0 {
         req = req.json(body);
     }
-    let out = match req.timeout(timeout).send().await {
+    let result = req.timeout(timeout).send().await;
+    body.zeroize_password();
+    let out = match result {
         Ok(res) => {
             let status = res.status();
             let body: serde_json::Value = res.json().await.unwrap_or_default();
@@ -1186,6 +1210,27 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     out
 }
 
+/// A comm JSON body can contain a password for import/unlock. Clear that
+/// application-owned string as soon as the request has been serialized and
+/// sent, and also on every earlier return path.
+struct CommRequestBody(Option<serde_json::Value>);
+
+impl CommRequestBody {
+    fn zeroize_password(&mut self) {
+        if let Some(serde_json::Value::String(password)) =
+            self.0.as_mut().and_then(|body| body.get_mut("password"))
+        {
+            password.zeroize();
+        }
+    }
+}
+
+impl Drop for CommRequestBody {
+    fn drop(&mut self) {
+        self.zeroize_password();
+    }
+}
+
 /// Disables local terminal echo on stdin for the lifetime of the guard,
 /// restoring the original termios settings on drop — including on an
 /// early return or a panic unwind (Codex 挑战 Medium #6: "异常退出时也要
@@ -1193,6 +1238,7 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
 /// pipe has no termios to touch and `disable` simply isn't called for it.
 struct EchoGuard {
     original: rustix::termios::Termios,
+    fd: rustix::fd::OwnedFd,
 }
 
 impl EchoGuard {
@@ -1201,14 +1247,22 @@ impl EchoGuard {
     /// the whole password read over.
     fn disable() -> Option<Self> {
         let stdin = std::io::stdin();
-        let original = rustix::termios::tcgetattr(&stdin).ok()?;
+        Self::disable_fd(&stdin)
+    }
+
+    fn disable_fd(fd: impl rustix::fd::AsFd) -> Option<Self> {
+        let owned_fd = rustix::io::dup(&fd).ok()?;
+        let original = rustix::termios::tcgetattr(&owned_fd).ok()?;
         let mut silenced = original.clone();
         silenced
             .local_modes
             .remove(rustix::termios::LocalModes::ECHO);
-        rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &silenced)
+        rustix::termios::tcsetattr(&owned_fd, rustix::termios::OptionalActions::Now, &silenced)
             .ok()?;
-        Some(Self { original })
+        Some(Self {
+            original,
+            fd: owned_fd,
+        })
     }
 }
 
@@ -1218,16 +1272,16 @@ impl Drop for EchoGuard {
         // with echo off until they run `stty sane`/open a new shell —
         // there is no better fallback at this point, and panicking out of
         // a `Drop` would only make things worse.
-        let stdin = std::io::stdin();
         let _ = rustix::termios::tcsetattr(
-            &stdin,
+            &self.fd,
             rustix::termios::OptionalActions::Now,
             &self.original,
         );
     }
 }
 
-/// Reads the Hyphae keystore password for `agent24 comm import` from
+/// Reads the Hyphae keystore password for `agent24 comm import` and
+/// `agent24 comm unlock` from
 /// stdin — never from a `--password`-style CLI flag, which would put the
 /// plaintext on argv, visible to any other user on the same host via `ps`
 /// (COMM-HYPHAE.md §3's rule for Hyphae's own `--password-stdin`, applied
@@ -1238,7 +1292,7 @@ impl Drop for EchoGuard {
 /// untouched. Reads one line and strips exactly one trailing `\n`/`\r\n`
 /// (keeping any other whitespace the password itself might contain, same
 /// rule the design doc uses for message content).
-fn read_password_from_stdin() -> Result<String, String> {
+fn read_password_from_stdin() -> Result<Zeroizing<String>, String> {
     use std::io::Write;
     let is_tty = std::io::stdin().is_terminal();
     let _echo_guard = if is_tty {
@@ -1249,28 +1303,47 @@ fn read_password_from_stdin() -> Result<String, String> {
         None
     };
 
-    let mut line = String::new();
-    let read_result = std::io::stdin().read_line(&mut line);
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let result = read_password_line(&mut input);
     if is_tty {
         // With echo off, the Enter key the user pressed never printed a
         // newline on the terminal — print one ourselves so whatever comes
         // next doesn't start on the same line as the prompt.
         eprintln!();
     }
-    // `_echo_guard` drops here (echo restored) regardless of which path
-    // below returns — including the two error returns.
+    // `_echo_guard` drops here on both success and error, restoring terminal echo.
+    result
+}
+
+const PASSWORD_MAX_BYTES: usize = 4096;
+
+fn read_password_line(reader: &mut impl BufRead) -> Result<Zeroizing<String>, String> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    let mut limited = std::io::Read::take(&mut *reader, (PASSWORD_MAX_BYTES + 3) as u64);
+    let read_result = limited.read_until(b'\n', &mut bytes);
     read_result.map_err(|e| format!("reading password from stdin: {e}"))?;
 
-    let trimmed = line.strip_suffix('\n').unwrap_or(&line);
-    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-    if trimmed.is_empty() {
+    let content = strip_one_password_line_ending(&bytes);
+    if content.is_empty() {
         return Err(
-            "no password was read from stdin; pipe the Hyphae keystore password in, e.g. \
-             `echo \"$PASSWORD\" | agent24 comm import <from> --yes`"
-                .to_owned(),
+            "no password was read from stdin; pipe the Hyphae keystore password in".to_owned(),
         );
     }
-    Ok(trimmed.to_owned())
+    if content.len() > PASSWORD_MAX_BYTES {
+        return Err("password must be between 1 and 4096 UTF-8 bytes".to_owned());
+    }
+    let password =
+        std::str::from_utf8(content).map_err(|_| "password must be valid UTF-8".to_owned())?;
+    Ok(Zeroizing::new(password.to_owned()))
+}
+
+fn strip_one_password_line_ending(line: &[u8]) -> &[u8] {
+    if let Some(without_lf) = line.strip_suffix(b"\n") {
+        without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+    } else {
+        line
+    }
 }
 
 /// The v1 error envelope's `error.code`/`error.message`, as a bare JSON value
@@ -1982,6 +2055,90 @@ mod tests {
         });
         let out = format_comm_error(&body);
         assert_eq!(out, "comm: not_configured — no default identity");
+    }
+
+    #[test]
+    fn comm_unlock_has_only_the_remember_flag() {
+        let cli = Cli::try_parse_from(["agent24", "comm", "unlock", "--remember"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Comm {
+                action: CommAction::Unlock { remember: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn password_line_removes_only_one_lf_or_crlf_and_keeps_spaces() {
+        assert_eq!(strip_one_password_line_ending(b" pass \n"), b" pass ");
+        assert_eq!(strip_one_password_line_ending(b"pass\r\n"), b"pass");
+        assert_eq!(strip_one_password_line_ending(b"pass\r"), b"pass\r");
+        assert_eq!(strip_one_password_line_ending(b"pass\r\r\n"), b"pass\r");
+        assert_eq!(strip_one_password_line_ending(b"no-newline"), b"no-newline");
+    }
+
+    #[test]
+    fn password_line_enforces_utf8_byte_limit_and_reads_bounded_without_newline() {
+        use std::io::Cursor;
+
+        let max_utf8 = "é".repeat(2048);
+        let mut valid = Cursor::new(max_utf8.as_bytes());
+        assert_eq!(read_password_line(&mut valid).unwrap().len(), 4096);
+
+        let too_many_utf8 = "é".repeat(2049);
+        let mut over = Cursor::new(too_many_utf8.as_bytes());
+        assert!(read_password_line(&mut over).is_err());
+
+        let long_without_newline = vec![b'x'; 100_000];
+        let mut bounded = Cursor::new(long_without_newline);
+        assert!(read_password_line(&mut bounded).is_err());
+        assert_eq!(bounded.position(), (PASSWORD_MAX_BYTES + 3) as u64);
+    }
+
+    #[test]
+    fn echo_guard_restores_terminal_after_early_error() {
+        fn fail_with_echo_disabled(slave: &std::fs::File) -> Result<(), ()> {
+            let _guard = EchoGuard::disable_fd(slave).unwrap();
+            assert!(
+                !rustix::termios::tcgetattr(slave)
+                    .unwrap()
+                    .local_modes
+                    .contains(rustix::termios::LocalModes::ECHO)
+            );
+            Err(())
+        }
+
+        let master =
+            rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+                .unwrap();
+        rustix::pty::grantpt(&master).unwrap();
+        rustix::pty::unlockpt(&master).unwrap();
+        let slave_name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(slave_name.to_str().unwrap())
+            .unwrap();
+        let initially_echo = rustix::termios::tcgetattr(&slave)
+            .unwrap()
+            .local_modes
+            .contains(rustix::termios::LocalModes::ECHO);
+        let result = fail_with_echo_disabled(&slave);
+        assert!(result.is_err());
+        assert_eq!(
+            rustix::termios::tcgetattr(&slave)
+                .unwrap()
+                .local_modes
+                .contains(rustix::termios::LocalModes::ECHO),
+            initially_echo
+        );
+    }
+
+    #[test]
+    fn comm_request_body_zeroizes_password_field() {
+        let mut body = CommRequestBody(Some(serde_json::json!({"password":"secret"})));
+        body.zeroize_password();
+        assert_eq!(body.0.as_ref().unwrap()["password"], "");
     }
 
     #[test]

@@ -159,9 +159,10 @@ async fn real_hyphae_binary_envelopes_round_trip() {
         }
     }
 
-    // 4. `contact add` with an invalid npub must fail as `other_error`
-    //    (exit code 4) — Hyphae classifies this as other_error, not
-    //    user_error (COMM-HYPHAE.md G6).
+    // 4. Preserve the behavior of both accepted binaries: the legacy
+    //    acceptance reference classifies this as OtherError (exit 4), while
+    //    the currently locked Hyphae main build classifies it as UserError
+    //    (exit 1).
     let envelope = runner
         .run(Invocation {
             args: vec![
@@ -179,11 +180,16 @@ async fn real_hyphae_binary_envelopes_round_trip() {
         .expect("contact add with a bad npub should still parse as a valid envelope");
     match envelope {
         Envelope::Failed { exit, error, .. } => {
-            assert_eq!(exit, ExitClass::OtherError);
-            assert_eq!(error, "other_error");
+            let (expected_exit, expected_error) = if actual == reference {
+                (ExitClass::OtherError, "other_error")
+            } else {
+                (ExitClass::UserError, "user_error")
+            };
+            assert_eq!(exit, expected_exit);
+            assert_eq!(error, expected_error);
         }
         Envelope::Ok { data } => {
-            panic!("expected other_error for an invalid npub, got Ok({data:?})")
+            panic!("expected an error for an invalid npub, got Ok({data:?})")
         }
     }
 }

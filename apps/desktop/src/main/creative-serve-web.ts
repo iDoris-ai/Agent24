@@ -3,12 +3,26 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { Readable } from 'node:stream'
 
-export type CreativeServeWebState = 'stopped' | 'starting' | 'ready' | 'failed'
+import { assertResourceSafeBaseAncestryIsSafe, verifyEntryFileIntegrity } from './open-design-component'
+
+export type CreativeServeWebState = 'stopped' | 'starting' | 'ready' | 'failed' | 'needs-download'
 
 export interface CreativeServeWebStatus {
   state: CreativeServeWebState
   origin?: string
   error?: string
+  /** Set when state === 'needs-download': the Open Design component's
+   * declared download size, surfaced from the baked manifest, so the
+   * renderer can show "~N MB" without a round trip of its own. */
+  size?: number
+}
+
+/** The subset of OpenDesignComponentInstaller's surface CreativeServeWeb
+ * needs — kept narrow and duck-typed here so this file never imports
+ * Electron-coupled installer wiring directly (keeps the existing unit tests
+ * free of filesystem/network fixtures unless they opt in). */
+export interface OpenDesignComponentAccessor {
+  status(): { state: string; dir?: string; size?: number }
 }
 
 export interface CreativeServeWebOptions {
@@ -21,6 +35,11 @@ export interface CreativeServeWebOptions {
   nodeBinary?: string
   port?: number
   readyTimeoutMs?: number
+  /** On-demand Open Design component (owner decision 2026-10-05: no longer
+   * bundled in the installer). When set and no explicit dev checkout/legacy
+   * bundled resources are found, CreativeServeWeb consults this instead of
+   * `resourcesPath` to locate the headless launcher + resource root. */
+  component?: OpenDesignComponentAccessor
 }
 
 type SpawnFn = typeof spawn
@@ -32,7 +51,15 @@ const DEFAULT_READY_TIMEOUT_MS = 15_000
 const CHECKOUT_STOP_TIMEOUT_MS = 5_000
 const HEADLESS_STOP_TIMEOUT_MS = 60_000
 export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
-const AGENT24_HEADLESS_PROTOCOL = 1
+// v2 (Opus review of #670, 2026-10-05): the fork's agent24-headless.cjs now
+// accepts an explicit resourceSafeBase (fork PR iDoris-ai/open-design-
+// agent24#7, not yet merged/pinned — see the on-demand branch below for why
+// this constant is bumped here ahead of that pin update). NOTE: this makes
+// the on-demand path incompatible with the CURRENTLY pinned fork commit
+// (still protocol v1) until the fork PR merges and OPEN_DESIGN_SHA is
+// re-pinned — intentional per review instruction ("pin 暂不改...先写好代码与
+// 测试"), not an oversight.
+const AGENT24_HEADLESS_PROTOCOL = 2
 
 export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'
 
@@ -97,7 +124,7 @@ function canonicalHeadlessOrigin(raw: unknown, field: string): string {
 
 export interface Agent24HeadlessReady {
   type: 'ready'
-  protocol: 1
+  protocol: 2
   instanceId: string
   pinVersion: string
   webOrigin: string
@@ -231,10 +258,75 @@ export class CreativeServeWeb {
   private async startOnce(): Promise<CreativeServeWebStatus> {
     const environment = this.options.environment ?? process.env
     const explicitCheckout = this.options.checkoutDir ?? environment.A24_OPEN_DESIGN_DIR?.trim()
+    // Legacy path: a build that still bundles the Open Design trees directly
+    // under resourcesPath (kept for back-compat / tests that pass a fully
+    // staged resourcesPath without a component accessor).
     const headlessEntry = explicitCheckout
       ? null
       : resolveAgent24HeadlessLauncher(this.options.resourcesPath)
-    if (headlessEntry) return this.startPackagedHeadless(headlessEntry, environment)
+    if (headlessEntry) return this.startPackagedHeadless(headlessEntry, environment, this.options.resourcesPath)
+
+    // On-demand path (owner decision 2026-10-05): the installer owns whether
+    // the component is present; this file never downloads anything itself.
+    //
+    // PR #670 review (H1): `unavailable` means the installer has no baked
+    // manifest at all (a dev/unreleased build) — it does NOT mean "no Open
+    // Design available". Such a build must still fall through to the
+    // original resolveOpenDesignCheckout sibling-checkout discovery below
+    // (dev convenience, no env var required). Only `not-installed` /
+    // `downloading` / `verifying` / `failed` — i.e. a real baked manifest
+    // that isn't installed yet — short-circuits to `needs-download` here.
+    if (!explicitCheckout && this.options.component) {
+      const componentStatus = this.options.component.status()
+      if (componentStatus.state === 'installed' && componentStatus.dir) {
+        const installedHeadlessEntry = resolveAgent24HeadlessLauncher(componentStatus.dir)
+        if (installedHeadlessEntry) {
+          // C1 (Opus review of #670, 2026-10-05): a symlink written at
+          // runtime into the app's own resourcesPath used to stand in for
+          // this — EROFS on a read-only AppImage FUSE mount, EACCES on a
+          // root-owned deb /opt install, breaks a signed mac bundle, and
+          // races across multiple users on the same machine. The real fix
+          // is fork-side (iDoris-ai/open-design-agent24#7, not yet merged):
+          // agent24-headless.cjs now accepts an explicit resourceSafeBase
+          // instead of always deriving it from runtimeExecutable's own
+          // location. We never touch resourcesPath for the on-demand case
+          // at all now — resourceSafeBase is just componentStatus.dir's own
+          // realpath (it must equal its own realpath: the fork's new check
+          // rejects a resourceSafeBase that is itself reached through a
+          // symlink, by design — see OpenDesignComponentInstaller, which
+          // installs with mode 0700 so this directory's ownership/
+          // writability already satisfies the fork's POSIX check).
+          const resourceSafeBase = fs.realpathSync(componentStatus.dir)
+          // M1/M4 ("self-checking is not a boundary", Opus re-review of the
+          // fork PR, 2026-10-06): verify BEFORE spawning anything, not just
+          // trust the fork's own (later, post-spawn) self-check — the
+          // ancestor-chain ownership/mode walk (M1) and the installed
+          // entry files' content hashes against the marker recorded at
+          // install time (M4). Both throw with a clear message on failure;
+          // caught here and surfaced as a normal 'failed' status rather
+          // than an uncaught exception, same as every other failure path
+          // in this method.
+          try {
+            assertResourceSafeBaseAncestryIsSafe(resourceSafeBase)
+            verifyEntryFileIntegrity(componentStatus.dir)
+          } catch (error) {
+            this.current = { state: 'failed', error: error instanceof Error ? error.message : String(error) }
+            return this.status()
+          }
+          return this.startPackagedHeadless(installedHeadlessEntry, environment, componentStatus.dir, resourceSafeBase)
+        }
+        // Installed-but-missing-launcher (e.g. the dir was deleted after the
+        // installer last validated it): surface needs-download so the
+        // renderer's existing "下载" button doubles as "重新下载", same as
+        // the not-installed/failed branch below.
+        this.current = { state: 'needs-download', size: undefined }
+        return this.status()
+      }
+      if (componentStatus.state !== 'unavailable') {
+        this.current = { state: 'needs-download', size: componentStatus.size }
+        return this.status()
+      }
+    }
 
     const checkoutDir = explicitCheckout
       ?? resolveOpenDesignCheckout(process.cwd(), environment, this.options.resourcesPath)
@@ -309,8 +401,14 @@ export class CreativeServeWeb {
   private async startPackagedHeadless(
     headlessEntry: string,
     environment: NodeJS.ProcessEnv,
+    baseResourcesPath: string | undefined,
+    /** v2-only (see the on-demand branch above): an explicit, pre-realpath'd
+     * trust root for resourceRoot. Omitted for the legacy bundled-resources
+     * path, which keeps relying on the fork's v1 runtimeExecutable-derived
+     * default. */
+    resourceSafeBase?: string,
   ): Promise<CreativeServeWebStatus> {
-    const resourcesPath = this.options.resourcesPath
+    const resourcesPath = baseResourcesPath
     const stateRoot = this.options.stateRoot
     const runtimeExecutable = this.options.runtimeExecutable
     const pinVersion = this.options.pinVersion ?? OPEN_DESIGN_PIN_VERSION
@@ -327,7 +425,21 @@ export class CreativeServeWeb {
       return this.status()
     }
 
-    const resourceRoot = path.join(resourcesPath, 'open-design')
+    // M2 closed-loop finding (2026-10-05): resourceRoot must be built from
+    // the SAME base as resourceSafeBase when one is given. The fork's own
+    // v2 check (isUnderSafeBase) does a plain path.relative(safeBase,
+    // resourceRoot) string comparison — it never realpath()s resourceRoot
+    // itself, only resourceSafeBase. Building resourceRoot from the raw,
+    // un-realpath'd resourcesPath while resourceSafeBase is already
+    // fs.realpathSync'd (see the on-demand branch above) means the two
+    // would silently disagree on ANY system where the installed
+    // component's path traverses a symlink (observed locally on macOS's
+    // /var/folders tmp mount; a real ~/.agent24/... path is not usually
+    // symlinked, but nothing guarantees that on every host) — the real
+    // headless launcher would then reject every on-demand launch with
+    // "resourceRoot must be under resourceSafeBase". Anchoring both to the
+    // identical resolved base removes the mismatch unconditionally.
+    const resourceRoot = path.join(resourceSafeBase ?? resourcesPath, 'open-design')
     const dataRoot = path.join(stateRoot, 'data')
     const runtimeRoot = path.join(stateRoot, 'runtime')
     const configPath = path.join(stateRoot, 'agent24-headless.json')
@@ -340,6 +452,7 @@ export class CreativeServeWeb {
       dataRoot,
       runtimeRoot,
       runtimeExecutable,
+      ...(resourceSafeBase ? { resourceSafeBase } : {}),
     })}\n`, { encoding: 'utf8', mode: 0o600 })
     fs.chmodSync(configPath, 0o600)
 
