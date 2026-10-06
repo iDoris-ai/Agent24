@@ -63,6 +63,12 @@ tags:
     description: Cron-driven scheduled runs (CRUD + run-now).
   - name: tools
     description: Tool inventory, risk classes, and trust overrides.
+  - name: memory
+    description: >-
+      M1-T10: the personal-memory surface — list/search qualified assertions
+      with provenance, retract one, and the persistent pause switch. Personal
+      space only; `owner` is injected by the daemon from session identity and
+      is never a request parameter.
   - name: sin90
     description: The Sin90 Personal-OS module (own store; degrades independently).
 
@@ -906,6 +912,153 @@ paths:
           description: Removed
         "404":
           description: No such rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /memory/assertions:
+    get:
+      operationId: listMemoryAssertions
+      x-milestone: M1-T10
+      tags: [memory]
+      summary: List or search personal-memory assertions
+      description: >-
+        Personal space only. Without `q`: the latest qualified assertions,
+        newest `recorded_at` first. With `q`: full-text `search_any` over the
+        SAME scope + qualified + current filters. `owner` is injected by the
+        daemon from session identity — never a request parameter.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: >-
+            Default 20 if omitted. Capped at 200 regardless of what is asked
+            for. `0` (or anything else that is not a positive integer) is a
+            400, not silently clamped up to 1.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+      responses:
+        "200":
+          description: Assertion list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assertions]
+                properties:
+                  assertions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MemoryAssertion"
+        "400":
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Personal memory is not available on this daemon
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /memory/assertions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: forgetMemoryAssertion
+      x-milestone: M1-T10
+      tags: [memory]
+      summary: Retract (forget) one assertion
+      description: >-
+        Stops it being recalled in any new session; the original conversation
+        stays in the local event log. Repeatable (already-retracted is still
+        204). An id that does not exist UNDER THIS OWNER 404s — identically
+        whether it never existed or belongs to a module partition, so this
+        never leaks which case it was.
+      responses:
+        "204":
+          description: Retracted (or already was)
+        "503":
+          description: Personal memory is not available on this daemon
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No such assertion
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /memory/settings:
+    get:
+      operationId: getMemorySettings
+      x-milestone: M1-T10
+      tags: [memory]
+      summary: Read the personal-memory pause switch
+      responses:
+        "200":
+          description: Current setting
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemorySettings"
+        "503":
+          description: Personal memory is not available on this daemon
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      operationId: putMemorySettings
+      x-milestone: M1-T10
+      tags: [memory]
+      summary: Set the personal-memory pause switch
+      description: >-
+        Turning it off stops new writes and cross-session recall for any
+        NEWLY STARTED run from the moment this returns; existing assertions
+        are kept, and the setting survives a daemon restart. Does not affect
+        a run that is already resuming from an approval wait — that run
+        replays its own already-persisted messages (which captured whatever
+        this switch said at the moment IT started) rather than re-deciding
+        anything against the current value of this switch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MemorySettings"
+      responses:
+        "200":
+          description: The stored setting
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemorySettings"
+        "400":
+          description: Malformed request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Personal memory is not available on this daemon
           content:
             application/json:
               schema:
@@ -1949,6 +2102,54 @@ components:
         created_at:
           type: string
           format: date-time
+
+    MemoryAssertion:
+      type: object
+      required: [id, text, recorded_at, status, evidence, session]
+      description: >-
+        One qualified personal-memory assertion, with provenance (M1-T10 /
+        `docs/research/MEMORY-STRATEGY.md` §4.1).
+      properties:
+        id:
+          type: string
+        text:
+          type: string
+          description: The remembered original sentence.
+          examples: ["我对花生过敏"]
+        recorded_at:
+          type: string
+          format: date-time
+          description: When the system recorded this belief.
+        status:
+          type: string
+          enum: [active, retracted, held]
+          description: >-
+            `held` = an unconfirmed candidate (never returned by this
+            endpoint today — list/search already filter to qualified,
+            current beliefs — but computed from the real row state rather
+            than hardcoded).
+        evidence:
+          type: array
+          items:
+            type: string
+          description: Evidence event id(s) this belief was recorded from.
+        session:
+          type: [string, "null"]
+          description: >-
+            The session its evidence was recorded in, or `null` when that
+            cannot be determined (no evidence, or the evidence event is
+            missing).
+
+    MemorySettings:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+          description: >-
+            The persistent personal-memory switch. `false` stops new writes
+            and cross-session recall; existing assertions are kept, and the
+            setting survives a daemon restart.
 
     ErrorBody:
       type: object

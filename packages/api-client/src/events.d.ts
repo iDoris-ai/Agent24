@@ -43,6 +43,11 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
+      payload: MemoryWriteSkippedPayload;
+      type: "memory.write_skipped";
+      [k: string]: unknown;
+    }
+  | {
       payload: MemoryRecalledPayload;
       type: "memory.recalled";
       [k: string]: unknown;
@@ -219,6 +224,18 @@ export interface Usage {
 export interface MemoryWriteFailedPayload {
   reason: string;
   session_id: string;
+  [k: string]: unknown;
+}
+/**
+ * M1-T10 review H1: `reason` is an open enum (today only `"paused"`).
+ */
+export interface MemoryWriteSkippedPayload {
+  reason: string;
+  run_id: string;
+  /**
+   * Null for transient (session-less) runs, same as `RunStartedPayload`.
+   */
+  session_id: string | null;
   [k: string]: unknown;
 }
 /**

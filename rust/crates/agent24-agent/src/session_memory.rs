@@ -105,6 +105,24 @@ impl SessionMemory {
         self
     }
 
+    /// M1-T10: this instance's personal partition key — the memory REST
+    /// surface (`agent24d::memory_routes`) needs it to query the SAME owner
+    /// this run loop reads and writes, without accepting it as a request
+    /// parameter (owner is injected by the daemon, never by a caller).
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// M1-T10: the underlying memory base — the memory REST surface needs a
+    /// handle to the SAME database this run loop reads and writes, without
+    /// being able to reach inside `agent24_agent::RunManager` (which this
+    /// instance is moved into once the daemon finishes building its state).
+    #[must_use]
+    pub fn kv(&self) -> &KvStore {
+        &self.kv
+    }
+
     #[must_use]
     pub fn with_policy(mut self, policy: CompactionPolicy) -> Self {
         self.policy = policy;
@@ -128,6 +146,12 @@ impl SessionMemory {
     ) -> agent24_memory::Result<Option<(Msg, Vec<String>)>> {
         self.check_owner()?;
         if self.recall_budget == 0 {
+            return Ok(None);
+        }
+        // M1-T10: the personal-memory pause switch is a single early check,
+        // right here at the recall entry point — paused means no
+        // cross-session recall at all, before any search runs.
+        if !self.kv.memory_enabled(&self.owner).await? {
             return Ok(None);
         }
 

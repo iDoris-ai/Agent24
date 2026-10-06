@@ -132,6 +132,18 @@ pub struct AppState {
     /// uses just below, and for the same reason (this reassignment happens
     /// before `state` is ever cloned into the router).
     pub attach_registry: Arc<crate::attach_registry::AttachRegistry>,
+    /// M1-T10: the memory base, for `/api/v1/memory/*` — `None` exactly when
+    /// `memory_owner` is `None` (memory unavailable; see [`open_memory_base`]).
+    /// A SEPARATE handle from the one the run loop got (both are clones of the
+    /// same pool via [`agent24_memory::KvStore`]'s `Clone`), because the
+    /// `SessionMemory` that owns the run loop's handle is moved into
+    /// [`agent24_agent::RunManager`] and no longer reachable from `AppState`.
+    pub memory_kv: Option<agent24_memory::KvStore>,
+    /// M1-T10: the personal partition key `memory_kv`'s handlers read and
+    /// write — the SAME owner [`session_memory`] computed for the run loop.
+    /// Never accepted from a request: the daemon injects it from session
+    /// identity, per `docs/research/MEMORY-STRATEGY.md` §4.1's T10 row.
+    pub memory_owner: Option<String>,
 }
 
 /// A shutdown request, from anything that can make one — a signal, `POST
@@ -559,6 +571,13 @@ impl AppState {
             risk_overrides,
             packages_root,
         } = deps;
+        // M1-T10: the memory REST surface needs a handle to the SAME base and
+        // owner the run loop below gets — captured here, before `memory` is
+        // moved into `RunManager::with_memory_and_workspace`, so no AppDeps
+        // field (and no change to any of its many construction sites) is
+        // needed for this.
+        let memory_kv = memory.as_ref().map(|m| m.kv().clone());
+        let memory_owner = memory.as_ref().map(|m| m.owner().to_owned());
         // ME4-desktop-model-ui: spawned here (not in `serve()`) so every
         // `AppState` — including the one every unit test builds via this
         // same `new()` — gets a real (if test-scale) writer task, and
@@ -672,6 +691,8 @@ impl AppState {
             deliverer,
             shutdown,
             attach_registry,
+            memory_kv,
+            memory_owner,
         }
     }
 }
@@ -1069,6 +1090,22 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/tool-overrides/{pattern}",
             axum::routing::put(crate::overrides::put_override)
                 .delete(crate::overrides::delete_override),
+        )
+        // M1-T10: personal-memory REST — list/search, retract (forget), and
+        // the persistent pause switch. Personal space only; `owner` is never
+        // a request parameter (`crate::memory_routes` module doc).
+        .route(
+            "/api/v1/memory/assertions",
+            get(crate::memory_routes::list_assertions),
+        )
+        .route(
+            "/api/v1/memory/assertions/{id}",
+            axum::routing::delete(crate::memory_routes::delete_assertion),
+        )
+        .route(
+            "/api/v1/memory/settings",
+            get(crate::memory_routes::get_memory_settings)
+                .put(crate::memory_routes::put_memory_settings),
         )
         .route("/api/v1/approvals", get(crate::approvals::list_approvals))
         .route(

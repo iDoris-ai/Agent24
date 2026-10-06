@@ -60,6 +60,7 @@ mod host_bootstrap {
 mod lifecycle;
 mod mcp;
 mod memory_callback;
+mod memory_routes;
 mod model_callback;
 mod module_approval_broker;
 mod module_approvals;

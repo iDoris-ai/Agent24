@@ -291,6 +291,9 @@ impl App {
             EventBody::ModelCall(_) => {}
             // Session-scoped memory failures have no run id for this run log.
             EventBody::MemoryWriteFailed(_) => {}
+            // M1-T10 review H1: a skipped "记住……" while paused — same
+            // non-rendering treatment as the write-failed case above.
+            EventBody::MemoryWriteSkipped(_) => {}
             // Recall audit ids are not rendered by this TUI.
             EventBody::MemoryRecalled(_) => {}
         }

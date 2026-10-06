@@ -518,6 +518,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/memory/assertions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List or search personal-memory assertions
+         * @description Personal space only. Without `q`: the latest qualified assertions, newest `recorded_at` first. With `q`: full-text `search_any` over the SAME scope + qualified + current filters. `owner` is injected by the daemon from session identity — never a request parameter.
+         */
+        get: operations["listMemoryAssertions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/assertions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Retract (forget) one assertion
+         * @description Stops it being recalled in any new session; the original conversation stays in the local event log. Repeatable (already-retracted is still 204). An id that does not exist UNDER THIS OWNER 404s — identically whether it never existed or belongs to a module partition, so this never leaks which case it was.
+         */
+        delete: operations["forgetMemoryAssertion"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the personal-memory pause switch */
+        get: operations["getMemorySettings"];
+        /**
+         * Set the personal-memory pause switch
+         * @description Turning it off stops new writes and cross-session recall for any NEWLY STARTED run from the moment this returns; existing assertions are kept, and the setting survives a daemon restart. Does not affect a run that is already resuming from an approval wait — that run replays its own already-persisted messages (which captured whatever this switch said at the moment IT started) rather than re-deciding anything against the current value of this switch.
+         */
+        put: operations["putMemorySettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sin90/directions": {
         parameters: {
             query?: never;
@@ -1133,6 +1196,33 @@ export interface components {
             source: string;
             /** Format: date-time */
             created_at: string;
+        };
+        /** @description One qualified personal-memory assertion, with provenance (M1-T10 / `docs/research/MEMORY-STRATEGY.md` §4.1). */
+        MemoryAssertion: {
+            id: string;
+            /**
+             * @description The remembered original sentence.
+             * @example 我对花生过敏
+             */
+            text: string;
+            /**
+             * Format: date-time
+             * @description When the system recorded this belief.
+             */
+            recorded_at: string;
+            /**
+             * @description `held` = an unconfirmed candidate (never returned by this endpoint today — list/search already filter to qualified, current beliefs — but computed from the real row state rather than hardcoded).
+             * @enum {string}
+             */
+            status: "active" | "retracted" | "held";
+            /** @description Evidence event id(s) this belief was recorded from. */
+            evidence: string[];
+            /** @description The session its evidence was recorded in, or `null` when that cannot be determined (no evidence, or the evidence event is missing). */
+            session: string | null;
+        };
+        MemorySettings: {
+            /** @description The persistent personal-memory switch. `false` stops new writes and cross-session recall; existing assertions are kept, and the setting survives a daemon restart. */
+            enabled: boolean;
         };
         ErrorBody: {
             /**
@@ -2176,6 +2266,159 @@ export interface operations {
             };
             /** @description No such rule */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listMemoryAssertions: {
+        parameters: {
+            query?: {
+                q?: string;
+                /** @description Default 20 if omitted. Capped at 200 regardless of what is asked for. `0` (or anything else that is not a positive integer) is a 400, not silently clamped up to 1. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Assertion list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        assertions: components["schemas"]["MemoryAssertion"][];
+                    };
+                };
+            };
+            /** @description Invalid query parameters */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Personal memory is not available on this daemon */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    forgetMemoryAssertion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retracted (or already was) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No such assertion */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Personal memory is not available on this daemon */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getMemorySettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current setting */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySettings"];
+                };
+            };
+            /** @description Personal memory is not available on this daemon */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    putMemorySettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemorySettings"];
+            };
+        };
+        responses: {
+            /** @description The stored setting */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySettings"];
+                };
+            };
+            /** @description Malformed request body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Personal memory is not available on this daemon */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

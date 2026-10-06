@@ -106,8 +106,17 @@ async fn valid_audit_for(assertion: &Assertion) -> agent24_memory::event::MemEve
 
 #[tokio::test]
 async fn only_a_matching_current_qualified_assertion_is_idempotent() {
+    // "closed recorded time" (a retracted row with otherwise-identical
+    // content) used to be case #10 here, asserted to `is_err()` like every
+    // other mismatch. M1-T10 review H3 deliberately changes exactly that one
+    // case: re-asserting an identical, retracted explicit-remember now
+    // REACTIVATES it instead of erroring (otherwise retracting something and
+    // then saying the identical sentence again can never be remembered
+    // again). It has its own test below,
+    // `reactivates_a_closed_row_with_otherwise_identical_content_review_h3`,
+    // with the opposite assertion on purpose — it is not an omission.
     type Mutation = fn(&mut Assertion);
-    let cases: [(&str, Mutation); 10] = [
+    let cases: [(&str, Mutation); 9] = [
         ("different owner", |a| a.scope = Scope::owner("other")),
         ("different content", |a| a.object = json!("tea")),
         ("different subject", |a| a.subject = "tea".into()),
@@ -124,9 +133,6 @@ async fn only_a_matching_current_qualified_assertion_is_idempotent() {
         }),
         ("future recorded time", |a| {
             a.recorded_from = "2999-01-01T00:00:00Z".into()
-        }),
-        ("closed recorded time", |a| {
-            a.recorded_to = Some("2000-01-01T00:00:00Z".into())
         }),
     ];
 
@@ -160,6 +166,57 @@ async fn only_a_matching_current_qualified_assertion_is_idempotent() {
             "{label} changed audit history"
         );
     }
+}
+
+/// M1-T10 review H3: the ONE deliberate exception to the "every mismatch
+/// dimension errors" rule above. A retracted row with otherwise-IDENTICAL
+/// content (same owner/scope/subject/predicate/object) is reactivated, not
+/// rejected — the explicit-remember id is deterministic on (owner, object),
+/// so without this a user who retracts something and then says the exact
+/// same sentence again could never be remembered again.
+#[tokio::test]
+async fn reactivates_a_closed_row_with_otherwise_identical_content_review_h3() {
+    let kv = KvStore::open_memory().await.unwrap();
+    let mut old = stored("u1", "same-id");
+    old.recorded_to = Some("2000-01-01T00:00:00Z".into());
+    kv.events()
+        .append(&valid_audit_for(&old).await)
+        .await
+        .unwrap();
+    kv.assertions().assert(&old).await.unwrap();
+    assert!(
+        kv.assertions()
+            .beliefs_as_of(&BeliefQuery::owner("u1"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "fixture must start out NOT currently believed (retracted)"
+    );
+
+    let result = kv
+        .write_gate()
+        .propose(vec![candidate("u1", "same-id")])
+        .await
+        .unwrap();
+    assert_eq!(result, vec![WriteDecision::Committed("same-id".into())]);
+
+    let now = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner("u1"))
+        .await
+        .unwrap();
+    assert_eq!(now.len(), 1, "reactivated — current again");
+    assert_eq!(now[0].evidence, vec!["new-evidence".to_owned()]);
+    assert_eq!(
+        kv.events()
+            .scan(&EventQuery::owner("u1"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event.kind == "assertion.reasserted")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
