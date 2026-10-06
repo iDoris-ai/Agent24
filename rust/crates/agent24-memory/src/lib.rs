@@ -13,6 +13,8 @@ pub mod assertion;
 pub mod condenser;
 pub mod consolidator;
 pub mod eval;
+#[cfg(test)]
+mod eval_m1;
 pub mod event;
 pub mod knowledge;
 pub mod reconcile;

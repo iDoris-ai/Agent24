@@ -1,4 +1,15 @@
 //! Rule based extraction for explicit user requests to remember something.
+//!
+//! **Known boundary (M1-T10 review R4, non-blocking, recorded for P1):** the
+//! personal-memory pause switch gates exactly two things today — this
+//! module's [`persist`] (new assertion writes) and
+//! `agent24_agent::SessionMemory::recall` (cross-session recall). It does
+//! NOT stop the raw conversation (`mem_events`) from being journaled while
+//! paused — that is correct today (nothing currently extracts facts from raw
+//! events; those two gates cover M1's entire surface), but a future P1
+//! auto-extraction pass over `mem_events` would need to either skip events
+//! recorded while paused or accept that they are fair game, since nothing
+//! marks them as "recorded while paused" today.
 
 use agent24_memory::{
     KvStore,
