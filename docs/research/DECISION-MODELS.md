@@ -53,7 +53,7 @@ Agent24 的直接动机：M1 真机验收中，规则式 `explicit_remember`（`
 ## 6. 持续跟进（每次调研追加）
 
 - [ ] 跟踪 Ollaya 版本与 `/v1/systemone` 协议稳定性
-- [ ] 逐个核实候选模型许可证
+- [x] 逐个核实候选模型许可证（见 §8，2026-10-07）
 - [ ] 评估召回门控场景（§2-2）
 - [ ] 与 iDoris 网关规划对齐（模型能力归属）
 
@@ -126,3 +126,47 @@ agent24-decide（新 crate，接口照 TypeSafe /v1/systemone 形状）
 - **许可证分散** → 每个模型接入前逐一核对，结论记进本台账。
 - **概率模型被提示注入或对抗改写** → 它只能「建议更严」，不能放宽 A 类不变量；确认 UI 的文案走可信渲染。
 - **漂移** → 决策日志 + 用户纠正回流 + 评测集持续回归（并入 CI）。
+
+---
+
+## 8. D0-7 许可证核实（2026-10-07）
+
+> 方法：逐个抓取 HuggingFace 模型卡 raw README 的 YAML `license:` 字段、HF API `cardData.license`、仓库 LICENSE 原文（HF 或 GitHub）；底座模型按 config / 卡片追到上一层再核一次。不采信搜索摘要和第三方文章。核实日期均为 2026-10-07。
+> 「原文已核实」= 读到了 YAML license 字段或 LICENSE 文件；只读到二手描述的标「未核实」。
+
+### 8.1 结论表
+
+| 候选 | 确切 repo | 许可证 | 可商用 | 出处 | 原文已核实 | 结论 |
+|---|---|---|---|---|---|---|
+| GLiClass-multilang | `knowledgator/gliclass-multilang-mini` / `-ultra` / `-edge` | Apache-2.0 | 是 | https://huggingface.co/knowledgator/gliclass-multilang-mini/raw/main/README.md（ultra/edge 同路径） | 是（YAML） | **保留**。底座：mini=`microsoft/mdeberta-v3-base`（MIT）、ultra=`google/mt5-xl`（Apache-2.0）、edge=`jhu-clsp/mmBERT-small`（MIT） |
+| GLiClass（旧多语言） | `knowledgator/gliclass-x-base` | Apache-2.0 | 是 | https://huggingface.co/knowledgator/gliclass-x-base/raw/main/README.md | 是（YAML） | **保留**。卡片原文：trained on synthetic and licensed data that allow commercial use |
+| mDeBERTa-xnli | `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` | MIT（权重） | **存疑** | https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-mnli-xnli/raw/main/README.md | 是（YAML） | **剔除出生产候选**，D0-5 可保留作对照。训练用了 XNLI，XNLI LICENSE 原文为 CC-BY-NC-4.0（https://github.com/facebookresearch/XNLI/blob/main/LICENSE） |
+| mDeBERTa-xnli 多语言变体 | `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` | MIT（权重） | **存疑** | https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7/raw/main/README.md | 是（YAML） | **剔除出生产候选**，同上。训练数据另含 `facebook/anli`（YAML：cc-by-nc-4.0） |
+| mDeBERTa 底座 | `microsoft/mdeberta-v3-base` | MIT | 是 | https://huggingface.co/microsoft/mdeberta-v3-base/raw/main/README.md | 是（YAML） | 底座本身无问题 |
+| Erlangshen NLI | `IDEA-CCNL/Erlangshen-Roberta-110M-NLI` / `-330M-NLI` / `Erlangshen-MegatronBert-1.3B-NLI` | Apache-2.0 | 是（权重） | https://huggingface.co/IDEA-CCNL/Erlangshen-Roberta-110M-NLI/raw/main/README.md（其余同路径）；Fengshenbang-LM LICENSE 亦为 Apache-2.0 | 是（YAML） | **保留，待补数据许可**。底座 `hfl/chinese-roberta-wwm-ext(-large)` Apache-2.0；微调数据（CMNLI/OCNLI 等 4 个中文 NLI 集）许可证未核实，见 8.2 |
+| bge-m3（SetFit 底座） | `BAAI/bge-m3` | MIT | 是 | https://huggingface.co/BAAI/bge-m3/raw/main/README.md | 是（仅 YAML） | **保留**。仓库无 LICENSE 文件，以 YAML 为准 |
+| SetFit 库 | `huggingface/setfit` | Apache-2.0 | 是 | https://raw.githubusercontent.com/huggingface/setfit/main/LICENSE | 是（LICENSE） | **保留** |
+| Qwen3Guard-0.6B | `Qwen/Qwen3Guard-Gen-0.6B`、`Qwen/Qwen3Guard-Stream-0.6B` | Apache-2.0 | 是 | https://huggingface.co/Qwen/Qwen3Guard-Gen-0.6B/raw/main/LICENSE（Stream 同路径） | 是（YAML + LICENSE） | **保留**。底座 `Qwen/Qwen3-0.6B` 为 Apache-2.0，不是 Qwen 自定义许可 |
+| Kev-0.8B | `jaredpalmer/kev-0.8b` | Apache-2.0 | 是 | https://huggingface.co/jaredpalmer/kev-0.8b/raw/main/README.md | 是（YAML） | **保留**。底座 `Qwen/Qwen3.5-0.8B-Base` Apache-2.0；Kev 1.0 发布于 2026-09-24 |
+| Kev-4B | `jaredpalmer/kev-4b` | Apache-2.0 | 是 | https://huggingface.co/jaredpalmer/kev-4b/raw/main/README.md | 是（YAML） | **保留，待补数据许可**。卡片称各数据源许可证记在 suite manifest，未读；卡片明确未使用 Jev 输出 |
+| Kev 代码 | `github.com/jaredpalmer/kev` | Apache-2.0 | 是 | https://github.com/jaredpalmer/kev/blob/main/LICENSE | 是（LICENSE） | **保留** |
+| Ollaya 运行时 | `github.com/ollaya-dev/ollaya` | Apache-2.0 | 是 | https://github.com/ollaya-dev/ollaya/blob/main/LICENSE（Cargo.toml 同为 Apache-2.0） | 是（LICENSE） | **保留（仅实验台）**。README 原文：Each model keeps its own license；随附 llama.cpp 为 MIT |
+| laya | `convaiinnovations/laya`（Ollaya 注册表 pin 在 commit `aa8c91ca`，含 en / multilingual / typed-decisions） | Apache-2.0 | 是 | https://huggingface.co/convaiinnovations/laya/raw/main/README.md | 是（YAML） | **保留，待补**。en 底座 ModernBERT-large（Apache-2.0）、multilingual 底座 mmBERT-base（MIT）；typed-decisions 用 teacher 分布蒸馏，teacher 未披露 |
+| decider | `Mapika/decider-0.8b` / `-2b` / `-2b-vision` / `-4b` | Apache-2.0 | 是 | https://huggingface.co/Mapika/decider-0.8b/raw/main/README.md（其余同路径） | 是（YAML） | **保留，待补数据许可**。底座 Qwen3.5-*-Base（Apache-2.0）；2b v11 部分数据由 Qwen3.6-27B 生成 |
+
+**小结**：所有候选的**权重许可**都是 Apache-2.0 或 MIT，没有 NC 或自定义许可。唯一实质性商用风险在**训练数据**：两个 mDeBERTa-xnli 模型用了 CC-BY-NC-4.0 的 XNLI（2mil7 还有 ANLI）。用 NC 数据训练出的权重能否商用尚无定论；Agent24 有商业实体分发（HyperCapital），按保守原则剔出生产候选，只在 D0-5 留作对照。中文 NLI 路线由 Erlangshen 承担，但它的训练数据也要补核（见下）。
+
+### 8.2 未核实项
+
+1. **Erlangshen NLI 的训练数据许可**（CMNLI、OCNLI 等 4 个中文 NLI 集）未核原文。注意：CMNLI 一般被描述为由 MNLI/XNLI 翻译而来——**本条未核实**；若属实，Erlangshen 与 mDeBERTa-xnli 是同一类数据风险，需在 D1 选型前核清。
+2. GLiClass-multilang 的训练集 `BioMike/formal-logic-reasoning-gliclass-2k`、`knowledgator/gliclass-v3-logic-dataset` 许可证未核。
+3. `MoritzLaurer/multilingual-NLI-26lang-2mil7` 的 YAML 没有 license 字段（已剔除，不影响结论）。
+4. Kev-4B 各数据源许可证（在 suite manifest 中）未读。
+5. laya typed-decisions 的 teacher 模型未披露，无法判断是否有闭源服务条款的连带限制。
+6. Ollaya 注册表里的 `jevk5`、`arbiter` 不在本次范围；README 写明 arbiter 底座为 Gemma 3 4B IT（Gemma Terms of Use，非 Apache-2.0），如要用需单独评估。
+
+### 8.3 对 D0-5 横评的影响
+
+- 横评名单不变；mDeBERTa-xnli 结果只作对照，不参与「胜出模型」评选。
+- D1 选型前补核 8.2 第 1、2 条（中文 NLI 与 GLiClass 是最可能胜出的 encoder 路线）。
+- 接入任何模型时 pin HF commit + sha256（§4 风险条已定），并在组件清单里带上许可证字段。
