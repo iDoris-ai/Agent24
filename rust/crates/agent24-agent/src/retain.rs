@@ -15,9 +15,30 @@ use agent24_memory::{
     KvStore,
     artifact::checksum,
     event::{EventId, Origin, Scope, Trust},
-    writer::{Candidate, MemoryWriter},
+    writer::{Candidate, MemoryWriter, WriteDecision},
 };
 use serde_json::json;
+
+/// fix683 (PR #683 review): the live result of [`persist`] — a tri-state
+/// replacing the old `Result<()>` that returned the SAME `Ok(())` whether
+/// the assertion was actually committed or skipped because personal memory
+/// was paused at commit time. Callers (ultimately `/api/v1/chat`'s
+/// `memory_receipt`) must derive their answer from THIS, never from a
+/// pre-model-call pause snapshot — pause can be toggled while the model is
+/// still generating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetainOutcome {
+    /// The assertion is durably persisted (including an idempotent reuse of
+    /// an identical already-current commit, or a reassert after forget).
+    Saved,
+    /// The personal-memory pause switch was found active inside the write
+    /// transaction; nothing was persisted.
+    SkippedPaused,
+    /// This call was never going to write anything, independent of pause:
+    /// either the prompt was not an explicit remember, or the origin is not
+    /// a trusted `UserSaid` provenance.
+    NotApplicable,
+}
 
 /// M1-T10 review H1: injected alongside recall, at run start, when
 /// [`explicit_remember`] matches the prompt but personal memory is paused —
@@ -186,18 +207,24 @@ fn strip_prefix_insensitive<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 /// Persist a user statement with the frozen SHA-256(owner ‖ object) identity.
+/// fix683: returns the LIVE [`RetainOutcome`] from the write-gate's decision
+/// — not a bare `Ok(())` that could mean either "committed" or "rolled back
+/// because paused". `propose()` decides per-candidate at commit time, inside
+/// the same transaction the pause re-check runs in; this maps that decision
+/// 1:1 instead of discarding it (the bug this fix closes: the old code threw
+/// the `Vec<WriteDecision>` away and always reported success).
 pub(super) async fn persist(
     kv: &KvStore,
     owner: &str,
     object: &str,
     evidence: EventId,
     origin: Origin,
-) -> agent24_memory::Result<()> {
+) -> agent24_memory::Result<RetainOutcome> {
     // Only a direct user run can authorize a qualified personal assertion.
     // Validate the propagated origin here so future callers cannot
     // accidentally turn model or scheduled content into user memory.
     if origin.trust != Trust::UserSaid {
-        return Ok(());
+        return Ok(RetainOutcome::NotApplicable);
     }
     // M1-T10 review M2: the personal-memory pause switch used to be checked
     // HERE, before the candidate was even built — outside any transaction,
@@ -220,14 +247,32 @@ pub(super) async fn persist(
     .with_evidence(vec![evidence])
     .remember();
 
-    kv.write_gate().propose(vec![candidate]).await?;
-    Ok(())
+    let decisions = kv.write_gate().propose(vec![candidate]).await?;
+    Ok(match decisions.into_iter().next() {
+        Some(WriteDecision::Committed(_)) => RetainOutcome::Saved,
+        Some(WriteDecision::SkippedPaused(_)) => RetainOutcome::SkippedPaused,
+        // Unreachable today: `WriteGate::policy` always maps `UserSaid` +
+        // `explicit_remember` (with non-empty evidence, which this
+        // candidate always has) to `Outcome::Commit`, never Hold/Reject.
+        // Handled explicitly rather than folded into `Saved` (PR #683
+        // review point 4) so a future policy change cannot silently start
+        // reporting a non-write as a successful remember.
+        Some(WriteDecision::Held(_)) | Some(WriteDecision::Rejected { .. }) | None => {
+            tracing::error!(
+                owner,
+                "explicit remember produced an unexpected write decision; \
+                 policy should always Commit or skip-paused for UserSaid+remember"
+            );
+            RetainOutcome::NotApplicable
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use super::RetainOutcome;
     use super::explicit_remember;
     use super::persist;
     use agent24_memory::event::{Origin, Trust};
@@ -286,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn model_origin_cannot_persist_a_qualified_remember_assertion() {
         let kv = KvStore::open_memory().await.unwrap();
-        persist(
+        let outcome = persist(
             &kv,
             "owner",
             "I am allergic to peanuts",
@@ -298,6 +343,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            outcome,
+            RetainOutcome::NotApplicable,
+            "a non-UserSaid origin must never report Saved"
+        );
 
         let beliefs = kv
             .assertions()
@@ -311,7 +361,7 @@ mod tests {
     async fn paused_memory_rejects_a_new_write() {
         let kv = KvStore::open_memory().await.unwrap();
         kv.set_memory_enabled("owner", false).await.unwrap();
-        persist(
+        let outcome = persist(
             &kv,
             "owner",
             "I am allergic to peanuts",
@@ -323,6 +373,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            outcome,
+            RetainOutcome::SkippedPaused,
+            "fix683: the live result must say SkippedPaused, not look like Saved"
+        );
 
         let beliefs = kv
             .assertions()
@@ -334,7 +389,7 @@ mod tests {
         // Negative control: the SAME statement, for an owner who never
         // paused, is written — proving the gate (not something else) is what
         // rejected the paused owner's write above.
-        persist(
+        let outcome2 = persist(
             &kv,
             "owner2",
             "I am allergic to peanuts",
@@ -346,6 +401,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(outcome2, RetainOutcome::Saved);
         let beliefs2 = kv
             .assertions()
             .beliefs_as_of(&BeliefQuery::owner("owner2"))

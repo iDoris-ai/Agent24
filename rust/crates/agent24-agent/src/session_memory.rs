@@ -300,13 +300,17 @@ impl SessionMemory {
         Ok(messages)
     }
 
+    /// fix683: returns the LIVE [`crate::retain::RetainOutcome`] instead of
+    /// a bare `Ok(())` — the old signature could not tell "committed" apart
+    /// from "rolled back because paused", both of which the retain path
+    /// used to report as the same `Ok(())`.
     pub(crate) async fn remember(
         &self,
         sid: &str,
         prompt: &str,
         answer: &str,
         prompt_origin: Origin,
-    ) -> agent24_memory::Result<()> {
+    ) -> agent24_memory::Result<crate::retain::RetainOutcome> {
         self.check_owner()?;
         let deadline = tokio::time::Instant::now() + super::MEMORY_WRITE_BUDGET;
         // This budget bounds lock acquisition and the work needed to prepare a
@@ -367,10 +371,13 @@ impl SessionMemory {
                 if let Some(object) = super::retain::explicit_remember(&retain_prompt) {
                     super::retain::persist(&kv, &owner, object, ids.user.clone(), user_origin).await
                 } else {
-                    Ok(())
+                    Ok(crate::retain::RetainOutcome::NotApplicable)
                 }
             } else {
-                Ok(())
+                // Discarded below: `append_result?` returns this task's Err
+                // before `retain_result` is ever read, so this placeholder
+                // value is never observed as a real outcome.
+                Ok(crate::retain::RetainOutcome::NotApplicable)
             };
             if let Err(err) = &append_result {
                 // This task can finish after remember() was cancelled, in which

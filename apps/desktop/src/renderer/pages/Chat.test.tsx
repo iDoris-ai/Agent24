@@ -173,6 +173,66 @@ describe('ChatPage', () => {
     expect(btn).toBeDisabled()
   })
 
+  // M1-T14: the receipt must come from the server's `memory_receipt` field,
+  // never from the model's own reply text — these three cover each value,
+  // plus the absent case is already covered implicitly by every other test
+  // above (none of their mock responses set `memory_receipt`).
+  it('shows the saved receipt line when memory_receipt is "saved"', async () => {
+    mockBackendProxy.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { message: { content: '好的' }, memory_receipt: 'saved' },
+    })
+    render(<ChatPage />)
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: '记住我对花生过敏' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+
+    await waitFor(() => expect(screen.getByText('好的')).toBeInTheDocument())
+    expect(screen.getByText('✓ 已记住，可在「记忆」页查看或撤回')).toBeInTheDocument()
+  })
+
+  it('shows the paused receipt line when memory_receipt is "paused_not_saved"', async () => {
+    mockBackendProxy.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { message: { content: '好的' }, memory_receipt: 'paused_not_saved' },
+    })
+    render(<ChatPage />)
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: '记住我对花生过敏' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+
+    await waitFor(() => expect(screen.getByText('好的')).toBeInTheDocument())
+    expect(screen.getByText('记忆已暂停，这条没有被记住')).toBeInTheDocument()
+  })
+
+  it('shows the failed receipt line when memory_receipt is "failed"', async () => {
+    mockBackendProxy.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { message: { content: '好的' }, memory_receipt: 'failed' },
+    })
+    render(<ChatPage />)
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: '记住我对花生过敏' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+
+    await waitFor(() => expect(screen.getByText('好的')).toBeInTheDocument())
+    expect(screen.getByText('记住失败，请稍后重试')).toBeInTheDocument()
+  })
+
+  it('shows no receipt line when memory_receipt is absent', async () => {
+    mockBackendProxy.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { message: { content: 'Hello from AI!' } },
+    })
+    render(<ChatPage />)
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'Hi there' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+
+    await waitFor(() => expect(screen.getByText('Hello from AI!')).toBeInTheDocument())
+    expect(screen.queryByText(/已记住|记忆已暂停|记住失败/)).not.toBeInTheDocument()
+  })
+
   it('clicking a suggestion sends it as a message', async () => {
     mockBackendProxy.mockResolvedValue({
       ok: true,

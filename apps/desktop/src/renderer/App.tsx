@@ -285,8 +285,22 @@ export function App(): JSX.Element {
 
         {/* Review M3: the chat suffix no longer takes a default-model prop —
             it shows ONLY the server's own reported model_id (chat-latency.ts),
-            never the topbar's daemon-default guess standing in for it. */}
-        {page === 'chat'             && <ChatPage />}
+            never the topbar's daemon-default guess standing in for it.
+            M1-T14: ChatPage stays MOUNTED for the app's whole lifetime — only
+            hidden via `display: none` — so navigating away to another page
+            and back never unmounts it. Unmounting would drop its message
+            list, input draft and per-conversation session_id (see Chat.tsx's
+            `useState(() => genChatSessionId())`), silently starting a new D1
+            memory session on every round trip through another page. */}
+        <div
+          style={
+            page === 'chat'
+              ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }
+              : { display: 'none' }
+          }
+        >
+          <ChatPage />
+        </div>
         {page === 'workbench'        && <WorkbenchPage />}
         {page === 'runs'             && <RunsPage />}
         {page === 'schedules'        && <SchedulesPage />}

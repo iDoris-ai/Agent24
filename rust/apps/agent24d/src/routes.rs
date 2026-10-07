@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use agent24_models::router::TaskProfile;
 use agent24_models::{CompletionRequest, ModelError};
 use agent24_protocol::{
-    ChatRequest, ChatResponse, ErrorBody, EventBody, Model, ModelDeltaPayload, RunCompletedPayload,
-    RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
+    ChatRequest, ChatResponse, ErrorBody, EventBody, MemoryReceipt, Model, ModelDeltaPayload,
+    RunCompletedPayload, RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
 };
 use agent24_store::{CallTimingRow, CallTimingSummaryRow, ModelUsageRow};
 use axum::body::Body;
@@ -512,12 +512,17 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // (`RunManager::chat_memory_prelude`, not duplicated here) and the SAME
     // `normalize_for_provider` ordering rules (system first, merge adjacent
     // `user` turns) the run loop's first call applies.
+    // M1-T14: captured here (alongside the messages to prepend) so the
+    // response built below can report a deterministic `memory_receipt` —
+    // never inferred from the model's own reply text.
+    let mut explicit_remember_state: Option<agent24_agent::ExplicitRememberState> = None;
     let messages = match (chat.session_id.as_deref(), latest_user_message.as_deref()) {
         (Some(sid), Some(prompt)) => {
-            let prelude = state
+            let (prelude, remember_state) = state
                 .runs
                 .chat_memory_prelude(&run_id, Some(sid), prompt)
                 .await;
+            explicit_remember_state = remember_state;
             let combined: Vec<agent24_models::Msg> =
                 prelude.into_iter().chain(base_messages.clone()).collect();
             agent24_agent::normalize_for_provider(&combined)
@@ -605,11 +610,37 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
             // memory. A log/retain failure is observed (`memory.write_failed`,
             // emitted by the reused code path) but never drops this already-
             // computed response.
-            if let (Some(sid), Some(prompt)) =
+            // fix683 (PR #683 review): `explicit_remember_state` is a
+            // snapshot taken BEFORE the model call — personal memory can be
+            // paused or un-paused by the time the write below actually
+            // commits (ChatPage now stays mounted, so the memory page is
+            // reachable mid-generation). It must therefore decide ONLY
+            // whether this field is present at all (same deterministic
+            // `explicit_remember(prompt)` match the write path uses on the
+            // same prompt text, so its Some/None agrees with the live
+            // outcome's NotApplicable/not). The saved/paused_not_saved/failed
+            // verdict comes exclusively from `chat_remember_turn`'s LIVE
+            // result, computed at commit time inside the write transaction.
+            let memory_receipt = if let (Some(sid), Some(prompt)) =
                 (chat.session_id.as_deref(), latest_user_message.as_deref())
             {
-                state.runs.chat_remember_turn(sid, prompt, &text).await;
-            }
+                let outcome = state.runs.chat_remember_turn(sid, prompt, &text).await;
+                explicit_remember_state.and(match outcome {
+                    agent24_agent::MemoryWriteOutcome::Saved => Some(MemoryReceipt::Saved),
+                    agent24_agent::MemoryWriteOutcome::SkippedPaused => {
+                        Some(MemoryReceipt::PausedNotSaved)
+                    }
+                    agent24_agent::MemoryWriteOutcome::Failed => Some(MemoryReceipt::Failed),
+                    // Unreachable in practice when `explicit_remember_state`
+                    // is `Some`: both snapshots run the same pure
+                    // `explicit_remember(prompt)` match on the same prompt.
+                    // Falls back to "no receipt" rather than fabricating
+                    // saved/paused — never lies about a non-write.
+                    agent24_agent::MemoryWriteOutcome::NotApplicable => None,
+                })
+            } else {
+                None
+            };
             state
                 .events
                 .broadcast(EventBody::RunCompleted(RunCompletedPayload {
@@ -626,6 +657,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 model_id: reported_model_id,
                 tier: Some(tier.to_owned()),
                 latency_ms: Some(latency_ms),
+                memory_receipt,
             })
             .into_response()
         }

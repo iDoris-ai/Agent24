@@ -231,6 +231,62 @@ describe('App', () => {
       expect(screen.getByText('No AI runtime')).toBeInTheDocument()
     })
   })
+
+  // M1-T14: switching to another page and back used to UNMOUNT ChatPage
+  // (`{page === 'chat' && <ChatPage />}`), which reset its message list and
+  // minted a fresh `session_id` — silently starting a new D1 memory session
+  // on every round trip through another page. ChatPage must now stay
+  // mounted (hidden via `display: none`) so a conversation survives
+  // navigation.
+  it('keeps the chat conversation and session_id across navigating away and back (M1-T14)', async () => {
+    mockBackendProxy.mockImplementation((req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/chat') {
+        return Promise.resolve({ ok: true, status: 200, data: { message: { content: 'ack' } } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
+    })
+
+    await act(async () => { render(<App />) })
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello there' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => {
+      expect(screen.getByText('hello there')).toBeInTheDocument()
+      expect(screen.getByText('ack')).toBeInTheDocument()
+    })
+    const firstSessionId = mockBackendProxy.mock.calls.find(
+      (c) => c[0].path === '/api/v1/chat',
+    )?.[0].body.session_id
+    expect(firstSessionId).toBeTruthy()
+
+    // Navigate to 记忆 and back to 对话. ChatPage stays MOUNTED the whole
+    // time (just hidden) — `hello there` is still findable in the DOM, so
+    // the real assertion is on visibility, not presence.
+    fireEvent.click(screen.getAllByText('记忆')[0])
+    await waitFor(() => {
+      expect(screen.getByText('hello there')).not.toBeVisible()
+    })
+    fireEvent.click(screen.getAllByText('对话')[0])
+
+    // The message list and session id must be exactly as they were.
+    await waitFor(() => {
+      expect(screen.getByText('hello there')).toBeVisible()
+      expect(screen.getByText('ack')).toBeVisible()
+    })
+
+    mockBackendProxy.mockClear()
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'second message' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith(
+        expect.objectContaining({ path: '/api/v1/chat' }),
+      )
+    })
+    const secondSessionId = mockBackendProxy.mock.calls.find(
+      (c) => c[0].path === '/api/v1/chat',
+    )?.[0].body.session_id
+    expect(secondSessionId).toBe(firstSessionId)
+  })
 })
 
 describe('pickChatModel (FU-89)', () => {

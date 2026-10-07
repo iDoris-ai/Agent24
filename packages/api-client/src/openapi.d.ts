@@ -768,6 +768,11 @@ export interface components {
             tier?: string | null;
             /** @description Server-measured wall-clock milliseconds for this call. */
             latency_ms?: number | null;
+            /**
+             * @description M1-T14: deterministic outcome of an explicit "记住…" turn, set by the daemon — never inferred from the model's own reply text. Omitted when this prompt was not an explicit remember, or session_id was omitted. "saved" covers the write-gate's own idempotent reassert/no-op case too (an identical belief already active), not just a fresh commit.
+             * @enum {string}
+             */
+            memory_receipt?: "saved" | "paused_not_saved" | "failed";
         };
         Session: {
             id: string;

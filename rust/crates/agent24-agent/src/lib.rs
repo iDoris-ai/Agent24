@@ -58,6 +58,46 @@ const SUMMARY_MAX_BYTES: usize = 500;
 /// "skipped" tool result so the wire protocol stays balanced.
 pub const MAX_TOOL_CALLS_PER_TURN: usize = 16;
 
+/// M1-T14: what [`RunManager::chat_memory_prelude`] found out about THIS
+/// prompt — independent of the messages it returns to prepend. The caller
+/// (`/api/v1/chat`) needs this to build a deterministic `memory_receipt`
+/// after the turn is committed, since the model's own reply text must never
+/// be the source of that signal (it has been observed claiming success on a
+/// turn the server actually skipped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitRememberState {
+    /// The prompt is an explicit remember, and personal memory is currently
+    /// paused — the write will be skipped.
+    Paused,
+    /// The prompt is an explicit remember, and personal memory is active —
+    /// the write is expected to land (success/failure determined by the
+    /// actual write that follows).
+    Active,
+}
+
+/// fix683 (PR #683 review): the LIVE result of [`RunManager::remember_exchange`]
+/// / [`RunManager::chat_remember_turn`] — a tri-state (four-state, counting
+/// failure) replacing the old bare `bool`, which could only say
+/// "write_gate didn't error", not "paused" vs "committed". `/api/v1/chat`'s
+/// `memory_receipt` must be built from THIS, never from the pre-model-call
+/// [`ExplicitRememberState`] snapshot — personal memory can be paused or
+/// un-paused while the model is still generating, after that snapshot was
+/// taken but before this turn's write actually runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryWriteOutcome {
+    /// The turn's explicit-remember assertion is durably persisted.
+    Saved,
+    /// Personal memory was paused at the moment of commit; nothing was
+    /// persisted for this turn's explicit remember.
+    SkippedPaused,
+    /// The write-gate (or the session append it depends on) reported an
+    /// error.
+    Failed,
+    /// There was nothing to write: no configured memory, no session, the
+    /// prompt was not an explicit remember, or the origin was untrusted.
+    NotApplicable,
+}
+
 /// H8: the reserved tool name the model calls to submit a plan for approval.
 /// Handled by the loop itself (not the registry), so it is never dispatchable
 /// as an ordinary tool.
@@ -593,25 +633,36 @@ impl RunManager {
 
     /// Commit the original exchange before best-effort compaction. Memory
     /// failures are observable but never fail an already-answered run.
+    /// fix683: returns the LIVE [`MemoryWriteOutcome`] — Saved/SkippedPaused/
+    /// Failed/NotApplicable — instead of the old bare `bool`, which collapsed
+    /// "committed" and "paused rollback" into the same `true`. M1-T14: the
+    /// chat surface uses this (and ONLY this, never the pre-call pause
+    /// snapshot) to build a deterministic `memory_receipt`.
     async fn remember_exchange(
         &self,
         session_id: Option<&str>,
         prompt: &str,
         answer: &str,
         prompt_origin: Origin,
-    ) {
+    ) -> MemoryWriteOutcome {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
-            return;
+            return MemoryWriteOutcome::NotApplicable;
         };
-        if let Err(err) = memory.remember(sid, prompt, answer, prompt_origin).await {
-            let reason = err.to_string();
-            tracing::error!(session_id = sid, %reason, "session memory write failed");
-            self.sink.emit(EventBody::MemoryWriteFailed(
-                agent24_protocol::MemoryWriteFailedPayload {
-                    session_id: sid.to_owned(),
-                    reason,
-                },
-            ));
+        match memory.remember(sid, prompt, answer, prompt_origin).await {
+            Ok(retain::RetainOutcome::Saved) => MemoryWriteOutcome::Saved,
+            Ok(retain::RetainOutcome::SkippedPaused) => MemoryWriteOutcome::SkippedPaused,
+            Ok(retain::RetainOutcome::NotApplicable) => MemoryWriteOutcome::NotApplicable,
+            Err(err) => {
+                let reason = err.to_string();
+                tracing::error!(session_id = sid, %reason, "session memory write failed");
+                self.sink.emit(EventBody::MemoryWriteFailed(
+                    agent24_protocol::MemoryWriteFailedPayload {
+                        session_id: sid.to_owned(),
+                        reason,
+                    },
+                ));
+                MemoryWriteOutcome::Failed
+            }
         }
     }
 
@@ -625,15 +676,20 @@ impl RunManager {
     /// ordering rules (system merged first, adjacent `user` turns merged).
     /// `run_id` is only used to tag the `memory.recalled`/`memory.write_skipped`
     /// events — this never touches the run/store tables `drive_new` does.
-    /// Empty when there is no configured memory (`self.memory` is `None`).
+    /// Empty/`None` when there is no configured memory (`self.memory` is
+    /// `None`). M1-T14: the second element of the tuple is this prompt's
+    /// [`ExplicitRememberState`] (`None` when it is not an explicit
+    /// remember at all) — the caller needs it, independent of the model's
+    /// own reply, to build a deterministic `memory_receipt` once the turn is
+    /// committed.
     pub async fn chat_memory_prelude(
         &self,
         run_id: &str,
         session_id: Option<&str>,
         prompt: &str,
-    ) -> Vec<Msg> {
+    ) -> (Vec<Msg>, Option<ExplicitRememberState>) {
         let Some(memory) = self.memory.as_ref() else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let mut prelude = Vec::new();
         match memory.recall(prompt).await {
@@ -650,7 +706,7 @@ impl RunManager {
                 tracing::warn!(run_id = %run_id, error = %err, "chat memory recall failed");
             }
         }
-        if retain::explicit_remember(prompt).is_some() {
+        let explicit_state = if retain::explicit_remember(prompt).is_some() {
             let paused = match memory.kv().memory_enabled(memory.owner()).await {
                 Ok(enabled) => !enabled,
                 Err(err) => {
@@ -666,9 +722,14 @@ impl RunManager {
                         reason: "paused".to_owned(),
                     }));
                 prelude.push(Msg::system(retain::PAUSED_WRITE_NOTICE));
+                Some(ExplicitRememberState::Paused)
+            } else {
+                Some(ExplicitRememberState::Active)
             }
-        }
-        prelude
+        } else {
+            None
+        };
+        (prelude, explicit_state)
     }
 
     /// M1-T12: the SAME post-answer commit `drive_new`'s run loop performs
@@ -679,8 +740,14 @@ impl RunManager {
     /// branch uses it — this prompt came directly from the chat caller, not
     /// from model/scheduler-originated text. Retain/log failures emit
     /// `memory.write_failed` and otherwise never propagate — the chat
-    /// response the caller already has must still reach its client.
-    pub async fn chat_remember_turn(&self, session_id: &str, prompt: &str, answer: &str) {
+    /// response the caller already has must still reach its client. Returns
+    /// the LIVE [`MemoryWriteOutcome`] — see [`RunManager::remember_exchange`].
+    pub async fn chat_remember_turn(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        answer: &str,
+    ) -> MemoryWriteOutcome {
         self.remember_exchange(
             Some(session_id),
             prompt,
@@ -690,7 +757,7 @@ impl RunManager {
                 trust: Trust::UserSaid,
             },
         )
-        .await;
+        .await
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
@@ -1660,7 +1727,7 @@ impl RunManager {
                 // after append starts, SessionMemory's detached transaction task
                 // keeps the session lock until SQLx confirms the append outcome.
                 tokio::select! {
-                    () = self.remember_exchange(
+                    _ = self.remember_exchange(
                         run.session_id.as_deref(),
                         &run.input.prompt,
                         &text,

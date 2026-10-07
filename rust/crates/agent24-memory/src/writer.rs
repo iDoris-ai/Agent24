@@ -109,6 +109,17 @@ pub enum WriteDecision {
         candidate_id: AssertionId,
         reason: String,
     },
+    /// fix683 (PR #683 review): the policy said Commit, but the personal-
+    /// memory pause switch was found ACTIVE inside the same `BEGIN
+    /// IMMEDIATE` transaction the write itself would have landed in
+    /// (`WriteGate::commit_with_audit`'s TOCTOU re-check) — so the
+    /// transaction was rolled back and NOTHING was persisted. This used to
+    /// be indistinguishable from [`WriteDecision::Committed`] (both returned
+    /// `Ok(())`), which let a caller's pre-call pause snapshot and the
+    /// actual commit-time outcome disagree and report the wrong receipt in
+    /// either direction. Only reachable from the explicit-remember Commit
+    /// path — [`WriteDecision::Held`] writes never re-check pause.
+    SkippedPaused(AssertionId),
 }
 
 /// The deterministic outcome of the policy, before any persistence.
@@ -117,6 +128,22 @@ enum Outcome {
     Commit,
     Hold,
     Reject(String),
+}
+
+/// fix683: what `commit_with_audit` actually did, independent of which
+/// `Outcome` branch called it — the pause re-check lives INSIDE this
+/// function (not in the caller), so only this function can tell a real
+/// commit apart from a pause rollback that returns the same `Ok(())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitStatus {
+    /// The assertion (or its audit) is durably persisted — including the
+    /// idempotent "identical commit already current" and "reassert after
+    /// forget" reuse paths, which are real commits, not a skip.
+    Committed,
+    /// The transaction was rolled back because personal memory was paused
+    /// at the moment of commit. Only reachable for the explicit-remember
+    /// Commit path (`verdict == "commit"` with `UserSaid` + remember).
+    SkippedPaused,
 }
 
 /// The governance write-gate over the semantic authority.
@@ -225,7 +252,16 @@ impl WriteGate {
 
     /// Persist a Commit/Hold assertion AND its audit event in ONE transaction, so
     /// a belief can never land without its governance record (and vice versa).
-    async fn commit_with_audit(&self, c: &Candidate, qualified: bool, verdict: &str) -> Result<()> {
+    /// fix683: returns [`CommitStatus`] instead of bare `()` so a pause
+    /// rollback (`CommitStatus::SkippedPaused`) is distinguishable from an
+    /// actual commit (`CommitStatus::Committed`) — the caller used to get
+    /// `Ok(())` for both and could not tell them apart.
+    async fn commit_with_audit(
+        &self,
+        c: &Candidate,
+        qualified: bool,
+        verdict: &str,
+    ) -> Result<CommitStatus> {
         let assertion = Self::to_assertion(c, qualified);
         let audit = Self::audit_event(c, verdict, None);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -255,7 +291,7 @@ impl WriteGate {
                 .is_none_or(|s| s.enabled);
             if !enabled {
                 tx.rollback().await?;
-                return Ok(());
+                return Ok(CommitStatus::SkippedPaused);
             }
 
             let existing = sqlx::query(
@@ -333,7 +369,7 @@ impl WriteGate {
                                 && body_matches;
                             if audit_matches {
                                 tx.commit().await?;
-                                return Ok(());
+                                return Ok(CommitStatus::Committed);
                             }
                         }
                     }
@@ -379,7 +415,7 @@ impl WriteGate {
                     reassert.at = now;
                     EventLog::append_tx(&mut tx, &reassert).await?;
                     tx.commit().await?;
-                    return Ok(());
+                    return Ok(CommitStatus::Committed);
                 }
 
                 return Err(MemoryError::Conflict(format!(
@@ -392,7 +428,7 @@ impl WriteGate {
         AssertionLedger::insert_tx(&mut tx, &assertion).await?;
         EventLog::append_tx(&mut tx, &audit).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(CommitStatus::Committed)
     }
 }
 
@@ -402,10 +438,10 @@ impl MemoryWriter for WriteGate {
         let mut out = Vec::with_capacity(candidates.len());
         for c in &candidates {
             let decision = match Self::policy(c) {
-                Outcome::Commit => {
-                    self.commit_with_audit(c, true, "commit").await?;
-                    WriteDecision::Committed(c.id.clone())
-                }
+                Outcome::Commit => match self.commit_with_audit(c, true, "commit").await? {
+                    CommitStatus::Committed => WriteDecision::Committed(c.id.clone()),
+                    CommitStatus::SkippedPaused => WriteDecision::SkippedPaused(c.id.clone()),
+                },
                 Outcome::Hold => {
                     self.commit_with_audit(c, false, "hold").await?;
                     WriteDecision::Held(c.id.clone())
