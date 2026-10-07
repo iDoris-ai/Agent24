@@ -1,0 +1,14 @@
+id: "s01-07-mixed-building-notice"
+title: "关于B座停水及电梯维保的通知 / Notice of Water Shut-off and Elevator Maintenance — Tower B"
+lang: "mixed"
+kind: "synthetic"
+pages: 1
+source_url: null
+publisher: "Agent24 Documenting（合成）"
+retrieved_at: "2026-10-07"
+license: "synthetic"
+sha256_original: "1b10bf62cead2d92908aca1de7e01a5786be64f2061456a53c5ceabe94391803"
+sha256_stored: "1b10bf62cead2d92908aca1de7e01a5786be64f2061456a53c5ceabe94391803"
+redactions: []
+covers: [C4, C6, C7, C9, C10]
+notes: "本仓库原创合成样本，内容虚构、无个人信息。故意设置：中文正文与表格日期冲突（12 日 vs 13 日）、中文与英文结束时间冲突（18:00 vs 17:00）、无需登记的否定、前导零编号、未提供联系电话。已知文本层异常：Chrome 输出的文本层含康熙部首码位（如 ⽔ U+2F54），锚点比对须先 NFKC 规范化。"

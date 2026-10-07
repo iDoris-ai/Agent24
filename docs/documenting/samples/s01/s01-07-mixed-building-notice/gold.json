@@ -1,0 +1,135 @@
+{
+  "id": "s01-07-mixed-building-notice",
+  "schema": "s01-gold-v1",
+  "fields": [
+    {
+      "key": "shutoff_date",
+      "status": "conflict",
+      "values": [
+        "2026-10-12",
+        "2026-10-13"
+      ],
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "2026年10月12日（周一）9:00至18:00"
+        },
+        {
+          "page": 1,
+          "quote": "10月13日"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "shutoff_end_time",
+      "status": "conflict",
+      "values": [
+        "18:00",
+        "17:00"
+      ],
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "9:00至18:00"
+        },
+        {
+          "page": 1,
+          "quote": "from 9:00 to 17:00"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "registration_for_shutoff",
+      "status": "present",
+      "value": "无需提前登记 / You do not need to register for the shut-off itself",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "本次停水无需提前登记"
+        },
+        {
+          "page": 1,
+          "quote": "You do not need to register for the shut-off itself"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "drinking_water_registration_deadline",
+      "status": "present",
+      "value": "10月10日17:00前",
+      "normalized": "2026-10-10T17:00",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "10月10日17:00前"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "drinking_water_limit",
+      "status": "present",
+      "value": "每户限领 2 桶（18.9L/桶）",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "每户限领 2 桶（18.9L/桶）"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "affected_units",
+      "status": "present",
+      "value": "B座 0302–2208 单元",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "B座 0302–2208 单元"
+        }
+      ],
+      "severity": "critical",
+      "note": "前导零不得丢失"
+    },
+    {
+      "key": "work_order",
+      "status": "present",
+      "value": "WO-000731",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "WO-000731"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "lift_in_service",
+      "status": "present",
+      "value": "1号电梯照常运行",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "1号电梯照常运行"
+        }
+      ],
+      "severity": "major"
+    },
+    {
+      "key": "contact_phone",
+      "status": "missing",
+      "severity": "major"
+    }
+  ],
+  "must_not_assert": [
+    "a contact phone number",
+    "that registration is required for the shut-off",
+    "a single resolved shut-off date or end time"
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}
