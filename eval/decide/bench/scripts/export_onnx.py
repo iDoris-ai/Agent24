@@ -124,6 +124,10 @@ def main() -> int:
     tokenizer.save_pretrained(int8_dir)
 
     onnx_path = next(int8_dir.glob("*.onnx"))
+    model_path = int8_dir / "model.onnx"
+    if onnx_path != model_path:
+        onnx_path.rename(model_path)
+    onnx_path = model_path
     fp32_size_mb = sum(f.stat().st_size for f in fp32_dir.glob("*") if f.is_file()) / (1024 * 1024)
     int8_size_mb = sum(f.stat().st_size for f in int8_dir.glob("*") if f.is_file()) / (1024 * 1024)
 
@@ -156,6 +160,9 @@ def main() -> int:
         clf = LogisticRegression(max_iter=2000)
         clf.fit(X, y)
         heads[point] = (clf, labels)
+        head = {"classes": [labels[int(i)] for i in clf.classes_],
+                "coefficients": clf.coef_.tolist(), "intercepts": clf.intercept_.tolist()}
+        (int8_dir / f"head_{point}.json").write_text(json.dumps(head, ensure_ascii=False), encoding="utf-8")
 
     results = {}
     for point in points:
@@ -165,6 +172,7 @@ def main() -> int:
         id2label = {i: lab for lab, i in label2id.items()}
         latencies = []
         correct = 0
+        reference_items = []
         for item in items:
             text = render_item_text(item)
             t0 = time.perf_counter()
@@ -175,6 +183,7 @@ def main() -> int:
             latencies.append((time.perf_counter() - t0) * 1000)
             if pred == item.expected:
                 correct += 1
+            reference_items.append({"input": text, "label": pred, "p": float(probs[best_pos])})
         latencies.sort()
         p50 = latencies[len(latencies) // 2] if latencies else None
         p95 = latencies[int(len(latencies) * 0.95)] if latencies else None
@@ -184,6 +193,8 @@ def main() -> int:
             "p50_latency_ms": p50,
             "p95_latency_ms": p95,
         }
+        (int8_dir / f"{point}_python.json").write_text(
+            json.dumps({"items": reference_items}, ensure_ascii=False), encoding="utf-8")
 
     state["stop"] = True
     report = {

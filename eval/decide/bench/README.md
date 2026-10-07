@@ -173,6 +173,13 @@ uv run --isolated --with 'optimum[onnxruntime]>=1.20,<2.2' --with 'transformers<
     --out-dir /tmp/onnx-e5-base
 ```
 
-输出 `onnx_export_report.json`：fp32/int8 文件体积、加载+量化耗时、周期
-采样的峰值 RSS（不是单次前后差——D0-6 §9.4 已经指出那种测法在内存压力下
-不可靠）、在三份评测集上重新训头后的准确率与 P50/P95 延迟。
+脚本在 `int8/` 保存量化 ONNX、分类头和 221 条逐条 Python 参考结果。模型资产
+只写入输出目录。Rust spike 默认跳过；设置路径后运行，它会校验一致性并打印
+单独测试进程的 RSS 与 P50/P95：
+
+```bash
+export CARGO_TARGET_DIR=$HOME/Dev/auraai/Agent24/rust/target
+export agent24_onnx_spike_dir=/tmp/onnx-e5-base/int8
+cd rust
+cargo test -p agent24-decide --features onnx-spike --test onnx_spike -- --nocapture
+```
