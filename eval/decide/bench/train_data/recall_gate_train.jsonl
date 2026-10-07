@@ -1,30 +1,62 @@
-{"text": "我上次说的那个过敏原是什么", "label": "need"}
-{"text": "按我一贯的口味给我推荐一家餐厅", "label": "need"}
-{"text": "帮我写封邮件，语气要照我平时喜欢的那种", "label": "need"}
-{"text": "我家那只猫叫什么名字来着", "label": "need"}
-{"text": "照我平时的习惯安排一下今天的日程", "label": "need"}
-{"text": "我是不是跟你提过我老婆的生日", "label": "need"}
-{"text": "根据我之前的目标，这周该做什么", "label": "need"}
-{"text": "老规矩，帮我订一下", "label": "need"}
-{"text": "按我的忌口帮我点菜", "label": "need"}
-{"text": "我现在住的那个城市天气怎么样", "label": "need"}
-{"text": "提醒我一下我吃的那个药叫什么", "label": "need"}
-{"text": "我儿子多大了", "label": "need"}
-{"text": "帮我写个自我介绍，用我平时的风格", "label": "need"}
-{"text": "我上次提到的那个项目进展怎么样了", "label": "need"}
-{"text": "你知道我不吃什么食物吧，按那个来推荐", "label": "need"}
-{"text": "嗨，在吗", "label": "no_need"}
-{"text": "现在是几点", "label": "no_need"}
-{"text": "帮我算一下123乘以456", "label": "no_need"}
-{"text": "世界上最大的沙漠是哪个", "label": "no_need"}
-{"text": "帮我把这段话润色一下", "label": "no_need"}
-{"text": "翻译这句英文", "label": "no_need"}
-{"text": "刚才你说的第二点是什么意思", "label": "no_need"}
-{"text": "帮我即兴创作一首诗，题材不限", "label": "no_need"}
-{"text": "帮我提炼这段材料的核心观点", "label": "no_need"}
-{"text": "明天天气预报怎么样", "label": "no_need"}
-{"text": "帮我查一下这个单词的意思", "label": "no_need"}
-{"text": "再见", "label": "no_need"}
-{"text": "这段代码为什么报错", "label": "no_need"}
-{"text": "说个脑筋急转弯", "label": "no_need"}
-{"text": "这篇待翻译的合同里有没有违约条款", "label": "no_need"}
+{"text": "我上次说的那个过敏原是什么", "label": "need", "lang": "zh"}
+{"text": "按我一贯的口味给我推荐一家餐厅", "label": "need", "lang": "zh"}
+{"text": "帮我写封邮件，语气要照我平时喜欢的那种", "label": "need", "lang": "zh"}
+{"text": "我家那只猫叫什么名字来着", "label": "need", "lang": "zh"}
+{"text": "照我平时的习惯安排一下今天的日程", "label": "need", "lang": "zh"}
+{"text": "我是不是跟你提过我老婆的生日", "label": "need", "lang": "zh"}
+{"text": "根据我之前的目标，这周该做什么", "label": "need", "lang": "zh"}
+{"text": "老规矩，帮我订一下", "label": "need", "lang": "zh"}
+{"text": "按我的忌口帮我点菜", "label": "need", "lang": "zh"}
+{"text": "我现在住的那个城市天气怎么样", "label": "need", "lang": "zh"}
+{"text": "提醒我一下我吃的那个药叫什么", "label": "need", "lang": "zh"}
+{"text": "我儿子多大了", "label": "need", "lang": "zh"}
+{"text": "帮我写个自我介绍，用我平时的风格", "label": "need", "lang": "zh"}
+{"text": "我上次提到的那个项目进展怎么样了", "label": "need", "lang": "zh"}
+{"text": "你知道我不吃什么食物吧，按那个来推荐", "label": "need", "lang": "zh"}
+{"text": "嗨，在吗", "label": "no_need", "lang": "zh"}
+{"text": "现在是几点", "label": "no_need", "lang": "zh"}
+{"text": "帮我算一下123乘以456", "label": "no_need", "lang": "zh"}
+{"text": "世界上最大的沙漠是哪个", "label": "no_need", "lang": "zh"}
+{"text": "帮我把这段话润色一下", "label": "no_need", "lang": "zh"}
+{"text": "翻译这句英文", "label": "no_need", "lang": "zh"}
+{"text": "刚才你说的第二点是什么意思", "label": "no_need", "lang": "zh"}
+{"text": "帮我即兴创作一首诗，题材不限", "label": "no_need", "lang": "zh"}
+{"text": "帮我提炼这段材料的核心观点", "label": "no_need", "lang": "zh"}
+{"text": "明天天气预报怎么样", "label": "no_need", "lang": "zh"}
+{"text": "帮我查一下这个单词的意思", "label": "no_need", "lang": "zh"}
+{"text": "再见", "label": "no_need", "lang": "zh"}
+{"text": "这段代码为什么报错", "label": "no_need", "lang": "zh"}
+{"text": "说个脑筋急转弯", "label": "no_need", "lang": "zh"}
+{"text": "这篇待翻译的合同里有没有违约条款", "label": "no_need", "lang": "zh"}
+{"text": "what was the name of my physical therapist", "label": "need", "lang": "en"}
+{"text": "plan dinner around my diet", "label": "need", "lang": "en"}
+{"text": "use my usual tone for this email", "label": "need", "lang": "en"}
+{"text": "what city did I say my parents live in", "label": "need", "lang": "en"}
+{"text": "follow my normal morning routine for today's plan", "label": "need", "lang": "en"}
+{"text": "is this snack ok given my allergies", "label": "need", "lang": "en"}
+{"text": "continue the project we discussed last week", "label": "need", "lang": "en"}
+{"text": "remind me of my niece's age", "label": "need", "lang": "en"}
+{"text": "hello!", "label": "no_need", "lang": "en"}
+{"text": "what's 15% of 240", "label": "no_need", "lang": "en"}
+{"text": "which ocean is the largest", "label": "no_need", "lang": "en"}
+{"text": "polish this paragraph for me", "label": "no_need", "lang": "en"}
+{"text": "translate good luck into French", "label": "no_need", "lang": "en"}
+{"text": "what did you mean by your second point", "label": "no_need", "lang": "en"}
+{"text": "compose a short limerick featuring a lazy cat", "label": "no_need", "lang": "en"}
+{"text": "bye for now", "label": "no_need", "lang": "en"}
+{"text": "นักกายภาพของผมชื่ออะไรนะ", "label": "need", "lang": "th"}
+{"text": "วางแผนมื้อเย็นตามอาหารที่ฉันกินได้", "label": "need", "lang": "th"}
+{"text": "เขียนอีเมลด้วยสำนวนที่ผมใช้ประจำ", "label": "need", "lang": "th"}
+{"text": "พ่อแม่ฉันอยู่จังหวัดไหนนะ", "label": "need", "lang": "th"}
+{"text": "จัดตารางวันนี้ตามกิจวัตรตอนเช้าของผม", "label": "need", "lang": "th"}
+{"text": "ขนมนี้ฉันกินได้ไหม ดูจากที่แพ้", "label": "need", "lang": "th"}
+{"text": "ทำโปรเจกต์ที่เราคุยกันอาทิตย์ก่อนต่อเลย", "label": "need", "lang": "th"}
+{"text": "หลานสาวผมอายุเท่าไหร่แล้ว", "label": "need", "lang": "th"}
+{"text": "ดีจ้า", "label": "no_need", "lang": "th"}
+{"text": "รากที่สองของ 144 คือเท่าไหร่", "label": "no_need", "lang": "th"}
+{"text": "มหาสมุทรที่ใหญ่ที่สุดคืออะไร", "label": "no_need", "lang": "th"}
+{"text": "ช่วยปรับสำนวนข้อความนี้ให้ลื่นขึ้น", "label": "no_need", "lang": "th"}
+{"text": "คำว่า good luck ภาษาฝรั่งเศสว่าอะไร", "label": "no_need", "lang": "th"}
+{"text": "ข้อสองที่คุณพูดหมายความว่าอะไร", "label": "no_need", "lang": "th"}
+{"text": "แต่งเพลงสั้นๆ เกี่ยวกับแมว", "label": "no_need", "lang": "th"}
+{"text": "ไปก่อนนะ บาย", "label": "no_need", "lang": "th"}
