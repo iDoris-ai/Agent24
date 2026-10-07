@@ -567,6 +567,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_submissions_cannot_consume_one_request_token_twice() {
+        let broker = test_broker().await;
+        let (insert_started, resume_insert) = broker.gate_next_insert().await;
+        let (g, _in_flight) = generation_with_good_params_admitted();
+        let first = submit_handler(g.clone(), true, ModuleApprovalKind::Advise, broker.clone());
+        let first = tokio::spawn(async move { first.call(good_params()).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), insert_started)
+            .await
+            .expect("the first submission must reach the insert gate")
+            .unwrap();
+
+        let second = submit_handler(g, true, ModuleApprovalKind::Advise, broker.clone());
+        let second_err = second.call(good_params()).await.unwrap_err();
+        assert_eq!(second_err.kind, Some(ErrorKind::TokenInvalid));
+        assert!(broker.list(None).await.unwrap().is_empty());
+
+        resume_insert.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .expect("the first submission should finish after storage resumes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(broker.list(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_callback_arriving_after_its_request_ended_is_refused_without_a_row() {
         let broker = test_broker().await;
         let g = running_generation();
