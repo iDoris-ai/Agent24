@@ -42,6 +42,7 @@ dependencies = [
  "agent24-mcp",
  "agent24-os-packages",
  "agent24-protocol",
+ "agent24-store",
  "clap",
  "crossterm",
  "futures-util",

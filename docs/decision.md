@@ -1388,6 +1388,37 @@ M1 真机验收反复暴露规则式意图判断（`retain.rs` 的 `explicit_rem
 
 ---
 
+## ADR-034：`agent24-decide` 的决策日志契约由 `agent24d` 实现，不是 `agent24-store`
+
+**日期**：2026-10-07
+**状态**：✅ 采纳（D0-2，见 [`docs/agent/PLAN-DECIDE.md`](agent/PLAN-DECIDE.md) D0-2 行）
+
+### 背景
+
+D0-2 要求"在 `agent24-decide` 里定义写入/追加/导出/删除的 trait（不让 decide crate 依赖 store）；store 侧实现，或在 agent24d 组合"——即把哪一侧实现 `agent24_decide::log::DecisionLog` trait 留给本 PR 决定。
+
+### 论证
+
+`docs/ARCHITECTURE-LAYERS.md` §1.1 记录的是一条已经在代码里成立的事实，不是一条可协商的风格建议："依赖方向一律向下，没有向上依赖"——`agent24-store` 是 L2，`agent24-decide` 是 L3；表里每一行 L3 crate（`policy`、`scheduler`、`agent`…）都依赖 `store`，没有一行反过来。如果让 `agent24-store` 实现 `DecisionLog`，`agent24-store` 就要 `use agent24_decide::...`，这是本仓库依赖图里第一条"低层依赖高层"的边，且没有对应的架构收益——ADR-033 #2 已经把 `agent24-decide` 设计成零内部依赖，目的就是让 D1 自由选择接线点；如果 D0-2 反过来把 `agent24-store` 焊到 `agent24-decide` 上，等于提前替 D1 做了这个选择，且选的是一个打破既有依赖方向的选项。
+
+另一个选项——把 `agent24-store` 的持久化方法改成直接消费 `agent24-decide` 的富类型（`Answer`、`Decision`）——在实现上也不通：`Answer` 字段私有、无 `Deserialize`（ADR-033 的设计：这个类型"目前不从进程外接受"），`agent24-store` 没有办法把一行 JSON 文本读回一个 `Answer`。这进一步说明两个 crate 的类型本来就不该互相知道对方的存在。
+
+`agent24d`（L5）已经是 `agent24-store` 与多个 L3 crate 的组合根（`agent`、`comm`、`mcp`、`memory`、`models`、`policy`、`scheduler`、`tools`、`workspace`——见 §1.1 的依赖表）。给这张表加一行 `decide`，让 `agent24d` 实现 `DecisionLog`（把 `agent24-decide` 的 DTO 翻译成 `agent24-store` 的 plain 字段，反向翻译导出结果），是把"两个互不知道对方的 L3/L2 crate 需要被接到一起"这件事放在它本就该发生的地方。
+
+### 决策
+
+1. `agent24-decide::log::DecisionLog` 的具体实现（真正写库的那个 struct）属于 `agent24d`，不是 `agent24-store`，也不是 `agent24-decide` 本身。D0-2 **不新增这个实现**——跟 D0-1 的 `RuleBackend` 一样，trait 本身先有形状，真正的消费者是 D1（记住意图 + 召回门控接上决策服务那天）。
+2. `agent24-store` 新增的 `decision_log.rs` 只用自己的 plain DTO（`NewDecisionLogEntry`/`DecisionLogRow`/…），每个 JSON 形状的字段都是"已经序列化好的字符串"，`agent24-store` 从不解析或构造 `agent24-decide` 的任何类型。`agent24-decide` 新增的 `log.rs` 同理不引入 `agent24-store` 依赖。两个 crate 对"决策日志"这件事各有一份独立的类型定义——这是故意的重复，不是疏漏：合并它们需要其中一个依赖另一个，而方向在今天的架构下无论哪边都不成立。
+3. `agent24 decide export`/`delete`（CLI）**不经过** `DecisionLog` trait，也不经过 daemon 的 REST 层——直接用 `agent24-store::Store::open` 打开 `~/.agent24/agent24.db`，和 `agent24 os install`/`uninstall` 不走 daemon 的理由相同（见 `agent24-cli/src/main.rs` 里 `os_local`/`cmd_decide` 各自的文档注释）：决策日志是"用户随时能查看、导出、删除自己的本地数据"这件隐私功能（§2.3），不应该依赖一个可能没在跑的进程。SQLite WAL 模式本来就允许多个进程并发读写同一个文件，`Store::open` 的连接参数已经按这个前提配置（`busy_timeout`、`journal_mode = WAL`），这不是新引入的并发风险。
+4. 因此 D0-2 交付的不是一个端到端可用的日志管线，而是三块独立但彼此吻合的契约：`agent24-decide::log`（D1 写入时用的形状）、`agent24-store::decision_log`（SQLite 持久化）、CLI 的直接读写（维护工具）。D1 接线时要做的翻译工作——把真实 `DecisionService::decide()` 的结果变成一个 `LogEntry`，调用某个实现了 `DecisionLog` 的 `agent24d` 内部类型——此刻还没有人写，留给 D1。
+
+### 代价与后果
+
+- 两套 DTO（`agent24-decide::log::LogEntry` 与 `agent24-store::decision_log::NewDecisionLogEntry`）字段基本对应但类型不同（例如 `FinalAction` 枚举 vs 裸 `String`），D1 接线时需要写一层显式映射；这层映射目前不存在，也没有测试覆盖，因为没有调用方。
+- CLI 直接打开 `agent24.db`，意味着将来如果决策日志需要经过某种访问控制（例如多用户、远程 attach），现在的直接文件访问路径要重新考虑——D0-2 的隐私模型是单用户单机，这个前提目前成立，但不是永久保证。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |

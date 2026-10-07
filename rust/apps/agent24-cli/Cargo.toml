@@ -14,6 +14,11 @@ path = "src/main.rs"
 agent24-protocol = { path = "../../crates/agent24-protocol" }
 agent24-mcp = { path = "../../crates/agent24-mcp" }
 agent24-os-packages = { path = "../../crates/agent24-os-packages" }
+# `agent24 decide export`/`delete` are local-only maintenance operations on
+# the decision log (D0-2) — like `agent24 os install`, they work on
+# ~/.agent24/agent24.db directly and do not need a running daemon (see
+# `cmd_decide`'s doc comment in main.rs and docs/decision.md ADR-034).
+agent24-store = { path = "../../crates/agent24-store" }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # `agent24 comm import`'s TTY password prompt disables local echo while the

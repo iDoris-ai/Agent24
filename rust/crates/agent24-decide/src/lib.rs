@@ -31,12 +31,18 @@
 //!   file cannot bypass the range/order checks the way a plain derive would.
 
 pub mod backend;
+pub mod log;
 pub mod points;
 pub mod service;
 pub mod threshold;
 pub mod types;
 
 pub use backend::{BackendOutcome, DecisionBackend, RuleBackend};
+pub use log::{
+    DECISION_LOG_SCHEMA_VERSION, DEFAULT_DECISION_LOG_RETENTION_DAYS, DecisionLog,
+    DecisionLogError, DeleteSelector, ExportFilter, FinalAction, LogEntry, LoggedLayer,
+    OutcomeEntry, OutcomeQuality, OutcomeSignal,
+};
 pub use service::DecisionService;
 pub use threshold::{Action, ThresholdBands, ThresholdError};
 pub use types::{
