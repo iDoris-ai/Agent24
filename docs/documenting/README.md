@@ -390,7 +390,12 @@ Documenting does not write a second, partial set of context rules. **T006 §7 is
   - In implementation there are **two paths**, and they are enforced differently.
   - **Path 1 — model calls the Documenting OS makes itself** (extraction, summarizing). Privacy comes from the manifest's `model_access` grant, which defaults to `LocalOnly`. The kernel then routes with `TaskProfile{privacy: LocalOnly}` and fails closed for remote tiers. A call cannot pass its own privacy value. This works **out-of-process only**. An in-process DomainModule has no Models handle at all (`KERNEL_GRANTS` = Events, Memory, Approval), so it would need a new `Capability`. That is an input to #701.
   - **Path 2 — document content returned to an agent run** (chat). Agent runs use `TaskProfile::default()` (`Privacy::Any`, BASELINE §9). Per-run task profiles do not exist yet (ID-1 is 📐), and nothing on this path can set `LocalOnly` today. This is the real leak path, and it is registered as an Agent24 dependency (§16).
-  - **Interim rule until Path 2 exists** (BASELINE §12 Q5, ADR-DOC-01 D8): document tools are advertised to the agent only when the model router has no remote tier. Runs that received document content are tainted: no egress-class tools, no memory retention, no remote continuation. A per-user opt-in for remote models is deferred.
+  - **Data-handling policy enforced by the kernel** (ADR-DOC-01 D8, #735).
+    - The user makes an informed choice of mode: strict local, or cloud processing authorized for specific data, purpose and destination.
+    - Strict local is enforced end to end: no model, HTTP/MCP, other-module, Exec, memory or background-task egress, and no silent cloud fallback.
+    - A module's self-declared `output_privacy` or an Exec warning never replaces egress control.
+    - Any mode that is not supported is shown as unavailable.
+  - **Documented interim limit** (BASELINE §12 Q5): until that enforcement lands, document tools are advertised only when the model router has no remote tier, and any run that received document content is treated as strict local. This is replaced once #735 delivers per-run/session policy enforcement.
 - **Source content is evidence, not instruction.** Document or KB content never grants execution authority and never overrides host rules.
 
 These are acceptance requirements for the implementation. They are not preconditions for merging this design document.
