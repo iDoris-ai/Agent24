@@ -3081,6 +3081,156 @@ pub(crate) mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    // These kernel paths do not yet have OpenAPI entries. Keep each reason and
+    // owning follow-up beside the path: M2-02/M2-04 remove their entries when
+    // those contracts land; the remaining exceptions have separate owners.
+    const UNDOCUMENTED_KERNEL_ROUTES: &[&str] = &[
+        "/os",                                  // M2-02: Domain-OS list contract.
+        "/os/{name}",                           // M2-02: Domain-OS update contract.
+        "/os/{name}/stop",                      // M2-02: Domain-OS stop contract.
+        "/os/{name}/commands/{command}",        // M2-02: Domain-OS command contract.
+        "/attached",                            // M2-04: attached-module register/list contract.
+        "/attached/{name}",                     // M2-04: attached-module delete/update contract.
+        "/timings",                             // M2-04: timings contract.
+        "/timings/summary",                     // M2-04: timings summary contract.
+        "/capabilities/creative", // OD-M11 (PAUSED): capability contract is out of scope.
+        "/capabilities/{capability_id}/revoke", // OD-M11 (PAUSED): capability contract is out of scope.
+        "/events", // WebSocket protocol is documented by protocol/events.schema.json.
+    ];
+
+    // Module-owned contract paths appear in OpenAPI but are not literal routes
+    // in build_router_with_modules. M2-07 records whether they stay here.
+    const MODULE_SURFACE_PATHS: &[&str] = &[
+        "/sin90/directions",
+        "/sin90/schedule-blocks",
+        "/sin90/schedule-blocks/{id}",
+        "/sin90/proposals",
+        "/sin90/proposals/{id}",
+        "/sin90/proposals/{id}/accept",
+        "/sin90/attention",
+    ];
+
+    // COMM routes are mounted by server::serve, outside the scanned builder;
+    // `/api/v1/comm/*` remains a known blind spot owned by the COMM workstream.
+    const EXTRA_RESERVED_NOT_IN_BUILD_ROUTER: &[&str] = &["/comm/*"];
+
+    fn route_openapi_mismatches(
+        server_source: &str,
+        openapi_source: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        use std::collections::BTreeSet;
+
+        let start = server_source
+            .find("pub fn build_router_with_modules")
+            .expect("build_router_with_modules must exist");
+        let body = &server_source[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("build_router_with_modules must be brace-terminated");
+        let body = &body[..end];
+
+        let mut routes = BTreeSet::new();
+        for (offset, _) in body.match_indices(".route(") {
+            let registration = &body[offset + ".route(".len()..];
+            let Some(quote_start) = registration.find('"') else {
+                continue;
+            };
+            let path_and_rest = &registration[quote_start + 1..];
+            let Some(quote_end) = path_and_rest.find('"') else {
+                continue;
+            };
+            let path = &path_and_rest[..quote_end];
+            if let Some(path) = path.strip_prefix("/api/v1") {
+                routes.insert(path.to_owned());
+            }
+        }
+        assert!(
+            routes.len() >= 20,
+            "route scan found only {} paths; build_router_with_modules may have changed shape",
+            routes.len()
+        );
+
+        let document: serde_yaml::Value =
+            serde_yaml::from_str(openapi_source).expect("protocol/openapi.yaml must parse as YAML");
+        let paths = document
+            .get("paths")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("OpenAPI document must contain a paths mapping");
+        let openapi: BTreeSet<String> = paths
+            .keys()
+            .filter_map(serde_yaml::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+
+        let undocumented: BTreeSet<&str> = UNDOCUMENTED_KERNEL_ROUTES.iter().copied().collect();
+        let module_paths: BTreeSet<&str> = MODULE_SURFACE_PATHS.iter().copied().collect();
+        let _known_external_blind_spot = EXTRA_RESERVED_NOT_IN_BUILD_ROUTER;
+        let expected_openapi: BTreeSet<String> = routes
+            .iter()
+            .filter(|path| !undocumented.contains(path.as_str()))
+            .cloned()
+            .collect();
+        let actual_openapi: BTreeSet<String> = openapi
+            .iter()
+            .filter(|path| !module_paths.contains(path.as_str()))
+            .cloned()
+            .collect();
+
+        let missing_from_openapi = expected_openapi
+            .difference(&actual_openapi)
+            .cloned()
+            .collect();
+        let extra_in_openapi = actual_openapi
+            .difference(&expected_openapi)
+            .cloned()
+            .collect();
+        (missing_from_openapi, extra_in_openapi)
+    }
+
+    fn assert_route_openapi_covered(server_source: &str, openapi_source: &str) {
+        let (missing_from_openapi, extra_in_openapi) =
+            route_openapi_mismatches(server_source, openapi_source);
+        assert!(
+            missing_from_openapi.is_empty(),
+            "kernel routes missing from OpenAPI (except UNDOCUMENTED_KERNEL_ROUTES): {missing_from_openapi:?}"
+        );
+        assert!(
+            extra_in_openapi.is_empty(),
+            "OpenAPI paths without a kernel route (except MODULE_SURFACE_PATHS): {extra_in_openapi:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_routes_and_openapi_paths_have_no_unlisted_drift() {
+        let routes = include_str!("server.rs");
+        let openapi = include_str!("../../../../protocol/openapi.yaml");
+        assert_route_openapi_covered(routes, openapi);
+    }
+
+    #[test]
+    fn route_openapi_gate_rejects_an_undocumented_kernel_route() {
+        let routes = include_str!("server.rs").replace(
+            ".route(\"/api/v1/health\"",
+            ".route(\"/api/v1/not-in-openapi\", get(health))\n        .route(\"/api/v1/health\"",
+        );
+        let openapi = include_str!("../../../../protocol/openapi.yaml");
+        let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(&routes, openapi);
+        assert_eq!(missing_from_openapi, ["/not-in-openapi"]);
+        assert!(extra_in_openapi.is_empty());
+    }
+
+    #[test]
+    fn route_openapi_gate_rejects_an_unimplemented_openapi_path() {
+        let routes = include_str!("server.rs");
+        let openapi = include_str!("../../../../protocol/openapi.yaml").replace(
+            "paths:\n",
+            "paths:\n  /not-in-router:\n    get:\n      responses: {}\n",
+        );
+        let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(routes, &openapi);
+        assert!(missing_from_openapi.is_empty());
+        assert_eq!(extra_in_openapi, ["/not-in-router"]);
+    }
+
     /// A disable's stop is cut off at a fixed instant after the shutdown
     /// began — the budget any module gets — however late its waiter is first
     /// polled (review of SUP-5, round 2). The token is cancelled directly:
