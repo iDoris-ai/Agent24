@@ -10,6 +10,7 @@ description = "Agent24 decision service (D0): DecisionRequest/Question/Decision 
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
 thiserror = "2"
 
 [dev-dependencies]

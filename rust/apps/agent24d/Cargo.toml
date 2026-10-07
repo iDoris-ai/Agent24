@@ -11,6 +11,9 @@ agent24-agent = { path = "../../crates/agent24-agent" }
 # COMM-2a: `/api/v1/comm/*` — see `src/comm_routes.rs`.
 agent24-comm = { path = "../../crates/agent24-comm" }
 agent24-core = { path = "../../crates/agent24-core" }
+# D0-3: `GET /api/v1/decide/profile` only — hardware probe + tier policy,
+# not the decision cascade itself (that is D1, still unwired).
+agent24-decide = { path = "../../crates/agent24-decide" }
 agent24-domain = { path = "../../crates/agent24-domain" }
 agent24-os-packages = { path = "../../crates/agent24-os-packages" }
 agent24-mcp = { path = "../../crates/agent24-mcp" }
