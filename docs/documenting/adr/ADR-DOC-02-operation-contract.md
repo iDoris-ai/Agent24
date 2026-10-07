@@ -1,6 +1,8 @@
 # ADR-DOC-02：DocumentService 操作契约
 
 > **状态**：Proposed。生效条件同 ADR-DOC-01：PR-Daemon APPROVE + jason 确认；§9 的决策项由 David 拍板（Q1、Q2、Q4、Q5 已定）。
+> - ✅ PR-Daemon 已在 #736 给出 APPROVE。
+> - ⏳ **待 jason 确认**。确认后状态改为 Accepted。
 > **日期**：2026-10-07 · **作者**：David Xu · **Issue**：#701（DOC-1-02 第 2 部分）
 > **依赖**：[ADR-DOC-01](ADR-DOC-01-placement-and-integration.md)（进程外 OS `documents`、模块声明工具、类型化 preload、D8 由内核执行的资料处理政策、D9 审计）。
 > **依据**：[README](../README.md) §2.2 / §2.3 / §5 / §7 / §8 / §9.1 / §10 / §11 / §14 / §17 #1–#3 / §22.1；[BASELINE](../BASELINE.md) §7–§8。
