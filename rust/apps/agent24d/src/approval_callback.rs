@@ -231,9 +231,10 @@ impl Handler for ApprovalSubmitHandler {
             };
 
             // Step 5: token admission and insert are one lifecycle-bound
-            // operation. If the owner has ended before admission, no token
-            // is consumed; if it ends while the write is pending, dropping
-            // the store future prevents the row/event from being produced.
+            // operation. If the owner ends while the write is pending, the
+            // store future is cancelled. If storage committed just before
+            // cancellation, the timeout fallback below re-announces the
+            // durable row before reporting success.
             let request_id = parsed.request_id;
             let approval_token = parsed.approval_token;
             let action = parsed.action;
@@ -257,11 +258,12 @@ impl Handler for ApprovalSubmitHandler {
             match bind_to_lifecycle(Some(lifecycle), submit).await {
                 Ok(result) => result,
                 Err(timeout) => match broker
-                    .find_existing(&lookup_module, &lookup_request_id, kind)
+                    .announce_existing_required(&lookup_module, &lookup_request_id, kind)
                     .await
                 {
                     // The write may have committed as the lifecycle expired.
-                    // Report that durable result instead of claiming timeout.
+                    // Ensure its REQUEST event is delivered before reporting
+                    // that durable result as success.
                     Ok(Some(existing)) => Ok(answer_json(&existing)),
                     Ok(None) => Err(lifecycle_timeout_error(timeout)),
                     Err(err) => Err(request_error(err)),
@@ -563,6 +565,55 @@ mod tests {
         assert!(
             resume_insert.send(()).is_err(),
             "the timed-out insert future must be dropped before storage resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_expiry_after_commit_still_broadcasts_required_event() {
+        let events = crate::events::EventsHub::default();
+        let mut received_events = events.subscribe();
+        let broker =
+            ModuleApprovalBroker::new(agent24_store::Store::open_memory().await.unwrap(), events);
+        let (write_committed, resume_broadcast) = broker.gate_next_broadcast().await;
+        let (g, in_flight) = generation_with_good_params_admitted();
+        let h = submit_handler(g, true, ModuleApprovalKind::Advise, broker.clone());
+        let submission = tokio::spawn(async move { h.call(good_params()).await });
+
+        // Pause after SQLite committed the row but before insert() broadcasts.
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_committed)
+            .await
+            .expect("the approval row must be committed before the broadcast gate")
+            .unwrap();
+        drop(in_flight);
+
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(1), submission)
+            .await
+            .expect("lifecycle expiry should let the callback return via its durable-row fallback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer["decision"], "pending");
+        assert_eq!(broker.list(None).await.unwrap().len(), 1);
+        assert!(
+            resume_broadcast.send(()).is_err(),
+            "lifecycle expiry must cancel the paused insert before fallback announces the row"
+        );
+
+        let (_, event) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), received_events.recv())
+                .await
+                .expect("a successful persisted approval must emit its required event")
+                .unwrap();
+        assert!(matches!(
+            event,
+            agent24_protocol::EventBody::ModuleApprovalRequired(_)
+        ));
+        broker
+            .announce_existing_required("probe", "req-1", ModuleApprovalKind::Advise)
+            .await
+            .unwrap();
+        assert!(
+            received_events.try_recv().is_err(),
+            "re-announcing the same approval must be deduplicated"
         );
     }
 

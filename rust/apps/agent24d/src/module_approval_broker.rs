@@ -8,7 +8,8 @@
 //!
 //! See `docs/design/T7b-ME3e-approvals.md`, decisions 3-6.
 
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use agent24_protocol::{
     ApprovalAnswer, ApprovalRequestError, EventBody, ModuleApproval, ModuleApprovalDecision,
@@ -27,6 +28,32 @@ const MODULE_APPROVAL_TTL_SECS: u64 = 300;
 /// How often the periodic scan runs (design doc decision 5: "比如每 10 秒跑
 /// 一次，具体间隔留给实现阶段").
 const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Keep recent announcement IDs for the race between lifecycle cancellation
+/// and the timeout fallback. The cap matches the event hub's replay window.
+const ANNOUNCED_APPROVAL_CAPACITY: usize = 4096;
+
+#[derive(Default)]
+struct AnnouncementDeduper {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl AnnouncementDeduper {
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn remember(&mut self, id: &str) {
+        self.ids.insert(id.to_owned());
+        self.order.push_back(id.to_owned());
+        if self.order.len() > ANNOUNCED_APPROVAL_CAPACITY
+            && let Some(expired) = self.order.pop_front()
+        {
+            self.ids.remove(&expired);
+        }
+    }
+}
 
 /// The kernel-executable action closed set (design doc decisions 4 and 6).
 /// T7b shipped this EMPTY (every `gate` submission was `forbidden` before a
@@ -175,8 +202,11 @@ pub struct ModuleApprovalBroker {
     store: Store,
     events: crate::events::EventsHub,
     clock: Arc<dyn Clock>,
+    announced: Mutex<AnnouncementDeduper>,
     #[cfg(test)]
     insert_gate: tokio::sync::Mutex<Option<InsertGate>>,
+    #[cfg(test)]
+    post_write_gate: tokio::sync::Mutex<Option<InsertGate>>,
 }
 
 #[cfg(test)]
@@ -201,8 +231,11 @@ impl ModuleApprovalBroker {
             store,
             events,
             clock,
+            announced: Mutex::new(AnnouncementDeduper::default()),
             #[cfg(test)]
             insert_gate: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            post_write_gate: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -216,6 +249,22 @@ impl ModuleApprovalBroker {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
         *self.insert_gate.lock().await = Some(InsertGate {
+            started: started_tx,
+            resume: resume_rx,
+        });
+        (started_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn gate_next_broadcast(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *self.post_write_gate.lock().await = Some(InsertGate {
             started: started_tx,
             resume: resume_rx,
         });
@@ -250,6 +299,44 @@ impl ModuleApprovalBroker {
             .await
             .map(|opt| opt.as_ref().map(to_answer))
             .map_err(|e| ApprovalRequestError::BackendUnavailable(e.to_string()))
+    }
+
+    /// Find a committed row and ensure its REQUEST event has been announced.
+    /// Used only when lifecycle cancellation races a write commit. The
+    /// deduper makes this safe if `insert()` already broadcast before the
+    /// cancellation became observable.
+    pub async fn announce_existing_required(
+        &self,
+        module: &str,
+        request_id: &str,
+        kind: ModuleApprovalKind,
+    ) -> Result<Option<ApprovalAnswer>, ApprovalRequestError> {
+        let row = self
+            .store
+            .find_module_approval(module, request_id, kind)
+            .await
+            .map_err(|e| ApprovalRequestError::BackendUnavailable(e.to_string()))?;
+        if let Some(row) = row {
+            self.announce_required(&row);
+            Ok(Some(to_answer(&row)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn announce_required(&self, row: &ModuleApproval) {
+        let mut announced = self
+            .announced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if announced.contains(&row.id) {
+            return;
+        }
+        self.events
+            .broadcast(EventBody::ModuleApprovalRequired(Box::new(
+                ModuleApprovalSubmitted::from(row),
+            )));
+        announced.remember(&row.id);
     }
 
     /// Insert a brand-new `Pending` row and push `module-approval.required`
@@ -301,13 +388,15 @@ impl ModuleApprovalBroker {
             )
             .await
             .map_err(|e| ApprovalRequestError::BackendUnavailable(e.to_string()))?;
+        #[cfg(test)]
+        if let Some(gate) = self.post_write_gate.lock().await.take() {
+            let _ = gate.started.send(());
+            let _ = gate.resume.await;
+        }
         // T7c/ME-3e (design doc criterion 18): the WS event carries a frozen
         // `ModuleApprovalSubmitted` snapshot, NOT the full `ModuleApproval` —
         // `executed_at` must never appear on the submission event.
-        self.events
-            .broadcast(EventBody::ModuleApprovalRequired(Box::new(
-                ModuleApprovalSubmitted::from(&row),
-            )));
+        self.announce_required(&row);
         Ok(to_answer(&row))
     }
 
