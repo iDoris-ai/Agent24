@@ -21,7 +21,8 @@
 - **主干 = M1 记忆即产品（C3 P0）**，在 `ab/m1-memory` 上继续，做完以 merge 落 main；之后按 `MEMORY-STRATEGY` 的 P1 → P2 → P3 推进（见 [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) §3）。
 - **Open Design 线在 M10 告一阶段**：OD-M11 / OD-M12 / TPI-W / OC 全部 `PAUSED`，不与 M1 并行；M10 遗留的安全缺口（capability 路由级授权未实现、Desktop / ACP 仍用全权 token、ACP 不传 `workspace_id`）照原样登记在 [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) §0，恢复时从 OD-M11 起步。F11.4 托管器取舍随之推迟到恢复时再定。
 - **并行线 = COMM（Hyphae）**，留在笔记本做：COMM-5b → COMM-6 → COMM-7、DEP-C8。
-- **M1 之后第一项 = DM-SPIKE**（jason 2026-10-06 拍板）：决策模型（Ollaya / Laya / Jev 类）做记忆意图分类，规则兜底 + 模型判断，按评测门槛决定是否接入；该方向持续调研。定义与台账见 [`../research/DECISION-MODELS.md`](../research/DECISION-MODELS.md)。2026-10-07 jason 同意 D0–D3 方案并追加「按硬件自动适配」「积累数据训练个人决策模型」两条要求，任务拆解见 [`PLAN-DECIDE.md`](PLAN-DECIDE.md)。状态：**D0 `IN_PROGRESS`**（与 M1 真机验收并行，D0 不改现有调用点行为）；D1 起等 M1 合进 main。
+- **M1 之后第一项 = DM-SPIKE**（jason 2026-10-06 拍板）：决策模型（Ollaya / Laya / Jev 类）做记忆意图分类，规则兜底 + 模型判断，按评测门槛决定是否接入；该方向持续调研。定义与台账见 [`../research/DECISION-MODELS.md`](../research/DECISION-MODELS.md)。2026-10-07 jason 同意 D0–D3 方案并追加「按硬件自动适配」「积累数据训练个人决策模型」两条要求，任务拆解见 [`PLAN-DECIDE.md`](PLAN-DECIDE.md)。状态：**D0 `IN_PROGRESS`**（D0-1/2/3/4/5/7 已合，D0-6 Mac mini 实测进行中）；**M1 已于 2026-10-07 合入 main（#720），D1 前置已满足**。
+- **C3 P1 新增待办（jason 2026-10-07 提出，不急做，排在「清除权」ADR 之后）**：事件日志「原文永不删」的体积治理，见 [`../research/MEMORY-STRATEGY.md`](../research/MEMORY-STRATEGY.md) §4.2。
 
 **历史（2026-09-23 起的 ME-4 执行段，已收口）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
 定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
@@ -310,7 +311,7 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 
 ---
 
-## M1 v2 台账（2026-10-01 冻结；本表是 M1 唯一的状态来源）
+## M1 v2 台账（2026-10-01 冻结；本表是 M1 唯一的状态来源）—— ✅ 2026-10-07 已全部合入 main（#720）
 
 > 定义/验收见 [`M1-PLAN-v2.md`](M1-PLAN-v2.md)（已冻结 2026-10-01）。执行：集成分支 `ab/m1-memory`；~~B（Mac mini ab-codex）执行、A（笔记本）派活与验收~~ —— **2026-10-03 起全部在笔记本上派活/构建/测试/验收，B 机不再构建 Agent24**。[笔记本] 标注的需要本地模型。入队顺序见 M1-PLAN-v2 §2「依赖图与入队顺序」。
 
@@ -325,11 +326,17 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 | M1-T06b | LLM 抽取（笔记本，可选） | T06, T08 | `BACKLOG` |  |
 | M1-T07a | 中文可检索：FTS 接缝下移 + CJK 二元组 + `search_any`（迁移 0017） | — | `DONE` | PR #638 |
 | M1-T07 | Recall：run 前召回注入 | T05, T06, T07a | `DONE` | PR #652 |
+| M1-T07.1 | 召回注入改数据块 + 审批恢复输入快照 | T07 | `DONE` | PR #674 |
+| M1-T07.2 | `search_any` 噪声词过滤 | T07 | `DONE` | PR #675 |
 | M1-T07b | 向量召回（笔记本，可选） | T07 | `BACKLOG` |  |
-| M1-T08 | 召回评测基线 | T07 | `BACKLOG` |  |
+| M1-T08 | 召回评测基线（含安全硬门） | T07 | `DONE` | PR #675 |
 | M1-T09 | 存储层同事务撤回 `forget` | — | `DONE` | PR #640 |
-| M1-T10 | 记忆 REST：列出/搜索/撤回 | T07, T09 | `BACKLOG` |  |
-| M1-T11 | 桌面端「记忆」页 | T10 | `BACKLOG` |  |
+| M1-T10 | 记忆 REST：列出/搜索/撤回 + 暂停总开关 | T07, T09 | `DONE` | PR #672 |
+| M1-T11 | 桌面端「记忆」页 | T10 | `DONE` | PR #673 |
+| M1-T12 | 聊天页接入记忆（`/api/v1/chat` 可选 `session_id`） | T10 | `DONE` | PR #681 |
+| M1-T13 | 放宽「记住」识别 + 句末疑问不误识别 | T06 | `DONE` | PR #680 |
+| M1-T14 | 聊天切页不丢对话 + 记忆回执由系统给出 | T12 | `DONE` | PR #683 |
+| **M1 release** | 真机验收（jason 2026-10-06，`c503bf1`，有截图）→ `ab/m1-memory` 合入 main | 全部 | `DONE` | PR #720 `1e25795` |
 
 ## M1 —— 记忆成为产品（2026-08-23 规划；状态未改动，未重排）
 
