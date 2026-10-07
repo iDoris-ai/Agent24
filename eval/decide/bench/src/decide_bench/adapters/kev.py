@@ -33,14 +33,15 @@ import json as _json
 from ..types import EvalItem, Point, Prediction
 from .base import Candidate, CandidateUnavailable
 
-_SETUP_HINT = (
-    "Kev-0.8B 需要先在另一个终端起它自己的服务（本仓库不内嵌 Ollaya/mlx-lm 的 "
-    "pointer-head 实现）：\n"
-    "  git clone https://github.com/jaredpalmer/kev.git && cd kev\n"
-    "  uv sync --extra serve\n"
-    "  uv run --extra serve python -m kev.serve --run jaredpalmer/kev-0.8b --port 8008\n"
-    "再设置 KEV_BASE_URL（默认 http://127.0.0.1:8008）后重跑。"
-)
+def _setup_hint(model_id: str, port: int) -> str:
+    return (
+        f"Kev（{model_id}）需要先在另一个终端起它自己的服务（本仓库不内嵌 Ollaya/mlx-lm 的 "
+        "pointer-head 实现）：\n"
+        "  git clone https://github.com/jaredpalmer/kev.git && cd kev\n"
+        "  uv sync --extra serve\n"
+        f"  uv run --extra serve python -m kev.serve --run {model_id} --port {port}\n"
+        f"再设置 KEV_BASE_URL（默认 http://127.0.0.1:{port}）后重跑。"
+    )
 
 # English option text for each decision point, translated from
 # eval/decide/README.md's own label definitions — Kev is English-only, so
@@ -63,14 +64,31 @@ _TOOL_RISK_CRITERIA = {
 
 
 class KevCandidate(Candidate):
-    name = "kev-0.8b"
-    model_id = "jaredpalmer/kev-0.8b"
-    revision = "9a45d25e"  # Kev 1.0, per the model card's "Version" row
+    """Generalized over Kev's size — D0-5 only had kev-0.8b; D0-8 adds
+    kev-4b to compare sizes within the same family. Both talk to a
+    `kev.serve` process the caller must start out-of-band (see
+    ``_SETUP_HINT`` and the bench README's Kev section), each on its own
+    port so 0.8b and 4b can be benched without tearing one server down to
+    start the other.
+    """
+
     applicable_points: tuple[Point, ...] = ("retain_intent", "recall_gate", "tool_risk")
 
-    def __init__(self, base_url: str | None = None, timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        name: str = "kev-0.8b",
+        model_id: str = "jaredpalmer/kev-0.8b",
+        revision: str = "9a45d25e",  # Kev 1.0, per the model card's "Version" row
+        base_url: str | None = None,
+        default_port: int = 8008,
+        timeout_s: float = 30.0,
+    ) -> None:
         super().__init__()
-        self.base_url = base_url or os.environ.get("KEV_BASE_URL", "http://127.0.0.1:8008")
+        self.name = name
+        self.model_id = model_id
+        self.revision = revision
+        self.base_url = base_url or os.environ.get("KEV_BASE_URL", f"http://127.0.0.1:{default_port}")
+        self.default_port = default_port
         self.timeout_s = timeout_s
 
     def _post(self, payload: dict) -> dict:
@@ -92,7 +110,9 @@ class KevCandidate(Candidate):
                 }
             )
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-            raise CandidateUnavailable(f"Kev server unreachable at {self.base_url}: {exc}\n{_SETUP_HINT}") from exc
+            raise CandidateUnavailable(
+                f"Kev server unreachable at {self.base_url}: {exc}\n{_setup_hint(self.model_id, self.default_port)}"
+            ) from exc
         if "answers" not in resp:
             raise CandidateUnavailable(f"Kev server at {self.base_url} returned unexpected response: {resp}")
         self.resolved_sha = f"server@{self.base_url}"
@@ -154,3 +174,14 @@ class KevCandidate(Candidate):
             label = answer["choice"]
             p = answer["probabilities"].get(label)
         return Prediction(label=label, p=p, latency_ms=latency_ms, backend=self.name, raw=resp)
+
+
+def make_kev_0_8b() -> KevCandidate:
+    return KevCandidate(name="kev-0.8b", model_id="jaredpalmer/kev-0.8b", revision="9a45d25e", default_port=8008)
+
+
+def make_kev_4b() -> KevCandidate:
+    # D0-8: same family, next size up. §8.1 license note carries over —
+    # Apache-2.0, base Qwen3.5-4B-Base (Apache-2.0), data licenses "记在
+    # suite manifest，未读" (未核实, DECISION-MODELS.md §8.2 item 4).
+    return KevCandidate(name="kev-4b", model_id="jaredpalmer/kev-4b", revision="6cfce5c2fa", default_port=8009)

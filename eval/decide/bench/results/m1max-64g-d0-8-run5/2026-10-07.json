@@ -1,0 +1,6063 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-07",
+  "generated_at": "2026-10-07T12:17:24.163936+00:00",
+  "machine_id": "m1max-64g-d0-8",
+  "machine_info": {
+    "platform": "macOS-26.4.1-arm64-arm-64bit",
+    "python": "3.11.15",
+    "cpu_brand": "Apple M1 Max",
+    "ram_bytes": "68719476736"
+  },
+  "points_run": [
+    "retain_intent",
+    "recall_gate",
+    "tool_risk"
+  ],
+  "candidates": [
+    {
+      "name": "kev-4b",
+      "model_id": "jaredpalmer/kev-4b",
+      "revision": "6cfce5c2fa",
+      "resolved_sha": "server@http://127.0.0.1:8009",
+      "available": true,
+      "unavailable_reason": null,
+      "load_latency_s": 4.921796875074506,
+      "peak_rss_mb": 14.203125,
+      "download_size_mb": 152.3280372619629,
+      "points": {
+        "retain_intent": {
+          "point": "retain_intent",
+          "n_items": 226,
+          "n_abstained": 0,
+          "accuracy": 0.6902654867256637,
+          "macro_f1": 0.6628472398047778,
+          "ece": 0.12048672566371679,
+          "cost_weighted_error_rate": 0.29150326797385623,
+          "p50_latency_ms": 503.87202110141516,
+          "p95_latency_ms": 958.8688854128122,
+          "retain_intent_extra": {
+            "false_write_rate": 0.2619047619047619,
+            "remember_recall": 0.8448275862068966
+          },
+          "predictions": [
+            {
+              "id": "ri-001",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8899,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-002",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.9093,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-003",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8621,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-004",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8253,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-005",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.851,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-006",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.9122,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-007",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.7515,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-008",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.84,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-009",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8681,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-010",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.7766,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-011",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8981,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-012",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.4147,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-013",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.9045,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-014",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8868,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-015",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8186,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-016",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.7461,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-017",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8152,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-018",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.863,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-019",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8643,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-020",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.834,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-021",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.381,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-022",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8552,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-023",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.6826,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-024",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.9028,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-025",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8381,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-026",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4371,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-027",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4363,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-028",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.5776,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-029",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8701,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-030",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8388,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-031",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.7929,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-032",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8595,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-033",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8659,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-034",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4795,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-035",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4462,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-036",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.7033,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-037",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6936,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-038",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.8152,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-039",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.697,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-040",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4172,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-041",
+              "expected": "forget",
+              "predicted": "none",
+              "p": 0.4541,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-042",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4997,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-043",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.427,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-044",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6964,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-045",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6519,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-046",
+              "expected": "ask_memory",
+              "predicted": "remember",
+              "p": 0.6518,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-047",
+              "expected": "ask_memory",
+              "predicted": "none",
+              "p": 0.4246,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-048",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.3602,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-049",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.3995,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-050",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.575,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-051",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.7483,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-052",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5735,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-053",
+              "expected": "ask_memory",
+              "predicted": "remember",
+              "p": 0.3358,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-054",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.8156,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-055",
+              "expected": "ask_memory",
+              "predicted": "none",
+              "p": 0.3372,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-056",
+              "expected": "ask_memory",
+              "predicted": "none",
+              "p": 0.354,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-057",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.7603,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-058",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5717,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-059",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.8714,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-060",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.751,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-061",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6029,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-062",
+              "expected": "ask_memory",
+              "predicted": "none",
+              "p": 0.3623,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-063",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.7108,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-064",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.7209,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-065",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.8354,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-066",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.6239,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-067",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.378,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-068",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.6315,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-069",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.8535,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-070",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.6192,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-071",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.5068,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-072",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.44,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-073",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5786,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-074",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.4699,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-075",
+              "expected": "preference",
+              "predicted": "remember",
+              "p": 0.4635,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-076",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.4432,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-077",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5803,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-078",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5047,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-079",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.4704,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-080",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.4177,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-081",
+              "expected": "preference",
+              "predicted": "remember",
+              "p": 0.5214,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-082",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6477,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-083",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6416,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-084",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.8187,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-085",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.7903,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-086",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4535,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-087",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.5332,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-088",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4097,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-089",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.5683,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-090",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.5982,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-091",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4407,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-092",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4276,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-093",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.3523,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-094",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.6153,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-095",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.456,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-096",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4038,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-097",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4979,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-098",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.6185,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-099",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.8366,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-100",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4011,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-101",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.5519,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-102",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8984,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-103",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8215,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-104",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8106,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-105",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5204,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-106",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.7363,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-107",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.7607,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-108",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8491,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-109",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.771,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-110",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.3939,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-111",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5576,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-112",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6345,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-113",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.695,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-114",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.5771,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-115",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.5735,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-116",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.5127,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-117",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.7259,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-118",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6574,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-119",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.7875,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-120",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.8569,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-121",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.684,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-122",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5642,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-123",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.4392,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-124",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.9035,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-125",
+              "expected": "ask_memory",
+              "predicted": "none",
+              "p": 0.4224,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-126",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5172,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-127",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6145,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-128",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.7908,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-129",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6313,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-130",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6285,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-131",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.7149,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-132",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.792,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-133",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.5924,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-134",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.7597,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-135",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.7577,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-136",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.3706,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-137",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.6862,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-138",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.3348,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-139",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.7459,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-140",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6885,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-141",
+              "expected": "preference",
+              "predicted": "remember",
+              "p": 0.5787,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-142",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6187,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-143",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5863,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-144",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5081,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-145",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5203,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-146",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.43,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-147",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5529,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-148",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5614,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-149",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.8018,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-150",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4299,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-151",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.6945,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-152",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.6157,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-153",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.436,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-154",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.7066,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-155",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.8124,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-156",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.527,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-157",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.8071,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-158",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4366,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-159",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5439,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-160",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6004,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-161",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5412,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-162",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.6638,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-163",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.5027,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-164",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.8684,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-165",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.3615,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-166",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5882,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-167",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.5986,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-168",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.6394,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-169",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4532,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-170",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.3783,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-171",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.3547,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-172",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.3746,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-173",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4746,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-174",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4945,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-175",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4905,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-176",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.3705,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-177",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4077,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-178",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4505,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-179",
+              "expected": "forget",
+              "predicted": "none",
+              "p": 0.317,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-180",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6414,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-181",
+              "expected": "forget",
+              "predicted": "none",
+              "p": 0.3827,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-182",
+              "expected": "forget",
+              "predicted": "remember",
+              "p": 0.4858,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-183",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5335,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-184",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.3582,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-185",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.651,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-186",
+              "expected": "ask_memory",
+              "predicted": "none",
+              "p": 0.5079,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-187",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.3799,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-188",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5407,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-189",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.3379,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-190",
+              "expected": "ask_memory",
+              "predicted": "remember",
+              "p": 0.3336,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-191",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.4453,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-192",
+              "expected": "ask_memory",
+              "predicted": "none",
+              "p": 0.4875,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-193",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.3934,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-194",
+              "expected": "correct",
+              "predicted": "none",
+              "p": 0.3446,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-195",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.6452,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-196",
+              "expected": "correct",
+              "predicted": "none",
+              "p": 0.3063,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-197",
+              "expected": "correct",
+              "predicted": "none",
+              "p": 0.4763,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-198",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.6586,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-199",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.6379,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-200",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.4322,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-201",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.3429,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-202",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.5572,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-203",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5475,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-204",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5646,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-205",
+              "expected": "preference",
+              "predicted": "none",
+              "p": 0.5251,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-206",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.4179,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-207",
+              "expected": "preference",
+              "predicted": "remember",
+              "p": 0.3536,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-208",
+              "expected": "preference",
+              "predicted": "remember",
+              "p": 0.3153,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-209",
+              "expected": "preference",
+              "predicted": "none",
+              "p": 0.339,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-210",
+              "expected": "preference",
+              "predicted": "none",
+              "p": 0.5302,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-211",
+              "expected": "preference",
+              "predicted": "none",
+              "p": 0.4773,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-212",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.6678,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-213",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4238,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-214",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.3645,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-215",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.5931,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-216",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.358,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-217",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4826,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-218",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.3909,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-219",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4571,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-220",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.7098,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-221",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.7256,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-222",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.436,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-223",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.3791,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-224",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6212,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-225",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.4033,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "ri-226",
+              "expected": "correct",
+              "predicted": "remember",
+              "p": 0.3828,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            }
+          ],
+          "by_lang": {
+            "en": {
+              "n_items": 66,
+              "accuracy": 0.7424242424242424,
+              "macro_f1": 0.7200547990021674,
+              "cost_weighted_error_rate": 0.25327510917030566
+            },
+            "mixed": {
+              "n_items": 12,
+              "accuracy": 0.8333333333333334,
+              "macro_f1": 0.76,
+              "cost_weighted_error_rate": 0.15555555555555556
+            },
+            "th": {
+              "n_items": 62,
+              "accuracy": 0.532258064516129,
+              "macro_f1": 0.5116393925991449,
+              "cost_weighted_error_rate": 0.4221105527638191
+            },
+            "zh": {
+              "n_items": 86,
+              "accuracy": 0.7441860465116279,
+              "macro_f1": 0.7115893628406528,
+              "cost_weighted_error_rate": 0.2534246575342466
+            }
+          },
+          "lang_inferred": false
+        },
+        "recall_gate": {
+          "point": "recall_gate",
+          "n_items": 221,
+          "n_abstained": 0,
+          "accuracy": 0.6787330316742082,
+          "macro_f1": 0.6077740282464692,
+          "ece": 0.13038190045248868,
+          "cost_weighted_error_rate": 0.365296803652968,
+          "p50_latency_ms": 222.49087505042553,
+          "p95_latency_ms": 413.02120801992714,
+          "retain_intent_extra": null,
+          "predictions": [
+            {
+              "id": "rg-001",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9027000000000001,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-002",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8407,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-003",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7865,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-004",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8749,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-005",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8241,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-006",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7926,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-007",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7814,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-008",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6958,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-009",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9141,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-010",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9278,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-011",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8542,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-012",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9569,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-013",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9405,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-014",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9594,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-015",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9356,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-016",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.912,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-017",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8774,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-018",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9562,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-019",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8604,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-020",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9181,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-021",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8707,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-022",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9534,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-023",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9501,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-024",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9458,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-025",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9193,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-026",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8504,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-027",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9032,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-028",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9308,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-029",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9596,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-030",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9342,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-031",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7861,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-032",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7933,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-033",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6253,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-034",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7865,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-035",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9382,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-036",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.812,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-037",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8815,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-038",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7917,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-039",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8145,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-040",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8626,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-041",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6615,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-042",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6619999999999999,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-043",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6569,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-044",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6235999999999999,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-045",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5367,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-046",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6048,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-047",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.8254,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-048",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.736,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-049",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6531,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-050",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6253,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-051",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6381,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-052",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5839,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-053",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5071,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-054",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5262,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-055",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7925,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-056",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6789000000000001,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-057",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5188,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-058",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6009,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-059",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5178,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-060",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7615000000000001,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-061",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5348999999999999,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-062",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7532,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-063",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6298,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-064",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6626000000000001,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-065",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7904,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-066",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7805,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-067",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6068,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-068",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.79,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-069",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5506,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-070",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5132,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-071",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7086,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-072",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.8665,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-073",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7653,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-074",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7825,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-075",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7163999999999999,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-076",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.752,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-077",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.8251,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-078",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7987,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-079",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6496999999999999,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-080",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5881000000000001,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-081",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7936,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-082",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9238999999999999,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-083",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8881,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-084",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7957,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-085",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8035,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-086",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7485999999999999,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-087",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8074,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-088",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7459,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-089",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8898,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-090",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5518000000000001,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-091",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.666,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-092",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7996,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-093",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6918,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-094",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7315,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-095",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9386,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-096",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9043,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-097",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.53,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-098",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7774,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-099",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9094,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-100",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.5759,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-101",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8578,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-102",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8787,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-103",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8717,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-104",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8438,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-105",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8279,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-106",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8915,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-107",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8795,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-108",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9615,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-109",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9498,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-110",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.95,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-111",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.872,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-112",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9529,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-113",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.923,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-114",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8828,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-115",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8548,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-116",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7745,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-117",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7753,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-118",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6865,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-119",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8707,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-120",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8782,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-121",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7657,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-122",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8288,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-123",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6343,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-124",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6783,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-125",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9389,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-126",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8901,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-127",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9513,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-128",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7659,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-129",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6323,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-130",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8935,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-131",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7266,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-132",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5043,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-133",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5487,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-134",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7369,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-135",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7051,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-136",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7769,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-137",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.8196,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-138",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6847,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-139",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6066,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-140",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6568,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-141",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7615000000000001,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-142",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7765,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-143",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5877,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-144",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7334,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-145",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7872,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-146",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7783,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-147",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.8953,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-148",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5490999999999999,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-149",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5922,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-150",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.652,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-151",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.8327,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-152",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7609,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-153",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6653,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-154",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.606,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-155",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6523,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-156",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7268,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-157",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7515,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-158",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7496,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-159",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8476,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-160",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7524,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-161",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8568,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-162",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.808,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-163",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7437,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-164",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7827999999999999,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-165",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6786,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-166",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5809,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-167",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7894,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-168",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8371999999999999,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-169",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9284,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-170",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9305,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-171",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9448,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-172",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8038,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-173",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8452,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-174",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8263,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-175",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8718,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-176",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8684000000000001,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-177",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9041,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-178",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5611999999999999,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-179",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6232,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-180",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7532,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-181",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9135,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-182",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8094,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-183",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6932,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-184",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7619,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-185",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6392,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-186",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6643,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-187",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7635000000000001,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-188",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.8431,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-189",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9676,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-190",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6445000000000001,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-191",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7778,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-192",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7257,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-193",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6506000000000001,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-194",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5196000000000001,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-195",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5219,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-196",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7277,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-197",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5503,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-198",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6134999999999999,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-199",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6897,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-200",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5645,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-201",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5529,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-202",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5212,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-203",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5481,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-204",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6089,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-205",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7123999999999999,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-206",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7348,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-207",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7997,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-208",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7147,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-209",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6783,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-210",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7819,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-211",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7384,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-212",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.665,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-213",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6388,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-214",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7014,
+              "correct": false,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-215",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6412,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-216",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7135,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-217",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.7724,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-218",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6032,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-219",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5565,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-220",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5287999999999999,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            },
+            {
+              "id": "rg-221",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.9,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "mixed",
+              "lang_inferred": false
+            }
+          ],
+          "by_lang": {
+            "en": {
+              "n_items": 65,
+              "accuracy": 0.7076923076923077,
+              "macro_f1": 0.6615511098931214,
+              "cost_weighted_error_rate": 0.3382352941176471
+            },
+            "mixed": {
+              "n_items": 7,
+              "accuracy": 0.8571428571428571,
+              "macro_f1": 0.8444444444444446,
+              "cost_weighted_error_rate": 0.25
+            },
+            "th": {
+              "n_items": 62,
+              "accuracy": 0.6129032258064516,
+              "macro_f1": 0.47234042553191485,
+              "cost_weighted_error_rate": 0.448
+            },
+            "zh": {
+              "n_items": 87,
+              "accuracy": 0.6896551724137931,
+              "macro_f1": 0.6255380200860832,
+              "cost_weighted_error_rate": 0.3375796178343949
+            }
+          },
+          "lang_inferred": false
+        },
+        "tool_risk": {
+          "point": "tool_risk",
+          "n_items": 144,
+          "n_abstained": 0,
+          "accuracy": 0.7013888888888888,
+          "macro_f1": 0.6946964850218275,
+          "ece": 0.14021458333333328,
+          "cost_weighted_error_rate": 0.4212678936605317,
+          "p50_latency_ms": 293.355458881706,
+          "p95_latency_ms": 623.4648437239229,
+          "retain_intent_extra": null,
+          "predictions": [
+            {
+              "id": "tr-001",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.907,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-002",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.9031,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-003",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8817,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-004",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.9117,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-005",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.7881,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-006",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.5846,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-007",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8113,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-008",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.6853,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-009",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8061,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-010",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8469,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-011",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8092,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-012",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.7445,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-013",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.3305,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-014",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.6285,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-015",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.6149,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-016",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5109,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-017",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.4365,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-018",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.7096,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-019",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5727,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-020",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.7478,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-021",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5974,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-022",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5452,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-023",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.417,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-024",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.4102,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-025",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5873,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-026",
+              "expected": "medium",
+              "predicted": "low",
+              "p": 0.5199,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-027",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4463,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-028",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.4999,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-029",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.3987,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-030",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.459,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-031",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4665,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-032",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.4269,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-033",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4257,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-034",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4111,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-035",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.392,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-036",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.3847,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-037",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.5218,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-038",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.518,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-039",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.3621,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-040",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.3989,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-041",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.4891,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-042",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.5252,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-043",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3926,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-044",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.6086,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-045",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.6022,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-046",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.3756,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-047",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.4735,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-048",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3731,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-049",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.6294,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-050",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.5525,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-051",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.6016,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-052",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3925,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-053",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3598,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-054",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.5439,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-055",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.4985,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-056",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.4673,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-057",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.6152,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-058",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.4703,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-059",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.4664,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-060",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.4502,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-061",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.456,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-062",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.4547,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-063",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3881,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-064",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3795,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "zh",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-065",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.9065,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-066",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.9313,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-067",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8402,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-068",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8163,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-069",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8325,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-070",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8784,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-071",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.3974,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-072",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8595,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-073",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.857,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-074",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.7073,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-075",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5411,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-076",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.4032,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-077",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.7318,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-078",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.4853,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-079",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.7047,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-080",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.4014,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-081",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.3915,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-082",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5958,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-083",
+              "expected": "medium",
+              "predicted": "low",
+              "p": 0.5589,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-084",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.48,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-085",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.5038,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-086",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4803,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-087",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4043,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-088",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4685,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-089",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.7369,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-090",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.4097,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-091",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.3793,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-092",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.5957,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-093",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.3979,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-094",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.4267,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-095",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3688,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-096",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.33,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-097",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.4104,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-098",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.5274,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-099",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.4071,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-100",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.6285,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-101",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.4846,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-102",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.4797,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-103",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.4484,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-104",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3832,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "en",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-105",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8888,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-106",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.913,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-107",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8861,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-108",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8318,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-109",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.777,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-110",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.9041,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-111",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.7793,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-112",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.8385,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-113",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.4308,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-114",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.7528,
+              "correct": true,
+              "cost_level": "low",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-115",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.613,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-116",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.4812,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-117",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.7299,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-118",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.7294,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-119",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.7407,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-120",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.3807,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-121",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.3746,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-122",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5586,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-123",
+              "expected": "medium",
+              "predicted": "low",
+              "p": 0.6094,
+              "correct": false,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-124",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.5316,
+              "correct": true,
+              "cost_level": "medium",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-125",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.549,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-126",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.3972,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-127",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.3993,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-128",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.586,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-129",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.3378,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-130",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.4096,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-131",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.3663,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-132",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.4773,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-133",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.4508,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-134",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.4308,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-135",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.5798,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-136",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3776,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-137",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.4657,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-138",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.5682,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-139",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.5059,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-140",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.6604,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-141",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.4844,
+              "correct": true,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-142",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3955,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-143",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3373,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            },
+            {
+              "id": "tr-144",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.7023,
+              "correct": false,
+              "cost_level": "high",
+              "lang": "th",
+              "lang_inferred": false
+            }
+          ],
+          "by_lang": {
+            "en": {
+              "n_items": 40,
+              "accuracy": 0.75,
+              "macro_f1": 0.7392676767676767,
+              "cost_weighted_error_rate": 0.36153846153846153
+            },
+            "th": {
+              "n_items": 40,
+              "accuracy": 0.725,
+              "macro_f1": 0.7111244019138755,
+              "cost_weighted_error_rate": 0.4
+            },
+            "zh": {
+              "n_items": 64,
+              "accuracy": 0.65625,
+              "macro_f1": 0.6631409813141558,
+              "cost_weighted_error_rate": 0.4672489082969432
+            }
+          },
+          "lang_inferred": false
+        }
+      },
+      "overlap_warning": null
+    }
+  ]
+}

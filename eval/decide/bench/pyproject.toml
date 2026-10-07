@@ -9,6 +9,7 @@ dependencies = [
   "sentencepiece>=0.2.0",
   "gliclass>=0.1.20",
   "setfit>=1.2.0",
+  "sentence-transformers>=3.0",
   "huggingface-hub>=0.26",
   "psutil>=6.0",
   "scikit-learn>=1.5",
@@ -19,6 +20,13 @@ dependencies = [
 mlx = [
   "mlx-lm>=0.19",
 ]
+# NOTE: there is deliberately no "export" extra for ONNX (optimum /
+# onnxruntime) here — `optimum[onnxruntime]` needs `transformers<4.47`
+# while `gliclass` (a base dependency of this project) needs
+# `transformers>=5.0`, a genuine, unresolvable conflict for one shared
+# lockfile. scripts/export_onnx.py instead runs in its own ephemeral
+# `uv run --isolated --with ...` environment — see that script's header
+# and the bench README's ONNX section.
 
 [project.scripts]
 bench = "decide_bench.cli:main"
