@@ -58,6 +58,19 @@
 | T01-E | 入站路径收口（Hyphae 侧，见 `HYPHAE-CLI-INTEGRATION.md`） | `BACKLOG` | 其后的入站高层授权与持久化待立项 |
 | DEP-C8 / C9 | Hyphae lock 升级 / 发布包加入 hyphae | `BACKLOG` | 见 [`../Deployment/TASKS.md`](../Deployment/TASKS.md) |
 
+### COMM-6b 拆片（计划；基线 `ab/comm`）
+
+任务定义与逐片验收见 [`PLAN-COMM6b.md`](PLAN-COMM6b.md)。每个 task PR ≤300 行，base 为 `ab/comm`，先测试并在原 base 证明失败；高风险片须 PR-Daemon APPROVE 后才合。
+
+| Task | 范围 | 开工门 | 高风险 | 状态 |
+|---|---|---|---|---|
+| COMM-6b.1 | 联系人新增表单 | 可立即开工 | 是：keystore 写入；等 APPROVE | `BACKLOG` |
+| COMM-6b.2 | relay 编辑与手动探测 | 可立即开工 | 是：配置写入/外部探测；等 APPROVE | `BACKLOG` |
+| COMM-6b.3 | 身份创建与默认切换 | 等 Hyphae 发版 + DEP-C8 升级 `hyphae.lock.json`（#132 profile 标签规则） | 是：身份/密钥写入；等 APPROVE | `BLOCKED` |
+| COMM-6b.4 | 旧 HOME 导入向导与导入门 | 等 Hyphae 发版 + DEP-C8 升级 `hyphae.lock.json`（profile 解析路径） | 是：跨目录数据导入；等 APPROVE | `BLOCKED` |
+
+Hyphae #132 已合入其 main（当前 main `6c613b6` 包含该改动）；凡发布或解析 kind 30078 profile 事件的路径，必须等待 Hyphae 发版及 lock 升级验证后再开工。联系人和 relay 两片不经过 profile 事件，可先做。COMM-7 仍独立 BACKLOG。
+
 ## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
 
 > 定义/验收在 PLAN-ME4 §三；Sin90 侧 task 的定义与状态在 `iDoris-ai/Sin90` 的 `docs/agent/tasks.md`，这里只记**门**。
