@@ -3,7 +3,7 @@
 > **Owner:** David Xu  
 > **Project:** Agent24 / iDoris OfficeSuite  
 > **Status:** Working baseline — revised after review (scope/ownership baseline; contracts and acceptance being completed before implementation)  
-> **Updated:** 2026-10-06
+> **Updated:** 2026-10-07
 
 ## 1. Purpose
 
@@ -18,9 +18,18 @@ This document deliberately focuses on David's scope. Related systems are describ
 - the product form: a first-party built-in Agent24 feature with kernel tools, a native UI and replaceable engines, not loaded through a Workspace (§2.1–§2.3);
 - three parallel workstreams instead of a serial Workspace → KB → Documenting chain (§12, §14);
 - a DocumentService contract skeleton and Agent24 default registration (§10);
-- a knowledge-context ON/OFF policy (§9);
+- a knowledge-context policy (§9);
 - cross-scenario behavioural constraints derived from the 13 T005 scenarios (§11);
 - first vertical slices (§15) and release hard gates (§18).
+
+The 2026-10-07 design review on PR #685 led to further changes:
+
+- knowledge context **default ON with a persistent Off** is now treated as a settled product direction, not an open decision (§9);
+- three distinct terms: product Workspace, file working directory and knowledge space (§2.3);
+- knowledge dependency is classified by whether an operation retrieves knowledge the user did not explicitly provide (§9.1);
+- the T006 context-inheritance and safety contract is adopted as a normative dependency (§9.3);
+- a single commit point for revisions (§10);
+- pre-implementation gates (§22.1).
 
 Items not yet agreed by the team are marked **proposed** or **TBD**.
 
@@ -56,7 +65,7 @@ What this means in practice:
   2. **Document UI** — native Electron/React/TypeScript pages: file list, preview/edit, change diff, revision and export entry points.
   3. **Engine adapters** — reuse existing editing, OCR and conversion engines behind adapters. Documenting does not build an Office suite from scratch.
 - **Process model is not product shape.** OCR, conversion and similar jobs may run in separate background processes. That is a runtime choice only. Likewise, “DocumentService” (§10) is an interface boundary, not a requirement for separate deployment.
-- **One library.** The document page connects to the unified material/knowledge library (§5, §7) instead of creating another store.
+- **One library.** The document page connects to the unified material/knowledge library (§5, §7) instead of creating another store. “One library” means a single entry point and stable document identity. It does not rule out the draft/revision mapping metadata that Documenting needs. Where the editable authority and saved revisions live is settled by §17 #1 and §22.1.
 
 Still open: the editor and content model (§17 #2, #3, #6). The direction above fixes the form, not those choices.
 
@@ -79,12 +88,24 @@ Both paths call the **same** registered document operations. Neither is a privil
 
 ### 2.3 Terminology: “Workspace”
 
-Agent24 uses “workspace” for two different things. In this document:
+Following T006 §3.1, this document uses three distinct terms. Matching names in Agent24 or upstream WeKnora must not be treated as the same thing.
 
-- **Product Workspace** — a complete external application hosted inside Agent24 (managed sidecar + isolated view), such as Open Design as the Creative Workspace or WeKnora as the Knowledge Workspace. See `docs/open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md`. **Documenting is not a product Workspace.** Having a UI does not make something a Workspace.
-- **Kernel workspace (`a24.workspace.v1`)** — a registered, pinned scratch directory that a run is bound to (`ADR-002-WORKSPACE-CONTRACT.md`). Documenting may use it for temporary drafts and export files like any other kernel consumer. That is normal kernel usage, not a Workspace dependency.
+- **Product Workspace** — the product entry for an application or a multi-step workflow, such as Open Design, Open Creator or the Knowledge Workspace.
+  - It may be hosted natively or adapt an external application.
+  - The generic contract keeps runtime kind (`desktop-sidecar | service`), UI kind (`embedded-web | host-native | none`) and transport (`acp | rest | other-reviewed`) independent.
+  - Open Design currently uses a managed sidecar plus an isolated view (`docs/open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md`). That is one way of hosting, not the definition.
+- **File working directory** — the kernel workspace `a24.workspace.v1`, a registered, pinned scratch directory that a run is bound to (`ADR-002-WORKSPACE-CONTRACT.md`).
+  - Documenting may use it for temporary drafts and export files, like any other kernel consumer.
+  - It is not an identity or organization boundary.
+  - It is never the only location of a saved revision (§22.1).
+- **Knowledge space** — the personal / organization / project / KB scope of material and its ACL. It is separate from both of the above.
 
-A product Workspace becomes relevant to Documenting only if the team later adopts a full external document-editing application (§17 #11). Even then, the base document tools must remain callable by the agent without that application being open.
+**Documenting is not loaded through a product Workspace.** It is a first-party feature with its own native page (§2.1). Having a UI does not make something a Workspace.
+
+The relationship runs in two directions:
+
+- **Workspaces as callers.** Other product Workspaces and multi-step workflows may call Documenting operations, the same way the chat and the document page do.
+- **Documenting inside a Workspace.** Documenting may need a Workspace adapter only if the team adopts a full external document-editing application (§17 #11). Even then, the base document tools must remain callable by the agent without that application being open.
 
 ## 3. Mission
 
@@ -181,7 +202,7 @@ Documenting must not create a second Agent loop, authentication system, approval
 
 ### Workspace
 
-A product Workspace (§2.3) hosts an external application and may compose multi-step application workflows. It may consume Documenting, but Workspace is **not a prerequisite for Documenting to exist**. Documenting is not loaded through a Workspace, and its delivery is not gated on the generic Workspace host (§12). Generic Workspace work is separate platform work.
+A product Workspace (§2.3) is the entry for an application or multi-step workflow, hosted natively or adapting an external application. It may call Documenting, but Workspace is **not a prerequisite for Documenting to exist**. Documenting is not loaded through a Workspace, and its delivery is not gated on the generic Workspace host (§12). Generic Workspace work is separate platform work.
 
 ### Spreadsheet / Creative / Connectors
 
@@ -217,7 +238,7 @@ A useful responsibility model is:
        WeKnora                Document engine
  parse / search / RAG          edit / render
  citation / knowledge            export
-   (optional per §9)
+  (default ON, §9)
 ```
 
 WeKnora can provide knowledge operations to Documenting while also being exposed as a full Knowledge Workspace through the generic Workspace host. These are two different product entry paths over related knowledge.
@@ -268,23 +289,57 @@ Documenting is responsible for making that evidence useful in the document workf
 
 For extraction and comparison outputs (tables, field lists, figures), provenance is required **per value**, not only per paragraph or per answer. A value without a verifiable source is shown as unsourced, not silently trusted.
 
-## 9. Knowledge Context ON/OFF (proposed)
+## 9. Knowledge Context (default ON)
 
-Knowledge (KB/WeKnora) is a dependency of some Documenting operations, not of Documenting as a whole.
+**Settled product direction** (T006 §1 and §7.1, pinned in §21):
+
+- The Knowledge Workspace is **ON by default** for new installs, with a clear and **persistent Off** switch.
+- On upgrade, an existing user's explicit Off choice is kept.
+- Before each task, the host automatically attaches the personal context and the context of the current active organization, as far as the user's permissions allow.
+- Default ON does **not** mean reading all material, being configured and ready, or permission to send data off the device.
+
+Still open (§17 #8): who may override the setting, the override rules across org / personal / task, and the concrete interfaces.
+
+Knowledge is a dependency of some Documenting operations, not of Documenting as a whole.
 
 ### 9.1 Operation classes
 
-| Class | Examples | Behaviour when knowledge is OFF or unavailable |
+Operations are classified by **whether they need to retrieve knowledge the user did not explicitly provide**. The operation's name and the number of documents involved do not decide the class.
+
+| Class | Examples | Behaviour when knowledge is Off or unavailable |
 |---|---|---|
-| Knowledge-free | import, open/render, local text read, edit, diff, revision, preflight, export | Works normally. |
-| Knowledge-optional | summarize/extract/translate a given document, draft from given material | Runs on the explicitly provided documents only, and says that no KB context was used. |
-| Knowledge-required | search across a corpus, cross-document QA, “find the latest policy” | Pauses with an explicit `knowledge_disabled` / `knowledge_unavailable` state. Never silently degrades into an answer without evidence. |
+| Knowledge-free | import, open/render, find text inside a given document, edit, diff, revision, preflight, export; QA, compare or extract across documents the user explicitly provided | Works, as long as document storage itself is available (see below). |
+| Knowledge-optional | summarize or draft where personal/org background would help but is not required | Runs on the provided material only. The result states that no knowledge context was attached (`skipped` or `failed`, never reported as `empty`). |
+| Knowledge-required | retrieve material that was not explicitly provided: search across knowledge spaces, “find the latest policy”, answers that must rest on organization rules | Pauses with an explicit `knowledge_disabled` / `knowledge_unavailable` state. Never silently degrades into an answer without evidence. |
+
+Knowledge being Off and the original-document storage being unreachable are **two different states**. In the second case import/edit/export cannot be promised unconditionally. See §22.1.
 
 ### 9.2 Assembly rules
 
-- The same policy applies to every entry point: direct Agent24 call, Assistant, UI and Workspace. No entry point may bypass it.
-- The default (ON/OFF) and who may change it are Agent24 policy, set per org/workspace and overridable per task within that policy. The final default is **TBD** (§17).
-- The task result records whether knowledge was used, which resources/revisions were consulted, and the index state at the time (§7).
+- **One policy for every entry point:** direct Agent24 call, chat, Assistant, document page, and Workspaces acting as callers. No entry point may bypass it.
+- **The host assembles context.** A host context-policy hook does the assembly; it does not wait for the model to choose to call a tool.
+- **Identity comes from the host.** The host injects the trusted principal and the explicit active organization. The model may supply a query or task intent, but it cannot widen the allowlist.
+- **Results record their context:**
+  - the context state: `context_attached / empty / skipped / failed`;
+  - which packs, resources and revisions were consulted;
+  - the index state at the time (§7).
+- **Service states are kept distinct:** `registered / loading / ready / degraded / unavailable / disabled`. Entry visible, service alive, identity usable and index ready are four different facts.
+
+### 9.3 Normative dependency: T006 §7
+
+Documenting does not write a second, partial set of context rules. **T006 §7 is normative** for context inheritance, Off semantics and privacy. Implementation acceptance must demonstrate at least the following:
+
+- **Inheritance.** A fresh run, conversation continuation, resume, approval continuation and delegated subtasks all go through the same context policy. Subtasks inherit only the pieces they need, as restricted references.
+- **Off.**
+  - Off is persisted.
+  - Switching it off cancels in-flight knowledge queries, discards late results, clears reusable ContextPack caches, and stops prefetch/retry started for the feature.
+  - No tool may bypass Off.
+  - Re-enabling re-checks identity, permissions and readiness, then rebuilds packs. Old tokens and stale caches are never revived.
+  - Content already sent to a model or written into an artifact cannot be withdrawn, and the UI says so.
+- **LocalOnly.** LocalOnly covers parsing/OCR, embedding, rerank, model and plugin egress. There is no automatic fallback to cloud services. If the policy cannot be proven for a path, that path fails closed.
+- **Source content is evidence, not instruction.** Document or KB content never grants execution authority and never overrides host rules.
+
+These are acceptance requirements for the implementation. They are not preconditions for merging this design document.
 
 ## 10. DocumentService Contract & Agent24 Default Registration (proposed skeleton)
 
@@ -296,16 +351,26 @@ Knowledge (KB/WeKnora) is a dependency of some Documenting operations, not of Do
 |---|---|---|
 | `document.import` / `document.get` / `document.list` | read / create-record | free |
 | `document.render` / `document.read_range` | read | free |
-| `document.search` | read | required |
-| `document.ask` / `summarize` / `extract` / `compare` / `translate` | read | optional or required |
+| `document.find` (inside given documents) | read | free |
+| `document.search` (across knowledge spaces) | read | required |
+| `document.ask` / `summarize` / `extract` / `compare` / `translate` | read | free on explicitly provided documents; optional or required per §9.1 |
 | `document.draft.create` | mutate-draft | optional |
 | `document.change.propose` | mutate-draft | optional |
-| `document.change.review` (accept/reject) | commit | free |
-| `document.revision.commit` / `list` / `restore` | commit | free |
+| `document.change.review` (accept/reject) | mutate-draft (records decisions; creates no revision) | free |
+| `document.revision.list` / `get` | read | free |
+| `document.revision.commit` | **commit — the single commit point** | free |
+| `document.revision.restore` | commit (creates a new revision through `revision.commit`) | free |
 | `document.preflight` | read | free |
 | `document.export` | create-artifact | free |
 | `document.package.assemble` | create-artifact | free |
 | `document.delivery.prepare` | handoff (side effect executed by Agent24) | free |
+
+**Single commit point.**
+
+- Accepting or rejecting suggestions only updates the working-draft state. `document.revision.commit` is the only operation that creates a revision. Restore also goes through it and produces a new revision; it never rewrites history.
+- “Accept and save” in the menu path (§2.2 A, step 4) is a UI composition: review decisions followed by **one** commit.
+- The idempotency key of that commit is bound to the document, the `base_revision` and the reviewed change set. A retry therefore yields the same revision, not a second one.
+- The ADR defines this precisely.
 
 ### 10.2 Per-operation contract fields
 
@@ -313,7 +378,7 @@ Every operation must specify:
 
 - **inputs / outputs**, including document id and revision;
 - **identity source** — always the Agent24 trusted caller context, never model-supplied arguments;
-- **risk class** and whether Agent24 approval is required;
+- **risk class** and whether Agent24 approval is required. The business labels above (read / mutate-draft / commit / create-artifact / handoff) must map onto Agent24's actual kernel risk, permission and approval categories. The ADR provides the mapping table. Documenting does not invent its own permission tiers;
 - **concurrency** — mutating operations require `base_revision`; a mismatch returns `revision_conflict` rather than overwriting;
 - **typed errors** — at least `unsupported_format`, `parse_failed`, `partial_parse`, `knowledge_disabled`, `knowledge_unavailable`, `stale_index`, `revision_conflict`, `permission_denied`, `cancelled`;
 - **job semantics** — long-running operations return a job id with status, progress, cancellation and resume/retry behaviour;
@@ -322,8 +387,9 @@ Every operation must specify:
 ### 10.3 Default registration
 
 - Documenting registers with Agent24 as a default capability at startup, without loading Sin90/Cos72, a Workspace or a UI.
-- Agent24 can discover the operations, their risk classes and their availability (for example engine present, knowledge ON/OFF and healthy).
+- Agent24 can discover the operations, their risk classes and their availability (for example engine present, knowledge context enabled and ready).
 - UI, Assistant and Workspace call the same registered operations. A bespoke demo-UI path does not count as integration.
+- Direct edits typed in the document page go through the same controlled business entry as agent calls, with the same identity, `base_revision`, commit point and audit trail. There is no UI-only write path.
 
 ## 11. Cross-Scenario Behavioural Constraints (proposed)
 
@@ -393,10 +459,11 @@ This is a dependency-oriented framework, **not yet a sprint schedule**. Each pha
 - stable document identity and revision semantics;
 - source/artifact model with input binding (§7.1);
 - read/render boundary;
-- knowledge ON/OFF policy (§9);
+- knowledge context integration point: classification and recorded context state (§9);
+- **early end-to-end format check:** use a Chinese notice and a sanitized template to validate read, edit of a specified region, revision save, and real reopen + layout check of PDF and the selected editable format. This exposes delivery problems in D1, not after an editor is built in D4 (§22.1);
 - baseline acceptance fixtures and sample set (§18.2).
 
-Needs: Agent24 registration, trusted caller context, and decisions §17 #1–#2. Does **not** need Line W or Line K.
+Needs: Agent24 registration, trusted caller context, and decisions §17 #1–#3 (the first formats and fidelity scope are frozen before the engine choice). Does **not** need Line W or Line K.
 
 **D2 — Read & understand**
 
@@ -404,7 +471,7 @@ Needs: Agent24 registration, trusted caller context, and decisions §17 #1–#2.
 - selected summarize/extract/translate/compare operations;
 - citation UX, exact source jump, visible parse/index/error states.
 
-Needs: Line K only for search, cross-document QA and KB-backed citation. Single-document operations run without it.
+Needs: Line K only for operations that retrieve knowledge the user did not explicitly provide, and for KB-backed citation (§9.1). Reading, finding, QA and comparison over explicitly provided documents, whether one or several, run without it.
 
 **D3 — Edit & review**
 
@@ -463,14 +530,14 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 
 | # | Decision | Blocks |
 |---|---|---|
-| 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? | D1 |
+| 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? Also covers persistence/recovery and the promotion of temporary artifacts (§22.1). | D1 — must be resolved before any persistent data is written |
 | 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | D1 |
-| 3 | **DOCX fidelity level** — basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. | D3–D4 |
+| 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). | D1 format check, D3–D4 |
 | 4 | **PDF scope** — reading, OCR, form filling (interactive vs flat overlay), page operations and true content editing are separate capabilities. | D2, form slice |
 | 5 | **Collaboration depth** — single-user, async review, multi-user revision or real-time co-editing. | D3 |
-| 6 | **Document engine/editor choice** — follows representative tasks, not the other way round. | D3 |
+| 6 | **Document engine/editor choice** — follows representative tasks and the frozen format scope (#3), not the other way round. | D3 |
 | 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). | D1 fixtures |
-| 8 | **Knowledge default** — default ON or OFF, and who may change it (§9.2). | D1 |
+| 8 | **Knowledge setting overrides** — who may override the setting, the override rules across org / personal / task, and the concrete interfaces. The default itself is settled: ON, with a persistent Off (§9). | D2 knowledge-optional/required operations |
 | 9 | **Line W assignment** — which parts, if any, are temporarily David's, the handover owner and the exit date (§12). | Line W start (not Line D) |
 | 10 | **Roadmap conflicts** — how conflicts between this plan and existing Agent24/T006 roadmaps are resolved and recorded. | planning |
 | 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). | D3 engine choice |
@@ -485,7 +552,7 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 - Attachment versions and recipients in a package match the approved revision and confirmed targets.
 - Batch isolation holds (§11.9).
 - Permission revoked mid-task, cancellation and network loss leave a consistent state: no half-committed revision and no duplicated delivery.
-- Knowledge OFF/unavailable behaves as in §9.1.
+- Knowledge Off/unavailable behaves as in §9.1, and the T006 §7 inheritance, Off and LocalOnly requirements listed in §9.3 are demonstrated.
 
 ### 18.2 Sample set
 
@@ -548,7 +615,8 @@ This working baseline is derived from the current project direction and the foll
 - WeKnora upstream capability documentation;
 - the 2026-10-05 applicability review of this document;
 - the 2026-10-06 product-form clarification with the design repository (§2.1–§2.3);
-- Agent24 `docs/open-design-workspace/design/ADR-001` and `ADR-002` (Workspace terminology).
+- Agent24 `docs/open-design-workspace/design/ADR-001` and `ADR-002` (Workspace terminology);
+- the 2026-10-07 design review on PR #685 (knowledge default ON, terminology, retrieval-based classification, commit point, pre-implementation gates).
 
 Pinned references:
 
@@ -557,6 +625,7 @@ Pinned references:
 | Agent24 design (reviewed version) | `iDoris-ai/Agent24` `bb76d8d3221516cac0fb3e4af2185dc5c627f753` (branch `docs/documenting-design`) |
 | Agent24 source baseline | `54cec44a7410532e8a864ea90860f2d442c06ba2` |
 | Research baseline (T001–T008) | `jhfnetboy/researcher` `9e374e1d8cd5b3415a1c5ee81029eb5aef187fde` |
+| T006 WeKnora Workspace plan (normative for §9) | `jhfnetboy/researcher` `c7ab2129dbf1ae3af2150adfded9aa1a449889dd` — `topics/T006-knowledge-media-base/subtopics/weknora-workspace-development-plan.md` §1, §3.1, §4, §7 |
 
 Where these sources contain research proposals rather than approved engineering decisions, this document keeps the corresponding item marked **proposed** or **TBD**. Historical implementation observations in research documents are not treated as current run results.
 
@@ -564,7 +633,7 @@ Where these sources contain research proposals rather than approved engineering 
 
 Before implementation, and before converting this framework into a detailed GitHub Project plan, confirm:
 
-1. decisions §17 #1, #2, #7, #8, which block D1;
+1. decisions §17 #1, #2, #3, #7, which block D1;
 2. generic Workspace is tracked as independent platform work with its own owner, and any temporary David assignment has an exit (§17 #9);
 3. the KB/WeKnora test endpoint and the Line K service contract owner;
 4. the sanitized sample set and gold labels for V1/V2 (§18.2);
@@ -574,11 +643,37 @@ Allowed before these are confirmed: baseline verification, sample preparation, c
 
 After confirmation, create milestones/issues from §12–§19 rather than expanding scope directly in implementation PRs.
 
+### 22.1 Pre-implementation gates
+
+The following must be frozen before the corresponding implementation starts. They do **not** block merging this framework, and merging the framework does not mean the product is complete.
+
+1. **Content and persistence authority.**
+   - Define the single editable authority, persistent save/recover, and the rules for promoting temporary artifacts to saved revisions (§17 #1).
+   - A scratch file working directory is never the only location of a saved revision.
+   - “One library” means a unified entry point and stable identity. Draft/revision mapping metadata is allowed.
+   - Knowledge retrieval being Off and the original-document storage being unreachable are different states. The latter cannot unconditionally promise import/edit/export.
+2. **Formats and engines.**
+   - Freeze the first formats and fidelity scope (§17 #3) before choosing an engine (§17 #6).
+   - In D1, a Chinese notice and a sanitized template validate the path end to end (§14 D1).
+   - All 13 scenarios are not required at once.
+3. **Commit and permission contract.** The DocumentService ADR defines:
+   - the single commit point and its idempotency (§10.1);
+   - the read-only operations split from commit/restore;
+   - the mapping of business risk labels to Agent24 kernel risk/permission categories;
+   - one controlled business entry shared by UI direct edits and agent calls (§10.3).
+4. **Context and safety contract.** The T006 §7 requirements in §9.3 are part of the implementation acceptance for any knowledge-optional or knowledge-required operation.
+
 ---
 
 ## Appendix A — Scenario Traceability (S01–S13)
 
 All 13 scenarios are currently **partial**: the direction is present, but acceptance is not yet defined. The table records where each gap is now addressed. Closing a row requires a test in the slice or a gate that uses it.
+
+As implementation starts, each row (and each capability group A1–A12) is extended into a full trace chain:
+
+```text
+scenario/capability ID → contract (ADR section) → test ID → owner/phase → passing evidence
+```
 
 | ID | Scenario | Gaps to close | Addressed by |
 |---|---|---|---|
