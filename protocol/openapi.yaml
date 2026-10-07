@@ -155,6 +155,179 @@ paths:
                     items:
                       $ref: "#/components/schemas/Model"
 
+  /os:
+    get:
+      operationId: listDomainOs
+      tags: [system]
+      summary: List domain OS modules and registry state
+      responses:
+        "200":
+          description: Module configuration, runtime state, and resource availability
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainOsList"
+        "503":
+          description: "registry_invalid: the os.json registry could not be read or parsed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /os/{name}:
+    patch:
+      operationId: updateDomainOs
+      tags: [system]
+      summary: Enable or disable a domain OS module
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DomainOsUpdate"
+      responses:
+        "200":
+          description: Updated module list and runtime state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainOsList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: "attached_module or admission_refused"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "internal or stop_failed: configuration write or module stop failed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "registry_invalid or disable_pending"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /os/{name}/stop:
+    post:
+      operationId: stopDomainOs
+      tags: [system]
+      summary: Stop a running domain OS module without changing os.json
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Stop was requested and the module no longer admits requests
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainOsStopResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: "stop_failed: the module supervisor could not stop cleanly"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "disable_pending: the module is still admitting requests"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /os/{name}/commands/{command}:
+    post:
+      operationId: invokeAttachedModuleCommand
+      tags: [system]
+      summary: Invoke a command declared by an attached module
+      description: >-
+        A JSON object body of at most 64 KiB is forwarded to the module; its object
+        result is returned.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: command
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Command result from the attached module
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainOsCommandResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: "forbidden: the command is not declared by the module manifest"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          description: "payload_too_large: the request exceeded the daemon-wide body limit"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "busy: the module has reached its in-flight command limit"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "connection_lost or module_error: the module connection ended or returned an invalid response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "module_not_ready: the module is not attached or its command was not sent"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "504":
+          description: "timeout: the module did not answer before the command deadline"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /usage:
     get:
       operationId: getUsage
@@ -1351,7 +1524,7 @@ components:
 
   responses:
     BadRequest:
-      description: Malformed or invalid request
+      description: "invalid_request: malformed or invalid request"
       content:
         application/json:
           schema:
@@ -1363,7 +1536,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
-      description: Resource not found
+      description: "not_found: resource not found"
       content:
         application/json:
           schema:
@@ -1376,6 +1549,67 @@ components:
             $ref: "#/components/schemas/Error"
 
   schemas:
+    DomainOsView:
+      type: object
+      required: [name, namespace, version, enabled, state, granted, missing_models, resources, restart_required]
+      properties:
+        name:
+          type: string
+        namespace:
+          type: string
+        version:
+          type: string
+        enabled:
+          type: boolean
+        state:
+          type: string
+          description: "Open enum: mounted | disabled | degraded | refused."
+        detail:
+          type: string
+        granted:
+          type: array
+          items:
+            type: string
+        missing_models:
+          type: array
+          items:
+            type: string
+        resources:
+          type: string
+          description: "Open enum: ok | missing | unknown | not_checked."
+        restart_required:
+          type: boolean
+    DomainOsList:
+      type: object
+      required: [modules]
+      properties:
+        modules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DomainOsView"
+        registry_error:
+          type: string
+    DomainOsUpdate:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+    DomainOsStopResponse:
+      type: object
+      required: [name, stopped]
+      properties:
+        name:
+          type: string
+        stopped:
+          type: boolean
+    DomainOsCommandResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+          additionalProperties: true
     ShutdownReport:
       type: object
       required: [ephemeral, drain_ms, stop_grace_ms, exit_bound_ms, config_warnings, previous]
