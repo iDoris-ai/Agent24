@@ -1751,21 +1751,11 @@ pub async fn serve(
     // when nobody needed it (wasted time), and if it is too strict a module that
     // does need the check gets `Unknown` instead of a definite answer (less
     // information, never wrong information). Neither can change what mounts.
-    // A model declaration lives in a manifest, and reading a manifest means
-    // constructing the module — which is exactly what the catalogue exists to
-    // avoid. So the probe is skipped: this build compiles in no domain OS at all
-    // (T11), and paying a multi-provider network sweep at every startup to
-    // discover that would be worse than the `Unknown` it would avoid.
-    //
-    // This is a CONSTANT, not a predicate, and deliberately so — writing a
-    // predicate over data the catalogue does not carry would look like a check
-    // while always answering the same thing. When a module that needs models
-    // arrives, `Installed` gains a `requires_models` field and this becomes a real
-    // predicate over it.
-    // Packages carry their manifest already (it was read at discovery), so a
-    // package that declares a model can be known without constructing
-    // anything: probe if any does. Compiled-in modules still cannot say without
-    // being built, and none in this build declares one.
+    // A model declaration lives in a manifest. Packages carry that manifest
+    // already (it was read at discovery), so a package that declares a model can
+    // be known without constructing anything: probe if any does. Compiled-in
+    // modules still cannot say without being built, and none in this build
+    // declares one.
     let needs_models = catalogue.iter().any(|e| {
         matches!(&e.build, crate::domain::Build::Package(p) if !p.manifest.requires_models().is_empty())
             && os_config.as_ref().is_ok_and(|c| c.is_enabled(&e.name))
