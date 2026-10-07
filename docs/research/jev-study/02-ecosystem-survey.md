@@ -1,6 +1,7 @@
 # 02 Jev 类决策模型生态调研（2026-10-07）
 
 > 依据：jason 博客（blog.mushroom.cv，本地源码目录 `mycelium/blog/src/content/blog/`）中 14 篇相关拆解文章的全文，以及本地搜索接口 `127.0.0.1:8888/api/search` 的补充查询。
+> 各篇的完整文件名、标题与线上地址（`https://blog.mushroom.cv/blog/<文件名去掉 .md>`）见 [`sources.md`](sources.md) §3。
 > 每条结论都标了出处文件名。**文章里没有的数字一律不写**；成绩注明来源：「自报」= 项目方自己公布，「实测」= 文章作者或社区复测。
 
 ## 一句话结论
