@@ -17,10 +17,10 @@
 
   各方向独立开发、互不阻塞。
 - **task PR 合进集成分支**。每攒约 10 个，开一次 **release PR `ab/<方向>` → `main`**，作为该方向的阶段发布。
-- **评审分级**：
-  - **普通 task PR 不请 PR-Daemon 评审**，但必须满足三条：CI 全绿、`pre-pr-check.sh` 已跑并在 PR body 逐类回应、本地门禁通过。
-  - **以下 task PR 仍须单独请 PR-Daemon 评审**：涉及安全、权限 / 授权、数据写入语义、存储迁移、对外协议 / wire 格式。
-  - **release PR**：PR-Daemon 完整评审，加 jason 真机验收，两者都通过才合 main。
+- **评审与合并门槛**（PR-Daemon 照常评审全部 PR，包括 base 为集成分支的 task PR）：
+  - **普通 task PR**：CI 全绿 + `pre-pr-check.sh` 逐类回应 + 本地门禁通过后，即可合入集成分支；PR-Daemon 的意见在后续 task 中修复。
+  - **安全 / 权限 / 授权、数据写入语义、存储迁移、对外协议 / wire 格式类 task PR**：必须等 PR-Daemon APPROVE 后再合。
+  - **release PR**：必须 PR-Daemon APPROVE，并通过 jason 真机验收，才合入 main。
 - **三条硬约束**：
   1. **集成分支每周至少吸收一次 main**。用 merge，不用 rebase，避免 M10 那样漂移 600+ 提交。
   2. **集成分支受 ruleset 保护**：禁止 force-push，task PR 合并前 CI 必须全绿（ruleset `ab-integration`）。ruleset 按**精确分支名**列出集成分支，避免误伤 task 分支；新开一个方向时，先把它的集成分支名加进 ruleset。
