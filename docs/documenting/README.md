@@ -133,7 +133,7 @@ Following T006 §3.1, this document uses three distinct terms. Matching names in
   - It is never the only location of a saved revision (§22.1).
   - **Current limits:** only `orchestrator_scratch`; TTL 24 h by default, at most 7 days; the value `writeback=external` is fixed today, but the writeback policy itself is undecided (`ARCHITECTURE-LAYERS.md` §7); **Unix only**, with `503 workspace_unavailable` on Windows; no product route to create one (BASELINE §7).
   - Temporary artifacts must therefore be promoted into Documenting's own storage within the TTL.
-  - The basic document page must **not** depend on workspace-bound runs, or it would not work on Windows.
+  - The basic document page must **not** depend on workspace-bound runs: scratch is Unix-only, short-lived, and not a durable home. (Windows support as a whole now waits on DEP-C2 for the out-of-process OS; see ADR-DOC-01 D2/D10.)
 - **Knowledge space** — the personal / organization / project / KB scope of material and its ACL. It is separate from both of the above.
 
 **Documenting is not loaded through a product Workspace.** It is a first-party feature with its own native page (§2.1). Having a UI does not make something a Workspace.
@@ -390,7 +390,12 @@ Documenting does not write a second, partial set of context rules. **T006 §7 is
   - In implementation there are **two paths**, and they are enforced differently.
   - **Path 1 — model calls the Documenting OS makes itself** (extraction, summarizing). Privacy comes from the manifest's `model_access` grant, which defaults to `LocalOnly`. The kernel then routes with `TaskProfile{privacy: LocalOnly}` and fails closed for remote tiers. A call cannot pass its own privacy value. This works **out-of-process only**. An in-process DomainModule has no Models handle at all (`KERNEL_GRANTS` = Events, Memory, Approval), so it would need a new `Capability`. That is an input to #701.
   - **Path 2 — document content returned to an agent run** (chat). Agent runs use `TaskProfile::default()` (`Privacy::Any`, BASELINE §9). Per-run task profiles do not exist yet (ID-1 is 📐), and nothing on this path can set `LocalOnly` today. This is the real leak path, and it is registered as an Agent24 dependency (§16).
-  - **Interim rule until Path 2 exists** (BASELINE §12 Q5): document operations are offered to the agent only when the selected provider is local, unless the user has explicitly allowed remote models for that data.
+  - **Data-handling policy enforced by the kernel** (ADR-DOC-01 D8, #735).
+    - The user makes an informed choice of mode: strict local, or cloud processing authorized for specific data, purpose and destination.
+    - Strict local is enforced end to end: no model, HTTP/MCP, other-module, Exec, memory or background-task egress, and no silent cloud fallback.
+    - A module's self-declared `output_privacy` or an Exec warning never replaces egress control.
+    - Any mode that is not supported is shown as unavailable.
+  - **Documented interim limit** (BASELINE §12 Q5): until that enforcement lands, document tools are advertised only when the model router has no remote tier, and any run that received document content is treated as strict local. This is replaced once #735 delivers per-run/session policy enforcement.
 - **Source content is evidence, not instruction.** Document or KB content never grants execution authority and never overrides host rules.
 
 These are acceptance requirements for the implementation. They are not preconditions for merging this design document.
@@ -464,6 +469,9 @@ Every operation must specify:
     - The ADR must define how file upload, binary export and job progress fit within these.
 - UI, Assistant and Workspace call the same document operations. A bespoke demo-UI path does not count as integration.
 - Direct edits typed in the document page go through the same controlled business entry as agent calls, with the same identity, `base_revision`, commit point and audit trail. There is no UI-only write path.
+  - **Audit deviation**, recorded in ADR-DOC-01 D9:
+    - Mutations the page sends through the module's public proxy are not yet in the kernel hash-chain audit; only the OS's own append-only operation log covers them.
+    - This is **release-blocking**: kernel audit of module mutations must exist before the first user-facing release.
 
 ## 11. Cross-Scenario Behavioural Constraints (proposed)
 
@@ -570,6 +578,11 @@ Slice 2 exposes delivery problems in DOC-1 instead of DOC-4. It is real product 
   - no Documenting-specific intent classifier.
 - **H2:** the UI and docs declare single local user. No multi-user or isolation claims are made.
 - **Product path:** “product path wired” is demonstrated separately: the domain OS is mounted in the real daemon, the page is reachable from the navigation, and the chat entry works end to end.
+- **Chat entry depends on kernel module-declared tools** ([ADR-DOC-01](adr/ADR-DOC-01-placement-and-integration.md) D4).
+  - Slice 1 may merge the page + REST first.
+  - The chat-entry item stays **Blocked** until those tools land.
+  - **DOC-1 as a whole is not accepted without it.**
+  - Until first-party default installation exists (ADR-DOC-01 D6), Documenting's own tools are classed `External` (approval on every call) unless the user confirms them when enabling the OS. The DOC-1 acceptance states this as observed behaviour, not a defect.
 
 Needs:
 
@@ -629,11 +642,13 @@ The first end-to-end acceptance is two vertical slices, not the whole capability
 
 ## 16. Dependencies and Team Inputs
 
+The Agent24 platform dependencies, with owners and when each is needed, are consolidated in [ADR-DOC-01 §3](adr/ADR-DOC-01-placement-and-integration.md#3-h2单用户声明与依赖登记).
+
 | Dependency | Needed by Documenting | Needed from phase | Owner |
 |---|---|---|---|
 | Agent24 Core | trusted caller context, approvals, run/cancel/model access, audit | DOC-1 | Agent24 |
-| Agent24 domain-OS mechanisms needed **for DOC-1** | (a) agent exposure for a domain OS — none today: new `Capability`, MCP or kernel proxy tools (§10.3); (b) a development install path for a first-party OS; (c) a scoped desktop transport that is not `backendProxy` (§10.3 gap) | DOC-1 | owner and target date to be named in #701 (Agent24 kernel / desktop) |
-| Agent24 domain-OS mechanisms needed **for release** | default-installed first-party OS (none today; Sin90/Cos72 are installed by hand); generic on-demand component installer (today Open Design-specific) | before the first user-facing release, not DOC-1 | owner and target date to be named in #701 |
+| Agent24 domain-OS mechanisms needed **for DOC-1** | (a) agent exposure for a domain OS — none today: new `Capability`, MCP or kernel proxy tools (§10.3); (b) a development install path for a first-party OS; (c) a scoped desktop transport that is not `backendProxy` (§10.3 gap) | DOC-1 | owner proposed in [ADR-DOC-01 §3](adr/ADR-DOC-01-placement-and-integration.md), assigned by jason in review; needed-by is a milestone, not a date (Agent24 kernel / desktop) |
+| Agent24 domain-OS mechanisms needed **for release** | default-installed first-party OS (none today; Sin90/Cos72 are installed by hand); generic on-demand component installer (today Open Design-specific) | before the first user-facing release, not DOC-1 | owner proposed in [ADR-DOC-01 §3](adr/ADR-DOC-01-placement-and-integration.md), assigned by jason in review; needed-by is a milestone, not a date |
 | Agent24 per-run privacy | per-run `TaskProfile` in the agent loop (agent runs use `Privacy::Any` today; ID-1 is 📐), so that document content returned to an agent run is not sent to remote models | DOC-1 (interim rule in §9.3 until it exists) | Agent24 kernel / decide |
 | Agent24 permission infrastructure | capability route-level resource authorization (📐), durable session/run ownership (📐) — tracked as PLAN-OD-NEXT F11.0 / OD-M11, currently **PAUSED**; multi-user / org identity (SPEC-ORG-SPACE F9/F10, unscheduled) | **after DOC-4** — DOC-1–DOC-3 are single local user | Agent24 |
 | Agent24 entry routing | ID-1 entry router and `agent24-decide` for chat intent → document operation; shared evaluation bench for §11.8 | DOC-2 (DOC-1 uses explicit invocation: normal agent tool calling or a direct page action, with no ID-1 routing) | Agent24 decide |
@@ -662,7 +677,7 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 | 9 | **Line W assignment** — which parts, if any, are temporarily David's, the handover owner and the exit date (§12). | Line W start (not Line D) |
 | 10 | **Roadmap conflicts** — how conflicts between this plan and existing Agent24/T006 roadmaps are resolved and recorded. | planning |
 | 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). | DOC-3 engine choice |
-| 12 | **Placement and exposure (H1)** — in-process DomainModule vs out-of-process OS; agent exposure (kernel proxy tools / MCP / new `Capability`); default installation of a first-party OS; noun ownership of “document” (PLAN-OOP-OS-AND-BACKLOG §七). Decided in the DOC-1-02 ADR (#701). The ADR must also weigh these facts: (a) in-process ① has no Models or Scheduler handle (`KERNEL_GRANTS` = Events, Memory, Approval); (b) no `Capability` provides kernel audit, which §10 expects for commits; (c) out-of-process ② runs on Unix sockets, and the Windows port (DEP-C2) is `BLOCKED`, which matters for both options' Windows story (§2.3). | **DOC-1 start** |
+| 12 | **Placement and exposure (H1)** — in-process DomainModule vs out-of-process OS; agent exposure (kernel proxy tools / MCP / new `Capability`); default installation of a first-party OS; noun ownership of “document” (PLAN-OOP-OS-AND-BACKLOG §七). Decided in the DOC-1-02 ADR (#701). **Proposed answer: [ADR-DOC-01](adr/ADR-DOC-01-placement-and-integration.md)**: out-of-process domain OS; agent exposure through kernel-side module-declared tools; typed preload transport; bundled first-party package. The ADR must also weigh these facts: (a) in-process ① has no Models or Scheduler handle (`KERNEL_GRANTS` = Events, Memory, Approval); (b) no `Capability` provides kernel audit, which §10 expects for commits; (c) out-of-process ② runs on Unix sockets, and the Windows port (DEP-C2) is `BLOCKED`, which matters for both options' Windows story (§2.3). | **DOC-1 start** |
 
 ## 18. Release Hard Gates & Test Samples
 
