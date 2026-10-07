@@ -668,7 +668,7 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 
 | # | Decision | Blocks |
 |---|---|---|
-| 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? Also covers persistence/recovery and the promotion of temporary artifacts (§22.1). | DOC-1 — must be resolved before any persistent data is written |
+| 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? Also covers persistence/recovery and the promotion of temporary artifacts (§22.1). **Decided for DOC-1 (David, 2026-10-07): Documenting-managed, see [ADR-DOC-02 §2](adr/ADR-DOC-02-operation-contract.md#2-存储与唯一可编辑权威690).** | DOC-1 — must be resolved before any persistent data is written |
 | 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | DOC-1 slice 2 (a minimal model for editing a template region; slice 1 only needs the provenance anchor format, page/block/range, which the ADR defines), then DOC-3 |
 | 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). | DOC-1 (read side for slice 1; edit/export side for slice 2), DOC-3–DOC-4 |
 | 4 | **PDF scope** — reading, OCR, form filling (interactive vs flat overlay), page operations and true content editing are separate capabilities. | DOC-2, form slice |
