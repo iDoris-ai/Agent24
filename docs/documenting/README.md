@@ -404,7 +404,7 @@ These are acceptance requirements for the implementation. They are not precondit
 
 “Capability integration” is not sufficient as a deliverable. DOC-1 (§14) must produce this contract as a reviewed ADR (#701) before implementation of the operations it covers.
 
-**Proposed contract: [ADR-DOC-02](adr/ADR-DOC-02-operation-contract.md)** (PR-Daemon approved in #736; awaiting jason's confirmation) — storage authority (§17 #1), identity and provenance anchors, DOC-1 operations and risk mapping, the single commit point and idempotency, typed errors, jobs and availability.
+**Contract: [ADR-DOC-02](adr/ADR-DOC-02-operation-contract.md)** (Accepted 2026-10-07) — storage authority (§17 #1), identity and provenance anchors, DOC-1 operations and risk mapping, the single commit point and idempotency, typed errors, jobs and availability.
 
 ### 10.1 Operations (initial list)
 
