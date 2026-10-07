@@ -22,7 +22,7 @@
 - **Open Design 线在 M10 告一阶段**：OD-M11 / OD-M12 / TPI-W / OC 全部 `PAUSED`，不与 M1 并行；M10 遗留的安全缺口（capability 路由级授权未实现、Desktop / ACP 仍用全权 token、ACP 不传 `workspace_id`）照原样登记在 [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) §0，恢复时从 OD-M11 起步。F11.4 托管器取舍随之推迟到恢复时再定。
 - **并行线 = COMM（Hyphae）**，留在笔记本做：COMM-5b → COMM-6 → COMM-7、DEP-C8。
 - **M1 之后第一项 = DM-SPIKE**（jason 2026-10-06 拍板）：决策模型（Ollaya / Laya / Jev 类）做记忆意图分类，规则兜底 + 模型判断，按评测门槛决定是否接入；该方向持续调研。定义与台账见 [`../research/DECISION-MODELS.md`](../research/DECISION-MODELS.md)。2026-10-07 jason 同意 D0–D3 方案并追加「按硬件自动适配」「积累数据训练个人决策模型」两条要求，任务拆解见 [`PLAN-DECIDE.md`](PLAN-DECIDE.md)。状态：**D0 `IN_PROGRESS`**（D0-1/2/3/4/5/7 已合，D0-6 Mac mini 实测进行中）；**M1 已于 2026-10-07 合入 main（#720），D1 前置已满足**。
-- **C3 P1 新增待办（jason 2026-10-07 提出，不急做，排在「清除权」ADR 之后）**：事件日志「原文永不删」的体积治理，见 [`../research/MEMORY-STRATEGY.md`](../research/MEMORY-STRATEGY.md) §4.2。
+- **C3 P1 新增待办（jason 2026-10-07 提出；M2-07 裁决为 P1 优先处理，排在「清除权」ADR 之后）**：事件日志「原文永不删」的体积治理，合并 F7 的保留/压实策略。默认 20 万行 / 256 MiB 配额同样作用于 personal 分区；写满后记忆静默停写。见 [`../research/MEMORY-STRATEGY.md`](../research/MEMORY-STRATEGY.md) §4.2。
 
 **历史（2026-09-23 起的 ME-4 执行段，已收口）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
 定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
@@ -314,18 +314,18 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 ## M2 台账（2026-10-07 立；M-E 收口余项；本表是 M2 唯一的状态来源）
 
 > 定义/验收/核实结论见 [`PLAN-M2.md`](PLAN-M2.md)。集成分支 `ab/m2`，task 分支 `ab/m2-NN-<短名>`，PR base = `ab/m2`。「高风险」= 合并前须等 PR-Daemon APPROVE（`AGENTS.md`）。
-> 核实结论摘要：F4b/F4d/F4e、F5a/b/c 已解决；F4a、F4c、FU-70 仍存在；F3/F6/F7 待 jason 拍板（PLAN-M2 §3 D1–D3）；FU-45 未到期。
+> 收口结论（2026-10-08）：F4a/b/c/d/e、F5a/b/c 已解决；F3 维持 `/api/v1/<name>` + 保留段名单并关闭；F6 接受检查级 symlink 并关闭；F7 保留策略移交 C3 P1 且须优先处理；FU-45 未到期。FU-41/49/53/54/70 已勾。
 
 | ID | 任务 | 依赖 | 高风险 | 状态 | 证据 |
 |---|---|---|---|---|---|
-| M2-01 | 计划 + 台账 + roadmap 启动标注 | — | 否 | `IN_PROGRESS` | 本 PR |
-| M2-02 | OpenAPI 补 `/os` 族契约（F4a） | M2-03 | 是（协议） | `BACKLOG` |  |
-| M2-03 | 路由 ↔ OpenAPI 双向覆盖门（F4a / FU-10） | — | 否 | `BACKLOG` |  |
-| M2-04 | OpenAPI 补 `/attached`、`/timings` 契约（F4a） | M2-03 | 是（协议） | `BACKLOG` |  |
-| M2-05 | `os list/enable/disable` 不再回退临时 daemon（F4c）+ F4d 过时注释 | — | 否 | `BACKLOG` |  |
-| M2-06 | 审批回调绑定请求生命周期（FU-70 / FU-54） | — | 是（权限 + 数据写入） | `BACKLOG` |  |
-| M2-07 | 记账收口（SPEC / followups / ADR，按 D1–D3 落文） | M2-02…06、D1–D3 | 否 | `BACKLOG` |  |
-| M2-08 | 模块目录 `openat` 逐级打开（F6，**仅当 D2 = B**） | D2 | 是（安全） | `BACKLOG` |  |
+| M2-01 | 计划 + 台账 + roadmap 启动标注 | — | 否 | `DONE` | #731 |
+| M2-02 | OpenAPI 补 `/os` 族契约（F4a） | M2-03 | 是（协议） | `DONE` | #745 |
+| M2-03 | 路由 ↔ OpenAPI 双向覆盖门（F4a / FU-10） | — | 否 | `DONE` | #737 |
+| M2-04 | OpenAPI 补 `/attached`、`/timings` 契约（F4a） | M2-03 | 是（协议） | `DONE` | #747 |
+| M2-05 | `os list/enable/disable` 不再回退临时 daemon（F4c）+ F4d 过时注释 | — | 否 | `DONE` | #738 |
+| M2-06 | 审批回调绑定请求生命周期（FU-70 / FU-54） | — | 是（权限 + 数据写入） | `DONE` | #746 |
+| M2-07 | 记账收口（SPEC / followups / ADR，按 D1–D3 落文） | M2-02…06、D1–D3 | 否 | `DONE` | 本 PR |
+| M2-08 | 模块目录 `openat` 逐级打开（F6，**仅当 D2 = B**） | D2 | 是（安全） | `CANCELLED` | D2 接受检查级处理；不做 |
 | **M2 release** | `ab/m2` → main（PR-Daemon APPROVE + jason 真机验收） | 全部 | — | `BACKLOG` |  |
 
 ## M1 v2 台账（2026-10-01 冻结；本表是 M1 唯一的状态来源）—— ✅ 2026-10-07 已全部合入 main（#720）

@@ -8,10 +8,19 @@ use std::path::Path;
 use std::process::Command;
 
 fn tmp_home() -> tempfile::TempDir {
-    tempfile::Builder::new()
+    let home = tempfile::Builder::new()
         .prefix("a24m205")
         .tempdir_in("/tmp")
-        .unwrap()
+        .unwrap();
+    std::fs::create_dir(home.path().join("tmp")).unwrap();
+    home
+}
+
+#[test]
+fn each_test_home_has_an_existing_private_temp_dir() {
+    let home = tmp_home();
+    let tmp = home.path().join("tmp");
+    assert!(tmp.is_dir(), "TMPDIR must exist inside the per-test HOME");
 }
 
 fn cli(home: &Path, daemon_bin: &Path, args: &[&str]) -> std::process::Output {
