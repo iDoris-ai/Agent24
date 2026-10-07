@@ -19,12 +19,20 @@
 //!   trigger a *suggestion* or a *stricter* action, never a laxer one.
 //! - An unavailable backend returns [`types::Outcome::Unavailable`] — the
 //!   cascade never silently downgrades to a different backend or invents a
-//!   result (see [`service::DecisionService`]).
+//!   result. It carries forward the most recent non-empty floor a prior
+//!   layer actually left behind (see [`service::DecisionService`]).
 //! - An LLM asked to simulate a calibrated classifier is tagged
 //!   `backend = llm_simulation` and its answers can never report
-//!   `calibrated = true` — enforced at construction, see [`types::Answer::new`].
+//!   `calibrated = true`. **Enforced by [`service::DecisionService::decide`]**,
+//!   which re-stamps every answer against the evaluating backend's own
+//!   `kind()` — not merely by [`types::Answer::new`]'s own check, which only
+//!   holds if a backend's `evaluate()` tells the truth about its own kind
+//!   (review #688 M1: it does not have to, so the service does not trust it).
 //! - There is no global default threshold; [`threshold::ThresholdBands`] must
-//!   be constructed explicitly per decision point.
+//!   be constructed explicitly per decision point, and that construction
+//!   path is the ONLY way to get one — `Deserialize` goes through it too
+//!   (`#[serde(try_from = "...")]`, review #688 M2), so a hand-edited config
+//!   file cannot bypass the range/order checks the way a plain derive would.
 
 pub mod backend;
 pub mod catalog;
