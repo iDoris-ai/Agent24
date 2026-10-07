@@ -38,6 +38,12 @@ class Candidate(ABC):
     def __init__(self) -> None:
         self._loaded = False
         self.resolved_sha: str | None = None
+        #: set by a candidate's own load() when it trains on train_data and
+        #: that data has near-duplicate overlap with the eval set it will be
+        #: scored on (see decide_bench.overlap); None if not applicable or
+        #: no overlap found. Surfaced in the report, never used to silently
+        #: fix the data — see PLAN-DECIDE D0-6 / PR #718 review.
+        self.overlap_warning: str | None = None
 
     def applicable(self, point: Point) -> bool:
         return point in self.applicable_points

@@ -14,6 +14,7 @@ import json
 import time
 from pathlib import Path
 
+from ..overlap import check_overlap, render_overlap_report
 from ..render import render_item_text
 from ..types import LABELS, EvalItem, Point, Prediction
 from .base import Candidate, CandidateUnavailable
@@ -57,6 +58,16 @@ class SetFitBgeM3Candidate(Candidate):
             from datasets import Dataset
         except ImportError as exc:
             raise CandidateUnavailable(f"setfit/datasets not importable: {exc}") from exc
+
+        # D0-6: besides the exact-text assert in _load_train_rows below,
+        # check for near-duplicate (char n-gram Jaccard >= 0.7) templates
+        # between train_data and eval — this is reported, never used to
+        # silently alter either file. See decide_bench.overlap docstring
+        # and PR #718's review for why this exists.
+        overlap_hits = check_overlap(points=list(self.applicable_points))
+        self.overlap_warning = (
+            render_overlap_report(overlap_hits, threshold=0.7).strip() if overlap_hits else None
+        )
 
         self._models: dict[Point, object] = {}
         self.train_counts: dict[Point, int] = {}

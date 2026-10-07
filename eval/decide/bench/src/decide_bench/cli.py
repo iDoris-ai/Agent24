@@ -29,6 +29,7 @@ from pathlib import Path
 from .adapters import build_registry
 from .data import load_sets
 from .hardware import default_machine_id, machine_info
+from .overlap import DEFAULT_THRESHOLD, check_overlap, render_overlap_report
 from .report import render_markdown
 from .runner import result_to_dict, run_candidate
 from .types import Point
@@ -95,6 +96,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sets", type=str, default=None, help="comma-separated point names (default: all three)")
     parser.add_argument("--machine", type=str, default=None, help="machine-id for results/<machine-id>/ (e.g. m1max-64g)")
     parser.add_argument("--out-dir", type=str, default=None, help="override results output directory")
+    parser.add_argument(
+        "--check-overlap",
+        action="store_true",
+        help=(
+            "compare train_data/*.jsonl against eval/decide/*.jsonl for near-duplicate "
+            "templates (char n-gram Jaccard, see overlap.py) and exit; runs no model"
+        ),
+    )
+    parser.add_argument(
+        "--overlap-threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=f"Jaccard similarity threshold for --check-overlap (default {DEFAULT_THRESHOLD})",
+    )
     parser.add_argument("--_run_one", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_out", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -102,6 +117,13 @@ def main(argv: list[str] | None = None) -> int:
     points: list[Point] = (
         [p.strip() for p in args.sets.split(",")] if args.sets else ["retain_intent", "recall_gate", "tool_risk"]
     )
+
+    if args.check_overlap:
+        # Pure data check, no model loading, no subprocess fan-out — runs
+        # before the registry is even built.
+        hits = check_overlap(points=points, threshold=args.overlap_threshold)
+        sys.stdout.write(render_overlap_report(hits, args.overlap_threshold))
+        return 1 if hits else 0
 
     if args._run_one:
         # Internal worker mode: run exactly one candidate in this process

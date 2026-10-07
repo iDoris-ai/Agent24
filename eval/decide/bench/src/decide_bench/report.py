@@ -76,6 +76,24 @@ def render_markdown(run: dict[str, Any]) -> str:
         )
     lines.append("")
 
+    overlap_warned = [c for c in available if c.get("overlap_warning")]
+    if overlap_warned:
+        lines.append("## 训练/评测近似重复检测")
+        lines.append("")
+        lines.append(
+            "字符 n-gram Jaccard（阈值 0.7，见 `decide_bench/overlap.py`）在以下候选的"
+            "训练集/评测集之间发现命中——不是静默修过的数据，原始命中见下，解读见各自"
+            "结果文档的说明段。"
+        )
+        lines.append("")
+        for c in overlap_warned:
+            lines.append(f"### {c['name']}")
+            lines.append("")
+            lines.append("```")
+            lines.append(c["overlap_warning"])
+            lines.append("```")
+            lines.append("")
+
     lines.append("## Unavailable")
     lines.append("")
     if not unavailable:

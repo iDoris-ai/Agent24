@@ -65,3 +65,37 @@ reason），不会让整轮横评失败。
 `train_data/*.jsonl` 是手写的少样本训练数据，`setfit_bgem3.py` 加载时用
 文本精确匹配断言它与对应的 `eval/decide/*.jsonl` 没有交集；一旦有人不小
 心把评测句子抄进训练集，启动就会 `AssertionError` 而不是悄悄把分数刷高。
+
+### 近似重复检测（D0-6，补 PR #718 复审遗留项）
+
+逐字精确匹配只挡得住原样复制。PR #718 复审（clestons）另外用
+`difflib.SequenceMatcher` 跑了一遍训练集/评测集，发现有换模板词的近义
+句混进了训练集（例如训练集「上海明天天气」对评测集「北京明天天气」，
+相似度 0.94；三份评测集里命中率 2–6%）——这类重叠逐字检查查不出来，
+会让 SetFit 的分数虚高。
+
+`decide_bench/overlap.py` 补了这道检查，同时跑两个指标（详见模块
+docstring 为什么两个都做，不是二选一）：
+
+- 字符 3-gram Jaccard 相似度（零额外依赖、确定性）
+- `difflib.SequenceMatcher.ratio()`（与复审方法一致，标准库自带）
+
+两者任一 ≥ 阈值（默认 0.7，取自复审实测的量级）就算命中。跑法：
+
+```bash
+uv run bench --check-overlap                       # 阈值 0.7，跑三份评测集
+uv run bench --check-overlap --overlap-threshold 0.6  # 调阈值
+uv run bench --check-overlap --sets tool_risk       # 只查一个点
+```
+
+有命中时退出码为 1，并打印每一对 `(eval_id, train_text)` 及两个相似度分
+数，方便定位。本仓库当前状态下三份 `train_data/*.jsonl` 对各自评测集在
+阈值 0.7 下为 **0 命中**（2026-10-07 修过一批模板撞词的训练样本，见
+`results/m1max-64g/2026-10-07-dedup.md`）；不是静默改数据——改哪些、为
+什么改、改了以后分数怎么变，都在那份文档里。
+
+`setfit_bgem3.py` 的 `load()` 在训练前也会跑一次这个检查：如果（将来）
+又有命中，不会让候选失败，而是把命中清单塞进该候选结果的
+`overlap_warning` 字段，`render.py` 会在横评报告里单独起一节列出来——
+确认过某次结果干净，不代表以后改了训练集还干净，这道检查就是防止那种
+情况悄悄发生。

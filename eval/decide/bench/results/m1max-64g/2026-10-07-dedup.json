@@ -1,0 +1,2198 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-07",
+  "generated_at": "2026-10-07T10:00:20.565360+00:00",
+  "machine_id": "m1max-64g",
+  "machine_info": {
+    "platform": "macOS-26.4.1-arm64-arm-64bit",
+    "python": "3.11.15",
+    "cpu_brand": "Apple M1 Max",
+    "ram_bytes": "68719476736"
+  },
+  "points_run": [
+    "retain_intent",
+    "recall_gate",
+    "tool_risk"
+  ],
+  "candidates": [
+    {
+      "name": "setfit-bge-m3",
+      "model_id": "BAAI/bge-m3",
+      "revision": "5617a9f61b028005a4858fdac845db406aefb181",
+      "resolved_sha": "5617a9f61b028005a4858fdac845db406aefb181",
+      "available": true,
+      "unavailable_reason": null,
+      "load_latency_s": 292.08230816712603,
+      "peak_rss_mb": 4269.46875,
+      "download_size_mb": 4352.947310447693,
+      "points": {
+        "retain_intent": {
+          "point": "retain_intent",
+          "n_items": 101,
+          "n_abstained": 0,
+          "accuracy": 0.7623762376237624,
+          "macro_f1": 0.7716189973903224,
+          "ece": 0.259378645532202,
+          "cost_weighted_error_rate": 0.23410404624277456,
+          "p50_latency_ms": 30.829292023554444,
+          "p95_latency_ms": 84.69204208813608,
+          "retain_intent_extra": {
+            "false_write_rate": 0.16176470588235295,
+            "remember_recall": 0.7878787878787878
+          },
+          "predictions": [
+            {
+              "id": "ri-001",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.600040078163147,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-002",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5409917235374451,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-003",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5913629531860352,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-004",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.3921666741371155,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-005",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5373852849006653,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-006",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.6083946228027344,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-007",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.46018680930137634,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-008",
+              "expected": "remember",
+              "predicted": "forget",
+              "p": 0.34997090697288513,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-009",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4895000755786896,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-010",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.44817376136779785,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-011",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.40939563512802124,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-012",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4739382266998291,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-013",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5933122038841248,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-014",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5696506500244141,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-015",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4421125054359436,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-016",
+              "expected": "remember",
+              "predicted": "preference",
+              "p": 0.4379253089427948,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-017",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5011095404624939,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-018",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4346487522125244,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-019",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4995795488357544,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-020",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.37262028455734253,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-021",
+              "expected": "remember",
+              "predicted": "ask_memory",
+              "p": 0.36891767382621765,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-022",
+              "expected": "remember",
+              "predicted": "ask_memory",
+              "p": 0.4483366012573242,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-023",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.39392924308776855,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-024",
+              "expected": "remember",
+              "predicted": "ask_memory",
+              "p": 0.4037518799304962,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-025",
+              "expected": "remember",
+              "predicted": "ask_memory",
+              "p": 0.5536002516746521,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-026",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.44859325885772705,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-027",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4194013476371765,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-028",
+              "expected": "remember",
+              "predicted": "none",
+              "p": 0.30488041043281555,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-029",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.5540844202041626,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-030",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.55206298828125,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-031",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.2860703766345978,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-032",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.4703177511692047,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-033",
+              "expected": "remember",
+              "predicted": "remember",
+              "p": 0.48910051584243774,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-034",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6617697477340698,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-035",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6328819394111633,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-036",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6379279494285583,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-037",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6495241522789001,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-038",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6606680750846863,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-039",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6812174916267395,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-040",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.648615300655365,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-041",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.6059046983718872,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-042",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.5775396227836609,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-043",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.5996130704879761,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-044",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.5311303734779358,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-045",
+              "expected": "forget",
+              "predicted": "forget",
+              "p": 0.5671800971031189,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-046",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6615368723869324,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-047",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6103416085243225,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-048",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5841044187545776,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-049",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6469482779502869,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-050",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6832413077354431,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-051",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6138139367103577,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-052",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6272415518760681,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-053",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.45314884185791016,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-054",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6871570944786072,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-055",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5169250965118408,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-056",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.5907855033874512,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-057",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.4683970510959625,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-058",
+              "expected": "ask_memory",
+              "predicted": "remember",
+              "p": 0.4319952428340912,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-059",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6993574500083923,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-060",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.37610092759132385,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-061",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6458019018173218,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-062",
+              "expected": "ask_memory",
+              "predicted": "remember",
+              "p": 0.360790878534317,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-063",
+              "expected": "ask_memory",
+              "predicted": "ask_memory",
+              "p": 0.6403152942657471,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-064",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.6813732981681824,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-065",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.4466897249221802,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-066",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.6054240465164185,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-067",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.5820608735084534,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-068",
+              "expected": "correct",
+              "predicted": "none",
+              "p": 0.2580558657646179,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-069",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.27010825276374817,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-070",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.4400649666786194,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-071",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.6711528301239014,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-072",
+              "expected": "correct",
+              "predicted": "correct",
+              "p": 0.5834873914718628,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-073",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.7037150263786316,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-074",
+              "expected": "preference",
+              "predicted": "forget",
+              "p": 0.2929419279098511,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-075",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5955285429954529,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-076",
+              "expected": "preference",
+              "predicted": "none",
+              "p": 0.2456694096326828,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-077",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.5543065667152405,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-078",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.43778032064437866,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "ri-079",
+              "expected": "preference",
+              "predicted": "forget",
+              "p": 0.4575999677181244,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-080",
+              "expected": "preference",
+              "predicted": "remember",
+              "p": 0.4068185091018677,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-081",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6522746086120605,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-082",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6783682107925415,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-083",
+              "expected": "preference",
+              "predicted": "preference",
+              "p": 0.6931403279304504,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-084",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.5166285037994385,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "ri-085",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.5887284874916077,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "ri-086",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.32161781191825867,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-087",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4090568721294403,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-088",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4058085083961487,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-089",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.3396311402320862,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-090",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.4434102475643158,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-091",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4717048108577728,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-092",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4769645929336548,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-093",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.45006299018859863,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-094",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.44482821226119995,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-095",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.5152288675308228,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-096",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.37836360931396484,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-097",
+              "expected": "none",
+              "predicted": "ask_memory",
+              "p": 0.3271053731441498,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-098",
+              "expected": "none",
+              "predicted": "correct",
+              "p": 0.20742163062095642,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-099",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.31704163551330566,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "ri-100",
+              "expected": "none",
+              "predicted": "remember",
+              "p": 0.4260552227497101,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "ri-101",
+              "expected": "none",
+              "predicted": "none",
+              "p": 0.3090495765209198,
+              "correct": true,
+              "cost_level": "medium"
+            }
+          ]
+        },
+        "recall_gate": {
+          "point": "recall_gate",
+          "n_items": 100,
+          "n_abstained": 0,
+          "accuracy": 0.85,
+          "macro_f1": 0.849624060150376,
+          "ece": 0.22645807147026065,
+          "cost_weighted_error_rate": 0.16939890710382513,
+          "p50_latency_ms": 42.11847891565412,
+          "p95_latency_ms": 62.73128135362639,
+          "retain_intent_extra": null,
+          "predictions": [
+            {
+              "id": "rg-001",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5756598711013794,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-002",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5350266098976135,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-003",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5336659550666809,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-004",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6258907318115234,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-005",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.695269763469696,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-006",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6453461647033691,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-007",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5125221610069275,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-008",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6374077796936035,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-009",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5529569387435913,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-010",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6176906228065491,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-011",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5244112610816956,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-012",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6123737692832947,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-013",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6045902967453003,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-014",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5587916970252991,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-015",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6062914133071899,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-016",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6266026496887207,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-017",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5730289220809937,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-018",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6292083263397217,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-019",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6264913082122803,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-020",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.596360445022583,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-021",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.5379349589347839,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-022",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6077298521995544,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-023",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7251977920532227,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-024",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6977670788764954,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-025",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5429661273956299,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-026",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5260863900184631,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-027",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.555025577545166,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-028",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5536702871322632,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-029",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6381515264511108,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-030",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6155015826225281,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-031",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5866517424583435,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-032",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.5386136770248413,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-033",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.5405938625335693,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-034",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.740630030632019,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-035",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5483909249305725,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-036",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.6311034560203552,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-037",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6018332242965698,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-038",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.762527585029602,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-039",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.848322331905365,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-040",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.5994601845741272,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-041",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6758761405944824,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-042",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.540433406829834,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-043",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7089208364486694,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-044",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7071261405944824,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-045",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5780032873153687,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-046",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6533330082893372,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-047",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7053213119506836,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-048",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.6670958995819092,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-049",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6605069041252136,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-050",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6090620160102844,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-051",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6923698782920837,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-052",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7199681401252747,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-053",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7097702026367188,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-054",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7221764326095581,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-055",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6719481348991394,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-056",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7160388231277466,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-057",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5996110439300537,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-058",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5190658569335938,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-059",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5232328772544861,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-060",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6624863147735596,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-061",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6988385915756226,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-062",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6745603084564209,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-063",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6022752523422241,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-064",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5976358652114868,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-065",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5499590635299683,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "rg-066",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6785072088241577,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-067",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.8143718838691711,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-068",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6024043560028076,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-069",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7546254992485046,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-070",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7284896969795227,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-071",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6415468454360962,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-072",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6167802810668945,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-073",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6130257844924927,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-074",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5059603452682495,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-075",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6905197501182556,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-076",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5350574851036072,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-077",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5072047114372253,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-078",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6535093784332275,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-079",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5624046325683594,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-080",
+              "expected": "need",
+              "predicted": "no_need",
+              "p": 0.5924419164657593,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-081",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.5874595642089844,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-082",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.5607532262802124,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-083",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5873273611068726,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-084",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6279133558273315,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-085",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.5422226190567017,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-086",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.6178692579269409,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-087",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6138876676559448,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-088",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.525344729423523,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-089",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.525065004825592,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-090",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7364145517349243,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-091",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.7404557466506958,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-092",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.5902774333953857,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-093",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6069128513336182,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-094",
+              "expected": "need",
+              "predicted": "need",
+              "p": 0.6878169775009155,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-095",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6030738949775696,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-096",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6703003644943237,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-097",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.7345166802406311,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-098",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.6446616649627686,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "rg-099",
+              "expected": "no_need",
+              "predicted": "no_need",
+              "p": 0.572009801864624,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "rg-100",
+              "expected": "no_need",
+              "predicted": "need",
+              "p": 0.62969970703125,
+              "correct": false,
+              "cost_level": "low"
+            }
+          ]
+        },
+        "tool_risk": {
+          "point": "tool_risk",
+          "n_items": 64,
+          "n_abstained": 0,
+          "accuracy": 0.46875,
+          "macro_f1": 0.4241898148148148,
+          "ece": 0.15445950161665678,
+          "cost_weighted_error_rate": 0.5065502183406113,
+          "p50_latency_ms": 47.98079142346978,
+          "p95_latency_ms": 90.46791436849158,
+          "retain_intent_extra": null,
+          "predictions": [
+            {
+              "id": "tr-001",
+              "expected": "low",
+              "predicted": "medium",
+              "p": 0.33479106426239014,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-002",
+              "expected": "low",
+              "predicted": "medium",
+              "p": 0.33099570870399475,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-003",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.3975646495819092,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-004",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.3502047061920166,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-005",
+              "expected": "low",
+              "predicted": "must_review",
+              "p": 0.3360450863838196,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-006",
+              "expected": "low",
+              "predicted": "medium",
+              "p": 0.2960054576396942,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-007",
+              "expected": "low",
+              "predicted": "medium",
+              "p": 0.2985190153121948,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-008",
+              "expected": "low",
+              "predicted": "must_review",
+              "p": 0.3423500061035156,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-009",
+              "expected": "low",
+              "predicted": "must_review",
+              "p": 0.291583776473999,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-010",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.288291335105896,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-011",
+              "expected": "low",
+              "predicted": "low",
+              "p": 0.3765638470649719,
+              "correct": true,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-012",
+              "expected": "low",
+              "predicted": "must_review",
+              "p": 0.3760043680667877,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-013",
+              "expected": "low",
+              "predicted": "must_review",
+              "p": 0.28851231932640076,
+              "correct": false,
+              "cost_level": "low"
+            },
+            {
+              "id": "tr-014",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.35945385694503784,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-015",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.402265340089798,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-016",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.3841803967952728,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-017",
+              "expected": "medium",
+              "predicted": "must_review",
+              "p": 0.34733453392982483,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-018",
+              "expected": "medium",
+              "predicted": "must_review",
+              "p": 0.32866132259368896,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-019",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.35087835788726807,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-020",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.30985987186431885,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-021",
+              "expected": "medium",
+              "predicted": "must_review",
+              "p": 0.45235222578048706,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-022",
+              "expected": "medium",
+              "predicted": "must_review",
+              "p": 0.3404267430305481,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-023",
+              "expected": "medium",
+              "predicted": "low",
+              "p": 0.318950891494751,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-024",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.27714577317237854,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-025",
+              "expected": "medium",
+              "predicted": "medium",
+              "p": 0.30591562390327454,
+              "correct": true,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-026",
+              "expected": "medium",
+              "predicted": "must_review",
+              "p": 0.3171800971031189,
+              "correct": false,
+              "cost_level": "medium"
+            },
+            {
+              "id": "tr-027",
+              "expected": "high",
+              "predicted": "must_review",
+              "p": 0.3324650824069977,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-028",
+              "expected": "high",
+              "predicted": "must_review",
+              "p": 0.29235342144966125,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-029",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.29891374707221985,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-030",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.28406840562820435,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-031",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.30727052688598633,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-032",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.3761535584926605,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-033",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.36081281304359436,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-034",
+              "expected": "high",
+              "predicted": "high",
+              "p": 0.2883516252040863,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-035",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.28035712242126465,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-036",
+              "expected": "high",
+              "predicted": "low",
+              "p": 0.349945992231369,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-037",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.30011603236198425,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-038",
+              "expected": "high",
+              "predicted": "medium",
+              "p": 0.33387327194213867,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-039",
+              "expected": "high",
+              "predicted": "must_review",
+              "p": 0.33867159485816956,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-040",
+              "expected": "high",
+              "predicted": "must_review",
+              "p": 0.3122495114803314,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-041",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3436339795589447,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-042",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.36266738176345825,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-043",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.37318867444992065,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-044",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3317309319972992,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-045",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3220360279083252,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-046",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.38845255970954895,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-047",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3413713276386261,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-048",
+              "expected": "must_review",
+              "predicted": "medium",
+              "p": 0.291464239358902,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-049",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3880764842033386,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-050",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.39695560932159424,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-051",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.293558806180954,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-052",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3060941994190216,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-053",
+              "expected": "must_review",
+              "predicted": "medium",
+              "p": 0.3696846067905426,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-054",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.33311766386032104,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-055",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.28783828020095825,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-056",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.33922550082206726,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-057",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3982621431350708,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-058",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.342291921377182,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-059",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.3213721513748169,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-060",
+              "expected": "must_review",
+              "predicted": "high",
+              "p": 0.3458767831325531,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-061",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.2832726836204529,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-062",
+              "expected": "must_review",
+              "predicted": "must_review",
+              "p": 0.30719801783561707,
+              "correct": true,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-063",
+              "expected": "must_review",
+              "predicted": "low",
+              "p": 0.265013188123703,
+              "correct": false,
+              "cost_level": "high"
+            },
+            {
+              "id": "tr-064",
+              "expected": "must_review",
+              "predicted": "medium",
+              "p": 0.3350680470466614,
+              "correct": false,
+              "cost_level": "high"
+            }
+          ]
+        }
+      },
+      "overlap_warning": null
+    }
+  ]
+}
