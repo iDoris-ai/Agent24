@@ -283,6 +283,14 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub model: Option<String>,
+    /// M1-T12: opt-in session id for D1 personal memory on the stateless chat
+    /// surface. `None` (the default) keeps `/api/v1/chat` byte-for-byte
+    /// unchanged — no recall, no write. When set, the daemon reuses the SAME
+    /// `SessionMemory` recall/retain machinery the agent loop (`/api/v1/runs`)
+    /// uses, keyed by this id. The owner is always the daemon-injected
+    /// personal-memory owner — never taken from the request.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -305,6 +313,31 @@ pub struct ChatResponse {
     /// client-side timing when present.
     #[serde(default)]
     pub latency_ms: Option<u64>,
+    /// M1-T14: what the daemon ACTUALLY did with an explicit "记住…" turn —
+    /// set deterministically by the server, never inferred from the model's
+    /// own reply text (the local model has been observed claiming success on
+    /// a turn the server skipped). `None` when this prompt was not an
+    /// explicit remember, or `session_id` was omitted (no personal memory in
+    /// play at all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_receipt: Option<MemoryReceipt>,
+}
+
+/// M1-T14: the deterministic outcome of an explicit "记住…" turn on
+/// `/api/v1/chat`. See [`ChatResponse::memory_receipt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryReceipt {
+    /// The assertion was committed — or was already an identical, currently
+    /// active belief (the write-gate's own idempotent reassert/no-op case
+    /// counts as saved, not failed).
+    Saved,
+    /// The prompt matched an explicit remember, but personal memory is
+    /// paused — the assertion was never written.
+    PausedNotSaved,
+    /// The prompt matched an explicit remember and memory is active, but the
+    /// write itself failed.
+    Failed,
 }
 
 // ── Session ──────────────────────────────────────────────────────────────────

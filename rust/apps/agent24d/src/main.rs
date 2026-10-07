@@ -11,6 +11,7 @@ mod attach_listener;
 mod attach_registry;
 mod attached;
 mod attached_routes;
+mod authz;
 // Remaining public capability primitives are staged for the next endpoints.
 #[allow(
     dead_code,
@@ -60,6 +61,7 @@ mod host_bootstrap {
 mod lifecycle;
 mod mcp;
 mod memory_callback;
+mod memory_routes;
 mod model_callback;
 mod module_approval_broker;
 mod module_approvals;

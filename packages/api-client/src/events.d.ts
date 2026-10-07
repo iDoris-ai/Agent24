@@ -38,6 +38,21 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
+      payload: MemoryWriteFailedPayload;
+      type: "memory.write_failed";
+      [k: string]: unknown;
+    }
+  | {
+      payload: MemoryWriteSkippedPayload;
+      type: "memory.write_skipped";
+      [k: string]: unknown;
+    }
+  | {
+      payload: MemoryRecalledPayload;
+      type: "memory.recalled";
+      [k: string]: unknown;
+    }
+  | {
       payload: RunFailedPayload;
       type: "run.failed";
       [k: string]: unknown;
@@ -201,6 +216,34 @@ export interface Usage {
   cost_usd?: number;
   prompt_tokens: number;
   total_tokens: number;
+  [k: string]: unknown;
+}
+/**
+ * The answer completed, but its session exchange could not be recorded.
+ */
+export interface MemoryWriteFailedPayload {
+  reason: string;
+  session_id: string;
+  [k: string]: unknown;
+}
+/**
+ * M1-T10 review H1: `reason` is an open enum (today only `"paused"`).
+ */
+export interface MemoryWriteSkippedPayload {
+  reason: string;
+  run_id: string;
+  /**
+   * Null for transient (session-less) runs, same as `RunStartedPayload`.
+   */
+  session_id: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Assertion ids that were actually included in a run's recalled context.
+ */
+export interface MemoryRecalledPayload {
+  ids: string[];
+  run_id: string;
   [k: string]: unknown;
 }
 export interface RunFailedPayload {

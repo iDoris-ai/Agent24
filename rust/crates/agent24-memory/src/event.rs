@@ -494,6 +494,25 @@ impl EventLog {
         })
     }
 
+    /// M1-T10: look up one event by id, scoped to `owner` — a caller asking
+    /// for a real id under the WRONG owner gets `None`, same as a nonexistent
+    /// id, so this cannot be used to probe whether another owner's id exists.
+    /// Used by the memory REST surface to show an assertion's provenance
+    /// (which session its evidence event belongs to, when it was recorded).
+    /// Inherent, not on [`EventStore`], for the same reason `scan_stream`
+    /// below is.
+    pub async fn get(&self, owner: &str, id: &EventId) -> Result<Option<StoredEvent>> {
+        let row = sqlx::query(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at
+             FROM mem_events WHERE id = ? AND scope_owner = ?",
+        )
+        .bind(id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::row_to_stored).transpose()
+    }
+
     /// T8.5c-P (design §3.2): row-by-row streaming scan, not "fetch a whole
     /// batch then iterate it". Inherent, not on [`EventStore`] — `EventLog` is
     /// the trait's only implementor (see the module doc's ADR reference and
@@ -702,6 +721,23 @@ mod tests {
             .unwrap();
         assert_eq!(s1.len(), 1);
         assert_eq!(s1[0].event.id, "a");
+    }
+
+    #[tokio::test]
+    async fn get_is_owner_scoped_and_does_not_leak_existence() {
+        let log = log().await;
+        log.append(&ev("a", "u1", Some("s1"), "msg")).await.unwrap();
+
+        let found = log.get("u1", &"a".to_owned()).await.unwrap();
+        assert_eq!(
+            found.map(|s| s.event.scope.session),
+            Some(Some("s1".into()))
+        );
+
+        // Negative control: the right id, the wrong owner — `None`, exactly
+        // like a nonexistent id, so this cannot be used to probe for it.
+        assert_eq!(log.get("u2", &"a".to_owned()).await.unwrap(), None);
+        assert_eq!(log.get("u1", &"nope".to_owned()).await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -13,12 +13,15 @@ pub mod assertion;
 pub mod condenser;
 pub mod consolidator;
 pub mod eval;
+#[cfg(test)]
+mod eval_m1;
 pub mod event;
 pub mod knowledge;
 pub mod reconcile;
 pub mod replay;
 pub mod retriever;
 pub mod session;
+pub mod session_log;
 pub mod trace;
 pub mod vector;
 pub mod writer;
@@ -28,6 +31,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use agent24_core::util::now_iso8601;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -162,6 +166,8 @@ pub struct OsPartitionRow {
     /// (`touch_os_partition_last_seen`) — T8.5c-W-mount decision 5. Migration
     /// 0015 made the column nullable for exactly this state.
     pub last_seen_at: Option<String>,
+    /// Distinguishes module-local spaces from the agent's personal space.
+    pub space_kind: String,
 }
 
 /// The identity of a partition, as the kernel states it when recording one.
@@ -237,7 +243,19 @@ fn os_partition_row(r: &sqlx::sqlite::SqliteRow) -> OsPartitionRow {
         module_name: r.get("module_name"),
         first_seen_at: r.get("first_seen_at"),
         last_seen_at: r.get::<Option<String>, _>("last_seen_at"),
+        space_kind: r.get("space_kind"),
     }
+}
+
+/// M1-T10: the `kv` namespace [`KvStore::memory_enabled`]/[`KvStore::set_memory_enabled`]
+/// store the personal-memory switch under, keyed by owner.
+pub const MEMORY_SETTINGS_NAMESPACE: &str = "memory_settings";
+
+/// `owner`'s persistent personal-memory switch (M1-T10). Round-tripped
+/// through the generic `kv` table via [`KvStore::fetch`]/[`KvStore::put`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySettings {
+    pub enabled: bool,
 }
 
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
@@ -287,6 +305,7 @@ impl KvStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::rebuild_fts_if_needed(&pool).await?;
         Ok(Self {
             pool,
             oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
@@ -311,6 +330,7 @@ impl KvStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::rebuild_fts_if_needed(&pool).await?;
         // T8.5c-W-mount decision 4: this pool's one connection is already
         // needed by the in-process path, so there is no headroom to lend an
         // out-of-process caller — `oop_admission` stays `None`, not
@@ -321,6 +341,17 @@ impl KvStore {
             pool,
             oop_admission: None,
         })
+    }
+
+    async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
+                .fetch_optional(pool)
+                .await?;
+        if marker.as_deref() == Some("1") {
+            retriever::FtsRetriever::new(pool.clone()).rebuild().await?;
+        }
+        Ok(())
     }
 
     /// T8.5c-W-mount decision 4: the daemon-level connection-admission
@@ -341,6 +372,11 @@ impl KvStore {
         event::EventLog::new(self.pool.clone())
     }
 
+    /// A session event-log writer over this store's database.
+    pub fn session_log(&self) -> session_log::SessionLog {
+        session_log::SessionLog::new(self.pool.clone())
+    }
+
     /// An [`artifact::ArtifactCas`] over the SAME database file — MD-2b's
     /// CAS-versioned editable-content authority shares the KV store's pool.
     pub fn artifacts(&self) -> artifact::ArtifactCas {
@@ -351,6 +387,39 @@ impl KvStore {
     /// bi-temporal semantic authority shares the KV store's pool.
     pub fn assertions(&self) -> assertion::AssertionLedger {
         assertion::AssertionLedger::new(self.pool.clone())
+    }
+
+    /// Retract an assertion and append its event in the same transaction.
+    pub async fn forget(&self, owner: &str, id: &str, at: &str) -> Result<assertion::Forget> {
+        assertion::forget(&self.pool, owner, id, at).await
+    }
+
+    /// M1-T10: `owner`'s persistent personal-memory switch. `Ok(true)` (the
+    /// default) when the owner has never set one — a fresh owner's memory is
+    /// ON, never silently paused. Stored in the generic `kv` table (namespace
+    /// [`MEMORY_SETTINGS_NAMESPACE`]), so it survives a daemon restart the
+    /// same way every other `kv` row does.
+    pub async fn memory_enabled(&self, owner: &str) -> Result<bool> {
+        Ok(self
+            .fetch::<MemorySettings>(MEMORY_SETTINGS_NAMESPACE, owner)
+            .await?
+            .is_none_or(|s| s.enabled))
+    }
+
+    /// Set `owner`'s persistent personal-memory switch (M1-T10). Turning it
+    /// off stops new writes and cross-session recall from the moment this
+    /// returns — the two gates that check it are `agent24_agent::retain::persist`
+    /// (writes) and `agent24_agent::SessionMemory::recall` (cross-session
+    /// recall), neither of which lives in this crate — but never touches
+    /// existing assertions: the switch is a gate on future reads/writes, not
+    /// a purge.
+    pub async fn set_memory_enabled(&self, owner: &str, enabled: bool) -> Result<()> {
+        self.put(
+            MEMORY_SETTINGS_NAMESPACE,
+            owner,
+            &MemorySettings { enabled },
+        )
+        .await
     }
 
     /// An [`retriever::FtsRetriever`] over the SAME database file — MD-3b's
@@ -434,6 +503,21 @@ impl KvStore {
     /// The identity a key encodes is `(org_id, space_id)`. Who walked up to it
     /// is not part of it.
     pub async fn record_os_partition(&self, id: OsPartitionIdentity<'_>) -> Result<()> {
+        self.record_partition(id, "module").await
+    }
+
+    /// Record the authenticated user's personal partition. Its reserved module
+    /// name is intentionally outside the manifest-name grammar.
+    pub async fn record_personal_partition(&self, id: OsPartitionIdentity<'_>) -> Result<()> {
+        if id.module != "@agent" {
+            return Err(MemoryError::Conflict(
+                "personal partition module must be @agent".into(),
+            ));
+        }
+        self.record_partition(id, "personal").await
+    }
+
+    async fn record_partition(&self, id: OsPartitionIdentity<'_>, kind: &str) -> Result<()> {
         // Dropping `logical_user` from the guard let a non-member be recorded as
         // a partition's creator, which review caught: the kernel's own path
         // resolves the org by membership first, so it could not happen there —
@@ -468,13 +552,14 @@ impl KvStore {
         let res = sqlx::query(
             "INSERT INTO mem_os_partitions
                  (owner_key, key_version, org_id, space_id, logical_user,
-                  module_name, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                  module_name, first_seen_at, last_seen_at, space_kind)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
              ON CONFLICT(owner_key) DO UPDATE SET first_seen_at = first_seen_at
                WHERE key_version = excluded.key_version
                  AND org_id = excluded.org_id
                  AND space_id = excluded.space_id
-                 AND module_name = excluded.module_name",
+                 AND module_name = excluded.module_name
+                 AND space_kind = excluded.space_kind",
         )
         .bind(id.owner_key)
         .bind(id.key_version)
@@ -483,6 +568,7 @@ impl KvStore {
         .bind(id.user)
         .bind(id.module)
         .bind(&now)
+        .bind(kind)
         .execute(&self.pool)
         .await?;
         if res.rows_affected() == 0 {
@@ -731,7 +817,7 @@ impl KvStore {
     ) -> Result<Vec<OsPartitionRow>> {
         let rows = sqlx::query(
             "SELECT owner_key, key_version, org_id, space_id, logical_user,
-                    module_name, first_seen_at, last_seen_at
+                    module_name, first_seen_at, last_seen_at, space_kind
              FROM mem_os_partitions WHERE key_version = ?
              ORDER BY first_seen_at ASC, owner_key ASC",
         )
@@ -944,7 +1030,7 @@ impl KvStore {
     async fn os_partitions_where(&self, column: &str, value: &str) -> Result<Vec<OsPartitionRow>> {
         let rows = sqlx::query(&format!(
             "SELECT owner_key, key_version, org_id, space_id, logical_user,
-                    module_name, first_seen_at, last_seen_at
+                    module_name, first_seen_at, last_seen_at, space_kind
              FROM mem_os_partitions WHERE {column} = ?
              ORDER BY first_seen_at ASC, owner_key ASC"
         ))
@@ -1042,6 +1128,7 @@ mod tests {
 
     use super::*;
     use crate::event::EventStore as _;
+    use crate::retriever::Retriever as _;
     use serde::Deserialize;
 
     #[tokio::test]
@@ -1231,7 +1318,10 @@ mod tests {
     #[tokio::test]
     async fn migration_0015_keeps_the_0013_schema_and_only_makes_last_seen_at_nullable() {
         let dir = tempfile::tempdir().unwrap();
-        let kv = KvStore::open(&dir.path().join("m.db")).await.unwrap();
+        let kv = KvStore {
+            pool: pool_migrated_up_to(&dir.path().join("m.db"), 16).await,
+            oop_admission: None,
+        };
 
         let columns = sqlx::query("PRAGMA table_info(mem_os_partitions)")
             .fetch_all(&kv.pool)
@@ -1431,6 +1521,244 @@ mod tests {
             "a historical non-null last_seen_at must not be wiped to NULL by the rebuild — \
              the migration only changes what a NEW insert writes, not existing rows"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_0017_rebuilds_cjk_fts_for_existing_assertions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let pool = pool_migrated_up_to(&path, 17).await;
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 16);
+        for (id, text) in [
+            ("cjk", "我对花生过敏"),
+            ("vitamin", "维生素B12"),
+            ("rust", "我喜欢Rust编程"),
+        ] {
+            sqlx::query(
+                "INSERT INTO mem_assertions
+                     (id, scope_owner, scope, subject, predicate, object, valid_from,
+                      recorded_from, evidence, confidence, modality, writer_version, qualified)
+                 VALUES (?, 'alice', '{\"owner\":\"alice\"}', 'user', 'said',
+                         ?, '2026-01-01', '2026-01-01', '[]', 1.0, 'said', 'test', 1)",
+            )
+            .bind(id)
+            .bind(serde_json::to_string(text).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Before 0017, the legacy trigger indexes each mixed string as one
+        // unicode61 token, so complete-string MATCH remains supported.
+        for (token, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
+            let hits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM mem_assertions_fts WHERE mem_assertions_fts MATCH ? AND id = ?",
+            )
+            .bind(format!("\"{token}\""))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(hits, 1, "legacy index should retain {token} as a token");
+        }
+        pool.close().await;
+
+        for _ in 0..2 {
+            let kv = KvStore::open(&path).await.unwrap();
+            assert_eq!(
+                kv.retriever()
+                    .search_any("我对什么过敏？", "alice", 5)
+                    .await
+                    .unwrap()[0]
+                    .assertion
+                    .id,
+                "cjk"
+            );
+            let retriever = kv.retriever();
+            for (query, id) in [("你用Rust吗", "rust"), ("Should I take B12?", "vitamin")] {
+                let hits = retriever.search_any(query, "alice", 5).await.unwrap();
+                assert_eq!(hits.len(), 1, "mixed query should uniquely find {id}");
+                assert_eq!(hits[0].assertion.id, id, "mixed query: {query}");
+            }
+            for (query, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
+                assert_eq!(
+                    retriever.search(query, "alice", 5).await.unwrap()[0]
+                        .assertion
+                        .id,
+                    id,
+                    "AND search should retain full-token matching for {query}"
+                );
+                assert_eq!(
+                    retriever.search_any(query, "alice", 5).await.unwrap()[0]
+                        .assertion
+                        .id,
+                    id,
+                    "OR search should retain full-token matching for {query}"
+                );
+                assert!(
+                    retriever
+                        .search(&format!("{query} missing"), "alice", 5)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "search must keep its AND semantics"
+                );
+            }
+            let marker: Option<String> =
+                sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
+                    .fetch_optional(&kv.pool)
+                    .await
+                    .unwrap();
+            assert_ne!(marker.as_deref(), Some("1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_0016_preserves_rows_and_adds_personal_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let pool = pool_migrated_up_to(&path, 16).await;
+        let version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 15);
+        sqlx::query(
+            "INSERT INTO mem_orgs (org_id, display_name, created_at) VALUES ('o', 'O', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at) VALUES ('a','v2','o','os:a','u','a','first-a',NULL),('b','v2','o','os:b','u','b','first-b','last-b')")
+            .execute(&pool).await.unwrap();
+        pool.close().await;
+
+        let kv = KvStore::open(&path).await.unwrap();
+        let rows = kv.os_partitions_for("u").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].owner_key, "a");
+        assert_eq!(rows[0].key_version, "v2");
+        assert_eq!(rows[0].org_id, "o");
+        assert_eq!(rows[0].space_id, "os:a");
+        assert_eq!(rows[0].logical_user, "u");
+        assert_eq!(rows[0].module_name, "a");
+        assert_eq!(rows[0].first_seen_at, "first-a");
+        assert_eq!(rows[0].last_seen_at, None);
+        assert_eq!(rows[1].owner_key, "b");
+        assert_eq!(rows[1].key_version, "v2");
+        assert_eq!(rows[1].org_id, "o");
+        assert_eq!(rows[1].space_id, "os:b");
+        assert_eq!(rows[1].logical_user, "u");
+        assert_eq!(rows[1].module_name, "b");
+        assert_eq!(rows[1].first_seen_at, "first-b");
+        assert_eq!(rows[1].last_seen_at.as_deref(), Some("last-b"));
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT space_kind FROM mem_os_partitions ORDER BY owner_key")
+                .fetch_all(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(kinds, ["module", "module"]);
+        let nullable: i64 = sqlx::query_scalar("SELECT \"notnull\" FROM pragma_table_info('mem_os_partitions') WHERE name='space_kind'")
+            .fetch_one(&kv.pool).await.unwrap();
+        assert_eq!(nullable, 1);
+        let duplicate = sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at) VALUES ('c','v2','o','os:a','u','c','t',NULL)")
+            .execute(&kv.pool).await;
+        assert!(matches!(duplicate.unwrap_err(), sqlx::Error::Database(e)
+            if e.code().as_deref() == Some("2067")));
+        let fk = sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at) VALUES ('c','v2','missing','os:c','u','c','t',NULL)")
+            .execute(&kv.pool).await;
+        assert!(matches!(fk.unwrap_err(), sqlx::Error::Database(e)
+            if e.code().as_deref() == Some("787")));
+        for invalid in [Some("other"), Some(""), None] {
+            let result = sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at,space_kind) VALUES ('c','v2','o','os:c','u','c','t',NULL,?)")
+                .bind(invalid).execute(&kv.pool).await;
+            assert!(result.is_err(), "invalid space_kind {invalid:?} accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_0016_records_personal_partition_idempotently() {
+        let kv = KvStore::open_memory().await.unwrap();
+        let org = kv.ensure_org_for_user("alice").await.unwrap();
+        let key = "usr:alice";
+        let id = OsPartitionIdentity {
+            owner_key: key,
+            key_version: "v2",
+            org_id: &org,
+            space_id: key,
+            user: "alice",
+            module: "@agent",
+        };
+        kv.record_personal_partition(id).await.unwrap();
+        kv.record_personal_partition(id).await.unwrap();
+        assert!(
+            kv.record_os_partition(id).await.is_err(),
+            "module upsert must not reinterpret a personal row"
+        );
+        let wrong_module = OsPartitionIdentity {
+            module: "ordinary-module",
+            ..id
+        };
+        assert!(kv.record_personal_partition(wrong_module).await.is_err());
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].module_name, "@agent");
+        assert_eq!(rows[0].space_kind, "personal");
+    }
+
+    #[tokio::test]
+    async fn migration_0016_failure_rolls_back_and_reopens_at_0015() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.db");
+        let pool = pool_migrated_up_to(&path, 16).await;
+        let mut migrator = sqlx::migrate!("./migrations");
+        let migrations = migrator.migrations.to_mut();
+        migrations.retain(|m| m.version <= 16);
+        let failing = migrations.iter_mut().find(|m| m.version == 16).unwrap();
+        failing
+            .sql
+            .to_mut()
+            .push_str("\nSELECT * FROM table_that_does_not_exist;");
+        assert!(migrator.run(&pool).await.is_err());
+        pool.close().await;
+
+        let reopened = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                    .unwrap()
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        let version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert_eq!(version, 15);
+        let columns = sqlx::query("PRAGMA table_info(mem_os_partitions)")
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+        assert!(
+            !columns
+                .iter()
+                .any(|r| r.get::<String, _>("name") == "space_kind")
+        );
+        reopened.close().await;
+        let upgraded = KvStore::open(&path).await.unwrap();
+        let version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&upgraded.pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 17);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);
@@ -1884,6 +2212,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_enabled_defaults_true_and_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("a24mem-settings-{}", std::process::id()));
+        let path = dir.join("mem.db");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Negative control: a fresh owner who never touched the switch is ON.
+        {
+            let kv = KvStore::open(&path).await.unwrap();
+            assert!(kv.memory_enabled("alice").await.unwrap());
+            kv.set_memory_enabled("alice", false).await.unwrap();
+            assert!(!kv.memory_enabled("alice").await.unwrap());
+            // Untouched owners stay unaffected by another owner's switch.
+            assert!(kv.memory_enabled("bob").await.unwrap());
+        }
+        // Still off after a simulated daemon restart (fresh pool, same file).
+        let reopened = KvStore::open(&path).await.unwrap();
+        assert!(!reopened.memory_enabled("alice").await.unwrap());
+        assert!(reopened.memory_enabled("bob").await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn keys_and_entries_are_sorted_and_scoped() {
         let kv = KvStore::open_memory().await.unwrap();
         kv.set("ns", "b", &serde_json::json!("B")).await.unwrap();
@@ -2083,5 +2432,624 @@ mod tests {
             (0, 0),
             "a refused rekey must not create a usage row for the never-realized new owner"
         );
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::assertion::{Assertion, AssertionStore, Forget};
+    use crate::event::{EventQuery, EventStore, Scope};
+    use crate::retriever::Retriever;
+    use sha2::{Digest, Sha256};
+
+    async fn setup(owner: &str) -> KvStore {
+        let kv = KvStore::open_memory().await.unwrap();
+        kv.assertions()
+            .assert(&Assertion::new(
+                "a1",
+                Scope::owner(owner),
+                "favorite_color",
+                "is",
+                serde_json::json!("blue"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        kv
+    }
+
+    async fn events(kv: &KvStore, owner: &str) -> Vec<event::StoredEvent> {
+        kv.events().scan(&EventQuery::owner(owner)).await.unwrap()
+    }
+
+    fn retract_id(owner: &str, id: &str) -> String {
+        let input = serde_json::to_string(&["retract", owner, id]).unwrap();
+        let hash = Sha256::digest(input.as_bytes());
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn forget_records_timestamp_and_one_correct_retraction_event() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("recorded_to").as_deref(),
+            Some("t2")
+        );
+        let events = events(&kv, "alice").await;
+        assert_eq!(events.len(), 1);
+        let e = &events[0].event;
+        assert_eq!(e.id, retract_id("alice", "a1"));
+        assert_eq!(e.kind, "assertion.retracted");
+        assert_eq!(e.scope.owner, "alice");
+        assert_eq!(e.body["assertion_id"], "a1");
+        assert_eq!(e.at, "t2");
+    }
+
+    #[tokio::test]
+    async fn forget_repeat_keeps_original_timestamp_and_one_event() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
+        assert_eq!(
+            kv.forget("alice", "a1", "t3").await.unwrap(),
+            Forget::AlreadyForgotten
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("recorded_to").as_deref(),
+            Some("t2")
+        );
+        let ev = events(&kv, "alice").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].event.at, "t2");
+    }
+
+    #[tokio::test]
+    async fn forget_foreign_owner_and_missing_id_are_not_found_without_side_effects() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("bob", "a1", "t4").await.unwrap(),
+            Forget::NotFound
+        );
+        assert_eq!(
+            kv.forget("alice", "missing", "t4").await.unwrap(),
+            Forget::NotFound
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("recorded_to"), None);
+        assert!(events(&kv, "alice").await.is_empty());
+        assert!(events(&kv, "bob").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_quota_failure_keeps_assertion_live_and_can_retry() {
+        let kv = setup("alice").await;
+        sqlx::query("UPDATE mem_owner_quota SET max_rows=0 WHERE owner='*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            kv.forget("alice", "a1", "t2").await,
+            Err(MemoryError::QuotaExceeded { .. })
+        ));
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("recorded_to"), None);
+        assert!(events(&kv, "alice").await.is_empty());
+        sqlx::query("UPDATE mem_owner_quota SET max_rows=100 WHERE owner='*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.forget("alice", "a1", "t3").await.unwrap(),
+            Forget::Forgotten
+        );
+        assert_eq!(events(&kv, "alice").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forgotten_assertion_stays_out_of_search_after_rebuild() {
+        let kv = setup("alice").await;
+        kv.assertions()
+            .assert(&Assertion::new(
+                "a2",
+                Scope::owner("alice"),
+                "favorite_color",
+                "is",
+                serde_json::json!("green"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let retriever = kv.retriever();
+        assert_eq!(
+            retriever.search("blue", "alice", 10).await.unwrap().len(),
+            1
+        );
+        let before = retriever
+            .search_any("blue missing", "alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].assertion.id, "a1");
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
+        assert!(
+            retriever
+                .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            retriever
+                .search_any("blue missing", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query("DELETE FROM mem_assertions_fts")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert!(
+            retriever
+                .search("green", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        retriever.rebuild().await.unwrap();
+        assert!(
+            retriever
+                .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            retriever
+                .search_any("blue missing", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let live = retriever
+            .search_any("green missing", "alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].assertion.id, "a2");
+    }
+
+    #[tokio::test]
+    async fn forget_retraction_ids_do_not_collide_across_owner_and_assertion_id() {
+        let kv = KvStore::open_memory().await.unwrap();
+        let store = kv.assertions();
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            store
+                .assert(&Assertion::new(
+                    id,
+                    Scope::owner(owner),
+                    "favorite_color",
+                    "is",
+                    serde_json::json!("blue"),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let retriever = kv.retriever();
+        for owner in ["alice", "alicex"] {
+            assert_eq!(retriever.search("blue", owner, 10).await.unwrap().len(), 1);
+        }
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            assert_eq!(kv.forget(owner, id, "t2").await.unwrap(), Forget::Forgotten);
+            assert_eq!(
+                kv.forget(owner, id, "t3").await.unwrap(),
+                Forget::AlreadyForgotten
+            );
+        }
+        for owner in ["alice", "alicex"] {
+            let events = events(&kv, owner).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.kind, "assertion.retracted");
+        }
+        assert_ne!(
+            events(&kv, "alice").await[0].event.id,
+            events(&kv, "alicex").await[0].event.id
+        );
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        retriever.rebuild().await.unwrap();
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_log_tests {
+    use super::*;
+    use agent24_models::Msg;
+    use event::{EventQuery, EventStore, MemEvent, Origin, Scope, Trust};
+    use session::CanonicalSession;
+    use session_log::ImportOutcome;
+
+    fn origin(trust: Trust) -> Origin {
+        Origin {
+            source: "test".into(),
+            trust,
+        }
+    }
+    fn assistant(s: &str) -> Msg {
+        Msg::assistant(Some(s.into()), vec![])
+    }
+    async fn events(kv: &KvStore, owner: &str, sid: &str) -> Result<Vec<event::StoredEvent>> {
+        kv.events()
+            .scan(&EventQuery::owner(owner).session(sid))
+            .await
+    }
+    async fn turn(
+        log: &session_log::SessionLog,
+        sid: &str,
+        turn_no: u64,
+        u: &str,
+        a: &str,
+    ) -> Result<()> {
+        append(log, "o", sid, turn_no, u, a).await?;
+        Ok(())
+    }
+    async fn append(
+        log: &session_log::SessionLog,
+        o: &str,
+        s: &str,
+        turn_no: u64,
+        u: &str,
+        a: &str,
+    ) -> Result<session_log::TurnIds> {
+        log.append_turn(
+            o,
+            s,
+            turn_no,
+            &Msg::user(u),
+            origin(Trust::UserSaid),
+            &assistant(a),
+            origin(Trust::Model),
+        )
+        .await
+    }
+    async fn quota(kv: &KvStore, owner: &str, rows: i64) -> Result<()> {
+        sqlx::query("INSERT INTO mem_owner_quota(owner,max_rows,max_bytes) VALUES(?,?,268435456)")
+            .bind(owner)
+            .bind(rows)
+            .execute(&kv.pool)
+            .await?;
+        Ok(())
+    }
+    fn turn_id(o: &str, s: &str, n: u64, role: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(o, s, n, role))?)
+        ))
+    }
+    fn contents(view: &session_log::SessionView) -> Vec<&str> {
+        view.tail
+            .iter()
+            .map(|(_, m)| m.content.as_deref().unwrap_or("<missing>"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_rejects_incomplete_event_pair() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let (o, s) = ("owner", "s");
+        let assistant = assistant("answer");
+        let occupied = MemEvent::new(
+            turn_id(o, s, 1, "assistant")?,
+            Scope::owner(o).with_session(s),
+            "message",
+            serde_json::to_value(&assistant)?,
+            origin(Trust::Model),
+        );
+        kv.events().append(&occupied).await?;
+
+        // This only checks the pre-write conflict check; it does not prove transaction rollback.
+        assert!(matches!(
+            append(&kv.session_log(), o, s, 1, "question", "answer").await,
+            Err(MemoryError::Conflict(_))
+        ));
+        assert!(
+            events(&kv, o, s)
+                .await?
+                .iter()
+                .all(|e| e.event.body["role"] != "user")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_is_idempotent_and_conflict_checked() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let (o, s) = ("owner", "s");
+        let log = kv.session_log();
+        let first = append(&log, o, s, 1, "question", "answer").await?;
+        let retry = append(&log, o, s, 1, "question", "answer").await?;
+        assert_eq!((first.user, first.assistant), (retry.user, retry.assistant));
+        assert_eq!(events(&kv, o, s).await?.len(), 2);
+        assert!(matches!(
+            append(&log, o, s, 1, "question", "changed").await,
+            Err(MemoryError::Conflict(_))
+        ));
+        let changed_user = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("changed question"),
+                origin(Trust::UserSaid),
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_assistant = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::UserSaid),
+                &assistant("changed"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_user_trust = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::Model),
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_assistant_trust = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::UserSaid),
+                &assistant("answer"),
+                origin(Trust::UserSaid),
+            )
+            .await;
+        for err in [
+            changed_user,
+            changed_assistant,
+            changed_user_trust,
+            changed_assistant_trust,
+        ] {
+            assert!(
+                matches!(err, Err(MemoryError::Conflict(_))),
+                "expected conflicting turn identity: {err:?}"
+            );
+        }
+        let different_source = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                Origin {
+                    source: "another-source".into(),
+                    trust: Trust::UserSaid,
+                },
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        assert!(
+            matches!(different_source, Err(MemoryError::Conflict(_))),
+            "same IDs with different provenance must conflict"
+        );
+        append(
+            &log,
+            "other-owner",
+            s,
+            1,
+            "separate question",
+            "separate answer",
+        )
+        .await?;
+        assert_eq!(events(&kv, "other-owner", s).await?.len(), 2);
+        assert_eq!(
+            contents(&log.load_view(o, s).await?),
+            ["question", "answer"]
+        );
+        assert_eq!(
+            events(&kv, o, s).await?.len(),
+            2,
+            "conflicts must leave history unchanged"
+        );
+        append(&log, o, "another-session", 1, "session isolated", "answer").await?;
+        assert_eq!(events(&kv, o, "another-session").await?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_user_text_in_distinct_turns_is_preserved() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+
+        let first = append(&log, "o", "s", 1, "继续", "第一轮回答").await?;
+        let second = append(&log, "o", "s", 2, "继续", "第二轮回答").await?;
+        assert_eq!(
+            append(&log, "o", "s", 1, "继续", "第一轮回答").await?,
+            first
+        );
+        assert_eq!(
+            append(&log, "o", "s", 2, "继续", "第二轮回答").await?,
+            second
+        );
+        assert_eq!(events(&kv, "o", "s").await?.len(), 4);
+        assert_eq!(
+            contents(&log.load_view("o", "s").await?),
+            ["继续", "第一轮回答", "继续", "第二轮回答"]
+        );
+
+        append(&log, "o", "same-answer", 1, "继续", "相同回答").await?;
+        append(&log, "o", "same-answer", 2, "继续", "相同回答").await?;
+        assert_eq!(events(&kv, "o", "same-answer").await?.len(), 4);
+        assert_eq!(
+            contents(&log.load_view("o", "same-answer").await?),
+            ["继续", "相同回答", "继续", "相同回答"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_zero_and_one_roll_back_turn() -> Result<()> {
+        for rows in [0, 1] {
+            let kv = KvStore::open_memory().await?;
+            quota(&kv, "q", rows).await?;
+            // quota=1 rejects the second event write, so it verifies transaction rollback.
+            assert!(matches!(
+                append(&kv.session_log(), "q", "s", 1, "u", "a").await,
+                Err(MemoryError::QuotaExceeded { owner, dimension: "rows" }) if owner == "q"
+            ));
+            assert!(
+                events(&kv, "q", "s").await?.is_empty(),
+                "quota={rows} must leave no partial turn"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_is_atomic_marked_idempotent_and_replayable() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let mut old = CanonicalSession::new("legacy");
+        old.summary = Some("older context".into());
+        old.recent = vec![Msg::user("old question"), assistant("old answer")];
+        let log = kv.session_log();
+        assert!(matches!(
+            log.import_legacy("o", &old).await?,
+            ImportOutcome::Imported { events: 4 }
+        ));
+        assert!(matches!(
+            log.import_legacy("o", &old).await?,
+            ImportOutcome::AlreadyImported
+        ));
+        let stored = events(&kv, "o", "legacy").await?;
+        assert_eq!(stored.len(), 4);
+        assert_eq!(stored[0].event.kind, "session.summary");
+        assert_eq!(stored[0].event.body["covered_through_seq"], 0);
+        assert_eq!(stored[1].event.origin.source, "migration");
+        assert_eq!(stored[3].event.kind, "session.imported");
+        assert_eq!(
+            stored[3].event.body,
+            serde_json::json!({"from":"kv","messages":2,"had_summary":true})
+        );
+        let replay = replay::replayed_from_events(&stored)?;
+        assert_eq!(replay.messages, old.recent);
+        assert_eq!(
+            replay
+                .provenance
+                .iter()
+                .map(|p| p.trust)
+                .collect::<Vec<_>>(),
+            [Trust::UserSaid, Trust::Model]
+        );
+        assert!(matches!(
+            log.import_legacy("o", &CanonicalSession::new("empty"))
+                .await?,
+            ImportOutcome::NothingToImport
+        ));
+        let failed = KvStore::open_memory().await?;
+        quota(&failed, "q", 1).await?;
+        assert!(failed.session_log().import_legacy("q", &old).await.is_err());
+        assert!(events(&failed, "q", "legacy").await?.is_empty());
+
+        let next = append(&log, "o", "legacy", 1, "new question", "new answer").await?;
+        assert_eq!(
+            next,
+            append(&log, "o", "legacy", 1, "new question", "new answer").await?
+        );
+        assert_eq!(
+            contents(&log.load_view("o", "legacy").await?),
+            ["old question", "old answer", "new question", "new answer"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summaries_follow_session_message_sequences() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        turn(&log, "s", 1, "one", "two").await?;
+        turn(&log, "other", 1, "interleave", "x").await?;
+        turn(&log, "s", 2, "three", "four").await?;
+        let first_summary_seq = log.append_summary("o", "s", "summary one", 2).await?;
+        assert!(
+            events(&kv, "o", "s").await?.iter().any(
+                |event| event.seq == first_summary_seq && event.event.kind == "session.summary"
+            )
+        );
+        assert_eq!(contents(&log.load_view("o", "s").await?), ["three", "four"]);
+        turn(&log, "other", 2, "interleave two", "y").await?;
+        turn(&log, "s", 3, "five", "six").await?;
+        let second_summary_seq = log.append_summary("o", "s", "summary two", 6).await?;
+        assert!(
+            events(&kv, "o", "s")
+                .await?
+                .iter()
+                .any(|event| event.seq == second_summary_seq
+                    && event.event.kind == "session.summary")
+        );
+        let view = log.load_view("o", "s").await?;
+        assert_eq!(view.summary.as_deref(), Some("summary two"));
+        assert_eq!(view.covered_through_seq, 6);
+        assert_eq!(contents(&view), ["five", "six"]);
+        Ok(())
     }
 }

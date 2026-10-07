@@ -26,6 +26,9 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@agent24/api-client':
+        specifier: workspace:*
+        version: link:../../packages/api-client
       '@agent24/node-daemon':
         specifier: workspace:*
         version: link:../../packages/node-daemon

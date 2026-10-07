@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use agent24_models::router::TaskProfile;
 use agent24_models::{CompletionRequest, ModelError};
 use agent24_protocol::{
-    ChatRequest, ChatResponse, ErrorBody, EventBody, Model, ModelDeltaPayload, RunCompletedPayload,
-    RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
+    ChatRequest, ChatResponse, ErrorBody, EventBody, MemoryReceipt, Model, ModelDeltaPayload,
+    RunCompletedPayload, RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
 };
 use agent24_store::{CallTimingRow, CallTimingSummaryRow, ModelUsageRow};
 use axum::body::Body;
@@ -482,32 +482,68 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         }
     };
 
+    // M1-T12: the latest user turn is what SessionMemory recall/retain both
+    // key on (same as a run's `run.input.prompt`) — found before the run_id
+    // exists so a session-less request pays none of this.
+    let latest_user_message = chat
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone());
+    // Run_id generated up-front (not after the memory prelude below) so the
+    // SAME id tags `memory.recalled`/`memory.write_skipped` as tags
+    // `run.started` — a transient run, session_id null unless the caller
+    // opted into memory (SPEC-002 §2).
+    let run_id = format!("run_{}", agent24_core::util::ulid());
+    let base_messages: Vec<agent24_models::Msg> = chat
+        .messages
+        .iter()
+        .map(|m| agent24_models::Msg {
+            role: m.role.clone(),
+            content: Some(m.content.clone()),
+            tool_calls: vec![],
+            tool_call_id: None,
+        })
+        .collect();
+    // Without `session_id` the message list is untouched — byte-for-byte
+    // the same request this endpoint always sent. With it, reuse the SAME
+    // SessionMemory recall/pause-notice machinery the agent loop uses
+    // (`RunManager::chat_memory_prelude`, not duplicated here) and the SAME
+    // `normalize_for_provider` ordering rules (system first, merge adjacent
+    // `user` turns) the run loop's first call applies.
+    // M1-T14: captured here (alongside the messages to prepend) so the
+    // response built below can report a deterministic `memory_receipt` —
+    // never inferred from the model's own reply text.
+    let mut explicit_remember_state: Option<agent24_agent::ExplicitRememberState> = None;
+    let messages = match (chat.session_id.as_deref(), latest_user_message.as_deref()) {
+        (Some(sid), Some(prompt)) => {
+            let (prelude, remember_state) = state
+                .runs
+                .chat_memory_prelude(&run_id, Some(sid), prompt)
+                .await;
+            explicit_remember_state = remember_state;
+            let combined: Vec<agent24_models::Msg> =
+                prelude.into_iter().chain(base_messages.clone()).collect();
+            agent24_agent::normalize_for_provider(&combined)
+        }
+        _ => base_messages,
+    };
     let request = CompletionRequest {
         // /chat is the plain conversational surface — no tools offered here;
         // tool-using work goes through /runs (the agent loop)
-        messages: chat
-            .messages
-            .iter()
-            .map(|m| agent24_models::Msg {
-                role: m.role.clone(),
-                content: Some(m.content.clone()),
-                tool_calls: vec![],
-                tool_call_id: None,
-            })
-            .collect(),
+        messages,
         model: chat.model,
         tools: vec![],
         response_format: None,
         max_tokens: None,
         disable_thinking: false,
     };
-    // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
-    let run_id = format!("run_{}", agent24_core::util::ulid());
     state
         .events
         .broadcast(EventBody::RunStarted(RunStartedPayload {
             run_id: run_id.clone(),
-            session_id: None,
+            session_id: chat.session_id.clone(),
             schedule_id: None,
         }));
 
@@ -568,6 +604,43 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     run_id: run_id.clone(),
                     text: text.clone(),
                 }));
+            // M1-T12: commit this turn to the SAME SessionLog + retain path
+            // the agent loop uses (`RunManager::chat_remember_turn`, reusing
+            // `remember_exchange` as-is) — only when the caller opted into
+            // memory. A log/retain failure is observed (`memory.write_failed`,
+            // emitted by the reused code path) but never drops this already-
+            // computed response.
+            // fix683 (PR #683 review): `explicit_remember_state` is a
+            // snapshot taken BEFORE the model call — personal memory can be
+            // paused or un-paused by the time the write below actually
+            // commits (ChatPage now stays mounted, so the memory page is
+            // reachable mid-generation). It must therefore decide ONLY
+            // whether this field is present at all (same deterministic
+            // `explicit_remember(prompt)` match the write path uses on the
+            // same prompt text, so its Some/None agrees with the live
+            // outcome's NotApplicable/not). The saved/paused_not_saved/failed
+            // verdict comes exclusively from `chat_remember_turn`'s LIVE
+            // result, computed at commit time inside the write transaction.
+            let memory_receipt = if let (Some(sid), Some(prompt)) =
+                (chat.session_id.as_deref(), latest_user_message.as_deref())
+            {
+                let outcome = state.runs.chat_remember_turn(sid, prompt, &text).await;
+                explicit_remember_state.and(match outcome {
+                    agent24_agent::MemoryWriteOutcome::Saved => Some(MemoryReceipt::Saved),
+                    agent24_agent::MemoryWriteOutcome::SkippedPaused => {
+                        Some(MemoryReceipt::PausedNotSaved)
+                    }
+                    agent24_agent::MemoryWriteOutcome::Failed => Some(MemoryReceipt::Failed),
+                    // Unreachable in practice when `explicit_remember_state`
+                    // is `Some`: both snapshots run the same pure
+                    // `explicit_remember(prompt)` match on the same prompt.
+                    // Falls back to "no receipt" rather than fabricating
+                    // saved/paused — never lies about a non-write.
+                    agent24_agent::MemoryWriteOutcome::NotApplicable => None,
+                })
+            } else {
+                None
+            };
             state
                 .events
                 .broadcast(EventBody::RunCompleted(RunCompletedPayload {
@@ -584,6 +657,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 model_id: reported_model_id,
                 tier: Some(tier.to_owned()),
                 latency_ms: Some(latency_ms),
+                memory_receipt,
             })
             .into_response()
         }

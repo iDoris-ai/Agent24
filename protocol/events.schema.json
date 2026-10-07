@@ -89,6 +89,55 @@
       "type": "object",
       "properties": {
         "payload": {
+          "$ref": "#/$defs/MemoryWriteFailedPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "memory.write_failed"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "description": "M1-T10 review H1: emitted at run start instead of silently dropping an\nexplicit \"记住……\" while personal memory is paused — the model is ALSO\ntold (a data notice injected alongside recall), so it does not tell\nthe user it remembered something it did not.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/MemoryWriteSkippedPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "memory.write_skipped"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/MemoryRecalledPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "memory.recalled"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
           "$ref": "#/$defs/RunFailedPayload"
         },
         "type": {
@@ -467,6 +516,65 @@
       "required": [
         "code",
         "message"
+      ]
+    },
+    "MemoryRecalledPayload": {
+      "description": "Assertion ids that were actually included in a run's recalled context.",
+      "type": "object",
+      "properties": {
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "ids"
+      ]
+    },
+    "MemoryWriteFailedPayload": {
+      "description": "The answer completed, but its session exchange could not be recorded.",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "reason"
+      ]
+    },
+    "MemoryWriteSkippedPayload": {
+      "description": "M1-T10 review H1: `reason` is an open enum (today only `\"paused\"`).",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Null for transient (session-less) runs, same as `RunStartedPayload`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "run_id",
+        "reason",
+        "session_id"
       ]
     },
     "ModelCallPayload": {

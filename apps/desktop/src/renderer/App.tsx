@@ -19,6 +19,7 @@ import CommunicationPage from './pages/comm/Communication'
 import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
 import CreativePage from './pages/Creative'
+import MemoryPage from './pages/Memory'
 import logoSidebar from './assets/logo-sidebar.png'
 
 // Static module route map — M2 will replace this with dynamic import()
@@ -38,6 +39,7 @@ type BuiltinPage =
   | 'voice'
   | 'creative'
   | 'models'
+  | 'memory'
   | 'settings'
   | 'modules-manager'
 type Page = BuiltinPage | string  // string = module route
@@ -53,6 +55,8 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'creative',        icon: '🎨', label: 'Design' },
   { id: 'models',          icon: '🤖', label: '模型' },
   { id: 'modules-manager', icon: '🧩', label: '模块管理' },
+  // M1-T11: 记忆页紧挨设置，和它共享"这是你对 Agent24 的控制面"这同一个位置。
+  { id: 'memory',          icon: '🧠', label: '记忆' },
   { id: 'settings',        icon: '⚙️', label: '设置' },
 ]
 
@@ -60,7 +64,8 @@ const BUILTIN_TITLES: Record<BuiltinPage, string> = {
   chat: '对话', workbench: '工作台', runs: '运行任务',
   schedules: '定时调度', approvals: '待审批', voice: '语音',
   communication: '通信概览',
-  creative: 'Design', models: '模型管理', 'modules-manager': '模块管理', settings: '设置',
+  creative: 'Design', models: '模型管理', 'modules-manager': '模块管理',
+  memory: '记忆', settings: '设置',
 }
 
 // FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
@@ -284,8 +289,22 @@ export function App(): JSX.Element {
 
         {/* Review M3: the chat suffix no longer takes a default-model prop —
             it shows ONLY the server's own reported model_id (chat-latency.ts),
-            never the topbar's daemon-default guess standing in for it. */}
-        {page === 'chat'             && <ChatPage />}
+            never the topbar's daemon-default guess standing in for it.
+            M1-T14: ChatPage stays MOUNTED for the app's whole lifetime — only
+            hidden via `display: none` — so navigating away to another page
+            and back never unmounts it. Unmounting would drop its message
+            list, input draft and per-conversation session_id (see Chat.tsx's
+            `useState(() => genChatSessionId())`), silently starting a new D1
+            memory session on every round trip through another page. */}
+        <div
+          style={
+            page === 'chat'
+              ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }
+              : { display: 'none' }
+          }
+        >
+          <ChatPage />
+        </div>
         {page === 'workbench'        && <WorkbenchPage />}
         {page === 'runs'             && <RunsPage />}
         {page === 'schedules'        && <SchedulesPage />}
@@ -295,6 +314,7 @@ export function App(): JSX.Element {
         {page === 'creative'         && <CreativePage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
+        {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage />}
         {/* Module UI pages — static map in M1, dynamic import() in M2 */}
         {moduleNavItems.map((m) => {
