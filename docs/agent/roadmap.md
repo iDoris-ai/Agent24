@@ -60,7 +60,9 @@ M4–M6 是 2026-08-25 追加的**产品线**（Cos72 workspace），依据见
 - **F1.2 personal space（原 F8c）** — agent loop 自己的记忆搬进空间模型，消掉 ADR-030 硬门槛 3 那条例外。
 - **F1.3 记忆接进 agent loop（原 F2）** — 会话轮次写进 EventLog；`Condenser` 取代 `CanonicalSession` 的压缩，后者降级为投影。
 
-## M2 — M-E 收口余项（本轮不做，登记在案）
+## M2 — M-E 收口余项（▶️ 2026-10-07 启动，集成分支 `ab/m2`，计划见 [`PLAN-M2.md`](PLAN-M2.md)）
+
+> 2026-10-07 逐条对照代码核实：F4b/F4d/F4e 已解决（#183/#182/#196），F4a、F4c 仍存在；F3/F6/F7 需 jason 拍板。下列原文保留作出处。
 
 目标：把 `SPEC-ME-FOLLOWUPS.md` 剩下的债清掉。
 

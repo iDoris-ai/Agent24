@@ -311,6 +311,23 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 
 ---
 
+## M2 台账（2026-10-07 立；M-E 收口余项；本表是 M2 唯一的状态来源）
+
+> 定义/验收/核实结论见 [`PLAN-M2.md`](PLAN-M2.md)。集成分支 `ab/m2`，task 分支 `ab/m2-NN-<短名>`，PR base = `ab/m2`。「高风险」= 合并前须等 PR-Daemon APPROVE（`AGENTS.md`）。
+> 核实结论摘要：F4b/F4d/F4e、F5a/b/c 已解决；F4a、F4c、FU-70 仍存在；F3/F6/F7 待 jason 拍板（PLAN-M2 §3 D1–D3）；FU-45 未到期。
+
+| ID | 任务 | 依赖 | 高风险 | 状态 | 证据 |
+|---|---|---|---|---|---|
+| M2-01 | 计划 + 台账 + roadmap 启动标注 | — | 否 | `IN_PROGRESS` | 本 PR |
+| M2-02 | OpenAPI 补 `/os` 族契约（F4a） | M2-03 | 是（协议） | `BACKLOG` |  |
+| M2-03 | 路由 ↔ OpenAPI 双向覆盖门（F4a / FU-10） | — | 否 | `BACKLOG` |  |
+| M2-04 | OpenAPI 补 `/attached`、`/timings` 契约（F4a） | M2-03 | 是（协议） | `BACKLOG` |  |
+| M2-05 | `os list/enable/disable` 不再回退临时 daemon（F4c）+ F4d 过时注释 | — | 否 | `BACKLOG` |  |
+| M2-06 | 审批回调绑定请求生命周期（FU-70 / FU-54） | — | 是（权限 + 数据写入） | `BACKLOG` |  |
+| M2-07 | 记账收口（SPEC / followups / ADR，按 D1–D3 落文） | M2-02…06、D1–D3 | 否 | `BACKLOG` |  |
+| M2-08 | 模块目录 `openat` 逐级打开（F6，**仅当 D2 = B**） | D2 | 是（安全） | `BACKLOG` |  |
+| **M2 release** | `ab/m2` → main（PR-Daemon APPROVE + jason 真机验收） | 全部 | — | `BACKLOG` |  |
+
 ## M1 v2 台账（2026-10-01 冻结；本表是 M1 唯一的状态来源）—— ✅ 2026-10-07 已全部合入 main（#720）
 
 > 定义/验收见 [`M1-PLAN-v2.md`](M1-PLAN-v2.md)（已冻结 2026-10-01）。执行：集成分支 `ab/m1-memory`；~~B（Mac mini ab-codex）执行、A（笔记本）派活与验收~~ —— **2026-10-03 起全部在笔记本上派活/构建/测试/验收，B 机不再构建 Agent24**。[笔记本] 标注的需要本地模型。入队顺序见 M1-PLAN-v2 §2「依赖图与入队顺序」。
