@@ -1,0 +1,14 @@
+id: "s01-03-zh-holiday-2026"
+title: "国务院办公厅关于2026年部分节假日安排的通知（国办发明电〔2025〕7号）"
+lang: "zh"
+kind: "text_pdf"
+pages: 2
+source_url: "https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm"
+publisher: "国务院办公厅"
+retrieved_at: "2026-10-07"
+license: "CN-Copyright-Art5"
+sha256_original: "182376afd5d9f161b21ee0998d76fa94b338dcd9f64e9c9a879a6a0bd6198859"
+sha256_stored: "182376afd5d9f161b21ee0998d76fa94b338dcd9f64e9c9a879a6a0bd6198859"
+redactions: []
+covers: [C1, C5, C6]
+notes: "网页原文经 Chrome 无头打印为 PDF（gov.cn 打印样式），正文未改。已知文本层异常：标题被抽取为“部分节假日日安排”（显示为“部分节假日安排”）。"

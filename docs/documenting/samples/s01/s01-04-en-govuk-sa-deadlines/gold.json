@@ -1,0 +1,107 @@
+{
+  "id": "s01-04-en-govuk-sa-deadlines",
+  "schema": "s01-gold-v1",
+  "fields": [
+    {
+      "key": "register_deadline",
+      "status": "present",
+      "value": "5 October (if you need to complete a return and have not sent one before)",
+      "anchors": [
+        {
+          "page": 2,
+          "quote": "You must tell HMRC by 5 October"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "paper_return_deadline",
+      "status": "present",
+      "value": "11:59pm on 31 October 2026",
+      "normalized": "2026-10-31T23:59",
+      "anchors": [
+        {
+          "page": 2,
+          "quote": "11:59pm on 31 October 2026"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "online_return_deadline",
+      "status": "present",
+      "value": "11:59pm on 31 January 2027",
+      "normalized": "2027-01-31T23:59",
+      "anchors": [
+        {
+          "page": 3,
+          "quote": "You must submit your online tax return by 11:59pm on 31 January 2027"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "payment_deadline",
+      "status": "present",
+      "value": "11:59pm on 31 January 2027",
+      "normalized": "2027-01-31T23:59",
+      "anchors": [
+        {
+          "page": 3,
+          "quote": "You need to pay your Self Assessment tax by 11:59pm on 31 January 2027"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "tax_code_submission_deadline",
+      "status": "present",
+      "value": "11:59pm on 30 December 2026",
+      "normalized": "2026-12-30T23:59",
+      "anchors": [
+        {
+          "page": 3,
+          "quote": "you must submit it by 11:59pm on 30 December 2026"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "profit_unknown_still_required",
+      "status": "present",
+      "value": "If you do not know your profit for the whole tax year, you still need to send a tax return.",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 2,
+          "quote": "If you do not know your profit for the whole tax year, you still need to send a tax return."
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "trustees_no_online",
+      "status": "present",
+      "value": "You cannot send a return online.",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 3,
+          "quote": "You cannot send a return online."
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "penalty_amount",
+      "status": "missing",
+      "severity": "major"
+    }
+  ],
+  "must_not_assert": [
+    "a penalty amount such as £100",
+    "that people who do not know their profit need not send a return"
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}

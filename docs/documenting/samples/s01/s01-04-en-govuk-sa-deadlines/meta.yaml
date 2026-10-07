@@ -1,0 +1,14 @@
+id: "s01-04-en-govuk-sa-deadlines"
+title: "Self Assessment tax returns: Deadlines (GOV.UK)"
+lang: "en"
+kind: "text_pdf"
+pages: 4
+source_url: "https://www.gov.uk/self-assessment-tax-returns/deadlines"
+publisher: "HM Revenue and Customs / GOV.UK"
+retrieved_at: "2026-10-07"
+license: "OGL-UK-3.0"
+sha256_original: "8e497af28f13c186a34d4343016ab9e932f5ef4b2f4c41115cc5cdfbad053df7"
+sha256_stored: "8e497af28f13c186a34d4343016ab9e932f5ef4b2f4c41115cc5cdfbad053df7"
+redactions: []
+covers: [C3, C5, C6]
+notes: "Printed from the live page with headless Chrome; content is for tax year 2025-26 as of retrieval. Reading-order trap: the '!' callout appears mid-page 2 visually but at the end of page 2 in the text layer. Penalty amounts are on a different page (expected 'missing')."
