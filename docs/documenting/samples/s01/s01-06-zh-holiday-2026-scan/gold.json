@@ -1,0 +1,67 @@
+{
+  "id": "s01-06-zh-holiday-2026-scan",
+  "schema": "s01-gold-v1",
+  "fields": [
+    {
+      "key": "doc_number",
+      "status": "present",
+      "value": "国办发明电〔2025〕7号",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "国办发明电〔2025〕7号"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "spring_festival_makeup_workdays",
+      "status": "present",
+      "value": "2月14日（周六）、2月28日（周六）上班",
+      "normalized": "2026-02-14,2026-02-28",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "2月14日（周六）、2月28日（周六）"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "labour_day_holiday",
+      "status": "present",
+      "value": "5月1日至5日放假调休，共5天；5月9日（周六）上班",
+      "normalized": "2026-05-01/2026-05-05",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "5月1日（周五）至5日（周二）放假调休，共5天"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "national_day_makeup_workdays",
+      "status": "present",
+      "value": "9月20日（周日）、10月10日（周六）上班",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "9月20日（周日）、10月10日（周六）上班"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "issue_date",
+      "status": "missing",
+      "severity": "major",
+      "note": "成文日期在原件第 2 页，扫描件只有第 1 页"
+    }
+  ],
+  "must_not_assert": [
+    "an issue date"
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}

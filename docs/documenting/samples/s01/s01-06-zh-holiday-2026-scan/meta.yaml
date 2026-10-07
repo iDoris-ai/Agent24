@@ -1,0 +1,16 @@
+id: "s01-06-zh-holiday-2026-scan"
+title: "国务院办公厅关于2026年部分节假日安排的通知（第 1 页模拟扫描）"
+lang: "zh"
+kind: "image"
+pages: 1
+source_url: "https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm"
+publisher: "国务院办公厅"
+retrieved_at: "2026-10-07"
+license: "CN-Copyright-Art5"
+sha256_original: "78e459d6c6c8d7305b1a4b44f80aa44e2f4670706099463ba0411f65ccd4c8de"
+sha256_stored: "78e459d6c6c8d7305b1a4b44f80aa44e2f4670706099463ba0411f65ccd4c8de"
+redactions: []
+covers: [C2]
+derived_from: "s01-03-zh-holiday-2026"
+synthetic_derived: true
+notes: "由 s01-03 第 1 页以 macOS sips 栅格化（72 dpi）、旋转 2°、放大到 900px 宽、JPEG 质量 45 生成的模拟扫描件；正文未改。按规范计入合成占比（派生）。只含第 1 页，成文日期在第 2 页，因此期望“缺失”。"
