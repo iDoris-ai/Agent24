@@ -142,7 +142,9 @@ David's primary scope is the **Documenting business capability**, delivered as t
 
 The scope must not be reduced to a frontend page.
 
-Temporary Workspace / WeKnora integration work is tracked separately in §12 with its own scope and exit conditions. It does not extend this list.
+David also owns **Line K, the KB service** (§12). That is a separate line with its own scope, issues and acceptance. It is not part of the Documenting scope above, and Documenting does not wait on it.
+
+Generic Workspace integration work (Line W) is tracked separately in §12 with its own scope and exit conditions. It does not extend this list.
 
 ### 4.2 Capability map
 
@@ -171,7 +173,7 @@ Listing a capability group here is **not** acceptance coverage. Every group is c
 
 ### KnowledgeBase / MediaBase
 
-The KB/Media provider owns or supplies the agreed lower-level capabilities such as:
+These are boundaries of **Documenting**, not statements about who owns the other line. The KB (Line K, owned by David, §12) and Media providers own or supply the agreed lower-level capabilities such as:
 
 - ingestion backend;
 - parsing/OCR jobs;
@@ -412,12 +414,17 @@ The previous plan made the generic Workspace host (former Phase A) and the Knowl
 ```text
 Line D  Documenting core   D1 → D2 → D3 → D4          owner: David Xu
 Line W  Workspace integration (scoped, time-boxed)    owner: TBD; David's share explicit
-Line K  KB service dependency (per operation)         owner: KB/Knowledge team
+Line K  KB service (Documenting depends per operation) owner: David Xu (since 2026-10-07)
 ```
 
 - **Line D** is David's mainline: getting ordinary users' document tasks working end to end. It does not wait for Line W. Knowledge-free operations (§9.1) do not wait for Line K.
 - **Line W** is independent platform work, not a prerequisite for Line D. It covers the generic Workspace host, the OD compatibility adapter and the WeKnora Workspace entry. Documenting is not delivered through it (§2.3). Any part temporarily assigned to David is listed explicitly with an exit condition (a handover owner and date). It is not added to §4.1.
-- **Line K** is consumed through an agreed service contract (ingest/status, search, source, citation, ACL, revision mapping). Documenting depends on it per operation (§14). It does not own or operate it.
+- **Line K** is consumed through an agreed service contract (ingest/status, search, source, citation, ACL, revision mapping). Documenting depends on it per operation (§14).
+  - David owns Line K as well as Line D, as **two separate lines**.
+  - Documenting still uses the KB only through the service contract. It does not reach into WeKnora internals, and it keeps no private knowledge store.
+  - Line D does not wait for Line K.
+  - Line K has its own issues and acceptance. Its work must not be counted as Documenting progress, or the other way round.
+  - When both lines compete for time, the priority is decided explicitly and recorded on the board, never silently.
 
 ## 13. WeKnora Fork Principle
 
@@ -494,7 +501,7 @@ Needs: Agent24/connectors for execution and receipts.
 
 Independent platform work; not on Documenting's critical path. Reproducible OD baseline and golden paths → generic Workspace contract → OD compatibility adapter with regression evidence and a rollback path → WeKnora Workspace entry. Start with a trusted adapter calling WeKnora REST, rather than assuming Agent24 can consume WeKnora HTTP MCP directly.
 
-### Line K — KB service (formerly the service part of Phase B)
+### Line K — KB service (owner: David; formerly the service part of Phase B)
 
 Upstream-tracking WeKnora fork, adapter/service contract, search/source integration, citation preservation, identity/scope mapping, explicit health/capability states, and document ↔ KB revision mapping (§7).
 
@@ -516,7 +523,7 @@ The first end-to-end acceptance is two vertical slices, not the whole capability
 | Dependency | Needed by Documenting | Needed from phase | Owner |
 |---|---|---|---|
 | Agent24 Core | capability registration, trusted caller context, permissions, approvals, run/cancel/model/tool access | D1 | Agent24 |
-| WeKnora / KB | ingest/status, search, source, citation, ACL, revision mapping | D2 (knowledge ops only) | KB/Knowledge |
+| WeKnora / KB | ingest/status, search, source, citation, ACL, revision mapping | D2 (knowledge ops only) | David Xu (Line K) |
 | Document engines (edit / OCR / conversion) | rendering, structured edit, layout, revision-safe mutation, OCR, export — reused existing engines behind adapters (§2.1) | D1 (render), D3–D4 | engine choice TBD; adapters owned by Documenting |
 | Agent24 desktop shell | navigation entry, native page hosting, open-file-from-chat | D1 | Agent24 desktop |
 | OpenDesign/OpenCreator | context/artifact/run/cancel handoff | Line W | Workspace/Creative |
@@ -635,7 +642,7 @@ Before implementation, and before converting this framework into a detailed GitH
 
 1. decisions §17 #1, #2, #3, #7, which block D1;
 2. generic Workspace is tracked as independent platform work with its own owner, and any temporary David assignment has an exit (§17 #9);
-3. the KB/WeKnora test endpoint and the Line K service contract owner;
+3. the KB/WeKnora test endpoint, and the Line K service contract (owner: David);
 4. the sanitized sample set and gold labels for V1/V2 (§18.2);
 5. review of the DocumentService contract skeleton (§10) as an ADR draft.
 
