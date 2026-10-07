@@ -1038,21 +1038,16 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
 /// today and for the foreseeable future.
 async fn cmd_decide(action: DecideAction) -> Result<(), String> {
+    match &action {
+        DecideAction::Export { jsonl, .. } => require_jsonl(*jsonl)?,
+        DecideAction::Delete { .. } => {}
+    }
     let dir = agent24_protocol::state_file::state_dir().ok_or_else(|| "HOME not set".to_owned())?;
     let store = agent24_store::Store::open(&dir.join("agent24.db"))
         .await
         .map_err(|e| e.to_string())?;
     match action {
-        DecideAction::Export {
-            jsonl,
-            point,
-            since,
-        } => {
-            if !jsonl {
-                return Err(
-                    "only --jsonl export is supported today (PLAN-DECIDE.md's own ask)".to_owned(),
-                );
-            }
+        DecideAction::Export { point, since, .. } => {
             let rows = store
                 .export_decision_log(point.as_deref(), since.as_deref())
                 .await
@@ -1063,6 +1058,27 @@ async fn cmd_decide(action: DecideAction) -> Result<(), String> {
             Ok(())
         }
         DecideAction::Delete { action } => cmd_decide_delete(&store, action).await,
+    }
+}
+
+/// `export`'s `--jsonl` guard, pulled out to a pure function so it is
+/// directly unit-testable (pre-pr-check T2) without a `Store` or `HOME` —
+/// see `jsonl_flag_is_required_and_checked_before_touching_the_store` below.
+fn require_jsonl(jsonl: bool) -> Result<(), String> {
+    if jsonl {
+        Ok(())
+    } else {
+        Err("only --jsonl export is supported today (PLAN-DECIDE.md's own ask)".to_owned())
+    }
+}
+
+/// `delete all`'s `--confirm` guard, pulled out for the same reason — see
+/// `delete_all_without_confirm_is_rejected_and_deletes_nothing` below.
+fn require_confirm(confirm: bool) -> Result<(), String> {
+    if confirm {
+        Ok(())
+    } else {
+        Err("this deletes the ENTIRE decision log — pass --confirm to proceed".to_owned())
     }
 }
 
@@ -1095,11 +1111,7 @@ async fn cmd_decide_delete(
             Ok(())
         }
         DecideDeleteAction::All { confirm } => {
-            if !confirm {
-                return Err(
-                    "this deletes the ENTIRE decision log — pass --confirm to proceed".to_owned(),
-                );
-            }
+            require_confirm(confirm)?;
             let deleted = store
                 .delete_all_decision_log()
                 .await
@@ -2179,6 +2191,99 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // ── D0-2 `agent24 decide` guards (pre-pr-check T2) ──────────────────────
+
+    /// Removing the `require_jsonl` call from `cmd_decide` (or short-circuiting
+    /// it to always `Ok(())`) makes this test red: `jsonl: false` must be
+    /// rejected, not silently treated as "export anyway".
+    #[test]
+    fn jsonl_flag_is_required_and_checked_before_touching_the_store() {
+        assert!(require_jsonl(false).is_err());
+        assert!(require_jsonl(true).is_ok());
+    }
+
+    /// Same for `delete all`'s `--confirm`: removing `require_confirm`'s call
+    /// in `cmd_decide_delete` (or inlining `confirm` as always-true) makes
+    /// this red.
+    #[test]
+    fn confirm_flag_is_required_for_delete_all() {
+        assert!(require_confirm(false).is_err());
+        assert!(require_confirm(true).is_ok());
+    }
+
+    /// S3: both guards are evaluated by `cmd_decide`/`cmd_decide_delete`
+    /// themselves, at the point the action would actually run (export's
+    /// query, delete's `DELETE`) — not once at CLI entry/arg-parsing time
+    /// and then trusted for the rest of the call. There is no separate
+    /// "validate the whole `Cli` up front" pass whose result could go stale
+    /// between parsing and execution: `require_jsonl`/`require_confirm` are
+    /// called with the SAME `bool` clap just parsed, in the same function
+    /// that performs the action, on every invocation (a fresh CLI process
+    /// each time — there is no cached/startup-time decision to go stale).
+    #[tokio::test]
+    async fn delete_all_without_confirm_is_rejected_and_deletes_nothing() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        store
+            .insert_decision_log(&agent24_store::NewDecisionLogEntry {
+                decision_id: "d1".to_owned(),
+                ts: "2026-10-07T00:00:00Z".to_owned(),
+                schema_version: 1,
+                point: "retain.intent".to_owned(),
+                input: Some("记住我对花生过敏".to_owned()),
+                context_json: Some("{}".to_owned()),
+                question_json: "[]".to_owned(),
+                layers_json: "[]".to_owned(),
+                final_action: "execute".to_owned(),
+                hw_tier: None,
+            })
+            .await
+            .unwrap();
+
+        let result = cmd_decide_delete(&store, DecideDeleteAction::All { confirm: false }).await;
+        assert!(result.is_err());
+
+        let remaining = store.export_decision_log(None, None).await.unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "a rejected --confirm must not delete anything"
+        );
+    }
+
+    #[test]
+    fn decision_log_export_line_uses_the_key_final_not_final_action_and_nests_json() {
+        let row = agent24_store::DecisionLogExportRow {
+            log: agent24_store::DecisionLogRow {
+                decision_id: "d1".to_owned(),
+                ts: "2026-10-07T00:00:00Z".to_owned(),
+                schema_version: 1,
+                point: "retain.intent".to_owned(),
+                input: Some("记住我对花生过敏".to_owned()),
+                context_json: Some(r#"{"turn":1}"#.to_owned()),
+                question_json: r#"[{"kind":"noul","id":"q1"}]"#.to_owned(),
+                layers_json: r#"[{"backend":"rule"}]"#.to_owned(),
+                final_action: "execute".to_owned(),
+                hw_tier: Some("t2".to_owned()),
+                scrubbed_at: None,
+            },
+            outcomes: vec![agent24_store::DecisionOutcomeRow {
+                ts: "2026-10-07T00:01:00Z".to_owned(),
+                signal: "clarify_answer".to_owned(),
+                label_json: r#"{"answer":true}"#.to_owned(),
+                quality: "high".to_owned(),
+            }],
+        };
+        let line = decision_log_export_line(&row).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["final"], "execute");
+        assert!(v.get("final_action").is_none());
+        assert_eq!(
+            v["context"]["turn"], 1,
+            "context must be nested JSON, not a string"
+        );
+        assert_eq!(v["outcomes"][0]["label"]["answer"], true);
+    }
 
     #[test]
     fn old_ready_line_requires_and_keeps_legacy_token() {
