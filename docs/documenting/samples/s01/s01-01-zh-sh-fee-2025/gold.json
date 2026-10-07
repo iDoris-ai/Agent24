@@ -1,0 +1,106 @@
+{
+  "id": "s01-01-zh-sh-fee-2025",
+  "schema": "s01-gold-v1",
+  "fields": [
+    {
+      "key": "doc_number",
+      "status": "present",
+      "value": "沪财税〔2025〕145号",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "沪财税〔2025〕145号"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "issue_date",
+      "status": "present",
+      "value": "2025年12月22日",
+      "normalized": "2025-12-22",
+      "anchors": [
+        {
+          "page": 3,
+          "quote": "2025 年 12 月 22 日"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "right_to_refuse",
+      "status": "present",
+      "value": "凡未列入《收费目录》的行政事业性收费事项，公民、法人和其他社会组织可拒绝支付",
+      "anchors": [
+        {
+          "page": 2,
+          "quote": "凡未列入《收费目录》的行政事业性收费事项，公民、法人和其他社会组织可拒绝支付"
+        }
+      ],
+      "severity": "major"
+    },
+    {
+      "key": "id_card_fee",
+      "status": "present",
+      "value": "到期换发20元/证，因丢失损换等换、补领40元/证",
+      "anchors": [
+        {
+          "page": 14,
+          "quote": "到期换发20元/证，因丢失损换等换、补领40元/证"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "id_card_first_issue_exemption",
+      "status": "present",
+      "value": "停征首次申领居民身份证工本费",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 14,
+          "quote": "停征首次申领居民身份证工本费"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "taiwan_permit_exemption_period",
+      "status": "present",
+      "value": "自2025年7月1日至2027年12月31日，对在本市首次申领台湾居民来往大陆通行证的台湾居民免收证件费",
+      "normalized": "2025-07-01/2027-12-31",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 16,
+          "quote": "自2025年7月1日至2027年12月31日"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "approval_number_leading_zero",
+      "status": "present",
+      "value": "沪价费〔2012〕009号",
+      "anchors": [
+        {
+          "page": 9,
+          "quote": "沪价费〔2012〕009号"
+        }
+      ],
+      "severity": "critical",
+      "note": "前导零不得丢失"
+    },
+    {
+      "key": "payment_deadline_for_individuals",
+      "status": "missing",
+      "severity": "major"
+    }
+  ],
+  "must_not_assert": [
+    "a payment deadline for individuals",
+    "an application address or phone number"
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}

@@ -1,0 +1,80 @@
+{
+  "id": "s01-02-en-epa-boil-water",
+  "schema": "s01-gold-v1",
+  "fields": [
+    {
+      "key": "action_required",
+      "status": "present",
+      "value": "DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST.",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST."
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "boil_duration",
+      "status": "present",
+      "value": "three (3) minutes",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "let it boil for three (3) minutes"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "advisory_duration",
+      "status": "present",
+      "value": "until further notice",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "until further notice"
+        }
+      ],
+      "severity": "major"
+    },
+    {
+      "key": "contamination_dates",
+      "status": "missing",
+      "severity": "critical",
+      "note": "Template blanks: (date) ______"
+    },
+    {
+      "key": "expected_resolution",
+      "status": "missing",
+      "severity": "major",
+      "note": "Template blank: within ______ (estimated time frame)"
+    },
+    {
+      "key": "water_system_contact",
+      "status": "missing",
+      "severity": "major"
+    },
+    {
+      "key": "epa_hotline",
+      "status": "present",
+      "value": "1-800-426-4791",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "1-800-426-4791"
+        }
+      ],
+      "severity": "critical"
+    }
+  ],
+  "must_not_assert": [
+    "a specific contamination date",
+    "a specific resolution date",
+    "a contact phone number for the water system",
+    "that residents must act within 24 hours"
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}
