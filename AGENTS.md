@@ -3,11 +3,29 @@
 > 2026-10-03 起 Agent24 的全部任务（派发、编译、测试、验收）都在**笔记本**上执行；B 机（Mac mini ab-codex）因磁盘不足不再构建 Agent24，下文已去掉 B 端专属约定。
 
 ## 分支规则
-- 集成分支：`ab/<里程碑>`（例如 `ab/m1-memory`）。**每个 task PR 的 base 必须是对应的 `ab/*` 集成分支**，绝不能是 `main`。
+- 集成分支：`ab/<里程碑或方向>`（例如 `ab/m1-memory`、`ab/decide`），规则见下节「里程碑方向分支工作流」。**每个 task PR 的 base 必须是对应的 `ab/*` 集成分支**，绝不能是 `main`。
 - task 分支：`ab/<里程碑>-NN-<短名>`，每个 task 一个 git worktree，放在 `~/Dev/auraai/` 下（笔记本 Agent24 主 checkout 是 `~/Dev/auraai/Agent24`）。
 - task PR ≤ 300 行（不含锁文件/生成文件），超了就拆。
 - **不许碰**：`main`、任何 `feat/*`、`ci/*`、`test/*`、`docs/*`、`build/*` 分支及其 PR（那些由笔记本 + PR-Daemon 管）。不许 force-push 别人的分支。
 - 集成分支 → `main` 的 release PR 永远由人开、人审，worker 不开。
+
+## 里程碑方向分支工作流（2026-10-07 jason 拍板，适用于每个方向的里程碑系列）
+- **一个方向一条集成分支** `ab/<方向>`，例如：
+  - `ab/decide`：决策服务 D1–D3；
+  - `ab/memory-p1`：记忆 P1；
+  - `ab/comm`：Hyphae COMM6b/7。
+
+  各方向独立开发、互不阻塞。
+- **task PR 合进集成分支**。每攒约 10 个，开一次 **release PR `ab/<方向>` → `main`**，作为该方向的阶段发布。
+- **评审与合并门槛**（PR-Daemon 照常评审全部 PR，包括 base 为集成分支的 task PR）：
+  - **普通 task PR**：CI 全绿 + `pre-pr-check.sh` 逐类回应 + 本地门禁通过后，即可合入集成分支；PR-Daemon 的意见在后续 task 中修复。
+  - **安全 / 权限 / 授权、数据写入语义、存储迁移、对外协议 / wire 格式类 task PR**：必须等 PR-Daemon APPROVE 后再合。
+  - **release PR**：必须 PR-Daemon APPROVE，并通过 jason 真机验收，才合入 main。
+- **三条硬约束**：
+  1. **集成分支每周至少吸收一次 main**。用 merge，不用 rebase，避免 M10 那样漂移 600+ 提交。
+  2. **集成分支受 ruleset 保护**：禁止 force-push，task PR 合并前 CI 必须全绿（ruleset `ab-integration`）。ruleset 按**精确分支名**列出集成分支，避免误伤 task 分支；新开一个方向时，先把它的集成分支名加进 ruleset。
+  3. **命名**：集成分支 `ab/<方向>`；task 分支 `ab/<方向>-NN-<短名>`。task 分支只合进本方向的集成分支，不跨方向。
+- 未经 jason 允许，**禁止在 Mac mini 上执行任何任务**（构建、测试、基准、下载模型）。
 
 ## 任务来源
 - 当前里程碑的任务定义与验收标准只认集成分支上的计划文档（任务 prompt 会指明路径）。prompt 与计划冲突时以计划为准，并在 PR body 里指出冲突。

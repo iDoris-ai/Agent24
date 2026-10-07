@@ -40,3 +40,5 @@ jobs:
           allowlist: bot*,dependabot[bot],github-actions[bot]
           remote-organization-name: AAStarCommunity
           remote-repository-name: Brood
+          # 合并后不锁 PR：集成分支上的 task PR 会在 CI 绿后先合并、再由 PR-Daemon 补评审（AGENTS.md 里程碑方向分支工作流），锁了评审就写不进去。
+          lock-pullrequest-aftermerge: false
