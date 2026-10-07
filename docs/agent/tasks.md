@@ -39,6 +39,22 @@
 | TPI-W 第三方工具接入 Workflow（Playbook、去 Creative 专名、harness 模板、评估清单） | `PAUSED` | 同上；依赖 OD-M11 F11.0a–F11.3 |
 | OC OpenCreator 集成（OC-0 调研 → OC-1 边界 ADR → OC-2 接入 → OC-3 E2E 落地） | `PAUSED` | 同上；依赖 TPI-W |
 
+## K1 内核依赖（#735）台账（2026-10-07 立）
+
+定义见 [`PLAN-KERNEL-K1.md`](PLAN-KERNEL-K1.md)。这是通用内核依赖规划，不是 Documenting 业务实现授权。#735 四项内核能力与安全模式要求、ADR 拍板点、依赖和验收判据均以计划为准。
+
+| ID | 任务 | 状态 | 风险 / 依赖 / 说明 |
+|---|---|---|---|
+| K1-1 | ADR-K1-01 通用模块工具契约 | `PLANNED` | **高风险**；PR-Daemon APPROVE；不含 Documenting 专属业务存储/编辑器 |
+| K1-2 | ADR-K1-02 会话数据流与安全模式 | `PLANNED` | **高风险**；对齐 C5 A-3、C2 ID-1/3；需 jason 拍板默认与授权粒度 |
+| K1-3 | ADR-K1-03 启用授权与信任 | `PLANNED` | **高风险**；核对 OD-M11 F11.0/F11.1 接缝；该线当前 PAUSED，不因 K1 自动恢复 |
+| K1-4 | ADR-K1-04 执行审计与共同授权 | `PLANNED` | **高风险**；依赖 C1 K-2 审计字段约束方案；需 jason 拍板保留/删除边界 |
+| K1-5 | 通用模块工具调用协议实现 | `BLOCKED` | **高风险**；等 ADR-K1-01/03 APPROVE；每个实现 PR ≤300 行 |
+| K1-6 | 隐私策略、来源标记与启用授权实现 | `BLOCKED` | **高风险**；等 ADR-K1-02/03 APPROVE 及 C5 A-3、ID-1/3 接口；安全负例见计划 |
+| K1-7 | 模块调用审计、共同授权与 #708 E2E | `BLOCKED` | **高风险**；等 K-2 与 ADR-K1-04 APPROVE；#708 记录真实产品路径证据 |
+
+所有 K1 任务涉及权限、隐私、审计或协议，须 PR-Daemon APPROVE 后才可合入 `ab/kernel`。本台账不改变 C5 A-3 / ID-1/3 / OD-M11 状态，也不将 Documenting 业务存储或编辑器移入内核。
+
 ## COMM（Hyphae 通信）台账（2026-10-03 立；任务定义见 [`../design/COMM-HYPHAE.md`](../design/COMM-HYPHAE.md) §8）
 
 | ID | 任务 | 状态 | 证据 |
