@@ -79,6 +79,7 @@ class CandidateResult:
     peak_rss_mb: float | None
     download_size_mb: float | None
     points: dict[str, PointResult] = field(default_factory=dict)
+    overlap_warning: str | None = None
 
 
 def run_point(candidate: Candidate, point: Point, items: list[EvalItem]) -> PointResult:
@@ -182,6 +183,7 @@ def run_candidate(
         load_latency_s=load_latency,
         peak_rss_mb=None,
         download_size_mb=_download_size_mb(candidate.model_id),
+        overlap_warning=candidate.overlap_warning,
     )
 
     for point in points:
