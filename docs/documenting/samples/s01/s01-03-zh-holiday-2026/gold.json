@@ -1,0 +1,102 @@
+{
+  "id": "s01-03-zh-holiday-2026",
+  "schema": "s01-gold-v1",
+  "fields": [
+    {
+      "key": "doc_number",
+      "status": "present",
+      "value": "国办发明电〔2025〕7号",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "国办发明电〔2025〕7号"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "spring_festival_holiday",
+      "status": "present",
+      "value": "2月15日至23日放假调休，共9天",
+      "normalized": "2026-02-15/2026-02-23",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "2月15日（农历腊月二十八、周日）至23日（农历正月初七、周一）放假调休，共9天"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "spring_festival_makeup_workdays",
+      "status": "present",
+      "value": "2月14日（周六）、2月28日（周六）上班",
+      "normalized": "2026-02-14,2026-02-28",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "2月14日（周六）、2月28日（周六）"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "qingming_holiday",
+      "status": "present",
+      "value": "4月4日至6日放假，共3天（无调休）",
+      "normalized": "2026-04-04/2026-04-06",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "4月4日（周六）至6日（周一）放假，共3天"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "national_day_holiday",
+      "status": "present",
+      "value": "10月1日至7日放假调休，共7天",
+      "normalized": "2026-10-01/2026-10-07",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "10月1日（周四）至7日（周三）放假调休，共7天"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "national_day_makeup_workdays",
+      "status": "present",
+      "value": "9月20日（周日）、10月10日（周六）上班",
+      "normalized": "2026-09-20,2026-10-10",
+      "anchors": [
+        {
+          "page": 1,
+          "quote": "9月20日（周日）、10月10日（周六）上班"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "issue_date",
+      "status": "present",
+      "value": "2025年11月4日",
+      "normalized": "2025-11-04",
+      "anchors": [
+        {
+          "page": 2,
+          "quote": "2025年11月4日"
+        }
+      ],
+      "severity": "major"
+    }
+  ],
+  "must_not_assert": [
+    "a makeup workday for 清明节, 端午节 or 中秋节",
+    "a holiday length other than stated"
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}
