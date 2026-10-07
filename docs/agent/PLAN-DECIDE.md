@@ -25,14 +25,17 @@ HardwareProbe ──► HardwareProfile ──► TierPolicy ──► 每个决
 
 - **探测是确定性代码，不是模型**：内存总量与可用量、CPU 架构与核数、加速器（Apple Metal / CUDA / 无）、磁盘余量、OS、是否电池供电。
 - **模型目录** `decide-models.catalog.json`：每个候选写明 HF 仓库 + 固定 revision + sha256、许可证、下载体积、常驻内存、各档实测 P95 延迟、适用决策点、所需运行时（进程内 ort/candle 或 oMLX/Ollaya）。目录里的延迟和内存数字**只能来自 D0 实测**，不抄模型卡。
-- **分档（草案，D0 实测后定稿）**：
+- **五档模型方案（jason 于 2026-10-07 拍板，方案 B）**：
 
-| 档位 | 典型机器 | 快速层（每条消息都跑） | 深度层（复杂判断，可选） |
-|---|---|---|---|
-| **T0 仅规则** | 未同意下载 / 离线 / 磁盘不足 / < 8GB | 规则 | 无 |
-| **T1 轻量** | 8–16GB，无独显或省电模式 | int8 小 encoder（CPU） | 无 |
-| **T2 标准** | 16–32GB Apple Silicon（如 Mac mini M4 24GB） | encoder + Qwen3Guard-0.6B | Kev-0.8B 类（oMLX/Metal，按需加载） |
-| **T3 充裕** | ≥ 32GB（如 M1 Max 64GB） | 同 T2 | Kev-4B 类；具备本地微调能力（见 §2.4） |
+| 内存档 | 快速层（每条消息都跑） | 深度层（按需、可选） |
+|---|---|---|
+| **8GB** | multilingual-e5 `e5-small` int8 + 分类头 | 无 |
+| **16GB** | `e5-base` int8 + 分类头 | 无 |
+| **24GB** | `e5-large-instruct` int8 + 分类头 | 无 |
+| **32GB** | Qwen3-Embedding-4B int8 + 分类头 | 无 |
+| **64GB+** | Qwen3-Embedding-8B int8 + 分类头 | 可选 Kev-4B |
+
+方案 A（随时可切换）：Qwen3-Embedding 0.6B / 0.6B / 4B / 4B / 8B 对应 8 / 16 / 24 / 32 / 64GB 五档。切换仅更换模型目录并重训分类头，不改变决策服务接口或调用点。两种方案都必须支持中文、英文、泰文。硬件档位不是自动下载授权；用户拒绝、离线或不满足资源条件时保持规则路径。详见 [`PLAN-DECIDE-D1.md`](PLAN-DECIDE-D1.md)。
 
 - **用户可见、可覆盖**：设置页显示「本机档位 + 每个决策点用的模型 + 为什么」，用户可降档或关闭；硬件变化（换机、内存压力持续告警）时重新推荐，但**不自动升档下载**，要用户确认。
 - **与 iDoris 的关系**：iDoris 规划里的 `HardwareAwareModelRecommender`（iDoris/docs 07）先在这里落地一个只服务决策模型的版本，接口按可迁移设计，后续由 iDoris 网关接管全模型推荐。
