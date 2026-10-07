@@ -1,6 +1,10 @@
 # ADR-DOC-01：Documenting 的定位、进程形态与对外暴露（H1 / H2）
 
-> **状态**：Proposed。生效需 PR-Daemon APPROVE 加 jason 确认，生效后经 `ab/documenting` 的首个 release PR 进 `main`。**DOC-1 的实现必须在这之后开工。**
+> **状态**：**Accepted**（2026-10-07）。两项生效条件都已满足：
+> - jason 在 [#733](https://github.com/iDoris-ai/Agent24/pull/733#issuecomment-6038721787) 确认了平台优先级、分工、验收口径，并要求按 #735 对齐安全模式；
+> - PR-Daemon 在 #733 给出 APPROVE（针对 `dabc2c3`）。
+>
+> 本 ADR 已合入 `ab/documenting`，会经首个 release PR 进入 `main`。**DOC-1 的实现必须在这之后开工。**
 > **日期**：2026-10-07 · **作者**：David Xu · **Issue**：#701（DOC-1-02）
 > **编号**：本目录独立编号（`ADR-DOC-xx`），先例是 `docs/open-design-workspace/design/ADR-00x`，目的是避免和各方向并行追加的全局 ADR 号撞号。
 > **依据**：
@@ -218,6 +222,6 @@
 
 ## 5. 本 ADR 的验收
 
-1. jason 已于 2026-10-07 在 #733 上确认三项：平台优先级（D10）、分工（§3）、DOC-1 的验收口径（D4）。同时要求按 #735 对齐安全模式，本版 D8 已对齐。**剩余条件：PR-Daemon APPROVE。** 满足后状态改为 Accepted，随首个 release PR 进 `main`。
+1. ✅ jason 已于 2026-10-07 在 #733 上确认三项：平台优先级（D10）、分工（§3）、DOC-1 的验收口径（D4）。同时要求按 #735 对齐安全模式，本版 D8 已对齐。✅ PR-Daemon 已 APPROVE。状态已改为 **Accepted**，随首个 release PR 进 `main`。
 2. README §17 #12 指向本 ADR。§16 的平台依赖指向第 3 节。
 3. 内核侧 C 的 ADR 由负责方在 `ab/documenting` 之外另开，本 ADR 只是它的需求方。

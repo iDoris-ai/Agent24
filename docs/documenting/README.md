@@ -404,7 +404,7 @@ These are acceptance requirements for the implementation. They are not precondit
 
 “Capability integration” is not sufficient as a deliverable. DOC-1 (§14) must produce this contract as a reviewed ADR (#701) before implementation of the operations it covers.
 
-**Proposed contract: [ADR-DOC-02](adr/ADR-DOC-02-operation-contract.md)** — storage authority (§17 #1), identity and provenance anchors, DOC-1 operations and risk mapping, the single commit point and idempotency, typed errors, jobs and availability.
+**Proposed contract: [ADR-DOC-02](adr/ADR-DOC-02-operation-contract.md)** (PR-Daemon approved in #736; awaiting jason's confirmation) — storage authority (§17 #1), identity and provenance anchors, DOC-1 operations and risk mapping, the single commit point and idempotency, typed errors, jobs and availability.
 
 ### 10.1 Operations (initial list)
 
@@ -679,7 +679,7 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 | 9 | **Line W assignment** — which parts, if any, are temporarily David's, the handover owner and the exit date (§12). | Line W start (not Line D) |
 | 10 | **Roadmap conflicts** — how conflicts between this plan and existing Agent24/T006 roadmaps are resolved and recorded. | planning |
 | 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). | DOC-3 engine choice |
-| 12 | **Placement and exposure (H1)** — in-process DomainModule vs out-of-process OS; agent exposure (kernel proxy tools / MCP / new `Capability`); default installation of a first-party OS; noun ownership of “document” (PLAN-OOP-OS-AND-BACKLOG §七). Decided in the DOC-1-02 ADR (#701). **Proposed answer: [ADR-DOC-01](adr/ADR-DOC-01-placement-and-integration.md)**: out-of-process domain OS; agent exposure through kernel-side module-declared tools; typed preload transport; bundled first-party package. The ADR must also weigh these facts: (a) in-process ① has no Models or Scheduler handle (`KERNEL_GRANTS` = Events, Memory, Approval); (b) no `Capability` provides kernel audit, which §10 expects for commits; (c) out-of-process ② runs on Unix sockets, and the Windows port (DEP-C2) is `BLOCKED`, which matters for both options' Windows story (§2.3). | **DOC-1 start** |
+| 12 | **Placement and exposure (H1)** — in-process DomainModule vs out-of-process OS; agent exposure (kernel proxy tools / MCP / new `Capability`); default installation of a first-party OS; noun ownership of “document” (PLAN-OOP-OS-AND-BACKLOG §七). Decided in the DOC-1-02 ADR (#701). **Decided by [ADR-DOC-01](adr/ADR-DOC-01-placement-and-integration.md) (Accepted 2026-10-07)**: out-of-process domain OS; agent exposure through kernel-side module-declared tools; typed preload transport; bundled first-party package. The ADR must also weigh these facts: (a) in-process ① has no Models or Scheduler handle (`KERNEL_GRANTS` = Events, Memory, Approval); (b) no `Capability` provides kernel audit, which §10 expects for commits; (c) out-of-process ② runs on Unix sockets, and the Windows port (DEP-C2) is `BLOCKED`, which matters for both options' Windows story (§2.3). | **DOC-1 start** |
 
 ## 18. Release Hard Gates & Test Samples
 
