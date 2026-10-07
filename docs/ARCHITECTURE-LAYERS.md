@@ -68,7 +68,7 @@
 
 | crate | 依赖 |
 |---|---|
-| protocol / sidecar-host-protocol / os-fd / os-cwd / worker / comm | （无内部依赖） |
+| protocol / sidecar-host-protocol / os-fd / os-cwd / worker / comm / **decide** 🟡 | （无内部依赖） |
 | core、domain、models | protocol |
 | store | core, protocol |
 | workspace | core, protocol, store, os-cwd |
@@ -85,7 +85,7 @@
 | agent24-cli | mcp, os-packages, protocol |
 | agent24-sidecar-host | sidecar-host-protocol（**没有任何 app 依赖它，Desktop 也不调用**） |
 
-依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
+依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`decide` 同样没有消费者（D0-1，见下）；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
 
 ---
 
@@ -137,6 +137,7 @@
 | `agent24-mcp` | 外部 MCP server 适配 | 外部工具包装成普通 `Tool`，与内建工具走同一条审批流水线 |
 | `agent24-comm` | Hyphae（Nostr）CLI 调用、keystore 串行化、密码存储、REST 路由与 daemon 状态 | 二进制哈希校验、密码只走 stdin（[COMM-HYPHAE](design/COMM-HYPHAE.md)） |
 | `agent24-worker` 🟡 | Python ML Worker（embedding / whisper）的 Rust 侧 wire 契约 + HTTP 客户端 | workspace 内没有任何 crate 依赖它 |
+| `agent24-decide` 🟡 | 决策服务（D0-1，[ADR-033](decision.md)）：`DecisionRequest`/`Question`/`Decision` 等类型 + `DecisionBackend` trait + `RuleBackend` + 级联 `DecisionService`；接口形状照 Jev `/v1/systemone`（choice/noul/score + 校准概率） | 只依赖 serde/serde_json/async-trait/thiserror；不依赖任何其它内部 crate；**D0-1 不接入 agent24d，不改任何现有调用点**；无消费者，等 D1 接线（记住意图 + 召回门控） |
 
 ### L4 运行时内核 — `agent24-agent`
 
