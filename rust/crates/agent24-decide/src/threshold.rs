@@ -42,10 +42,48 @@ pub enum ThresholdError {
 /// Boundaries are inclusive on the upper edge of each band they open:
 /// `p == execute_at` already executes, `p == escalate_below` is the start of
 /// the abstain band (not escalate — escalate is strictly *below* it).
+///
+/// `Deserialize` goes through [`ThresholdBands::new`] via
+/// `#[serde(try_from = "RawThresholdBands")]`, **not** a plain derive —
+/// a plain `#[derive(Deserialize)]` fills the private fields directly and
+/// bypasses the range/order checks entirely (review #688 M2, reproduced
+/// with an independent probe crate: inverted bounds `{execute_at: 0.2,
+/// escalate_below: 0.9}` deserialized successfully, and because
+/// `action_for` checks `p >= execute_at` first, every `p` in `[0, 1]` then
+/// came out `Execute` — exactly the direction `lib.rs`'s "only ever
+/// stricter, never laxer" constraint forbids). Private fields alone only
+/// block a struct literal and setters; they do nothing against
+/// `Deserialize`, which is a different bypass. See the `*_json_is_rejected`
+/// tests below for the regression coverage.
+///
+/// No [`Default`] either (see module docs for why) — enforced at compile
+/// time, not just by a runtime test that happens to construct explicitly:
+///
+/// ```compile_fail
+/// let _ = agent24_decide::ThresholdBands::default();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawThresholdBands")]
 pub struct ThresholdBands {
     execute_at: f32,
     escalate_below: f32,
+}
+
+/// Unvalidated wire shape `ThresholdBands::deserialize` parses into before
+/// handing it to [`ThresholdBands::new`] via the `TryFrom` below — the one
+/// and only path JSON can reach this type through.
+#[derive(Debug, Deserialize)]
+pub struct RawThresholdBands {
+    execute_at: f32,
+    escalate_below: f32,
+}
+
+impl TryFrom<RawThresholdBands> for ThresholdBands {
+    type Error = ThresholdError;
+
+    fn try_from(raw: RawThresholdBands) -> Result<Self, Self::Error> {
+        ThresholdBands::new(raw.execute_at, raw.escalate_below)
+    }
 }
 
 impl ThresholdBands {
@@ -157,8 +195,69 @@ mod tests {
         // implement `Default`. If someone adds `impl Default` later, the
         // only way to catch it here is a doc note — see the module docs —
         // this test exists so the intent is written down next to the type.
+        // The doc comment on `ThresholdBands` itself carries a
+        // `compile_fail` doctest that actually enforces this (review #688
+        // L5) — this runtime test only documents intent next to the type.
         let explicit = ThresholdBands::new(0.8, 0.3).expect("valid bands");
         assert_eq!(explicit.execute_at(), 0.8);
         assert_eq!(explicit.escalate_below(), 0.3);
+    }
+
+    #[test]
+    fn valid_json_round_trips_through_deserialize() {
+        let bands: ThresholdBands =
+            serde_json::from_str(r#"{"execute_at": 0.8, "escalate_below": 0.3}"#)
+                .expect("valid bands must deserialize");
+        assert_eq!(bands.execute_at(), 0.8);
+        assert_eq!(bands.escalate_below(), 0.3);
+
+        let round_tripped: ThresholdBands =
+            serde_json::from_str(&serde_json::to_string(&bands).expect("serialize"))
+                .expect("deserialize again");
+        assert_eq!(round_tripped, bands);
+    }
+
+    #[test]
+    fn inverted_order_json_is_rejected_not_silently_accepted() {
+        // Exactly review #688 M2's repro: fields present and in-range
+        // individually, but escalate_below > execute_at.
+        let result: Result<ThresholdBands, _> =
+            serde_json::from_str(r#"{"execute_at": 0.2, "escalate_below": 0.9}"#);
+        assert!(
+            result.is_err(),
+            "a plain #[derive(Deserialize)] would have accepted this and inverted the whole policy — see type docs"
+        );
+    }
+
+    #[test]
+    fn out_of_range_json_is_rejected() {
+        let too_high: Result<ThresholdBands, _> =
+            serde_json::from_str(r#"{"execute_at": 5.0, "escalate_below": 0.2}"#);
+        assert!(too_high.is_err());
+
+        let negative: Result<ThresholdBands, _> =
+            serde_json::from_str(r#"{"execute_at": 0.8, "escalate_below": -3.0}"#);
+        assert!(negative.is_err());
+    }
+
+    #[test]
+    fn nan_json_is_rejected() {
+        // Standard JSON has no `NaN` literal at all — serde_json fails to
+        // even PARSE this as JSON (a syntax error), before `TryFrom` ever
+        // runs. Included anyway because the review explicitly asked for a
+        // "NaN JSON must fail to deserialize" case: it does fail, just at
+        // the tokenizer rather than at `ThresholdBands::new`'s validation.
+        // (A value that reaches `new` as an actual `f32::NAN` — e.g. built
+        // in Rust, not via JSON — is already covered by `action_for`'s
+        // documented NaN behavior, not by this constructor: NaN compares
+        // false against every bound, including its own, so `new` cannot
+        // detect it as "out of range" via `contains`. `action_for(NaN)`
+        // still lands safely in `AbstainOrAsk`, see its doc comment.)
+        let result: Result<ThresholdBands, _> =
+            serde_json::from_str(r#"{"execute_at": NaN, "escalate_below": 0.2}"#);
+        assert!(
+            result.is_err(),
+            "JSON has no NaN literal; this must fail to parse, not silently succeed"
+        );
     }
 }

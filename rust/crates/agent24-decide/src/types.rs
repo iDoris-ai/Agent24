@@ -136,9 +136,19 @@ pub enum AnswerValue {
 ///
 /// `calibrated` is the load-bearing field: a caller must never be able to
 /// claim a `BackendKind::LlmSimulation` answer is a calibrated probability
-/// just by passing `calibrated: true`. [`Answer::new`] takes the backend kind
-/// and overrides the flag itself — the invariant holds regardless of what the
-/// caller asks for, it is not left to caller discipline.
+/// just by passing `calibrated: true`. [`Answer::new`] overrides the flag
+/// for the `backend` it is TOLD about — but a `DecisionBackend::evaluate`
+/// implementation chooses that argument itself, so `new` alone cannot stop
+/// a backend whose own `kind()` is `LlmSimulation` from constructing its
+/// answers with `BackendKind::Encoder` and getting `calibrated: true` out
+/// (review #688 R2/R4 reproduced exactly this with an independent probe
+/// crate). **The actual enforcement point is
+/// [`crate::service::DecisionService::decide`]**, which re-stamps every
+/// answer against the backend's own `kind()` right after `evaluate()`
+/// returns, via [`Answer::normalized_for`] — not by trusting what the
+/// backend passed into `new`. `new`'s own override stays as defense in
+/// depth for direct callers (tests, a future backend built without going
+/// through the service), it is just not sufficient on its own.
 ///
 /// Fields are private on purpose: the only way to build one is through
 /// [`Answer::new`], so the override can never be bypassed by a struct
@@ -156,7 +166,9 @@ pub struct Answer {
 impl Answer {
     /// `calibrated` is only honored for backends that can actually report a
     /// calibrated probability. For [`BackendKind::LlmSimulation`] it is
-    /// always forced to `false`, no matter what the caller passes.
+    /// always forced to `false`, no matter what the caller passes. See the
+    /// type-level docs above for why this alone is not the enforcement a
+    /// caller can rely on — [`Answer::normalized_for`] is.
     pub fn new(
         question_id: impl Into<String>,
         value: AnswerValue,
@@ -190,6 +202,24 @@ impl Answer {
 
     pub fn calibrated(&self) -> bool {
         self.calibrated
+    }
+
+    /// Re-stamps `calibrated` according to `kind`, overriding whatever the
+    /// answer currently carries. This is the REAL enforcement for the
+    /// "`llm_simulation` answers are never calibrated" invariant: it is
+    /// called by [`crate::service::DecisionService::decide`] with the
+    /// evaluating backend's own `DecisionBackend::kind()` — a value the
+    /// backend's `evaluate()` implementation does not control — right after
+    /// `evaluate()` returns, so a backend that mismatches its own `kind()`
+    /// when building `Answer`s (via a wrong `backend` argument to
+    /// [`Answer::new`], by bug or by malice) cannot make a simulated answer
+    /// look calibrated. `pub(crate)`: nothing outside this crate should call
+    /// it directly instead of going through the service.
+    pub(crate) fn normalized_for(mut self, kind: BackendKind) -> Self {
+        if matches!(kind, BackendKind::LlmSimulation) {
+            self.calibrated = false;
+        }
+        self
     }
 }
 
@@ -316,6 +346,43 @@ mod tests {
             true,
         );
         assert!(rule.calibrated());
+    }
+
+    #[test]
+    fn normalized_for_forces_llm_simulation_false_even_if_the_answer_claimed_calibrated() {
+        // Simulates exactly the bug review #688 R2/R4 reproduced: an answer
+        // built with the WRONG `BackendKind` (as if the backend lied about
+        // itself to `Answer::new`), caught only because the service calls
+        // `normalized_for` with the backend's real `kind()` afterwards.
+        let mislabeled = Answer::new(
+            "x",
+            AnswerValue::Bool(true),
+            Some(0.97),
+            BackendKind::Encoder,
+            true,
+        );
+        assert!(
+            mislabeled.calibrated(),
+            "Answer::new alone trusted the (wrong) backend argument"
+        );
+
+        let corrected = mislabeled.normalized_for(BackendKind::LlmSimulation);
+        assert!(
+            !corrected.calibrated(),
+            "normalized_for must override to false regardless of prior state"
+        );
+    }
+
+    #[test]
+    fn normalized_for_leaves_non_llm_simulation_answers_untouched() {
+        let answer = Answer::new(
+            "x",
+            AnswerValue::Bool(true),
+            Some(0.9),
+            BackendKind::Encoder,
+            true,
+        );
+        assert_eq!(answer.clone().normalized_for(BackendKind::Encoder), answer);
     }
 
     #[test]
