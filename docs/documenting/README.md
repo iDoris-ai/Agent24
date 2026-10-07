@@ -41,7 +41,7 @@ The supplementary architecture review on PR #685 (2026-10-07, after merge) led t
   - interfaces through existing contracts only (§10.3);
   - `TaskProfile{LocalOnly}` and reuse of the decision service (§2.2, §9.3).
 - **L1–L3:**
-  - D1 narrowed to the read-only part of V1 (§14);
+  - D1 starts with a read-only V1 slice on S01, then a multilingual template walkthrough on the product path (§14, confirmed 2026-10-07);
   - normative references and source baseline updated (§21);
   - Line K limited to its service contract during D1 (§12).
 
@@ -89,6 +89,9 @@ What this means in practice:
   1. **Document capability** — read, parse, create, edit, review, save revisions, export, with tests. Implemented as the Documenting domain OS (Rust), which owns its storage and routes and consumes kernel capabilities through handles (§2.1 correction, §10).
   2. **Document UI** — native Electron/React/TypeScript pages: file list, preview/edit, change diff, revision and export entry points.
   3. **Engine adapters** — reuse existing editing, OCR and conversion engines behind adapters. Documenting does not build an Office suite from scratch.
+     - **What “engine” means here.** It only means the existing library or component that does the format-specific work: parsing and rendering a PDF, reading and writing DOCX, OCR, converting between formats, or the in-page editor widget.
+     - It is not a separate product, service or extra layer. Documenting edits documents either way.
+     - Which libraries to use is decision §17 #6.
      - Engines run **out of process** and ship as **on-demand downloaded components** (pinned version + sha256, atomic install), following the Open Design decision of 2026-10-05 (`docs/Deployment/TASKS.md` DEP-A9).
      - They are never in the installer. Open Design once grew the AppImage from 146 MB to 934 MB.
 - **Process model is not product shape.** OCR, conversion and similar jobs run in separate background processes (the engine components above). That is a runtime choice only. Likewise, “DocumentService” (§10) is an interface boundary, not a requirement for separate deployment. Whether the domain OS itself runs in-process or out-of-process is decided in the ADR. Either way, users do not install, log into or manage a separate product.
@@ -528,19 +531,26 @@ This is a dependency-oriented framework, **not yet a sprint schedule**. Each pha
 
 **D1 — Foundation**
 
-D1 is the **read-only part of V1** (L1). There is no edit engine in D1.
+D1 is built as **small slices that merge early**, starting read-only (confirmed 2026-10-07):
 
-- D1-02 ADR (#701): placement as a domain OS and agent exposure (H1); Agent24-side permission dependencies and the single-user declaration (H2). It is **merged to `main` before D1 implementation starts**, so that it never sits unmerged while code is built. The first slice follows directly, which keeps the M10 lesson (“ADR goes to main with the first slice”) without leaving a gap;
+1. **Slice 1, read-only V1 on S01:** import, render, extraction with per-value provenance.
+2. **Slice 2, template walkthrough on the product path:** read → edit a specified region → save a revision → export PDF and the selected editable format → real reopen and layout check. It uses **multilingual samples** (Chinese, English, mixed) and a sanitized template.
+
+Slice 2 exposes delivery problems in D1 instead of D4. It is real product code, not a throwaway spike.
+
+- D1-02 ADR (#701): placement as a domain OS and agent exposure (H1); Agent24-side permission dependencies and the single-user declaration (H2). It is **reviewed and merged to `main` before D1 implementation starts**, through the first aggregate PR from `feat/documenting`, so that it never sits unmerged while code is built. Slice 1 follows directly;
 - Documenting domain-OS skeleton, REST routes in `openapi.yaml`, and a TS document page with the **Documents** navigation entry (§2.1, §10.3);
 - import, render, and extraction with **per-value provenance**, run end to end on S01 through the product path and the conversation entry (§2.2);
-- stable document identity and revision semantics for imported originals (no edit yet);
+- stable document identity and revision semantics: imported originals in slice 1, and the first saved edit revision in slice 2;
 - read/render boundary; knowledge context integration point: classification and recorded context state (§9);
-- baseline acceptance fixtures and sample set for S01 (§18.2);
-- **format feasibility spike** (proposed reconciliation, to be confirmed by the reviewer):
-  - The 2026-10-07 review asked D1 to validate read → edit region → save revision → export/reopen early. The supplementary review keeps edit engines out of D1.
-  - Proposal: run that check as a **throwaway spike outside the product path**, with a Chinese notice and a sanitized template. It only produces evidence for decisions §17 #3 and #6 and ships nothing.
+- baseline acceptance fixtures and sample sets: S01 for slice 1, multilingual template samples for slice 2 (§18.2).
 
-Process (lessons from M10, `ARCHITECTURE-LAYERS.md` §6): every slice merges to `main` early. There is no long-lived integration branch. “Product path wired” is accepted separately from “component landed”.
+**Process** (lessons from M10, `ARCHITECTURE-LAYERS.md` §6):
+
+- Work lands on the feature branch `feat/documenting`. Each slice PR is merged there as soon as it is done.
+- `feat/documenting` **syncs `main` at least weekly**, so it never drifts the way M10's 633-commit branch did.
+- It is merged to `main` through a **periodic aggregate PR**, at least once per completed slice, and that aggregate PR is reviewed.
+- “Product path wired” is accepted separately from “component landed”.
 
 **D1 acceptance** (in addition to §20), from the supplementary review's M items:
 
@@ -554,7 +564,15 @@ Process (lessons from M10, `ARCHITECTURE-LAYERS.md` §6): every slice merges to 
 - **H2:** the UI and docs declare single local user. No multi-user or isolation claims are made.
 - **Product path:** “product path wired” is demonstrated separately: the domain OS is mounted in the real daemon, the page is reachable from the navigation, and the chat entry works end to end.
 
-Needs: the D1 rows of Agent24 domain-OS mechanisms and per-run privacy (§16), decision §17 #1 (where originals and revisions are stored), §17 #7 (slices) and the read-side part of §17 #3 (which formats are imported and rendered first). Does **not** need Line W or Line K.
+Needs:
+
+- the D1 rows of Agent24 domain-OS mechanisms and per-run privacy (§16);
+- decision §17 #1 (where originals and revisions are stored);
+- decision §17 #7 (slices);
+- decision §17 #3 (first formats — the read side for slice 1, the edit/export side for slice 2);
+- for slice 2, a minimal content model (§17 #2) and the library choice for the first editable format (§17 #6).
+
+Does **not** need Line W or Line K.
 
 **D2 — Read & understand**
 
@@ -627,11 +645,11 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 | # | Decision | Blocks |
 |---|---|---|
 | 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? Also covers persistence/recovery and the promotion of temporary artifacts (§22.1). | D1 — must be resolved before any persistent data is written |
-| 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | D3 (D1 is read-only and only needs the provenance anchor format — page/block/range — which the ADR defines) |
-| 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). | D1 (read side: which formats are imported/rendered first), D3–D4 (edit/export side) |
+| 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | D1 slice 2 (a minimal model for editing a template region; slice 1 only needs the provenance anchor format, page/block/range, which the ADR defines), then D3 |
+| 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). | D1 (read side for slice 1; edit/export side for slice 2), D3–D4 |
 | 4 | **PDF scope** — reading, OCR, form filling (interactive vs flat overlay), page operations and true content editing are separate capabilities. | D2, form slice |
 | 5 | **Collaboration depth** — single-user, async review, multi-user revision or real-time co-editing. Constrained by H2: anything beyond single-user waits for the Agent24 permission infrastructure (§16). | D3 |
-| 6 | **Document engine/editor choice** — follows representative tasks and the frozen format scope (#3), not the other way round. | D3 |
+| 6 | **Document engine/editor choice** — follows representative tasks and the frozen format scope (#3), not the other way round. | D1 slice 2 (library for the first editable format), D3 (editor UI and further formats) |
 | 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). | D1 fixtures |
 | 8 | **Knowledge setting overrides** — who may override the setting, the override rules across org / personal / task, and the concrete interfaces. The default itself is settled: ON, with a persistent Off (§9). | D2 knowledge-optional/required operations |
 | 9 | **Line W assignment** — which parts, if any, are temporarily David's, the handover owner and the exit date (§12). | Line W start (not Line D) |
@@ -759,7 +777,7 @@ The following must be frozen before the corresponding implementation starts. The
    - Knowledge retrieval being Off and the original-document storage being unreachable are different states. The latter cannot unconditionally promise import/edit/export.
 2. **Formats and engines.**
    - Freeze the first formats and fidelity scope (§17 #3) before choosing an engine (§17 #6).
-   - In D1, a throwaway spike with a Chinese notice and a sanitized template checks edit/save/export feasibility outside the product path, as evidence for #3 and #6 (§14 D1, pending reviewer confirmation).
+   - In D1, slice 2 walks a sanitized template through edit → save → export → reopen on the product path, with multilingual samples (§14 D1).
    - All 13 scenarios are not required at once.
 3. **Commit and permission contract.** The DocumentService ADR defines:
    - the single commit point and its idempotency (§10.1);
