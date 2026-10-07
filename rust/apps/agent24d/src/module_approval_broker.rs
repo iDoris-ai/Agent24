@@ -175,6 +175,14 @@ pub struct ModuleApprovalBroker {
     store: Store,
     events: crate::events::EventsHub,
     clock: Arc<dyn Clock>,
+    #[cfg(test)]
+    insert_gate: tokio::sync::Mutex<Option<InsertGate>>,
+}
+
+#[cfg(test)]
+struct InsertGate {
+    started: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl ModuleApprovalBroker {
@@ -193,7 +201,25 @@ impl ModuleApprovalBroker {
             store,
             events,
             clock,
+            #[cfg(test)]
+            insert_gate: tokio::sync::Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn gate_next_insert(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *self.insert_gate.lock().await = Some(InsertGate {
+            started: started_tx,
+            resume: resume_rx,
+        });
+        (started_rx, resume_tx)
     }
 
     /// The submit flow (design doc decision 4, steps 3/5/6) — EXCLUDING the
@@ -241,6 +267,12 @@ impl ModuleApprovalBroker {
         target: Option<String>,
         payload: serde_json::Value,
     ) -> Result<ApprovalAnswer, ApprovalRequestError> {
+        #[cfg(test)]
+        if let Some(gate) = self.insert_gate.lock().await.take() {
+            let _ = gate.started.send(());
+            let _ = gate.resume.await;
+        }
+
         let id = mint_id().map_err(|e| ApprovalRequestError::BackendUnavailable(e.to_string()))?;
         let digest = agent24_protocol::approval_digest(&payload);
         let created_at = now_iso(self.clock.as_ref());
