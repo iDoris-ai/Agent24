@@ -1,0 +1,60 @@
+{"text": "记住我喜欢吃辣的", "label": "remember"}
+{"text": "帮我记住，我周末一般都在家", "label": "remember"}
+{"text": "麻烦你记一下，我是左撇子", "label": "remember"}
+{"text": "记住：我每天早上七点起床", "label": "remember"}
+{"text": "我养了一只猫叫豆豆，记住这个", "label": "remember"}
+{"text": "please remember my favorite color is blue", "label": "remember"}
+{"text": "remember that I work night shifts", "label": "remember"}
+{"text": "你要记住，我对青霉素过敏", "label": "remember"}
+{"text": "记住我老家是四川的", "label": "remember"}
+{"text": "帮我记一下我的生日是三月十号", "label": "remember"}
+{"text": "别记这件事了", "label": "forget"}
+{"text": "把你记的关于我公司的事都删掉", "label": "forget"}
+{"text": "这句话不用记", "label": "forget"}
+{"text": "忘掉我刚才说的那个地址", "label": "forget"}
+{"text": "清空你对我的所有记忆", "label": "forget"}
+{"text": "刚才那句别当真，不要记下来", "label": "forget"}
+{"text": "forget what I just told you about my ex", "label": "forget"}
+{"text": "把我说过喜欢猫的那条记录删了", "label": "forget"}
+{"text": "不要把我住址记下来", "label": "forget"}
+{"text": "这条就当没说过，别留着", "label": "forget"}
+{"text": "你记得我喜欢什么颜色吗", "label": "ask_memory"}
+{"text": "你还记得我老家在哪吗", "label": "ask_memory"}
+{"text": "你知道我对什么过敏吗", "label": "ask_memory"}
+{"text": "你记住我的生日了没", "label": "ask_memory"}
+{"text": "你是不是记得我养了只狗", "label": "ask_memory"}
+{"text": "do you remember what my job is", "label": "ask_memory"}
+{"text": "你脑子里还有我的信息吗", "label": "ask_memory"}
+{"text": "你记得我上次跟你说的那件事吗", "label": "ask_memory"}
+{"text": "关于我你都记了什么", "label": "ask_memory"}
+{"text": "你对我的了解还准吗", "label": "ask_memory"}
+{"text": "其实我不是对花生过敏，是对芒果过敏", "label": "correct"}
+{"text": "更新一下，我现在住在杭州了，不是上海", "label": "correct"}
+{"text": "我说错了，我的生日是五月不是六月", "label": "correct"}
+{"text": "改一下，我现在换工作了，在做设计", "label": "correct"}
+{"text": "不对，我养的是两只猫不是一只", "label": "correct"}
+{"text": "actually my phone number changed, update it", "label": "correct"}
+{"text": "上次说的职位信息不准了，我升职了", "label": "correct"}
+{"text": "我离婚了，之前说的家庭情况要改一下", "label": "correct"}
+{"text": "纠正一下，孩子今年八岁了不是七岁", "label": "correct"}
+{"text": "我搬家了，地址变了", "label": "correct"}
+{"text": "以后回复都用简体中文", "label": "preference"}
+{"text": "从今天起，跟我说话别太啰嗦", "label": "preference"}
+{"text": "以后帮我写代码都加注释", "label": "preference"}
+{"text": "跟我交流以后用更正式的语气", "label": "preference"}
+{"text": "以后遇到我的邮件都先翻译成英文再回复", "label": "preference"}
+{"text": "from now on always give me a short summary first", "label": "preference"}
+{"text": "今后不用每次都叫我的全名", "label": "preference"}
+{"text": "以后给我的建议都要给出两个备选方案", "label": "preference"}
+{"text": "跟我说话以后不要用敬语", "label": "preference"}
+{"text": "以后每次对话开头先问我今天的心情", "label": "preference"}
+{"text": "现在几点了", "label": "none"}
+{"text": "帮我查一下明天的会议安排", "label": "none"}
+{"text": "他跟我说记住他的生日", "label": "none"}
+{"text": "怎么才能记住很多单词", "label": "none"}
+{"text": "这篇文章讲的是如何提升记忆力", "label": "none"}
+{"text": "记住这个密码，等一下登录要用", "label": "none"}
+{"text": "帮我写一封辞职信", "label": "none"}
+{"text": "翻译一下这段英文", "label": "none"}
+{"text": "what's the capital of France", "label": "none"}
+{"text": "帮我总结一下这篇论文", "label": "none"}
