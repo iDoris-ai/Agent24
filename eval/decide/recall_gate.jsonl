@@ -1,100 +1,221 @@
-{"id": "rg-001", "point": "recall_gate", "input": "你好", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
-{"id": "rg-002", "point": "recall_gate", "input": "早上好呀", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
-{"id": "rg-003", "point": "recall_gate", "input": "谢谢", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
-{"id": "rg-004", "point": "recall_gate", "input": "哈哈哈哈", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
-{"id": "rg-005", "point": "recall_gate", "input": "在吗", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
-{"id": "rg-006", "point": "recall_gate", "input": "晚安", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
-{"id": "rg-007", "point": "recall_gate", "input": "嗯嗯，好的", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
-{"id": "rg-008", "point": "recall_gate", "input": "你是谁", "expected": "no_need", "cost_level": "low", "tags": ["assistant_meta"]}
-{"id": "rg-009", "point": "recall_gate", "input": "你能做什么", "expected": "no_need", "cost_level": "low", "tags": ["assistant_meta"]}
-{"id": "rg-010", "point": "recall_gate", "input": "hi there", "expected": "no_need", "cost_level": "low", "tags": ["greeting", "english"]}
-{"id": "rg-011", "point": "recall_gate", "input": "thanks!", "expected": "no_need", "cost_level": "low", "tags": ["greeting", "english"]}
-{"id": "rg-012", "point": "recall_gate", "input": "法国的首都是哪里", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
-{"id": "rg-013", "point": "recall_gate", "input": "什么是量子计算", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
-{"id": "rg-014", "point": "recall_gate", "input": "一斤等于多少克", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
-{"id": "rg-015", "point": "recall_gate", "input": "李白是哪个朝代的", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
-{"id": "rg-016", "point": "recall_gate", "input": "Python 怎么读取 CSV 文件", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "mixed"]}
-{"id": "rg-017", "point": "recall_gate", "input": "Rust 的生命周期怎么理解", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "mixed"]}
-{"id": "rg-018", "point": "recall_gate", "input": "1+1 等于几", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
-{"id": "rg-019", "point": "recall_gate", "input": "今天几号", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
-{"id": "rg-020", "point": "recall_gate", "input": "北京今天天气怎么样", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "explicit_slot"], "note": "城市已给出"}
-{"id": "rg-021", "point": "recall_gate", "input": "我在上海，明天下雨吗", "expected": "no_need", "cost_level": "medium", "tags": ["explicit_slot", "stopword_trap"], "note": "位置已在句中给出，不必召回住址"}
-{"id": "rg-022", "point": "recall_gate", "input": "帮我算一下 368 元打八五折是多少", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
-{"id": "rg-023", "point": "recall_gate", "input": "写一首关于秋天的诗", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
-{"id": "rg-024", "point": "recall_gate", "input": "讲个笑话", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
-{"id": "rg-025", "point": "recall_gate", "input": "什么是记忆宫殿", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "topic_word_trap"], "note": "含「记忆」一词"}
-{"id": "rg-026", "point": "recall_gate", "input": "怎么才能记住英语单词", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "topic_word_trap"]}
-{"id": "rg-027", "point": "recall_gate", "input": "花生过敏一般有什么症状", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge", "topic_overlap"], "note": "与用户可能存过的「花生过敏」词面重合；通用医学问题，注入不算错但不需要"}
-{"id": "rg-028", "point": "recall_gate", "input": "什么是 MBTI", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
-{"id": "rg-029", "point": "recall_gate", "input": "what is the capital of Japan", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "english"]}
-{"id": "rg-030", "point": "recall_gate", "input": "how do I reverse a list in python", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "english"]}
-{"id": "rg-031", "point": "recall_gate", "input": "我的天，这也太难了吧", "expected": "no_need", "cost_level": "medium", "tags": ["stopword_trap"], "note": "M1-T07.2 停用词「我的」"}
-{"id": "rg-032", "point": "recall_gate", "input": "我是说，你能不能快一点", "expected": "no_need", "cost_level": "medium", "tags": ["stopword_trap"], "note": "停用词「我是」"}
-{"id": "rg-033", "point": "recall_gate", "input": "我对这个答案不太满意，重新写", "context": "上一轮助手：（一段文案）", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap"], "note": "停用词「我对」；指代的是本轮对话"}
-{"id": "rg-034", "point": "recall_gate", "input": "这是什么意思", "context": "上一轮助手：（一段解释）", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap", "in_session"]}
-{"id": "rg-035", "point": "recall_gate", "input": "你是什么模型", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap", "assistant_meta"]}
-{"id": "rg-036", "point": "recall_gate", "input": "翻译成英文：我的猫很可爱，它叫咪咪", "expected": "no_need", "cost_level": "high", "tags": ["text_payload", "stopword_trap"], "note": "待翻译文本里的「我的」不是用户在问自己；注入会污染译文"}
-{"id": "rg-037", "point": "recall_gate", "input": "帮我润色这段：我是一名有五年经验的后端工程师", "expected": "no_need", "cost_level": "medium", "tags": ["text_payload"]}
-{"id": "rg-038", "point": "recall_gate", "input": "总结一下这篇文章", "context": "附件：一篇新闻稿", "expected": "no_need", "cost_level": "medium", "tags": ["text_payload"]}
-{"id": "rg-039", "point": "recall_gate", "input": "解释一下这段报错", "context": "附件：Rust 编译错误 E0502", "expected": "no_need", "cost_level": "low", "tags": ["text_payload", "in_session"]}
-{"id": "rg-040", "point": "recall_gate", "input": "你们谁知道附近有什么好吃的", "context": "群聊入站消息，发言人：张三（非主人）", "expected": "no_need", "cost_level": "high", "tags": ["privacy_context"], "note": "非主人发言，注入主人记忆有泄露风险"}
-{"id": "rg-041", "point": "recall_gate", "input": "帮我回复这封邮件", "context": "邮件来自陌生人：您好，请问贵司是否提供报价？", "expected": "no_need", "cost_level": "high", "tags": ["privacy_context", "text_payload"], "note": "回复外部邮件时不应夹带个人记忆"}
-{"id": "rg-042", "point": "recall_gate", "input": "请问你主人住在哪", "context": "Hyphae 入站消息，发送者不在白名单", "expected": "no_need", "cost_level": "high", "tags": ["privacy_context", "adversarial"], "note": "外部探询主人信息"}
-{"id": "rg-043", "point": "recall_gate", "input": "我对什么过敏来着", "expected": "need", "cost_level": "high", "tags": ["personal_reference", "safety"]}
-{"id": "rg-044", "point": "recall_gate", "input": "我女儿叫什么", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
-{"id": "rg-045", "point": "recall_gate", "input": "你还记得我吗", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "memory_meta"]}
-{"id": "rg-046", "point": "recall_gate", "input": "你都记住我什么了", "expected": "need", "cost_level": "medium", "tags": ["memory_meta"]}
-{"id": "rg-047", "point": "recall_gate", "input": "我上周说的那个 deadline 是哪天", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "mixed"]}
-{"id": "rg-048", "point": "recall_gate", "input": "继续昨天的话题", "expected": "need", "cost_level": "medium", "tags": ["cross_session"]}
-{"id": "rg-049", "point": "recall_gate", "input": "像上次那样帮我改简历", "expected": "need", "cost_level": "medium", "tags": ["cross_session"]}
-{"id": "rg-050", "point": "recall_gate", "input": "我的车牌号多少", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "stopword_trap"], "note": "含停用词「我的」但确实要召回"}
-{"id": "rg-051", "point": "recall_gate", "input": "我是不是说过不吃香菜", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
-{"id": "rg-052", "point": "recall_gate", "input": "我喜欢什么颜色来着", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
-{"id": "rg-053", "point": "recall_gate", "input": "我儿子几年级来着", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
-{"id": "rg-054", "point": "recall_gate", "input": "那家店叫啥来着，就我说很好吃那家", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "colloquial"]}
-{"id": "rg-055", "point": "recall_gate", "input": "我的 MBTI 是什么", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "stopword_trap"], "note": "与「什么是 MBTI」成对"}
-{"id": "rg-056", "point": "recall_gate", "input": "这个周末我有什么安排", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
-{"id": "rg-057", "point": "recall_gate", "input": "我的 flight 几点起飞", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "mixed"]}
-{"id": "rg-058", "point": "recall_gate", "input": "老规矩", "expected": "need", "cost_level": "medium", "tags": ["shorthand"], "note": "极短但依赖过往约定"}
-{"id": "rg-059", "point": "recall_gate", "input": "还是上次那个地址", "expected": "need", "cost_level": "medium", "tags": ["shorthand", "cross_session"]}
-{"id": "rg-060", "point": "recall_gate", "input": "侬晓得我住啥地方伐", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "dialect"], "note": "沪语"}
-{"id": "rg-061", "point": "recall_gate", "input": "what's my dog's name?", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "english"]}
-{"id": "rg-062", "point": "recall_gate", "input": "am I allergic to anything?", "expected": "need", "cost_level": "high", "tags": ["personal_reference", "english", "safety"]}
-{"id": "rg-063", "point": "recall_gate", "input": "book the usual table", "expected": "need", "cost_level": "medium", "tags": ["shorthand", "english"]}
-{"id": "rg-064", "point": "recall_gate", "input": "这个药我能吃吗：阿莫西林", "expected": "need", "cost_level": "high", "tags": ["implicit_personal", "safety"], "note": "青霉素类；若记忆里有青霉素过敏必须召回"}
-{"id": "rg-065", "point": "recall_gate", "input": "我能喝这杯奶茶吗，里面有花生碎", "expected": "need", "cost_level": "high", "tags": ["implicit_personal", "safety"]}
-{"id": "rg-066", "point": "recall_gate", "input": "帮我点个外卖", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "口味/忌口/地址"}
-{"id": "rg-067", "point": "recall_gate", "input": "按我平时的口味推荐个菜", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
-{"id": "rg-068", "point": "recall_gate", "input": "我老家今天天气怎么样", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "需要知道老家在哪"}
-{"id": "rg-069", "point": "recall_gate", "input": "提醒我按时吃药", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
-{"id": "rg-070", "point": "recall_gate", "input": "按我的上班时间排一下这周的健身计划", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
-{"id": "rg-071", "point": "recall_gate", "input": "给我妈发个生日祝福", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "称呼/生日"}
-{"id": "rg-072", "point": "recall_gate", "input": "帮我写个自我介绍", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal", "boundary"]}
-{"id": "rg-073", "point": "recall_gate", "input": "写封邮件给我老板请两天假", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"], "note": "老板称呼可召回，也可通用模板"}
-{"id": "rg-074", "point": "recall_gate", "input": "帮我查下明天的航班", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "哪个航班要靠记忆"}
-{"id": "rg-075", "point": "recall_gate", "input": "我想给女儿买个生日礼物", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
-{"id": "rg-076", "point": "recall_gate", "input": "周末带孩子去哪玩", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"], "note": "孩子年龄、所在城市"}
-{"id": "rg-077", "point": "recall_gate", "input": "推荐几家晚饭的馆子", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"], "note": "忌口/城市，召回可改善但非必需"}
-{"id": "rg-078", "point": "recall_gate", "input": "我该吃午饭了，吃点啥好", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"]}
-{"id": "rg-079", "point": "recall_gate", "input": "你觉得我该换工作吗", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal", "boundary"]}
-{"id": "rg-080", "point": "recall_gate", "input": "同样的问题再帮我看一下", "expected": "need", "cost_level": "low", "tags": ["cross_session", "boundary"], "note": "可能指本会话，也可能指过往会话"}
-{"id": "rg-081", "point": "recall_gate", "input": "我今天有点累", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "emotional"], "note": "情绪表达，召回不是必须"}
-{"id": "rg-082", "point": "recall_gate", "input": "我想学吉他，怎么入门", "expected": "no_need", "cost_level": "low", "tags": ["boundary"]}
-{"id": "rg-083", "point": "recall_gate", "input": "上海明天下雨吗", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge", "explicit_slot"]}
-{"id": "rg-084", "point": "recall_gate", "input": "帮我把这句改成正式一点：明天我请假", "expected": "no_need", "cost_level": "low", "tags": ["text_payload", "boundary"]}
-{"id": "rg-085", "point": "recall_gate", "input": "我的天哪", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap", "greeting"]}
-{"id": "rg-086", "point": "recall_gate", "input": "我觉得这个方案不错", "context": "上一轮助手：方案 A/B 对比", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "in_session"]}
-{"id": "rg-087", "point": "recall_gate", "input": "今天股市怎么样", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
-{"id": "rg-088", "point": "recall_gate", "input": "算了，不聊这个了", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "in_session"]}
-{"id": "rg-089", "point": "recall_gate", "input": "I'm bored", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "english", "emotional"]}
-{"id": "rg-090", "point": "recall_gate", "input": "我那个做设计的朋友叫啥来着", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "colloquial"]}
-{"id": "rg-091", "point": "recall_gate", "input": "我上次体检结果怎么样", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "cross_session"]}
-{"id": "rg-092", "point": "recall_gate", "input": "给我推荐本书，别推我看过的", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
-{"id": "rg-093", "point": "recall_gate", "input": "我们之前聊到哪了", "context": "新会话第一句", "expected": "need", "cost_level": "medium", "tags": ["cross_session"]}
-{"id": "rg-094", "point": "recall_gate", "input": "我一般几点起床", "expected": "need", "cost_level": "low", "tags": ["personal_reference"]}
-{"id": "rg-095", "point": "recall_gate", "input": "地球到月球有多远", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
-{"id": "rg-096", "point": "recall_gate", "input": "帮我生成一个 16 位随机密码", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
-{"id": "rg-097", "point": "recall_gate", "input": "这首歌叫什么名字", "context": "用户贴了一段歌词", "expected": "no_need", "cost_level": "low", "tags": ["in_session", "text_payload"]}
-{"id": "rg-098", "point": "recall_gate", "input": "把上面的表格转成 Markdown", "expected": "no_need", "cost_level": "low", "tags": ["in_session"]}
-{"id": "rg-099", "point": "recall_gate", "input": "你记得 Python 的 GIL 是什么吗", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "topic_word_trap", "mixed"], "note": "含「你记得…吗」但问的是通用知识"}
-{"id": "rg-100", "point": "recall_gate", "input": "我刚才说了什么", "expected": "no_need", "cost_level": "low", "tags": ["in_session", "boundary"], "note": "本会话上下文可答，不需要跨会话记忆"}
+{"id": "rg-001", "point": "recall_gate", "lang": "zh", "input": "你好", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
+{"id": "rg-002", "point": "recall_gate", "lang": "zh", "input": "早上好呀", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
+{"id": "rg-003", "point": "recall_gate", "lang": "zh", "input": "谢谢", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
+{"id": "rg-004", "point": "recall_gate", "lang": "zh", "input": "哈哈哈哈", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
+{"id": "rg-005", "point": "recall_gate", "lang": "zh", "input": "在吗", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
+{"id": "rg-006", "point": "recall_gate", "lang": "zh", "input": "晚安", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
+{"id": "rg-007", "point": "recall_gate", "lang": "zh", "input": "嗯嗯，好的", "expected": "no_need", "cost_level": "low", "tags": ["greeting"]}
+{"id": "rg-008", "point": "recall_gate", "lang": "zh", "input": "你是谁", "expected": "no_need", "cost_level": "low", "tags": ["assistant_meta"]}
+{"id": "rg-009", "point": "recall_gate", "lang": "zh", "input": "你能做什么", "expected": "no_need", "cost_level": "low", "tags": ["assistant_meta"]}
+{"id": "rg-010", "point": "recall_gate", "lang": "en", "input": "hi there", "expected": "no_need", "cost_level": "low", "tags": ["greeting", "english"]}
+{"id": "rg-011", "point": "recall_gate", "lang": "en", "input": "thanks!", "expected": "no_need", "cost_level": "low", "tags": ["greeting", "english"]}
+{"id": "rg-012", "point": "recall_gate", "lang": "zh", "input": "法国的首都是哪里", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
+{"id": "rg-013", "point": "recall_gate", "lang": "zh", "input": "什么是量子计算", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
+{"id": "rg-014", "point": "recall_gate", "lang": "zh", "input": "一斤等于多少克", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
+{"id": "rg-015", "point": "recall_gate", "lang": "zh", "input": "李白是哪个朝代的", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
+{"id": "rg-016", "point": "recall_gate", "lang": "mixed", "input": "Python 怎么读取 CSV 文件", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "mixed"]}
+{"id": "rg-017", "point": "recall_gate", "lang": "mixed", "input": "Rust 的生命周期怎么理解", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "mixed"]}
+{"id": "rg-018", "point": "recall_gate", "lang": "zh", "input": "1+1 等于几", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
+{"id": "rg-019", "point": "recall_gate", "lang": "zh", "input": "今天几号", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
+{"id": "rg-020", "point": "recall_gate", "lang": "zh", "input": "北京今天天气怎么样", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "explicit_slot"], "note": "城市已给出"}
+{"id": "rg-021", "point": "recall_gate", "lang": "zh", "input": "我在上海，明天下雨吗", "expected": "no_need", "cost_level": "medium", "tags": ["explicit_slot", "stopword_trap"], "note": "位置已在句中给出，不必召回住址"}
+{"id": "rg-022", "point": "recall_gate", "lang": "zh", "input": "帮我算一下 368 元打八五折是多少", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
+{"id": "rg-023", "point": "recall_gate", "lang": "zh", "input": "写一首关于秋天的诗", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
+{"id": "rg-024", "point": "recall_gate", "lang": "zh", "input": "讲个笑话", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
+{"id": "rg-025", "point": "recall_gate", "lang": "zh", "input": "什么是记忆宫殿", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "topic_word_trap"], "note": "含「记忆」一词"}
+{"id": "rg-026", "point": "recall_gate", "lang": "zh", "input": "怎么才能记住英语单词", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "topic_word_trap"]}
+{"id": "rg-027", "point": "recall_gate", "lang": "zh", "input": "花生过敏一般有什么症状", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge", "topic_overlap"], "note": "与用户可能存过的「花生过敏」词面重合；通用医学问题，注入不算错但不需要"}
+{"id": "rg-028", "point": "recall_gate", "lang": "zh", "input": "什么是 MBTI", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge"]}
+{"id": "rg-029", "point": "recall_gate", "lang": "en", "input": "what is the capital of Japan", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "english"]}
+{"id": "rg-030", "point": "recall_gate", "lang": "en", "input": "how do I reverse a list in python", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "english"]}
+{"id": "rg-031", "point": "recall_gate", "lang": "zh", "input": "我的天，这也太难了吧", "expected": "no_need", "cost_level": "medium", "tags": ["stopword_trap"], "note": "M1-T07.2 停用词「我的」"}
+{"id": "rg-032", "point": "recall_gate", "lang": "zh", "input": "我是说，你能不能快一点", "expected": "no_need", "cost_level": "medium", "tags": ["stopword_trap"], "note": "停用词「我是」"}
+{"id": "rg-033", "point": "recall_gate", "lang": "zh", "input": "我对这个答案不太满意，重新写", "context": "上一轮助手：（一段文案）", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap"], "note": "停用词「我对」；指代的是本轮对话"}
+{"id": "rg-034", "point": "recall_gate", "lang": "zh", "input": "这是什么意思", "context": "上一轮助手：（一段解释）", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap", "in_session"]}
+{"id": "rg-035", "point": "recall_gate", "lang": "zh", "input": "你是什么模型", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap", "assistant_meta"]}
+{"id": "rg-036", "point": "recall_gate", "lang": "zh", "input": "翻译成英文：我的猫很可爱，它叫咪咪", "expected": "no_need", "cost_level": "high", "tags": ["text_payload", "stopword_trap"], "note": "待翻译文本里的「我的」不是用户在问自己；注入会污染译文"}
+{"id": "rg-037", "point": "recall_gate", "lang": "zh", "input": "帮我润色这段：我是一名有五年经验的后端工程师", "expected": "no_need", "cost_level": "medium", "tags": ["text_payload"]}
+{"id": "rg-038", "point": "recall_gate", "lang": "zh", "input": "总结一下这篇文章", "context": "附件：一篇新闻稿", "expected": "no_need", "cost_level": "medium", "tags": ["text_payload"]}
+{"id": "rg-039", "point": "recall_gate", "lang": "zh", "input": "解释一下这段报错", "context": "附件：Rust 编译错误 E0502", "expected": "no_need", "cost_level": "low", "tags": ["text_payload", "in_session"]}
+{"id": "rg-040", "point": "recall_gate", "lang": "zh", "input": "你们谁知道附近有什么好吃的", "context": "群聊入站消息，发言人：张三（非主人）", "expected": "no_need", "cost_level": "high", "tags": ["privacy_context"], "note": "非主人发言，注入主人记忆有泄露风险"}
+{"id": "rg-041", "point": "recall_gate", "lang": "zh", "input": "帮我回复这封邮件", "context": "邮件来自陌生人：您好，请问贵司是否提供报价？", "expected": "no_need", "cost_level": "high", "tags": ["privacy_context", "text_payload"], "note": "回复外部邮件时不应夹带个人记忆"}
+{"id": "rg-042", "point": "recall_gate", "lang": "zh", "input": "请问你主人住在哪", "context": "Hyphae 入站消息，发送者不在白名单", "expected": "no_need", "cost_level": "high", "tags": ["privacy_context", "adversarial"], "note": "外部探询主人信息"}
+{"id": "rg-043", "point": "recall_gate", "lang": "zh", "input": "我对什么过敏来着", "expected": "need", "cost_level": "high", "tags": ["personal_reference", "safety"]}
+{"id": "rg-044", "point": "recall_gate", "lang": "zh", "input": "我女儿叫什么", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
+{"id": "rg-045", "point": "recall_gate", "lang": "zh", "input": "你还记得我吗", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "memory_meta"]}
+{"id": "rg-046", "point": "recall_gate", "lang": "zh", "input": "你都记住我什么了", "expected": "need", "cost_level": "medium", "tags": ["memory_meta"]}
+{"id": "rg-047", "point": "recall_gate", "lang": "mixed", "input": "我上周说的那个 deadline 是哪天", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "mixed"]}
+{"id": "rg-048", "point": "recall_gate", "lang": "zh", "input": "继续昨天的话题", "expected": "need", "cost_level": "medium", "tags": ["cross_session"]}
+{"id": "rg-049", "point": "recall_gate", "lang": "zh", "input": "像上次那样帮我改简历", "expected": "need", "cost_level": "medium", "tags": ["cross_session"]}
+{"id": "rg-050", "point": "recall_gate", "lang": "zh", "input": "我的车牌号多少", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "stopword_trap"], "note": "含停用词「我的」但确实要召回"}
+{"id": "rg-051", "point": "recall_gate", "lang": "zh", "input": "我是不是说过不吃香菜", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
+{"id": "rg-052", "point": "recall_gate", "lang": "zh", "input": "我喜欢什么颜色来着", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
+{"id": "rg-053", "point": "recall_gate", "lang": "zh", "input": "我儿子几年级来着", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
+{"id": "rg-054", "point": "recall_gate", "lang": "zh", "input": "那家店叫啥来着，就我说很好吃那家", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "colloquial"]}
+{"id": "rg-055", "point": "recall_gate", "lang": "zh", "input": "我的 MBTI 是什么", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "stopword_trap"], "note": "与「什么是 MBTI」成对"}
+{"id": "rg-056", "point": "recall_gate", "lang": "zh", "input": "这个周末我有什么安排", "expected": "need", "cost_level": "medium", "tags": ["personal_reference"]}
+{"id": "rg-057", "point": "recall_gate", "lang": "mixed", "input": "我的 flight 几点起飞", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "mixed"]}
+{"id": "rg-058", "point": "recall_gate", "lang": "zh", "input": "老规矩", "expected": "need", "cost_level": "medium", "tags": ["shorthand"], "note": "极短但依赖过往约定"}
+{"id": "rg-059", "point": "recall_gate", "lang": "zh", "input": "还是上次那个地址", "expected": "need", "cost_level": "medium", "tags": ["shorthand", "cross_session"]}
+{"id": "rg-060", "point": "recall_gate", "lang": "zh", "input": "侬晓得我住啥地方伐", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "dialect"], "note": "沪语"}
+{"id": "rg-061", "point": "recall_gate", "lang": "en", "input": "what's my dog's name?", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "english"]}
+{"id": "rg-062", "point": "recall_gate", "lang": "en", "input": "am I allergic to anything?", "expected": "need", "cost_level": "high", "tags": ["personal_reference", "english", "safety"]}
+{"id": "rg-063", "point": "recall_gate", "lang": "en", "input": "book the usual table", "expected": "need", "cost_level": "medium", "tags": ["shorthand", "english"]}
+{"id": "rg-064", "point": "recall_gate", "lang": "zh", "input": "这个药我能吃吗：阿莫西林", "expected": "need", "cost_level": "high", "tags": ["implicit_personal", "safety"], "note": "青霉素类；若记忆里有青霉素过敏必须召回"}
+{"id": "rg-065", "point": "recall_gate", "lang": "zh", "input": "我能喝这杯奶茶吗，里面有花生碎", "expected": "need", "cost_level": "high", "tags": ["implicit_personal", "safety"]}
+{"id": "rg-066", "point": "recall_gate", "lang": "zh", "input": "帮我点个外卖", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "口味/忌口/地址"}
+{"id": "rg-067", "point": "recall_gate", "lang": "zh", "input": "按我平时的口味推荐个菜", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
+{"id": "rg-068", "point": "recall_gate", "lang": "zh", "input": "我老家今天天气怎么样", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "需要知道老家在哪"}
+{"id": "rg-069", "point": "recall_gate", "lang": "zh", "input": "提醒我按时吃药", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
+{"id": "rg-070", "point": "recall_gate", "lang": "zh", "input": "按我的上班时间排一下这周的健身计划", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
+{"id": "rg-071", "point": "recall_gate", "lang": "zh", "input": "给我妈发个生日祝福", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "称呼/生日"}
+{"id": "rg-072", "point": "recall_gate", "lang": "zh", "input": "帮我写个自我介绍", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal", "boundary"]}
+{"id": "rg-073", "point": "recall_gate", "lang": "zh", "input": "写封邮件给我老板请两天假", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"], "note": "老板称呼可召回，也可通用模板"}
+{"id": "rg-074", "point": "recall_gate", "lang": "zh", "input": "帮我查下明天的航班", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"], "note": "哪个航班要靠记忆"}
+{"id": "rg-075", "point": "recall_gate", "lang": "zh", "input": "我想给女儿买个生日礼物", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
+{"id": "rg-076", "point": "recall_gate", "lang": "zh", "input": "周末带孩子去哪玩", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"], "note": "孩子年龄、所在城市"}
+{"id": "rg-077", "point": "recall_gate", "lang": "zh", "input": "推荐几家晚饭的馆子", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"], "note": "忌口/城市，召回可改善但非必需"}
+{"id": "rg-078", "point": "recall_gate", "lang": "zh", "input": "我该吃午饭了，吃点啥好", "expected": "need", "cost_level": "low", "tags": ["implicit_personal", "boundary"]}
+{"id": "rg-079", "point": "recall_gate", "lang": "zh", "input": "你觉得我该换工作吗", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal", "boundary"]}
+{"id": "rg-080", "point": "recall_gate", "lang": "zh", "input": "同样的问题再帮我看一下", "expected": "need", "cost_level": "low", "tags": ["cross_session", "boundary"], "note": "可能指本会话，也可能指过往会话"}
+{"id": "rg-081", "point": "recall_gate", "lang": "zh", "input": "我今天有点累", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "emotional"], "note": "情绪表达，召回不是必须"}
+{"id": "rg-082", "point": "recall_gate", "lang": "zh", "input": "我想学吉他，怎么入门", "expected": "no_need", "cost_level": "low", "tags": ["boundary"]}
+{"id": "rg-083", "point": "recall_gate", "lang": "zh", "input": "上海明天下雨吗", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge", "explicit_slot"]}
+{"id": "rg-084", "point": "recall_gate", "lang": "zh", "input": "帮我把这句改成正式一点：明天我请假", "expected": "no_need", "cost_level": "low", "tags": ["text_payload", "boundary"]}
+{"id": "rg-085", "point": "recall_gate", "lang": "zh", "input": "我的天哪", "expected": "no_need", "cost_level": "low", "tags": ["stopword_trap", "greeting"]}
+{"id": "rg-086", "point": "recall_gate", "lang": "zh", "input": "我觉得这个方案不错", "context": "上一轮助手：方案 A/B 对比", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "in_session"]}
+{"id": "rg-087", "point": "recall_gate", "lang": "zh", "input": "今天股市怎么样", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
+{"id": "rg-088", "point": "recall_gate", "lang": "zh", "input": "算了，不聊这个了", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "in_session"]}
+{"id": "rg-089", "point": "recall_gate", "lang": "en", "input": "I'm bored", "expected": "no_need", "cost_level": "low", "tags": ["boundary", "english", "emotional"]}
+{"id": "rg-090", "point": "recall_gate", "lang": "zh", "input": "我那个做设计的朋友叫啥来着", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "colloquial"]}
+{"id": "rg-091", "point": "recall_gate", "lang": "zh", "input": "我上次体检结果怎么样", "expected": "need", "cost_level": "medium", "tags": ["personal_reference", "cross_session"]}
+{"id": "rg-092", "point": "recall_gate", "lang": "zh", "input": "给我推荐本书，别推我看过的", "expected": "need", "cost_level": "medium", "tags": ["implicit_personal"]}
+{"id": "rg-093", "point": "recall_gate", "lang": "zh", "input": "我们之前聊到哪了", "context": "新会话第一句", "expected": "need", "cost_level": "medium", "tags": ["cross_session"]}
+{"id": "rg-094", "point": "recall_gate", "lang": "zh", "input": "我一般几点起床", "expected": "need", "cost_level": "low", "tags": ["personal_reference"]}
+{"id": "rg-095", "point": "recall_gate", "lang": "zh", "input": "地球到月球有多远", "expected": "no_need", "cost_level": "low", "tags": ["general_knowledge"]}
+{"id": "rg-096", "point": "recall_gate", "lang": "zh", "input": "帮我生成一个 16 位随机密码", "expected": "no_need", "cost_level": "low", "tags": ["task_generic"]}
+{"id": "rg-097", "point": "recall_gate", "lang": "zh", "input": "这首歌叫什么名字", "context": "用户贴了一段歌词", "expected": "no_need", "cost_level": "low", "tags": ["in_session", "text_payload"]}
+{"id": "rg-098", "point": "recall_gate", "lang": "zh", "input": "把上面的表格转成 Markdown", "expected": "no_need", "cost_level": "low", "tags": ["in_session"]}
+{"id": "rg-099", "point": "recall_gate", "lang": "mixed", "input": "你记得 Python 的 GIL 是什么吗", "expected": "no_need", "cost_level": "medium", "tags": ["general_knowledge", "topic_word_trap", "mixed"], "note": "含「你记得…吗」但问的是通用知识"}
+{"id": "rg-100", "point": "recall_gate", "lang": "zh", "input": "我刚才说了什么", "expected": "no_need", "cost_level": "low", "tags": ["in_session", "boundary"], "note": "本会话上下文可答，不需要跨会话记忆"}
+{"id": "rg-101", "point": "recall_gate", "lang": "en", "input": "good morning!", "expected": "no_need", "cost_level": "low", "tags": ["english", "greeting"]}
+{"id": "rg-102", "point": "recall_gate", "lang": "en", "input": "hey, you there?", "expected": "no_need", "cost_level": "low", "tags": ["english", "greeting"]}
+{"id": "rg-103", "point": "recall_gate", "lang": "en", "input": "ok cool", "expected": "no_need", "cost_level": "low", "tags": ["english", "greeting"]}
+{"id": "rg-104", "point": "recall_gate", "lang": "en", "input": "night night", "expected": "no_need", "cost_level": "low", "tags": ["english", "greeting"]}
+{"id": "rg-105", "point": "recall_gate", "lang": "en", "input": "lol", "expected": "no_need", "cost_level": "low", "tags": ["english", "greeting"]}
+{"id": "rg-106", "point": "recall_gate", "lang": "en", "input": "who made you?", "expected": "no_need", "cost_level": "low", "tags": ["english", "assistant_meta"]}
+{"id": "rg-107", "point": "recall_gate", "lang": "en", "input": "what model are you running on?", "expected": "no_need", "cost_level": "low", "tags": ["english", "assistant_meta"]}
+{"id": "rg-108", "point": "recall_gate", "lang": "en", "input": "how many ounces are in a pound", "expected": "no_need", "cost_level": "medium", "tags": ["english", "general_knowledge"]}
+{"id": "rg-109", "point": "recall_gate", "lang": "en", "input": "who wrote Pride and Prejudice?", "expected": "no_need", "cost_level": "medium", "tags": ["english", "general_knowledge"]}
+{"id": "rg-110", "point": "recall_gate", "lang": "en", "input": "what's a memory palace?", "expected": "no_need", "cost_level": "medium", "tags": ["english", "general_knowledge", "topic_word_trap"], "note": "含 memory 一词"}
+{"id": "rg-111", "point": "recall_gate", "lang": "en", "input": "tips to remember vocabulary faster", "expected": "no_need", "cost_level": "medium", "tags": ["english", "general_knowledge", "topic_word_trap"]}
+{"id": "rg-112", "point": "recall_gate", "lang": "en", "input": "what are common symptoms of a shellfish allergy", "expected": "no_need", "cost_level": "low", "tags": ["english", "general_knowledge", "topic_overlap"], "note": "与用户可能存过的过敏词面重合；通用医学问题"}
+{"id": "rg-113", "point": "recall_gate", "lang": "en", "input": "explain Rust ownership in simple terms", "expected": "no_need", "cost_level": "medium", "tags": ["english", "general_knowledge"]}
+{"id": "rg-114", "point": "recall_gate", "lang": "en", "input": "what's the weather in London tomorrow", "expected": "no_need", "cost_level": "medium", "tags": ["english", "general_knowledge", "explicit_slot"]}
+{"id": "rg-115", "point": "recall_gate", "lang": "en", "input": "I'm in Seattle right now — will it rain tomorrow?", "expected": "no_need", "cost_level": "medium", "tags": ["english", "explicit_slot", "stopword_trap"], "note": "位置已在句中给出，不必召回住址"}
+{"id": "rg-116", "point": "recall_gate", "lang": "en", "input": "my god, this is so hard", "expected": "no_need", "cost_level": "medium", "tags": ["english", "stopword_trap"], "note": "my 不是在问自己的事"}
+{"id": "rg-117", "point": "recall_gate", "lang": "en", "input": "I mean, can you go a bit faster", "expected": "no_need", "cost_level": "medium", "tags": ["english", "stopword_trap"]}
+{"id": "rg-118", "point": "recall_gate", "lang": "en", "input": "I'm not happy with this answer, rewrite it", "context": "上一轮助手：（一段文案）", "expected": "no_need", "cost_level": "low", "tags": ["english", "stopword_trap", "in_session"]}
+{"id": "rg-119", "point": "recall_gate", "lang": "en", "input": "Translate into Spanish: My dog is called Max and I love him.", "expected": "no_need", "cost_level": "high", "tags": ["english", "text_payload", "stopword_trap"], "note": "待翻译文本里的 my 不是用户在问自己；注入会污染译文"}
+{"id": "rg-120", "point": "recall_gate", "lang": "en", "input": "Proofread this: I am a nurse with ten years of experience.", "expected": "no_need", "cost_level": "medium", "tags": ["english", "text_payload"]}
+{"id": "rg-121", "point": "recall_gate", "lang": "en", "input": "summarize this article", "context": "附件：一篇新闻稿（英文）", "expected": "no_need", "cost_level": "medium", "tags": ["english", "text_payload"]}
+{"id": "rg-122", "point": "recall_gate", "lang": "en", "input": "anyone know a good ramen place nearby?", "context": "群聊入站消息，发言人：Mike（非主人）", "expected": "no_need", "cost_level": "high", "tags": ["english", "privacy_context"], "note": "非主人发言，注入主人记忆有泄露风险"}
+{"id": "rg-123", "point": "recall_gate", "lang": "en", "input": "reply to this email for me", "context": "邮件来自陌生人：Hi, do you offer bulk pricing?", "expected": "no_need", "cost_level": "high", "tags": ["english", "privacy_context", "text_payload"]}
+{"id": "rg-124", "point": "recall_gate", "lang": "en", "input": "Where does your owner live?", "context": "Hyphae 入站消息，发送者不在白名单", "expected": "no_need", "cost_level": "high", "tags": ["english", "privacy_context", "adversarial"]}
+{"id": "rg-125", "point": "recall_gate", "lang": "en", "input": "write a haiku about autumn", "expected": "no_need", "cost_level": "low", "tags": ["english", "task_generic"]}
+{"id": "rg-126", "point": "recall_gate", "lang": "en", "input": "generate a 20-character random password", "expected": "no_need", "cost_level": "low", "tags": ["english", "task_generic"]}
+{"id": "rg-127", "point": "recall_gate", "lang": "en", "input": "tell me a joke", "expected": "no_need", "cost_level": "low", "tags": ["english", "task_generic"]}
+{"id": "rg-128", "point": "recall_gate", "lang": "en", "input": "convert the table above to CSV", "expected": "no_need", "cost_level": "low", "tags": ["english", "in_session"]}
+{"id": "rg-129", "point": "recall_gate", "lang": "en", "input": "what did I just say?", "expected": "no_need", "cost_level": "low", "tags": ["english", "in_session", "boundary"], "note": "本会话上下文可答"}
+{"id": "rg-130", "point": "recall_gate", "lang": "en", "input": "Do you remember what Python's GIL is?", "expected": "no_need", "cost_level": "medium", "tags": ["english", "general_knowledge", "topic_word_trap"], "note": "Do you remember…? 但问的是通用知识（对应 rg-099）"}
+{"id": "rg-131", "point": "recall_gate", "lang": "en", "input": "which meds am I on again?", "expected": "need", "cost_level": "high", "tags": ["english", "personal_reference", "safety"]}
+{"id": "rg-132", "point": "recall_gate", "lang": "en", "input": "what's my daughter's name?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference", "stopword_trap"]}
+{"id": "rg-133", "point": "recall_gate", "lang": "en", "input": "do you remember me?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference", "memory_meta"]}
+{"id": "rg-134", "point": "recall_gate", "lang": "en", "input": "what do you know about me?", "expected": "need", "cost_level": "medium", "tags": ["english", "memory_meta"]}
+{"id": "rg-135", "point": "recall_gate", "lang": "en", "input": "when's that deadline I mentioned last week?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference", "cross_session"]}
+{"id": "rg-136", "point": "recall_gate", "lang": "en", "input": "let's pick up where we left off yesterday", "expected": "need", "cost_level": "medium", "tags": ["english", "cross_session"]}
+{"id": "rg-137", "point": "recall_gate", "lang": "en", "input": "fix my resume like you did last time", "expected": "need", "cost_level": "medium", "tags": ["english", "cross_session"]}
+{"id": "rg-138", "point": "recall_gate", "lang": "en", "input": "what's my license plate number?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference", "stopword_trap"]}
+{"id": "rg-139", "point": "recall_gate", "lang": "en", "input": "did I tell you I hate cilantro?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference"]}
+{"id": "rg-140", "point": "recall_gate", "lang": "en", "input": "what's that restaurant I said was amazing called?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference", "colloquial"]}
+{"id": "rg-141", "point": "recall_gate", "lang": "en", "input": "what's my MBTI type?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference", "stopword_trap"], "note": "与 what is MBTI 成对"}
+{"id": "rg-142", "point": "recall_gate", "lang": "en", "input": "what plans do I have this weekend?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference"]}
+{"id": "rg-143", "point": "recall_gate", "lang": "en", "input": "how old is my son now?", "expected": "need", "cost_level": "medium", "tags": ["english", "personal_reference"]}
+{"id": "rg-144", "point": "recall_gate", "lang": "en", "input": "Can I take this? It's amoxicillin.", "expected": "need", "cost_level": "high", "tags": ["english", "implicit_personal", "safety"], "note": "若记忆里有青霉素过敏必须召回"}
+{"id": "rg-145", "point": "recall_gate", "lang": "en", "input": "can I eat this cookie? it has walnuts in it", "expected": "need", "cost_level": "high", "tags": ["english", "implicit_personal", "safety"]}
+{"id": "rg-146", "point": "recall_gate", "lang": "en", "input": "order me some dinner", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal"], "note": "口味/忌口/地址"}
+{"id": "rg-147", "point": "recall_gate", "lang": "en", "input": "suggest a dish I'd like", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal"]}
+{"id": "rg-148", "point": "recall_gate", "lang": "en", "input": "how's the weather back in my hometown?", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal"]}
+{"id": "rg-149", "point": "recall_gate", "lang": "en", "input": "remind me to take my meds", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal"]}
+{"id": "rg-150", "point": "recall_gate", "lang": "en", "input": "send my mom a birthday message", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal"]}
+{"id": "rg-151", "point": "recall_gate", "lang": "en", "input": "write a short bio for me", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal", "boundary"]}
+{"id": "rg-152", "point": "recall_gate", "lang": "en", "input": "where should I take the kids this weekend?", "expected": "need", "cost_level": "low", "tags": ["english", "implicit_personal", "boundary"]}
+{"id": "rg-153", "point": "recall_gate", "lang": "en", "input": "should I quit my job?", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal", "boundary"]}
+{"id": "rg-154", "point": "recall_gate", "lang": "en", "input": "recommend a book, but not one I've already read", "expected": "need", "cost_level": "medium", "tags": ["english", "implicit_personal"]}
+{"id": "rg-155", "point": "recall_gate", "lang": "en", "input": "the usual, please", "expected": "need", "cost_level": "medium", "tags": ["english", "shorthand"]}
+{"id": "rg-156", "point": "recall_gate", "lang": "en", "input": "same address as last time", "expected": "need", "cost_level": "medium", "tags": ["english", "shorthand", "cross_session"]}
+{"id": "rg-157", "point": "recall_gate", "lang": "en", "input": "where did we leave off?", "context": "新会话第一句", "expected": "need", "cost_level": "medium", "tags": ["english", "cross_session"]}
+{"id": "rg-158", "point": "recall_gate", "lang": "th", "input": "สวัสดีครับ", "expected": "no_need", "cost_level": "low", "tags": ["thai", "greeting", "polite_particle"]}
+{"id": "rg-159", "point": "recall_gate", "lang": "th", "input": "หวัดดี", "expected": "no_need", "cost_level": "low", "tags": ["thai", "greeting"]}
+{"id": "rg-160", "point": "recall_gate", "lang": "th", "input": "ขอบคุณค่ะ", "expected": "no_need", "cost_level": "low", "tags": ["thai", "greeting", "polite_particle"]}
+{"id": "rg-161", "point": "recall_gate", "lang": "th", "input": "55555", "expected": "no_need", "cost_level": "low", "tags": ["thai", "greeting"], "note": "泰文网络用语，5 读 ha，相当于哈哈哈"}
+{"id": "rg-162", "point": "recall_gate", "lang": "th", "input": "อยู่ไหม", "expected": "no_need", "cost_level": "low", "tags": ["thai", "greeting", "question_particle"], "note": "相当于「在吗」"}
+{"id": "rg-163", "point": "recall_gate", "lang": "th", "input": "ฝันดีนะ", "expected": "no_need", "cost_level": "low", "tags": ["thai", "greeting"]}
+{"id": "rg-164", "point": "recall_gate", "lang": "th", "input": "โอเค ได้เลย", "expected": "no_need", "cost_level": "low", "tags": ["thai", "greeting"]}
+{"id": "rg-165", "point": "recall_gate", "lang": "th", "input": "คุณเป็นใคร", "expected": "no_need", "cost_level": "low", "tags": ["thai", "assistant_meta"]}
+{"id": "rg-166", "point": "recall_gate", "lang": "th", "input": "คุณทำอะไรได้บ้าง", "expected": "no_need", "cost_level": "low", "tags": ["thai", "assistant_meta"]}
+{"id": "rg-167", "point": "recall_gate", "lang": "th", "input": "คุณใช้โมเดลอะไร", "expected": "no_need", "cost_level": "low", "tags": ["thai", "assistant_meta"]}
+{"id": "rg-168", "point": "recall_gate", "lang": "th", "input": "เมืองหลวงของญี่ปุ่นคืออะไร", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge"]}
+{"id": "rg-169", "point": "recall_gate", "lang": "th", "input": "หนึ่งกิโลกรัมเท่ากับกี่ปอนด์", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge"]}
+{"id": "rg-170", "point": "recall_gate", "lang": "th", "input": "สุนทรภู่เป็นกวีสมัยไหน", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge"]}
+{"id": "rg-171", "point": "recall_gate", "lang": "th", "input": "ควอนตัมคอมพิวเตอร์คืออะไร", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge"]}
+{"id": "rg-172", "point": "recall_gate", "lang": "th", "input": "พรุ่งนี้กรุงเทพฯ ฝนตกไหม", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge", "explicit_slot", "question_particle"]}
+{"id": "rg-173", "point": "recall_gate", "lang": "th", "input": "ผมอยู่ภูเก็ต พรุ่งนี้ฝนจะตกหรือเปล่า", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "explicit_slot", "stopword_trap", "question_particle"], "note": "位置已在句中给出"}
+{"id": "rg-174", "point": "recall_gate", "lang": "th", "input": "วิธีจำศัพท์ภาษาอังกฤษให้ได้เร็ว", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge", "topic_word_trap"]}
+{"id": "rg-175", "point": "recall_gate", "lang": "th", "input": "วังแห่งความจำคืออะไร", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge", "topic_word_trap"], "note": "memory palace；含 ความจำ 一词"}
+{"id": "rg-176", "point": "recall_gate", "lang": "th", "input": "อาการแพ้กุ้งมีอะไรบ้าง", "expected": "no_need", "cost_level": "low", "tags": ["thai", "general_knowledge", "topic_overlap"]}
+{"id": "rg-177", "point": "recall_gate", "lang": "th", "input": "จำได้ไหมว่า GIL ใน Python คืออะไร", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "general_knowledge", "topic_word_trap", "question_particle"], "note": "จำได้ไหม 但问的是通用知识"}
+{"id": "rg-178", "point": "recall_gate", "lang": "th", "input": "ผมหมายถึง ช่วยเร็วกว่านี้หน่อยได้ไหม", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "stopword_trap", "question_particle"]}
+{"id": "rg-179", "point": "recall_gate", "lang": "th", "input": "ฉันไม่ค่อยพอใจคำตอบนี้ เขียนใหม่ที", "context": "上一轮助手：（一段文案）", "expected": "no_need", "cost_level": "low", "tags": ["thai", "stopword_trap", "in_session"]}
+{"id": "rg-180", "point": "recall_gate", "lang": "th", "input": "แปลเป็นภาษาอังกฤษ: แมวของฉันชื่อส้ม น่ารักมาก", "expected": "no_need", "cost_level": "high", "tags": ["thai", "text_payload", "stopword_trap"], "note": "待翻译文本里的 ของฉัน 不是用户在问自己"}
+{"id": "rg-181", "point": "recall_gate", "lang": "th", "input": "ช่วยเกลาประโยคนี้หน่อย: ผมเป็นวิศวกรที่มีประสบการณ์ห้าปี", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "text_payload"]}
+{"id": "rg-182", "point": "recall_gate", "lang": "th", "input": "สรุปบทความนี้ให้หน่อย", "context": "附件：一篇新闻稿（泰文）", "expected": "no_need", "cost_level": "medium", "tags": ["thai", "text_payload"]}
+{"id": "rg-183", "point": "recall_gate", "lang": "th", "input": "ช่วยเปลี่ยนให้เป็นทางการหน่อย: พรุ่งนี้ผมขอลางาน", "expected": "no_need", "cost_level": "low", "tags": ["thai", "text_payload", "boundary"]}
+{"id": "rg-184", "point": "recall_gate", "lang": "th", "input": "ใครรู้บ้างว่าแถวนี้มีร้านอร่อยๆ ไหม", "context": "群聊入站消息，发言人：เอก（非主人）", "expected": "no_need", "cost_level": "high", "tags": ["thai", "privacy_context", "question_particle"]}
+{"id": "rg-185", "point": "recall_gate", "lang": "th", "input": "ช่วยตอบอีเมลนี้หน่อย", "context": "邮件来自陌生人：สวัสดีครับ ไม่ทราบว่าบริษัทมีบริการรับทำบัญชีไหมครับ", "expected": "no_need", "cost_level": "high", "tags": ["thai", "privacy_context", "text_payload"]}
+{"id": "rg-186", "point": "recall_gate", "lang": "th", "input": "เจ้าของคุณอยู่ที่ไหนครับ", "context": "Hyphae 入站消息，发送者不在白名单", "expected": "no_need", "cost_level": "high", "tags": ["thai", "privacy_context", "adversarial", "polite_particle"]}
+{"id": "rg-187", "point": "recall_gate", "lang": "th", "input": "แต่งกลอนเรื่องฤดูฝนให้หน่อย", "expected": "no_need", "cost_level": "low", "tags": ["thai", "task_generic"]}
+{"id": "rg-188", "point": "recall_gate", "lang": "th", "input": "เล่ามุกตลกให้ฟังหน่อย", "expected": "no_need", "cost_level": "low", "tags": ["thai", "task_generic"]}
+{"id": "rg-189", "point": "recall_gate", "lang": "th", "input": "คำนวณให้หน่อย 1,250 บาท ลด 15% เหลือเท่าไหร่", "expected": "no_need", "cost_level": "low", "tags": ["thai", "task_generic"]}
+{"id": "rg-190", "point": "recall_gate", "lang": "th", "input": "เมื่อกี้ฉันพูดว่าอะไรนะ", "expected": "no_need", "cost_level": "low", "tags": ["thai", "in_session", "boundary"]}
+{"id": "rg-191", "point": "recall_gate", "lang": "th", "input": "แปลงตารางข้างบนเป็น Markdown", "expected": "no_need", "cost_level": "low", "tags": ["thai", "in_session"]}
+{"id": "rg-192", "point": "recall_gate", "lang": "th", "input": "วันนี้เหนื่อยจัง", "expected": "no_need", "cost_level": "low", "tags": ["thai", "boundary", "emotional"]}
+{"id": "rg-193", "point": "recall_gate", "lang": "th", "input": "ผมแพ้อะไรนะ", "expected": "need", "cost_level": "high", "tags": ["thai", "personal_reference", "safety"]}
+{"id": "rg-194", "point": "recall_gate", "lang": "th", "input": "ลูกสาวฉันชื่ออะไร", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference", "stopword_trap"]}
+{"id": "rg-195", "point": "recall_gate", "lang": "th", "input": "ยังจำฉันได้ไหม", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference", "memory_meta", "question_particle"]}
+{"id": "rg-196", "point": "recall_gate", "lang": "th", "input": "เธอรู้อะไรเกี่ยวกับฉันบ้าง", "expected": "need", "cost_level": "medium", "tags": ["thai", "memory_meta"]}
+{"id": "rg-197", "point": "recall_gate", "lang": "th", "input": "เดดไลน์ที่ผมบอกเมื่ออาทิตย์ก่อนคือวันไหน", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference", "cross_session"]}
+{"id": "rg-198", "point": "recall_gate", "lang": "th", "input": "คุยต่อจากเมื่อวานเลย", "expected": "need", "cost_level": "medium", "tags": ["thai", "cross_session"]}
+{"id": "rg-199", "point": "recall_gate", "lang": "th", "input": "แก้เรซูเม่ให้เหมือนครั้งก่อน", "expected": "need", "cost_level": "medium", "tags": ["thai", "cross_session"]}
+{"id": "rg-200", "point": "recall_gate", "lang": "th", "input": "ทะเบียนรถผมเลขอะไรนะ", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference", "stopword_trap"]}
+{"id": "rg-201", "point": "recall_gate", "lang": "th", "input": "ฉันเคยบอกไหมว่าไม่กินผักชี", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference", "question_particle"]}
+{"id": "rg-202", "point": "recall_gate", "lang": "th", "input": "ร้านที่ผมบอกว่าอร่อยมากชื่ออะไรนะ", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference", "colloquial"]}
+{"id": "rg-203", "point": "recall_gate", "lang": "th", "input": "สุดสัปดาห์นี้ฉันมีนัดอะไรบ้าง", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference"]}
+{"id": "rg-204", "point": "recall_gate", "lang": "th", "input": "ลูกชายผมเรียนชั้นอะไรแล้วนะ", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference"]}
+{"id": "rg-205", "point": "recall_gate", "lang": "th", "input": "เพื่อนที่เป็นดีไซเนอร์ของฉันชื่ออะไรนะ", "expected": "need", "cost_level": "medium", "tags": ["thai", "personal_reference", "colloquial"]}
+{"id": "rg-206", "point": "recall_gate", "lang": "th", "input": "ยานี้ผมกินได้ไหม: อะม็อกซีซิลลิน", "expected": "need", "cost_level": "high", "tags": ["thai", "implicit_personal", "safety", "question_particle"], "note": "青霉素类；若记忆里有青霉素过敏必须召回"}
+{"id": "rg-207", "point": "recall_gate", "lang": "th", "input": "ชานมแก้วนี้มีถั่ว ฉันกินได้หรือเปล่า", "expected": "need", "cost_level": "high", "tags": ["thai", "implicit_personal", "safety", "question_particle"]}
+{"id": "rg-208", "point": "recall_gate", "lang": "th", "input": "สั่งข้าวเย็นให้หน่อย", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal"]}
+{"id": "rg-209", "point": "recall_gate", "lang": "th", "input": "แนะนำเมนูที่ฉันน่าจะชอบ", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal"]}
+{"id": "rg-210", "point": "recall_gate", "lang": "th", "input": "บ้านเกิดผมวันนี้อากาศเป็นยังไง", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal"]}
+{"id": "rg-211", "point": "recall_gate", "lang": "th", "input": "เตือนให้กินยาตรงเวลาด้วย", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal"]}
+{"id": "rg-212", "point": "recall_gate", "lang": "th", "input": "ส่งคำอวยพรวันเกิดให้แม่หน่อย", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal"]}
+{"id": "rg-213", "point": "recall_gate", "lang": "th", "input": "ช่วยเขียนแนะนำตัวให้หน่อย", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal", "boundary"]}
+{"id": "rg-214", "point": "recall_gate", "lang": "th", "input": "เสาร์อาทิตย์นี้พาลูกไปเที่ยวไหนดี", "expected": "need", "cost_level": "low", "tags": ["thai", "implicit_personal", "boundary"]}
+{"id": "rg-215", "point": "recall_gate", "lang": "th", "input": "คิดว่าผมควรเปลี่ยนงานไหม", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal", "boundary", "question_particle"]}
+{"id": "rg-216", "point": "recall_gate", "lang": "th", "input": "แนะนำหนังสือหน่อย ไม่เอาเล่มที่อ่านแล้ว", "expected": "need", "cost_level": "medium", "tags": ["thai", "implicit_personal"]}
+{"id": "rg-217", "point": "recall_gate", "lang": "th", "input": "เอาเหมือนเดิม", "expected": "need", "cost_level": "medium", "tags": ["thai", "shorthand"], "note": "相当于「老规矩」"}
+{"id": "rg-218", "point": "recall_gate", "lang": "th", "input": "ส่งไปที่อยู่เดิมนะ", "expected": "need", "cost_level": "medium", "tags": ["thai", "shorthand", "cross_session"]}
+{"id": "rg-219", "point": "recall_gate", "lang": "th", "input": "เราคุยกันถึงไหนแล้ว", "context": "新会话第一句", "expected": "need", "cost_level": "medium", "tags": ["thai", "cross_session"]}
+{"id": "rg-220", "point": "recall_gate", "lang": "mixed", "input": "ช่วย check หน่อยว่าผมแพ้ยาตัวไหนบ้าง", "expected": "need", "cost_level": "high", "tags": ["mixed", "personal_reference", "safety"]}
+{"id": "rg-221", "point": "recall_gate", "lang": "mixed", "input": "translate อันนี้เป็นไทย: My sister lives in Bangkok", "expected": "no_need", "cost_level": "high", "tags": ["mixed", "text_payload", "stopword_trap"]}

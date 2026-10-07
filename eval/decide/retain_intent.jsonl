@@ -1,101 +1,226 @@
-{"id": "ri-001", "point": "retain_intent", "input": "记住我对花生过敏", "expected": "remember", "cost_level": "high", "tags": ["basic", "safety"]}
-{"id": "ri-002", "point": "retain_intent", "input": "你记住，我对花生过敏。", "expected": "remember", "cost_level": "high", "tags": ["comma_form", "safety"], "note": "M1 真机验收漏识别原句，M1-T13 已修"}
-{"id": "ri-003", "point": "retain_intent", "input": "请记住：我女儿叫朵朵", "expected": "remember", "cost_level": "medium", "tags": ["polite"]}
-{"id": "ri-004", "point": "retain_intent", "input": "帮我记一下，下周三下午交房租", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"]}
-{"id": "ri-005", "point": "retain_intent", "input": "麻烦记一下我的工位在3楼B区", "expected": "remember", "cost_level": "medium", "tags": ["polite"]}
-{"id": "ri-006", "point": "retain_intent", "input": "记住我住在杭州西湖区", "expected": "remember", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-007", "point": "retain_intent", "input": "帮我记住：周五之前要把报销单交了", "expected": "remember", "cost_level": "medium", "tags": ["polite"]}
-{"id": "ri-008", "point": "retain_intent", "input": "记着啊，我不吃香菜", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"], "note": "规则能命中但抽取结果带「啊，」"}
-{"id": "ri-009", "point": "retain_intent", "input": "你记一下哈，我儿子学校四点半放学", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"], "note": "规则能命中但抽取结果带「哈，」"}
-{"id": "ri-010", "point": "retain_intent", "input": "记住喽，明天八点楼下见", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"]}
-{"id": "ri-011", "point": "retain_intent", "input": "你给我记好了，我老婆生日是3月8号", "expected": "remember", "cost_level": "medium", "tags": ["colloquial", "dialect", "rule_fn"], "note": "北方口语「给我记好了」"}
-{"id": "ri-012", "point": "retain_intent", "input": "记下来：车牌号沪A12345", "expected": "remember", "cost_level": "medium", "tags": ["colloquial", "rule_fn"], "note": "动词「记下来」不在规则表"}
-{"id": "ri-013", "point": "retain_intent", "input": "这个你要记住：我的血型是O型", "expected": "remember", "cost_level": "high", "tags": ["verb_mid", "safety", "rule_fn"], "note": "动词在句中"}
-{"id": "ri-014", "point": "retain_intent", "input": "我对青霉素过敏，你记住哈", "expected": "remember", "cost_level": "high", "tags": ["verb_tail", "safety", "rule_fn"], "note": "动词在句末"}
-{"id": "ri-015", "point": "retain_intent", "input": "千万别忘了我对芒果过敏", "expected": "remember", "cost_level": "high", "tags": ["negation_positive", "safety", "rule_fn"], "note": "否定词＋忘＝肯定的记住"}
-{"id": "ri-016", "point": "retain_intent", "input": "以后别忘了我是素食者", "expected": "remember", "cost_level": "medium", "tags": ["negation_positive", "rule_fn"]}
-{"id": "ri-017", "point": "retain_intent", "input": "记得我下个月要去成都出差", "expected": "remember", "cost_level": "medium", "tags": ["ambiguous", "rule_fn"], "note": "「记得…」作祈使；无句末疑问词"}
-{"id": "ri-018", "point": "retain_intent", "input": "帮我记牢，阿拉儿子礼拜三要打疫苗", "expected": "remember", "cost_level": "medium", "tags": ["dialect", "rule_fn"], "note": "沪语"}
-{"id": "ri-019", "point": "retain_intent", "input": "记到起哈，我明天要早起赶飞机", "expected": "remember", "cost_level": "medium", "tags": ["dialect", "rule_fn"], "note": "川渝话「记到起」"}
-{"id": "ri-020", "point": "retain_intent", "input": "帮我记住，我食唔得花生", "expected": "remember", "cost_level": "high", "tags": ["dialect", "safety"], "note": "粤语「食唔得」＝不能吃"}
-{"id": "ri-021", "point": "retain_intent", "input": "你帮我记住这个好不好", "context": "上一轮用户：我下周二体检，要空腹", "expected": "remember", "cost_level": "medium", "tags": ["a_not_a", "context_needed"], "note": "M1-T13 陷阱；规则抽出「这个好不好」，内容无效，需要上下文指代"}
-{"id": "ri-022", "point": "retain_intent", "input": "你记住我对花生过敏好不好", "expected": "remember", "cost_level": "high", "tags": ["a_not_a", "safety"]}
-{"id": "ri-023", "point": "retain_intent", "input": "帮我记一下我的会员号行不行，88812", "expected": "remember", "cost_level": "medium", "tags": ["a_not_a"]}
-{"id": "ri-024", "point": "retain_intent", "input": "你记住，我对花生过敏，好吗", "expected": "remember", "cost_level": "high", "tags": ["comma_form", "tag_question", "safety", "rule_fn"], "note": "句末附加问「好吗」是礼貌请求，不是询问"}
-{"id": "ri-025", "point": "retain_intent", "input": "你能记住我对猫毛过敏吗", "expected": "remember", "cost_level": "high", "tags": ["polite_question", "ambiguous", "safety", "rule_fn"], "note": "能力问句形式的请求；可接受反问澄清，但不能判成无关"}
-{"id": "ri-026", "point": "retain_intent", "input": "记住这个", "context": "上一轮用户：我的医保卡号是 3301XXXX", "expected": "remember", "cost_level": "medium", "tags": ["context_needed"], "note": "规则抽出「这个」，内容需指代消解"}
-{"id": "ri-027", "point": "retain_intent", "input": "对，记下", "context": "上一轮助手：需要我记住你的车位号 B2-117 吗？", "expected": "remember", "cost_level": "medium", "tags": ["context_needed", "clarify_answer", "rule_fn"]}
-{"id": "ri-028", "point": "retain_intent", "input": "好啊", "context": "上一轮助手：要我记住你的公司地址吗？", "expected": "remember", "cost_level": "medium", "tags": ["context_needed", "clarify_answer", "rule_fn"]}
-{"id": "ri-029", "point": "retain_intent", "input": "remember that I'm allergic to shellfish", "expected": "remember", "cost_level": "high", "tags": ["english", "safety"]}
-{"id": "ri-030", "point": "retain_intent", "input": "Please remember my wife's name is Anna", "expected": "remember", "cost_level": "medium", "tags": ["english", "polite", "rule_fn"], "note": "规则只认 please remember that"}
-{"id": "ri-031", "point": "retain_intent", "input": "note that my office moved to building C", "expected": "remember", "cost_level": "medium", "tags": ["english", "rule_fn"]}
-{"id": "ri-032", "point": "retain_intent", "input": "帮我 remember 一下，我的 flight 是 CA1234", "expected": "remember", "cost_level": "medium", "tags": ["mixed"]}
-{"id": "ri-033", "point": "retain_intent", "input": "remember 我对 peanut 过敏", "expected": "remember", "cost_level": "high", "tags": ["mixed", "safety"]}
-{"id": "ri-034", "point": "retain_intent", "input": "别记这个", "context": "上一轮用户：我前任叫小周", "expected": "forget", "cost_level": "high", "tags": ["negation", "context_needed"]}
-{"id": "ri-035", "point": "retain_intent", "input": "这个不用记", "context": "上一轮用户：我银行卡尾号 6688", "expected": "forget", "cost_level": "high", "tags": ["negation", "context_needed"]}
-{"id": "ri-036", "point": "retain_intent", "input": "不要记住我刚才说的地址", "expected": "forget", "cost_level": "high", "tags": ["negation"]}
-{"id": "ri-037", "point": "retain_intent", "input": "你别记住这个，我随口说的", "expected": "forget", "cost_level": "high", "tags": ["negation"]}
-{"id": "ri-038", "point": "retain_intent", "input": "我没让你记住这个，删掉", "expected": "forget", "cost_level": "high", "tags": ["negation", "complaint"], "note": "用户撤回误写入，是强标签来源"}
-{"id": "ri-039", "point": "retain_intent", "input": "忘掉我刚才说的过敏信息", "expected": "forget", "cost_level": "high", "tags": ["basic"]}
-{"id": "ri-040", "point": "retain_intent", "input": "把我住址那条删了", "expected": "forget", "cost_level": "high", "tags": ["colloquial"]}
-{"id": "ri-041", "point": "retain_intent", "input": "删除关于我女儿的所有记忆", "expected": "forget", "cost_level": "high", "tags": ["basic"]}
-{"id": "ri-042", "point": "retain_intent", "input": "清空你对我的记忆", "expected": "forget", "cost_level": "high", "tags": ["basic", "bulk"]}
-{"id": "ri-043", "point": "retain_intent", "input": "唔使记呢个", "context": "上一轮用户：我屋企电话系 2345XXXX", "expected": "forget", "cost_level": "high", "tags": ["dialect", "negation", "context_needed"], "note": "粤语「不用记这个」"}
-{"id": "ri-044", "point": "retain_intent", "input": "forget that I live in Shanghai", "expected": "forget", "cost_level": "high", "tags": ["english"]}
-{"id": "ri-045", "point": "retain_intent", "input": "don't remember this, it's private", "expected": "forget", "cost_level": "high", "tags": ["english", "negation"]}
-{"id": "ri-046", "point": "retain_intent", "input": "你记住我吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"], "note": "M1-T13 原始误识别句"}
-{"id": "ri-047", "point": "retain_intent", "input": "你记住他的名字了吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"], "note": "M1-T13 原始误识别句"}
-{"id": "ri-048", "point": "retain_intent", "input": "你记住这件事吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"]}
-{"id": "ri-049", "point": "retain_intent", "input": "你记住我对什么过敏了吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"]}
-{"id": "ri-050", "point": "retain_intent", "input": "你还记得我对什么过敏吗", "expected": "ask_memory", "cost_level": "high", "tags": ["basic"]}
-{"id": "ri-051", "point": "retain_intent", "input": "你记不记得我对什么过敏", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
-{"id": "ri-052", "point": "retain_intent", "input": "你记没记住我女儿的名字", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
-{"id": "ri-053", "point": "retain_intent", "input": "我说的你记住没记住", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
-{"id": "ri-054", "point": "retain_intent", "input": "你到底有没有记住我的生日", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
-{"id": "ri-055", "point": "retain_intent", "input": "记住了没", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "colloquial"]}
-{"id": "ri-056", "point": "retain_intent", "input": "你记住冇？", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "dialect"], "note": "粤/湘「冇」"}
-{"id": "ri-057", "point": "retain_intent", "input": "你仲记唔记得我生日几时", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a", "dialect"], "note": "粤语"}
-{"id": "ri-058", "point": "retain_intent", "input": "侬记得伐，我上趟讲过的那家店", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "dialect"], "note": "沪语「伐」作疑问"}
-{"id": "ri-059", "point": "retain_intent", "input": "你记得我生日不", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "colloquial"], "note": "句末「不」作疑问，无问号"}
-{"id": "ri-060", "point": "retain_intent", "input": "我跟你说过我女儿叫什么来着？", "expected": "ask_memory", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-061", "point": "retain_intent", "input": "你都记了我哪些事", "expected": "ask_memory", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-062", "point": "retain_intent", "input": "Remember when we went to Japan? Good times.", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap", "rule_fp"], "note": "规则把整句当成要记住的内容"}
-{"id": "ri-063", "point": "retain_intent", "input": "你还 remember 我女儿叫啥不", "expected": "ask_memory", "cost_level": "high", "tags": ["mixed", "question_trap"]}
-{"id": "ri-064", "point": "retain_intent", "input": "不对，我是对芒果过敏，不是花生", "expected": "correct", "cost_level": "high", "tags": ["basic", "safety"], "note": "当成新增会与旧事实并存，安全相关"}
-{"id": "ri-065", "point": "retain_intent", "input": "我搬家了，现在住在苏州", "expected": "correct", "cost_level": "medium", "tags": ["implicit"]}
-{"id": "ri-066", "point": "retain_intent", "input": "你记错了，我女儿叫朵朵不是豆豆", "expected": "correct", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-067", "point": "retain_intent", "input": "更正一下：会议改到周四了", "expected": "correct", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-068", "point": "retain_intent", "input": "我上个月从那家公司离职了", "expected": "correct", "cost_level": "medium", "tags": ["implicit"]}
-{"id": "ri-069", "point": "retain_intent", "input": "记住，我现在不住上海了，搬到杭州了", "expected": "correct", "cost_level": "medium", "tags": ["comma_form", "remember_form", "rule_fp"], "note": "记住句式但语义是更新；规则当新增写入"}
-{"id": "ri-070", "point": "retain_intent", "input": "上次说的不算，我其实能吃辣", "expected": "correct", "cost_level": "medium", "tags": ["colloquial"]}
-{"id": "ri-071", "point": "retain_intent", "input": "actually my birthday is May 3, not May 2", "expected": "correct", "cost_level": "medium", "tags": ["english"]}
-{"id": "ri-072", "point": "retain_intent", "input": "my allergy 不是 peanut，是 mango，update 一下", "expected": "correct", "cost_level": "high", "tags": ["mixed", "safety"]}
-{"id": "ri-073", "point": "retain_intent", "input": "以后用中文回复我", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-074", "point": "retain_intent", "input": "回答简短一点，别啰嗦", "expected": "preference", "cost_level": "medium", "tags": ["colloquial"]}
-{"id": "ri-075", "point": "retain_intent", "input": "以后叫我老王就行", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-076", "point": "retain_intent", "input": "代码示例都用 Rust 写", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-077", "point": "retain_intent", "input": "以后发消息别带表情", "expected": "preference", "cost_level": "medium", "tags": ["negation"]}
-{"id": "ri-078", "point": "retain_intent", "input": "记住，以后回答都用中文", "expected": "preference", "cost_level": "low", "tags": ["comma_form", "remember_form", "rule_fp"], "note": "记住句式但属于偏好；规则当事实写入，后果较轻"}
-{"id": "ri-079", "point": "retain_intent", "input": "早上别给我发提醒，九点以后再说", "expected": "preference", "cost_level": "medium", "tags": ["colloquial"]}
-{"id": "ri-080", "point": "retain_intent", "input": "你记住你是一个翻译助手", "expected": "preference", "cost_level": "medium", "tags": ["remember_form", "persona", "rule_fp"], "note": "对助手角色的指令，不是关于用户的事实"}
-{"id": "ri-081", "point": "retain_intent", "input": "以后我问菜谱，默认按两人份", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
-{"id": "ri-082", "point": "retain_intent", "input": "from now on, reply in English", "expected": "preference", "cost_level": "medium", "tags": ["english"]}
-{"id": "ri-083", "point": "retain_intent", "input": "以后 reply 都用 English", "expected": "preference", "cost_level": "medium", "tags": ["mixed"]}
-{"id": "ri-084", "point": "retain_intent", "input": "今天天气怎么样", "expected": "none", "cost_level": "low", "tags": ["basic"]}
-{"id": "ri-085", "point": "retain_intent", "input": "帮我写一封请假邮件", "expected": "none", "cost_level": "low", "tags": ["basic"]}
-{"id": "ri-086", "point": "retain_intent", "input": "记住一个人要多久", "expected": "none", "cost_level": "high", "tags": ["question_trap", "no_question_mark", "rule_fp"], "note": "无问号的问句，规则会写入「一个人要多久」"}
-{"id": "ri-087", "point": "retain_intent", "input": "帮我记住密码的方法有哪些", "expected": "none", "cost_level": "high", "tags": ["question_trap", "no_question_mark", "rule_fp"], "note": "实为询问记忆技巧"}
-{"id": "ri-088", "point": "retain_intent", "input": "记住我的话，你会后悔的", "expected": "none", "cost_level": "high", "tags": ["idiom", "rule_fp"], "note": "「记住我的话」＝警告语气"}
-{"id": "ri-089", "point": "retain_intent", "input": "记住这些单词有什么技巧吗", "expected": "none", "cost_level": "medium", "tags": ["question_trap"]}
-{"id": "ri-090", "point": "retain_intent", "input": "怎么才能记住英语单词", "expected": "none", "cost_level": "medium", "tags": ["question_trap"]}
-{"id": "ri-091", "point": "retain_intent", "input": "记住了，谢谢", "expected": "none", "cost_level": "high", "tags": ["acknowledgement"], "note": "用户自己表示记住了"}
-{"id": "ri-092", "point": "retain_intent", "input": "好的我会记住的", "expected": "none", "cost_level": "high", "tags": ["acknowledgement"]}
-{"id": "ri-093", "point": "retain_intent", "input": "记住！", "expected": "none", "cost_level": "medium", "tags": ["empty"], "note": "无内容"}
-{"id": "ri-094", "point": "retain_intent", "input": "他说记住这个号码：13800138000", "expected": "none", "cost_level": "high", "tags": ["quotation"], "note": "引述他人"}
-{"id": "ri-095", "point": "retain_intent", "input": "我妈总跟我说「记住，出门带钥匙」", "expected": "none", "cost_level": "high", "tags": ["quotation"]}
-{"id": "ri-096", "point": "retain_intent", "input": "老师让我们记住圆周率前十位", "expected": "none", "cost_level": "medium", "tags": ["quotation"]}
-{"id": "ri-097", "point": "retain_intent", "input": "记住我，是这首歌的名字吗", "expected": "none", "cost_level": "medium", "tags": ["quotation", "question_trap"]}
-{"id": "ri-098", "point": "retain_intent", "input": "我对花生过敏的话能吃杏仁吗", "expected": "none", "cost_level": "medium", "tags": ["implicit_fact"], "note": "含个人事实但没有记住请求；属 P2 候选抽取范围"}
-{"id": "ri-099", "point": "retain_intent", "input": "我女儿今天三岁了！", "expected": "none", "cost_level": "medium", "tags": ["implicit_fact"], "note": "同上"}
-{"id": "ri-100", "point": "retain_intent", "input": "remember to drink water", "expected": "none", "cost_level": "high", "tags": ["english", "rule_fp"], "note": "提醒类，不是事实；规则写入「to drink water」"}
-{"id": "ri-101", "point": "retain_intent", "input": "How do I remember all these passwords?", "expected": "none", "cost_level": "medium", "tags": ["english", "question_trap"]}
+{"id": "ri-001", "point": "retain_intent", "lang": "zh", "input": "记住我对花生过敏", "expected": "remember", "cost_level": "high", "tags": ["basic", "safety"]}
+{"id": "ri-002", "point": "retain_intent", "lang": "zh", "input": "你记住，我对花生过敏。", "expected": "remember", "cost_level": "high", "tags": ["comma_form", "safety"], "note": "M1 真机验收漏识别原句，M1-T13 已修"}
+{"id": "ri-003", "point": "retain_intent", "lang": "zh", "input": "请记住：我女儿叫朵朵", "expected": "remember", "cost_level": "medium", "tags": ["polite"]}
+{"id": "ri-004", "point": "retain_intent", "lang": "zh", "input": "帮我记一下，下周三下午交房租", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"]}
+{"id": "ri-005", "point": "retain_intent", "lang": "zh", "input": "麻烦记一下我的工位在3楼B区", "expected": "remember", "cost_level": "medium", "tags": ["polite"]}
+{"id": "ri-006", "point": "retain_intent", "lang": "zh", "input": "记住我住在杭州西湖区", "expected": "remember", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-007", "point": "retain_intent", "lang": "zh", "input": "帮我记住：周五之前要把报销单交了", "expected": "remember", "cost_level": "medium", "tags": ["polite"]}
+{"id": "ri-008", "point": "retain_intent", "lang": "zh", "input": "记着啊，我不吃香菜", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"], "note": "规则能命中但抽取结果带「啊，」"}
+{"id": "ri-009", "point": "retain_intent", "lang": "zh", "input": "你记一下哈，我儿子学校四点半放学", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"], "note": "规则能命中但抽取结果带「哈，」"}
+{"id": "ri-010", "point": "retain_intent", "lang": "zh", "input": "记住喽，明天八点楼下见", "expected": "remember", "cost_level": "medium", "tags": ["colloquial"]}
+{"id": "ri-011", "point": "retain_intent", "lang": "zh", "input": "你给我记好了，我老婆生日是3月8号", "expected": "remember", "cost_level": "medium", "tags": ["colloquial", "dialect", "rule_fn"], "note": "北方口语「给我记好了」"}
+{"id": "ri-012", "point": "retain_intent", "lang": "zh", "input": "记下来：车牌号沪A12345", "expected": "remember", "cost_level": "medium", "tags": ["colloquial", "rule_fn"], "note": "动词「记下来」不在规则表"}
+{"id": "ri-013", "point": "retain_intent", "lang": "zh", "input": "这个你要记住：我的血型是O型", "expected": "remember", "cost_level": "high", "tags": ["verb_mid", "safety", "rule_fn"], "note": "动词在句中"}
+{"id": "ri-014", "point": "retain_intent", "lang": "zh", "input": "我对青霉素过敏，你记住哈", "expected": "remember", "cost_level": "high", "tags": ["verb_tail", "safety", "rule_fn"], "note": "动词在句末"}
+{"id": "ri-015", "point": "retain_intent", "lang": "zh", "input": "千万别忘了我对芒果过敏", "expected": "remember", "cost_level": "high", "tags": ["negation_positive", "safety", "rule_fn"], "note": "否定词＋忘＝肯定的记住"}
+{"id": "ri-016", "point": "retain_intent", "lang": "zh", "input": "以后别忘了我是素食者", "expected": "remember", "cost_level": "medium", "tags": ["negation_positive", "rule_fn"]}
+{"id": "ri-017", "point": "retain_intent", "lang": "zh", "input": "记得我下个月要去成都出差", "expected": "remember", "cost_level": "medium", "tags": ["ambiguous", "rule_fn"], "note": "「记得…」作祈使；无句末疑问词"}
+{"id": "ri-018", "point": "retain_intent", "lang": "zh", "input": "帮我记牢，阿拉儿子礼拜三要打疫苗", "expected": "remember", "cost_level": "medium", "tags": ["dialect", "rule_fn"], "note": "沪语"}
+{"id": "ri-019", "point": "retain_intent", "lang": "zh", "input": "记到起哈，我明天要早起赶飞机", "expected": "remember", "cost_level": "medium", "tags": ["dialect", "rule_fn"], "note": "川渝话「记到起」"}
+{"id": "ri-020", "point": "retain_intent", "lang": "zh", "input": "帮我记住，我食唔得花生", "expected": "remember", "cost_level": "high", "tags": ["dialect", "safety"], "note": "粤语「食唔得」＝不能吃"}
+{"id": "ri-021", "point": "retain_intent", "lang": "zh", "input": "你帮我记住这个好不好", "context": "上一轮用户：我下周二体检，要空腹", "expected": "remember", "cost_level": "medium", "tags": ["a_not_a", "context_needed"], "note": "M1-T13 陷阱；规则抽出「这个好不好」，内容无效，需要上下文指代"}
+{"id": "ri-022", "point": "retain_intent", "lang": "zh", "input": "你记住我对花生过敏好不好", "expected": "remember", "cost_level": "high", "tags": ["a_not_a", "safety"]}
+{"id": "ri-023", "point": "retain_intent", "lang": "zh", "input": "帮我记一下我的会员号行不行，88812", "expected": "remember", "cost_level": "medium", "tags": ["a_not_a"]}
+{"id": "ri-024", "point": "retain_intent", "lang": "zh", "input": "你记住，我对花生过敏，好吗", "expected": "remember", "cost_level": "high", "tags": ["comma_form", "tag_question", "safety", "rule_fn"], "note": "句末附加问「好吗」是礼貌请求，不是询问"}
+{"id": "ri-025", "point": "retain_intent", "lang": "zh", "input": "你能记住我对猫毛过敏吗", "expected": "remember", "cost_level": "high", "tags": ["polite_question", "ambiguous", "safety", "rule_fn"], "note": "能力问句形式的请求；可接受反问澄清，但不能判成无关"}
+{"id": "ri-026", "point": "retain_intent", "lang": "zh", "input": "记住这个", "context": "上一轮用户：我的医保卡号是 3301XXXX", "expected": "remember", "cost_level": "medium", "tags": ["context_needed"], "note": "规则抽出「这个」，内容需指代消解"}
+{"id": "ri-027", "point": "retain_intent", "lang": "zh", "input": "对，记下", "context": "上一轮助手：需要我记住你的车位号 B2-117 吗？", "expected": "remember", "cost_level": "medium", "tags": ["context_needed", "clarify_answer", "rule_fn"]}
+{"id": "ri-028", "point": "retain_intent", "lang": "zh", "input": "好啊", "context": "上一轮助手：要我记住你的公司地址吗？", "expected": "remember", "cost_level": "medium", "tags": ["context_needed", "clarify_answer", "rule_fn"]}
+{"id": "ri-029", "point": "retain_intent", "lang": "en", "input": "remember that I'm allergic to shellfish", "expected": "remember", "cost_level": "high", "tags": ["english", "safety"]}
+{"id": "ri-030", "point": "retain_intent", "lang": "en", "input": "Please remember my wife's name is Anna", "expected": "remember", "cost_level": "medium", "tags": ["english", "polite", "rule_fn"], "note": "规则只认 please remember that"}
+{"id": "ri-031", "point": "retain_intent", "lang": "en", "input": "note that my office moved to building C", "expected": "remember", "cost_level": "medium", "tags": ["english", "rule_fn"]}
+{"id": "ri-032", "point": "retain_intent", "lang": "mixed", "input": "帮我 remember 一下，我的 flight 是 CA1234", "expected": "remember", "cost_level": "medium", "tags": ["mixed"]}
+{"id": "ri-033", "point": "retain_intent", "lang": "mixed", "input": "remember 我对 peanut 过敏", "expected": "remember", "cost_level": "high", "tags": ["mixed", "safety"]}
+{"id": "ri-034", "point": "retain_intent", "lang": "zh", "input": "别记这个", "context": "上一轮用户：我前任叫小周", "expected": "forget", "cost_level": "high", "tags": ["negation", "context_needed"]}
+{"id": "ri-035", "point": "retain_intent", "lang": "zh", "input": "这个不用记", "context": "上一轮用户：我银行卡尾号 6688", "expected": "forget", "cost_level": "high", "tags": ["negation", "context_needed"]}
+{"id": "ri-036", "point": "retain_intent", "lang": "zh", "input": "不要记住我刚才说的地址", "expected": "forget", "cost_level": "high", "tags": ["negation"]}
+{"id": "ri-037", "point": "retain_intent", "lang": "zh", "input": "你别记住这个，我随口说的", "expected": "forget", "cost_level": "high", "tags": ["negation"]}
+{"id": "ri-038", "point": "retain_intent", "lang": "zh", "input": "我没让你记住这个，删掉", "expected": "forget", "cost_level": "high", "tags": ["negation", "complaint"], "note": "用户撤回误写入，是强标签来源"}
+{"id": "ri-039", "point": "retain_intent", "lang": "zh", "input": "忘掉我刚才说的过敏信息", "expected": "forget", "cost_level": "high", "tags": ["basic"]}
+{"id": "ri-040", "point": "retain_intent", "lang": "zh", "input": "把我住址那条删了", "expected": "forget", "cost_level": "high", "tags": ["colloquial"]}
+{"id": "ri-041", "point": "retain_intent", "lang": "zh", "input": "删除关于我女儿的所有记忆", "expected": "forget", "cost_level": "high", "tags": ["basic"]}
+{"id": "ri-042", "point": "retain_intent", "lang": "zh", "input": "清空你对我的记忆", "expected": "forget", "cost_level": "high", "tags": ["basic", "bulk"]}
+{"id": "ri-043", "point": "retain_intent", "lang": "zh", "input": "唔使记呢个", "context": "上一轮用户：我屋企电话系 2345XXXX", "expected": "forget", "cost_level": "high", "tags": ["dialect", "negation", "context_needed"], "note": "粤语「不用记这个」"}
+{"id": "ri-044", "point": "retain_intent", "lang": "en", "input": "forget that I live in Shanghai", "expected": "forget", "cost_level": "high", "tags": ["english"]}
+{"id": "ri-045", "point": "retain_intent", "lang": "en", "input": "don't remember this, it's private", "expected": "forget", "cost_level": "high", "tags": ["english", "negation"]}
+{"id": "ri-046", "point": "retain_intent", "lang": "zh", "input": "你记住我吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"], "note": "M1-T13 原始误识别句"}
+{"id": "ri-047", "point": "retain_intent", "lang": "zh", "input": "你记住他的名字了吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"], "note": "M1-T13 原始误识别句"}
+{"id": "ri-048", "point": "retain_intent", "lang": "zh", "input": "你记住这件事吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"]}
+{"id": "ri-049", "point": "retain_intent", "lang": "zh", "input": "你记住我对什么过敏了吗", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap"]}
+{"id": "ri-050", "point": "retain_intent", "lang": "zh", "input": "你还记得我对什么过敏吗", "expected": "ask_memory", "cost_level": "high", "tags": ["basic"]}
+{"id": "ri-051", "point": "retain_intent", "lang": "zh", "input": "你记不记得我对什么过敏", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
+{"id": "ri-052", "point": "retain_intent", "lang": "zh", "input": "你记没记住我女儿的名字", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
+{"id": "ri-053", "point": "retain_intent", "lang": "zh", "input": "我说的你记住没记住", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
+{"id": "ri-054", "point": "retain_intent", "lang": "zh", "input": "你到底有没有记住我的生日", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a"]}
+{"id": "ri-055", "point": "retain_intent", "lang": "zh", "input": "记住了没", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "colloquial"]}
+{"id": "ri-056", "point": "retain_intent", "lang": "zh", "input": "你记住冇？", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "dialect"], "note": "粤/湘「冇」"}
+{"id": "ri-057", "point": "retain_intent", "lang": "zh", "input": "你仲记唔记得我生日几时", "expected": "ask_memory", "cost_level": "high", "tags": ["a_not_a", "dialect"], "note": "粤语"}
+{"id": "ri-058", "point": "retain_intent", "lang": "zh", "input": "侬记得伐，我上趟讲过的那家店", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "dialect"], "note": "沪语「伐」作疑问"}
+{"id": "ri-059", "point": "retain_intent", "lang": "zh", "input": "你记得我生日不", "expected": "ask_memory", "cost_level": "high", "tags": ["question_trap", "colloquial"], "note": "句末「不」作疑问，无问号"}
+{"id": "ri-060", "point": "retain_intent", "lang": "zh", "input": "我跟你说过我女儿叫什么来着？", "expected": "ask_memory", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-061", "point": "retain_intent", "lang": "zh", "input": "你都记了我哪些事", "expected": "ask_memory", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-062", "point": "retain_intent", "lang": "en", "input": "Remember when we went to Japan? Good times.", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap", "rule_fp"], "note": "规则把整句当成要记住的内容"}
+{"id": "ri-063", "point": "retain_intent", "lang": "mixed", "input": "你还 remember 我女儿叫啥不", "expected": "ask_memory", "cost_level": "high", "tags": ["mixed", "question_trap"]}
+{"id": "ri-064", "point": "retain_intent", "lang": "zh", "input": "不对，我是对芒果过敏，不是花生", "expected": "correct", "cost_level": "high", "tags": ["basic", "safety"], "note": "当成新增会与旧事实并存，安全相关"}
+{"id": "ri-065", "point": "retain_intent", "lang": "zh", "input": "我搬家了，现在住在苏州", "expected": "correct", "cost_level": "medium", "tags": ["implicit"]}
+{"id": "ri-066", "point": "retain_intent", "lang": "zh", "input": "你记错了，我女儿叫朵朵不是豆豆", "expected": "correct", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-067", "point": "retain_intent", "lang": "zh", "input": "更正一下：会议改到周四了", "expected": "correct", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-068", "point": "retain_intent", "lang": "zh", "input": "我上个月从那家公司离职了", "expected": "correct", "cost_level": "medium", "tags": ["implicit"]}
+{"id": "ri-069", "point": "retain_intent", "lang": "zh", "input": "记住，我现在不住上海了，搬到杭州了", "expected": "correct", "cost_level": "medium", "tags": ["comma_form", "remember_form", "rule_fp"], "note": "记住句式但语义是更新；规则当新增写入"}
+{"id": "ri-070", "point": "retain_intent", "lang": "zh", "input": "上次说的不算，我其实能吃辣", "expected": "correct", "cost_level": "medium", "tags": ["colloquial"]}
+{"id": "ri-071", "point": "retain_intent", "lang": "en", "input": "actually my birthday is May 3, not May 2", "expected": "correct", "cost_level": "medium", "tags": ["english"]}
+{"id": "ri-072", "point": "retain_intent", "lang": "mixed", "input": "my allergy 不是 peanut，是 mango，update 一下", "expected": "correct", "cost_level": "high", "tags": ["mixed", "safety"]}
+{"id": "ri-073", "point": "retain_intent", "lang": "zh", "input": "以后用中文回复我", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-074", "point": "retain_intent", "lang": "zh", "input": "回答简短一点，别啰嗦", "expected": "preference", "cost_level": "medium", "tags": ["colloquial"]}
+{"id": "ri-075", "point": "retain_intent", "lang": "zh", "input": "以后叫我老王就行", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-076", "point": "retain_intent", "lang": "zh", "input": "代码示例都用 Rust 写", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-077", "point": "retain_intent", "lang": "zh", "input": "以后发消息别带表情", "expected": "preference", "cost_level": "medium", "tags": ["negation"]}
+{"id": "ri-078", "point": "retain_intent", "lang": "zh", "input": "记住，以后回答都用中文", "expected": "preference", "cost_level": "low", "tags": ["comma_form", "remember_form", "rule_fp"], "note": "记住句式但属于偏好；规则当事实写入，后果较轻"}
+{"id": "ri-079", "point": "retain_intent", "lang": "zh", "input": "早上别给我发提醒，九点以后再说", "expected": "preference", "cost_level": "medium", "tags": ["colloquial"]}
+{"id": "ri-080", "point": "retain_intent", "lang": "zh", "input": "你记住你是一个翻译助手", "expected": "preference", "cost_level": "medium", "tags": ["remember_form", "persona", "rule_fp"], "note": "对助手角色的指令，不是关于用户的事实"}
+{"id": "ri-081", "point": "retain_intent", "lang": "zh", "input": "以后我问菜谱，默认按两人份", "expected": "preference", "cost_level": "medium", "tags": ["basic"]}
+{"id": "ri-082", "point": "retain_intent", "lang": "en", "input": "from now on, reply in English", "expected": "preference", "cost_level": "medium", "tags": ["english"]}
+{"id": "ri-083", "point": "retain_intent", "lang": "mixed", "input": "以后 reply 都用 English", "expected": "preference", "cost_level": "medium", "tags": ["mixed"]}
+{"id": "ri-084", "point": "retain_intent", "lang": "zh", "input": "今天天气怎么样", "expected": "none", "cost_level": "low", "tags": ["basic"]}
+{"id": "ri-085", "point": "retain_intent", "lang": "zh", "input": "帮我写一封请假邮件", "expected": "none", "cost_level": "low", "tags": ["basic"]}
+{"id": "ri-086", "point": "retain_intent", "lang": "zh", "input": "记住一个人要多久", "expected": "none", "cost_level": "high", "tags": ["question_trap", "no_question_mark", "rule_fp"], "note": "无问号的问句，规则会写入「一个人要多久」"}
+{"id": "ri-087", "point": "retain_intent", "lang": "zh", "input": "帮我记住密码的方法有哪些", "expected": "none", "cost_level": "high", "tags": ["question_trap", "no_question_mark", "rule_fp"], "note": "实为询问记忆技巧"}
+{"id": "ri-088", "point": "retain_intent", "lang": "zh", "input": "记住我的话，你会后悔的", "expected": "none", "cost_level": "high", "tags": ["idiom", "rule_fp"], "note": "「记住我的话」＝警告语气"}
+{"id": "ri-089", "point": "retain_intent", "lang": "zh", "input": "记住这些单词有什么技巧吗", "expected": "none", "cost_level": "medium", "tags": ["question_trap"]}
+{"id": "ri-090", "point": "retain_intent", "lang": "zh", "input": "怎么才能记住英语单词", "expected": "none", "cost_level": "medium", "tags": ["question_trap"]}
+{"id": "ri-091", "point": "retain_intent", "lang": "zh", "input": "记住了，谢谢", "expected": "none", "cost_level": "high", "tags": ["acknowledgement"], "note": "用户自己表示记住了"}
+{"id": "ri-092", "point": "retain_intent", "lang": "zh", "input": "好的我会记住的", "expected": "none", "cost_level": "high", "tags": ["acknowledgement"]}
+{"id": "ri-093", "point": "retain_intent", "lang": "zh", "input": "记住！", "expected": "none", "cost_level": "medium", "tags": ["empty"], "note": "无内容"}
+{"id": "ri-094", "point": "retain_intent", "lang": "zh", "input": "他说记住这个号码：13800138000", "expected": "none", "cost_level": "high", "tags": ["quotation"], "note": "引述他人"}
+{"id": "ri-095", "point": "retain_intent", "lang": "zh", "input": "我妈总跟我说「记住，出门带钥匙」", "expected": "none", "cost_level": "high", "tags": ["quotation"]}
+{"id": "ri-096", "point": "retain_intent", "lang": "zh", "input": "老师让我们记住圆周率前十位", "expected": "none", "cost_level": "medium", "tags": ["quotation"]}
+{"id": "ri-097", "point": "retain_intent", "lang": "zh", "input": "记住我，是这首歌的名字吗", "expected": "none", "cost_level": "medium", "tags": ["quotation", "question_trap"]}
+{"id": "ri-098", "point": "retain_intent", "lang": "zh", "input": "我对花生过敏的话能吃杏仁吗", "expected": "none", "cost_level": "medium", "tags": ["implicit_fact"], "note": "含个人事实但没有记住请求；属 P2 候选抽取范围"}
+{"id": "ri-099", "point": "retain_intent", "lang": "zh", "input": "我女儿今天三岁了！", "expected": "none", "cost_level": "medium", "tags": ["implicit_fact"], "note": "同上"}
+{"id": "ri-100", "point": "retain_intent", "lang": "en", "input": "remember to drink water", "expected": "none", "cost_level": "high", "tags": ["english", "rule_fp"], "note": "提醒类，不是事实；规则写入「to drink water」"}
+{"id": "ri-101", "point": "retain_intent", "lang": "en", "input": "How do I remember all these passwords?", "expected": "none", "cost_level": "medium", "tags": ["english", "question_trap"]}
+{"id": "ri-102", "point": "retain_intent", "lang": "en", "input": "Remember this: my blood type is A negative.", "expected": "remember", "cost_level": "high", "tags": ["english", "basic", "safety"]}
+{"id": "ri-103", "point": "retain_intent", "lang": "en", "input": "Can you remember that I'm lactose intolerant?", "expected": "remember", "cost_level": "high", "tags": ["english", "polite_question", "ambiguous", "safety", "rule_fn"], "note": "能力问句形式的请求（对应 ri-025）；可接受反问澄清，不能判成 ask_memory/none"}
+{"id": "ri-104", "point": "retain_intent", "lang": "en", "input": "I'm allergic to latex, keep that in mind.", "expected": "remember", "cost_level": "high", "tags": ["english", "verb_tail", "safety", "rule_fn"], "note": "动词短语 keep in mind 在句末"}
+{"id": "ri-105", "point": "retain_intent", "lang": "en", "input": "Make a note: my landlord's name is Mr. Patel.", "expected": "remember", "cost_level": "medium", "tags": ["english", "colloquial", "rule_fn"]}
+{"id": "ri-106", "point": "retain_intent", "lang": "en", "input": "Don't forget I'm vegan.", "expected": "remember", "cost_level": "medium", "tags": ["english", "negation_positive", "rule_fn"], "note": "否定形式表达肯定，对应「千万别忘了」"}
+{"id": "ri-107", "point": "retain_intent", "lang": "en", "input": "Remember, my daughter's school lets out at 3:15.", "expected": "remember", "cost_level": "medium", "tags": ["english", "comma_form", "rule_fn"]}
+{"id": "ri-108", "point": "retain_intent", "lang": "en", "input": "pls remember my gym is closed on Mondays", "expected": "remember", "cost_level": "medium", "tags": ["english", "colloquial", "rule_fn"], "note": "口语缩写 pls"}
+{"id": "ri-109", "point": "retain_intent", "lang": "en", "input": "Remember that I take metformin twice a day, ok?", "expected": "remember", "cost_level": "high", "tags": ["english", "tag_question", "safety", "rule_fn"], "note": "句末 ok? 是礼貌附加问，不是询问"}
+{"id": "ri-110", "point": "retain_intent", "lang": "en", "input": "Yes, save that.", "context": "上一轮助手：Should I remember that your dentist is Dr. Lin?", "expected": "remember", "cost_level": "medium", "tags": ["english", "context_needed", "clarify_answer", "rule_fn"]}
+{"id": "ri-111", "point": "retain_intent", "lang": "en", "input": "Store this for later: my passport expires in March 2028.", "expected": "remember", "cost_level": "medium", "tags": ["english", "colloquial", "rule_fn"]}
+{"id": "ri-112", "point": "retain_intent", "lang": "en", "input": "Forget everything you know about me.", "expected": "forget", "cost_level": "high", "tags": ["english", "bulk"]}
+{"id": "ri-113", "point": "retain_intent", "lang": "en", "input": "Please don't save that.", "context": "上一轮用户：My ex's name is Jordan.", "expected": "forget", "cost_level": "high", "tags": ["english", "negation", "context_needed", "polite"]}
+{"id": "ri-114", "point": "retain_intent", "lang": "en", "input": "Delete what I said about my salary.", "expected": "forget", "cost_level": "high", "tags": ["english", "basic"]}
+{"id": "ri-115", "point": "retain_intent", "lang": "en", "input": "Scratch that, don't remember it.", "context": "上一轮用户：my debit card PIN is 4471", "expected": "forget", "cost_level": "high", "tags": ["english", "negation", "context_needed", "colloquial"], "note": "含 remember 字样的否定句"}
+{"id": "ri-116", "point": "retain_intent", "lang": "en", "input": "Remove my home address from your memory.", "expected": "forget", "cost_level": "high", "tags": ["english", "basic"]}
+{"id": "ri-117", "point": "retain_intent", "lang": "en", "input": "Wipe your memory of me.", "expected": "forget", "cost_level": "high", "tags": ["english", "bulk", "colloquial"]}
+{"id": "ri-118", "point": "retain_intent", "lang": "en", "input": "That was a joke, don't keep it.", "context": "上一轮用户：I'm secretly a billionaire.", "expected": "forget", "cost_level": "high", "tags": ["english", "negation", "context_needed"]}
+{"id": "ri-119", "point": "retain_intent", "lang": "en", "input": "I never asked you to remember that — delete it.", "expected": "forget", "cost_level": "high", "tags": ["english", "negation", "complaint"], "note": "用户撤回误写入"}
+{"id": "ri-120", "point": "retain_intent", "lang": "en", "input": "Do you remember me?", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap"], "note": "对应「你记住我吗」"}
+{"id": "ri-121", "point": "retain_intent", "lang": "en", "input": "Do you remember my wife's name?", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap"]}
+{"id": "ri-122", "point": "retain_intent", "lang": "en", "input": "Did you remember what I told you yesterday?", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap"]}
+{"id": "ri-123", "point": "retain_intent", "lang": "en", "input": "Remember my allergy?", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap", "colloquial"], "note": "句首 Remember 但有问号，是省略 do you 的问句"}
+{"id": "ri-124", "point": "retain_intent", "lang": "en", "input": "you remember my birthday right", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap", "no_question_mark", "tag_question"], "note": "无问号，句末 right 作附加问"}
+{"id": "ri-125", "point": "retain_intent", "lang": "en", "input": "Remember when I told you about my trip to Lisbon?", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap"], "note": "Remember when… 是回忆式问句，不是记住请求"}
+{"id": "ri-126", "point": "retain_intent", "lang": "en", "input": "What do you know about me?", "expected": "ask_memory", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-127", "point": "retain_intent", "lang": "en", "input": "What have you got saved about me?", "expected": "ask_memory", "cost_level": "medium", "tags": ["english", "basic", "colloquial"]}
+{"id": "ri-128", "point": "retain_intent", "lang": "en", "input": "You remembered my kid's name, didn't you?", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap", "tag_question"]}
+{"id": "ri-129", "point": "retain_intent", "lang": "en", "input": "do u still remember where I work", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap", "no_question_mark", "colloquial"], "note": "口语缩写 u，无问号"}
+{"id": "ri-130", "point": "retain_intent", "lang": "en", "input": "Have you memorized my schedule yet?", "expected": "ask_memory", "cost_level": "high", "tags": ["english", "question_trap"]}
+{"id": "ri-131", "point": "retain_intent", "lang": "en", "input": "No wait, I'm allergic to walnuts, not almonds.", "expected": "correct", "cost_level": "high", "tags": ["english", "basic", "safety"]}
+{"id": "ri-132", "point": "retain_intent", "lang": "en", "input": "I moved — I live in Austin now.", "expected": "correct", "cost_level": "medium", "tags": ["english", "implicit"]}
+{"id": "ri-133", "point": "retain_intent", "lang": "en", "input": "You got it wrong, my son is 7, not 6.", "expected": "correct", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-134", "point": "retain_intent", "lang": "en", "input": "Update: I changed jobs, I'm a nurse now.", "expected": "correct", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-135", "point": "retain_intent", "lang": "en", "input": "Remember, I don't live in Boston anymore, I moved to Denver.", "expected": "correct", "cost_level": "medium", "tags": ["english", "comma_form", "remember_form"], "note": "记住句式但语义是更新（对应 ri-069）"}
+{"id": "ri-136", "point": "retain_intent", "lang": "en", "input": "Correction — my dog's name is Biscuit, not Buster.", "expected": "correct", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-137", "point": "retain_intent", "lang": "en", "input": "I'm no longer on blood thinners, my doctor took me off them.", "expected": "correct", "cost_level": "high", "tags": ["english", "implicit", "safety"]}
+{"id": "ri-138", "point": "retain_intent", "lang": "en", "input": "Scratch the old number, my new phone ends in 5520.", "expected": "correct", "cost_level": "medium", "tags": ["english", "colloquial"]}
+{"id": "ri-139", "point": "retain_intent", "lang": "en", "input": "Actually I can eat gluten now, the celiac test came back negative.", "expected": "correct", "cost_level": "high", "tags": ["english", "basic", "safety"]}
+{"id": "ri-140", "point": "retain_intent", "lang": "en", "input": "Keep your answers short from now on.", "expected": "preference", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-141", "point": "retain_intent", "lang": "en", "input": "Call me Sam.", "expected": "preference", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-142", "point": "retain_intent", "lang": "en", "input": "Stop using emojis.", "expected": "preference", "cost_level": "medium", "tags": ["english", "negation"]}
+{"id": "ri-143", "point": "retain_intent", "lang": "en", "input": "Always use metric units with me.", "expected": "preference", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-144", "point": "retain_intent", "lang": "en", "input": "Remember to always answer in Spanish.", "expected": "preference", "cost_level": "low", "tags": ["english", "remember_form", "rule_fp"], "note": "Remember to… 是对助手的持续指令；当事实写入后果较轻"}
+{"id": "ri-145", "point": "retain_intent", "lang": "en", "input": "Remember, you're my writing coach.", "expected": "preference", "cost_level": "medium", "tags": ["english", "comma_form", "remember_form", "persona"], "note": "对助手角色的指令（对应 ri-080）"}
+{"id": "ri-146", "point": "retain_intent", "lang": "en", "input": "Don't send me notifications after 10pm.", "expected": "preference", "cost_level": "medium", "tags": ["english", "negation"]}
+{"id": "ri-147", "point": "retain_intent", "lang": "en", "input": "Write code samples in TypeScript by default.", "expected": "preference", "cost_level": "medium", "tags": ["english", "basic"]}
+{"id": "ri-148", "point": "retain_intent", "lang": "en", "input": "pls be less formal w/ me", "expected": "preference", "cost_level": "medium", "tags": ["english", "colloquial"]}
+{"id": "ri-149", "point": "retain_intent", "lang": "en", "input": "What's the weather like today?", "expected": "none", "cost_level": "low", "tags": ["english", "basic"]}
+{"id": "ri-150", "point": "retain_intent", "lang": "en", "input": "My boss said \"remember, the deadline is Friday.\"", "expected": "none", "cost_level": "high", "tags": ["english", "quotation"]}
+{"id": "ri-151", "point": "retain_intent", "lang": "en", "input": "How long does it take to memorize a poem?", "expected": "none", "cost_level": "medium", "tags": ["english", "question_trap"]}
+{"id": "ri-152", "point": "retain_intent", "lang": "en", "input": "Remember the Titans is my favorite movie.", "expected": "none", "cost_level": "high", "tags": ["english", "quotation", "implicit_fact", "boundary", "rule_fp"], "note": "Remember the Titans 是片名；含个人偏好但无记住请求，规则会误写入"}
+{"id": "ri-153", "point": "retain_intent", "lang": "en", "input": "Got it, I'll remember that.", "expected": "none", "cost_level": "high", "tags": ["english", "acknowledgement"]}
+{"id": "ri-154", "point": "retain_intent", "lang": "en", "input": "I can never remember people's names. Any tips?", "expected": "none", "cost_level": "medium", "tags": ["english", "question_trap"]}
+{"id": "ri-155", "point": "retain_intent", "lang": "en", "input": "Write a song called \"Remember Me\".", "expected": "none", "cost_level": "medium", "tags": ["english", "quotation"]}
+{"id": "ri-156", "point": "retain_intent", "lang": "en", "input": "My grandma always says \"remember who you are.\"", "expected": "none", "cost_level": "high", "tags": ["english", "quotation"]}
+{"id": "ri-157", "point": "retain_intent", "lang": "en", "input": "I turned 40 today!", "expected": "none", "cost_level": "medium", "tags": ["english", "implicit_fact"], "note": "含个人事实但没有记住请求；属 P2 候选抽取范围"}
+{"id": "ri-158", "point": "retain_intent", "lang": "mixed", "input": "help me remember 一下我的 locker number 是 42", "expected": "remember", "cost_level": "medium", "tags": ["mixed", "colloquial", "rule_fn"]}
+{"id": "ri-159", "point": "retain_intent", "lang": "mixed", "input": "你 remember 我吗", "expected": "ask_memory", "cost_level": "high", "tags": ["mixed", "question_trap"], "note": "中英混杂版「你记住我吗」"}
+{"id": "ri-160", "point": "retain_intent", "lang": "mixed", "input": "以后 code review 的 comment 都用 English 写", "expected": "preference", "cost_level": "medium", "tags": ["mixed"]}
+{"id": "ri-161", "point": "retain_intent", "lang": "th", "input": "จำไว้ว่าผมแพ้กุ้งครับ", "expected": "remember", "cost_level": "high", "tags": ["thai", "basic", "safety", "polite_particle", "rule_fn"]}
+{"id": "ri-162", "point": "retain_intent", "lang": "th", "input": "ช่วยจำหน่อยนะคะ ลูกสาวชื่อน้องมะลิ", "expected": "remember", "cost_level": "medium", "tags": ["thai", "polite", "polite_particle", "rule_fn"]}
+{"id": "ri-163", "point": "retain_intent", "lang": "th", "input": "ช่วยจดไว้หน่อย วันศุกร์นี้ต้องจ่ายค่าเช่าบ้าน", "expected": "remember", "cost_level": "medium", "tags": ["thai", "colloquial", "rule_fn"]}
+{"id": "ri-164", "point": "retain_intent", "lang": "th", "input": "ผมแพ้ยาเพนิซิลลิน จำไว้ด้วยนะครับ", "expected": "remember", "cost_level": "high", "tags": ["thai", "verb_tail", "safety", "polite_particle", "rule_fn"], "note": "动词在句末（对应 ri-014）"}
+{"id": "ri-165", "point": "retain_intent", "lang": "th", "input": "อย่าลืมนะว่าฉันกินเจ", "expected": "remember", "cost_level": "medium", "tags": ["thai", "negation_positive", "rule_fn"], "note": "อย่าลืม＝别忘了，否定形式表达肯定"}
+{"id": "ri-166", "point": "retain_intent", "lang": "th", "input": "จำไว้เลย กรุ๊ปเลือดผมคือ B", "expected": "remember", "cost_level": "high", "tags": ["thai", "comma_form", "safety", "rule_fn"]}
+{"id": "ri-167", "point": "retain_intent", "lang": "th", "input": "ช่วยจำว่าฉันทำงานที่สีลมได้ไหมคะ", "expected": "remember", "cost_level": "medium", "tags": ["thai", "polite_question", "ambiguous", "question_particle", "polite_particle", "rule_fn"], "note": "ช่วย…ได้ไหม 是礼貌请求，不是询问（对应 ri-025）；与 จำผมได้ไหม（问句）对照"}
+{"id": "ri-168", "point": "retain_intent", "lang": "th", "input": "จำไว้ให้หน่อยนะ ทะเบียนรถผม กข 1234", "expected": "remember", "cost_level": "medium", "tags": ["thai", "colloquial", "rule_fn"]}
+{"id": "ri-169", "point": "retain_intent", "lang": "th", "input": "ช่วยจำไว้หน่อยนะครับ ว่าผมไม่กินเผ็ด", "expected": "remember", "cost_level": "medium", "tags": ["thai", "polite", "polite_particle", "rule_fn"]}
+{"id": "ri-170", "point": "retain_intent", "lang": "th", "input": "จดไว้ว่าลูกชายเลิกเรียนสี่โมงครึ่ง", "expected": "remember", "cost_level": "medium", "tags": ["thai", "basic", "rule_fn"]}
+{"id": "ri-171", "point": "retain_intent", "lang": "th", "input": "จำไว้", "context": "上一轮用户：เลขประกันสังคมของฉันคือ 1-1002-XXXX", "expected": "remember", "cost_level": "medium", "tags": ["thai", "context_needed", "rule_fn"], "note": "内容需指代消解（对应 ri-026）"}
+{"id": "ri-172", "point": "retain_intent", "lang": "th", "input": "ได้เลย จำไว้", "context": "上一轮助手：ให้ฉันจำไว้ไหมคะว่าคุณจอดรถชั้น B3?", "expected": "remember", "cost_level": "medium", "tags": ["thai", "context_needed", "clarify_answer", "rule_fn"]}
+{"id": "ri-173", "point": "retain_intent", "lang": "th", "input": "ช่วยจำไว้ทีว่าแม่ฉันเป็นเบาหวาน", "expected": "remember", "cost_level": "medium", "tags": ["thai", "basic", "rule_fn"]}
+{"id": "ri-174", "point": "retain_intent", "lang": "th", "input": "อย่าจำเรื่องนี้นะ", "context": "上一轮用户：แฟนเก่าผมชื่อต้น", "expected": "forget", "cost_level": "high", "tags": ["thai", "negation", "context_needed"], "note": "อย่าจำ＝别记"}
+{"id": "ri-175", "point": "retain_intent", "lang": "th", "input": "ไม่ต้องจำนะคะ", "context": "上一轮用户：เลขบัญชีธนาคารฉันลงท้าย 7788", "expected": "forget", "cost_level": "high", "tags": ["thai", "negation", "context_needed", "polite_particle"]}
+{"id": "ri-176", "point": "retain_intent", "lang": "th", "input": "ลืมเรื่องที่ผมพูดเมื่อกี้ไปเลย", "expected": "forget", "cost_level": "high", "tags": ["thai", "basic"]}
+{"id": "ri-177", "point": "retain_intent", "lang": "th", "input": "ลบที่อยู่บ้านฉันออกจากความจำด้วย", "expected": "forget", "cost_level": "high", "tags": ["thai", "basic"]}
+{"id": "ri-178", "point": "retain_intent", "lang": "th", "input": "ล้างความจำเกี่ยวกับฉันทั้งหมด", "expected": "forget", "cost_level": "high", "tags": ["thai", "bulk"]}
+{"id": "ri-179", "point": "retain_intent", "lang": "th", "input": "อย่าจำที่อยู่ที่ฉันเพิ่งบอกนะ", "expected": "forget", "cost_level": "high", "tags": ["thai", "negation"]}
+{"id": "ri-180", "point": "retain_intent", "lang": "th", "input": "ผมไม่ได้ให้จำเรื่องนี้ ลบทิ้งเลยครับ", "expected": "forget", "cost_level": "high", "tags": ["thai", "negation", "complaint", "polite_particle"], "note": "用户撤回误写入"}
+{"id": "ri-181", "point": "retain_intent", "lang": "th", "input": "เมื่อกี้พูดเล่นนะ อย่าเก็บไว้", "context": "上一轮用户：ฉันเป็นเจ้าของบริษัทพันล้าน", "expected": "forget", "cost_level": "high", "tags": ["thai", "negation", "context_needed"]}
+{"id": "ri-182", "point": "retain_intent", "lang": "th", "input": "ลบทุกอย่างที่จำไว้เกี่ยวกับลูกสาวฉัน", "expected": "forget", "cost_level": "high", "tags": ["thai", "basic"]}
+{"id": "ri-183", "point": "retain_intent", "lang": "th", "input": "จำผมได้ไหม", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "question_particle"], "note": "…ได้ไหม 问句，对应「你记住我吗」；与 ช่วยจำ…ได้ไหม（请求）对照"}
+{"id": "ri-184", "point": "retain_intent", "lang": "th", "input": "จำได้หรือเปล่าว่าฉันแพ้อะไร", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "question_particle"], "note": "หรือเปล่า 疑问助词"}
+{"id": "ri-185", "point": "retain_intent", "lang": "th", "input": "ยังจำชื่อลูกสาวผมได้อยู่ใช่ไหม", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "tag_question", "question_particle"], "note": "ใช่ไหม 附加问"}
+{"id": "ri-186", "point": "retain_intent", "lang": "th", "input": "จำวันเกิดฉันได้หรือยัง", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "question_particle"], "note": "หรือยัง＝了吗"}
+{"id": "ri-187", "point": "retain_intent", "lang": "th", "input": "จำไว้แล้วใช่ไหมคะ", "context": "上一轮用户：ฉันแพ้นมวัว", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "tag_question", "context_needed", "question_particle", "polite_particle"], "note": "确认是否记住了，不是新的记住请求"}
+{"id": "ri-188", "point": "retain_intent", "lang": "th", "input": "เธอจำอะไรเกี่ยวกับฉันได้บ้าง", "expected": "ask_memory", "cost_level": "medium", "tags": ["thai", "basic"]}
+{"id": "ri-189", "point": "retain_intent", "lang": "th", "input": "ร้านที่ผมเคยเล่าให้ฟัง ยังจำได้อยู่หรือเปล่าครับ", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "question_particle", "polite_particle"]}
+{"id": "ri-190", "point": "retain_intent", "lang": "th", "input": "จำได้มั้ยว่าบ้านฉันอยู่แถวไหน", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "question_particle", "colloquial"], "note": "มั้ย 是 ไหม 的口语写法"}
+{"id": "ri-191", "point": "retain_intent", "lang": "th", "input": "ที่ฉันบอกไว้ จำได้ป่ะ", "expected": "ask_memory", "cost_level": "high", "tags": ["thai", "question_trap", "question_particle", "colloquial"], "note": "ป่ะ 是 หรือเปล่า 的口语缩略"}
+{"id": "ri-192", "point": "retain_intent", "lang": "th", "input": "ฉันเคยบอกเธอไหมว่าลูกชายชื่ออะไร", "expected": "ask_memory", "cost_level": "medium", "tags": ["thai", "basic", "question_particle"]}
+{"id": "ri-193", "point": "retain_intent", "lang": "th", "input": "เก็บข้อมูลอะไรของผมไว้บ้างครับ", "expected": "ask_memory", "cost_level": "medium", "tags": ["thai", "basic", "polite_particle"]}
+{"id": "ri-194", "point": "retain_intent", "lang": "th", "input": "ไม่ใช่ ฉันแพ้มะม่วง ไม่ใช่ถั่ว", "expected": "correct", "cost_level": "high", "tags": ["thai", "basic", "safety"]}
+{"id": "ri-195", "point": "retain_intent", "lang": "th", "input": "ผมย้ายบ้านแล้ว ตอนนี้อยู่เชียงใหม่", "expected": "correct", "cost_level": "medium", "tags": ["thai", "implicit"]}
+{"id": "ri-196", "point": "retain_intent", "lang": "th", "input": "จำผิดแล้ว ลูกสาวฉันชื่อมะปราง ไม่ใช่มะลิ", "expected": "correct", "cost_level": "medium", "tags": ["thai", "basic"]}
+{"id": "ri-197", "point": "retain_intent", "lang": "th", "input": "ขอแก้หน่อยนะคะ ประชุมเลื่อนเป็นวันพฤหัส", "expected": "correct", "cost_level": "medium", "tags": ["thai", "polite", "polite_particle"]}
+{"id": "ri-198", "point": "retain_intent", "lang": "th", "input": "จำไว้นะ ตอนนี้ผมไม่ได้ทำที่เดิมแล้ว ย้ายไปอยู่ธนาคาร", "expected": "correct", "cost_level": "medium", "tags": ["thai", "comma_form", "remember_form"], "note": "จำไว้ 句式但语义是更新"}
+{"id": "ri-199", "point": "retain_intent", "lang": "th", "input": "ผมลาออกจากบริษัทเก่าตั้งแต่เดือนที่แล้ว", "expected": "correct", "cost_level": "medium", "tags": ["thai", "implicit"]}
+{"id": "ri-200", "point": "retain_intent", "lang": "th", "input": "หมอให้เลิกกินยาความดันแล้วนะ อัปเดตด้วย", "expected": "correct", "cost_level": "high", "tags": ["thai", "basic", "safety"]}
+{"id": "ri-201", "point": "retain_intent", "lang": "th", "input": "ที่บอกไปก่อนหน้านี้ไม่ถูก จริงๆ ผมกินเผ็ดได้", "expected": "correct", "cost_level": "medium", "tags": ["thai", "colloquial"]}
+{"id": "ri-202", "point": "retain_intent", "lang": "th", "input": "เมื่อก่อนบอกว่าลูกเจ็ดขวบ ตอนนี้แปดขวบแล้วนะ", "expected": "correct", "cost_level": "medium", "tags": ["thai", "basic"]}
+{"id": "ri-203", "point": "retain_intent", "lang": "th", "input": "ต่อไปตอบเป็นภาษาไทยนะ", "expected": "preference", "cost_level": "medium", "tags": ["thai", "basic"]}
+{"id": "ri-204", "point": "retain_intent", "lang": "th", "input": "ตอบสั้นๆ พอ ไม่ต้องยาว", "expected": "preference", "cost_level": "medium", "tags": ["thai", "colloquial"]}
+{"id": "ri-205", "point": "retain_intent", "lang": "th", "input": "เรียกผมว่าพี่บอลก็ได้ครับ", "expected": "preference", "cost_level": "medium", "tags": ["thai", "basic", "polite_particle"]}
+{"id": "ri-206", "point": "retain_intent", "lang": "th", "input": "ไม่ต้องใส่อีโมจิในข้อความนะคะ", "expected": "preference", "cost_level": "medium", "tags": ["thai", "negation", "polite_particle"]}
+{"id": "ri-207", "point": "retain_intent", "lang": "th", "input": "จำไว้นะ ต่อไปตอบเป็นภาษาอังกฤษทุกครั้ง", "expected": "preference", "cost_level": "low", "tags": ["thai", "comma_form", "remember_form"], "note": "จำไว้ 句式但属于偏好（对应 ri-078）"}
+{"id": "ri-208", "point": "retain_intent", "lang": "th", "input": "จำไว้ว่าคุณเป็นผู้ช่วยแปลภาษา", "expected": "preference", "cost_level": "medium", "tags": ["thai", "remember_form", "persona"], "note": "对助手角色的指令，不是关于用户的事实"}
+{"id": "ri-209", "point": "retain_intent", "lang": "th", "input": "ตัวอย่างโค้ดเขียนเป็น Python ทุกครั้งนะ", "expected": "preference", "cost_level": "medium", "tags": ["thai", "basic"]}
+{"id": "ri-210", "point": "retain_intent", "lang": "th", "input": "ช่วงเช้าอย่าส่งแจ้งเตือนมา หลังสิบโมงค่อยส่ง", "expected": "preference", "cost_level": "medium", "tags": ["thai", "negation"]}
+{"id": "ri-211", "point": "retain_intent", "lang": "th", "input": "พูดกับฉันแบบเป็นกันเองได้เลย ไม่ต้องสุภาพมาก", "expected": "preference", "cost_level": "medium", "tags": ["thai", "basic"]}
+{"id": "ri-212", "point": "retain_intent", "lang": "th", "input": "วันนี้อากาศเป็นยังไง", "expected": "none", "cost_level": "low", "tags": ["thai", "basic"]}
+{"id": "ri-213", "point": "retain_intent", "lang": "th", "input": "ช่วยเขียนอีเมลลาป่วยให้หน่อย", "expected": "none", "cost_level": "low", "tags": ["thai", "basic"]}
+{"id": "ri-214", "point": "retain_intent", "lang": "th", "input": "จำหน้าคนยังไงให้แม่น", "expected": "none", "cost_level": "medium", "tags": ["thai", "question_trap", "no_question_mark"], "note": "问记忆技巧"}
+{"id": "ri-215", "point": "retain_intent", "lang": "th", "input": "ต้องใช้เวลานานไหมกว่าจะจำศัพท์ได้หมด", "expected": "none", "cost_level": "medium", "tags": ["thai", "question_trap", "question_particle"]}
+{"id": "ri-216", "point": "retain_intent", "lang": "th", "input": "จำได้แล้ว ขอบคุณนะ", "expected": "none", "cost_level": "high", "tags": ["thai", "acknowledgement"], "note": "用户自己表示记住了"}
+{"id": "ri-217", "point": "retain_intent", "lang": "th", "input": "เขาบอกให้จำเบอร์นี้ไว้ 081-234-5678", "expected": "none", "cost_level": "high", "tags": ["thai", "quotation"], "note": "引述他人"}
+{"id": "ri-218", "point": "retain_intent", "lang": "th", "input": "แม่ชอบพูดว่า \"จำไว้นะ ออกจากบ้านต้องล็อกประตู\"", "expected": "none", "cost_level": "high", "tags": ["thai", "quotation"]}
+{"id": "ri-219", "point": "retain_intent", "lang": "th", "input": "จำคำฉันไว้เลย แล้วแกจะเสียใจ", "expected": "none", "cost_level": "high", "tags": ["thai", "idiom"], "note": "「记住我的话」式警告"}
+{"id": "ri-220", "point": "retain_intent", "lang": "th", "input": "วันนี้ลูกชายฉันครบห้าขวบแล้ว!", "expected": "none", "cost_level": "medium", "tags": ["thai", "implicit_fact"]}
+{"id": "ri-221", "point": "retain_intent", "lang": "th", "input": "ฉันแพ้กุ้ง กินปูได้ไหมคะ", "expected": "none", "cost_level": "medium", "tags": ["thai", "implicit_fact", "question_particle", "polite_particle"], "note": "含个人事实但没有记住请求"}
+{"id": "ri-222", "point": "retain_intent", "lang": "th", "input": "จำไว้!", "expected": "none", "cost_level": "medium", "tags": ["thai", "empty"], "note": "无内容"}
+{"id": "ri-223", "point": "retain_intent", "lang": "mixed", "input": "ช่วย remember ไว้หน่อย ผมแพ้ seafood", "expected": "remember", "cost_level": "high", "tags": ["mixed", "safety", "rule_fn"]}
+{"id": "ri-224", "point": "retain_intent", "lang": "mixed", "input": "ยัง remember ผมอยู่ไหม", "expected": "ask_memory", "cost_level": "high", "tags": ["mixed", "question_trap", "question_particle"]}
+{"id": "ri-225", "point": "retain_intent", "lang": "mixed", "input": "delete ข้อมูลเงินเดือนผมออกด้วย", "expected": "forget", "cost_level": "high", "tags": ["mixed"]}
+{"id": "ri-226", "point": "retain_intent", "lang": "mixed", "input": "เบอร์โทรผมเปลี่ยนแล้ว update เป็นลงท้าย 3301 นะ", "expected": "correct", "cost_level": "medium", "tags": ["mixed"]}
