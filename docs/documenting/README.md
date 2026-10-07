@@ -538,7 +538,7 @@ D1 is built as **small slices that merge early**, starting read-only (confirmed 
 
 Slice 2 exposes delivery problems in D1 instead of D4. It is real product code, not a throwaway spike.
 
-- D1-02 ADR (#701): placement as a domain OS and agent exposure (H1); Agent24-side permission dependencies and the single-user declaration (H2). It is **reviewed and merged to `main` before D1 implementation starts**, through the first aggregate PR from `feat/documenting`, so that it never sits unmerged while code is built. Slice 1 follows directly;
+- D1-02 ADR (#701): placement as a domain OS and agent exposure (H1); Agent24-side permission dependencies and the single-user declaration (H2). It is **reviewed and merged to `main` before D1 implementation starts**, through the first release PR from `ab/documenting`, so that it never sits unmerged while code is built. Slice 1 follows directly;
 - Documenting domain-OS skeleton, REST routes in `openapi.yaml`, and a TS document page with the **Documents** navigation entry (§2.1, §10.3);
 - import, render, and extraction with **per-value provenance**, run end to end on S01 through the product path and the conversation entry (§2.2);
 - stable document identity and revision semantics: imported originals in slice 1, and the first saved edit revision in slice 2;
@@ -547,9 +547,14 @@ Slice 2 exposes delivery problems in D1 instead of D4. It is real product code, 
 
 **Process** (lessons from M10, `ARCHITECTURE-LAYERS.md` §6):
 
-- Work lands on the feature branch `feat/documenting`. Each slice PR is merged there as soon as it is done.
-- `feat/documenting` **syncs `main` at least weekly**, so it never drifts the way M10's 633-commit branch did.
-- It is merged to `main` through a **periodic aggregate PR**, at least once per completed slice, and that aggregate PR is reviewed.
+- The process follows `AGENTS.md` “里程碑方向分支工作流” (jason, 2026-10-07).
+- **Integration branch `ab/documenting`**, protected by the ruleset `ab-integration`: no force-push, merge by PR only, CI must be green.
+- **Task branches `ab/documenting-NN-<short-name>`**, one worktree each. Each task PR is ≤ 300 lines and targets `ab/documenting`, never `main`.
+- **Task PR review:**
+  - Ordinary task PRs need green CI, `pre-pr-check.sh` answered in the PR body, and passing local gates.
+  - Task PRs touching security, permission/authorization, data-write semantics, storage migrations or external protocol/wire formats also get a separate PR-Daemon review. Example: the #701 ADR and the domain-OS routes.
+- **Release:** after about 10 task PRs, or at a completed slice, a **release PR `ab/documenting` → `main`** is opened by a human. It gets a full PR-Daemon review plus jason's real-device acceptance.
+- **Weekly sync:** `ab/documenting` absorbs `main` at least weekly, **by merge, not rebase**, so it never drifts the way M10's 633-commit branch did.
 - “Product path wired” is accepted separately from “component landed”.
 
 **D1 acceptance** (in addition to §20), from the supplementary review's M items:
