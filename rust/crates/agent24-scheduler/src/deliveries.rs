@@ -1631,12 +1631,23 @@ mod pump_tests {
             fetch_attempts_and_updated_at(&store, &stable_fire_id).await;
         let mut seen = trigger.calls().len();
         for _ in 0..5 {
-            clock.set(clock.now() + chrono::Duration::seconds(3)); // > DEFER_RECHECK (2s)
-            wait_until(
-                || async { trigger.calls().len() > seen },
-                "the pump never re-polled after the skip window",
-            )
-            .await;
+            // Keep advancing the virtual clock (> DEFER_RECHECK, 2s) on every
+            // poll, not once per round: the owner-skip window is computed
+            // from `clock.now()` when the PREVIOUS round's Deferred is
+            // applied, and `trigger.calls()` grows as soon as that round's
+            // trigger is entered — before the apply. A single advance per
+            // round could therefore land before the apply, which then set the
+            // window past the clock and stalled this loop until the 5s
+            // deadline (seen on CI; ~1% locally under parallel load).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while trigger.calls().len() <= seen {
+                assert!(
+                    Instant::now() < deadline,
+                    "the pump never re-polled after the skip window"
+                );
+                clock.set(clock.now() + chrono::Duration::seconds(3));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             seen = trigger.calls().len();
         }
         let (_, updated_at_now) = fetch_attempts_and_updated_at(&store, &stable_fire_id).await;
@@ -1862,11 +1873,29 @@ mod pump_tests {
         }
 
         wait_for_last_error(&store, "mod-p", "kernel bug: attempt panicked").await;
+        let fire_id = store.list_module_schedules("mod-p").await.unwrap()[0]
+            .last_fire
+            .tick
+            .as_ref()
+            .unwrap()
+            .fire_id
+            .clone();
         let t1 = clock.now();
         clock.set(t1 + chrono::Duration::seconds(6)); // past the 5s backoff
+        // Proof that attempt 2's outcome was APPLIED, not just that its
+        // trigger was entered: `trigger.calls()` is bumped at the very start
+        // of `trigger()`, before the panic is even raised, let alone routed
+        // through `apply_attempt`. Advancing the clock on that signal alone
+        // let `apply_attempt` sometimes run AFTER the advance, computing the
+        // 15s backoff from `t2 + 16s` instead of `t2` — the third attempt
+        // then never became due and this test timed out (seen on CI, ~3.5%
+        // locally). `last_error` cannot tell rounds apart here (every panic
+        // writes the same text), but `attempts` is written in the same CAS
+        // UPDATE as `next_attempt_at` (`apply_delivery_outcome`), so
+        // `attempts == 2` proves the backoff was computed from `t2`.
         wait_until(
-            || async { trigger.calls() >= 2 },
-            "the second attempt never happened",
+            || async { fetch_attempts_and_updated_at(&store, &fire_id).await.0 >= 2 },
+            "the second attempt's outcome was never applied",
         )
         .await;
         let t2 = clock.now();
@@ -2116,58 +2145,73 @@ mod pump_tests {
     /// Review round 2, **L-f** (the L1 half): an attempt that has ALREADY
     /// finished when cancellation fires must still have its outcome
     /// durably applied — not discarded because the `JoinSet`'s `Drop`
-    /// (which aborts everything STILL running) raced ahead of it. Uses a
-    /// trigger the test controls precisely: it signals "I have been called"
-    /// and then returns immediately, so the test can release it and cancel
-    /// the pump back-to-back, racing the real completion against the real
-    /// cancellation on a genuine multi-threaded runtime.
+    /// (which aborts everything STILL running) raced ahead of it.
+    ///
+    /// The trigger cancels the pump ITSELF and then returns
+    /// `ModuleDelivered` with no await in between, on a CURRENT-THREAD
+    /// runtime. Both facts — "cancellation fired" and "the attempt
+    /// finished" — therefore become true in the same poll of the attempt
+    /// task, before the pump can run again. Its next poll sees both at
+    /// once, and `biased;` sends it into the cancellation branch, which
+    /// must drain the finished attempt rather than drop it.
+    ///
+    /// The previous version signalled the test, which then cancelled, on a
+    /// 2-worker runtime. That was flaky on CI: the signal is not proof of
+    /// completion (the attempt still had to return and reach the `JoinSet`
+    /// on another worker). When the cancel branch's non-blocking drain ran
+    /// first, the attempt was — by design — aborted as still in flight and
+    /// the row stayed `pending`. And when the pump applied the result
+    /// through the normal join branch first, the drain was never exercised
+    /// at all.
     ///
     /// Mutation: make the cancellation branch of `run`'s `select!` return
     /// immediately instead of draining `try_join_next_with_id` first — this
-    /// test goes red intermittently (the delivered write is sometimes lost).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// test goes red on every run (the delivered write is lost).
+    #[tokio::test(flavor = "current_thread")]
     async fn an_attempt_that_finishes_right_as_cancel_fires_still_lands() {
-        struct SignalThenDeliver {
-            called: tokio::sync::Notify,
+        struct CancelThenDeliver {
+            cancel: CancellationToken,
+            calls: AtomicUsize,
         }
         #[async_trait]
-        impl RunTrigger for SignalThenDeliver {
+        impl RunTrigger for CancelThenDeliver {
             async fn trigger(&self, invocation: &ScheduleInvocation) -> FireOutcome {
-                self.called.notify_one();
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 let InvocationTarget::Module { fire_id, .. } = &invocation.target else {
-                    panic!("SignalThenDeliver is only exercised with Module targets");
+                    panic!("CancelThenDeliver is only exercised with Module targets");
                 };
+                // No await between these two: the attempt finishes in the
+                // same poll that fires the cancellation.
+                self.cancel.cancel();
                 FireOutcome::ModuleDelivered {
                     fire_id: fire_id.clone(),
                 }
             }
         }
         let store = Store::open_memory().await.unwrap();
-        let trigger = Arc::new(SignalThenDeliver {
-            called: tokio::sync::Notify::new(),
+        let cancel = CancellationToken::new();
+        let trigger = Arc::new(CancelThenDeliver {
+            cancel: cancel.clone(),
+            calls: AtomicUsize::new(0),
         });
         let (scheduler, _events) =
             scheduler_with(store.clone(), Arc::clone(&trigger) as Arc<dyn RunTrigger>);
         let now0 = utc("2026-08-01T00:00:00Z");
         seed_module_fire(&scheduler, &store, "mod-race", "k", now0).await;
         let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
-        let cancel = CancellationToken::new();
         let pump = DeliveryPump::new(Arc::clone(&scheduler));
         let handle =
             tokio::spawn(pump.run(Arc::clone(&clock) as Arc<dyn Clock>, cancel.child_token()));
 
-        tokio::time::timeout(Duration::from_secs(5), trigger.called.notified())
-            .await
-            .expect("the attempt never started");
-        // The trigger has been called and is about to return `ModuleDelivered`
-        // — cancel RIGHT NOW, racing the real task completion against the
-        // real cancellation, exactly the window `run`'s cancel branch has to
-        // cover by draining `try_join_next_with_id` before it returns.
-        cancel.cancel();
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await
-            .expect("the pump must stop promptly")
+            .expect("the pump must stop promptly once the attempt cancels it")
             .unwrap();
+        assert_eq!(
+            trigger.calls.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one attempt must have run before the pump stopped"
+        );
 
         let states = store.list_module_schedules("mod-race").await.unwrap();
         assert_eq!(

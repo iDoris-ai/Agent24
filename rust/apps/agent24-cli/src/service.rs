@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 16] = [
+pub const PASSTHROUGH_VARS: [&str; 17] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -127,6 +127,9 @@ pub const PASSTHROUGH_VARS: [&str; 16] = [
     "OLLAMA_URL",
     "A24_GUARDIAN",
     "A24_GUARDIAN_ALWAYS_REVIEW",
+    // D0-3: decision-model download consent (`GET /api/v1/decide/profile`).
+    // Without it a launchd-started daemon always reports effective tier T0.
+    "A24_DECIDE_DOWNLOAD_CONSENT",
     "A24_APPROVAL_TIMEOUT_SECS",
     "A24_SCHEDULER_TICK_SECS",
     // ME-3a. Missing it meant `agent24 os install` wrote to the override

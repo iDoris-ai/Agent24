@@ -1,0 +1,4 @@
+{
+  "$comment": "D0-3 (docs/agent/PLAN-DECIDE.md §1.1): entries start empty on purpose. download_bytes/resident_bytes/measured numbers must come from D0-5/D0-6 real measurement, never copied from a model card. See docs/decision.md ADR-033 and src/catalog.rs for the loader that validates this file (revision + sha256 required per entry).",
+  "entries": []
+}
