@@ -1,8 +1,14 @@
 # ADR-DOC-02：DocumentService 操作契约
 
-> **状态**：Proposed。生效条件同 ADR-DOC-01：PR-Daemon APPROVE + jason 确认；§9 的决策项由 David 拍板（Q1、Q2、Q4、Q5 已定）。
-> - ✅ PR-Daemon 已在 #736 给出 APPROVE。
-> - ⏳ **待 jason 确认**。确认后状态改为 Accepted。
+> **状态**：**Accepted**（2026-10-07）。生效条件都已满足：
+> - PR-Daemon 已 APPROVE（#736；幂等统一修正见 #742）；
+> - jason 已在 [#740](https://github.com/iDoris-ai/Agent24/pull/740#issuecomment-6040439976) 确认；
+> - §9 的决策项由 David 拍板（Q1、Q2、Q4、Q5 已定）。
+>
+> **jason 确认时记录的已知事项**（不阻塞）：
+> 1. DOC-1 所有文档工具按 `External` 处理，每次调用都要审批。改善它依赖 #735 的“启用时权限确认”，这一项已列为内核优先事项。
+> 2. Agent run 取消后，模块侧的 job 会继续跑（Q7）。内核的取消信号、结构化工具错误码已在 #735 跟踪。
+> 3. Q3（备份 / 迁出格式、静态加密、磁盘配额）是**发布前**必须决定的事项，由 jason 和 David 共同决定。
 > **日期**：2026-10-07 · **作者**：David Xu · **Issue**：#701（DOC-1-02 第 2 部分）
 > **依赖**：[ADR-DOC-01](ADR-DOC-01-placement-and-integration.md)（进程外 OS `documents`、模块声明工具、类型化 preload、D8 由内核执行的资料处理政策、D9 审计）。
 > **依据**：[README](../README.md) §2.2 / §2.3 / §5 / §7 / §8 / §9.1 / §10 / §11 / §14 / §17 #1–#3 / §22.1；[BASELINE](../BASELINE.md) §7–§8。
