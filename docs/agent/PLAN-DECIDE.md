@@ -89,7 +89,7 @@ HardwareProbe ──► HardwareProfile ──► TierPolicy ──► 每个决
 | D0-3 | `HardwareProbe` + `TierPolicy` + 目录 schema；`GET /api/v1/decide/profile`（openapi 手写 + 生成客户端） | Sonnet | D0-1 | macOS / Linux 探测有测试（注入假数据）；无网/拒绝下载时稳定落 T0 |
 | D0-4 | 三份中文评测集：记住意图约 100 句、召回门控约 100 句、工具风险约 60 例；含问句陷阱、A-不-A 问句、口语变体、少量英文 | Opus | — | 每条有期望标签与误判代价等级；评测集进仓库 `eval/decide/` |
 | D0-5 | 横评脚本：规则 / GLiClass-multilang / mDeBERTa-xnli / Erlangshen-NLI / SetFit(bge-m3) / Qwen3Guard-0.6B / Kev-0.8B | Sonnet | D0-4 | 输出准确率、ECE、按代价加权误判率、P95 延迟、RSS、下载体积 |
-| D0-6 | 两台机器实测（笔记本 M1 Max 64GB、Mac mini M4 24GB），产出分档表并回填目录 | Sonnet 跑，Opus 定稿 | D0-5 | 结果追加到调研台账 §8；§1.1 分档表定稿 |
+| D0-6 | 两台机器实测（笔记本 M1 Max 64GB、Mac mini M4 24GB），产出分档表并回填目录 | Sonnet 跑，Opus 定稿 | D0-5 | 结果追加到调研台账 §9（§8 已用于 D0-7 许可证）；§1.1 分档表定稿 |
 | D0-7 | 候选许可证逐个核实 | Opus | — | 结论进调研台账；不可商用的剔除 |
 
 D0-1 / D0-3 / D0-4 / D0-7 可并行。规则基线在 M1 合入 main 前从 `ab/m1-memory` 的 `retain.rs` 取。
