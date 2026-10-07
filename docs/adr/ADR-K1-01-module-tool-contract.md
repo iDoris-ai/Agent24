@@ -21,6 +21,7 @@ Documenting 是第一个消费方，也是通用契约的需求来源之一；�
 | 主题 | 已有事实 | 对 K1 工具契约的差距 |
 |---|---|---|
 | Manifest 与授权 | `DomainOsManifest` 有 `kernel_capabilities`、`model_access`、`host_commands`，没有模块 Agent 工具清单（`rust/crates/agent24-domain/src/lib.rs:480-492`）。Capability 是按内核可提供的能力集取交集（`rust/apps/agent24d/src/domain.rs:62-76,116-122`）。 | 需要新增工具声明和逐工具宿主授权；模块自报的风险/隐私属性不能授予权限。现有 `host_commands` 是反向桌面命令，不是 agent 工具授权。 |
+| agent24d callback | `KERNEL_OOP_GRANTS` 仅列 Events/Approval/Memory/Scheduler/Models，`CallbackDeps` 承载内核句柄（`rust/apps/agent24d/src/domain.rs:116-150`）；`mount_package` 的 callback registry 注册事件、调度、模型等宿主方法（`:1438-1490,1538,1610-1644`）。事件 callback 在 handler 内按 capability 授权（`rust/apps/agent24d/src/events_emit.rs:5-9`）。 | 这些是模块调用内核的反向 callback，不是模块贡献 Agent 工具的注册/调用协议；不能把现有 capability grant 当作逐工具授权。 |
 | 身份与命名 | OS `name` 是路由命名空间、事件模块名和数据目录的单一来源，其他值必须精确匹配（`rust/crates/agent24-domain/src/lib.rs:470-472,780-803,920-928`）。 | 为工具定义内核生成/校验的稳定全名，避免模块间冲突；工具名不是授权本身。 |
 | 工具注册与发现 | `ToolRegistry` 持有静态工具 map 和 allowlist（`rust/crates/agent24-tools/src/lib.rs:305-316`）；`mount_all` 前构建 builtin/MCP registry（`rust/apps/agent24d/src/server.rs:1523-1558`），`adverts()` 只过滤已 allowlist 且可执行的工具（`:466-481`）。 | 当前没有模块向 agent loop 注册工具、根据模块实时生命周期或 `/capabilities` 过滤模块工具的接缝。 |
 | 工具调用上下文 | 内建工具的 `ToolContext` 已由宿主持有 `run_id`、`session_id`、`tool_call_id` 与 workspace authority（`rust/crates/agent24-tools/src/lib.rs:35-44,52-114`）。 | 进程外模块工具协议尚未把这些可信关联及获准资源范围作为宿主注入上下文；不得接受模型或模块自报身份来扩权。 |
