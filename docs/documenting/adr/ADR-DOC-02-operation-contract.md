@@ -2,7 +2,7 @@
 
 > **状态**：Proposed。生效条件同 ADR-DOC-01：PR-Daemon APPROVE + jason 确认；§9 的决策项由 David 拍板（Q1、Q2、Q4、Q5 已定）。
 > **日期**：2026-10-07 · **作者**：David Xu · **Issue**：#701（DOC-1-02 第 2 部分）
-> **依赖**：[ADR-DOC-01](ADR-DOC-01-placement-and-integration.md)（进程外 OS `documents`、模块声明工具、类型化 preload、D8 隐私污点、D9 审计）。
+> **依赖**：[ADR-DOC-01](ADR-DOC-01-placement-and-integration.md)（进程外 OS `documents`、模块声明工具、类型化 preload、D8 由内核执行的资料处理政策、D9 审计）。
 > **依据**：[README](../README.md) §2.2 / §2.3 / §5 / §7 / §8 / §9.1 / §10 / §11 / §14 / §17 #1–#3 / §22.1；[BASELINE](../BASELINE.md) §7–§8。
 >
 > 文中行号按 `dd8f7ff` 核对。
@@ -23,7 +23,7 @@
 | 错误信封 | `{error:{code,message,hint?,details?}}`，`code` 是开放枚举（`rust/crates/agent24-protocol/src/types.rs:247-264`）；413 用 `payload_too_large`（`rust/crates/agent24-domain/src/http.rs:121-122`） |
 | 工具错误 | `ToolError` = `Invalid(String) / Denied(String) / Failed(String) / Timeout(Duration) / Cancelled / AbortRun(String)`（`rust/crates/agent24-tools/src/lib.rs:153-170`）。agent loop 把 `Cancelled` 与 `AbortRun` 同等处理，**会取消整个 run**（`rust/crates/agent24-agent/src/lib.rs:1347`、`:1986`） |
 | 代理 | 首字节 10 s、总 30 s（`rust/crates/agent24-os-proto/src/proxy.rs:116`、`:124`）；响应体同样 1 MiB 上限（`:1709-1722`）；只自动重试无 body 的 GET/HEAD/OPTIONS（`:1546-1556`）；未派发即拒绝的 `module_stopping` / `module_overloaded` 等（`:1303-1436`），以及派发后结果未知的 503 `request_abandoned`（`:1286-1298`） |
-| 事件 | `module` 信封：`payload.module` = manifest id，`payload.kind` 为点分名（`protocol/events.schema.json:762-786`）。`_a24/events/emit` 每个 generation 令牌桶容量 20、每秒补 5（`rust/apps/agent24d/src/events_emit.rs:23-25`），payload ≤ 256 节点、字符串 ≤ 8 KiB（`:39-41`）。`EventsHub` 是广播给**所有** WS 客户端的通道（`rust/apps/agent24d/src/events.rs:22-28`） |
+| 事件 | `module` 信封：`payload.module` = manifest id，`payload.kind` 为点分名（`protocol/events.schema.json:762-786`）。`_a24/events/emit` 每个 generation 令牌桶容量 20、每秒补 5（`rust/apps/agent24d/src/events_emit.rs:23-25`），payload ≤ 256 节点、字符串 ≤ 8 KiB（`:39-41`）。`EventsHub` 是广播给**所有** WS 客户端的通道（`rust/apps/agent24d/src/events.rs:22-30`，每个 WS 订阅在 `:134`） |
 
 ## 2. 存储与唯一可编辑权威（#690）
 
@@ -53,7 +53,7 @@
 ```json
 { "document_id": "doc_…", "revision": 1, "content_sha256": "sha256:…",
   "text_layer_sha256": "sha256:…", "engine": { "id": "…", "version": "…" },
-  "block_id": "body/p[12]", "page": 3, "block_text_sha256": "sha256:…",
+  "block_id": "p3/b12", "page": 3, "block_text_sha256": "sha256:…",
   "text_range": { "unit": "utf8", "start": 120, "end": 168 },
   "geometry": { "box": "CropBox", "unit": "pt", "origin": "top-left-rotated",
                 "rects": [[72.0, 410.5, 300.2, 428.0], [72.0, 430.0, 180.4, 447.5]] },
@@ -70,7 +70,7 @@
 
 ## 4. 操作清单（DOC-1）
 
-- **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有输出都是 `output_privacy: local_only`（D8）。
+- **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
 - **分页**：`list`、`find`、`read_range`、抽取结果、`job.get` 统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；单页响应 ≤ 512 KiB，给 1 MiB 上限留余量。
 - **风险映射**（用户确认后的内核 `RiskClass`，`types.rs:1036-1050`）：read → `Read`；create-record / mutate-draft / commit / create-artifact → `WriteLocal`；handoff → `External`。**DOC-1 没有第一方默认安装，所有工具实际按 `External` 处理、每次审批**，除非用户在启用时逐个确认（D4.2）。
 
@@ -79,7 +79,7 @@
 | 1 | upload | `POST /uploads`（`Idempotency-Key`）；`POST /uploads/{id}/chunks`（≤768 KiB） | 不通告 | free | create-record |
 | 1 | import | `POST /imports {upload_id}` → 202 job | **不通告**（Q4 已定：只从页面经原生文件对话框导入） | free | create-record |
 | 1 | get / list | `GET /documents[/{id}]` | `documents.list`、`documents.get` | free | read |
-| 1 | render | `GET /documents/{id}/revisions/{rev}/pages/{n}?scale=`（≤ 1 MiB） | 不通告 | free | read |
+| 1 | render | `GET /documents/{id}/revisions/{rev}/pages/{n}?scale=`（≤ 1 MiB；超出时自动降低 scale，仍超出则按瓦片分块） | 不通告 | free | read |
 | 1 | read_range | `GET /documents/{id}/revisions/{rev}/text?block=&cursor=` | `documents.read_range` | free | read |
 | 1 | find | `POST /documents/{id}/find {revision, query, cursor}` | `documents.find` | free | read |
 | 1 | extract | `POST /documents/{id}/extractions {revision, schema}` → 202 job；`GET /extractions/{id}` | `documents.extract` | free（显式给定文档） | read |
@@ -105,6 +105,8 @@
       - `head ≠ base` → 409 `revision_conflict`（`details.current_revision`）。
       - 哈希不符 → 409 `change_set_stale`；还有未决定条目 → 422 `change_set_incomplete`。
    2. **构建新字节**并按 §2.2 写入 blob。这一步超出 5 s 预算（远小于 10 s 首字节期限）时，立即返回 202 job，该 job 以 `commit_key` 为键。
+      - **键在返回 202 之前就已占住**，`target_ref` 指向 job。
+      - 之后再命中这个键：job 还在进行，就返回该 job；已成功，就返回它生成的 revision。
    3. **`BEGIN IMMEDIATE`**：重查键和 head；插入 `revision = base + 1`（`UNIQUE (document_id, revision)`），并 `UPDATE documents SET head_revision = ? WHERE id = ? AND head_revision = ?`；冻结 change set；写操作日志（D9）；返回 201。
    - **空提交**：全部条目被拒绝，或零个 op → 不产生 revision。返回 200 `{revision: head, committed: false}`，change set 冻结为 `closed_no_change`。目标内容与 head 相同的 restore 同样处理。
 4. **键表** `idempotency(kind, key, request_sha256, target_ref, created_at)`，`UNIQUE (kind, key)`。kind 与键的来源：
@@ -113,7 +115,7 @@
      |---|---|
      | `upload` | 页面的 `Idempotency-Key` |
      | `import` | `upload_id` |
-     | `extract` | `(document_id, revision, schema_sha256, extractor_version, model_profile)`，实际服务的 `model_id` 记在结果上 |
+     | `extract` | `(document_id, revision, schema_sha256, extractor_version, model_id)`，键用实际的模型 id，不用 profile；需要重新抽取时，页面可以显式带 `rerun: true`，同时换一个新键 |
      | `propose` | `(document_id, base_revision, ops_sha256)` |
      | `export` | `(document_id, revision, format, options_sha256)` |
      | `commit` | `commit_key` |
@@ -157,21 +159,26 @@
 
 **会看到但不属于本命名空间的内核 / 代理码**：
 
-- **未派发，可以安全重试**：`module_overloaded`、`module_stopping`。
-- **派发了但结果未知，只能用同一个键重发**：`request_abandoned`、`upstream_timeout`、`upstream_connection_closed`。
+- **未派发，可以安全重试**：`module_overloaded`、`module_stopping`、`module_not_ready`、`module_draining`、`duplicate_request_id`（`agent24-os-proto/src/drain.rs:152-155`）。
+- **派发了但结果未知，只能用同一个键重发**：
+  - `request_abandoned`、`upstream_timeout`、`upstream_connection_closed`；
+  - `upstream_unavailable`：它在 `proxy.rs:1587` 表示“未发出”，在 `:1731` 表示“响应中途断了”，无法区分，按未知处理；
+  - `upstream_response_too_large`：模块可能已经执行；
+  - `module_panicked`、`module_killed`、`stop_failed`。
+- **默认规则**：未列出的码一律按“结果未知”处理，用同一个键重发。
 - **内核工具代理产生**：`module_unavailable`（D4.4）。
 
 ## 7. Job
 
 - **`jobs` 表**：`job_id`（`job_` + ULID）、`kind`、`document_id`、`revision`、`status`（`queued / running / cancelling / succeeded / failed / cancelled / interrupted`）、`attempt`、`progress {stage, done, total, unit}`、`error {code, message}`、`result_ref`、`origin`、时间戳；经键表与幂等键关联（§5.4）。
-- **键命中时**：`queued` / `running` → 返回该 job；`succeeded` → 返回结果；`failed` / `interrupted` / `cancelled` → **重新启用**（同一个 `job_id`，`attempt + 1`，回到 `queued`）。`POST /jobs/{id}/retry` 是同一动作的显式形式。
+- **键命中时**：`queued` / `running` → 返回该 job；`succeeded` → 返回结果；`failed` / `interrupted` → **自动重新启用**（同一个 `job_id`，`attempt + 1`，回到 `queued`）。**`cancelled` 不会因键命中而重启**，返回原 job 及其 `cancelled` 状态，只能由用户显式调用 `POST /jobs/{id}/retry` 重启。这样，内容推导的键（例如 agent 调用 `extract` / `export`）不会悄悄撤销用户的取消。`POST /jobs/{id}/retry` 是同一动作的显式形式。
 - **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具调用最多等 manifest 声明的 `inline_wait_ms`（**严格小于**注册的超时，至少留 5 s 余量），到期返回 `{job_id, status}`，agent 用 `documents.job.get` 查询。
 - **完成**：结果行与 `status = succeeded` 在**同一个事务**里写入。
 - **取消**：`POST /jobs/{id}/cancel` 幂等，置 `cancelling`；工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
 - **崩溃恢复**：OS 启动时 `running` → `interrupted`，`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
 - **事件**：manifest 申请 `events`，经 `_a24/events/emit` 发出，`payload.module = documents`，`kind` 取 `job.progress`、`job.finished`、`document.imported`、`revision.committed`。
-  - **整个模块合计 ≤ 2 次/秒**（低于内核的每秒 5 次），进度按 job 合并只发最新一条；被 `rate_limited` 拒绝的进度事件直接丢弃。
-  - **payload 只带 id、stage、计数、status、错误码**，不带标题、文件名、查询或内容：`EventsHub` 广播给所有 WS 客户端，D8 的污点管不到它。
+  - **整个模块合计 ≤ 2 次/秒**（低于内核的每秒 5 次），进度按 job 合并只发最新一条；被 `rate_limited` 拒绝的进度事件直接丢弃。**终态事件**（`job.finished`、`revision.committed`）优先发送，被限流时短暂退避后重发一次；最终仍以 job 行为准。
+  - **payload 只带 id、stage、计数、status、错误码**，不带标题、文件名、查询或内容：`EventsHub` 广播给所有 WS 客户端，D8 的资料处理政策管不到这条通道。
   - 事件只是提示，**job 行才是权威**；断线后用 `GET /jobs/{id}` 对账。
 - **agent run 取消**：内核目前不会通知模块。run 取消后 job 继续运行，结果保留（Q7）。
 
