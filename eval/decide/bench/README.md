@@ -173,18 +173,13 @@ uv run --isolated --with 'optimum[onnxruntime]>=1.20,<2.2' --with 'transformers<
     --out-dir /tmp/onnx-e5-base
 ```
 
-脚本输出 `onnx_export_report.json`，并在 `int8/` 保存分类头和逐条 Python
-参考结果。模型、tokenizer 和头文件留在输出目录，不进仓库。
-
-Rust D1-1 spike 默认不需要模型资产，集成测试会跳过。配置 `int8/` 路径后
-对 221 条 `recall_gate` 样本逐条对照：标签一致率 ≥99%，最大类别概率绝对误差
-≤0.02；标签分歧仅允许在双方概率都处于 0.5 ±0.02 的边界带。下列命令测量
-Rust 单独进程 RSS 与 P50/P95：
+脚本在 `int8/` 保存量化 ONNX、分类头和 221 条逐条 Python 参考结果。模型资产
+只写入输出目录。Rust spike 默认跳过；设置路径后运行，它会校验一致性并打印
+单独测试进程的 RSS 与 P50/P95：
 
 ```bash
 export CARGO_TARGET_DIR=$HOME/Dev/auraai/Agent24/rust/target
 export agent24_onnx_spike_dir=/tmp/onnx-e5-base/int8
 cd rust
-cargo test -p agent24-decide --features onnx-spike --test onnx_spike
-cargo run -p agent24-decide --features onnx-spike --bin onnx_spike_bench
+cargo test -p agent24-decide --features onnx-spike --test onnx_spike -- --nocapture
 ```

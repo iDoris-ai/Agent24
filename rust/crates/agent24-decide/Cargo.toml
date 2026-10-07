@@ -24,11 +24,6 @@ name = "onnx_spike"
 path = "tests/onnx_spike.rs"
 required-features = ["onnx-spike"]
 
-[[bin]]
-name = "onnx_spike_bench"
-path = "src/bin/onnx_spike_bench.rs"
-required-features = ["onnx-spike"]
-
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

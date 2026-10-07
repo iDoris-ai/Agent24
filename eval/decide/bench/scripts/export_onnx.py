@@ -160,15 +160,9 @@ def main() -> int:
         clf = LogisticRegression(max_iter=2000)
         clf.fit(X, y)
         heads[point] = (clf, labels)
-        class_labels = [labels[int(class_id)] for class_id in clf.classes_]
-        (int8_dir / f"head_{point}.json").write_text(
-            json.dumps({
-                "classes": class_labels,
-                "coefficients": clf.coef_.tolist(),
-                "intercepts": clf.intercept_.tolist(),
-            }, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        head = {"classes": [labels[int(i)] for i in clf.classes_],
+                "coefficients": clf.coef_.tolist(), "intercepts": clf.intercept_.tolist()}
+        (int8_dir / f"head_{point}.json").write_text(json.dumps(head, ensure_ascii=False), encoding="utf-8")
 
     results = {}
     for point in points:
@@ -189,14 +183,7 @@ def main() -> int:
             latencies.append((time.perf_counter() - t0) * 1000)
             if pred == item.expected:
                 correct += 1
-            reference_items.append({
-                "id": item.id,
-                "input": text,
-                "input_ids": tokenizer(args.query_prefix + text, truncation=True)["input_ids"],
-                "expected": item.expected,
-                "label": pred,
-                "p": float(probs[best_pos]),
-            })
+            reference_items.append({"input": text, "label": pred, "p": float(probs[best_pos])})
         latencies.sort()
         p50 = latencies[len(latencies) // 2] if latencies else None
         p95 = latencies[int(len(latencies) * 0.95)] if latencies else None
@@ -207,9 +194,7 @@ def main() -> int:
             "p95_latency_ms": p95,
         }
         (int8_dir / f"{point}_python.json").write_text(
-            json.dumps({"items": reference_items}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+            json.dumps({"items": reference_items}, ensure_ascii=False), encoding="utf-8")
 
     state["stop"] = True
     report = {

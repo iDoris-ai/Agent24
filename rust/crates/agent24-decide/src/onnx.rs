@@ -88,40 +88,11 @@ impl OnnxEmbeddingClassifier {
             .iter()
             .map(|id| i64::from(*id))
             .collect();
-        let types: Vec<i64> = encoding
-            .get_type_ids()
-            .iter()
-            .map(|id| i64::from(*id))
-            .collect();
         let len = ids.len();
-        let mut inputs = vec![
-            (
-                "input_ids",
-                Tensor::from_array(([1, len], ids))
-                    .map_err(display_error)?
-                    .into_dyn(),
-            ),
-            (
-                "attention_mask",
-                Tensor::from_array(([1, len], mask.clone()))
-                    .map_err(display_error)?
-                    .into_dyn(),
-            ),
-        ];
-        if self
-            .session
-            .inputs
-            .iter()
-            .any(|input| input.name == "token_type_ids")
-        {
-            inputs.push((
-                "token_type_ids",
-                Tensor::from_array(([1, len], types))
-                    .map_err(display_error)?
-                    .into_dyn(),
-            ));
-        }
-        let outputs = self.session.run(inputs).map_err(display_error)?;
+        let outputs = self.session.run(ort::inputs! {
+            "input_ids" => Tensor::from_array(([1, len], ids)).map_err(display_error)?,
+            "attention_mask" => Tensor::from_array(([1, len], mask.clone())).map_err(display_error)?,
+        }).map_err(display_error)?;
         let hidden = outputs[0]
             .try_extract_array::<f32>()
             .map_err(display_error)?;
@@ -199,27 +170,19 @@ mod tests {
     use super::{LinearHead, validate_hidden_shape};
 
     #[test]
-    fn mismatched_head_class_rows_are_rejected() {
+    fn invalid_head_and_output_dimensions_are_rejected() {
         let head = LinearHead {
             classes: vec!["a".into(), "b".into(), "c".into()],
             coefficients: vec![vec![0.1; 2]],
             intercepts: vec![0.0],
         };
         assert!(head.validate().is_err());
-    }
-
-    #[test]
-    fn non_3d_encoder_output_is_rejected() {
         assert!(validate_hidden_shape(&[1, 768], 1).is_err());
-    }
-
-    #[test]
-    fn classifier_width_mismatch_is_rejected() {
-        let head = LinearHead {
+        let wrong_width = LinearHead {
             classes: vec!["a".into(), "b".into()],
             coefficients: vec![vec![0.1; 2]],
             intercepts: vec![0.0],
         };
-        assert!(head.validate_width(3).is_err());
+        assert!(wrong_width.validate_width(3).is_err());
     }
 }
