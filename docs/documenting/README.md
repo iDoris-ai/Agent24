@@ -704,6 +704,8 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 
 ### 18.2 Sample set
 
+The spec for sources, coverage, gold labels and verification is [`samples/README.md`](samples/README.md). It starts with S01; jason confirmed on 2026-10-07 that no existing samples exist, so samples come from public sources that can legally be committed.
+
 - Sanitized, representative documents per slice, including bad cases: scans, mixed language, complex tables, same-name different versions, and duplicates.
 - Gold labels for critical fields (§11.8).
 - Each sample pinned and versioned with the fixtures.
