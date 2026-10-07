@@ -86,6 +86,77 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/os": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List domain OS modules and registry state */
+        get: operations["listDomainOs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Enable or disable a domain OS module */
+        patch: operations["updateDomainOs"];
+        trace?: never;
+    };
+    "/os/{name}/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stop a running domain OS module without changing os.json */
+        post: operations["stopDomainOs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/{name}/commands/{command}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Invoke a command declared by an attached module
+         * @description A JSON object body of at most 64 KiB is forwarded to the module; its object result is returned.
+         */
+        post: operations["invokeAttachedModuleCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/usage": {
         parameters: {
             query?: never;
@@ -733,6 +804,36 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        DomainOsView: {
+            name: string;
+            namespace: string;
+            version: string;
+            enabled: boolean;
+            /** @description Open enum: mounted | disabled | degraded | refused. */
+            state: string;
+            detail?: string;
+            granted: string[];
+            missing_models: string[];
+            /** @description Open enum: ok | missing | unknown | not_checked. */
+            resources: string;
+            restart_required: boolean;
+        };
+        DomainOsList: {
+            modules: components["schemas"]["DomainOsView"][];
+            registry_error?: string;
+        };
+        DomainOsUpdate: {
+            enabled: boolean;
+        };
+        DomainOsStopResponse: {
+            name: string;
+            stopped: boolean;
+        };
+        DomainOsCommandResponse: {
+            result: {
+                [key: string]: unknown;
+            };
+        };
         ShutdownReport: {
             /** @description An ephemeral daemon keeps no shutdown evidence. */
             ephemeral: boolean;
@@ -1418,7 +1519,7 @@ export interface components {
         };
     };
     responses: {
-        /** @description Malformed or invalid request */
+        /** @description invalid_request: malformed or invalid request */
         BadRequest: {
             headers: {
                 [name: string]: unknown;
@@ -1436,7 +1537,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Resource not found */
+        /** @description not_found: resource not found */
         NotFound: {
             headers: {
                 [name: string]: unknown;
@@ -1548,6 +1649,216 @@ export interface operations {
                     "application/json": {
                         models: components["schemas"]["Model"][];
                     };
+                };
+            };
+        };
+    };
+    listDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Module configuration, runtime state, and resource availability */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsList"];
+                };
+            };
+            /** @description registry_invalid: the os.json registry could not be read or parsed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DomainOsUpdate"];
+            };
+        };
+        responses: {
+            /** @description Updated module list and runtime state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description attached_module or admission_refused */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description internal or stop_failed: configuration write or module stop failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description registry_invalid or disable_pending */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    stopDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stop was requested and the module no longer admits requests */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsStopResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description stop_failed: the module supervisor could not stop cleanly */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description disable_pending: the module is still admitting requests */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    invokeAttachedModuleCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                command: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Command result from the attached module */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsCommandResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description forbidden: the command is not declared by the module manifest */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description busy: the module has reached its in-flight command limit */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description connection_lost or module_error: the module connection ended or returned an invalid response */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description module_not_ready: the module is not attached or its command was not sent */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description timeout: the module did not answer before the command deadline */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };
