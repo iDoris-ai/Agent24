@@ -20,10 +20,7 @@ fn tmp_home() -> tempfile::TempDir {
 fn each_test_home_has_an_existing_private_temp_dir() {
     let home = tmp_home();
     let tmp = home.path().join("tmp");
-    assert!(
-        tmp.is_dir(),
-        "TMPDIR must exist inside the per-test HOME"
-    );
+    assert!(tmp.is_dir(), "TMPDIR must exist inside the per-test HOME");
 }
 
 fn cli(home: &Path, daemon_bin: &Path, args: &[&str]) -> std::process::Output {
