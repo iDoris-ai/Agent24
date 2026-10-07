@@ -26,6 +26,14 @@ def render_markdown(run: dict[str, Any]) -> str:
         " ECE 只在该候选对该点产出概率时计算，否则记为 `—`。"
     )
     lines.append("")
+    lines.append(
+        "注：`erlangshen-nli` / `mdeberta-xnli-control` 用同一个中文 hypothesis 模板"
+        "（`这句话属于：{}`）跑标准 zero-shot-classification pipeline，没有为每个模型分"
+        "别调过模板或 premise/hypothesis 顺序——`erlangshen-nli` 的分数明显偏低，可能部分"
+        "来自这一点而不是模型本身在其训练任务上的真实水平，D1 选型前若要用这条路线需要单"
+        "独调一遍模板再比。"
+    )
+    lines.append("")
 
     unavailable = [c for c in run["candidates"] if not c["available"]]
     available = [c for c in run["candidates"] if c["available"]]

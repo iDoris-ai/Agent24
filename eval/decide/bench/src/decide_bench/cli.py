@@ -33,7 +33,7 @@ from .report import render_markdown
 from .runner import result_to_dict, run_candidate
 from .types import Point
 
-RESULTS_DIR = Path(__file__).resolve().parents[3] / "results"
+RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
 
 
 def _run_one_subprocess(name: str, points: list[Point], timeout_s: float = 1800.0) -> dict:
