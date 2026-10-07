@@ -1,0 +1,91 @@
+{
+  "id": "s01-05-zh-putuo-fee-2024",
+  "schema": "s01-gold-v1",
+  "fields": [
+    {
+      "key": "dog_fee_inner_ring",
+      "status": "present",
+      "value": "内环以内区域500元/犬.年",
+      "anchors": [
+        {
+          "page": 9,
+          "quote": "内环以内区域500元/犬.年"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "dog_fee_outer_ring",
+      "status": "present",
+      "value": "内环以外区域300元/犬.年（农村地区停征）",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 9,
+          "quote": "内环以外区域300元/犬.年(农村地区"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "residence_permit_fee",
+      "status": "present",
+      "value": "20元/证",
+      "anchors": [
+        {
+          "page": 9,
+          "quote": "20元/证"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "id_card_first_issue_exemption",
+      "status": "present",
+      "value": "停征首次申领居民身份证工本费",
+      "negation": true,
+      "anchors": [
+        {
+          "page": 7,
+          "quote": "停征首次申领"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "approval_number_leading_zero",
+      "status": "present",
+      "value": "沪价费[2012]009号",
+      "anchors": [
+        {
+          "page": 3,
+          "quote": "沪价费[2012]009号"
+        }
+      ],
+      "severity": "critical"
+    },
+    {
+      "key": "referenced_exam_fee_table",
+      "status": "missing",
+      "anchors": [
+        {
+          "page": 10,
+          "quote": "后附表《上海市考试考务费目录清单》"
+        }
+      ],
+      "severity": "major",
+      "note": "被引用的附表不在本文件中"
+    },
+    {
+      "key": "issue_date",
+      "status": "missing",
+      "severity": "major"
+    }
+  ],
+  "must_not_assert": [
+    "exam fee amounts from the missing attached table",
+    "an issue date"
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}
