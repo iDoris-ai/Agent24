@@ -21,7 +21,7 @@
 - **主干 = M1 记忆即产品（C3 P0）**，在 `ab/m1-memory` 上继续，做完以 merge 落 main；之后按 `MEMORY-STRATEGY` 的 P1 → P2 → P3 推进（见 [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) §3）。
 - **Open Design 线在 M10 告一阶段**：OD-M11 / OD-M12 / TPI-W / OC 全部 `PAUSED`，不与 M1 并行；M10 遗留的安全缺口（capability 路由级授权未实现、Desktop / ACP 仍用全权 token、ACP 不传 `workspace_id`）照原样登记在 [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) §0，恢复时从 OD-M11 起步。F11.4 托管器取舍随之推迟到恢复时再定。
 - **并行线 = COMM（Hyphae）**，留在笔记本做：COMM-5b → COMM-6 → COMM-7、DEP-C8。
-- **M1 之后第一项 = DM-SPIKE**（jason 2026-10-06 拍板）：决策模型（Ollaya / Laya / Jev 类）做记忆意图分类，规则兜底 + 模型判断，按评测门槛决定是否接入；该方向持续调研。定义与台账见 [`../research/DECISION-MODELS.md`](../research/DECISION-MODELS.md)。状态：`BACKLOG`（等 M1 合进 main）。
+- **M1 之后第一项 = DM-SPIKE**（jason 2026-10-06 拍板）：决策模型（Ollaya / Laya / Jev 类）做记忆意图分类，规则兜底 + 模型判断，按评测门槛决定是否接入；该方向持续调研。定义与台账见 [`../research/DECISION-MODELS.md`](../research/DECISION-MODELS.md)。2026-10-07 jason 同意 D0–D3 方案并追加「按硬件自动适配」「积累数据训练个人决策模型」两条要求，任务拆解见 [`PLAN-DECIDE.md`](PLAN-DECIDE.md)。状态：**D0 `IN_PROGRESS`**（与 M1 真机验收并行，D0 不改现有调用点行为）；D1 起等 M1 合进 main。
 
 **历史（2026-09-23 起的 ME-4 执行段，已收口）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
 定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
