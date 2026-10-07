@@ -19,6 +19,7 @@ mod attached_routes;
 )]
 mod capabilities;
 mod comm_routes;
+mod decide_routes;
 mod domain;
 mod events;
 mod events_emit;
