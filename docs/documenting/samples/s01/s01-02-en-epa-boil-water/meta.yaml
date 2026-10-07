@@ -1,0 +1,14 @@
+id: "s01-02-en-epa-boil-water"
+title: "Drinking Water Warning — E. coli boil water advisory (public notification template)"
+lang: "en"
+kind: "text_pdf"
+pages: 3
+source_url: "https://www.epa.gov/system/files/documents/2025-07/pn_e_coli_boil_advisory.pdf"
+publisher: "U.S. Environmental Protection Agency, Region 8"
+retrieved_at: "2026-10-07"
+license: "US-17USC105"
+sha256_original: "2a2c8c1c14f1577ce011a6137aab33baa4dcfdd879d11d6e37c7813be5de8f4a"
+sha256_stored: "2a2c8c1c14f1577ce011a6137aab33baa4dcfdd879d11d6e37c7813be5de8f4a"
+redactions: []
+covers: [C3, C6, C7, C9]
+notes: "Template: dates, time frame and contact are blank (expected 'missing'). 'within 24 hours' on p2 is an obligation of the water-system operator, not of residents."

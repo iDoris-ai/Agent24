@@ -122,7 +122,12 @@ notes: "…"
 规则：
 
 - **`status` 三选一**：`present`、`missing`、`conflict`。缺失和冲突本身就是正确答案，不能用模型的推测填补。
-- **锚点**：`quote` 必须逐字取自原件，空白规范化除外。`page` 从 1 开始。扫描件可以额外给 `rects`，格式与 ADR-DOC-02 §3 相同，第一版不强制。
+- **锚点**：`quote` 必须逐字取自原件**显示的文字**。`page` 从 1 开始。扫描件可以额外给 `rects`，格式与 ADR-DOC-02 §3 相同，第一版不强制。
+- **锚点比对规则**：比对前，两边都先做 Unicode **NFKC** 规范化，再把空白（含换行）折叠成单个空格。收集样本时实测到两类文本层异常：
+  - 文本层和显示不一致，例如 s01-03 的标题被抽取成“节假日日”；
+  - 部首码位替代，例如 Chrome 输出的文本层里，“水”被编码成 U+2F54。
+
+  这类异常记在 `meta.yaml` 的 `notes` 里。harness 遇到时应判为“锚点可解析但文本层异常”，不能算成抽取正确。
 - **`severity`**：
   - `critical`：日期、金额、否定词、编号。错一项就单独记为**严重错误**，不和普通准确率平均（T005 §9.2）。
   - `major`：要求、对象。
@@ -137,6 +142,21 @@ notes: "…"
 3. **人工核对（必须）**：David 逐项对照原件核对。核对后 `verified_by` 填 `david`，改动直接写进 `gold.json`。**未核对的金标不进入验收统计。**
 4. **入库**：每个样本目录都通过 PR 合入 `ab/documenting`。之后要修改金标，必须在 PR 里说明原因，旧版本由 git 追溯。
 5. **使用**：#708 的验收 harness 读取 `gold.json`，分别统计：字段正确率、`missing` / `conflict` 判对率、锚点命中率、严重错误数（单独列出），以及 `must_not_assert` 违规数。
+
+## 6.5 S01 样本索引（v1，2026-10-07）
+
+| id | 来源 | 类型 | 覆盖 |
+|---|---|---|---|
+| s01-01-zh-sh-fee-2025 | 上海市财政局、发改委 | text_pdf，33 页 | C1 C5 C6 C7 C8 C9 |
+| s01-02-en-epa-boil-water | U.S. EPA Region 8 | text_pdf，3 页 | C3 C6 C7 C9 |
+| s01-03-zh-holiday-2026 | 国务院办公厅（gov.cn 网页打印） | text_pdf，2 页 | C1 C5 C6 |
+| s01-04-en-govuk-sa-deadlines | HMRC / GOV.UK（OGL） | text_pdf，4 页 | C3 C5 C6 |
+| s01-05-zh-putuo-fee-2024 | 上海市普陀区 | text_pdf，10 页 | C7 C8 C9 |
+| s01-06-zh-holiday-2026-scan | 由 s01-03 派生的模拟扫描 | image | C2 |
+| s01-07-mixed-building-notice | 合成 | synthetic | C4 C6 C7 C9 C10 |
+
+- **合成占比**：2/7（s01-06 是派生件，也计入合成），满足 ≤ 30%。合计 1.78 MB。
+- **核对状态**：全部金标都是 `claude-draft`，**等待 David 核对**（§5 第 3 步），核对前不计入验收统计。
 
 ## 7. 样本变大后的存放（待 jason 决定）
 
