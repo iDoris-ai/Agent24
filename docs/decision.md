@@ -1357,6 +1357,37 @@ SPEC-MD-ME §5 的 ME-3 行写的是「经 MCP/协议」，那是立项时的猜
 
 **仍开放**：见 A3 设计 §11（Q1 桌面端是否显示回复文本、Q2 配对 UX、Q3 第二条连接策略、Q4 P2 是否持久化 transcript）。
 
+---
+
+## ADR-033：`agent24-decide` 位于 L3，D0-1 只定契约、不接入任何调用点
+
+**日期**：2026-10-07
+**状态**：✅ 采纳（D0-1，见 [`docs/agent/PLAN-DECIDE.md`](agent/PLAN-DECIDE.md) D0-1 行；方案见 [`docs/research/DECISION-MODELS.md`](research/DECISION-MODELS.md) §7.3）
+
+### 背景
+
+M1 真机验收反复暴露规则式意图判断（`retain.rs` 的 `explicit_remember`）的天花板：中文口语穷举不完，一修再修（#680）。`DECISION-MODELS.md` §7 的结论是「规则兜底 + 决策模型判断」的分层架构，`PLAN-DECIDE.md` 把它拆成 D0–D4。本 ADR 只记录 D0-1 这一片——新增 `agent24-decide` crate 本身——落在架构里的什么位置，以及它刻意不做什么。
+
+### 决策
+
+1. **分层位置：L3 内核能力服务**，与 `agent24-models` / `agent24-tools` / `agent24-policy` 同级。理由：它和这些 crate 一样是「被 L4/L5 调用的无状态能力」，不持有 run 生命周期（L4 的职责），不做权威持久化（L2 的职责），也不是契约层的纯类型（L0 已经有 `agent24-protocol` / `agent24-domain`，`agent24-decide` 的类型不是内核↔领域 OS 的边界契约，不该塞进 L0）。`docs/ARCHITECTURE-LAYERS.md` 的 L3 表与依赖表已各加一行，状态标 🟡（代码与测试在 main 上，但未接入任何产品路径）。
+2. **依赖最小化**：只依赖 `serde` / `serde_json`（workspace 既有）+ `async-trait` / `thiserror`（照搬 `agent24-models` 等 crate 已经在用的同一做法，不引入新的依赖范式）。不依赖 `agent24-protocol`、`agent24-domain`、`agent24-models` 或任何其它内部 crate——D0-1 的契约是独立的，这样 D1 接线时才有自由在 `agent24-agent`、`agent24d` 或两者之间决定挂载点，而不被过早的依赖方向绑住。
+3. **D0-1 不接入任何现有调用点**（`PLAN-DECIDE.md` §4 的硬约束）：`agent24d` 不感知这个 crate；`retain.rs` 等现有规则判断的行为零变化。`DecisionService` 目前只有 `RuleBackend` 一个实现，Encoder/Deep/LlmSimulation 后端是 D0-5 评测过关之后才接入的 D1+ 工作。
+4. **A 类判断永不进入**：本 crate 的类型系统不提供任何「决策结果可以放宽权限」的路径——`Outcome` 只有 `Decided` / `Abstain` / `Unavailable` 三态，没有能越过审批门、WriteGate、Authorizer 等不变量的出口。调用方要用决策服务的输出收紧动作（执行/反问/交人），而不是绕过既有的确定性代码。
+5. **不静默降级**：`DecisionService::decide` 的级联规则是——规则命中立即返回 `Decided`（短路，不下探）；某层 `NoConclusion` 就下探到下一层，但可以留下一个非最终的 `floor`（`BackendOutcome::NoConclusion { floor }`，空表示这层确实什么都没给出，`RuleBackend` 未命中时就是这种情况）；某层 `Unavailable` 就立即停止级联，返回 `Outcome::Unavailable` 并带上**上一个真正留下过非空 `floor` 的层的结论**（没有就是空），绝不跳过失败层去问更深的后端，也绝不替失败层编造一个结果。单测 `unavailable_layer_stops_the_cascade_without_downgrading`（没有 floor 可带，确认不降级）/ `unavailable_layer_carries_the_last_floor_forward`（有非空 floor，确认原样带上）/ `an_empty_floor_carries_forward_as_empty_not_as_a_fabricated_answer` 锁定这三种情形。
+   > 2026-10-07 评审修正（#688 R2/R4 M3）：本条原先的措辞和 `unavailable_layer_carries_forward_the_rule_layers_conclusion` 这个测试名，描述的是一条当时并不存在的路径——`floor_answers` 只在 `NoConclusion` 分支被置空，`Decided` 一律直接返回，所以"携带结论"从未被走到，测试也没断言 `answers`。按 `PLAN-DECIDE.md` §0 的要求把这条路径真正接通（`BackendOutcome::NoConclusion` 改为携带 `floor: Vec<Answer>`），而不是删掉这段描述。
+6. **`llm_simulation` 标记由 `DecisionService` 强制，不只是构造函数**：`Answer::new` 接收 `BackendKind`，当传入的后端是 `LlmSimulation` 时无条件把 `calibrated` 覆盖为 `false`——但这个参数是 `evaluate()` 实现自己选的，不保证等于该后端 `DecisionBackend::kind()` 的真实值。**真正的强制点在 `DecisionService::decide`**：每个后端返回的 `Answer`，都会在 `evaluate()` 返回后立刻用该后端自己的 `kind()` 重新盖章（`Answer::normalized_for`），不信任后端在构造 `Answer` 时自报的 `BackendKind`。单测 `decide_normalizes_calibrated_by_the_backends_real_kind_not_its_self_report` 锁定：一个 `kind()` 返回 `LlmSimulation`、但 `evaluate()` 用 `BackendKind::Encoder` 构造答案的假后端，经 `decide()` 后 `calibrated()` 仍必须为 `false`。
+   > 2026-10-07 评审修正（#688 R2/R4 M1）：本条原先说"不是靠调用方自觉遵守的约定"，但 `Answer::new` 的 `backend` 参数恰恰是自由参数，`service.rs` 原先从不拿它对 `backend.kind()` 做核对——评审用独立探针 crate 实跑出反例（后端自报 `kind()=LlmSimulation`，`evaluate()` 里传 `BackendKind::Encoder`，得到 `calibrated=true`）。现在改为由 service 统一归一化，上面这句话才成立。
+7. **没有全局默认阈值，反序列化走同一条校验**：`ThresholdBands` 不实现 `Default`，也没有零参数构造函数；`execute_at` / `escalate_below` 必须按决策点显式传入并校验（范围、次序），`docs/agent/PLAN-DECIDE.md` §0 明确禁止「全局 0.5 默认」。`Deserialize` 同样经过 `ThresholdBands::new` 校验（`#[serde(try_from = "RawThresholdBands")]`），不是一个绕过校验的平行通路。
+   > 2026-10-07 评审修正（#688 R4 M2）：本条原先遗漏了反序列化这条路径——`#[derive(Deserialize)]` 会直接填充私有字段，完全跳过 `new()` 的范围/次序校验；评审实跑出次序颠倒的 JSON（`execute_at=0.2, escalate_below=0.9`）反序列化成功，且因为 `action_for` 先判断 `p >= execute_at`，结果是整个概率区间都变成 `Execute`——方向正好是「放宽」，与 lib.rs 的硬约束相反。
+
+### 代价与后果
+
+- 现在没有任何代码路径消费 `agent24-decide`——这是有意的：D0-1 的验收是「契约能表达 D0-4/D0-5 需要的所有场景」，不是「立刻提升记住意图的准确率」。D1 才接线。
+- 因为不依赖 `agent24-protocol`，`DecisionRequest`/`Decision` 暂时不是 wire 类型；D1 接入 REST（如果需要）时要么在 `agent24d` 里补一层映射，要么回来给这些类型加 `agent24-protocol` 依赖——留给 D1 决定，不在本 ADR 内假装已解决。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
