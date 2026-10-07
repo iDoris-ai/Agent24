@@ -1,60 +1,156 @@
-{"text": "记住我喜欢吃辣的", "label": "remember"}
-{"text": "帮我记住，我周末一般都在家", "label": "remember"}
-{"text": "麻烦你记一下，我是左撇子", "label": "remember"}
-{"text": "记住：我每天早上七点起床", "label": "remember"}
-{"text": "我养了一只猫叫豆豆，记住这个", "label": "remember"}
-{"text": "please remember my favorite color is blue", "label": "remember"}
-{"text": "remember that I work night shifts", "label": "remember"}
-{"text": "你要记住，我对青霉素过敏", "label": "remember"}
-{"text": "记住我老家是四川的", "label": "remember"}
-{"text": "帮我记一下我的生日是三月十号", "label": "remember"}
-{"text": "别记这件事了", "label": "forget"}
-{"text": "把你记的关于我公司的事都删掉", "label": "forget"}
-{"text": "刚说的内容不用保留", "label": "forget"}
-{"text": "忘掉我刚才说的那个地址", "label": "forget"}
-{"text": "把你知道的关于我的事情全部删除", "label": "forget"}
-{"text": "刚才那句别当真，不要记下来", "label": "forget"}
-{"text": "forget what I just told you about my ex", "label": "forget"}
-{"text": "把我说过喜欢猫的那条记录删了", "label": "forget"}
-{"text": "不要把我住址记下来", "label": "forget"}
-{"text": "这条就当没说过，别留着", "label": "forget"}
-{"text": "你记得我喜欢什么颜色吗", "label": "ask_memory"}
-{"text": "你还记得我老家在哪吗", "label": "ask_memory"}
-{"text": "你知道我平时几点睡觉吗", "label": "ask_memory"}
-{"text": "你记住我的生日了没", "label": "ask_memory"}
-{"text": "你是不是记得我养了只狗", "label": "ask_memory"}
-{"text": "do you remember what my job is", "label": "ask_memory"}
-{"text": "你脑子里还有我的信息吗", "label": "ask_memory"}
-{"text": "你记得我上次跟你说的那件事吗", "label": "ask_memory"}
-{"text": "关于我你都记了什么", "label": "ask_memory"}
-{"text": "你对我的了解还准吗", "label": "ask_memory"}
-{"text": "其实我不是对花生过敏，是对芒果过敏", "label": "correct"}
-{"text": "更新一下，我现在住在杭州了，不是上海", "label": "correct"}
-{"text": "我说错了，我的生日是五月不是六月", "label": "correct"}
-{"text": "改一下，我现在换工作了，在做设计", "label": "correct"}
-{"text": "不对，我养的是两只猫不是一只", "label": "correct"}
-{"text": "actually my phone number changed, update it", "label": "correct"}
-{"text": "上次说的职位信息不准了，我升职了", "label": "correct"}
-{"text": "我离婚了，之前说的家庭情况要改一下", "label": "correct"}
-{"text": "纠正一下，孩子今年八岁了不是七岁", "label": "correct"}
-{"text": "我搬家了，地址变了", "label": "correct"}
-{"text": "以后回复都用简体中文", "label": "preference"}
-{"text": "从今天起，跟我说话别太啰嗦", "label": "preference"}
-{"text": "以后帮我写代码都加注释", "label": "preference"}
-{"text": "跟我交流以后用更正式的语气", "label": "preference"}
-{"text": "以后遇到我的邮件都先翻译成英文再回复", "label": "preference"}
-{"text": "from now on always give me a short summary first", "label": "preference"}
-{"text": "今后不用每次都叫我的全名", "label": "preference"}
-{"text": "以后给我的建议都要给出两个备选方案", "label": "preference"}
-{"text": "跟我说话以后不要用敬语", "label": "preference"}
-{"text": "以后每次对话开头先问我今天的心情", "label": "preference"}
-{"text": "现在几点了", "label": "none"}
-{"text": "帮我查一下明天的会议安排", "label": "none"}
-{"text": "他跟我说记住他的生日", "label": "none"}
-{"text": "怎样才能提高记忆力", "label": "none"}
-{"text": "这篇文章讲的是如何提升记忆力", "label": "none"}
-{"text": "记住这个密码，等一下登录要用", "label": "none"}
-{"text": "帮我写一封辞职信", "label": "none"}
-{"text": "翻译一下这段英文", "label": "none"}
-{"text": "what's the capital of France", "label": "none"}
-{"text": "帮我总结一下这篇论文", "label": "none"}
+{"text": "记住我喜欢吃辣的", "label": "remember", "lang": "zh"}
+{"text": "帮我记住，我周末一般都在家", "label": "remember", "lang": "zh"}
+{"text": "麻烦你记一下，我是左撇子", "label": "remember", "lang": "zh"}
+{"text": "记住：我每天早上七点起床", "label": "remember", "lang": "zh"}
+{"text": "我养了一只猫叫豆豆，记住这个", "label": "remember", "lang": "zh"}
+{"text": "please remember my favorite color is blue", "label": "remember", "lang": "en"}
+{"text": "remember that I work night shifts", "label": "remember", "lang": "en"}
+{"text": "你要记住，我对青霉素过敏", "label": "remember", "lang": "zh"}
+{"text": "记住我老家是四川的", "label": "remember", "lang": "zh"}
+{"text": "帮我记一下我的生日是三月十号", "label": "remember", "lang": "zh"}
+{"text": "别记这件事了", "label": "forget", "lang": "zh"}
+{"text": "把你记的关于我公司的事都删掉", "label": "forget", "lang": "zh"}
+{"text": "刚说的内容不用保留", "label": "forget", "lang": "zh"}
+{"text": "忘掉我刚才说的那个地址", "label": "forget", "lang": "zh"}
+{"text": "把你知道的关于我的事情全部删除", "label": "forget", "lang": "zh"}
+{"text": "刚才那句别当真，不要记下来", "label": "forget", "lang": "zh"}
+{"text": "forget what I just told you about my ex", "label": "forget", "lang": "en"}
+{"text": "把我说过喜欢猫的那条记录删了", "label": "forget", "lang": "zh"}
+{"text": "不要把我住址记下来", "label": "forget", "lang": "zh"}
+{"text": "这条就当没说过，别留着", "label": "forget", "lang": "zh"}
+{"text": "你记得我喜欢什么颜色吗", "label": "ask_memory", "lang": "zh"}
+{"text": "你还记得我老家在哪吗", "label": "ask_memory", "lang": "zh"}
+{"text": "你知道我平时几点睡觉吗", "label": "ask_memory", "lang": "zh"}
+{"text": "你记住我的生日了没", "label": "ask_memory", "lang": "zh"}
+{"text": "你是不是记得我养了只狗", "label": "ask_memory", "lang": "zh"}
+{"text": "do you remember what my job is", "label": "ask_memory", "lang": "en"}
+{"text": "你脑子里还有我的信息吗", "label": "ask_memory", "lang": "zh"}
+{"text": "你记得我上次跟你说的那件事吗", "label": "ask_memory", "lang": "zh"}
+{"text": "关于我你都记了什么", "label": "ask_memory", "lang": "zh"}
+{"text": "你对我的了解还准吗", "label": "ask_memory", "lang": "zh"}
+{"text": "其实我不是对花生过敏，是对芒果过敏", "label": "correct", "lang": "zh"}
+{"text": "更新一下，我现在住在杭州了，不是上海", "label": "correct", "lang": "zh"}
+{"text": "我说错了，我的生日是五月不是六月", "label": "correct", "lang": "zh"}
+{"text": "改一下，我现在换工作了，在做设计", "label": "correct", "lang": "zh"}
+{"text": "不对，我养的是两只猫不是一只", "label": "correct", "lang": "zh"}
+{"text": "actually my phone number changed, update it", "label": "correct", "lang": "en"}
+{"text": "上次说的职位信息不准了，我升职了", "label": "correct", "lang": "zh"}
+{"text": "我离婚了，之前说的家庭情况要改一下", "label": "correct", "lang": "zh"}
+{"text": "纠正一下，孩子今年八岁了不是七岁", "label": "correct", "lang": "zh"}
+{"text": "我搬家了，地址变了", "label": "correct", "lang": "zh"}
+{"text": "以后回复都用简体中文", "label": "preference", "lang": "zh"}
+{"text": "从今天起，跟我说话别太啰嗦", "label": "preference", "lang": "zh"}
+{"text": "以后帮我写代码都加注释", "label": "preference", "lang": "zh"}
+{"text": "跟我交流以后用更正式的语气", "label": "preference", "lang": "zh"}
+{"text": "以后遇到我的邮件都先翻译成英文再回复", "label": "preference", "lang": "zh"}
+{"text": "from now on always give me a short summary first", "label": "preference", "lang": "en"}
+{"text": "今后不用每次都叫我的全名", "label": "preference", "lang": "zh"}
+{"text": "以后给我的建议都要给出两个备选方案", "label": "preference", "lang": "zh"}
+{"text": "跟我说话以后不要用敬语", "label": "preference", "lang": "zh"}
+{"text": "以后每次对话开头先问我今天的心情", "label": "preference", "lang": "zh"}
+{"text": "现在几点了", "label": "none", "lang": "zh"}
+{"text": "帮我查一下明天的会议安排", "label": "none", "lang": "zh"}
+{"text": "他跟我说记住他的生日", "label": "none", "lang": "zh"}
+{"text": "怎样才能提高记忆力", "label": "none", "lang": "zh"}
+{"text": "这篇文章讲的是如何提升记忆力", "label": "none", "lang": "zh"}
+{"text": "记住这个密码，等一下登录要用", "label": "none", "lang": "zh"}
+{"text": "帮我写一封辞职信", "label": "none", "lang": "zh"}
+{"text": "翻译一下这段英文", "label": "none", "lang": "zh"}
+{"text": "what's the capital of France", "label": "none", "lang": "en"}
+{"text": "帮我总结一下这篇论文", "label": "none", "lang": "zh"}
+{"text": "keep in mind that I'm diabetic", "label": "remember", "lang": "en"}
+{"text": "please note my son's name is Leo", "label": "remember", "lang": "en"}
+{"text": "remember I usually work from home on Fridays", "label": "remember", "lang": "en"}
+{"text": "save this: my locker code is 2291", "label": "remember", "lang": "en"}
+{"text": "just so you know for the future, I hate mushrooms", "label": "remember", "lang": "en"}
+{"text": "don't forget our anniversary is June 12", "label": "remember", "lang": "en"}
+{"text": "for future reference, I'm left-handed", "label": "remember", "lang": "en"}
+{"text": "could you hang on to this: my sister lives in Oslo", "label": "remember", "lang": "en"}
+{"text": "erase what you saved about my health", "label": "forget", "lang": "en"}
+{"text": "don't keep a record of what I just said", "label": "forget", "lang": "en"}
+{"text": "please forget my old address", "label": "forget", "lang": "en"}
+{"text": "remove everything you have about my job", "label": "forget", "lang": "en"}
+{"text": "that's private, don't store it", "label": "forget", "lang": "en"}
+{"text": "clear all the notes you have on me", "label": "forget", "lang": "en"}
+{"text": "drop the thing I said about my brother", "label": "forget", "lang": "en"}
+{"text": "never mind, don't hold on to that last part", "label": "forget", "lang": "en"}
+{"text": "do you still know my favorite food?", "label": "ask_memory", "lang": "en"}
+{"text": "have you saved my kid's birthday?", "label": "ask_memory", "lang": "en"}
+{"text": "what do you remember about my family?", "label": "ask_memory", "lang": "en"}
+{"text": "did you keep the note about my flight?", "label": "ask_memory", "lang": "en"}
+{"text": "you know where I live, right?", "label": "ask_memory", "lang": "en"}
+{"text": "can you recall what car I drive?", "label": "ask_memory", "lang": "en"}
+{"text": "what info do you have on me", "label": "ask_memory", "lang": "en"}
+{"text": "you still remember my knee injury?", "label": "ask_memory", "lang": "en"}
+{"text": "my email changed, I use a new one now", "label": "correct", "lang": "en"}
+{"text": "wrong, I have two kids, not three", "label": "correct", "lang": "en"}
+{"text": "I'm not vegetarian anymore", "label": "correct", "lang": "en"}
+{"text": "update my city to Toronto, I relocated", "label": "correct", "lang": "en"}
+{"text": "fix that: my mom's birthday is in July", "label": "correct", "lang": "en"}
+{"text": "I said Tuesday before but it's actually Wednesday", "label": "correct", "lang": "en"}
+{"text": "my doctor changed my dosage, it's 20mg now", "label": "correct", "lang": "en"}
+{"text": "I got married, so update my status", "label": "correct", "lang": "en"}
+{"text": "always reply in bullet points", "label": "preference", "lang": "en"}
+{"text": "use British spelling with me", "label": "preference", "lang": "en"}
+{"text": "no need to greet me every time", "label": "preference", "lang": "en"}
+{"text": "address me as Dr. Kim", "label": "preference", "lang": "en"}
+{"text": "keep explanations beginner-friendly", "label": "preference", "lang": "en"}
+{"text": "send reminders in the evening, not the morning", "label": "preference", "lang": "en"}
+{"text": "please stop apologizing so much", "label": "preference", "lang": "en"}
+{"text": "show code in Go unless I say otherwise", "label": "preference", "lang": "en"}
+{"text": "what time is it in Tokyo", "label": "none", "lang": "en"}
+{"text": "my friend told me to remember his number", "label": "none", "lang": "en"}
+{"text": "how can I train my memory", "label": "none", "lang": "en"}
+{"text": "summarize this paragraph for me", "label": "none", "lang": "en"}
+{"text": "sure, noted on my side, thanks", "label": "none", "lang": "en"}
+{"text": "write a poem about rain", "label": "none", "lang": "en"}
+{"text": "is it hard to memorize a speech", "label": "none", "lang": "en"}
+{"text": "he keeps shouting remember the Alamo", "label": "none", "lang": "en"}
+{"text": "ผมเป็นโรคเบาหวานนะ ช่วยบันทึกไว้ด้วย", "label": "remember", "lang": "th"}
+{"text": "ช่วยจดไว้ว่าลูกชายชื่อน้องภูมิ", "label": "remember", "lang": "th"}
+{"text": "จำไว้นะ ฉันทำงานที่บ้านทุกวันศุกร์", "label": "remember", "lang": "th"}
+{"text": "บันทึกไว้หน่อย รหัสล็อกเกอร์คือ 4512", "label": "remember", "lang": "th"}
+{"text": "อย่าลืมนะว่าวันครบรอบแต่งงานคือ 12 มิถุนา", "label": "remember", "lang": "th"}
+{"text": "จำไว้ด้วยว่าฉันไม่ชอบเห็ด", "label": "remember", "lang": "th"}
+{"text": "ช่วยจำไว้ทีว่าพี่สาวผมอยู่ขอนแก่น", "label": "remember", "lang": "th"}
+{"text": "ฉันถนัดซ้ายนะ จดไว้ด้วย", "label": "remember", "lang": "th"}
+{"text": "ลบเรื่องสุขภาพของผมที่บันทึกไว้ออก", "label": "forget", "lang": "th"}
+{"text": "เรื่องนั้นไม่ต้องบันทึกลงไปนะ", "label": "forget", "lang": "th"}
+{"text": "ลืมที่อยู่เก่าของฉันไปได้เลย", "label": "forget", "lang": "th"}
+{"text": "ลบข้อมูลเรื่องงานของผมทั้งหมด", "label": "forget", "lang": "th"}
+{"text": "อันนี้เป็นเรื่องส่วนตัว ไม่ต้องเก็บ", "label": "forget", "lang": "th"}
+{"text": "ล้างทุกอย่างที่บันทึกเกี่ยวกับผม", "label": "forget", "lang": "th"}
+{"text": "ที่พูดถึงน้องชายเมื่อกี้ ลบทิ้งไป", "label": "forget", "lang": "th"}
+{"text": "ช่างมันเถอะ ประโยคสุดท้ายไม่ต้องจด", "label": "forget", "lang": "th"}
+{"text": "ยังจำอาหารที่ผมชอบได้อยู่หรือเปล่า", "label": "ask_memory", "lang": "th"}
+{"text": "วันเกิดของลูก เธอเก็บไว้แล้วหรือยัง", "label": "ask_memory", "lang": "th"}
+{"text": "เธอรู้เรื่องครอบครัวผมแค่ไหน", "label": "ask_memory", "lang": "th"}
+{"text": "เรื่องเที่ยวบินที่บอกไว้ เก็บไว้รึเปล่า", "label": "ask_memory", "lang": "th"}
+{"text": "รู้ใช่ไหมว่าฉันพักอยู่ที่ไหน", "label": "ask_memory", "lang": "th"}
+{"text": "ผมขับรถอะไร ยังจำได้ป่ะ", "label": "ask_memory", "lang": "th"}
+{"text": "มีข้อมูลอะไรของฉันอยู่บ้าง", "label": "ask_memory", "lang": "th"}
+{"text": "เรื่องหัวเข่าที่ผมเล่า จำได้มั้ย", "label": "ask_memory", "lang": "th"}
+{"text": "อีเมลผมเปลี่ยนแล้วนะ", "label": "correct", "lang": "th"}
+{"text": "ผิดแล้ว ฉันมีลูกสองคน ไม่ใช่สาม", "label": "correct", "lang": "th"}
+{"text": "ตอนนี้ผมไม่ได้กินมังสวิรัติแล้ว", "label": "correct", "lang": "th"}
+{"text": "เปลี่ยนเมืองเป็นโคราชนะ ย้ายมาแล้ว", "label": "correct", "lang": "th"}
+{"text": "แก้ให้หน่อย วันเกิดแม่อยู่เดือนกรกฎา", "label": "correct", "lang": "th"}
+{"text": "ที่บอกวันอังคารผิดนะ จริงๆ เป็นวันพุธ", "label": "correct", "lang": "th"}
+{"text": "หมอปรับยาแล้ว ตอนนี้กิน 20 มิลลิกรัม", "label": "correct", "lang": "th"}
+{"text": "ฉันแต่งงานแล้ว อัปเดตสถานะด้วย", "label": "correct", "lang": "th"}
+{"text": "ตอบเป็นข้อๆ ทุกครั้งนะ", "label": "preference", "lang": "th"}
+{"text": "ใช้หน่วยเมตริกกับผมเสมอ", "label": "preference", "lang": "th"}
+{"text": "ไม่ต้องทักทายทุกครั้งก็ได้", "label": "preference", "lang": "th"}
+{"text": "เรียกฉันว่าคุณหมอคิมนะ", "label": "preference", "lang": "th"}
+{"text": "อธิบายแบบง่ายๆ สำหรับมือใหม่", "label": "preference", "lang": "th"}
+{"text": "เตือนตอนเย็นแทนตอนเช้านะ", "label": "preference", "lang": "th"}
+{"text": "เลิกขอโทษบ่อยๆ ได้แล้ว", "label": "preference", "lang": "th"}
+{"text": "เขียนโค้ดเป็นภาษา Go ถ้าไม่ได้บอกเป็นอย่างอื่น", "label": "preference", "lang": "th"}
+{"text": "ตอนนี้ที่โตเกียวกี่โมง", "label": "none", "lang": "th"}
+{"text": "เพื่อนบอกให้จำเบอร์เขาไว้", "label": "none", "lang": "th"}
+{"text": "ฝึกความจำยังไงดี", "label": "none", "lang": "th"}
+{"text": "สรุปย่อหน้านี้ให้หน่อย", "label": "none", "lang": "th"}
+{"text": "โอเค เดี๋ยวฉันจดเอง ขอบใจนะ", "label": "none", "lang": "th"}
+{"text": "แต่งกลอนเรื่องฝนตกให้หน่อย", "label": "none", "lang": "th"}
+{"text": "ท่องสุนทรพจน์ให้ขึ้นใจยากไหม", "label": "none", "lang": "th"}
+{"text": "ช่วยแปลประโยคนี้เป็นภาษาจีน", "label": "none", "lang": "th"}
