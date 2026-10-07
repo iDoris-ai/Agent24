@@ -2,6 +2,7 @@
 
 > 立于 2026-10-06（jason 拍板）。本文是**持续调研台账**：记录「决策模型」方向的候选、评估结论与跟进事项；每次调研或 Spike 后追加一节，不删历史。
 > 执行状态见 [`../agent/tasks.md`](../agent/tasks.md)「DM-SPIKE」。
+> 任务拆解（含硬件自动适配、数据积累与个人模型）见 [`../agent/PLAN-DECIDE.md`](../agent/PLAN-DECIDE.md)。
 
 ## 1. 是什么，为什么关心
 
