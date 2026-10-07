@@ -68,7 +68,7 @@
 
 | crate | 依赖 |
 |---|---|
-| protocol / sidecar-host-protocol / os-fd / os-cwd / worker / comm | （无内部依赖） |
+| protocol / sidecar-host-protocol / os-fd / os-cwd / worker / comm / **decide** 🟡 | （无内部依赖） |
 | core、domain、models | protocol |
 | store | core, protocol |
 | workspace | core, protocol, store, os-cwd |
@@ -82,10 +82,10 @@
 | os-packages | domain, os-proto |
 | os-sdk | os-proto |
 | **agent24d** | agent, comm, core, domain, mcp, memory, models, os-packages, os-proto, policy, protocol, scheduler, store, tools, workspace（os-sdk 仅 dev 依赖） |
-| agent24-cli | mcp, os-packages, protocol |
+| agent24-cli | mcp, os-packages, protocol, store（D0-2：`decide export`/`delete` 直接读写 `agent24.db`，不经过 daemon，见 ADR-034） |
 | agent24-sidecar-host | sidecar-host-protocol（**没有任何 app 依赖它，Desktop 也不调用**） |
 
-依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
+依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`decide` 同样没有消费者（D0-1，见下）；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
 
 ---
 
@@ -115,7 +115,8 @@
   - 分配：intent → reservation → materialization → commitment → registration；
   - 保留（retention）；
   - legacy recovery holds；
-  - run 的 workspace 准入与终止。
+  - run 的 workspace 准入与终止；
+  - 决策日志（D0-2，[ADR-034](decision.md)）：`decision_log` + `decision_outcome`，plain DTO（不依赖 `agent24-decide`），写入/导出/三种删除/保留期 scrub，无生产调用方。
 - **workspace**：`WorkspaceService`（`rust/crates/agent24-workspace/src/service.rs`）把持久化的根目录证据和**用文件描述符钉住的真实目录**组合起来，签发进程内的 `WorkspaceHandle`。**当前仅 Unix**：Unix 上非 ephemeral 的 daemon 启动时组合它；非 Unix（Windows）上 daemon 不组合 `WorkspaceService`（crate 的非 Unix 实现直接返回 `UnsupportedPlatform`；产品 API 因 service 未组合返回 `503 workspace_unavailable`），workspace-bound run 不可用，只有 legacy 路径。
   - **workspace-bound run**（带 `workspace_id`）：`fs_read` / `fs_write` 的路径经 `WorkspaceHandle` 在钉住的根内解析；`shell_exec` **只**把子进程 cwd 钉在 workspace 根并照常走审批，**不是 OS 沙箱**，命令本身仍可访问根目录之外（ADR-002）。每次需要时重新校验 run / 租约 / workspace 事实。
   - **legacy run**（不带 `workspace_id`，今天的默认情况）：工具上下文是 `ToolContext::legacy`，文件工具退回到工具自身配置的 allowlist 根目录，shell 退回到配置的 `workdir`。
@@ -137,6 +138,7 @@
 | `agent24-mcp` | 外部 MCP server 适配 | 外部工具包装成普通 `Tool`，与内建工具走同一条审批流水线 |
 | `agent24-comm` | Hyphae（Nostr）CLI 调用、keystore 串行化、密码存储、REST 路由与 daemon 状态 | 二进制哈希校验、密码只走 stdin（[COMM-HYPHAE](design/COMM-HYPHAE.md)） |
 | `agent24-worker` 🟡 | Python ML Worker（embedding / whisper）的 Rust 侧 wire 契约 + HTTP 客户端 | workspace 内没有任何 crate 依赖它 |
+| `agent24-decide` 🟡 | 决策服务（D0-1，[ADR-033](decision.md)）：`DecisionRequest`/`Question`/`Decision` 等类型 + `DecisionBackend` trait + `RuleBackend` + 级联 `DecisionService`；接口形状照 Jev `/v1/systemone`（choice/noul/score + 校准概率）。D0-2（[ADR-034](decision.md)）追加 `log` 模块：决策日志的 `DecisionLog` trait + DTO（`LogEntry`/`OutcomeEntry`/`ExportFilter`/`DeleteSelector`） | 只依赖 serde/serde_json/async-trait/thiserror；不依赖任何其它内部 crate；**D0-1/D0-2 都不接入 agent24d，不改任何现有调用点**；无消费者，等 D1 接线（记住意图 + 召回门控）时才有人实现 `DecisionLog`（预期落在 `agent24d`，ADR-034） |
 
 ### L4 运行时内核 — `agent24-agent`
 

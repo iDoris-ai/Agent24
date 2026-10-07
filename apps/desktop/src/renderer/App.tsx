@@ -15,6 +15,7 @@ import CodeSandboxPage from './pages/CodeSandbox'
 import ServiceBoxDemoPage from './pages/ServiceBoxDemo'
 import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
+import CommunicationPage from './pages/comm/Communication'
 import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
 import CreativePage from './pages/Creative'
@@ -33,6 +34,7 @@ type BuiltinPage =
   | 'workbench'
   | 'runs'
   | 'schedules'
+  | 'communication'
   | 'approvals'
   | 'voice'
   | 'creative'
@@ -47,6 +49,7 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'workbench',       icon: '🔧', label: '工作台' },
   { id: 'runs',            icon: '📋', label: '任务' },
   { id: 'schedules',       icon: '⏰', label: '调度' },
+  { id: 'communication',   icon: '🪢', label: '通信' },
   { id: 'approvals',       icon: '🔐', label: '审批' },
   { id: 'voice',           icon: '🎙️', label: '语音' },
   { id: 'creative',        icon: '🎨', label: 'Design' },
@@ -60,6 +63,7 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
 const BUILTIN_TITLES: Record<BuiltinPage, string> = {
   chat: '对话', workbench: '工作台', runs: '运行任务',
   schedules: '定时调度', approvals: '待审批', voice: '语音',
+  communication: '通信概览',
   creative: 'Design', models: '模型管理', 'modules-manager': '模块管理',
   memory: '记忆', settings: '设置',
 }
@@ -304,6 +308,7 @@ export function App(): JSX.Element {
         {page === 'workbench'        && <WorkbenchPage />}
         {page === 'runs'             && <RunsPage />}
         {page === 'schedules'        && <SchedulesPage />}
+        {page === 'communication'    && <CommunicationPage />}
         {page === 'approvals'        && <ApprovalsPage />}
         {page === 'voice'            && <VoicePanel />}
         {page === 'creative'         && <CreativePage />}

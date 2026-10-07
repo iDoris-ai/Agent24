@@ -23,6 +23,7 @@ mod allocation_retention_plan;
 mod allocation_retention_writer;
 mod allocation_types;
 mod audit;
+mod decision_log;
 mod legacy_recovery;
 mod model_call_timings;
 mod module_approvals;
@@ -64,6 +65,10 @@ pub use allocation_types::{
     AllocationFailureReason, AllocationId, AllocationPhase, AllocationValueError,
 };
 pub use audit::AuditEntry;
+pub use decision_log::{
+    DecisionLogExportRow, DecisionLogRow, DecisionOutcomeRow, NewDecisionLogEntry,
+    NewDecisionOutcome,
+};
 pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
 };

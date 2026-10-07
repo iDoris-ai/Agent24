@@ -1060,6 +1060,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route(
+            "/api/v1/decide/profile",
+            get(crate::decide_routes::get_decide_profile),
+        )
+        .route(
             "/api/v1/capabilities/creative",
             post(mint_creative_capability),
         )

@@ -43,6 +43,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/decide/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Local hardware profile + decision-model hardware/effective tier (docs/agent/PLAN-DECIDE.md §1.1)
+         * @description Deterministic hardware probe (RAM/CPU/accelerator/disk/OS/battery) plus
+         *     the tier it implies, and the tier actually in effect once download
+         *     consent is applied (D0-3 reads consent from the daemon's own
+         *     `A24_DECIDE_DOWNLOAD_CONSENT` env var — no per-request input yet).
+         *     `reasons` is a human-readable trail, not a stable machine-parseable
+         *     enum. No decision-model inference happens on this route; it never
+         *     downloads anything.
+         */
+        get: operations["getDecideProfile"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/models": {
         parameters: {
             query?: never;
@@ -1128,6 +1154,43 @@ export interface components {
             /** @default 0 */
             cost_usd: number;
         };
+        /** @description D0-3 deterministic hardware probe output (docs/agent/PLAN-DECIDE.md §1.1) */
+        HardwareProfile: {
+            total_mem_bytes: number;
+            avail_mem_bytes: number;
+            /**
+             * @example aarch64
+             * @example x86_64
+             */
+            arch: string;
+            cpu_cores: number;
+            /** @enum {string} */
+            accelerator: "metal" | "cuda" | "none";
+            free_disk_bytes: number;
+            /**
+             * @example macos
+             * @example linux
+             * @example windows
+             */
+            os: string;
+            /** @description Null when the platform/probe cannot tell — not implemented for any OS yet (sysinfo has no power-source API) */
+            on_battery?: boolean | null;
+        };
+        DecideProfile: {
+            profile: components["schemas"]["HardwareProfile"];
+            /**
+             * @description What the hardware alone supports, ignoring download consent and any user override
+             * @enum {string}
+             */
+            hardware_tier: "t0" | "t1" | "t2" | "t3";
+            /**
+             * @description hardware_tier capped by download consent and (downgrade-only) user override
+             * @enum {string}
+             */
+            effective_tier: "t0" | "t1" | "t2" | "t3";
+            /** @description Human-readable trail, not a stable machine-parseable enum */
+            reasons: string[];
+        };
         Model: {
             id: string;
             /**
@@ -1445,6 +1508,26 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             503: components["responses"]["ProviderUnavailable"];
+        };
+    };
+    getDecideProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hardware profile and tier decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DecideProfile"];
+                };
+            };
         };
     };
     listModels: {

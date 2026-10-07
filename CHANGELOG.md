@@ -5,6 +5,12 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [Unreleased]
 
+- **D0-1（决策服务，`docs/agent/PLAN-DECIDE.md`，ADR-033）**：新增 `agent24-decide` crate
+  —— `DecisionRequest`/`Question`/`Decision` 等类型、`DecisionBackend` trait、`RuleBackend`、
+  级联 `DecisionService`。只是接口与一个确定性规则后端，**不接入 `agent24d`，不改任何现有
+  调用点的行为**；版本号 `0.5.1` 只是跟随当前 workspace 其它 crate 的统一版本号起步，本身
+  不代表一次发布。
+
 ## [0.5.1] — 2026-10-01
 
 **DEP-A「现在就能做」阶段收口：CLI 四平台发布流水线 + 桌面端 Linux 包**。自 0.5.0 起主要是

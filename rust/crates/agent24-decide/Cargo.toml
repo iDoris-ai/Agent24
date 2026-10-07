@@ -1,0 +1,20 @@
+[package]
+name = "agent24-decide"
+version = "0.5.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent24 decision service (D0): DecisionRequest/Question/Decision types, DecisionBackend trait, RuleBackend, layered DecisionService — no silent downgrade, no global threshold default (docs/agent/PLAN-DECIDE.md, docs/decision.md ADR-033)"
+
+[dependencies]
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
