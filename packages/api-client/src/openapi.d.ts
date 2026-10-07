@@ -157,6 +157,79 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/attached": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List attached module registrations
+         * @description List fields expose public metadata without token credentials or token hashes.
+         */
+        get: operations["listAttachedModules"];
+        put?: never;
+        /** Register an attached module or rotate its token */
+        post: operations["registerAttachedModule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attached/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke an attached module registration */
+        delete: operations["revokeAttachedModule"];
+        options?: never;
+        head?: never;
+        /** Enable or disable an attached module */
+        patch: operations["updateAttachedModule"];
+        trace?: never;
+    };
+    "/timings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List model-call timing rows */
+        get: operations["listTimings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/timings/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Summarize timing totals by source, model, and step */
+        get: operations["summarizeTimings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/usage": {
         parameters: {
             query?: never;
@@ -833,6 +906,64 @@ export interface components {
             result: {
                 [key: string]: unknown;
             };
+        };
+        AttachedAddRequest: {
+            /** @description Exact domain-os.yml text stored by the daemon. */
+            manifest: string;
+            /** @default false */
+            allow_relax: boolean;
+        };
+        AttachedAddResponse: {
+            name: string;
+            manifest_digest: string;
+            /** @description One-time plaintext handshake token; save it now. */
+            token: string;
+            socket_path: string;
+            token_id: string;
+        };
+        AttachedView: {
+            name: string;
+            manifest_digest: string;
+            token_id: string;
+            /** Format: date-time */
+            created_at: string;
+            /** @description Open enum: detached | attached | disabled. */
+            attach_status: string;
+            /** @description Live generation number when attached. */
+            generation?: number;
+        };
+        AttachedList: {
+            modules: components["schemas"]["AttachedView"][];
+        };
+        AttachedUpdate: {
+            enabled: boolean;
+        };
+        Timing: {
+            id: number;
+            /** Format: date-time */
+            ts: string;
+            source: string;
+            model_id: string | null;
+            tier: string | null;
+            served_by: string | null;
+            ok: boolean;
+            error_kind: string | null;
+            step: string | null;
+            session_id: string | null;
+            seq: number | null;
+            first_token_ms: number | null;
+            total_ms: number;
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+        };
+        TimingSummary: {
+            source: string;
+            model_id: string;
+            step: string;
+            count: number;
+            p50_ms: number;
+            p95_ms: number;
+            max_ms: number;
         };
         ShutdownReport: {
             /** @description An ephemeral daemon keeps no shutdown evidence. */
@@ -1519,6 +1650,24 @@ export interface components {
         };
     };
     responses: {
+        /** @description internal: the request could not be completed */
+        Internal: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+        PayloadTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description invalid_request: malformed or invalid request */
         BadRequest: {
             headers: {
@@ -1816,15 +1965,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description payload_too_large: the request exceeded the daemon-wide body limit */
-            413: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
+            413: components["responses"]["PayloadTooLarge"];
             /** @description busy: the module has reached its in-flight command limit */
             429: {
                 headers: {
@@ -1861,6 +2002,206 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+        };
+    };
+    listAttachedModules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registrations and live attach status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedList"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
+    registerAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachedAddRequest"];
+            };
+        };
+        responses: {
+            /** @description Existing registration was rotated; includes the new one-time token */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedAddResponse"];
+                };
+            };
+            /** @description Registration created; includes the one-time token */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedAddResponse"];
+                };
+            };
+            /** @description invalid_request or invalid_manifest */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description relax_requires_confirmation: privacy widening needs allow_relax */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description name_taken: this name is already provided by another module */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
+    revokeAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registration revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    updateAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachedUpdate"];
+            };
+        };
+        responses: {
+            /** @description Updated registration list and live status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    listTimings: {
+        parameters: {
+            query?: {
+                source?: string;
+                /** @description Timestamp lower bound passed to the timing store. */
+                since?: string;
+                /** @description Defaults to 500, accepts u32 values, and caps results at 5000; invalid values return 400. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matching rows, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        timings: components["schemas"]["Timing"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    summarizeTimings: {
+        parameters: {
+            query?: {
+                /** @description Timestamp lower bound passed to the timing store. */
+                since?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Count, p50, p95, and maximum duration per group */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        summary: components["schemas"]["TimingSummary"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["Internal"];
         };
     };
     getUsage: {

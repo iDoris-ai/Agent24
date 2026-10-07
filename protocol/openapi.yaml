@@ -43,6 +43,10 @@ security:
 tags:
   - name: system
     description: Health, version, and process-level daemon endpoints.
+  - name: attached
+    description: Attached module registrations and control.
+  - name: timings
+    description: Model-call timing rows and summaries.
   - name: chat
     description: One-shot LLM chat completion.
   - name: sessions
@@ -298,11 +302,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "413":
-          description: "payload_too_large: the request exceeded the daemon-wide body limit"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/PayloadTooLarge"
         "429":
           description: "busy: the module has reached its in-flight command limit"
           content:
@@ -327,6 +327,175 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+
+  /attached:
+    post:
+      operationId: registerAttachedModule
+      tags: [attached]
+      summary: Register an attached module or rotate its token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttachedAddRequest"
+      responses:
+        "200":
+          description: Existing registration was rotated; includes the new one-time token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachedAddResponse"
+        "201":
+          description: Registration created; includes the one-time token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachedAddResponse"
+        "400": { description: "invalid_request or invalid_manifest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413":
+          description: "payload_too_large: the request exceeded the daemon-wide body limit"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403": { description: "relax_requires_confirmation: privacy widening needs allow_relax", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "name_taken: this name is already provided by another module", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500":
+          $ref: "#/components/responses/Internal"
+    get:
+      operationId: listAttachedModules
+      tags: [attached]
+      summary: List attached module registrations
+      description: List fields expose public metadata without token credentials or token hashes.
+      responses:
+        "200":
+          description: Registrations and live attach status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachedList"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /attached/{name}:
+    delete:
+      operationId: revokeAttachedModule
+      tags: [attached]
+      summary: Revoke an attached module registration
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Registration revoked
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/Internal"
+    patch:
+      operationId: updateAttachedModule
+      tags: [attached]
+      summary: Enable or disable an attached module
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttachedUpdate"
+      responses:
+        "200":
+          description: Updated registration list and live status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachedList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /timings:
+    get:
+      operationId: listTimings
+      tags: [timings]
+      summary: List model-call timing rows
+      parameters:
+        - name: source
+          in: query
+          schema:
+            type: string
+        - name: since
+          in: query
+          description: Timestamp lower bound passed to the timing store.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Defaults to 500, accepts u32 values, and caps results at 5000; invalid values return 400.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 4294967295
+      responses:
+        "200":
+          description: Matching rows, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [timings]
+                properties:
+                  timings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Timing"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /timings/summary:
+    get:
+      operationId: summarizeTimings
+      tags: [timings]
+      summary: Summarize timing totals by source, model, and step
+      parameters:
+        - name: since
+          in: query
+          description: Timestamp lower bound passed to the timing store.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Count, p50, p95, and maximum duration per group
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [summary]
+                properties:
+                  summary:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimingSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/Internal"
 
   /usage:
     get:
@@ -1523,6 +1692,18 @@ components:
         type: string
 
   responses:
+    Internal:
+      description: "internal: the request could not be completed"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: "payload_too_large: the request exceeded the daemon-wide body limit"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     BadRequest:
       description: "invalid_request: malformed or invalid request"
       content:
@@ -1610,6 +1791,76 @@ components:
         result:
           type: object
           additionalProperties: true
+    AttachedAddRequest:
+      type: object
+      required: [manifest]
+      properties:
+        manifest: { type: string, description: Exact domain-os.yml text stored by the daemon. }
+        allow_relax: { type: boolean, default: false }
+    AttachedAddResponse:
+      type: object
+      required: [name, manifest_digest, token, socket_path, token_id]
+      properties:
+        name: { type: string }
+        manifest_digest: { type: string }
+        token:
+          type: string
+          description: One-time plaintext handshake token; save it now.
+        socket_path: { type: string }
+        token_id: { type: string }
+    AttachedView:
+      type: object
+      additionalProperties: false
+      required: [name, manifest_digest, token_id, created_at, attach_status]
+      properties:
+        name: { type: string }
+        manifest_digest: { type: string }
+        token_id: { type: string }
+        created_at: { type: string, format: date-time }
+        attach_status:
+          type: string
+          description: "Open enum: detached | attached | disabled."
+        generation: { type: integer, minimum: 1, description: Live generation number when attached. }
+    AttachedList:
+      type: object
+      required: [modules]
+      properties:
+        modules: { type: array, items: { $ref: "#/components/schemas/AttachedView" } }
+    AttachedUpdate:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+    Timing:
+      type: object
+      required: [id, ts, source, model_id, tier, served_by, ok, error_kind, step, session_id, seq, first_token_ms, total_ms, prompt_tokens, completion_tokens]
+      properties:
+        id: { type: integer }
+        ts: { type: string, format: date-time }
+        source: { type: string }
+        model_id: { type: [string, "null"] }
+        tier: { type: [string, "null"] }
+        served_by: { type: [string, "null"] }
+        ok: { type: boolean }
+        error_kind: { type: [string, "null"] }
+        step: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        seq: { type: [integer, "null"] }
+        first_token_ms: { type: [integer, "null"] }
+        total_ms: { type: integer }
+        prompt_tokens: { type: [integer, "null"] }
+        completion_tokens: { type: [integer, "null"] }
+    TimingSummary:
+      type: object
+      required: [source, model_id, step, count, p50_ms, p95_ms, max_ms]
+      properties:
+        source: { type: string }
+        model_id: { type: string }
+        step: { type: string }
+        count: { type: integer }
+        p50_ms: { type: integer }
+        p95_ms: { type: integer }
+        max_ms: { type: integer }
     ShutdownReport:
       type: object
       required: [ephemeral, drain_ms, stop_grace_ms, exit_bound_ms, config_warnings, previous]

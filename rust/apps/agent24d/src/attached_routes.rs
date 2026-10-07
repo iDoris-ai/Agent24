@@ -390,6 +390,19 @@ mod tests {
         assert!(!text.contains("token_sha256"));
         assert_eq!(body["modules"][0]["name"], "agentear");
         assert_eq!(body["modules"][0]["attach_status"], "detached");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../protocol/fixtures/attached/list.json"
+        ))
+        .unwrap();
+        let keys = |value: &serde_json::Value| {
+            value["modules"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(keys(&body), keys(&fixture));
     }
 
     #[tokio::test]

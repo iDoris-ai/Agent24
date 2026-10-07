@@ -3075,10 +3075,6 @@ pub(crate) mod tests {
     // owning follow-up beside the path: M2-02/M2-04 remove their entries when
     // those contracts land; the remaining exceptions have separate owners.
     const UNDOCUMENTED_KERNEL_ROUTES: &[&str] = &[
-        "/attached",                            // M2-04: attached-module register/list contract.
-        "/attached/{name}",                     // M2-04: attached-module delete/update contract.
-        "/timings",                             // M2-04: timings contract.
-        "/timings/summary",                     // M2-04: timings summary contract.
         "/capabilities/creative", // OD-M11 (PAUSED): capability contract is out of scope.
         "/capabilities/{capability_id}/revoke", // OD-M11 (PAUSED): capability contract is out of scope.
         "/events", // WebSocket protocol is documented by protocol/events.schema.json.
