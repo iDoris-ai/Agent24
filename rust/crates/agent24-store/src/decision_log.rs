@@ -407,6 +407,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inserting_a_duplicate_decision_id_fails_instead_of_overwriting() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .insert_decision_log(&entry("d1", "2026-10-07T00:00:00Z", "retain.intent"))
+            .await
+            .unwrap();
+        let second = store
+            .insert_decision_log(&entry("d1", "2026-10-08T00:00:00Z", "recall.gate"))
+            .await;
+        assert!(
+            second.is_err(),
+            "a duplicate decision_id must not silently overwrite"
+        );
+
+        let exported = store.export_decision_log(None, None).await.unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(
+            exported[0].log.point, "retain.intent",
+            "the original row must survive a rejected duplicate insert"
+        );
+    }
+
+    #[tokio::test]
     async fn appending_an_outcome_for_an_unknown_decision_fails_the_foreign_key() {
         let store = Store::open_memory().await.unwrap();
         let result = store

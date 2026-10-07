@@ -6,10 +6,12 @@
 //! `agent24-decide` is L3, and `docs/ARCHITECTURE-LAYERS.md` §1.1 is
 //! explicit that dependencies only ever point "down" (L3 may depend on L2,
 //! never the reverse) — so `agent24-store` cannot depend on this crate to
-//! implement [`DecisionLog`]. The concrete SQLite-backed implementation is
-//! composed in `agent24d` (L5), which already depends on both `agent24-store`
-//! and (as of this change) `agent24-decide`; see `docs/decision.md` ADR-034
-//! for the full reasoning and the alternative this rejected.
+//! implement [`DecisionLog`]. The concrete SQLite-backed implementation
+//! belongs in `agent24d` (L5), which already depends on `agent24-store` and
+//! could add `agent24-decide` without violating that direction — but this PR
+//! does NOT add that dependency or that implementation (`agent24d/Cargo.toml`
+//! is untouched); see `docs/decision.md` ADR-034 for the full reasoning,
+//! including why D0-2 stops at defining the trait.
 //!
 //! D0-2 ships this trait with **zero production callers**, same as D0-1's
 //! `RuleBackend` — nothing in `agent24d` constructs a decision today
