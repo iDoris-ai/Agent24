@@ -103,6 +103,15 @@ D0-1 / D0-3 / D0-4 / D0-7 可并行。规则基线在 M1 合入 main 前从 `ab/
 - 决策日志正式开始记录，撤回 / 澄清回答回流为标签；
 - 验收：误写入率 ≤ 规则版；记住召回显著提升；无关问题误注入 = 0；CPU 上 P95 < 100ms；T0 档行为与今天的规则版逐字节一致。
 
+#### D1 前置（来自 [#688 评审](https://github.com/iDoris-ai/Agent24/pull/688#pullrequestreview-5439484307) L1–L4，接线前需要定下来）
+
+- **L1**：`Outcome::Unavailable` 不报告失败的是哪一层——`Decision.backend` 报的是上一个跑完的层，失败层只能从 `reason` 的自由文本里读；接线前要不要加一个显式的 `failed: BackendKind` 字段。
+- **L2**：`DecisionService` 不校验后端返回的答案是否覆盖 `request.questions`、`question_id` 是否对得上、`Score` 是否落在 `min/max` 内、`Answer.p` 是否在 `[0,1]`；接线前要定由谁（service 还是调用方）做这层校验。
+- **L3**：`Decision.model` 目前三处都硬编码 `None`，`DecisionBackend` 没有报告 `ModelRef` 的途径，`Decision` 也只保留最后一层——这正是 D0-2 §2.1 `layers[]`（每层的 backend、模型 id+revision、标签、概率、耗时）记不下来的那个缺口；`agent24_decide::log::LoggedLayer` 已经按 §2.1 定好了形状，但 D1 要先扩展 `DecisionService` 才能真正填出多层数据。
+- **L4**：`DecisionService` 完全不使用 `ThresholdBands`——级联只看某层是不是 `Decided`，不看概率落在哪个阈值段，所以 `Outcome::Abstain` 文档里"反问/不做"的语义目前走不到；阈值应该在 service 里应用还是在调用方应用，接线前要定。
+
+D0-2（决策日志）本身不受这四条阻塞——日志 schema 和导出/删除接口与 `DecisionService` 的内部行为无关——但 D1 把记住意图/召回门控接上真实决策服务时，这四条都会变成绕不开的问题。
+
 ### D2 — Guardian 风险 + 入口路由（ID-1）
 
 验收：危险操作漏判 = 0；`always_review` 硬清单不可被模型覆盖；TaskProfile 字段与 iDoris 对齐。
