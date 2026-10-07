@@ -33,17 +33,19 @@ The 2026-10-07 design review on PR #685 led to further changes:
 
 The supplementary architecture review on PR #685 (2026-10-07, after merge) led to this follow-up:
 
-- **H1:** the review recommends that Documenting be a **first-party, default-installed, default-enabled domain OS** (`docs/ARCHITECTURE-LAYERS.md` §3.2), not an L3 kernel capability. This is the working direction, **to be ratified in the D1-02 ADR (#701) before D1 starts**, together with in-process vs out-of-process and how agent-facing operations are exposed (§2.1, §10.3, §17 #12).
-- **H2:** permission infrastructure Agent24 does not have yet is registered as an Agent24-side dependency. D1–D3 are explicitly **single local user**. Multi-user gates move after D4 (§16, §18.1).
+- **H1:** the review recommends that Documenting be a **first-party, default-installed, default-enabled domain OS** (`docs/ARCHITECTURE-LAYERS.md` §3.2), not an L3 kernel capability. This is the working direction, **to be ratified in the DOC-1-02 ADR (#701) before DOC-1 starts**, together with in-process vs out-of-process and how agent-facing operations are exposed (§2.1, §10.3, §17 #12).
+- **H2:** permission infrastructure Agent24 does not have yet is registered as an Agent24-side dependency. DOC-1–DOC-3 are explicitly **single local user**. Multi-user gates move after DOC-4 (§16, §18.1).
 - **M1–M4:**
   - memory boundary (§5);
   - kernel file working directory limits (§2.3);
   - interfaces through existing contracts only (§10.3);
   - `TaskProfile{LocalOnly}` and reuse of the decision service (§2.2, §9.3).
 - **L1–L3:**
-  - D1 starts with a read-only V1 slice on S01, then a multilingual template walkthrough on the product path (§14, confirmed 2026-10-07);
+  - DOC-1 starts with a read-only V1 slice on S01, then a multilingual template walkthrough on the product path (§14, confirmed 2026-10-07);
   - normative references and source baseline updated (§21);
-  - Line K limited to its service contract during D1 (§12).
+  - Line K limited to its service contract during DOC-1 (§12).
+
+**Phase names.** The phases of Line D are named **DOC-1 … DOC-4** (formerly D1–D4), so they are not confused with the decision service's D0–D4 phases (`docs/agent/PLAN-DECIDE.md`, branch `ab/decide`). Task IDs follow the pattern DOC-1-01, DOC-1-02 and so on.
 
 Items not yet agreed by the team are marked **proposed** or **TBD**.
 
@@ -77,7 +79,7 @@ The product is **not** defined by RAG, a vector database, or six AI buttons. Tho
 - Documenting has its own identity, revisions, storage and page. Per `docs/ARCHITECTURE-LAYERS.md` §3.2 that makes it a **domain OS**: an application living on the kernel, with its own storage and routes, consuming kernel capabilities through handles.
 - The kernel stays the authority for runs, models, tools, approval and audit. This is the same boundary T11 enforced when Sin90 moved out of the kernel.
 - The working direction is therefore a **first-party, default-installed, default-enabled domain OS**, as recommended by the supplementary review and **to be ratified in #701**. It is consistent with “same repo, built in, not loaded through a product Workspace”.
-- The D1-02 ADR (#701) decides, before D1 starts:
+- The DOC-1-02 ADR (#701) decides, before DOC-1 starts:
   - in-process DomainModule (①) vs out-of-process OS (②);
   - how agent-facing operations are exposed;
   - how “default-installed” works (§10.3, §17 #12).
@@ -238,7 +240,7 @@ Documenting must not create a second Agent loop, authentication system, approval
 
 ### Memory (`docs/laws/MEMORY.md`, `agent24-memory`)
 
-- **No memory writes in D1–D3.** Facts extracted from documents are **never written to user memory automatically**, and D1–D3 do not write user memory at all.
+- **No memory writes in DOC-1–DOC-3.** Facts extracted from documents are **never written to user memory automatically**, and DOC-1–DOC-3 do not write user memory at all.
 - **The intended path does not exist yet.** It would go through the memory `WriteGate` with provenance: extracted values enter as tool output and are held, not committed; a commit without evidence is downgraded (`rust/crates/agent24-memory/src/writer.rs`). However, `WriteGate` has **no consumer on any product path today** (📐), and a domain OS only gets its own partitioned memory handle (`docs/laws/MEMORY.md` L-MEM-1/2).
 - **How document-derived facts may reach user memory** is routed to #701 and later phases.
 - **Document text is evidence, not memory or instruction** (§9.3).
@@ -343,7 +345,7 @@ For extraction and comparison outputs (tables, field lists, figures), provenance
 
 - The Knowledge Workspace is **ON by default** for new installs, with a clear and **persistent Off** switch.
 - On upgrade, an existing user's explicit Off choice is kept.
-- Before each task, the host automatically attaches the personal context and the context of the current active organization, as far as the user's permissions allow. *(D1–D3 are single local user, H2: organization context applies only once Agent24 org identity exists, see §16.)*
+- Before each task, the host automatically attaches the personal context and the context of the current active organization, as far as the user's permissions allow. *(DOC-1–DOC-3 are single local user, H2: organization context applies only once Agent24 org identity exists, see §16.)*
 - Default ON does **not** mean reading all material, being configured and ready, or permission to send data off the device.
 
 Still open (§17 #8): who may override the setting, the override rules across org / personal / task, and the concrete interfaces.
@@ -366,7 +368,7 @@ Knowledge being Off and the original-document storage being unreachable are **tw
 
 - **One policy for every entry point:** direct Agent24 call, chat, Assistant, document page, and Workspaces acting as callers. No entry point may bypass it.
 - **The host assembles context.** A host context-policy hook does the assembly; it does not wait for the model to choose to call a tool.
-- **Identity comes from the host.** The host injects the trusted principal and the explicit active organization (in D1–D3, the single local user; no organization). The model may supply a query or task intent, but it cannot widen the allowlist.
+- **Identity comes from the host.** The host injects the trusted principal and the explicit active organization (in DOC-1–DOC-3, the single local user; no organization). The model may supply a query or task intent, but it cannot widen the allowlist.
 - **Results record their context:**
   - the context state: `context_attached / empty / skipped / failed`;
   - which packs, resources and revisions were consulted;
@@ -395,7 +397,7 @@ These are acceptance requirements for the implementation. They are not precondit
 
 ## 10. DocumentService Contract, Default Installation and Agent Exposure (proposed skeleton)
 
-“Capability integration” is not sufficient as a deliverable. D1 (§14) must produce this contract as a reviewed ADR (#701) before implementation of the operations it covers.
+“Capability integration” is not sufficient as a deliverable. DOC-1 (§14) must produce this contract as a reviewed ADR (#701) before implementation of the operations it covers.
 
 ### 10.1 Operations (initial list)
 
@@ -429,7 +431,7 @@ These are acceptance requirements for the implementation. They are not precondit
 Every operation must specify:
 
 - **inputs / outputs**, including document id and revision;
-- **identity source** — always the Agent24 trusted caller context, never model-supplied arguments. Today that context is a **single local user** with the legacy full-access bearer (BASELINE §6). D1–D3 declare single-user local operation, and multi-user claims wait for the Agent24 dependencies in §16;
+- **identity source** — always the Agent24 trusted caller context, never model-supplied arguments. Today that context is a **single local user** with the legacy full-access bearer (BASELINE §6). DOC-1–DOC-3 declare single-user local operation, and multi-user claims wait for the Agent24 dependencies in §16;
 - **risk class** and whether Agent24 approval is required. The business labels above (read / mutate-draft / commit / create-artifact / handoff) must map onto Agent24's actual kernel risk, permission and approval categories. The ADR provides the mapping table. Documenting does not invent its own permission tiers;
 - **concurrency** — mutating operations require `base_revision`; a mismatch returns `revision_conflict` rather than overwriting;
 - **typed errors** — at least `unsupported_format`, `parse_failed`, `partial_parse`, `knowledge_disabled`, `knowledge_unavailable`, `stale_index`, `revision_conflict`, `permission_denied`, `cancelled`;
@@ -472,7 +474,7 @@ These constraints come from the gaps found across the 13 T005 scenarios (S01–S
 3. **Pinned versions.** Templates, policies, review baselines and approved revisions are pinned (§7.1). Outputs never float to “latest”.
 4. **Per-value provenance.** Extracted fields, table cells and attachment numbering trace to a source location, or are explicitly unsourced (§8).
 5. **Recipients and receipts.** Delivery targets are exact and confirmed. Every delivery has a receipt or an explicit failure state. Batch-edit permission does not imply bulk-send permission.
-6. **Separated authority.** Edit vs approve, prepare vs approve vs pay, and delete of a sole original each require distinct permissions, enforced by Agent24. This depends on multi-user permission infrastructure Agent24 does not have yet (§16). In D1–D3 (single local user) it is limited to distinct, confirmed steps for one user.
+6. **Separated authority.** Edit vs approve, prepare vs approve vs pay, and delete of a sole original each require distinct permissions, enforced by Agent24. This depends on multi-user permission infrastructure Agent24 does not have yet (§16). In DOC-1–DOC-3 (single local user) it is limited to distinct, confirmed steps for one user.
 7. **Declared non-support.** Unaligned, unparsed or unsupported regions (for example interactive vs flat PDF fields, or complex layout) are shown explicitly and are never covered by a confident output.
 8. **Gold-standard evaluation.** Critical fields (deadlines, negations, amounts, dates, IDs) are evaluated against labelled samples, not by impression.
 9. **Batch isolation.** In batch operations each item is isolated: no cross-recipient content leakage, per-item preview, and partial failure/retry without duplicating completed items.
@@ -482,7 +484,7 @@ These constraints come from the gaps found across the 13 T005 scenarios (S01–S
 The previous plan made the generic Workspace host (former Phase A) and the Knowledge Workspace (former Phase B) **serial prerequisites** of Documenting. In practice that would turn David into the de facto owner of Workspace and KB, regardless of any disclaimer. This revision replaces the serial chain with three workstreams.
 
 ```text
-Line D  Documenting core   D1 → D2 → D3 → D4          owner: David Xu
+Line D  Documenting core   DOC-1 → DOC-2 → DOC-3 → DOC-4          owner: David Xu
 Line W  Workspace integration (scoped, time-boxed)    owner: TBD; David's share explicit
 Line K  KB service (Documenting depends per operation) owner: David Xu (since 2026-10-07)
 ```
@@ -495,7 +497,7 @@ Line K  KB service (Documenting depends per operation) owner: David Xu (since 20
   - Line D does not wait for Line K.
   - Line K has its own issues and acceptance. Its work must not be counted as Documenting progress, or the other way round.
   - When both lines compete for time, the priority is decided explicitly and recorded on the board, never silently.
-  - **During D1, Line D's read-only slice comes first, and Line K is limited to drafting its service contract.** The two lines are not built out in parallel.
+  - **During DOC-1, Line D's read-only slice comes first, and Line K is limited to drafting its service contract.** The two lines are not built out in parallel.
 
 ## 13. WeKnora Fork Principle
 
@@ -529,16 +531,16 @@ This is a dependency-oriented framework, **not yet a sprint schedule**. Each pha
 
 ### Line D — Documenting core (owner: David)
 
-**D1 — Foundation**
+**DOC-1 — Foundation**
 
-D1 is built as **small slices that merge early**, starting read-only (confirmed 2026-10-07):
+DOC-1 is built as **small slices that merge early**, starting read-only (confirmed 2026-10-07):
 
 1. **Slice 1, read-only V1 on S01:** import, render, extraction with per-value provenance.
 2. **Slice 2, template walkthrough on the product path:** read → edit a specified region → save a revision → export PDF and the selected editable format → real reopen and layout check. It uses **multilingual samples** (Chinese, English, mixed) and a sanitized template.
 
-Slice 2 exposes delivery problems in D1 instead of D4. It is real product code, not a throwaway spike.
+Slice 2 exposes delivery problems in DOC-1 instead of DOC-4. It is real product code, not a throwaway spike.
 
-- D1-02 ADR (#701): placement as a domain OS and agent exposure (H1); Agent24-side permission dependencies and the single-user declaration (H2). It is **reviewed and merged to `main` before D1 implementation starts**, through the first release PR from `ab/documenting`, so that it never sits unmerged while code is built. Slice 1 follows directly;
+- DOC-1-02 ADR (#701): placement as a domain OS and agent exposure (H1); Agent24-side permission dependencies and the single-user declaration (H2). It is **reviewed and merged to `main` before DOC-1 implementation starts**, through the first release PR from `ab/documenting`, so that it never sits unmerged while code is built. Slice 1 follows directly;
 - Documenting domain-OS skeleton, REST routes in `openapi.yaml`, and a TS document page with the **Documents** navigation entry (§2.1, §10.3);
 - import, render, and extraction with **per-value provenance**, run end to end on S01 through the product path and the conversation entry (§2.2);
 - stable document identity and revision semantics: imported originals in slice 1, and the first saved edit revision in slice 2;
@@ -550,14 +552,14 @@ Slice 2 exposes delivery problems in D1 instead of D4. It is real product code, 
 - The process follows `AGENTS.md` “里程碑方向分支工作流” (jason, 2026-10-07).
 - **Integration branch `ab/documenting`**, protected by the ruleset `ab-integration`: no force-push, merge by PR only, CI must be green.
 - **Task branches `ab/documenting-NN-<short-name>`**, one worktree each. Each task PR is ≤ 300 lines and targets `ab/documenting`, never `main`.
-- **Task PR review:**
-  - Ordinary task PRs need green CI, `pre-pr-check.sh` answered in the PR body, and passing local gates.
-  - Task PRs touching security, permission/authorization, data-write semantics, storage migrations or external protocol/wire formats also get a separate PR-Daemon review. Example: the #701 ADR and the domain-OS routes.
-- **Release:** after about 10 task PRs, or at a completed slice, a **release PR `ab/documenting` → `main`** is opened by a human. It gets a full PR-Daemon review plus jason's real-device acceptance.
-- **Weekly sync:** `ab/documenting` absorbs `main` at least weekly, **by merge, not rebase**, so it never drifts the way M10's 633-commit branch did.
+- **Review and merge thresholds** (AGENTS.md as corrected by #724). PR-Daemon reviews **every** PR, including task PRs into `ab/documenting`:
+  - **Ordinary task PRs** merge once CI is green, `pre-pr-check.sh` is answered in the PR body, and local gates pass. PR-Daemon findings are fixed in follow-up task PRs.
+  - **Task PRs touching security, permission/authorization, data-write semantics, storage migrations or external protocol/wire formats** must wait for PR-Daemon **APPROVE** before merging. Examples: the #701 ADR and the domain-OS routes.
+  - **Release PR** `ab/documenting` → `main`: opened by a human after about 10 task PRs or a completed slice. It needs PR-Daemon APPROVE plus jason's real-device acceptance.
+- **Sync with `main`:** before every code submission, `main` is merged into `ab/documenting` through a sync PR (merge, not rebase; the ruleset forbids direct pushes). This also satisfies AGENTS.md's “at least weekly” and prevents M10-style drift (633 commits).
 - “Product path wired” is accepted separately from “component landed”.
 
-**D1 acceptance** (in addition to §20), from the supplementary review's M items:
+**DOC-1 acceptance** (in addition to §20), from the supplementary review's M items:
 
 - **M1:** no user-memory writes from any document operation.
 - **M2:** no dependency on workspace-bound runs. The S01 slice works with no scratch workspace, and temporary artifacts are promoted or discarded within the TTL.
@@ -571,7 +573,7 @@ Slice 2 exposes delivery problems in D1 instead of D4. It is real product code, 
 
 Needs:
 
-- the D1 rows of Agent24 domain-OS mechanisms and per-run privacy (§16);
+- the DOC-1 rows of Agent24 domain-OS mechanisms and per-run privacy (§16);
 - decision §17 #1 (where originals and revisions are stored);
 - decision §17 #7 (slices);
 - decision §17 #3 (first formats — the read side for slice 1, the edit/export side for slice 2);
@@ -579,15 +581,15 @@ Needs:
 
 Does **not** need Line W or Line K.
 
-**D2 — Read & understand**
+**DOC-2 — Read & understand**
 
-- the rest of V1 beyond D1's S01 slice (e.g. S06 reading part); document page with recent files, import and new; preview/navigation, including original + recognition status for scans;
+- the rest of V1 beyond DOC-1's S01 slice (e.g. S06 reading part); document page with recent files, import and new; preview/navigation, including original + recognition status for scans;
 - selected summarize/extract/translate/compare operations;
 - citation UX, exact source jump, visible parse/index/error states.
 
 Needs: Line K only for operations that retrieve knowledge the user did not explicitly provide, and for KB-backed citation (§9.1). Reading, finding, QA and comparison over explicitly provided documents, whether one or several, run without it.
 
-**D3 — Edit & review**
+**DOC-3 — Edit & review**
 
 - draft creation, targeted edits, undo or equivalent safe revision behaviour;
 - diff, accept/reject, conflict detection, creation of a new revision;
@@ -595,7 +597,7 @@ Needs: Line K only for operations that retrieve knowledge the user did not expli
 
 Needs: document engine decision (§17 #6), Agent24 approval.
 
-**D4 — Render & deliver**
+**DOC-4 — Render & deliver**
 
 - layout preview, preflight checks, selected fixed/editable exports, conversion warnings;
 - reopen/visual validation, hidden-content cleanup;
@@ -629,19 +631,19 @@ The first end-to-end acceptance is two vertical slices, not the whole capability
 
 | Dependency | Needed by Documenting | Needed from phase | Owner |
 |---|---|---|---|
-| Agent24 Core | trusted caller context, approvals, run/cancel/model access, audit | D1 | Agent24 |
-| Agent24 domain-OS mechanisms needed **for D1** | (a) agent exposure for a domain OS — none today: new `Capability`, MCP or kernel proxy tools (§10.3); (b) a development install path for a first-party OS; (c) a scoped desktop transport that is not `backendProxy` (§10.3 gap) | D1 | owner and target date to be named in #701 (Agent24 kernel / desktop) |
-| Agent24 domain-OS mechanisms needed **for release** | default-installed first-party OS (none today; Sin90/Cos72 are installed by hand); generic on-demand component installer (today Open Design-specific) | before the first user-facing release, not D1 | owner and target date to be named in #701 |
-| Agent24 per-run privacy | per-run `TaskProfile` in the agent loop (agent runs use `Privacy::Any` today; ID-1 is 📐), so that document content returned to an agent run is not sent to remote models | D1 (interim rule in §9.3 until it exists) | Agent24 kernel / decide |
-| Agent24 permission infrastructure | capability route-level resource authorization (📐), durable session/run ownership (📐) — tracked as PLAN-OD-NEXT F11.0 / OD-M11, currently **PAUSED**; multi-user / org identity (SPEC-ORG-SPACE F9/F10, unscheduled) | **after D4** — D1–D3 are single local user | Agent24 |
-| Agent24 entry routing | ID-1 entry router and `agent24-decide` for chat intent → document operation; shared evaluation bench for §11.8 | D2 (D1 uses explicit invocation: normal agent tool calling or a direct page action, with no ID-1 routing) | Agent24 decide |
-| WeKnora / KB | ingest/status, search, source, citation, ACL, revision mapping | D2 (knowledge ops only) | David Xu (Line K) |
-| Document engines (edit / OCR / conversion) | rendering, structured edit, layout, revision-safe mutation, OCR, export — reused existing engines behind adapters (§2.1) | D1 (render), D3–D4 | engine choice TBD; adapters owned by Documenting |
-| Agent24 desktop shell | navigation entry, native page hosting, open-file-from-chat | D1 | Agent24 desktop |
+| Agent24 Core | trusted caller context, approvals, run/cancel/model access, audit | DOC-1 | Agent24 |
+| Agent24 domain-OS mechanisms needed **for DOC-1** | (a) agent exposure for a domain OS — none today: new `Capability`, MCP or kernel proxy tools (§10.3); (b) a development install path for a first-party OS; (c) a scoped desktop transport that is not `backendProxy` (§10.3 gap) | DOC-1 | owner and target date to be named in #701 (Agent24 kernel / desktop) |
+| Agent24 domain-OS mechanisms needed **for release** | default-installed first-party OS (none today; Sin90/Cos72 are installed by hand); generic on-demand component installer (today Open Design-specific) | before the first user-facing release, not DOC-1 | owner and target date to be named in #701 |
+| Agent24 per-run privacy | per-run `TaskProfile` in the agent loop (agent runs use `Privacy::Any` today; ID-1 is 📐), so that document content returned to an agent run is not sent to remote models | DOC-1 (interim rule in §9.3 until it exists) | Agent24 kernel / decide |
+| Agent24 permission infrastructure | capability route-level resource authorization (📐), durable session/run ownership (📐) — tracked as PLAN-OD-NEXT F11.0 / OD-M11, currently **PAUSED**; multi-user / org identity (SPEC-ORG-SPACE F9/F10, unscheduled) | **after DOC-4** — DOC-1–DOC-3 are single local user | Agent24 |
+| Agent24 entry routing | ID-1 entry router and `agent24-decide` for chat intent → document operation; shared evaluation bench for §11.8 | DOC-2 (DOC-1 uses explicit invocation: normal agent tool calling or a direct page action, with no ID-1 routing) | Agent24 decide |
+| WeKnora / KB | ingest/status, search, source, citation, ACL, revision mapping | DOC-2 (knowledge ops only) | David Xu (Line K) |
+| Document engines (edit / OCR / conversion) | rendering, structured edit, layout, revision-safe mutation, OCR, export — reused existing engines behind adapters (§2.1) | DOC-1 (render), DOC-3–DOC-4 | engine choice TBD; adapters owned by Documenting |
+| Agent24 desktop shell | navigation entry, native page hosting, open-file-from-chat | DOC-1 | Agent24 desktop |
 | OpenDesign/OpenCreator | context/artifact/run/cancel handoff | Line W | Workspace/Creative |
-| Connectors | actual email/Drive/filesystem/business-system action + receipt | D4 | connector/Agent24 |
+| Connectors | actual email/Drive/filesystem/business-system action + receipt | DOC-4 | connector/Agent24 |
 | Media | transcription for meeting material (S07) | later | Media |
-| Product samples | representative real workflows and sanitized files (§18.2) | D1 | team/product |
+| Product samples | representative real workflows and sanitized files (§18.2) | DOC-1 | team/product |
 
 ## 17. Open Decisions
 
@@ -649,18 +651,18 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 
 | # | Decision | Blocks |
 |---|---|---|
-| 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? Also covers persistence/recovery and the promotion of temporary artifacts (§22.1). | D1 — must be resolved before any persistent data is written |
-| 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | D1 slice 2 (a minimal model for editing a template region; slice 1 only needs the provenance anchor format, page/block/range, which the ADR defines), then D3 |
-| 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). | D1 (read side for slice 1; edit/export side for slice 2), D3–D4 |
-| 4 | **PDF scope** — reading, OCR, form filling (interactive vs flat overlay), page operations and true content editing are separate capabilities. | D2, form slice |
-| 5 | **Collaboration depth** — single-user, async review, multi-user revision or real-time co-editing. Constrained by H2: anything beyond single-user waits for the Agent24 permission infrastructure (§16). | D3 |
-| 6 | **Document engine/editor choice** — follows representative tasks and the frozen format scope (#3), not the other way round. | D1 slice 2 (library for the first editable format), D3 (editor UI and further formats) |
-| 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). | D1 fixtures |
-| 8 | **Knowledge setting overrides** — who may override the setting, the override rules across org / personal / task, and the concrete interfaces. The default itself is settled: ON, with a persistent Off (§9). | D2 knowledge-optional/required operations |
+| 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? Also covers persistence/recovery and the promotion of temporary artifacts (§22.1). | DOC-1 — must be resolved before any persistent data is written |
+| 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | DOC-1 slice 2 (a minimal model for editing a template region; slice 1 only needs the provenance anchor format, page/block/range, which the ADR defines), then DOC-3 |
+| 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). | DOC-1 (read side for slice 1; edit/export side for slice 2), DOC-3–DOC-4 |
+| 4 | **PDF scope** — reading, OCR, form filling (interactive vs flat overlay), page operations and true content editing are separate capabilities. | DOC-2, form slice |
+| 5 | **Collaboration depth** — single-user, async review, multi-user revision or real-time co-editing. Constrained by H2: anything beyond single-user waits for the Agent24 permission infrastructure (§16). | DOC-3 |
+| 6 | **Document engine/editor choice** — follows representative tasks and the frozen format scope (#3), not the other way round. | DOC-1 slice 2 (library for the first editable format), DOC-3 (editor UI and further formats) |
+| 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). | DOC-1 fixtures |
+| 8 | **Knowledge setting overrides** — who may override the setting, the override rules across org / personal / task, and the concrete interfaces. The default itself is settled: ON, with a persistent Off (§9). | DOC-2 knowledge-optional/required operations |
 | 9 | **Line W assignment** — which parts, if any, are temporarily David's, the handover owner and the exit date (§12). | Line W start (not Line D) |
 | 10 | **Roadmap conflicts** — how conflicts between this plan and existing Agent24/T006 roadmaps are resolved and recorded. | planning |
-| 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). | D3 engine choice |
-| 12 | **Placement and exposure (H1)** — in-process DomainModule vs out-of-process OS; agent exposure (kernel proxy tools / MCP / new `Capability`); default installation of a first-party OS; noun ownership of “document” (PLAN-OOP-OS-AND-BACKLOG §七). Decided in the D1-02 ADR (#701). The ADR must also weigh these facts: (a) in-process ① has no Models or Scheduler handle (`KERNEL_GRANTS` = Events, Memory, Approval); (b) no `Capability` provides kernel audit, which §10 expects for commits; (c) out-of-process ② runs on Unix sockets, and the Windows port (DEP-C2) is `BLOCKED`, which matters for both options' Windows story (§2.3). | **D1 start** |
+| 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). | DOC-3 engine choice |
+| 12 | **Placement and exposure (H1)** — in-process DomainModule vs out-of-process OS; agent exposure (kernel proxy tools / MCP / new `Capability`); default installation of a first-party OS; noun ownership of “document” (PLAN-OOP-OS-AND-BACKLOG §七). Decided in the DOC-1-02 ADR (#701). The ADR must also weigh these facts: (a) in-process ① has no Models or Scheduler handle (`KERNEL_GRANTS` = Events, Memory, Approval); (b) no `Capability` provides kernel audit, which §10 expects for commits; (c) out-of-process ② runs on Unix sockets, and the Windows port (DEP-C2) is `BLOCKED`, which matters for both options' Windows story (§2.3). | **DOC-1 start** |
 
 ## 18. Release Hard Gates & Test Samples
 
@@ -672,7 +674,7 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 - Attachment versions and recipients in a package match the approved revision and confirmed targets.
 - Batch isolation holds (§11.9).
 - Cancellation and network loss leave a consistent state: no half-committed revision and no duplicated delivery.
-- **Multi-user gates — apply only after D4, once the Agent24 permission infrastructure in §16 exists:**
+- **Multi-user gates — apply only after DOC-4, once the Agent24 permission infrastructure in §16 exists:**
   - permission revoked mid-task;
   - separated authority between users (§11.6);
   - per-user isolation.
@@ -742,7 +744,7 @@ This working baseline is derived from the current project direction and the foll
 - the 2026-10-06 product-form clarification with the design repository (§2.1–§2.3);
 - Agent24 `docs/open-design-workspace/design/ADR-001` and `ADR-002` (Workspace terminology);
 - **normative:** Agent24 `docs/ARCHITECTURE-LAYERS.md` (layering, domain OS vs kernel capability, extension decision table) and `docs/laws/` (`MEMORY.md`, `CONTEXT.md`, `APPROVAL.md`);
-- `docs/documenting/BASELINE.md` (D1-01 facts, pinned SHA);
+- `docs/documenting/BASELINE.md` (DOC-1-01 facts, pinned SHA);
 - the 2026-10-07 design review on PR #685 (knowledge default ON, terminology, retrieval-based classification, commit point, pre-implementation gates);
 - the 2026-10-07 supplementary architecture review on PR #685 (H1 domain OS, H2 permission dependencies, M1–M4, L1–L3).
 
@@ -761,8 +763,8 @@ Where these sources contain research proposals rather than approved engineering 
 
 Before implementation, and before converting this framework into a detailed GitHub Project plan, confirm:
 
-1. the D1-02 ADR (#701) resolving H1 (placement, process model, agent exposure, default installation) and H2 (permission dependencies, single-user declaration) — **required before D1 starts**;
-2. decisions §17 #1, #7 and the read-side part of #3, which block D1;
+1. the DOC-1-02 ADR (#701) resolving H1 (placement, process model, agent exposure, default installation) and H2 (permission dependencies, single-user declaration) — **required before DOC-1 starts**;
+2. decisions §17 #1, #7 and the read-side part of #3, which block DOC-1;
 3. generic Workspace is tracked as independent platform work with its own owner, and any temporary David assignment has an exit (§17 #9);
 4. the KB/WeKnora test endpoint, and the Line K service contract (owner: David);
 5. the sanitized sample set and gold labels for S01 first, then V1/V2 (§18.2).
@@ -782,7 +784,7 @@ The following must be frozen before the corresponding implementation starts. The
    - Knowledge retrieval being Off and the original-document storage being unreachable are different states. The latter cannot unconditionally promise import/edit/export.
 2. **Formats and engines.**
    - Freeze the first formats and fidelity scope (§17 #3) before choosing an engine (§17 #6).
-   - In D1, slice 2 walks a sanitized template through edit → save → export → reopen on the product path, with multilingual samples (§14 D1).
+   - In DOC-1, slice 2 walks a sanitized template through edit → save → export → reopen on the product path, with multilingual samples (§14 DOC-1).
    - All 13 scenarios are not required at once.
 3. **Commit and permission contract.** The DocumentService ADR defines:
    - the single commit point and its idempotency (§10.1);
@@ -810,11 +812,11 @@ scenario/capability ID → contract (ADR section) → test ID → owner/phase �
 | S03 | CV / intro / cover letter | purpose and audience, template choice, verify real experience and contacts, facts unchanged by polishing | §11.1/3, V2 |
 | S04 | Archive receipts/manuals/warranties | reversible classify/rename, same-name versions and duplicates, never delete a sole original, find by purchase fields, delete permission | §7.1, §11.6, §18.2 |
 | S05 | Compare two versions | fixed inputs, paragraph/page alignment, separate text/number/format diffs, unaligned regions not guaranteed; edit diff ≠ cross-format compare | §10.1, §11.7 |
-| S06 | Admin intake with many attachments | source access scope, existing reply versions, per-attachment list, exact recipients, receipt/failure, archive link | §11.2/5, V1, D4 |
+| S06 | Admin intake with many attachments | source access scope, existing reply versions, per-attachment list, exact recipients, receipt/failure, archive link | §11.2/5, V1, DOC-4 |
 | S07 | Meeting material & minutes | decision/discussion/open items, owner and date evidence, unconfirmed stays pending, attachment trace; transcription by Media | §5, §11.1/4, §16 |
 | S08 | Template-based drafting | template version and replaceable-field whitelist, residue check, tables, editable + publish dual output | §7.1, §11.3, §18.1, V2 |
 | S09 | Sales/support material response | approved material only, quote/exception check, no widened promises, package bound to approved version and recipient | §7.1, §11.1/2/5 |
 | S10 | Supplier material summary | field schema, multi-row headers, currency/tax/unit/validity, empty ≠ zero, non-comparable items, per-value source, structured export | §8, §11.1/4, spreadsheet boundary §5 |
 | S11 | Expense statement & receipt pack | duplicate receipts, amount/date gold labels, number ↔ attachment mapping, calculation handoff, prepare/approve/pay separation, finance data scope | §11.2/4/6/8 |
 | S12 | Personalized onboarding material | per-person binding, pinned template/policy, per-recipient isolation and preview, partial failure/retry, batch edit ≠ bulk send | §7.1, §11.3/5/9 |
-| S13 | Collaborative report revision | suggestion ownership, comments vs body, edit/approve separation, pinned review baseline and approved version, DOCX revision support scope | D3, §11.3/6, §17 #3/#5 |
+| S13 | Collaborative report revision | suggestion ownership, comments vs body, edit/approve separation, pinned review baseline and approved version, DOCX revision support scope | DOC-3, §11.3/6, §17 #3/#5 |

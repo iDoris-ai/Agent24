@@ -1,17 +1,17 @@
-# Documenting — D1-01 Baseline
+# Documenting — DOC-1-01 Baseline
 
-> **Issue:** #700 (D1-01) · **Design baseline:** [README.md](README.md) (PR #685)  
+> **Issue:** #700 (DOC-1-01) · **Design baseline:** [README.md](README.md) (PR #685)  
 > **Pinned Agent24 SHA:** `4fe8c2642c7c853a5d420eb5571f257fe2f1f60d` (`main`, 2026-10-07)  
 > **Date:** 2026-10-07 · **Author:** David Xu  
 > **Scope:** facts only. No product code was changed.
 
-This document records what Agent24 provides **today** that the DocumentService contract (D1-02, README §10) depends on. Every claim cites a file and line at the pinned SHA, or a command that was run.
+This document records what Agent24 provides **today** that the DocumentService contract (DOC-1-02, README §10) depends on. Every claim cites a file and line at the pinned SHA, or a command that was run.
 
 How to read it:
 
 - Paths are relative to the repository root.
 - ✅ = implemented, 🟡 = partially implemented, 📐 = designed only.
-- §11 lists the gaps against the README contract and the questions the D1-02 ADR must answer.
+- §11 lists the gaps against the README contract and the questions the DOC-1-02 ADR must answer.
 
 > **Correction (2026-10-07, supplementary architecture review on PR #685, H1).**
 >
@@ -22,7 +22,7 @@ How to read it:
 >   - a domain OS cannot contribute agent tools today;
 >   - MCP tools are always `External`;
 >   - the tool pipeline is frozen at startup.
-> - These facts are why the agent-exposure mechanism (kernel proxy tools, MCP, or a new `Capability`) must be decided in the D1-02 ADR (#701).
+> - These facts are why the agent-exposure mechanism (kernel proxy tools, MCP, or a new `Capability`) must be decided in the DOC-1-02 ADR (#701).
 > - This file stays pinned to `4fe8c26`. It is not otherwise rewritten.
 
 ## 1. Summary
@@ -362,7 +362,7 @@ A native React page needs none of the Creative / `WebContentsView` machinery.
 - `window.agent24` is mocked with `Object.defineProperty`.
 - There is no end-to-end harness.
 
-## 11. Gaps against the contract (inputs to D1-02)
+## 11. Gaps against the contract (inputs to DOC-1-02)
 
 | README requirement | Today | Gap / question for the ADR |
 |---|---|---|
@@ -370,13 +370,13 @@ A native React page needs none of the Creative / `WebContentsView` machinery.
 | UI and agent call the **same** operations; UI edits share one business entry (§2.2, §10.3) | Tools only run inside agent runs; no invoke endpoint | **Main architectural question.** Proposal to evaluate: a shared Rust `DocumentService` crate called by (a) thin `Tool` adapters for the agent and (b) new typed REST routes for the UI, both entering the same validation/commit/audit path. The ADR must decide how UI-initiated mutations get approval and a context without a run. |
 | Typed results and errors (§10.2) | `Tool::call` returns `String`; `ToolError` flattened to text | Tools: JSON-in-string with a versioned schema, or change the trait. REST: typed responses in `protocol/openapi.yaml`. |
 | Business risk labels map to kernel categories (§10.2) | Four classes; name-based approval kind, default `module` | Proposed mapping: read/find/render/list → `Read`; draft/propose/review → ADR question (`Read`-like vs `WriteLocal`); `revision.commit`/`restore`/`export`/`package` → `WriteLocal`; delivery execution stays with connectors (`External`). Add a `document` approval kind in `BrokerGate::check`. |
-| Identity from trusted host context (§10.2) | Single local user; no principal in `ToolContext` | Record as single-user for D1; define where principal will come from when ADR-005 lands; never accept it from model args. |
+| Identity from trusted host context (§10.2) | Single local user; no principal in `ToolContext` | Record as single-user for DOC-1; define where principal will come from when ADR-005 lands; never accept it from model args. |
 | `base_revision` + `revision_conflict` (§10.2) | No client-supplied CAS anywhere | New; model on `ArtifactCas.expect_version` / schedule revision. |
 | Single commit point + idempotency (§10.1) | No revision/package tables; no idempotency on runs/tools | *(Superseded by H1: storage belongs to the Documenting domain OS's own data dir, ADR-029.)* New store migrations (next after `0013`) or a separate documents DB; idempotency via UNIQUE key or `FireId`-style hash + `ON CONFLICT DO NOTHING`. |
 | Saved revisions not only in scratch (§22.1) | Scratch is Unix-only, per run, no product route; no blob store | Need a persistent document/blob area under the state dir (or the source-of-truth decided in #690). |
 | Jobs for OCR/convert/export (§10.2) | No job abstraction | New job table with status/progress/cancel/resume, or reuse runs; ADR decision. |
 | Audit of commits/exports | Only denials/approvals audited | Explicit `append_audit` on commit, restore, export, package, delivery.prepare. |
-| Knowledge context hook, LocalOnly (§9.2, §9.3) | No hook; runs always `Privacy::Any` | Depends on T006 owner (#704, #713). Until LocalOnly per run exists, D1 must not send restricted document content to remote models by default. |
+| Knowledge context hook, LocalOnly (§9.2, §9.3) | No hook; runs always `Privacy::Any` | Depends on T006 owner (#704, #713). Until LocalOnly per run exists, DOC-1 must not send restricted document content to remote models by default. |
 | Native page + chat handoff (§2.2) | Page = small `App.tsx` change; no cross-page navigation; chat plain text; tool events not in renderer | App-level navigation with parameters; structured file references in chat or forwarded tool events. |
 | Import/export of real files (§2.2, §18) | JSON-only proxy, no dialogs, CSP blocks `blob:` | Typed IPC with native file dialogs in main; CSP review for viewers; viewer/editor dependency choice follows #692/#696. |
 
@@ -386,4 +386,4 @@ A native React page needs none of the Creative / `WebContentsView` machinery.
 2. How does a mutation the user starts directly in the UI get approval and audit without an agent run? Is the user's own click consent enough for `WriteLocal`, with audit only?
 3. Should draft/propose operations be `Read` (no externally visible side effect) or `WriteLocal`?
 4. *(Reframed by H1: as a domain OS, storage lives in its own data dir; the open question is its layout and the original/revision authority, #690.)* Where does document storage live: a new store migration series in `agent24.db`, or a separate `documents.db` plus a blob directory? This depends on #690.
-5. What is the minimum privacy rule for D1, given that runs are always `Privacy::Any`? For example: document tools are offered only when the selected provider is local, until per-run LocalOnly lands.
+5. What is the minimum privacy rule for DOC-1, given that runs are always `Privacy::Any`? For example: document tools are offered only when the selected provider is local, until per-run LocalOnly lands.
