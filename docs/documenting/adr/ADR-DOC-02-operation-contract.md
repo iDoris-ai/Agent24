@@ -123,11 +123,18 @@
      | `commit` | `commit_key` |
 
    - 同一个键对应的 `request_sha256` 不同 → 422 `idempotency_key_reused`。
+   - **`request_sha256` 的规范化范围**：只覆盖**有效业务参数**，经 RFC 8785（JCS）规范化后计算 SHA-256。仅用于追踪的易变字段一律排除：`tool_call_id`、`run_id`、`x-a24-*` 请求 id、`Idempotency-Key` 头本身、时间戳、客户端版本。这样，同一个业务请求即使带着新的追踪 id，也不会被误报为 `idempotency_key_reused`。
+   - **授权每次都重新检查**：键命中时，先做本次调用的授权与可用性检查，再返回已有结果。幂等命中不能跳过授权。
    - 占键在 `BEGIN IMMEDIATE` 内完成，由 SQLite 单写者串行化。若仍遇到 UNIQUE 冲突（其他连接），回滚后重读该行并按命中处理。
-5. **agent 路径**：内核不重试，每次调用的 `tool_call_id` 都是新的，所以 **`tool_call_id` 只作信息记录，不作幂等键**，去重靠上表中由内容推导的键。页面遇到“结果未知”（`request_abandoned`、`upstream_timeout`）时用同一个键重发；代理不会重试 POST（`proxy.rs:1546-1556`）。
+5. **agent 路径**：内核不重试，每次调用的 `tool_call_id` 都是新的。**两层分工**与 ADR-DOC-01 D4.3 一致：`tool_call_id` / `run_id` 只用于可信调用关联与审计（写进操作日志），**业务幂等只看上表的业务键**，DOC-1 没有传输层去重。页面遇到“结果未知”（`request_abandoned`、`upstream_timeout`）时用同一个键重发；代理不会重试 POST（`proxy.rs:1546-1556`）。
 6. **上传**：状态在 `uploads/<upload_id>/` 和 `uploads` 表里，**不在 `tmp/`**，启动清理和孤儿 GC 都不碰它；最后一个块到达 24 h 后过期。每块带 `Upload-Offset` 和 `Chunk-Sha256`：
    - `offset` 等于已接收长度 → 追加并 fsync；这一段已接收且哈希相同 → 200 重放；其他情况 → 409 `upload_offset_mismatch`（`details.received_offset`）。
    - import 时校验整个文件的 sha256，不符 → 422 `upload_checksum_mismatch`。
+
+7. **幂等验收**（#740 要求，记录到 #708）：
+   - **不同 `tool_call_id`、相同有效业务参数** → 复用同一个 job 或业务结果，不重复产生副作用。
+   - **相同业务键、不同有效业务载荷** → 拒绝，返回 422 `idempotency_key_reused`。
+   - **已取消 job 的普通重放** → 不会复活，返回原 job 及其 `cancelled` 状态。只有显式调用 `POST /jobs/{id}/retry` 才会重启（§7）。
 
 ## 6. 类型化错误
 

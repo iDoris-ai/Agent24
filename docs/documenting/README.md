@@ -579,6 +579,10 @@ Slice 2 exposes delivery problems in DOC-1 instead of DOC-4. It is real product 
   - the interim rule for agent runs holds (§9.3 path 2);
   - no Documenting-specific intent classifier.
 - **H2:** the UI and docs declare single local user. No multi-user or isolation claims are made.
+- **Idempotency** ([ADR-DOC-02](adr/ADR-DOC-02-operation-contract.md) §5.7):
+  - a new `tool_call_id` with the same business parameters reuses the same job or result;
+  - the same business key with a different payload returns `idempotency_key_reused`;
+  - a cancelled job is never revived by a plain replay.
 - **Product path:** “product path wired” is demonstrated separately: the domain OS is mounted in the real daemon, the page is reachable from the navigation, and the chat entry works end to end.
 - **Chat entry depends on kernel module-declared tools** ([ADR-DOC-01](adr/ADR-DOC-01-placement-and-integration.md) D4).
   - Slice 1 may merge the page + REST first.
