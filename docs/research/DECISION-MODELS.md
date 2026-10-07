@@ -329,3 +329,300 @@ SetFit 相对其余候选的大幅领先。D1 选型引用去重后的数字即�
 - 其余候选在两台机器上均可用，包括 `kev-0.8b`（按 README 指引临时起
   了 `kev.serve` 服务，验收后已停止，未改动用户机器上任何既有模型或
   服务）。
+
+## 10. D0-8 同系列选型（2026-10-07）
+
+> 任务见 [`PLAN-DECIDE.md`](../agent/PLAN-DECIDE.md) D0-8。本节只在**本机
+> M1 Max 64GB 笔记本**上实测（硬约束：禁止 ssh/Mac mini）；完整原始结果
+> 见 `eval/decide/bench/results/m1max-64g-d0-8*/`。**五档里除「64GB+」外
+> 的内存可用性都是按本机实测 RSS 推算，不是在对应档位机器上实测**——
+> 跟 §9.0 的教训一样（16GB 和假设的 24GB 行为不同），这里的 8/16/24/32
+> 档结论同样需要后续真机复核才能定档。
+
+### 10.0 范围与方法
+
+- **三语评测集**：评测集与训练集已从 `ab/decide-01`（PR #726）合入
+  `ab/decide`，每条都有显式 `lang`（`zh`/`en`/`th`/`mixed`），`retain_intent`
+  226 条 / `recall_gate` 221 条 / `tool_risk` 144 条，`eval/decide/bench
+  --check-overlap` 在阈值 0.7 下仍为 0 命中。**泰文条目由模型撰写，母语
+  者复核尚未完成**（见 `eval/decide/TH_REVIEW.md`）——本节所有泰文分数
+  只作参考，不作为选型硬门槛，和 README 的既有声明一致。
+- **render.py 的 bug 修复**：#726 评审指出 `tool_risk` 的渲染前缀固定
+  用中文模板（「工具调用：…，参数：…」），把英文/泰文的 `args`/`context`
+  糊在一个中文壳子里，不只是读起来别扭，还会在语言推断时制造假信号。
+  本节的所有数字已经用修过的语言中立模板（`tool: … args: … context:
+  …`）跑出，`decide_bench/render.py` 的改动见本 PR diff。`qwen3guard-0.6b`
+  自己另起一套中文 prompt（不经过 `render_item_text`），不在这次修复范
+  围内，三语下可能有相同问题，未修，分数照旧标出。
+- **训练/推理分离**：`embed_head.py` 家族（`e5-*`/`qwen3-embed-*`/
+  `minilm-multilingual`）的"训练"只是在已加载的 backbone 上 `encode()`
+  几十到两百条 `train_data/` 句子再拟合一个 `sklearn.LogisticRegression`
+  头，训练阶段和推理阶段的 RSS 增量基本相等（见 10.3）——这不是测量误
+  差，是因为两者复用同一个常驻 backbone，没有本质不同的"训练态"。只有
+  `setfit-bge-m3`（SetFit 库真正的对比学习训练器）训练阶段有意义的更高
+  峰值。五档判定只看**推理**成本，训练只在本机做一次、落盘保存头。
+- **预算假设**：「快速层」（每条消息都跑）用 **≤ 推理 RSS 占物理内存
+  10%**；「深度层」（可选、按需加载，PLAN-DECIDE §7.3 的第 3 层）放宽到
+  **≤ 20%**，因为它不是每条消息都跑、且用户可见「正在加载深度模型」的
+  等待态。这两个数字是本节自己定的分析假设，不是 jason 已拍板的数字。
+
+### 10.1 D0-8 新增候选许可证结论表
+
+> 方法同 §8：读 HF `cardData.license`（YAML frontmatter，经
+> `huggingface_hub.model_info` 解析，等同于直接读 README 的 YAML 字段）、
+> 必要时读原始 README/LICENSE 全文；核实日期 2026-10-07。
+
+| 候选 | 确切 repo | 许可证 | 可商用 | 出处 | 原文已核实 | 结论 |
+|---|---|---|---|---|---|---|
+| Qwen3-Embedding-0.6B/4B/8B | `Qwen/Qwen3-Embedding-{0.6B,4B,8B}` | Apache-2.0 | 是 | https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/raw/main/README.md（4B/8B 同路径） | 是（YAML） | **保留**，三档同系列、同许可证 |
+| multilingual-e5 small/base/large/large-instruct | `intfloat/multilingual-e5-{small,base,large,large-instruct}` | MIT | 是 | https://huggingface.co/intfloat/multilingual-e5-base/raw/main/README.md（其余同路径） | 是（YAML） | **保留**。训练数据含 mC4/CC 等网页语料，卡片未声明 NC 限制；未逐条核对每个子数据集许可证（见 10.1.1） |
+| paraphrase-multilingual-MiniLM-L12-v2 | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | Apache-2.0 | 是 | https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/raw/main/README.md | 是（YAML） | **保留**，8GB 档极小体积对照 |
+| Qwen3（因果 LLM 底座）0.6B/1.7B/4B/8B | `Qwen/Qwen3-{0.6B,1.7B,4B,8B}` | Apache-2.0 | 是 | https://huggingface.co/Qwen/Qwen3-0.6B/raw/main/README.md（其余同路径） | 是（YAML） | **保留**。本仓库实际加载的是 `mlx-community` 的预量化版（见下），权重来自同一组 Apache-2.0 base |
+| mlx-community 预量化包 | `mlx-community/Qwen3-{1.7B,4B}-4bit` | Apache-2.0 | 是 | https://huggingface.co/mlx-community/Qwen3-4B-4bit/raw/main/README.md（1.7B 同路径） | 是（YAML） | **保留**，纯量化重打包，不改变底座许可证 |
+| Kev-4B | `jaredpalmer/kev-4b` | Apache-2.0 | 是 | https://huggingface.co/jaredpalmer/kev-4b/raw/main/README.md | 是（YAML） | **保留，待补数据许可**（同 §8.1 Kev-4B 行）。`provenance.json` 显示训练数据为 `evals/round10/skills/train.jsonl`，具体许可证仍记在未读的 suite manifest 里；base `Qwen/Qwen3.5-4B-Base`（Apache-2.0，revision `1001bb4d826a52d1f399e183466143f4da7b741b`） |
+| KaLM-embedding-multilingual-mini-instruct-v2.5 | `KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5` | Apache-2.0 | 是（权重层面） | https://huggingface.co/KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5/raw/main/README.md | 是（YAML） | **仅对照，不进生产候选**——README 未列全部训练数据来源明细，本次时间预算内未逐一核对是否含 NC 语料；按保守原则不推荐。**且本次实测环境不兼容**：`transformers==5.19.0` 加载其自定义建模代码报 `'Qwen2Config' object has no attribute 'rope_theta'`，`unavailable`，不是许可证问题，是环境/版本问题 |
+
+**任务里点名的 AgentJev-0.6B / KaLM-Jev Nano**：在 HuggingFace 上搜索未
+找到与这两个名字严格对应的官方仓库（搜到的同名/近名条目要么是第三方
+未注明出处的重新上传如 `lujihong/agentjev-0.6b-int8-onnx`，要么是不同
+项目），**本次未下载、未测**——不确定官方 repo 是哪个、许可证是什么，
+比瞎猜一个下载更不负责任。如果 jason 能提供准确的 HF repo id，下一轮
+可以补测。
+
+**小结**：所有新增候选的权重许可证同样全部是 Apache-2.0 或 MIT，没有
+NC/自定义许可；延续 §8.1 的结论——真正的风险点在训练数据，不是权重许
+可证本身。
+
+#### 10.1.1 未核实项（延续 §8.2 编号）
+
+7. multilingual-e5 系列的具体训练数据集清单（mC4 等）每个子集的许可证
+   未逐一核对。
+8. Kev-4B 的 suite manifest（各数据源许可证）仍未读，同 §8.2 第 4 条对
+   Kev-4B 本身的结论。
+9. KaLM-embedding-v2.5 的训练数据来源未逐一核对，这是它被列为「仅对
+   照」而非生产候选的主要原因（不是许可证证据上有负面发现，而是没有
+   查够，按保守原则处理）；且环境不兼容，本次实际上也没能跑出准确率
+   数字可供参考。
+
+### 10.2 横评结果（三语合计，详细按语言分表见各 `results/*/*.md`）
+
+全部数字 2026-10-07 单次运行，本机 M1 Max 64GB；`setfit-bge-m3` 与
+`embed_head.py` 家族训练用的是当前（合入 #726 后）的 `train_data/`，比
+§9 的数字基于更大的训练/评测集，**与 §9 的旧数字不可直接比较**。
+
+#### retain_intent（n=226：zh 86 / en 66 / th 62 / mixed 12）
+
+| 候选 | 系列 | 准确率 | 宏F1 | 代价加权误判率 | P50(ms) | P95(ms) |
+|---|---|---|---|---|---|---|
+| rule | — | 0.230 | 0.120 | 0.800 | 0.0 | 0.0 |
+| erlangshen-nli | NLI 零样本 | 0.124 | 0.037 | 0.899 | 279 | 581 |
+| mdeberta-xnli-control | NLI 零样本（对照） | 0.190 | 0.147 | 0.833 | 336 | 1689 |
+| gliclass-multilang | GLiClass | 0.367 | 0.276 | 0.642 | 2485 | 5067 |
+| qwen3-llm-0.6b | D. Qwen3 LLM 读 logit | 0.319 | 0.269 | 0.718 | 51 | 75 |
+| qwen3-llm-1.7b | D. Qwen3 LLM 读 logit | 0.416 | 0.304 | 0.495 | 162 | 214 |
+| qwen3-llm-4b | D. Qwen3 LLM 读 logit | 0.642 | 0.629 | 0.307 | 222 | 440 |
+| qwen3-llm-8b | D. Qwen3 LLM 读 logit | 0.752 | 0.720 | 0.216 | 376 | 389 |
+| kev-0.8b | E. Kev | 0.496 | 0.493 | 0.508 | 163 | 261 |
+| kev-4b | E. Kev | 0.690 | 0.663 | 0.292 | 504 | 959 |
+| minilm-multilingual | C. 8GB 对照 | 0.743 | 0.743 | 0.212 | 17 | 31 |
+| e5-small | B. e5 | 0.770 | 0.780 | 0.196 | 21 | 36 |
+| e5-base | B. e5 | 0.832 | 0.840 | 0.150 | 23 | 38 |
+| e5-large | B. e5 | 0.836 | 0.844 | 0.137 | 36 | 56 |
+| e5-large-instruct | B. e5 | **0.858** | **0.865** | **0.127** | 33 | 58 |
+| qwen3-embed-0.6b | A. Qwen3-Embedding | 0.823 | 0.831 | 0.154 | 50 | 282 |
+| qwen3-embed-4b | A. Qwen3-Embedding | 0.832 | 0.836 | 0.152 | 92 | 167 |
+| qwen3-embed-8b | A. Qwen3-Embedding | 0.841 | 0.853 | 0.140 | 125 | 190 |
+| setfit-bge-m3 | C. 对照基线 | 0.832 | 0.845 | 0.165 | 38 | 69 |
+
+#### recall_gate（n=221：zh 87 / en 65 / th 62 / mixed 7）
+
+| 候选 | 系列 | 准确率 | 宏F1 | 代价加权误判率 | P50(ms) | P95(ms) |
+|---|---|---|---|---|---|---|
+| erlangshen-nli | NLI 零样本 | 0.443 | 0.307 | 0.495 | 68 | 144 |
+| mdeberta-xnli-control | NLI 零样本（对照） | 0.611 | 0.503 | 0.466 | 95 | 146 |
+| gliclass-multilang | GLiClass | 0.538 | 0.518 | 0.452 | 1895 | 3084 |
+| qwen3-llm-0.6b | D | 0.557 | 0.358 | 0.505 | 63 | 76 |
+| qwen3-llm-1.7b | D | 0.557 | 0.358 | 0.505 | 161 | 190 |
+| qwen3-llm-4b | D | 0.796 | 0.792 | 0.247 | 161 | 168 |
+| qwen3-llm-8b | D | 0.787 | 0.775 | 0.244 | 283 | 299 |
+| kev-0.8b | E | 0.484 | 0.455 | 0.521 | 108 | 172 |
+| kev-4b | E | 0.679 | 0.608 | 0.365 | 223 | 413 |
+| minilm-multilingual | C | 0.787 | 0.787 | 0.251 | 17 | 26 |
+| e5-small | B | 0.805 | 0.805 | 0.251 | 23 | 47 |
+| e5-base | B | **0.869** | **0.868** | **0.158** | 21 | 35 |
+| e5-large | B | 0.828 | 0.828 | 0.210 | 34 | 54 |
+| e5-large-instruct | B | 0.837 | 0.835 | 0.215 | 32 | 51 |
+| qwen3-embed-0.6b | A | 0.801 | 0.800 | 0.224 | 48 | 80 |
+| qwen3-embed-4b | A | 0.824 | 0.823 | 0.217 | 81 | 122 |
+| qwen3-embed-8b | A | 0.864 | 0.864 | 0.185 | 139 | 202 |
+| setfit-bge-m3 | C | 0.837 | 0.837 | 0.194 | 34 | 54 |
+
+#### tool_risk（n=144：zh 64 / en 40 / th 40）
+
+| 候选 | 系列 | 准确率 | 宏F1 | 代价加权误判率 | P50(ms) | P95(ms) |
+|---|---|---|---|---|---|---|
+| erlangshen-nli | NLI 零样本 | 0.299 | 0.226 | 0.585 | 152 | 233 |
+| mdeberta-xnli-control | NLI 零样本（对照） | 0.319 | 0.215 | 0.573 | 239 | 1553 |
+| gliclass-multilang | GLiClass | 0.201 | 0.096 | 0.933 | 3194 | 5980 |
+| qwen3guard-0.6b | 内容安全分类器 | 0.292 | 0.241 | 0.838 | 315 | 488 |
+| qwen3-llm-0.6b | D | 0.319 | 0.217 | 0.708 | 84 | 103 |
+| qwen3-llm-1.7b | D | 0.278 | 0.175 | 0.793 | 200 | 252 |
+| qwen3-llm-4b | D | 0.306 | 0.246 | 0.724 | 262 | 363 |
+| qwen3-llm-8b | D | 0.528 | 0.545 | 0.452 | 460 | 557 |
+| kev-0.8b | E | 0.431 | 0.401 | 0.618 | 224 | 277 |
+| kev-4b | E | **0.701** | **0.695** | **0.421** | 293 | 624 |
+| minilm-multilingual | C | 0.528 | 0.479 | 0.476 | 18 | 28 |
+| e5-small | B | 0.472 | 0.444 | 0.524 | 27 | 46 |
+| e5-base | B | 0.535 | 0.518 | 0.438 | 28 | 56 |
+| e5-large | B | 0.535 | 0.484 | 0.495 | 46 | 89 |
+| e5-large-instruct | B | 0.549 | 0.538 | 0.497 | 36 | 61 |
+| qwen3-embed-0.6b | A | 0.660 | 0.640 | 0.421 | 58 | 116 |
+| qwen3-embed-4b | A | **0.688** | **0.681** | 0.391 | 129 | 221 |
+| qwen3-embed-8b | A | 0.653 | 0.644 | 0.454 | 202 | 375 |
+| setfit-bge-m3 | C | 0.542 | 0.520 | 0.389 | 33 | 57 |
+
+**跨点小结**：
+
+- **Qwen3-Embedding 和 e5 两个 embedding 家族都明显优于三个零样本路线
+  （GLiClass/mDeBERTa/Erlangshen）和四档 Qwen3 因果 LLM 的小尺寸**——
+  这和 §7.1 的结论一致（专用分类器优于用小 LLM 当分类器），在三语、更
+  大评测集上依然成立。
+- **同系列尺寸连贯、规模收益递减**：Qwen3-Embedding 0.6B→4B→8B 在
+  `retain_intent`（0.823→0.832→0.841）和 `recall_gate`
+  （0.801→0.824→0.864）上单调提升，但增量越来越小；`tool_risk` 上 4B
+  反而略高于 8B（0.688 vs 0.653），不是严格单调。e5 small→base→large
+  也类似：base 之后继续加大不再明显提升（large 甚至在 `recall_gate` 上
+  不如 base），**"越大越好"在这两个决策点上过了 base/0.6B 这一档边际收
+  益就很小**，这是选型表没有无脑选最大模型的主要依据。
+- **Qwen3 因果 LLM 读 logit 的尺寸曲线最陡**：0.6B 几乎不可用
+  （`retain_intent` 0.319，接近 6 类随机猜测的 0.167 但也没高多少），
+  8B 才追上embedding 路线的下限（0.752/0.787/0.528）。这条路线如果要
+  用，**不能用小尺寸**，和 embedding 家族"小尺寸也能用"的特性相反。
+- **Kev 同样尺寸越大越好，且在 `tool_risk` 上是本次横评的最高分**
+  （kev-4b 0.701），但延迟也最高（P95 624ms，是同点最快候选的 20 多
+  倍）——适合 PLAN-DECIDE §7.3 的"深度层"定位（按需加载、处理复杂判
+  断），不适合每条消息都跑的快速层。kev 的 RSS 数字（13–14MB）只是
+  bench 客户端自己的内存，不是 `kev.serve` 外部进程的真实占用，README
+  里已经说明这个口径限制，这次同样没有单独采样服务进程。
+- **setfit-bge-m3 不再像 §9 那样明显领先**：在这份更大、三语的评测集
+  上，它的三点分数（0.832/0.837/0.542）和 e5-base／qwen3-embed-8b 基本
+  同一水平，不再是单一碾压选项——§9 的数据是在小得多（且几乎全中文）
+  的旧评测集上测的，**跨语言泛化之后，差距消失了**。这是本次最值得写
+  进结论的发现：如果 jason 之前倾向"T3 就用 SetFit"，这次数据不再强支
+  持"非它不可"，e5-base 体积小一百倍、延迟低一个量级，三语平均分接
+  近，是更均衡的选择。
+- **按语言看，三个零样本路线和 `rule` 基线在非中文上明显更弱**（如
+  `rule` 在 `retain_intent` 上 zh 0.326 / en 0.167 / th 0.177，完整分
+  表见 `results/m1max-64g-d0-8/2026-10-07.md`），这正是 D0-4 评测集扩成
+  三语要解决的问题；embedding 家族的语言差距小得多（e5-large-instruct
+  在 `retain_intent` 上 zh 0.849 / en 0.818 / th **0.887**，泰文反而最
+  高——但泰文条目未经母语者复核，这个"反而最高"可能是机器生成的泰文
+  题面本身更规整、更贴近训练分布，不能直接读成"泰文能力真的最强"）。
+
+### 10.3 训练/推理资源分离
+
+| 候选 | 加载耗时(s) | 加载阶段RSS增量(MB) | 整次运行峰值RSS增量(MB) | 下载体积(MB) |
+|---|---|---|---|---|
+| setfit-bge-m3 | 454 | 3932 | 3932 | 4353 |
+| e5-small | 24 | 1049 | 1056 | 470 |
+| e5-base | 14 | 1046 | 1052 | 1082 |
+| e5-large | 17 | 1048 | 1054 | 2157 |
+| e5-large-instruct | 16 | 1041 | 1047 | 1089 |
+| minilm-multilingual | 14 | 1197 | 1220 | 458 |
+| qwen3-embed-0.6b | 18 | 764 | 827 | 1152 |
+| qwen3-embed-4b | 34 | 769 | 822 | 7686 |
+| qwen3-embed-8b | 58 | 625 | 625 | 14449 |
+
+`加载阶段RSS增量`（训练阶段，对会训练头的候选）和`整次运行峰值`
+（含推理）几乎相等，印证了 10.0 的预期：这个头训练配方（`encode()` +
+`LogisticRegression`）不会产生比推理更高的内存峰值。唯一数量级不同的
+是 `setfit-bge-m3`（真训练器，3.9GB），它的训练耗时（454s，约 7.5 分
+钟）也比其余候选（14–58s）高一个量级——这部分峰值内存和耗时发生在
+**开发机训练一次、落盘保存头**的阶段，用户机器只做推理，不会复现这
+454s/3.9GB。
+
+**已知不稳定项（如实记录，不挑一个数字假装精确）**：`qwen3-embed-4b`／
+`qwen3-embed-8b` 在两次独立跑测里的峰值 RSS 差出一个数量级——更早一次
+单独跑这两个候选时记到 6784MB／8566MB，上表这次（和其余 7 个候选一起
+跑、系统刚载入过更多模型之后）只记到 822MB／625MB。这和 §9.4 记录的
+`qwen3guard-0.6b` RSS 在两台机器上翻倍是同一类问题：当前 runner.py 用
+进程退出前后的一次性 delta（`resource.getrusage().ru_maxrss`），在内
+存压力、分配器行为不同的情况下不可靠。**本节五档表里 Qwen3-Embedding
+的内存数字采用两次里较高的那个（更保守）**，但真实数字需要用
+`export_onnx.py` 那种周期采样方法重新测，不能当作定论。
+
+### 10.4 ONNX 导出（Rust `ort` 集成路线的第一步）
+
+用 `scripts/export_onnx.py` 把 `e5-base`（10.2 里`recall_gate`最高分、
+综合表现均衡、体积小的候选）导出 ONNX 并做动态 int8 量化：
+
+| 项 | fp32 ONNX | int8 ONNX（动态量化） |
+|---|---|---|
+| 文件体积 | 1080 MB | **287 MB**（≈ 3.8x 压缩） |
+| retain_intent 准确率 | — | 0.819（PyTorch 原始：0.832，量化掉了 1.3 个点） |
+| recall_gate 准确率 | — | 0.864（PyTorch 原始：0.869） |
+| tool_risk 准确率 | — | 0.514（PyTorch 原始：0.535） |
+| P50/P95 延迟（onnxruntime，CPU） | — | 15ms / 39ms（retain_intent，三点里最慢的 tool_risk 是 37/82ms） |
+| 导出+量化+推理总耗时 | — | 29.7s |
+| 本次测到的峰值 RSS | — | **10.7GB——不是生产数字，见下** |
+
+**int8 量化基本不掉分**（三点平均降 0.6–2.1 个点），延迟比 PyTorch 原
+生更快（15ms vs e5-base 的 23ms P50）。**峰值 RSS 10.7GB 这个数字不能
+直接拿来做五档判断**：`export_onnx.py` 的这次运行把 PyTorch 导出（需要
+同时装 `torch`+`transformers` 来源模型）、量化、onnxruntime 推理全部
+算在同一个进程的生命周期内周期采样，10.7GB 主要是**一次性导出步骤**
+的开销（`optimum` 用 PyTorch 追踪模型图），不是 Rust `ort` 只加载那
+287MB int8 文件做推理时的真实占用——后者预期接近"int8 文件体积 +
+onnxruntime 运行时开销"，量级应该在几百 MB，不是 10GB，但**本次没有单
+独测这个数字**（需要把导出步骤和推理步骤分成两个进程才能干净地测）。
+这是留给下一轮的工作，不在这次报告里编一个数字出来。
+
+### 10.5 五档推荐表（8 / 16 / 24 / 32 / 64GB+，待 jason 拍板）
+
+> 不改 `PLAN-DECIDE.md` §1.1 的分档草案表本身。预算假设见 10.0：快速层
+> ≤10% 物理内存、深度层 ≤20%。**8/16/24/32 档的内存可用性都是从本机
+> 64GB 实测 RSS 推算，不是在对应内存的机器上实测**，上线前必须在真机
+> 复核——这条和 §9.0/§9.2 的教训完全一样，这次没有条件在笔记本上模拟
+> 更小内存的机器，只能把同一句话再说一遍。
+
+| 档位 | 快速层推荐 | 推理RSS | 10%预算 | 是否超预算 | 依据 |
+|---|---|---|---|---|---|
+| **8GB** | `e5-small`（B 系列最小档） | ~1.05GB | 0.8GB | **超约 30%** | 三语平均分（0.770/0.805/0.472）明显优于零样本路线和 rule，体积最小的两个候选（minilm 1.22GB、e5-small 1.05GB）里 e5-small 分数更高；但确实超过严格 10% 预算——8GB 机器的该预算本身就很紧，比 §9.2 SetFit 在 16GB 上 thrashing 的那种"4GB 比 2GB 预算"情况宽松一些（这里是 1.05 比 0.8，超约 30% 而非几倍），**风险比 §9.2 低但不是零**，如果 jason 认为 8GB 档必须严格卡 10%，备选是 `rule` only（T0 语义，0 内存但§10.2 显示跨语言准确率只有 0.12–0.23） |
+| **16GB** | `e5-base`（同系列下一档） | ~1.05GB | 1.6GB | 不超 | 同系列从 small 到 base 是真实的下一个尺寸台阶（120M→278M 参数），三点分数全面提升（尤其 `recall_gate` 0.805→0.869），RSS 几乎不变（e5 系列的 RSS 主要是 transformers/torch 运行时本身的开销，不随这个尺寸区间线性增长）——这正是"小档质量够、本身就该往上走一档"而不是"质量不行所以混搭"的例子 |
+| **24GB** | `e5-large-instruct`（同系列、instruct 变体） | ~1.05GB | 2.4GB | 不超 | 10.2 显示 `large-instruct` 在三点上全面不输甚至优于 `large`（同样 560M 参数，指令微调变体），RSS 同样几乎不变；这一档把"同系列"坐实到参数量意义上的最大 e5 尺寸，往上 e5 没有更大的型号了 |
+| **32GB** | `qwen3-embed-4b`（切换到 A 系列，理由见下） | ~0.8–6.8GB（不稳定，见10.3，保守按6.8GB） | 3.2GB | **按保守数字超约 2 倍** | e5 系列到 large 已经没有更大尺寸，继续用同一个模型在 32GB 档"浪费"了多出来的 8GB——`qwen3-embed-4b` 在 `tool_risk` 上有真实提升（0.549→0.688），`retain_intent`/`recall_gate` 持平或小升，是用这档多余预算换真实收益的合理选择，**但 10.3 的 RSS 测量不稳定问题在这里最致命**：若保守数字（6.8GB）是真的，这已经远超严格 10% 预算，只是用深度层 20% 的假设（6.4GB）也勉强不够；若实际更接近乐观数字（0.8GB）则完全在预算内。**这一档的结论最依赖后续用周期采样法重测**，现在只能给一个范围 |
+| **64GB+** | `qwen3-embed-8b`（同系列下一档，深度层备选 `kev-4b`） | ~0.6–8.6GB（同样不稳定，保守按8.6GB） | 6.4GB（10%）／12.8GB（20%深度层） | 按保守数字不超深度层预算 | 延续 32GB 档的系列（A），8B 三点分数（0.841/0.864/0.653）是 embedding 路线里最高或接近最高；64GB 机器哪怕按保守的 8.6GB 算也只占 13.4%，落在深度层 20% 预算内。可选再加一层 `kev-4b`（PLAN-DECIDE §7.3 的"深度层"定位）处理复杂 `tool_risk` 判断——它的 0.701 是全表最高分，代价是 P95 624ms，不适合快速层但适合按需调用。`setfit-bge-m3` 仍是可选对照（三点分数相近，体积更小但训练耗时高），不作为默认推荐，理由见 10.2 的"不再明显领先"小结 |
+
+**为什么不是单一系列贯穿全部五档**：multilingual-e5 系列只有三个真实
+参数量台阶（small 120M / base 278M / large 560M，`large-instruct` 是同
+尺寸的变体不是第四个台阶），自然覆盖 8/16/24GB 三档；32GB/64GB+ 这两
+档的预算足够装下更大的模型，继续用 560M 的 e5-large 不是"质量不够"，
+是"没有更大的同系列模型可用、白白浪费预算"，所以换到 Qwen3-Embedding
+系列（0.6B 这档没有用上，因为 e5-large 在 24GB 档的表现已经持平或优于
+它）接上 4B/8B 两档。**这是"先穷举同系列能到哪、到头了再换系列接上"
+的做法，不是每档各挑一个不相关的模型**。
+
+### 10.6 Unavailable 项汇总
+
+- **`kalm-embed-v2.5-reference`**：`'Qwen2Config' object has no attribute
+  'rope_theta'`——这台机器装的 `transformers==5.19.0` 与该模型自带的
+  `trust_remote_code` 建模代码不兼容，不是许可证或下载问题；见 10.1。
+- **AgentJev-0.6B / KaLM-Jev Nano**：未下载、未测——找不到确定的官方
+  HF repo，见 10.1。
+- 其余全部候选（A/B/C/D/E 五类共 20 个新增 + 7 个 D0-5 既有候选）本次
+  在 64GB 笔记本上都可用，完整 `unavailable` 字段见各
+  `results/m1max-64g-d0-8*/2026-10-07.json`。
+
+### 10.7 本次下载与清理（PR body 另有完整台账）
+
+新下载合计约 42GB（HF 缓存从会话开始的 37GB 增长到跑完时的 79GB），在
+60GB 预算内；`kev-4b` 的 base（`Qwen/Qwen3.5-4B-Base`，约 9.3GB）和
+`qwen3-embed-8b`（约 14.4GB）是其中最大的两块。跑完后**没有删除任何本
+次下载的模型**——磁盘总可用约 93GB，且这些
+模型本身就是下一轮复测（尤其 10.3 提到的 RSS 重测）会复用的对象，删
+了还要重下没有意义；如果 jason 要收紧磁盘，可以安全删除
+`~/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-8B`（14.4GB，
+本次横评里不是五档推荐的强制依赖，e5 系列已覆盖大部分场景）和
+`~/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base`（9.3GB，只被
+`kev-4b` 用到）。`kev.serve` 的两个临时服务（0.8b/4b）已在跑完后停
+止，未改动用户机器上任何既有模型或服务，和 D0-5/D0-6 的既有约定一致。

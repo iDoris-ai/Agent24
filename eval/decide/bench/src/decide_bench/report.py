@@ -65,14 +65,53 @@ def render_markdown(run: dict[str, Any]) -> str:
             lines.append("| " + " | ".join(row) + " |")
         lines.append("")
 
+        by_lang_rows = [(c["name"], c["points"].get(point)) for c in available]
+        by_lang_rows = [(name, pr) for name, pr in by_lang_rows if pr and pr.get("by_lang")]
+        if by_lang_rows:
+            any_inferred = any(pr.get("lang_inferred") for _, pr in by_lang_rows)
+            lines.append(f"### {point} 按语言")
+            lines.append("")
+            if any_inferred:
+                lines.append(
+                    "注：本次评测集没有显式 `lang` 字段，语言标签由 "
+                    "`decide_bench.lang.infer_lang` 按简单规则推断（含泰文字符→th，"
+                    "含 CJK→zh，否则 en），不是人工标注的三语评测集；`ab/decide-01` "
+                    "的三语评测集合入后会改用显式标签重跑。"
+                )
+                lines.append("")
+            lines.append("| 候选 | 语言 | n | 准确率 | 宏F1 | 代价加权误判率 |")
+            lines.append("|---|---|---|---|---|---|")
+            for name, pr in by_lang_rows:
+                for lang in sorted(pr["by_lang"]):
+                    bl = pr["by_lang"][lang]
+                    lines.append(
+                        f"| {name} | {lang} | {bl['n_items']} | {_fmt(bl['accuracy'])} | "
+                        f"{_fmt(bl['macro_f1'])} | {_fmt(bl['cost_weighted_error_rate'])} |"
+                    )
+            lines.append("")
+
     lines.append("## 资源与下载")
     lines.append("")
-    lines.append("| 候选 | model_id | revision | resolved_sha | 加载耗时(s) | 峰值RSS增量(MB) | 下载体积(MB，HF 缓存估算) |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append(
+        "`加载阶段RSS增量` = `load()` 返回时的 RSS 增量——对会在 `load()` 里训练一个头的候选"
+        "（`setfit-bge-m3`、`e5-*`/`qwen3-embed-*`/`minilm-multilingual`/`kalm-embed-*` 这些"
+        "`embed_head.py` 家族）就是「加载 backbone + 训练头」的合并峰值；`峰值RSS增量` 是整次"
+        "运行（加载 + 全部 `predict()`）的峰值。两者之差是这次跑测到的「推理又多吃了多少」——"
+        "对 `embed_head.py` 家族这个差值通常接近 0，因为推理复用同一个已加载的 backbone，没有"
+        "新的大额分配；训练阶段真正可能显著更贵的只有 `setfit-bge-m3`（真正的对比学习训练器，"
+        "不是一次 `encode()`）。"
+    )
+    lines.append("")
+    lines.append(
+        "| 候选 | model_id | revision | resolved_sha | 加载耗时(s) | 加载阶段RSS增量(MB) | "
+        "峰值RSS增量(MB) | 下载体积(MB，HF 缓存估算) |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|")
     for c in available:
         lines.append(
             f"| {c['name']} | {c['model_id'] or '—'} | {c['revision'] or '—'} | {c['resolved_sha'] or '—'} | "
-            f"{_fmt(c['load_latency_s'], 1)} | {_fmt(c['peak_rss_mb'], 1)} | {_fmt(c['download_size_mb'], 1)} |"
+            f"{_fmt(c['load_latency_s'], 1)} | {_fmt(c.get('load_phase_rss_mb'), 1)} | "
+            f"{_fmt(c['peak_rss_mb'], 1)} | {_fmt(c['download_size_mb'], 1)} |"
         )
     lines.append("")
 

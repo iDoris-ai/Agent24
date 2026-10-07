@@ -41,6 +41,10 @@ class EvalItem:
     tags: list[str] = field(default_factory=list)
     context: Any | None = None
     note: str | None = None
+    #: explicit zh/en/th tag, once `ab/decide-01`'s trilingual eval set
+    #: lands; None on today's sets, where decide_bench.lang.resolve_lang
+    #: falls back to inferring it (see that module's docstring).
+    lang: str | None = None
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> "EvalItem":
@@ -53,6 +57,7 @@ class EvalItem:
             tags=list(d.get("tags", [])),
             context=d.get("context"),
             note=d.get("note"),
+            lang=d.get("lang"),
         )
 
 

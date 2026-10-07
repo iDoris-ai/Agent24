@@ -99,3 +99,80 @@ uv run bench --check-overlap --sets tool_risk       # 只查一个点
 `overlap_warning` 字段，`render.py` 会在横评报告里单独起一节列出来——
 确认过某次结果干净，不代表以后改了训练集还干净，这道检查就是防止那种
 情况悄悄发生。
+
+## D0-8：同系列多尺寸补测（2026-10-07）
+
+PLAN-DECIDE D0-8 要求按「同一系列、多尺寸」补测，覆盖中/英/泰三语，并给
+每个候选许可证结论。完整结论见
+[`../../../docs/research/DECISION-MODELS.md`](../../../docs/research/DECISION-MODELS.md)
+§10；本节只记代码层面的东西。
+
+### 按语言分指标
+
+当前 `eval/decide/*.jsonl` 还没有显式 `lang` 字段（三语评测集在
+`ab/decide-01`，尚未合入）。`decide_bench.lang.resolve_lang` 优先读
+`item.lang`，没有就用 `infer_lang` 按规则推断（含泰文字符→th，含 CJK→
+zh，否则 en）。`render.py` 在每个候选每个点下面加一张「按语言」子表，
+只要本次报告里有任何一条是推断出来的，就在表前面加一行说明——不是悄悄
+把推断结果当成真实标签用。`ab/decide-01` 合入后重跑即可自动改用显式
+标签，不需要改这边的代码。
+
+### 新增候选（`adapters/embed_head.py` / `causal_logit.py` / `kev.py`）
+
+| name | 系列 | 尺寸 | 训练方式 |
+|---|---|---|---|
+| `qwen3-embed-0.6b` / `-4b` / `-8b` | Qwen3-Embedding | 0.6B/4B/8B | embedding + LogisticRegression（见下） |
+| `e5-small` / `-base` / `-large` / `-large-instruct` | multilingual-e5 | small/base/large/large-instruct | 同上，带 `query: ` 前缀（模型卡要求） |
+| `minilm-multilingual` | paraphrase-multilingual-MiniLM-L12-v2 | 118M | 同上，8GB 档极小对照 |
+| `kalm-embed-v2.5-reference` | KaLM-Embedding v2.5 | mini-instruct | 同上，**仅对照，许可证未按 §10 核实到可商用结论** |
+| `qwen3-llm-0.6b` / `-1.7b` / `-4b` / `-8b` | Qwen3（因果 LLM） | 0.6B–8B | 零训练，读首 token logit（见下），MLX |
+| `kev-4b` | Kev | 4B | 同 `kev-0.8b`，经其自带 `/v1/systemone` 服务 |
+
+**`adapters/embed_head.py` 不是 `setfit` 库**：它是 sentence-transformers
+`.encode()` + `sklearn.LogisticRegression`，训练数据仍是
+`train_data/*.jsonl`（通过新拆出的 `decide_bench/train_data.py`，
+`setfit_bgem3.py` 也改成引用这一份，行为不变）。这是故意的简化——
+`setfit` 库的对比学习训练器不是每个 backbone 都能直接套（e5 需要
+query/passage 前缀、Qwen3 causal 底座的 `.encode()` 支持不一致），而这个
+配方在全部新增 backbone 上都能跑。**跟 `setfit-bge-m3` 比较时要记得这一
+点**：差异里既有 backbone 的差异，也有头训练方式的差异，不是纯粹的
+backbone ablation。
+
+**`adapters/causal_logit.py`**：对 Qwen3 系列因果 LLM，一次前向读「A/B/
+C/…」几个候选字母 token 的 logit，softmax 限定在候选集合内（不是全词表
+的 argmax token），零训练。优先 MLX（`mlx_lm`，见 `uv sync --extra mlx`）
+——0.6B/8B 复用 `~/.omlx/models/` 里已下载好的 4bit 权重（不产生新下
+载，报告里 `download_size_mb=0`），1.7B/4B 新下载
+`mlx-community` 的预量化权重。不套 chat 模板，纯续写式 prompt——这些是
+base 模型，套用某个模型专属的对话模板会让"零训练"的说法掺进针对单一
+模型调过的 prompt 工程，削弱"同系列尺寸连贯"比较的可信度。
+
+**`kev-4b`**：和 `kev-0.8b` 同一套适配器（`KevCandidate` 已泛化为接受
+`model_id`/`revision`/端口），同样需要手动起服务，换个端口避免冲突：
+
+```bash
+git clone https://github.com/jaredpalmer/kev.git && cd kev
+uv python pin 3.12 && uv sync --extra serve
+uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009
+KEV_BASE_URL=http://127.0.0.1:8009 uv run bench --candidates kev-4b ...
+```
+
+### ONNX 导出（`scripts/export_onnx.py`）
+
+把横评里胜出的小体积 embedding+头导出 ONNX（动态 int8 量化），用
+onnxruntime 重新测推理 RSS/延迟——这是 Rust `ort` 集成路线的第一步。脚本
+**不在本项目 `pyproject.toml` 的依赖里**：`optimum[onnxruntime]` 需要
+`transformers<4.47`，与本项目基础依赖 `gliclass`（需要
+`transformers>=5.0`）冲突，锁不到一个公共环境。脚本自己起一个临时环境：
+
+```bash
+uv run --isolated --with 'optimum[onnxruntime]>=1.20,<2.2' --with 'transformers<4.47' \
+    --with torch --with onnx --with scikit-learn --with psutil \
+    python scripts/export_onnx.py --model-id intfloat/multilingual-e5-base \
+    --revision d128750597153bb5987e10b1c3493a34e5a4502a --query-prefix "query: " \
+    --out-dir /tmp/onnx-e5-base
+```
+
+输出 `onnx_export_report.json`：fp32/int8 文件体积、加载+量化耗时、周期
+采样的峰值 RSS（不是单次前后差——D0-6 §9.4 已经指出那种测法在内存压力下
+不可靠）、在三份评测集上重新训头后的准确率与 P50/P95 延迟。
