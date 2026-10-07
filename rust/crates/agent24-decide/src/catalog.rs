@@ -1,7 +1,8 @@
 //! Model catalog (D0-3, `docs/agent/PLAN-DECIDE.md` §1.1): `decide-models.catalog.json`
 //! lives at the crate root. Every entry pins a HF repo to an exact
 //! `revision` + `sha256` — "pin 版本 + sha256，同 Open Design 组件机制" — so
-//! loading rejects any entry missing either field rather than silently
+//! loading rejects any entry missing either field, or whose revision is not a
+//! full 40-hex commit SHA / sha256 not 64 hex (#689 review), rather than silently
 //! treating it as "latest" (which is exactly the kind of drift pinning
 //! exists to prevent).
 //!
@@ -85,6 +86,17 @@ pub enum CatalogError {
     MissingRevision { id: String },
     #[error("entry {id:?} is missing sha256 (pin required, no \"latest\")")]
     MissingSha256 { id: String },
+    #[error("entry {id:?} revision must be a 40-char lowercase hex commit SHA, not a branch/tag")]
+    InvalidRevision { id: String },
+    #[error("entry {id:?} sha256 must be 64 lowercase hex chars")]
+    InvalidSha256 { id: String },
+}
+
+/// `true` iff `s` is exactly `len` lowercase ASCII hex digits. Branch names
+/// (`main`), tags and short SHAs are all rejected: only a full commit SHA /
+/// full digest is a real pin.
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A loaded, validated model catalog.
@@ -112,6 +124,12 @@ impl ModelCatalog {
                 .sha256
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| CatalogError::MissingSha256 { id: e.id.clone() })?;
+            if !is_lower_hex(&revision, 40) {
+                return Err(CatalogError::InvalidRevision { id: e.id });
+            }
+            if !is_lower_hex(&sha256, 64) {
+                return Err(CatalogError::InvalidSha256 { id: e.id });
+            }
             entries.push(CatalogEntry {
                 id: e.id,
                 hf_repo: e.hf_repo,
@@ -161,8 +179,8 @@ mod tests {
             "entries": [{
                 "id": "qwen3guard-0.6b",
                 "hf_repo": "Qwen/Qwen3Guard-0.6B",
-                "revision": "abc123",
-                "sha256": "deadbeef",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "license": "Apache-2.0",
                 "download_bytes": 1200000000,
                 "resident_bytes": 1400000000,
@@ -173,7 +191,10 @@ mod tests {
         }"#;
         let catalog = ModelCatalog::load_str(json).expect("valid entry must load");
         assert_eq!(catalog.entries().len(), 1);
-        assert_eq!(catalog.entries()[0].revision, "abc123");
+        assert_eq!(
+            catalog.entries()[0].revision,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
         assert_eq!(catalog.entries()[0].tiers, vec![Tier::T2, Tier::T3]);
     }
 
@@ -183,7 +204,7 @@ mod tests {
             "entries": [{
                 "id": "no-revision",
                 "hf_repo": "org/model",
-                "sha256": "deadbeef",
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "license": "Apache-2.0",
                 "download_bytes": 1,
                 "resident_bytes": 1,
@@ -205,7 +226,7 @@ mod tests {
             "entries": [{
                 "id": "no-sha",
                 "hf_repo": "org/model",
-                "revision": "main",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
                 "license": "Apache-2.0",
                 "download_bytes": 1,
                 "resident_bytes": 1,
@@ -228,7 +249,7 @@ mod tests {
                 "id": "blank-revision",
                 "hf_repo": "org/model",
                 "revision": "",
-                "sha256": "deadbeef",
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "license": "Apache-2.0",
                 "download_bytes": 1,
                 "resident_bytes": 1,
@@ -251,8 +272,8 @@ mod tests {
                 {
                     "id": "good",
                     "hf_repo": "org/good",
-                    "revision": "main",
-                    "sha256": "deadbeef",
+                    "revision": "0123456789abcdef0123456789abcdef01234567",
+                    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     "license": "Apache-2.0",
                     "download_bytes": 1,
                     "resident_bytes": 1,
@@ -261,7 +282,7 @@ mod tests {
                 {
                     "id": "bad",
                     "hf_repo": "org/bad",
-                    "sha256": "deadbeef",
+                    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     "license": "Apache-2.0",
                     "download_bytes": 1,
                     "resident_bytes": 1,
@@ -276,6 +297,70 @@ mod tests {
                 id: "bad".to_owned()
             },
             "a bad entry must fail the whole catalog, not be silently dropped"
+        );
+    }
+
+    fn entry_with(revision: &str, sha256: &str) -> String {
+        format!(
+            r#"{{"entries": [{{"id": "x", "hf_repo": "org/m", "revision": "{revision}",
+                "sha256": "{sha256}", "license": "Apache-2.0", "download_bytes": 1,
+                "resident_bytes": 1, "runtime": "ort"}}]}}"#
+        )
+    }
+
+    #[test]
+    fn branch_tag_or_short_sha_revision_is_rejected() {
+        for rev in [
+            "main",
+            "v1.0",
+            "0123456",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef012345670",
+            "0123456789abcdef0123456789abcdef0123456g",
+        ] {
+            let err = ModelCatalog::load_str(&entry_with(
+                rev,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                CatalogError::InvalidRevision { id: "x".to_owned() },
+                "revision {rev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_64_hex_sha256_is_rejected() {
+        for sha in [
+            "deadbeef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdez",
+        ] {
+            let err = ModelCatalog::load_str(&entry_with(
+                "0123456789abcdef0123456789abcdef01234567",
+                sha,
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                CatalogError::InvalidSha256 { id: "x".to_owned() },
+                "sha256 {sha:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_pins_are_accepted() {
+        assert!(
+            ModelCatalog::load_str(&entry_with(
+                "0123456789abcdef0123456789abcdef01234567",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            ))
+            .is_ok()
         );
     }
 }
