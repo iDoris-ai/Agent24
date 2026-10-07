@@ -12,6 +12,22 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
 thiserror = "2"
+ort = { version = "=2.0.0-rc.10", optional = true }
+tokenizers = { version = "0.21", optional = true }
+
+[features]
+default = []
+onnx-spike = ["dep:ort", "dep:tokenizers"]
+
+[[test]]
+name = "onnx_spike"
+path = "tests/onnx_spike.rs"
+required-features = ["onnx-spike"]
+
+[[bin]]
+name = "onnx_spike_bench"
+path = "src/bin/onnx_spike_bench.rs"
+required-features = ["onnx-spike"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
