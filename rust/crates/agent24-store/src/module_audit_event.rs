@@ -25,19 +25,21 @@ fn invalid(msg: impl Into<String>) -> StoreError {
 
 /// Bounded, ASCII, no-whitespace identifier shared by every relational
 /// field below. Heuristics reject common credential-shaped values, but
-/// this type is not a secrecy filter. Only [`AuditRef::new`] builds one, so a
-/// bad value never exists; `TryFrom<String>` (via `serde(try_from)`)
-/// re-runs the same check on every deserialize, rejecting a corrupted row
-/// on read too.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+/// this type is not a secrecy filter. New writes use [`AuditRef::new`]; stored
+/// values are structurally validated on read without reapplying heuristics
+/// that may evolve over time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "String")]
 pub struct AuditRef(String);
 
 impl AuditRef {
     pub const MAX_LEN: usize = 128;
 
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
+        Self::parse(value.into(), true)
+    }
+
+    fn parse(value: String, reject_credentials: bool) -> Result<Self> {
         if value.is_empty() || value.len() > Self::MAX_LEN {
             return Err(invalid(format!(
                 "audit ref must be 1..={} bytes, got {}",
@@ -52,7 +54,7 @@ impl AuditRef {
                 "audit ref must contain only ASCII alphanumerics plus -_.:/@",
             ));
         }
-        if looks_credential_like(&value) {
+        if reject_credentials && looks_credential_like(&value) {
             return Err(invalid(
                 "audit ref resembles a credential or encoded payload",
             ));
@@ -68,18 +70,21 @@ impl AuditRef {
 
 fn looks_credential_like(value: &str) -> bool {
     if let Some((_, authority_and_path)) = value.split_once("://") {
-        let authority = authority_and_path
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default();
-        if let Some((userinfo, _)) = authority.rsplit_once('@')
+        let mut authority_parts = authority_and_path.split(['/', '?', '#']);
+        if let Some(authority) = authority_parts.next()
+            && let Some((userinfo, _)) = authority.rsplit_once('@')
             && userinfo.contains(':')
         {
             return true;
         }
     }
 
-    let lower = value.to_ascii_lowercase();
+    // UUIDs are common run/tool-call identifiers, both alone and with a
+    // caller prefix such as `run-`. They can be 40 characters with prefix.
+    if has_uuid_suffix(value) {
+        return false;
+    }
+
     const TOKEN_PREFIXES: &[&str] = &[
         "ghp_",
         "gho_",
@@ -98,35 +103,75 @@ fn looks_credential_like(value: &str) -> bool {
         "pypi-",
         "hf_",
     ];
-    if TOKEN_PREFIXES.iter().any(|prefix| lower.contains(prefix)) {
-        return true;
+    for (index, _) in value.char_indices() {
+        let lower_tail = value[index..].to_ascii_lowercase();
+        for prefix in TOKEN_PREFIXES {
+            if lower_tail.starts_with(prefix)
+                && is_token_boundary(value.as_bytes().get(index.wrapping_sub(1)).copied())
+            {
+                let suffix = &value[index + prefix.len()..];
+                if is_high_entropy_token_suffix(suffix) {
+                    return true;
+                }
+            }
+        }
     }
 
-    // Long uninterrupted base64/base64url or hexadecimal chunks are
-    // unusual in host identifiers and can carry credentials or payloads.
-    let mut chunk_len = 0;
-    let mut hex_len = 0;
-    for byte in value.bytes().chain(std::iter::once(b' ')) {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'_' | b'-') {
-            chunk_len += 1;
-            if byte.is_ascii_hexdigit() {
-                hex_len += 1;
-            } else {
-                hex_len = 0;
-            }
-            if chunk_len >= 40 || hex_len >= 32 {
-                return true;
-            }
-        } else {
-            chunk_len = 0;
-            hex_len = 0;
+    // A long standalone base64/base64url segment needs a base64 signal in
+    // addition to length. Lowercase hex digests and ordinary path components
+    // are valid identifiers and do not meet this rule.
+    for segment in
+        value.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '=' | '_' | '-'))
+    {
+        if segment.len() >= 40 && has_base64_features(segment) {
+            return true;
         }
     }
     false
 }
 
-/// Canonical RFC3339 timestamp in UTC (`Z`, no more than nanosecond
-/// precision). Its validated representation cannot contain the `|`
+fn is_token_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|b| !b.is_ascii_alphanumeric())
+}
+
+fn is_high_entropy_token_suffix(suffix: &str) -> bool {
+    if suffix.len() < 20 {
+        return false;
+    }
+    let lower = suffix.bytes().any(|b| b.is_ascii_lowercase());
+    let upper = suffix.bytes().any(|b| b.is_ascii_uppercase());
+    let digit = suffix.bytes().any(|b| b.is_ascii_digit());
+    (lower || upper) && digit
+}
+
+fn has_base64_features(segment: &str) -> bool {
+    if segment.bytes().any(|b| matches!(b, b'+' | b'=')) {
+        return true;
+    }
+    let lower = segment.bytes().any(|b| b.is_ascii_lowercase());
+    let upper = segment.bytes().any(|b| b.is_ascii_uppercase());
+    let digit = segment.bytes().any(|b| b.is_ascii_digit());
+    lower && upper && digit
+}
+
+fn has_uuid_suffix(value: &str) -> bool {
+    let uuid_start = value.len().saturating_sub(36);
+    let uuid = &value[uuid_start..];
+    let bytes = uuid.as_bytes();
+    if bytes.len() != 36
+        || ![8, 13, 18, 23].into_iter().all(|i| bytes[i] == b'-')
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| [8, 13, 18, 23].contains(&i) || b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    uuid_start == 0 || value.as_bytes()[uuid_start - 1].is_ascii_punctuation()
+}
+
+/// Canonical RFC3339 timestamp in UTC (`Z`, fixed millisecond precision).
+/// Its validated representation cannot contain the `|`
 /// separator used by the audit hash preimage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -143,7 +188,7 @@ impl AuditTimestamp {
             || value.len() > Self::MAX_LEN
             || !value.ends_with('Z')
             || parsed.offset().local_minus_utc() != 0
-            || parsed.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true) != value
+            || parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) != value
         {
             return Err(invalid("audit timestamp must be canonical RFC3339 UTC"));
         }
@@ -173,6 +218,16 @@ impl TryFrom<String> for AuditRef {
     type Error = StoreError;
     fn try_from(value: String) -> Result<Self> {
         Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for AuditRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value, false).map_err(serde::de::Error::custom)
     }
 }
 
@@ -348,6 +403,30 @@ pub enum ModuleToolAuditEvent {
 }
 
 impl ModuleToolAuditEvent {
+    fn validate_refs_for_write(&self) -> Result<()> {
+        let relation = self.relation();
+        let mut refs = vec![
+            relation.actor.as_str(),
+            relation.run_id.as_str(),
+            relation.tool_call_id.as_str(),
+            relation.module_id.as_str(),
+            relation.operation_id.as_str(),
+            relation.authorization_ref.as_str(),
+        ];
+        if let Some(session_ref) = &relation.session_ref {
+            refs.push(session_ref.as_str());
+        }
+        if let Some(resource_ref) = &relation.resource_ref {
+            refs.push(resource_ref.as_str());
+        }
+        if refs.iter().any(|value| looks_credential_like(value)) {
+            return Err(invalid(
+                "audit ref resembles a credential or encoded payload",
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn relation(&self) -> &ModuleToolAuditRelation {
         match self {
@@ -376,6 +455,7 @@ impl Store {
         ts: &AuditTimestamp,
         event: &ModuleToolAuditEvent,
     ) -> Result<AuditEntry> {
+        event.validate_refs_for_write()?;
         let actor = event.relation().actor.as_str().to_owned();
         let detail = serde_json::to_value(event)?;
         self.append_audit(ts.as_str(), &actor, event.action(), &detail)
@@ -437,16 +517,72 @@ mod tests {
         for value in [
             "https://user:password@example.test/path".to_owned(),
             "ghp_1234567890abcdefghijklmnopqrstuv".to_owned(),
-            "sk_live_demo".to_owned(),
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature".to_owned(),
-            "a".repeat(48),
-            "0123456789abcdef".repeat(4),
+            "sk-live-6bH4sJ9qP2wX7mN5cR8vT1zK".to_owned(),
+            "xoxb-6bH4sJ9qP2wX7mN5cR8vT1zK".to_owned(),
+            "payload-QWxhZGRpbjpvcGVuIHNlc2FtZQ==QWxhZGRpbjpvcGVuIHNlc2FtZQ==".to_owned(),
+            "payload-Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk".to_owned(),
         ] {
             assert!(
                 AuditRef::new(value).is_err(),
                 "accepted credential-like ref"
             );
         }
+    }
+
+    #[test]
+    fn ordinary_identifier_shapes_are_not_mistaken_for_credentials() {
+        for value in [
+            "task_1",
+            "risk_level",
+            "run.task-1",
+            "slovakia",
+            "heyjude",
+            "box:xoxo",
+            "branch_hf_1",
+            "desk_calendar_sync",
+            "disk_cache_entry",
+            "task-sketch-01",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "run-550e8400-e29b-41d4-a716-446655440000",
+            "tool-550e8400-e29b-41d4-a716-446655440000",
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "resource/path/to/some/deeply/nested/thing",
+        ] {
+            assert!(
+                AuditRef::new(value).is_ok(),
+                "rejected ordinary identifier {value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_audit_refs_remain_readable_but_new_writes_revalidate_them() {
+        let historical = serde_json::json!({
+            "actor": "actor-1",
+            "run_id": "ghp_1234567890abcdefghijklmnopqrstuv",
+            "tool_call_id": "tool-1",
+            "module_id": "module-1",
+            "operation_id": "operation-1",
+            "authorization_ref": "authz-1"
+        });
+        let parsed: std::result::Result<ModuleToolAuditRelation, _> =
+            serde_json::from_value(historical);
+        let relation = parsed.unwrap();
+        assert_eq!(
+            relation.run_id.as_str(),
+            "ghp_1234567890abcdefghijklmnopqrstuv"
+        );
+
+        let event = ModuleToolAuditEvent::PreDispatch(relation);
+        let store = Store::open_memory().await.unwrap();
+        let timestamp = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+        assert!(
+            store
+                .append_module_tool_audit_event(&timestamp, &event)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -469,6 +605,8 @@ mod tests {
         }
         let ts = AuditTimestamp::new("2026-10-08T00:00:00.123Z").unwrap();
         assert_eq!(ts.as_str(), "2026-10-08T00:00:00.123Z");
+        let zero_millis = AuditTimestamp::new("2026-10-08T00:00:01.000Z").unwrap();
+        assert_eq!(zero_millis.as_str(), "2026-10-08T00:00:01.000Z");
         assert!(!ts.as_str().contains('|'));
         assert!(AuditRef::new("actor|action").is_err());
     }
@@ -532,7 +670,7 @@ mod tests {
     async fn pre_dispatch_then_terminal_events_append_onto_a_verifiable_chain() {
         let store = Store::open_memory().await.unwrap();
         let pre = ModuleToolAuditEvent::PreDispatch(relation());
-        let pre_ts = AuditTimestamp::new("2026-10-08T00:00:00Z").unwrap();
+        let pre_ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
         let pre_entry = store
             .append_module_tool_audit_event(&pre_ts, &pre)
             .await
@@ -545,7 +683,7 @@ mod tests {
             duration_ms: Some(DurationMs::new(42).unwrap()),
             size_bytes: Some(SizeBytes::new(128).unwrap()),
         };
-        let terminal_ts = AuditTimestamp::new("2026-10-08T00:00:01Z").unwrap();
+        let terminal_ts = AuditTimestamp::new("2026-10-08T00:00:01.000Z").unwrap();
         let terminal_entry = store
             .append_module_tool_audit_event(&terminal_ts, &terminal)
             .await
@@ -591,7 +729,7 @@ mod tests {
         ] {
             assert!(AuditTimestamp::new(ts).is_err());
         }
-        let ts = AuditTimestamp::new("2026-10-08T00:00:00Z").unwrap();
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
         let entry = store
             .append_module_tool_audit_event(&ts, &event)
             .await
