@@ -8,12 +8,11 @@
 //! Scope (per task spec): host-generated per-tool permission summary
 //! (readable/writable/external scope text, host risk level, source,
 //! module version, and a derived permission-scope fingerprint) plus
-//! `grant`/`deny`/`lookup` storage. No call gate (6a.2), no revocation
-//! propagation (6a.3), no UI/export (6a.4) — those are separate slices.
+//! `grant`/`deny`/`lookup` storage and durable 6a.3 revocation state. No call
+//! gate (6a.2), no UI/export (6a.4) — those are separate slices.
 //!
-//! Tool identity is the `(module, op)` string pair (task spec: K1-5.1's tool
-//! registry types have not merged yet, so this slice does not depend on
-//! them — reconcile when it does).
+//! Tool identity remains the `(module, op)` string pair in this persistence
+//! contract. It stays independent of capability claims and runtime handles.
 //!
 //! Fail-closed is structural, not a convention callers must remember:
 //! [`ConsentLookup::NotGranted`] is the only outcome for a `(module, op)`
@@ -214,10 +213,21 @@ pub struct ModuleConsentRecord {
     pub expires_at: String,
 }
 
-/// The outcome of [`Store::lookup_module_consent`]. Every variant other than
-/// `Granted` carries the stale/mismatched/expired/denied record anyway (for
-/// audit/debugging by a future caller) — but [`Self::is_authorized`], not
-/// the variant name, is what any call-gating code must consult.
+/// A persisted module authorization revocation. `op: None` revokes every
+/// tool for the module; `Some(op)` revokes only that tool. This host consent
+/// event is intentionally independent of capability claims and epochs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleConsentRevocation {
+    pub module: String,
+    pub op: Option<String>,
+    pub revoked_at: String,
+}
+
+/// The outcome of [`Store::lookup_module_consent`]. Outcomes tied to a stored
+/// decision or stale/expired record carry that record for audit/debugging;
+/// `NotGranted` has none. `Revoked` may have no record when lifecycle
+/// invalidation precedes the first consent. [`Self::is_authorized`] is the
+/// single authorization predicate for future call-gating code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentLookup {
     /// No row exists for this `(module, op)` at all — the task spec's
@@ -226,6 +236,10 @@ pub enum ConsentLookup {
     /// A row exists, matches the current version/fingerprint, has not
     /// expired, and its decision is `Denied`.
     Denied(ModuleConsentRecord),
+    /// A previously recorded consent was explicitly revoked (or invalidated
+    /// by a module lifecycle change). This differs from `Denied`: denial is
+    /// the user's recorded refusal; revocation withdraws an earlier consent.
+    Revoked(Option<ModuleConsentRecord>),
     /// A row exists but its `module_version` or `scope_fingerprint` no
     /// longer matches what the caller just computed for the tool as it
     /// exists now — the ADR §4 "旧许可不能被自动扩张" case. Re-consent is
@@ -358,6 +372,54 @@ fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
 }
 
 impl Store {
+    /// Subscribe to post-commit consent revocations. A broadcast channel is
+    /// used because multiple independent consumers may need the event; the
+    /// durable table remains authoritative if a receiver starts late.
+    pub fn subscribe_module_consent_revocations(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ModuleConsentRevocation> {
+        self.module_consent_revocations.subscribe()
+    }
+
+    /// Persist a revocation for one tool (`op: Some`) or every tool in a
+    /// module (`op: None`), then broadcast it. `now` must be RFC 3339; invalid
+    /// timestamps fail before any write or notification.
+    pub async fn revoke_module_consent(
+        &self,
+        module: &str,
+        op: Option<&str>,
+        now: &str,
+    ) -> Result<()> {
+        let (_, revoked_at) = parse_instant(now)?;
+        let key = op.unwrap_or("*");
+        sqlx::query(
+            "INSERT INTO module_consent_revocations (module, op, revoked_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (module, op) DO UPDATE SET revoked_at = excluded.revoked_at",
+        )
+        .bind(module)
+        .bind(key)
+        .bind(&revoked_at)
+        .execute(self.pool())
+        .await?;
+        let _ = self
+            .module_consent_revocations
+            .send(ModuleConsentRevocation {
+                module: module.to_owned(),
+                op: op.map(str::to_owned),
+                revoked_at,
+            });
+        Ok(())
+    }
+
+    /// Lifecycle invalidation for disable/uninstall/package replacement. The
+    /// operation is deliberately best-effort at call sites that already have
+    /// an established lifecycle result; failures are returned for logging.
+    pub async fn invalidate_module_consents(&self, module: &str) -> Result<()> {
+        self.revoke_module_consent(module, None, &Utc::now().to_rfc3339())
+            .await
+    }
+
     /// The sole write path: a fresh grant/deny for `(module, op)` always
     /// REPLACES whatever row was there (migration doc comment) — there is no
     /// in-place field mutation of an existing consent row anywhere in this
@@ -465,10 +527,35 @@ impl Store {
             .bind(op)
             .fetch_optional(self.pool())
             .await?;
-        let Some(row) = row else {
+        let revocations = sqlx::query(
+            "SELECT revoked_at FROM module_consent_revocations
+             WHERE module = ? AND op IN (?, '*')",
+        )
+        .bind(module)
+        .bind(op)
+        .fetch_all(self.pool())
+        .await?;
+        let record = row.as_ref().map(row_to_record).transpose()?;
+        if let Some(record) = &record {
+            let consented_at = match parse_instant(&record.decided_at) {
+                Ok((at, _)) => at,
+                Err(_) => return Ok(ConsentLookup::Revoked(Some(record.clone()))),
+            };
+            let revoked = revocations.iter().any(|row| {
+                parse_instant(&row.get::<String, _>("revoked_at"))
+                    .map_or(true, |(at, _)| at >= consented_at)
+            });
+            if revoked {
+                return Ok(ConsentLookup::Revoked(Some(record.clone())));
+            }
+        } else if !revocations.is_empty() {
+            // Revoking before a consent exists remains observable and
+            // fail-closed; a later consent row supersedes it by timestamp.
+            return Ok(ConsentLookup::Revoked(None));
+        }
+        let Some(record) = record else {
             return Ok(ConsentLookup::NotGranted);
         };
-        let record = row_to_record(&row)?;
         if record.module_version != current_module_version
             || record.scope_fingerprint != current_scope_fingerprint
         {
@@ -1079,5 +1166,156 @@ mod tests {
             .unwrap();
         assert!(matches!(lookup, ConsentLookup::Denied(_)));
         assert!(!lookup.is_authorized());
+    }
+
+    // ADR-K1-03 §3 / 6a.3 counterexamples: explicit revocation is a durable
+    // state distinct from a user's original refusal, and observers must be
+    // notified so a later slice can stop queued and in-flight calls.
+    #[tokio::test]
+    async fn revoking_a_tool_is_immediate_persistent_and_distinct_from_deny() {
+        let store = store().await;
+        let s = summary("doc body");
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .revoke_module_consent(&s.module, Some(&s.op), "2026-10-08T01:00:00Z")
+            .await
+            .unwrap();
+
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T01:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(lookup, ConsentLookup::Revoked(_)));
+        assert!(!lookup.is_authorized());
+
+        store
+            .deny_module_consent(&s, "2026-10-08T02:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let denied = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T02:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(denied, ConsentLookup::Denied(_)));
+        assert!(!denied.is_authorized());
+
+        store
+            .grant_module_consent(&s, "2026-10-08T03:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let regranted = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T03:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(regranted, ConsentLookup::Granted(_)));
+        assert!(regranted.is_authorized());
+    }
+
+    #[tokio::test]
+    async fn revocation_survives_reopening_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("consents.db");
+        let s = summary("doc body");
+        {
+            let store = Store::open(&db).await.unwrap();
+            store
+                .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+                .await
+                .unwrap();
+            store
+                .revoke_module_consent(&s.module, Some(&s.op), "2026-10-08T01:00:00Z")
+                .await
+                .unwrap();
+        }
+        let reopened = Store::open(&db).await.unwrap();
+        let lookup = reopened
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T01:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(lookup, ConsentLookup::Revoked(_)));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_revocation_is_visible_before_a_consent_row_exists() {
+        let store = store().await;
+        let s = summary("doc body");
+        store.invalidate_module_consents(&s.module).await.unwrap();
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(lookup, ConsentLookup::Revoked(None)));
+        assert!(!lookup.is_authorized());
+    }
+
+    #[tokio::test]
+    async fn module_revocation_covers_each_tool_and_broadcasts_scope() {
+        let store = store().await;
+        let first = summary("doc body");
+        let mut second = first.clone();
+        second.op = "write_doc".to_owned();
+        store
+            .grant_module_consent(&first, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .grant_module_consent(&second, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let mut events = store.subscribe_module_consent_revocations();
+
+        store
+            .revoke_module_consent(&first.module, None, "2026-10-08T01:00:00Z")
+            .await
+            .unwrap();
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.module, first.module);
+        assert_eq!(event.op, None);
+        for s in [&first, &second] {
+            let lookup = store
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-08T01:00:01Z",
+                )
+                .await
+                .unwrap();
+            assert!(matches!(lookup, ConsentLookup::Revoked(_)));
+        }
     }
 }

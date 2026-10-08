@@ -208,6 +208,7 @@ fn classify(fire_id: &FireId, result: Result<KernelResponse, KernelCallError>) -
         Err(KernelCallError::Timeout) => {
             failed("the module did not answer within the delivery timeout".to_owned())
         }
+        Err(KernelCallError::Cancelled) => deferred(DeferReason::KernelTransient),
         Err(KernelCallError::ResponseTooLarge) => {
             failed("the module's response exceeded the limit".to_owned())
         }

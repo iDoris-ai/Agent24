@@ -475,6 +475,12 @@ async fn apply(
             return Err(why.clone());
         }
     }
+    if !enabled && let Err(e) = state.store.invalidate_module_consents(name).await {
+        // Config publication is the established result of this route. Keep
+        // its lifecycle behavior intact while surfacing failed invalidation
+        // for operators.
+        tracing::error!(module = name, error = %e, "failed to invalidate module consents after disable");
+    }
     let handed = if enabled {
         None
     } else {
@@ -954,6 +960,9 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
             "not_found",
             &format!("no domain OS named {name:?}; this daemon provides {known:?}"),
         );
+    }
+    if let Err(e) = state.store.invalidate_module_consents(&name).await {
+        tracing::error!(module = name, error = %e, "failed to invalidate module consents before package stop");
     }
     let handed = hand_off(
         state.supervisors.as_deref(),
@@ -1946,6 +1955,43 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
         let cfg = crate::os_config::OsConfig::load(&path).unwrap();
         assert!(!cfg.is_enabled("refused-mod"));
+    }
+
+    #[tokio::test]
+    async fn disabling_a_module_persists_consent_invalidation() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        crate::os_config::OsConfig::set_enabled(&path, "consent-mod", true).unwrap();
+        let summary = agent24_store::ToolPermissionSummary::new(
+            "consent-mod",
+            "read_doc",
+            "1.0.0",
+            agent24_store::ConsentSource::FirstParty,
+            Some("docs".into()),
+            None,
+            None,
+            agent24_store::HostRiskLevel::Low,
+        );
+        st.store
+            .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+
+        let response = t8_patch(&st, "consent-mod", false, Some(path)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let lookup = st
+            .store
+            .lookup_module_consent(
+                &summary.module,
+                &summary.op,
+                &summary.module_version,
+                &summary.scope_fingerprint(),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(lookup, agent24_store::ConsentLookup::Revoked(_)));
+        assert!(!lookup.is_authorized());
     }
 
     /// Judgement criterion 4 — the blocked `message` is exactly what `os

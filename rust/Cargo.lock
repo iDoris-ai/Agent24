@@ -218,6 +218,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -316,6 +317,7 @@ name = "agent24-store"
 version = "0.5.1"
 dependencies = [
  "agent24-core",
+ "agent24-decide",
  "agent24-protocol",
  "chrono",
  "serde",
@@ -338,6 +340,7 @@ dependencies = [
  "async-trait",
  "cap-std",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
