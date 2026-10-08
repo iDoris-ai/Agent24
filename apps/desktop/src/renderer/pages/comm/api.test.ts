@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  addContact,
   CommApiError,
   getCommStatus,
   listCommContacts,
@@ -121,6 +122,37 @@ describe('COMM typed backend API', () => {
 
     setProxy((() => ({ ok: true, status: 200, data: { ok: true, data: [{ nickname: 'broken' }] } })) as never)
     await expect(listCommContacts()).rejects.toThrow('Malformed COMM response data')
+  })
+
+  it('adds a contact with exactly one POST request matching the input, omitting a blank role', async () => {
+    const proxy = setProxy((() => successful({})) as never)
+    await expect(addContact('bob', 'npub1bob')).resolves.toBeUndefined()
+    expect(proxy).toHaveBeenCalledTimes(1)
+    expect(proxy.mock.calls[0][0]).toEqual({
+      method: 'POST',
+      path: '/api/v1/comm/contact',
+      body: { nickname: 'bob', npub: 'npub1bob' },
+    })
+  })
+
+  it('includes role in the contact add request body when given', async () => {
+    const proxy = setProxy((() => successful({})) as never)
+    await addContact('bob', 'npub1bob', 'human')
+    expect(proxy.mock.calls[0][0]).toEqual({
+      method: 'POST',
+      path: '/api/v1/comm/contact',
+      body: { nickname: 'bob', npub: 'npub1bob', role: 'human' },
+    })
+  })
+
+  it('surfaces a server rejection for contact add without retrying', async () => {
+    const proxy = setProxy((() => ({
+      ok: false,
+      status: 400,
+      data: { ok: false, error: 'invalid', message: 'npub is not well-formed' },
+    })) as never)
+    await expect(addContact('bob', 'not-a-npub')).rejects.toMatchObject({ name: 'CommApiError', status: 400 })
+    expect(proxy).toHaveBeenCalledTimes(1)
   })
 
   it('converts IPC/network failures into errors without retrying', async () => {

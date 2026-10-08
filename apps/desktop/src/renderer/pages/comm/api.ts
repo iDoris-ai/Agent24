@@ -224,6 +224,26 @@ export const listCommIdentities = (): Promise<CommIdentity[]> =>
 export const listCommContacts = (): Promise<CommContact[]> =>
   request('GET', '/api/v1/comm/contact', isContactList)
 
+/**
+ * `contact add` has no documented response data shape (it is Hyphae's own
+ * CLI output, not part of the frozen `GET /comm/contact` contract) — the
+ * caller re-reads the list after success instead of trusting this value, so
+ * any envelope `data` is accepted here as long as the write itself
+ * succeeded.
+ */
+function isAnyData(_value: unknown): _value is unknown {
+  return true
+}
+
+/** Sends exactly the given fields; `role` is included only when provided. */
+export const addContact = (nickname: string, npub: string, role?: string): Promise<void> =>
+  request<unknown>(
+    'POST',
+    '/api/v1/comm/contact',
+    isAnyData,
+    role === undefined ? { nickname, npub } : { nickname, npub, role },
+  ).then(() => undefined)
+
 export const listCommRelays = (): Promise<CommRelayConfig> =>
   request('GET', '/api/v1/comm/relay', isRelayConfig)
 
