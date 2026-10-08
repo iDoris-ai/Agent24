@@ -241,8 +241,9 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
 /// via [`Refused`], exactly like a malformed manifest: the registry already
 /// built from earlier packages is left untouched, never partially updated.
 ///
-/// This registry is **not communicated to the agent and offers no invocation
-/// path** — see `agent24_domain::tool::ModuleToolRegistry`'s own docs.
+/// This function only builds the registry; it offers no invocation path.
+/// What the agent may see is decided by `ModuleToolRegistry::adverts`
+/// through the host's `ModuleToolAdvertView` gates (K1-5.2).
 pub fn build_tool_registry(found: &[Discovered]) -> (ModuleToolRegistry, Vec<Refused>) {
     let mut registry = ModuleToolRegistry::new();
     let mut refused = Vec::new();
