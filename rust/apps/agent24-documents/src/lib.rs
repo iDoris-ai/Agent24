@@ -10,6 +10,7 @@
 //! unavailable with a typed reason (ADR-DOC-02 §8).
 
 pub mod blob;
+pub mod db;
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
