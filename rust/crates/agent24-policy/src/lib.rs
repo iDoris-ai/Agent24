@@ -10,6 +10,7 @@
 //! Audit is double-written: full detail into the hash-chained audit table,
 //! ids-only into logs (payloads never hit stderr).
 
+pub mod consent_gate;
 pub mod guardian;
 pub mod overrides;
 
