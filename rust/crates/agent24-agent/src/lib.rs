@@ -486,6 +486,16 @@ enum ParkedCallStop {
 }
 
 impl RunManager {
+    // Keep the invalid version case explicit: mapping it to zero makes the
+    // source fail `EgressRequest::authorize` instead of widening access.
+    #[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
+    fn egress_policy_version(policy_version: i64) -> u64 {
+        match u64::try_from(policy_version) {
+            Ok(version) => version,
+            Err(_) => 0,
+        }
+    }
+
     pub async fn task_profile_for_run(&self, run_id: &str, base: TaskProfile) -> TaskProfile {
         let mode = match self.store.run_policy_snapshot(run_id).await {
             Ok(snapshot) => snapshot.effective_mode,
@@ -624,7 +634,7 @@ impl RunManager {
                         revision: source.revision_digest,
                         local_only: source.mode == agent24_store::SourceMode::LocalOnly,
                         authorization_ref: source.authorization_ref,
-                        policy_version: u64::try_from(source.policy_version).unwrap_or(0),
+                        policy_version: Self::egress_policy_version(source.policy_version),
                     })
                     .collect();
                 context.with_egress_resources(resources)
