@@ -38,6 +38,12 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// The OS's data directory; the blob store and `documents.db` live in it.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     /// A database error during a request. Storage that stops working after
     /// it opened (busy, full, read-only, corrupt) is 503 with the cause; any
     /// other failure is unexpected, 500.
@@ -208,7 +214,7 @@ async fn open_storage(data_dir: &Path) -> Opened {
 }
 
 /// Runs filesystem work (directory fsyncs, the probe) off the async workers.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(f).await {
         Ok(v) => v,
         // A blocking task is only cancelled when the runtime shuts down.
@@ -235,7 +241,7 @@ where
     }
 }
 
-fn io_cause(e: &io::Error) -> StorageCause {
+pub(crate) fn io_cause(e: &io::Error) -> StorageCause {
     match e.kind() {
         io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => StorageCause::DiskFull,
         // Permission, read-only volume, a file where a directory should be…:

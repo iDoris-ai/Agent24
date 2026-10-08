@@ -6,6 +6,29 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 
+/// The closed §6 code set (`DocumentsErrorCode`).
+pub const CODES: &[&str] = &[
+    "invalid_request",
+    "not_found",
+    "payload_too_large",
+    "unsupported_format",
+    "parse_failed",
+    "partial_parse",
+    "idempotency_key_reused",
+    "change_set_incomplete",
+    "upload_checksum_mismatch",
+    "knowledge_disabled",
+    "revision_conflict",
+    "change_set_stale",
+    "change_set_committed",
+    "upload_offset_mismatch",
+    "stale_index",
+    "permission_denied",
+    "knowledge_unavailable",
+    "engine_unavailable",
+    "storage_unavailable",
+];
+
 /// Why storage cannot serve requests (§6 `storage_unavailable.details.cause`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageCause {
@@ -85,6 +108,31 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", message.into(), false)
     }
 
+    /// 413: a body over the route's limit.
+    #[must_use]
+    pub fn payload_too_large(limit: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            format!("the body is over {limit} bytes"),
+            false,
+        )
+    }
+
+    /// 409: a chunk that neither appends nor replays (§5.6).
+    #[must_use]
+    pub fn upload_offset_mismatch(received_offset: i64) -> Self {
+        let mut e = Self::new(
+            StatusCode::CONFLICT,
+            "upload_offset_mismatch",
+            format!("the upload has {received_offset} bytes; send the chunk at that offset"),
+            false,
+        );
+        e.details
+            .insert("received_offset".into(), received_offset.into());
+        e
+    }
+
     /// 422: the same key was sent before with a different request (§5.4).
     #[must_use]
     pub fn idempotency_key_reused() -> Self {
@@ -108,6 +156,13 @@ impl ApiError {
             message.into(),
             false,
         )
+    }
+
+    /// Adds a code-specific detail, e.g. `invalid_request` with `status`.
+    #[must_use]
+    pub fn with_detail(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.details.insert(key.into(), value.into());
+        self
     }
 
     #[must_use]
@@ -177,6 +232,49 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(v["error"]["code"], "not_found");
         assert_eq!(v["error"]["details"], json!({ "retryable": false }));
+    }
+
+    /// `CODES` is the OpenAPI `DocumentsErrorCode` enum, read from the spec.
+    #[test]
+    fn the_closed_code_set_matches_the_contract() {
+        let spec = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../protocol/openapi.yaml"
+        ))
+        .unwrap();
+        let start = spec.find("    DocumentsErrorCode:").unwrap();
+        let block = &spec[start..];
+        let listed: Vec<&str> = block
+            .lines()
+            .skip_while(|l| l.trim() != "enum:")
+            .skip(1)
+            .map_while(|l| l.trim().strip_prefix("- "))
+            .collect();
+        assert_eq!(listed, CODES);
+    }
+
+    #[tokio::test]
+    async fn a_detail_is_added_beside_retryable() {
+        let e = ApiError::invalid_request("x").with_detail("status", "queued");
+        let (_, v) = body(e).await;
+        assert_eq!(
+            v["error"]["details"],
+            json!({ "retryable": false, "status": "queued" })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offset_mismatch_is_409_with_the_received_offset_and_a_big_body_413() {
+        let (status, v) = body(ApiError::upload_offset_mismatch(7)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(v["error"]["code"], "upload_offset_mismatch");
+        assert_eq!(
+            v["error"]["details"],
+            json!({ "retryable": false, "received_offset": 7 })
+        );
+        let (status, v) = body(ApiError::payload_too_large(786_432)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(v["error"]["code"], "payload_too_large");
     }
 
     #[tokio::test]
