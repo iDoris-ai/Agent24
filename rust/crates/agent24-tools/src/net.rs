@@ -120,7 +120,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
 {
-    ctx.authorize_egress(EgressPurpose::HttpFetch, destination)
+    ctx.authorize_egress_if_restricted(EgressPurpose::HttpFetch, destination)
         .await?;
     // Kept in the same helper as the resolver so tests can verify that a
     // denied request never invokes DNS at all.
@@ -136,7 +136,8 @@ where
 #[async_trait]
 impl Tool for HttpFetchTool {
     fn requires_outbound_policy(&self) -> bool {
-        true
+        // Egress authorization is conditional on this run's source resources.
+        false
     }
 
     fn info(&self) -> ToolInfo {
@@ -261,7 +262,7 @@ impl Tool for HttpFetchTool {
             .build()
             .map_err(|e| ToolError::Failed(format!("http client init: {e}")))?;
         if !matches!(host, Host::Domain(_)) {
-            ctx.authorize_egress(
+            ctx.authorize_egress_if_restricted(
                 EgressPurpose::HttpFetch,
                 EgressDestination::exact(format!("{}://{}:{}", url.scheme(), host, port)),
             )
@@ -387,6 +388,24 @@ mod tests {
 
         assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
         assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_fetch_does_not_require_egress_policy_before_dns() {
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&lookups);
+        let result = resolve_domain_with_egress(
+            &ToolContext::legacy("run_test", None, None, "tc_test"),
+            EgressDestination::exact("https://example.invalid:443"),
+            || async move {
+                resolver_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![SocketAddr::from(([93, 184, 216, 34], 443))])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

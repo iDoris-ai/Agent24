@@ -314,6 +314,13 @@ impl ShellExecTool {
 
 #[async_trait]
 impl Tool for ShellExecTool {
+    fn requires_outbound_policy(&self) -> bool {
+        // The check is per-run: ordinary runs retain the approval flow, while
+        // restricted runs are rejected at call time because the destination
+        // of an arbitrary child process cannot be bounded.
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "shell_exec",
@@ -350,11 +357,11 @@ impl Tool for ShellExecTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
-        // Child processes are not network-isolated by the host. Their argv,
-        // stdin, shared files and later socket traffic cannot be bounded to a
-        // provable destination, so a run policy cannot authorize this path.
-        // Keep this before spawn (including the already-approved resume path).
-        ctx.authorize_egress(
+        // Child processes are not network-isolated by the host. Restricted
+        // source policies therefore fail closed before spawn (including the
+        // already-approved resume path). Ordinary runs have no source egress
+        // resources and retain the pre-gate approval behavior.
+        ctx.authorize_egress_if_restricted(
             EgressPurpose::ProcessExecution,
             EgressDestination::unknown(),
         )
@@ -624,15 +631,23 @@ mod tests {
         let tool = ShellExecTool::new(dir.path().to_path_buf());
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["/bin/echo", "safe"]));
+        let restricted = ctx().with_egress_policy(
+            <dyn agent24_domain::EgressGate>::deny_all(),
+            vec![agent24_domain::EgressResource::local_only(
+                "selected_material:private",
+                "rev-1",
+            )],
+            0,
+        );
         let err = tool
-            .call(&ctx(), &input, &CancellationToken::new())
+            .call(&restricted, &input, &CancellationToken::new())
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
     }
 
     #[tokio::test]
-    async fn shell_exec_does_not_spawn_when_egress_policy_is_unavailable() {
+    async fn shell_exec_runs_for_ordinary_run_without_egress_policy() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("child-ran");
         let tool = ShellExecTool::new(dir.path().to_path_buf());
@@ -641,12 +656,12 @@ mod tests {
             "argv".to_owned(),
             serde_json::json!(["/usr/bin/touch", marker]),
         );
-        let err = tool
+        let out = tool
             .call(&ctx(), &input, &CancellationToken::new())
             .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)), "{err}");
-        assert!(!marker.exists(), "a denied shell command must not spawn");
+            .unwrap();
+        assert!(out.contains("\"exit_code\":0"), "{out}");
+        assert!(marker.exists(), "ordinary shell command should spawn");
     }
 
     /// FU-103/J-6, end-to-end through `ShellExecTool::call` (not just the
@@ -690,24 +705,24 @@ mod tests {
         let tool = ShellExecTool::new(dir.path().to_path_buf());
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["printenv"]));
-        let err = tool
+        let output = tool
             .call(&ctx(), &input, &CancellationToken::new())
             .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+            .unwrap();
+        assert!(!output.contains("leaked-if-this-appears-in-child-stdout"));
     }
 
     #[tokio::test]
-    async fn shell_exec_does_not_run_nonzero_command_without_network_sandbox() {
+    async fn shell_exec_reports_nonzero_exit_for_ordinary_run() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["/usr/bin/false"]));
-        let err = tool
+        let output = tool
             .call(&ctx(), &input, &CancellationToken::new())
             .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+            .unwrap();
+        assert!(output.contains("\"exit_code\":1"), "{output}");
     }
 
     #[tokio::test]
@@ -755,7 +770,91 @@ mod tests {
             .dispatch("shell_exec", &ctx(), &input, &CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(matches!(err, ToolError::Timeout(_)), "{err}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn ordinary_shell_exec_runs_after_approval_without_egress_gate() {
+        struct AllowApproval;
+        #[async_trait]
+        impl crate::ApprovalGate for AllowApproval {
+            async fn check(
+                &self,
+                _info: &ToolInfo,
+                _ctx: &ToolContext,
+                _input: &Map<String, Value>,
+                _standing_target: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> crate::GateDecision {
+                crate::GateDecision::Allow
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::new()
+            .with_gate(Arc::new(AllowApproval))
+            .with(Arc::new(ShellExecTool::new(dir.path().to_path_buf())));
+        let input = serde_json::json!({"argv":["/bin/echo", "ordinary"]})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let output = registry
+            .dispatch("shell_exec", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(output.contains("ordinary"));
+    }
+
+    #[tokio::test]
+    async fn local_only_shell_exec_is_denied_even_by_permissive_egress_gate() {
+        struct AllowEgress;
+        #[async_trait]
+        impl agent24_domain::EgressGate for AllowEgress {
+            async fn check(
+                &self,
+                _request: &agent24_domain::EgressRequest,
+            ) -> Result<(), agent24_domain::EgressDecision> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let mut input = Map::new();
+        input.insert(
+            "argv".to_owned(),
+            serde_json::json!(["/bin/echo", "sensitive"]),
+        );
+        let restricted = ctx().with_egress_policy(
+            Arc::new(AllowEgress),
+            vec![agent24_domain::EgressResource::local_only(
+                "selected_material:secret",
+                "rev-1",
+            )],
+            0,
+        );
+        let err = tool
+            .call(&restricted, &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn shell_exec_is_denied_when_source_policy_lookup_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let mut input = Map::new();
+        input.insert(
+            "argv".to_owned(),
+            serde_json::json!(["/bin/echo", "unknown"]),
+        );
+        let unavailable = ctx().with_egress_policy_unavailable();
+        let err = tool
+            .call(&unavailable, &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
     }
 }

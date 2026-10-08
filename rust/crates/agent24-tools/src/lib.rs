@@ -44,6 +44,7 @@ pub struct ToolContext {
     workspace: WorkspaceAuthority,
     egress: Option<Arc<dyn EgressGate>>,
     egress_resources: Vec<EgressResource>,
+    egress_policy_unavailable: bool,
     authorization_generation: u64,
 }
 
@@ -69,6 +70,7 @@ impl ToolContext {
             workspace: WorkspaceAuthority::Legacy,
             egress: None,
             egress_resources: Vec::new(),
+            egress_policy_unavailable: false,
             authorization_generation: 0,
         }
     }
@@ -85,6 +87,40 @@ impl ToolContext {
         self.egress_resources = resources;
         self.authorization_generation = generation;
         self
+    }
+
+    /// Bind the run's source resources when no live host gate is available.
+    /// Restricted resources are then denied at the tool's egress boundary.
+    #[must_use]
+    pub fn with_egress_resources(mut self, resources: Vec<EgressResource>) -> Self {
+        self.egress_resources = resources;
+        self
+    }
+
+    /// Mark the source-policy lookup as unavailable. Per-run egress consumers
+    /// fail closed when this marker is present, while ordinary runs with no
+    /// restricted resources retain their pre-egress behavior.
+    #[must_use]
+    pub fn with_egress_policy_unavailable(mut self) -> Self {
+        self.egress_policy_unavailable = true;
+        self
+    }
+
+    /// Apply the live egress gate only when this run has restricted or
+    /// explicitly authorized source resources. An empty resource set means
+    /// this run carries no source material governed by ADR-K1-02 §2.4.
+    pub async fn authorize_egress_if_restricted(
+        &self,
+        purpose: EgressPurpose,
+        destination: EgressDestination,
+    ) -> Result<(), ToolError> {
+        if self.egress_policy_unavailable {
+            return Err(ToolError::Denied("outbound policy unavailable".into()));
+        }
+        if self.egress_resources.is_empty() {
+            return Ok(());
+        }
+        self.authorize_egress(purpose, destination).await
     }
 
     fn with_egress_gate(mut self, gate: Arc<dyn EgressGate>) -> Self {
@@ -131,6 +167,7 @@ impl ToolContext {
             workspace: WorkspaceAuthority::Bound(authority),
             egress: None,
             egress_resources: Vec::new(),
+            egress_policy_unavailable: false,
             authorization_generation: 0,
         }
     }
@@ -180,6 +217,7 @@ impl ToolContext {
             workspace: self.workspace.clone(),
             egress: self.egress.clone(),
             egress_resources: self.egress_resources.clone(),
+            egress_policy_unavailable: self.egress_policy_unavailable,
             authorization_generation: self.authorization_generation,
         }
     }
@@ -321,7 +359,9 @@ impl ApprovalGate for DenyAllGate {
 pub trait Tool: Send + Sync {
     fn info(&self) -> ToolInfo;
 
-    /// Any tool sending run data outside the host must require the live egress gate.
+    /// Whether this tool always needs a registry-bound egress gate, regardless
+    /// of per-run source provenance. Source-aware tools enforce the gate at
+    /// their actual boundary using `ToolContext::authorize_egress_if_restricted`.
     fn requires_outbound_policy(&self) -> bool {
         true
     }
@@ -856,20 +896,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_http_fetch_stays_unavailable_without_egress_policy() {
+    async fn ordinary_http_fetch_is_advertised_without_egress_policy() {
         let registry = ToolRegistry::new().with(Arc::new(HttpFetchTool::new(false)));
-        assert!(registry.adverts().is_empty());
-        let input = serde_json::json!({"url":"https://example.com"})
-            .as_object()
-            .cloned()
-            .unwrap();
-        let err = registry
-            .dispatch("http_fetch", &ctx(), &input, &CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ToolError::Denied(reason) if reason == "outbound policy unavailable")
-        );
+        assert_eq!(registry.adverts().len(), 1);
+        assert!(registry.list().iter().any(|tool| tool.name == "http_fetch"));
     }
 
     #[tokio::test]
@@ -885,15 +915,12 @@ mod tests {
         }
         // and they are not advertised to the model
         let advertised: Vec<String> = reg.adverts().into_iter().map(|a| a.name).collect();
-        assert_eq!(advertised, vec!["fs_read"]);
-        // Egress consumers remain absent from discovery until the live gate is installed.
+        assert_eq!(advertised, vec!["fs_read", "http_fetch"]);
+        // Run-scoped egress checks live at actual network/process boundaries;
+        // listing does not blanket-disable ordinary runs with no source resources.
         let listed = reg.list();
-        assert_eq!(listed.len(), 2);
-        assert!(
-            listed
-                .iter()
-                .all(|tool| tool.name != "shell_exec" && tool.name != "http_fetch")
-        );
+        assert!(listed.iter().any(|tool| tool.name == "shell_exec"));
+        assert!(listed.iter().any(|tool| tool.name == "http_fetch"));
     }
 
     /// H1's whole point: `requires_approval` is DERIVED, so it cannot drift
@@ -1143,9 +1170,9 @@ mod tests {
             .with_risk_overrides(Arc::new(FixedOverride("fs_read", RiskClass::Exec)));
         assert_eq!(reg.tool_risk_class("fs_read"), Some(RiskClass::Exec));
         assert!(reg.tool_requires_approval("fs_read"));
-        // and a tightened tool stops being advertised without an interactive gate
+        // The tightened read tool disappears; ordinary HTTP stays available.
         let advertised: Vec<String> = reg.adverts().into_iter().map(|a| a.name).collect();
-        assert!(advertised.is_empty());
+        assert_eq!(advertised, vec!["http_fetch"]);
     }
 
     /// `GET /api/v1/tools` must describe what will actually happen on the next

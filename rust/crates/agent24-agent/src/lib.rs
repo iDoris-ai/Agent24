@@ -608,6 +608,32 @@ impl RunManager {
                 authority,
             )
         };
+        let context = match self.store.run_policy_snapshot(&run.id).await {
+            Ok(snapshot) if snapshot.sources.is_empty() => context.with_egress_policy_unavailable(),
+            Ok(snapshot) => {
+                let resources = snapshot
+                    .sources
+                    .into_iter()
+                    // User-authored prompt text is present in every run and
+                    // does not by itself represent selected sensitive source
+                    // material for tool egress. Selected/unknown sources keep
+                    // the strict source policy from 6b.2.
+                    .filter(|source| source.kind != agent24_store::SourceKind::UserInput)
+                    .map(|source| agent24_domain::EgressResource {
+                        resource_id: source.source_id,
+                        revision: source.revision_digest,
+                        local_only: source.mode == agent24_store::SourceMode::LocalOnly,
+                        authorization_ref: source.authorization_ref,
+                        policy_version: u64::try_from(source.policy_version).unwrap_or(0),
+                    })
+                    .collect();
+                context.with_egress_resources(resources)
+            }
+            Err(err) => {
+                tracing::warn!(run_id = %run.id, error = %err, "run source policy lookup failed; restricting tool egress");
+                context.with_egress_policy_unavailable()
+            }
+        };
         #[cfg(test)]
         let context = if let Some((gate, resources, generation)) = &self.test_egress_policy {
             context.with_egress_policy(Arc::clone(gate), resources.clone(), *generation)
@@ -4430,7 +4456,7 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
-        let (egress_gate, resources, generation) = fixture_egress_policy();
+        let (egress_gate, _resources, generation) = fixture_egress_policy();
         let tools = ToolRegistry::builtin(workdir)
             .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
             .with_egress_gate(Arc::clone(&egress_gate));
@@ -4459,7 +4485,7 @@ mod approval_tests {
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
         )
-        .with_test_egress_policy(egress_gate, resources, generation);
+        .with_test_egress_policy(egress_gate, Vec::new(), generation);
         Harness {
             manager,
             broker,
@@ -4745,7 +4771,7 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
-        let (egress_gate, resources, generation) = fixture_egress_policy();
+        let (egress_gate, _resources, generation) = fixture_egress_policy();
         let tools = ToolRegistry::builtin(workdir)
             .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
             .with_egress_gate(Arc::clone(&egress_gate));
@@ -4765,7 +4791,7 @@ mod approval_tests {
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
         )
-        .with_test_egress_policy(egress_gate, resources, generation);
+        .with_test_egress_policy(egress_gate, Vec::new(), generation);
         Harness {
             manager,
             broker,
@@ -4820,6 +4846,11 @@ mod approval_tests {
                 None,
                 &now_iso8601(),
             )
+            .await
+            .unwrap();
+        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+        h.store
+            .tag_run_source("run_1", 0, &source, &now_iso8601())
             .await
             .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);

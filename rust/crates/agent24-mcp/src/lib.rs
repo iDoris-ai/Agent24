@@ -260,7 +260,8 @@ impl McpTool {
 #[async_trait]
 impl Tool for McpTool {
     fn requires_outbound_policy(&self) -> bool {
-        true
+        // Source egress is enforced per run at the actual MCP call boundary.
+        false
     }
 
     fn info(&self) -> ToolInfo {
@@ -297,7 +298,7 @@ impl Tool for McpTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
-        ctx.authorize_egress(
+        ctx.authorize_egress_if_restricted(
             EgressPurpose::McpTool,
             EgressDestination::exact(format!("mcp:{}:{}", self.server.name(), self.remote_name)),
         )
