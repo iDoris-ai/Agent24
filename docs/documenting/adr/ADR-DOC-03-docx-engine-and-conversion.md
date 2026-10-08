@@ -5,7 +5,8 @@
 > **日期**：2026-10-08 · **起草**：Claude Code（应 jason 要求）· **负责人**：David Xu · **Issue**：#696
 > **依赖**：
 > - [ADR-DOC-01](ADR-DOC-01-placement-and-integration.md)：D2 进程外、D6 引擎按需下载、D8 隐私、D10 macOS 优先；
-> - [ADR-DOC-02](ADR-DOC-02-operation-contract.md)：唯一提交点、change set、typed errors、`/capabilities`。
+> - [ADR-DOC-02](ADR-DOC-02-operation-contract.md)：唯一提交点、change set、typed errors、`/capabilities`；
+> - 第 1 片的读取引擎决定（#802，David 2026-10-08）：PDFKit + Vision，以随 OS package 分发的 Swift 辅助进程运行，是 D6 的例外。本 ADR 的引擎不适用这个例外，仍然按需下载。
 >
 > **依据**：
 > - [README](../README.md) §2.1、§17 #2 / #3 / #6 / #11；
@@ -63,7 +64,7 @@ SuperDoc 是 AGPL-3.0（另有商业授权）。为了让 AGPL 义务只落在�
 - **组件**：LibreOffice 26.x，pin + sha256，按需下载，运行在独立进程。许可证为 MPL-2.0。
 - **只承担三类工作**：
   1. DOCX 导出 PDF；
-  2. ADR-DOC-02 `render` 操作需要的页面预览图；
+  2. DOCX 的页面预览：LibreOffice 只负责把 DOCX 转成 PDF，**页面渲染复用第 1 片的 PDFKit 路径**（#802）。全系统只保留一条渲染路径；
   3. 导入时把 DOC / ODT / RTF 转成 DOCX。转出的文件**标为转换副本**，不当作原件的无损修改。
 - **禁止 LibreOffice 写回权威 DOCX，也不允许它重新保存权威 DOCX。**
   - 原因：PoC 显示它会把整份文档重新写出（§5）。
@@ -128,7 +129,10 @@ SuperDoc 是 AGPL-3.0（另有商业授权）。为了让 AGPL 义务只落在�
   - DOCX：默认 `review-preserving`。
   - 清洁交付版：必须由用户显式选择。导出前列出全部修订、批注和隐藏内容，由用户确认后才导出（README §11）。
   - PDF：由 D3 的 worker 从选定的 revision 生成。
-- **`/capabilities`**：`engines` 中登记两项，`superdoc-sdk`（kind `edit`、`export`）和 `libreoffice`（kind `render`、`export`、`convert`），各自注明版本。未下载时，对应操作返回 `engine_unavailable`。
+- **`/capabilities`**：`engines` 中登记两项，各自注明版本。未下载时，对应操作返回 `engine_unavailable`。
+  - `superdoc-sdk`：kind `edit`、`export`；
+  - `libreoffice`：kind `export`、`convert`。
+  - **协议变更**：第 1 片的 OpenAPI（#803）把 `engines[].kind` 定为封闭枚举 `parse | ocr | render | export`。第 2 片的 OpenAPI 要在枚举里**新增 `edit` 和 `convert`**。这属于 wire 格式变更，须经 PR-Daemon APPROVE，并同步更新契约测试和 `api-client`。#803 本身不用改。
 
 ## 4. 平台与体积
 
