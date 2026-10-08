@@ -15,6 +15,8 @@ agent24-os-sdk = { path = "../../crates/agent24-os-sdk" }
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -22,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # The kernel's own manifest validator, so the test proves the daemon would accept domain-os.yml.
 agent24-domain = { path = "../../crates/agent24-domain" }
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

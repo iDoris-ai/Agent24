@@ -9,6 +9,8 @@
 //! route is `GET /capabilities`, and it reports every operation as
 //! unavailable with a typed reason (ADR-DOC-02 §8).
 
+pub mod blob;
+
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 
@@ -123,7 +125,13 @@ mod tests {
         let m =
             DomainOsManifest::from_yaml(MANIFEST_YAML).expect("kernel must accept the manifest");
         assert_eq!(m.name(), "documents");
+        // The kernel registers this version; /capabilities reports Cargo's.
+        assert_eq!(m.version(), env!("CARGO_PKG_VERSION"));
         assert_eq!(m.route_namespace(), "/api/v1/documents");
+        // `from_yaml` also refuses an event_module or data_dir that differs from
+        // the name-derived value (agent24-domain/src/lib.rs, the checks on
+        // `raw.event_module != raw.name` and `raw.data_dir != expected_dir`).
+        assert_eq!(m.event_module(), "documents");
         assert_eq!(m.impl_kind(), ImplKind::OutOfProcessProvider);
         assert_eq!(m.model_access(), ModelAccess::LocalOnly);
         assert_eq!(
