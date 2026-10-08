@@ -75,6 +75,12 @@ tags:
       is never a request parameter.
   - name: sin90
     description: The Sin90 Personal-OS module (own store; degrades independently).
+  - name: documents
+    description: >-
+      The Documenting domain OS (ADR-DOC-01 / ADR-DOC-02), an out-of-process
+      module served under `/api/v1/documents`. Every error carries
+      `details.retryable`; clients branch on `error.code`, never on the HTTP
+      status. Single local user (ADR-DOC-01 §3).
 
 paths:
   /health:
@@ -1672,6 +1678,62 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
+  /documents/capabilities:
+    get:
+      operationId: documentsGetCapabilities
+      tags: [documents]
+      summary: What the Documenting OS can do right now (ADR-DOC-02 §8)
+      responses:
+        "200":
+          description: Storage, engine and knowledge state, and per-operation availability
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsCapabilities" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents:
+    get:
+      operationId: documentsListDocuments
+      tags: [documents]
+      summary: List documents, newest first
+      parameters:
+        - $ref: "#/components/parameters/DocumentsCursor"
+        - $ref: "#/components/parameters/DocumentsLimit"
+      responses:
+        "200":
+          description: One page of documents
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentList" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents/{document_id}:
+    get:
+      operationId: documentsGetDocument
+      tags: [documents]
+      summary: Get one document and its head revision
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: The document
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentDetail" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1690,6 +1752,22 @@ components:
       required: true
       schema:
         type: string
+    DocumentId:
+      name: document_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/DocumentIdString" }
+    DocumentsCursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque `next_cursor` from the previous page (ADR-DOC-02 §4).
+      schema: { type: string }
+    DocumentsLimit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
 
   responses:
     Internal:
@@ -1729,6 +1807,49 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
 
+    DocumentsBadRequest:
+      description: >-
+        `invalid_request` from the OS (DocumentsError) or from the kernel
+        (generic Error); the code is shared, so either envelope may arrive.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/DocumentsError"
+              - $ref: "#/components/schemas/ModuleProxyError"
+    DocumentsNotFound:
+      description: >-
+        `not_found`: the document, revision, job or upload does not exist or
+        has expired (DocumentsError), or the kernel has no such route
+        (generic Error).
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/DocumentsError"
+              - $ref: "#/components/schemas/ModuleProxyError"
+    DocumentsUnavailable:
+      description: >-
+        Exactly one of: the OS reports `storage_unavailable`,
+        `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or
+        the kernel proxy reports the module unreachable (`module_not_ready`,
+        `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists
+        which proxy codes are safe to retry.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/DocumentsUnavailableError"
+              - $ref: "#/components/schemas/ModuleProxyError"
+    DocumentsProxyFailure:
+      description: >-
+        The kernel proxy could not complete the call: 500 (module failure),
+        502 (`upstream_unavailable`, `upstream_connection_closed`,
+        `request_abandoned`, …) or 504 (`upstream_timeout`). The module may
+        have executed; resend with the same idempotency key (ADR-DOC-02 §6).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ModuleProxyError" }
   schemas:
     DomainOsView:
       type: object
@@ -2753,6 +2874,205 @@ components:
       properties:
         error:
           $ref: "#/components/schemas/ErrorBody"
+
+    # ---- Documenting OS (ADR-DOC-02) ----
+    DocumentIdString:
+      type: string
+      description: >-
+        `doc_` + ULID, generated by the OS (ADR-DOC-02 §3). The first ULID
+        character is 0–7: larger values overflow 128 bits.
+      pattern: "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    Sha256Address:
+      type: string
+      pattern: "^sha256:[0-9a-f]{64}$"
+    DocumentsErrorCode:
+      type: string
+      description: Closed set; adding a code requires amending ADR-DOC-02 §6.
+      enum:
+        - invalid_request
+        - not_found
+        - payload_too_large
+        - unsupported_format
+        - parse_failed
+        - partial_parse
+        - idempotency_key_reused
+        - change_set_incomplete
+        - upload_checksum_mismatch
+        - knowledge_disabled
+        - revision_conflict
+        - change_set_stale
+        - change_set_committed
+        - upload_offset_mismatch
+        - stale_index
+        - permission_denied
+        - knowledge_unavailable
+        - engine_unavailable
+        - storage_unavailable
+    DocumentsError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code: { $ref: "#/components/schemas/DocumentsErrorCode" }
+            message: { type: string }
+            hint: { type: string }
+            details:
+              type: object
+              required: [retryable]
+              properties:
+                retryable: { type: boolean }
+              additionalProperties: true
+          # Code-specific details (ADR-DOC-02 §6).
+          allOf:
+            - if: { properties: { code: { const: engine_unavailable } } }
+              then:
+                properties:
+                  details:
+                    required: [engine]
+                    properties: { retryable: { const: true }, engine: { type: string } }
+            - if: { properties: { code: { const: knowledge_unavailable } } }
+              then:
+                properties: { details: { properties: { retryable: { const: true } } } }
+            - if: { properties: { code: { const: revision_conflict } } }
+              then:
+                properties:
+                  details:
+                    required: [current_revision]
+                    properties: { current_revision: { type: integer, minimum: 1 } }
+            - if: { properties: { code: { const: change_set_committed } } }
+              then:
+                properties:
+                  details:
+                    required: [revision]
+                    properties: { revision: { type: integer, minimum: 1 } }
+            - if: { properties: { code: { const: upload_offset_mismatch } } }
+              then:
+                properties:
+                  details:
+                    required: [received_offset]
+                    properties: { received_offset: { type: integer, minimum: 0 } }
+    DocumentsUnavailableError:
+      description: The three availability codes a 503 from the OS itself may carry.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [storage_unavailable, engine_unavailable, knowledge_unavailable] }
+    ModuleProxyError:
+      description: >-
+        An error produced by the kernel or its proxy, not by the OS: the
+        generic envelope, with any code except the ones only the Documenting
+        OS uses. `invalid_request`, `not_found` and `payload_too_large` are
+        shared with the kernel and stay allowed.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            error:
+              properties:
+                code:
+                  not:
+                    enum:
+                      - unsupported_format
+                      - parse_failed
+                      - partial_parse
+                      - idempotency_key_reused
+                      - change_set_incomplete
+                      - upload_checksum_mismatch
+                      - knowledge_disabled
+                      - revision_conflict
+                      - change_set_stale
+                      - change_set_committed
+                      - upload_offset_mismatch
+                      - stale_index
+                      - permission_denied
+                      - knowledge_unavailable
+                      - engine_unavailable
+                      - storage_unavailable
+    DocumentsOperationStatus:
+      oneOf:
+        - type: object
+          required: [op, available]
+          properties:
+            op: { type: string }
+            available: { type: boolean, const: true }
+            reason: { type: "null" }
+        - type: object
+          required: [op, available, reason]
+          properties:
+            op: { type: string }
+            available: { type: boolean, const: false }
+            reason: { $ref: "#/components/schemas/DocumentsErrorCode" }
+    DocumentsCapabilities:
+      type: object
+      required: [os_version, storage, engines, knowledge, operations]
+      properties:
+        os_version: { type: string }
+        storage:
+          type: object
+          required: [state]
+          properties:
+            state: { type: string, enum: [ready, degraded, unavailable] }
+        engines:
+          type: array
+          items:
+            type: object
+            required: [id, kind, formats, state]
+            properties:
+              id: { type: string }
+              kind: { type: string, enum: [parse, ocr, render, export] }
+              formats: { type: array, items: { type: string } }
+              state: { type: string, enum: [absent, installing, ready, failed] }
+              version: { type: [string, "null"] }
+        knowledge:
+          type: object
+          required: [setting, state]
+          properties:
+            setting: { type: string, enum: ["on", "off"] }
+            state:
+              type: string
+              enum: [registered, loading, ready, degraded, unavailable, disabled]
+        operations:
+          type: array
+          items: { $ref: "#/components/schemas/DocumentsOperationStatus" }
+    DocumentRevisionSummary:
+      type: object
+      required: [revision, content_sha256, size, media_type]
+      properties:
+        revision: { type: integer, minimum: 1 }
+        content_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        size: { type: integer, minimum: 0 }
+        media_type: { type: string }
+    Document:
+      type: object
+      required: [document_id, title, media_type, head_revision, created_at, updated_at]
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        title: { type: string }
+        media_type: { type: string }
+        head_revision: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    DocumentDetail:
+      allOf:
+        - $ref: "#/components/schemas/Document"
+        - type: object
+          required: [head]
+          properties:
+            head: { $ref: "#/components/schemas/DocumentRevisionSummary" }
+    DocumentList:
+      type: object
+      required: [documents, next_cursor]
+      properties:
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/Document" }
+        next_cursor: { type: [string, "null"] }
 
     # ---- Sin90 module (SIN90-domain.md) ----
     Sin90DirectionStatus:
