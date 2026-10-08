@@ -77,9 +77,9 @@ pub use legacy_recovery::{
 };
 pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
 pub use module_audit_event::{
-    ActorRef, AuditRef, AuthorizationRef, DurationMs, MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId,
-    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef,
-    RunId, SessionRef, SizeBytes, ToolCallId,
+    ActorRef, AuditRef, AuditTimestamp, AuthorizationRef, DurationMs,
+    MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId, ModuleToolAuditEvent, ModuleToolAuditRelation,
+    ModuleToolResultCode, OperationId, ResourceRef, RunId, SessionRef, SizeBytes, ToolCallId,
 };
 pub use module_consents::{
     ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentRecord,
@@ -93,7 +93,7 @@ pub use run_workspace_authority::RunWorkspaceAuthoritySnapshot;
 pub use run_workspace_orphan::WorkspaceOrphanSweep;
 pub use run_workspace_terminal::RunTerminalTransition;
 pub use source_policy::{
-    PolicySnapshot, SOURCE_TAG_SCHEMA_VERSION, SourceKind, SourceMode, SourceRef,
+    PolicySnapshot, SOURCE_TAG_SCHEMA_VERSION, SourceKind, SourceMode, SourceRef, StoredSourceTag,
 };
 
 use sqlx::SqlitePool;

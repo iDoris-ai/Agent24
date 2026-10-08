@@ -8,9 +8,27 @@
 //! processing mode, policy version, optional authorization reference), and
 //! persists/reads it back associated with a run and one of its messages.
 //!
-//! **Write-only in this slice.** Nothing in Agent24 yet consumes these tags
-//! to gate a model call, a tool, or any other output — that is
-//! ADR-K1-02 §6 6b.2/6b.3. This slice changes no outbound behavior.
+//! ## Model-call coverage (K1-6b.2)
+//!
+//! The run source policy is merged at these production call sites:
+//!
+//! - `RunManager::run_loop` in `agent24-agent/src/lib.rs`: every run-loop model
+//!   call, including approval continuation and restart recovery (which reuse
+//!   the same loop), reads the persisted policy.
+//! - REST `/api/v1/chat` in `agent24d/src/routes.rs`: reads the transient/run
+//!   policy before its model call; missing policy is `LocalOnly`.
+//! - Explorer child calls in `agent24-agent/src/subagent.rs`: reads the parent
+//!   run policy; missing store or read failure is `LocalOnly`.
+//! - Session compaction in `RouterSummarizer::summarize` in
+//!   `agent24-agent/src/lib.rs`: uses `merge_source_policy` with `LocalOnly`.
+//!   `Summarizer` currently has no run/message provenance, and a session can
+//!   span runs, so compaction stays fail-closed until that provenance is
+//!   available.
+//!
+//! 6b.3 explicitly defers the HTTP/MCP/module/Exec egress gates. This list is
+//! the complete set of production model-router call sites covered by 6b.2;
+//! test-only calls and the router's own unit tests are not policy consumers.
+//! Thread text cannot widen persisted policy.
 //!
 //! **Fail-closed by construction** (ADR-K1-02 §0): `SourceMode` defaults to
 //! `LocalOnly`; a run with no tags folds to `LocalOnly`
@@ -147,13 +165,18 @@ impl SourceRef {
 
 /// A run's effective source policy, folded from every tag persisted against
 /// it (ADR-K1-02 §2.1: "会话由宿主汇总消息和被引用资料的标签，生成 run 的
-/// 有效政策"). Write-only in this slice — nothing consumes `effective_mode`
-/// to gate a call yet.
+/// 有效政策"). Model consumers use `effective_mode` to constrain routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySnapshot {
     pub schema_version: i64,
     pub effective_mode: SourceMode,
     pub sources: Vec<SourceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSourceTag {
+    pub seq: i64,
+    pub source: SourceRef,
 }
 
 impl PolicySnapshot {
@@ -197,17 +220,41 @@ impl PolicySnapshot {
 /// `tag_json` fails to parse as the current shape, or decodes to a
 /// different `source_id` than the row's own column (defense in depth
 /// against a hand-edited or corrupted row).
-fn decode_tag_row(row: &SqliteRow) -> SourceRef {
-    let source_id: String = row.get("source_id");
-    let created_at: String = row.get("created_at");
-    let schema_version: i64 = row.get("schema_version");
-    if schema_version != SOURCE_TAG_SCHEMA_VERSION {
-        return SourceRef::fail_closed_unknown(source_id, created_at);
+fn decode_tag_row(row: &SqliteRow) -> StoredSourceTag {
+    let seq = match row.try_get::<i64, _>("seq") {
+        Ok(seq) if seq >= 0 => seq,
+        _ => -1,
+    };
+    let source_id = match row.try_get::<String, _>("source_id") {
+        Ok(source_id) => source_id,
+        Err(_) => return fail_closed_tag(seq, String::new(), String::new()),
+    };
+    let created_at = match row.try_get::<String, _>("created_at") {
+        Ok(created_at) => created_at,
+        Err(_) => return fail_closed_tag(seq, source_id, String::new()),
+    };
+    let schema_version = match row.try_get::<i64, _>("schema_version") {
+        Ok(version) => version,
+        Err(_) => return fail_closed_tag(seq, source_id, created_at),
+    };
+    if seq < 0 || schema_version != SOURCE_TAG_SCHEMA_VERSION {
+        return fail_closed_tag(seq, source_id, created_at);
     }
-    let tag_json: String = row.get("tag_json");
-    match serde_json::from_str::<SourceRef>(&tag_json) {
+    let tag_json = match row.try_get::<String, _>("tag_json") {
+        Ok(tag_json) => tag_json,
+        Err(_) => return fail_closed_tag(seq, source_id, created_at),
+    };
+    let source = match serde_json::from_str::<SourceRef>(&tag_json) {
         Ok(parsed) if parsed.source_id == source_id => parsed,
         _ => SourceRef::fail_closed_unknown(source_id, created_at),
+    };
+    StoredSourceTag { seq, source }
+}
+
+fn fail_closed_tag(seq: i64, source_id: String, created_at: String) -> StoredSourceTag {
+    StoredSourceTag {
+        seq,
+        source: SourceRef::fail_closed_unknown(source_id, created_at),
     }
 }
 
@@ -246,9 +293,9 @@ impl Store {
     /// Empty for a run with none — callers needing the fail-closed default
     /// use [`Store::run_policy_snapshot`] instead of treating an empty
     /// result as "unrestricted".
-    pub async fn list_run_source_tags(&self, run_id: &str) -> Result<Vec<SourceRef>> {
+    pub async fn list_run_source_tags(&self, run_id: &str) -> Result<Vec<StoredSourceTag>> {
         let rows = sqlx::query(
-            "SELECT source_id, schema_version, tag_json, created_at \
+            "SELECT seq, source_id, schema_version, tag_json, created_at \
              FROM run_source_tags WHERE run_id = ? ORDER BY seq ASC, source_id ASC",
         )
         .bind(run_id)
@@ -261,7 +308,9 @@ impl Store {
     /// every persisted tag. `LocalOnly` when the run has none.
     pub async fn run_policy_snapshot(&self, run_id: &str) -> Result<PolicySnapshot> {
         let tags = self.list_run_source_tags(run_id).await?;
-        Ok(PolicySnapshot::from_tags(tags))
+        Ok(PolicySnapshot::from_tags(
+            tags.into_iter().map(|tag| tag.source).collect(),
+        ))
     }
 }
 
@@ -338,7 +387,8 @@ mod tests {
             .await
             .unwrap();
         let tags = store.list_run_source_tags("run_tagged").await.unwrap();
-        assert_eq!(tags, vec![tag]);
+        assert_eq!(tags[0].seq, 0);
+        assert_eq!(tags[0].source, tag);
     }
 
     #[tokio::test]
@@ -374,8 +424,8 @@ mod tests {
 
         let tags = store.list_run_source_tags("run_old_schema").await.unwrap();
         assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0].mode, SourceMode::LocalOnly);
-        assert_eq!(tags[0].source_id, "doc_legacy");
+        assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.source_id, "doc_legacy");
 
         let snap = store.run_policy_snapshot("run_old_schema").await.unwrap();
         assert_eq!(snap.effective_mode, SourceMode::LocalOnly);
@@ -396,7 +446,24 @@ mod tests {
 
         let tags = store.list_run_source_tags("run_malformed").await.unwrap();
         assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0].mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+    }
+
+    #[tokio::test]
+    async fn unreadable_columns_degrade_without_panicking_and_keep_message_seq() {
+        let store = store_with_run("run_bad_columns").await;
+        sqlx::query(
+            "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
+             VALUES (?, 7, 'doc_bad_columns', 'unknown', 'ignored', '2026-01-01T00:00:00Z')",
+        )
+        .bind("run_bad_columns")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let tags = store.list_run_source_tags("run_bad_columns").await.unwrap();
+        assert_eq!(tags[0].seq, 7);
+        assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
     }
 
     #[tokio::test]
@@ -427,7 +494,8 @@ mod tests {
 
         let reopened = Store::open(&path).await.unwrap();
         let tags = reopened.list_run_source_tags("run_restart").await.unwrap();
-        assert_eq!(tags, vec![tag]);
+        assert_eq!(tags[0].seq, 0);
+        assert_eq!(tags[0].source, tag);
         let snap = reopened.run_policy_snapshot("run_restart").await.unwrap();
         assert_eq!(snap.effective_mode, SourceMode::LocalOnly);
     }
