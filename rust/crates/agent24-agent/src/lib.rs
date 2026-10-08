@@ -160,10 +160,10 @@ fn run_prompt_origin(run: &Run) -> Origin {
 
 /// A [`Summarizer`] backed by the model router.
 ///
-/// Uses the SAME [`TaskProfile::default()`] as chat/runs deliberately: the
-/// conversation being summarized already went to whichever provider the router
-/// picked for those calls, so summarizing it there is no new exposure — whereas
-/// forcing LocalOnly would silently stop compacting on remote-only setups.
+/// Session compaction currently folds with `LocalOnly`: source tags are
+/// attached to individual runs, while a session can contain messages from
+/// multiple runs and this interface does not carry a run ID. Until that
+/// provenance can be resolved across the compacted messages, fail closed.
 pub struct RouterSummarizer {
     router: Arc<ModelRouter>,
     /// Daemon shutdown token — compaction can call a slow provider, and a stuck
@@ -234,9 +234,11 @@ impl Summarizer for RouterSummarizer {
             max_tokens: None,
             disable_thinking: false,
         };
+        let profile =
+            merge_source_policy(TaskProfile::default(), agent24_store::SourceMode::LocalOnly);
         let (_provider, res) = self
             .router
-            .complete(TaskProfile::default(), &req, &self.shutdown)
+            .complete(profile, &req, &self.shutdown)
             .await
             .map_err(|e| e.to_string())?;
         let summary = res.message.content.unwrap_or_default().trim().to_owned();

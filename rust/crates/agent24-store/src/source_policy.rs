@@ -8,7 +8,27 @@
 //! processing mode, policy version, optional authorization reference), and
 //! persists/reads it back associated with a run and one of its messages.
 //!
-//! Model consumers fold trusted tags before each call; thread text cannot widen policy.
+//! ## Model-call coverage (K1-6b.2)
+//!
+//! The run source policy is merged at these production call sites:
+//!
+//! - `RunManager::run_loop` in `agent24-agent/src/lib.rs`: every run-loop model
+//!   call, including approval continuation and restart recovery (which reuse
+//!   the same loop), reads the persisted policy.
+//! - REST `/api/v1/chat` in `agent24d/src/routes.rs`: reads the transient/run
+//!   policy before its model call; missing policy is `LocalOnly`.
+//! - Explorer child calls in `agent24-agent/src/subagent.rs`: reads the parent
+//!   run policy; missing store or read failure is `LocalOnly`.
+//! - Session compaction in `RouterSummarizer::summarize` in
+//!   `agent24-agent/src/lib.rs`: uses `merge_source_policy` with `LocalOnly`.
+//!   `Summarizer` currently has no run/message provenance, and a session can
+//!   span runs, so compaction stays fail-closed until that provenance is
+//!   available.
+//!
+//! 6b.3 explicitly defers the HTTP/MCP/module/Exec egress gates. This list is
+//! the complete set of production model-router call sites covered by 6b.2;
+//! test-only calls and the router's own unit tests are not policy consumers.
+//! Thread text cannot widen persisted policy.
 //!
 //! **Fail-closed by construction** (ADR-K1-02 §0): `SourceMode` defaults to
 //! `LocalOnly`; a run with no tags folds to `LocalOnly`
