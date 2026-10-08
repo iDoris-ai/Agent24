@@ -1041,6 +1041,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/documents/documents/{document_id}/revisions/{revision}/pages/{page}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Render one page of a revision as PNG (ADR-DOC-02 §4)
+         * @description The image is at most 1 MiB. The OS lowers `scale` until it fits and reports the scale it used in `Documents-Render-Scale`. If the requested area does not fit even at scale 0.25, the response is 413 `payload_too_large`: request smaller tiles with `region`. Renders are a cache derived from the revision and can be rebuilt (§3).
+         */
+        get: operations["documentsRenderPage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1764,6 +1784,20 @@ export interface components {
                 code?: "upload_offset_mismatch";
             };
         };
+        /** @description A 413 from the OS itself. */
+        DocumentsTooLargeError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "payload_too_large";
+            };
+        };
+        /** @description The 422s of render. */
+        DocumentsRenderUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "unsupported_format" | "parse_failed";
+            };
+        };
         /** @description The 422 of upload creation. */
         DocumentsUploadUnprocessableError: components["schemas"]["DocumentsError"] & {
             error?: {
@@ -2091,6 +2125,24 @@ export interface components {
                 "application/json": components["schemas"]["DocumentsConflictError"];
             };
         };
+        /** @description `payload_too_large`: the render does not fit in 1 MiB even at scale 0.25; request a smaller `region` */
+        DocumentsTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsTooLargeError"];
+            };
+        };
+        /** @description `unsupported_format` or `parse_failed` (§6); render has no `require_complete` */
+        DocumentsRenderUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsRenderUnprocessableError"];
+            };
+        };
         /** @description `idempotency_key_reused`: the same key with a different body (§5.4) */
         DocumentsUploadUnprocessable: {
             headers: {
@@ -2137,6 +2189,7 @@ export interface components {
         JobId: components["schemas"]["JobIdString"];
         /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). */
         DocumentsIdempotencyKey: string;
+        RevisionNumber: number;
         DocumentsLimit: number;
     };
     requestBodies: never;
@@ -4181,6 +4234,45 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsRenderPage: {
+        parameters: {
+            query?: {
+                scale?: number;
+                /** @description `x,y,width,height` in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame as anchor geometry. Width and height must be greater than 0; an empty or off-page region is 400 `invalid_request`. */
+                region?: string;
+            };
+            header?: never;
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+                revision: components["parameters"]["RevisionNumber"];
+                /** @description 1-based physical page. */
+                page: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The rendered page or region */
+            200: {
+                headers: {
+                    /** @description The scale actually used, at most the one requested. */
+                    "Documents-Render-Scale": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/png": string;
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            413: components["responses"]["DocumentsTooLarge"];
+            422: components["responses"]["DocumentsRenderUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
