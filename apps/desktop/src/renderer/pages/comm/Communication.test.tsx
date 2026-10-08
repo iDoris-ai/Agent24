@@ -4,12 +4,13 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import CommunicationPage from './Communication'
 import {
   addContact, getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
-  startCommDaemon, stopCommDaemon, unlockComm,
+  probeCommRelay, setCommRelays, startCommDaemon, stopCommDaemon, unlockComm,
   type CommDaemonStatus,
 } from './api'
 
 vi.mock('./api', () => ({
   addContact: vi.fn(),
+  probeCommRelay: vi.fn(), setCommRelays: vi.fn(),
   getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
   startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(),
 }))
@@ -32,6 +33,8 @@ function success() {
   vi.mocked(stopCommDaemon).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
   vi.mocked(unlockComm).mockResolvedValue({ unlocked: true, remembered: false })
   vi.mocked(addContact).mockResolvedValue(undefined)
+  vi.mocked(setCommRelays).mockResolvedValue(relayConfig)
+  vi.mocked(probeCommRelay).mockResolvedValue({ url: 'wss://relay.example', connected: true, error: null })
 }
 
 afterEach(() => { cleanup(); vi.clearAllMocks() })
@@ -43,7 +46,7 @@ describe('CommunicationPage', () => {
     expect(await screen.findByText('npub1alice')).toBeInTheDocument()
     expect(screen.getAllByText('默认身份')).toHaveLength(2)
     expect(screen.getByText('npub1bob')).toBeInTheDocument()
-    expect(screen.getAllByText('wss://relay.example')).toHaveLength(2)
+    expect(screen.getAllByText('wss://relay.example').length).toBeGreaterThanOrEqual(2)
     expect(screen.getByText('来源：config · 已配置')).toBeInTheDocument()
     expect(screen.getByText('运行中')).toBeInTheDocument()
     expect(screen.getByText('最近一次握手成功')).toBeInTheDocument()
@@ -183,6 +186,93 @@ describe('CommunicationPage', () => {
     expect((screen.getByLabelText('昵称') as HTMLInputElement).value).toBe('carol')
     expect(screen.getByText('npub1bob')).toBeInTheDocument()
     expect(screen.queryByText('npub1qpzry9x8gf2tvdw0s3jn54khce6mua7l')).not.toBeInTheDocument()
+  })
+
+  it('replaces the complete relay list once and refreshes it after saving', async () => {
+    success()
+    const updated = { relays: ['wss://one.example', 'ws://two.example'], source: 'config', configured: true }
+    vi.mocked(listCommRelays).mockResolvedValueOnce(relayConfig).mockResolvedValue(updated)
+    vi.mocked(setCommRelays).mockResolvedValue(updated)
+    render(<CommunicationPage />)
+    await screen.findByLabelText('Relay 地址（每行一条）')
+    const input = screen.getByLabelText('Relay 地址（每行一条）')
+    fireEvent.change(input, { target: { value: updated.relays.join('\n') } })
+    fireEvent.click(screen.getByRole('button', { name: '保存 Relay' }))
+    await waitFor(() => expect(setCommRelays).toHaveBeenCalledTimes(1))
+    expect(setCommRelays).toHaveBeenCalledWith(updated.relays)
+    expect(await screen.findByText('wss://one.example')).toBeInTheDocument()
+    expect(screen.getByText('ws://two.example')).toBeInTheDocument()
+  })
+
+  it('rejects empty, over-limit, and non-ws relay lists without sending a request', async () => {
+    success()
+    render(<CommunicationPage />)
+    await screen.findByLabelText('Relay 地址（每行一条）')
+    const input = screen.getByLabelText('Relay 地址（每行一条）')
+    const submit = screen.getByRole('button', { name: '保存 Relay' })
+    for (const value of ['', Array.from({ length: 9 }, (_, i) => `wss://r${i}.example`).join('\n'), 'https://relay.example']) {
+      fireEvent.change(input, { target: { value } })
+      expect(submit).toBeDisabled()
+      fireEvent.submit(input.closest('form')!)
+    }
+    expect(setCommRelays).not.toHaveBeenCalled()
+  })
+
+  it('allows only one pending relay save and retains the entered config when it fails', async () => {
+    success()
+    let rejectSave!: (error: Error) => void
+    vi.mocked(setCommRelays).mockReturnValueOnce(new Promise((_resolve, reject) => { rejectSave = reject }))
+    render(<CommunicationPage />)
+    await screen.findByLabelText('Relay 地址（每行一条）')
+    const input = screen.getByLabelText('Relay 地址（每行一条）')
+    fireEvent.change(input, { target: { value: 'wss://new.example' } })
+    const submit = screen.getByRole('button', { name: '保存 Relay' })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    expect(setCommRelays).toHaveBeenCalledTimes(1)
+    expect(submit).toBeDisabled()
+    rejectSave(new Error('relay write rejected'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('relay write rejected')
+    expect((input as HTMLTextAreaElement).value).toBe('wss://new.example')
+    expect(screen.getAllByText('wss://relay.example').some((element) => element.tagName === 'LI')).toBe(true)
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('ignores a relay refresh that resolves after a newer save', async () => {
+    success()
+    let resolveOld!: (value: typeof relayConfig) => void
+    const updated = { relays: ['wss://new.example'], source: 'config', configured: true }
+    vi.mocked(listCommRelays)
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve }))
+      .mockResolvedValue(updated)
+    vi.mocked(setCommRelays).mockResolvedValue(updated)
+    render(<CommunicationPage />)
+    const input = await screen.findByLabelText('Relay 地址（每行一条）')
+    fireEvent.change(input, { target: { value: updated.relays.join('\n') } })
+    fireEvent.click(screen.getByRole('button', { name: '保存 Relay' }))
+    await waitFor(() => expect(screen.getAllByText('wss://new.example').some((element) => element.tagName === 'LI')).toBe(true))
+    resolveOld(relayConfig)
+    await Promise.resolve()
+    expect(screen.getAllByText('wss://new.example').some((element) => element.tagName === 'LI')).toBe(true)
+  })
+
+  it('probes only on explicit click and keeps probe and catch-up status independent', async () => {
+    success()
+    vi.mocked(getCommStatus).mockResolvedValueOnce(status).mockResolvedValue({
+      ...status,
+      relay_probe: { url: 'wss://relay.example', connected: false, at_ms: 200, error: 'offline' },
+      catch_up: { state: 'incomplete', last_incomplete_at_ms: 150 },
+    })
+    vi.mocked(probeCommRelay).mockResolvedValue({ url: 'wss://relay.example', connected: false, error: 'offline' })
+    render(<CommunicationPage />)
+    await screen.findByLabelText('Relay 地址（每行一条）')
+    expect(probeCommRelay).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '探测 Relay' }))
+    await waitFor(() => expect(probeCommRelay).toHaveBeenCalledTimes(1))
+    expect(probeCommRelay).toHaveBeenCalledWith()
+    expect(await screen.findByText('最近一次握手失败')).toBeInTheDocument()
+    expect(screen.getByText('检测到补收不完整')).toBeInTheDocument()
+    expect(screen.queryByText(/补收完成|已送达/)).not.toBeInTheDocument()
   })
 
   it('uses only IPC proxy wrappers and never invokes fetch or storage for secrets', async () => {

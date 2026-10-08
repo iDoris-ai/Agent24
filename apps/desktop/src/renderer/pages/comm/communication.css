@@ -26,6 +26,10 @@
 .comm-contact-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
 .comm-contact-form label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; flex: 1 1 180px; }
 .comm-contact-form input[type="text"] { min-width: 160px; padding: 8px; }
+.comm-relay-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.comm-relay-form label { display: flex; flex: 1 1 320px; flex-direction: column; gap: 6px; font-size: 13px; }
+.comm-relay-form textarea { min-width: 240px; padding: 8px; font: inherit; }
+.comm-relay-form .comm-actions { margin-top: 0; }
 .comm-alert, .comm-notice { border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 .comm-alert { color: var(--danger, #d94f4f); background: rgba(217,79,79,.1); }
 .comm-notice { color: var(--success, #42b883); background: rgba(66,184,131,.1); }

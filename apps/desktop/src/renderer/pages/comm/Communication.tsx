@@ -5,6 +5,8 @@ import {
   listCommContacts,
   listCommIdentities,
   listCommRelays,
+  probeCommRelay,
+  setCommRelays,
   startCommDaemon,
   stopCommDaemon,
   unlockComm,
@@ -15,7 +17,7 @@ import {
 } from './api'
 import './communication.css'
 
-type WriteAction = 'start' | 'stop' | 'unlock' | 'addContact'
+type WriteAction = 'start' | 'stop' | 'unlock' | 'addContact' | 'saveRelays' | 'probeRelay'
 
 // Bech32 charset (BIP-173). Structural-only mirror of agent24-comm's
 // `is_valid_npub` — hrp, length, and charset, WITHOUT verifying the
@@ -32,6 +34,16 @@ function looksLikeNpub(value: string): boolean {
   if (value.slice(0, sep) !== 'npub') return false
   const data = value.slice(sep + 1)
   return data.split('').every((char) => BECH32_CHARSET.includes(char))
+}
+
+function relayValues(value: string): string[] {
+  return value.split(/\r?\n/).map((relay) => relay.trim()).filter(Boolean)
+}
+
+function hasValidRelayList(value: string): boolean {
+  const relays = relayValues(value)
+  return relays.length >= 1 && relays.length <= 8 &&
+    relays.every((relay) => relay.startsWith('ws://') || relay.startsWith('wss://'))
 }
 
 function messageOf(error: unknown, secret = ''): string {
@@ -104,6 +116,8 @@ export default function CommunicationPage() {
   const [contactNickname, setContactNickname] = useState('')
   const [contactNpub, setContactNpub] = useState('')
   const [contactRole, setContactRole] = useState('')
+  const [relayDraft, setRelayDraft] = useState('')
+  const relayDraftDirty = useRef(false)
   const sequence = useRef(0)
   const mounted = useRef(false)
 
@@ -120,7 +134,12 @@ export default function CommunicationPage() {
     else failures.push(`身份：${messageOf(results[0].reason)}`)
     if (results[1].status === 'fulfilled') setContacts(results[1].value)
     else failures.push(`联系人：${messageOf(results[1].reason)}`)
-    if (results[2].status === 'fulfilled') setRelays(results[2].value)
+    if (results[2].status === 'fulfilled') {
+      setRelays(results[2].value)
+      if (!relayDraftDirty.current) {
+        setRelayDraft(results[2].value.relays.join('\n'))
+      }
+    }
     else failures.push(`Relay：${messageOf(results[2].reason)}`)
     if (results[3].status === 'fulfilled') setDaemon(results[3].value)
     else failures.push(`进程状态：${messageOf(results[3].reason)}`)
@@ -154,13 +173,25 @@ export default function CommunicationPage() {
         if (mounted.current && token === sequence.current) {
           setNotice(result.remembered ? '已解锁，口令已记入系统钥匙串。' : '已解锁，本次会话内有效。')
         }
-      } else {
+      } else if (action === 'addContact') {
         await addContact(contactNickname, contactNpub, contactRole.trim() ? contactRole : undefined)
         if (mounted.current && token === sequence.current) {
           setNotice('已添加联系人。')
           setContactNickname('')
           setContactNpub('')
           setContactRole('')
+        }
+      } else if (action === 'saveRelays') {
+        const saved = await setCommRelays(relayValues(relayDraft))
+        if (mounted.current && token === sequence.current) {
+          setRelayDraft(saved.relays.join('\n'))
+          relayDraftDirty.current = false
+          setNotice('Relay 配置已保存。')
+        }
+      } else {
+        const probe = await probeCommRelay()
+        if (mounted.current && token === sequence.current) {
+          setNotice(`手动探测完成：${probe.connected ? '握手成功' : '握手失败'}。`)
         }
       }
     } catch (error) {
@@ -241,6 +272,22 @@ export default function CommunicationPage() {
           <p>来源：{relays.source} · {relays.configured ? '已配置' : '未配置'}</p>
           {relays.relays.length ? <ul>{relays.relays.map((relay) => <li key={relay}>{relay}</li>)}</ul> : <p className="comm-muted">尚未配置 Relay</p>}
         </>}
+        <form className="comm-relay-form" onSubmit={(event) => {
+          event.preventDefault()
+          if (!hasValidRelayList(relayDraft)) return
+          void runAction('saveRelays')
+        }}>
+          <label>Relay 地址（每行一条）<textarea rows={4} value={relayDraft} onChange={(event) => {
+            relayDraftDirty.current = true
+            setRelayDraft(event.target.value)
+          }} /></label>
+          <div className="comm-actions">
+            <button type="submit" disabled={pending !== null || !hasValidRelayList(relayDraft)}>{pending === 'saveRelays' ? '保存中…' : '保存 Relay'}</button>
+            <button type="button" onClick={() => void runAction('probeRelay')} disabled={pending !== null}>
+              {pending === 'probeRelay' ? '探测中…' : '探测 Relay'}
+            </button>
+          </div>
+        </form>
       </section>
 
       <section className="comm-card">

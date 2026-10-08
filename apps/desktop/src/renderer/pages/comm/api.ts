@@ -20,6 +20,12 @@ export interface CommRelayConfig {
   configured: boolean
 }
 
+export interface CommRelayProbe {
+  url: string | null
+  connected: boolean
+  error: string | null
+}
+
 export type CommDaemonProcessState =
   | 'stopped'
   | 'starting'
@@ -204,7 +210,7 @@ function isUnlockResult(value: unknown): value is CommUnlockResult {
 }
 
 async function request<T>(
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'PUT',
   path: string,
   validate: (value: unknown) => value is T,
   body?: unknown,
@@ -246,6 +252,19 @@ export const addContact = (nickname: string, npub: string, role?: string): Promi
 
 export const listCommRelays = (): Promise<CommRelayConfig> =>
   request('GET', '/api/v1/comm/relay', isRelayConfig)
+
+/** Replaces the relay list in one request; the backend validates 1..=8 ws(s) URLs. */
+export const setCommRelays = (relays: string[]): Promise<CommRelayConfig> =>
+  request('PUT', '/api/v1/comm/relay', isRelayConfig, { relays })
+
+function isCommRelayProbe(value: unknown): value is CommRelayProbe {
+  return isRecord(value) && nullableString(value['url']) &&
+    typeof value['connected'] === 'boolean' && nullableString(value['error'])
+}
+
+/** Runs only after an explicit user action; omitting url asks the server to use its configured default. */
+export const probeCommRelay = (): Promise<CommRelayProbe> =>
+  request('POST', '/api/v1/comm/relay/probe', isCommRelayProbe, {})
 
 export const getCommStatus = (): Promise<CommDaemonStatus> =>
   request('GET', '/api/v1/comm/daemon', isDaemonStatus)
