@@ -91,6 +91,12 @@ pub enum ConsentDenyReason {
     Stale(ModuleConsentRecord),
     Expired(ModuleConsentRecord),
     Denied(ModuleConsentRecord),
+    /// The grant was revoked (by the user, or by a module lifecycle event —
+    /// disable / uninstall / scope-changing upgrade). Kept distinct from
+    /// `Denied`: revocation is a later withdrawal of a once-given consent,
+    /// not a refusal at enable time (ADR-K1-03 §3). `None` when lifecycle
+    /// invalidation left no record to point at.
+    Revoked(Option<ModuleConsentRecord>),
     /// `org_restricted` or `source_restricted` was set on the request.
     PolicyRestricted,
 }
@@ -105,6 +111,7 @@ impl ConsentDenyReason {
             ConsentDenyReason::Stale(_) => "stale",
             ConsentDenyReason::Expired(_) => "expired",
             ConsentDenyReason::Denied(_) => "denied",
+            ConsentDenyReason::Revoked(_) => "revoked",
             ConsentDenyReason::PolicyRestricted => "policy_restricted",
         }
     }
@@ -240,6 +247,9 @@ impl ConsentGate for StoreConsentGate {
             },
             ConsentLookup::Expired(record) => ConsentGateDecision::Deny {
                 reason: ConsentDenyReason::Expired(record),
+            },
+            ConsentLookup::Revoked(record) => ConsentGateDecision::Deny {
+                reason: ConsentDenyReason::Revoked(record),
             },
             ConsentLookup::Granted(record) => {
                 // TODO: External can pre-answer approval only for a standing
@@ -540,6 +550,30 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn revoked_consent_denies_with_a_distinct_revoked_reason() {
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .revoke_module_consent(&s.module, None, "2026-10-08T00:00:05Z")
+            .await
+            .unwrap();
+        let gate = StoreConsentGate::new(store);
+        let req = request_for(&s, RiskClass::Read);
+
+        let decision = gate.authorize(&req, "2026-10-08T00:00:06Z").await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Deny {
+                reason: ConsentDenyReason::Revoked(_)
+            }
+        ));
+    }
+
     // ── ADR反例5 (fragment) — 已拒绝/撤销记录下的新调用立即拒绝 ─────────────
 
     #[tokio::test]
@@ -640,7 +674,15 @@ mod tests {
             ConsentDenyReason::Expired(dummy.clone()).reason_code(),
             "expired"
         );
-        assert_eq!(ConsentDenyReason::Denied(dummy).reason_code(), "denied");
+        assert_eq!(
+            ConsentDenyReason::Denied(dummy.clone()).reason_code(),
+            "denied"
+        );
+        assert_eq!(
+            ConsentDenyReason::Revoked(Some(dummy)).reason_code(),
+            "revoked"
+        );
+        assert_eq!(ConsentDenyReason::Revoked(None).reason_code(), "revoked");
         assert_eq!(
             ConsentDenyReason::PolicyRestricted.reason_code(),
             "policy_restricted"
