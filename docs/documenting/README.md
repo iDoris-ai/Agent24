@@ -759,6 +759,7 @@ This working baseline is derived from the current project direction and the foll
 
 - iDoris product / OfficeSuite positioning;
 - T005 Documenting report, user scenarios & atomic capabilities, David Xu handoff, Agent24 kernel integration study;
+- T005 document editing engines study (2026-10-07): bounded editing with product-grade Office interoperability, per-format support contract, candidate providers and gates G0–G9 — research input for §17 #2, #3, #6, #11;
 - T006 Document ↔ KnowledgeBase/MediaBase service boundaries and WeKnora Workspace development plan;
 - T007 Assistant and T008 Media roadmap (for boundaries);
 - Agent24 current architecture/ADR/code observations;
@@ -779,6 +780,7 @@ Pinned references:
 | Agent24 source baseline | `c18d805` (main, 2026-10-07, after `docs/ARCHITECTURE-LAYERS.md` and BASELINE.md landed); earlier `54cec44` predates the architecture overview |
 | Research baseline (T001–T008) | `jhfnetboy/researcher` `9e374e1d8cd5b3415a1c5ee81029eb5aef187fde` |
 | T006 WeKnora Workspace plan (normative for §9) | `jhfnetboy/researcher` `c7ab2129dbf1ae3af2150adfded9aa1a449889dd` — `topics/T006-knowledge-media-base/subtopics/weknora-workspace-development-plan.md` §1, §3.1, §4, §7 |
+| T005 document editing engines (research input, not normative) | `jhfnetboy/researcher` `33f30f18a4c3e5566e286579684ebdff54911cb4` — `topics/T005-documenting/subtopics/document-editing-engines.md`; written before #701 closed, so its §6.4 integration gaps are superseded by ADR-DOC-01/02 except the renderer-side editor exception to D6 and Office hand-back re-import |
 
 Where these sources contain research proposals rather than approved engineering decisions, this document keeps the corresponding item marked **proposed** or **TBD**. Historical implementation observations in research documents are not treated as current run results.
 
