@@ -7,6 +7,7 @@ describe('ModelsPage', () => {
   beforeEach(() => {
     window.agent24 = {
       backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
+      idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' }),
     } as never
   })
 
@@ -57,6 +58,7 @@ describe('ModelsPage', () => {
           default_model: 'Qwen3-8B-4bit',
         },
       }),
+      idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' }),
     } as never
 
     render(<ModelsPage />)
@@ -68,5 +70,21 @@ describe('ModelsPage', () => {
     expect(screen.getByText('已加载')).toBeInTheDocument()
     expect(screen.getByText('未加载')).toBeInTheDocument()
     expect(screen.queryByText('oMLX 未运行 — 启动后此处显示实时模型状态')).not.toBeInTheDocument()
+  })
+
+  it('renders the frozen iDoris Admin v0 status without exposing credentials', async () => {
+    window.agent24 = {
+      backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
+      idorisStatus: vi.fn().mockResolvedValue({
+        state: 'available',
+        status: {
+          status: 'ok', service: 'idoris', version: '1.2.3', contract_version: 'admin-v0', instance_id: 'instance-1',
+          components: 4, runtimes: 2, subscriptions: 0, budget_configured: true, audit_configured: true,
+          capacity: { state: 'observed', entries: [] },
+        },
+      }),
+    } as never
+    render(<ModelsPage />)
+    expect(await screen.findByTestId('idoris-status-available')).toHaveTextContent('v1.2.3 · 4 components · 2 runtimes · capacity observed')
   })
 })

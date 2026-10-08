@@ -17,9 +17,13 @@ import {
   classifyCreativeUrl,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
+import { createIdorisStatusProvider } from './idoris-admin'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
+// Start the one-shot inherited-FD read immediately. The promise is awaited
+// before any managed child is spawned, so the secret-bearing FD is closed first.
+const idorisStatusProviderPromise = createIdorisStatusProvider()
 // A3-4 review M5: the sequenced/capped event log lives here, in main, so it
 // survives the renderer's VoicePanel unmounting when the user switches
 // sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
@@ -203,7 +207,8 @@ process.on('unhandledRejection', (reason) => {
   console.error('[main] unhandledRejection', reason)
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const idorisStatus = await idorisStatusProviderPromise
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
   // CreativeServeWeb only ever reads this accessor's current status — it
@@ -257,7 +262,7 @@ app.whenReady().then(() => {
     })
   })
 
-  registerIpcHandlers()
+  registerIpcHandlers({ idorisStatus })
   mainWin = createMainWindow()
   ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
   ipcMain.handle(IpcChannels.CreativeRestart, (_event, bounds: CreativeViewBounds) => restartCreativeView(bounds))
