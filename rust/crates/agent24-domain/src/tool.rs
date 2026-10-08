@@ -156,6 +156,9 @@ pub struct RawToolDeclaration {
     output_privacy: String,
     timeout_ms: u64,
     inline_wait_ms: u64,
+    /// Untrusted semantic claim only; the host must verify storage and effects.
+    #[serde(default)]
+    reversible_draft: bool,
 }
 
 /// One module-declared tool operation, VALIDATED.
@@ -174,6 +177,7 @@ pub struct ToolDeclaration {
     output_privacy: DeclaredOutputPrivacy,
     timeout_ms: u64,
     inline_wait_ms: u64,
+    reversible_draft: bool,
 }
 
 impl ToolDeclaration {
@@ -209,6 +213,14 @@ impl ToolDeclaration {
     /// by [`validate_tools`], never by the caller.
     pub fn inline_wait_ms(&self) -> u64 {
         self.inline_wait_ms
+    }
+
+    /// Whether the manifest declares the tool as a reversible draft. This is
+    /// not authorization: the host must independently verify source, storage
+    /// path, revision/undo behavior, and absence of commit/delete/external
+    /// semantics before using it for the narrow L-APPR-5 exception.
+    pub fn reversible_draft(&self) -> bool {
+        self.reversible_draft
     }
 }
 
@@ -282,6 +294,7 @@ pub(crate) fn validate_tools(
             output_privacy,
             timeout_ms: r.timeout_ms,
             inline_wait_ms: r.inline_wait_ms,
+            reversible_draft: r.reversible_draft,
         });
     }
     Ok(out)
@@ -614,6 +627,7 @@ mod tests {
             output_privacy: output_privacy.to_owned(),
             timeout_ms: 5_000,
             inline_wait_ms: 1_000,
+            reversible_draft: false,
         }
     }
 
@@ -628,6 +642,7 @@ mod tests {
         assert_eq!(out[0].output_privacy(), DeclaredOutputPrivacy::LocalOnly);
         assert_eq!(out[0].timeout_ms(), 5_000);
         assert_eq!(out[0].inline_wait_ms(), 1_000);
+        assert!(!out[0].reversible_draft());
     }
 
     #[test]

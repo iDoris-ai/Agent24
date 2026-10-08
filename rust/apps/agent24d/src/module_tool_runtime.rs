@@ -314,6 +314,8 @@ mod tests {
             risk,
             org_restricted: false,
             source_restricted: false,
+            reversible_draft_declared: false,
+            draft_verification: None,
         };
         let gate: Arc<dyn ConsentGate> = Arc::new(StoreConsentGate::new(store));
         let authorization: Arc<dyn ModuleToolAuthorization> =

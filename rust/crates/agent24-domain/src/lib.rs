@@ -2548,6 +2548,17 @@ mod tool_manifest_tests {
         let m = manifest(ONE_TOOL).expect("one valid tool");
         assert_eq!(m.tools().len(), 1);
         assert_eq!(m.tools()[0].operation(), "list-notes");
+        assert!(!m.tools()[0].reversible_draft());
+    }
+
+    #[test]
+    fn reversible_draft_is_an_explicit_manifest_claim() {
+        let declared = ONE_TOOL.replace(
+            "output_privacy: local_only",
+            "output_privacy: local_only\n    reversible_draft: true",
+        );
+        let m = manifest(&declared).expect("recognized semantic marker");
+        assert!(m.tools()[0].reversible_draft());
     }
 
     /// One invalid tool entry fails the WHOLE manifest (ADR-K1-01 §5(2)) —

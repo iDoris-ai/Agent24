@@ -1595,6 +1595,10 @@ pub async fn serve(
             risk: agent24_protocol::RiskClass::External,
             org_restricted: false,
             source_restricted: false,
+            // The host has no verified reversible-draft semantics for this
+            // path yet, so the L-APPR-5 draft exception never applies here.
+            reversible_draft_declared: false,
+            draft_verification: None,
         };
         let authorization = StdArc::new(
             agent24_policy::consent_gate::ModuleConsentAuthorization::new(
