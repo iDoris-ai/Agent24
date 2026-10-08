@@ -1,5 +1,5 @@
 //! K1-6b.1 (ADR-K1-02 §6 slice 6b.1) — source tags & persistent run
-//! metadata, storage side. See `migrations/0015_run_source_tags.sql` for the
+//! metadata, storage side. See `migrations/0016_run_source_tags.sql` for the
 //! schema.
 //!
 //! This module defines the kernel-private `SourceRef`/`PolicySnapshot`
