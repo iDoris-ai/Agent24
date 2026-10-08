@@ -324,9 +324,10 @@ impl RegisteredTool {
 /// same way here as they are there, not just when their operation names
 /// happen to collide too.
 ///
-/// **Not communicated to the agent, and provides no invocation path.** That
-/// is K1-5.2 (discovery/announcement) and K1-5.3 (the call path); this type
-/// offers neither.
+/// `iter()` and `get()` expose registered tools without announcement gates;
+/// callers that prepare a model-facing tool list must use [`Self::adverts`].
+/// The registry itself provides no invocation path. K1-5.2 handles
+/// discovery/announcement and K1-5.3 handles calls.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleToolRegistry {
     tools: BTreeMap<String, RegisteredTool>,
@@ -491,14 +492,15 @@ impl ModuleToolAdvert {
 /// 2026-10-08 ruling point 5). [`ModuleToolRegistry::adverts`] queries this
 /// trait fresh on every call, for every registered tool — nothing cached.
 ///
-/// **Every method defaults to the most conservative answer**, so a zero-
-/// override impl — `impl ModuleToolAdvertView for Noop {}` — advertises
-/// nothing. None of the four gates has a real backing system wired into
-/// this crate yet: gates 1+2/3 need live lifecycle/`/capabilities` state a
-/// future host (e.g. `agent24d`) must supply; gate 4 needs K1-6a.1's
+/// Gates 1-4 default to `false` (fail-closed). Gate 5 has no default
+/// implementation: every host must explicitly answer whether the remote-tier
+/// guard blocks each `(module, operation)`. This makes an incomplete host
+/// implementation fail at compile time instead of silently allowing a
+/// document tool through. None of the gates has a real backing system wired
+/// into this crate yet: gates 1+2/3 need live lifecycle/`/capabilities` state
+/// a future host (e.g. `agent24d`) must supply; gate 4 needs K1-6a.1's
 /// authorization store (#769, not merged); gate 5 needs K1-6a AND K1-6b,
-/// neither accepted yet. Gate 5 only ever NARROWS what gates 1-4 allowed,
-/// never the reverse, so defaulting it open widens nothing.
+/// neither accepted yet. Gate 5 only narrows what gates 1-4 allow.
 pub trait ModuleToolAdvertView {
     /// Gates 1+2 (ADR-K1-01 §2.2): `module` is registered, enabled, running
     /// and ready — NOT disabled, circuit-broken (breaker tripped), backing
@@ -527,17 +529,14 @@ pub trait ModuleToolAdvertView {
     }
 
     /// Gate 5 — jason's 2026-10-08 ruling point 5 (ADR-K1-01 §2.1, §4.4):
-    /// while `true` for `(module, operation)`, that tool is withheld even
-    /// if gates 1-4 all passed, until K1-6a AND K1-6b are BOTH accepted.
-    /// This crate has no "document" domain of its own (§0 forbids adding
-    /// one); a host wiring a real check owns both "is this a Documenting
-    /// operation" and "does a remote model tier exist" and combines them
-    /// itself. Default `false`: this slice has no Documenting tools and no
-    /// remote-tier source, so the hook is a no-op — harmless, since the
-    /// three gates above already default to blocking everything.
-    fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
-        false
-    }
+    /// `true` for `(module, operation)` withholds that tool even if gates
+    /// 1-4 pass, until K1-6a AND K1-6b are BOTH accepted. This crate has no
+    /// "document" domain of its own (§0 forbids adding one); a host wiring a
+    /// real check owns both "is this a Documenting operation" and "does a
+    /// remote model tier exist" and combines them itself. There is
+    /// intentionally no default: the host must explicitly implement this
+    /// check, and return `true` whenever the ruling requires withholding.
+    fn blocked_by_remote_tier_guard(&self, module: &str, operation: &str) -> bool;
 }
 
 #[cfg(test)]
@@ -828,10 +827,13 @@ mod tests {
         }
     }
 
-    /// The trait's own defaults, with nothing overridden — the "default
-    /// trait" the task asks for a dedicated test on.
+    /// Uses gates 1-4's fail-closed defaults and explicitly blocks at gate 5.
     struct NoopView;
-    impl ModuleToolAdvertView for NoopView {}
+    impl ModuleToolAdvertView for NoopView {
+        fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
+            true
+        }
+    }
 
     fn registry_with_one_tool() -> ModuleToolRegistry {
         let mut reg = ModuleToolRegistry::new();
@@ -956,6 +958,29 @@ mod tests {
     }
 
     #[test]
+    fn a_view_with_remote_tier_guard_enabled_withholds_an_otherwise_ready_tool() {
+        let reg = registry_with_one_tool();
+
+        struct GuardedView;
+        impl ModuleToolAdvertView for GuardedView {
+            fn module_ready(&self, _module: &str) -> bool {
+                true
+            }
+            fn operation_available(&self, _module: &str, _operation: &str) -> bool {
+                true
+            }
+            fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
+                true
+            }
+            fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
+                true
+            }
+        }
+
+        assert!(reg.adverts(&GuardedView).is_empty());
+    }
+
+    #[test]
     fn only_the_tool_whose_module_passes_every_gate_is_advertised() {
         let mut reg = ModuleToolRegistry::new();
         reg.register_module("ready-module", &[declared("list-notes")])
@@ -973,6 +998,9 @@ mod tests {
             }
             fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
                 true
+            }
+            fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
+                false
             }
         }
 
