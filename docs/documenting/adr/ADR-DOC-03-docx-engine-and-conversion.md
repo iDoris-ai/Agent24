@@ -33,6 +33,11 @@
 - **调用方**：只有 `documents` OS。agent 和页面都调 Documenting 的操作（ADR-DOC-02），由 OS 再调 SDK。
   - agent 和页面不直接接触 SDK。
   - 不暴露 SuperDoc 自带的 MCP、CLI 或 agent 工具。
+- **调用协议**：OS（Rust）直接启动原生 host：`superdoc host --stdio`，用 JSON-RPC 2.0 通信。
+  - 用到的方法：`host.capabilities`、`document.open`、`document.invoke`（`operationId` + `input` + `options`）、`document.save`、`document.close`、`host.shutdown`。
+  - **不需要 Node 运行时。** 2026-10-08 用最小环境（只有 `PATH=/usr/bin:/bin`，不装 Node）实测，跑通了打开 → 定位书签 → 修订模式替换 → 保存 → 关闭。
+  - 下载组件因此只是 host 二进制及其资源目录。
+  - `document.save` 的返回里带有 `report`，用于填写导出报告。
 - **用途**：读结构、定位目标、修改与插入、修订（tracked）、批注、导出 DOCX。
   - 定位目标的手段：书签、内容控件、表格单元格、列表项、文本匹配。
   - 本 ADR 用到的操作见 §3。
