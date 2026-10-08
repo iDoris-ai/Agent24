@@ -515,15 +515,32 @@ mod tests {
         };
         assert!(exec(&db, &upl("complete", 4)).await.is_err());
         assert!(exec(&db, &upl("imported", 9)).await.is_err());
-        exec(&db, &upl("receiving", 4)).await.unwrap();
-        assert!(
-            exec(
-                &db,
-                &format!("UPDATE uploads SET status = 'complete' WHERE id = '{UPL}'")
+        // 0004: an upload starts empty, and `received` moves only to the end
+        // of the recorded chunks.
+        exec(&db, &upl("receiving", 0)).await.unwrap();
+        let chunk = |offset: i64, size: i64| {
+            format!(
+                "INSERT INTO upload_chunks (upload_id, chunk_offset, chunk_size, sha256) VALUES ('{UPL}', {offset}, {size}, '{SHA}')"
             )
-            .await
-            .is_err()
+        };
+        exec(&db, &chunk(0, 4)).await.unwrap();
+        exec(
+            &db,
+            &format!("UPDATE uploads SET received = 4 WHERE id = '{UPL}'"),
+        )
+        .await
+        .unwrap();
+        let err = exec(
+            &db,
+            &format!("UPDATE uploads SET status = 'complete' WHERE id = '{UPL}'"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("only when received = total_size"),
+            "{err}"
         );
+        exec(&db, &chunk(4, 6)).await.unwrap();
         exec(
             &db,
             &format!("UPDATE uploads SET received = 10, status = 'complete' WHERE id = '{UPL}'"),
@@ -618,6 +635,11 @@ mod tests {
             )
         };
         assert!(exec(&db, &upl(11)).await.is_err());
-        exec(&db, &upl(10)).await.unwrap();
+        exec(&db, &upl(0)).await.unwrap();
+        let more = format!("UPDATE uploads SET received = 11 WHERE id = '{UPL}'");
+        assert!(exec(&db, &more).await.is_err());
     }
 }
+
+#[cfg(test)]
+mod migration_0004_test;
