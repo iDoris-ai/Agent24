@@ -78,7 +78,7 @@ pub struct ConsentGateRequest {
 }
 
 /// Closed set of deny reasons (task spec): `not_granted` / `stale` /
-/// `expired` / `denied` / `host_risk_exceeds` / `policy_restricted`. The
+/// `expired` / `denied` / `policy_restricted`. The
 /// four store-backed variants carry the record that produced them (when one
 /// exists) for a future caller's audit/debugging use, same shape as
 /// `agent24_store::ConsentLookup`.
