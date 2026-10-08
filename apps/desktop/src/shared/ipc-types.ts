@@ -31,6 +31,7 @@ export const IpcChannels = {
   ModulesInstall: 'modules:install',
   ModulesUninstall: 'modules:uninstall',
   LlmStatus: 'llm:status',
+  IdorisStatus: 'idoris:status',
   // A3-4: push channel only (main -> renderer via webContents.send). Not an
   // ipcMain.handle() target — see main/agentear-events.ts.
   AgentEarEvent: 'agentear:event',
@@ -175,6 +176,47 @@ export interface LlmStatusResult {
   url: string
   model: string
 }
+
+export interface IdorisCapacityEntry {
+  id: string
+  capability: string
+  resident: boolean
+  estimated_memory_gb: number
+  ctx_limit: number
+  queue_depth: number
+  admission_status: 'ready' | 'requires_eviction' | 'blocked'
+}
+
+export type IdorisCapacity =
+  | { state: 'observed'; entries: IdorisCapacityEntry[] }
+  | { state: 'unavailable' }
+  | { state: 'error' }
+
+export interface IdorisStatusResponse {
+  status: 'ok'
+  service: 'idoris'
+  version: string
+  contract_version: string
+  instance_id: string
+  components: number
+  runtimes: number
+  subscriptions: number
+  budget_configured: boolean
+  audit_configured: boolean
+  capacity: IdorisCapacity
+}
+
+export type IdorisUnavailableReason =
+  | 'handoff-missing'
+  | 'handoff-invalid'
+  | 'invalid-config'
+  | 'unreachable'
+  | 'http-error'
+  | 'invalid-response'
+
+export type IdorisStatusResult =
+  | { state: 'available'; status: IdorisStatusResponse }
+  | { state: 'unavailable'; reason: IdorisUnavailableReason }
 
 export interface ModuleInstallResult {
   ok: boolean
