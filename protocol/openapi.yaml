@@ -73,6 +73,128 @@ tags:
     description: The Sin90 Personal-OS module (own store; degrades independently).
 
 paths:
+  /module-consents:
+    get:
+      operationId: listModuleConsents
+      x-milestone: M-C
+      tags: [tools]
+      summary: List module tool authorizations
+      description: >-
+        Host identity is injected by agent24d. The response is limited to
+        permission metadata and excludes tool input, output, message bodies,
+        and credentials.
+      responses:
+        "200":
+          description: Persisted per-tool decisions, including revoked or expired entries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorizationList"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Host authority required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /module-consents/export:
+    get:
+      operationId: exportModuleConsents
+      x-milestone: M-C
+      tags: [tools]
+      summary: Export module tool authorizations as JSON
+      description: >-
+        Exports module, tool, scope, risk, source, validity, and status
+        metadata. Audit history is exposed by the later audit export endpoint.
+      responses:
+        "200":
+          description: Downloadable JSON export
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorizationList"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /module-consents/modules/{module}:
+    parameters:
+      - name: module
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: revokeModuleConsents
+      x-milestone: M-C
+      tags: [tools]
+      summary: Revoke every tool authorization for a module
+      description: Persists revocation and broadcasts the 6a.3 revocation notice.
+      responses:
+        "200":
+          description: Module authorizations revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorizationRevocation"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /module-consents/modules/{module}/tools/{tool}:
+    parameters:
+      - name: module
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tool
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: revokeModuleToolConsent
+      x-milestone: M-C
+      tags: [tools]
+      summary: Revoke one module tool authorization
+      description: Persists revocation and broadcasts the 6a.3 revocation notice.
+      responses:
+        "200":
+          description: Tool authorization revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorizationRevocation"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /health:
     get:
       operationId: getHealth
@@ -2382,6 +2504,46 @@ components:
             op: { type: string, const: carry_over_task }
             task_id: { type: string }
             to_week: { type: string }
+
+    ModuleAuthorizationList:
+      type: object
+      required: [authorizations]
+      additionalProperties: false
+      properties:
+        authorizations:
+          type: array
+          items: { $ref: "#/components/schemas/ModuleAuthorization" }
+
+    ModuleAuthorization:
+      type: object
+      required: [module, tool, module_version, scope_summary, host_risk, source, decided_at, expires_at, status]
+      additionalProperties: false
+      properties:
+        module: { type: string }
+        tool: { type: string }
+        module_version: { type: string }
+        scope_summary:
+          type: object
+          required: [readable, writable, external]
+          additionalProperties: false
+          properties:
+            readable: { type: [string, "null"] }
+            writable: { type: [string, "null"] }
+            external: { type: [string, "null"] }
+        host_risk: { type: string, enum: [low, medium, high] }
+        source: { type: string, enum: [first_party, manual_install] }
+        decided_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        status: { type: string, enum: [granted, denied, revoked, expired, stale, not_granted] }
+
+    ModuleAuthorizationRevocation:
+      type: object
+      required: [module, tool, status]
+      additionalProperties: false
+      properties:
+        module: { type: string }
+        tool: { type: [string, "null"] }
+        status: { type: string, const: revoked }
 
     Sin90Proposal:
       type: object

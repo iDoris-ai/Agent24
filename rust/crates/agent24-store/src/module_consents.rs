@@ -372,6 +372,16 @@ fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
 }
 
 impl Store {
+    /// Returns persisted per-tool authorization decisions for the host's
+    /// management surface. The route derives current status with
+    /// [`Store::lookup_module_consent`], which applies expiry and revocation.
+    pub async fn list_module_consents(&self) -> Result<Vec<ModuleConsentRecord>> {
+        let rows = sqlx::query("SELECT * FROM module_consents ORDER BY module, op")
+            .fetch_all(self.pool())
+            .await?;
+        rows.iter().map(row_to_record).collect()
+    }
+
     /// Subscribe to post-commit consent revocations. A broadcast channel is
     /// used because multiple independent consumers may need the event; the
     /// durable table remains authoritative if a receiver starts late.
