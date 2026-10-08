@@ -478,12 +478,17 @@ enum ParkedCallStop {
 
 impl RunManager {
     pub async fn task_profile_for_run(&self, run_id: &str, base: TaskProfile) -> TaskProfile {
-        let mode = self
-            .store
-            .run_policy_snapshot(run_id)
-            .await
-            .map(|snapshot| snapshot.effective_mode)
-            .unwrap_or(agent24_store::SourceMode::LocalOnly);
+        let mode = match self.store.run_policy_snapshot(run_id).await {
+            Ok(snapshot) => snapshot.effective_mode,
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    error = %err,
+                    "run source policy lookup failed; restricting model call to LocalOnly"
+                );
+                agent24_store::SourceMode::LocalOnly
+            }
+        };
         merge_source_policy(base, mode)
     }
 
@@ -2433,6 +2438,33 @@ pub(crate) mod tests {
             )
             .await;
         assert!(remote.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cloud_authorized_policy_preserves_the_base_profile() {
+        use agent24_models::router::Privacy;
+
+        let shareable = TaskProfile::default();
+        assert_eq!(
+            merge_source_policy(shareable, agent24_store::SourceMode::CloudAuthorized).privacy,
+            Privacy::Any
+        );
+        let already_restricted = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..TaskProfile::default()
+        };
+        assert_eq!(
+            merge_source_policy(
+                already_restricted,
+                agent24_store::SourceMode::CloudAuthorized
+            )
+            .privacy,
+            Privacy::LocalOnly
+        );
+        assert_eq!(
+            merge_source_policy(shareable, agent24_store::SourceMode::LocalOnly).privacy,
+            Privacy::LocalOnly
+        );
     }
 
     #[tokio::test]

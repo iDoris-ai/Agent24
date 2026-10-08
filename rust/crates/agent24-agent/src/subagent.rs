@@ -212,11 +212,17 @@ impl ExplorerSubagent {
                 disable_thinking: false,
             };
             let mode = match &store {
-                Some(store) => store
-                    .run_policy_snapshot(ctx.run_id())
-                    .await
-                    .map(|snapshot| snapshot.effective_mode)
-                    .unwrap_or(agent24_store::SourceMode::LocalOnly),
+                Some(store) => match store.run_policy_snapshot(ctx.run_id()).await {
+                    Ok(snapshot) => snapshot.effective_mode,
+                    Err(err) => {
+                        tracing::warn!(
+                            run_id = ctx.run_id(),
+                            error = %err,
+                            "explorer source policy lookup failed; restricting model call to LocalOnly"
+                        );
+                        agent24_store::SourceMode::LocalOnly
+                    }
+                },
                 None => agent24_store::SourceMode::LocalOnly,
             };
             let profile = super::merge_source_policy(TaskProfile::default(), mode);
