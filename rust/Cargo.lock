@@ -313,6 +313,7 @@ name = "agent24-store"
 version = "0.5.1"
 dependencies = [
  "agent24-core",
+ "agent24-decide",
  "agent24-protocol",
  "chrono",
  "serde",

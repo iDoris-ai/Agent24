@@ -1,9 +1,9 @@
 //! K1-7.1 (ADR-K1-04 §2.1/§2.2): typed, closed-set audit events for K1
 //! module-tool-call attempts. Every field is a bounded, charset-restricted
-//! identifier ([`AuditRef`] and its newtypes) or a closed enum
-//! ([`ModuleToolResultCode`]) — [`ModuleToolAuditEvent`] has no free-text
-//! field, so prompts, credentials or arbitrary JSON cannot reach the hash
-//! chain through it.
+//! identifier ([`AuditRef`] and its newtypes), a constrained UTC timestamp,
+//! or a closed enum ([`ModuleToolResultCode`]). The reference checks reject
+//! common credential-shaped values heuristically; confidentiality still
+//! depends on callers supplying host-generated identifiers only.
 //!
 //! Writing still goes through [`Store::append_audit`]'s existing
 //! `BEGIN IMMEDIATE` chain (ADR-K1-04 §2.2). Not wired to any dispatch
@@ -14,10 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AuditEntry, Result, Store, StoreError};
 
-/// ADR-K1-04 §2.2: same 180-day window as
-/// `agent24_decide::log::DEFAULT_DECISION_LOG_RETENTION_DAYS`. K1-7.4
-/// implements expiry/checkpointing against this; defined here only so the
-/// two values cannot silently drift apart.
+/// ADR-K1-04 §2.2: same configured 180-day window as the decision log.
+/// A cross-crate unit test keeps the constants aligned. K1-7.4 must still
+/// implement expiry/checkpointing; this constant does not enforce retention.
 pub const MODULE_TOOL_AUDIT_RETENTION_DAYS: u32 = 180;
 
 fn invalid(msg: impl Into<String>) -> StoreError {
@@ -25,8 +24,8 @@ fn invalid(msg: impl Into<String>) -> StoreError {
 }
 
 /// Bounded, ASCII, no-whitespace identifier shared by every relational
-/// field below — long enough for UUIDs/dotted names, too restrictive for
-/// prose or a credential blob. Only [`AuditRef::new`] builds one, so a
+/// field below. Heuristics reject common credential-shaped values, but
+/// this type is not a secrecy filter. Only [`AuditRef::new`] builds one, so a
 /// bad value never exists; `TryFrom<String>` (via `serde(try_from)`)
 /// re-runs the same check on every deserialize, rejecting a corrupted row
 /// on read too.
@@ -53,12 +52,120 @@ impl AuditRef {
                 "audit ref must contain only ASCII alphanumerics plus -_.:/@",
             ));
         }
+        if looks_credential_like(&value) {
+            return Err(invalid(
+                "audit ref resembles a credential or encoded payload",
+            ));
+        }
         Ok(Self(value))
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+fn looks_credential_like(value: &str) -> bool {
+    if let Some((_, authority_and_path)) = value.split_once("://") {
+        let authority = authority_and_path
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        if let Some((userinfo, _)) = authority.rsplit_once('@')
+            && userinfo.contains(':')
+        {
+            return true;
+        }
+    }
+
+    let lower = value.to_ascii_lowercase();
+    const TOKEN_PREFIXES: &[&str] = &[
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "sk_",
+        "eyj",
+        "xox",
+        "ya29.",
+        "akia",
+        "glpat-",
+        "npm_",
+        "pypi-",
+        "hf_",
+    ];
+    if TOKEN_PREFIXES.iter().any(|prefix| lower.contains(prefix)) {
+        return true;
+    }
+
+    // Long uninterrupted base64/base64url or hexadecimal chunks are
+    // unusual in host identifiers and can carry credentials or payloads.
+    let mut chunk_len = 0;
+    let mut hex_len = 0;
+    for byte in value.bytes().chain(std::iter::once(b' ')) {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'_' | b'-') {
+            chunk_len += 1;
+            if byte.is_ascii_hexdigit() {
+                hex_len += 1;
+            } else {
+                hex_len = 0;
+            }
+            if chunk_len >= 40 || hex_len >= 32 {
+                return true;
+            }
+        } else {
+            chunk_len = 0;
+            hex_len = 0;
+        }
+    }
+    false
+}
+
+/// Canonical RFC3339 timestamp in UTC (`Z`, no more than nanosecond
+/// precision). Its validated representation cannot contain the `|`
+/// separator used by the audit hash preimage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AuditTimestamp(String);
+
+impl AuditTimestamp {
+    pub const MAX_LEN: usize = 30;
+
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let parsed = chrono::DateTime::parse_from_rfc3339(&value)
+            .map_err(|_| invalid("audit timestamp must be canonical RFC3339 UTC"))?;
+        if value.len() < 20
+            || value.len() > Self::MAX_LEN
+            || !value.ends_with('Z')
+            || parsed.offset().local_minus_utc() != 0
+            || parsed.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true) != value
+        {
+            return Err(invalid("audit timestamp must be canonical RFC3339 UTC"));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AuditTimestamp {
+    type Error = StoreError;
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<AuditTimestamp> for String {
+    fn from(value: AuditTimestamp) -> String {
+        value.0
     }
 }
 
@@ -266,12 +373,13 @@ impl Store {
     /// no parameter lets a caller pass additional/raw JSON.
     pub async fn append_module_tool_audit_event(
         &self,
-        ts: &str,
+        ts: &AuditTimestamp,
         event: &ModuleToolAuditEvent,
     ) -> Result<AuditEntry> {
         let actor = event.relation().actor.as_str().to_owned();
         let detail = serde_json::to_value(event)?;
-        self.append_audit(ts, &actor, event.action(), &detail).await
+        self.append_audit(ts.as_str(), &actor, event.action(), &detail)
+            .await
     }
 }
 
@@ -325,10 +433,51 @@ mod tests {
     }
 
     #[test]
+    fn credential_shaped_refs_are_rejected() {
+        for value in [
+            "https://user:password@example.test/path".to_owned(),
+            "ghp_1234567890abcdefghijklmnopqrstuv".to_owned(),
+            "sk_live_demo".to_owned(),
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature".to_owned(),
+            "a".repeat(48),
+            "0123456789abcdef".repeat(4),
+        ] {
+            assert!(
+                AuditRef::new(value).is_err(),
+                "accepted credential-like ref"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_retention_matches_decision_log_retention() {
+        assert_eq!(
+            MODULE_TOOL_AUDIT_RETENTION_DAYS,
+            agent24_decide::DEFAULT_DECISION_LOG_RETENTION_DAYS
+        );
+    }
+
+    #[test]
+    fn audit_timestamp_is_canonical_utc_and_excludes_hash_separator() {
+        for invalid_ts in [
+            "yesterday",
+            "2026-10-08T00:00:00+00:00",
+            "2026-10-08T00:00:00+01:00",
+            "2026-10-08T00:00:00Z|actor",
+        ] {
+            assert!(AuditTimestamp::new(invalid_ts).is_err());
+        }
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00.123Z").unwrap();
+        assert_eq!(ts.as_str(), "2026-10-08T00:00:00.123Z");
+        assert!(!ts.as_str().contains('|'));
+        assert!(AuditRef::new("actor|action").is_err());
+    }
+
+    #[test]
     fn oversized_or_empty_ref_is_rejected() {
         assert!(AuditRef::new("").is_err());
         assert!(AuditRef::new("a".repeat(AuditRef::MAX_LEN + 1)).is_err());
-        assert!(AuditRef::new("a".repeat(AuditRef::MAX_LEN)).is_ok());
+        assert!(AuditRef::new("a.".repeat(AuditRef::MAX_LEN / 2)).is_ok());
     }
 
     #[test]
@@ -383,8 +532,9 @@ mod tests {
     async fn pre_dispatch_then_terminal_events_append_onto_a_verifiable_chain() {
         let store = Store::open_memory().await.unwrap();
         let pre = ModuleToolAuditEvent::PreDispatch(relation());
+        let pre_ts = AuditTimestamp::new("2026-10-08T00:00:00Z").unwrap();
         let pre_entry = store
-            .append_module_tool_audit_event("2026-10-08T00:00:00Z", &pre)
+            .append_module_tool_audit_event(&pre_ts, &pre)
             .await
             .unwrap();
         assert_eq!(pre_entry.action, "k1.module_tool.pre_dispatch");
@@ -395,8 +545,9 @@ mod tests {
             duration_ms: Some(DurationMs::new(42).unwrap()),
             size_bytes: Some(SizeBytes::new(128).unwrap()),
         };
+        let terminal_ts = AuditTimestamp::new("2026-10-08T00:00:01Z").unwrap();
         let terminal_entry = store
-            .append_module_tool_audit_event("2026-10-08T00:00:01Z", &terminal)
+            .append_module_tool_audit_event(&terminal_ts, &terminal)
             .await
             .unwrap();
         assert_eq!(terminal_entry.action, "k1.module_tool.terminal");
@@ -427,6 +578,35 @@ mod tests {
             }
             ModuleToolAuditEvent::PreDispatch(_) => panic!("expected Terminal"),
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_delimited_timestamps_are_rejected_before_hashing() {
+        let store = Store::open_memory().await.unwrap();
+        let event = ModuleToolAuditEvent::PreDispatch(relation());
+        for ts in [
+            "yesterday",
+            "2026-10-08T00:00:00+01:00",
+            "2026-10-08T00:00:00Z|forged",
+        ] {
+            assert!(AuditTimestamp::new(ts).is_err());
+        }
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00Z").unwrap();
+        let entry = store
+            .append_module_tool_audit_event(&ts, &event)
+            .await
+            .unwrap();
+        let detail = serde_json::to_string(&serde_json::to_value(&event).unwrap()).unwrap();
+        assert_eq!(
+            entry.hash,
+            crate::audit::entry_hash(
+                &entry.prev_hash,
+                ts.as_str(),
+                event.relation().actor.as_str(),
+                event.action(),
+                &detail,
+            )
+        );
     }
 
     #[test]
