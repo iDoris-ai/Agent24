@@ -36,5 +36,5 @@
     {"proposition": "residents must see a doctor"}
   ],
   "labeled_by": "claude-draft",
-  "verified_by": null
+  "verified_by": "david"
 }
