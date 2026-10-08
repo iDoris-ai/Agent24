@@ -65,6 +65,7 @@ and say plainly if the answer isn't there. Do not propose changes or take action
 /// The read-only explorer, exposed to the main agent as the `explore` tool.
 pub struct ExplorerSubagent {
     router: Arc<ModelRouter>,
+    store: Option<agent24_store::Store>,
     /// A registry containing ONLY read tools and NOT `explore` — this is what
     /// makes the read-only and no-recursion guarantees structural.
     tools: Arc<ToolRegistry>,
@@ -75,7 +76,23 @@ impl ExplorerSubagent {
     /// Passing anything broader would silently hand the sub-run write/exec or
     /// re-entrancy, so the daemon builds it with `read_only` and nothing else.
     pub fn new(router: Arc<ModelRouter>, tools: Arc<ToolRegistry>) -> Self {
-        Self { router, tools }
+        Self {
+            router,
+            tools,
+            store: None,
+        }
+    }
+
+    pub fn new_with_store(
+        router: Arc<ModelRouter>,
+        tools: Arc<ToolRegistry>,
+        store: agent24_store::Store,
+    ) -> Self {
+        Self {
+            router,
+            tools,
+            store: Some(store),
+        }
     }
 
     fn specs_of(tools: &ToolRegistry) -> Vec<ToolSpec> {
@@ -150,8 +167,9 @@ impl Tool for ExplorerSubagent {
         let tools = Arc::clone(&self.tools);
         let sub_ctx = ctx.clone();
         let sub_cancel = cancel.clone();
+        let store = self.store.clone();
         let handle = tokio::spawn(async move {
-            Self::explore_loop(router, tools, &sub_ctx, task, &sub_cancel).await
+            Self::explore_loop(router, tools, store, &sub_ctx, task, &sub_cancel).await
         });
         match handle.await {
             Ok(result) => result,
@@ -171,6 +189,7 @@ impl ExplorerSubagent {
     async fn explore_loop(
         router: Arc<ModelRouter>,
         tools: Arc<ToolRegistry>,
+        store: Option<agent24_store::Store>,
         ctx: &ToolContext,
         task: String,
         cancel: &CancellationToken,
@@ -192,14 +211,16 @@ impl ExplorerSubagent {
                 max_tokens: None,
                 disable_thinking: false,
             };
-            // Privacy note: the explorer uses the SAME (default) profile as a
-            // normal run. It is not more privileged than the main agent w.r.t.
-            // remote models — the only NEW egress vector a sub-agent could add,
-            // arbitrary network fetches, is removed by giving it no `http_fetch`
-            // (see ToolRegistry::read_only). So no separate privacy tier is
-            // warranted here; hardening the whole daemon to LocalOnly is a
-            // config decision, not this tool's to make.
-            let complete = router.complete(TaskProfile::default(), &request, cancel);
+            let mode = match &store {
+                Some(store) => store
+                    .run_policy_snapshot(ctx.run_id())
+                    .await
+                    .map(|snapshot| snapshot.effective_mode)
+                    .unwrap_or(agent24_store::SourceMode::LocalOnly),
+                None => agent24_store::SourceMode::LocalOnly,
+            };
+            let profile = super::merge_source_policy(TaskProfile::default(), mode);
+            let complete = router.complete(profile, &request, cancel);
             let (_, response) = match tokio::time::timeout_at(deadline, complete).await {
                 Ok(Ok(ok)) => ok,
                 Ok(Err(ModelError::Cancelled)) => return Err(ToolError::Cancelled),
@@ -365,6 +386,41 @@ mod tests {
             Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)])),
             Arc::new(ToolRegistry::read_only(workspace)),
         )
+    }
+
+    #[tokio::test]
+    async fn delegated_call_inherits_persisted_local_only_policy() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at) \
+             VALUES ('run_1', 'queued', '{}', '{}', '2026-10-08T00:00:00Z')",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let tag = agent24_store::SourceRef::user_input("run_1", "2026-10-08T00:00:00Z");
+        store
+            .tag_run_source("run_1", 0, &tag, "2026-10-08T00:00:00Z")
+            .await
+            .unwrap();
+
+        let remote = Scripted::new(vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let explorer = ExplorerSubagent::new_with_store(
+            Arc::new(ModelRouter::with_defaults(vec![(
+                remote.clone(),
+                Tier::Remote,
+            )])),
+            Arc::new(ToolRegistry::read_only(dir.path().to_path_buf())),
+            store,
+        );
+        let mut input = Map::new();
+        input.insert("task".to_owned(), Value::String("inspect".to_owned()));
+        let result = explorer
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await;
+        assert!(matches!(result, Err(ToolError::Failed(_))));
+        assert_eq!(remote.calls.load(Ordering::SeqCst), 0);
     }
 
     /// The registry the explorer runs against contains ONLY fs_read — the
