@@ -21,6 +21,10 @@
 //! the entry it relies on is durable, even if an earlier writer of the same
 //! content stopped between linking and syncing.
 //!
+//! `data_dir` must be on a file system that supports hard links (APFS, ext4,
+//! …); on one that does not (exFAT, some network mounts) `put` fails rather
+//! than falling back to a replacing rename.
+//!
 //! One `BlobStore` per data dir: `open` takes an exclusive lock on
 //! `blobs/.lock` for the store's lifetime, so startup recovery cannot delete
 //! another live instance's in-flight writes.
@@ -47,7 +51,7 @@ pub enum BlobError {
     InvalidAddress(String),
     #[error("blob not found: {0}")]
     NotFound(String),
-    #[error("blob {address} is corrupt: content hashes to {actual}")]
+    #[error("blob {address} is corrupt: {actual}")]
     Corrupt { address: String, actual: String },
     #[error("the blob store is already open in another instance or process")]
     Locked,
@@ -104,6 +108,8 @@ fn to_hex(digest: &[u8]) -> String {
     })
 }
 
+/// Unix only, like the OS itself (ADR-DOC-01 D2/D10): on Windows, opening a
+/// directory needs `FILE_FLAG_BACKUP_SEMANTICS`, to be added with Windows support.
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
@@ -169,6 +175,11 @@ impl BlobStore {
 
     /// Store everything `reader` yields. Identical content is stored once and
     /// never rewritten.
+    ///
+    /// When the address already exists, the stored file is kept and only its
+    /// length is checked (a mismatch is reported as [`BlobError::Corrupt`]);
+    /// its bytes are not re-hashed. Callers that need that guarantee read with
+    /// [`BlobStore::read_verified`].
     pub fn put(&self, mut reader: impl Read) -> Result<BlobRef, BlobError> {
         let tmp = self.tmp_path();
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
@@ -195,8 +206,17 @@ impl BlobStore {
         match fs::hard_link(&tmp, &path) {
             Ok(()) => {}
             // Already stored (by us earlier, a concurrent writer, or another
-            // process): keep the existing file untouched.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            // process): keep the existing file untouched, but do not report
+            // success over a stored file that cannot be this content.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let stored = fs::metadata(&path)?.len();
+                if stored != size {
+                    return Err(BlobError::Corrupt {
+                        address: format!("{PREFIX}{hex}"),
+                        actual: format!("a stored file of {stored} bytes, expected {size}"),
+                    });
+                }
+            }
             Err(e) => return Err(BlobError::Io(e)),
         }
         fsync_dir(&shard)?;
@@ -234,7 +254,7 @@ impl BlobStore {
         if actual != address {
             return Err(BlobError::Corrupt {
                 address: address.to_owned(),
-                actual,
+                actual: format!("content hashes to {actual}"),
             });
         }
         Ok(bytes)
@@ -344,6 +364,22 @@ mod tests {
 
     /// A failure after the tmp file is complete (here: the shard path is a
     /// regular file, so the shard directory cannot be created) still removes it.
+    /// #804 review: a dedup hit must not report success over a stored file
+    /// that cannot hold this content.
+    #[test]
+    fn a_dedup_hit_on_a_truncated_stored_file_is_reported_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        store.put_bytes(b"hello").unwrap();
+        let path = dir.path().join("blobs/sha256/2c").join(&HELLO[7 + 2..]);
+        fs::write(&path, b"hel").unwrap();
+        assert!(matches!(
+            store.put_bytes(b"hello"),
+            Err(BlobError::Corrupt { .. })
+        ));
+        assert!(files_under(&dir.path().join("blobs/tmp")).is_empty());
+    }
+
     #[test]
     fn a_failure_after_the_tmp_file_is_written_leaves_no_tmp_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -372,7 +408,7 @@ mod tests {
     fn open_clears_leftover_tmp_writes_and_never_promotes_them() {
         let dir = tempfile::tempdir().unwrap();
         drop(BlobStore::open(dir.path()).unwrap());
-        // A crash between "write tmp" and "rename" leaves this behind.
+        // A crash between "write tmp" and the hard_link publish leaves this behind.
         fs::write(dir.path().join("blobs/tmp/123-0"), b"half a file").unwrap();
         let store = BlobStore::open(dir.path()).unwrap();
         assert!(files_under(&dir.path().join("blobs/tmp")).is_empty());
