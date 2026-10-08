@@ -12,12 +12,14 @@
 //!
 //! A valid module consent is necessary to call any module tool, but does not
 //! by itself waive per-call approval. `Allow` therefore carries
-//! `per_call_approval`: `Read` is false; `WriteLocal` and `Exec` are true per
-//! L-APPR-5; `External` is also true because module consent is not the required
-//! `tool → exact target` standing-grant shape. Only policy or consent failures
-//! deny the call here. A future caller must obtain per-call approval whenever
-//! this flag is true. These rules agree with `RiskClass::escape_rank`'s
-//! description of which classes a standing grant can pre-answer.
+//! `per_call_approval`: `Read` is false; `WriteLocal` is true except for the
+//! narrowly qualified, host-verified reversible-draft case in L-APPR-5;
+//! `Exec` is always true, and `External` is also true because module consent
+//! is not the required `tool → exact target` standing-grant shape. Only policy
+//! or consent failures deny the call here. A future caller must obtain
+//! per-call approval whenever this flag is true. These rules agree with
+//! `RiskClass::escape_rank`'s description of which classes a standing grant
+//! can pre-answer.
 //!
 //! This gate also does not bypass policy/organizational/source restrictions —
 //! the `org_restricted`/`source_restricted` placeholders on
@@ -175,10 +177,10 @@ pub enum ConsentGateDecision {
     Allow {
         grant_ref: GrantRef,
         /// Whether the caller must still request approval for this call.
-        /// L-APPR-5 requires this for `WriteLocal` and `Exec`; this gate also
-        /// requires it for `External` until consent is scoped as `tool → exact
-        /// target` (ADR-K1-03). `Read` is the only class that skips it in
-        /// this module-consent gate.
+        /// L-APPR-5 requires this for `WriteLocal`, except a host-verified
+        /// reversible draft with matching first-party consent, and always for
+        /// `Exec`. This gate also requires it for `External` until consent is
+        /// scoped as `tool → exact target` (ADR-K1-03). `Read` also skips it.
         per_call_approval: bool,
     },
     Deny {
@@ -389,9 +391,10 @@ mod tests {
         ));
     }
 
-    // ── L-APPR-5 matrix: consent is required for every risk class; only Read
-    // skips per-call approval. L-APPR-5 and escape_rank say WriteLocal/Exec
-    // always ask; External needs a tool → exact target standing-grant shape.
+    // ── L-APPR-5 matrix: consent is required for every risk class. Read skips
+    // per-call approval; WriteLocal can skip only for a qualified reversible
+    // draft. Exec always asks; External needs a tool → exact target
+    // standing-grant shape.
 
     #[tokio::test]
     async fn every_risk_class_requires_matching_consent_and_sets_approval_by_law() {
