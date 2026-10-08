@@ -1538,10 +1538,13 @@ pub async fn serve(
     // that holds ONLY read builtins and NOT itself, so the sub-run cannot write,
     // execute, or recurse — the guarantees are structural, not policy-checked.
     let explorer_tools = StdArc::new(agent24_tools::ToolRegistry::read_only(workspace));
-    tools = tools.with(StdArc::new(agent24_agent::subagent::ExplorerSubagent::new(
-        Arc::clone(&router),
-        explorer_tools,
-    )));
+    tools = tools.with(StdArc::new(
+        agent24_agent::subagent::ExplorerSubagent::new_with_store(
+            Arc::clone(&router),
+            explorer_tools,
+            store.clone(),
+        ),
+    ));
     // H5: register self-wake. It creates one-shot schedules in the same store the
     // scheduler reads, so an agent can schedule its own follow-ups; the woken run
     // is gated like any other (see self_wake module docs).
@@ -4315,12 +4318,14 @@ pub(crate) mod tests {
             schedule_id: None,
             tool_call_id,
             tool,
+            source: "builtin",
             kind,
             risk: if kind == "exec" {
                 agent24_protocol::RiskClass::Exec
             } else {
                 agent24_protocol::RiskClass::WriteLocal
             },
+            per_call_approval: false,
             standing_target: None,
             summary,
             payload,

@@ -556,13 +556,19 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // response body — see chat-latency.ts), but the DB row exists regardless
     // of whether any client asks.
     let call_start = std::time::Instant::now();
-    // Default profile: shareable + simple → local-first tier order, so everyday
-    // chat prefers the on-device model and only falls back outward (D2).
+    // An untagged transient chat run resolves to LocalOnly; message text cannot widen it.
     // `complete_served` (not the plain `complete`) so the timing row below can
     // report WHICH TIER actually served this call, not just the provider name.
     match state
         .router
-        .complete_served(TaskProfile::default(), &request, &cancel)
+        .complete_served(
+            state
+                .runs
+                .task_profile_for_run(&run_id, TaskProfile::default())
+                .await,
+            &request,
+            &cancel,
+        )
         .await
     {
         Ok(served) => {

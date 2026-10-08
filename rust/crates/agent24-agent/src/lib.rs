@@ -46,6 +46,16 @@ use agent24_tools::{
 use agent24_workspace::WorkspaceService;
 use tokio_util::sync::CancellationToken;
 
+pub fn merge_source_policy(
+    mut profile: TaskProfile,
+    mode: agent24_store::SourceMode,
+) -> TaskProfile {
+    if mode == agent24_store::SourceMode::LocalOnly {
+        profile.privacy = agent24_models::router::Privacy::LocalOnly;
+    }
+    profile
+}
+
 /// Completion→tools round trips per run before the run is failed. A model
 /// stuck asking for tools forever must terminate deterministically.
 pub const MAX_ITERATIONS: usize = 10;
@@ -150,10 +160,10 @@ fn run_prompt_origin(run: &Run) -> Origin {
 
 /// A [`Summarizer`] backed by the model router.
 ///
-/// Uses the SAME [`TaskProfile::default()`] as chat/runs deliberately: the
-/// conversation being summarized already went to whichever provider the router
-/// picked for those calls, so summarizing it there is no new exposure — whereas
-/// forcing LocalOnly would silently stop compacting on remote-only setups.
+/// Session compaction currently folds with `LocalOnly`: source tags are
+/// attached to individual runs, while a session can contain messages from
+/// multiple runs and this interface does not carry a run ID. Until that
+/// provenance can be resolved across the compacted messages, fail closed.
 pub struct RouterSummarizer {
     router: Arc<ModelRouter>,
     /// Daemon shutdown token — compaction can call a slow provider, and a stuck
@@ -224,9 +234,11 @@ impl Summarizer for RouterSummarizer {
             max_tokens: None,
             disable_thinking: false,
         };
+        let profile =
+            merge_source_policy(TaskProfile::default(), agent24_store::SourceMode::LocalOnly);
         let (_provider, res) = self
             .router
-            .complete(TaskProfile::default(), &req, &self.shutdown)
+            .complete(profile, &req, &self.shutdown)
             .await
             .map_err(|e| e.to_string())?;
         let summary = res.message.content.unwrap_or_default().trim().to_owned();
@@ -465,6 +477,21 @@ enum ParkedCallStop {
 }
 
 impl RunManager {
+    pub async fn task_profile_for_run(&self, run_id: &str, base: TaskProfile) -> TaskProfile {
+        let mode = match self.store.run_policy_snapshot(run_id).await {
+            Ok(snapshot) => snapshot.effective_mode,
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    error = %err,
+                    "run source policy lookup failed; restricting model call to LocalOnly"
+                );
+                agent24_store::SourceMode::LocalOnly
+            }
+        };
+        merge_source_policy(base, mode)
+    }
+
     async fn persist_new_run(&self, run: &Run) -> Result<(), AgentError> {
         let Some(_) = run.workspace_id.as_ref() else {
             self.store.insert_run(run).await?;
@@ -1516,24 +1543,19 @@ impl RunManager {
             return;
         }
         // K1-6b.1 (ADR-K1-02 §6, §2.1): tag the run's user input at entry.
-        // Best-effort and write-only — nothing reads this tag to gate
-        // anything yet (6b.2/6b.3), and a run whose tag write fails simply
-        // has no persisted tag, which `Store::run_policy_snapshot` already
-        // treats as `LocalOnly` (ADR-K1-02 §0's "缺失一律按 LocalOnly") —
-        // the same outcome a successful `LocalOnly` write would have
-        // produced, so failing this call closed by skipping it cannot widen
-        // what a future consumer is allowed to do with this run.
         let user_source_tag = agent24_store::SourceRef::user_input(&run_id, now_iso8601());
         if let Err(err) = self
             .store
             .tag_run_source(&run_id, user_msg_seq, &user_source_tag, &now_iso8601())
             .await
         {
-            tracing::warn!(
-                run_id = %run_id,
-                error = %err,
-                "failed to persist source tag for run input; absence already defaults to LocalOnly"
-            );
+            self.finish_failed(
+                &run_id,
+                "source_policy_unavailable",
+                &format!("failed to persist run source policy: {err}"),
+            )
+            .await;
+            return;
         }
         // The audit event names exactly the ids that made it into the
         // now-durable snapshot — emitted only once the snapshot is safely on
@@ -1696,7 +1718,11 @@ impl RunManager {
                 disable_thinking: false,
             };
             let outcome = tokio::select! {
-                r = self.router.complete(TaskProfile::default(), &request, &cancel) => r,
+                r = self.router.complete(
+                    self.task_profile_for_run(&run_id, TaskProfile::default()).await,
+                    &request,
+                    &cancel,
+                ) => r,
                 () = cancel.cancelled() => Err(ModelError::Cancelled),
             };
 
@@ -2378,6 +2404,88 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn resumed_thread_cannot_rebuild_remote_permission_from_default_profile() {
+        let remote = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let store = Store::open_memory().await.unwrap();
+        let manager = RunManager::new(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                remote.clone(),
+                Tier::Remote,
+            )])),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(RecordingSink(StdMutex::new(vec![]))),
+            CancellationToken::new(),
+        );
+        let mut run = manager.start_run(create()).await.unwrap();
+        let _ = wait_terminal(&store, &run.id).await;
+        sqlx::query("UPDATE runs SET status='running', ended_at=NULL WHERE id=?")
+            .bind(&run.id)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        run.status = RunStatus::Running;
+        manager
+            .run_loop(
+                run,
+                vec![Msg::user("thread text cannot authorize cloud")],
+                false,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(remote.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cloud_authorized_policy_preserves_the_base_profile() {
+        use agent24_models::router::Privacy;
+
+        let shareable = TaskProfile::default();
+        assert_eq!(
+            merge_source_policy(shareable, agent24_store::SourceMode::CloudAuthorized).privacy,
+            Privacy::Any
+        );
+        let already_restricted = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..TaskProfile::default()
+        };
+        assert_eq!(
+            merge_source_policy(
+                already_restricted,
+                agent24_store::SourceMode::CloudAuthorized
+            )
+            .privacy,
+            Privacy::LocalOnly
+        );
+        assert_eq!(
+            merge_source_policy(shareable, agent24_store::SourceMode::LocalOnly).privacy,
+            Privacy::LocalOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn source_tag_write_failure_stops_before_any_model_call() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, _, store) = manager_with(provider.clone()).await;
+        sqlx::query(
+            "CREATE TRIGGER reject_source_tag BEFORE INSERT ON run_source_tags \
+             BEGIN SELECT RAISE(FAIL, 'source tag unavailable'); END",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+
+        let run = manager.start_run(create()).await.unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.error.unwrap().code, "source_policy_unavailable");
+        assert!(provider.seen.lock().unwrap().is_empty());
+    }
 
     /// Every role in `messages`, in order — the shape an HF-strict chat
     /// template (Gemma/Mistral) actually validates.
@@ -4848,8 +4956,10 @@ mod approval_tests {
                     schedule_id: None,
                     tool_call_id: "tc_probe",
                     tool: "shell_exec",
+                    source: "builtin",
                     kind: "exec",
                     risk: RiskClass::Exec,
+                    per_call_approval: false,
                     standing_target: None,
                     summary: "probe".to_owned(),
                     payload: serde_json::Map::new(),
