@@ -195,6 +195,13 @@ fn tier_label(t: Tier) -> &'static str {
 }
 
 impl ModelRouter {
+    #[must_use]
+    pub fn has_remote_tier(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|routed| routed.tier == Tier::Remote)
+    }
+
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
     /// `base_cooldown`, capped at `max_cooldown`.
     ///

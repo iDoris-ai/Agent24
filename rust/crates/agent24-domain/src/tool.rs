@@ -454,23 +454,24 @@ impl ModuleToolRegistry {
     ///
     /// Still registration-only: an advert carries display/description data
     /// only, never a call path or `tool_call_id`. That is K1-5.3.
-    pub fn adverts(&self, view: &dyn ModuleToolAdvertView) -> Vec<ModuleToolAdvert> {
-        self.tools
-            .values()
-            .filter(|t| {
-                let module = t.module();
-                let operation = t.declaration().operation();
-                view.module_ready(module)
-                    && view.operation_available(module, operation)
-                    && view.is_authorized(module, operation)
-                    && !view.blocked_by_remote_tier_guard(module, operation)
-            })
-            .map(|t| ModuleToolAdvert {
-                full_name: Self::full_name(t.module(), t.declaration().operation()),
-                description: t.declaration().description().to_owned(),
-                input_schema: t.declaration().input_schema().clone(),
-            })
-            .collect()
+    pub async fn adverts(&self, view: &dyn ModuleToolAdvertView) -> Vec<ModuleToolAdvert> {
+        let mut adverts = Vec::new();
+        for tool in self.tools.values() {
+            let module = tool.module();
+            let operation = tool.declaration().operation();
+            if view.module_ready(module).await
+                && view.operation_available(module, operation).await
+                && view.has_current_consent(module, operation).await
+                && !view.blocked_by_remote_tier_guard(module, operation).await
+            {
+                adverts.push(ModuleToolAdvert {
+                    full_name: Self::full_name(module, operation),
+                    description: tool.declaration().description().to_owned(),
+                    input_schema: tool.declaration().input_schema().clone(),
+                });
+            }
+        }
+        adverts
     }
 }
 
@@ -568,28 +569,25 @@ impl ModuleToolAdvert {
 /// 2026-10-08 ruling point 5). [`ModuleToolRegistry::adverts`] queries this
 /// trait fresh on every call, for every registered tool — nothing cached.
 ///
-/// Gates 1-4 default to `false` (fail-closed). Gate 5 has no default
-/// implementation: every host must explicitly answer whether the remote-tier
-/// guard blocks each `(module, operation)`. This makes an incomplete host
-/// implementation fail at compile time instead of silently allowing a
-/// document tool through. None of the gates has a real backing system wired
-/// into this crate yet: gates 1+2/3 need live lifecycle/`/capabilities` state
-/// a future host (e.g. `agent24d`) must supply; gate 4 needs K1-6a.1's
-/// authorization store (#769, not merged); gate 5 needs K1-6a AND K1-6b,
-/// neither accepted yet. Gate 5 only narrows what gates 1-4 allow.
-pub trait ModuleToolAdvertView {
-    /// Gates 1+2 (ADR-K1-01 §2.2): `module` is registered, enabled, running
-    /// and ready — NOT disabled, circuit-broken (breaker tripped), backing
-    /// off, draining/stopping, or crashed. Default: not ready (fail-closed).
-    fn module_ready(&self, _module: &str) -> bool {
+/// Every gate is awaited fresh for every registered tool. Defaults fail closed;
+/// agent24d supplies live supervisor state, registered manifest operations,
+/// ConsentGate lookups, and the remote-tier/document guard. Gate 5 only narrows
+/// what gates 1-4 allow.
+#[async_trait::async_trait]
+pub trait ModuleToolAdvertView: Send + Sync {
+    /// Gates 1+2 (ADR-K1-01 §2.2): `module` is registered and its current
+    /// generation is running and ready. Disabled or unmounted modules have no
+    /// running slot; draining/stopping generations are not ready. Default:
+    /// not ready (fail-closed).
+    async fn module_ready(&self, _module: &str) -> bool {
         false
     }
 
     /// Gate 3: `operation`'s capability is known AND currently available
-    /// (e.g. the module's `/capabilities` response). Unknown and known-
+    /// in the host's validated operation registry. Unknown and known-
     /// unavailable are the SAME outcome: both answer `false`. Default:
-    /// unavailable (fail-closed — no capability source wired here).
-    fn operation_available(&self, _module: &str, _operation: &str) -> bool {
+    /// unavailable (fail-closed).
+    async fn operation_available(&self, _module: &str, _operation: &str) -> bool {
         false
     }
 
@@ -598,9 +596,8 @@ pub trait ModuleToolAdvertView {
     /// covering any scope a version upgrade added. The module's own
     /// `risk`/`output_privacy` DECLARATION — including an unconfirmed
     /// third-party module self-reporting `Read`/`local_only` — never
-    /// substitutes for this. Default: unauthorized — K1-6a.1 (#769) is not
-    /// merged, so there is no authorization source to consult yet.
-    fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
+    /// substitutes for this. Default: unauthorized (fail-closed).
+    async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
         false
     }
 
@@ -612,7 +609,7 @@ pub trait ModuleToolAdvertView {
     /// remote model tier exist" and combines them itself. There is
     /// intentionally no default: the host must explicitly implement this
     /// check, and return `true` whenever the ruling requires withholding.
-    fn blocked_by_remote_tier_guard(&self, module: &str, operation: &str) -> bool;
+    async fn blocked_by_remote_tier_guard(&self, module: &str, operation: &str) -> bool;
 }
 
 #[cfg(test)]
@@ -887,20 +884,21 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ModuleToolAdvertView for TestView {
-        fn module_ready(&self, _module: &str) -> bool {
+        async fn module_ready(&self, _module: &str) -> bool {
             self.module_ready
         }
 
-        fn operation_available(&self, _module: &str, _operation: &str) -> bool {
+        async fn operation_available(&self, _module: &str, _operation: &str) -> bool {
             self.operation_available
         }
 
-        fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
+        async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
             self.authorized
         }
 
-        fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
+        async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
             self.remote_tier_blocked
         }
     }
@@ -909,8 +907,9 @@ mod tests {
     /// "not blocked" on purpose, so `the_default_trait_advertises_nothing`
     /// proves gates 1-3 alone keep everything unadvertised (#773 review).
     struct NoopView;
+    #[async_trait::async_trait]
     impl ModuleToolAdvertView for NoopView {
-        fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
+        async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
             false
         }
     }
@@ -922,23 +921,23 @@ mod tests {
         reg
     }
 
-    #[test]
-    fn the_default_trait_advertises_nothing() {
+    #[tokio::test]
+    async fn the_default_trait_advertises_nothing() {
         // A host that has wired up none of the four gates yet — e.g. before
         // K1-6a.1 (#769) merges an authorization source — must not advertise
         // ANY registered tool, no matter how many are registered.
         let mut reg = registry_with_one_tool();
         reg.register_module("cos72", &[declared("other-op")])
             .unwrap();
-        assert!(reg.adverts(&NoopView).is_empty());
+        assert!(reg.adverts(&NoopView).await.is_empty());
     }
 
-    #[test]
-    fn all_gates_passing_advertises_the_tool() {
+    #[tokio::test]
+    async fn all_gates_passing_advertises_the_tool() {
         // Positive control: once every gate answers favorably, the tool is
         // advertised with the display data the manifest declared.
         let reg = registry_with_one_tool();
-        let adverts = reg.adverts(&TestView::all_pass());
+        let adverts = reg.adverts(&TestView::all_pass()).await;
         assert_eq!(adverts.len(), 1);
         assert_eq!(adverts[0].full_name(), "sin90.list-notes");
         assert_eq!(adverts[0].description(), "does a thing");
@@ -951,8 +950,8 @@ mod tests {
     // ---- ADR-K1-01 §5(4): disabled/breaker/backoff/draining/crashed or
     // capability unknown/unavailable → filtered out of the announcement.
 
-    #[test]
-    fn a_module_that_is_not_running_and_ready_is_filtered_even_when_otherwise_authorized() {
+    #[tokio::test]
+    async fn a_module_that_is_not_running_and_ready_is_filtered_even_when_otherwise_authorized() {
         // Stands in for disabled, circuit-broken, backing off, draining, or
         // crashed — all of those collapse to `module_ready() == false` here.
         let reg = registry_with_one_tool();
@@ -960,34 +959,34 @@ mod tests {
             module_ready: false,
             ..TestView::all_pass()
         };
-        assert!(reg.adverts(&view).is_empty());
+        assert!(reg.adverts(&view).await.is_empty());
     }
 
-    #[test]
-    fn an_operation_whose_capability_is_unknown_or_unavailable_is_filtered() {
+    #[tokio::test]
+    async fn an_operation_whose_capability_is_unknown_or_unavailable_is_filtered() {
         let reg = registry_with_one_tool();
         let view = TestView {
             operation_available: false,
             ..TestView::all_pass()
         };
-        assert!(reg.adverts(&view).is_empty());
+        assert!(reg.adverts(&view).await.is_empty());
     }
 
     // ---- ADR-K1-01 §5(1): no host authorization → not advertised; a
     // self-reported low risk never substitutes for it.
 
-    #[test]
-    fn an_unauthorized_tool_is_not_advertised_even_when_fully_ready() {
+    #[tokio::test]
+    async fn an_unauthorized_tool_is_not_advertised_even_when_fully_ready() {
         let reg = registry_with_one_tool();
         let view = TestView {
             authorized: false,
             ..TestView::all_pass()
         };
-        assert!(reg.adverts(&view).is_empty());
+        assert!(reg.adverts(&view).await.is_empty());
     }
 
-    #[test]
-    fn a_self_reported_read_local_only_declaration_does_not_substitute_for_authorization() {
+    #[tokio::test]
+    async fn a_self_reported_read_local_only_declaration_does_not_substitute_for_authorization() {
         // `declared()` builds a `risk: read, output_privacy: local_only`
         // tool — the least-alarming self-report a module can make. It must
         // not move the outcome: only `TestView::authorized` does.
@@ -998,70 +997,72 @@ mod tests {
             authorized: false,
             ..TestView::all_pass()
         };
-        assert!(reg.adverts(&view).is_empty());
+        assert!(reg.adverts(&view).await.is_empty());
     }
 
     // ---- jason's 2026-10-08 ruling point 5: the remote-tier/document guard
     // narrows what gates 1-4 already allowed; it never widens it.
 
-    #[test]
-    fn the_remote_tier_guard_withholds_a_tool_even_when_otherwise_fully_authorized() {
+    #[tokio::test]
+    async fn the_remote_tier_guard_withholds_a_tool_even_when_otherwise_fully_authorized() {
         let reg = registry_with_one_tool();
         let view = TestView {
             remote_tier_blocked: true,
             ..TestView::all_pass()
         };
-        assert!(reg.adverts(&view).is_empty());
+        assert!(reg.adverts(&view).await.is_empty());
     }
 
     // ---- "动态状态变化时，后续通告应更新": adverts is recomputed fresh on
     // every call, so two calls against views that disagree see different
     // results without any cache to invalidate.
 
-    #[test]
-    fn adverts_reflects_the_view_handed_to_it_on_every_call() {
+    #[tokio::test]
+    async fn adverts_reflects_the_view_handed_to_it_on_every_call() {
         let reg = registry_with_one_tool();
         assert!(
             reg.adverts(&TestView {
                 authorized: false,
                 ..TestView::all_pass()
             })
+            .await
             .is_empty(),
             "unauthorized view must not advertise"
         );
         assert_eq!(
-            reg.adverts(&TestView::all_pass()).len(),
+            reg.adverts(&TestView::all_pass()).await.len(),
             1,
             "the same registry, now queried with a view where every gate \
              passes, must advertise immediately — no stale cache"
         );
     }
 
-    #[test]
-    fn a_view_with_remote_tier_guard_enabled_withholds_an_otherwise_ready_tool() {
+    #[tokio::test]
+    async fn a_view_with_remote_tier_guard_enabled_withholds_an_otherwise_ready_tool() {
         let reg = registry_with_one_tool();
 
         struct GuardedView;
+        #[async_trait::async_trait]
         impl ModuleToolAdvertView for GuardedView {
-            fn module_ready(&self, _module: &str) -> bool {
+            async fn module_ready(&self, _module: &str) -> bool {
                 true
             }
-            fn operation_available(&self, _module: &str, _operation: &str) -> bool {
+            async fn operation_available(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
-            fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
+            async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
-            fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
+            async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
         }
 
-        assert!(reg.adverts(&GuardedView).is_empty());
+        assert!(reg.adverts(&GuardedView).await.is_empty());
     }
 
-    #[test]
-    fn only_the_tool_whose_module_passes_every_gate_is_advertised() {
+    #[tokio::test]
+    async fn only_the_tool_whose_module_passes_every_gate_is_advertised() {
         let mut reg = ModuleToolRegistry::new();
         reg.register_module("ready-module", &[declared("list-notes")])
             .unwrap();
@@ -1069,22 +1070,23 @@ mod tests {
             .unwrap();
 
         struct PerModuleView;
+        #[async_trait::async_trait]
         impl ModuleToolAdvertView for PerModuleView {
-            fn module_ready(&self, module: &str) -> bool {
+            async fn module_ready(&self, module: &str) -> bool {
                 module == "ready-module"
             }
-            fn operation_available(&self, _module: &str, _operation: &str) -> bool {
+            async fn operation_available(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
-            fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
+            async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
-            fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
+            async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
                 false
             }
         }
 
-        let adverts = reg.adverts(&PerModuleView);
+        let adverts = reg.adverts(&PerModuleView).await;
         assert_eq!(adverts.len(), 1);
         assert_eq!(adverts[0].full_name(), "ready-module.list-notes");
     }

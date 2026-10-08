@@ -95,9 +95,10 @@ impl ExplorerSubagent {
         }
     }
 
-    fn specs_of(tools: &ToolRegistry) -> Vec<ToolSpec> {
+    async fn specs_of(tools: &ToolRegistry) -> Vec<ToolSpec> {
         tools
-            .adverts()
+            .live_adverts()
+            .await
             .into_iter()
             .map(|a| ToolSpec {
                 name: a.name,
@@ -195,7 +196,7 @@ impl ExplorerSubagent {
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
         let deadline = tokio::time::Instant::now() + EXPLORE_WALL_CLOCK;
-        let tool_specs = Self::specs_of(&tools);
+        let tool_specs = Self::specs_of(&tools).await;
         let mut messages = vec![Msg::system(EXPLORER_SYSTEM_PROMPT), Msg::user(task)];
         let mut last_text = String::new();
 
