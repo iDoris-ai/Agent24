@@ -8,11 +8,13 @@ description = "Agent24 tool trait + registry + builtin tools (C3 scope: http_fet
 
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
+agent24-domain = { path = "../agent24-domain" }
 agent24-workspace = { path = "../agent24-workspace" }
 async-trait = "0.1"
 cap-std = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = { workspace = true }
+serde = { workspace = true }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "process", "time", "fs", "io-util"] }
 tokio-util = "0.7"

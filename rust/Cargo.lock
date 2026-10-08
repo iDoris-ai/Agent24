@@ -314,6 +314,7 @@ name = "agent24-store"
 version = "0.5.1"
 dependencies = [
  "agent24-core",
+ "agent24-decide",
  "agent24-protocol",
  "chrono",
  "serde",
@@ -330,11 +331,13 @@ dependencies = [
 name = "agent24-tools"
 version = "0.5.1"
 dependencies = [
+ "agent24-domain",
  "agent24-protocol",
  "agent24-workspace",
  "async-trait",
  "cap-std",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

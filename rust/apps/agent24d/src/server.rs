@@ -4165,12 +4165,14 @@ pub(crate) mod tests {
             schedule_id: None,
             tool_call_id,
             tool,
+            source: "builtin",
             kind,
             risk: if kind == "exec" {
                 agent24_protocol::RiskClass::Exec
             } else {
                 agent24_protocol::RiskClass::WriteLocal
             },
+            per_call_approval: false,
             standing_target: None,
             summary,
             payload,
