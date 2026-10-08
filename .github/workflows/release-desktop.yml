@@ -1,10 +1,34 @@
-name: Release Desktop (Linux)
+name: Release Desktop (Linux + macOS)
 
 # DEP-A6: desktop Linux packages (AppImage + deb), built on top of DEP-A3's
-# CLI release pipeline (release.yml, #608/#609). This workflow never creates
-# the GitHub Release itself (M5 in docs/Deployment/TASKS.md — A3 owns Release
-# creation, A6 only appends assets to the same tag) and never touches the
-# SHA256SUMS file A3 produces (writes its own SHA256SUMS-desktop instead).
+# CLI release pipeline (release.yml, #608/#609). DEP-B2 (owner decision
+# 2026-10-05: ship a normal UNSIGNED macOS dmg now — no Apple Developer
+# account is not a reason to wait) adds the macOS job below. This workflow
+# never creates the GitHub Release itself (M5 in docs/Deployment/TASKS.md —
+# A3 owns Release creation, this workflow only appends assets to the same
+# tag) and never touches the SHA256SUMS file A3 produces (writes its own
+# SHA256SUMS-desktop instead).
+#
+# macOS note (DEP-A10): the Open Design on-demand component also ships for
+# macOS, reusing stage:open-design / rebuild:open-design-native / pack:open-
+# design completely unmodified. tools-pack's `mac <action>` CLI has no `--to
+# dir` target (only `all|app|dmg|zip`, see tools-pack/src/index.ts's
+# TO_HELP_BY_PLATFORM) — but `--to app` (which maps to electron-builder's
+# `dir` target under the hood) already produces the exact `app/ open-design/
+# open-design-web-standalone/` layout those scripts expect: electron-builder's
+# own `afterPack` hook copies the Next standalone web output into
+# `open-design-web-standalone` for mac the same way it does for win, and
+# `asar: false` keeps `app/` a loose, inspectable directory. So the "Build
+# exact Open Design mac resource base" step below is the mac analogue of the
+# Linux job's equivalent step, pointed at `Contents/Resources` instead of a
+# Linux `--to dir` output — no new Agent24-side resource-assembly script was
+# needed. Verified against a real build, not just unit tests: the real
+# pipeline also needed two runtime fixes in src/main/{open-design-component,
+# creative-serve-web}.ts (a tar listing exceeding Node's default execFile
+# buffer, and a symlink so the Open Design fork's own launcher — which
+# expects resourceRoot inside the app bundle — accepts the on-demand
+# component's install directory outside it); both already landed via PR #670
+# and apply to Linux too, not just mac.
 #
 # Same tag filter as release.yml — see that file's header comment for why
 # `v[0-9]+.[0-9]+.[0-9]+` doesn't match `agent24-os-sdk-v9.9.9` / `v0.4.0-m4`.
@@ -286,9 +310,13 @@ jobs:
             # C1: the manifest dir must hold ONLY the manifest — no tarball
             # anywhere under resources/ (the actual bug this PR had: packing
             # the tarball into the same dir extraResources bundles).
-            if find "$resources" -maxdepth 1 -name '*.tar.gz' -print | grep -q .; then
+            # L1 (review finding, 2026-10-05): no -maxdepth here — a tarball
+            # nested a level or two down (e.g. under resources/app/) would
+            # have been just as real a regression and the old -maxdepth 1
+            # silently never looked for it.
+            if find "$resources" -name '*.tar.gz' -print | grep -q .; then
               echo "::error::found a .tar.gz bundled inside $resources — the on-demand component must never ship inside the installer"
-              find "$resources" -maxdepth 1 -name '*.tar.gz'
+              find "$resources" -name '*.tar.gz'
               exit 1
             fi
           }
@@ -338,6 +366,37 @@ jobs:
             find "$EXTRACT" -type l -lname '/*'
             exit 1
           fi
+
+      # M2 (review finding, 2026-10-05): every check above only proves the
+      # shipped tarball LOOKS right — nothing before this point ever
+      # actually installs it through the real installer into the real
+      # default ~/.agent24/components/open-design/ and launches it through
+      # the real packaged Electron binary. See scripts/ci-on-demand-
+      # smoke.mjs's own header comment for exactly what this does and does
+      # not prove (short version: it proves Agent24's own on-demand runtime
+      # integration end to end; it stands in for the fork's own
+      # agent24-headless.cjs with a local fixture launcher because the
+      # officially pinned Open Design commit doesn't speak protocol v2 yet
+      # — that's covered by the fork PR's own test suite instead).
+      - name: 'M2: on-demand install (real installer, real default dir) -> real packaged launch -> /api/ready'
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPIMAGE_ROOT="$RUNNER_TEMP/desktop-package-verify/appimage/squashfs-root"
+          test -d "$APPIMAGE_ROOT"
+          # AppRun is electron-builder's own generated wrapper SCRIPT (not a
+          # symlink to the binary — real run, 2026-10-05: it failed with
+          # "/agent24-desktop: No such file or directory" because it
+          # resolves its own binary's location relative to $APPDIR, which
+          # is only set when actually launched through the AppImage FUSE
+          # mount, not when run directly from this extracted squashfs-root).
+          # The real binary sits at the top of squashfs-root, named after
+          # package.json's build.linux.executableName.
+          EXECUTABLE_NAME="$(jq -r '.build.linux.executableName' package.json)"
+          RUNTIME_EXECUTABLE="$APPIMAGE_ROOT/$EXECUTABLE_NAME"
+          test -x "$RUNTIME_EXECUTABLE"
+          A24_SMOKE_RUNTIME_EXECUTABLE="$RUNTIME_EXECUTABLE" node scripts/ci-on-demand-smoke.mjs
 
       - name: List packaged artifacts (installer size reduction vs. the previous bundled build)
         working-directory: apps/desktop
@@ -448,27 +507,439 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-macos:
+    name: Build + smoke test (macOS ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          # Current standard Intel macOS runner label (same source as
+          # release.yml's comment, fetched 2026-10-01): macos-13 is retired.
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      # DEP-A10: mac DOES get an on-demand Open Design component after all —
+      # research (see this file's header comment) found that tools-pack's
+      # `mac build --to app` target already produces the exact
+      # `app/ open-design/ open-design-web-standalone/` layout Agent24's
+      # EXISTING stage/rebuild/pack scripts expect (electron-builder's own
+      # `afterPack` hook copies the Next standalone web output into
+      # `open-design-web-standalone` for mac too, same as it does for win —
+      # `asar: false` keeps `app/` a loose, inspectable directory). So this
+      # reuses stage:open-design / rebuild:open-design-native / pack:open-
+      # design completely unmodified, just pointed at the mac build's
+      # Contents/Resources directory instead of a Linux `--to dir` output.
+      - name: Checkout exact reviewed Open Design fork
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          repository: iDoris-ai/open-design-agent24
+          ref: ${{ env.OPEN_DESIGN_SHA }}
+          path: open-design
+
+      - name: Setup Node.js for Open Design
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Build exact Open Design mac resource base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C open-design rev-parse HEAD)" = "$OPEN_DESIGN_SHA"
+          corepack enable
+          corepack prepare pnpm@10.33.2 --activate
+          (
+            cd open-design
+            pnpm install --frozen-lockfile
+            pnpm --filter @open-design/tools-pack dev mac build \
+              --to app \
+              --portable \
+              --namespace agent24-release \
+              --dir "$RUNNER_TEMP/open-design-pack" \
+              --json > "$RUNNER_TEMP/open-design-pack.json"
+          )
+          cat "$RUNNER_TEMP/open-design-pack.json"
+          RESOURCE_PACKAGE="$(find "$RUNNER_TEMP/open-design-pack" -type f -path '*/Contents/Resources/app/package.json' -print -quit)"
+          test -n "$RESOURCE_PACKAGE"
+          RESOURCE_DIR="$(dirname "$(dirname "$RESOURCE_PACKAGE")")"
+          echo "A24_OPEN_DESIGN_RESOURCES_DIR=$RESOURCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Agent24 pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
+        with:
+          version: 9.12.0
+
+      - name: Setup Node.js for Agent24
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      # Owner decision 2026-10-06 (DEP-A13): explicit, belt-and-suspenders
+      # arch pin for this step. The REAL root cause of a prior mac x64
+      # native-module architecture mismatch here was a stray repo-root
+      # .npmrc hardcoding `arch=arm64` (removed — see that commit), which
+      # silently overrode electron's own install.js's `npm_config_arch ||
+      # process.arch` fallback on every platform. Pinning npm_config_arch/
+      # npm_config_platform explicitly here, derived from matrix.arch
+      # rather than ambient process.arch detection, means this step no
+      # longer depends on nothing-else-having-gone-wrong to pick the right
+      # Electron binary for THIS runner.
+      - name: Install dependencies
+        env:
+          npm_config_arch: ${{ matrix.arch }}
+          npm_config_platform: darwin
+        run: pnpm install --frozen-lockfile
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-desktop-macos-${{ matrix.arch }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
+      - name: Build agent24d (release)
+        working-directory: rust
+        run: cargo build --release --bin agent24d
+
+      - name: Self-check — binary architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          file rust/target/release/agent24d
+          archs="$(lipo -archs rust/target/release/agent24d)"
+          echo "archs: $archs"
+          case "${{ matrix.arch }}" in
+            arm64) echo "$archs" | grep -qw arm64 ;;
+            x64)   echo "$archs" | grep -qw x86_64 ;;
+          esac
+
+      - name: Build node-daemon
+        run: pnpm --filter @agent24/node-daemon build
+
+      - name: Build desktop renderer + electron main
+        # ensure-open-design-component-dir.mjs (chained into this script)
+        # guarantees .open-design-component/ exists even before the pack
+        # step below runs, same as the Linux job.
+        run: pnpm --filter @agent24/desktop build
+
+      - name: Stage exact Open Design Creative resources
+        run: pnpm --filter @agent24/desktop stage:open-design
+
+      - name: Rebuild Open Design native modules for Agent24 Electron
+        env:
+          A24_OPEN_DESIGN_SOURCE_DIR: ${{ github.workspace }}/open-design
+          # Same reasoning as "Install dependencies" above: pin explicitly
+          # from matrix.arch rather than trusting ambient process.arch/
+          # npm_config_arch detection to already be correct.
+          A24_ELECTRON_ARCH: ${{ matrix.arch }}
+          A24_ELECTRON_PLATFORM: darwin
+        run: pnpm --filter @agent24/desktop rebuild:open-design-native
+
+      # Owner decision 2026-10-06 (DEP-A13): the actual bug this caught —
+      # Agent24's own node_modules/electron binary silently downloaded as
+      # the WRONG architecture (root cause: the stray .npmrc above) —
+      # showed up as a cryptic "spawn Unknown system error -86" deep
+      # inside rebuild-open-design-native.mjs's own runtime probe, not as
+      # a clear, named assertion failure. Explicit file/lipo -archs checks
+      # here (mirroring the existing agent24d self-check above) turn that
+      # into an immediate, readable failure instead, for every .node
+      # addon AND the Electron binary itself — not just the one the probe
+      # happened to touch.
+      - name: Self-check — Electron + native module architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          assert_arch() {
+            local label="$1" path="$2"
+            test -e "$path" || { echo "::error::$label is missing: $path"; exit 1; }
+            file "$path"
+            local archs
+            archs="$(lipo -archs "$path" 2>/dev/null || file "$path")"
+            echo "$label archs: $archs"
+            case "${{ matrix.arch }}" in
+              arm64) echo "$archs" | grep -qw -e arm64 -e arm64e ;;
+              x64)   echo "$archs" | grep -qw -e x86_64 -e x86_64h ;;
+            esac
+          }
+          ELECTRON_BINARY="$(find apps/desktop/node_modules/electron/dist -maxdepth 1 -iname 'Electron.app' -print -quit)/Contents/MacOS/Electron"
+          assert_arch "Agent24's node_modules/electron" "$ELECTRON_BINARY"
+          # Packages like node-pty ship PREBUILT .node files for every
+          # platform+arch they support (prebuilds/<platform>-<arch>/*.node)
+          # — resolved dynamically at require() time, so only ONE of them
+          # is ever actually loaded on this runner. A blanket "every .node
+          # file must match this arch" check is simply wrong for those —
+          # real run, 2026-10-06: it failed on node-pty's own
+          # prebuilds/win32-arm64/pty.node (a Windows DLL, intentionally
+          # shipped, never loaded on mac). Skip any .node sitting in a
+          # prebuilds/<platform>-<arch>/ directory whose own name doesn't
+          # match darwin-${{ matrix.arch }} — those are a DIFFERENT
+          # package's deliberate multi-platform packaging, not this
+          # build's output.
+          while IFS= read -r -d '' node_file; do
+            case "$node_file" in
+              */prebuilds/darwin-${{ matrix.arch }}/*) ;;
+              */prebuilds/*) continue ;;
+            esac
+            assert_arch "native module $node_file" "$node_file"
+          done < <(find apps/desktop/.open-design-resources -name '*.node' -print0)
+
+      - name: Resolve app version (for the component manifest's download URL)
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack the Open Design on-demand component (tarball + manifest, in separate dirs)
+        working-directory: apps/desktop
+        env:
+          A24_OD_STAGE_DIR: ${{ github.workspace }}/apps/desktop/.open-design-resources
+          A24_OD_PACK_OUT_DIR: ${{ github.workspace }}/apps/desktop/.open-design-component
+          A24_OD_TARBALL_OUT_DIR: ${{ github.workspace }}/apps/desktop/.open-design-component-dist
+          A24_OD_APP_VERSION: ${{ steps.ver.outputs.version }}
+          A24_OD_REPOSITORY: ${{ github.repository }}
+          A24_OD_PLATFORM: darwin
+          A24_OD_ARCH: ${{ matrix.arch }}
+        run: pnpm pack:open-design
+
+      # H3 (review finding, 2026-10-05): the previous order built the dmg
+      # FIRST (`--mac dmg`) and only ad-hoc signed the leftover unpacked
+      # .app in release/mac* AFTER — a copy that was never the one sealed
+      # into the dmg. Whatever signature (or lack of one) electron-builder's
+      # own packaging already produced is what actually shipped; the manual
+      # signing step below ran too late to change it. Correct order: build
+      # the unpacked .app only (`--mac dir`), sign THAT, then pack the
+      # already-signed app into a dmg via `--prepackaged` (which does not
+      # rebuild the app — it just wraps the given, already-signed, bundle).
+      - name: 'electron-builder (macOS: build unsigned .app, dir target only)'
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --mac dir
+
+      - name: Ad-hoc sign the .app so it launches on this architecture
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(realpath "$(find release -maxdepth 2 -name '*.app' -print -quit)")"
+          test -n "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign -dv "$APP"
+          # Absolute: M2's smoke-test step below reads this from a
+          # DIFFERENT working directory context and requires an absolute
+          # path (a relative one broke CI — 2026-10-05 real run).
+          echo "A24_SIGNED_APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: 'electron-builder (macOS: pack the SIGNED .app into a dmg)'
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --prepackaged "$A24_SIGNED_APP_PATH" --mac dmg
+
+      - name: Smoke test — mount dmg, check codesign, run bundled agent24d, /health is 200, no Open Design trees
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG="$(ls release/*.dmg)"
+          MOUNT_ROOT="$RUNNER_TEMP/a24-dmg-mount"
+          mkdir -p "$MOUNT_ROOT"
+          hdiutil attach "$DMG" -mountpoint "$MOUNT_ROOT" -nobrowse -quiet
+          trap 'hdiutil detach "$MOUNT_ROOT" -quiet || true' EXIT
+
+          APP="$(find "$MOUNT_ROOT" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP"
+          codesign -dv "$APP" 2>&1 | tee "$RUNNER_TEMP/codesign.log"
+          grep -q 'Signature=adhoc' "$RUNNER_TEMP/codesign.log"
+          # H3 (review finding, 2026-10-05): -dv only prints whatever
+          # signature metadata is embedded; it does not check that the
+          # signature actually matches the bundle's current on-disk
+          # contents. --verify re-hashes everything the signature covers
+          # and fails loudly on any mismatch — the real proof that the app
+          # mounted from the dmg is the one that was signed, not a stale or
+          # tampered copy sealed in by a build step that ran out of order.
+          codesign --verify --deep --strict "$APP"
+
+          # Owner decision 2026-10-06 (DEP-A13): the final, end-to-end proof
+          # that what's actually SHIPPED in this dmg is the right
+          # architecture — not just the pre-packaging checks earlier in
+          # this job (which could in principle pass while electron-builder
+          # still bundled something else).
+          MAIN_EXECUTABLE="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          file "$MAIN_EXECUTABLE"
+          archs="$(lipo -archs "$MAIN_EXECUTABLE")"
+          echo "shipped Electron binary archs: $archs"
+          case "${{ matrix.arch }}" in
+            arm64) echo "$archs" | grep -qw -e arm64 -e arm64e ;;
+            x64)   echo "$archs" | grep -qw -e x86_64 -e x86_64h ;;
+          esac
+
+          RESOURCES="$APP/Contents/Resources"
+          test ! -e "$RESOURCES/open-design"
+          test ! -e "$RESOURCES/open-design-web-standalone"
+          test ! -e "$RESOURCES/app"
+          # L1 (review finding, 2026-10-05): no -maxdepth here either — see
+          # the matching Linux-job comment above.
+          if find "$RESOURCES" -name '*.tar.gz' -print | grep -q .; then
+            echo "::error::found a .tar.gz bundled inside $RESOURCES — the on-demand component must never ship inside the installer"
+            exit 1
+          fi
+
+          MANIFEST="$RESOURCES/open-design-component.json"
+          test -f "$MANIFEST"
+          test "$(jq -r '.version' "$MANIFEST")" = "0.22.2"
+          test "$(jq -r '.odSha' "$MANIFEST")" = "$OPEN_DESIGN_SHA"
+          test "$(jq -r '.platform' "$MANIFEST")" = "darwin"
+          test "$(jq -r '.arch' "$MANIFEST")" = "${{ matrix.arch }}"
+
+          MAX_INSTALLER_BYTES=$((250 * 1024 * 1024))
+          DMG_SIZE="$(stat -f%z "$DMG")"
+          echo "$(basename "$DMG"): $DMG_SIZE bytes"
+          if [ "$DMG_SIZE" -gt "$MAX_INSTALLER_BYTES" ]; then
+            echo "::error::$(basename "$DMG") is $DMG_SIZE bytes, over the $MAX_INSTALLER_BYTES byte cap — Open Design (or something else large) may have been re-bundled"
+            exit 1
+          fi
+
+          AGENT24D="$RESOURCES/backend/agent24d"
+          test -x "$AGENT24D"
+          SMOKE_HOME="$RUNNER_TEMP/a-b2-smoke-home"
+          rm -rf "$SMOKE_HOME"
+          mkdir -p "$SMOKE_HOME"
+          HOME="$SMOKE_HOME" "$AGENT24D" serve --port 0 &
+          AGENT_PID=$!
+
+          STATE="$SMOKE_HOME/.agent24/daemon.json"
+          for _ in $(seq 1 60); do
+            [ -f "$STATE" ] && break
+            sleep 1
+          done
+          if [ ! -f "$STATE" ]; then
+            echo "::error::daemon.json did not appear under \$HOME/.agent24 within 60s"
+            kill "$AGENT_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "daemon.json:"; cat "$STATE"
+
+          PORT="$(jq -r '.port' "$STATE")"
+          BODY="$RUNNER_TEMP/health.json"
+          STATUS="$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/health")"
+          echo "health status: $STATUS body: $(cat "$BODY")"
+          kill "$AGENT_PID" 2>/dev/null || true
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::health check returned $STATUS instead of 200"
+            exit 1
+          fi
+
+      - name: Smoke test — Open Design darwin component tarball extracts and passes the staging contract
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="$(ls .open-design-component-dist/open-design-*.tar.gz)"
+          EXTRACT="$RUNNER_TEMP/od-component-smoke"
+          rm -rf "$EXTRACT"
+          mkdir -p "$EXTRACT"
+          tar -xzf "$TARBALL" -C "$EXTRACT"
+          test -d "$EXTRACT/app"
+          test -d "$EXTRACT/open-design"
+          test -d "$EXTRACT/open-design-web-standalone"
+          test "$(jq -r '.version' "$EXTRACT/app/package.json")" = "0.22.2"
+          for relative in \
+            app/prebundled/agent24-headless.cjs \
+            app/prebundled/agent24-headless.mjs \
+            app/prebundled/daemon/daemon-cli.mjs \
+            app/prebundled/daemon/daemon-sidecar.mjs \
+            app/prebundled/web-sidecar.mjs; do
+            test -f "$EXTRACT/$relative"
+          done
+          if find "$EXTRACT" -type l -lname '/*' | grep -q .; then
+            echo "::error::Open Design darwin component tarball contains an absolute symlink"
+            find "$EXTRACT" -type l -lname '/*'
+            exit 1
+          fi
+
+      # M2 (review finding, 2026-10-05): see the matching Linux-job comment
+      # above for what this does and does not prove. Reuses the already-
+      # signed .app from the "Ad-hoc sign" step directly (its own env var,
+      # not the dmg-mounted copy — that one gets unmounted by that step's
+      # own EXIT trap before this step runs; its signature is already
+      # proven by the codesign --verify smoke test above).
+      - name: 'M2: on-demand install (real installer, real default dir) -> real packaged launch -> /api/ready'
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${A24_SIGNED_APP_PATH:-}"
+          RUNTIME_EXECUTABLE="$(find "$A24_SIGNED_APP_PATH/Contents/MacOS" -maxdepth 1 -type f -print -quit)"
+          test -x "$RUNTIME_EXECUTABLE"
+          A24_SMOKE_RUNTIME_EXECUTABLE="$RUNTIME_EXECUTABLE" node scripts/ci-on-demand-smoke.mjs
+
+      - name: Report dmg + Open Design tarball sizes
+        working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          ls -la release/*.dmg .open-design-component-dist/open-design-*.tar.gz
+          echo "--- sizes ---"
+          du -h release/*.dmg .open-design-component-dist/open-design-*.tar.gz
+
+      - name: Copy the Open Design component tarball next to the dmg
+        # Same reasoning as the Linux job: upload-artifact flattens
+        # multi-path uploads relative to their greatest common ancestor.
+        run: cp apps/desktop/.open-design-component-dist/open-design-*.tar.gz apps/desktop/release/
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: desktop-macos-${{ matrix.arch }}
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/open-design-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Append to Release
-    needs: build
+    needs: [build, build-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
+      - name: Download artifacts (Linux + both macOS architectures)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          name: desktop-linux-x64
+          pattern: desktop-*
           path: dist
+          merge-multiple: true
 
       - name: Checksums (separate file — A3 owns SHA256SUMS)
         working-directory: dist
         run: |
           set -euo pipefail
           ls -la
-          shasum -a 256 -- *.AppImage *.deb open-design-*.tar.gz > SHA256SUMS-desktop
+          shasum -a 256 -- *.AppImage *.deb *.dmg open-design-*.tar.gz > SHA256SUMS-desktop
           cat SHA256SUMS-desktop
           shasum -a 256 -c SHA256SUMS-desktop
 
@@ -502,5 +973,5 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           gh release upload "$TAG" \
-            dist/*.AppImage dist/*.deb dist/open-design-*.tar.gz dist/SHA256SUMS-desktop \
+            dist/*.AppImage dist/*.deb dist/*.dmg dist/open-design-*.tar.gz dist/SHA256SUMS-desktop \
             --clobber

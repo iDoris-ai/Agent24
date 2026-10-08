@@ -21,7 +21,7 @@
 | C7 | 第三方工具集成 | Desktop `CreativeServeWeb`、`agent24 acp`、`agent24-sidecar-host`、`agent24-mcp` | Open Design 现行路径 ✅；按需下载组件（不再打进安装包，见 `open-design-component.ts`）✅；目标形态 🟡/📐；MCP ✅ |
 | C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1a…4b、COMM-5a 已交付；UI 与联调未做 |
 | C9 | 语音（AgentEar） | 附着模块（A3） | ✅ P0–P2（非流式单轮） |
-| C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；macOS 签名包被 Apple 账号阻塞 |
+| C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；2026-10-05 裁决后 Desktop 加 macOS 未签名 dmg（ad-hoc 签名，`DEP-B2a`）；只有公证（`DEP-B2b`）还卡 Apple 账号 |
 | C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9 社区子集随 C3 P3；F9 其余与 F10 等第二个真实用户；F11 随 C3 P1（2026-10-03 裁决） |
 | C12 | Web3 身份与结算（AAStar） | — | 📐 Agent24 代码中**尚无接线**，只在生态规划中 |
 

@@ -124,16 +124,34 @@ export async function packOpenDesignComponent({
   // macOS ships bsdtar, which lacks these flags — fall back to a plain
   // archive there; its content (and sha256 for THAT build) is still correct,
   // only cross-run byte-identity is not guaranteed.
-  const gnuFlags = await isGnuTar()
+  const usingGnuTar = await isGnuTar()
+  const gnuFlags = usingGnuTar
     ? ['--sort=name', '--mtime=UTC 2020-01-01', '--owner=0', '--group=0', '--numeric-owner']
+    : []
+  // L2 (review finding, 2026-10-05): bsdtar (macOS's /usr/bin/tar) archives
+  // AppleDouble extended attributes/ACLs (copyfile(3) metadata) by default
+  // in create mode. node_modules trees routinely pick these up (e.g. a
+  // quarantine xattr from a download, or Finder having touched a file) —
+  // pure bloat and non-determinism in a tarball meant to be downloaded by
+  // every platform, not just macOS. GNU tar never does this, so these flags
+  // are a no-op (and unrecognized) there.
+  const macMetadataFlags = !usingGnuTar
+    ? ['--no-mac-metadata', '--no-acls', '--no-xattrs']
     : []
   try {
     await execFileAsync('tar', [
       ...gnuFlags,
+      ...macMetadataFlags,
       '-czf', tempAssetPath,
       '-C', stageDir,
       'app', 'open-design', 'open-design-web-standalone',
-    ])
+    ], {
+      // Belt-and-suspenders alongside --no-mac-metadata above: disables the
+      // copyfile(3) AppleDouble mechanism at the OS level for this process,
+      // so no ._* sidecar metadata gets picked up even by tooling that
+      // doesn't honor bsdtar's own flags. A no-op everywhere but macOS.
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+    })
 
     const sha256 = await sha256File(tempAssetPath)
     const size = fs.statSync(tempAssetPath).size
