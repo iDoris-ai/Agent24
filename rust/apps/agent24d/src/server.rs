@@ -1078,6 +1078,19 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             get(crate::routes::get_timings_summary),
         )
         .route("/api/v1/tools", get(crate::routes::get_tools))
+        .route("/api/v1/module-consents", get(crate::consent_routes::list))
+        .route(
+            "/api/v1/module-consents/export",
+            get(crate::consent_routes::export),
+        )
+        .route(
+            "/api/v1/module-consents/modules/{module}",
+            axum::routing::delete(crate::consent_routes::revoke_module),
+        )
+        .route(
+            "/api/v1/module-consents/modules/{module}/tools/{tool}",
+            axum::routing::delete(crate::consent_routes::revoke_tool),
+        )
         .route(
             "/api/v1/tool-overrides",
             get(crate::overrides::list_overrides),
@@ -3251,6 +3264,146 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn module_consent_listing_route_is_available_to_the_host() {
+        let router = build_router(state().await);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(body["authorizations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn module_consent_export_contains_metadata_only_and_revoke_broadcasts() {
+        let state = state().await;
+        let summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "read_document",
+            "1.2.3",
+            agent24_store::ConsentSource::FirstParty,
+            Some("local documents".to_owned()),
+            None,
+            Some("https://example.invalid".to_owned()),
+            agent24_store::HostRiskLevel::Medium,
+        );
+        state
+            .store
+            .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let second_summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "write_document",
+            "1.2.3",
+            agent24_store::ConsentSource::FirstParty,
+            None,
+            Some("local documents".to_owned()),
+            None,
+            agent24_store::HostRiskLevel::Medium,
+        );
+        state
+            .store
+            .grant_module_consent(
+                &second_summary,
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut notifications = state.store.subscribe_module_consent_revocations();
+        let router = build_router(state);
+
+        let exported = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents/export")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        assert_eq!(
+            exported.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=module-authorizations.json"
+        );
+        let bytes = exported.into_body().collect().await.unwrap().to_bytes();
+        let serialized = String::from_utf8(bytes.to_vec()).unwrap();
+        let export: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let authorization = &export["authorizations"][0];
+        assert_eq!(authorization["module"], "doc-module");
+        assert_eq!(authorization["tool"], "read_document");
+        assert_eq!(
+            authorization["scope_summary"]["readable"],
+            "local documents"
+        );
+        assert_eq!(authorization["status"], "granted");
+        for forbidden in ["body", "content", "credential", "token", "password"] {
+            assert!(!serialized.to_lowercase().contains(forbidden));
+        }
+
+        let revoked = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/v1/module-consents/modules/doc-module/tools/read_document")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let notice = notifications.recv().await.unwrap();
+        assert_eq!(notice.module, "doc-module");
+        assert_eq!(notice.op.as_deref(), Some("read_document"));
+
+        let revoked = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/v1/module-consents/modules/doc-module")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let notice = notifications.recv().await.unwrap();
+        assert_eq!(notice.module, "doc-module");
+        assert_eq!(notice.op, None);
+    }
+
+    #[tokio::test]
+    async fn module_consent_routes_reject_creative_identity() {
+        let (state, _host, creative) = capability_state().await;
+        let router = build_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

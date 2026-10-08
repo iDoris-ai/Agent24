@@ -207,6 +207,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "memory",
     // T7b/ME-3e: `/api/v1/module-approvals`.
     "module-approvals",
+    // K1-6a.4: `/api/v1/module-consents` management endpoints.
+    "module-consents",
     "models",
     // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
     // — and the set-equality test below is what forced this entry the moment the

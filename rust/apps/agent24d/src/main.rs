@@ -20,6 +20,7 @@ mod authz;
 )]
 mod capabilities;
 mod comm_routes;
+mod consent_routes;
 mod decide_routes;
 mod domain;
 mod events;
