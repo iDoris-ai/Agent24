@@ -963,23 +963,24 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     if let Some(done) = os_local(&action) {
         return done;
     }
-    let ep = match connect().await {
-        Ok(ep) => ep,
-        // The bootstrapping case, and it is the one that matters most: if a domain
-        // OS is what keeps the daemon from starting, "ask the daemon to disable it"
-        // is exactly the advice that cannot work. `os.json` is plain JSON and
-        // nothing stops the user editing it — so say that, with the edit spelled
-        // out, rather than leaving them stuck behind a tool that requires the very
-        // thing that is broken.
-        Err(e) => {
+    let ep = match attach_only().await {
+        Some(ep) => ep,
+        // `connect` would start an ephemeral daemon with an isolated package
+        // root. Its empty catalogue would report false facts about the user's
+        // installed OS packages, so these commands only use a resident daemon.
+        None => {
             let path = agent24_protocol::state_file::state_dir()
                 .map(|d| d.join("os.json").display().to_string())
                 .unwrap_or_else(|| "~/.agent24/os.json".to_owned());
-            return Err(format!(
-                "{e}\n  this command goes through the daemon, which owns os.json. \
-                 If a domain OS is what stops the daemon starting, {}",
+            let hint = format!(
+                "daemon not running; start it with `agent24 daemon start`.\n  {}",
                 offline_hint(&path, &action)
-            ));
+            );
+            if matches!(action, OsAction::List) {
+                println!("{hint}");
+                return Ok(());
+            }
+            return Err(hint);
         }
     };
     let req = match &action {

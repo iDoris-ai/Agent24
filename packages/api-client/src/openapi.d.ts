@@ -86,6 +86,150 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/os": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List domain OS modules and registry state */
+        get: operations["listDomainOs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Enable or disable a domain OS module */
+        patch: operations["updateDomainOs"];
+        trace?: never;
+    };
+    "/os/{name}/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stop a running domain OS module without changing os.json */
+        post: operations["stopDomainOs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/{name}/commands/{command}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Invoke a command declared by an attached module
+         * @description A JSON object body of at most 64 KiB is forwarded to the module; its object result is returned.
+         */
+        post: operations["invokeAttachedModuleCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attached": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List attached module registrations
+         * @description List fields expose public metadata without token credentials or token hashes.
+         */
+        get: operations["listAttachedModules"];
+        put?: never;
+        /** Register an attached module or rotate its token */
+        post: operations["registerAttachedModule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attached/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke an attached module registration */
+        delete: operations["revokeAttachedModule"];
+        options?: never;
+        head?: never;
+        /** Enable or disable an attached module */
+        patch: operations["updateAttachedModule"];
+        trace?: never;
+    };
+    "/timings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List model-call timing rows */
+        get: operations["listTimings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/timings/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Summarize timing totals by source, model, and step */
+        get: operations["summarizeTimings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/usage": {
         parameters: {
             query?: never;
@@ -733,6 +877,94 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        DomainOsView: {
+            name: string;
+            namespace: string;
+            version: string;
+            enabled: boolean;
+            /** @description Open enum: mounted | disabled | degraded | refused. */
+            state: string;
+            detail?: string;
+            granted: string[];
+            missing_models: string[];
+            /** @description Open enum: ok | missing | unknown | not_checked. */
+            resources: string;
+            restart_required: boolean;
+        };
+        DomainOsList: {
+            modules: components["schemas"]["DomainOsView"][];
+            registry_error?: string;
+        };
+        DomainOsUpdate: {
+            enabled: boolean;
+        };
+        DomainOsStopResponse: {
+            name: string;
+            stopped: boolean;
+        };
+        DomainOsCommandResponse: {
+            result: {
+                [key: string]: unknown;
+            };
+        };
+        AttachedAddRequest: {
+            /** @description Exact domain-os.yml text stored by the daemon. */
+            manifest: string;
+            /** @default false */
+            allow_relax: boolean;
+        };
+        AttachedAddResponse: {
+            name: string;
+            manifest_digest: string;
+            /** @description One-time plaintext handshake token; save it now. */
+            token: string;
+            socket_path: string;
+            token_id: string;
+        };
+        AttachedView: {
+            name: string;
+            manifest_digest: string;
+            token_id: string;
+            /** Format: date-time */
+            created_at: string;
+            /** @description Open enum: detached | attached | disabled. */
+            attach_status: string;
+            /** @description Live generation number when attached. */
+            generation?: number;
+        };
+        AttachedList: {
+            modules: components["schemas"]["AttachedView"][];
+        };
+        AttachedUpdate: {
+            enabled: boolean;
+        };
+        Timing: {
+            id: number;
+            /** Format: date-time */
+            ts: string;
+            source: string;
+            model_id: string | null;
+            tier: string | null;
+            served_by: string | null;
+            ok: boolean;
+            error_kind: string | null;
+            step: string | null;
+            session_id: string | null;
+            seq: number | null;
+            first_token_ms: number | null;
+            total_ms: number;
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+        };
+        TimingSummary: {
+            source: string;
+            model_id: string;
+            step: string;
+            count: number;
+            p50_ms: number;
+            p95_ms: number;
+            max_ms: number;
+        };
         ShutdownReport: {
             /** @description An ephemeral daemon keeps no shutdown evidence. */
             ephemeral: boolean;
@@ -1418,7 +1650,25 @@ export interface components {
         };
     };
     responses: {
-        /** @description Malformed or invalid request */
+        /** @description internal: the request could not be completed */
+        Internal: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+        PayloadTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description invalid_request: malformed or invalid request */
         BadRequest: {
             headers: {
                 [name: string]: unknown;
@@ -1436,7 +1686,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Resource not found */
+        /** @description not_found: resource not found */
         NotFound: {
             headers: {
                 [name: string]: unknown;
@@ -1550,6 +1800,408 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    listDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Module configuration, runtime state, and resource availability */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsList"];
+                };
+            };
+            /** @description registry_invalid: the os.json registry could not be read or parsed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DomainOsUpdate"];
+            };
+        };
+        responses: {
+            /** @description Updated module list and runtime state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description attached_module or admission_refused */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description internal or stop_failed: configuration write or module stop failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description registry_invalid or disable_pending */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    stopDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stop was requested and the module no longer admits requests */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsStopResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description stop_failed: the module supervisor could not stop cleanly */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description disable_pending: the module is still admitting requests */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    invokeAttachedModuleCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                command: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Command result from the attached module */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsCommandResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description forbidden: the command is not declared by the module manifest */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
+            /** @description busy: the module has reached its in-flight command limit */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description connection_lost or module_error: the module connection ended or returned an invalid response */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description module_not_ready: the module is not attached or its command was not sent */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description timeout: the module did not answer before the command deadline */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listAttachedModules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registrations and live attach status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedList"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
+    registerAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachedAddRequest"];
+            };
+        };
+        responses: {
+            /** @description Existing registration was rotated; includes the new one-time token */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedAddResponse"];
+                };
+            };
+            /** @description Registration created; includes the one-time token */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedAddResponse"];
+                };
+            };
+            /** @description invalid_request or invalid_manifest */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description relax_requires_confirmation: privacy widening needs allow_relax */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description name_taken: this name is already provided by another module */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
+    revokeAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registration revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    updateAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachedUpdate"];
+            };
+        };
+        responses: {
+            /** @description Updated registration list and live status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    listTimings: {
+        parameters: {
+            query?: {
+                source?: string;
+                /** @description Timestamp lower bound passed to the timing store. */
+                since?: string;
+                /** @description Defaults to 500, accepts u32 values, and caps results at 5000; invalid values return 400. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matching rows, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        timings: components["schemas"]["Timing"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    summarizeTimings: {
+        parameters: {
+            query?: {
+                /** @description Timestamp lower bound passed to the timing store. */
+                since?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Count, p50, p95, and maximum duration per group */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        summary: components["schemas"]["TimingSummary"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["Internal"];
         };
     };
     getUsage: {
