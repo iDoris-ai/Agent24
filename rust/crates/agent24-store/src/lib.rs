@@ -36,6 +36,7 @@ mod run_workspace_admission;
 mod run_workspace_authority;
 mod run_workspace_orphan;
 mod run_workspace_terminal;
+pub mod source_policy;
 mod terminal_core;
 mod terminal_helpers;
 pub(crate) mod terminal_mutations;
@@ -91,6 +92,9 @@ pub use run_workspace_admission::{RunAdmission, RunAdmissionDenial};
 pub use run_workspace_authority::RunWorkspaceAuthoritySnapshot;
 pub use run_workspace_orphan::WorkspaceOrphanSweep;
 pub use run_workspace_terminal::RunTerminalTransition;
+pub use source_policy::{
+    PolicySnapshot, SOURCE_TAG_SCHEMA_VERSION, SourceKind, SourceMode, SourceRef,
+};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

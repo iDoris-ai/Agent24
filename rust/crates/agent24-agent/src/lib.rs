@@ -1485,6 +1485,13 @@ impl RunManager {
         });
         snapshot.extend(prior_context);
         snapshot.push(Msg::user(run.input.prompt.clone()));
+        // K1-6b.1 (ADR-K1-02 §6): the seq this run's own user-input message
+        // will be assigned by the batch append below. Valid because THIS
+        // call is always the run's first `append_run_messages_tx` (a fresh
+        // run's `MAX(seq)` starts at -1), so each row's assigned seq equals
+        // its index in `snapshot`/`pending` — the user message is pushed
+        // last, so its seq is `snapshot.len() - 1`.
+        let user_msg_seq = (snapshot.len() - 1) as i64;
         let pending: Vec<agent24_store::PendingRunMessage> = snapshot
             .iter()
             .map(|msg| agent24_store::PendingRunMessage {
@@ -1507,6 +1514,26 @@ impl RunManager {
             )
             .await;
             return;
+        }
+        // K1-6b.1 (ADR-K1-02 §6, §2.1): tag the run's user input at entry.
+        // Best-effort and write-only — nothing reads this tag to gate
+        // anything yet (6b.2/6b.3), and a run whose tag write fails simply
+        // has no persisted tag, which `Store::run_policy_snapshot` already
+        // treats as `LocalOnly` (ADR-K1-02 §0's "缺失一律按 LocalOnly") —
+        // the same outcome a successful `LocalOnly` write would have
+        // produced, so failing this call closed by skipping it cannot widen
+        // what a future consumer is allowed to do with this run.
+        let user_source_tag = agent24_store::SourceRef::user_input(&run_id, now_iso8601());
+        if let Err(err) = self
+            .store
+            .tag_run_source(&run_id, user_msg_seq, &user_source_tag, &now_iso8601())
+            .await
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %err,
+                "failed to persist source tag for run input; absence already defaults to LocalOnly"
+            );
         }
         // The audit event names exactly the ids that made it into the
         // now-durable snapshot — emitted only once the snapshot is safely on
