@@ -65,6 +65,7 @@ mod memory_routes;
 mod model_callback;
 mod module_approval_broker;
 mod module_approvals;
+mod module_tool_runtime;
 mod os_config;
 mod os_memory;
 mod os_memory_page;

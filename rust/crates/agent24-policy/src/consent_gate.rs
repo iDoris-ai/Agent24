@@ -2,10 +2,8 @@
 //! **authorization decision service** — "does this module tool call have
 //! valid host-recorded consent, and must it still receive per-call approval?"
 //!
-//! This is deliberately NOT wired to any dispatch path. K1-5.3's module tool
-//! call path does not exist yet; this slice ships the service, trait and
-//! tests, for 5.3 to call once it does (task spec). It also does not touch
-//! 6a.1's storage (`agent24_store::module_consents`) — it only *consults*
+//! This service is consumed by module-tool authorization and advert checks.
+//! It does not mutate 6a.1's storage (`agent24_store::module_consents`) — it only *consults*
 //! [`agent24_store::Store::lookup_module_consent`].
 //!
 //! ## What `Allow` means — and does not mean
@@ -15,8 +13,9 @@
 //! `per_call_approval`: `Read` is false; `WriteLocal` and `Exec` are true per
 //! L-APPR-5; `External` is also true because module consent is not the required
 //! `tool → exact target` standing-grant shape. Only policy or consent failures
-//! deny the call here. A future caller must obtain per-call approval whenever
-//! this flag is true. These rules agree with `RiskClass::escape_rank`'s
+//! deny the call here. The module-tool adapter carries this flag into the
+//! host's dispatch path, whose existing approval gate runs for every gated
+//! host risk. These rules agree with `RiskClass::escape_rank`'s
 //! description of which classes a standing grant can pre-answer.
 //!
 //! This gate also does not bypass policy/organizational/source restrictions —
@@ -64,9 +63,8 @@ pub struct ConsentGateRequest {
     /// not re-derive it itself because it has no access to the host's tool
     /// registry).
     pub current_scope_fingerprint: String,
-    /// The call's side-effect classification (NOT
-    /// `agent24_store::HostRiskLevel` — that is the enablement-time risk
-    /// RATING on the consent record itself, a different axis).
+    /// Host-computed side-effect classification, never the module's manifest
+    /// declaration. `HostRiskLevel` is the enablement-time rating, a different axis.
     pub risk: RiskClass,
     /// Placeholder for ADR §2's "组织、管理员、来源本身的更严格限制" — the
     /// organizational half. `true` denies regardless of consent state.
@@ -161,16 +159,83 @@ pub enum ConsentGateDecision {
 }
 
 impl ConsentGateDecision {
+    /// Whether consent exists. This does not waive per-call approval.
     #[must_use]
-    pub fn is_allowed(&self) -> bool {
+    pub fn has_consent(&self) -> bool {
         matches!(self, ConsentGateDecision::Allow { .. })
     }
 }
 
+pub struct ModuleConsentAuthorization {
+    gate: std::sync::Arc<dyn ConsentGate>,
+    request: ConsentGateRequest,
+    now: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
+}
+
+impl ModuleConsentAuthorization {
+    #[must_use]
+    pub fn new(
+        gate: std::sync::Arc<dyn ConsentGate>,
+        request: ConsentGateRequest,
+        now: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Self {
+        Self { gate, request, now }
+    }
+
+    async fn decision(&self, module: &str, operation: &str) -> ConsentGateDecision {
+        if self.request.module != module || self.request.op != operation {
+            return ConsentGateDecision::Deny {
+                reason: ConsentDenyReason::NotGranted,
+            };
+        }
+        self.gate.authorize(&self.request, &(self.now)()).await
+    }
+}
+
+#[async_trait]
+impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
+    async fn authorize(
+        &self,
+        module: &str,
+        operation: &str,
+        _ctx: &agent24_tools::ToolContext,
+    ) -> Result<agent24_tools::ModuleToolGrantContext, agent24_domain::tool::ModuleToolCallError>
+    {
+        use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode};
+        let denied = || ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::PermissionDenied,
+            retryable: false,
+            details: None,
+            unknown_code: None,
+        };
+        match self.decision(module, operation).await {
+            ConsentGateDecision::Allow {
+                grant_ref,
+                per_call_approval,
+            } => Ok(agent24_tools::ModuleToolGrantContext {
+                authorized_resources: Vec::new(),
+                authorization_ref: format!(
+                    "{}:{}",
+                    grant_ref.scope_fingerprint, grant_ref.decided_at
+                ),
+                per_call_approval,
+            }),
+            ConsentGateDecision::Deny { .. } => Err(denied()),
+        }
+    }
+
+    async fn has_current_consent(&self, module: &str, operation: &str) -> bool {
+        matches!(
+            self.decision(module, operation).await,
+            ConsentGateDecision::Allow { .. }
+        )
+    }
+}
+
 /// The authorization judgment service itself. A trait (task spec: "提供服务、
-/// trait") so K1-5.3's future dispatch path can depend on the abstraction,
-/// not a concrete store-backed type, the same way `agent24_tools::ApprovalGate`
-/// decouples dispatch from any one broker implementation.
+/// trait") so K1-5.3's dispatch adapter and live-advert checks depend on this
+/// abstraction, not a concrete store-backed type, the same way
+/// `agent24_tools::ApprovalGate` decouples dispatch from any one broker.
 #[async_trait]
 pub trait ConsentGate: Send + Sync {
     /// `now` is the caller-supplied current instant (RFC 3339), threaded
@@ -312,7 +377,7 @@ mod tests {
         let req = request_for(&s, RiskClass::Read);
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:00Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -334,7 +399,7 @@ mod tests {
         let req = request_for(&s, RiskClass::Read);
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:00Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -401,11 +466,11 @@ mod tests {
                         grant_ref.scope_fingerprint,
                         granted_summary.scope_fingerprint()
                     );
-                    assert_eq!(
-                        per_call_approval,
-                        risk.requires_approval(),
-                        "{risk:?} has incorrect L-APPR-5 approval behavior"
-                    );
+                    let expected = match risk {
+                        RiskClass::Read => false,
+                        RiskClass::WriteLocal | RiskClass::Exec | RiskClass::External => true,
+                    };
+                    assert_eq!(per_call_approval, expected, "{risk:?} L-APPR-5 behavior");
                 }
                 ConsentGateDecision::Deny { reason } => {
                     panic!("{risk:?} with consent must allow: {reason:?}")
@@ -429,7 +494,7 @@ mod tests {
         req.org_restricted = true;
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -451,7 +516,7 @@ mod tests {
         req.source_restricted = true;
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -487,7 +552,7 @@ mod tests {
         let req = request_for(&widened, RiskClass::Read);
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -520,7 +585,7 @@ mod tests {
         let req = request_for(&upgraded, RiskClass::Read);
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -541,7 +606,7 @@ mod tests {
         let req = request_for(&s, RiskClass::Read);
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -588,7 +653,7 @@ mod tests {
         let req = request_for(&s, RiskClass::Read);
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -620,7 +685,7 @@ mod tests {
         let req = request_for(&s, RiskClass::Read);
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {
@@ -640,7 +705,7 @@ mod tests {
         req.org_restricted = true;
 
         let decision = gate.authorize(&req, "2026-10-08T00:00:00Z").await;
-        assert!(!decision.is_allowed());
+        assert!(!decision.has_consent());
         assert!(matches!(
             decision,
             ConsentGateDecision::Deny {

@@ -241,6 +241,7 @@ name = "agent24-policy"
 version = "0.5.1"
 dependencies = [
  "agent24-core",
+ "agent24-domain",
  "agent24-models",
  "agent24-protocol",
  "agent24-store",

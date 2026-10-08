@@ -234,8 +234,8 @@ pub trait ApprovalGate: Send + Sync {
 /// the person who owns the machine decides how far to trust them. If an
 /// installer could write here, a marketplace entry would ship its own
 /// exemption, and the conservative default for third-party code would be
-/// worth nothing. Any future install path that touches this is a bug, not a
-/// feature.
+/// worth nothing. Module tool risk is also host-computed and may be tightened,
+/// but never relaxed below its configured class, so L-APPR-5 cannot be skipped.
 pub trait RiskOverrides: Send + Sync {
     /// The user's class for `tool_name`, or `None` to keep the declared one.
     fn resolve(&self, tool_name: &str) -> Option<RiskClass>;
@@ -266,6 +266,10 @@ impl ApprovalGate for DenyAllGate {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn info(&self) -> ToolInfo;
+
+    async fn advertisable(&self) -> bool {
+        true
+    }
 
     /// JSON Schema for the input object
     fn parameters(&self) -> Value;
@@ -317,6 +321,10 @@ pub trait ModuleToolAuthorization: Send + Sync {
         operation: &str,
         ctx: &ToolContext,
     ) -> Result<ModuleToolGrantContext, ModuleToolCallError>;
+
+    async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +354,10 @@ impl ModuleToolAuthorization for DenyModuleToolAuthorization {
     ) -> Result<ModuleToolGrantContext, ModuleToolCallError> {
         Err(permission_denied())
     }
+
+    async fn has_current_consent(&self, _: &str, _: &str) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -373,6 +385,7 @@ pub struct ModuleTool {
     timeout: Duration,
     inline_wait: Duration,
     risk: RiskClass,
+    advert_view: Arc<dyn agent24_domain::tool::ModuleToolAdvertView>,
     authorization: Arc<dyn ModuleToolAuthorization>,
     runtime: Arc<dyn ModuleToolRuntime>,
 }
@@ -387,6 +400,7 @@ impl ModuleTool {
         timeout: Duration,
         inline_wait: Duration,
         risk: RiskClass,
+        advert_view: Arc<dyn agent24_domain::tool::ModuleToolAdvertView>,
         authorization: Arc<dyn ModuleToolAuthorization>,
         runtime: Arc<dyn ModuleToolRuntime>,
     ) -> Result<Self, &'static str> {
@@ -404,6 +418,7 @@ impl ModuleTool {
             timeout,
             inline_wait,
             risk,
+            advert_view,
             authorization,
             runtime,
         })
@@ -412,6 +427,22 @@ impl ModuleTool {
 
 #[async_trait]
 impl Tool for ModuleTool {
+    async fn advertisable(&self) -> bool {
+        self.advert_view.module_ready(&self.module).await
+            && self
+                .advert_view
+                .operation_available(&self.module, &self.operation)
+                .await
+            && self
+                .advert_view
+                .has_current_consent(&self.module, &self.operation)
+                .await
+            && !self
+                .advert_view
+                .blocked_by_remote_tier_guard(&self.module, &self.operation)
+                .await
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             self.name.clone(),
@@ -604,6 +635,17 @@ impl ToolRegistry {
         self
     }
 
+    #[must_use]
+    pub fn register_module_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        let name = tool.info().name;
+        if self.tools.contains_key(&name) {
+            return Err(format!("refusing to register duplicate tool name {name}"));
+        }
+        self.allowed.insert(name.clone());
+        self.tools.insert(name, tool);
+        Ok(())
+    }
+
     /// The default builtin set rooted at `workspace` (fs whitelist + shell cwd).
     pub fn builtin(workspace: std::path::PathBuf) -> Self {
         Self::new()
@@ -731,6 +773,32 @@ impl ToolRegistry {
                     parameters: t.parameters(),
                 }
             })
+            .collect()
+    }
+
+    pub async fn live_adverts(&self) -> Vec<ToolAdvert> {
+        let mut adverts = Vec::new();
+        for tool in self.tools.values() {
+            let info = tool.info();
+            if self.allowed.contains(&info.name)
+                && (self.interactive_gate || !self.effective_risk(&info).requires_approval())
+                && tool.advertisable().await
+            {
+                adverts.push(ToolAdvert {
+                    name: info.name,
+                    description: info.description,
+                    parameters: tool.parameters(),
+                });
+            }
+        }
+        adverts
+    }
+
+    pub async fn live_plan_adverts(&self) -> Vec<ToolAdvert> {
+        self.live_adverts()
+            .await
+            .into_iter()
+            .filter(|a| self.tool_risk_class(&a.name) == Some(RiskClass::Read))
             .collect()
     }
 
@@ -983,6 +1051,15 @@ mod tests {
 
     use super::*;
 
+    struct DenyAdvertView;
+
+    #[async_trait]
+    impl agent24_domain::tool::ModuleToolAdvertView for DenyAdvertView {
+        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
     struct SlowTool;
 
     #[async_trait]
@@ -1158,6 +1235,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
                 risk,
+                Arc::new(DenyAdvertView),
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(ModuleFixtureRuntime),
             )
@@ -1176,6 +1254,16 @@ mod tests {
             Some(RiskClass::WriteLocal)
         );
         assert!(reg.tool_requires_approval("sample.write"));
+    }
+
+    #[test]
+    fn module_tool_registration_reports_duplicate_names_without_replacing_existing_tool() {
+        let registry = ToolRegistry::new().with(module_fixture("sample", "write", RiskClass::Read));
+        let mut registry = registry;
+        assert!(matches!(
+            registry.register_module_tool(module_fixture("sample", "write", RiskClass::External)),
+            Err(error) if error.contains("duplicate tool name sample.write")
+        ));
     }
 
     #[test]
@@ -1487,6 +1575,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
                 RiskClass::External,
+                Arc::new(DenyAdvertView),
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(Runtime),
             )
