@@ -522,6 +522,83 @@ mod tests {
         .unwrap();
     }
 
+    // ---- 0003_documents_guard (PR-Daemon on #810) ----
+
+    #[tokio::test]
+    async fn import_creates_a_document_and_r1_in_one_transaction() {
+        let (_dir, db) = open().await;
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query(&format!("INSERT INTO documents (id, title, media_type, head_revision) VALUES ('{DOC}', 't', 'application/pdf', 1)"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin) VALUES ('{DOC}', 1, '{SHA}', 1, 'application/pdf', 'import')"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM revisions").await, 1);
+    }
+
+    /// Codex R3 on #810: a REPLACE in the same transaction, before r1 exists.
+    #[tokio::test]
+    async fn a_replace_before_r1_cannot_point_the_head_anywhere() {
+        let (_dir, db) = open().await;
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query(&format!("INSERT INTO documents (id, title, media_type, head_revision) VALUES ('{DOC}', 't', 'application/pdf', 1)"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let replace = format!(
+            "INSERT OR REPLACE INTO documents (id, title, media_type, head_revision) VALUES ('{DOC}', 't', 'application/pdf', 77)"
+        );
+        assert!(sqlx::query(&replace).execute(&mut *tx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn documents_are_never_deleted() {
+        let (_dir, db) = open().await;
+        add_document(&db, DOC).await.unwrap();
+        let del = exec(&db, "DELETE FROM documents").await;
+        assert!(del.unwrap_err().to_string().contains("never deleted"));
+    }
+
+    /// Without recursive_triggers (e.g. someone using the sqlite3 shell), a
+    /// REPLACE skips the delete trigger; the insert trigger still holds.
+    #[tokio::test]
+    async fn the_insert_guard_holds_on_a_connection_without_recursive_triggers() {
+        use sqlx::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).await.unwrap();
+        add_document(&db, DOC).await.unwrap();
+        add_revision(&db, DOC, "1", SHA).await.unwrap();
+        let mut raw = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new().filename(dir.path().join(DB_FILE)),
+        )
+        .await
+        .unwrap();
+        let rt: i64 = sqlx::query_scalar("PRAGMA recursive_triggers")
+            .fetch_one(&mut raw)
+            .await
+            .unwrap();
+        assert_eq!(rt, 0, "this connection must not have recursive triggers");
+        let replace = |id: &str| {
+            format!(
+                "INSERT OR REPLACE INTO documents (id, title, media_type, head_revision) VALUES ('{id}', 't', 'application/pdf', 77)"
+            )
+        };
+        assert!(sqlx::query(&replace(DOC)).execute(&mut raw).await.is_err());
+        // Codex R3's window: the document row exists but r1 does not yet. A
+        // guard keyed only on "revisions exist" would let this through.
+        sqlx::query(&format!("INSERT INTO documents (id, title, media_type, head_revision) VALUES ('{DOC2}', 't', 'application/pdf', 1)"))
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        assert!(sqlx::query(&replace(DOC2)).execute(&mut raw).await.is_err());
+    }
+
     #[tokio::test]
     async fn upload_progress_cannot_exceed_its_size() {
         let (_dir, db) = open().await;
