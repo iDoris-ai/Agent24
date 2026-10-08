@@ -25,7 +25,7 @@ beforeAll(() => {
   for (const name of ['DocumentsUpload', 'DocumentsUploadRequest', 'DocumentsError']) {
     v[name] = ajv.compile({ ...openapi, $ref: `#/components/schemas/${name}` }) as Validator
   }
-  for (const name of ['DocumentsBadRequest', 'DocumentsNotFound', 'DocumentsConflict', 'DocumentsUploadUnprocessable', 'DocumentsUnavailable']) {
+  for (const name of ['DocumentsBadRequest', 'DocumentsNotFound', 'DocumentsConflict', 'DocumentsUploadUnprocessable', 'DocumentsUnavailable', 'DocumentsProxyFailure']) {
     v[name] = ajv.compile({ ...openapi, ...openapi.components.responses[name].content['application/json'].schema }) as Validator
   }
 })
@@ -93,9 +93,9 @@ describe('upload routes', () => {
     }
     const p = openapi.components.parameters
     expect(p.UploadId.schema.pattern).toBe('^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$')
-    expect(p.DocumentsIdempotencyKey.schema).toEqual({ type: 'string', minLength: 1, maxLength: 200 })
+    expect(p.DocumentsIdempotencyKey.schema).toEqual({ type: 'string', minLength: 1, maxLength: 200, pattern: '^[\\x21-\\x7E]+$' })
     const headers = openapi.paths['/documents/uploads/{upload_id}/chunks'].post.parameters.filter((x: any) => x.in === 'header')
-    expect(headers[0].schema).toEqual({ type: 'integer', minimum: 0 })
+    expect(headers[0].schema).toEqual({ type: 'integer', minimum: 0, maximum: 9007199254740991 })
     expect(headers[1].schema.$ref).toBe('#/components/schemas/Sha256Address')
   })
 })
@@ -108,7 +108,7 @@ describe('upload schemas', () => {
   it('never take a path as the upload filename, nor unknown fields', () => {
     const base = { total_size: 10, sha256: fixture('upload.json').sha256 }
     ok('DocumentsUploadRequest', { ...base, filename: '通告.pdf' })
-    for (const filename of ['/Users/x/a.pdf', 'dir/a.pdf', 'C:\\a.pdf', '']) {
+    for (const filename of ['/Users/x/a.pdf', 'dir/a.pdf', 'C:\\a.pdf', '', 'a\u0000.pdf', 'a\u0000/b']) {
       expect(v.DocumentsUploadRequest({ ...base, filename }), filename).toBe(false)
     }
     expect(v.DocumentsUploadRequest({ ...base, path: '/tmp/a.pdf' })).toBe(false)
@@ -119,6 +119,53 @@ describe('upload schemas', () => {
     expect(v.DocumentsUpload({ ...up, upload_id: 'upl_8ZZZZZZZZZZZZZZZZZZZZZZZZZ' })).toBe(false)
     expect(v.DocumentsUploadRequest({ total_size: 0, sha256: up.sha256 })).toBe(false)
     expect(v.DocumentsUploadRequest({ total_size: 10 })).toBe(false)
+  })
+
+  it('cap sizes at 2^53 - 1, the largest JavaScript safe integer (§5.4 JCS)', () => {
+    const up = fixture('upload.json')
+    const max = 9007199254740991
+    ok('DocumentsUploadRequest', { total_size: max, sha256: up.sha256 })
+    expect(v.DocumentsUploadRequest({ total_size: max + 1, sha256: up.sha256 })).toBe(false)
+    ok('DocumentsUpload', { ...up, total_size: max, received: max })
+    expect(v.DocumentsUpload({ ...up, total_size: max + 1 })).toBe(false)
+    expect(v.DocumentsUpload({ ...up, received: max + 1 })).toBe(false)
+    const sizeRule: string = openapi.components.schemas.DocumentsUploadRequest.properties.total_size.description
+    for (const part of [/integer literal/, /`10\.0`/, /`1e1`/, /refused with 400/]) expect(sizeRule).toMatch(part)
+  })
+
+  it('take an Idempotency-Key of visible ASCII without spaces', () => {
+    const key = new RegExp(openapi.components.parameters.DocumentsIdempotencyKey.schema.pattern, 'u')
+    for (const good of ['k1', 'a-b_c.d:e/f', '~!']) expect(key.test(good), good).toBe(true)
+    for (const bad of ['a b', 'é', 'a\tb', '']) expect(key.test(bad), JSON.stringify(bad)).toBe(false)
+    // Every documents operation takes the same key syntax.
+    const shared = openapi.components.parameters.DocumentsIdempotencyKey.schema
+    let seen = 0
+    for (const [path, item] of Object.entries<any>(openapi.paths)) {
+      if (!path.startsWith('/documents/')) continue
+      for (const op of Object.values<any>(item)) {
+        for (const p of op?.parameters ?? []) {
+          if (p.$ref || p.name !== 'Idempotency-Key') continue
+          seen++
+          expect(p.schema, path).toEqual(shared)
+        }
+      }
+    }
+    expect(seen, 'inline Idempotency-Key parameters').toBeGreaterThan(0)
+  })
+})
+
+describe('the OS 500 (ADR-DOC-02 §6)', () => {
+  it('may be the kernel code internal, and never an OS-only code', () => {
+    ok('DocumentsProxyFailure', err('internal'))
+    ok('DocumentsProxyFailure', kernelErr('internal'))
+    ok('DocumentsProxyFailure', kernelErr('upstream_timeout'))
+    ok('DocumentsProxyFailure', err('upstream_timeout', { retryable: true }))
+    for (const retryable of [true, 'no', null]) {
+      expect(v.DocumentsProxyFailure(err('internal', { retryable })), `internal with retryable ${JSON.stringify(retryable)}`).toBe(false)
+    }
+    expect(v.DocumentsProxyFailure(err('internal', {})), 'internal with details but no retryable').toBe(false)
+    expect(v.DocumentsProxyFailure(err('storage_unavailable', { retryable: true, cause: 'busy' }))).toBe(false)
+    expect(openapi.components.responses.DocumentsProxyFailure.description).toMatch(/OS's own `internal`/)
   })
 })
 
@@ -144,6 +191,7 @@ describe('narrowed error envelopes', () => {
 
   it('a 409 carries received_offset and an upload 422 is idempotency_key_reused only', () => {
     ok('DocumentsConflict', err('upload_offset_mismatch', { retryable: false, received_offset: 786432 }))
+    expect(v.DocumentsConflict(err('upload_offset_mismatch', { retryable: false, received_offset: 9007199254740992 }))).toBe(false)
     expect(v.DocumentsConflict(err('upload_offset_mismatch'))).toBe(false)
     ok('DocumentsUploadUnprocessable', err('idempotency_key_reused'))
     expect(v.DocumentsUploadUnprocessable(err('upload_checksum_mismatch')), 'checksum is checked at import, not upload').toBe(false)
