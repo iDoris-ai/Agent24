@@ -28,7 +28,8 @@ impl StorageCause {
         }
     }
 
-    /// Only lock contention clears by itself; the rest need the user.
+    /// Only lock contention (`locked`, `busy`) clears by itself; the rest
+    /// need the user (#814 review).
     #[must_use]
     pub fn retryable(self) -> bool {
         matches!(self, StorageCause::Locked | StorageCause::Busy)
