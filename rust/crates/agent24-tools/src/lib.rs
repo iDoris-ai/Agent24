@@ -613,6 +613,10 @@ impl ToolRegistry {
     #[must_use]
     pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
         let name = tool.info().name;
+        if self.tools.contains_key(&name) {
+            tracing::warn!("refusing to register duplicate tool name {name}");
+            return self;
+        }
         self.allowed.insert(name.clone());
         self.tools.insert(name, tool);
         self
@@ -622,16 +626,24 @@ impl ToolRegistry {
     /// later, by policy-managed module tools).
     #[must_use]
     pub fn with_unlisted(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.tools.insert(tool.info().name, tool);
+        let name = tool.info().name;
+        if self.tools.contains_key(&name) {
+            tracing::warn!("refusing to register duplicate tool name {name}");
+            return self;
+        }
+        self.tools.insert(name, tool);
         self
     }
 
     #[must_use]
-    pub fn with_module_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+    pub fn register_module_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
         let name = tool.info().name;
+        if self.tools.contains_key(&name) {
+            return Err(format!("refusing to register duplicate tool name {name}"));
+        }
         self.allowed.insert(name.clone());
         self.tools.insert(name, tool);
-        self
+        Ok(())
     }
 
     /// The default builtin set rooted at `workspace` (fs whitelist + shell cwd).
@@ -680,7 +692,8 @@ impl ToolRegistry {
     /// and the person who owns the machine has standing to correct it. A
     /// builtin's class is not a guess: we wrote `shell_exec` and know it runs
     /// commands. So an override may always TIGHTEN, and may relax anything
-    /// third-party, but may not relax a builtin along [`RiskClass::escape_rank`].
+    /// third-party, but may not relax a builtin or module tool along
+    /// [`RiskClass::escape_rank`].
     ///
     /// That single rule is what stops `shell_exec → read` ("stop asking me
     /// about shell") and `shell_exec → external` (which would quietly make it
@@ -700,8 +713,9 @@ impl ToolRegistry {
             && over.escape_rank() > declared.escape_rank()
         {
             tracing::warn!(
-                "ignoring override {declared:?} → {over:?} for protected tool {}: its risk \
+                "ignoring override {declared:?} → {over:?} for {} {}: this source's class \
                  may be tightened but not relaxed",
+                info.source,
                 info.name
             );
             return declared;
@@ -1192,6 +1206,94 @@ mod tests {
             }
         }
         Arc::new(Remote)
+    }
+
+    struct ModuleFixtureRuntime;
+    #[async_trait]
+    impl ModuleToolRuntime for ModuleFixtureRuntime {
+        async fn check_available(&self, _: &str, _: &str) -> Result<(), ModuleToolCallError> {
+            Ok(())
+        }
+        async fn invoke(
+            &self,
+            _: ModuleToolContext,
+            _: Map<String, Value>,
+            _: Duration,
+            _: CancellationToken,
+        ) -> Result<ModuleToolResult, ModuleToolCallError> {
+            Err(ModuleToolCallError::ModuleUnavailable)
+        }
+    }
+
+    fn module_fixture(name: &str, operation: &str, risk: RiskClass) -> Arc<dyn Tool> {
+        Arc::new(
+            ModuleTool::new(
+                name,
+                operation,
+                "module fixture",
+                serde_json::json!({"type":"object"}),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                risk,
+                Arc::new(DenyAdvertView),
+                Arc::new(DenyModuleToolAuthorization),
+                Arc::new(ModuleFixtureRuntime),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn module_tool_risk_override_cannot_relax_declared_risk() {
+        let reg = ToolRegistry::new()
+            .with(module_fixture("sample", "write", RiskClass::WriteLocal))
+            .with_risk_overrides(Arc::new(FixedOverride("sample.write", RiskClass::Read)));
+
+        assert_eq!(
+            reg.tool_risk_class("sample.write"),
+            Some(RiskClass::WriteLocal)
+        );
+        assert!(reg.tool_requires_approval("sample.write"));
+    }
+
+    #[test]
+    fn module_tool_registration_reports_duplicate_names_without_replacing_existing_tool() {
+        let registry = ToolRegistry::new().with(module_fixture("sample", "write", RiskClass::Read));
+        let mut registry = registry;
+        assert!(matches!(
+            registry.register_module_tool(module_fixture("sample", "write", RiskClass::External)),
+            Err(error) if error.contains("duplicate tool name sample.write")
+        ));
+    }
+
+    #[test]
+    fn registering_a_module_name_collision_keeps_the_existing_tool() {
+        struct Existing;
+        #[async_trait]
+        impl Tool for Existing {
+            fn info(&self) -> ToolInfo {
+                ToolInfo::new("sample.read", "builtin", "existing", RiskClass::Read)
+            }
+            fn parameters(&self) -> Value {
+                serde_json::json!({"type":"object"})
+            }
+            async fn call(
+                &self,
+                _: &ToolContext,
+                _: &Map<String, Value>,
+                _: &CancellationToken,
+            ) -> Result<String, ToolError> {
+                Ok("existing".to_owned())
+            }
+        }
+
+        let reg = ToolRegistry::new()
+            .with(Arc::new(Existing))
+            .with(module_fixture("sample", "read", RiskClass::WriteLocal));
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "builtin");
+        assert_eq!(listed[0].risk_class, RiskClass::Read);
     }
 
     fn targeted_external_tool() -> Arc<dyn Tool> {

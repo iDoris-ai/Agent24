@@ -40,7 +40,7 @@ pub const AVAILABLE_DECISIONS: [&str; 4] = ["approve", "approve_for_session", "d
 
 /// The decisions offered for ONE approval (H4).
 ///
-/// Two rules, and the second is the one that matters:
+/// Three rules, applied when each approval is created:
 ///
 /// 1. `approve_for_target` appears only when this call is eligible — the tool
 ///    is `external` AND declares a target argument AND the call filled it.
@@ -50,11 +50,19 @@ pub const AVAILABLE_DECISIONS: [&str; 4] = ["approve", "approve_for_session", "d
 ///    prompting, and the broad grant then covers every address that tool can
 ///    reach. Making the safe option the only option is the whole mechanism.
 ///
-/// Non-external tools are untouched — `fs_write`/`shell_exec` keep the session
-/// grant they always had, and never gain a target-scoped one.
-pub fn decisions_for(risk: RiskClass, standing_target: Option<&str>) -> Vec<String> {
+/// 3. A module call with `per_call_approval=true` gets neither standing option.
+///    The broker also skips matching existing grants before it creates the
+///    approval. Builtin behavior intentionally remains as-is.
+pub fn decisions_for(
+    risk: RiskClass,
+    standing_target: Option<&str>,
+    source: &str,
+    per_call_approval: bool,
+) -> Vec<String> {
     let mut out = vec!["approve".to_owned()];
-    if risk.standing_grant_eligible() {
+    if source == "module" && per_call_approval {
+        // Per-call module approvals may only authorize this invocation.
+    } else if risk.standing_grant_eligible() {
         if standing_target.is_some() {
             out.push("approve_for_target".to_owned());
         }
@@ -101,10 +109,16 @@ pub struct ApprovalRequest<'a> {
     pub schedule_id: Option<&'a str>,
     pub tool_call_id: &'a str,
     pub tool: &'a str,
+    /// Registry origin, used to keep module tools' per-call approvals isolated
+    /// from standing grants created for other tool implementations.
+    pub source: &'a str,
     /// Open enum used by the always-review policy: exec | fs_write | network | module
     pub kind: &'a str,
     /// EFFECTIVE class (declared + user overrides), not the declared one.
     pub risk: RiskClass,
+    /// Whether this call requires an approval every time, independent of
+    /// standing grants. Module WriteLocal/Exec/External calls set this true.
+    pub per_call_approval: bool,
     /// This call's value for the tool's declared target argument, if any.
     pub standing_target: Option<&'a str>,
     pub summary: String,
@@ -248,23 +262,38 @@ impl ApprovalBroker {
             schedule_id,
             tool_call_id,
             tool,
+            source,
             kind,
             risk,
+            per_call_approval,
             standing_target,
             summary,
             payload,
         } = req;
+        let module_per_call = source == "module" && per_call_approval;
         // A target-scoped grant is only offerable when there is something
         // durable to hang it on. A transient run's id never recurs, so a grant
         // scoped to it could never match again — offering it would be a button
         // that silently does nothing.
-        let grant_ctx = grant_ctx(run_id, session_id, schedule_id, tool, risk, standing_target);
+        let grant_ctx = grant_ctx(
+            run_id,
+            session_id,
+            schedule_id,
+            tool,
+            risk,
+            if module_per_call {
+                None
+            } else {
+                standing_target
+            },
+        );
         let scope = grant_ctx.scope.clone();
         let grant_scope = grant_scope(session_id, schedule_id);
         let offer_target = grant_ctx.target.as_deref();
 
         // Standing grant (H4): persistent, and matched on the EXACT target.
-        if let (Some((kind_s, id)), Some(target)) = (grant_scope, offer_target) {
+        if !module_per_call && let (Some((kind_s, id)), Some(target)) = (grant_scope, offer_target)
+        {
             match self
                 .store
                 .standing_grant_exists(kind_s, id, tool, target)
@@ -284,14 +313,17 @@ impl ApprovalBroker {
                 Ok(false) => {}
                 // Fail closed: an unreadable grant table means we ask a human,
                 // never that we assume a grant exists.
-                Err(err) => tracing::error!("standing grant lookup failed ({err}); asking a human"),
+                Err(err) => {
+                    tracing::error!("standing grant lookup failed ({err}); asking a human")
+                }
             }
         }
 
         // Broad session grant. Deliberately NOT consulted for external tools:
         // they can no longer mint one (see `decisions_for`), and a grant minted
         // before H4 must not keep authorising every address afterwards.
-        let granted = !risk.standing_grant_eligible()
+        let granted = !module_per_call
+            && !risk.standing_grant_eligible()
             && self
                 .grants
                 .lock()
@@ -337,6 +369,18 @@ impl ApprovalBroker {
                 )),
             };
             match decision {
+                GuardianDecision::AutoApprove(_) if module_per_call => {
+                    // L-APPR-5 requires a human decision on every module call;
+                    // Guardian approval is also an automatic decision.
+                    self.audit(
+                        "approval.guardian_escalated",
+                        serde_json::json!({
+                            "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
+                            "kind": kind, "reason": "module_per_call_approval",
+                        }),
+                    )
+                    .await;
+                }
                 GuardianDecision::AutoApprove(assessment) => {
                     // No human saw this call, so the audit must prove WHAT was
                     // auto-approved — full payload, not just the summary (the
@@ -399,7 +443,7 @@ impl ApprovalBroker {
             kind: kind.to_owned(),
             summary,
             payload,
-            available_decisions: decisions_for(risk, offer_target),
+            available_decisions: decisions_for(risk, offer_target, source, per_call_approval),
             standing_target: offer_target.map(str::to_owned),
             status: ApprovalStatus::Pending,
             decision: None,
@@ -843,6 +887,10 @@ impl ApprovalGate for BrokerGate {
         ctx: &ToolContext,
         standing_target: Option<&str>,
     ) {
+        if info.source == "module" && info.risk_class.requires_approval() {
+            // Module per-call approvals cannot mint or restore standing grants.
+            return;
+        }
         let eligible = match decision.kind.as_str() {
             "approve_for_session" => !info.risk_class.standing_grant_eligible(),
             "approve_for_target" => {
@@ -911,10 +959,13 @@ impl ApprovalGate for BrokerGate {
                     schedule_id: ctx.schedule_id(),
                     tool_call_id: ctx.tool_call_id(),
                     tool: &info.name,
+                    source: &info.source,
                     kind,
                     // `info` is the EFFECTIVE ToolInfo the registry built, so
                     // this already accounts for the user's H2 overrides.
                     risk: info.risk_class,
+                    per_call_approval: info.source == "module"
+                        && info.risk_class.requires_approval(),
                     standing_target,
                     summary,
                     payload: input.clone(),
@@ -961,8 +1012,10 @@ mod tests {
             schedule_id: None,
             tool_call_id,
             tool,
+            source: "builtin",
             kind,
             risk,
+            per_call_approval: false,
             standing_target: None,
             summary,
             payload,
@@ -1503,6 +1556,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn module_per_call_approval_ignores_existing_session_grants() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let first = tokio::spawn(async move {
+            b.request(
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shared-name",
+                    "exec",
+                    "builtin call".to_owned(),
+                    Map::new(),
+                ),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        broker
+            .resolve(&id, decision("approve_for_session", None))
+            .await
+            .unwrap();
+        assert_eq!(first.await.unwrap(), Verdict::Approved);
+
+        // Simulate a module implementation now occupying a name that already
+        // has a legacy grant. Per-call approval must still create a new ask.
+        seed_run(&store, "run_2").await;
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let second = tokio::spawn(async move {
+            let mut request = req(
+                "run_2",
+                Some("sess_1"),
+                "tc_2",
+                "shared-name",
+                "exec",
+                "module call".to_owned(),
+                Map::new(),
+            );
+            request.source = "module";
+            request.per_call_approval = true;
+            b.request(request, &request_cancel).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.list_approvals(None).await.unwrap().len(),
+            2,
+            "module per-call approval must ask despite an existing session grant"
+        );
+        cancel.cancel();
+        assert!(matches!(second.await.unwrap(), Verdict::Aborted(_)));
+    }
+
+    #[tokio::test]
+    async fn guardian_low_risk_module_per_call_approval_still_asks_a_human() {
+        let guardian = Arc::new(Guardian::new(Arc::new(FixedAssessor(
+            guardian::RiskLevel::Low,
+        ))));
+        let (broker, _events, store) = broker_with(Duration::from_secs(30), Some(guardian)).await;
+        seed_run(&store, "run_module_guardian").await;
+
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            let mut request = req(
+                "run_module_guardian",
+                Some("sess_guardian"),
+                "tc_module_guardian",
+                "module.write_local",
+                "module",
+                "module.write_local: {}".to_owned(),
+                Map::new(),
+            );
+            request.source = "module";
+            request.per_call_approval = true;
+            b.request(request, &request_cancel).await
+        });
+
+        let id = wait_for_pending(&store).await;
+        let audits = store.list_audit().await.unwrap();
+        assert!(audits.iter().any(|audit| {
+            audit.action == "approval.guardian_escalated"
+                && audit.detail["reason"] == "module_per_call_approval"
+                && audit.detail["tool_call_id"] == "tc_module_guardian"
+        }));
+        assert_eq!(
+            store
+                .list_approvals(Some(ApprovalStatus::Pending))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a low Guardian verdict must not approve a module call without a human"
+        );
+
+        cancel.cancel();
+        assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
+        assert_eq!(
+            store.get_approval(&id).await.unwrap().unwrap().status,
+            ApprovalStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
     async fn grants_are_scoped_to_session_and_tool() {
         // An approve_for_session grant must NOT leak across sessions or tools:
         // a different session, or a different tool in the same session, still
@@ -1777,8 +1938,10 @@ mod tests {
             schedule_id,
             tool_call_id: "tc_1",
             tool: "mcp_slack_post",
+            source: "mcp",
             kind: "module",
             risk: RiskClass::External,
+            per_call_approval: false,
             standing_target: target,
             summary: "post a message".to_owned(),
             payload: Map::new(),
@@ -1792,7 +1955,7 @@ mod tests {
     /// address the tool can reach.
     #[test]
     fn external_calls_swap_the_broad_grant_for_a_targeted_one() {
-        let offered = decisions_for(RiskClass::External, Some("#ops"));
+        let offered = decisions_for(RiskClass::External, Some("#ops"), "mcp", false);
         assert!(offered.contains(&"approve_for_target".to_owned()));
         assert!(
             !offered.contains(&"approve_for_session".to_owned()),
@@ -1804,8 +1967,25 @@ mod tests {
     /// grant at all — not a broad one as a consolation prize.
     #[test]
     fn an_external_call_without_a_target_gets_no_standing_option() {
-        let offered = decisions_for(RiskClass::External, None);
+        let offered = decisions_for(RiskClass::External, None, "mcp", false);
         assert_eq!(offered, vec!["approve", "deny", "abort"]);
+    }
+
+    #[test]
+    fn module_per_call_approval_offers_no_standing_grants() {
+        for risk in [RiskClass::WriteLocal, RiskClass::Exec, RiskClass::External] {
+            assert_eq!(
+                decisions_for(risk, Some("#ops"), "module", true),
+                vec!["approve", "deny", "abort"],
+                "{risk:?} module calls must ask for this invocation only"
+            );
+        }
+        // A source with the same risk and the existing builtin contract keeps
+        // its current session option; this PR does not change builtin policy.
+        assert!(
+            decisions_for(RiskClass::Exec, None, "builtin", true)
+                .contains(&"approve_for_session".to_owned())
+        );
     }
 
     /// Non-external tools are untouched by H4: shell/fs keep the session grant
@@ -1813,7 +1993,7 @@ mod tests {
     #[test]
     fn non_external_tools_keep_the_session_grant_and_gain_nothing() {
         for risk in [RiskClass::Exec, RiskClass::WriteLocal, RiskClass::Read] {
-            let offered = decisions_for(risk, Some("#ops"));
+            let offered = decisions_for(risk, Some("#ops"), "builtin", false);
             assert!(
                 offered.contains(&"approve_for_session".to_owned()),
                 "{risk:?}"

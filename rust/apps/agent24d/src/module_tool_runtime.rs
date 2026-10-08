@@ -328,7 +328,9 @@ mod tests {
         if risk.requires_approval() {
             registry = registry.with_gate(approvals.clone());
         }
-        registry = registry.with_module_tool(Arc::new(tool));
+        registry
+            .register_module_tool(Arc::new(tool))
+            .expect("fixture registers a unique module tool name");
         (registry, runtime, approvals)
     }
 

@@ -1618,7 +1618,16 @@ pub async fn serve(
             StdArc::clone(authorization),
             StdArc::clone(&module_tool_runtime_dyn),
         ) {
-            Ok(tool) => tools = tools.with_module_tool(StdArc::new(tool)),
+            Ok(tool) => {
+                if let Err(error) = tools.register_module_tool(StdArc::new(tool)) {
+                    tracing::warn!(
+                    module,
+                    operation = declaration.operation(),
+                    %error,
+                    "module tool was not registered"
+                    );
+                }
+            }
             Err(error) => {
                 tracing::warn!(module, operation = declaration.operation(), %error, "module tool was not assembled")
             }
@@ -4245,12 +4254,14 @@ pub(crate) mod tests {
             schedule_id: None,
             tool_call_id,
             tool,
+            source: "builtin",
             kind,
             risk: if kind == "exec" {
                 agent24_protocol::RiskClass::Exec
             } else {
                 agent24_protocol::RiskClass::WriteLocal
             },
+            per_call_approval: false,
             standing_target: None,
             summary,
             payload,

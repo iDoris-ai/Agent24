@@ -1,9 +1,9 @@
 //! K1-7.1 (ADR-K1-04 §2.1/§2.2): typed, closed-set audit events for K1
 //! module-tool-call attempts. Every field is a bounded, charset-restricted
-//! identifier ([`AuditRef`] and its newtypes) or a closed enum
-//! ([`ModuleToolResultCode`]) — [`ModuleToolAuditEvent`] has no free-text
-//! field, so prompts, credentials or arbitrary JSON cannot reach the hash
-//! chain through it.
+//! identifier ([`AuditRef`] and its newtypes), a constrained UTC timestamp,
+//! or a closed enum ([`ModuleToolResultCode`]). The reference checks reject
+//! common credential-shaped values heuristically; confidentiality still
+//! depends on callers supplying host-generated identifiers only.
 //!
 //! Writing still goes through [`Store::append_audit`]'s existing
 //! `BEGIN IMMEDIATE` chain (ADR-K1-04 §2.2). Not wired to any dispatch
@@ -14,10 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AuditEntry, Result, Store, StoreError};
 
-/// ADR-K1-04 §2.2: same 180-day window as
-/// `agent24_decide::log::DEFAULT_DECISION_LOG_RETENTION_DAYS`. K1-7.4
-/// implements expiry/checkpointing against this; defined here only so the
-/// two values cannot silently drift apart.
+/// ADR-K1-04 §2.2: same configured 180-day window as the decision log.
+/// A cross-crate unit test keeps the constants aligned. K1-7.4 must still
+/// implement expiry/checkpointing; this constant does not enforce retention.
 pub const MODULE_TOOL_AUDIT_RETENTION_DAYS: u32 = 180;
 
 fn invalid(msg: impl Into<String>) -> StoreError {
@@ -25,20 +24,22 @@ fn invalid(msg: impl Into<String>) -> StoreError {
 }
 
 /// Bounded, ASCII, no-whitespace identifier shared by every relational
-/// field below — long enough for UUIDs/dotted names, too restrictive for
-/// prose or a credential blob. Only [`AuditRef::new`] builds one, so a
-/// bad value never exists; `TryFrom<String>` (via `serde(try_from)`)
-/// re-runs the same check on every deserialize, rejecting a corrupted row
-/// on read too.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+/// field below. Heuristics reject common credential-shaped values, but
+/// this type is not a secrecy filter. New writes use [`AuditRef::new`]; stored
+/// values are structurally validated on read without reapplying heuristics
+/// that may evolve over time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "String")]
 pub struct AuditRef(String);
 
 impl AuditRef {
     pub const MAX_LEN: usize = 128;
 
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
+        Self::parse(value.into(), true)
+    }
+
+    fn parse(value: String, reject_credentials: bool) -> Result<Self> {
         if value.is_empty() || value.len() > Self::MAX_LEN {
             return Err(invalid(format!(
                 "audit ref must be 1..={} bytes, got {}",
@@ -53,6 +54,11 @@ impl AuditRef {
                 "audit ref must contain only ASCII alphanumerics plus -_.:/@",
             ));
         }
+        if reject_credentials && looks_credential_like(&value) {
+            return Err(invalid(
+                "audit ref resembles a credential or encoded payload",
+            ));
+        }
         Ok(Self(value))
     }
 
@@ -62,10 +68,166 @@ impl AuditRef {
     }
 }
 
+fn looks_credential_like(value: &str) -> bool {
+    if let Some((_, authority_and_path)) = value.split_once("://") {
+        let mut authority_parts = authority_and_path.split(['/', '?', '#']);
+        if let Some(authority) = authority_parts.next()
+            && let Some((userinfo, _)) = authority.rsplit_once('@')
+            && userinfo.contains(':')
+        {
+            return true;
+        }
+    }
+
+    // UUIDs are common run/tool-call identifiers, both alone and with a
+    // caller prefix such as `run-`. They can be 40 characters with prefix.
+    if has_uuid_suffix(value) {
+        return false;
+    }
+
+    const TOKEN_PREFIXES: &[&str] = &[
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "sk_",
+        "eyj",
+        "xox",
+        "ya29.",
+        "akia",
+        "glpat-",
+        "npm_",
+        "pypi-",
+        "hf_",
+    ];
+    for (index, _) in value.char_indices() {
+        let lower_tail = value[index..].to_ascii_lowercase();
+        for prefix in TOKEN_PREFIXES {
+            if lower_tail.starts_with(prefix)
+                && is_token_boundary(value.as_bytes().get(index.wrapping_sub(1)).copied())
+            {
+                let suffix = &value[index + prefix.len()..];
+                if is_high_entropy_token_suffix(suffix) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // A long standalone base64/base64url segment needs a base64 signal in
+    // addition to length. Lowercase hex digests and ordinary path components
+    // are valid identifiers and do not meet this rule.
+    for segment in
+        value.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '=' | '_' | '-'))
+    {
+        if segment.len() >= 40 && has_base64_features(segment) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_token_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|b| !b.is_ascii_alphanumeric())
+}
+
+fn is_high_entropy_token_suffix(suffix: &str) -> bool {
+    if suffix.len() < 20 {
+        return false;
+    }
+    let lower = suffix.bytes().any(|b| b.is_ascii_lowercase());
+    let upper = suffix.bytes().any(|b| b.is_ascii_uppercase());
+    let digit = suffix.bytes().any(|b| b.is_ascii_digit());
+    (lower || upper) && digit
+}
+
+fn has_base64_features(segment: &str) -> bool {
+    if segment.bytes().any(|b| matches!(b, b'+' | b'=')) {
+        return true;
+    }
+    let lower = segment.bytes().any(|b| b.is_ascii_lowercase());
+    let upper = segment.bytes().any(|b| b.is_ascii_uppercase());
+    let digit = segment.bytes().any(|b| b.is_ascii_digit());
+    lower && upper && digit
+}
+
+fn has_uuid_suffix(value: &str) -> bool {
+    let uuid_start = value.len().saturating_sub(36);
+    let uuid = &value[uuid_start..];
+    let bytes = uuid.as_bytes();
+    if bytes.len() != 36
+        || ![8, 13, 18, 23].into_iter().all(|i| bytes[i] == b'-')
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| [8, 13, 18, 23].contains(&i) || b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    uuid_start == 0 || value.as_bytes()[uuid_start - 1].is_ascii_punctuation()
+}
+
+/// Canonical RFC3339 timestamp in UTC (`Z`, fixed millisecond precision).
+/// Its validated representation cannot contain the `|`
+/// separator used by the audit hash preimage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AuditTimestamp(String);
+
+impl AuditTimestamp {
+    pub const MAX_LEN: usize = 30;
+
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let parsed = chrono::DateTime::parse_from_rfc3339(&value)
+            .map_err(|_| invalid("audit timestamp must be canonical RFC3339 UTC"))?;
+        if value.len() < 20
+            || value.len() > Self::MAX_LEN
+            || !value.ends_with('Z')
+            || parsed.offset().local_minus_utc() != 0
+            || parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) != value
+        {
+            return Err(invalid("audit timestamp must be canonical RFC3339 UTC"));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AuditTimestamp {
+    type Error = StoreError;
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<AuditTimestamp> for String {
+    fn from(value: AuditTimestamp) -> String {
+        value.0
+    }
+}
+
 impl TryFrom<String> for AuditRef {
     type Error = StoreError;
     fn try_from(value: String) -> Result<Self> {
         Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for AuditRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value, false).map_err(serde::de::Error::custom)
     }
 }
 
@@ -241,6 +403,30 @@ pub enum ModuleToolAuditEvent {
 }
 
 impl ModuleToolAuditEvent {
+    fn validate_refs_for_write(&self) -> Result<()> {
+        let relation = self.relation();
+        let mut refs = vec![
+            relation.actor.as_str(),
+            relation.run_id.as_str(),
+            relation.tool_call_id.as_str(),
+            relation.module_id.as_str(),
+            relation.operation_id.as_str(),
+            relation.authorization_ref.as_str(),
+        ];
+        if let Some(session_ref) = &relation.session_ref {
+            refs.push(session_ref.as_str());
+        }
+        if let Some(resource_ref) = &relation.resource_ref {
+            refs.push(resource_ref.as_str());
+        }
+        if refs.iter().any(|value| looks_credential_like(value)) {
+            return Err(invalid(
+                "audit ref resembles a credential or encoded payload",
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn relation(&self) -> &ModuleToolAuditRelation {
         match self {
@@ -266,12 +452,14 @@ impl Store {
     /// no parameter lets a caller pass additional/raw JSON.
     pub async fn append_module_tool_audit_event(
         &self,
-        ts: &str,
+        ts: &AuditTimestamp,
         event: &ModuleToolAuditEvent,
     ) -> Result<AuditEntry> {
+        event.validate_refs_for_write()?;
         let actor = event.relation().actor.as_str().to_owned();
         let detail = serde_json::to_value(event)?;
-        self.append_audit(ts, &actor, event.action(), &detail).await
+        self.append_audit(ts.as_str(), &actor, event.action(), &detail)
+            .await
     }
 }
 
@@ -325,10 +513,109 @@ mod tests {
     }
 
     #[test]
+    fn credential_shaped_refs_are_rejected() {
+        for value in [
+            "https://user:password@example.test/path".to_owned(),
+            "ghp_1234567890abcdefghijklmnopqrstuv".to_owned(),
+            "sk-live-6bH4sJ9qP2wX7mN5cR8vT1zK".to_owned(),
+            "xoxb-6bH4sJ9qP2wX7mN5cR8vT1zK".to_owned(),
+            "payload-QWxhZGRpbjpvcGVuIHNlc2FtZQ==QWxhZGRpbjpvcGVuIHNlc2FtZQ==".to_owned(),
+            "payload-Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk".to_owned(),
+        ] {
+            assert!(
+                AuditRef::new(value).is_err(),
+                "accepted credential-like ref"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_identifier_shapes_are_not_mistaken_for_credentials() {
+        for value in [
+            "task_1",
+            "risk_level",
+            "run.task-1",
+            "slovakia",
+            "heyjude",
+            "box:xoxo",
+            "branch_hf_1",
+            "desk_calendar_sync",
+            "disk_cache_entry",
+            "task-sketch-01",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "run-550e8400-e29b-41d4-a716-446655440000",
+            "tool-550e8400-e29b-41d4-a716-446655440000",
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "resource/path/to/some/deeply/nested/thing",
+        ] {
+            assert!(
+                AuditRef::new(value).is_ok(),
+                "rejected ordinary identifier {value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_audit_refs_remain_readable_but_new_writes_revalidate_them() {
+        let historical = serde_json::json!({
+            "actor": "actor-1",
+            "run_id": "ghp_1234567890abcdefghijklmnopqrstuv",
+            "tool_call_id": "tool-1",
+            "module_id": "module-1",
+            "operation_id": "operation-1",
+            "authorization_ref": "authz-1"
+        });
+        let parsed: std::result::Result<ModuleToolAuditRelation, _> =
+            serde_json::from_value(historical);
+        let relation = parsed.unwrap();
+        assert_eq!(
+            relation.run_id.as_str(),
+            "ghp_1234567890abcdefghijklmnopqrstuv"
+        );
+
+        let event = ModuleToolAuditEvent::PreDispatch(relation);
+        let store = Store::open_memory().await.unwrap();
+        let timestamp = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+        assert!(
+            store
+                .append_module_tool_audit_event(&timestamp, &event)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audit_retention_matches_decision_log_retention() {
+        assert_eq!(
+            MODULE_TOOL_AUDIT_RETENTION_DAYS,
+            agent24_decide::DEFAULT_DECISION_LOG_RETENTION_DAYS
+        );
+    }
+
+    #[test]
+    fn audit_timestamp_is_canonical_utc_and_excludes_hash_separator() {
+        for invalid_ts in [
+            "yesterday",
+            "2026-10-08T00:00:00+00:00",
+            "2026-10-08T00:00:00+01:00",
+            "2026-10-08T00:00:00Z|actor",
+        ] {
+            assert!(AuditTimestamp::new(invalid_ts).is_err());
+        }
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00.123Z").unwrap();
+        assert_eq!(ts.as_str(), "2026-10-08T00:00:00.123Z");
+        let zero_millis = AuditTimestamp::new("2026-10-08T00:00:01.000Z").unwrap();
+        assert_eq!(zero_millis.as_str(), "2026-10-08T00:00:01.000Z");
+        assert!(!ts.as_str().contains('|'));
+        assert!(AuditRef::new("actor|action").is_err());
+    }
+
+    #[test]
     fn oversized_or_empty_ref_is_rejected() {
         assert!(AuditRef::new("").is_err());
         assert!(AuditRef::new("a".repeat(AuditRef::MAX_LEN + 1)).is_err());
-        assert!(AuditRef::new("a".repeat(AuditRef::MAX_LEN)).is_ok());
+        assert!(AuditRef::new("a.".repeat(AuditRef::MAX_LEN / 2)).is_ok());
     }
 
     #[test]
@@ -383,8 +670,9 @@ mod tests {
     async fn pre_dispatch_then_terminal_events_append_onto_a_verifiable_chain() {
         let store = Store::open_memory().await.unwrap();
         let pre = ModuleToolAuditEvent::PreDispatch(relation());
+        let pre_ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
         let pre_entry = store
-            .append_module_tool_audit_event("2026-10-08T00:00:00Z", &pre)
+            .append_module_tool_audit_event(&pre_ts, &pre)
             .await
             .unwrap();
         assert_eq!(pre_entry.action, "k1.module_tool.pre_dispatch");
@@ -395,8 +683,9 @@ mod tests {
             duration_ms: Some(DurationMs::new(42).unwrap()),
             size_bytes: Some(SizeBytes::new(128).unwrap()),
         };
+        let terminal_ts = AuditTimestamp::new("2026-10-08T00:00:01.000Z").unwrap();
         let terminal_entry = store
-            .append_module_tool_audit_event("2026-10-08T00:00:01Z", &terminal)
+            .append_module_tool_audit_event(&terminal_ts, &terminal)
             .await
             .unwrap();
         assert_eq!(terminal_entry.action, "k1.module_tool.terminal");
@@ -427,6 +716,35 @@ mod tests {
             }
             ModuleToolAuditEvent::PreDispatch(_) => panic!("expected Terminal"),
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_delimited_timestamps_are_rejected_before_hashing() {
+        let store = Store::open_memory().await.unwrap();
+        let event = ModuleToolAuditEvent::PreDispatch(relation());
+        for ts in [
+            "yesterday",
+            "2026-10-08T00:00:00+01:00",
+            "2026-10-08T00:00:00Z|forged",
+        ] {
+            assert!(AuditTimestamp::new(ts).is_err());
+        }
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+        let entry = store
+            .append_module_tool_audit_event(&ts, &event)
+            .await
+            .unwrap();
+        let detail = serde_json::to_string(&serde_json::to_value(&event).unwrap()).unwrap();
+        assert_eq!(
+            entry.hash,
+            crate::audit::entry_hash(
+                &entry.prev_hash,
+                ts.as_str(),
+                event.relation().actor.as_str(),
+                event.action(),
+                &detail,
+            )
+        );
     }
 
     #[test]
