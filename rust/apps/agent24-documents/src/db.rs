@@ -410,6 +410,118 @@ mod tests {
         );
     }
 
+    // ---- 0002_integrity (PR-Daemon on #807) ----
+
+    #[tokio::test]
+    async fn the_head_can_only_move_to_an_existing_revision() {
+        let (_dir, db) = open().await;
+        add_document(&db, DOC).await.unwrap();
+        add_revision(&db, DOC, "1", SHA).await.unwrap();
+        let head =
+            |rev: i64| format!("UPDATE documents SET head_revision = {rev} WHERE id = '{DOC}'");
+        assert!(exec(&db, &head(99)).await.is_err());
+        add_revision(&db, DOC, "2", SHA2).await.unwrap();
+        exec(&db, &head(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_origin_ids_must_be_strings() {
+        let (_dir, db) = open().await;
+        let job = |origin: &str| {
+            format!(
+                "INSERT INTO jobs (id, kind, status, origin) VALUES ('{JOB}', 'extract', 'queued', '{origin}')"
+            )
+        };
+        assert!(
+            exec(
+                &db,
+                &job(r#"{"kind":"run","run_id":123,"tool_call_id":{"a":1}}"#)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            exec(
+                &db,
+                &job(r#"{"kind":"run","run_id":"r1","tool_call_id":7}"#)
+            )
+            .await
+            .is_err()
+        );
+        exec(
+            &db,
+            &job(r#"{"kind":"run","run_id":"r1","tool_call_id":"t1"}"#),
+        )
+        .await
+        .unwrap();
+        let retarget = format!(
+            r#"UPDATE jobs SET origin = '{{"kind":"run","run_id":5,"tool_call_id":"t1"}}' WHERE id = '{JOB}'"#
+        );
+        assert!(exec(&db, &retarget).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_job_revision_needs_its_document_and_must_exist() {
+        let (_dir, db) = open().await;
+        add_document(&db, DOC).await.unwrap();
+        add_revision(&db, DOC, "1", SHA).await.unwrap();
+        let job = |doc: &str, rev: &str| {
+            format!(
+                "INSERT INTO jobs (id, kind, document_id, revision, status, origin) VALUES ('{JOB}', 'extract', {doc}, {rev}, 'queued', '{{\"kind\":\"page\"}}')"
+            )
+        };
+        assert!(
+            exec(&db, &job("NULL", "1")).await.is_err(),
+            "revision without document"
+        );
+        assert!(
+            exec(&db, &job(&format!("'{DOC}'"), "2")).await.is_err(),
+            "revision that does not exist"
+        );
+        exec(&db, &job(&format!("'{DOC}'"), "1")).await.unwrap();
+        assert!(
+            exec(
+                &db,
+                &format!("UPDATE jobs SET revision = 9 WHERE id = '{JOB}'")
+            )
+            .await
+            .is_err()
+        );
+        exec(
+            &db,
+            &format!("UPDATE jobs SET revision = NULL WHERE id = '{JOB}'"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_upload_is_complete_only_with_every_byte() {
+        let (_dir, db) = open().await;
+        let upl = |status: &str, received: i64| {
+            format!(
+                "INSERT INTO uploads (id, total_size, sha256, received, status) VALUES ('{UPL}', 10, '{SHA}', {received}, '{status}')"
+            )
+        };
+        assert!(exec(&db, &upl("complete", 4)).await.is_err());
+        assert!(exec(&db, &upl("imported", 9)).await.is_err());
+        exec(&db, &upl("receiving", 4)).await.unwrap();
+        assert!(
+            exec(
+                &db,
+                &format!("UPDATE uploads SET status = 'complete' WHERE id = '{UPL}'")
+            )
+            .await
+            .is_err()
+        );
+        exec(
+            &db,
+            &format!("UPDATE uploads SET received = 10, status = 'complete' WHERE id = '{UPL}'"),
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn upload_progress_cannot_exceed_its_size() {
         let (_dir, db) = open().await;
