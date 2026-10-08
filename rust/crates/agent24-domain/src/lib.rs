@@ -2569,7 +2569,7 @@ mod tool_manifest_tests {
     fn duplicate_operations_in_one_manifest_are_refused() {
         let two = format!(
             "{ONE_TOOL}  - operation: list-notes\n    description: again\n    \
-             input_schema: {{type: object}}\n    risk: write\n    output_privacy: local_only\n    \
+             input_schema: {{type: object}}\n    risk: write_local\n    output_privacy: local_only\n    \
              timeout_ms: 1000\n    inline_wait_ms: 0\n"
         );
         let err = manifest(&two).expect_err("duplicate operation");
