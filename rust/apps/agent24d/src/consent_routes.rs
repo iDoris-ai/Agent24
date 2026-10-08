@@ -71,12 +71,12 @@ fn view(record: agent24_store::ModuleConsentRecord, status: &'static str) -> Aut
     }
 }
 
-async fn authorization_views(state: &AppState) -> Result<Vec<AuthorizationView>, Response> {
+async fn authorization_views(state: &AppState) -> Result<Vec<AuthorizationView>, Box<Response>> {
     let records = state
         .store
         .list_module_consents()
         .await
-        .map_err(|err| storage_error("list", err))?;
+        .map_err(|err| Box::new(storage_error("list", err)))?;
     let now = Utc::now().to_rfc3339();
     let mut views = Vec::with_capacity(records.len());
     for record in records {
@@ -90,7 +90,7 @@ async fn authorization_views(state: &AppState) -> Result<Vec<AuthorizationView>,
                 &now,
             )
             .await
-            .map_err(|err| storage_error("resolve_status", err))?;
+            .map_err(|err| Box::new(storage_error("resolve_status", err)))?;
         let status = match lookup {
             agent24_store::ConsentLookup::Granted(_) => "granted",
             agent24_store::ConsentLookup::Denied(_) => "denied",
@@ -112,7 +112,7 @@ struct AuthorizationList {
 pub async fn list(State(state): State<AppState>) -> Response {
     match authorization_views(&state).await {
         Ok(authorizations) => Json(AuthorizationList { authorizations }).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -126,7 +126,7 @@ pub async fn export(State(state): State<AppState>) -> Response {
             );
             response
         }
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
