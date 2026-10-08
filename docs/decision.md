@@ -1130,6 +1130,8 @@ Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清�
 > 记录；详见 ADR-031、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`、
 > `docs/agent/PLAN-ME4-OS-CAPABILITIES.md`。
 
+> **F3 裁决记录（jason，2026-10-07；M2 收口）**：继续使用 `/api/v1/<name>`，保留模块名保留段名单及其双向集合测试，F3 关闭。迁移到 `/api/v1/os/<name>` 会与内核现有 `/os/{name}` 路由冲突，并要求已发布模块 manifest、SDK、调度回调路径和桌面端协同迁移；现有保留段检查已把冲突后果从 daemon panic 降为该模块被拒绝。代价是内核新增顶层路由段会占用同名模块名，因此新路由优先挂在已有段下，新增顶层段须在 PR 说明理由。
+
 ### 与记忆（ADR-028）的关系
 
 记忆层保持**领域 OS 无关**：内核提供通用记忆（L0–L4），领域 OS **用但不拥有**它；领域态（Sin90 的 direction/proposal…）留在领域 OS 自己的 DB。换 OS 不动内核记忆。
