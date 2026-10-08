@@ -23,6 +23,8 @@
 //! ones a future caller might add without updating a second hand-written
 //! check elsewhere.
 
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
@@ -142,22 +144,56 @@ impl ToolPermissionSummary {
     /// 变化时旧授权不匹配"), so a version bump with byte-identical scope
     /// still has to go through the version check, not get silently absorbed
     /// into a changed fingerprint.
+    ///
+    /// PR #769 review (blocking F1): an earlier version of this function
+    /// joined the five fields with a literal `|field=` delimiter, which is
+    /// NOT injective — a `readable`/`writable`/`external` value containing
+    /// a substring like `|writable=` can make two genuinely different
+    /// summaries hash identically (the review's exact A/B reproduction is
+    /// pinned as a regression test below), and `Option::unwrap_or("-")`
+    /// separately made `None` indistinguishable from the literal text
+    /// `"-"`. [`CanonicalScope`]'s JSON encoding fixes both: `serde_json`
+    /// escapes every quote/backslash/control byte inside a string so no
+    /// field value can forge a key/value/field boundary, the field set and
+    /// order are fixed by the struct's declaration (never attacker/
+    /// caller-influenced), and `None` serializes to the JSON literal `null`
+    /// — byte-distinct from the quoted string `"-"`. Two different
+    /// `(source, risk, readable, writable, external)` tuples therefore
+    /// always serialize to different byte strings, which is exactly what
+    /// "fingerprint" requires.
     #[must_use]
     pub fn scope_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
-        let canonical = format!(
-            "source={}|risk={}|readable={}|writable={}|external={}",
-            source_str(self.source),
-            risk_str(self.risk),
-            self.readable.as_deref().unwrap_or("-"),
-            self.writable.as_deref().unwrap_or("-"),
-            self.external.as_deref().unwrap_or("-"),
-        );
-        format!(
-            "sha256:{}",
-            hex_encode(&Sha256::digest(canonical.as_bytes()))
-        )
+        let canonical = CanonicalScope {
+            source: source_str(self.source),
+            risk: risk_str(self.risk),
+            readable: self.readable.as_deref(),
+            writable: self.writable.as_deref(),
+            external: self.external.as_deref(),
+        };
+        #[allow(
+            clippy::expect_used,
+            reason = "a fixed-shape struct of &str/Option<&str> fields always serializes"
+        )]
+        let bytes =
+            serde_json::to_vec(&canonical).expect("CanonicalScope serialization cannot fail");
+        format!("sha256:{}", hex_encode(&Sha256::digest(&bytes)))
     }
+}
+
+/// The exact byte shape [`ToolPermissionSummary::scope_fingerprint`] hashes.
+/// A dedicated struct — not a `format!`-joined string — IS the fix for PR
+/// #769's blocking F1: serde's struct serialization always emits these five
+/// keys, in this declaration order, with byte-escaped string values and a
+/// distinct `null` for `None`, so no value any field could hold can make two
+/// different tuples collide (see the doc comment above).
+#[derive(Serialize)]
+struct CanonicalScope<'a> {
+    source: &'static str,
+    risk: &'static str,
+    readable: Option<&'a str>,
+    writable: Option<&'a str>,
+    external: Option<&'a str>,
 }
 
 /// A persisted consent decision — the row as stored, independent of what any
@@ -277,6 +313,33 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// PR #769 review (blocking F2): `decided_at`/`expires_at` must never be
+/// compared as raw strings — an earlier version did exactly that
+/// (`record.expires_at.as_str() < now`), which is wrong two independent
+/// ways the review reproduced: an unparseable value like `"garbage"` sorts
+/// lexicographically AFTER any real ISO-8601 date and so never expires, and
+/// a non-UTC offset like `"...+08:00"` sorts by its literal digits rather
+/// than the instant it names, so a timestamp already hours past its true
+/// UTC expiry can still compare as "not yet expired" against a `now` given
+/// in `Z` form.
+///
+/// This parses ANY valid RFC 3339 string (any offset, chrono normalizes it),
+/// returning both the UTC epoch milliseconds (what comparisons must use)
+/// and the canonical, offset-free UTC text at millisecond precision (what
+/// [`Store::upsert_module_consent`] stores instead of the caller's raw
+/// input) — so every row this crate writes itself is already in the one
+/// form two timestamps can be safely compared by, and a caller handing in
+/// an unparseable string is rejected rather than silently accepted.
+fn parse_instant(s: &str) -> Result<(i64, String)> {
+    let parsed = DateTime::parse_from_rfc3339(s)
+        .map_err(|_| StoreError::Conflict(format!("invalid timestamp: {s}")))?;
+    let utc = parsed.with_timezone(&Utc);
+    Ok((
+        utc.timestamp_millis(),
+        utc.to_rfc3339_opts(SecondsFormat::Millis, true),
+    ))
+}
+
 fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
     Ok(ModuleConsentRecord {
         module: row.get("module"),
@@ -307,6 +370,15 @@ impl Store {
         decided_at: &str,
         expires_at: &str,
     ) -> Result<ModuleConsentRecord> {
+        // PR #769 review (blocking F2): reject at write time rather than
+        // storing — and later comparing — a value that was never a real
+        // timestamp, or one in a non-UTC offset that a naive string
+        // comparison would get wrong. Storing the CANONICAL (UTC,
+        // millisecond-precision, `Z`-suffixed) text rather than the
+        // caller's raw input means every row this crate writes is already
+        // in the one form `lookup_module_consent` can trust.
+        let (_, decided_at) = parse_instant(decided_at)?;
+        let (_, expires_at) = parse_instant(expires_at)?;
         let scope_fingerprint = summary.scope_fingerprint();
         let row = sqlx::query(
             "INSERT INTO module_consents
@@ -344,9 +416,12 @@ impl Store {
     }
 
     /// Records the host's confirmation that the user explicitly accepted
-    /// `summary` for its `(module, op)`, valid until `expires_at` (ADR §3:
-    /// the caller must pass a bounded value — this call does not invent or
-    /// validate one). Replaces any previous record for the same tool.
+    /// `summary` for its `(module, op)`, valid until `expires_at` — which
+    /// must be a parseable RFC 3339 instant (`decided_at` too); an
+    /// unparseable value is rejected rather than stored (PR #769 review F2).
+    /// ADR §3 also requires the value to be *bounded* (not "forever"); this
+    /// call does not check that — only that it parses. Replaces any
+    /// previous record for the same tool.
     pub async fn grant_module_consent(
         &self,
         summary: &ToolPermissionSummary,
@@ -399,10 +474,24 @@ impl Store {
         {
             return Ok(ConsentLookup::Stale(record));
         }
-        // `<` mirrors `module_approvals`'s decide-CAS/timeout-scan split
-        // (`expires_at >= now` is still valid, `< now` is expired): the
-        // instant exactly equal to `expires_at` counts as still valid.
-        if record.expires_at.as_str() < now {
+        // PR #769 review (blocking F2): compare real instants, never raw
+        // text. `<` on the parsed millis mirrors `module_approvals`'s
+        // decide-CAS/timeout-scan split (`expires_at >= now` is still
+        // valid, `< now` is expired) — the instant exactly equal to
+        // `expires_at` counts as still valid.
+        //
+        // Fail-closed, not an error, on either side failing to parse: `now`
+        // is caller-supplied on every call, and `record.expires_at` SHOULD
+        // always be the canonical text `upsert_module_consent` wrote — but
+        // a lookup must not assume that invariant holds for a row it did
+        // not itself just write (a legacy row from before this fix, or one
+        // written directly against the database). Either failure resolves
+        // to `Expired`, never silently falls through to `Granted`.
+        let is_expired = match (parse_instant(now), parse_instant(&record.expires_at)) {
+            (Ok((now_millis, _)), Ok((expiry_millis, _))) => expiry_millis < now_millis,
+            _ => true,
+        };
+        if is_expired {
             return Ok(ConsentLookup::Expired(record));
         }
         Ok(match record.decision {
@@ -748,5 +837,247 @@ mod tests {
             .await
             .unwrap();
         assert!(lookup.is_authorized());
+    }
+
+    // ── PR #769 review, blocking F1: scope_fingerprint() must be injective ──
+
+    #[test]
+    fn scope_fingerprint_no_longer_collides_on_the_reviewers_exact_ab_inputs() {
+        // The exact A/B construction from the PR #769 review: two summaries
+        // with genuinely different read/write scope, built so that joining
+        // the fields with a literal `|field=` delimiter (the OLD encoding)
+        // produces byte-identical canonical strings.
+        let a = ToolPermissionSummary::new(
+            "m",
+            "op",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("inbox|writable=mailbox delete".to_owned()),
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        let b = ToolPermissionSummary::new(
+            "m",
+            "op",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("inbox".to_owned()),
+            Some("mailbox delete|writable=-".to_owned()),
+            None,
+            HostRiskLevel::Low,
+        );
+
+        // Negative control, kept ONLY to pin the regression this fix
+        // resolves — never called by production code. Reproduces the OLD,
+        // buggy `format!("source={}|risk={}|readable={}|writable={}|external={}", ...)`
+        // join this function used before PR #769's review.
+        fn old_buggy_canonical(s: &ToolPermissionSummary) -> String {
+            format!(
+                "source={}|risk={}|readable={}|writable={}|external={}",
+                source_str(s.source),
+                risk_str(s.risk),
+                s.readable.as_deref().unwrap_or("-"),
+                s.writable.as_deref().unwrap_or("-"),
+                s.external.as_deref().unwrap_or("-"),
+            )
+        }
+        assert_eq!(
+            old_buggy_canonical(&a),
+            old_buggy_canonical(&b),
+            "sanity check on the negative control itself: the OLD delimiter-joined \
+             encoding must still collide on these inputs, or this test no longer \
+             reproduces the bug it exists to pin"
+        );
+
+        // The fix: the new CanonicalScope/JSON-based fingerprint must NOT
+        // collide on the same two summaries.
+        assert_ne!(
+            a.scope_fingerprint(),
+            b.scope_fingerprint(),
+            "a readable/writable/external value containing `|field=` text must not \
+             let two different permission scopes hash to the same fingerprint"
+        );
+    }
+
+    #[test]
+    fn none_and_the_literal_dash_no_longer_collide() {
+        // R4's addition to F1: the OLD `unwrap_or("-")` made an explicit
+        // "no permission" (`None`) indistinguishable from the literal text
+        // `"-"` — both produced the substring `readable=-`. JSON's `null`
+        // vs `"-"` must not have the same problem.
+        let no_permission = ToolPermissionSummary::new(
+            "m",
+            "op",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            None,
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        let literal_dash = ToolPermissionSummary::new(
+            "m",
+            "op",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("-".to_owned()),
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        assert_ne!(
+            no_permission.scope_fingerprint(),
+            literal_dash.scope_fingerprint(),
+            "None (explicit \"no permission\") must not fingerprint identically to \
+             Some(\"-\") (a tool whose readable scope text happens to be the string \"-\")"
+        );
+    }
+
+    // ── PR #769 review, blocking F2: real-time comparison, not string compare ─
+
+    #[tokio::test]
+    async fn grant_rejects_an_unparseable_expires_at_rather_than_storing_it() {
+        let store = store().await;
+        let s = summary("doc body");
+        let err = store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "garbage")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)));
+
+        // Confirms this really is "rejected", not "accepted and then also
+        // broken": nothing got written for this tool at all.
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T00:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(lookup, ConsentLookup::NotGranted);
+    }
+
+    #[tokio::test]
+    async fn grant_rejects_an_unparseable_decided_at() {
+        let store = store().await;
+        let s = summary("doc body");
+        let err = store
+            .grant_module_consent(&s, "not-a-timestamp", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn an_offset_timestamp_is_normalized_to_utc_and_compared_by_real_instant() {
+        // The review's second reproduction: `"...+08:00"` is 8 hours AHEAD
+        // of UTC, so `2026-10-08T08:00:00+08:00` names the same instant as
+        // `2026-10-08T00:00:00Z`. Under the OLD raw-string comparison this
+        // would have sorted as "not yet expired" against a `now` one second
+        // later in `Z` form (`'8' > '0'` at the hour digit) — the exact
+        // false negative the review demonstrated.
+        let store = store().await;
+        let s = summary("doc body");
+        let granted = store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-10-08T08:00:00+08:00")
+            .await
+            .unwrap();
+        // Stored canonicalized to UTC, not the caller's raw offset text.
+        assert_eq!(granted.expires_at, "2026-10-08T00:00:00.000Z");
+
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T00:00:01Z", // one real second past the true UTC expiry
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(lookup, ConsentLookup::Expired(_)),
+            "an offset timestamp whose UTC instant has passed must be judged \
+             Expired even though its raw text would have sorted later than `now`"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_garbage_expires_at_never_makes_a_lookup_not_expire() {
+        // The review's first reproduction: a literal unparseable value like
+        // `"garbage"` sorts lexicographically AFTER any real ISO-8601 date,
+        // so the OLD string comparison treated it as "never expires". This
+        // can only reach storage by bypassing `grant_module_consent`'s
+        // write-time validation (simulated here with a raw INSERT, standing
+        // in for a legacy/pre-fix or externally-written row) — the lookup
+        // path must fail closed on it regardless of how it got there.
+        let store = store().await;
+        let s = summary("doc body");
+        let fp = s.scope_fingerprint();
+        sqlx::query(
+            "INSERT INTO module_consents
+                (module, op, module_version, scope_fingerprint, source, risk,
+                 readable, writable, external, decision, decided_at, expires_at)
+             VALUES (?, ?, ?, ?, 'first_party', 'low', ?, NULL, NULL, 'granted',
+                     '2026-10-08T00:00:00.000Z', 'garbage')",
+        )
+        .bind(&s.module)
+        .bind(&s.op)
+        .bind(&s.module_version)
+        .bind(&fp)
+        .bind(&s.readable)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &fp,
+                "2026-10-08T00:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(lookup, ConsentLookup::Expired(_)),
+            "an unparseable stored expires_at must fail closed to Expired, never Granted"
+        );
+        assert!(!lookup.is_authorized());
+    }
+
+    // ── confirms the suggested-but-non-blocking coverage gap: deny overrides ─
+    // a previous grant for the same (module, op), not just the reverse ───────
+
+    #[tokio::test]
+    async fn granting_then_denying_the_same_tool_makes_the_latest_decision_win() {
+        let store = store().await;
+        let s = summary("doc body");
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .deny_module_consent(&s, "2026-10-08T01:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T01:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(lookup, ConsentLookup::Denied(_)));
+        assert!(!lookup.is_authorized());
     }
 }
