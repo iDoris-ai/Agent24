@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent24_domain::{EgressDestination, EgressPurpose};
 use agent24_protocol::{RiskClass, ToolInfo};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -349,6 +350,15 @@ impl Tool for ShellExecTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        // Child processes are not network-isolated by the host. Their argv,
+        // stdin, shared files and later socket traffic cannot be bounded to a
+        // provable destination, so a run policy cannot authorize this path.
+        // Keep this before spawn (including the already-approved resume path).
+        ctx.authorize_egress(
+            EgressPurpose::ProcessExecution,
+            EgressDestination::unknown(),
+        )
+        .await?;
         let argv: Vec<String> = input
             .get("argv")
             .and_then(Value::as_array)
@@ -461,6 +471,37 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn shell_exec_requires_a_live_egress_policy() {
+        // An argv-only child process is not a network sandbox: it can open
+        // sockets or invoke another program that does. Keep it unavailable
+        // unless the host has installed the run's live egress policy.
+        assert!(ShellExecTool::new(std::path::PathBuf::from("/tmp")).requires_outbound_policy());
+    }
+
+    #[tokio::test]
+    async fn shell_exec_does_not_spawn_for_local_only_run_data() {
+        use agent24_domain::{EgressGate, EgressResource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let local_only = ctx().with_egress_policy(
+            <dyn EgressGate>::deny_all(),
+            vec![EgressResource::local_only("user_input:run-1", "prompt")],
+            0,
+        );
+        let mut input = Map::new();
+        input.insert(
+            "argv".to_owned(),
+            serde_json::json!(["/bin/sh", "-c", "touch child-ran"]),
+        );
+        let result = tool
+            .call(&local_only, &input, &CancellationToken::new())
+            .await;
+        assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
+        assert!(!dir.path().join("child-ran").exists());
+    }
     use crate::ToolRegistry;
     use std::sync::Arc;
 
@@ -609,7 +650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_exec_runs_argv_without_shell_interpretation() {
+    async fn shell_exec_fails_closed_without_a_provable_process_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
         let cancel = CancellationToken::new();
@@ -619,10 +660,8 @@ mod tests {
             "argv".to_owned(),
             serde_json::json!(["/bin/echo", "$HOME", "two words"]),
         );
-        let out = tool.call(&ctx(), &input, &cancel).await.unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["exit_code"], 0);
-        assert_eq!(parsed["stdout"], "$HOME two words\n");
+        let result = tool.call(&ctx(), &input, &cancel).await;
+        assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
     }
 
     /// FU-103/J-6, end-to-end through `ShellExecTool::call` (not just the
@@ -667,39 +706,24 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["printenv"]));
-        let out = tool.call(&ctx(), &input, &cancel).await.unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        let stdout = parsed["stdout"].as_str().unwrap();
-        assert!(
-            !stdout.contains("secret_test_key"),
-            "secret leaked into shell_exec's child:\n{stdout}"
-        );
-        assert!(
-            stdout.contains("PATH="),
-            "PATH must still reach shell_exec's child:\n{stdout}"
-        );
+        let result = tool.call(&ctx(), &input, &cancel).await;
+        assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
     }
 
     #[tokio::test]
-    async fn shell_exec_reports_nonzero_exit() {
+    async fn shell_exec_blocks_local_commands_without_network_isolation() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["/usr/bin/false"]));
-        let out = tool
-            .call(&ctx(), &input, &CancellationToken::new())
-            .await
-            .unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["exit_code"], 1);
+        let result = tool.call(&ctx(), &input, &CancellationToken::new()).await;
+        assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
     }
 
     #[tokio::test]
-    async fn shell_exec_times_out_through_the_registry_budget() {
-        // Registry-level timeout uses tool.timeout(); the whitelist+approval
-        // gates are bypassed here by whitelisting a non-approval wrapper —
-        // instead we test the budget directly through dispatch on a
-        // no-approval clone of the tool.
+    async fn shell_exec_rejects_before_starting_a_timed_process() {
+        // Even a registry wrapper that skips approval cannot bypass the
+        // process egress check in the tool implementation.
         struct NoApproval(ShellExecTool);
         #[async_trait]
         impl Tool for NoApproval {
@@ -739,7 +763,7 @@ mod tests {
             .dispatch("shell_exec", &ctx(), &input, &CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Timeout(_)), "{err}");
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

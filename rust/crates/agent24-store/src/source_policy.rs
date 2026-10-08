@@ -144,6 +144,21 @@ impl SourceRef {
         }
     }
 
+    /// A recalled memory item is derived persisted content. Its original
+    /// source may no longer be available, so preserve the memory record as a
+    /// LocalOnly taint instead of treating recall as fresh user input.
+    pub fn memory_recall(assertion_id: &str, created_at: impl Into<String>) -> Self {
+        SourceRef {
+            source_id: format!("memory_assertion:{assertion_id}"),
+            kind: SourceKind::SelectedMaterial,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
     /// The fail-closed tag constructed when a stored row cannot be
     /// confidently decoded (unknown/mismatched `schema_version`, or
     /// `tag_json` that fails to parse). Preserves the row's own
@@ -304,6 +319,21 @@ impl Store {
         Ok(rows.iter().map(decode_tag_row).collect())
     }
 
+    /// All source labels accumulated by a session. Used when a scheduled or
+    /// resumed continuation creates a fresh run: a new run must not forget
+    /// taint from earlier messages merely because its prompt is short.
+    pub async fn list_session_source_tags(&self, session_id: &str) -> Result<Vec<StoredSourceTag>> {
+        let rows = sqlx::query(
+            "SELECT t.seq, t.source_id, t.schema_version, t.tag_json, t.created_at \
+             FROM run_source_tags t JOIN runs r ON r.id = t.run_id \
+             WHERE r.session_id = ? ORDER BY r.created_at ASC, t.seq ASC, t.source_id ASC",
+        )
+        .bind(session_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.iter().map(decode_tag_row).collect())
+    }
+
     /// The run's fail-closed effective policy (ADR-K1-02 §2.1), folded from
     /// every persisted tag. `LocalOnly` when the run has none.
     pub async fn run_policy_snapshot(&self, run_id: &str) -> Result<PolicySnapshot> {
@@ -376,6 +406,47 @@ mod tests {
         assert_eq!(snap, PolicySnapshot::fail_closed());
         assert_eq!(snap.effective_mode, SourceMode::LocalOnly);
         assert!(snap.sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_source_tags_include_prior_run_provenance_for_background_continuations() {
+        let store = store_with_run("run_parent").await;
+        sqlx::query(
+            "INSERT INTO sessions (id, title, channel, created_at, updated_at) \
+             VALUES ('session-1', 'test', 'desktop', 't', 't')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET session_id = 'session-1' WHERE id = 'run_parent'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .tag_run_source(
+                "run_parent",
+                0,
+                &SourceRef::selected_material("document-1", Some("sha256:abc".into()), "t"),
+                "t",
+            )
+            .await
+            .unwrap();
+
+        let tags = store.list_session_source_tags("session-1").await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].source.source_id, "selected_material:document-1");
+        assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+    }
+
+    #[test]
+    fn recalled_memory_is_a_local_only_derived_source() {
+        let tag = SourceRef::memory_recall("assertion-7", "2026-10-08T00:00:00Z");
+        assert_eq!(tag.mode, SourceMode::LocalOnly);
+        assert_eq!(tag.source_id, "memory_assertion:assertion-7");
+        assert_eq!(
+            PolicySnapshot::from_tags(vec![tag]).effective_mode,
+            SourceMode::LocalOnly
+        );
     }
 
     #[tokio::test]

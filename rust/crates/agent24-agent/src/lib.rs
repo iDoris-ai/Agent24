@@ -1521,8 +1521,10 @@ impl RunManager {
         let prior_context_len = prior_context.len();
         let mut snapshot = Vec::with_capacity(prior_context_len + 3);
         let mut recalled_ids = None;
+        let mut recalled_msg_seq = None;
         if let Some((recalled, ids)) = recall {
             recalled_ids = Some(ids);
+            recalled_msg_seq = Some(snapshot.len() as i64);
             snapshot.push(recalled);
         }
         if write_skipped {
@@ -1588,6 +1590,64 @@ impl RunManager {
             )
             .await;
             return;
+        }
+        // A continuation (including self-wake/scheduler runs) carries forward
+        // every source label already accumulated by its session. Read errors
+        // stop the run before its first model call.
+        if let Some(session_id) = run.session_id.as_deref() {
+            let inherited = match self.store.list_session_source_tags(session_id).await {
+                Ok(tags) => tags,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to load session source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            for inherited_tag in inherited {
+                if let Err(err) = self
+                    .store
+                    .tag_run_source(&run_id, user_msg_seq, &inherited_tag.source, &now_iso8601())
+                    .await
+                {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to persist inherited session source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        // Recalled assertions are persisted derivatives. Attach their
+        // LocalOnly provenance to this run's recall block so later turns,
+        // resume and any further derivatives keep the taint.
+        if let Some(ids) = recalled_ids.as_ref() {
+            for id in ids {
+                let tag = agent24_store::SourceRef::memory_recall(id, now_iso8601());
+                if let Err(err) = self
+                    .store
+                    .tag_run_source(
+                        &run_id,
+                        recalled_msg_seq.unwrap_or(user_msg_seq),
+                        &tag,
+                        &now_iso8601(),
+                    )
+                    .await
+                {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to persist recalled-memory source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
         // The audit event names exactly the ids that made it into the
         // now-durable snapshot — emitted only once the snapshot is safely on
@@ -3120,16 +3180,12 @@ pub(crate) mod tests {
         let shell = agent24_tools::ShellExecTool::new(legacy.path().to_path_buf());
         let mut shell_input = serde_json::Map::new();
         shell_input.insert("argv".into(), serde_json::json!(["/bin/pwd"]));
-        let shell_out =
-            agent24_tools::Tool::call(&shell, &ctx, &shell_input, &CancellationToken::new())
-                .await
-                .unwrap();
-        let shell_json: serde_json::Value = serde_json::from_str(&shell_out).unwrap();
-        assert_eq!(shell_json["exit_code"], 0);
-        assert_eq!(
-            std::path::Path::new(shell_json["stdout"].as_str().unwrap().trim()),
-            root.canonicalize().unwrap()
-        );
+        let shell_result =
+            agent24_tools::Tool::call(&shell, &ctx, &shell_input, &CancellationToken::new()).await;
+        assert!(matches!(
+            shell_result,
+            Err(agent24_tools::ToolError::Denied(_))
+        ));
         sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
             .bind(workspace_timestamp(now_iso8601()))
             .bind(LEASE)
@@ -3603,7 +3659,7 @@ pub(crate) mod tests {
         store: &Store,
         session_id: &str,
         prompt: &str,
-    ) {
+    ) -> Run {
         let run = manager
             .start_run(RunCreate {
                 session_id: Some(session_id.to_owned()),
@@ -3617,7 +3673,7 @@ pub(crate) mod tests {
         for _ in 0..200 {
             let current = store.get_run(&run.id).await.unwrap().unwrap();
             if current.status != RunStatus::Running && current.status != RunStatus::Queued {
-                return;
+                return current;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -3635,8 +3691,16 @@ pub(crate) mod tests {
             manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
         seed_session(&store, "sess_mem").await;
 
-        run_in_session(&manager, &store, "sess_mem", "first question").await;
-        run_in_session(&manager, &store, "sess_mem", "second question").await;
+        let first = run_in_session(&manager, &store, "sess_mem", "first question").await;
+        let second_run = run_in_session(&manager, &store, "sess_mem", "second question").await;
+
+        let inherited_policy = store.run_policy_snapshot(&second_run.id).await.unwrap();
+        assert!(
+            inherited_policy
+                .sources
+                .iter()
+                .any(|source| { source.source_id == format!("user_input:{}", first.id) })
+        );
 
         let seen = provider.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "expected one completion per run");
@@ -4491,7 +4555,7 @@ mod approval_tests {
     }
 
     #[tokio::test]
-    async fn approved_shell_exec_actually_executes() {
+    async fn approval_does_not_override_the_process_egress_gate() {
         let dir = tempfile::tempdir().unwrap();
         let h = harness(dir.path().to_path_buf()).await;
         let run = h.manager.start_run(create()).await.unwrap();
@@ -4507,22 +4571,9 @@ mod approval_tests {
             .unwrap();
         let done = wait_terminal(&h.store, &run.id).await;
         assert_eq!(done.status, RunStatus::Completed);
-        assert!(done.output.unwrap().text.contains("approved-output"));
+        assert!(!dir.path().join("approved-output").exists());
         let calls = h.store.list_tool_calls(&run.id).await.unwrap();
-        assert_eq!(calls[0].status, ToolCallStatus::Completed);
-        let seen = h.events.lock().unwrap().clone();
-        assert_eq!(
-            seen,
-            vec![
-                "run.started",
-                "tool.started",
-                "approval.required",
-                "approval.resolved",
-                "tool.completed",
-                "model.delta",
-                "run.completed"
-            ]
-        );
+        assert_eq!(calls[0].status, ToolCallStatus::Denied);
     }
 
     // ── H8 plan mode ─────────────────────────────────────────────────────────
@@ -4857,12 +4908,9 @@ mod approval_tests {
 
         let done = wait_terminal(&h.store, "run_1").await;
         assert_eq!(done.status, RunStatus::Completed);
-        // The parked shell_exec actually ran on resume; its output flowed into
-        // the final answer.
-        assert!(
-            done.output.unwrap().text.contains("resumed-output"),
-            "the parked tool did not run on resume"
-        );
+        // The persisted approval is not an egress authorization. Resume must
+        // re-run the live process boundary check and refuse the child.
+        assert!(!done.output.unwrap().text.contains("resumed-output"));
         // The reconstructed thread gained the tool result for the parked call,
         // keyed on the THREAD's provider id (call_provider_1) — NOT the
         // approval's tc_internal_1. Resume works across the two id namespaces.
@@ -4873,6 +4921,12 @@ mod approval_tests {
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
             "no tool result was recorded for the resumed call"
         );
+        assert!(thread.iter().any(|m| {
+            m.role == "tool"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("outbound request denied"))
+        }));
     }
 
     #[tokio::test]
