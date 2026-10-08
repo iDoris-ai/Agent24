@@ -1,106 +1,40 @@
 {
   "id": "s01-04-en-govuk-sa-deadlines",
-  "schema": "s01-gold-v1",
+  "schema": "s01-gold-v2",
   "fields": [
-    {
-      "key": "register_deadline",
-      "status": "present",
-      "value": "5 October (if you need to complete a return and have not sent one before)",
-      "anchors": [
-        {
-          "page": 2,
-          "quote": "You must tell HMRC by 5 October"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "paper_return_deadline",
-      "status": "present",
-      "value": "11:59pm on 31 October 2026",
-      "normalized": "2026-10-31T23:59",
-      "anchors": [
-        {
-          "page": 2,
-          "quote": "11:59pm on 31 October 2026"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "online_return_deadline",
-      "status": "present",
-      "value": "11:59pm on 31 January 2027",
-      "normalized": "2027-01-31T23:59",
-      "anchors": [
-        {
-          "page": 3,
-          "quote": "You must submit your online tax return by 11:59pm on 31 January 2027"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "payment_deadline",
-      "status": "present",
-      "value": "11:59pm on 31 January 2027",
-      "normalized": "2027-01-31T23:59",
-      "anchors": [
-        {
-          "page": 3,
-          "quote": "You need to pay your Self Assessment tax by 11:59pm on 31 January 2027"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "tax_code_submission_deadline",
-      "status": "present",
-      "value": "11:59pm on 30 December 2026",
-      "normalized": "2026-12-30T23:59",
-      "anchors": [
-        {
-          "page": 3,
-          "quote": "you must submit it by 11:59pm on 30 December 2026"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "profit_unknown_still_required",
-      "status": "present",
-      "value": "If you do not know your profit for the whole tax year, you still need to send a tax return.",
-      "negation": true,
-      "anchors": [
-        {
-          "page": 2,
-          "quote": "If you do not know your profit for the whole tax year, you still need to send a tax return."
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "trustees_no_online",
-      "status": "present",
-      "value": "You cannot send a return online.",
-      "negation": true,
-      "anchors": [
-        {
-          "page": 3,
-          "quote": "You cannot send a return online."
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "penalty_amount",
-      "status": "missing",
-      "severity": "major"
-    }
+    {"key": "tax_year", "q": "ctx", "status": "present", "value": "6 April 2025 to 5 April 2026", "normalized": "2025-04-06/2026-04-05", "time": {"kind": "interval"}, "severity": "critical", "anchors": [{"page": 2, "quote": "The last tax year started on 6 April 2025 and ended on 5 April 2026."}], "role": "context"},
+    {"key": "receipt_requirement", "q": "Q1", "status": "present", "value": "HMRC must receive your tax return and any money you owe by the deadline", "severity": "major", "anchors": [{"page": 2, "quote": "HM Revenue and Customs (HMRC) must receive your tax return and any money you owe by the deadline."}], "note": "receipt, not posting, by the deadline"},
+    {"key": "profit_unknown_still_required", "q": "Q4", "status": "present", "value": "If you do not know your profit for the whole tax year, you still need to send a tax return", "applies_if": ["does not know their profit for the whole tax year"], "negation": true, "severity": "critical", "anchors": [{"page": 2, "quote": "If you do not know your profit for the whole tax year, you still need to send a tax return."}]},
+    {"key": "register_deadline", "q": "Q2", "status": "present", "value": "5 October", "normalized": "2026-10-05", "time": {"kind": "date", "inferred": ["year"], "inferred_from": "p2 heading “If you register after 5 October 2026”"}, "audience": "people who need to complete a tax return for the previous year and have either not sent a tax return before, or registered before but did not need to send one for tax year 2024 to 2025", "applies_if": ["needs to complete a tax return for the previous year", "has not sent a tax return before, or registered before but did not need to send a tax return for 2024 to 2025"], "severity": "critical", "anchors": [{"page": 2, "quote": "You must tell HMRC by 5 October if you need to complete a tax return for the previous year and you have either:"}, {"page": 2, "quote": "not sent a tax return before"}, {"page": 2, "quote": "registered before but did not need to send a tax return for the tax year 2024 to 2025"}, {"page": 2, "quote": "If you register after 5 October 2026"}], "related": ["register_action", "late_registration_filing_deadline"]},
+    {"key": "register_action", "q": "Q1", "status": "present", "value": "Tell HMRC by registering for Self Assessment", "applies_if": ["needs to complete a tax return for the previous year", "has not sent a tax return before, or registered before but did not need to send a tax return for 2024 to 2025"], "severity": "major", "anchors": [{"page": 2, "quote": "You must tell HMRC by 5 October if you need to complete a tax return for the previous year and you have either:"}, {"page": 2, "quote": "not sent a tax return before"}, {"page": 2, "quote": "registered before but did not need to send a tax return for the tax year 2024 to 2025"}, {"page": 2, "quote": "You can tell HMRC by registering for Self Assessment."}], "related": ["register_deadline"]},
+    {"key": "late_registration_filing_deadline", "q": "Q2", "status": "present", "value": "3 months from the date on the letter or email", "time": {"kind": "relative", "trigger": "date on HMRC's letter or email", "duration": "P3M"}, "audience": "people who register after 5 October 2026", "applies_if": ["registered after 5 October 2026"], "severity": "critical", "anchors": [{"page": 2, "quote": "If you register after 5 October 2026"}, {"page": 2, "quote": "HMRC will send you a letter or email with a different deadline to send your tax return by - this will be 3 months from the date on the letter or email."}]},
+    {"key": "late_registration_payment_deadline", "q": "ctx", "status": "present", "value": "11:59pm on 31 January 2027", "normalized": "2027-01-31T23:59", "time": {"kind": "datetime", "boundary": "unspecified"}, "audience": "people who register after 5 October 2026", "applies_if": ["registered after 5 October 2026"], "severity": "critical", "anchors": [{"page": 2, "quote": "If you register after 5 October 2026"}, {"page": 2, "quote": "You must still pay the tax you owe by 11:59pm on 31 January 2027"}], "note": "same fact as payment_deadline (scored there); kept as context to show late registration does not move it", "role": "context", "related": ["payment_deadline"]},
+    {"key": "paper_return_deadline", "q": "Q2", "status": "present", "value": "11:59pm on 31 October 2026", "normalized": "2026-10-31T23:59", "time": {"kind": "datetime", "boundary": "unspecified"}, "audience": "individuals sending a paper return", "exceptions": ["late_registration_filing_deadline", "special_entities_paper_deadline", "partnership_company_partner_paper_deadline"], "severity": "critical", "anchors": [{"page": 2, "quote": "Sending a paper tax return"}, {"page": 2, "quote": "HMRC must receive your paper tax return (/self-assessment-tax-return-forms) by 11:59pm on 31 October 2026 or you’ll get a late filing penalty"}]},
+    {"key": "return_submission_open_date", "q": "Q2", "status": "present", "value": "any time on or after 6 April 2026", "normalized": "2026-04-06", "time": {"kind": "date"}, "severity": "critical", "anchors": [{"page": 2, "quote": "You can send it any time on or after 6 April 2026 as long as HMRC receives it by the deadline."}, {"page": 3, "quote": "You can submit your return any time on or after 6 April 2026 up to the deadline."}]},
+    {"key": "online_return_deadline", "q": "Q2", "status": "present", "value": "11:59pm on 31 January 2027", "normalized": "2027-01-31T23:59", "time": {"kind": "datetime", "boundary": "unspecified"}, "audience": "individuals filing online", "exceptions": ["late_registration_filing_deadline", "special_entities_cannot_file_online", "partnership_company_partner_online_deadline"], "severity": "critical", "anchors": [{"page": 3, "quote": "Submitting an online tax return"}, {"page": 3, "quote": "You must submit your online tax return (/log-in-file-self-assessment-tax-return) by 11:59pm on 31 January 2027 or you’ll get a late filing penalty"}]},
+    {"key": "tax_code_submission_deadline", "q": "Q2", "status": "present", "value": "11:59pm on 30 December 2026", "normalized": "2026-12-30T23:59", "time": {"kind": "datetime", "boundary": "unspecified"}, "applies_if": ["wants to pay the Self Assessment bill through their tax code"], "severity": "critical", "anchors": [{"page": 3, "quote": "Submitting an online tax return"}, {"page": 3, "quote": "If you want to pay your Self Assessment bill through your tax code"}, {"page": 3, "quote": "you must submit it by 11:59pm on 30 December 2026."}], "note": "online return under the “Submitting an online tax return” section; the printed link text wraps inside “(/pay-self-assessment-…)”, so the sentence is anchored in pieces"},
+    {"key": "tax_code_deadline_missed", "q": "Q1", "status": "present", "value": "If you miss this deadline, you’ll have to pay another way", "applies_if": ["wanted to pay through tax code and missed 30 December 2026"], "severity": "major", "anchors": [{"page": 3, "quote": "If you want to pay your Self Assessment bill through your tax code"}, {"page": 3, "quote": "you must submit it by 11:59pm on 30 December 2026."}, {"page": 3, "quote": "If you miss this deadline, you’ll have to pay another way."}]},
+    {"key": "payment_deadline", "q": "Q2", "status": "present", "value": "11:59pm on 31 January 2027", "normalized": "2027-01-31T23:59", "time": {"kind": "datetime", "boundary": "unspecified"}, "severity": "critical", "anchors": [{"page": 3, "quote": "Paying the tax you owe"}, {"page": 3, "quote": "You need to pay your Self Assessment tax (/pay-self-assessment-tax-bill) by 11:59pm on 31 January 2027 or you’ll get a penalty"}], "related": ["payments_on_account_second_deadline"]},
+    {"key": "payments_on_account_second_deadline", "q": "Q2", "status": "present", "value": "31 July", "time": {"kind": "date"}, "applies_if": ["makes payments on account"], "severity": "critical", "anchors": [{"page": 3, "quote": "There is a second payment deadline of 31 July if you make payments towards your bill - these are known as ‘payments on account"}], "note": "the year is not stated; do not infer one"},
+    {"key": "special_entities_paper_deadline", "q": "ctx", "status": "present", "value": "31 January 2027", "normalized": "2027-01-31", "time": {"kind": "date"}, "audience": "trustees of a registered pension scheme or non-resident companies", "severity": "critical", "anchors": [{"page": 3, "quote": "Trustees of a registered pension scheme or non-resident companies"}, {"page": 3, "quote": "HMRC must receive a paper tax return (/self-assessment-tax-return-forms) by 31 January 2027."}], "note": "no time of day is stated; do not add 11:59pm", "role": "context"},
+    {"key": "special_entities_cannot_file_online", "q": "ctx", "status": "present", "value": "You cannot send a return online", "audience": "trustees of a registered pension scheme or non-resident companies", "negation": true, "severity": "critical", "anchors": [{"page": 3, "quote": "Trustees of a registered pension scheme or non-resident companies"}, {"page": 3, "quote": "You cannot send a return online."}], "role": "context"},
+    {"key": "partnership_company_partner_online_deadline", "q": "ctx", "status": "present", "value": "12 months from the accounting date", "time": {"kind": "relative", "trigger": "the partnership's accounting date", "duration": "P12M"}, "audience": "partnerships with a limited company as a partner", "applies_if": ["partnership's accounting date is between 1 February and 5 April", "one of the partners is a limited company"], "severity": "critical", "anchors": [{"page": 3, "quote": "Partnership returns if you have a company as a partner"}, {"page": 4, "quote": "If your partnership’s accounting date is between 1 February and 5 April and one of your partners is a limited company, the deadline for:"}, {"page": 4, "quote": "online returns is 12 months from the accounting date"}], "role": "context"},
+    {"key": "partnership_company_partner_paper_deadline", "q": "ctx", "status": "present", "value": "9 months from the accounting date", "time": {"kind": "relative", "trigger": "the partnership's accounting date", "duration": "P9M"}, "audience": "partnerships with a limited company as a partner", "applies_if": ["partnership's accounting date is between 1 February and 5 April", "one of the partners is a limited company"], "severity": "critical", "anchors": [{"page": 3, "quote": "Partnership returns if you have a company as a partner"}, {"page": 4, "quote": "If your partnership’s accounting date is between 1 February and 5 April and one of your partners is a limited company, the deadline for:"}, {"page": 4, "quote": "paper returns is 9 months from the accounting date"}], "role": "context"},
+    {"key": "penalty_amount", "q": "Q3", "status": "missing", "severity": "critical", "missing_reason": "referenced_but_absent", "note": "pp2–4 mention “a late filing penalty” / “a penalty” and link to the Penalties page, whose content is not in this document"},
+    {"key": "tax_bill_amount", "q": "Q3", "status": "missing", "severity": "critical", "missing_reason": "not_in_document", "note": "p3 only points to an estimator: “You can estimate your Self Assessment tax bill (/self-assessment-tax-calculator)”"}
   ],
   "must_not_assert": [
-    "a penalty amount such as £100",
-    "that people who do not know their profit need not send a return"
+    {"proposition": "a specific penalty amount"},
+    {"proposition": "every paper return is due by 31 October 2026"},
+    {"proposition": "trustees of a registered pension scheme can file online"},
+    {"proposition": "non-resident companies can file online"},
+    {"proposition": "registering after 5 October 2026 also extends the deadline for paying the tax"},
+    {"proposition": "a specific calendar date for the late-registration filing deadline", "unless": "computed from a letter or email date the user supplied"},
+    {"proposition": "a specific calendar date for the partnership online-return deadline", "unless": "computed from an accounting date the user supplied"},
+    {"proposition": "a specific calendar date for the partnership paper-return deadline", "unless": "computed from an accounting date the user supplied"},
+    {"proposition": "the 31 July payment deadline is in a specific year"},
+    {"proposition": "people who do not know their profit for the whole year do not need to send a return"},
+    {"proposition": "posting the paper return by the deadline is enough"}
   ],
   "labeled_by": "claude-draft",
   "verified_by": null

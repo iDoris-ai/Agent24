@@ -1,101 +1,31 @@
 {
   "id": "s01-03-zh-holiday-2026",
-  "schema": "s01-gold-v1",
+  "schema": "s01-gold-v2",
   "fields": [
-    {
-      "key": "doc_number",
-      "status": "present",
-      "value": "国办发明电〔2025〕7号",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "国办发明电〔2025〕7号"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "spring_festival_holiday",
-      "status": "present",
-      "value": "2月15日至23日放假调休，共9天",
-      "normalized": "2026-02-15/2026-02-23",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "2月15日（农历腊月二十八、周日）至23日（农历正月初七、周一）放假调休，共9天"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "spring_festival_makeup_workdays",
-      "status": "present",
-      "value": "2月14日（周六）、2月28日（周六）上班",
-      "normalized": "2026-02-14,2026-02-28",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "2月14日（周六）、2月28日（周六）"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "qingming_holiday",
-      "status": "present",
-      "value": "4月4日至6日放假，共3天（无调休）",
-      "normalized": "2026-04-04/2026-04-06",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "4月4日（周六）至6日（周一）放假，共3天"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "national_day_holiday",
-      "status": "present",
-      "value": "10月1日至7日放假调休，共7天",
-      "normalized": "2026-10-01/2026-10-07",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "10月1日（周四）至7日（周三）放假调休，共7天"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "national_day_makeup_workdays",
-      "status": "present",
-      "value": "9月20日（周日）、10月10日（周六）上班",
-      "normalized": "2026-09-20,2026-10-10",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "9月20日（周日）、10月10日（周六）上班"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "issue_date",
-      "status": "present",
-      "value": "2025年11月4日",
-      "normalized": "2025-11-04",
-      "anchors": [
-        {
-          "page": 2,
-          "quote": "2025年11月4日"
-        }
-      ],
-      "severity": "major"
-    }
+    {"key": "doc_number", "q": "ctx", "status": "present", "value": "国办发明电〔2025〕7号", "severity": "critical", "anchors": [{"page": 1, "quote": "国办发明电〔2025〕7号"}], "role": "context"},
+    {"key": "holiday_year", "q": "ctx", "status": "present", "value": "2026年", "normalized": "2026", "severity": "critical", "anchors": [{"page": 1, "quote": "现将2026年元旦、春节、清明节、劳动节、端午节、中秋节和国庆节放假调休日期的具体安排通知如下。"}], "note": "下列日期的年份都由这句推出，不取文号里的 2025", "role": "context"},
+    {"key": "new_year_holiday", "q": "Q2", "status": "present", "value": "1月1日至3日放假调休，共3天", "normalized": "2026-01-01/2026-01-03", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "一、元旦：1月1日（周四）至3日（周六）放假调休，共3天。"}]},
+    {"key": "new_year_makeup_workday", "q": "Q2", "status": "present", "value": "1月4日（周日）上班", "normalized": "2026-01-04", "time": {"kind": "date", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "共3天。1月"}, {"page": 1, "quote": "4日（周日）上班。"}], "note": "文本层里“1月”和“4日”之间插入了重复的“、元旦：”，按交错规则分两段锚"},
+    {"key": "spring_festival_holiday", "q": "Q2", "status": "present", "value": "2月15日至23日放假调休，共9天", "normalized": "2026-02-15/2026-02-23", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "二、春节：2月15日（农历腊月二十八、周日）至23日（农历正月初七、周一）放假调休，共9天。"}]},
+    {"key": "spring_festival_makeup_workdays", "q": "Q2", "status": "present", "value": "2月14日（周六）、2月28日（周六）上班", "normalized": "2026-02-14,2026-02-28", "time": {"kind": "dates", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "共9天。2月14日（周六）、2月28日（周六）上班。"}]},
+    {"key": "qingming_holiday", "q": "Q2", "status": "present", "value": "4月4日至6日放假，共3天", "normalized": "2026-04-04/2026-04-06", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "三、清明节：4月4日（周六）至6日（周一）放假，共3天。"}]},
+    {"key": "labour_day_holiday", "q": "Q2", "status": "present", "value": "5月1日至5日放假调休，共5天", "normalized": "2026-05-01/2026-05-05", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "四、劳动节：5月1日（周五）至5日（周二）放假调休，共5天。"}]},
+    {"key": "labour_day_makeup_workday", "q": "Q2", "status": "present", "value": "5月9日（周六）上班", "normalized": "2026-05-09", "time": {"kind": "date", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "共5天。5"}, {"page": 1, "quote": "月9日（周六）上班。"}], "note": "文本层里“5”和“月9日”之间插入了重复的“四、劳动节：”，按交错规则分两段锚"},
+    {"key": "dragon_boat_holiday", "q": "Q2", "status": "present", "value": "6月19日至21日放假，共3天", "normalized": "2026-06-19/2026-06-21", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "五、端午节：6月19日（周五）至21日（周日）放假，共3天。"}]},
+    {"key": "mid_autumn_holiday", "q": "Q2", "status": "present", "value": "9月25日至27日放假，共3天", "normalized": "2026-09-25/2026-09-27", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "六、中秋节：9月25日（周五）至27日（周日）放假，共3天。"}]},
+    {"key": "national_day_holiday", "q": "Q2", "status": "present", "value": "10月1日至7日放假调休，共7天", "normalized": "2026-10-01/2026-10-07", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "七、国庆节：10月1日（周四）至7日（周三）放假调休，共7天。"}]},
+    {"key": "national_day_makeup_workdays", "q": "Q2", "status": "present", "value": "9月20日（周日）、10月10日（周六）上班", "normalized": "2026-09-20,2026-10-10", "time": {"kind": "dates", "inferred": ["year"], "inferred_from": "holiday_year"}, "severity": "critical", "anchors": [{"page": 1, "quote": "9月20日（周日）、10月10日（周六）上班。"}], "note": "文本层里前面插入了重复的“七、国庆节：”；显示上紧接在国庆节放假句之后"},
+    {"key": "paid_leave_encouragement", "q": "Q1", "status": "present", "value": "鼓励单位和个人结合落实带薪年休假等制度，实际形成较长假期", "severity": "major", "anchors": [{"page": 2, "quote": "鼓励单位和个人结合落实带薪年休假等制度，实际形成较长假期，推动错峰出行。"}]},
+    {"key": "issue_date", "q": "ctx", "status": "present", "value": "2025年11月4日", "normalized": "2025-11-04", "time": {"kind": "date"}, "severity": "critical", "anchors": [{"page": 2, "quote": "国务院办公厅 2025年11月4日"}, {"page": 2, "quote": "成文日期： 2025年11月04日"}], "role": "context"}
   ],
   "must_not_assert": [
-    "a makeup workday for 清明节, 端午节 or 中秋节",
-    "a holiday length other than stated"
+    {"proposition": "本通知为2026年清明节统一安排了调休上班日"},
+    {"proposition": "本通知为2026年端午节统一安排了调休上班日"},
+    {"proposition": "本通知为2026年中秋节统一安排了调休上班日"},
+    {"proposition": "本通知统一安排的调休上班日不止 1月4日、2月14日、2月28日、5月9日、9月20日、10月10日 这六天"},
+    {"proposition": "这份通知安排的是2025年的节假日"},
+    {"proposition": "本通知要求单位或个人必须使用带薪年休假"},
+    {"proposition": "本通知保证每个人在放假期间都不用上班"}
   ],
   "labeled_by": "claude-draft",
   "verified_by": null
