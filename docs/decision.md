@@ -1130,6 +1130,8 @@ Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清�
 > 记录；详见 ADR-031、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`、
 > `docs/agent/PLAN-ME4-OS-CAPABILITIES.md`。
 
+> **F3 裁决记录（jason，2026-10-07；M2 收口）**：继续使用 `/api/v1/<name>`，保留模块名保留段名单及其双向集合测试，F3 关闭。迁移到 `/api/v1/os/<name>` 会与内核现有 `/os/{name}` 路由冲突，并要求已发布模块 manifest、SDK、调度回调路径和桌面端协同迁移；现有保留段检查已把冲突后果从 daemon panic 降为该模块被拒绝。代价是内核新增顶层路由段会占用同名模块名，因此新路由优先挂在已有段下，新增顶层段须在 PR 说明理由。
+
 ### 与记忆（ADR-028）的关系
 
 记忆层保持**领域 OS 无关**：内核提供通用记忆（L0–L4），领域 OS **用但不拥有**它；领域态（Sin90 的 direction/proposal…）留在领域 OS 自己的 DB。换 OS 不动内核记忆。
@@ -1416,6 +1418,48 @@ D0-2 要求"在 `agent24-decide` 里定义写入/追加/导出/删除的 trait�
 
 - 两套 DTO（`agent24-decide::log::LogEntry` 与 `agent24-store::decision_log::NewDecisionLogEntry`）字段基本对应但类型不同（例如 `FinalAction` 枚举 vs 裸 `String`），D1 接线时需要写一层显式映射；这层映射目前不存在，也没有测试覆盖，因为没有调用方。
 - CLI 直接打开 `agent24.db`，意味着将来如果决策日志需要经过某种访问控制（例如多用户、远程 attach），现在的直接文件访问路径要重新考虑——D0-2 的隐私模型是单用户单机，这个前提目前成立，但不是永久保证。
+
+---
+
+## ADR-035：iDoris Admin session token 由可信 launcher 通过匿名 inherited FD/HANDLE 一次性交付
+
+**日期**：2026-10-08
+**状态**：✅ 采纳（jason 明确拍板；追踪 issue：Agent24 #765）
+
+### 背景
+
+iDoris M4 的 Admin v0 是独立 loopback listener，Bearer session token 只用于本机管理面。Agent24 只消费 iDoris，不拥有/拉起 iDoris，因此不能为了状态卡把 Agent24 改成 iDoris process owner；但 Electron main 又必须拿到同一枚 Admin token，且 renderer 永远不能拿到它。
+
+### 决策
+
+1. **macOS/Linux**：可信 parent launcher 每次启动生成一枚新的 64 位小写 hex Admin session token，通过两条独立的 **anonymous one-shot pipe** 分别交给 iDoris stdin（现有 `serve --admin-token-stdin`）和 Agent24 Electron main 的专用 inherited FD。argv 只允许出现非秘密的 FD 编号选择器；token 本身不得进入 argv/env/普通文件/stdout/stderr/log。
+2. **Windows**：保持同一权威模型，改用显式 allowlist 的 inherited HANDLE；不得用“继承全部 handles”的宽泛配置。
+3. Electron main 只读一次 65-byte canonical frame（64 hex + `\n`），有界超时，随后立即关闭 FD/HANDLE；token 只驻留 main-process memory。renderer/preload return value、browser storage、generic backend proxy 均不得得到 token。
+4. renderer 只获得零参数、固定功能的 `idorisStatus()`；renderer 不能提供 host/URL/path/header/port/token/FD selector。Admin HTTP client 固定 `127.0.0.1` + trusted non-secret port config，只访问冻结的 Admin route；M4 read path 不跟随 redirect、不使用 proxy、5s timeout、响应体 ≤256 KiB、错误只返回有限 typed state。
+5. token 为 per-launch session secret；launcher 在两条 pipe 完成写入后立即关闭写端并丢弃（可控内存中尽可能清零）自己的 token 副本；重启/轮换使旧 token 失效，不跨 launch 持久化或复用。
+
+### 信任边界与安全假设
+
+**信任**：token mint/handoff 时的 parent launcher、iDoris Admin listener/auth、消费 token 的 Agent24 Electron main。
+**不信任 token**：Electron renderer/web contents、preload 返回值、普通子进程、shell/argv/env diagnostics、文件/日志/crash text、远端或非 loopback host。
+
+安全保证依赖这些假设：launcher 使用 CSPRNG；只把每个 pipe 的读端继承给目标 child，并且只有在同时提供一个合法 selector 时才继承 secret FD；未使用端点立即关闭且默认 non-inheritable/CLOEXEC；Agent24 main 在继续 spawn descendant 前完成读取/关闭；非法/重复 selector 会在继续启动前关闭所有被参数明确声明且可安全识别的 token FD 候选；iDoris Admin 始终 loopback-only 且 bearer fail-closed；renderer IPC 保持 least-privilege、zero-arg、read-only。
+
+### 失陷情形 / 保证边界
+
+- **可信 launcher 在 mint/handoff 前或过程中被攻破**：这是 root-of-trust compromise。攻击者可读/替换 token 或启动恶意 consumer；pipe 无法保护生成 secret 的组件。恢复动作是终止受影响进程、轮换/重启 session、先恢复 launcher 完整性。
+- **launcher 在成功 handoff、关闭两条写端并丢弃 token 后才被攻破**：单凭 launcher 自身不应再能恢复已经交付的旧 token，因此不会自动泄露既有 session；但攻击者仍可控制未来 launch，若同时具备读取其它进程内存/FD 的 OS 权限，则落入下面的 OS-level attacker 情形。
+- **Electron main 被攻破**：攻击者可读 main memory 里的 token 或滥用 main 已有 Admin 权限。该方案保护 renderer compromise，不声称能保护已失陷的 trusted consumer。
+- **iDoris 被攻破**：Admin 权威和模型控制完整性失效，与 secret transport 无关。
+- **renderer 被攻破**：按本 ADR，renderer 仍拿不到 token；剩余风险是滥用 main 暴露的窄 IPC，因此 M4 IPC 必须固定、零参数、只读。
+- **root/admin/debugger，或同账号下具备 OS 授权的进程检查能力的 attacker**：可能直接读进程内存/handle 或篡改进程，超出本机制保护范围。
+- **crash/core dump**：main memory 中仍可能包含 token；禁止显式把 token 放进 error/crash payload，并保持 per-launch 生命周期。
+- **FD/HANDLE 误继承**：可能把 token 泄漏给 descendant；用 default non-inheritance/CLOEXEC、显式 allowlist、读后立即 close 和 bearing tests 防御。
+- **token 泄漏后的 replay**：仍存活的 session token 可在本机重放；用每次启动随机 token + restart/rotation invalidation 降低窗口。
+
+### 备选与取舍
+
+argv 会暴露给 process listing；env 容易被继承/诊断 dump；0600 普通文件虽然可接受但引入 at-rest、cleanup、backup/indexing 风险；OS keychain 更适合长期 credential；localhost bootstrap endpoint 又需要第二套 bootstrap auth。匿名 inherited pipe/FD/HANDLE 是成熟的 process-launch secret-handoff 模式之一，最匹配“一次启动 session secret”，但本 ADR **不**声称它零风险或是唯一行业标准。
 
 ---
 
