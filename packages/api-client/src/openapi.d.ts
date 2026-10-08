@@ -1061,6 +1061,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/documents/documents/{document_id}/revisions/{revision}/text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the text layer of a revision, one page of blocks at a time
+         * @description Blocks come from the revision's pinned text layer; their text is stored as parsed, not normalized, so anchor offsets stay valid (§3). A page holds at most `limit` blocks and at most 512 KiB of serialized JSON; the OS ends the page early to stay under that and continues from `next_cursor` (§4). By default a partial parse is reported in `parse_status`; with `require_complete=true` it is 422 `partial_parse` (§6, Q8).
+         */
+        get: operations["documentsReadText"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/documents/{document_id}/find": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Find text inside one revision; every match is an anchor
+         * @description A page holds at most `limit` matches and at most 512 KiB of serialized JSON, then continues from `next_cursor` (§4). A partial parse is reported with the regions that were not searched, or is 422 `partial_parse` with `require_complete` (§6).
+         */
+        post: operations["documentsFind"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1798,6 +1838,13 @@ export interface components {
                 code?: "unsupported_format" | "parse_failed";
             };
         };
+        /** @description The 422s of text and find. */
+        DocumentsReadUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "unsupported_format" | "parse_failed" | "partial_parse";
+            };
+        };
         /** @description The 422 of upload creation. */
         DocumentsUploadUnprocessableError: components["schemas"]["DocumentsError"] & {
             error?: {
@@ -1926,6 +1973,87 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         } & (unknown & unknown & unknown & unknown);
+        DocumentsEngineRef: {
+            id: string;
+            version: string;
+        };
+        /** @description PDF CropBox frame, in points multiplied by UserUnit, origin at the top-left of the page as displayed after /Rotate (§3). Each rect is [x0, y0, x1, y1] with x0 ≤ x1 and y0 ≤ y1 (checked by the OS, not expressible here); several rects cover a span across lines or columns. */
+        DocumentsGeometry: {
+            /** @constant */
+            box: "CropBox";
+            /** @constant */
+            unit: "pt";
+            /** @constant */
+            origin: "top-left-rotated";
+            rects: number[][];
+        };
+        /** @description UTF-8 byte offsets into the block text, half-open [start, end) with start ≤ end ≤ the block's byte length, in logical (stored) order; both on character boundaries (§3). The OS checks these; a client that finds the quote or hashes no longer match shows the anchor as stale ("定位失效") instead of guessing a position. */
+        DocumentsTextRange: {
+            /** @constant */
+            unit: "utf8";
+            start: number;
+            end: number;
+        };
+        /** @description Per-value provenance (ADR-DOC-02 §3). Bound to the pinned text layer, never migrated across revisions; `block_text_sha256` + `quote` + `rects` let a client detect a stale anchor instead of guessing. */
+        DocumentsAnchor: {
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            content_sha256: components["schemas"]["Sha256Address"];
+            /** @description Media type of the anchored revision. It tells a client, and this schema, whether the source is paginated (PDF, images) or flowing (e.g. DOCX in slice 2). */
+            media_type: string;
+            text_layer_sha256: components["schemas"]["Sha256Address"];
+            engine: components["schemas"]["DocumentsEngineRef"];
+            block_id: string;
+            /** @description 1-based physical page; omitted for flowing formats such as DOCX. */
+            page?: number;
+            block_text_sha256: components["schemas"]["Sha256Address"];
+            text_range: components["schemas"]["DocumentsTextRange"];
+            geometry?: components["schemas"]["DocumentsGeometry"];
+            quote: string;
+        };
+        DocumentsTextBlock: {
+            block_id: string;
+            page?: number;
+            text: string;
+            text_sha256: components["schemas"]["Sha256Address"];
+            geometry?: components["schemas"]["DocumentsGeometry"];
+        };
+        DocumentsUnparsedRegion: {
+            page?: number;
+            geometry?: components["schemas"]["DocumentsGeometry"];
+            reason: string;
+        };
+        DocumentsTextPage: {
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            content_sha256: components["schemas"]["Sha256Address"];
+            /** @description Media type of the revision; see DocumentsAnchor.media_type. */
+            media_type: string;
+            text_layer_sha256: components["schemas"]["Sha256Address"];
+            engine: components["schemas"]["DocumentsEngineRef"];
+            /** @enum {string} */
+            parse_status: "complete" | "partial";
+            unparsed_regions?: components["schemas"]["DocumentsUnparsedRegion"][];
+            blocks: components["schemas"]["DocumentsTextBlock"][];
+            next_cursor: string | null;
+        } & (unknown & unknown);
+        DocumentsFindRequest: {
+            revision: number;
+            query: string;
+            cursor?: string;
+            /** @default 50 */
+            limit: number;
+            /** @default false */
+            require_complete: boolean;
+        };
+        DocumentsFindResult: {
+            /** @enum {string} */
+            parse_status: "complete" | "partial";
+            /** @description The regions that were not searched, so "no match" is not mistaken for "not there". */
+            unparsed_regions?: components["schemas"]["DocumentsUnparsedRegion"][];
+            matches: components["schemas"]["DocumentsAnchor"][];
+            next_cursor: string | null;
+        };
         DocumentList: {
             documents: components["schemas"]["Document"][];
             next_cursor: string | null;
@@ -2143,6 +2271,15 @@ export interface components {
                 "application/json": components["schemas"]["DocumentsRenderUnprocessableError"];
             };
         };
+        /** @description Text and find: `unsupported_format`, `parse_failed`, or `partial_parse` when `require_complete` was set (§6). */
+        DocumentsReadUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsReadUnprocessableError"];
+            };
+        };
         /** @description `idempotency_key_reused`: the same key with a different body (§5.4) */
         DocumentsUploadUnprocessable: {
             headers: {
@@ -2190,6 +2327,8 @@ export interface components {
         /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). */
         DocumentsIdempotencyKey: string;
         RevisionNumber: number;
+        /** @description Turn a partial parse into 422 `partial_parse` instead of a result status. */
+        DocumentsRequireComplete: boolean;
         DocumentsLimit: number;
     };
     requestBodies: never;
@@ -4273,6 +4412,77 @@ export interface operations {
             404: components["responses"]["DocumentsNotFound"];
             413: components["responses"]["DocumentsTooLarge"];
             422: components["responses"]["DocumentsRenderUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsReadText: {
+        parameters: {
+            query?: {
+                /** @description Start at this block id instead of the first one. */
+                block?: string;
+                /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
+                cursor?: components["parameters"]["DocumentsCursor"];
+                limit?: components["parameters"]["DocumentsLimit"];
+                /** @description Turn a partial parse into 422 `partial_parse` instead of a result status. */
+                require_complete?: components["parameters"]["DocumentsRequireComplete"];
+            };
+            header?: never;
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+                revision: components["parameters"]["RevisionNumber"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of blocks */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsTextPage"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsReadUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsFind: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsFindRequest"];
+            };
+        };
+        responses: {
+            /** @description One page of matches */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsFindResult"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsReadUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
