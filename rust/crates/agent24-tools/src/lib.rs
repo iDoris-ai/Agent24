@@ -21,6 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult};
 use agent24_protocol::{Decision, RiskClass, ToolInfo};
 use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
@@ -285,12 +286,257 @@ pub trait Tool: Send + Sync {
         Duration::from_secs(30)
     }
 
+    /// Module calls have a per-call cancellation boundary. The registry must
+    /// not translate their cancellation into `ToolError::Cancelled`, which
+    /// cancels the owning run in the agent loop.
+    fn isolates_cancellation(&self) -> bool {
+        false
+    }
+
     async fn call(
         &self,
         ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError>;
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModuleToolContext {
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub tool_call_id: String,
+    pub module_id: String,
+    pub operation: String,
+    pub authorized_resources: Vec<String>,
+    pub authorization_ref: String,
+}
+
+#[async_trait]
+pub trait ModuleToolAuthorization: Send + Sync {
+    async fn authorize(
+        &self,
+        module: &str,
+        operation: &str,
+        ctx: &ToolContext,
+    ) -> Option<ModuleToolGrantContext>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleToolGrantContext {
+    pub authorized_resources: Vec<String>,
+    pub authorization_ref: String,
+}
+
+pub struct DenyModuleToolAuthorization;
+
+#[async_trait]
+impl ModuleToolAuthorization for DenyModuleToolAuthorization {
+    async fn authorize(
+        &self,
+        _module: &str,
+        _operation: &str,
+        _ctx: &ToolContext,
+    ) -> Option<ModuleToolGrantContext> {
+        None
+    }
+}
+
+#[async_trait]
+pub trait ModuleToolRuntime: Send + Sync {
+    async fn check_available(
+        &self,
+        module: &str,
+        operation: &str,
+    ) -> Result<(), ModuleToolCallError>;
+    async fn invoke(
+        &self,
+        context: ModuleToolContext,
+        arguments: Map<String, Value>,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ModuleToolResult, ModuleToolCallError>;
+}
+
+pub struct ModuleTool {
+    module: String,
+    operation: String,
+    name: String,
+    description: String,
+    schema: Value,
+    timeout: Duration,
+    inline_wait: Duration,
+    authorization: Arc<dyn ModuleToolAuthorization>,
+    runtime: Arc<dyn ModuleToolRuntime>,
+}
+
+impl ModuleTool {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // Mirrors the module advert plus the two host adapters.
+    pub fn new(
+        module: impl Into<String>,
+        operation: impl Into<String>,
+        description: impl Into<String>,
+        schema: Value,
+        timeout: Duration,
+        inline_wait: Duration,
+        authorization: Arc<dyn ModuleToolAuthorization>,
+        runtime: Arc<dyn ModuleToolRuntime>,
+    ) -> Result<Self, &'static str> {
+        if inline_wait >= timeout {
+            return Err("inline_wait must be shorter than timeout");
+        }
+        let module = module.into();
+        let operation = operation.into();
+        Ok(Self {
+            name: format!("{module}.{operation}"),
+            module,
+            operation,
+            description: description.into(),
+            schema,
+            timeout,
+            inline_wait,
+            authorization,
+            runtime,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ModuleTool {
+    fn info(&self) -> ToolInfo {
+        ToolInfo::new(
+            self.name.clone(),
+            "module",
+            self.description.clone(),
+            RiskClass::External,
+        )
+    }
+    fn parameters(&self) -> Value {
+        self.schema.clone()
+    }
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+    fn isolates_cancellation(&self) -> bool {
+        true
+    }
+
+    async fn call(
+        &self,
+        ctx: &ToolContext,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        // TODO(K1-5.3): replace this interface adapter with ConsentGate from #777.
+        let Some(grant) = self
+            .authorization
+            .authorize(&self.module, &self.operation, ctx)
+            .await
+        else {
+            return Err(ToolError::Failed(module_error_json(
+                ModuleToolCallError::Module {
+                    code: ModuleToolErrorCode::PermissionDenied,
+                    retryable: false,
+                    details: None,
+                    unknown_code: None,
+                },
+            )));
+        };
+        if let Err(error) = self
+            .runtime
+            .check_available(&self.module, &self.operation)
+            .await
+        {
+            return Err(ToolError::Failed(module_error_json(error)));
+        }
+        let context = ModuleToolContext {
+            run_id: ctx.run_id().to_owned(),
+            session_id: ctx.session_id().map(str::to_owned),
+            tool_call_id: ctx.tool_call_id().to_owned(),
+            module_id: self.module.clone(),
+            operation: self.operation.clone(),
+            authorized_resources: grant.authorized_resources,
+            authorization_ref: grant.authorization_ref,
+        };
+        let call_cancel = cancel.child_token();
+        let result = match tokio::time::timeout(
+            self.inline_wait,
+            self.runtime
+                .invoke(context, input.clone(), self.timeout, call_cancel.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                call_cancel.cancel();
+                return Err(ToolError::Failed(module_error_json(
+                    ModuleToolCallError::ResultUnknown,
+                )));
+            }
+        };
+        match result {
+            Ok(ModuleToolResult::Completed { payload, replayed }) => Ok(serde_json::json!({
+                "kind":"completed", "payload":payload, "replayed":replayed
+            })
+            .to_string()),
+            Ok(ModuleToolResult::Pending { .. }) => Err(ToolError::Failed(module_error_json(
+                ModuleToolCallError::InvalidResult,
+            ))),
+            Err(failure) => Err(ToolError::Failed(module_error_json(failure))),
+        }
+    }
+}
+
+fn module_error_json(failure: ModuleToolCallError) -> String {
+    let (code, retryable, unknown, result_unknown) = match failure {
+        ModuleToolCallError::Module {
+            code,
+            retryable,
+            unknown_code,
+            ..
+        } => (module_code(code), retryable, unknown_code, false),
+        ModuleToolCallError::InvalidResult => ("invalid_result", false, None, false),
+        ModuleToolCallError::ResultUnknown => ("result_unknown", false, None, true),
+        ModuleToolCallError::ResponseTooLarge => ("response_too_large", false, None, true),
+        ModuleToolCallError::Cancelled => ("cancelled", false, None, false),
+        ModuleToolCallError::Timeout => ("timeout", false, None, false),
+        ModuleToolCallError::ModuleUnavailable => ("module_unavailable", false, None, false),
+    };
+    let module_code = unknown.map(|raw| {
+        raw.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            .take(64)
+            .collect::<String>()
+    });
+    // Module-provided details may contain arguments, credentials, or output
+    // fragments. Do not expose them through ToolError's model-facing path.
+    serde_json::json!({"error": {"code":code, "retryable":retryable,
+        "module_code":module_code, "result_unknown":result_unknown}})
+    .to_string()
+}
+
+fn module_code(code: ModuleToolErrorCode) -> &'static str {
+    match code {
+        ModuleToolErrorCode::InvalidInput => "invalid_input",
+        ModuleToolErrorCode::PermissionDenied => "permission_denied",
+        ModuleToolErrorCode::ModuleUnavailable => "module_unavailable",
+        ModuleToolErrorCode::OperationUnavailable => "operation_unavailable",
+        ModuleToolErrorCode::RateLimited => "rate_limited",
+        ModuleToolErrorCode::Timeout => "timeout",
+        ModuleToolErrorCode::Cancelled => "cancelled",
+        ModuleToolErrorCode::ResponseTooLarge => "response_too_large",
+        ModuleToolErrorCode::InvalidResult => "invalid_result",
+        ModuleToolErrorCode::ModuleError => "module_error",
+        ModuleToolErrorCode::ResultUnknown => "result_unknown",
+    }
+}
+
+fn unknown_module_outcome(code: &str) -> ToolError {
+    ToolError::Failed(
+        serde_json::json!({"error":{"code":code,"retryable":false,"result_unknown":true}})
+            .to_string(),
+    )
 }
 
 /// What the agent loop advertises to the model (provider-neutral; the models
@@ -357,6 +603,15 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_unlisted(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.insert(tool.info().name, tool);
+        self
+    }
+
+    /// Register a module tool after filtering it through module advert gates.
+    #[must_use]
+    pub fn with_module_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        let name = tool.info().name;
+        self.allowed.insert(name.clone());
+        self.tools.insert(name, tool);
         self
     }
 
@@ -677,9 +932,19 @@ impl ToolRegistry {
         let budget = tool.timeout();
         tokio::select! {
             r = tokio::time::timeout(budget, tool.call(ctx, input, cancel)) => {
-                r.map_err(|_| ToolError::Timeout(budget))?
+                match r {
+                    Ok(result) => result,
+                    Err(_) if tool.isolates_cancellation() => Err(unknown_module_outcome("timeout")),
+                    Err(_) => Err(ToolError::Timeout(budget)),
+                }
             }
-            () = cancel.cancelled() => Err(ToolError::Cancelled),
+            () = cancel.cancelled() => {
+                if tool.isolates_cancellation() {
+                    Err(unknown_module_outcome("cancelled"))
+                } else {
+                    Err(ToolError::Cancelled)
+                }
+            }
         }
     }
 }
@@ -1114,6 +1379,16 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::Cancelled), "{err}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn module_tool_authorization_defaults_to_denial() {
+        assert!(
+            DenyModuleToolAuthorization
+                .authorize("m", "op", &ctx())
+                .await
+                .is_none()
+        );
     }
 
     #[test]
