@@ -2039,6 +2039,93 @@ paths:
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
         "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
 
+  /documents/documents/{document_id}/extractions:
+    post:
+      operationId: documentsExtract
+      tags: [documents]
+      summary: Extract fields from one revision, each value with its provenance; starts a job
+      description: >-
+        Idempotent on the business key (document_id, revision, schema_sha256,
+        extractor_version, model_id) — the actual model id, not a profile
+        (§5.4). The replay statuses are those of import: 202 while queued or
+        running or when a failed or interrupted job is re-queued (same job_id,
+        attempt + 1); 200 once it has succeeded (with `result.extraction_id`)
+        or was cancelled (it stays cancelled). To extract again on purpose,
+        send `rerun: true` with a new `Idempotency-Key`: that key joins the
+        business key, so resending it replays the same rerun and a new key
+        runs again; `rerun: true` without the header is 400
+        `invalid_request`, and the same key with a different request is 422
+        `idempotency_key_reused`. Field keys must be unique (400 otherwise).
+        Field descriptions and the document text are untrusted data: the OS
+        passes them to the model under a fixed extraction instruction and
+        never follows instructions found in them. The model is called through the kernel under
+        `LocalOnly` (ADR-DOC-01 D8); with no local model available the
+        answer is 503 `engine_unavailable` with `details.engine` naming the
+        model.
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: "Required with `rerun: true`; ignored otherwise."
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentsExtractRequest" }
+      responses:
+        "200":
+          description: Replay of an extraction job that already succeeded or was cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "202":
+          description: The extraction job, new, still running, or re-queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "422": { $ref: "#/components/responses/DocumentsExtractUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/extractions/{extraction_id}:
+    get:
+      operationId: documentsGetExtraction
+      tags: [documents]
+      summary: Get an extraction's values, one page at a time
+      description: >-
+        Values follow the S01 gold-label shape (docs/documenting/samples):
+        `present` with `anchors[]` that together cover the whole proposition
+        (or `anchors: []` and `unsourced_reason` when there is no verifiable
+        source), `missing` with `missing_reason`, or `conflict` with every
+        candidate and its own `anchors[]`; a conflict is never resolved by the
+        extractor. A page holds at most
+        `limit` values and at most 512 KiB of serialized JSON (§4).
+      parameters:
+        - name: extraction_id
+          in: path
+          required: true
+          schema: { $ref: "#/components/schemas/ExtractionIdString" }
+        - $ref: "#/components/parameters/DocumentsCursor"
+        - $ref: "#/components/parameters/DocumentsLimit"
+      responses:
+        "200":
+          description: The extraction and one page of its values
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsExtraction" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2184,6 +2271,13 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/DocumentsRenderUnprocessableError" }
+    DocumentsExtractUnprocessable:
+      description: >-
+        `unsupported_format`, `parse_failed`, or `idempotency_key_reused` when
+        a rerun key is reused with a different request (§5.4, §6).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsExtractUnprocessableError" }
     DocumentsReadUnprocessable:
       description: >-
         Text and find: `unsupported_format`, `parse_failed`, or
@@ -3396,6 +3490,15 @@ components:
             error:
               properties:
                 code: { enum: [unsupported_format, parse_failed] }
+    DocumentsExtractUnprocessableError:
+      description: The 422s of extraction.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [unsupported_format, parse_failed, idempotency_key_reused] }
     DocumentsReadUnprocessableError:
       description: The 422s of text and find.
       allOf:
@@ -3603,10 +3706,11 @@ components:
             message: { type: string }
         result:
           type: [object, "null"]
-          description: Set when `succeeded`, e.g. the imported document and its r1.
+          description: Set when `succeeded`, e.g. the imported document and its r1, or the extraction.
           properties:
             document_id: { $ref: "#/components/schemas/DocumentIdString" }
             revision: { type: integer, minimum: 1 }
+            extraction_id: { $ref: "#/components/schemas/ExtractionIdString" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
       allOf:
@@ -3630,6 +3734,18 @@ components:
         # still working or succeeded: no error.
         - if: { properties: { status: { enum: [queued, running, cancelling, succeeded] } } }
           then: { properties: { error: { type: "null" } } }
+        # a succeeded extraction names its result.
+        - if:
+            properties: { status: { const: succeeded }, kind: { const: extract } }
+            required: [status, kind]
+          then:
+            required: [result]
+            properties:
+              result:
+                type: object
+                required: [extraction_id]
+                properties:
+                  extraction_id: { $ref: "#/components/schemas/ExtractionIdString" }
         # a succeeded import names its document and r1.
         - if:
             properties: { status: { const: succeeded }, kind: { const: import } }
@@ -3807,6 +3923,140 @@ components:
         next_cursor: { type: [string, "null"] }
       if: { properties: { parse_status: { const: partial } } }
       then: { required: [unparsed_regions], properties: { unparsed_regions: { minItems: 1 } } }
+    ExtractionIdString:
+      type: string
+      pattern: "^ext_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    DocumentsExtractField:
+      type: object
+      required: [key, description]
+      additionalProperties: false
+      properties:
+        key: { type: string, pattern: "^[a-z][a-z0-9_]{0,63}$" }
+        description:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: What to find, in the reader's words.
+        type:
+          type: string
+          enum: [text, date, datetime, amount, number, identifier, boolean]
+          description: A hint for the extractor; values keep the source wording either way.
+    DocumentsExtractRequest:
+      type: object
+      required: [revision, schema]
+      additionalProperties: false
+      properties:
+        revision: { type: integer, minimum: 1 }
+        schema:
+          type: object
+          required: [fields]
+          additionalProperties: false
+          properties:
+            fields:
+              type: array
+              minItems: 1
+              maxItems: 100
+              items: { $ref: "#/components/schemas/DocumentsExtractField" }
+        rerun: { type: boolean, default: false }
+    DocumentsEvidence:
+      type: array
+      minItems: 1
+      description: >-
+        Anchors that together cover the whole proposition: the value and what
+        decides its meaning — condition, audience, negation, table row label
+        and column header (samples README §4.2). They may span blocks and pages.
+      items: { $ref: "#/components/schemas/DocumentsAnchor" }
+    DocumentsExtractCandidate:
+      type: object
+      required: [value, normalized, anchors]
+      properties:
+        value: { type: string, description: As written in the source. }
+        normalized: { type: string, description: For comparison only. }
+        anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+    DocumentsExtractedValue:
+      type: object
+      required: [key, status]
+      properties:
+        key: { type: string }
+        status: { type: string, enum: [present, missing, conflict] }
+        value: { type: string, description: As written in the source; never rewritten. }
+        normalized: { type: string, description: For comparison only. }
+        anchors:
+          type: array
+          description: >-
+            Evidence for a present value (see DocumentsEvidence). Empty only
+            when the value has no verifiable source, and then
+            `unsourced_reason` says why (ADR-DOC-02 §3).
+          items: { $ref: "#/components/schemas/DocumentsAnchor" }
+        unsourced_reason: { type: string, minLength: 1 }
+        missing_reason:
+          type: string
+          enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+        candidates:
+          type: array
+          minItems: 2
+          items: { $ref: "#/components/schemas/DocumentsExtractCandidate" }
+      allOf:
+        # present: a value, and evidence or the reason there is none (§3).
+        - if: { properties: { status: { const: present } } }
+          then:
+            required: [value, anchors]
+            properties:
+              value: { type: string }
+              anchors: { type: array, items: { $ref: "#/components/schemas/DocumentsAnchor" } }
+              candidates: false
+              missing_reason: false
+            if: { properties: { anchors: { maxItems: 0 } } }
+            then:
+              required: [unsourced_reason]
+              properties: { unsourced_reason: { type: string, minLength: 1 } }
+        # missing: why, and nothing asserted.
+        - if: { properties: { status: { const: missing } } }
+          then:
+            required: [missing_reason]
+            properties:
+              missing_reason:
+                type: string
+                enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+              value: false
+              normalized: false
+              anchors: false
+              candidates: false
+              unsourced_reason: false
+        # conflict: every candidate with its evidence, none chosen.
+        - if: { properties: { status: { const: conflict } } }
+          then:
+            required: [candidates]
+            properties:
+              candidates:
+                type: array
+                minItems: 2
+                items: { $ref: "#/components/schemas/DocumentsExtractCandidate" }
+              value: false
+              normalized: false
+              anchors: false
+              missing_reason: false
+              unsourced_reason: false
+    DocumentsExtraction:
+      type: object
+      required: [extraction_id, document_id, revision, content_sha256, schema_sha256, extractor_version, model_id, created_at, values, next_cursor]
+      properties:
+        extraction_id: { $ref: "#/components/schemas/ExtractionIdString" }
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+        content_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        schema_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        extractor_version: { type: string, minLength: 1 }
+        model_id:
+          type: string
+          minLength: 1
+          description: The model actually used (§5.4), always a local one (ADR-DOC-01 D8).
+        created_at: { type: string, format: date-time }
+        values:
+          type: array
+          maxItems: 200
+          items: { $ref: "#/components/schemas/DocumentsExtractedValue" }
+        next_cursor: { type: [string, "null"] }
     DocumentList:
       type: object
       required: [documents, next_cursor]
