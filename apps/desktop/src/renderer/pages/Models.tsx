@@ -55,6 +55,9 @@ export default function ModelsPage() {
   }, [])
 
   const hasLive = liveModels.length > 0
+  const idorisModelCount = idorisStatus?.state === 'available'
+    ? idorisStatus.models?.sources.reduce((count, source) => count + source.models.length, 0)
+    : undefined
 
   return (
     <div className="content">
@@ -69,6 +72,11 @@ export default function ModelsPage() {
         {idorisStatus?.state === 'available' ? (
           <div data-testid="idoris-status-available">
             v{idorisStatus.status.version} · {idorisStatus.status.components} components · {idorisStatus.status.runtimes} runtimes · capacity {idorisStatus.status.capacity.state}
+            {idorisStatus.backends && idorisStatus.models && (
+              <div data-testid="idoris-status-resources" style={{ marginTop: 4, color: 'var(--muted)' }}>
+                {idorisStatus.backends.length} backends · {idorisModelCount} models
+              </div>
+            )}
           </div>
         ) : (
           <div style={{ color: 'var(--muted)' }}>状态不可用 — Admin session 未连接</div>
