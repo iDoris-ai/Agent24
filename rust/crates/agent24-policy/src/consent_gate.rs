@@ -43,7 +43,7 @@
 //! is a compile error here rather than silently falling through to `Allow`.
 
 use agent24_protocol::RiskClass;
-use agent24_store::{ConsentLookup, ModuleConsentRecord, Store};
+use agent24_store::{ConsentLookup, ConsentSource, ModuleConsentRecord, Store};
 use async_trait::async_trait;
 
 /// One call's identity plus the policy placeholders the task spec calls
@@ -68,6 +68,12 @@ pub struct ConsentGateRequest {
     /// `agent24_store::HostRiskLevel` — that is the enablement-time risk
     /// RATING on the consent record itself, a different axis).
     pub risk: RiskClass,
+    /// Untrusted manifest declaration, copied from the validated tool entry.
+    /// It is only a claim; exemption also requires host verification below.
+    pub reversible_draft_declared: bool,
+    /// Facts determined by the host from the registered tool and its execution
+    /// boundary. Missing evidence is intentionally ineligible.
+    pub draft_verification: Option<HostVerifiedDraftSemantics>,
     /// Placeholder for ADR §2's "组织、管理员、来源本身的更严格限制" — the
     /// organizational half. `true` denies regardless of consent state.
     pub org_restricted: bool,
@@ -75,6 +81,33 @@ pub struct ConsentGateRequest {
     /// kept separate from `org_restricted` for future audit distinction.
     /// `true` denies regardless of consent state.
     pub source_restricted: bool,
+}
+
+/// Host-verified facts required to classify a `WriteLocal` call as a reversible
+/// draft. A module's manifest never supplies these facts. The dispatch host
+/// must construct this only after verifying the actual storage target and
+/// operation semantics; it must use `None` when any fact cannot be verified.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostVerifiedDraftSemantics {
+    pub writes_only_to_module_data_dir: bool,
+    pub has_revision_history: bool,
+    pub can_be_undone: bool,
+    pub modifies_authoritative_content: bool,
+    pub has_commit_semantics: bool,
+    pub has_delete_semantics: bool,
+    pub external: bool,
+}
+
+impl HostVerifiedDraftSemantics {
+    fn qualifies(&self) -> bool {
+        self.writes_only_to_module_data_dir
+            && self.has_revision_history
+            && self.can_be_undone
+            && !self.modifies_authoritative_content
+            && !self.has_commit_semantics
+            && !self.has_delete_semantics
+            && !self.external
+    }
 }
 
 /// Closed set of deny reasons (task spec): `not_granted` / `stale` /
@@ -242,14 +275,22 @@ impl ConsentGate for StoreConsentGate {
                 reason: ConsentDenyReason::Expired(record),
             },
             ConsentLookup::Granted(record) => {
-                // TODO: External can pre-answer approval only for a standing
-                // grant shaped `tool → exact target` (L-APPR-5, ADR-K1-03).
-                // Module consent has no such target scope, so External stays
-                // per-call. `requires_approval` also keeps WriteLocal/Exec
-                // per-call as required by L-APPR-5.
+                // The only WriteLocal exception is a narrow reversible draft:
+                // the validated manifest marker is merely a claim, while the
+                // host supplies verified operation/path semantics. Source and
+                // consent fingerprint come from the matched host consent row.
+                // Every uncertain or missing fact falls back to ordinary
+                // per-call approval.
+                let reversible_draft = request.risk == RiskClass::WriteLocal
+                    && request.reversible_draft_declared
+                    && record.source == ConsentSource::FirstParty
+                    && request
+                        .draft_verification
+                        .as_ref()
+                        .is_some_and(HostVerifiedDraftSemantics::qualifies);
                 ConsentGateDecision::Allow {
                     grant_ref: GrantRef::from(&record),
-                    per_call_approval: request.risk.requires_approval(),
+                    per_call_approval: request.risk.requires_approval() && !reversible_draft,
                 }
             }
         }
@@ -287,8 +328,23 @@ mod tests {
             module_version: summary.module_version.clone(),
             current_scope_fingerprint: summary.scope_fingerprint(),
             risk,
+            reversible_draft_declared: false,
+            draft_verification: None,
             org_restricted: false,
             source_restricted: false,
+        }
+    }
+
+    fn eligible_draft_request(summary: &ToolPermissionSummary) -> ConsentGateRequest {
+        ConsentGateRequest {
+            reversible_draft_declared: true,
+            draft_verification: Some(HostVerifiedDraftSemantics {
+                writes_only_to_module_data_dir: true,
+                has_revision_history: true,
+                can_be_undone: true,
+                ..HostVerifiedDraftSemantics::default()
+            }),
+            ..request_for(summary, RiskClass::WriteLocal)
         }
     }
 
@@ -402,6 +458,165 @@ mod tests {
                 }
             }
         }
+    }
+
+    // K1-6a.5: only the host-verified, first-party, consent-matched,
+    // reversible draft subset may skip per-call approval.
+    #[tokio::test]
+    async fn eligible_reversible_draft_skips_per_call_approval() {
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let decision = StoreConsentGate::new(store)
+            .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
+            .await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Allow {
+                per_call_approval: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn eligible_draft_without_enablement_consent_is_denied() {
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let decision = StoreConsentGate::new(store().await)
+            .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
+            .await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Deny {
+                reason: ConsentDenyReason::NotGranted
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn draft_exemption_requires_first_party_source() {
+        let store = store().await;
+        let s = summary(ConsentSource::ManualInstall, HostRiskLevel::High);
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let decision = StoreConsentGate::new(store)
+            .authorize(&eligible_draft_request(&s), "2026-10-08T00:00:01Z")
+            .await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Allow {
+                per_call_approval: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn draft_exemption_requires_current_matching_consent_fingerprint() {
+        let store = store().await;
+        let granted = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        store
+            .grant_module_consent(&granted, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let mut changed = eligible_draft_request(&granted);
+        changed.current_scope_fingerprint.push_str("-changed");
+        let decision = StoreConsentGate::new(store)
+            .authorize(&changed, "2026-10-08T00:00:01Z")
+            .await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Deny {
+                reason: ConsentDenyReason::Stale(_)
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unverified_or_ineligible_draft_semantics_keep_per_call_approval() {
+        type DraftMutation = (&'static str, fn(&mut ConsentGateRequest));
+        let cases: [DraftMutation; 8] = [
+            ("marker absent", |r: &mut ConsentGateRequest| {
+                r.reversible_draft_declared = false;
+            }),
+            ("verification unavailable", |r: &mut ConsentGateRequest| {
+                r.draft_verification = None;
+            }),
+            ("commit semantics", |r: &mut ConsentGateRequest| {
+                r.draft_verification.as_mut().unwrap().has_commit_semantics = true;
+            }),
+            ("outside private storage", |r: &mut ConsentGateRequest| {
+                r.draft_verification
+                    .as_mut()
+                    .unwrap()
+                    .writes_only_to_module_data_dir = false;
+            }),
+            ("delete semantics", |r: &mut ConsentGateRequest| {
+                r.draft_verification.as_mut().unwrap().has_delete_semantics = true;
+            }),
+            ("authoritative write", |r: &mut ConsentGateRequest| {
+                r.draft_verification
+                    .as_mut()
+                    .unwrap()
+                    .modifies_authoritative_content = true;
+            }),
+            ("not reversible", |r: &mut ConsentGateRequest| {
+                r.draft_verification.as_mut().unwrap().can_be_undone = false;
+            }),
+            ("no revision history", |r: &mut ConsentGateRequest| {
+                r.draft_verification.as_mut().unwrap().has_revision_history = false;
+            }),
+        ];
+        for (name, mutate) in cases {
+            let store = store().await;
+            let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+            store
+                .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+                .await
+                .unwrap();
+            let mut request = eligible_draft_request(&s);
+            mutate(&mut request);
+            let decision = StoreConsentGate::new(store)
+                .authorize(&request, "2026-10-08T00:00:01Z")
+                .await;
+            assert!(
+                matches!(
+                    decision,
+                    ConsentGateDecision::Allow {
+                        per_call_approval: true,
+                        ..
+                    }
+                ),
+                "{name} must retain per-call approval"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_risk_never_uses_draft_exemption() {
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let mut request = eligible_draft_request(&s);
+        request.risk = RiskClass::External;
+        let decision = StoreConsentGate::new(store)
+            .authorize(&request, "2026-10-08T00:00:01Z")
+            .await;
+        assert!(matches!(
+            decision,
+            ConsentGateDecision::Allow {
+                per_call_approval: true,
+                ..
+            }
+        ));
     }
 
     // ── ADR反例2/8 — 更严组织/来源限制优先，哪怕许可完全匹配 ────────────────
