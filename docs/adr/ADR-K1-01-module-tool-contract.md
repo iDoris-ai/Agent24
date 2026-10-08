@@ -1,6 +1,6 @@
 # ADR-K1-01：通用模块工具契约
 
-> **状态**：Proposed（K1-1；本 ADR 仅提出契约，不授权实现；涉及工具授权与执行协议，PR 须等待 PR-Daemon APPROVE 后方可合入 `ab/kernel`）
+> **状态**：**Accepted**（2026-10-08 jason 确认；PR-Daemon 已 APPROVE。实现按 PLAN-KERNEL-K1 §4 切片进行，每片仍须 PR-Daemon APPROVE）
 >
 > **日期**：2026-10-07 · **方向**：Kernel K1 · **任务**：#735 / K1-1
 >
@@ -14,7 +14,7 @@
 
 Documenting 是第一个消费方，也是通用契约的需求来源之一；它的文档存储、版本、编辑器、PDF/导出、领域操作及业务幂等键仍由 Documenting ADR 和 #701/#702/#703 定义。内核不得加入 `document` 领域路由、存储或业务规则。
 
-本 ADR 不定义授权 UI、信任根/签名验证、隐私标记传播的完整状态机、审计哈希链字段或业务审计界面；分别由 [ADR-K1-03](../ADR-K1-03-enable-authorization-trust-revocation.md)、[ADR-K1-02](ADR-K1-02-session-dataflow-security-modes.md)、计划中的 ADR-K1-04 承接。本 ADR 对其依赖作出兼容约束。此提案不表示对应机制已存在。
+本 ADR 不定义授权 UI、信任根/签名验证、隐私标记传播的完整状态机、审计哈希链字段或业务审计界面；分别由 [ADR-K1-03](ADR-K1-03-enable-authorization-trust-revocation.md)、[ADR-K1-02](ADR-K1-02-session-dataflow-security-modes.md)、计划中的 ADR-K1-04 承接。本 ADR 对其依赖作出兼容约束。此提案不表示对应机制已存在。
 
 ## 1. 现状与差距
 
