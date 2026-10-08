@@ -85,6 +85,17 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", message.into(), false)
     }
 
+    /// 422: the same key was sent before with a different request (§5.4).
+    #[must_use]
+    pub fn idempotency_key_reused() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "idempotency_key_reused",
+            "this Idempotency-Key was used for a different request".into(),
+            false,
+        )
+    }
+
     #[must_use]
     pub fn status(&self) -> StatusCode {
         self.status
@@ -151,6 +162,14 @@ mod tests {
         let (status, v) = body(ApiError::not_found("gone")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(v["error"]["code"], "not_found");
+        assert_eq!(v["error"]["details"], json!({ "retryable": false }));
+    }
+
+    #[tokio::test]
+    async fn a_reused_key_is_422_and_not_retryable() {
+        let (status, v) = body(ApiError::idempotency_key_reused()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["error"]["code"], "idempotency_key_reused");
         assert_eq!(v["error"]["details"], json!({ "retryable": false }));
     }
 }
