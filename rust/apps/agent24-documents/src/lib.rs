@@ -17,7 +17,7 @@ pub mod idem;
 pub mod state;
 pub mod uploads;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -82,7 +82,7 @@ enum Needs {
 /// until its route lands it reports the code of what it needs, so a client
 /// never sees `available: true` for a 404.
 const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
-    ("upload", Needs::Storage, false),
+    ("upload", Needs::Storage, true),
     ("import", Needs::Storage, false),
     ("get", Needs::Storage, false),
     ("list", Needs::Storage, false),
@@ -140,6 +140,11 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
         .route("/uploads", post(uploads::create_upload))
+        .route(
+            "/uploads/{upload_id}/chunks",
+            post(uploads::chunks::append_chunk)
+                .layer(DefaultBodyLimit::max(uploads::chunks::MAX_CHUNK)),
+        )
         .with_state(state)
 }
 
@@ -211,27 +216,30 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// Every operation, once, each unavailable with the expected reason.
-    fn assert_operations(body: &serde_json::Value) {
-        let mut got: Vec<(String, String)> = body["operations"]
+    /// Every operation, once: those in `available` available with no
+    /// reason, the rest unavailable with the expected reason.
+    fn assert_operations(body: &serde_json::Value, available: &[&str]) {
+        let mut got: Vec<(String, Option<String>)> = body["operations"]
             .as_array()
             .unwrap()
             .iter()
             .map(|op| {
-                assert_eq!(op["available"], false, "no operation has a route yet: {op}");
-                (
-                    op["op"].as_str().unwrap().to_owned(),
-                    op["reason"].as_str().unwrap().to_owned(),
-                )
+                let name = op["op"].as_str().unwrap().to_owned();
+                let on = available.contains(&name.as_str());
+                assert_eq!(op["available"], on, "{op}");
+                (name, op["reason"].as_str().map(str::to_owned))
             })
             .collect();
         let reported = got.len();
         got.sort();
         got.dedup_by(|a, b| a.0 == b.0);
         assert_eq!(got.len(), reported, "an operation is listed twice");
-        let expected: Vec<(String, String)> = EXPECTED
+        let expected: Vec<(String, Option<String>)> = EXPECTED
             .iter()
-            .map(|&(op, reason)| (op.to_owned(), reason.to_owned()))
+            .map(|&(op, reason)| {
+                let reason = (!available.contains(&op)).then(|| reason.to_owned());
+                (op.to_owned(), reason)
+            })
             .collect();
         assert_eq!(got, expected);
     }
@@ -247,7 +255,7 @@ mod tests {
         assert_eq!(body["engines"], serde_json::json!([]));
         assert_eq!(body["knowledge"]["setting"], "on");
         assert_eq!(body["knowledge"]["state"], "unavailable");
-        assert_operations(&body);
+        assert_operations(&body, &[]);
     }
 
     #[tokio::test]
@@ -255,8 +263,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = get_capabilities_json(AppState::open(dir.path()).await).await;
         assert_eq!(body["storage"], serde_json::json!({ "state": "ready" }));
-        // Ready storage alone does not make an operation without a route available.
-        assert_operations(&body);
+        // Ready storage makes only the operations with routes available.
+        assert_operations(&body, &["upload"]);
     }
 
     #[tokio::test]

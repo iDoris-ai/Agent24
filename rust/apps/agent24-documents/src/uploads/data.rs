@@ -16,6 +16,7 @@ pub fn upload_dir(data_dir: &Path, upload_id: &str) -> PathBuf {
     data_dir.join("uploads").join(upload_id)
 }
 
+#[derive(Debug)]
 pub enum WriteError {
     Io(io::Error),
     /// The file holds fewer bytes than the rows count: data was lost.
@@ -35,6 +36,12 @@ impl From<io::Error> for WriteError {
 /// directories are synced on every write, not only when created: a first
 /// attempt can create them and fail before its sync, and the row a retry
 /// commits must not point at a file a power loss could still take away.
+///
+/// The caller must pass the upload's committed `received` as `offset`: the
+/// cut discards everything past it, so a smaller offset would destroy
+/// counted bytes, and a replay must not call this at all. It takes no lock;
+/// the caller holds one turn per upload across the write and the commit
+/// that counts it (`chunks.rs`, #827 review).
 pub fn write_at(dir: &Path, offset: u64, bytes: &[u8]) -> Result<(), WriteError> {
     #[cfg(test)]
     hooks::in_writer(dir);
