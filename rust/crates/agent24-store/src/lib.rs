@@ -77,13 +77,13 @@ pub use legacy_recovery::{
 };
 pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
 pub use module_audit_event::{
-    ActorRef, AuditRef, AuthorizationRef, DurationMs, MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId,
-    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef,
-    RunId, SessionRef, SizeBytes, ToolCallId,
+    ActorRef, AuditRef, AuditTimestamp, AuthorizationRef, DurationMs,
+    MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId, ModuleToolAuditEvent, ModuleToolAuditRelation,
+    ModuleToolResultCode, OperationId, ResourceRef, RunId, SessionRef, SizeBytes, ToolCallId,
 };
 pub use module_consents::{
     ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentRecord,
-    ToolPermissionSummary,
+    ModuleConsentRevocation, ToolPermissionSummary,
 };
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
@@ -142,6 +142,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    module_consent_revocations: tokio::sync::broadcast::Sender<ModuleConsentRevocation>,
 }
 
 impl Store {
@@ -160,7 +161,11 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        Ok(Self {
+            pool,
+            module_consent_revocations,
+        })
     }
 
     /// In-memory database for tests.
@@ -174,7 +179,11 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        Ok(Self {
+            pool,
+            module_consent_revocations,
+        })
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
@@ -200,7 +209,11 @@ pub mod test_hooks {
     /// build.
     #[must_use]
     pub fn from_pool(pool: sqlx::SqlitePool) -> super::Store {
-        super::Store { pool }
+        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        super::Store {
+            pool,
+            module_consent_revocations,
+        }
     }
 
     /// Insert a schedule row with arbitrary (possibly invalid) JSON columns —

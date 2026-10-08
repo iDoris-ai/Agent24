@@ -116,6 +116,17 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
     }
 }
 
+/// Module id of the Documenting OS, as adopted in ADR-DOC-01
+/// (`docs/documenting/adr/ADR-DOC-01-placement-and-integration.md`). Gate 5
+/// (jason 2026-10-08 ruling #5) withholds this module's tools whenever a remote
+/// model tier exists, until K1-6a and K1-6b are both accepted.
+const DOCUMENTS_MODULE_ID: &str = "documents";
+
+/// Whether gate 5 treats `module` as a document-class module.
+fn is_document_class_module(module: &str) -> bool {
+    module == DOCUMENTS_MODULE_ID
+}
+
 pub struct AgentModuleToolAdvertView {
     runtime: Arc<AgentModuleToolRuntime>,
     authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
@@ -159,7 +170,7 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
     }
 
     async fn blocked_by_remote_tier_guard(&self, module: &str, _operation: &str) -> bool {
-        self.remote_tier_present && module == "documenting"
+        self.remote_tier_present && is_document_class_module(module)
     }
 }
 
@@ -168,6 +179,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn gate_five_recognises_the_adopted_documents_module_id() {
+        // ADR-DOC-01 adopted "documents"; the earlier "documenting" literal
+        // never matched any real module, leaving gate 5 dead (#790 review).
+        assert!(is_document_class_module("documents"));
+        assert!(!is_document_class_module("documenting"));
+        assert!(!is_document_class_module("sin90"));
+    }
     use agent24_domain::tool::{ModuleToolCallError, ModuleToolResult};
     use agent24_policy::consent_gate::{
         ConsentGate, ConsentGateRequest, ModuleConsentAuthorization, StoreConsentGate,
@@ -345,7 +365,9 @@ mod tests {
         if risk.requires_approval() {
             registry = registry.with_gate(approvals.clone());
         }
-        registry = registry.with_module_tool(Arc::new(tool));
+        registry
+            .register_module_tool(Arc::new(tool))
+            .expect("fixture registers a unique module tool name");
         (registry, runtime, approvals, store)
     }
 
@@ -408,6 +430,38 @@ mod tests {
             rows[0].detail["pre_dispatch"]["authorization_ref"],
             "denied:no_grant"
         );
+    }
+
+    #[tokio::test]
+    async fn revoked_consent_is_audited_as_denied_with_revoked_reason() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        store
+            .revoke_module_consent(
+                "fake_module",
+                Some("write_local"),
+                "2026-10-08T00:00:00.500Z",
+            )
+            .await
+            .unwrap();
+
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].detail["pre_dispatch"]["authorization_ref"],
+            "denied:revoked"
+        );
+        assert_eq!(rows[1].detail["terminal"]["result"], "denied");
     }
 
     #[tokio::test]
@@ -523,10 +577,11 @@ mod tests {
     #[tokio::test]
     async fn a_pre_dispatch_record_left_by_interruption_is_not_reported_complete() {
         use agent24_store::{
-            ActorRef, AuthorizationRef, ModuleId, ModuleToolAuditEvent, ModuleToolAuditRelation,
-            OperationId, RunId, SessionRef, ToolCallId,
+            ActorRef, AuditTimestamp, AuthorizationRef, ModuleId, ModuleToolAuditEvent,
+            ModuleToolAuditRelation, OperationId, RunId, SessionRef, ToolCallId,
         };
         let store = Store::open_memory().await.unwrap();
+        let timestamp = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
         let relation = ModuleToolAuditRelation {
             actor: ActorRef::new("agent24d").unwrap(),
             run_id: RunId::new("run").unwrap(),
@@ -539,7 +594,7 @@ mod tests {
         };
         store
             .append_module_tool_audit_event(
-                "2026-10-08T00:00:00Z",
+                &timestamp,
                 &ModuleToolAuditEvent::PreDispatch(relation),
             )
             .await

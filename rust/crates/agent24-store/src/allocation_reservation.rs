@@ -209,7 +209,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        Store { pool }
+        crate::test_hooks::from_pool(pool)
     }
 
     fn intent(id: &str, workspace: &str, name: &str) -> AllocationIntent {

@@ -1797,13 +1797,13 @@ pub(crate) mod tests {
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn strict_facts_classify_storage_enums_and_sql_failures() {
-        let store = Store {
-            pool: sqlx::sqlite::SqlitePoolOptions::new()
+        let store = crate::test_hooks::from_pool(
+            sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap(),
-        };
+        );
         execute(
             &store,
             "CREATE TABLE runs (id INTEGER,status);
@@ -2000,13 +2000,13 @@ pub(crate) mod tests {
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn getter_rejects_storage_and_value_corruption_without_writes() {
-        let store = Store {
-            pool: sqlx::sqlite::SqlitePoolOptions::new()
+        let store = crate::test_hooks::from_pool(
+            sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap(),
-        };
+        );
         // No affinity: a TEXT column would silently coerce INTEGER/REAL samples.
         let fields = [
             "run_id",
