@@ -1,16 +1,16 @@
 # ADR-K1-02：会话数据流与安全模式
 
-> **状态**：Proposed（K1-2；本 ADR 仅提出契约，不授权实现；隐私与出站执行属于高风险，PR 须等待 PR-Daemon APPROVE 后方可合入 `ab/kernel`）
+> **状态**：**Accepted**（2026-10-08 jason 确认；PR-Daemon 已 APPROVE。实现按 PLAN-KERNEL-K1 §4 切片进行，每片仍须 PR-Daemon APPROVE）
 >
 > **日期**：2026-10-07 · **方向**：Kernel K1 · **任务**：#735 / K1-2
 >
-> **依据**：[#735](https://github.com/iDoris-ai/Agent24/issues/735)；[PLAN-KERNEL-K1 §2(2)、§4 K1-2](../agent/PLAN-KERNEL-K1.md)；C5 A-3、C2 ID-1/ID-3（[COMPONENT-ROADMAP](../agent/COMPONENT-ROADMAP.md)）；Jason 2026-10-07 对 PLAN-KERNEL-K1 §2 五组问题的裁决；[ADR-K1-01](ADR-K1-01-module-tool-contract.md)；[ADR-K1-03](../ADR-K1-03-enable-authorization-trust-revocation.md)。
+> **依据**：[#735](https://github.com/iDoris-ai/Agent24/issues/735)；[PLAN-KERNEL-K1 §2(2)、§4 K1-2](../agent/PLAN-KERNEL-K1.md)；C5 A-3、C2 ID-1/ID-3（[COMPONENT-ROADMAP](../agent/COMPONENT-ROADMAP.md)）；Jason 2026-10-07 对 PLAN-KERNEL-K1 §2 五组问题的裁决；[ADR-K1-01](ADR-K1-01-module-tool-contract.md)；[ADR-K1-03](ADR-K1-03-enable-authorization-trust-revocation.md)。
 >
 > 本文行号按 K1-2 起草时的 `ab/kernel` 工作树核对；它们描述**现状**，不是未来实现承诺。
 
 ## 0. 范围与边界
 
-本 ADR 定义会话数据的来源、修订与处理模式如何由宿主建立并跨执行边界传播，以及 LocalOnly 和获准云处理的出口门。它覆盖主对话、恢复、委派、模型路由、HTTP/MCP/模块/Exec、记忆和后台任务。它定义政策契约，不实现代码、不承诺首发提供云模式，也不替代 [ADR-K1-03](../ADR-K1-03-enable-authorization-trust-revocation.md) 的启用授权或计划中的 ADR-K1-04 审计字段。
+本 ADR 定义会话数据的来源、修订与处理模式如何由宿主建立并跨执行边界传播，以及 LocalOnly 和获准云处理的出口门。它覆盖主对话、恢复、委派、模型路由、HTTP/MCP/模块/Exec、记忆和后台任务。它定义政策契约，不实现代码、不承诺首发提供云模式，也不替代 [ADR-K1-03](ADR-K1-03-enable-authorization-trust-revocation.md) 的启用授权或计划中的 ADR-K1-04 审计字段。
 
 安全模式只有两个有效结果：`LocalOnly` 与 `CloudAuthorized`。未知、缺失、过期、互相矛盾或无法恢复的状态一律按 `LocalOnly` 处理；不设“尽力而为”的中间态。文档和其他敏感来源默认 `LocalOnly`。获准云处理是可选能力、默认关闭；首发是否承诺此能力另行决定。
 
@@ -52,7 +52,7 @@
 
 `LocalOnly` 是出口约束，不只是 provider 偏好。模型路由必须使用宿主计算出的 `TaskProfile.privacy = LocalOnly`；没有本地模型、代理不支持或结果无法证明由允许的本地 tier 服务时，返回 unavailable，不回退远端。模型/provider 的名义 tier 必须可信配置，不能采信响应或调用方自报。
 
-云处理仅可在功能明确启用后使用，默认关闭。显式用户授权绑定**资料 × 用途 × 目的地**，包含可校验的来源/修订或资料范围、用途、精确服务/接收方（不能仅是“云”）、有效期、签发者、当前策略版本与撤销状态。授权每次外发前校验；资料、用途、目的地、修订范围或政策任一不匹配即拒绝。组织/管理员限制、来源自身限制和更严格会话模式优先；授权拒绝、过期、撤销、未知或授权服务不可用均 fail closed。第一方工具首次权限确认与升级扩权重同意遵循 [ADR-K1-03](../ADR-K1-03-enable-authorization-trust-revocation.md)；模块工具契约遵循 [ADR-K1-01](ADR-K1-01-module-tool-contract.md)。
+云处理仅可在功能明确启用后使用，默认关闭。显式用户授权绑定**资料 × 用途 × 目的地**，包含可校验的来源/修订或资料范围、用途、精确服务/接收方（不能仅是“云”）、有效期、签发者、当前策略版本与撤销状态。授权每次外发前校验；资料、用途、目的地、修订范围或政策任一不匹配即拒绝。组织/管理员限制、来源自身限制和更严格会话模式优先；授权拒绝、过期、撤销、未知或授权服务不可用均 fail closed。第一方工具首次权限确认与升级扩权重同意遵循 [ADR-K1-03](ADR-K1-03-enable-authorization-trust-revocation.md)；模块工具契约遵循 [ADR-K1-01](ADR-K1-01-module-tool-contract.md)。
 
 ### 2.4 LocalOnly fail-closed 出口门清单
 

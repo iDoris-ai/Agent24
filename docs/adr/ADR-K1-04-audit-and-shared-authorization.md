@@ -1,10 +1,10 @@
 # ADR-K1-04：审计与共同授权入口
 
-> **状态**：Proposed（K1-4；本 ADR 仅提出契约，不授权实现；涉及审计与授权，PR 须等待 PR-Daemon APPROVE 后方可合入 `ab/kernel`）
+> **状态**：**Accepted**（2026-10-08 jason 确认；PR-Daemon 已 APPROVE。实现按 PLAN-KERNEL-K1 §4 切片进行，每片仍须 PR-Daemon APPROVE）
 >
 > **日期**：2026-10-07 · **方向**：Kernel K1 · **任务**：#735 / K1-4
 >
-> **依据**：[#735](https://github.com/iDoris-ai/Agent24/issues/735)；[PLAN-KERNEL-K1 §2(4)、§4 K1-4/K1-7](../agent/PLAN-KERNEL-K1.md)；[COMPONENT-ROADMAP C1 K-2](../agent/COMPONENT-ROADMAP.md)；[ADR-K1-01](ADR-K1-01-module-tool-contract.md)；[ADR-K1-03](../ADR-K1-03-enable-authorization-trust-revocation.md)；jason 2026-10-07 对审计/授权问题的裁决。
+> **依据**：[#735](https://github.com/iDoris-ai/Agent24/issues/735)；[PLAN-KERNEL-K1 §2(4)、§4 K1-4/K1-7](../agent/PLAN-KERNEL-K1.md)；[COMPONENT-ROADMAP C1 K-2](../agent/COMPONENT-ROADMAP.md)；[ADR-K1-01](ADR-K1-01-module-tool-contract.md)；[ADR-K1-03](ADR-K1-03-enable-authorization-trust-revocation.md)；jason 2026-10-07 对审计/授权问题的裁决。
 >
 > 本 ADR 的现状行号按本次 `ab/kernel` 工作树核对；行号用于描述现状，不表示相关能力已满足本 ADR。
 
