@@ -1,5 +1,7 @@
 //! Jobs (ADR-DOC-02 §7): `GET /jobs/{job_id}`, cancel and retry. The row,
-//! not any event, is the authority.
+//! not any event, is the authority. [`runner`] runs one attempt of a job.
+
+pub mod runner;
 
 use axum::Json;
 use axum::extract::Path as UrlPath;
