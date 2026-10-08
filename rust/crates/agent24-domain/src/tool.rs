@@ -9,8 +9,10 @@
 //! unplausible input schema, unknown risk/privacy enum, or inconsistent
 //! `timeout_ms`/`inline_wait_ms` pair. [`ModuleToolRegistry`] then namespaces
 //! each validated tool as `<module>.<operation>` and refuses — atomically,
-//! without touching what is already there — any registration that would
-//! collide with an existing entry.
+//! without touching what is already there — any registration whose MODULE
+//! NAME has already registered, even if this call's operation names collide
+//! with nothing (ADR-K1-01 §3: cross-module impersonation must fail closed at
+//! the module level, not only when two operation names happen to collide).
 //!
 //! This is registration only. The registry here is **not wired to the agent
 //! loop**: nothing in this module advertises a tool to a model, and nothing
@@ -22,9 +24,19 @@
 //! tier at K1-6a; nothing in this crate treats a module's own `risk` or
 //! `output_privacy` value as an authorization, a grant, or a reason to skip
 //! confirmation (ADR-K1-01 §2.1, §5(1)).
+//!
+//! `risk` reuses [`agent24_protocol::RiskClass`] — the SAME closed enum the
+//! approval path already reads (`Read`/`WriteLocal`/`Exec`/`External`) —
+//! rather than a second, tool-specific vocabulary. `agent24-domain` already
+//! depends on `agent24-protocol`, so this costs nothing, and it is what lets
+//! Documenting's `handoff` (ADR-DOC-02, which maps it to `RiskClass::External`)
+//! declare itself as `external` directly: a second enum here would have forced
+//! a lossy mapping (no `External`-equivalent tier existed) the first time a
+//! real manifest tried to declare that operation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use agent24_protocol::RiskClass;
 use serde::{Deserialize, Serialize};
 
 use crate::{DomainError, is_valid_module_name};
@@ -32,54 +44,26 @@ use crate::{DomainError, is_valid_module_name};
 /// Conservative sanity ceiling on a declared `timeout_ms`: ten minutes. The
 /// ADR leaves the exact operative limit to the host, which "can shorten, never
 /// lengthen" it (§2.4) — this bounds the DECLARATION itself, so a manifest
-/// cannot claim a single tool call may run unboundedly long.
+/// cannot claim a single tool call may run unboundedly long. Twice
+/// `agent24_os_proto`'s existing `MAX_METHOD_CALL_TIMEOUT` (300s): that
+/// constant bounds one kernel→module HTTP round trip, while this one bounds a
+/// tool's declared ceiling for a call that may itself include slower
+/// module-side work (e.g. a long-running local model); doubling the nearest
+/// existing precedent rather than inventing an unrelated number.
 pub const MAX_DECLARED_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
-/// Self-reported risk tier for a module-declared tool operation.
-///
-/// A DECLARATION, not an authority (ADR-K1-01 §2.1, §5(1)): the host decides
-/// a tool's real risk at K1-6a, and an unconfirmed third-party module
-/// reporting `Read` must not be treated as proof the operation is low-risk.
-/// `non_exhaustive` so a future tier does not silently break an exhaustive
-/// match outside this crate (mirrors [`crate::Capability`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DeclaredRisk {
-    Read,
-    Write,
-    Destructive,
-}
-
-impl DeclaredRisk {
-    pub const ALL: &'static [Self] = &[Self::Read, Self::Write, Self::Destructive];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Destructive => "destructive",
-        }
-    }
-
-    /// Names the rejected string and the choices, like [`crate::Capability::parse`]:
-    /// a serde variant error cannot recover what the manifest actually typed.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|r| r.as_str() == s)
-            .ok_or_else(|| {
-                format!(
-                    "risk: {s:?} is not one of {}",
-                    Self::ALL
-                        .iter()
-                        .map(|r| r.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-    }
+/// Map a manifest's `risk` STRING onto [`RiskClass`], naming the rejected
+/// value and the choices like [`crate::Capability::parse`] — `RiskClass`'s
+/// own `Deserialize` (snake_case) does the real mapping, but its serde error
+/// cannot quote which string the manifest actually typed in a form a caller
+/// can read back.
+fn parse_risk(s: &str) -> Result<RiskClass, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned())).map_err(|_| {
+        format!(
+            "risk: {s:?} is not one of read, write_local, exec, external \
+             (agent24_protocol::RiskClass)"
+        )
+    })
 }
 
 /// Self-reported output-data sensitivity for a module-declared tool.
@@ -186,7 +170,7 @@ pub struct ToolDeclaration {
     operation: String,
     description: String,
     input_schema: serde_json::Value,
-    risk: DeclaredRisk,
+    risk: RiskClass,
     output_privacy: DeclaredOutputPrivacy,
     timeout_ms: u64,
     inline_wait_ms: u64,
@@ -206,7 +190,7 @@ impl ToolDeclaration {
     }
 
     /// Self-reported; see this module's docs — not an authority.
-    pub fn risk(&self) -> DeclaredRisk {
+    pub fn risk(&self) -> RiskClass {
         self.risk
     }
 
@@ -268,7 +252,7 @@ pub(crate) fn validate_tools(
                 r.operation
             )));
         }
-        let risk = DeclaredRisk::parse(&r.risk)
+        let risk = parse_risk(&r.risk)
             .map_err(|e| DomainError::Manifest(format!("tools.{:?}: {e}", r.operation)))?;
         let output_privacy = DeclaredOutputPrivacy::parse(&r.output_privacy)
             .map_err(|e| DomainError::Manifest(format!("tools.{:?}: {e}", r.operation)))?;
@@ -322,12 +306,23 @@ impl RegisteredTool {
 }
 
 /// The host-side, READ-ONLY directory of registered module tools
-/// (ADR-K1-01 §2.1, §2.2, §5(2)).
+/// (ADR-K1-01 §2.1, §2.2, §3, §5(2)).
 ///
 /// Read-only in the sense that matters: there is no public method that
 /// removes or overwrites an entry. [`register_module`](Self::register_module)
 /// is the only way in, and it refuses — atomically, leaving the registry
 /// exactly as it was — rather than overwrite anything already registered.
+///
+/// The fail-closed boundary is the **module name**, not just the full
+/// `<module>.<operation>` name (ADR-K1-01 §3's "cross-module impersonation /
+/// tool-name collision": "模块名由 manifest 校验, 工具名按命名空间限定, 注册
+/// 冲突 fail closed"). Once a module name has registered — even with an EMPTY
+/// tool list — no later call under that same module name may add, change, or
+/// claim anything, regardless of which operation names it declares. This
+/// mirrors the mounter's own module-identity de-duplication: two discovered
+/// packages that (incorrectly) declare the same `name` must be refused the
+/// same way here as they are there, not just when their operation names
+/// happen to collide too.
 ///
 /// **Not communicated to the agent, and provides no invocation path.** That
 /// is K1-5.2 (discovery/announcement) and K1-5.3 (the call path); this type
@@ -335,6 +330,11 @@ impl RegisteredTool {
 #[derive(Debug, Clone, Default)]
 pub struct ModuleToolRegistry {
     tools: BTreeMap<String, RegisteredTool>,
+    /// Every module name that has ever registered, even with zero tools. A
+    /// module that declares no tools still CLAIMS its name — a later package
+    /// sharing that name must be refused even though it collides with no
+    /// individual tool.
+    registered_modules: BTreeSet<String>,
 }
 
 impl ModuleToolRegistry {
@@ -352,19 +352,43 @@ impl ModuleToolRegistry {
 
     /// Register every tool `module` declared, or none of them.
     ///
-    /// Atomic and fail-closed (ADR-K1-01 §5(2)): if ANY of `module`'s tools
-    /// would collide with an already-registered full name — including one
-    /// registered under a DIFFERENT module id, which happens if two
-    /// discovered packages declare the same module name — the whole call is
-    /// refused and the registry is left exactly as it was. Never partially
-    /// registers a module's tools, and never overwrites an existing entry.
-    /// An empty `tools` slice always succeeds as a no-op (a module that
-    /// declares no tools has nothing to register).
+    /// Atomic and fail-closed at the MODULE level (ADR-K1-01 §3, §5(2)): if
+    /// `module` has already registered — under ANY previous call, including
+    /// one with an empty `tools` list — this call is refused in full and the
+    /// registry is left exactly as it was, regardless of whether this call's
+    /// operation names happen to collide with anything already registered.
+    /// That is the gap a full-name-only check misses: two discovered packages
+    /// declaring the same module `name` but DIFFERENT operations (`list-notes`
+    /// vs `delete-all`) produce no full-name collision at all, yet the second
+    /// one is exactly the cross-module impersonation §3 requires to fail
+    /// closed. A full-name collision check runs too (defense in depth — it
+    /// should be unreachable once a module name is unique, since
+    /// `validate_tools` already refuses a duplicate operation WITHIN one
+    /// manifest), but the module-name check is the one that actually gates
+    /// this method, and it runs first. Never partially registers a module's
+    /// tools, and never overwrites an existing entry.
     pub fn register_module(
         &mut self,
         module: &str,
         tools: &[ToolDeclaration],
     ) -> Result<(), String> {
+        if !is_valid_module_name(module) {
+            return Err(format!(
+                "tool registration refused: {module:?} is not a valid module name"
+            ));
+        }
+        if self.registered_modules.contains(module) {
+            return Err(format!(
+                "tool registration refused for module {module:?}: this module name \
+                 is already registered (ADR-K1-01 §3: cross-module impersonation \
+                 must fail closed at the module level, not only on an operation-name \
+                 collision)"
+            ));
+        }
+        // Defense in depth only — see the docstring above. Unreachable in
+        // practice once the module-name check above holds, since a module
+        // name can register at most once and `validate_tools` already
+        // refuses a duplicate operation within one manifest.
         let mut conflicts = Vec::new();
         for t in tools {
             let name = Self::full_name(module, t.operation());
@@ -379,6 +403,7 @@ impl ModuleToolRegistry {
                 conflicts.join(", ")
             ));
         }
+        self.registered_modules.insert(module.to_owned());
         for t in tools {
             let name = Self::full_name(module, t.operation());
             self.tools.insert(
@@ -434,7 +459,7 @@ mod tests {
         let out = validate_tools(vec![raw("list-notes", "read", "local_only")]).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].operation(), "list-notes");
-        assert_eq!(out[0].risk(), DeclaredRisk::Read);
+        assert_eq!(out[0].risk(), RiskClass::Read);
         assert_eq!(out[0].output_privacy(), DeclaredOutputPrivacy::LocalOnly);
         assert_eq!(out[0].timeout_ms(), 5_000);
         assert_eq!(out[0].inline_wait_ms(), 1_000);
@@ -460,7 +485,7 @@ mod tests {
     fn a_duplicate_operation_in_one_manifest_is_refused() {
         let err = validate_tools(vec![
             raw("list-notes", "read", "local_only"),
-            raw("list-notes", "write", "local_only"),
+            raw("list-notes", "write_local", "local_only"),
         ])
         .unwrap_err();
         assert!(err.to_string().contains("declared more than once"), "{err}");
@@ -581,33 +606,70 @@ mod tests {
         assert_eq!(reg.len(), 1);
     }
 
+    /// THE reflex case for the module-level gap: two installed packages share
+    /// a module `name` ("dup") but declare DIFFERENT operations, so there is
+    /// NO full-name collision at all (`dup.list-notes` vs `dup.delete-all`).
+    /// Before this fix, a full-name-only check let both through — exactly the
+    /// cross-module impersonation ADR-K1-01 §3 requires to fail closed. Named
+    /// after the module identity it is actually testing, not the operation
+    /// names (which deliberately do NOT collide).
     #[test]
-    fn two_discovered_packages_sharing_a_module_name_do_not_overwrite_each_other() {
-        // §5(2)'s "two modules register the same operation": two installed
-        // packages that (incorrectly) share a module id each declaring the
-        // same operation name collide on the same full name.
+    fn same_module_name_different_operations_is_refused_at_the_module_level() {
         let mut reg = ModuleToolRegistry::new();
         reg.register_module("dup", &[declared("list-notes")])
             .unwrap();
         let before = reg.get("dup.list-notes").unwrap().clone();
 
         let err = reg
-            .register_module("dup", &[declared("list-notes"), declared("other-op")])
+            .register_module("dup", &[declared("delete-all")])
             .unwrap_err();
-        assert!(err.contains("dup.list-notes"), "{err}");
-        // Atomic: `other-op` must NOT have been registered either.
+        assert!(err.contains("dup"), "{err}");
+        assert!(err.contains("already"), "{err}");
+        // The whole point: no full name collided, yet the second package's
+        // operation must still be refused.
         assert!(
-            reg.get("dup.other-op").is_none(),
-            "partial registration leaked an entry"
+            reg.get("dup.delete-all").is_none(),
+            "a non-colliding operation name must not let a second package \
+             claim an already-registered module"
         );
         assert_eq!(reg.get("dup.list-notes").unwrap(), &before);
         assert_eq!(reg.len(), 1);
+    }
+
+    /// A module that declares NO tools still claims its name. A later package
+    /// sharing that name must be refused even though the first registration
+    /// left nothing in `tools` to collide with.
+    #[test]
+    fn an_empty_tool_list_still_claims_the_module_name() {
+        let mut reg = ModuleToolRegistry::new();
+        reg.register_module("dup", &[]).unwrap();
+        assert!(reg.is_empty(), "an empty tool list registers no tools");
+
+        let err = reg
+            .register_module("dup", &[declared("list-notes")])
+            .unwrap_err();
+        assert!(err.contains("dup"), "{err}");
+        assert!(
+            reg.get("dup.list-notes").is_none(),
+            "the module name was already claimed by the empty-tools registration"
+        );
+        assert!(reg.is_empty());
     }
 
     #[test]
     fn registering_an_empty_tool_list_is_a_harmless_no_op() {
         let mut reg = ModuleToolRegistry::new();
         reg.register_module("no-tools", &[]).unwrap();
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn a_registration_with_an_invalid_module_name_is_refused() {
+        let mut reg = ModuleToolRegistry::new();
+        let err = reg
+            .register_module("Not.Valid", &[declared("list-notes")])
+            .unwrap_err();
+        assert!(err.contains("not a valid module name"), "{err}");
         assert!(reg.is_empty());
     }
 

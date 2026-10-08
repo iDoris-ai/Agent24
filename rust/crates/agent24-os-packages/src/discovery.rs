@@ -224,16 +224,21 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
 }
 
 /// Build the host-side module-tool registry from a scan's `found` packages,
-/// in order (K1-5.1, ADR-K1-01 §2.1/§2.2/§5(2)).
+/// in order (K1-5.1, ADR-K1-01 §2.1/§2.2/§3/§5(2)).
 ///
 /// Each package's manifest has already validated its OWN tool list
 /// internally (no duplicate operation, valid names/schema/enums — see
 /// `agent24_domain::tool::validate_tools`), so registering it here can only
-/// fail on a collision against an EARLIER package in this same batch. That
-/// happens if two found directories declare the same module `name` — `scan`
-/// does not dedupe by name (see its own doc comment; that is "downstream",
-/// the mounter's job). A colliding module's tools are refused IN FULL via
-/// [`Refused`], exactly like a malformed manifest: the registry already
+/// fail if an EARLIER package in this same batch already claimed the same
+/// module `name` — `scan` does not dedupe by name (see its own doc comment;
+/// that is "downstream", the mounter's job). The gate is the MODULE NAME, not
+/// just an operation-name collision: two found directories that declare the
+/// same `name` but DIFFERENT operations produce no full-name collision at
+/// all, yet the later one must still be refused in full — see
+/// `ModuleToolRegistry::register_module`'s own docs for why a full-name-only
+/// check would miss exactly the cross-module impersonation ADR-K1-01 §3
+/// requires to fail closed. A colliding module's tools are refused IN FULL
+/// via [`Refused`], exactly like a malformed manifest: the registry already
 /// built from earlier packages is left untouched, never partially updated.
 ///
 /// This registry is **not communicated to the agent and offers no invocation
@@ -825,11 +830,54 @@ mod tests {
             "the second registration must not add or overwrite"
         );
         assert_eq!(refused.len(), 1);
-        assert!(refused[0].why.contains("dup.list-notes"), "{:?}", refused);
+        assert!(refused[0].why.contains("dup"), "{:?}", refused);
         assert_eq!(
             refused[0].dir.file_name().unwrap().to_string_lossy(),
             "zzz-dup",
             "the LATER package (by scan order) is the one refused, the earlier stays"
+        );
+    }
+
+    /// THE real reflex case (ADR-K1-01 §3): two found packages share a module
+    /// `name` ("dup") but declare DIFFERENT operations, so there is no
+    /// full-name collision at all (`dup.list-notes` vs `dup.delete-all`).
+    /// Before the module-level fix, a full-name-only check let BOTH through
+    /// — the test above alone could not catch this, because its two packages
+    /// happen to declare the SAME operation and so collide on the full name
+    /// regardless of whether the check is module-level or name-level.
+    #[test]
+    fn two_found_packages_sharing_a_module_name_with_different_operations_are_still_refused() {
+        let root = tempfile::tempdir().unwrap();
+        install(
+            root.path(),
+            "aaa-dup",
+            &manifest_yaml_with_tool("dup", "out_of_process_provider", "list-notes"),
+        );
+        install(
+            root.path(),
+            "zzz-dup",
+            &manifest_yaml_with_tool("dup", "out_of_process_provider", "delete-all"),
+        );
+
+        let scan = scan(root.path());
+        assert!(scan.refused.is_empty(), "{:?}", scan.refused);
+
+        let (registry, refused) = build_tool_registry(&scan.found);
+        assert_eq!(
+            registry.len(),
+            1,
+            "the second package's non-colliding operation must still be refused \
+             at the module level"
+        );
+        assert!(registry.get("dup.list-notes").is_some());
+        assert!(
+            registry.get("dup.delete-all").is_none(),
+            "no full name collided, but the module name was already claimed"
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0].dir.file_name().unwrap().to_string_lossy(),
+            "zzz-dup"
         );
     }
 }
