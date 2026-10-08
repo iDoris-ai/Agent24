@@ -185,6 +185,7 @@ mod tests {
     struct FakeModule {
         running: AtomicBool,
         calls: AtomicUsize,
+        failure: std::sync::Mutex<Option<ModuleToolCallError>>,
     }
 
     #[async_trait]
@@ -205,6 +206,9 @@ mod tests {
             _: CancellationToken,
         ) -> Result<ModuleToolResult, ModuleToolCallError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.failure.lock().unwrap().clone() {
+                return Err(error);
+            }
             Ok(ModuleToolResult::Completed {
                 payload: serde_json::json!({"ok": true}),
                 replayed: false,
@@ -235,7 +239,10 @@ mod tests {
         }
     }
 
-    struct CountingApproval(AtomicUsize);
+    struct CountingApproval {
+        calls: AtomicUsize,
+        deny: AtomicBool,
+    }
 
     struct RelaxModuleRisk;
 
@@ -255,8 +262,12 @@ mod tests {
             _: Option<&str>,
             _: &CancellationToken,
         ) -> GateDecision {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            GateDecision::Allow
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.deny.load(Ordering::SeqCst) {
+                GateDecision::Deny("user refused".to_owned())
+            } else {
+                GateDecision::Allow
+            }
         }
     }
 
@@ -277,7 +288,7 @@ mod tests {
         risk: RiskClass,
         granted: bool,
         running: bool,
-    ) -> (ToolRegistry, Arc<FakeModule>, Arc<CountingApproval>) {
+    ) -> (ToolRegistry, Arc<FakeModule>, Arc<CountingApproval>, Store) {
         let store = Store::open_memory().await.unwrap();
         let summary = summary();
         if granted {
@@ -295,7 +306,7 @@ mod tests {
             org_restricted: false,
             source_restricted: false,
         };
-        let gate: Arc<dyn ConsentGate> = Arc::new(StoreConsentGate::new(store));
+        let gate: Arc<dyn ConsentGate> = Arc::new(StoreConsentGate::new(store.clone()));
         let authorization: Arc<dyn ModuleToolAuthorization> =
             Arc::new(ModuleConsentAuthorization::new(
                 gate,
@@ -305,6 +316,7 @@ mod tests {
         let runtime = Arc::new(FakeModule {
             running: AtomicBool::new(running),
             calls: AtomicUsize::new(0),
+            failure: std::sync::Mutex::new(None),
         });
         let view: Arc<dyn ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
@@ -321,15 +333,20 @@ mod tests {
             view,
             authorization,
             runtime.clone(),
+            store.clone(),
+            "agent24d",
         )
         .unwrap();
-        let approvals = Arc::new(CountingApproval(AtomicUsize::new(0)));
+        let approvals = Arc::new(CountingApproval {
+            calls: AtomicUsize::new(0),
+            deny: AtomicBool::new(false),
+        });
         let mut registry = ToolRegistry::new().with_risk_overrides(Arc::new(RelaxModuleRisk));
         if risk.requires_approval() {
             registry = registry.with_gate(approvals.clone());
         }
         registry = registry.with_module_tool(Arc::new(tool));
-        (registry, runtime, approvals)
+        (registry, runtime, approvals, store)
     }
 
     fn context() -> ToolContext {
@@ -338,24 +355,40 @@ mod tests {
 
     #[tokio::test]
     async fn granted_fake_module_is_advertised_and_callable() {
-        let (registry, runtime, _) = fixture(RiskClass::Read, true, true).await;
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
         assert_eq!(registry.live_adverts().await.len(), 1);
+        let mut arguments = Map::new();
+        arguments.insert(
+            "credential".to_owned(),
+            Value::String("do-not-audit-this-secret".to_owned()),
+        );
         let result = registry
             .dispatch(
                 "fake_module.write_local",
                 &context(),
-                &Map::new(),
+                &arguments,
                 &CancellationToken::new(),
             )
             .await
             .unwrap();
         assert!(result.contains("\"ok\":true"));
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let audit = store.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 2, "pre-dispatch and terminal audit required");
+        assert_eq!(audit[0].action, "k1.module_tool.pre_dispatch");
+        assert_eq!(audit[1].detail["terminal"]["result"], "success");
+        assert_eq!(audit[0].detail["pre_dispatch"]["actor"], "agent24d");
+        assert_eq!(audit[0].detail["pre_dispatch"]["run_id"], "run");
+        assert_eq!(audit[0].detail["pre_dispatch"]["module_id"], "fake_module");
+        let audit_text =
+            serde_json::to_string(&audit.iter().map(|entry| &entry.detail).collect::<Vec<_>>())
+                .unwrap();
+        assert!(!audit_text.contains("do-not-audit-this-secret"));
     }
 
     #[tokio::test]
     async fn missing_consent_is_not_advertised_and_never_reaches_fake_module() {
-        let (registry, runtime, _) = fixture(RiskClass::Read, false, true).await;
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, false, true).await;
         assert!(registry.live_adverts().await.is_empty());
         let error = registry
             .dispatch(
@@ -368,11 +401,18 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("permission_denied"));
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].detail["terminal"]["result"], "denied");
+        assert_eq!(
+            rows[0].detail["pre_dispatch"]["authorization_ref"],
+            "denied:no_grant"
+        );
     }
 
     #[tokio::test]
     async fn write_local_module_tool_asks_existing_approval_gate_every_call() {
-        let (registry, runtime, approvals) = fixture(RiskClass::WriteLocal, true, true).await;
+        let (registry, runtime, approvals, _) = fixture(RiskClass::WriteLocal, true, true).await;
         assert_eq!(registry.live_adverts().await.len(), 1);
         for _ in 0..2 {
             registry
@@ -385,13 +425,13 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(approvals.0.load(Ordering::SeqCst), 2);
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 2);
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn stopped_module_tool_returns_module_unavailable_without_dispatch() {
-        let (registry, runtime, _) = fixture(RiskClass::Read, true, false).await;
+        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, false).await;
         assert!(registry.live_adverts().await.is_empty());
         let error = registry
             .dispatch(
@@ -404,5 +444,108 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("module_unavailable"));
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn module_tool_records_each_execution_terminal_code() {
+        let cases = [
+            (ModuleToolCallError::ModuleUnavailable, "failed"),
+            (ModuleToolCallError::Timeout, "timeout"),
+            (ModuleToolCallError::Cancelled, "cancelled"),
+            (ModuleToolCallError::ResultUnknown, "result_unknown"),
+        ];
+        for (failure, expected) in cases {
+            let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+            *runtime.failure.lock().unwrap() = Some(failure);
+            assert!(
+                registry
+                    .dispatch(
+                        "fake_module.write_local",
+                        &context(),
+                        &Map::new(),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .is_err()
+            );
+            let rows = store.list_audit().await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].detail["terminal"]["result"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_unavailable_fails_closed_before_module_dispatch() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        sqlx::query("CREATE TRIGGER reject_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(FAIL, 'offline'); END")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("module_tool_audit_unavailable"));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        assert!(store.list_audit().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_gate_denial_is_audited_before_returning() {
+        let (registry, runtime, approvals, store) =
+            fixture(RiskClass::WriteLocal, true, true).await;
+        approvals.deny.store(true, Ordering::SeqCst);
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("denied"));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].detail["terminal"]["result"], "denied");
+        assert_ne!(
+            rows[0].detail["pre_dispatch"]["authorization_ref"],
+            "denied:no_grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pre_dispatch_record_left_by_interruption_is_not_reported_complete() {
+        use agent24_store::{
+            ActorRef, AuthorizationRef, ModuleId, ModuleToolAuditEvent, ModuleToolAuditRelation,
+            OperationId, RunId, SessionRef, ToolCallId,
+        };
+        let store = Store::open_memory().await.unwrap();
+        let relation = ModuleToolAuditRelation {
+            actor: ActorRef::new("agent24d").unwrap(),
+            run_id: RunId::new("run").unwrap(),
+            session_ref: Some(SessionRef::new("session").unwrap()),
+            tool_call_id: ToolCallId::new("call").unwrap(),
+            module_id: ModuleId::new("fake_module").unwrap(),
+            operation_id: OperationId::new("write_local").unwrap(),
+            authorization_ref: AuthorizationRef::new("grant:ref").unwrap(),
+            resource_ref: None,
+        };
+        store
+            .append_module_tool_audit_event(
+                "2026-10-08T00:00:00Z",
+                &ModuleToolAuditEvent::PreDispatch(relation),
+            )
+            .await
+            .unwrap();
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "k1.module_tool.pre_dispatch");
     }
 }

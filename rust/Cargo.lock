@@ -333,9 +333,11 @@ version = "0.5.1"
 dependencies = [
  "agent24-domain",
  "agent24-protocol",
+ "agent24-store",
  "agent24-workspace",
  "async-trait",
  "cap-std",
+ "chrono",
  "reqwest",
  "serde",
  "serde_json",

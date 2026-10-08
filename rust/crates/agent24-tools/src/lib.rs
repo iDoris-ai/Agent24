@@ -23,6 +23,11 @@ use std::time::Duration;
 
 use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult};
 use agent24_protocol::{Decision, RiskClass, ToolInfo};
+use agent24_store::{
+    ActorRef, AuthorizationRef, DurationMs, ModuleId, ModuleToolAuditEvent,
+    ModuleToolAuditRelation, ModuleToolResultCode, OperationId, RunId, SessionRef, Store,
+    ToolCallId,
+};
 use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -300,6 +305,13 @@ pub trait Tool: Send + Sync {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError>;
+
+    /// Record a kernel-side refusal that happens before `call` (for example,
+    /// a capability or approval-gate denial). Ordinary tools have no module
+    /// audit stream, so their default is a no-op.
+    async fn audit_denied(&self, _ctx: &ToolContext) -> Result<(), ToolError> {
+        Ok(())
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -388,9 +400,54 @@ pub struct ModuleTool {
     advert_view: Arc<dyn agent24_domain::tool::ModuleToolAdvertView>,
     authorization: Arc<dyn ModuleToolAuthorization>,
     runtime: Arc<dyn ModuleToolRuntime>,
+    audit_store: Store,
+    audit_actor: String,
 }
 
 impl ModuleTool {
+    fn audit_relation(
+        &self,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> Result<ModuleToolAuditRelation, ToolError> {
+        Ok(ModuleToolAuditRelation {
+            actor: ActorRef::new(self.audit_actor.clone()).map_err(|_| audit_unavailable())?,
+            run_id: RunId::new(ctx.run_id()).map_err(|_| audit_unavailable())?,
+            session_ref: ctx
+                .session_id()
+                .map(SessionRef::new)
+                .transpose()
+                .map_err(|_| audit_unavailable())?,
+            tool_call_id: ToolCallId::new(ctx.tool_call_id()).map_err(|_| audit_unavailable())?,
+            module_id: ModuleId::new(self.module.clone()).map_err(|_| audit_unavailable())?,
+            operation_id: OperationId::new(self.operation.clone())
+                .map_err(|_| audit_unavailable())?,
+            authorization_ref: AuthorizationRef::new(authorization_ref)
+                .map_err(|_| audit_unavailable())?,
+            resource_ref: None,
+        })
+    }
+
+    async fn audit_refusal(&self, ctx: &ToolContext) -> Result<(), ToolError> {
+        let authorization_ref = self
+            .authorization
+            .authorize(&self.module, &self.operation, ctx)
+            .await
+            .map_or_else(
+                |_| "denied:no_grant".to_owned(),
+                |grant| grant.authorization_ref,
+            );
+        let relation = self.audit_relation(ctx, &authorization_ref)?;
+        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
+            .await?;
+        self.finish_audit(
+            &relation,
+            ModuleToolResultCode::Denied,
+            std::time::Instant::now(),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)] // Mirrors the module advert plus the two host adapters.
     pub fn new(
         module: impl Into<String>,
@@ -403,6 +460,8 @@ impl ModuleTool {
         advert_view: Arc<dyn agent24_domain::tool::ModuleToolAdvertView>,
         authorization: Arc<dyn ModuleToolAuthorization>,
         runtime: Arc<dyn ModuleToolRuntime>,
+        audit_store: Store,
+        audit_actor: impl Into<String>,
     ) -> Result<Self, &'static str> {
         if inline_wait >= timeout {
             return Err("inline_wait must be shorter than timeout");
@@ -421,6 +480,8 @@ impl ModuleTool {
             advert_view,
             authorization,
             runtime,
+            audit_store,
+            audit_actor: audit_actor.into(),
         })
     }
 }
@@ -461,18 +522,39 @@ impl Tool for ModuleTool {
         true
     }
 
+    async fn audit_denied(&self, ctx: &ToolContext) -> Result<(), ToolError> {
+        self.audit_refusal(ctx).await
+    }
+
     async fn call(
         &self,
         ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
-        let grant = self
+        let authorized = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
-            .await
-            .map_err(|error| ToolError::Failed(module_error_json(error)))?;
+            .await;
+        let authorization_ref = authorized.as_ref().map_or_else(
+            |_| "denied:no_grant".to_owned(),
+            |grant| grant.authorization_ref.clone(),
+        );
+        let relation = self.audit_relation(ctx, &authorization_ref)?;
+        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
+            .await?;
+        let started = std::time::Instant::now();
+        let grant = match authorized {
+            Ok(grant) => grant,
+            Err(error) => {
+                self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
+                    .await?;
+                return Err(ToolError::Failed(module_error_json(error)));
+            }
+        };
         if grant.per_call_approval && !self.risk.requires_approval() {
+            self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
+                .await?;
             return Err(ToolError::Failed(module_error_json(permission_denied())));
         }
         if let Err(error) = self
@@ -480,6 +562,8 @@ impl Tool for ModuleTool {
             .check_available(&self.module, &self.operation)
             .await
         {
+            self.finish_audit(&relation, result_code(&error), started)
+                .await?;
             return Err(ToolError::Failed(module_error_json(error)));
         }
         let context = ModuleToolContext {
@@ -502,11 +586,19 @@ impl Tool for ModuleTool {
             Ok(result) => result,
             Err(_) => {
                 call_cancel.cancel();
+                self.finish_audit(&relation, ModuleToolResultCode::ResultUnknown, started)
+                    .await?;
                 return Err(ToolError::Failed(module_error_json(
                     ModuleToolCallError::ResultUnknown,
                 )));
             }
         };
+        let code = match &result {
+            Ok(ModuleToolResult::Completed { .. }) => ModuleToolResultCode::Success,
+            Ok(ModuleToolResult::Pending { .. }) => ModuleToolResultCode::ResultUnknown,
+            Err(error) => result_code(error),
+        };
+        self.finish_audit(&relation, code, started).await?;
         match result {
             Ok(ModuleToolResult::Completed { payload, replayed }) => Ok(serde_json::json!({
                 "kind":"completed", "payload":payload, "replayed":replayed
@@ -517,6 +609,71 @@ impl Tool for ModuleTool {
             ))),
             Err(failure) => Err(ToolError::Failed(module_error_json(failure))),
         }
+    }
+}
+
+fn audit_unavailable() -> ToolError {
+    ToolError::Failed("module_tool_audit_unavailable".to_owned())
+}
+
+fn result_code(error: &ModuleToolCallError) -> ModuleToolResultCode {
+    match error {
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::PermissionDenied,
+            ..
+        } => ModuleToolResultCode::Denied,
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::Cancelled,
+            ..
+        }
+        | ModuleToolCallError::Cancelled => ModuleToolResultCode::Cancelled,
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::Timeout,
+            ..
+        }
+        | ModuleToolCallError::Timeout => ModuleToolResultCode::Timeout,
+        ModuleToolCallError::ResultUnknown
+        | ModuleToolCallError::ResponseTooLarge
+        | ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::ResponseTooLarge,
+            ..
+        } => ModuleToolResultCode::ResultUnknown,
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::ResultUnknown,
+            ..
+        } => ModuleToolResultCode::ResultUnknown,
+        ModuleToolCallError::InvalidResult
+        | ModuleToolCallError::ModuleUnavailable
+        | ModuleToolCallError::Module { .. } => ModuleToolResultCode::Failed,
+    }
+}
+
+impl ModuleTool {
+    async fn append_audit(&self, event: &ModuleToolAuditEvent) -> Result<(), ToolError> {
+        self.audit_store
+            .append_module_tool_audit_event(&chrono::Utc::now().to_rfc3339(), event)
+            .await
+            .map(|_| ())
+            .map_err(|_| audit_unavailable())
+    }
+
+    async fn finish_audit(
+        &self,
+        relation: &ModuleToolAuditRelation,
+        result: ModuleToolResultCode,
+        started: std::time::Instant,
+    ) -> Result<(), ToolError> {
+        let duration = started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(DurationMs::MAX)) as u64;
+        let event = ModuleToolAuditEvent::Terminal {
+            relation: relation.clone(),
+            result,
+            duration_ms: Some(DurationMs::new(duration).map_err(|_| audit_unavailable())?),
+            size_bytes: None,
+        };
+        self.append_audit(&event).await
     }
 }
 
@@ -836,6 +993,7 @@ impl ToolRegistry {
 
         // 2. capability whitelist
         if !self.allowed.contains(name) {
+            tool.audit_denied(ctx).await?;
             return Err(ToolError::Denied(format!(
                 "tool {name} is not in the capability whitelist"
             )));
@@ -879,8 +1037,14 @@ impl ToolRegistry {
                 .await
             {
                 GateDecision::Allow => {}
-                GateDecision::Deny(reason) => return Err(ToolError::Denied(reason)),
-                GateDecision::AbortRun(reason) => return Err(ToolError::AbortRun(reason)),
+                GateDecision::Deny(reason) => {
+                    tool.audit_denied(ctx).await?;
+                    return Err(ToolError::Denied(reason));
+                }
+                GateDecision::AbortRun(reason) => {
+                    tool.audit_denied(ctx).await?;
+                    return Err(ToolError::AbortRun(reason));
+                }
             }
         }
 
@@ -1476,6 +1640,8 @@ mod tests {
                 Arc::new(DenyAdvertView),
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(Runtime),
+                agent24_store::Store::open_memory().await.unwrap(),
+                "agent24d",
             )
             .unwrap()
             .call(&ctx(), &Map::new(), &CancellationToken::new())
