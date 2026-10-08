@@ -924,6 +924,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/documents/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a chunked upload (ADR-DOC-02 §5.6)
+         * @description Idempotent on `Idempotency-Key` (kind `upload`, §5.4): the same key with the same body returns the existing upload; with a different body, `idempotency_key_reused`.
+         */
+        post: operations["documentsCreateUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/uploads/{upload_id}/chunks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Append one chunk of raw bytes at the given offset
+         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires.
+         */
+        post: operations["documentsAppendUploadChunk"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1617,13 +1657,41 @@ export interface components {
                 } & {
                     [key: string]: unknown;
                 };
-            } & (unknown & unknown & unknown & unknown & unknown);
+            } & (unknown & unknown & unknown & unknown & unknown & unknown);
         };
         /** @description The three availability codes a 503 from the OS itself may carry. */
         DocumentsUnavailableError: components["schemas"]["DocumentsError"] & {
             error?: {
                 /** @enum {unknown} */
                 code?: "storage_unavailable" | "engine_unavailable" | "knowledge_unavailable";
+            };
+        };
+        /** @description A 400 from the OS itself. */
+        DocumentsInvalidRequestError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "invalid_request";
+            };
+        };
+        /** @description A 404 from the OS itself. */
+        DocumentsNotFoundError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "not_found";
+            };
+        };
+        /** @description The 409s of the slice-1 upload routes. */
+        DocumentsConflictError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "upload_offset_mismatch";
+            };
+        };
+        /** @description The 422 of upload creation. */
+        DocumentsUploadUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "idempotency_key_reused";
             };
         };
         /** @description An error produced by the kernel or its proxy, not by the OS: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. */
@@ -1684,6 +1752,26 @@ export interface components {
         };
         DocumentDetail: components["schemas"]["Document"] & {
             head: components["schemas"]["DocumentRevisionSummary"];
+        };
+        DocumentsUploadRequest: {
+            total_size: number;
+            /** @description Whole-file hash, checked at import (`upload_checksum_mismatch`). */
+            sha256: components["schemas"]["Sha256Address"];
+            /** @description Display name only, used as the default title. A base name, never a path (ADR-001): no `/` or `\`. */
+            filename?: string;
+        };
+        DocumentsUpload: {
+            upload_id: string;
+            total_size: number;
+            sha256: components["schemas"]["Sha256Address"];
+            received: number;
+            /** @enum {string} */
+            status: "receiving" | "complete" | "imported" | "expired";
+            /**
+             * Format: date-time
+             * @description 24 h after the last chunk arrived (§5.6).
+             */
+            expires_at: string;
         };
         DocumentList: {
             documents: components["schemas"]["Document"][];
@@ -1845,13 +1933,19 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description `invalid_request` from the OS (DocumentsError) or from the kernel (generic Error); the code is shared, so either envelope may arrive. */
+        /** @description `invalid_request` from the OS (DocumentsError, with details), or `invalid_request` / `invalid_request_path` from the kernel proxy (no details). */
         DocumentsBadRequest: {
             headers: {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["DocumentsError"] | components["schemas"]["ModuleProxyError"];
+                "application/json": components["schemas"]["DocumentsInvalidRequestError"] | (components["schemas"]["Error"] & {
+                    error?: {
+                        /** @enum {unknown} */
+                        code?: "invalid_request" | "invalid_request_path";
+                        details?: never;
+                    };
+                });
             };
         };
         /** @description `not_found`: the document, revision, job or upload does not exist or has expired (DocumentsError), or the kernel has no such route (generic Error). */
@@ -1860,7 +1954,31 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["DocumentsError"] | components["schemas"]["ModuleProxyError"];
+                "application/json": components["schemas"]["DocumentsNotFoundError"] | (components["schemas"]["Error"] & {
+                    error?: {
+                        /** @enum {unknown} */
+                        code?: "not_found";
+                        details?: never;
+                    };
+                });
+            };
+        };
+        /** @description `upload_offset_mismatch` with `details.received_offset` (§5.6) */
+        DocumentsConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsConflictError"];
+            };
+        };
+        /** @description `idempotency_key_reused`: the same key with a different body (§5.4) */
+        DocumentsUploadUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsUploadUnprocessableError"];
             };
         };
         /** @description Exactly one of: the OS reports `storage_unavailable`, `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or the kernel proxy reports the module unreachable (`module_not_ready`, `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists which proxy codes are safe to retry. */
@@ -1887,6 +2005,9 @@ export interface components {
         DocumentId: components["schemas"]["DocumentIdString"];
         /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
         DocumentsCursor: string;
+        UploadId: string;
+        /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). */
+        DocumentsIdempotencyKey: string;
         DocumentsLimit: number;
     };
     requestBodies: never;
@@ -3728,6 +3849,85 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsCreateUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). */
+                "Idempotency-Key": components["parameters"]["DocumentsIdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsUploadRequest"];
+            };
+        };
+        responses: {
+            /** @description Replay of an existing upload with the same key and body */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsUpload"];
+                };
+            };
+            /** @description Upload created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsUpload"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            422: components["responses"]["DocumentsUploadUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsAppendUploadChunk: {
+        parameters: {
+            query?: never;
+            header: {
+                "Upload-Offset": number;
+                "Chunk-Sha256": components["schemas"]["Sha256Address"];
+            };
+            path: {
+                upload_id: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description The upload after this chunk */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsUpload"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["DocumentsConflict"];
+            413: components["responses"]["PayloadTooLarge"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];

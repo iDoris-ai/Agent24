@@ -127,7 +127,7 @@ describe('Documenting OS OpenAPI: ADR rules', () => {
   })
 
   it('keeps OS 503s and proxy 503s apart', () => {
-    ok('Unavailable503', err('storage_unavailable', { retryable: true }))
+    ok('Unavailable503', err('storage_unavailable', { retryable: true, cause: 'busy' }))
     ok('Unavailable503', { error: { code: 'module_not_ready', message: 'm' } })
     // An OS availability code must carry retryable; the generic branch cannot absorb it.
     expect(v.Unavailable503({ error: { code: 'storage_unavailable', message: 'm' } })).toBe(false)
