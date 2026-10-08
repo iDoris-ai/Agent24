@@ -1,0 +1,37 @@
+{
+  "id": "s01-08-zh-shtax-iit-2025",
+  "schema": "s01-gold-v2",
+  "fields": [
+    {"key": "doc_number", "q": "ctx", "status": "present", "value": "国家税务总局通告2026年第1号", "severity": "critical", "anchors": [{"page": 1, "quote": "文号：国家税务总局通告2026年第1号"}], "role": "context"},
+    {"key": "issuer", "q": "ctx", "status": "present", "value": "国家税务总局", "severity": "major", "anchors": [{"page": 1, "quote": "国家税务总局 2026年2月3日"}], "note": "本件是国家税务总局上海市税务局网站转载；发文单位是国家税务总局", "role": "context"},
+    {"key": "issue_date", "q": "ctx", "status": "present", "value": "2026年2月3日", "normalized": "2026-02-03", "time": {"kind": "date"}, "severity": "critical", "anchors": [{"page": 1, "quote": "国家税务总局 2026年2月3日"}], "role": "context"},
+    {"key": "web_publish_time", "q": "ctx", "status": "present", "value": "2026-02-10 10:32", "normalized": "2026-02-10T10:32", "time": {"kind": "datetime"}, "severity": "critical", "anchors": [{"page": 1, "quote": "发布时间：2026-02-10 10:32"}], "note": "网页发布时间，不是成文日期；原文没写时区，不补", "role": "context"},
+    {"key": "validity_status", "q": "ctx", "status": "present", "value": "全文有效", "severity": "major", "anchors": [{"page": 1, "quote": "状态：全文有效"}], "role": "context"},
+    {"key": "tax_year", "q": "ctx", "status": "present", "value": "2025年度", "normalized": "2025", "severity": "critical", "anchors": [{"page": 1, "quote": "2025年度个人所得税综合所得汇算清缴办理时间为2026年3月1日至6月30日"}], "role": "context"},
+    {"key": "filing_period", "q": "Q2", "status": "present", "value": "2026年3月1日至6月30日", "normalized": "2026-03-01/2026-06-30", "time": {"kind": "interval"}, "severity": "critical", "anchors": [{"page": 1, "quote": "2025年度个人所得税综合所得汇算清缴办理时间为2026年3月1日至6月30日"}]},
+    {"key": "early_period_booking_open_date", "q": "Q2", "status": "present", "value": "自2月25日起", "normalized": "2026-02-25", "time": {"kind": "date", "inferred": ["year"], "inferred_from": "filing_period"}, "applies_if": ["需要在3月1日至3月20日期间办理"], "severity": "critical", "anchors": [{"page": 1, "quote": "纳税人需在3月1日至3月20日期间办理"}, {"page": 1, "quote": "的，可"}, {"page": 1, "quote": "以自2月25日起通过个人所得税APP提前预约；"}], "note": "正文在文本层与下一行交错，按交错规则分段锚；原文是“可以”预约，不是必须"},
+    {"key": "early_period_window", "q": "Q2", "status": "present", "value": "3月1日至3月20日期间", "normalized": "2026-03-01/2026-03-20", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "filing_period"}, "severity": "critical", "anchors": [{"page": 1, "quote": "纳税人需在3月1日至3月20日期间办理"}, {"page": 1, "quote": "的，可"}, {"page": 1, "quote": "以自2月25日起通过个人所得税APP提前预约；"}], "note": "这是“可以提前预约”的适用期间，不是要求所有人在 3 月 20 日前办完"},
+    {"key": "booking_channel", "q": "Q1", "status": "present", "value": "个人所得税APP", "applies_if": ["需要在3月1日至3月20日期间办理"], "severity": "major", "anchors": [{"page": 1, "quote": "纳税人需在3月1日至3月20日期间办理"}, {"page": 1, "quote": "的，可"}, {"page": 1, "quote": "以自2月25日起通过个人所得税APP提前预约；"}], "note": "原文是“可以……提前预约”，没有说不预约就不能办"},
+    {"key": "late_period_no_booking", "q": "Q4", "status": "present", "value": "3月21日至6月30日期间，纳税人无需预约，可以随时办理", "normalized": "2026-03-21/2026-06-30", "time": {"kind": "interval", "inferred": ["year"], "inferred_from": "filing_period"}, "applies_if": ["在3月21日至6月30日期间办理"], "negation": true, "severity": "critical", "anchors": [{"page": 1, "quote": "前预约；3月21日至6月30日期间，纳税人无需预约，可以随时办理。"}]},
+    {"key": "site_sponsor_phone", "q": "Q6", "status": "present", "value": "021-12366", "applies_if": ["想联系转载本通告的网站主办单位（国家税务总局上海市税务局）"], "severity": "critical", "anchors": [{"page": 1, "quote": "主办单位：国家税务总局上海市税务局"}, {"page": 1, "quote": "电话：021-12366"}], "note": "页脚网站主办单位的电话；通告正文没有指明咨询方式（见 notice_contact），回答时须说明这一点"},
+    {"key": "who_must_file", "q": "Q5", "status": "missing", "severity": "major", "missing_reason": "not_in_document", "note": "通告只规定办理时间和预约方式，没说哪些纳税人需要办理汇算"},
+    {"key": "late_filing_consequence", "q": "Q2", "status": "missing", "severity": "major", "missing_reason": "not_in_document", "note": "没有写 6 月 30 日后未办理会怎样、能否补办"},
+    {"key": "late_filing_penalty_amount", "q": "Q3", "status": "missing", "severity": "critical", "missing_reason": "not_in_document"},
+    {"key": "tax_amount", "q": "Q3", "status": "missing", "severity": "critical", "missing_reason": "not_in_document", "note": "通告不涉及应补或应退的税额"},
+    {"key": "filing_method_details", "q": "Q1", "status": "missing", "severity": "major", "missing_reason": "not_in_document", "note": "只给了预约渠道（个人所得税APP），没有说汇算本身怎么办理"},
+    {"key": "notice_contact", "q": "Q6", "status": "missing", "severity": "critical", "missing_reason": "not_in_document", "note": "通告正文没有咨询方式；页脚 021-12366 是网站主办单位电话（见 site_sponsor_phone）"}
+  ],
+  "must_not_assert": [
+    {"proposition": "3月21日至6月30日期间办理也需要预约"},
+    {"proposition": "3月1日至3月20日期间不预约就不能办理"},
+    {"proposition": "本通告规定的办理期间延续到2026年6月30日之后"},
+    {"proposition": "通告说明了哪些纳税人需要办理汇算"},
+    {"proposition": "通告写明了逾期未办理的后果"},
+    {"proposition": "通告写明了逾期未办理的罚款金额"},
+    {"proposition": "这份通告的发文单位是国家税务总局上海市税务局"},
+    {"proposition": "通告的成文日期是2026年2月10日"},
+    {"proposition": "通告正文给出了咨询电话"}
+  ],
+  "labeled_by": "claude-draft",
+  "verified_by": null
+}

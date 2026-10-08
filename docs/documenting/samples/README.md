@@ -183,28 +183,24 @@ v1 的问题来自 2026-10-08 的 Codex 审阅：适用对象表达不了、相�
 4. **入库**：每个样本目录都通过 PR 合入 `ab/documenting`。之后要修改金标，必须在 PR 里说明原因，旧版本由 git 追溯。
 5. **使用**：#708 的验收 harness 读取 `gold.json`，分别统计：字段正确率、`missing` / `conflict` 判对率、锚点命中率、严重错误数（单独列出），以及 `must_not_assert` 违规数。
 
-## 6.5 S01 样本索引（v1，2026-10-07）
+## 6.5 S01 样本索引（v2，2026-10-08）
 
-| id | 来源 | 类型 | 覆盖 |
-|---|---|---|---|
-| s01-01-zh-sh-fee-2025 | 上海市财政局、发改委 | text_pdf，33 页 | C1 C5 C6 C7 C8 C9 |
-| s01-02-en-epa-boil-water | U.S. EPA Region 8 | text_pdf，3 页 | C3 C6 C7 C9 |
-| s01-03-zh-holiday-2026 | 国务院办公厅（gov.cn 网页打印） | text_pdf，2 页 | C1 C5 C6 |
-| s01-04-en-govuk-sa-deadlines | HMRC / GOV.UK（OGL） | text_pdf，4 页 | C3 C5 C6 |
-| s01-05-zh-putuo-fee-2024 | 上海市普陀区 | text_pdf，10 页 | C7 C8 C9 |
-| s01-06-zh-holiday-2026-scan | 由 s01-03 派生的模拟扫描 | image | C2 |
-| s01-07-mixed-building-notice | 合成 | synthetic | C4 C6 C7 C9 C10 |
+| id | 来源 | 类型 | 问题 | 覆盖 | 字段（必答 / 背景） |
+|---|---|---|---|---|---|
+| s01-01-zh-sh-fee-2025 | 上海市财政局、发改委 | text_pdf，33 页 | Q2–Q6 | C1 C6 C7 C8 C9 | 20 / 5 |
+| s01-02-en-epa-boil-water | U.S. EPA Region 8 | text_pdf，3 页 | Q1 Q2 Q5 Q6 | C3 C6 C9 | 11 / 3 |
+| s01-03-zh-holiday-2026 | 国务院办公厅（gov.cn 网页打印） | text_pdf，2 页 | Q1 Q2 | C1 | 12 / 3 |
+| s01-04-en-govuk-sa-deadlines | HMRC / GOV.UK（OGL） | text_pdf，4 页 | Q1–Q4 | C3 C5 C6 C9 | 14 / 6 |
+| s01-05-zh-putuo-fee-2024 | 上海市普陀区 | text_pdf，10 页 | Q3 Q4 Q6 | C1 C6 C7 C8 C9 | 18 / 6 |
+| s01-06-zh-holiday-2026-scan | 由 s01-03 派生的模拟扫描 | image，1 页 | Q2 | C2 C9 | 11 / 3 |
+| s01-07-mixed-building-notice | 合成 | synthetic，1 页 | Q1–Q6 | C4 C5 C6 C7 C9 C10 | 17 / 3 |
+| s01-08-zh-shtax-iit-2025 | 国家税务总局（上海市税务局网站转载） | text_pdf，1 页 | Q1–Q6 | C1 C5 C6 C9 | 12 / 6 |
 
-- **合成占比**：2/7（s01-06 是派生件，也计入合成），满足 ≤ 30%。合计 1.78 MB。
-- **核对状态**：全部金标都是 `claude-draft`，核对前不计入验收统计。
-- **v2 返工中**（2026-10-08）：Codex 审阅（§5 第 2.5 步）认定 v1 金标不能签核，主要问题有：
-  - 10 个锚点和文本层对不上；
-  - 缺失字段的严重度标错了；
-  - 适用条件和对象没有标；
-  - 覆盖点报多了；
-  - 样本只有 7 份，少于 §2 要求的 8 份。
-
-  因此全部金标改按 `s01-gold-v2` 重写，并补第 8 份真实样本。返工完成后，本表的覆盖列按字段级证据重新核算。
+- **数量与占比**：8 份，满足 §2 的下限。合成占比 2/8 = 25%（s01-06 是派生件，也计入合成），满足 ≤ 30%。源文件合计 2,082,196 字节，单个都小于 1 MiB。
+- **覆盖**：C1–C10 都有样本覆盖，每个覆盖点在各样本 `meta.yaml` 的 `covers` 里指到具体字段。
+- **审阅**：Codex 按 §5 第 2.5 步审了四轮（2026-10-08），第四轮结论是可以交人工核对，没有阻塞项。
+- **锚点**：文本层 PDF 的锚点全部在 L1 或 L2 命中；s01-06 的 13 个图片锚点是“待目视”，要在人工核对时确认。
+- **核对状态**：全部金标仍是 `claude-draft`、`verified_by: null`，David 核对前不计入验收统计。v1 的索引和返工原因见 git 历史。
 
 ## 7. 样本变大后的存放（待 jason 决定）
 

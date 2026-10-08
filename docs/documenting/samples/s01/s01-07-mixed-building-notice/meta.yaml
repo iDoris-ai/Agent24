@@ -10,5 +10,21 @@ license: "synthetic"
 sha256_original: "1b10bf62cead2d92908aca1de7e01a5786be64f2061456a53c5ceabe94391803"
 sha256_stored: "1b10bf62cead2d92908aca1de7e01a5786be64f2061456a53c5ceabe94391803"
 redactions: []
-covers: [C4, C6, C7, C9, C10]
-notes: "本仓库原创合成样本，内容虚构、无个人信息。故意设置：中文正文与表格日期冲突（12 日 vs 13 日）、中文与英文结束时间冲突（18:00 vs 17:00）、无需登记的否定、前导零编号、未提供联系电话。已知文本层异常：Chrome 输出的文本层含康熙部首码位（如 ⽔ U+2F54），锚点比对须先 NFKC 规范化。"
+public_officials: []
+covers:
+  C4: [drinking_water_registration_deadline, lifts_under_maintenance]
+  C5: [drinking_water_registration_deadline, shutoff_date]
+  C6: [shutoff_registration_not_needed]
+  C7: [affected_units, drinking_water_limit]
+  C9: [contact_phone]
+  C10: [shutoff_date, shutoff_end_time]
+reader: "B 座的业主或租户"
+questions: [Q1, Q2, Q3, Q4, Q5, Q6]
+extraction_notes:
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "中文正文相邻行交错，如“本次停水无需 / 10月10日17:00前在物业前台登记，每 / 提前登记；……”"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "“B / 座”“物业服务 / 中 / 心”被拆到不同行（L2 或分段锚）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "“Shut-off”里是连字 ﬀ（U+FB00），NFKC 后为 ff"}
+derived_from: null
+sha256_parent: null
+derivation: []
+notes: "本仓库原创合成样本，内容虚构、无个人信息，由仓库外的 HTML 经 Chrome 无头打印。故意设置：正文与表格日期冲突（12 日 vs 13 日）、中英文结束时间冲突（18:00 vs 17:00）、无需登记的否定、前导零编号、未提供联系电话。v1 记录的康熙部首码位来自另一个抽取器（Claude Read），PDFKit 复现不了，已删除。"
