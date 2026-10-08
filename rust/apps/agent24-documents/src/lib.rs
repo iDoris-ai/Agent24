@@ -15,9 +15,11 @@ pub mod error;
 pub mod id;
 pub mod idem;
 pub mod state;
+pub mod uploads;
 
 use axum::extract::State;
-use axum::{Json, Router, routing::get};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -137,6 +139,7 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<Capabilities> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
+        .route("/uploads", post(uploads::create_upload))
         .with_state(state)
 }
 
