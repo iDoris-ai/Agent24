@@ -2,6 +2,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   addContact,
+  probeCommRelay,
+  setCommRelays,
   CommApiError,
   getCommStatus,
   listCommContacts,
@@ -143,6 +145,24 @@ describe('COMM typed backend API', () => {
       path: '/api/v1/comm/contact',
       body: { nickname: 'bob', npub: 'npub1bob', role: 'human' },
     })
+  })
+
+  it('replaces all relays with one PUT and validates the returned config', async () => {
+    const config = { relays: ['wss://one.example', 'ws://two.example'], source: 'config', configured: true }
+    const proxy = setProxy((() => successful(config)) as never)
+    await expect(setCommRelays(config.relays)).resolves.toEqual(config)
+    expect(proxy).toHaveBeenCalledTimes(1)
+    expect(proxy.mock.calls[0][0]).toEqual({
+      method: 'PUT', path: '/api/v1/comm/relay', body: { relays: config.relays },
+    })
+  })
+
+  it('requests a manual relay probe without a URL and validates the independent result', async () => {
+    const probe = { url: 'wss://one.example', connected: true, error: null }
+    const proxy = setProxy((() => successful(probe)) as never)
+    await expect(probeCommRelay()).resolves.toEqual(probe)
+    expect(proxy).toHaveBeenCalledTimes(1)
+    expect(proxy.mock.calls[0][0]).toEqual({ method: 'POST', path: '/api/v1/comm/relay/probe', body: {} })
   })
 
   it('surfaces a server rejection for contact add without retrying', async () => {
