@@ -74,22 +74,22 @@ fn gate_in(gates: &Mutex<Vec<Gate>>, upload_id: &str) -> (Arc<Notify>, Arc<Notif
 
 // ---- helpers ----
 
-const PDF: &[u8] = b"%PDF-1.7\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n";
+pub(super) const PDF: &[u8] = b"%PDF-1.7\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 const JPEG: &[u8] = b"\xff\xd8\xff\xe0\0\x10JFIF\0";
 
-struct Env {
-    dir: tempfile::TempDir,
-    state: AppState,
+pub(super) struct Env {
+    pub dir: tempfile::TempDir,
+    pub state: AppState,
 }
 
-async fn env() -> Env {
+pub(super) async fn env() -> Env {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::open(dir.path()).await;
     Env { dir, state }
 }
 
-fn sha(bytes: &[u8]) -> String {
+pub(super) fn sha(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hex: String = Sha256::digest(bytes)
         .iter()
@@ -98,7 +98,7 @@ fn sha(bytes: &[u8]) -> String {
     format!("sha256:{hex}")
 }
 
-async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, Value) {
+pub(super) async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, Value) {
     let res = crate::router(state.clone()).oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
@@ -111,7 +111,7 @@ async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, Value) {
 }
 
 /// A complete upload of `bytes`.
-async fn upload(state: &AppState, bytes: &[u8], filename: &str) -> String {
+pub(super) async fn upload(state: &AppState, bytes: &[u8], filename: &str) -> String {
     let body = json!({ "total_size": bytes.len(), "sha256": sha(bytes), "filename": filename });
     let req = Request::post("/uploads")
         .header("content-type", "application/json")
@@ -167,7 +167,7 @@ async fn queue(state: &AppState, upload_id: &str, title: Option<&str>) -> String
 }
 
 /// The job once it stops working, as `GET /jobs/{id}` shows it.
-async fn settled(state: &AppState, job_id: &str) -> Value {
+pub(super) async fn settled(state: &AppState, job_id: &str) -> Value {
     let start = Instant::now();
     loop {
         let req = Request::get(format!("/jobs/{job_id}"))
@@ -189,7 +189,7 @@ async fn settled(state: &AppState, job_id: &str) -> Value {
     }
 }
 
-async fn count(state: &AppState, table: &str) -> i64 {
+pub(super) async fn count(state: &AppState, table: &str) -> i64 {
     let storage = state.storage().await.unwrap();
     sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
         .fetch_one(storage.db.pool())
@@ -197,7 +197,7 @@ async fn count(state: &AppState, table: &str) -> i64 {
         .unwrap()
 }
 
-async fn upload_status(state: &AppState, id: &str) -> String {
+pub(super) async fn upload_status(state: &AppState, id: &str) -> String {
     let storage = state.storage().await.unwrap();
     sqlx::query_scalar("SELECT status FROM uploads WHERE id = ?")
         .bind(id)
@@ -206,12 +206,12 @@ async fn upload_status(state: &AppState, id: &str) -> String {
         .unwrap()
 }
 
-async fn exec(state: &AppState, sql: &str) {
+pub(super) async fn exec(state: &AppState, sql: &str) {
     let storage = state.storage().await.unwrap();
     sqlx::query(sql).execute(storage.db.pool()).await.unwrap();
 }
 
-fn failed_with(job: &Value, code: &str) {
+pub(super) fn failed_with(job: &Value, code: &str) {
     assert_eq!(
         (job["status"].as_str(), job["error"]["code"].as_str()),
         (Some("failed"), Some(code)),
@@ -220,7 +220,7 @@ fn failed_with(job: &Value, code: &str) {
 }
 
 /// Nothing of an import was written, and the upload is as it was.
-async fn nothing_imported(state: &AppState, upload_id: &str) {
+pub(super) async fn nothing_imported(state: &AppState, upload_id: &str) {
     for table in ["documents", "revisions", "oplog"] {
         assert_eq!(count(state, table).await, 0, "{table}");
     }
