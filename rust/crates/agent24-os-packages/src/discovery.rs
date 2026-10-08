@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use agent24_domain::DomainOsManifest;
+use agent24_domain::tool::ModuleToolRegistry;
 
 /// The file a package must contain to be a package at all.
 pub const MANIFEST_FILE: &str = "domain-os.yml";
@@ -222,6 +223,35 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
     })
 }
 
+/// Build the host-side module-tool registry from a scan's `found` packages,
+/// in order (K1-5.1, ADR-K1-01 §2.1/§2.2/§5(2)).
+///
+/// Each package's manifest has already validated its OWN tool list
+/// internally (no duplicate operation, valid names/schema/enums — see
+/// `agent24_domain::tool::validate_tools`), so registering it here can only
+/// fail on a collision against an EARLIER package in this same batch. That
+/// happens if two found directories declare the same module `name` — `scan`
+/// does not dedupe by name (see its own doc comment; that is "downstream",
+/// the mounter's job). A colliding module's tools are refused IN FULL via
+/// [`Refused`], exactly like a malformed manifest: the registry already
+/// built from earlier packages is left untouched, never partially updated.
+///
+/// This registry is **not communicated to the agent and offers no invocation
+/// path** — see `agent24_domain::tool::ModuleToolRegistry`'s own docs.
+pub fn build_tool_registry(found: &[Discovered]) -> (ModuleToolRegistry, Vec<Refused>) {
+    let mut registry = ModuleToolRegistry::new();
+    let mut refused = Vec::new();
+    for d in found {
+        if let Err(why) = registry.register_module(d.manifest.name(), d.manifest.tools()) {
+            refused.push(Refused {
+                dir: d.dir.clone(),
+                why,
+            });
+        }
+    }
+    (registry, refused)
+}
+
 /// Re-checks the package at `dir` against `expected` (a `ModuleSpec`'s
 /// manifest digest, frozen at mount time). `Ok(())` means manifest-
 /// consistent under THIS check's scope — not a guarantee that nothing about
@@ -280,6 +310,16 @@ mod tests {
             "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
              event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
              kernel_capabilities: [events]\nimpl_kind: {kind}\n{spawn}"
+        )
+    }
+
+    /// Like [`manifest_yaml`], plus one declared tool operation named `op`.
+    fn manifest_yaml_with_tool(name: &str, kind: &str, op: &str) -> String {
+        format!(
+            "{}tools:\n  - operation: {op}\n    description: does a thing\n    \
+             input_schema: {{type: object, properties: {{}}}}\n    risk: read\n    \
+             output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
+            manifest_yaml(name, kind)
         )
     }
 
@@ -726,5 +766,70 @@ mod tests {
 
         let err = recheck(&dir, &digest).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
+    }
+
+    // K1-5.1 — `build_tool_registry` (ADR-K1-01 §2.1/§2.2/§5(2)).
+
+    #[test]
+    fn two_distinct_modules_tools_register_without_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        install(
+            root.path(),
+            "sin90",
+            &manifest_yaml_with_tool("sin90", "out_of_process_provider", "list-notes"),
+        );
+        install(
+            root.path(),
+            "cos72",
+            &manifest_yaml_with_tool("cos72", "out_of_process_provider", "list-notes"),
+        );
+
+        let scan = scan(root.path());
+        assert!(scan.refused.is_empty(), "{:?}", scan.refused);
+        let (registry, refused) = build_tool_registry(&scan.found);
+        assert!(refused.is_empty(), "{:?}", refused);
+        assert!(registry.get("sin90.list-notes").is_some());
+        assert!(registry.get("cos72.list-notes").is_some());
+    }
+
+    #[test]
+    fn two_found_packages_sharing_a_module_name_do_not_overwrite_each_others_tools() {
+        // `scan` does not dedupe by declared `name` — that is the mounter's
+        // job, downstream. Two package DIRECTORIES can therefore both declare
+        // `name: dup`; registering the second one's tools must be refused
+        // without disturbing the first's.
+        let root = tempfile::tempdir().unwrap();
+        install(
+            root.path(),
+            "aaa-dup",
+            &manifest_yaml_with_tool("dup", "out_of_process_provider", "list-notes"),
+        );
+        install(
+            root.path(),
+            "zzz-dup",
+            &manifest_yaml_with_tool("dup", "out_of_process_provider", "list-notes"),
+        );
+
+        let scan = scan(root.path());
+        assert!(scan.refused.is_empty(), "{:?}", scan.refused);
+        assert_eq!(
+            scan.found.len(),
+            2,
+            "both directories parse as valid packages"
+        );
+
+        let (registry, refused) = build_tool_registry(&scan.found);
+        assert_eq!(
+            registry.len(),
+            1,
+            "the second registration must not add or overwrite"
+        );
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].why.contains("dup.list-notes"), "{:?}", refused);
+        assert_eq!(
+            refused[0].dir.file_name().unwrap().to_string_lossy(),
+            "zzz-dup",
+            "the LATER package (by scan order) is the one refused, the earlier stays"
+        );
     }
 }

@@ -80,6 +80,7 @@
 
 pub mod http;
 pub mod memory;
+pub mod tool;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -444,6 +445,14 @@ struct RawManifest {
     /// (A1's reverse channel is HTTP and has no equivalent field).
     #[serde(default)]
     host_commands: Vec<String>,
+    /// K1-5.1 (ADR-K1-01 §2.1): module-declared Agent tools. Collected RAW
+    /// and validated afterwards by [`tool::validate_tools`], same reason as
+    /// `kernel_capabilities` — a bad entry must be able to name itself.
+    /// Absent on every manifest written before this field existed, which is
+    /// why it defaults to empty rather than being required: an old manifest
+    /// means "no module Agent tools", never "all of them".
+    #[serde(default)]
+    tools: Vec<tool::RawToolDeclaration>,
     /// Declared here ONLY so `deny_unknown_fields` does not reject the very
     /// fields step one just read. Their values are consumed by
     /// [`ManifestEnvelope`]; re-reading them here would be reading the same
@@ -489,6 +498,7 @@ pub struct DomainOsManifest {
     impl_kind: ImplKind,
     spawn: Option<SpawnCommand>,
     host_commands: Vec<String>,
+    tools: Vec<tool::ToolDeclaration>,
 }
 
 /// Names that are not usable as a directory on Windows regardless of extension.
@@ -894,6 +904,11 @@ impl DomainOsManifest {
             }
         }
 
+        // K1-5.1: all-or-nothing, like every other gate above — one invalid or
+        // duplicate tool fails the WHOLE manifest rather than silently dropping
+        // just that entry (ADR-K1-01 §5(2)).
+        let tools = tool::validate_tools(raw.tools)?;
+
         Ok(Self {
             name: raw.name,
             version: raw.version,
@@ -906,6 +921,7 @@ impl DomainOsManifest {
             host_commands: raw.host_commands,
             impl_kind: raw.impl_kind,
             spawn: raw.spawn,
+            tools,
         })
     }
 
@@ -1002,6 +1018,15 @@ impl DomainOsManifest {
     /// this list.
     pub fn host_commands(&self) -> &[String] {
         &self.host_commands
+    }
+
+    /// K1-5.1 (ADR-K1-01 §2.1): the module's declared Agent tools, already
+    /// validated by [`tool::validate_tools`]. Empty for every manifest that
+    /// predates this field. **Not an authorization list** — see
+    /// [`tool::ModuleToolRegistry`] for the registration step, and the ADR
+    /// for why declaring a tool here grants nothing by itself.
+    pub fn tools(&self) -> &[tool::ToolDeclaration] {
+        &self.tools
     }
 }
 
@@ -2479,5 +2504,75 @@ mod attach_tests {
             .is_ok(),
             "exactly 32 characters must be accepted"
         );
+    }
+}
+
+/// K1-5.1 (ADR-K1-01 §2.1): the manifest-level `tools[]` field, wired through
+/// `DomainOsManifest::from_yaml`. Per-entry validation (name/schema/risk/
+/// privacy/timeout rules) is covered directly in `tool::tests`; this module
+/// checks the manifest-level wiring: compatibility with manifests that
+/// predate the field, and fail-closed on a single bad entry.
+#[cfg(test)]
+mod tool_manifest_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn manifest(extra: &str) -> Result<DomainOsManifest> {
+        DomainOsManifest::from_yaml(&format!(
+            "name: sin90\n\
+             version: \"0.2.1\"\n\
+             route_namespace: /api/v1/sin90\n\
+             event_module: sin90\n\
+             data_dir: ~/.agent24/os/sin90/\n\
+             kernel_capabilities: [events]\n\
+             impl_kind: in_process_crate\n{extra}"
+        ))
+    }
+
+    const ONE_TOOL: &str = "tools:\n  - operation: list-notes\n    description: lists notes\n    \
+         input_schema: {type: object, properties: {}}\n    risk: read\n    \
+         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n";
+
+    /// A manifest written before this field existed has no `tools` key at
+    /// all; it must parse to an empty list, never be refused and never be
+    /// read as "every tool is allowed".
+    #[test]
+    fn a_manifest_without_tools_parses_with_an_empty_list() {
+        let m = manifest("").expect("tools-less manifest");
+        assert!(m.tools().is_empty());
+    }
+
+    #[test]
+    fn a_manifest_with_one_valid_tool_parses_it() {
+        let m = manifest(ONE_TOOL).expect("one valid tool");
+        assert_eq!(m.tools().len(), 1);
+        assert_eq!(m.tools()[0].operation(), "list-notes");
+    }
+
+    /// One invalid tool entry fails the WHOLE manifest (ADR-K1-01 §5(2)) —
+    /// not just that entry, and not a manifest with the other fields
+    /// accepted and `tools` silently dropped.
+    #[test]
+    fn one_invalid_tool_refuses_the_whole_manifest() {
+        let bad = ONE_TOOL.replace("risk: read", "risk: catastrophic");
+        let err = manifest(&bad).expect_err("unknown risk enum");
+        assert!(err.to_string().contains("risk:"), "{err}");
+        // Control: the same manifest with a known risk value is accepted.
+        assert!(manifest(ONE_TOOL).is_ok());
+    }
+
+    /// Two tools declaring the same operation in one manifest are a
+    /// duplicate registration attempt and must be refused at parse time,
+    /// before anything reaches `ModuleToolRegistry`.
+    #[test]
+    fn duplicate_operations_in_one_manifest_are_refused() {
+        let two = format!(
+            "{ONE_TOOL}  - operation: list-notes\n    description: again\n    \
+             input_schema: {{type: object}}\n    risk: write\n    output_privacy: local_only\n    \
+             timeout_ms: 1000\n    inline_wait_ms: 0\n"
+        );
+        let err = manifest(&two).expect_err("duplicate operation");
+        assert!(err.to_string().contains("more than once"), "{err}");
     }
 }
