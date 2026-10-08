@@ -9,6 +9,8 @@
 //! route is `GET /capabilities`, and it reports every operation as
 //! unavailable with a typed reason (ADR-DOC-02 §8).
 
+pub mod blob;
+
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 
