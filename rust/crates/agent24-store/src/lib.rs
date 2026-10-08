@@ -27,6 +27,7 @@ mod decision_log;
 mod legacy_recovery;
 mod model_call_timings;
 mod module_approvals;
+mod module_audit_event;
 mod module_model_usage;
 mod module_schedules;
 mod repo;
@@ -73,6 +74,11 @@ pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
 };
 pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
+pub use module_audit_event::{
+    ActorRef, AuditRef, AuthorizationRef, DurationMs, MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId,
+    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef,
+    RunId, SessionRef, SizeBytes, ToolCallId,
+};
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
 pub use repo::*;
@@ -107,6 +113,10 @@ pub enum StoreError {
     /// the line.
     #[error("module schedule quota reached")]
     QuotaExceeded,
+    /// K1-7.1 (ADR-K1-04 §2.1): a typed K1 module-tool audit field failed
+    /// its closed-set/bounded-identifier validation.
+    #[error("invalid audit metadata: {0}")]
+    InvalidAuditMetadata(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
