@@ -206,6 +206,22 @@ export interface IdorisStatusResponse {
   capacity: IdorisCapacity
 }
 
+export interface IdorisBackend {
+  provider_id: string
+  locality: 'loopback' | 'lan' | 'remote'
+  form: 'http_service' | 'spawn_cli' | 'bundled_binary' | 'nostr_node' | 'mitm_proxy' | 'batch_job'
+  lifecycle_runtime_bound: boolean
+}
+
+export type IdorisModelSource =
+  | { provider_id: string; source: 'http_models_endpoint'; state: 'observed'; models: string[] }
+  | { provider_id: string; source: 'subscription_registration'; state: 'configured'; models: string[] }
+  | { provider_id: string; source: 'http_models_endpoint'; state: 'error'; models: []; error: 'unavailable' | 'authentication_failed' }
+
+export interface IdorisModelsResponse {
+  sources: IdorisModelSource[]
+}
+
 export type IdorisUnavailableReason =
   | 'handoff-missing'
   | 'handoff-invalid'
@@ -215,7 +231,7 @@ export type IdorisUnavailableReason =
   | 'invalid-response'
 
 export type IdorisStatusResult =
-  | { state: 'available'; status: IdorisStatusResponse }
+  | { state: 'available'; status: IdorisStatusResponse; backends?: IdorisBackend[]; models?: IdorisModelsResponse }
   | { state: 'unavailable'; reason: IdorisUnavailableReason }
 
 export interface ModuleInstallResult {

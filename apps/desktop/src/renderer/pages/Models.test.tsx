@@ -82,9 +82,18 @@ describe('ModelsPage', () => {
           components: 4, runtimes: 2, subscriptions: 0, budget_configured: true, audit_configured: true,
           capacity: { state: 'observed', entries: [] },
         },
+        backends: [
+          { provider_id: 'omlx-local', locality: 'loopback', form: 'http_service', lifecycle_runtime_bound: true },
+          { provider_id: 'llama-local', locality: 'loopback', form: 'spawn_cli', lifecycle_runtime_bound: true },
+        ],
+        models: { sources: [
+          { provider_id: 'omlx-local', source: 'http_models_endpoint', state: 'observed', models: ['qwen3-8b', 'bge-m3'] },
+          { provider_id: 'subscription', source: 'subscription_registration', state: 'configured', models: ['remote-coding'] },
+        ] },
       }),
     } as never
     render(<ModelsPage />)
     expect(await screen.findByTestId('idoris-status-available')).toHaveTextContent('v1.2.3 · 4 components · 2 runtimes · capacity observed')
+    expect(screen.getByTestId('idoris-status-resources')).toHaveTextContent('2 backends · 3 models')
   })
 })
