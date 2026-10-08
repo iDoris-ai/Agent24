@@ -450,6 +450,7 @@ impl ModuleToolRegistry {
                 view.module_ready(module)
                     && view.operation_available(module, operation)
                     && view.is_authorized(module, operation)
+                    && view.outbound_gate_ready(module, operation)
                     && !view.blocked_by_remote_tier_guard(module, operation)
             })
             .map(|t| ModuleToolAdvert {
@@ -492,7 +493,7 @@ impl ModuleToolAdvert {
 /// 2026-10-08 ruling point 5). [`ModuleToolRegistry::adverts`] queries this
 /// trait fresh on every call, for every registered tool — nothing cached.
 ///
-/// Gates 1-4 default to `false` (fail-closed). Gate 5 has no default
+/// Gates 1-4 and 6 default to `false` (fail-closed). Gate 5 has no default
 /// implementation: every host must explicitly answer whether the remote-tier
 /// guard blocks each `(module, operation)`. This makes an incomplete host
 /// implementation fail at compile time instead of silently allowing a
@@ -500,7 +501,8 @@ impl ModuleToolAdvert {
 /// into this crate yet: gates 1+2/3 need live lifecycle/`/capabilities` state
 /// a future host (e.g. `agent24d`) must supply; gate 4 needs K1-6a.1's
 /// authorization store (#769, not merged); gate 5 needs K1-6a AND K1-6b,
-/// neither accepted yet. Gate 5 only narrows what gates 1-4 allow.
+/// neither accepted yet. Gate 5 only narrows what gates 1-4 allow. Gate 6
+/// also withholds tools until K1-5.3 invokes through the live egress gate.
 pub trait ModuleToolAdvertView {
     /// Gates 1+2 (ADR-K1-01 §2.2): `module` is registered, enabled, running
     /// and ready — NOT disabled, circuit-broken (breaker tripped), backing
@@ -525,6 +527,15 @@ pub trait ModuleToolAdvertView {
     /// substitutes for this. Default: unauthorized — K1-6a.1 (#769) is not
     /// merged, so there is no authorization source to consult yet.
     fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
+        false
+    }
+
+    /// K1-6b.3: whether this operation's invocation path is wired to the
+    /// host-owned live egress decision API. This is only an advert readiness
+    /// gate; K1-5.3 must pass source policy, purpose, exact destination and
+    /// authorization generation into the checker immediately before invoking.
+    /// Until that call path lands, this defaults false and suppresses adverts.
+    fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
         false
     }
 
@@ -796,6 +807,7 @@ mod tests {
         operation_available: bool,
         authorized: bool,
         remote_tier_blocked: bool,
+        outbound_ready: bool,
     }
 
     impl TestView {
@@ -805,6 +817,7 @@ mod tests {
                 operation_available: true,
                 authorized: true,
                 remote_tier_blocked: false,
+                outbound_ready: true,
             }
         }
     }
@@ -820,6 +833,10 @@ mod tests {
 
         fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
             self.authorized
+        }
+
+        fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
+            self.outbound_ready
         }
 
         fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
@@ -868,6 +885,14 @@ mod tests {
             adverts[0].input_schema(),
             &serde_json::json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[test]
+    fn a_tool_without_a_live_egress_call_path_is_not_advertised() {
+        let reg = registry_with_one_tool();
+        let mut view = TestView::all_pass();
+        view.outbound_ready = false;
+        assert!(reg.adverts(&view).is_empty());
     }
 
     // ---- ADR-K1-01 §5(4): disabled/breaker/backoff/draining/crashed or
@@ -999,6 +1024,9 @@ mod tests {
                 true
             }
             fn is_authorized(&self, _module: &str, _operation: &str) -> bool {
+                true
+            }
+            fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
             fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {

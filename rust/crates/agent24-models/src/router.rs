@@ -12,6 +12,7 @@
 //!   clears it. This is the closed feedback loop the bare trait deliberately
 //!   omits.
 
+use agent24_domain::{EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -402,6 +403,28 @@ impl ModelRouter {
             .map(|s| (s.provider, s.response))
     }
 
+    /// Host-authorized completion variant for callers carrying a live source snapshot.
+    pub async fn complete_with_egress(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
+    ) -> Result<(String, CompletionResponse), ModelError> {
+        self.complete_served_with_egress(
+            profile,
+            req,
+            cancel,
+            gate,
+            resources,
+            authorization_generation,
+        )
+        .await
+        .map(|served| (served.provider, served.response))
+    }
+
     /// ME4-4.2.2a: route and complete, and say WHICH TIER served it. Only
     /// `Unavailable` falls through to the next routed provider (and records a
     /// cooldown); `Provider`/`Cancelled` errors stop immediately. A LocalOnly
@@ -412,6 +435,28 @@ impl ModelRouter {
         profile: TaskProfile,
         req: &CompletionRequest,
         cancel: &CancellationToken,
+    ) -> Result<Served, ModelError> {
+        self.complete_served_with_egress(
+            profile,
+            req,
+            cancel,
+            <dyn EgressGate>::deny_all(),
+            Vec::new(),
+            0,
+        )
+        .await
+    }
+
+    /// Host-authorized variant. The live gate is called immediately before
+    /// each remote provider attempt, so a grant revoked during routing is denied.
+    pub async fn complete_served_with_egress(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
     ) -> Result<Served, ModelError> {
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
@@ -427,6 +472,19 @@ impl ModelRouter {
         let mut tried: Vec<String> = Vec::new();
         for idx in route {
             let r = &self.providers[idx];
+            if r.tier == Tier::Remote {
+                let request = EgressRequest::remote(
+                    resources.clone(),
+                    EgressPurpose::ModelInference,
+                    r.provider
+                        .outbound_destination()
+                        .map_or_else(EgressDestination::unknown, EgressDestination::exact),
+                    authorization_generation,
+                );
+                request.authorize(gate.as_ref()).await.map_err(|_| {
+                    ModelError::Unavailable("outbound policy denied or unavailable".into())
+                })?;
+            }
             match r.provider.complete(req, cancel).await {
                 Ok(response) => {
                     self.record_success(r.provider.name());
@@ -468,8 +526,38 @@ impl ModelRouter {
     /// because their provider was briefly unreachable, is a confident wrong answer
     /// (ME-2's mount-time resource check).
     pub async fn models_detailed(&self, cancel: &CancellationToken) -> ModelInventory {
+        self.models_detailed_with_egress(cancel, <dyn EgressGate>::deny_all(), Vec::new(), 0)
+            .await
+    }
+
+    /// Host-authorized inventory. Remote `/models` requests use the same
+    /// exact destination/source gate as inference requests.
+    pub async fn models_detailed_with_egress(
+        &self,
+        cancel: &CancellationToken,
+        gate: std::sync::Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        authorization_generation: u64,
+    ) -> ModelInventory {
         let mut inv = ModelInventory::default();
         for r in &self.providers {
+            if r.tier == Tier::Remote {
+                let request = EgressRequest::remote(
+                    resources.clone(),
+                    EgressPurpose::ModelDiscovery,
+                    r.provider
+                        .outbound_destination()
+                        .map_or_else(EgressDestination::unknown, EgressDestination::exact),
+                    authorization_generation,
+                );
+                if request.authorize(gate.as_ref()).await.is_err() {
+                    inv.failures.push(format!(
+                        "{}: outbound policy denied or unavailable",
+                        r.provider.name()
+                    ));
+                    continue;
+                }
+            }
             match r.provider.models(cancel).await {
                 Ok(mut models) => inv.models.append(&mut models),
                 Err(err) => {
@@ -545,6 +633,9 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
+        fn outbound_destination(&self) -> Option<String> {
+            Some(format!("provider:{}", self.name))
+        }
         async fn complete(
             &self,
             _req: &CompletionRequest,
@@ -594,6 +685,27 @@ mod tests {
         ModelRouter::new(providers, Duration::from_secs(10), Duration::from_secs(60))
     }
 
+    struct TestGrant;
+    #[async_trait]
+    impl EgressGate for TestGrant {
+        async fn check(
+            &self,
+            _request: &EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            Ok(())
+        }
+    }
+
+    fn authorized_test_scope() -> (Arc<dyn EgressGate>, Vec<EgressResource>) {
+        (
+            Arc::new(TestGrant),
+            vec![
+                EgressResource::cloud_authorized("test-resource", "test-revision", 1)
+                    .with_authorization_ref("test-grant"),
+            ],
+        )
+    }
+
     #[test]
     fn tier_order_respects_privacy_and_complexity() {
         assert_eq!(
@@ -630,14 +742,18 @@ mod tests {
             (remote.clone(), Tier::Remote),
             (local.clone(), Tier::Local),
         ]);
+        let (gate, resources) = authorized_test_scope();
         let (name, _) = r
-            .complete(
+            .complete_with_egress(
                 TaskProfile {
                     privacy: Privacy::Any,
                     complexity: Complexity::Simple,
                 },
                 &req(),
                 &CancellationToken::new(),
+                gate,
+                resources,
+                1,
             )
             .await
             .unwrap();
@@ -653,19 +769,35 @@ mod tests {
             (local.clone(), Tier::Local),
             (remote.clone(), Tier::Remote),
         ]);
+        let (gate, resources) = authorized_test_scope();
         let (name, _) = r
-            .complete(
+            .complete_with_egress(
                 TaskProfile {
                     privacy: Privacy::Any,
                     complexity: Complexity::Complex,
                 },
                 &req(),
                 &CancellationToken::new(),
+                gate,
+                resources,
+                1,
             )
             .await
             .unwrap();
         assert_eq!(name, "remote");
         assert_eq!(local.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_provider_is_not_called_without_a_host_egress_gate() {
+        let remote = StubProvider::ok("remote");
+        let r = router(vec![(remote.clone(), Tier::Remote)]);
+        assert!(
+            r.complete(TaskProfile::default(), &req(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(remote.calls(), 0);
     }
 
     #[tokio::test]
@@ -775,14 +907,18 @@ mod tests {
             (up.clone(), Tier::Remote),
         ]);
         // Simple prefers local (down) → falls through to remote (up)
+        let (gate, resources) = authorized_test_scope();
         let (name, _) = r
-            .complete(
+            .complete_with_egress(
                 TaskProfile {
                     privacy: Privacy::Any,
                     complexity: Complexity::Simple,
                 },
                 &req(),
                 &CancellationToken::new(),
+                gate,
+                resources,
+                1,
             )
             .await
             .unwrap();
@@ -1108,8 +1244,16 @@ mod tests {
         let a = StubProvider::down("local");
         let b = StubProvider::down("remote");
         let r = router(vec![(a, Tier::Local), (b, Tier::Remote)]);
+        let (gate, resources) = authorized_test_scope();
         let err = r
-            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .complete_with_egress(
+                TaskProfile::default(),
+                &req(),
+                &CancellationToken::new(),
+                gate,
+                resources,
+                1,
+            )
             .await
             .unwrap_err();
         let msg = err.to_string();

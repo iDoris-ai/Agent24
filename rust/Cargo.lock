@@ -120,6 +120,7 @@ dependencies = [
 name = "agent24-mcp"
 version = "0.5.1"
 dependencies = [
+ "agent24-domain",
  "agent24-protocol",
  "agent24-tools",
  "async-trait",
@@ -155,6 +156,7 @@ dependencies = [
 name = "agent24-models"
 version = "0.5.1"
 dependencies = [
+ "agent24-domain",
  "agent24-protocol",
  "async-trait",
  "reqwest",
@@ -328,6 +330,7 @@ dependencies = [
 name = "agent24-tools"
 version = "0.5.1"
 dependencies = [
+ "agent24-domain",
  "agent24-protocol",
  "agent24-workspace",
  "async-trait",

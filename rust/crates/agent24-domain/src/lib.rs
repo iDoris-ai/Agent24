@@ -2576,3 +2576,7 @@ mod tool_manifest_tests {
         assert!(err.to_string().contains("more than once"), "{err}");
     }
 }
+mod egress;
+pub use egress::{
+    EgressDecision, EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource,
+};

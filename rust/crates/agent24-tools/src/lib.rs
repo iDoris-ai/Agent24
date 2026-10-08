@@ -21,6 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent24_domain::{EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource};
 use agent24_protocol::{Decision, RiskClass, ToolInfo};
 use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
@@ -41,6 +42,9 @@ pub struct ToolContext {
     /// The persisted tool-call row this execution belongs to
     tool_call_id: String,
     workspace: WorkspaceAuthority,
+    egress: Option<Arc<dyn EgressGate>>,
+    egress_resources: Vec<EgressResource>,
+    authorization_generation: u64,
 }
 
 #[derive(Clone)]
@@ -63,7 +67,51 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Legacy,
+            egress: None,
+            egress_resources: Vec::new(),
+            authorization_generation: 0,
         }
+    }
+
+    /// Bind the host's current source policy and live authorization checker to this call.
+    #[must_use]
+    pub fn with_egress_policy(
+        mut self,
+        gate: Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        generation: u64,
+    ) -> Self {
+        self.egress = Some(gate);
+        self.egress_resources = resources;
+        self.authorization_generation = generation;
+        self
+    }
+
+    fn with_egress_gate(mut self, gate: Arc<dyn EgressGate>) -> Self {
+        self.egress = Some(gate);
+        self
+    }
+
+    /// A missing policy service or destination is denied. Call immediately before network I/O.
+    pub async fn authorize_egress(
+        &self,
+        purpose: EgressPurpose,
+        destination: EgressDestination,
+    ) -> Result<(), ToolError> {
+        let gate = self
+            .egress
+            .as_ref()
+            .ok_or_else(|| ToolError::Denied("outbound policy unavailable".into()))?;
+        let request = EgressRequest::remote(
+            self.egress_resources.clone(),
+            purpose,
+            destination,
+            self.authorization_generation,
+        );
+        request
+            .authorize(gate.as_ref())
+            .await
+            .map_err(|_| ToolError::Denied("outbound request denied".into()))
     }
 
     #[doc(hidden)]
@@ -81,6 +129,9 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Bound(authority),
+            egress: None,
+            egress_resources: Vec::new(),
+            authorization_generation: 0,
         }
     }
 
@@ -127,6 +178,9 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: self.workspace.clone(),
+            egress: self.egress.clone(),
+            egress_resources: self.egress_resources.clone(),
+            authorization_generation: self.authorization_generation,
         }
     }
 }
@@ -138,6 +192,7 @@ impl fmt::Debug for ToolContext {
             .field("session_id", &self.session_id)
             .field("schedule_id", &self.schedule_id)
             .field("tool_call_id", &self.tool_call_id)
+            .field("egress_bound", &self.egress.is_some())
             .field(
                 "workspace",
                 &match self.workspace {
@@ -266,6 +321,11 @@ impl ApprovalGate for DenyAllGate {
 pub trait Tool: Send + Sync {
     fn info(&self) -> ToolInfo;
 
+    /// Any tool sending run data outside the host must require the live egress gate.
+    fn requires_outbound_policy(&self) -> bool {
+        true
+    }
+
     /// JSON Schema for the input object
     fn parameters(&self) -> Value;
 
@@ -313,6 +373,7 @@ pub struct ToolRegistry {
     interactive_gate: bool,
     /// User-local risk adjustments (H2). None → declared classes stand.
     overrides: Option<Arc<dyn RiskOverrides>>,
+    outbound_gate: Option<Arc<dyn EgressGate>>,
 }
 
 impl ToolRegistry {
@@ -323,6 +384,7 @@ impl ToolRegistry {
             gate: Arc::new(DenyAllGate),
             interactive_gate: false,
             overrides: None,
+            outbound_gate: None,
         }
     }
 
@@ -340,6 +402,13 @@ impl ToolRegistry {
     pub fn with_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
         self.gate = gate;
         self.interactive_gate = true;
+        self
+    }
+
+    /// Install the host-owned live egress checker.
+    #[must_use]
+    pub fn with_egress_gate(mut self, gate: Arc<dyn EgressGate>) -> Self {
+        self.outbound_gate = Some(gate);
         self
     }
 
@@ -455,6 +524,7 @@ impl ToolRegistry {
     pub fn list(&self) -> Vec<ToolInfo> {
         self.tools
             .values()
+            .filter(|tool| !tool.requires_outbound_policy() || self.outbound_gate.is_some())
             .map(|t| {
                 let info = t.info();
                 let effective = self.effective_risk(&info);
@@ -473,6 +543,7 @@ impl ToolRegistry {
             .filter(|t| {
                 let info = t.info();
                 self.allowed.contains(&info.name)
+                    && (!t.requires_outbound_policy() || self.outbound_gate.is_some())
                     && (self.interactive_gate || !self.effective_risk(&info).requires_approval())
             })
             .map(|t| {
@@ -531,6 +602,9 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| ToolError::Invalid(format!("unknown tool: {name}")))?;
+        if tool.requires_outbound_policy() && self.outbound_gate.is_none() {
+            return Err(ToolError::Denied("outbound policy unavailable".into()));
+        }
 
         // 2. capability whitelist
         if !self.allowed.contains(name) {
@@ -583,7 +657,11 @@ impl ToolRegistry {
         }
 
         // 4. execute under the tool's budget, cancellable at any point
-        Self::run_budgeted(tool, ctx, input, cancel).await
+        let call_ctx = self.outbound_gate.as_ref().map_or_else(
+            || ctx.clone(),
+            |gate| ctx.clone().with_egress_gate(Arc::clone(gate)),
+        );
+        Self::run_budgeted(tool, &call_ctx, input, cancel).await
     }
 
     /// Execute a tool whose approval was ALREADY granted out of band — the
@@ -615,7 +693,14 @@ impl ToolRegistry {
                 "tool {name} is not in the capability whitelist"
             )));
         }
-        Self::run_budgeted(tool, ctx, input, cancel).await
+        if tool.requires_outbound_policy() && self.outbound_gate.is_none() {
+            return Err(ToolError::Denied("outbound policy unavailable".into()));
+        }
+        let call_ctx = self.outbound_gate.as_ref().map_or_else(
+            || ctx.clone(),
+            |gate| ctx.clone().with_egress_gate(Arc::clone(gate)),
+        );
+        Self::run_budgeted(tool, &call_ctx, input, cancel).await
     }
 
     /// Restore grant side-effects for a durable approval without asking again.
@@ -720,6 +805,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for SlowTool {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+
         fn info(&self) -> ToolInfo {
             ToolInfo::new("slow", "builtin", "sleeps", RiskClass::Read)
         }
@@ -767,6 +856,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_tool_is_neither_advertised_nor_dispatchable_without_egress_gate() {
+        let registry = ToolRegistry::new().with(Arc::new(HttpFetchTool::new(false)));
+        assert!(registry.adverts().is_empty());
+        let input = serde_json::json!({"url":"https://example.com"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let err = registry
+            .dispatch("http_fetch", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(reason) if reason.contains("outbound policy")));
+    }
+
+    #[tokio::test]
     async fn approval_stub_auto_denies_shell_exec_and_fs_write() {
         let dir = tempfile::tempdir().unwrap();
         let reg = ToolRegistry::builtin(dir.path().to_path_buf());
@@ -779,14 +883,14 @@ mod tests {
         }
         // and they are not advertised to the model
         let advertised: Vec<String> = reg.adverts().into_iter().map(|a| a.name).collect();
-        assert_eq!(advertised, vec!["fs_read", "http_fetch"]);
-        // but ARE listed on /tools with the flag visible
+        assert_eq!(advertised, vec!["fs_read"]);
+        // Egress consumers remain absent from discovery until the live gate is installed.
         let listed = reg.list();
-        assert_eq!(listed.len(), 4);
+        assert_eq!(listed.len(), 2);
         assert!(
             listed
                 .iter()
-                .any(|t| t.name == "shell_exec" && t.requires_approval)
+                .all(|tool| tool.name != "shell_exec" && tool.name != "http_fetch")
         );
     }
 
@@ -841,6 +945,10 @@ mod tests {
         struct Remote;
         #[async_trait]
         impl Tool for Remote {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 ToolInfo::new(
                     "mcp_fs_read",
@@ -868,6 +976,10 @@ mod tests {
         struct Remote;
         #[async_trait]
         impl Tool for Remote {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 ToolInfo::new("mcp_post", "mcp", "post", RiskClass::External)
             }
@@ -1031,7 +1143,7 @@ mod tests {
         assert!(reg.tool_requires_approval("fs_read"));
         // and a tightened tool stops being advertised without an interactive gate
         let advertised: Vec<String> = reg.adverts().into_iter().map(|a| a.name).collect();
-        assert_eq!(advertised, vec!["http_fetch"]);
+        assert!(advertised.is_empty());
     }
 
     /// `GET /api/v1/tools` must describe what will actually happen on the next
@@ -1084,6 +1196,10 @@ mod tests {
         struct Hanging;
         #[async_trait]
         impl Tool for Hanging {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 ToolInfo::new("hang", "builtin", "", RiskClass::Read)
             }

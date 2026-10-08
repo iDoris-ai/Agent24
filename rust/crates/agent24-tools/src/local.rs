@@ -138,6 +138,10 @@ impl FsReadTool {
 
 #[async_trait]
 impl Tool for FsReadTool {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "fs_read",
@@ -218,6 +222,10 @@ impl FsWriteTool {
 
 #[async_trait]
 impl Tool for FsWriteTool {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "fs_write",
@@ -695,6 +703,10 @@ mod tests {
         struct NoApproval(ShellExecTool);
         #[async_trait]
         impl Tool for NoApproval {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 // Re-declared as Read purely to skip the gate for this budget
                 // test; the real ShellExecTool is Exec and always gated.

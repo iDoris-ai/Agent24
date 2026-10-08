@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent24_domain::{EgressDestination, EgressPurpose};
 use agent24_protocol::{RiskClass, ToolInfo};
 use agent24_tools::{Tool, ToolContext, ToolError};
 use async_trait::async_trait;
@@ -258,6 +259,10 @@ impl McpTool {
 
 #[async_trait]
 impl Tool for McpTool {
+    fn requires_outbound_policy(&self) -> bool {
+        true
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             self.name.clone(),
@@ -288,10 +293,15 @@ impl Tool for McpTool {
 
     async fn call(
         &self,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        ctx.authorize_egress(
+            EgressPurpose::McpTool,
+            EgressDestination::exact(format!("mcp:{}:{}", self.server.name(), self.remote_name)),
+        )
+        .await?;
         match self
             .server
             .call(&self.remote_name, input.clone(), cancel)

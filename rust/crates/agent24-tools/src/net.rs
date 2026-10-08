@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use crate::{Tool, ToolContext, ToolError, truncate};
+use agent24_domain::{EgressDestination, EgressPurpose};
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
@@ -111,6 +112,10 @@ fn str_arg<'a>(input: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl Tool for HttpFetchTool {
+    fn requires_outbound_policy(&self) -> bool {
+        true
+    }
+
     fn info(&self) -> ToolInfo {
         // RiskClass::Read, deliberately — a GET/HEAD changes nothing off the
         // machine, so it is not `External`. What makes it dangerous is
@@ -146,7 +151,7 @@ impl Tool for HttpFetchTool {
 
     async fn call(
         &self,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
@@ -224,6 +229,11 @@ impl Tool for HttpFetchTool {
         let client = builder
             .build()
             .map_err(|e| ToolError::Failed(format!("http client init: {e}")))?;
+        ctx.authorize_egress(
+            EgressPurpose::HttpFetch,
+            EgressDestination::exact(format!("{}://{}:{}", url.scheme(), host, port)),
+        )
+        .await?;
         let response = tokio::select! {
             r = client.request(method, url.clone()).send() => {
                 r.map_err(|e| ToolError::Failed(format!("request failed: {e}")))?
@@ -280,6 +290,17 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use agent24_domain::{EgressDecision, EgressGate, EgressRequest, EgressResource};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct FixtureGrant;
+    #[async_trait]
+    impl EgressGate for FixtureGrant {
+        async fn check(&self, _request: &EgressRequest) -> Result<(), EgressDecision> {
+            Ok(())
+        }
+    }
 
     fn input(url: &str) -> Map<String, Value> {
         let mut m = Map::new();
@@ -288,7 +309,14 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        ToolContext::legacy("run_test", None, None, "tc_test")
+        ToolContext::legacy("run_test", None, None, "tc_test").with_egress_policy(
+            Arc::new(FixtureGrant),
+            vec![
+                EgressResource::cloud_authorized("fixture", "fixture-rev", 1)
+                    .with_authorization_ref("fixture-grant"),
+            ],
+            1,
+        )
     }
 
     #[test]
