@@ -14,6 +14,7 @@ pub mod db;
 pub mod error;
 pub mod id;
 pub mod idem;
+pub mod jobs;
 pub mod state;
 pub mod timestamp;
 pub mod uploads;
@@ -87,7 +88,7 @@ const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("import", Needs::Storage, false),
     ("get", Needs::Storage, false),
     ("list", Needs::Storage, false),
-    ("job", Needs::Storage, false),
+    ("job", Needs::Storage, true),
     ("render", Needs::Engine, false),
     ("read_range", Needs::Engine, false),
     ("find", Needs::Engine, false),
@@ -140,6 +141,9 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<Capabilities> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
+        .route("/jobs/{job_id}", get(jobs::get_job))
+        .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
+        .route("/jobs/{job_id}/retry", post(jobs::retry_job))
         .route("/uploads", post(uploads::create_upload))
         .route(
             "/uploads/{upload_id}/chunks",
@@ -265,7 +269,7 @@ mod tests {
         let body = get_capabilities_json(AppState::open(dir.path()).await).await;
         assert_eq!(body["storage"], serde_json::json!({ "state": "ready" }));
         // Ready storage makes only the operations with routes available.
-        assert_operations(&body, &["upload"]);
+        assert_operations(&body, &["job", "upload"]);
     }
 
     #[tokio::test]
