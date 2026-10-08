@@ -298,7 +298,7 @@ pub trait Tool: Send + Sync {
     ) -> Result<String, ToolError>;
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(serde::Serialize)]
 pub struct ModuleToolContext {
     pub run_id: String,
     pub session_id: Option<String>,
@@ -313,23 +313,40 @@ pub struct ModuleToolContext {
 pub trait ModuleToolAuthorization: Send + Sync {
     async fn authorize(
         &self,
-        _module: &str,
-        _operation: &str,
-        _ctx: &ToolContext,
-    ) -> Option<ModuleToolGrantContext> {
-        None
-    }
+        module: &str,
+        operation: &str,
+        ctx: &ToolContext,
+    ) -> Result<ModuleToolGrantContext, ModuleToolCallError>;
 }
 
 #[derive(Debug, Clone)]
 pub struct ModuleToolGrantContext {
     pub authorized_resources: Vec<String>,
     pub authorization_ref: String,
+    pub per_call_approval: bool,
 }
-
 pub struct DenyModuleToolAuthorization;
 
-impl ModuleToolAuthorization for DenyModuleToolAuthorization {}
+fn permission_denied() -> ModuleToolCallError {
+    ModuleToolCallError::Module {
+        code: ModuleToolErrorCode::PermissionDenied,
+        retryable: false,
+        details: None,
+        unknown_code: None,
+    }
+}
+
+#[async_trait]
+impl ModuleToolAuthorization for DenyModuleToolAuthorization {
+    async fn authorize(
+        &self,
+        _: &str,
+        _: &str,
+        _: &ToolContext,
+    ) -> Result<ModuleToolGrantContext, ModuleToolCallError> {
+        Err(permission_denied())
+    }
+}
 
 #[async_trait]
 pub trait ModuleToolRuntime: Send + Sync {
@@ -355,12 +372,12 @@ pub struct ModuleTool {
     schema: Value,
     timeout: Duration,
     inline_wait: Duration,
+    risk: RiskClass,
     authorization: Arc<dyn ModuleToolAuthorization>,
     runtime: Arc<dyn ModuleToolRuntime>,
 }
 
 impl ModuleTool {
-    #[must_use]
     #[allow(clippy::too_many_arguments)] // Mirrors the module advert plus the two host adapters.
     pub fn new(
         module: impl Into<String>,
@@ -369,6 +386,7 @@ impl ModuleTool {
         schema: Value,
         timeout: Duration,
         inline_wait: Duration,
+        risk: RiskClass,
         authorization: Arc<dyn ModuleToolAuthorization>,
         runtime: Arc<dyn ModuleToolRuntime>,
     ) -> Result<Self, &'static str> {
@@ -385,6 +403,7 @@ impl ModuleTool {
             schema,
             timeout,
             inline_wait,
+            risk,
             authorization,
             runtime,
         })
@@ -398,7 +417,7 @@ impl Tool for ModuleTool {
             self.name.clone(),
             "module",
             self.description.clone(),
-            RiskClass::External,
+            self.risk,
         )
     }
     fn parameters(&self) -> Value {
@@ -417,21 +436,14 @@ impl Tool for ModuleTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
-        // TODO(K1-5.3): replace this interface adapter with ConsentGate from #777.
-        let Some(grant) = self
+        let grant = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
             .await
-        else {
-            return Err(ToolError::Failed(module_error_json(
-                ModuleToolCallError::Module {
-                    code: ModuleToolErrorCode::PermissionDenied,
-                    retryable: false,
-                    details: None,
-                    unknown_code: None,
-                },
-            )));
-        };
+            .map_err(|error| ToolError::Failed(module_error_json(error)))?;
+        if grant.per_call_approval && !self.risk.requires_approval() {
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         if let Err(error) = self
             .runtime
             .check_available(&self.module, &self.operation)
@@ -580,15 +592,6 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_unlisted(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.insert(tool.info().name, tool);
-        self
-    }
-
-    /// Register a module tool after filtering it through module advert gates.
-    #[must_use]
-    pub fn with_module_tool(mut self, tool: Arc<dyn Tool>) -> Self {
-        let name = tool.info().name;
-        self.allowed.insert(name.clone());
-        self.tools.insert(name, tool);
         self
     }
 
@@ -1393,6 +1396,7 @@ mod tests {
                 serde_json::json!({"type":"object"}),
                 Duration::from_secs(2),
                 Duration::from_secs(1),
+                RiskClass::External,
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(Runtime),
             )
