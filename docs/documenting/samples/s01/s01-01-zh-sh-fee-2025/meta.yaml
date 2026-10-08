@@ -10,5 +10,23 @@ license: "CN-Copyright-Art5"
 sha256_original: "0e58ee69d38b31399abde104ba987c7038efed0e1e93690471c52142271146b7"
 sha256_stored: "0e58ee69d38b31399abde104ba987c7038efed0e1e93690471c52142271146b7"
 redactions: []
-covers: [C1, C5, C6, C7, C8, C9]
-notes: "正文 3 页 + 附件表格 30 页；多行表头、合并单元格；含“停征/免征/可拒绝支付”等豁免表述；无面向个人的截止日期。"
+public_officials: []
+covers:
+  C1: [right_to_refuse]
+  C6: [id_card_first_issue_exemption, taiwan_permit_first_application_exemption]
+  C7: [public_kindergarten_fee_approval_number, id_card_loss_replacement_fee]
+  C8: [id_card_first_issue_exemption, public_kindergarten_full_day_level1_fee]
+  C9: [payment_deadline_for_individuals, application_contact]
+reader: "在上海办理以下事项的个人：到期换领、丢失补领或首次申领居民身份证；申领临时身份证；申领或首次申领台湾居民来往大陆通行证；孩子上公办幼儿园（全日制或寄宿制）；想知道哪些收费可以拒付"
+questions: [Q2, Q3, Q4, Q5, Q6]
+extraction_notes:
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "数字与汉字之间多出空格，如“145 号”（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 3, "finding": "日期里多出空格，如“2025 年 12 月 22 日”（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 2, "finding": "行末断词，如“收费事 / 项”（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 16, "finding": "单元格内换行断词，如“来往大陆 / 通行证”“(含签 / 注)”（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 14, "finding": "表格单元格内换行把词拆开，如“居民身份证工 / 本费”“等换 / 、补领”（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 9, "finding": "“政策依据”和“批准文号”两列被拼成一行；列归属按渲染页核对"}
+derived_from: null
+sha256_parent: null
+derivation: []
+notes: "正文 3 页 + 附件表格 30 页；多行表头、合并单元格。p14“损换”是原文用字（疑为“损坏”），不是抽取问题。正文发给各部门，读者按个人缴费场景限定在上述证件和收费上。"

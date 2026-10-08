@@ -1,79 +1,39 @@
 {
   "id": "s01-02-en-epa-boil-water",
-  "schema": "s01-gold-v1",
+  "schema": "s01-gold-v2",
   "fields": [
-    {
-      "key": "action_required",
-      "status": "present",
-      "value": "DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST.",
-      "negation": true,
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST."
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "boil_duration",
-      "status": "present",
-      "value": "three (3) minutes",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "let it boil for three (3) minutes"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "advisory_duration",
-      "status": "present",
-      "value": "until further notice",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "until further notice"
-        }
-      ],
-      "severity": "major"
-    },
-    {
-      "key": "contamination_dates",
-      "status": "missing",
-      "severity": "critical",
-      "note": "Template blanks: (date) ______"
-    },
-    {
-      "key": "expected_resolution",
-      "status": "missing",
-      "severity": "major",
-      "note": "Template blank: within ______ (estimated time frame)"
-    },
-    {
-      "key": "water_system_contact",
-      "status": "missing",
-      "severity": "major"
-    },
-    {
-      "key": "epa_hotline",
-      "status": "present",
-      "value": "1-800-426-4791",
-      "anchors": [
-        {
-          "page": 1,
-          "quote": "1-800-426-4791"
-        }
-      ],
-      "severity": "critical"
-    }
+    {"key": "affected_water_system_name", "q": "Q5", "status": "missing", "severity": "major", "missing_reason": "blank_in_template", "note": "p1 only prints the label “(Name of Water System)” under a blank line"},
+    {"key": "do_not_drink_without_boiling", "q": "Q1", "status": "present", "value": "DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST.", "negation": true, "severity": "critical", "anchors": [{"page": 1, "quote": "DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST."}]},
+    {"key": "water_preparation", "q": "Q1", "status": "present", "value": "Bring all water to a boil, let it boil for three (3) minutes, and let it cool before using, or use bottled water", "severity": "critical", "anchors": [{"page": 1, "quote": "Bring all water to a boil, let it boil for three (3) minutes, and let it cool before using or use bottled water."}], "note": "the boiling time “three (3) minutes” is scored only here; bottled water is the alternative and does not need boiling"},
+    {"key": "safe_water_uses", "q": "Q1", "status": "present", "value": "drinking, making ice, brushing teeth, washing dishes, and food preparation", "severity": "major", "anchors": [{"page": 1, "quote": "Boiled or bottled water should be used for drinking, making ice, brushing teeth, washing dishes, and food preparation"}]},
+    {"key": "safe_water_instruction_end_condition", "q": "Q2", "status": "present", "value": "until further notice", "time": {"kind": "open_ended", "end_condition": "the water system informs customers that tests show no bacteria and boiling is no longer needed"}, "severity": "critical", "anchors": [{"page": 1, "quote": "Boiled or bottled water should be used for drinking, making ice, brushing teeth, washing dishes, and food preparation until further notice."}, {"page": 1, "quote": "We will inform you when tests show no bacteria and you no longer need to boil your water."}]},
+    {"key": "seek_medical_advice", "q": "Q1", "status": "present", "value": "If you experience any of these symptoms and they persist, you may want to seek medical advice", "applies_if": ["has symptoms such as diarrhea, cramps, nausea or headaches, and they persist"], "severity": "major", "anchors": [{"page": 1, "quote": "Human pathogens in these wastes can cause short-term effects, such as diarrhea, cramps, nausea, headaches, or other symptoms."}, {"page": 1, "quote": "If you experience any of these symptoms and they persist, you may want to seek medical advice."}], "note": "a suggestion (“may want to”), not a requirement"},
+    {"key": "share_notice", "q": "Q1", "status": "present", "value": "Share the information with all the other people who drink this water, by posting this notice in a public place or distributing copies by hand or mail", "severity": "major", "anchors": [{"page": 1, "quote": "Please share this information with all the other people who drink this water"}, {"page": 1, "quote": "You can do this by posting this notice in a public place or distributing copies by hand or mail."}]},
+    {"key": "investigation_under_way", "q": "ctx", "status": "present", "value": "We are now conducting a thorough investigation to determine the source of the contamination", "severity": "major", "anchors": [{"page": 1, "quote": "We are now conducting a thorough investigation to determine the source of the contamination."}], "role": "context"},
+    {"key": "contamination_dates", "q": "ctx", "status": "missing", "severity": "critical", "missing_reason": "blank_in_template", "note": "p1 “On (date) __________”, “collected on (date) ______________”; “Updated 6/10/25” and “Rev. 06/10/2025” are template revision dates", "role": "context"},
+    {"key": "expected_resolution", "q": "Q2", "status": "missing", "severity": "critical", "missing_reason": "blank_in_template", "note": "p1 “within _______________ (estimated time frame)”"},
+    {"key": "corrective_action_section_details", "q": "Q1", "status": "missing", "severity": "major", "missing_reason": "blank_in_template", "note": "p1 “Corrective action being taken includes (e.g., location of alternative water):” is followed by blank lines; this field is only that section (specific measures, alternative-water location), not the investigation sentence"},
+    {"key": "water_system_contact", "q": "Q6", "status": "missing", "severity": "critical", "missing_reason": "blank_in_template", "note": "name of contact, phone number and mailing address are all blank"},
+    {"key": "epa_hotline", "q": "Q6", "status": "present", "value": "1-800-426-4791", "applies_if": ["looking for general guidelines on lessening the risk of infection by microbes"], "severity": "critical", "anchors": [{"page": 1, "quote": "General guidelines on ways to lessen the risk of infection by microbes are available from the EPA Safe Drinking Water Hotline at 1-800-426-4791."}]},
+    {"key": "operator_public_notice_deadline", "q": "ctx", "status": "present", "value": "within 24 hours after you learn of the violation", "time": {"kind": "relative", "trigger": "the operator learns of the violation", "duration": "PT24H"}, "audience": "PWS operator / responsible party (not residents)", "applies_if": ["reader is the water-system operator or responsible party"], "severity": "critical", "anchors": [{"page": 1, "quote": "ATTENTION: PWS OPERATOR/RESPONSIBLE PARTY"}, {"page": 2, "quote": "you must provide public notice to persons served as soon as practical but within 24 hours after you learn of the violation"}], "role": "context"}
   ],
   "must_not_assert": [
-    "a specific contamination date",
-    "a specific resolution date",
-    "a contact phone number for the water system",
-    "that residents must act within 24 hours"
+    {"proposition": "the notice names the affected water system"},
+    {"proposition": "the notice names the affected locality"},
+    {"proposition": "the contamination was learned of on a specific date"},
+    {"proposition": "the samples were collected on a specific date"},
+    {"proposition": "the problem is expected to be resolved within a specific time frame"},
+    {"proposition": "the notice gives a contact name for the local water system"},
+    {"proposition": "the notice gives a phone number for the local water system"},
+    {"proposition": "the notice gives a mailing address for the local water system"},
+    {"proposition": "specific corrective measures (such as chlorination or flushing) are under way", "unless": "presents them as example actions listed for operators"},
+    {"proposition": "an alternative-water location has been arranged"},
+    {"proposition": "the water is already safe to drink without boiling"},
+    {"proposition": "bottled water must also be boiled"},
+    {"proposition": "residents must notify others within 24 hours"},
+    {"proposition": "residents must contact EPA"},
+    {"proposition": "residents must sign the certification of public notification"},
+    {"proposition": "residents must see a doctor"}
   ],
   "labeled_by": "claude-draft",
   "verified_by": null

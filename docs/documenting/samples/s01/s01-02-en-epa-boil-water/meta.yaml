@@ -10,5 +10,17 @@ license: "US-17USC105"
 sha256_original: "2a2c8c1c14f1577ce011a6137aab33baa4dcfdd879d11d6e37c7813be5de8f4a"
 sha256_stored: "2a2c8c1c14f1577ce011a6137aab33baa4dcfdd879d11d6e37c7813be5de8f4a"
 redactions: []
-covers: [C3, C6, C7, C9]
-notes: "Template: dates, time frame and contact are blank (expected 'missing'). 'within 24 hours' on p2 is an obligation of the water-system operator, not of residents."
+public_officials:
+  - {"page": 2, "name": "Jamie Harris", "role": "RTCR Manager, US EPA Region 8", "contact": "institutional: 303-312-6072, the same number p2 gives for the Region 8 RTCR Manager"}
+covers:
+  C3: [water_preparation]
+  C6: [do_not_drink_without_boiling]
+  C9: [affected_water_system_name, expected_resolution, water_system_contact]
+reader: "a resident who receives this boil-water notice from their water system"
+questions: [Q1, Q2, Q5, Q6]
+extraction_notes:
+  - {"extractor": "PDFKit (macOS 26.6.2)", "finding": "no anomalies affecting anchors"}
+derived_from: null
+sha256_parent: null
+derivation: []
+notes: "Template: water-system name, dates, time frame, corrective actions and local contact are blank (missing_reason blank_in_template). The 24-hour deadline on p2 binds the PWS operator, not residents."
