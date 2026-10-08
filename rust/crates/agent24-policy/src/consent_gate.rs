@@ -1,7 +1,6 @@
 //! K1-6a.2 (ADR-K1-03 "K1-6a 实现切片建议" item 2): the host-side
-//! **authorization decision service** — "does this module tool call get to
-//! skip repeated per-call approval, given the host's recorded consent for
-//! this exact (module, tool version, permission-scope fingerprint)".
+//! **authorization decision service** — "does this module tool call have
+//! valid host-recorded consent, and must it still receive per-call approval?"
 //!
 //! This is deliberately NOT wired to any dispatch path. K1-5.3's module tool
 //! call path does not exist yet; this slice ships the service, trait and
@@ -11,27 +10,21 @@
 //!
 //! ## What `Allow` means — and does not mean
 //!
-//! Per the task spec's rule 2 (ADR §1/§4 and the interface section with
-//! OD-M11's capability route, item 2 — "任一层拒绝...即拒绝", "该映射不要求
-//! ...也不恢复其暂停任务"): an [`ConsentGateDecision::Allow`] means ONLY
-//! "module consent exists for this exact tool/version/scope and is not
-//! stale/expired/denied" — i.e. permission to skip the REPEATED per-call
-//! approval prompt that module consent exists to remove. It is NOT:
+//! A valid module consent is necessary to call any module tool, but does not
+//! by itself waive per-call approval. `Allow` therefore carries
+//! `per_call_approval`: `Read` is false; `WriteLocal` and `Exec` are true per
+//! L-APPR-5; `External` is also true because module consent is not the required
+//! `tool → exact target` standing-grant shape. Only policy or consent failures
+//! deny the call here. A future caller must obtain per-call approval whenever
+//! this flag is true. These rules agree with `RiskClass::escape_rank`'s
+//! description of which classes a standing grant can pre-answer.
 //!
-//! - a bypass of the existing [`agent24_tools::ApprovalGate`]/broker pipeline
-//!   for [`RiskClass::Exec`] or [`RiskClass::External`] calls — those two
-//!   classes always resolve to [`ConsentDenyReason::HostRiskExceeds`] here,
-//!   regardless of how clean the matching consent record is, so a future
-//!   caller falls through to the existing high-risk gate for them (mirrors
-//!   `RiskClass`'s own doc comments: `Exec` "always gated, never eligible
-//!   for a standing grant"; `External` "only class a target-scoped standing
-//!   grant may cover" — i.e. still gated by default, not consent-exempt);
-//! - a bypass of any policy/organizational/source restriction — the
-//!   `org_restricted`/`source_restricted` placeholders on
-//!   [`ConsentGateRequest`] stand in for the real policy engine ADR §2
-//!   describes (LocalOnly, org/admin/source limits) that does not exist yet
-//!   (K1-6b); when either is `true` this gate denies unconditionally, before
-//!   even looking at the consent store.
+//! This gate also does not bypass policy/organizational/source restrictions —
+//! the `org_restricted`/`source_restricted` placeholders on
+//! [`ConsentGateRequest`] stand in for the real policy engine ADR §2
+//! describes (LocalOnly, org/admin/source limits) that does not exist yet
+//! (K1-6b); when either is `true` this gate denies unconditionally, before
+//! even looking at the consent store.
 //!
 //! Both overrides apply even to an otherwise-perfectly-matching `Granted`
 //! consent (ADR §2: "即使用户给某项工具常驻许可，每次调用仍受当前风险等级
@@ -40,12 +33,12 @@
 //!
 //! ## Fail-closed shape
 //!
-//! [`ConsentGate::authorize`] has exactly two ways to produce
-//! [`ConsentGateDecision::Allow`]: the policy placeholders are both clear,
-//! the risk class is not `Exec`/`External`, AND the store lookup resolves to
-//! [`agent24_store::ConsentLookup::Granted`]. Every other reachable state —
-//! no record, a stale/expired/denied record, or the store call itself
-//! failing — denies. The match on [`agent24_store::ConsentLookup`] is
+//! [`ConsentGate::authorize`] produces [`ConsentGateDecision::Allow`] only
+//! when the policy placeholders are clear and the store lookup resolves to
+//! [`agent24_store::ConsentLookup::Granted`], regardless of risk class.
+//! Every other reachable state — no record, a stale/expired/denied record, or
+//! the store call itself failing — denies. The match on
+//! [`agent24_store::ConsentLookup`] is
 //! exhaustive with no wildcard arm, so a future variant added to that enum
 //! is a compile error here rather than silently falling through to `Allow`.
 
@@ -98,10 +91,6 @@ pub enum ConsentDenyReason {
     Stale(ModuleConsentRecord),
     Expired(ModuleConsentRecord),
     Denied(ModuleConsentRecord),
-    /// The call's `RiskClass` is `Exec` or `External` — module consent does
-    /// not exempt these from the existing approval pipeline, independent of
-    /// whether a matching grant exists.
-    HostRiskExceeds,
     /// `org_restricted` or `source_restricted` was set on the request.
     PolicyRestricted,
 }
@@ -116,14 +105,13 @@ impl ConsentDenyReason {
             ConsentDenyReason::Stale(_) => "stale",
             ConsentDenyReason::Expired(_) => "expired",
             ConsentDenyReason::Denied(_) => "denied",
-            ConsentDenyReason::HostRiskExceeds => "host_risk_exceeds",
             ConsentDenyReason::PolicyRestricted => "policy_restricted",
         }
     }
 }
 
-/// Opaque reference to the consent grant that authorized a bypass — NOT a
-/// capability or bearer token (ADR interface section, item 1: this layer
+/// Opaque reference to the consent grant that authorized the module call —
+/// NOT a capability or bearer token (ADR interface section, item 1: this layer
 /// answers module consent only and "不复用...bearer 作为用户同意记录"; item
 /// 3: module/third-party code cannot mint or extend one). A future caller
 /// may use it for audit logging; it grants nothing by itself.
@@ -151,8 +139,18 @@ impl From<&ModuleConsentRecord> for GrantRef {
 /// The service's answer for one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentGateDecision {
-    Allow { grant_ref: GrantRef },
-    Deny { reason: ConsentDenyReason },
+    Allow {
+        grant_ref: GrantRef,
+        /// Whether the caller must still request approval for this call.
+        /// L-APPR-5 requires this for `WriteLocal` and `Exec`; this gate also
+        /// requires it for `External` until consent is scoped as `tool → exact
+        /// target` (ADR-K1-03). `Read` is the only class that skips it in
+        /// this module-consent gate.
+        per_call_approval: bool,
+    },
+    Deny {
+        reason: ConsentDenyReason,
+    },
 }
 
 impl ConsentGateDecision {
@@ -202,16 +200,6 @@ impl ConsentGate for StoreConsentGate {
             };
         }
 
-        // Rule 2 continued: Exec/External never gain an exemption from the
-        // existing approval pipeline through module consent alone. This is
-        // independent of consent state, so it is also checked before the
-        // store lookup.
-        if matches!(request.risk, RiskClass::Exec | RiskClass::External) {
-            return ConsentGateDecision::Deny {
-                reason: ConsentDenyReason::HostRiskExceeds,
-            };
-        }
-
         let lookup = match self
             .store
             .lookup_module_consent(
@@ -229,7 +217,8 @@ impl ConsentGate for StoreConsentGate {
             // caller cannot tell "no row" from "could not ask" from the
             // outside — both must behave identically, so both map to
             // `NotGranted`.
-            Err(_) => {
+            Err(err) => {
+                tracing::error!("module consent lookup failed ({err}); denying call");
                 return ConsentGateDecision::Deny {
                     reason: ConsentDenyReason::NotGranted,
                 };
@@ -252,9 +241,17 @@ impl ConsentGate for StoreConsentGate {
             ConsentLookup::Expired(record) => ConsentGateDecision::Deny {
                 reason: ConsentDenyReason::Expired(record),
             },
-            ConsentLookup::Granted(record) => ConsentGateDecision::Allow {
-                grant_ref: GrantRef::from(&record),
-            },
+            ConsentLookup::Granted(record) => {
+                // TODO: External can pre-answer approval only for a standing
+                // grant shaped `tool → exact target` (L-APPR-5, ADR-K1-03).
+                // Module consent has no such target scope, so External stays
+                // per-call. `requires_approval` also keeps WriteLocal/Exec
+                // per-call as required by L-APPR-5.
+                ConsentGateDecision::Allow {
+                    grant_ref: GrantRef::from(&record),
+                    per_call_approval: request.risk.requires_approval(),
+                }
+            }
         }
     }
 }
@@ -336,89 +333,75 @@ mod tests {
         ));
     }
 
-    // ── rule 1 positive — exact match, not expired, granted ⇒ Allow ─────────
+    // ── L-APPR-5 matrix: consent is required for every risk class; only Read
+    // skips per-call approval. L-APPR-5 and escape_rank say WriteLocal/Exec
+    // always ask; External needs a tool → exact target standing-grant shape.
 
     #[tokio::test]
-    async fn matching_granted_consent_with_read_risk_allows() {
-        let store = store().await;
-        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
-        store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
-            .await
-            .unwrap();
-        let gate = StoreConsentGate::new(store);
-        let req = request_for(&s, RiskClass::Read);
+    async fn every_risk_class_requires_matching_consent_and_sets_approval_by_law() {
+        for risk in [
+            RiskClass::Read,
+            RiskClass::WriteLocal,
+            RiskClass::Exec,
+            RiskClass::External,
+        ] {
+            // No record denies regardless of risk: consent authorizes module
+            // access but cannot itself replace per-call approval.
+            let missing_store = store().await;
+            let missing_gate = StoreConsentGate::new(missing_store);
+            let missing_summary = summary(ConsentSource::FirstParty, HostRiskLevel::High);
+            let missing = missing_gate
+                .authorize(&request_for(&missing_summary, risk), "2026-10-08T00:00:01Z")
+                .await;
+            assert!(
+                matches!(
+                    missing,
+                    ConsentGateDecision::Deny {
+                        reason: ConsentDenyReason::NotGranted
+                    }
+                ),
+                "{risk:?} without consent must deny"
+            );
 
-        let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(decision.is_allowed());
-        match decision {
-            ConsentGateDecision::Allow { grant_ref } => {
-                assert_eq!(grant_ref.module, "documenting");
-                assert_eq!(grant_ref.op, "read_doc");
-                assert_eq!(grant_ref.scope_fingerprint, s.scope_fingerprint());
+            // A matching consent authorizes the module call. Approval remains
+            // per-call for every class except Read (L-APPR-5). External also
+            // stays per-call until a tool → exact target grant exists.
+            let granted_store = store().await;
+            let granted_summary = summary(ConsentSource::FirstParty, HostRiskLevel::High);
+            granted_store
+                .grant_module_consent(
+                    &granted_summary,
+                    "2026-10-08T00:00:00Z",
+                    "2026-11-08T00:00:00Z",
+                )
+                .await
+                .unwrap();
+            let granted_gate = StoreConsentGate::new(granted_store);
+            let granted = granted_gate
+                .authorize(&request_for(&granted_summary, risk), "2026-10-08T00:00:01Z")
+                .await;
+            match granted {
+                ConsentGateDecision::Allow {
+                    grant_ref,
+                    per_call_approval,
+                } => {
+                    assert_eq!(grant_ref.module, "documenting");
+                    assert_eq!(grant_ref.op, "read_doc");
+                    assert_eq!(
+                        grant_ref.scope_fingerprint,
+                        granted_summary.scope_fingerprint()
+                    );
+                    assert_eq!(
+                        per_call_approval,
+                        risk.requires_approval(),
+                        "{risk:?} has incorrect L-APPR-5 approval behavior"
+                    );
+                }
+                ConsentGateDecision::Deny { reason } => {
+                    panic!("{risk:?} with consent must allow: {reason:?}")
+                }
             }
-            ConsentGateDecision::Deny { .. } => panic!("expected Allow"),
         }
-    }
-
-    #[tokio::test]
-    async fn matching_granted_consent_with_write_local_risk_allows() {
-        let store = store().await;
-        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Medium);
-        store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
-            .await
-            .unwrap();
-        let gate = StoreConsentGate::new(store);
-        let req = request_for(&s, RiskClass::WriteLocal);
-
-        let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(decision.is_allowed());
-    }
-
-    // ── rule 2 — Exec/External never bypass the existing approval gate,  ───
-    // even with an otherwise-perfect matching Granted record ───────────────
-
-    #[tokio::test]
-    async fn exec_risk_is_denied_even_with_a_matching_granted_consent() {
-        let store = store().await;
-        let s = summary(ConsentSource::FirstParty, HostRiskLevel::High);
-        store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
-            .await
-            .unwrap();
-        let gate = StoreConsentGate::new(store);
-        let req = request_for(&s, RiskClass::Exec);
-
-        let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
-        assert!(matches!(
-            decision,
-            ConsentGateDecision::Deny {
-                reason: ConsentDenyReason::HostRiskExceeds
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn external_risk_is_denied_even_with_a_matching_granted_consent() {
-        let store = store().await;
-        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Medium);
-        store
-            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
-            .await
-            .unwrap();
-        let gate = StoreConsentGate::new(store);
-        let req = request_for(&s, RiskClass::External);
-
-        let decision = gate.authorize(&req, "2026-10-08T00:00:01Z").await;
-        assert!(!decision.is_allowed());
-        assert!(matches!(
-            decision,
-            ConsentGateDecision::Deny {
-                reason: ConsentDenyReason::HostRiskExceeds
-            }
-        ));
     }
 
     // ── ADR反例2/8 — 更严组织/来源限制优先，哪怕许可完全匹配 ────────────────
@@ -658,10 +641,6 @@ mod tests {
             "expired"
         );
         assert_eq!(ConsentDenyReason::Denied(dummy).reason_code(), "denied");
-        assert_eq!(
-            ConsentDenyReason::HostRiskExceeds.reason_code(),
-            "host_risk_exceeds"
-        );
         assert_eq!(
             ConsentDenyReason::PolicyRestricted.reason_code(),
             "policy_restricted"
