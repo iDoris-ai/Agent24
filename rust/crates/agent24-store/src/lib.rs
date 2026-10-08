@@ -28,6 +28,7 @@ mod legacy_recovery;
 mod model_call_timings;
 mod module_approvals;
 mod module_audit_event;
+mod module_consents;
 mod module_model_usage;
 mod module_schedules;
 mod repo;
@@ -78,6 +79,10 @@ pub use module_audit_event::{
     ActorRef, AuditRef, AuthorizationRef, DurationMs, MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId,
     ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef,
     RunId, SessionRef, SizeBytes, ToolCallId,
+};
+pub use module_consents::{
+    ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentRecord,
+    ToolPermissionSummary,
 };
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
