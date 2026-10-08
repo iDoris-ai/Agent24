@@ -3,12 +3,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import CommunicationPage from './Communication'
 import {
-  getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
+  addContact, getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm,
   type CommDaemonStatus,
 } from './api'
 
 vi.mock('./api', () => ({
+  addContact: vi.fn(),
   getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
   startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(),
 }))
@@ -30,6 +31,7 @@ function success() {
   vi.mocked(startCommDaemon).mockResolvedValue(status)
   vi.mocked(stopCommDaemon).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
   vi.mocked(unlockComm).mockResolvedValue({ unlocked: true, remembered: false })
+  vi.mocked(addContact).mockResolvedValue(undefined)
 }
 
 afterEach(() => { cleanup(); vi.clearAllMocks() })
@@ -129,6 +131,58 @@ describe('CommunicationPage', () => {
     expect(button).toBeDisabled()
     finish(status)
     await waitFor(() => expect(button).toBeEnabled())
+  })
+
+  it('submits exactly one add-contact request for valid input, then refreshes and clears the form', async () => {
+    success()
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    fireEvent.change(screen.getByLabelText('昵称'), { target: { value: 'carol' } })
+    fireEvent.change(screen.getByLabelText('公钥（npub）'), { target: { value: 'npub1qpzry9x8gf2tvdw0s3jn54khce6mua7l' } })
+    fireEvent.change(screen.getByLabelText('角色（可选）'), { target: { value: 'friend' } })
+    const newContact = { nickname: 'carol', npub: 'npub1qpzry9x8gf2tvdw0s3jn54khce6mua7l', role: 'friend' }
+    vi.mocked(listCommContacts).mockResolvedValue([contact, newContact])
+    fireEvent.click(screen.getByRole('button', { name: '添加联系人' }))
+    await waitFor(() => expect(addContact).toHaveBeenCalledTimes(1))
+    expect(addContact).toHaveBeenCalledWith('carol', 'npub1qpzry9x8gf2tvdw0s3jn54khce6mua7l', 'friend')
+    expect(await screen.findByText(newContact.npub)).toBeInTheDocument()
+    expect((screen.getByLabelText('昵称') as HTMLInputElement).value).toBe('')
+  })
+
+  it('disables the submit button for an empty nickname, a malformed npub, and while a write is pending', async () => {
+    success()
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    const submit = screen.getByRole('button', { name: '添加联系人' })
+    expect(submit).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('昵称'), { target: { value: 'carol' } })
+    fireEvent.change(screen.getByLabelText('公钥（npub）'), { target: { value: 'not-a-valid-npub' } })
+    expect(submit).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('公钥（npub）'), { target: { value: 'npub1qpzry9x8gf2tvdw0s3jn54khce6mua7l' } })
+    expect(submit).toBeEnabled()
+    let finish!: (value: void) => void
+    vi.mocked(addContact).mockReturnValue(new Promise((resolve) => { finish = resolve }))
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    expect(addContact).toHaveBeenCalledTimes(1)
+    expect(submit).toBeDisabled()
+    finish(undefined)
+    await waitFor(() => expect(submit).toBeDisabled())
+  })
+
+  it('keeps the entered values and the existing list, and shows no success notice, when the server rejects the add', async () => {
+    success()
+    vi.mocked(addContact).mockRejectedValueOnce(Object.assign(new Error('nickname must not be empty'), { code: 'invalid' }))
+    render(<CommunicationPage />)
+    await screen.findByText('npub1alice')
+    fireEvent.change(screen.getByLabelText('昵称'), { target: { value: 'carol' } })
+    fireEvent.change(screen.getByLabelText('公钥（npub）'), { target: { value: 'npub1qpzry9x8gf2tvdw0s3jn54khce6mua7l' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加联系人' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('nickname must not be empty')
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect((screen.getByLabelText('昵称') as HTMLInputElement).value).toBe('carol')
+    expect(screen.getByText('npub1bob')).toBeInTheDocument()
+    expect(screen.queryByText('npub1qpzry9x8gf2tvdw0s3jn54khce6mua7l')).not.toBeInTheDocument()
   })
 
   it('uses only IPC proxy wrappers and never invokes fetch or storage for secrets', async () => {

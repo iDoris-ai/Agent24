@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  addContact,
   getCommStatus,
   listCommContacts,
   listCommIdentities,
@@ -14,7 +15,24 @@ import {
 } from './api'
 import './communication.css'
 
-type WriteAction = 'start' | 'stop' | 'unlock'
+type WriteAction = 'start' | 'stop' | 'unlock' | 'addContact'
+
+// Bech32 charset (BIP-173). Structural-only mirror of agent24-comm's
+// `is_valid_npub` — hrp, length, and charset, WITHOUT verifying the
+// checksum. The server remains the sole source of truth; this only keeps an
+// obviously malformed value from reaching a write request.
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+
+function looksLikeNpub(value: string): boolean {
+  // hrp === 'npub' and every data char in BECH32_CHARSET already forces
+  // ASCII lowercase, so no separate ASCII/case check is needed here.
+  if (value.length < 8 || value.length > 90) return false
+  const sep = value.lastIndexOf('1')
+  if (sep <= 0 || value.length - sep - 1 < 6) return false
+  if (value.slice(0, sep) !== 'npub') return false
+  const data = value.slice(sep + 1)
+  return data.split('').every((char) => BECH32_CHARSET.includes(char))
+}
 
 function messageOf(error: unknown, secret = ''): string {
   const text = error instanceof Error ? error.message : String(error)
@@ -83,6 +101,9 @@ export default function CommunicationPage() {
   const [remember, setRemember] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [contactNickname, setContactNickname] = useState('')
+  const [contactNpub, setContactNpub] = useState('')
+  const [contactRole, setContactRole] = useState('')
   const sequence = useRef(0)
   const mounted = useRef(false)
 
@@ -128,10 +149,18 @@ export default function CommunicationPage() {
       } else if (action === 'stop') {
         await stopCommDaemon()
         if (mounted.current && token === sequence.current) setNotice('已提交停止请求。')
-      } else {
+      } else if (action === 'unlock') {
         const result = await unlockComm(submittedPassword, remember)
         if (mounted.current && token === sequence.current) {
           setNotice(result.remembered ? '已解锁，口令已记入系统钥匙串。' : '已解锁，本次会话内有效。')
+        }
+      } else {
+        await addContact(contactNickname, contactNpub, contactRole.trim() ? contactRole : undefined)
+        if (mounted.current && token === sequence.current) {
+          setNotice('已添加联系人。')
+          setContactNickname('')
+          setContactNpub('')
+          setContactRole('')
         }
       }
     } catch (error) {
@@ -186,6 +215,24 @@ export default function CommunicationPage() {
             </tr>)}
           </tbody></table></div>
         )}
+        <form
+          className="comm-contact-form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            if (contactNickname.trim().length === 0 || !looksLikeNpub(contactNpub)) return
+            void runAction('addContact')
+          }}
+        >
+          <label>昵称<input type="text" value={contactNickname} onChange={(event) => setContactNickname(event.target.value)} /></label>
+          <label>公钥（npub）<input type="text" value={contactNpub} onChange={(event) => setContactNpub(event.target.value)} /></label>
+          <label>角色（可选）<input type="text" value={contactRole} onChange={(event) => setContactRole(event.target.value)} /></label>
+          <button
+            type="submit"
+            disabled={pending !== null || contactNickname.trim().length === 0 || !looksLikeNpub(contactNpub)}
+          >
+            {pending === 'addContact' ? '添加中…' : '添加联系人'}
+          </button>
+        </form>
       </section>
 
       <section className="comm-card">
