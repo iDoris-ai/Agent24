@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "storage_unavailable",
+    "message": "documents.db could not be opened",
+    "details": { "retryable": true }
+  }
+}

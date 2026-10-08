@@ -3090,6 +3090,10 @@ pub(crate) mod tests {
         "/sin90/proposals/{id}",
         "/sin90/proposals/{id}/accept",
         "/sin90/attention",
+        // Documenting OS (ADR-DOC-02 §4), served by rust/apps/agent24-documents.
+        "/documents/capabilities",
+        "/documents/documents",
+        "/documents/documents/{document_id}",
     ];
 
     // COMM routes are mounted by server::serve, outside the scanned builder;
