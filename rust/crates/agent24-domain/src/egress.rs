@@ -10,6 +10,7 @@ pub enum EgressPurpose {
     HttpFetch,
     McpTool,
     ModuleTool,
+    ProcessExecution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +151,7 @@ impl dyn EgressGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct ExactGrant {
         resource: &'static str,
@@ -261,5 +263,34 @@ mod tests {
             7,
         );
         assert!(unknown.authorize(&grant).await.is_err());
+    }
+
+    struct RevocableGrant(AtomicBool);
+
+    #[async_trait]
+    impl EgressGate for RevocableGrant {
+        async fn check(&self, _request: &EgressRequest) -> Result<(), EgressDecision> {
+            self.0
+                .load(Ordering::SeqCst)
+                .then_some(())
+                .ok_or(EgressDecision)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queued_authorization_is_rechecked_after_revocation_or_expiry() {
+        let grant = RevocableGrant(AtomicBool::new(true));
+        let request = EgressRequest::remote(
+            vec![
+                EgressResource::cloud_authorized("doc:a", "rev-1", 2)
+                    .with_authorization_ref("grant-a"),
+            ],
+            EgressPurpose::ModelInference,
+            EgressDestination::exact("provider:a"),
+            9,
+        );
+        assert!(request.authorize(&grant).await.is_ok());
+        grant.0.store(false, Ordering::SeqCst);
+        assert!(request.authorize(&grant).await.is_err());
     }
 }
