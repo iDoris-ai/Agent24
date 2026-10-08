@@ -116,6 +116,17 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
     }
 }
 
+/// Module id of the Documenting OS, as adopted in ADR-DOC-01
+/// (`docs/documenting/adr/ADR-DOC-01-placement-and-integration.md`). Gate 5
+/// (jason 2026-10-08 ruling #5) withholds this module's tools whenever a remote
+/// model tier exists, until K1-6a and K1-6b are both accepted.
+const DOCUMENTS_MODULE_ID: &str = "documents";
+
+/// Whether gate 5 treats `module` as a document-class module.
+fn is_document_class_module(module: &str) -> bool {
+    module == DOCUMENTS_MODULE_ID
+}
+
 pub struct AgentModuleToolAdvertView {
     runtime: Arc<AgentModuleToolRuntime>,
     authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
@@ -159,7 +170,7 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
     }
 
     async fn blocked_by_remote_tier_guard(&self, module: &str, _operation: &str) -> bool {
-        self.remote_tier_present && module == "documenting"
+        self.remote_tier_present && is_document_class_module(module)
     }
 }
 
@@ -168,6 +179,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn gate_five_recognises_the_adopted_documents_module_id() {
+        // ADR-DOC-01 adopted "documents"; the earlier "documenting" literal
+        // never matched any real module, leaving gate 5 dead (#790 review).
+        assert!(is_document_class_module("documents"));
+        assert!(!is_document_class_module("documenting"));
+        assert!(!is_document_class_module("sin90"));
+    }
     use agent24_domain::tool::{ModuleToolCallError, ModuleToolResult};
     use agent24_policy::consent_gate::{
         ConsentGate, ConsentGateRequest, ModuleConsentAuthorization, StoreConsentGate,
