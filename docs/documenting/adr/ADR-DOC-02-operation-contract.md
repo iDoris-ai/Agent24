@@ -170,7 +170,18 @@
 | `permission_denied` | 403 | `Denied` | OS 侧拒绝 |
 | `knowledge_unavailable` | 503 | `Failed` | `retryable: true` |
 | `engine_unavailable` | 503 | `Failed` | `details.engine`；`retryable: true` |
-| `storage_unavailable` | 503 | `Failed` | `data_dir` 或 DB 不可用；与知识关闭是不同状态 |
+| `storage_unavailable` | 503 | `Failed` | `data_dir` 或 DB 不可用；与知识关闭是不同状态。`details.cause` 说明原因；`retryable` **按原因定**（见表下说明） |
+
+**`storage_unavailable` 的 `retryable`**（David，2026-10-08，回应 #803 评审）：不像 `engine_unavailable` / `knowledge_unavailable` 那样固定为 `true`，而是由 OS 按原因决定。这是有意的不对称，不要统一改成 `true`。
+
+| `details.cause` | `retryable` | 含义 |
+|---|---|---|
+| `locked` / `busy` | `true` | DB 被锁或暂时打不开，稍后重试即可 |
+| `corrupt` | `false` | DB 或 blob 区校验失败，需要用户处理 |
+| `not_writable` | `false` | `data_dir` 不可写（权限、只读卷） |
+| `disk_full` | `false` | 磁盘已满，释放空间后由用户重试 |
+
+界面对 `retryable: false` 的情况给出处理提示，不自动重试。
 
 **会看到但不属于本命名空间的内核 / 代理码**：
 
