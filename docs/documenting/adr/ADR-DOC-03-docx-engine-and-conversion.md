@@ -159,13 +159,23 @@ Windows 的时间点仍然跟随 ADR-DOC-01 D10。
 
 **交叉验证**：SuperDoc 的输出交给 LibreOffice 打开并导出 PDF。中文、合并单元格、新增行和图片都正常。
 
+**真实 Word 读取验证**（Word for Mac 16.113.4，未授权的只读模式，通过 AppleScript 读取）：
+- 7 个文件（原始样本、SuperDoc 的 4 个版本、LibreOffice 的 2 个版本）都能正常打开，没有出现修复提示。
+- SuperDoc 的输出：
+  - Word 识别出书签、批注、脚注、表格、图片和内容控件里的文字；
+  - 修订模式下读到 10 条修订：Agent24 8 条，王五 2 条；
+  - 选择性提交后只剩王五的 2 条，被拒的单元格恢复为"待定"；
+  - `final` 导出后 0 条，王五的修订也被接受了。
+- LibreOffice 修订模式的输出：作者全部显示为 "Unknown Author"，我们的署名丢失。
+
 **脚本与样本**：见 `docs/documenting/evidence/2026-10-08-engine-poc/`（另一个 PR）。
 
 ## 6. 待办与重新评估的条件
 
 | 项 | 时机 | 说明 |
 |---|---|---|
-| 在真实 Microsoft Word 中重新打开 | DOC-1 第 2 片验收前 | 本次没有 Word，只用 LibreOffice 替代；需要一台装有声明支持版本 Word 的 macOS 机器 |
+| Word 中的版式核对（从 Word 导出 PDF，与 LibreOffice 渲染逐页对比） | **暂缓**（jason 2026-10-08）；DOC-1 第 2 片验收前补做 | 读取层面已用真实 Word 验证（§5）。版式需要 Word 能保存或导出，当前的 Word 未授权，只能只读 |
+| G6b Office 回流实测（在 Word 中修改后导回） | **暂缓**（jason 2026-10-08）；与下面的回流操作一起做 | 同样需要授权的 Word |
 | 用 S03 / S08 真实 Word 模板复测 | DOC-1 第 2 片 | 本次样本是手写的 |
 | #692 格式矩阵 | DOC-1 第 2 片之前 | README §17 规定 #3 先于 #6。本 ADR 提前定了引擎方向，若矩阵要求的能力 SuperDoc 不能通过，就重新评估 |
 | 正式许可审查 | 首个对外发行之前 | 审查 D2 边界，以及下载组件的源码提供义务 |
