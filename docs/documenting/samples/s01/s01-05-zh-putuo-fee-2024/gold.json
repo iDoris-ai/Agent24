@@ -1,90 +1,43 @@
 {
   "id": "s01-05-zh-putuo-fee-2024",
-  "schema": "s01-gold-v1",
+  "schema": "s01-gold-v2",
   "fields": [
-    {
-      "key": "dog_fee_inner_ring",
-      "status": "present",
-      "value": "内环以内区域500元/犬.年",
-      "anchors": [
-        {
-          "page": 9,
-          "quote": "内环以内区域500元/犬.年"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "dog_fee_outer_ring",
-      "status": "present",
-      "value": "内环以外区域300元/犬.年（农村地区停征）",
-      "negation": true,
-      "anchors": [
-        {
-          "page": 9,
-          "quote": "内环以外区域300元/犬.年(农村地区"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "residence_permit_fee",
-      "status": "present",
-      "value": "20元/证",
-      "anchors": [
-        {
-          "page": 9,
-          "quote": "20元/证"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "id_card_first_issue_exemption",
-      "status": "present",
-      "value": "停征首次申领居民身份证工本费",
-      "negation": true,
-      "anchors": [
-        {
-          "page": 7,
-          "quote": "停征首次申领"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "approval_number_leading_zero",
-      "status": "present",
-      "value": "沪价费[2012]009号",
-      "anchors": [
-        {
-          "page": 3,
-          "quote": "沪价费[2012]009号"
-        }
-      ],
-      "severity": "critical"
-    },
-    {
-      "key": "referenced_exam_fee_table",
-      "status": "missing",
-      "anchors": [
-        {
-          "page": 10,
-          "quote": "后附表《上海市考试考务费目录清单》"
-        }
-      ],
-      "severity": "major",
-      "note": "被引用的附表不在本文件中"
-    },
-    {
-      "key": "issue_date",
-      "status": "missing",
-      "severity": "major"
-    }
+    {"key": "directory_year", "q": "ctx", "status": "present", "value": "2024年度", "normalized": "2024", "severity": "critical", "anchors": [{"page": 1, "quote": "上海市普陀区2024年度行政事业性收费目录清单"}], "note": "防止拿 2025 年度的上海市目录（s01-01）替代", "role": "context"},
+    {"key": "issue_date", "q": "ctx", "status": "missing", "severity": "critical", "missing_reason": "not_in_document", "note": "全 10 页没有成文或发布日期；“2024年度”是目录年度，URL 里的 2025 也不是日期标注", "role": "context"},
+    {"key": "dog_fee_inner_ring", "q": "Q3", "status": "present", "value": "内环以内区域500元/犬.年", "applies_if": ["养犬地点在内环以内区域"], "severity": "critical", "anchors": [{"page": 9, "quote": "19 犬类管理费", "part": "row"}, {"page": 9, "quote": "收费标准", "part": "column"}, {"page": 9, "quote": "内环以内区域500元/犬.年"}]},
+    {"key": "dog_fee_outer_ring", "q": "Q3", "status": "present", "value": "内环以外区域300元/犬.年", "applies_if": ["养犬地点在内环以外区域"], "exceptions": ["rural_dog_fee_suspension"], "severity": "critical", "anchors": [{"page": 9, "quote": "19 犬类管理费", "part": "row"}, {"page": 9, "quote": "收费标准", "part": "column"}, {"page": 9, "quote": "内环以外区域300元/犬.年(农村地区停征)"}]},
+    {"key": "rural_dog_fee_suspension", "q": "Q4", "status": "present", "value": "(农村地区停征)", "audience": "内环以外区域农村地区的养犬人", "applies_if": ["养犬地点在内环以外区域的农村地区"], "negation": true, "severity": "critical", "anchors": [{"page": 9, "quote": "19 犬类管理费", "part": "row"}, {"page": 9, "quote": "收费标准", "part": "column"}, {"page": 9, "quote": "内环以外区域300元/犬.年(农村地区停征)"}], "note": "原文是半角括号，照录"},
+    {"key": "residence_card_lost_or_damaged_replacement_fee", "q": "Q3", "status": "present", "value": "20元/证", "applies_if": ["上海市居住证丢失或损坏后补办"], "severity": "critical", "anchors": [{"page": 9, "quote": "20 上海市居住证工本费(限丢失、损坏补办)", "part": "row"}, {"page": 9, "quote": "收费标准", "part": "column"}, {"page": 9, "quote": "上海市居住证工本费(限丢失、损坏补办) 20元/证"}]},
+    {"key": "id_card_renewal_fee", "q": "Q3", "status": "present", "value": "到期换发20元/证", "applies_if": ["居民身份证到期换发"], "severity": "critical", "anchors": [{"page": 7, "quote": "①居民身份证", "part": "row"}, {"page": 7, "quote": "收费标准", "part": "column"}, {"page": 7, "quote": "到期换发20元/证"}]},
+    {"key": "id_card_loss_replacement_fee", "q": "Q3", "status": "present", "value": "因丢失损换等换、补领40元/证", "applies_if": ["因丢失、损坏等原因换领或补领居民身份证"], "severity": "critical", "anchors": [{"page": 7, "quote": "①居民身份证", "part": "row"}, {"page": 7, "quote": "收费标准", "part": "column"}, {"page": 7, "quote": "因丢失损换等换、补领40元/证"}], "note": "原文“损换”照录（疑为“损坏”），不得改写"},
+    {"key": "id_card_first_issue_exemption", "q": "Q4", "status": "present", "value": "停征首次申领居民身份证工本费", "audience": "首次申领居民身份证的人", "applies_if": ["首次申领"], "negation": true, "severity": "critical", "anchors": [{"page": 7, "quote": "(4)居民身份证工本费", "part": "row"}, {"page": 7, "quote": "备注", "part": "column"}, {"page": 7, "quote": "停征首次申领居民身份证工本费"}]},
+    {"key": "temporary_id_card_fee", "q": "Q3", "status": "present", "value": "10元/证", "applies_if": ["申领临时身份证"], "severity": "critical", "anchors": [{"page": 8, "quote": "②临时身份证 10元/证", "part": "row"}, {"page": 8, "quote": "收费标准", "part": "column"}]},
+    {"key": "passport_fee", "q": "Q3", "status": "present", "value": "120元/本", "applies_if": ["申领护照"], "severity": "critical", "anchors": [{"page": 8, "quote": "(5)公民出入境证件费", "part": "row"}, {"page": 8, "quote": "①护照 120元/本", "part": "row"}, {"page": 8, "quote": "收费标准", "part": "column"}]},
+    {"key": "public_kindergarten_full_day_level1_fee", "q": "Q3", "status": "present", "value": "225元/月", "applies_if": ["公办幼儿园", "全日制", "一级园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "全日制一级园225元/月、二级园175元/月、三级园125元/月、市级示范园700元/月；"}]},
+    {"key": "public_kindergarten_full_day_level2_fee", "q": "Q3", "status": "present", "value": "175元/月", "applies_if": ["公办幼儿园", "全日制", "二级园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "全日制一级园225元/月、二级园175元/月、三级园125元/月、市级示范园700元/月；"}]},
+    {"key": "public_kindergarten_full_day_level3_fee", "q": "Q3", "status": "present", "value": "125元/月", "applies_if": ["公办幼儿园", "全日制", "三级园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "全日制一级园225元/月、二级园175元/月、三级园125元/月、市级示范园700元/月；"}]},
+    {"key": "public_kindergarten_full_day_model_fee", "q": "Q3", "status": "present", "value": "700元/月", "applies_if": ["公办幼儿园", "全日制", "市级示范园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "全日制一级园225元/月、二级园175元/月、三级园125元/月、市级示范园700元/月；"}]},
+    {"key": "public_kindergarten_boarding_level1_fee", "q": "Q3", "status": "present", "value": "390元/月", "applies_if": ["公办幼儿园", "寄宿制", "一级园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "寄宿制一级园390元/月、二级园340元/月、三级园290元/月、市级示范园800元/月"}]},
+    {"key": "public_kindergarten_boarding_level2_fee", "q": "Q3", "status": "present", "value": "340元/月", "applies_if": ["公办幼儿园", "寄宿制", "二级园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "寄宿制一级园390元/月、二级园340元/月、三级园290元/月、市级示范园800元/月"}]},
+    {"key": "public_kindergarten_boarding_level3_fee", "q": "Q3", "status": "present", "value": "290元/月", "applies_if": ["公办幼儿园", "寄宿制", "三级园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "寄宿制一级园390元/月、二级园340元/月、三级园290元/月、市级示范园800元/月"}]},
+    {"key": "public_kindergarten_boarding_model_fee", "q": "Q3", "status": "present", "value": "800元/月", "applies_if": ["公办幼儿园", "寄宿制", "市级示范园"], "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "收费标准", "part": "column"}, {"page": 3, "quote": "寄宿制一级园390元/月、二级园340元/月、三级园290元/月、市级示范园800元/月"}]},
+    {"key": "public_kindergarten_fee_approval_number", "q": "ctx", "status": "present", "value": "沪价费[2012]009号", "severity": "critical", "anchors": [{"page": 3, "quote": "(1)公办幼儿园保育教育费", "part": "row"}, {"page": 3, "quote": "批准文号", "part": "column"}, {"page": 3, "quote": "沪价费[2012]009号"}], "note": "前导零和方括号都照录。显示页上位于该行“批准文号”列（按渲染页核对）；文本层把它排在“(2)托儿所管理费”之后", "role": "context"},
+    {"key": "foreign_invested_enterprise_site_use_fee", "q": "ctx", "status": "present", "value": "0.50-170元/平方米.年，详见文件", "audience": "外商投资企业", "severity": "critical", "anchors": [{"page": 2, "quote": "6 外商投资企业场地使用费", "part": "row"}, {"page": 2, "quote": "收费标准", "part": "column"}, {"page": 2, "quote": "0.50-170元/平方米.年，详见文件"}], "note": "面向企业，不是本样本读者的必答项；用来测 0.50 的末尾零、区间和单位", "role": "context"},
+    {"key": "exam_fee_table_reference", "q": "ctx", "status": "present", "value": "后附表《上海市考试考务费目录清单》", "severity": "minor", "anchors": [{"page": 10, "quote": "3.后附表《上海市考试考务费目录清单》。"}], "role": "context"},
+    {"key": "exam_fee_table_content", "q": "ctx", "status": "missing", "severity": "critical", "missing_reason": "referenced_but_absent", "note": "p10 注 3 提到附表，但 10 页里没有这张表", "role": "context"},
+    {"key": "application_contact", "q": "Q6", "status": "missing", "severity": "critical", "missing_reason": "not_in_document", "note": "全文没有办理地址或电话"}
   ],
   "must_not_assert": [
-    "exam fee amounts from the missing attached table",
-    "an issue date"
+    {"proposition": "清单写明了考试考务费的具体金额"},
+    {"proposition": "清单写明了成文日期"},
+    {"proposition": "清单写明了发布日期"},
+    {"proposition": "这是 2025 年度的收费目录"},
+    {"proposition": "所有上海市居住证的办理（含首次办理）都收 20 元/证"},
+    {"proposition": "农村地区也要缴纳犬类管理费"},
+    {"proposition": "所有居民身份证的申领、换领、补领都免费"},
+    {"proposition": "本清单规定了 2025–2027 年首次申领台湾居民来往大陆通行证免收证件费"},
+    {"proposition": "文件给出了办理地址"},
+    {"proposition": "文件给出了咨询电话"}
   ],
   "labeled_by": "claude-draft",
   "verified_by": null
