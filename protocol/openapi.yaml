@@ -1734,6 +1734,85 @@ paths:
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
         "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
 
+  /documents/uploads:
+    post:
+      operationId: documentsCreateUpload
+      tags: [documents]
+      summary: Start a chunked upload (ADR-DOC-02 §5.6)
+      description: >-
+        Idempotent on `Idempotency-Key` (kind `upload`, §5.4): the same key
+        with the same body returns the existing upload; with a different
+        body, `idempotency_key_reused`.
+      parameters:
+        - $ref: "#/components/parameters/DocumentsIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentsUploadRequest" }
+      responses:
+        "200":
+          description: Replay of an existing upload with the same key and body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsUpload" }
+        "201":
+          description: Upload created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsUpload" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "422": { $ref: "#/components/responses/DocumentsUploadUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/uploads/{upload_id}/chunks:
+    post:
+      operationId: documentsAppendUploadChunk
+      tags: [documents]
+      summary: Append one chunk of raw bytes at the given offset
+      description: >-
+        At most 786432 bytes (768 KiB) of raw body per chunk, counted in
+        bytes by the OS, leaving room under the 1 MiB proxy body limit. An
+        offset equal to the bytes received so far appends; a chunk already
+        received with the same hash is a 200 replay; anything else is
+        `upload_offset_mismatch` with `details.received_offset` (§5.6). The
+        checks run in that order: for a new chunk (offset equal to the bytes
+        received so far), a `Chunk-Sha256` that does not match the body's
+        bytes is 400 `invalid_request`; for a range already received, any
+        hash other than the stored one is the 409 above, as §5.6 requires.
+      parameters:
+        - $ref: "#/components/parameters/UploadId"
+        - name: Upload-Offset
+          in: header
+          required: true
+          schema: { type: integer, minimum: 0 }
+        - name: Chunk-Sha256
+          in: header
+          required: true
+          schema: { $ref: "#/components/schemas/Sha256Address" }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary, maxLength: 786432 }
+      responses:
+        "200":
+          description: The upload after this chunk
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsUpload" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/DocumentsConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1763,6 +1842,17 @@ components:
       required: false
       description: Opaque `next_cursor` from the previous page (ADR-DOC-02 §4).
       schema: { type: string }
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$" }
+    DocumentsIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-chosen key; reused on retry after an unknown outcome (§5.5).
+      schema: { type: string, minLength: 1, maxLength: 200 }
     DocumentsLimit:
       name: limit
       in: query
@@ -1809,14 +1899,19 @@ components:
 
     DocumentsBadRequest:
       description: >-
-        `invalid_request` from the OS (DocumentsError) or from the kernel
-        (generic Error); the code is shared, so either envelope may arrive.
+        `invalid_request` from the OS (DocumentsError, with details), or
+        `invalid_request` / `invalid_request_path` from the kernel proxy (no
+        details).
       content:
         application/json:
           schema:
             anyOf:
-              - $ref: "#/components/schemas/DocumentsError"
-              - $ref: "#/components/schemas/ModuleProxyError"
+              - $ref: "#/components/schemas/DocumentsInvalidRequestError"
+              - allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties: { code: { enum: [invalid_request, invalid_request_path] }, details: false }
     DocumentsNotFound:
       description: >-
         `not_found`: the document, revision, job or upload does not exist or
@@ -1826,8 +1921,22 @@ components:
         application/json:
           schema:
             anyOf:
-              - $ref: "#/components/schemas/DocumentsError"
-              - $ref: "#/components/schemas/ModuleProxyError"
+              - $ref: "#/components/schemas/DocumentsNotFoundError"
+              - allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties: { code: { enum: [not_found] }, details: false }
+    DocumentsConflict:
+      description: "`upload_offset_mismatch` with `details.received_offset` (§5.6)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsConflictError" }
+    DocumentsUploadUnprocessable:
+      description: "`idempotency_key_reused`: the same key with a different body (§5.4)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsUploadUnprocessableError" }
     DocumentsUnavailable:
       description: >-
         Exactly one of: the OS reports `storage_unavailable`,
@@ -2954,6 +3063,19 @@ components:
                   details:
                     required: [received_offset]
                     properties: { received_offset: { type: integer, minimum: 0 } }
+            # storage_unavailable: retryable depends on the cause (ADR-DOC-02 §6,
+            # David 2026-10-08) — only lock contention is worth an automatic retry.
+            - if: { properties: { code: { const: storage_unavailable } } }
+              then:
+                properties:
+                  details:
+                    required: [cause]
+                    properties:
+                      cause: { enum: [locked, busy, corrupt, not_writable, disk_full] }
+                    allOf:
+                      - if: { properties: { cause: { enum: [locked, busy] } } }
+                        then: { properties: { retryable: { const: true } } }
+                        else: { properties: { retryable: { const: false } } }
     DocumentsUnavailableError:
       description: The three availability codes a 503 from the OS itself may carry.
       allOf:
@@ -2963,6 +3085,42 @@ components:
             error:
               properties:
                 code: { enum: [storage_unavailable, engine_unavailable, knowledge_unavailable] }
+    DocumentsInvalidRequestError:
+      description: A 400 from the OS itself.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [invalid_request] }
+    DocumentsNotFoundError:
+      description: A 404 from the OS itself.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [not_found] }
+    DocumentsConflictError:
+      description: The 409s of the slice-1 upload routes.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [upload_offset_mismatch] }
+    DocumentsUploadUnprocessableError:
+      description: The 422 of upload creation.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [idempotency_key_reused] }
     ModuleProxyError:
       description: >-
         An error produced by the kernel or its proxy, not by the OS: the
@@ -3065,6 +3223,36 @@ components:
           required: [head]
           properties:
             head: { $ref: "#/components/schemas/DocumentRevisionSummary" }
+    DocumentsUploadRequest:
+      type: object
+      required: [total_size, sha256]
+      additionalProperties: false
+      properties:
+        total_size: { type: integer, minimum: 1 }
+        sha256:
+          $ref: "#/components/schemas/Sha256Address"
+          description: Whole-file hash, checked at import (`upload_checksum_mismatch`).
+        filename:
+          type: string
+          description: >-
+            Display name only, used as the default title. A base name, never a
+            path (ADR-001): no `/` or `\`.
+          minLength: 1
+          maxLength: 255
+          pattern: "^[^/\\\\]+$"
+    DocumentsUpload:
+      type: object
+      required: [upload_id, total_size, sha256, received, status, expires_at]
+      properties:
+        upload_id: { type: string, pattern: "^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$" }
+        total_size: { type: integer, minimum: 1 }
+        sha256: { $ref: "#/components/schemas/Sha256Address" }
+        received: { type: integer, minimum: 0 }
+        status: { type: string, enum: [receiving, complete, imported, expired] }
+        expires_at:
+          type: string
+          format: date-time
+          description: 24 h after the last chunk arrived (§5.6).
     DocumentList:
       type: object
       required: [documents, next_cursor]

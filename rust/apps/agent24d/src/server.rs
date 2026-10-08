@@ -3094,6 +3094,8 @@ pub(crate) mod tests {
         "/documents/capabilities",
         "/documents/documents",
         "/documents/documents/{document_id}",
+        "/documents/uploads",
+        "/documents/uploads/{upload_id}/chunks",
     ];
 
     // COMM routes are mounted by server::serve, outside the scanned builder;
