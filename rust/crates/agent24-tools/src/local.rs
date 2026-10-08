@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Tool, ToolContext, ToolError, truncate};
+use agent24_domain::{EgressDestination, EgressPurpose};
 
 const MAX_READ_BYTES: usize = 256 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024;
@@ -349,6 +350,15 @@ impl Tool for ShellExecTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        // Child processes are not network-isolated by the host. Their argv,
+        // stdin, shared files and later socket traffic cannot be bounded to a
+        // provable destination, so a run policy cannot authorize this path.
+        // Keep this before spawn (including the already-approved resume path).
+        ctx.authorize_egress(
+            EgressPurpose::ProcessExecution,
+            EgressDestination::unknown(),
+        )
+        .await?;
         let argv: Vec<String> = input
             .get("argv")
             .and_then(Value::as_array)
@@ -609,20 +619,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_exec_runs_argv_without_shell_interpretation() {
+    async fn shell_exec_fails_closed_when_child_network_use_cannot_be_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
-        let cancel = CancellationToken::new();
         let mut input = Map::new();
-        // `$HOME` must NOT be expanded — argv goes straight to exec
+        input.insert("argv".to_owned(), serde_json::json!(["/bin/echo", "safe"]));
+        let err = tool
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn shell_exec_does_not_spawn_when_egress_policy_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let mut input = Map::new();
         input.insert(
             "argv".to_owned(),
-            serde_json::json!(["/bin/echo", "$HOME", "two words"]),
+            serde_json::json!(["/usr/bin/touch", marker]),
         );
-        let out = tool.call(&ctx(), &input, &cancel).await.unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["exit_code"], 0);
-        assert_eq!(parsed["stdout"], "$HOME two words\n");
+        let err = tool
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a denied shell command must not spawn");
     }
 
     /// FU-103/J-6, end-to-end through `ShellExecTool::call` (not just the
@@ -664,34 +688,26 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
-        let cancel = CancellationToken::new();
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["printenv"]));
-        let out = tool.call(&ctx(), &input, &cancel).await.unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        let stdout = parsed["stdout"].as_str().unwrap();
-        assert!(
-            !stdout.contains("secret_test_key"),
-            "secret leaked into shell_exec's child:\n{stdout}"
-        );
-        assert!(
-            stdout.contains("PATH="),
-            "PATH must still reach shell_exec's child:\n{stdout}"
-        );
+        let err = tool
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
     }
 
     #[tokio::test]
-    async fn shell_exec_reports_nonzero_exit() {
+    async fn shell_exec_does_not_run_nonzero_command_without_network_sandbox() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ShellExecTool::new(dir.path().to_path_buf());
         let mut input = Map::new();
         input.insert("argv".to_owned(), serde_json::json!(["/usr/bin/false"]));
-        let out = tool
+        let err = tool
             .call(&ctx(), &input, &CancellationToken::new())
             .await
-            .unwrap();
-        let parsed: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["exit_code"], 1);
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
     }
 
     #[tokio::test]
@@ -739,7 +755,7 @@ mod tests {
             .dispatch("shell_exec", &ctx(), &input, &CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Timeout(_)), "{err}");
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

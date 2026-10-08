@@ -481,9 +481,13 @@ impl ModelRouter {
                         .map_or_else(EgressDestination::unknown, EgressDestination::exact),
                     authorization_generation,
                 );
-                request.authorize(gate.as_ref()).await.map_err(|_| {
-                    ModelError::Unavailable("outbound policy denied or unavailable".into())
-                })?;
+                if request.authorize(gate.as_ref()).await.is_err() {
+                    tried.push(format!(
+                        "{}: outbound policy denied or unavailable",
+                        r.provider.name()
+                    ));
+                    continue;
+                }
             }
             match r.provider.complete(req, cancel).await {
                 Ok(response) => {
@@ -706,6 +710,17 @@ mod tests {
         )
     }
 
+    struct TestDeny;
+    #[async_trait]
+    impl EgressGate for TestDeny {
+        async fn check(
+            &self,
+            _request: &EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            Err(agent24_domain::EgressDecision)
+        }
+    }
+
     #[test]
     fn tier_order_respects_privacy_and_complexity() {
         assert_eq!(
@@ -798,6 +813,42 @@ mod tests {
                 .is_err()
         );
         assert_eq!(remote.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn denied_remote_falls_back_to_healthy_local_provider() {
+        let remote = StubProvider::ok("remote");
+        let local = StubProvider::ok("local");
+        let r = router(vec![
+            (remote.clone(), Tier::Remote),
+            (local.clone(), Tier::Local),
+        ]);
+        let resources = vec![
+            EgressResource::cloud_authorized("test-resource", "test-revision", 1)
+                .with_authorization_ref("test-grant"),
+        ];
+        let served = r
+            .complete_served_with_egress(
+                TaskProfile {
+                    privacy: Privacy::Any,
+                    complexity: Complexity::Complex,
+                },
+                &req(),
+                &CancellationToken::new(),
+                Arc::new(TestDeny),
+                resources,
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(served.provider, "local");
+        assert_eq!(
+            remote.calls(),
+            0,
+            "a denied remote provider is never called"
+        );
+        assert_eq!(local.calls(), 1);
     }
 
     #[tokio::test]

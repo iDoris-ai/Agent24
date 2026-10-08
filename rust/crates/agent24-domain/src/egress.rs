@@ -10,6 +10,7 @@ pub enum EgressPurpose {
     HttpFetch,
     McpTool,
     ModuleTool,
+    ProcessExecution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

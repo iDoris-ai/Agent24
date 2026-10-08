@@ -1463,12 +1463,10 @@ fn c8_local_only_never_reaches_the_remote_stub() {
         "a local_only call must NEVER reach the remote stub"
     );
 
-    // H4: re-register as `remote_allowed` (needs `allow_relax`), reconnect,
-    // confirm remote IS reachable now (positive control the design itself
-    // asks for) — then re-register back to `local_only` and confirm a fresh
-    // `complexity: complex` call after RECONNECTING still counts 0 on the
-    // remote stub (the whole point of C8's H4 case: the OLD ModelGrant must
-    // not survive a re-registration that narrows privacy).
+    // H4: re-register as `remote_allowed` (needs `allow_relax`) and reconnect.
+    // The attached-module path has no live host egress grant, so a denied
+    // remote candidate must fall back to the healthy local provider. Then
+    // narrow back to `local_only` and verify the remote stub remains untouched.
     fae.command(serde_json::json!({"op": "close"}));
     let remote_manifest =
         attach_manifest("agentear", &["events", "models"], Some("remote_allowed"));
@@ -1494,11 +1492,12 @@ fn c8_local_only_never_reaches_the_remote_stub() {
         "_a24/model/complete",
         serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "complexity": "complex"}),
     );
-    assert_eq!(resp2["result"]["tier"], "remote", "{resp2}");
+    assert_eq!(resp2["result"]["tier"], "local", "{resp2}");
+    assert_eq!(local.request_count(), 2);
     assert_eq!(
         remote.request_count(),
-        1,
-        "remote_allowed must be able to reach the remote stub"
+        0,
+        "without a live host egress grant, a denied remote candidate must not be called"
     );
     fae2.command(serde_json::json!({"op": "close"}));
 
@@ -1529,9 +1528,10 @@ fn c8_local_only_never_reaches_the_remote_stub() {
     );
     assert_eq!(
         remote.request_count(),
-        1,
+        0,
         "the remote count must NOT have grown after narrowing back to local_only (H4's own point)"
     );
+    assert_eq!(local.request_count(), 3);
 
     fae3.command(serde_json::json!({"op": "close"}));
     stop(d);
