@@ -1,14 +1,43 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tower::ServiceExt;
 
 use crate::error::StorageCause;
 use crate::state::AppState;
 
 use super::Row;
+
+/// Gates between a retry's commit and its worker's start, by job id.
+/// (job id, entered, release).
+type RetryGate = (String, Arc<Notify>, Arc<Notify>);
+static RETRY_GATES: std::sync::Mutex<Vec<RetryGate>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn retry_gate(job_id: &str) -> (Arc<Notify>, Arc<Notify>) {
+    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    RETRY_GATES
+        .lock()
+        .unwrap()
+        .push((job_id.to_owned(), entered.clone(), release.clone()));
+    (entered, release)
+}
+
+pub(super) async fn after_retry_commit(job_id: &str) {
+    let gate = {
+        let mut gates = RETRY_GATES.lock().unwrap();
+        let at = gates.iter().position(|g| g.0 == job_id);
+        at.map(|i| gates.remove(i))
+    };
+    if let Some((_, entered, release)) = gate {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
 
 const JOB: &str = "job_01K75A0B1C2D3E4F5G6H7J8K9M";
 const DOC: &str = "doc_01K74Z3QJ8V5N2W9RTX6YB4MCD";
@@ -30,7 +59,8 @@ async fn exec(state: &AppState, sql: &str) {
     sqlx::query(sql).execute(storage.db.pool()).await.unwrap();
 }
 
-/// The error a job in `status` carries, as the contract has it.
+/// The error a job in `status` carries, as the contract has it. These jobs
+/// are `probe`, a kind no worker runs, so a retry only queues them.
 fn error_for(status: &str) -> &'static str {
     match status {
         "failed" => "json_object('code', 'parse_failed', 'message', 'x')",
@@ -45,7 +75,7 @@ async fn add_job_as(state: &AppState, id: &str, status: &str) {
         state,
         &format!(
             "INSERT INTO jobs (id, kind, status, origin, error)
-             VALUES ('{id}', 'import', '{status}', '{{\"kind\":\"page\"}}', {error})"
+             VALUES ('{id}', 'probe', '{status}', '{{\"kind\":\"page\"}}', {error})"
         ),
     )
     .await;
@@ -112,7 +142,7 @@ async fn a_job_is_read_in_the_contract_shape() {
     assert_eq!(v["job_id"], JOB);
     assert_eq!(
         (v["kind"].as_str(), v["status"].as_str()),
-        (Some("import"), Some("queued"))
+        (Some("probe"), Some("queued"))
     );
     assert_eq!(v["progress"], Value::Null);
     assert_eq!(v["error"], Value::Null);
@@ -323,6 +353,23 @@ async fn a_row_that_breaks_the_status_rules_is_never_sent() {
             .await;
         } else {
             add_job(&env.state, "queued").await;
+            if status == "succeeded" {
+                // A succeeded import must name its document and r1.
+                exec(
+                    &env.state,
+                    "INSERT INTO jobs (id, kind, status, origin) VALUES ('job_01K75A0B1C2D3E4F5G6H7J8K9N', 'import', 'queued', '{\"kind\":\"page\"}')",
+                )
+                .await;
+                exec(
+                    &env.state,
+                    "UPDATE jobs SET status = 'succeeded' WHERE id = 'job_01K75A0B1C2D3E4F5G6H7J8K9N'",
+                )
+                .await;
+                let (code, v) =
+                    call(&env.state, "GET", "/jobs/job_01K75A0B1C2D3E4F5G6H7J8K9N").await;
+                assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+                continue;
+            }
             exec(
                 &env.state,
                 &format!("UPDATE jobs SET status = '{status}', {set}"),
@@ -359,7 +406,17 @@ async fn a_restart_interrupts_working_jobs_and_finishes_cancelling_ones() {
             add_job_as(&state, id, status).await;
         }
     }
-    let state = AppState::open(dir.path()).await;
+    // Reopening in the same process can find the blob store lock still held
+    // for a moment (seen ~1 in 20 full-suite runs; e.g. a child another test
+    // spawns can briefly hold a copy of the descriptor). A restart is a new
+    // process, so this only affects the test: wait for the lock a little.
+    let state = AppState::open_with(dir.path(), std::time::Duration::ZERO).await;
+    for _ in 0..100 {
+        if state.storage().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     for (id, _, after) in ids {
         let (code, v) = call(&state, "GET", &format!("/jobs/{id}")).await;
         assert_eq!(code, StatusCode::OK, "{id}: {v}");
