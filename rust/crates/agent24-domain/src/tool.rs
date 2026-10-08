@@ -827,11 +827,13 @@ mod tests {
         }
     }
 
-    /// Uses gates 1-4's fail-closed defaults and explicitly blocks at gate 5.
+    /// Relies ONLY on gates 1-4's fail-closed defaults: gate 5 answers
+    /// "not blocked" on purpose, so `the_default_trait_advertises_nothing`
+    /// proves gates 1-3 alone keep everything unadvertised (#773 review).
     struct NoopView;
     impl ModuleToolAdvertView for NoopView {
         fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
-            true
+            false
         }
     }
 
