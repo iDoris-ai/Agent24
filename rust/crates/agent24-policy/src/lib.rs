@@ -1613,6 +1613,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guardian_low_risk_module_per_call_approval_still_asks_a_human() {
+        let guardian = Arc::new(Guardian::new(Arc::new(FixedAssessor(
+            guardian::RiskLevel::Low,
+        ))));
+        let (broker, _events, store) = broker_with(Duration::from_secs(30), Some(guardian)).await;
+        seed_run(&store, "run_module_guardian").await;
+
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            let mut request = req(
+                "run_module_guardian",
+                Some("sess_guardian"),
+                "tc_module_guardian",
+                "module.write_local",
+                "module",
+                "module.write_local: {}".to_owned(),
+                Map::new(),
+            );
+            request.source = "module";
+            request.per_call_approval = true;
+            b.request(request, &request_cancel).await
+        });
+
+        let id = wait_for_pending(&store).await;
+        let audits = store.list_audit().await.unwrap();
+        assert!(audits.iter().any(|audit| {
+            audit.action == "approval.guardian_escalated"
+                && audit.detail["reason"] == "module_per_call_approval"
+                && audit.detail["tool_call_id"] == "tc_module_guardian"
+        }));
+        assert_eq!(
+            store
+                .list_approvals(Some(ApprovalStatus::Pending))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a low Guardian verdict must not approve a module call without a human"
+        );
+
+        cancel.cancel();
+        assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
+        assert_eq!(
+            store.get_approval(&id).await.unwrap().unwrap().status,
+            ApprovalStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
     async fn grants_are_scoped_to_session_and_tool() {
         // An approve_for_session grant must NOT leak across sessions or tools:
         // a different session, or a different tool in the same session, still

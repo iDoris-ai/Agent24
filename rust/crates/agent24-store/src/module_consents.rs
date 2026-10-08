@@ -90,6 +90,10 @@ pub struct ToolPermissionSummary {
     pub readable: Option<String>,
     pub writable: Option<String>,
     pub external: Option<String>,
+    /// Whether the tool declares reversible-draft semantics. This remains a
+    /// declaration only; it is included in the consent fingerprint so
+    /// changing this exemption-relevant property invalidates prior consent.
+    pub reversible_draft: bool,
     /// Already clamped by [`Self::new`] — ADR §4/jason's ruling: a
     /// `ManualInstall` source can never carry a risk below `High`, regardless
     /// of what the host's own tool analysis computed.
@@ -131,13 +135,15 @@ impl ToolPermissionSummary {
             readable,
             writable,
             external,
+            reversible_draft: false,
             risk,
         }
     }
 
     /// The "权限范围指纹" (ADR §4 permission-scope fingerprint): a digest of
     /// everything a lookup must treat as "the same grant" — source, risk,
-    /// and the three scope descriptions. Deliberately excludes
+    /// the three scope descriptions, and whether the tool declares
+    /// reversible-draft semantics. Deliberately excludes
     /// `module_version`: [`Store::lookup_module_consent`] checks version and
     /// fingerprint as two INDEPENDENT dimensions (task spec: "版本或权限指纹
     /// 变化时旧授权不匹配"), so a version bump with byte-identical scope
@@ -145,7 +151,7 @@ impl ToolPermissionSummary {
     /// into a changed fingerprint.
     ///
     /// PR #769 review (blocking F1): an earlier version of this function
-    /// joined the five fields with a literal `|field=` delimiter, which is
+    /// joined the fields with a literal `|field=` delimiter, which is
     /// NOT injective — a `readable`/`writable`/`external` value containing
     /// a substring like `|writable=` can make two genuinely different
     /// summaries hash identically (the review's exact A/B reproduction is
@@ -157,7 +163,7 @@ impl ToolPermissionSummary {
     /// order are fixed by the struct's declaration (never attacker/
     /// caller-influenced), and `None` serializes to the JSON literal `null`
     /// — byte-distinct from the quoted string `"-"`. Two different
-    /// `(source, risk, readable, writable, external)` tuples therefore
+    /// `(source, risk, readable, writable, external, reversible_draft)` tuples therefore
     /// always serialize to different byte strings, which is exactly what
     /// "fingerprint" requires.
     #[must_use]
@@ -169,6 +175,7 @@ impl ToolPermissionSummary {
             readable: self.readable.as_deref(),
             writable: self.writable.as_deref(),
             external: self.external.as_deref(),
+            reversible_draft: self.reversible_draft,
         };
         #[allow(
             clippy::expect_used,
@@ -182,7 +189,7 @@ impl ToolPermissionSummary {
 
 /// The exact byte shape [`ToolPermissionSummary::scope_fingerprint`] hashes.
 /// A dedicated struct — not a `format!`-joined string — IS the fix for PR
-/// #769's blocking F1: serde's struct serialization always emits these five
+/// #769's blocking F1: serde's struct serialization always emits these six
 /// keys, in this declaration order, with byte-escaped string values and a
 /// distinct `null` for `None`, so no value any field could hold can make two
 /// different tuples collide (see the doc comment above).
@@ -193,6 +200,7 @@ struct CanonicalScope<'a> {
     readable: Option<&'a str>,
     writable: Option<&'a str>,
     external: Option<&'a str>,
+    reversible_draft: bool,
 }
 
 /// A persisted consent decision — the row as stored, independent of what any
@@ -372,6 +380,16 @@ fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
 }
 
 impl Store {
+    /// Returns persisted per-tool authorization decisions for the host's
+    /// management surface. The route derives current status with
+    /// [`Store::lookup_module_consent`], which applies expiry and revocation.
+    pub async fn list_module_consents(&self) -> Result<Vec<ModuleConsentRecord>> {
+        let rows = sqlx::query("SELECT * FROM module_consents ORDER BY module, op")
+            .fetch_all(self.pool())
+            .await?;
+        rows.iter().map(row_to_record).collect()
+    }
+
     /// Subscribe to post-commit consent revocations. A broadcast channel is
     /// used because multiple independent consumers may need the event; the
     /// durable table remains authoritative if a receiver starts late.
@@ -721,6 +739,37 @@ mod tests {
             .await
             .unwrap();
         assert!(!lookup.is_authorized());
+        assert!(matches!(lookup, ConsentLookup::Stale(_)));
+    }
+
+    #[tokio::test]
+    async fn adding_reversible_draft_to_an_existing_tool_makes_old_grant_stale() {
+        let store = store().await;
+        let originally_enabled = summary("doc body");
+        store
+            .grant_module_consent(
+                &originally_enabled,
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+
+        // An upgrade changes only the exemption-relevant declaration; the
+        // user must explicitly agree to that new permission summary.
+        let mut upgraded_declaration = originally_enabled.clone();
+        upgraded_declaration.reversible_draft = true;
+        let lookup = store
+            .lookup_module_consent(
+                &upgraded_declaration.module,
+                &upgraded_declaration.op,
+                &upgraded_declaration.module_version,
+                &upgraded_declaration.scope_fingerprint(),
+                "2026-10-08T00:00:01Z",
+            )
+            .await
+            .unwrap();
+
         assert!(matches!(lookup, ConsentLookup::Stale(_)));
     }
 

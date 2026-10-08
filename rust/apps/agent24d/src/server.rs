@@ -1078,6 +1078,19 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             get(crate::routes::get_timings_summary),
         )
         .route("/api/v1/tools", get(crate::routes::get_tools))
+        .route("/api/v1/module-consents", get(crate::consent_routes::list))
+        .route(
+            "/api/v1/module-consents/export",
+            get(crate::consent_routes::export),
+        )
+        .route(
+            "/api/v1/module-consents/modules/{module}",
+            axum::routing::delete(crate::consent_routes::revoke_module),
+        )
+        .route(
+            "/api/v1/module-consents/modules/{module}/tools/{tool}",
+            axum::routing::delete(crate::consent_routes::revoke_tool),
+        )
         .route(
             "/api/v1/tool-overrides",
             get(crate::overrides::list_overrides),
@@ -1515,12 +1528,128 @@ pub async fn serve(
         None => None,
     };
 
+    let state_dir = agent24_protocol::state_file::state_dir()
+        .ok_or_else(|| std::io::Error::other("HOME not set"))?;
+    let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
+    let catalogue = with_discovered(Vec::new(), &packages_root);
+
     // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
     // their tools. Registered with `with()` so they are dispatchable, while
     // McpTool sets requires_approval = true so EVERY call still goes through the
     // C4 gate — the whitelist decides "may be dispatched", the gate decides
     // "may run this time". A broken server is logged and skipped, never fatal.
     let mut tools = agent24_tools::ToolRegistry::builtin(workspace.clone());
+    let mut module_registry = agent24_domain::tool::ModuleToolRegistry::new();
+    let mut module_operations = std::collections::HashSet::new();
+    for entry in &catalogue {
+        if let crate::domain::Build::Package(package) = &entry.build {
+            if let Err(error) =
+                module_registry.register_module(entry.name.as_str(), package.manifest.tools())
+            {
+                tracing::warn!(module = entry.name, %error, "module tools were refused");
+                continue;
+            }
+            module_operations.extend(
+                package
+                    .manifest
+                    .tools()
+                    .iter()
+                    .map(|tool| (entry.name.clone(), tool.operation().to_owned())),
+            );
+        }
+    }
+    let module_tool_runtime =
+        crate::module_tool_runtime::AgentModuleToolRuntime::new(module_operations);
+    let module_tool_runtime_dyn: StdArc<dyn agent24_tools::ModuleToolRuntime> =
+        module_tool_runtime.clone();
+    let module_tool_supervisors = module_tool_runtime.supervisors_slot();
+    let consent_gate = StdArc::new(agent24_policy::consent_gate::StoreConsentGate::new(
+        store.clone(),
+    ));
+    let mut module_authorizations: std::collections::HashMap<
+        (String, String),
+        StdArc<dyn agent24_tools::ModuleToolAuthorization>,
+    > = std::collections::HashMap::new();
+    for (_, registered) in module_registry.iter() {
+        let module = registered.module().to_owned();
+        let declaration = registered.declaration();
+        let operation = declaration.operation().to_owned();
+        let summary = agent24_store::ToolPermissionSummary::new(
+            module.clone(),
+            operation.clone(),
+            catalogue
+                .iter()
+                .find(|entry| entry.name == module)
+                .map_or_else(String::new, |entry| entry.version.clone()),
+            agent24_store::ConsentSource::ManualInstall,
+            Some("invoke one host-registered module tool".to_owned()),
+            None,
+            Some("module operation".to_owned()),
+            agent24_store::HostRiskLevel::High,
+        );
+        let request = agent24_policy::consent_gate::ConsentGateRequest {
+            module: module.clone(),
+            op: operation.clone(),
+            module_version: summary.module_version.clone(),
+            current_scope_fingerprint: summary.scope_fingerprint(),
+            risk: agent24_protocol::RiskClass::External,
+            org_restricted: false,
+            source_restricted: false,
+            // The host has no verified reversible-draft semantics for this
+            // path yet, so the L-APPR-5 draft exception never applies here.
+            reversible_draft_declared: false,
+            draft_verification: None,
+        };
+        let authorization = StdArc::new(
+            agent24_policy::consent_gate::ModuleConsentAuthorization::new(
+                consent_gate.clone(),
+                request,
+                StdArc::new(agent24_core::util::now_iso8601),
+            ),
+        );
+        module_authorizations.insert((module, operation), authorization);
+    }
+    let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
+        StdArc::clone(&module_tool_runtime),
+        module_authorizations.clone(),
+        router.has_remote_tier(),
+    );
+    let advert_view_dyn: StdArc<dyn agent24_domain::tool::ModuleToolAdvertView> = advert_view;
+    for (_, registered) in module_registry.iter() {
+        let module = registered.module();
+        let declaration = registered.declaration();
+        let Some(authorization) =
+            module_authorizations.get(&(module.to_owned(), declaration.operation().to_owned()))
+        else {
+            continue;
+        };
+        match agent24_tools::ModuleTool::new(
+            module,
+            declaration.operation(),
+            declaration.description(),
+            declaration.input_schema().clone(),
+            Duration::from_millis(declaration.timeout_ms()),
+            Duration::from_millis(declaration.inline_wait_ms()),
+            agent24_protocol::RiskClass::External,
+            StdArc::clone(&advert_view_dyn),
+            StdArc::clone(authorization),
+            StdArc::clone(&module_tool_runtime_dyn),
+        ) {
+            Ok(tool) => {
+                if let Err(error) = tools.register_module_tool(StdArc::new(tool)) {
+                    tracing::warn!(
+                    module,
+                    operation = declaration.operation(),
+                    %error,
+                    "module tool was not registered"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(module, operation = declaration.operation(), %error, "module tool was not assembled")
+            }
+        }
+    }
     // H9: register the read-only explorer subagent. It runs against a registry
     // that holds ONLY read builtins and NOT itself, so the sub-run cannot write,
     // execute, or recurse — the guarantees are structural, not policy-checked.
@@ -1586,9 +1715,6 @@ pub async fn serve(
     // needs anything `AppState::new` builds, so there is no ordering hazard in
     // moving them here; the `catalogue`/`with_discovered` call below reuses
     // this same `packages_root`, not a second one.
-    let state_dir = agent24_protocol::state_file::state_dir()
-        .ok_or_else(|| std::io::Error::other("HOME not set"))?;
-    let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
     #[cfg(unix)]
     let workspace_service = if ephemeral {
         None
@@ -1701,29 +1827,6 @@ pub async fn serve(
         .module_approval_broker
         .spawn_scan(cancel.child_token());
 
-    // Domain OSes (ME-1b-b). THIS is the one place in the kernel that may name a
-    // module: someone has to say which OS is installed, and a composition root
-    // naming its components is not the coupling ADR-029 objects to. Everything
-    // downstream — routing, the data directory, the event module, the capability
-    // grant — is derived from the manifest, so `crate::domain` and
-    // `build_router_with_modules` still contain no module-shaped branch. An OS is
-    // another entry in the CATALOGUE below — each with its own builder, which the
-    // mounter calls only if that module is admissible and enabled, so one that
-    // fails to construct cannot stop the others.
-    //
-    // T11: this build compiles in no domain OS at all — Sin90 (the one that used
-    // to live here as `agent24-sin90-os`) now ships from `iDoris-ai/Sin90` as an
-    // out-of-process package, discovered below by `with_discovered` like any
-    // other third-party OS, not hardcoded into this catalogue. A future
-    // compiled-in OS is still just another entry in this `Vec`.
-    let catalogue: Vec<crate::domain::Installed> = Vec::new();
-
-    // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
-    // free function so it can be tested without standing up a daemon — see
-    // `with_discovered`. `packages_root` was computed earlier, before
-    // `AppState::new`, and injected there too — this reuses that same value.
-    let catalogue = with_discovered(catalogue, &packages_root);
-
     let os_config_path =
         crate::os_config::config_path().ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let os_config = crate::os_config::OsConfig::load(&os_config_path);
@@ -1800,6 +1903,9 @@ pub async fn serve(
         if ephemeral { &os_root } else { &state_dir },
         params.stop_grace,
     );
+    if let Ok(host) = &host {
+        let _ = module_tool_supervisors.set(StdArc::clone(&host.supervisors));
+    }
     if let Err(why) = &host {
         tracing::error!("out-of-process domain OS modules cannot be started: {why}");
     }
@@ -3254,6 +3360,146 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn module_consent_listing_route_is_available_to_the_host() {
+        let router = build_router(state().await);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(body["authorizations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn module_consent_export_contains_metadata_only_and_revoke_broadcasts() {
+        let state = state().await;
+        let summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "read_document",
+            "1.2.3",
+            agent24_store::ConsentSource::FirstParty,
+            Some("local documents".to_owned()),
+            None,
+            Some("https://example.invalid".to_owned()),
+            agent24_store::HostRiskLevel::Medium,
+        );
+        state
+            .store
+            .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let second_summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "write_document",
+            "1.2.3",
+            agent24_store::ConsentSource::FirstParty,
+            None,
+            Some("local documents".to_owned()),
+            None,
+            agent24_store::HostRiskLevel::Medium,
+        );
+        state
+            .store
+            .grant_module_consent(
+                &second_summary,
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut notifications = state.store.subscribe_module_consent_revocations();
+        let router = build_router(state);
+
+        let exported = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents/export")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        assert_eq!(
+            exported.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=module-authorizations.json"
+        );
+        let bytes = exported.into_body().collect().await.unwrap().to_bytes();
+        let serialized = String::from_utf8(bytes.to_vec()).unwrap();
+        let export: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let authorization = &export["authorizations"][0];
+        assert_eq!(authorization["module"], "doc-module");
+        assert_eq!(authorization["tool"], "read_document");
+        assert_eq!(
+            authorization["scope_summary"]["readable"],
+            "local documents"
+        );
+        assert_eq!(authorization["status"], "granted");
+        for forbidden in ["body", "content", "credential", "token", "password"] {
+            assert!(!serialized.to_lowercase().contains(forbidden));
+        }
+
+        let revoked = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/v1/module-consents/modules/doc-module/tools/read_document")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let notice = notifications.recv().await.unwrap();
+        assert_eq!(notice.module, "doc-module");
+        assert_eq!(notice.op.as_deref(), Some("read_document"));
+
+        let revoked = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/v1/module-consents/modules/doc-module")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let notice = notifications.recv().await.unwrap();
+        assert_eq!(notice.module, "doc-module");
+        assert_eq!(notice.op, None);
+    }
+
+    #[tokio::test]
+    async fn module_consent_routes_reject_creative_identity() {
+        let (state, _host, creative) = capability_state().await;
+        let router = build_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

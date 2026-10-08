@@ -1780,7 +1780,7 @@ impl RunManager {
             let request = CompletionRequest {
                 messages: self.request_messages_for(&messages, &run_id).await,
                 model: run.input.model_override.clone(),
-                tools: self.tool_specs_for(plan_mode),
+                tools: self.tool_specs_for(plan_mode).await,
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
@@ -2184,11 +2184,11 @@ impl RunManager {
 
     /// The tool specs advertised this turn: the full advert set normally, or the
     /// read-only subset plus `propose_plan` in plan mode (H8).
-    fn tool_specs_for(&self, plan_mode: bool) -> Vec<ToolSpec> {
+    async fn tool_specs_for(&self, plan_mode: bool) -> Vec<ToolSpec> {
         let adverts = if plan_mode {
-            self.tools.plan_adverts()
+            self.tools.live_plan_adverts().await
         } else {
-            self.tools.adverts()
+            self.tools.live_adverts().await
         };
         let mut specs: Vec<ToolSpec> = adverts
             .into_iter()
@@ -4633,6 +4633,7 @@ mod approval_tests {
         let plan: Vec<String> = h
             .manager
             .tool_specs_for(true)
+            .await
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -4649,6 +4650,7 @@ mod approval_tests {
         let full: Vec<String> = h
             .manager
             .tool_specs_for(false)
+            .await
             .into_iter()
             .map(|s| s.name)
             .collect();
