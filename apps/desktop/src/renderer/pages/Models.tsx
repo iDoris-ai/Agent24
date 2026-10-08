@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import type { IdorisStatusResult } from '../../shared/ipc-types'
 
 // Shape of one entry in `GET /api/v1/models`'s `models` array
 // (`agent24_protocol::Model`, `rust/crates/agent24-protocol/src/types.rs`):
@@ -33,6 +34,7 @@ function statusDot(model: OmlxModel) {
 export default function ModelsPage() {
   const [liveModels, setLiveModels] = useState<OmlxModel[]>([])
   const [loading, setLoading] = useState(true)
+  const [idorisStatus, setIdorisStatus] = useState<IdorisStatusResult | null>(null)
 
   useEffect(() => {
     // AUDIT-1: the daemon's real route is `/api/v1/models`, returning
@@ -47,9 +49,15 @@ export default function ModelsPage() {
       })
       .catch(() => {/* oMLX not running */})
       .finally(() => setLoading(false))
+    void window.agent24.idorisStatus().then(setIdorisStatus).catch(() => {
+      setIdorisStatus({ state: 'unavailable', reason: 'unreachable' })
+    })
   }, [])
 
   const hasLive = liveModels.length > 0
+  const idorisModelCount = idorisStatus?.state === 'available'
+    ? idorisStatus.models?.sources.reduce((count, source) => count + source.models.length, 0)
+    : undefined
 
   return (
     <div className="content">
@@ -58,6 +66,22 @@ export default function ModelsPage() {
         <button className="btn btn-primary" style={{ fontSize: 12 }}>+ 下载模型</button>
       </div>
       <div className="page-sub">64 GB 统一内存 · oMLX 管理主力 LLM · Ollama 备选</div>
+
+      <div style={{ margin: '12px 0 16px', padding: '10px 12px', background: 'var(--surface2)', borderRadius: 8, fontSize: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>iDoris 模型内核</div>
+        {idorisStatus?.state === 'available' ? (
+          <div data-testid="idoris-status-available">
+            v{idorisStatus.status.version} · {idorisStatus.status.components} components · {idorisStatus.status.runtimes} runtimes · capacity {idorisStatus.status.capacity.state}
+            {idorisStatus.backends && idorisStatus.models && (
+              <div data-testid="idoris-status-resources" style={{ marginTop: 4, color: 'var(--muted)' }}>
+                {idorisStatus.backends.length} backends · {idorisModelCount} models
+              </div>
+            )}
+          </div>
+        ) : (
+          <div style={{ color: 'var(--muted)' }}>状态不可用 — Admin session 未连接</div>
+        )}
+      </div>
 
       {/* Live oMLX model status */}
       {hasLive && (

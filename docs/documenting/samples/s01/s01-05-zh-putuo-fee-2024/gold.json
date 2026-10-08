@@ -40,5 +40,5 @@
     {"proposition": "文件给出了咨询电话"}
   ],
   "labeled_by": "claude-draft",
-  "verified_by": null
+  "verified_by": "david"
 }

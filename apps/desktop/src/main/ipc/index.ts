@@ -13,6 +13,7 @@ import type {
   DiscoverFilter,
   DiscoveredModule,
   LlmStatusResult,
+  IdorisStatusResult,
   ModuleInfo,
   ModuleInstallResult,
   ModuleUninstallResult,
@@ -130,7 +131,7 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
   )
 }
 
-export function registerIpcHandlers(): void {
+export function registerIpcHandlers(options: { idorisStatus?: () => Promise<IdorisStatusResult> } = {}): void {
   // oMLX: auto-detect running server
   ipcMain.handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | null> => {
     for (const candidate of OMLX_PROBE_CANDIDATES) {
@@ -267,6 +268,10 @@ export function registerIpcHandlers(): void {
     }
     return { provider: 'none', url: '', model: '' }
   })
+
+  ipcMain.handle(IpcChannels.IdorisStatus, (): Promise<IdorisStatusResult> =>
+    options.idorisStatus?.() ?? Promise.resolve({ state: 'unavailable', reason: 'handoff-missing' }),
+  )
 
   ipcMain.handle(IpcChannels.AppPing, () => 'pong')
   ipcMain.handle(IpcChannels.AppVersion, () => app.getVersion())

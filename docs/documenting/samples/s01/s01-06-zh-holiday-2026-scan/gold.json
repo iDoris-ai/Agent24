@@ -29,5 +29,5 @@
     {"proposition": "这张图上写有值班安排"}
   ],
   "labeled_by": "claude-draft",
-  "verified_by": null
+  "verified_by": "david"
 }
