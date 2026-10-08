@@ -22,6 +22,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
+agent24-domain = { path = "../agent24-domain" }
 agent24-policy = { path = "../agent24-policy" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"

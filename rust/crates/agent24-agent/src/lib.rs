@@ -463,6 +463,15 @@ pub struct RunManager {
     /// Optional per-session conversation memory (D1). `None` = runs start from
     /// the bare prompt, exactly as before.
     memory: Option<SessionMemory>,
+    /// Test harness injection for calls whose fixture models an explicitly
+    /// authorized cloud source. Production keeps this absent unless a host
+    /// policy service is wired in.
+    #[cfg(test)]
+    test_egress_policy: Option<(
+        Arc<dyn agent24_domain::EgressGate>,
+        Vec<agent24_domain::EgressResource>,
+        u64,
+    )>,
     /// Daemon-wide shutdown token; every run token is a child of it
     shutdown: CancellationToken,
     /// Live run cancellation tokens; entries removed when a run reaches a
@@ -553,6 +562,8 @@ impl RunManager {
             workspace,
             sink,
             memory,
+            #[cfg(test)]
+            test_egress_policy: None,
             shutdown,
             cancels: Mutex::new(HashMap::new()),
         })
@@ -565,7 +576,7 @@ impl RunManager {
     ) -> Result<ToolContext, AgentError> {
         let tool_call_id = tool_call_id.into();
         let lease_id = self.store.active_workspace_run_lease_id(&run.id).await?;
-        let Some(_) = run.workspace_id.as_ref() else {
+        let context = if run.workspace_id.is_none() {
             if lease_id.is_some() {
                 return Err(WorkspaceStoreError::CorruptRow {
                     table: "runs",
@@ -573,29 +584,50 @@ impl RunManager {
                 }
                 .into());
             }
-            return Ok(ToolContext::legacy(
+            ToolContext::legacy(
                 run.id.clone(),
                 run.session_id.clone(),
                 run.schedule_id.clone(),
                 tool_call_id,
-            ));
+            )
+        } else {
+            let lease_id = lease_id.ok_or(WorkspaceStoreError::CorruptRow {
+                table: "workspace_leases",
+                field: "row",
+            })?;
+            let service = self
+                .workspace
+                .as_ref()
+                .ok_or(AgentError::WorkspaceServiceUnavailable)?;
+            let authority = service.bind_run_authority(&run.id, &lease_id).await?;
+            ToolContext::workspace_bound(
+                run.id.clone(),
+                run.session_id.clone(),
+                run.schedule_id.clone(),
+                tool_call_id,
+                authority,
+            )
         };
-        let lease_id = lease_id.ok_or(WorkspaceStoreError::CorruptRow {
-            table: "workspace_leases",
-            field: "row",
-        })?;
-        let service = self
-            .workspace
-            .as_ref()
-            .ok_or(AgentError::WorkspaceServiceUnavailable)?;
-        let authority = service.bind_run_authority(&run.id, &lease_id).await?;
-        Ok(ToolContext::workspace_bound(
-            run.id.clone(),
-            run.session_id.clone(),
-            run.schedule_id.clone(),
-            tool_call_id,
-            authority,
-        ))
+        #[cfg(test)]
+        let context = if let Some((gate, resources, generation)) = &self.test_egress_policy {
+            context.with_egress_policy(Arc::clone(gate), resources.clone(), *generation)
+        } else {
+            context
+        };
+        Ok(context)
+    }
+
+    #[cfg(test)]
+    fn with_test_egress_policy(
+        mut self: Arc<Self>,
+        gate: Arc<dyn agent24_domain::EgressGate>,
+        resources: Vec<agent24_domain::EgressResource>,
+        generation: u64,
+    ) -> Arc<Self> {
+        if let Some(manager) = Arc::get_mut(&mut self) {
+            manager.test_egress_policy = Some((gate, resources, generation));
+        }
+        self
     }
 
     async fn cancel_workspace_resume_recovery(&self, run_id: &str) {
@@ -2782,6 +2814,70 @@ pub(crate) mod tests {
         (manager, sink, store)
     }
 
+    struct FixtureEgressGate;
+
+    #[async_trait]
+    impl agent24_domain::EgressGate for FixtureEgressGate {
+        async fn check(
+            &self,
+            request: &agent24_domain::EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            let fixture_resource = request.resources.len() == 1
+                && request.resources[0].resource_id == "agent-test-fixture"
+                && request.resources[0].revision.as_deref() == Some("fixture-rev-1")
+                && request.resources[0].authorization_ref.as_deref()
+                    == Some("agent-test-fixture-grant")
+                && request.resources[0].policy_version == 1
+                && !request.resources[0].local_only;
+            let fixture_destination = request
+                .destination
+                .id()
+                .is_some_and(|id| id.starts_with("http://127.0.0.1:"));
+            if request.purpose == agent24_domain::EgressPurpose::HttpFetch
+                && request.remote
+                && request.authorization_generation == 1
+                && fixture_resource
+                && fixture_destination
+            {
+                Ok(())
+            } else {
+                Err(agent24_domain::EgressDecision)
+            }
+        }
+    }
+
+    pub(crate) fn fixture_egress_policy() -> (
+        Arc<dyn agent24_domain::EgressGate>,
+        Vec<agent24_domain::EgressResource>,
+        u64,
+    ) {
+        (
+            Arc::new(FixtureEgressGate),
+            vec![
+                agent24_domain::EgressResource::cloud_authorized(
+                    "agent-test-fixture",
+                    "fixture-rev-1",
+                    1,
+                )
+                .with_authorization_ref("agent-test-fixture-grant"),
+            ],
+            1,
+        )
+    }
+
+    async fn manager_with_fixture_egress(
+        provider: Arc<dyn ModelProvider>,
+        tools: ToolRegistry,
+    ) -> (Arc<RunManager>, Arc<RecordingSink>, Store) {
+        let (manager, sink, store) = manager_with_tools(provider, tools).await;
+        let (gate, resources, generation) = fixture_egress_policy();
+        (
+            manager.with_test_egress_policy(gate, resources, generation),
+            sink,
+            store,
+        )
+    }
+
     async fn manager_with(
         provider: Arc<dyn ModelProvider>,
     ) -> (Arc<RunManager>, Arc<RecordingSink>, Store) {
@@ -4124,12 +4220,15 @@ pub(crate) mod tests {
     async fn model_fetches_a_url_through_http_fetch() {
         let url = http_fixture("fixture payload 42").await;
         // allow_local: the fixture lives on loopback
-        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let (egress_gate, _, _) = fixture_egress_policy();
+        let tools = ToolRegistry::new()
+            .with(Arc::new(agent24_tools::HttpFetchTool::new(true)))
+            .with_egress_gate(egress_gate);
         let provider = ScriptedProvider::new(vec![tool_call_turn(
             "http_fetch",
             serde_json::json!({ "url": url }).to_string(),
         )]);
-        let (manager, sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let (manager, sink, store) = manager_with_fixture_egress(Arc::new(provider), tools).await;
         let run = manager.start_run(create()).await.unwrap();
         let done = wait_terminal(&store, &run.id).await;
         assert_eq!(done.status, RunStatus::Completed);
@@ -4163,12 +4262,15 @@ pub(crate) mod tests {
         // the tool_call → the tool result answering it → closing assistant answer.
         // This is what a restarted daemon reconstructs a suspended run from.
         let url = http_fixture("fixture payload 42").await;
-        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let (egress_gate, _, _) = fixture_egress_policy();
+        let tools = ToolRegistry::new()
+            .with(Arc::new(agent24_tools::HttpFetchTool::new(true)))
+            .with_egress_gate(egress_gate);
         let provider = ScriptedProvider::new(vec![tool_call_turn(
             "http_fetch",
             serde_json::json!({ "url": url }).to_string(),
         )]);
-        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let (manager, _sink, store) = manager_with_fixture_egress(Arc::new(provider), tools).await;
         let run = manager.start_run(create()).await.unwrap();
         let done = wait_terminal(&store, &run.id).await;
         assert_eq!(done.status, RunStatus::Completed);
@@ -4299,6 +4401,7 @@ pub(crate) mod tests {
 mod approval_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use super::tests::fixture_egress_policy;
     use super::tests::*;
     use super::*;
     use agent24_models::router::Tier;
@@ -4327,8 +4430,10 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let (egress_gate, resources, generation) = fixture_egress_policy();
         let tools = ToolRegistry::builtin(workdir)
-            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
+            .with_egress_gate(Arc::clone(&egress_gate));
         struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
         impl EventSink for FnSink {
             fn emit(&self, body: EventBody) {
@@ -4353,7 +4458,8 @@ mod approval_tests {
             Arc::new(tools),
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
-        );
+        )
+        .with_test_egress_policy(egress_gate, resources, generation);
         Harness {
             manager,
             broker,
@@ -4454,8 +4560,10 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let (egress_gate, resources, generation) = fixture_egress_policy();
         let tools = ToolRegistry::builtin(workdir)
-            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
+            .with_egress_gate(Arc::clone(&egress_gate));
         struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
         impl EventSink for FnSink {
             fn emit(&self, body: EventBody) {
@@ -4472,7 +4580,8 @@ mod approval_tests {
             Arc::new(tools),
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
-        );
+        )
+        .with_test_egress_policy(egress_gate, resources, generation);
         Harness {
             manager,
             broker,
@@ -4636,8 +4745,10 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let (egress_gate, resources, generation) = fixture_egress_policy();
         let tools = ToolRegistry::builtin(workdir)
-            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
+            .with_egress_gate(Arc::clone(&egress_gate));
         struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
         impl EventSink for FnSink {
             fn emit(&self, body: EventBody) {
@@ -4653,7 +4764,8 @@ mod approval_tests {
             Arc::new(tools),
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
-        );
+        )
+        .with_test_egress_policy(egress_gate, resources, generation);
         Harness {
             manager,
             broker,

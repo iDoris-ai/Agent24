@@ -856,7 +856,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_tool_is_neither_advertised_nor_dispatchable_without_egress_gate() {
+    async fn remote_http_fetch_stays_unavailable_without_egress_policy() {
         let registry = ToolRegistry::new().with(Arc::new(HttpFetchTool::new(false)));
         assert!(registry.adverts().is_empty());
         let input = serde_json::json!({"url":"https://example.com"})
@@ -867,7 +867,9 @@ mod tests {
             .dispatch("http_fetch", &ctx(), &input, &CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Denied(reason) if reason.contains("outbound policy")));
+        assert!(
+            matches!(err, ToolError::Denied(reason) if reason == "outbound policy unavailable")
+        );
     }
 
     #[tokio::test]
