@@ -20,10 +20,16 @@ async fn exec(db: &Db, sql: &str) -> Result<(), sqlx::Error> {
 }
 
 /// The trigger's own message, so a test cannot pass on some other failure.
+/// `message` may list alternatives as `a|b`: when two guards both refuse a
+/// statement (0005's insert guards stand behind these delete guards), either
+/// may fire first.
 async fn refused(db: &Db, sql: &str, message: &str) {
     let err = exec(db, sql).await.expect_err(sql);
     let text = err.to_string();
-    assert!(text.contains(message), "{sql}: {text}");
+    assert!(
+        message.split('|').any(|m| text.contains(m)),
+        "{sql}: {text}"
+    );
 }
 
 async fn upload(db: &Db, total: i64) {
@@ -149,7 +155,7 @@ async fn chunks_are_immutable_and_outlive_a_live_upload() {
     refused(
         &db,
         &format!("REPLACE INTO upload_chunks (upload_id, chunk_offset, chunk_size, sha256) VALUES ('{UPL}', 0, 4, '{SHA}')"),
-        "chunks of a live upload cannot be deleted",
+        "chunks of a live upload cannot be deleted|a recorded chunk is never replaced",
     )
     .await;
     // Complete but not yet imported: the chunks are still needed.
@@ -252,7 +258,7 @@ async fn an_upload_is_never_deleted_or_replaced() {
     refused(
         &db,
         &format!("INSERT OR REPLACE INTO uploads (id, total_size, sha256, received, status) VALUES ('{UPL}', 10, '{SHA}', 0, 'receiving')"),
-        MSG,
+        "uploads are never deleted|an upload id is never reused",
     )
     .await;
 }
@@ -373,13 +379,19 @@ async fn an_upsert_cannot_rewrite_a_recorded_chunk() {
              ON CONFLICT (upload_id, chunk_offset) DO UPDATE SET sha256 = excluded.sha256"
         )
     };
-    // Before `received` moves the insert half is allowed, so the update half runs.
-    refused(&db, &upsert(SHA2), "upload chunks are immutable").await;
+    // The insert half is refused (0005's guard, or 0004's append rule once
+    // `received` has moved), so the update half never runs.
+    refused(
+        &db,
+        &upsert(SHA2),
+        "upload chunks are immutable|a recorded chunk is never replaced",
+    )
+    .await;
     exec(&db, &received(4)).await.unwrap();
     refused(
         &db,
         &upsert(SHA2),
-        "a chunk must start at the bytes received so far",
+        "a chunk must start at the bytes received so far|a recorded chunk is never replaced",
     )
     .await;
     let sha: String = sqlx::query_scalar("SELECT sha256 FROM upload_chunks")

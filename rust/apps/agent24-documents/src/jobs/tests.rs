@@ -294,12 +294,24 @@ async fn a_row_that_breaks_the_status_rules_is_never_sent() {
         ("queued", "created_at = '0300-02-29T00:00:00.000Z'"),
     ] {
         let env = env().await;
-        add_job(&env.state, "queued").await;
-        exec(
-            &env.state,
-            &format!("UPDATE jobs SET status = '{status}', {set}"),
-        )
-        .await;
+        if let Some(created) = set.strip_prefix("created_at = ") {
+            // 0005 fixes the creation time once written, so set it at insert.
+            exec(
+                &env.state,
+                &format!(
+                    "INSERT INTO jobs (id, kind, status, origin, created_at)
+                     VALUES ('{JOB}', 'import', '{status}', '{{\"kind\":\"page\"}}', {created})"
+                ),
+            )
+            .await;
+        } else {
+            add_job(&env.state, "queued").await;
+            exec(
+                &env.state,
+                &format!("UPDATE jobs SET status = '{status}', {set}"),
+            )
+            .await;
+        }
         let (code, v) = call(&env.state, "GET", &format!("/jobs/{JOB}")).await;
         assert_eq!(
             code,
