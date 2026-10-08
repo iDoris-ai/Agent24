@@ -472,6 +472,68 @@ pub struct ModuleToolAdvert {
     input_schema: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleToolErrorCode {
+    InvalidInput,
+    PermissionDenied,
+    ModuleUnavailable,
+    OperationUnavailable,
+    RateLimited,
+    Timeout,
+    Cancelled,
+    ResponseTooLarge,
+    InvalidResult,
+    ModuleError,
+    ResultUnknown,
+}
+
+impl ModuleToolErrorCode {
+    pub fn parse(code: &str) -> (Self, Option<String>) {
+        let known = match code {
+            "invalid_input" => Self::InvalidInput,
+            "permission_denied" => Self::PermissionDenied,
+            "module_unavailable" => Self::ModuleUnavailable,
+            "operation_unavailable" => Self::OperationUnavailable,
+            "rate_limited" => Self::RateLimited,
+            "timeout" => Self::Timeout,
+            "cancelled" => Self::Cancelled,
+            "response_too_large" => Self::ResponseTooLarge,
+            "invalid_result" => Self::InvalidResult,
+            "module_error" => Self::ModuleError,
+            "result_unknown" => Self::ResultUnknown,
+            _ => return (Self::ModuleError, Some(code.chars().take(64).collect())),
+        };
+        (known, None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModuleToolResult {
+    Completed {
+        payload: serde_json::Value,
+        replayed: bool,
+    },
+    Pending {
+        job: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModuleToolCallError {
+    InvalidResult,
+    Module {
+        code: ModuleToolErrorCode,
+        retryable: bool,
+        details: Option<serde_json::Value>,
+        unknown_code: Option<String>,
+    },
+    ResultUnknown,
+    ResponseTooLarge,
+    Cancelled,
+    Timeout,
+    ModuleUnavailable,
+}
+
 impl ModuleToolAdvert {
     /// `<module>.<operation>` — see [`ModuleToolRegistry::full_name`].
     pub fn full_name(&self) -> &str {
