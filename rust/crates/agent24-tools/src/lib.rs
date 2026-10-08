@@ -286,9 +286,6 @@ pub trait Tool: Send + Sync {
         Duration::from_secs(30)
     }
 
-    /// Module calls have a per-call cancellation boundary. The registry must
-    /// not translate their cancellation into `ToolError::Cancelled`, which
-    /// cancels the owning run in the agent loop.
     fn isolates_cancellation(&self) -> bool {
         false
     }
@@ -316,10 +313,12 @@ pub struct ModuleToolContext {
 pub trait ModuleToolAuthorization: Send + Sync {
     async fn authorize(
         &self,
-        module: &str,
-        operation: &str,
-        ctx: &ToolContext,
-    ) -> Option<ModuleToolGrantContext>;
+        _module: &str,
+        _operation: &str,
+        _ctx: &ToolContext,
+    ) -> Option<ModuleToolGrantContext> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -330,17 +329,7 @@ pub struct ModuleToolGrantContext {
 
 pub struct DenyModuleToolAuthorization;
 
-#[async_trait]
-impl ModuleToolAuthorization for DenyModuleToolAuthorization {
-    async fn authorize(
-        &self,
-        _module: &str,
-        _operation: &str,
-        _ctx: &ToolContext,
-    ) -> Option<ModuleToolGrantContext> {
-        None
-    }
-}
+impl ModuleToolAuthorization for DenyModuleToolAuthorization {}
 
 #[async_trait]
 pub trait ModuleToolRuntime: Send + Sync {
@@ -495,13 +484,21 @@ fn module_error_json(failure: ModuleToolCallError) -> String {
             retryable,
             unknown_code,
             ..
-        } => (module_code(code), retryable, unknown_code, false),
-        ModuleToolCallError::InvalidResult => ("invalid_result", false, None, false),
-        ModuleToolCallError::ResultUnknown => ("result_unknown", false, None, true),
-        ModuleToolCallError::ResponseTooLarge => ("response_too_large", false, None, true),
-        ModuleToolCallError::Cancelled => ("cancelled", false, None, false),
-        ModuleToolCallError::Timeout => ("timeout", false, None, false),
-        ModuleToolCallError::ModuleUnavailable => ("module_unavailable", false, None, false),
+        } => (code, retryable, unknown_code, false),
+        ModuleToolCallError::InvalidResult => {
+            (ModuleToolErrorCode::InvalidResult, false, None, false)
+        }
+        ModuleToolCallError::ResultUnknown => {
+            (ModuleToolErrorCode::ResultUnknown, false, None, true)
+        }
+        ModuleToolCallError::ResponseTooLarge => {
+            (ModuleToolErrorCode::ResponseTooLarge, false, None, true)
+        }
+        ModuleToolCallError::Cancelled => (ModuleToolErrorCode::Cancelled, false, None, false),
+        ModuleToolCallError::Timeout => (ModuleToolErrorCode::Timeout, false, None, false),
+        ModuleToolCallError::ModuleUnavailable => {
+            (ModuleToolErrorCode::ModuleUnavailable, false, None, false)
+        }
     };
     let module_code = unknown.map(|raw| {
         raw.chars()
@@ -509,27 +506,7 @@ fn module_error_json(failure: ModuleToolCallError) -> String {
             .take(64)
             .collect::<String>()
     });
-    // Module-provided details may contain arguments, credentials, or output
-    // fragments. Do not expose them through ToolError's model-facing path.
-    serde_json::json!({"error": {"code":code, "retryable":retryable,
-        "module_code":module_code, "result_unknown":result_unknown}})
-    .to_string()
-}
-
-fn module_code(code: ModuleToolErrorCode) -> &'static str {
-    match code {
-        ModuleToolErrorCode::InvalidInput => "invalid_input",
-        ModuleToolErrorCode::PermissionDenied => "permission_denied",
-        ModuleToolErrorCode::ModuleUnavailable => "module_unavailable",
-        ModuleToolErrorCode::OperationUnavailable => "operation_unavailable",
-        ModuleToolErrorCode::RateLimited => "rate_limited",
-        ModuleToolErrorCode::Timeout => "timeout",
-        ModuleToolErrorCode::Cancelled => "cancelled",
-        ModuleToolErrorCode::ResponseTooLarge => "response_too_large",
-        ModuleToolErrorCode::InvalidResult => "invalid_result",
-        ModuleToolErrorCode::ModuleError => "module_error",
-        ModuleToolErrorCode::ResultUnknown => "result_unknown",
-    }
+    serde_json::json!({"error":{"code":code,"retryable":retryable,"module_code":module_code,"result_unknown":result_unknown}}).to_string()
 }
 
 fn unknown_module_outcome(code: &str) -> ToolError {
@@ -930,15 +907,24 @@ impl ToolRegistry {
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
         let budget = tool.timeout();
+        let call_cancel = if tool.isolates_cancellation() {
+            cancel.child_token()
+        } else {
+            cancel.clone()
+        };
         tokio::select! {
-            r = tokio::time::timeout(budget, tool.call(ctx, input, cancel)) => {
+            r = tokio::time::timeout(budget, tool.call(ctx, input, &call_cancel)) => {
                 match r {
                     Ok(result) => result,
-                    Err(_) if tool.isolates_cancellation() => Err(unknown_module_outcome("timeout")),
+                    Err(_) if tool.isolates_cancellation() => {
+                        call_cancel.cancel();
+                        Err(unknown_module_outcome("timeout"))
+                    }
                     Err(_) => Err(ToolError::Timeout(budget)),
                 }
             }
             () = cancel.cancelled() => {
+                call_cancel.cancel();
                 if tool.isolates_cancellation() {
                     Err(unknown_module_outcome("cancelled"))
                 } else {
@@ -1382,12 +1368,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn module_tool_authorization_defaults_to_denial() {
+    async fn module_tool_authorization_defaults_to_denial_before_dispatch() {
+        struct Runtime;
+        #[async_trait]
+        impl ModuleToolRuntime for Runtime {
+            async fn check_available(&self, _: &str, _: &str) -> Result<(), ModuleToolCallError> {
+                Ok(())
+            }
+            async fn invoke(
+                &self,
+                _: ModuleToolContext,
+                _: Map<String, Value>,
+                _: Duration,
+                _: CancellationToken,
+            ) -> Result<ModuleToolResult, ModuleToolCallError> {
+                Err(ModuleToolCallError::ModuleUnavailable)
+            }
+        }
         assert!(
-            DenyModuleToolAuthorization
-                .authorize("m", "op", &ctx())
-                .await
-                .is_none()
+            ModuleTool::new(
+                "m",
+                "op",
+                "description",
+                serde_json::json!({"type":"object"}),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                Arc::new(DenyModuleToolAuthorization),
+                Arc::new(Runtime),
+            )
+            .unwrap()
+            .call(&ctx(), &Map::new(), &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("permission_denied")
         );
     }
 

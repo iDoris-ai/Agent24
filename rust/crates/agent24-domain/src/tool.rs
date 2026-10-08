@@ -472,7 +472,8 @@ pub struct ModuleToolAdvert {
     input_schema: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModuleToolErrorCode {
     InvalidInput,
     PermissionDenied,
