@@ -10,5 +10,21 @@ license: "CN-Copyright-Art5"
 sha256_original: "9206a6e7f1ad0d4e7aec0de358727c2e85553558aa32b516bb1ce8c1cb652efc"
 sha256_stored: "9206a6e7f1ad0d4e7aec0de358727c2e85553558aa32b516bb1ce8c1cb652efc"
 redactions: []
-covers: [C7, C8, C9]
+public_officials: []
+covers:
+  C1: [dog_fee_inner_ring]
+  C6: [rural_dog_fee_suspension, id_card_first_issue_exemption]
+  C7: [dog_fee_inner_ring, public_kindergarten_fee_approval_number, foreign_invested_enterprise_site_use_fee]
+  C8: [id_card_first_issue_exemption, residence_card_lost_or_damaged_replacement_fee]
+  C9: [issue_date, exam_fee_table_content]
+reader: "在普陀区办理以下事项的个人：到期换领、丢失补领或首次申领居民身份证；申领临时身份证或护照；丢失、损坏后补办上海市居住证；养犬（内环以内、内环以外或农村地区）；孩子上公办幼儿园（全日制或寄宿制）"
+questions: [Q3, Q4, Q6]
+extraction_notes:
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 3, "finding": "“沪价费[2012]009号”在文本层排在“(2)托儿所管理费”之后；渲染页上它属于“(1)公办幼儿园保育教育费”行的批准文号列"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 9, "finding": "单元格内换行把词拆开，如“(农村地区 / 停征)”“损坏 / 补办”（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 7, "finding": "单元格内换行把词拆开，如“居民身份证工 / 本费”“等换 / 、补领”（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "每页表头（含“收费标准”“批准文号”“备注”）都在文本层里，渲染页上也都显示"}
+derived_from: null
+sha256_parent: null
+derivation: []
 notes: "与 s01-01 同类、不同发布方与年度（同名异版素材）。批准文号用方括号 [ ]，与 s01-01 的〔〕不同。注 3 引用的《上海市考试考务费目录清单》附表在本文件中不存在。"
