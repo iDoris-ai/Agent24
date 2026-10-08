@@ -1,7 +1,11 @@
 # ADR-DOC-03：DOCX 编辑引擎与转换 worker（README §17 #6 / #11）
 
-> **状态**：**Proposed**。引擎方向已由 jason 于 2026-10-08 拍板：**只用 SuperDoc 的 headless SDK**（[#696 决策记录](https://github.com/iDoris-ai/Agent24/issues/696#issuecomment-6056284819)）。
-> 改为 Accepted 还需要两项：David 评审通过；PR-Daemon APPROVE。
+> **状态**：**Accepted**（2026-10-08）。三项条件都已满足：
+> - 引擎方向由 jason 拍板：只用 SuperDoc 的 headless SDK（[#696 决策记录](https://github.com/iDoris-ai/Agent24/issues/696#issuecomment-6056284819)）；
+> - David 评审同意（[#696](https://github.com/iDoris-ai/Agent24/issues/696#issuecomment-6064088128)）；
+> - PR-Daemon 在 #796 给出 APPROVE（针对 `3722775`）。
+>
+> 仍有条件：#692 格式矩阵冻结前，引擎选择仍以 §6 的重新评估条件为准。
 > **日期**：2026-10-08 · **起草**：Claude Code（应 jason 要求）· **负责人**：David Xu · **Issue**：#696
 > **依赖**：
 > - [ADR-DOC-01](ADR-DOC-01-placement-and-integration.md)：D2 进程外、D6 引擎按需下载、D8 隐私、D10 macOS 优先；
