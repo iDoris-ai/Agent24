@@ -326,6 +326,27 @@ async fn a_replay_returns_the_upload_as_it_is_now() {
     assert_eq!(again["expires_at"], "2030-01-03T03:04:05.678Z");
 }
 
+/// An expired upload still replays under its key, as it is now (#826 review).
+#[tokio::test]
+async fn a_replay_of_an_expired_upload_returns_it_expired() {
+    let env = env().await;
+    let (_, first) = post(&env.state, Some("k1"), &body(10, None)).await;
+    let id = first["upload_id"].as_str().unwrap();
+    let storage = env.state.storage().await.unwrap();
+    sqlx::query("UPDATE uploads SET status = 'expired' WHERE id = ?")
+        .bind(id)
+        .execute(storage.db.pool())
+        .await
+        .unwrap();
+    let (status, again) = post(&env.state, Some("k1"), &body(10, None)).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        (again["upload_id"].as_str(), again["status"].as_str()),
+        (Some(id), Some("expired"))
+    );
+    assert_eq!(count(&env.state, "SELECT count(*) FROM uploads").await, 1);
+}
+
 #[tokio::test]
 async fn a_database_held_by_another_writer_is_503_busy() {
     let env = env().await;

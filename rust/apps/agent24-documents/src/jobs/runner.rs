@@ -57,6 +57,12 @@ pub struct Commit {
 
 /// Runs attempt `attempt` of `job_id` in the background: claims it (only
 /// while queued at that attempt), then runs `work` on the claim.
+///
+/// A failed claim fails the attempt, even when another worker for the same
+/// attempt could have claimed it a moment later (only a duplicate start and
+/// a database error together do that). Settling retries, backing off to a
+/// minute, until the database answers: the job must not stay queued or
+/// running with no worker.
 pub fn spawn<W, F>(storage: Arc<Storage>, job_id: String, attempt: i64, work: W)
 where
     W: FnOnce(Arc<Storage>, Claim) -> F + Send + 'static,
@@ -145,13 +151,17 @@ async fn claim(
         .transpose()
         .map_err(|e| sqlx::Error::Decode(format!("job {job_id} input: {e}").into()))?;
     sqlx::query(&format!(
-        "UPDATE jobs SET status = 'running', updated_at = {NOW} WHERE id = ?"
+        "UPDATE jobs SET status = 'running', updated_at = {NOW}
+         WHERE id = ? AND attempt = ? AND status = 'queued'"
     ))
     .bind(job_id)
+    .bind(attempt)
     .execute(&mut *tx)
     .await?;
     #[cfg(test)]
     tests::before_claim_commit(&mut tx, job_id).await;
+    // A COMMIT that reports an error but did commit leaves the job running
+    // with nothing settling it; the next start's recovery interrupts it.
     tx.commit().await?;
     claimed.store(true, Ordering::SeqCst);
     Ok(Some(Claim {
@@ -265,6 +275,8 @@ async fn settle(
         Mine::Unclaimed => "('queued')",
         Mine::Claimed => "('running', 'cancelling')",
     };
+    // `execute`, not a RETURNING fetch: it runs the statement to the end, so
+    // a failure to commit is an error here and the supervisor retries.
     sqlx::query(&format!(
         "UPDATE jobs SET updated_at = {NOW},
                 status = CASE status WHEN 'cancelling' THEN 'cancelled' ELSE 'failed' END,

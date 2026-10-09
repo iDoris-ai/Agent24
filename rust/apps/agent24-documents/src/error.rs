@@ -119,7 +119,8 @@ impl ApiError {
         )
     }
 
-    /// 409: a chunk that neither appends nor replays (§5.6).
+    /// 409: a chunk that neither appends nor replays (§5.6). `received_offset`
+    /// is the upload's `received`, which 0001's CHECK keeps ≥ 0.
     #[must_use]
     pub fn upload_offset_mismatch(received_offset: i64) -> Self {
         let mut e = Self::new(

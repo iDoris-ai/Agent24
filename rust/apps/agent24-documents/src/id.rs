@@ -79,7 +79,9 @@ mod tests {
 
     use super::*;
 
-    /// The OpenAPI patterns, e.g. `^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$`.
+    /// The OpenAPI patterns, e.g. `^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$`,
+    /// written out here on purpose rather than calling `is_id`, so the test
+    /// checks the generator against the contract, not against itself.
     fn matches_schema(id: &str, prefix: &str) -> bool {
         let Some(rest) = id.strip_prefix(prefix).and_then(|r| r.strip_prefix('_')) else {
             return false;
