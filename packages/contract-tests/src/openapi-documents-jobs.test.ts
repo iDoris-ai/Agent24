@@ -140,16 +140,17 @@ describe('import and job schemas', () => {
     const imp: string = openapi.paths['/documents/imports'].post.description
     expect(imp).toMatch(/queued, running or cancelling/)
     expect(imp).toMatch(/POST \/documents\/jobs\/\{job_id\}\/retry/)
-    expect(imp).toMatch(/different `title` is 422\s+`idempotency_key_reused`/)
+    expect(imp).toMatch(/different `title` — including a `title`\s+added or left out — is 422 `idempotency_key_reused`/)
     expect(imp).toMatch(/24 h[\s\S]*404 `not_found`/)
     expect(imp).toMatch(/hash and\s+its format are checked before the job starts: 422\s+`upload_checksum_mismatch` or `unsupported_format`/)
     const retryOp = openapi.paths['/documents/jobs/{job_id}/retry'].post
     const retry: string = retryOp.description
-    expect(retry).toMatch(/no idempotency key: if a retry's outcome is unknown/)
-    expect(retry).toMatch(/400 with `details.status` `queued` or `running`, the earlier\s+retry landed/)
+    expect(retry).toMatch(/no idempotency key, so a retry whose outcome is unknown must not be\s+repeated blindly/)
+    expect(retry).toMatch(/GET the job and compare\s+`attempt`/)
+    expect(retry).not.toMatch(/the earlier\s+retry landed/)
     expect((retryOp.parameters ?? []).map((p: any) => p.$ref)).not.toContain('#/components/parameters/DocumentsIdempotencyKey')
     const chunk: string = openapi.paths['/documents/uploads/{upload_id}/chunks'].post.description
-    expect(chunk).toMatch(/complete or imported takes no new chunk: 409,\s+checked before any size check/)
+    expect(chunk).toMatch(/complete or imported takes no new chunk: 409\s+`upload_offset_mismatch` with `details.received_offset`, decided\s+before the `total_size` and `Chunk-Sha256` checks/)
     expect(chunk).toMatch(/still receiving, a new chunk that would run past\s+`total_size` is 400/)
     expect(chunk).toMatch(/24 h after its last chunk, is 404 `not_found`/)
     expect(chunk).toMatch(/413 `payload_too_large`/)

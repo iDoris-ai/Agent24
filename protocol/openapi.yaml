@@ -1783,10 +1783,11 @@ paths:
         received so far), a `Chunk-Sha256` that does not match the body's
         bytes is 400 `invalid_request`; for a range already received, any
         hash other than the stored one is the 409 above, as §5.6 requires.
-        An upload that is complete or imported takes no new chunk: 409,
-        checked before any size check (a received chunk still replays).
-        For an upload still receiving, a new chunk that would run past
-        `total_size` is 400 `invalid_request`. An unknown upload, or one
+        An upload that is complete or imported takes no new chunk: 409
+        `upload_offset_mismatch` with `details.received_offset`, decided
+        before the `total_size` and `Chunk-Sha256` checks (a received chunk
+        still replays). For an upload still receiving, a new chunk that would
+        run past `total_size` is 400 `invalid_request`. An unknown upload, or one
         24 h after its last chunk, is 404 `not_found`. A body over 768 KiB
         is 413 `payload_too_large`.
       parameters:
@@ -1831,8 +1832,8 @@ paths:
         failed or interrupted job is re-queued (same job_id, attempt + 1);
         200 once it has succeeded (with `result`) or was cancelled (it stays
         cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it).
-        The same `upload_id` with a different `title` is 422
-        `idempotency_key_reused`. An unknown upload, or one past its 24 h
+        The same `upload_id` with a different `title` — including a `title`
+        added or left out — is 422 `idempotency_key_reused`. An unknown upload, or one past its 24 h
         (§5.6), is 404 `not_found`; one that is not complete is 400
         `invalid_request` with `details.received`. The whole file's hash and
         its format are checked before the job starts: 422
@@ -1912,9 +1913,12 @@ paths:
       description: >-
         A job that is queued, running, cancelling or succeeded cannot be
         retried: 400 `invalid_request` with `details.status`. The route has
-        no idempotency key: if a retry's outcome is unknown and repeating it
-        gives 400 with `details.status` `queued` or `running`, the earlier
-        retry landed (`attempt` went up once). It answers 200 with the job,
+        no idempotency key, so a retry whose outcome is unknown must not be
+        repeated blindly — repeating it after it landed and the job failed
+        again restarts the job a second time. Instead GET the job and compare
+        `attempt` with its value before the retry: a higher `attempt` means
+        the job was restarted (by this retry or by an import replay). It
+        answers 200 with the job,
         where an import replay that re-queues answers 202: there the 202
         says the import is still to be done, here the request itself is
         the restart.
