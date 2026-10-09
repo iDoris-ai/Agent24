@@ -14,6 +14,7 @@ pub mod db;
 pub mod error;
 pub mod id;
 pub mod idem;
+pub mod imports;
 pub mod jobs;
 pub mod state;
 pub mod timestamp;

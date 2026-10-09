@@ -258,18 +258,34 @@ pub async fn retry_job(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Job>, ApiError> {
     job_id(&id)?;
-    transition(&storage, &id, |status| match status {
-        "failed" | "interrupted" | "cancelled" => Ok(Some(
-            "status = 'queued', attempt = attempt + 1, error = NULL, progress = NULL",
-        )),
-        other => Err(
-            ApiError::invalid_request(format!("a {other} job cannot be retried"))
-                .with_detail("status", other.to_owned()),
-        ),
-    })
-    .await
-    .map(Json)
+    // The re-queue and its worker's start go together, in a task of their
+    // own: a client that goes away mid-commit must not leave a queued job
+    // that no worker will run (and that a retry refuses, being queued).
+    let task = tokio::spawn(async move {
+        let job = transition(&storage, &id, |status| match status {
+            "failed" | "interrupted" | "cancelled" => Ok(Some(
+                "status = 'queued', attempt = attempt + 1, error = NULL, progress = NULL",
+            )),
+            other => Err(
+                ApiError::invalid_request(format!("a {other} job cannot be retried"))
+                    .with_detail("status", other.to_owned()),
+            ),
+        })
+        .await?;
+        #[cfg(test)]
+        tests::after_retry_commit(&id).await;
+        // Queued again: start its worker (the only kind with one so far).
+        if job.kind == "import" {
+            crate::imports::worker::spawn(storage, id, job.attempt);
+        }
+        Ok(job)
+    });
+    match task.await {
+        Ok(result) => result.map(Json),
+        // A spawned task is only cancelled when the runtime shuts down.
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

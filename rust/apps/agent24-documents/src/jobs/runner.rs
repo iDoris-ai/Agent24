@@ -165,6 +165,12 @@ async fn claim(
 }
 
 impl Claim {
+    /// The job this attempt belongs to.
+    #[must_use]
+    pub fn job_id(&self) -> &str {
+        &self.attempt.job_id
+    }
+
     /// The job's input, as written when the job was created.
     #[must_use]
     pub fn input(&self) -> Option<&Value> {

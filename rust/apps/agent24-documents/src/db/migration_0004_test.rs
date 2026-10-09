@@ -151,7 +151,8 @@ async fn chunks_are_immutable_and_outlive_a_live_upload() {
     .await;
     let delete = format!("DELETE FROM upload_chunks WHERE upload_id = '{UPL}'");
     refused(&db, &delete, "chunks of a live upload cannot be deleted").await;
-    // REPLACE deletes the old row first, which the delete trigger sees.
+    // REPLACE is refused by 0005's BEFORE INSERT guard before anything is
+    // deleted; the delete message is what 0004 alone would give (#834 review).
     refused(
         &db,
         &format!("REPLACE INTO upload_chunks (upload_id, chunk_offset, chunk_size, sha256) VALUES ('{UPL}', 0, 4, '{SHA}')"),
