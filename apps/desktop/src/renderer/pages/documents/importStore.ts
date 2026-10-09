@@ -41,6 +41,7 @@ export function subscribeImport(listener: () => void): () => void {
 /** For tests: forget everything. */
 export function resetImportStore(): void {
   state = initial
+  wake = null
   listeners.clear()
 }
 
@@ -55,7 +56,25 @@ export function describeError(res: DocumentsResponse & { ok: false }): string {
 const transient = (res: DocumentsResponse & { ok: false }): boolean =>
   res.status >= 500 && res.error.details?.['retryable'] !== false
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+/** Ends the current wait between reads early, for the job being followed. */
+let wake: { jobId: string; now: () => void } | null = null
+
+/** An OS event about `jobId` (ADR-DOC-02 §7): read the job now rather than
+ * at the next tick. Only a hint: what the read says is what counts. */
+export function nudge(jobId: string): void {
+  if (wake?.jobId === jobId) wake.now()
+}
+
+const sleep = (ms: number, jobId: string) =>
+  new Promise<void>((r) => {
+    const timer = setTimeout(done, ms)
+    function done(): void {
+      clearTimeout(timer)
+      wake = null
+      r()
+    }
+    wake = { jobId, now: done }
+  })
 
 /** Picks a file, uploads it and follows its job to the end. One at a time. */
 export async function startImport(api: Api): Promise<void> {
@@ -82,7 +101,7 @@ async function follow(api: Api, first: Job): Promise<void> {
   let failures = 0
   set({ job })
   while (WORKING.has(job.status)) {
-    await sleep(Math.min(POLL_MS * 2 ** failures, MAX_BACKOFF_MS))
+    await sleep(Math.min(POLL_MS * 2 ** failures, MAX_BACKOFF_MS), job.job_id)
     const res = await api.request({ op: 'job', jobId: job.job_id })
     if (!res.ok) {
       if (!transient(res)) {
