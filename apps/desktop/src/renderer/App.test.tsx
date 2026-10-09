@@ -188,6 +188,7 @@ describe('App', () => {
       request,
       importFile: vi.fn(),
       onImportProgress: () => () => {},
+      onEvent: () => () => {},
     }
     await act(async () => { render(<App />) })
     fireEvent.click(screen.getByRole('button', { name: /文档/ }))

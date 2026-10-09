@@ -32,13 +32,14 @@ interface Mock {
   request: ReturnType<typeof vi.fn>
   importFile: ReturnType<typeof vi.fn>
   progress: ((p: { sent: number; total: number }) => void) | null
+  event: ((e: { kind: string; payload: Record<string, unknown> }) => void) | null
 }
 
 /** `list` answers from `lists` in turn (the last one repeats); `job` from `jobs`. */
 function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Promise<Res>>; capabilities?: () => Promise<Res> }): Mock {
   const lists = [...(opts.lists ?? [() => ok({ documents: [], next_cursor: null })])]
   const jobs = [...(opts.jobs ?? [])]
-  const m: Mock = { request: vi.fn(), importFile: vi.fn(() => Promise.resolve(null)), progress: null }
+  const m: Mock = { request: vi.fn(), importFile: vi.fn(() => Promise.resolve(null)), progress: null, event: null }
   m.request.mockImplementation((req: { op: string }) => {
     if (req.op === 'capabilities') return (opts.capabilities ?? (() => ok({ storage: { state: 'ready' } })))()
     if (req.op === 'list') return (lists.length > 1 ? lists.shift()! : lists[0]!)()
@@ -54,6 +55,12 @@ function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Pro
         m.progress = cb
         return () => {
           m.progress = null
+        }
+      },
+      onEvent: (cb: Mock['event']) => {
+        m.event = cb
+        return () => {
+          m.event = null
         }
       },
     },
@@ -246,5 +253,33 @@ describe('DocumentsPage: importing', () => {
     fireEvent.click(screen.getByRole('button', IMPORT))
     await tick(1100)
     await waitFor(() => expect(screen.getByText('导入失败：不支持这种格式')).toBeInTheDocument())
+  })
+})
+
+describe('DocumentsPage: OS events (hints only)', () => {
+  it('an event about the job being followed reads it at once; one about another job does not', async () => {
+    const m = mount({ lists: [page([]), page([9])], jobs: [() => ok(job('succeeded'))] })
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await waitFor(() => expect(screen.getByText('排队中')).toBeInTheDocument())
+    const reads = () => m.request.mock.calls.filter(([r]) => r.op === 'job').length
+    act(() => m.event?.({ kind: 'job.finished', payload: { job_id: 'job_01K75A0B1C2D3E4F5G6H7J8K00' } }))
+    await tick(10)
+    expect(reads()).toBe(0)
+    act(() => m.event?.({ kind: 'job.finished', payload: { job_id: job('x').job_id } }))
+    await tick(10)
+    expect(reads()).toBe(1)
+    await waitFor(() => expect(screen.getByText('通告 9')).toBeInTheDocument())
+  })
+
+  it('a document imported from anywhere reloads the list; after leaving, events are not heard', async () => {
+    const m = mount({ lists: [page([]), page([7])] })
+    const { unmount } = render(<DocumentsPage />)
+    await waitFor(() => expect(screen.getByText('还没有文档。')).toBeInTheDocument())
+    act(() => m.event?.({ kind: 'document.imported', payload: { document_id: doc(7).document_id } }))
+    await waitFor(() => expect(screen.getByText('通告 7')).toBeInTheDocument())
+    unmount()
+    expect(m.event).toBeNull()
   })
 })

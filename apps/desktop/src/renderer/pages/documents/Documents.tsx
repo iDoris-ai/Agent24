@@ -4,7 +4,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { components } from '@agent24/api-client'
-import { describeError, getImportState, startImport, subscribeImport } from './importStore'
+import { describeError, getImportState, nudge, startImport, subscribeImport } from './importStore'
 
 type Doc = components['schemas']['Document']
 
@@ -77,6 +77,17 @@ export default function DocumentsPage() {
       generation.current++ // drop replies still in flight
     }
   }, [api])
+
+  // The OS's events are hints (ADR-DOC-02 §7): a job event reads that job
+  // now, a new document reloads the list (an import from anywhere).
+  useEffect(
+    () =>
+      api.onEvent((e) => {
+        if (e.kind === 'job.finished' || e.kind === 'job.progress') nudge(e.payload.job_id)
+        else if (e.kind === 'document.imported') void reload()
+      }),
+    [api, reload],
+  )
 
   // On mount and after each successful import (even one finished while the
   // page was away).
