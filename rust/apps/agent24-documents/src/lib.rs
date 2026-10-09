@@ -13,6 +13,7 @@ pub mod blob;
 pub mod db;
 pub mod error;
 pub mod id;
+pub mod idem;
 pub mod state;
 
 use axum::extract::State;
