@@ -25,26 +25,28 @@ const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
 /// Which rows of its attempt a worker may settle.
 #[derive(Debug, Clone, Copy)]
-pub enum Mine {
+enum Mine {
     /// It never claimed the job: only the still-queued job.
     Unclaimed,
     /// It claimed the job: only that claim, running or being cancelled.
     Claimed,
 }
 
-/// One attempt of one job, as a worker holds it.
+/// One attempt of one job, as a worker holds it. Only this module makes
+/// one, so code elsewhere cannot settle an attempt it never held.
 #[derive(Debug, Clone)]
-pub struct Attempt {
-    pub job_id: String,
-    pub attempt: i64,
-    pub mine: Mine,
+struct Attempt {
+    job_id: String,
+    attempt: i64,
+    mine: Mine,
 }
 
-/// A claimed attempt, handed to the kind's work with the job's input.
+/// A claimed attempt, handed to the kind's work with the job's input. Made
+/// only by a successful claim.
 #[derive(Debug, Clone)]
 pub struct Claim {
-    pub attempt: Attempt,
-    pub input: Option<Value>,
+    attempt: Attempt,
+    input: Option<Value>,
 }
 
 /// The transaction that ends a running attempt with its result.
@@ -135,6 +137,13 @@ async fn claim(
         tx.rollback().await?;
         return Ok(None);
     };
+    // The column CHECK (json_valid) admits some JSON serde does not (a
+    // number out of range, deep nesting): a claim on such an input fails,
+    // and the attempt is settled, rather than run as if it had none.
+    let input = input
+        .map(|s| serde_json::from_str::<Value>(&s))
+        .transpose()
+        .map_err(|e| sqlx::Error::Decode(format!("job {job_id} input: {e}").into()))?;
     sqlx::query(&format!(
         "UPDATE jobs SET status = 'running', updated_at = {NOW} WHERE id = ?"
     ))
@@ -151,11 +160,28 @@ async fn claim(
             attempt,
             mine: Mine::Claimed,
         },
-        input: input.and_then(|s| serde_json::from_str(&s).ok()),
+        input,
     }))
 }
 
 impl Claim {
+    /// The job's input, as written when the job was created.
+    #[must_use]
+    pub fn input(&self) -> Option<&Value> {
+        self.input.as_ref()
+    }
+
+    /// Ends this attempt unfinished: failed with `code` (from the closed §6
+    /// set), or cancelled if it was being cancelled.
+    pub async fn settle(
+        &self,
+        storage: &Storage,
+        code: &str,
+        message: &str,
+    ) -> Result<(), sqlx::Error> {
+        settle(storage, &self.attempt, code, message).await
+    }
+
     /// Takes the write lock to end this attempt with a result. `None` if the
     /// attempt is no longer running — being cancelled, ended or superseded —
     /// and nothing is to be committed; once the work returns, the supervisor
@@ -182,7 +208,8 @@ impl Claim {
 }
 
 impl Commit {
-    /// The transaction, for the kind's result rows.
+    /// The transaction, for the kind's result rows. It holds the write lock:
+    /// querying `storage.db.pool()` while it is open would wait on itself.
     pub fn conn(&mut self) -> &mut SqliteConnection {
         &mut self.tx
     }
@@ -220,7 +247,7 @@ impl Commit {
 
 /// Ends an unfinished attempt: failed with `code` (from the closed §6 set),
 /// or cancelled if it was being cancelled.
-pub async fn settle(
+async fn settle(
     storage: &Storage,
     me: &Attempt,
     code: &str,

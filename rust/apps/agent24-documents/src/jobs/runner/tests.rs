@@ -525,3 +525,33 @@ async fn a_job_started_twice_runs_once() {
     assert_eq!(finished(&env, &id, 2).await, row_of("succeeded", 1, None));
     assert_eq!(runs.load(SeqCst), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_input_serde_cannot_read_fails_the_claim_instead_of_running_without_it() {
+    let env = env().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    // Valid for the column's json_valid CHECK, out of range for serde (#833 review).
+    let deep = format!("{}1{}", "{\"a\":".repeat(150), "}".repeat(150));
+    for input in [r#"{"a":1e400}"#.to_owned(), deep] {
+        let id = crate::id::new_id(crate::id::IdKind::Job).unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, status, origin, attempt, input)
+             VALUES (?, 'probe', 'queued', '{\"kind\":\"page\"}', 1, ?)",
+        )
+        .bind(&id)
+        .bind(&input)
+        .execute(env.storage.db.pool())
+        .await
+        .unwrap();
+        spawn(env.storage.clone(), id.clone(), 1, counted(runs.clone()));
+        assert_eq!(
+            finished(&env, &id, 1).await,
+            row_of("failed", 1, Some("storage_unavailable"))
+        );
+    }
+    assert_eq!(
+        runs.load(SeqCst),
+        0,
+        "no work ran on an input it could not read"
+    );
+}
