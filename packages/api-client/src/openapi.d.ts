@@ -2022,6 +2022,42 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         } & (unknown & unknown & unknown & unknown & unknown & unknown);
+        /** @description kind `job.progress`: a job's latest progress. Coalesced per job, at most 2 events a second for the whole module; one dropped by the rate limit is not sent again. */
+        DocumentsJobProgressEvent: {
+            job_id: components["schemas"]["JobIdString"];
+            /** @description The job's kind, as in DocumentsJob. */
+            kind: string;
+            stage: string;
+            done: number;
+            total: number | null;
+            unit: string;
+        };
+        /** @description kind `job.finished`: a job reached an end state. Sent ahead of progress and, if rate-limited, once more after a short backoff. A job that is started again by its key or by `retry` finishes again with a higher `attempt`. */
+        DocumentsJobFinishedEvent: {
+            job_id: components["schemas"]["JobIdString"];
+            /** @description The job's kind, as in DocumentsJob. */
+            kind: string;
+            /** @enum {string} */
+            status: "succeeded" | "failed" | "cancelled" | "interrupted";
+            attempt: number;
+            /** @description The job's `error.code` when `failed` or `cancelled`, else null. */
+            error_code: null | components["schemas"]["DocumentsErrorCode"] | "cancelled";
+            document_id?: components["schemas"]["DocumentIdString"];
+            revision?: number;
+        } & (unknown & unknown & unknown);
+        /** @description kind `document.imported`: an import committed a new document and its first revision. Sent with the import job's `job.finished`. */
+        DocumentsDocumentImportedEvent: {
+            document_id: components["schemas"]["DocumentIdString"];
+            /** @constant */
+            revision: 1;
+            job_id: components["schemas"]["JobIdString"];
+        };
+        /** @description kind `revision.committed`: a commit made a new head revision (slice 2; slice 1 never sends it). Sent ahead of progress, like `job.finished`. */
+        DocumentsRevisionCommittedEvent: {
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            job_id?: components["schemas"]["JobIdString"];
+        };
         DocumentsEngineRef: {
             id: string;
             version: string;
