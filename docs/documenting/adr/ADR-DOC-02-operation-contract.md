@@ -212,6 +212,7 @@
   - **整个模块合计 ≤ 2 次/秒**（低于内核的每秒 5 次），进度按 job 合并只发最新一条；被 `rate_limited` 拒绝的进度事件直接丢弃。**终态事件**（`job.finished`、`revision.committed`）优先发送，被限流时短暂退避后重发一次；最终仍以 job 行为准。
   - **payload 只带 id、stage、计数、status、错误码**，不带标题、文件名、查询或内容：`EventsHub` 广播给所有 WS 客户端，D8 的资料处理政策管不到这条通道。
   - 事件只是提示，**job 行才是权威**；断线后用 `GET /jobs/{id}` 对账。
+  - **payload 结构**（#705）：见 `openapi.yaml` 的 `DocumentsJobProgressEvent`、`DocumentsJobFinishedEvent`、`DocumentsDocumentImportedEvent`、`DocumentsRevisionCommittedEvent`；字段是闭集，客户端仍忽略不认识的 kind 与字段。`job.finished` 带 `attempt` 与 `error_code`（取值同 job 的 `error.code`）；启动恢复置为 `interrupted` / `cancelled` 的 job 也发一次（尽力而为，受同样的限流）。
 - **agent run 取消**：内核目前不会通知模块。run 取消后 job 继续运行，结果保留（Q7）。
 
 ## 8. 可用性与发现（README §10.3）

@@ -3822,6 +3822,85 @@ components:
                 properties:
                   document_id: { $ref: "#/components/schemas/DocumentIdString" }
                   revision: { const: 1 }
+    # ── Documents events (ADR-DOC-02 §7) ──
+    # The OS sends these through `_a24/events/emit`; on the WS stream each is
+    # a `type: "module"` event (events.schema.json `ModuleEventPayload`) with
+    # `module: "documents"`, the `kind` named below and this object as its
+    # `payload`. The stream reaches every WS client, so a payload carries ids,
+    # stage, counts, status and error codes only: never a title, a file name,
+    # a query or content. Events are hints: the job row is the authority, and
+    # a client that reconnects or misses one reads `GET /jobs/{job_id}`.
+    # The OS sends exactly these fields (closed, so a contract test catches a
+    # leak); clients still ignore kinds and fields they do not know, which a
+    # later version may add.
+    DocumentsJobProgressEvent:
+      description: >-
+        kind `job.progress`: a job's latest progress. Coalesced per job, at
+        most 2 events a second for the whole module; one dropped by the rate
+        limit is not sent again.
+      type: object
+      required: [job_id, kind, stage, done, total, unit]
+      additionalProperties: false
+      properties:
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+        kind: { type: string, description: "The job's kind, as in DocumentsJob." }
+        stage: { type: string }
+        done: { type: integer, minimum: 0 }
+        total: { type: [integer, "null"], minimum: 0 }
+        unit: { type: string }
+    DocumentsJobFinishedEvent:
+      description: >-
+        kind `job.finished`: a job reached an end state. Sent ahead of
+        progress and, if rate-limited, once more after a short backoff. A job
+        that is started again by its key or by `retry` finishes again with
+        a higher `attempt`.
+      type: object
+      required: [job_id, kind, status, attempt, error_code]
+      additionalProperties: false
+      properties:
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+        kind: { type: string, description: "The job's kind, as in DocumentsJob." }
+        status: { type: string, enum: [succeeded, failed, cancelled, interrupted] }
+        attempt: { type: integer, minimum: 1 }
+        error_code:
+          description: The job's `error.code` when `failed` or `cancelled`, else null.
+          anyOf:
+            - type: "null"
+            - $ref: "#/components/schemas/DocumentsErrorCode"
+            - const: cancelled
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+      allOf:
+        # As in DocumentsJob: failed has a code from the closed set, cancelled
+        # has none or the "cancelled" marker, the others have none.
+        - if: { properties: { status: { const: failed } } }
+          then: { properties: { error_code: { $ref: "#/components/schemas/DocumentsErrorCode" } } }
+        - if: { properties: { status: { const: cancelled } } }
+          then: { properties: { error_code: { enum: [null, cancelled] } } }
+        - if: { properties: { status: { enum: [succeeded, interrupted] } } }
+          then: { properties: { error_code: { type: "null" } } }
+    DocumentsDocumentImportedEvent:
+      description: >-
+        kind `document.imported`: an import committed a new document and its
+        first revision. Sent with the import job's `job.finished`.
+      type: object
+      required: [document_id, revision, job_id]
+      additionalProperties: false
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { const: 1 }
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+    DocumentsRevisionCommittedEvent:
+      description: >-
+        kind `revision.committed`: a commit made a new head revision (slice 2;
+        slice 1 never sends it). Sent ahead of progress, like `job.finished`.
+      type: object
+      required: [document_id, revision]
+      additionalProperties: false
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 2 }
+        job_id: { $ref: "#/components/schemas/JobIdString" }
     DocumentsEngineRef:
       type: object
       required: [id, version]
