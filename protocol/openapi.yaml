@@ -1833,7 +1833,8 @@ paths:
         200 once it has succeeded (with `result`) or was cancelled (it stays
         cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it).
         The same `upload_id` with a different `title` — including a `title`
-        added or left out — is 422 `idempotency_key_reused`. An unknown upload, or one past its 24 h
+        added or left out — is 422 `idempotency_key_reused`; an empty `title`
+        is 400, never the same as none. An unknown upload, or one past its 24 h
         (§5.6), is 404 `not_found`; one that is not complete is 400
         `invalid_request` with `details.received`. The whole file's hash and
         its format are checked before the job starts: 422
@@ -1917,8 +1918,10 @@ paths:
         repeated blindly — repeating it after it landed and the job failed
         again restarts the job a second time. Instead GET the job and compare
         `attempt` with its value before the retry: a higher `attempt` means
-        the job was restarted (by this retry or by an import replay). It
-        answers 200 with the job,
+        the job was restarted (by this retry or by an import replay). An
+        unchanged `attempt` does not prove the retry was lost: it may still
+        be in flight, so read the job again before deciding. It answers 200
+        with the job,
         where an import replay that re-queues answers 202: there the 202
         says the import is still to be done, here the request itself is
         the restart.
@@ -1947,7 +1950,9 @@ paths:
         reports the scale it used in `Documents-Render-Scale`. If the
         requested area does not fit even at scale 0.25, the response is 413
         `payload_too_large`: request smaller tiles with `region`. Renders are
-        a cache derived from the revision and can be rebuilt (§3).
+        a cache derived from the revision and can be rebuilt (§3). A page past
+        the revision's last page is 404 `not_found`; a flowing format (DOCX)
+        has no pages and is 422 `unsupported_format`.
       parameters:
         - $ref: "#/components/parameters/DocumentId"
         - $ref: "#/components/parameters/RevisionNumber"
@@ -3631,14 +3636,14 @@ components:
         revision: { type: integer, minimum: 1 }
         content_sha256: { $ref: "#/components/schemas/Sha256Address" }
         size: { type: integer, minimum: 0 }
-        media_type: { type: string }
+        media_type: { $ref: "#/components/schemas/DocumentsMediaType" }
     Document:
       type: object
       required: [document_id, title, media_type, head_revision, created_at, updated_at]
       properties:
         document_id: { $ref: "#/components/schemas/DocumentIdString" }
         title: { type: string }
-        media_type: { type: string }
+        media_type: { $ref: "#/components/schemas/DocumentsMediaType" }
         head_revision: { type: integer, minimum: 1 }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -3809,6 +3814,18 @@ components:
             minItems: 4
             maxItems: 4
             items: { type: number, minimum: 0 }
+    DocumentsMediaType:
+      type: string
+      description: >-
+        Lowercase `type/subtype` without parameters, as the OS records it at
+        import (`application/pdf`, not `Application/PDF; x=y`).
+      pattern: "^[a-z0-9.+-]+/[a-z0-9.+-]+$"
+    DocumentsPaginatedMediaType:
+      description: >-
+        The paginated formats: their anchors and blocks have a page and
+        geometry; every other format is flowing and has neither (§3).
+      type: string
+      enum: [application/pdf, image/jpeg, image/png]
     DocumentsTextRange:
       type: object
       description: >-
@@ -3834,8 +3851,7 @@ components:
         revision: { type: integer, minimum: 1 }
         content_sha256: { $ref: "#/components/schemas/Sha256Address" }
         media_type:
-          type: string
-          pattern: "^[a-z0-9.+-]+/[a-z0-9.+-]+$"
+          $ref: "#/components/schemas/DocumentsMediaType"
           description: >-
             Media type of the anchored revision. It tells a client, and this
             schema, whether the source is paginated (PDF, images) or flowing
@@ -3854,7 +3870,7 @@ components:
       # Paginated sources (PDF, scans) always give a page and its geometry;
       # flowing ones (DOCX) give neither (§3).
       if:
-        properties: { media_type: { enum: [application/pdf, image/jpeg, image/png] } }
+        properties: { media_type: { $ref: "#/components/schemas/DocumentsPaginatedMediaType" } }
         required: [media_type]
       then:
         required: [page, geometry]
@@ -3888,8 +3904,7 @@ components:
         revision: { type: integer, minimum: 1 }
         content_sha256: { $ref: "#/components/schemas/Sha256Address" }
         media_type:
-          type: string
-          pattern: "^[a-z0-9.+-]+/[a-z0-9.+-]+$"
+          $ref: "#/components/schemas/DocumentsMediaType"
           description: Media type of the revision; see DocumentsAnchor.media_type.
         text_layer_sha256: { $ref: "#/components/schemas/Sha256Address" }
         engine: { $ref: "#/components/schemas/DocumentsEngineRef" }
@@ -3905,10 +3920,11 @@ components:
       allOf:
         - if: { properties: { parse_status: { const: partial } } }
           then: { required: [unparsed_regions], properties: { unparsed_regions: { minItems: 1 } } }
+          else: { properties: { unparsed_regions: { maxItems: 0 } } }
         # every block of a paginated source has a page and its geometry; a
         # flowing source's blocks have neither (§3)
         - if:
-            properties: { media_type: { enum: [application/pdf, image/jpeg, image/png] } }
+            properties: { media_type: { $ref: "#/components/schemas/DocumentsPaginatedMediaType" } }
             required: [media_type]
           then:
             properties:
@@ -3947,6 +3963,7 @@ components:
         next_cursor: { type: [string, "null"] }
       if: { properties: { parse_status: { const: partial } } }
       then: { required: [unparsed_regions], properties: { unparsed_regions: { minItems: 1 } } }
+      else: { properties: { unparsed_regions: { maxItems: 0 } } }
     ExtractionIdString:
       type: string
       pattern: "^ext_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
@@ -3993,18 +4010,31 @@ components:
     DocumentsExtractCandidate:
       type: object
       required: [value, normalized, anchors]
+      additionalProperties: false
       properties:
         value: { type: string, description: As written in the source. }
-        normalized: { type: string, description: For comparison only. }
+        normalized:
+          type: string
+          description: >-
+            For comparison only. Required here: candidates conflict because
+            their normalized forms differ.
         anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
     DocumentsExtractedValue:
       type: object
       required: [key, status]
+      additionalProperties: false
       properties:
-        key: { type: string }
+        key:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,63}$"
+          description: The `key` of the requested field.
         status: { type: string, enum: [present, missing, conflict] }
         value: { type: string, description: As written in the source; never rewritten. }
-        normalized: { type: string, description: For comparison only. }
+        normalized:
+          type: string
+          description: >-
+            For comparison only. Optional on a present value: some values
+            (free text) have no normal form.
         anchors:
           type: array
           description: >-
@@ -4030,10 +4060,16 @@ components:
               anchors: { type: array, items: { $ref: "#/components/schemas/DocumentsAnchor" } }
               candidates: false
               missing_reason: false
+            # no anchors: say why; anchors: they are the evidence, and
+            # there is nothing to excuse.
             if: { properties: { anchors: { maxItems: 0 } } }
             then:
               required: [unsourced_reason]
               properties: { unsourced_reason: { type: string, minLength: 1 } }
+            else:
+              properties:
+                anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+                unsourced_reason: false
         # missing: why, and nothing asserted.
         - if: { properties: { status: { const: missing } } }
           then:

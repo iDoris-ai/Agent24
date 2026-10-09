@@ -144,7 +144,29 @@ describe('anchors (§3)', () => {
       expect(v[schema](partial), `${schema} without regions`).toBe(false)
       expect(v[schema]({ ...partial, unparsed_regions: [] }), `${schema} with no regions`).toBe(false)
       ok(schema, { ...partial, unparsed_regions: regions })
+      // complete means everything was parsed: no regions left out (#817 review)
+      expect(v[schema]({ ...base, parse_status: 'complete', unparsed_regions: regions }), `${schema} complete with regions`).toBe(false)
+      ok(schema, { ...base, parse_status: 'complete', unparsed_regions: [] })
     }
+  })
+
+  it('define the paginated formats and the media type syntax once (#817 review)', () => {
+    const s = openapi.components.schemas
+    expect(s.DocumentsPaginatedMediaType.enum).toEqual(['application/pdf', 'image/jpeg', 'image/png'])
+    const paginated = { $ref: '#/components/schemas/DocumentsPaginatedMediaType' }
+    expect(s.DocumentsAnchor.if.properties.media_type).toEqual(paginated)
+    expect(s.DocumentsTextPage.allOf[1].if.properties.media_type).toEqual(paginated)
+    const mediaType = '#/components/schemas/DocumentsMediaType'
+    for (const schema of ['DocumentsAnchor', 'DocumentsTextPage', 'Document', 'DocumentRevisionSummary']) {
+      expect(s[schema].properties.media_type.$ref, schema).toBe(mediaType)
+    }
+    const syntax = new RegExp(s.DocumentsMediaType.pattern)
+    expect(syntax.test('application/pdf')).toBe(true)
+    for (const bad of ['Application/PDF', 'application/pdf; charset=x', 'pdf', '']) expect(syntax.test(bad), bad).toBe(false)
+    // ADR §3 agrees: a flowing format gives no page at all.
+    const adr = readFileSync(join(repoRoot, 'docs', 'documenting', 'adr', 'ADR-DOC-02-operation-contract.md'), 'utf8')
+    expect(adr).toMatch(/DOCX 等流式格式只用它定位，不给 `page`/)
+    expect(adr).not.toMatch(/`page` 可省略/)
   })
 
   it('a text block of a paginated source has a page and geometry; a flowing block has neither', () => {
