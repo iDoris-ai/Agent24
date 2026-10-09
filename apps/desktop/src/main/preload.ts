@@ -6,6 +6,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
   type BackendProxyRequest,
@@ -105,6 +106,14 @@ const api = {
   documents: {
     request: <R extends DocumentsRequest>(req: R): Promise<DocumentsResponse<R['op']>> =>
       ipcRenderer.invoke(IpcChannels.DocumentsRequest, req),
+    /** Picks a PDF, JPEG or PNG and imports it; null if the user cancels. */
+    importFile: (): Promise<DocumentsResponse<'job'> | null> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsImportFile),
+    onImportProgress: (cb: (p: DocumentsImportProgress) => void): (() => void) => {
+      const listener = (_event: unknown, p: DocumentsImportProgress): void => cb(p)
+      ipcRenderer.on(IpcChannels.DocumentsImportProgress, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.DocumentsImportProgress, listener)
+    },
   },
 } as const
 

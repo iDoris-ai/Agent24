@@ -47,6 +47,10 @@ export const IpcChannels = {
   // ADR-DOC-01 D5: the Documenting OS's typed channel. The renderer names an
   // operation; main maps it to a fixed route (main/documents.ts).
   DocumentsRequest: 'documents:request',
+  // Picks a file in a native dialog and imports it (main/documents-import.ts);
+  // progress is pushed on DocumentsImportProgress.
+  DocumentsImportFile: 'documents:import-file',
+  DocumentsImportProgress: 'documents:import-progress',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -360,3 +364,9 @@ export type DocumentsError = DocSchemas['ErrorBody']
 export type DocumentsResponse<Op extends DocumentsRequest['op'] = DocumentsRequest['op']> =
   | { ok: true; status: number; data: DocumentsResults[Op] }
   | { ok: false; status: number; error: DocumentsError }
+
+/** Bytes of the picked file sent so far, pushed while it uploads. */
+export interface DocumentsImportProgress {
+  sent: number
+  total: number
+}
