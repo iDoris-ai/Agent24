@@ -101,8 +101,12 @@ struct Env {
 }
 
 async fn env() -> Env {
+    env_with(crate::events::Events::default()).await
+}
+
+async fn env_with(events: crate::events::Events) -> Env {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::open(dir.path()).await;
+    let state = AppState::open_with_events(dir.path(), events).await;
     let storage = state.storage().await.unwrap();
     Env {
         _dir: dir,
@@ -554,4 +558,33 @@ async fn an_input_serde_cannot_read_fails_the_claim_instead_of_running_without_i
         0,
         "no work ran on an input it could not read"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_attempt_announces_its_own_end_and_a_late_supervisor_nothing() {
+    let (events, seen) = crate::events::tests::recorder(Duration::ZERO, 0);
+    let env = env_with(events).await;
+    let id = add_job(&env, 1).await;
+    // Attempt 1's supervisor is held while attempt 2 runs and succeeds.
+    HOLD_SETTLE.lock().unwrap().push(id.clone());
+    FAULTS.lock().unwrap().push((id.clone(), "claim", 1));
+    spawn(env.storage.clone(), id.clone(), 1, |_, _| async { Ok(()) });
+    wait_for(&SETTLES, &id, 1).await;
+    exec(&env, "UPDATE jobs SET status = 'queued', attempt = 2").await;
+    spawn(env.storage.clone(), id.clone(), 2, counted(Arc::default()));
+    // Its supervisor is held too, but its success is committed.
+    let start = Instant::now();
+    while row(&env, &id).await.0 != "succeeded" {
+        assert!(start.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    HOLD_SETTLE.lock().unwrap().retain(|j| *j != id);
+    assert_eq!(finished(&env, &id, 2).await, row_of("succeeded", 2, None));
+    let sent = crate::events::tests::sent(&seen, 1).await;
+    assert_eq!(
+        sent[0].1,
+        json!({ "job_id": id, "kind": "probe", "status": "succeeded", "attempt": 2, "error_code": null })
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(seen.lock().unwrap().len(), 1, "attempt 1 ended nothing");
 }

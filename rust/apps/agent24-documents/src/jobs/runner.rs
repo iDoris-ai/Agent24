@@ -19,6 +19,8 @@ use std::time::Duration;
 use serde_json::Value;
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 
+use crate::events::Events;
+use crate::jobs::snapshot;
 use crate::state::Storage;
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
@@ -53,6 +55,7 @@ pub struct Claim {
 pub struct Commit {
     tx: Transaction<'static, Sqlite>,
     attempt: Attempt,
+    events: Events,
 }
 
 /// Runs attempt `attempt` of `job_id` in the background: claims it (only
@@ -214,6 +217,7 @@ impl Claim {
             Some("running") => Ok(Some(Commit {
                 tx,
                 attempt: self.attempt.clone(),
+                events: storage.events.clone(),
             })),
             _ => {
                 tx.rollback().await?;
@@ -252,7 +256,12 @@ impl Commit {
         .await?
         .rows_affected();
         if done == 1 {
-            self.tx.commit().await
+            let job = snapshot(&mut *self.tx, &self.attempt.job_id).await;
+            self.tx.commit().await?;
+            if let Some(job) = job {
+                self.events.finished(&job);
+            }
+            Ok(())
         } else {
             // Cannot happen under the lock taken in begin_commit; never commit
             // result rows without the success that owns them.
@@ -262,7 +271,8 @@ impl Commit {
 }
 
 /// Ends an unfinished attempt: failed with `code` (from the closed §6 set),
-/// or cancelled if it was being cancelled.
+/// or cancelled if it was being cancelled. Announced only when it is what
+/// ended the attempt, so a late supervisor never speaks for another one.
 async fn settle(
     storage: &Storage,
     me: &Attempt,
@@ -275,9 +285,10 @@ async fn settle(
         Mine::Unclaimed => "('queued')",
         Mine::Claimed => "('running', 'cancelling')",
     };
-    // `execute`, not a RETURNING fetch: it runs the statement to the end, so
-    // a failure to commit is an error here and the supervisor retries.
-    sqlx::query(&format!(
+    // `execute`, not a RETURNING fetch, and an explicit commit: a failure to
+    // commit is an error here and the supervisor retries.
+    let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+    let ended = sqlx::query(&format!(
         "UPDATE jobs SET updated_at = {NOW},
                 status = CASE status WHEN 'cancelling' THEN 'cancelled' ELSE 'failed' END,
                 error = CASE status WHEN 'cancelling'
@@ -289,8 +300,19 @@ async fn settle(
     .bind(message)
     .bind(&me.job_id)
     .bind(me.attempt)
-    .execute(storage.db.pool())
-    .await?;
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    let job = if ended {
+        snapshot(&mut *tx, &me.job_id).await
+    } else {
+        None
+    };
+    tx.commit().await?;
+    if let Some(job) = job {
+        storage.events.finished(&job);
+    }
     #[cfg(test)]
     tests::settle_done(&me.job_id);
     Ok(())

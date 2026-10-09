@@ -13,6 +13,7 @@ pub mod blob;
 pub mod db;
 pub mod documents;
 pub mod error;
+pub mod events;
 pub mod id;
 pub mod idem;
 pub mod imports;
