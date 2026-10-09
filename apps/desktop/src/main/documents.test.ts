@@ -1,7 +1,7 @@
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
-import { documentsCall, documentsRoute, httpSender, toResponse, type Route } from './documents'
+import { documentsCall, documentsEvent, documentsRoute, httpSender, toResponse, type Route } from './documents'
 
 const DOC = 'doc_01K74Z3QJ8V5N2W9RTX6YB4MCD'
 const JOB = 'job_01K75A0B1C2D3E4F5G6H7J8K9M'
@@ -182,5 +182,28 @@ describe('httpSender', () => {
     server = null
     const unreachable = await httpSender(() => ({ port, token: '' }))({ method: 'GET', path: '/x' })
     expect(unreachable).toMatchObject({ status: 503, error: { code: 'backend_unreachable' } })
+  })
+})
+
+describe('documentsEvent', () => {
+  const ev = (module: string, kind: string, payload: Record<string, unknown>) => ({ module, kind, payload })
+
+  it('passes the Documenting OS\'s known events on', () => {
+    for (const [kind, payload] of [
+      ['job.finished', { job_id: JOB, status: 'succeeded' }],
+      ['job.progress', { job_id: JOB }],
+      ['document.imported', { document_id: DOC, job_id: JOB, revision: 1 }],
+      ['revision.committed', { document_id: DOC, revision: 2 }],
+    ] as const) {
+      expect(documentsEvent(ev('documents', kind, payload))).toEqual({ kind, payload })
+    }
+  })
+
+  it('drops another module\'s event, an unknown kind, and one without a well-formed id', () => {
+    expect(documentsEvent(ev('agentear', 'job.finished', { job_id: JOB }))).toBeNull()
+    expect(documentsEvent(ev('documents', 'document.deleted', { document_id: DOC }))).toBeNull()
+    expect(documentsEvent(ev('documents', 'job.finished', { job_id: 'job_x' }))).toBeNull()
+    expect(documentsEvent(ev('documents', 'job.finished', { document_id: DOC }))).toBeNull()
+    expect(documentsEvent(ev('documents', 'document.imported', { job_id: JOB }))).toBeNull()
   })
 })
