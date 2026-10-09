@@ -74,7 +74,7 @@
   - 高亮时界面扩展到**字素簇边界**（UAX #29：泰文、组合符、ZWJ 序列），存储的偏移不变。
 - **重新解析与 OCR**：锚点绑定 `text_layer_sha256`，不要求 OCR 可复现。即使用同一个钉住版本重跑，也不假定逐字节一致，解析始终用那份存储的文本层。`block_text_sha256` + `quote` + `rects` 用于校验，不一致时显示“定位失效”，**不猜位置**。
 - **不跨 revision 迁移**：r1 的锚点永远指向 r1。要在 r2 上定位，只能重新抽取。
-- **无来源**：没有可核验来源的值，`anchor: null` 并附 `unsourced_reason`。
+- **无来源**：没有可核验来源的值，`anchors` 为空并附 `unsourced_reason`。有来源的值可以带多个锚点（`anchors[]`），共同覆盖整句命题：值本身，以及决定含义的条件、对象、否定词、表格行列标题，可跨块、跨页（与 `samples/README.md` §4.2 的金标结构一致；2026-10-09 由单个 `anchor` 改为数组，回应 OpenAPI B2b 的审查）。
 
 ## 4. 操作清单（DOC-1）
 
@@ -123,7 +123,7 @@
      |---|---|
      | `upload` | 页面的 `Idempotency-Key` |
      | `import` | `upload_id` |
-     | `extract` | `(document_id, revision, schema_sha256, extractor_version, model_id)`，键用实际的模型 id，不用 profile；需要重新抽取时，页面可以显式带 `rerun: true`，同时换一个新键 |
+     | `extract` | `(document_id, revision, schema_sha256, extractor_version, model_id)`，键用实际的模型 id，不用 profile；需要重新抽取时，页面可以显式带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，并入上面的业务键，所以它只在同一组业务坐标内有效，换了 schema 或实际模型就是另一个键（2026-10-09 澄清） |
      | `propose` | `(document_id, base_revision, ops_sha256)` |
      | `export` | `(document_id, revision, format, options_sha256)` |
      | `commit` | `commit_key` |

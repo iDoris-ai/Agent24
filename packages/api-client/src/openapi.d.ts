@@ -1101,6 +1101,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/documents/documents/{document_id}/extractions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Extract fields from one revision, each value with its provenance; starts a job
+         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version, model_id) — the actual model id, not a profile (§5.4). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key joins the business key, so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8); with no local model available the answer is 503 `engine_unavailable` with `details.engine` naming the model.
+         */
+        post: operations["documentsExtract"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/extractions/{extraction_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get an extraction's values, one page at a time
+         * @description Values follow the S01 gold-label shape (docs/documenting/samples): `present` with `anchors[]` that together cover the whole proposition (or `anchors: []` and `unsourced_reason` when there is no verifiable source), `missing` with `missing_reason`, or `conflict` with every candidate and its own `anchors[]`; a conflict is never resolved by the extractor. A page holds at most `limit` values and at most 512 KiB of serialized JSON (§4).
+         */
+        get: operations["documentsGetExtraction"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1838,6 +1878,13 @@ export interface components {
                 code?: "unsupported_format" | "parse_failed";
             };
         };
+        /** @description The 422s of extraction. */
+        DocumentsExtractUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "unsupported_format" | "parse_failed" | "idempotency_key_reused";
+            };
+        };
         /** @description The 422s of text and find. */
         DocumentsReadUnprocessableError: components["schemas"]["DocumentsError"] & {
             error?: {
@@ -1963,16 +2010,17 @@ export interface components {
                 code: components["schemas"]["DocumentsErrorCode"] | "cancelled";
                 message: string;
             } | null;
-            /** @description Set when `succeeded`, e.g. the imported document and its r1. */
+            /** @description Set when `succeeded`, e.g. the imported document and its r1, or the extraction. */
             result?: {
                 document_id?: components["schemas"]["DocumentIdString"];
                 revision?: number;
+                extraction_id?: components["schemas"]["ExtractionIdString"];
             } | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
-        } & (unknown & unknown & unknown & unknown);
+        } & (unknown & unknown & unknown & unknown & unknown);
         DocumentsEngineRef: {
             id: string;
             version: string;
@@ -2052,6 +2100,63 @@ export interface components {
             /** @description The regions that were not searched, so "no match" is not mistaken for "not there". */
             unparsed_regions?: components["schemas"]["DocumentsUnparsedRegion"][];
             matches: components["schemas"]["DocumentsAnchor"][];
+            next_cursor: string | null;
+        };
+        ExtractionIdString: string;
+        DocumentsExtractField: {
+            key: string;
+            /** @description What to find, in the reader's words. */
+            description: string;
+            /**
+             * @description A hint for the extractor; values keep the source wording either way.
+             * @enum {string}
+             */
+            type?: "text" | "date" | "datetime" | "amount" | "number" | "identifier" | "boolean";
+        };
+        DocumentsExtractRequest: {
+            revision: number;
+            schema: {
+                fields: components["schemas"]["DocumentsExtractField"][];
+            };
+            /** @default false */
+            rerun: boolean;
+        };
+        /** @description Anchors that together cover the whole proposition: the value and what decides its meaning — condition, audience, negation, table row label and column header (samples README §4.2). They may span blocks and pages. */
+        DocumentsEvidence: components["schemas"]["DocumentsAnchor"][];
+        DocumentsExtractCandidate: {
+            /** @description As written in the source. */
+            value: string;
+            /** @description For comparison only. */
+            normalized: string;
+            anchors: components["schemas"]["DocumentsEvidence"];
+        };
+        DocumentsExtractedValue: {
+            key: string;
+            /** @enum {string} */
+            status: "present" | "missing" | "conflict";
+            /** @description As written in the source; never rewritten. */
+            value?: string;
+            /** @description For comparison only. */
+            normalized?: string;
+            /** @description Evidence for a present value (see DocumentsEvidence). Empty only when the value has no verifiable source, and then `unsourced_reason` says why (ADR-DOC-02 §3). */
+            anchors?: components["schemas"]["DocumentsAnchor"][];
+            unsourced_reason?: string;
+            /** @enum {string} */
+            missing_reason?: "blank_in_template" | "not_in_document" | "referenced_but_absent" | "outside_page_scope";
+            candidates?: components["schemas"]["DocumentsExtractCandidate"][];
+        } & (unknown & unknown & unknown);
+        DocumentsExtraction: {
+            extraction_id: components["schemas"]["ExtractionIdString"];
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            content_sha256: components["schemas"]["Sha256Address"];
+            schema_sha256: components["schemas"]["Sha256Address"];
+            extractor_version: string;
+            /** @description The model actually used (§5.4), always a local one (ADR-DOC-01 D8). */
+            model_id: string;
+            /** Format: date-time */
+            created_at: string;
+            values: components["schemas"]["DocumentsExtractedValue"][];
             next_cursor: string | null;
         };
         DocumentList: {
@@ -2269,6 +2374,15 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["DocumentsRenderUnprocessableError"];
+            };
+        };
+        /** @description `unsupported_format`, `parse_failed`, or `idempotency_key_reused` when a rerun key is reused with a different request (§5.4, §6). */
+        DocumentsExtractUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsExtractUnprocessableError"];
             };
         };
         /** @description Text and find: `unsupported_format`, `parse_failed`, or `partial_parse` when `require_complete` was set (§6). */
@@ -4483,6 +4597,83 @@ export interface operations {
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
             422: components["responses"]["DocumentsReadUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsExtract: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Required with `rerun: true`; ignored otherwise. */
+                "Idempotency-Key"?: string;
+            };
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsExtractRequest"];
+            };
+        };
+        responses: {
+            /** @description Replay of an extraction job that already succeeded or was cancelled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            /** @description The extraction job, new, still running, or re-queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsExtractUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsGetExtraction: {
+        parameters: {
+            query?: {
+                /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
+                cursor?: components["parameters"]["DocumentsCursor"];
+                limit?: components["parameters"]["DocumentsLimit"];
+            };
+            header?: never;
+            path: {
+                extraction_id: components["schemas"]["ExtractionIdString"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The extraction and one page of its values */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsExtraction"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
