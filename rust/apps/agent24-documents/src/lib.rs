@@ -12,6 +12,7 @@
 pub mod blob;
 pub mod db;
 pub mod documents;
+pub mod engine;
 pub mod error;
 pub mod id;
 pub mod idem;

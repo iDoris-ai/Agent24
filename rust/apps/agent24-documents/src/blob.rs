@@ -236,6 +236,18 @@ impl BlobStore {
         Ok(self.object_path(hex).1.is_file())
     }
 
+    /// Where a stored blob's file is, for an engine that reads it by path.
+    /// Blob files are never rewritten, so the path stays valid while the
+    /// blob is referenced.
+    pub fn path_of(&self, address: &str) -> Result<PathBuf, BlobError> {
+        let path = self.object_path(parse_address(address)?).1;
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(BlobError::NotFound(address.to_owned()))
+        }
+    }
+
     /// Open a blob for streaming. The caller gets the bytes as stored; use
     /// [`BlobStore::read_verified`] when the content must be re-checked.
     pub fn open_blob(&self, address: &str) -> Result<File, BlobError> {
