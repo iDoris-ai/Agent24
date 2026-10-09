@@ -646,7 +646,6 @@ The first end-to-end acceptance is two vertical slices, not the whole capability
 
 - **Form filling (S02)** is not in the first slices. Before it is promised, the supported form types and the manual-completion path for unsupported ones must be declared.
 - If only one slice ships first, it is called “first slice”. It must not be described as covering the T005 first-release recommendation.
-- The scenario mapping above is **TBD — to confirm with reviewer**.
 
 ## 16. Dependencies and Team Inputs
 
