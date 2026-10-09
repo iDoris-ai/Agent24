@@ -1813,6 +1813,109 @@ paths:
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
         "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
 
+  /documents/imports:
+    post:
+      operationId: documentsImport
+      tags: [documents]
+      summary: Import a completed upload as a new document (r1); starts a job
+      description: >-
+        Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on
+        `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job —
+        202 while it is queued or running, and 202 again when a failed or
+        interrupted job is re-queued (same job_id, attempt + 1); 200 once it
+        has succeeded (with `result`) or was cancelled (it stays cancelled;
+        only `POST /jobs/{job_id}/retry` restarts it). An upload that is not
+        complete is 400 `invalid_request` with `details.received`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentsImportRequest" }
+      responses:
+        "200":
+          description: Replay of a job that already succeeded or was cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "202":
+          description: The import job, new, still running, or re-queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "422": { $ref: "#/components/responses/DocumentsImportUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/jobs/{job_id}:
+    get:
+      operationId: documentsGetJob
+      tags: [documents]
+      summary: Get a job; the row, not any event, is the authority (§7)
+      description: >-
+        One job, not paginated. A job's result, when it is a collection (e.g.
+        extraction values), is paginated by its own resource (ADR-DOC-02 §4).
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/jobs/{job_id}/cancel:
+    post:
+      operationId: documentsCancelJob
+      tags: [documents]
+      summary: Cancel a job (idempotent); a cancelled job is never revived by a replay
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job, now cancelling, cancelled, or already finished
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/jobs/{job_id}/retry:
+    post:
+      operationId: documentsRetryJob
+      tags: [documents]
+      summary: Explicitly restart a failed, interrupted or cancelled job (attempt + 1)
+      description: >-
+        A job that is queued, running, cancelling or succeeded cannot be
+        retried: 400 `invalid_request` with `details.status`.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job, queued again
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1847,6 +1950,11 @@ components:
       in: path
       required: true
       schema: { type: string, pattern: "^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$" }
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/JobIdString" }
     DocumentsIdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -1937,6 +2045,13 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/DocumentsUploadUnprocessableError" }
+    DocumentsImportUnprocessable:
+      description: >-
+        `idempotency_key_reused`, `upload_checksum_mismatch` (whole-file hash
+        checked at import, §5.6) or `unsupported_format`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsImportUnprocessableError" }
     DocumentsUnavailable:
       description: >-
         Exactly one of: the OS reports `storage_unavailable`,
@@ -3121,6 +3236,15 @@ components:
             error:
               properties:
                 code: { enum: [idempotency_key_reused] }
+    DocumentsImportUnprocessableError:
+      description: The 422s of import.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [idempotency_key_reused, upload_checksum_mismatch, unsupported_format] }
     ModuleProxyError:
       description: >-
         An error produced by the kernel or its proxy, not by the OS: the
@@ -3223,6 +3347,9 @@ components:
           required: [head]
           properties:
             head: { $ref: "#/components/schemas/DocumentRevisionSummary" }
+    JobIdString:
+      type: string
+      pattern: "^job_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
     DocumentsUploadRequest:
       type: object
       required: [total_size, sha256]
@@ -3253,6 +3380,91 @@ components:
           type: string
           format: date-time
           description: 24 h after the last chunk arrived (§5.6).
+    DocumentsImportRequest:
+      type: object
+      required: [upload_id]
+      additionalProperties: false
+      properties:
+        upload_id: { type: string, pattern: "^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$" }
+        title: { type: string, minLength: 1, maxLength: 500 }
+    DocumentsJob:
+      type: object
+      required: [job_id, kind, status, attempt, created_at, updated_at]
+      properties:
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+        kind:
+          type: string
+          description: >-
+            `import` and `extract` in slice 1; later slices add more (e.g.
+            `export`), so clients must tolerate unknown kinds.
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+        status:
+          type: string
+          enum: [queued, running, cancelling, succeeded, failed, cancelled, interrupted]
+        attempt: { type: integer, minimum: 1 }
+        progress:
+          type: [object, "null"]
+          required: [stage, done, total, unit]
+          properties:
+            stage: { type: string }
+            done: { type: integer, minimum: 0 }
+            total: { type: [integer, "null"], minimum: 0 }
+            unit: { type: string }
+        error:
+          type: [object, "null"]
+          required: [code, message]
+          description: >-
+            Set when `failed`; `cancelled` appears only here, never as an HTTP
+            error (§6).
+          properties:
+            code:
+              anyOf:
+                - $ref: "#/components/schemas/DocumentsErrorCode"
+                - const: cancelled
+            message: { type: string }
+        result:
+          type: [object, "null"]
+          description: Set when `succeeded`, e.g. the imported document and its r1.
+          properties:
+            document_id: { $ref: "#/components/schemas/DocumentIdString" }
+            revision: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      allOf:
+        # failed: carries an error from the closed set (never "cancelled").
+        - if: { properties: { status: { const: failed } } }
+          then:
+            required: [error]
+            properties:
+              error:
+                type: object
+                properties: { code: { $ref: "#/components/schemas/DocumentsErrorCode" } }
+        # cancelled: no error, or the "cancelled" marker only.
+        - if: { properties: { status: { const: cancelled } } }
+          then:
+            properties:
+              error:
+                anyOf:
+                  - type: "null"
+                  - type: object
+                    properties: { code: { const: cancelled } }
+        # still working or succeeded: no error.
+        - if: { properties: { status: { enum: [queued, running, cancelling, succeeded] } } }
+          then: { properties: { error: { type: "null" } } }
+        # a succeeded import names its document and r1.
+        - if:
+            properties: { status: { const: succeeded }, kind: { const: import } }
+            required: [status, kind]
+          then:
+            required: [result]
+            properties:
+              result:
+                type: object
+                required: [document_id, revision]
+                properties:
+                  document_id: { $ref: "#/components/schemas/DocumentIdString" }
+                  revision: { const: 1 }
     DocumentList:
       type: object
       required: [documents, next_cursor]

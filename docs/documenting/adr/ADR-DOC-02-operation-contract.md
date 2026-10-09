@@ -79,7 +79,7 @@
 ## 4. 操作清单（DOC-1）
 
 - **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
-- **分页**：`list`、`find`、`read_range`、抽取结果、`job.get` 统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；单页响应 ≤ 512 KiB，给 1 MiB 上限留余量。
+- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；单页响应 ≤ 512 KiB，给 1 MiB 上限留余量。`job.get` 返回单个 job，不分页；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。
 - **风险映射**（用户确认后的内核 `RiskClass`，`types.rs:1036-1050`）：read → `Read`；create-record / mutate-draft / commit / create-artifact → `WriteLocal`；handoff → `External`。**DOC-1 没有第一方默认安装，所有工具实际按 `External` 处理、每次审批**，除非用户在启用时逐个确认（D4.2）。
 
 | 片 | 操作 | REST | 工具 | 知识类 | 业务风险 |

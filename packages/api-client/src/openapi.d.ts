@@ -964,6 +964,83 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/documents/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import a completed upload as a new document (r1); starts a job
+         * @description Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job — 202 while it is queued or running, and 202 again when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result`) or was cancelled (it stays cancelled; only `POST /jobs/{job_id}/retry` restarts it). An upload that is not complete is 400 `invalid_request` with `details.received`.
+         */
+        post: operations["documentsImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a job; the row, not any event, is the authority (§7)
+         * @description One job, not paginated. A job's result, when it is a collection (e.g. extraction values), is paginated by its own resource (ADR-DOC-02 §4).
+         */
+        get: operations["documentsGetJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/jobs/{job_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a job (idempotent); a cancelled job is never revived by a replay */
+        post: operations["documentsCancelJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/jobs/{job_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Explicitly restart a failed, interrupted or cancelled job (attempt + 1)
+         * @description A job that is queued, running, cancelling or succeeded cannot be retried: 400 `invalid_request` with `details.status`.
+         */
+        post: operations["documentsRetryJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1694,6 +1771,13 @@ export interface components {
                 code?: "idempotency_key_reused";
             };
         };
+        /** @description The 422s of import. */
+        DocumentsImportUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "idempotency_key_reused" | "upload_checksum_mismatch" | "unsupported_format";
+            };
+        };
         /** @description An error produced by the kernel or its proxy, not by the OS: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. */
         ModuleProxyError: components["schemas"]["Error"] & {
             error?: {
@@ -1753,6 +1837,7 @@ export interface components {
         DocumentDetail: components["schemas"]["Document"] & {
             head: components["schemas"]["DocumentRevisionSummary"];
         };
+        JobIdString: string;
         DocumentsUploadRequest: {
             total_size: number;
             /** @description Whole-file hash, checked at import (`upload_checksum_mismatch`). */
@@ -1773,6 +1858,40 @@ export interface components {
              */
             expires_at: string;
         };
+        DocumentsImportRequest: {
+            upload_id: string;
+            title?: string;
+        };
+        DocumentsJob: {
+            job_id: components["schemas"]["JobIdString"];
+            /** @description `import` and `extract` in slice 1; later slices add more (e.g. `export`), so clients must tolerate unknown kinds. */
+            kind: string;
+            document_id?: components["schemas"]["DocumentIdString"];
+            revision?: number;
+            /** @enum {string} */
+            status: "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "interrupted";
+            attempt: number;
+            progress?: {
+                stage: string;
+                done: number;
+                total: number | null;
+                unit: string;
+            } | null;
+            /** @description Set when `failed`; `cancelled` appears only here, never as an HTTP error (§6). */
+            error?: {
+                code: components["schemas"]["DocumentsErrorCode"] | "cancelled";
+                message: string;
+            } | null;
+            /** @description Set when `succeeded`, e.g. the imported document and its r1. */
+            result?: {
+                document_id?: components["schemas"]["DocumentIdString"];
+                revision?: number;
+            } | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        } & (unknown & unknown & unknown & unknown);
         DocumentList: {
             documents: components["schemas"]["Document"][];
             next_cursor: string | null;
@@ -1981,6 +2100,15 @@ export interface components {
                 "application/json": components["schemas"]["DocumentsUploadUnprocessableError"];
             };
         };
+        /** @description `idempotency_key_reused`, `upload_checksum_mismatch` (whole-file hash checked at import, §5.6) or `unsupported_format`. */
+        DocumentsImportUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsImportUnprocessableError"];
+            };
+        };
         /** @description Exactly one of: the OS reports `storage_unavailable`, `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or the kernel proxy reports the module unreachable (`module_not_ready`, `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists which proxy codes are safe to retry. */
         DocumentsUnavailable: {
             headers: {
@@ -2006,6 +2134,7 @@ export interface components {
         /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
         DocumentsCursor: string;
         UploadId: string;
+        JobId: components["schemas"]["JobIdString"];
         /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). */
         DocumentsIdempotencyKey: string;
         DocumentsLimit: number;
@@ -3928,6 +4057,130 @@ export interface operations {
             404: components["responses"]["DocumentsNotFound"];
             409: components["responses"]["DocumentsConflict"];
             413: components["responses"]["PayloadTooLarge"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsImport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Replay of a job that already succeeded or was cancelled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            /** @description The import job, new, still running, or re-queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsImportUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsGetJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: components["parameters"]["JobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsCancelJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: components["parameters"]["JobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job, now cancelling, cancelled, or already finished */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsRetryJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: components["parameters"]["JobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job, queued again */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
