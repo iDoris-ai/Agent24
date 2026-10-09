@@ -72,7 +72,7 @@ describe('import and job routes', () => {
 
   it('states the import replay statuses (§7)', () => {
     const d: string = openapi.paths['/documents/imports'].post.description
-    expect(d).toMatch(/202 while it is queued or running/)
+    expect(d).toMatch(/202 while it is queued, running or\s+cancelling/)
     expect(d).toMatch(/attempt \+ 1/)
     expect(d).toMatch(/200 once it\s+has succeeded/)
     expect(d).toMatch(/stays cancelled/)
@@ -119,6 +119,40 @@ describe('import and job schemas', () => {
     const { result: _r, ...succeededNoResult } = job
     expect(v.DocumentsJob(succeededNoResult), 'succeeded import with no result field').toBe(false)
     expect(v.DocumentsJob({ ...job, status: 'running', error: { code: 'parse_failed', message: 'x' } })).toBe(false)
+  })
+
+  it('an interrupted job carries no error, and only a succeeded job has a result (#813 review)', () => {
+    const job = fixture('job-import.json')
+    const interrupted = { ...job, status: 'interrupted', result: null, error: null }
+    ok('DocumentsJob', interrupted)
+    for (const code of ['cancelled', 'parse_failed']) {
+      expect(v.DocumentsJob({ ...interrupted, error: { code, message: 'x' } }), `interrupted with ${code}`).toBe(false)
+    }
+    for (const status of ['queued', 'running', 'cancelling', 'interrupted']) {
+      expect(v.DocumentsJob({ ...job, status, error: null }), `${status} with a result`).toBe(false)
+      ok('DocumentsJob', { ...job, status, error: null, result: null })
+    }
+    expect(v.DocumentsJob({ ...job, status: 'failed', error: { code: 'parse_failed', message: 'x' } }), 'failed with a result').toBe(false)
+    expect(v.DocumentsJob({ ...job, status: 'cancelled', error: null }), 'cancelled with a result').toBe(false)
+  })
+
+  it('states the import, retry and chunk edge cases (#812, #813 reviews)', () => {
+    const imp: string = openapi.paths['/documents/imports'].post.description
+    expect(imp).toMatch(/queued, running or cancelling/)
+    expect(imp).toMatch(/POST \/documents\/jobs\/\{job_id\}\/retry/)
+    expect(imp).toMatch(/different `title` is 422\s+`idempotency_key_reused`/)
+    expect(imp).toMatch(/24 h[\s\S]*404 `not_found`/)
+    expect(imp).toMatch(/hash and\s+its format are checked before the job starts: 422\s+`upload_checksum_mismatch` or `unsupported_format`/)
+    const retryOp = openapi.paths['/documents/jobs/{job_id}/retry'].post
+    const retry: string = retryOp.description
+    expect(retry).toMatch(/no idempotency key: if a retry's outcome is unknown/)
+    expect(retry).toMatch(/400 with `details.status` `queued` or `running`, the earlier\s+retry landed/)
+    expect((retryOp.parameters ?? []).map((p: any) => p.$ref)).not.toContain('#/components/parameters/DocumentsIdempotencyKey')
+    const chunk: string = openapi.paths['/documents/uploads/{upload_id}/chunks'].post.description
+    expect(chunk).toMatch(/complete or imported takes no new chunk: 409,\s+checked before any size check/)
+    expect(chunk).toMatch(/still receiving, a new chunk that would run past\s+`total_size` is 400/)
+    expect(chunk).toMatch(/24 h after its last chunk, is 404 `not_found`/)
+    expect(chunk).toMatch(/413 `payload_too_large`/)
   })
 
   it('keep job kind open for later slices but job status closed', () => {

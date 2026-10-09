@@ -955,7 +955,7 @@ export interface paths {
         put?: never;
         /**
          * Append one chunk of raw bytes at the given offset
-         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires.
+         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires. An upload that is complete or imported takes no new chunk: 409, checked before any size check (a received chunk still replays). For an upload still receiving, a new chunk that would run past `total_size` is 400 `invalid_request`. An unknown upload, or one 24 h after its last chunk, is 404 `not_found`. A body over 768 KiB is 413 `payload_too_large`.
          */
         post: operations["documentsAppendUploadChunk"];
         delete?: never;
@@ -975,7 +975,7 @@ export interface paths {
         put?: never;
         /**
          * Import a completed upload as a new document (r1); starts a job
-         * @description Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job — 202 while it is queued or running, and 202 again when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result`) or was cancelled (it stays cancelled; only `POST /jobs/{job_id}/retry` restarts it). An upload that is not complete is 400 `invalid_request` with `details.received`.
+         * @description Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job — 202 while it is queued, running or cancelling, and 202 again when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result`) or was cancelled (it stays cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it). The same `upload_id` with a different `title` is 422 `idempotency_key_reused`. An unknown upload, or one past its 24 h (§5.6), is 404 `not_found`; one that is not complete is 400 `invalid_request` with `details.received`. The whole file's hash and its format are checked before the job starts: 422 `upload_checksum_mismatch` or `unsupported_format`.
          */
         post: operations["documentsImport"];
         delete?: never;
@@ -1032,7 +1032,7 @@ export interface paths {
         put?: never;
         /**
          * Explicitly restart a failed, interrupted or cancelled job (attempt + 1)
-         * @description A job that is queued, running, cancelling or succeeded cannot be retried: 400 `invalid_request` with `details.status`.
+         * @description A job that is queued, running, cancelling or succeeded cannot be retried: 400 `invalid_request` with `details.status`. The route has no idempotency key: if a retry's outcome is unknown and repeating it gives 400 with `details.status` `queued` or `running`, the earlier retry landed (`attempt` went up once). It answers 200 with the job, where an import replay that re-queues answers 202: there the 202 says the import is still to be done, here the request itself is the restart.
          */
         post: operations["documentsRetryJob"];
         delete?: never;
@@ -2020,7 +2020,7 @@ export interface components {
             created_at: string;
             /** Format: date-time */
             updated_at: string;
-        } & (unknown & unknown & unknown & unknown & unknown);
+        } & (unknown & unknown & unknown & unknown & unknown & unknown);
         DocumentsEngineRef: {
             id: string;
             version: string;

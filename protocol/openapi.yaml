@@ -1783,6 +1783,12 @@ paths:
         received so far), a `Chunk-Sha256` that does not match the body's
         bytes is 400 `invalid_request`; for a range already received, any
         hash other than the stored one is the 409 above, as §5.6 requires.
+        An upload that is complete or imported takes no new chunk: 409,
+        checked before any size check (a received chunk still replays).
+        For an upload still receiving, a new chunk that would run past
+        `total_size` is 400 `invalid_request`. An unknown upload, or one
+        24 h after its last chunk, is 404 `not_found`. A body over 768 KiB
+        is 413 `payload_too_large`.
       parameters:
         - $ref: "#/components/parameters/UploadId"
         - name: Upload-Offset
@@ -1821,11 +1827,16 @@ paths:
       description: >-
         Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on
         `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job —
-        202 while it is queued or running, and 202 again when a failed or
-        interrupted job is re-queued (same job_id, attempt + 1); 200 once it
-        has succeeded (with `result`) or was cancelled (it stays cancelled;
-        only `POST /jobs/{job_id}/retry` restarts it). An upload that is not
-        complete is 400 `invalid_request` with `details.received`.
+        202 while it is queued, running or cancelling, and 202 again when a
+        failed or interrupted job is re-queued (same job_id, attempt + 1);
+        200 once it has succeeded (with `result`) or was cancelled (it stays
+        cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it).
+        The same `upload_id` with a different `title` is 422
+        `idempotency_key_reused`. An unknown upload, or one past its 24 h
+        (§5.6), is 404 `not_found`; one that is not complete is 400
+        `invalid_request` with `details.received`. The whole file's hash and
+        its format are checked before the job starts: 422
+        `upload_checksum_mismatch` or `unsupported_format`.
       requestBody:
         required: true
         content:
@@ -1900,7 +1911,13 @@ paths:
       summary: Explicitly restart a failed, interrupted or cancelled job (attempt + 1)
       description: >-
         A job that is queued, running, cancelling or succeeded cannot be
-        retried: 400 `invalid_request` with `details.status`.
+        retried: 400 `invalid_request` with `details.status`. The route has
+        no idempotency key: if a retry's outcome is unknown and repeating it
+        gives 400 with `details.status` `queued` or `running`, the earlier
+        retry landed (`attempt` went up once). It answers 200 with the job,
+        where an import replay that re-queues answers 202: there the 202
+        says the import is still to be done, here the request itself is
+        the restart.
       parameters:
         - $ref: "#/components/parameters/JobId"
       responses:
@@ -3731,9 +3748,12 @@ components:
                   - type: "null"
                   - type: object
                     properties: { code: { const: cancelled } }
-        # still working or succeeded: no error.
-        - if: { properties: { status: { enum: [queued, running, cancelling, succeeded] } } }
+        # still working, interrupted by a restart, or succeeded: no error.
+        - if: { properties: { status: { enum: [queued, running, cancelling, interrupted, succeeded] } } }
           then: { properties: { error: { type: "null" } } }
+        # only a succeeded job has a result.
+        - if: { properties: { status: { enum: [queued, running, cancelling, failed, cancelled, interrupted] } } }
+          then: { properties: { result: { type: "null" } } }
         # a succeeded extraction names its result.
         - if:
             properties: { status: { const: succeeded }, kind: { const: extract } }
