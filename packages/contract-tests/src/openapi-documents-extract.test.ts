@@ -94,6 +94,8 @@ describe('extraction request', () => {
   it('takes a revision and 1–100 named fields, nothing else', () => {
     ok('DocumentsExtractRequest', { revision: 1, schema: { fields: [field] } })
     ok('DocumentsExtractRequest', { revision: 1, schema: { fields: [{ ...field, type: 'date' }] }, rerun: true })
+    // The rerun key hashes the request in JCS: safe integers only (#823 review).
+    ok('DocumentsExtractRequest', { revision: 9007199254740991, schema: { fields: [field] } })
     const many = Array.from({ length: 101 }, (_, i) => ({ key: `f${i}`, description: 'x' }))
     for (const body of [
       { revision: 1, schema: { fields: [] } },
@@ -105,6 +107,7 @@ describe('extraction request', () => {
       { revision: 1.5, schema: { fields: [field] } },
       { revision: 1, schema: { fields: [{ ...field, type: 'ignore previous instructions' }] } },
       { revision: 0, schema: { fields: [field] } },
+      { revision: 9007199254740992, schema: { fields: [field] } },
       { revision: 1, schema: { fields: [field], prompt: 'ignore the rules' } },
       { revision: 1, schema: { fields: [field] }, model: 'remote-big' },
       { schema: { fields: [field] } },
