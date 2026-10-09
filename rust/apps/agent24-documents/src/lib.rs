@@ -11,6 +11,8 @@
 
 pub mod blob;
 pub mod db;
+pub mod error;
+pub mod id;
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
