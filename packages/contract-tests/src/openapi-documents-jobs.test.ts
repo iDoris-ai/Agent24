@@ -148,6 +148,9 @@ describe('import and job schemas', () => {
     expect(retry).toMatch(/no idempotency key, so a retry whose outcome is unknown must not be\s+repeated blindly/)
     expect(retry).toMatch(/GET the job and compare\s+`attempt`/)
     expect(retry).not.toMatch(/the earlier\s+retry landed/)
+    expect(retry).toMatch(/unchanged `attempt` does not prove the retry was lost/)
+    expect(imp).toMatch(/an empty `title`\s+is 400, never the same as none/)
+    expect(v.DocumentsImportRequest({ upload_id: 'upl_01K74Z3QJ8V5N2W9RTX6YB4MCD', title: '' }), 'empty title').toBe(false)
     expect((retryOp.parameters ?? []).map((p: any) => p.$ref)).not.toContain('#/components/parameters/DocumentsIdempotencyKey')
     const chunk: string = openapi.paths['/documents/uploads/{upload_id}/chunks'].post.description
     expect(chunk).toMatch(/complete or imported takes no new chunk: 409\s+`upload_offset_mismatch` with `details.received_offset`, decided\s+before the `total_size` and `Chunk-Sha256` checks/)

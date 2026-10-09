@@ -41,6 +41,16 @@ describe('page render', () => {
     }
   })
 
+  it('states what is not a page: past the last one, or a flowing format (#815 review)', () => {
+    const d: string = openapi.paths[PAGE].get.description
+    expect(d).toMatch(/page past\s+the revision's last page is 404 `not_found`/)
+    expect(d).toMatch(/flowing format \(DOCX\)\s+has no pages and is 422 `unsupported_format`/)
+    // ADR §4 agrees: the OS does not tile on its own; the client asks for regions.
+    const adr = readFileSync(join(repoRoot, 'docs', 'documenting', 'adr', 'ADR-DOC-02-operation-contract.md'), 'utf8')
+    expect(adr).toMatch(/降到 0\.25 仍超出则 413，由客户端用 `region` 分块请求/)
+    expect(adr).not.toMatch(/仍超出则按瓦片分块/)
+  })
+
   it('renders PNG and reports the scale it used', () => {
     const ok200 = openapi.paths[PAGE].get.responses['200']
     expect(Object.keys(ok200.content)).toEqual(['image/png'])

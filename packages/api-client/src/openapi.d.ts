@@ -975,7 +975,7 @@ export interface paths {
         put?: never;
         /**
          * Import a completed upload as a new document (r1); starts a job
-         * @description Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job — 202 while it is queued, running or cancelling, and 202 again when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result`) or was cancelled (it stays cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it). The same `upload_id` with a different `title` — including a `title` added or left out — is 422 `idempotency_key_reused`. An unknown upload, or one past its 24 h (§5.6), is 404 `not_found`; one that is not complete is 400 `invalid_request` with `details.received`. The whole file's hash and its format are checked before the job starts: 422 `upload_checksum_mismatch` or `unsupported_format`.
+         * @description Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job — 202 while it is queued, running or cancelling, and 202 again when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result`) or was cancelled (it stays cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it). The same `upload_id` with a different `title` — including a `title` added or left out — is 422 `idempotency_key_reused`; an empty `title` is 400, never the same as none. An unknown upload, or one past its 24 h (§5.6), is 404 `not_found`; one that is not complete is 400 `invalid_request` with `details.received`. The whole file's hash and its format are checked before the job starts: 422 `upload_checksum_mismatch` or `unsupported_format`.
          */
         post: operations["documentsImport"];
         delete?: never;
@@ -1032,7 +1032,7 @@ export interface paths {
         put?: never;
         /**
          * Explicitly restart a failed, interrupted or cancelled job (attempt + 1)
-         * @description A job that is queued, running, cancelling or succeeded cannot be retried: 400 `invalid_request` with `details.status`. The route has no idempotency key, so a retry whose outcome is unknown must not be repeated blindly — repeating it after it landed and the job failed again restarts the job a second time. Instead GET the job and compare `attempt` with its value before the retry: a higher `attempt` means the job was restarted (by this retry or by an import replay). It answers 200 with the job, where an import replay that re-queues answers 202: there the 202 says the import is still to be done, here the request itself is the restart.
+         * @description A job that is queued, running, cancelling or succeeded cannot be retried: 400 `invalid_request` with `details.status`. The route has no idempotency key, so a retry whose outcome is unknown must not be repeated blindly — repeating it after it landed and the job failed again restarts the job a second time. Instead GET the job and compare `attempt` with its value before the retry: a higher `attempt` means the job was restarted (by this retry or by an import replay). An unchanged `attempt` does not prove the retry was lost: it may still be in flight, so read the job again before deciding. It answers 200 with the job, where an import replay that re-queues answers 202: there the 202 says the import is still to be done, here the request itself is the restart.
          */
         post: operations["documentsRetryJob"];
         delete?: never;
@@ -1050,7 +1050,7 @@ export interface paths {
         };
         /**
          * Render one page of a revision as PNG (ADR-DOC-02 §4)
-         * @description The image is at most 1 MiB. The OS lowers `scale` until it fits and reports the scale it used in `Documents-Render-Scale`. If the requested area does not fit even at scale 0.25, the response is 413 `payload_too_large`: request smaller tiles with `region`. Renders are a cache derived from the revision and can be rebuilt (§3).
+         * @description The image is at most 1 MiB. The OS lowers `scale` until it fits and reports the scale it used in `Documents-Render-Scale`. If the requested area does not fit even at scale 0.25, the response is 413 `payload_too_large`: request smaller tiles with `region`. Renders are a cache derived from the revision and can be rebuilt (§3). A page past the revision's last page is 404 `not_found`; a flowing format (DOCX) has no pages and is 422 `unsupported_format`.
          */
         get: operations["documentsRenderPage"];
         put?: never;
@@ -1950,12 +1950,12 @@ export interface components {
             revision: number;
             content_sha256: components["schemas"]["Sha256Address"];
             size: number;
-            media_type: string;
+            media_type: components["schemas"]["DocumentsMediaType"];
         };
         Document: {
             document_id: components["schemas"]["DocumentIdString"];
             title: string;
-            media_type: string;
+            media_type: components["schemas"]["DocumentsMediaType"];
             head_revision: number;
             /** Format: date-time */
             created_at: string;
@@ -2035,6 +2035,13 @@ export interface components {
             origin: "top-left-rotated";
             rects: number[][];
         };
+        /** @description Lowercase `type/subtype` without parameters, as the OS records it at import (`application/pdf`, not `Application/PDF; x=y`). */
+        DocumentsMediaType: string;
+        /**
+         * @description The paginated formats: their anchors and blocks have a page and geometry; every other format is flowing and has neither (§3).
+         * @enum {string}
+         */
+        DocumentsPaginatedMediaType: "application/pdf" | "image/jpeg" | "image/png";
         /** @description UTF-8 byte offsets into the block text, half-open [start, end) with start ≤ end ≤ the block's byte length, in logical (stored) order; both on character boundaries (§3). The OS checks these; a client that finds the quote or hashes no longer match shows the anchor as stale ("定位失效") instead of guessing a position. */
         DocumentsTextRange: {
             /** @constant */
@@ -2048,7 +2055,7 @@ export interface components {
             revision: number;
             content_sha256: components["schemas"]["Sha256Address"];
             /** @description Media type of the anchored revision. It tells a client, and this schema, whether the source is paginated (PDF, images) or flowing (e.g. DOCX in slice 2). */
-            media_type: string;
+            media_type: components["schemas"]["DocumentsMediaType"];
             text_layer_sha256: components["schemas"]["Sha256Address"];
             engine: components["schemas"]["DocumentsEngineRef"];
             block_id: string;
@@ -2076,7 +2083,7 @@ export interface components {
             revision: number;
             content_sha256: components["schemas"]["Sha256Address"];
             /** @description Media type of the revision; see DocumentsAnchor.media_type. */
-            media_type: string;
+            media_type: components["schemas"]["DocumentsMediaType"];
             text_layer_sha256: components["schemas"]["Sha256Address"];
             engine: components["schemas"]["DocumentsEngineRef"];
             /** @enum {string} */
@@ -2126,17 +2133,18 @@ export interface components {
         DocumentsExtractCandidate: {
             /** @description As written in the source. */
             value: string;
-            /** @description For comparison only. */
+            /** @description For comparison only. Required here: candidates conflict because their normalized forms differ. */
             normalized: string;
             anchors: components["schemas"]["DocumentsEvidence"];
         };
         DocumentsExtractedValue: {
+            /** @description The `key` of the requested field. */
             key: string;
             /** @enum {string} */
             status: "present" | "missing" | "conflict";
             /** @description As written in the source; never rewritten. */
             value?: string;
-            /** @description For comparison only. */
+            /** @description For comparison only. Optional on a present value: some values (free text) have no normal form. */
             normalized?: string;
             /** @description Evidence for a present value (see DocumentsEvidence). Empty only when the value has no verifiable source, and then `unsourced_reason` says why (ADR-DOC-02 §3). */
             anchors?: components["schemas"]["DocumentsAnchor"][];

@@ -143,6 +143,19 @@ describe('extracted values (S01 gold shape)', () => {
     const pair = [{ value: 'a', normalized: 'a', anchors: [anchor()] }, { value: 'b', normalized: 'b', anchors: [anchor()] }]
     expect(v.DocumentsExtractedValue({ ...present(), candidates: pair }), 'present with valid candidates').toBe(false)
     expect(v.DocumentsExtractedValue({ ...present(), missing_reason: 'not_in_document' }), 'present with a missing reason').toBe(false)
+    // anchors are the evidence: nothing to excuse (#819 review)
+    expect(v.DocumentsExtractedValue({ ...present(), unsourced_reason: 'x' }), 'anchors and an unsourced reason').toBe(false)
+  })
+
+  it('a value names its field by the field key, and carries nothing undeclared (#819 review)', () => {
+    expect(v.DocumentsExtractedValue({ ...present(), key: 'Bad Key' }), 'key outside the field-key syntax').toBe(false)
+    expect(openapi.components.schemas.DocumentsExtractedValue.properties.key.pattern)
+      .toBe(openapi.components.schemas.DocumentsExtractField.properties.key.pattern)
+    expect(v.DocumentsExtractedValue({ ...present(), confidence: 0.9 }), 'an undeclared field').toBe(false)
+    const c = { value: 'a', normalized: 'a', anchors: [anchor()] }
+    const conflict = { key: 'shutoff_date', status: 'conflict', candidates: [c, { ...c, value: 'b', normalized: 'b' }] }
+    ok('DocumentsExtractedValue', conflict)
+    expect(v.DocumentsExtractedValue({ ...conflict, candidates: [c, { ...c, chosen: true }] }), 'a candidate with an undeclared field').toBe(false)
   })
 
   it('missing: nothing asserted', () => {
