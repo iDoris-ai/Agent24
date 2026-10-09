@@ -51,6 +51,8 @@ export const IpcChannels = {
   // progress is pushed on DocumentsImportProgress.
   DocumentsImportFile: 'documents:import-file',
   DocumentsImportProgress: 'documents:import-progress',
+  // The OS's job and document events, pushed (ADR-DOC-02 §7; main/documents.ts).
+  DocumentsEvent: 'documents:event',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -364,6 +366,14 @@ export type DocumentsError = DocSchemas['ErrorBody']
 export type DocumentsResponse<Op extends DocumentsRequest['op'] = DocumentsRequest['op']> =
   | { ok: true; status: number; data: DocumentsResults[Op] }
   | { ok: false; status: number; error: DocumentsError }
+
+/** An event from the Documenting OS (ADR-DOC-02 §7): a hint to read the job
+ * or the list again, never the truth itself. */
+export type DocumentsEvent =
+  | { kind: 'job.progress'; payload: DocSchemas['DocumentsJobProgressEvent'] }
+  | { kind: 'job.finished'; payload: DocSchemas['DocumentsJobFinishedEvent'] }
+  | { kind: 'document.imported'; payload: DocSchemas['DocumentsDocumentImportedEvent'] }
+  | { kind: 'revision.committed'; payload: DocSchemas['DocumentsRevisionCommittedEvent'] }
 
 /** Bytes of the picked file sent so far, pushed while it uploads. */
 export interface DocumentsImportProgress {

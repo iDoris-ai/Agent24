@@ -6,6 +6,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type DocumentsEvent,
   type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
@@ -113,6 +114,12 @@ const api = {
       const listener = (_event: unknown, p: DocumentsImportProgress): void => cb(p)
       ipcRenderer.on(IpcChannels.DocumentsImportProgress, listener)
       return () => ipcRenderer.removeListener(IpcChannels.DocumentsImportProgress, listener)
+    },
+    /** The OS's job and document events (hints: read the job or list again). */
+    onEvent: (cb: (e: DocumentsEvent) => void): (() => void) => {
+      const listener = (_event: unknown, e: DocumentsEvent): void => cb(e)
+      ipcRenderer.on(IpcChannels.DocumentsEvent, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.DocumentsEvent, listener)
     },
   },
 } as const

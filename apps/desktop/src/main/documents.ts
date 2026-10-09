@@ -5,7 +5,8 @@
 
 import http from 'node:http'
 import type { BackendEndpoint } from './backend-manager'
-import type { DocumentsError, DocumentsResponse } from '../shared/ipc-types'
+import type { ModuleEvent } from './agentear-events'
+import type { DocumentsError, DocumentsEvent, DocumentsResponse } from '../shared/ipc-types'
 
 const BASE = '/api/v1/documents'
 const DOCUMENT_ID = /^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$/
@@ -168,4 +169,27 @@ export async function documentsCall(req: unknown, send: Sender): Promise<Documen
   const route = documentsRoute(req)
   if (!route) return toResponse(failed(400, 'invalid_request', 'not an allowed documents operation'))
   return toResponse(await send(route))
+}
+
+/** The Documenting OS's event in a WS module event, or null: another
+ * module's, a kind this build does not know, or one without the id the page
+ * reads by. Only that id is checked: the page reads the job or the list
+ * again, so the rest is never trusted. */
+export function documentsEvent(event: ModuleEvent): DocumentsEvent | null {
+  if (event.module !== 'documents') return null
+  const { kind, payload } = event
+  const has = (key: string, pattern: RegExp): boolean => {
+    const v = payload[key]
+    return typeof v === 'string' && pattern.test(v)
+  }
+  switch (kind) {
+    case 'job.progress':
+    case 'job.finished':
+      return has('job_id', JOB_ID) ? ({ kind, payload } as DocumentsEvent) : null
+    case 'document.imported':
+    case 'revision.committed':
+      return has('document_id', DOCUMENT_ID) ? ({ kind, payload } as DocumentsEvent) : null
+    default:
+      return null
+  }
 }
