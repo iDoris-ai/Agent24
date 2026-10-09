@@ -3,9 +3,10 @@
 
 import http from 'node:http'
 import { execFile, type ChildProcess } from 'node:child_process'
-import { app, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { getBackendEndpoint } from '../backend-manager'
 import { documentsCall, httpSender } from '../documents'
+import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
   BackendEndpointResult,
@@ -294,6 +295,24 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
   ipcMain.handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, sendToDocuments),
   )
+  ipcMain.handle(IpcChannels.DocumentsImportFile, async (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.OpenDialogOptions = {
+      properties: ['openFile'],
+      filters: [{ name: 'PDF, JPEG, PNG', extensions: ['pdf', 'jpg', 'jpeg', 'png'] }],
+    }
+    let picked: Electron.OpenDialogReturnValue
+    try {
+      picked = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options)
+    } catch {
+      return { ok: false, status: 500, error: { code: 'dialog_failed', message: 'the file dialog could not open' } }
+    }
+    const path = picked.filePaths[0]
+    if (picked.canceled || !path) return null
+    return importFile(path, sendToDocuments, (p) => {
+      if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.DocumentsImportProgress, p)
+    })
+  })
   ipcMain.handle(IpcChannels.BackendProxy, (_event, req: unknown) => {
     if (!isBackendProxyRequest(req)) {
       return {
