@@ -192,6 +192,8 @@ impl AppState {
 /// Opens both stores. On a database failure the blob store is dropped, which
 /// releases its lock, so a reopen can take it again.
 async fn open_storage(data_dir: &Path) -> Opened {
+    // The blob store's lock comes first: it makes this the only instance, so
+    // the `recover` below never interrupts jobs another live instance runs.
     let dir = data_dir.to_owned();
     let blobs = blocking(move || BlobStore::open(&dir)).await.map_err(|e| {
         tracing::error!(error = %e, "documents: blob store unavailable");
