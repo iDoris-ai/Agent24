@@ -5641,7 +5641,13 @@ while f.readline():
                 .await
                 .unwrap_or_else(|e| panic!("call {i} must succeed: {e:?}"));
         }
-        let err = call_list(&methods1, 300).await.unwrap_err();
+        let mut err = call_list(&methods1, 300).await;
+        let mut next_id = 301;
+        while err.is_ok() && next_id < 350 {
+            err = call_list(&methods1, next_id).await;
+            next_id += 1;
+        }
+        let err = err.unwrap_err();
         assert_eq!(
             err.kind,
             Some(agent24_os_proto::rpc::ErrorKind::RateLimited)

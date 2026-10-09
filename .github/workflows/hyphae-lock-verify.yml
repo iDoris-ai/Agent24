@@ -10,21 +10,19 @@ name: Hyphae lock verify
 # honored automatically, not just a hash edit), and fails if the result
 # doesn't match `hyphae.lock.json`'s `linux-x64` entry byte-for-byte.
 #
-# Triggered on changes to the lock file itself, and also on changes to this
-# workflow file — the latter so that the job actually *runs* (and so proves
-# itself) the first time this workflow is introduced, rather than sitting
-# dormant until some future, unrelated lock edit.
+# COMM-5b also runs the real-peer zero-run acceptance on Rust changes to
+# main/ab/comm. An ignored workspace test alone is not acceptance evidence.
 
 on:
   push:
-    branches: [main]
+    branches: [main, "ab/comm"]
     paths:
-      - 'rust/crates/agent24-comm/hyphae.lock.json'
+      - 'rust/**'
       - '.github/workflows/hyphae-lock-verify.yml'
   pull_request:
-    branches: [main]
+    branches: [main, "ab/comm"]
     paths:
-      - 'rust/crates/agent24-comm/hyphae.lock.json'
+      - 'rust/**'
       - '.github/workflows/hyphae-lock-verify.yml'
   workflow_dispatch: {}
 
@@ -36,7 +34,7 @@ jobs:
   verify-linux-x64:
     name: Reproduce Hyphae linux-x64 and compare to lock
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout Agent24 (for hyphae.lock.json)
@@ -128,3 +126,26 @@ jobs:
             exit 1
           fi
           echo "linux-x64 reproducible build matches hyphae.lock.json ($actual)"
+
+      # COMM-5b T3 is explicitly executed: cargo test --workspace alone ignores
+      # the source/toolchain-dependent real-peer acceptance test.
+      - name: Setup Rust for COMM-5b T3
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo for T3
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agent24/rust/target
+          key: comm5b-${{ runner.os }}-${{ hashFiles('agent24/rust/Cargo.lock') }}
+
+      - name: COMM-5b real agent24d and Hyphae peer zero-run gate
+        working-directory: agent24/rust
+        env:
+          HYPHAE_SOURCE_DIR: ${{ github.workspace }}/hyphae-src
+          A24_HYPHAE_BIN: ${{ github.workspace }}/hyphae-src/hyphae
+        run: |
+          ulimit -n 4096
+          cargo test --locked -p agent24d --test comm_blackbox -- --ignored --nocapture

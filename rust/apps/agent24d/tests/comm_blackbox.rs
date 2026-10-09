@@ -1,8 +1,9 @@
 //! COMM-5b T3: an end-to-end, local-only zero-run gate.
 //!
-//! Run explicitly with `HYPHAE_SOURCE_DIR=/absolute/path/to/agent-speaker \
+//! Run explicitly with `HYPHAE_SOURCE_DIR=/absolute/path/to/locked-hyphae \
+//! A24_HYPHAE_BIN=/absolute/path/to/locked-hyphae/hyphae \
 //! cargo test -p agent24d --test comm_blackbox -- --ignored --nocapture`.
-//! The test builds lock-verified Hyphae and a relay from that source tree,
+//! Set A24_HYPHAE_BIN to the lock-built binary; this builds a local relay,
 //! starts agent24d and a bare Hyphae peer under temporary homes, and uses one
 //! local counter for the model and MCP module. Missing inputs are failures.
 
@@ -61,6 +62,11 @@ impl Counter {
                         break;
                     }
                 }
+                // A connect-and-close probe sends no HTTP request. Count all
+                // nonempty requests, including unknown/health paths below.
+                if header.is_empty() {
+                    continue;
+                }
                 let header_text = String::from_utf8_lossy(&header);
                 let content_length = header_text
                     .lines()
@@ -77,7 +83,8 @@ impl Counter {
                 request.push_str(&String::from_utf8_lossy(&body));
                 let mut stream = reader.into_inner();
                 let line = request.lines().next().unwrap_or("");
-                let (status, body) = if line.starts_with("GET /health ") {
+                eprintln!("COMM-5b counter: {line}");
+                let (status, body) = if line.starts_with("GET /__ready ") {
                     ("200 OK", json!({"status":"ok"}).to_string())
                 } else if line.starts_with("GET /counts ") {
                     ("200 OK", json!({"models": model_count.load(Ordering::SeqCst), "modules": module_count.load(Ordering::SeqCst)}).to_string())
@@ -96,6 +103,7 @@ impl Counter {
                     };
                     ("200 OK", body.to_string())
                 } else {
+                    model_count.fetch_add(1, Ordering::SeqCst);
                     ("200 OK", "{}".to_owned())
                 };
                 let _ = write!(
@@ -126,7 +134,7 @@ impl Counter {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok((200, body)) =
-                std::panic::catch_unwind(|| local_http(&url, "GET", "/health", None, None))
+                std::panic::catch_unwind(|| local_http(&url, "GET", "/__ready", None, None))
                 && body["status"] == "ok"
             {
                 return;
@@ -150,16 +158,42 @@ impl Drop for Counter {
     }
 }
 
+#[test]
+fn counter_counts_http_requests_but_not_empty_tcp_connections() {
+    let counter = Counter::start();
+    // A TCP probe that closes without HTTP bytes is not a model request.
+    drop(TcpStream::connect(counter.address).unwrap());
+    counter.wait_ready();
+    assert_eq!(counter.counts(), (0, 0));
+    let url = format!("http://{}", counter.address);
+    for path in ["/unexpected-health", "/v1/chat/completions", "/module-call"] {
+        assert_eq!(
+            local_http(&url, "POST", path, None, Some(&json!({}))).0,
+            200
+        );
+    }
+    assert_eq!(counter.counts(), (2, 1));
+}
+
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        if self.0.try_wait().unwrap().is_none() {
+            if let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::Term);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.0.kill();
+        }
         let _ = self.0.wait();
     }
 }
 
 struct DaemonGuard {
-    child: Child,
+    child: ChildGuard,
     _home: tempfile::TempDir,
     base: String,
     token: String,
@@ -175,8 +209,12 @@ impl Drop for DaemonGuard {
                 Some(&json!({})),
             )
         });
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let pid = rustix::process::Pid::from_raw(self.child.0.id() as i32).unwrap();
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Term);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while self.child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -197,7 +235,7 @@ fn local_http(
     let mut stream =
         TcpStream::connect((host, port.parse::<u16>().unwrap())).expect("connect local HTTP");
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     let path = format!(
         "/{}/{}",
@@ -229,8 +267,14 @@ fn local_http(
     stream.write_all(b"\r\n").unwrap();
     stream.write_all(&bytes).unwrap();
     let mut raw = String::new();
-    stream.read_to_string(&mut raw).unwrap();
-    let status = raw.split_whitespace().nth(1).unwrap().parse().unwrap();
+    stream
+        .read_to_string(&mut raw)
+        .unwrap_or_else(|error| panic!("{method} {path}: local HTTP read failed: {error}"));
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
     (
         status,
@@ -242,38 +286,80 @@ fn http(base: &str, method: &str, path: &str, token: &str, body: Option<&Value>)
     local_http(base, method, path, Some(token), body)
 }
 
-fn build(source: &Path, output: &Path, target: &str) {
-    let version = Command::new("go")
-        .arg("version")
-        .output()
-        .expect("Go toolchain required");
-    assert!(
-        version.status.success() && String::from_utf8_lossy(&version.stdout).contains("go1.26.4"),
-        "Go 1.26.4 is required: {}",
-        String::from_utf8_lossy(&version.stdout)
+fn build(source: &Path, output: &Path, target: &str, lock: &HyphaeLock) {
+    let (os, arch) = match current_platform().as_str() {
+        "darwin-arm64" => ("darwin", "arm64"),
+        "linux-x64" => ("linux", "amd64"),
+        platform => panic!("T3 requires a lock-supported host platform: {platform}"),
+    };
+    let result = bounded_output(
+        Command::new("go")
+            .current_dir(source)
+            .env("GOTOOLCHAIN", &lock.go)
+            .env("CGO_ENABLED", "0")
+            .env("GOOS", os)
+            .env("GOARCH", arch)
+            .args([
+                "build",
+                "-trimpath",
+                "-buildvcs=false",
+                "-ldflags=-buildid=",
+                "-o",
+            ])
+            .arg(output)
+            .arg(target),
+        None,
+        Duration::from_secs(180),
     );
-    let result = Command::new("go")
-        .current_dir(source)
-        .env("GOTOOLCHAIN", "go1.26.4")
-        .env("CGO_ENABLED", "0")
-        .env("GOOS", "darwin")
-        .env("GOARCH", "arm64")
-        .args([
-            "build",
-            "-trimpath",
-            "-buildvcs=false",
-            "-ldflags=-buildid=",
-            "-o",
-        ])
-        .arg(output)
-        .arg(target)
-        .output()
-        .expect("build local Hyphae binary");
     assert!(
         result.status.success(),
         "go build {target}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+fn bounded_output(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> std::process::Output {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = ChildGuard(command.spawn().expect("spawn fixture command"));
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let stdout = read(Box::new(stdout));
+    let stderr = read(Box::new(stderr));
+    if let Some(input) = input {
+        child.0.stdin.take().unwrap().write_all(input).unwrap();
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture command timeout: {command:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    std::process::Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
 }
 
 fn spawn_relay(bin: &Path, port: u16, data: &Path) -> ChildGuard {
@@ -318,7 +404,11 @@ fn spawn_agent24d(
     model_url: &str,
     hyphae: &Path,
 ) -> (DaemonGuard, u16, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    // Other worktrees share CARGO_TARGET_DIR and may replace agent24d while
+    // this scenario runs. Snapshot the Cargo-built executable into our HOME.
+    let binary = home.path().join("agent24d-under-test");
+    std::fs::copy(env!("CARGO_BIN_EXE_agent24d"), &binary).expect("snapshot real agent24d");
+    let mut command = Command::new(&binary);
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -326,22 +416,27 @@ fn spawn_agent24d(
         .env("A24_COMM_PASSWORD_STORE", "memory")
         .env("A24_HYPHAE_BIN", hyphae)
         .env("OMLX_URL", model_url)
+        .env("OLLAMA_URL", model_url)
+        .env("OPENAI_BASE_URL", model_url)
+        .env("A24_BASE_URL", model_url)
         .env("DEFAULT_MODEL", "comm5b-stub")
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn actual agent24d");
-    let stdout = child.stdout.take().unwrap();
+        .stderr(Stdio::inherit());
+    let mut child = ChildGuard(command.spawn().expect("spawn actual agent24d"));
+    let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut line = String::new();
-        let _ = BufReader::new(stdout).read_line(&mut line);
+        let mut reader = BufReader::new(stdout);
+        let _ = reader.read_line(&mut line);
         let _ = tx.send(line);
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
     });
     let ready = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("agent24d ready line");
+        .recv_timeout(Duration::from_secs(120))
+        .expect("agent24d ready line (bounded cold-start deadline)");
     let value: Value = serde_json::from_str(&ready).expect("ready JSON");
     let port = value["port"].as_u64().unwrap() as u16;
     let token = value["token"].as_str().expect("daemon token").to_owned();
@@ -371,16 +466,11 @@ fn b_run(bin: &Path, home: &Path, args: &[&str], password: Option<&str>) -> Valu
     } else {
         command.stdin(Stdio::null());
     }
-    let mut child = command.spawn().expect("spawn real Hyphae peer");
-    if let Some(password) = password {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(password.as_bytes())
-            .unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
+    let output = bounded_output(
+        &mut command,
+        password.map(str::as_bytes),
+        Duration::from_secs(30),
+    );
     assert!(
         output.status.success(),
         "Hyphae {:?} failed: {}",
@@ -427,6 +517,15 @@ fn local_real_peer_reads_are_zero_run_with_same_counter_positive_control() {
         lock.source_sha,
         "Hyphae source must match embedded lock; use the lock-pinned local source revision"
     );
+    assert!(
+        Command::new("git")
+            .current_dir(&source)
+            .args(["diff", "--quiet", "HEAD"])
+            .status()
+            .unwrap()
+            .success(),
+        "locked source must have no tracked modifications"
+    );
     assert_eq!(
         agent24_comm::binary::sha256_of(&fixture_bytes)
             .to_hex()
@@ -435,13 +534,22 @@ fn local_real_peer_reads_are_zero_run_with_same_counter_positive_control() {
         "query fixture provenance changed; review before updating this acceptance"
     );
     let root = tempfile::tempdir().unwrap();
-    let bin = root.path().join("hyphae");
+    let bin = PathBuf::from(
+        std::env::var_os("A24_HYPHAE_BIN")
+            .expect("A24_HYPHAE_BIN required: build using lock recipe"),
+    )
+    .canonicalize()
+    .expect("real Hyphae binary exists");
     let relay_bin = root.path().join("hyphae-relay");
-    build(&source, &bin, "./cmd/hyphae");
-    build(&source, &relay_bin, "./cmd/hyphae-relay");
+    build(&source, &relay_bin, "./cmd/hyphae-relay", &lock);
     let hash = agent24_comm::binary::sha256_of(&std::fs::read(&bin).unwrap());
     let expected = lock.expected_for(&current_platform()).unwrap();
     assert_eq!(hash, expected, "built Hyphae must match embedded lock");
+    eprintln!(
+        "COMM-5b T3 verified Hyphae source={} platform={} sha256={hash:?}",
+        lock.source_sha,
+        current_platform()
+    );
 
     let samples = serde_json::from_str::<Value>(include_str!(
         "../../../crates/agent24-comm/tests/fixtures/comm_inbound_six.json"
@@ -592,21 +700,6 @@ for line in sys.stdin:
     let run_id = run["id"].as_str().expect("created run id");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let rs = runs(&base, &token);
-        let (m, x) = counter.counts();
-        if rs.len() == before_runs + 1 && m > before_models && x > before_modules {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "positive control failed: runs={} models={m} modules={x}; run={run}",
-            rs.len()
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-    let positive_runs = runs(&base, &token).len();
-    assert_eq!(positive_runs, before_runs + 1, "positive control run delta");
-    loop {
         let (s, state) = http(
             &base,
             "GET",
@@ -623,10 +716,18 @@ for line in sys.stdin:
         }
         assert!(
             Instant::now() < deadline,
-            "positive-control run did not finish: {state}"
+            "positive-control run did not finish: {state}; counters={:?}",
+            counter.counts()
         );
         thread::sleep(Duration::from_millis(100));
     }
+    let positive_runs = runs(&base, &token).len();
+    assert_eq!(positive_runs, before_runs + 1, "positive control run delta");
+    let (models, modules) = counter.counts();
+    assert!(
+        models > before_models && modules > before_modules,
+        "completed control must reach both backends: models={models}, modules={modules}"
+    );
     let (base_models, base_modules) = counter.counts();
 
     let (s, v) = http(
@@ -678,16 +779,37 @@ for line in sys.stdin:
             .iter()
             .all(|id| rows.iter().any(|row| row["id"].as_str() == Some(id)))
         {
+            for (id, sample) in event_ids.iter().zip(&samples) {
+                let row = rows
+                    .iter()
+                    .find(|row| row["id"].as_str() == Some(id))
+                    .unwrap();
+                assert_eq!(
+                    row["plaintext"], sample["content"],
+                    "received peer payload unchanged"
+                );
+            }
+            let direct = b_run(
+                &bin,
+                &daemon._home.path().join(".agent24/comm/hyphae-home"),
+                &["history", "inbox", "--as", "a", "--limit", "200"],
+                None,
+            );
+            assert_eq!(
+                h["data"], direct["data"],
+                "COMM must return the complete Hyphae history unchanged, including ciphertext"
+            );
             seen = true;
             break;
         }
-        let _ = http(
+        let (s, pulled) = http(
             &base,
             "POST",
             "/api/v1/comm/inbox/pull",
             &token,
             Some(&json!({"as":"a"})),
         );
+        assert_eq!(s, 200, "pull inbox: {pulled}");
         thread::sleep(Duration::from_millis(250));
     }
     assert!(
@@ -717,12 +839,21 @@ for line in sys.stdin:
         (base_models, base_modules),
         "passive reads must not call model or MCP module"
     );
-    let _ = http(
+    let (s, stopped) = http(
         &base,
         "POST",
         "/api/v1/comm/daemon/stop",
         &token,
         Some(&json!({})),
     );
+    assert_eq!(s, 200, "stop managed Hyphae: {stopped}");
     drop(daemon);
+    assert_eq!(
+        counter.counts(),
+        (base_models, base_modules),
+        "stop/shutdown must remain passive"
+    );
+    eprintln!(
+        "COMM-5b T3 PASS: positive runs delta=1, models={base_models}, modules={base_modules}; six real peer events; passive runs delta=0, model/module delta=0"
+    );
 }
