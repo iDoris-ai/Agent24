@@ -52,6 +52,18 @@ pub fn new_id(kind: IdKind) -> Result<String, IdError> {
     Ok(format!("{}_{}", kind.prefix(), encode(value)))
 }
 
+/// Whether `s` is an id of `kind` in the form [`new_id`] mints.
+#[must_use]
+pub fn is_id(kind: IdKind, s: &str) -> bool {
+    s.strip_prefix(kind.prefix())
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(|ulid| {
+            ulid.len() == 26
+                && matches!(ulid.as_bytes()[0], b'0'..=b'7')
+                && ulid.bytes().all(|b| CROCKFORD.contains(&b))
+        })
+}
+
 /// 128 bits as 26 base32 characters, most significant first (the top two
 /// bits of the 130 encoded are always zero).
 fn encode(value: u128) -> String {
@@ -87,6 +99,23 @@ mod tests {
         ] {
             let id = new_id(kind).unwrap();
             assert!(matches_schema(&id, prefix), "{id}");
+        }
+    }
+
+    #[test]
+    fn is_id_accepts_minted_ids_only() {
+        let id = new_id(IdKind::Upload).unwrap();
+        assert!(is_id(IdKind::Upload, &id));
+        assert!(!is_id(IdKind::Job, &id));
+        for bad in [
+            "upl_",
+            "upl_8ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "upl_01K74Z3QJ8V5N2W9RTX6YB4MCI", // I is not Crockford
+            "upl_01k74z3qj8v5n2w9rtx6yb4mcd",
+            "upl_01K74Z3QJ8V5N2W9RTX6YB4MC",
+            "upl-01K74Z3QJ8V5N2W9RTX6YB4MCD",
+        ] {
+            assert!(!is_id(IdKind::Upload, bad), "{bad}");
         }
     }
 
