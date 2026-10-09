@@ -76,6 +76,50 @@
 - **不跨 revision 迁移**：r1 的锚点永远指向 r1。要在 r2 上定位，只能重新抽取。
 - **无来源**：没有可核验来源的值，`anchors` 为空并附 `unsourced_reason`。有来源的值可以带多个锚点（`anchors[]`），共同覆盖整句命题：值本身，以及决定含义的条件、对象、否定词、表格行列标题，可跨块、跨页（与 `samples/README.md` §4.2 的金标结构一致；2026-10-09 由单个 `anchor` 改为数组，回应 OpenAPI B2b 的审查）。
 
+### 3.1 第 1 片文本层的落地（建议，待 David 确认，2026-10-10）
+
+第 1 片读取引擎是 PDFKit + Vision（ADR-DOC-01 D6 修订）。以下是落地细节的建议，实现按它做；David 改了哪条，就按改后的版本调整实现。对应 §9 的 Q11–Q14。
+
+- **辅助进程**：`agent24-documents-pdfkit`，单个 Swift 源文件，用 `swiftc` 构建，随 OS package 放在 `bin/agent24-documents` 旁边。
+  - 每次解析启动一次：`parse <文件路径>`，结果以一份 JSON 写到 stdout。非零退出码表示整份失败（`parse_failed`）；部分页失败不算整份失败，见下面的「部分解析」。
+  - Rust 侧限时（每份 120 s）、限输出（64 MiB），超时或超限就杀掉进程，记为 `parse_failed`。
+  - 整个 OS 同时最多运行 2 个辅助进程，再来的排队等待（最多 16 个），队列满就回 503 `engine_unavailable`（`retryable: true`）。
+  - 签名和公证跟随 OS package 的发布流程（jason）。开发期不签名。
+  - Linux 上没有这个辅助进程：`engines[]` 报 `absent`，读取类操作报 `engine_unavailable`（D10）。
+- **引擎标识**：`engine.id = apple-pdfkit`，`engine.version` 是 macOS 的版本号（如 `26.6`），因为 PDFKit 的行为随系统版本变化。辅助进程自身的协议版本、切分规则版本和下面的各项上限写进 config，参与 `config_sha256`（canonical JSON 的 sha256）。
+- **何时解析**：
+  - 导入成功后，导入 job 尽力而为地多做一步：用当前引擎解析出文本层并钉住。这一步失败不影响导入，导入不依赖引擎（Linux 上照常成功）。
+  - `read_range` / `find` 找不到当前引擎和 config 的文本层时，就在后台开始解析，并最多等 8 s（内核代理要求 10 s 内返回响应头）。到时还没完成，回 503 `engine_unavailable`（`retryable: true`），解析继续进行，客户端稍后重试即可。
+  - 同一组 `(content_sha256, engine, version, config_sha256)` 同时只解析一次，等待者共享结果。
+- **块**：每页按 PDFKit 给出的行，在阅读顺序上把相邻行合并成段落；行距明显变大，或者左缘不对齐，就开始新段落。
+  - 上限：块文本 ≤ 16 KiB（UTF-8），每块 ≤ 64 行。超出就在行边界拆成下一个块；单行本身超长，就在字符边界拆开。拆分在分配 `block_id`、计算哈希之前完成，所以任何一个块序列化后都远小于响应的 512 KiB 上限。
+  - `block_id` 是 `p{页}/b{序号}`，序号在页内从 1 起按阅读顺序编号。图片（JPEG、PNG）只有第 1 页。
+  - 块文本按引擎原样存储，不做规范化（§3）。行与行之间用 `\n` 连接，这个 `\n` 算作**前一行**的一部分，所以块文本里每个字节都属于某一行。
+- **几何**：每个块记录它的每一行，包括这一行在块文本里的 UTF-8 范围（含行尾的 `\n`）和它的矩形。
+  - 块的 `geometry.rects` 是这些行的矩形。
+  - 命中的锚点取它覆盖到的那些**整行**的矩形，至少一个。第 1 片不做字符级的矩形，高亮可能比原文宽，但不会漏掉。
+- **部分解析**：按页判断。
+  - 页上的每个图像区域（扫描页、有页脚文字的扫描页、印章、截图）都用 Vision 做 OCR，与 PDFKit 读出的文字不重叠的行照常组成块；OCR 没读出文字的图像，按无文字处理。
+  - OCR 失败，或者这页没法渲染：未能读出的区域记进 `unparsed_regions`（`page` + 区域的 `geometry` + `reason`），每页最多一项：多个区域合并成一个 `rects` 列表，最多 16 个矩形，超过就改用整页的一个矩形（宁宽勿漏）；`reason` 取自一个短的固定集合（如 `ocr_failed`、`render_failed`）。按 README §11 第 7 条明确标出，不被当作“没有内容”。
+  - 既没有文字也没有图像的空白页：不算未解析，结果里就是没有块。
+  - 图片（JPEG、PNG）直接用 Vision OCR，失败就是整份 `parse_failed`。
+  - 文本层记录整份是否完整。`require_complete` 时，只要有未解析页就回 422 `partial_parse`，不返回内容。
+- **分页**：`read_range` 和 `find` 都按页向前推进。
+  - 一次响应最多覆盖 100 页，并按序列化字节数截断（同 `list`）；被截断的页，下次从这页中间的那个块（或那个命中）接着来。
+  - 响应里的 `parse_status` 和 `unparsed_regions` 只描述**这次响应覆盖的页**：这些页里有未解析的区域就是 `partial`，并列出这些区域。整份是否完整，用 `require_complete` 判断。
+  - 一次响应可以没有块或命中（比如覆盖的页全是未解析页，或者都没有命中），只要还没到最后一页，`next_cursor` 就不为空。所以全是扫描页的文档同样能翻完，`unparsed_regions` 也不会超过 100 项。
+- **游标**：不透明。它绑定 `(document_id, revision, text_layer_sha256)` 和下一个位置：
+  - `read_range` 的位置是页号加页内的块序号；
+  - `find` 的位置是页号、页内的块序号加块内的命中序号，同时绑定查询的哈希。所以一个块里超过一页的命中，也能从块中间接着翻。
+  - 换了查询，或者游标指向另一个文本层，回 400 `invalid_request`。
+  - 翻页过程中总是读游标里那个已钉住的文本层，即使期间有了新引擎版本的文本层。
+- **文本层 blob**：一份 JSON（`v: 1`），包含引擎、config、`parse_status`、`unparsed_regions`，以及块、行和矩形。存进 blob 区，`text_layer_sha256` 就是它的 blob 地址。`text_layers` 表登记 `(content_sha256, engine, version, config_sha256)`，同一组合只解析一次。没有游标的请求，用当前引擎和 config 的那一层。
+- **find 的匹配**：只在单个块内匹配，不跨块。
+  - 匹配的是存储的原文，只放宽两点，而且这两点都不改变偏移的对应关系：ASCII 字母不区分大小写；查询里的一段空白，可以匹配原文里任意一段空白（包括换行）。
+  - 查询不能只由空白组成（400 `invalid_request`）。
+  - 不做 Unicode 规范化，不做全角/半角折叠。中文原文不受这两点影响。
+  - 结果按块的阅读顺序排列；一个块内的多处命中，按出现顺序各自成为一个锚点，互不重叠。
+
 ## 4. 操作清单（DOC-1）
 
 - **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
@@ -246,3 +290,7 @@
 | Q8 | `partial_parse` / `stale_index` 何时作为结果状态、何时作为错误 | 默认作为结果状态，只在显式要求时报错 | David |
 | Q9 | 是否向 agent 通告 `job.cancel` / `job.retry` | DOC-1 不通告；如果通告，按 `WriteLocal` 处理，且只能操作同一个 run 启动的 job | David |
 | Q10 | commit 的内联预算（5 s）和 `inline_wait_ms` 的取值 | 先按 5 s，等第 2 片的 DOCX/PDF 实测后再调 | David |
+| Q11 | 第 1 片 PDFKit 辅助进程的形态：每次解析启动一次、stdout 一份 JSON、每份限时 120 s、同时最多 2 个；用 `swiftc` 构建并随 OS package 分发，签名和公证跟随发布流程（§3.1） | 建议如左 | David；签名和打包：jason |
+| Q12 | 块的切分与 `block_id`（`p{页}/b{序号}`，按行距和左缘把相邻行合并成段落，每块 ≤ 16 KiB、≤ 64 行），几何只做到整行；部分解析按页判断，每个图像区域都做 OCR，失败的区域标为未解析；分页按页推进，一次最多 100 页，`parse_status` 描述本次覆盖的页（§3.1） | 建议如左 | David |
+| Q13 | 文本层在导入后尽力预解析；读取或查找时缺了就后台解析，最多等 8 s，否则回 503 `engine_unavailable`（可重试）（§3.1） | 建议如左 | David |
+| Q14 | find 的匹配规则：块内匹配，只放宽 ASCII 大小写和空白，不做 Unicode 规范化（§3.1） | 建议如左 | David |
