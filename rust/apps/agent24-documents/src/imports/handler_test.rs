@@ -448,7 +448,15 @@ async fn first_imports_that_race_past_the_lookup_claim_the_key_once() {
         assert_eq!(keys, 1, "{titles:?}");
         let codes: Vec<_> = answers.iter().map(|(code, _)| *code).collect();
         if titles[0] == titles[1] {
-            assert_eq!(codes, [StatusCode::ACCEPTED; 2], "{answers:?}");
+            // The claim is 202; the replay is 202 while the job works, or
+            // 200 if the worker has already finished it (#838 CI).
+            assert!(codes.contains(&StatusCode::ACCEPTED), "{answers:?}");
+            assert!(
+                codes
+                    .iter()
+                    .all(|c| matches!(*c, StatusCode::ACCEPTED | StatusCode::OK)),
+                "{answers:?}"
+            );
             assert_eq!(answers[0].1["job_id"], answers[1].1["job_id"]);
         } else {
             assert!(codes.contains(&StatusCode::ACCEPTED), "{answers:?}");
