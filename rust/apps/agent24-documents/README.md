@@ -13,12 +13,13 @@ There is no first-party default installation yet (ADR-DOC-01 D6), so for develop
    cd rust && cargo build -p agent24-documents
    ```
 
-2. Assemble a package directory. The manifest's `spawn.command` is `bin/agent24-documents`, relative to that directory:
+2. Assemble a package directory. The manifest's `spawn.command` is `bin/agent24-documents`, relative to that directory. On macOS, also build the read engine into the same `bin/` ([read engine](../../../docs/documenting/engine-pdfkit.md)):
 
    ```sh
    mkdir -p /tmp/documents-pkg/bin
    cp apps/agent24-documents/domain-os.yml /tmp/documents-pkg/
    cp "$CARGO_TARGET_DIR/debug/agent24-documents" /tmp/documents-pkg/bin/
+   apps/agent24-documents/engines/pdfkit/build.sh /tmp/documents-pkg/bin   # macOS only
    ```
 
 3. Install the package, then (re)start the resident daemon:
@@ -34,3 +35,4 @@ There is no first-party default installation yet (ADR-DOC-01 D6), so for develop
    ```
 
 Platform: macOS first. On Linux the OS runs, but the slice-1 engines are macOS-only, so engine-backed operations report `engine_unavailable` (ADR-DOC-01 D6/D10, 2026-10-08 amendments). Windows waits for DEP-C2.
+
