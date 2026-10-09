@@ -8,7 +8,7 @@ rust/apps/agent24-documents/engines/pdfkit/build.sh <dir>     # writes <dir>/age
 ```
 
 - It reads one file per run and writes the pages' lines, in reading order, as text plus a rectangle in CropBox points, origin top left of the page as displayed. It also lists the regions it could not read. It writes no files and uses no network. Its output counts only on exit 0.
-- OCR (Vision) comes in the next change. Until then, a page with no text is listed as unparsed (`ocr_failed`), never treated as empty, and JPEG / PNG files exit 2.
+- Vision OCR reads every page that has no text, or that draws an image anywhere (including inside form XObjects, and inline images). Mixed pages are put back in reading order. A page it cannot render or recognise is listed as unparsed, not treated as empty. Renders stay within 40 megapixels. JPEG orientation (EXIF) is applied.
 - Text is kept as read, except for these clean-ups:
   - typographic ligatures (U+FB00–U+FB06) become the letters they stand for;
   - a selection that lies within an earlier line, and says nothing that line does not, is dropped, because that is text drawn twice in place (a fake bold);
