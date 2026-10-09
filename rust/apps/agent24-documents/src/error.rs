@@ -133,6 +133,19 @@ impl ApiError {
         e
     }
 
+    /// 422 with a code from the closed set: a request the OS understood but
+    /// cannot carry out, e.g. `unsupported_format` (§6).
+    #[must_use]
+    pub fn unprocessable(code: &'static str, message: impl Into<String>) -> Self {
+        debug_assert!(CODES.contains(&code), "{code} is not in the closed set");
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message.into(),
+            false,
+        )
+    }
+
     /// 422: the same key was sent before with a different request (§5.4).
     #[must_use]
     pub fn idempotency_key_reused() -> Self {
@@ -275,6 +288,14 @@ mod tests {
         let (status, v) = body(ApiError::payload_too_large(786_432)).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(v["error"]["code"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn an_unprocessable_request_is_422_with_its_code() {
+        let (status, v) = body(ApiError::unprocessable("unsupported_format", "x")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["error"]["code"], "unsupported_format");
+        assert_eq!(v["error"]["details"], json!({ "retryable": false }));
     }
 
     #[tokio::test]

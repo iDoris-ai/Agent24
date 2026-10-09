@@ -1,6 +1,8 @@
 //! Imports (ADR-DOC-02 §5.4, §7): a complete upload becomes a new document
-//! with r1, through an import job. [`worker`] does the job's work.
+//! with r1, through an import job: [`handler`] starts it, [`worker`] does
+//! the job's work.
 
+pub mod handler;
 pub mod worker;
 
 /// The formats slice 1 reads (README §17 #3), told by their first bytes.
@@ -17,5 +19,7 @@ pub fn media_type(head: &[u8]) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
+mod handler_test;
 #[cfg(test)]
 mod tests;

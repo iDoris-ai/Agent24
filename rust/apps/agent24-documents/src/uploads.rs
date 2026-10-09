@@ -30,7 +30,9 @@ pub struct UploadRequest {
 }
 
 /// A present `filename` must be a string: `null` is not the same as absent.
-fn present_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+pub(crate) fn present_string<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
     String::deserialize(d).map(Some)
 }
 

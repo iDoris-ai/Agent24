@@ -86,7 +86,7 @@ enum Needs {
 /// never sees `available: true` for a 404.
 const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("upload", Needs::Storage, true),
-    ("import", Needs::Storage, false),
+    ("import", Needs::Storage, true),
     ("get", Needs::Storage, false),
     ("list", Needs::Storage, false),
     ("job", Needs::Storage, true),
@@ -142,6 +142,7 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<Capabilities> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
+        .route("/imports", post(imports::handler::import))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{job_id}/retry", post(jobs::retry_job))
@@ -270,7 +271,7 @@ mod tests {
         let body = get_capabilities_json(AppState::open(dir.path()).await).await;
         assert_eq!(body["storage"], serde_json::json!({ "state": "ready" }));
         // Ready storage makes only the operations with routes available.
-        assert_operations(&body, &["job", "upload"]);
+        assert_operations(&body, &["import", "job", "upload"]);
     }
 
     #[tokio::test]
