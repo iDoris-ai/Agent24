@@ -73,7 +73,8 @@ async fn import(storage: &Arc<Storage>, claim: &Claim) -> Result<(), sqlx::Error
 
     // Stage `store`: the bytes into the blob store (§2.2's write order).
     let path = upload_dir(storage.data_dir(), &upload_id).join("data");
-    let (store, size) = (storage.clone(), received.unsigned_abs());
+    let size = u64::try_from(received).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let store = storage.clone();
     let stored = blocking(move || -> Result<_, BlobError> {
         let mut reader = Head {
             inner: std::fs::File::open(&path)?.take(size),

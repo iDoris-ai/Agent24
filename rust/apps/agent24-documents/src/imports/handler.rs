@@ -158,7 +158,7 @@ async fn start(storage: &Arc<Storage>, req: ImportRequest, request: String) -> A
         ));
     }
     let path = upload_dir(storage.data_dir(), &req.upload_id).join("data");
-    let size = received.unsigned_abs();
+    let size = u64::try_from(received).map_err(|e| Fail::Db(sqlx::Error::Decode(Box::new(e))))?;
     match blocking(move || check_data(&path, size, &sha256)).await {
         Ok(Checked::Ok) => {}
         Ok(Checked::Mismatch) => {

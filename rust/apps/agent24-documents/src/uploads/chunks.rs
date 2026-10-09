@@ -183,7 +183,9 @@ async fn append(
     }
 
     let dir = super::data::upload_dir(storage.data_dir(), id);
-    let start = offset.unsigned_abs();
+    // Never negative (`offset == received`, which 0001's CHECK keeps ≥ 0);
+    // if that ever changed, fail rather than write somewhere else.
+    let start = u64::try_from(offset).map_err(|e| Failure::Db(sqlx::Error::Decode(Box::new(e))))?;
     match blocking(move || write_at(&dir, start, &body)).await {
         Ok(()) => {}
         Err(WriteError::Io(e)) => {
