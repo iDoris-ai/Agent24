@@ -5,8 +5,8 @@
 //! `/api/v1/documents` by `agent24_os_sdk::Module::serve`, so every path
 //! below is relative to that namespace.
 //!
-//! Slice 1 lands in small PRs. Until storage and engines exist, the only
-//! route is `GET /capabilities`, and it reports every operation as
+//! Slice 1 lands in small PRs. `GET /capabilities` reports storage as it
+//! is now, and every operation without a route yet as
 //! unavailable with a typed reason (ADR-DOC-02 §8).
 
 pub mod blob;
@@ -15,8 +15,11 @@ pub mod error;
 pub mod id;
 pub mod state;
 
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
+
+use crate::state::AppState;
 
 /// The manifest the kernel digests; `main` hands these exact bytes to the SDK.
 pub const MANIFEST_YAML: &str = include_str!("../domain-os.yml");
@@ -65,27 +68,42 @@ pub struct OperationStatus {
     pub reason: Option<&'static str>,
 }
 
-/// Slice-1 operations (ADR-DOC-02 §4) and what each one waits on today.
-const SLICE1_OPERATIONS: &[(&str, &str)] = &[
-    ("upload", "storage_unavailable"),
-    ("import", "storage_unavailable"),
-    ("get", "storage_unavailable"),
-    ("list", "storage_unavailable"),
-    ("job", "storage_unavailable"),
-    ("render", "engine_unavailable"),
-    ("read_range", "engine_unavailable"),
-    ("find", "engine_unavailable"),
-    ("extract", "engine_unavailable"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Needs {
+    Storage,
+    Engine,
+}
+
+/// Slice-1 operations (ADR-DOC-02 §4): what each needs, and whether this
+/// build has its route yet. An operation is available only when both hold;
+/// until its route lands it reports the code of what it needs, so a client
+/// never sees `available: true` for a 404.
+const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
+    ("upload", Needs::Storage, false),
+    ("import", Needs::Storage, false),
+    ("get", Needs::Storage, false),
+    ("list", Needs::Storage, false),
+    ("job", Needs::Storage, false),
+    ("render", Needs::Engine, false),
+    ("read_range", Needs::Engine, false),
+    ("find", Needs::Engine, false),
+    ("extract", Needs::Engine, false),
 ];
 
-/// What this build can do right now. Later slice-1 PRs replace the fixed
-/// states with live checks of storage and engines.
+/// What this build can do right now. Engines are not wired yet, so engine
+/// operations are always unavailable.
 #[must_use]
-pub fn capabilities() -> Capabilities {
+pub async fn capabilities(state: &AppState) -> Capabilities {
+    // Asking also retries storage that failed to open (see `state`).
+    let storage_ready = state.storage().await.is_ok();
     Capabilities {
         os_version: env!("CARGO_PKG_VERSION"),
         storage: StorageStatus {
-            state: "unavailable",
+            state: if storage_ready {
+                "ready"
+            } else {
+                "unavailable"
+            },
         },
         engines: Vec::new(),
         knowledge: KnowledgeStatus {
@@ -94,22 +112,31 @@ pub fn capabilities() -> Capabilities {
         },
         operations: SLICE1_OPERATIONS
             .iter()
-            .map(|&(op, reason)| OperationStatus {
-                op,
-                available: false,
-                reason: Some(reason),
+            .map(|&(op, needs, routed)| {
+                let (ready, code) = match needs {
+                    Needs::Storage => (storage_ready, "storage_unavailable"),
+                    Needs::Engine => (false, "engine_unavailable"),
+                };
+                let available = routed && ready;
+                OperationStatus {
+                    op,
+                    available,
+                    reason: (!available).then_some(code),
+                }
             })
             .collect(),
     }
 }
 
-async fn get_capabilities() -> Json<Capabilities> {
-    Json(capabilities())
+async fn get_capabilities(State(state): State<AppState>) -> Json<Capabilities> {
+    Json(capabilities(&state).await)
 }
 
 /// The module's HTTP surface, relative to `/api/v1/documents`.
-pub fn router() -> Router {
-    Router::new().route("/capabilities", get(get_capabilities))
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/capabilities", get(get_capabilities))
+        .with_state(state)
 }
 
 #[cfg(test)]
@@ -117,6 +144,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::error::StorageCause;
     use agent24_domain::{Capability, DomainOsManifest, ImplKind, ModelAccess};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -167,9 +195,8 @@ mod tests {
         ("upload", "storage_unavailable"),
     ];
 
-    #[tokio::test]
-    async fn capabilities_route_reports_every_slice1_operation_with_a_typed_reason() {
-        let res = router()
+    async fn get_capabilities_json(state: AppState) -> serde_json::Value {
+        let res = router(state)
             .oneshot(Request::get("/capabilities").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -177,19 +204,17 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
             .await
             .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["os_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(body["storage"]["state"], "unavailable");
-        assert_eq!(body["engines"], serde_json::json!([]));
-        assert_eq!(body["knowledge"]["setting"], "on");
-        assert_eq!(body["knowledge"]["state"], "unavailable");
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
+    /// Every operation, once, each unavailable with the expected reason.
+    fn assert_operations(body: &serde_json::Value) {
         let mut got: Vec<(String, String)> = body["operations"]
             .as_array()
             .unwrap()
             .iter()
             .map(|op| {
-                assert_eq!(op["available"], false, "nothing is available yet: {op}");
+                assert_eq!(op["available"], false, "no operation has a route yet: {op}");
                 (
                     op["op"].as_str().unwrap().to_owned(),
                     op["reason"].as_str().unwrap().to_owned(),
@@ -208,8 +233,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capabilities_report_storage_that_failed_to_open_as_unavailable() {
+        let body = get_capabilities_json(AppState::unavailable(StorageCause::Corrupt)).await;
+        assert_eq!(body["os_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            body["storage"],
+            serde_json::json!({ "state": "unavailable" })
+        );
+        assert_eq!(body["engines"], serde_json::json!([]));
+        assert_eq!(body["knowledge"]["setting"], "on");
+        assert_eq!(body["knowledge"]["state"], "unavailable");
+        assert_operations(&body);
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_opened_storage_as_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = get_capabilities_json(AppState::open(dir.path()).await).await;
+        assert_eq!(body["storage"], serde_json::json!({ "state": "ready" }));
+        // Ready storage alone does not make an operation without a route available.
+        assert_operations(&body);
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_storage_once_it_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = AppState::open(dir.path()).await;
+        let second = AppState::open_with(dir.path(), std::time::Duration::ZERO).await;
+        let body = get_capabilities_json(second.clone()).await;
+        assert_eq!(body["storage"]["state"], "unavailable");
+        drop(first);
+        let body = get_capabilities_json(second).await;
+        assert_eq!(body["storage"]["state"], "ready");
+    }
+
+    #[tokio::test]
     async fn unknown_paths_are_404_not_a_catch_all() {
-        let res = router()
+        let res = router(AppState::unavailable(StorageCause::Busy))
             .oneshot(Request::get("/documents").body(Body::empty()).unwrap())
             .await
             .unwrap();

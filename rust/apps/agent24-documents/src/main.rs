@@ -2,10 +2,11 @@
 //!
 //! `connect()` takes over the kernel-bound listener (fd 3) and dials the
 //! callback socket; `serve()` nests [`agent24_documents::router`] under
-//! `/api/v1/documents`. Logs go to stderr, which the supervisor captures.
+//! `/api/v1/documents`. Storage is opened in between. Logs go to stderr, which the supervisor captures.
 
 use std::process::ExitCode;
 
+use agent24_documents::state::AppState;
 use agent24_os_sdk::Module;
 use tracing_subscriber::EnvFilter;
 
@@ -30,7 +31,9 @@ async fn main() -> ExitCode {
     };
     tracing::info!(data_dir = %module.data_dir().display(), "documents: connected");
 
-    match module.serve(agent24_documents::router()).await {
+    // A storage failure is logged and reported by the routes, not fatal.
+    let state = AppState::open(module.data_dir()).await;
+    match module.serve(agent24_documents::router(state)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "documents: server stopped");
