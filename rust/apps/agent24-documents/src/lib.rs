@@ -11,6 +11,7 @@
 
 pub mod blob;
 pub mod db;
+pub mod documents;
 pub mod error;
 pub mod id;
 pub mod idem;
@@ -87,8 +88,8 @@ enum Needs {
 const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("upload", Needs::Storage, true),
     ("import", Needs::Storage, true),
-    ("get", Needs::Storage, false),
-    ("list", Needs::Storage, false),
+    ("get", Needs::Storage, true),
+    ("list", Needs::Storage, true),
     ("job", Needs::Storage, true),
     ("render", Needs::Engine, false),
     ("read_range", Needs::Engine, false),
@@ -142,6 +143,8 @@ async fn get_capabilities(State(state): State<AppState>) -> Json<Capabilities> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
+        .route("/documents", get(documents::list_documents))
+        .route("/documents/{document_id}", get(documents::get_document))
         .route("/imports", post(imports::handler::import))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
@@ -271,7 +274,7 @@ mod tests {
         let body = get_capabilities_json(AppState::open(dir.path()).await).await;
         assert_eq!(body["storage"], serde_json::json!({ "state": "ready" }));
         // Ready storage makes only the operations with routes available.
-        assert_operations(&body, &["import", "job", "upload"]);
+        assert_operations(&body, &["get", "import", "job", "list", "upload"]);
     }
 
     #[tokio::test]
@@ -289,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_paths_are_404_not_a_catch_all() {
         let res = router(AppState::unavailable(StorageCause::Busy))
-            .oneshot(Request::get("/documents").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/no-such-route").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
