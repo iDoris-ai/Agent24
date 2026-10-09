@@ -59,7 +59,7 @@
 **锚点**（README §8 / §11.4 逐值溯源）：
 
 ```json
-{ "document_id": "doc_…", "revision": 1, "content_sha256": "sha256:…",
+{ "document_id": "doc_…", "revision": 1, "content_sha256": "sha256:…", "media_type": "application/pdf",
   "text_layer_sha256": "sha256:…", "engine": { "id": "…", "version": "…" },
   "block_id": "p3/b12", "page": 3, "block_text_sha256": "sha256:…",
   "text_range": { "unit": "utf8", "start": 120, "end": 168 },
@@ -68,7 +68,7 @@
   "quote": "原文片段" }
 ```
 
-- **定位**：`block_id` 是结构路径，DOCX 等流式格式用它定位，`page` 可省略；PDF / 扫描件给出 1 起的物理页号。`geometry` 以 PDF **CropBox** 为参照框，单位为乘过 `UserUnit` 的点，原点在应用 `/Rotate` 后显示页面的左上角；`rects[]` 覆盖跨行、跨栏的片段。
+- **定位**：`block_id` 是结构路径，DOCX 等流式格式用它定位，`page` 可省略；PDF / 扫描件给出 1 起的物理页号。`media_type` 标明锚点所在 revision 的格式：分页格式（PDF、JPEG、PNG）必须同时给出 `page` 和 `geometry`，流式格式两者都不给（2026-10-09 增补，让锚点能自我说明是否分页，回应 OpenAPI B2a 的审查）。`geometry` 以 PDF **CropBox** 为参照框，单位为乘过 `UserUnit` 的点，原点在应用 `/Rotate` 后显示页面的左上角；`rects[]` 覆盖跨行、跨栏的片段。
 - **偏移**：单位是 **UTF-8 字节**，相对块文本，半开区间 `[start, end)`，按**逻辑（存储）顺序**计，不按双向文本的视觉顺序；起止必须落在字符边界，否则 `invalid_request`。
   - 理由：OS 和引擎都是 Rust/UTF-8；块文本原样存储、不做规范化，偏移因此确定。渲染进程统一经 `api-client` 的换算函数转成 UTF-16。
   - 高亮时界面扩展到**字素簇边界**（UAX #29：泰文、组合符、ZWJ 序列），存储的偏移不变。
