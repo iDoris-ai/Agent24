@@ -6,6 +6,8 @@ import { contextBridge, ipcRenderer } from 'electron'
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type DocumentsRequest,
+  type DocumentsResponse,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type CreativeViewBounds,
@@ -99,6 +101,11 @@ const api = {
   },
   modelCallSnapshot: (): Promise<ModelCallEnvelope[]> =>
     ipcRenderer.invoke(IpcChannels.ModelCallSnapshot),
+  // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
+  documents: {
+    request: <R extends DocumentsRequest>(req: R): Promise<DocumentsResponse<R['op']>> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsRequest, req),
+  },
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)
