@@ -1916,6 +1916,60 @@ paths:
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
         "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
 
+  /documents/documents/{document_id}/revisions/{revision}/pages/{page}:
+    get:
+      operationId: documentsRenderPage
+      tags: [documents]
+      summary: Render one page of a revision as PNG (ADR-DOC-02 §4)
+      description: >-
+        The image is at most 1 MiB. The OS lowers `scale` until it fits and
+        reports the scale it used in `Documents-Render-Scale`. If the
+        requested area does not fit even at scale 0.25, the response is 413
+        `payload_too_large`: request smaller tiles with `region`. Renders are
+        a cache derived from the revision and can be rebuilt (§3).
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+        - $ref: "#/components/parameters/RevisionNumber"
+        - name: page
+          in: path
+          required: true
+          description: 1-based physical page.
+          schema: { type: integer, minimum: 1 }
+        - name: scale
+          in: query
+          required: false
+          schema: { type: number, minimum: 0.25, maximum: 4, default: 1 }
+        - name: region
+          in: query
+          required: false
+          description: >-
+            `x,y,width,height` in CropBox points, origin at the top-left of the
+            displayed (rotated) page — the same frame as anchor geometry.
+            Width and height must be greater than 0; an empty or off-page
+            region is 400 `invalid_request`.
+          schema:
+            type: string
+            pattern: "^[0-9]+(\\.[0-9]+)?(,[0-9]+(\\.[0-9]+)?){3}$"
+      responses:
+        "200":
+          description: The rendered page or region
+          headers:
+            Documents-Render-Scale:
+              description: The scale actually used, at most the one requested.
+              required: true
+              schema: { type: number, minimum: 0.25, maximum: 4 }
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "413": { $ref: "#/components/responses/DocumentsTooLarge" }
+        "422": { $ref: "#/components/responses/DocumentsRenderUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1961,6 +2015,11 @@ components:
       required: true
       description: Client-chosen key; reused on retry after an unknown outcome (§5.5).
       schema: { type: string, minLength: 1, maxLength: 200 }
+    RevisionNumber:
+      name: revision
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
     DocumentsLimit:
       name: limit
       in: query
@@ -2040,6 +2099,16 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/DocumentsConflictError" }
+    DocumentsTooLarge:
+      description: "`payload_too_large`: the render does not fit in 1 MiB even at scale 0.25; request a smaller `region`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsTooLargeError" }
+    DocumentsRenderUnprocessable:
+      description: "`unsupported_format` or `parse_failed` (§6); render has no `require_complete`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsRenderUnprocessableError" }
     DocumentsUploadUnprocessable:
       description: "`idempotency_key_reused`: the same key with a different body (§5.4)"
       content:
@@ -3227,6 +3296,24 @@ components:
             error:
               properties:
                 code: { enum: [upload_offset_mismatch] }
+    DocumentsTooLargeError:
+      description: A 413 from the OS itself.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [payload_too_large] }
+    DocumentsRenderUnprocessableError:
+      description: The 422s of render.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [unsupported_format, parse_failed] }
     DocumentsUploadUnprocessableError:
       description: The 422 of upload creation.
       allOf:
