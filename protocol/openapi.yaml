@@ -1742,7 +1742,9 @@ paths:
       description: >-
         Idempotent on `Idempotency-Key` (kind `upload`, §5.4): the same key
         with the same body returns the existing upload; with a different
-        body, `idempotency_key_reused`.
+        body, `idempotency_key_reused`. The body is checked before the key
+        is looked up, so an invalid body is 400 `invalid_request` even under
+        a used key.
       parameters:
         - $ref: "#/components/parameters/DocumentsIdempotencyKey"
       requestBody:
@@ -2199,7 +2201,8 @@ components:
       required: true
       description: >-
         Client-chosen key; reused on retry after an unknown outcome (§5.5).
-        Visible ASCII without spaces, as an HTTP header value carries it.
+        Visible ASCII without spaces: a deliberate subset of what an HTTP
+        header value may carry.
       schema: { type: string, minLength: 1, maxLength: 200, pattern: "^[\\x21-\\x7E]+$" }
     RevisionNumber:
       name: revision
@@ -3567,6 +3570,8 @@ components:
         500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The
         OS's `internal` always has `details.retryable: false`; a kernel
         `internal` may have no details, but an `internal` is never retryable.
+        The rule holds wherever this schema is used: the 500 response and,
+        through `DocumentsUnavailable`, the 503 one.
       allOf:
         - $ref: "#/components/schemas/Error"
         - if: { properties: { error: { required: [code], properties: { code: { const: internal } } } } }
@@ -4016,7 +4021,11 @@ components:
       required: [revision, schema]
       additionalProperties: false
       properties:
-        revision: { type: integer, minimum: 1 }
+        revision:
+          type: integer
+          minimum: 1
+          # Hashed for the rerun key (§5.4 JCS), which takes safe integers only.
+          maximum: 9007199254740991
         schema:
           type: object
           required: [fields]

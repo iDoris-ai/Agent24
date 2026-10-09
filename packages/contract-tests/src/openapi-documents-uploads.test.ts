@@ -133,6 +133,11 @@ describe('upload schemas', () => {
     for (const part of [/integer literal/, /`10\.0`/, /`1e1`/, /refused with 400/]) expect(sizeRule).toMatch(part)
   })
 
+  it('check the body before the key, so a bad body is 400 even under a used key (#826 review)', () => {
+    const d: string = openapi.paths['/documents/uploads'].post.description
+    expect(d).toMatch(/body is checked before the key\s+is looked up, so an invalid body is 400 `invalid_request` even under\s+a used key/)
+  })
+
   it('take an Idempotency-Key of visible ASCII without spaces', () => {
     const key = new RegExp(openapi.components.parameters.DocumentsIdempotencyKey.schema.pattern, 'u')
     for (const good of ['k1', 'a-b_c.d:e/f', '~!']) expect(key.test(good), good).toBe(true)

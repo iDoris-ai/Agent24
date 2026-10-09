@@ -135,6 +135,7 @@
 5. **agent 路径**：内核不重试，每次调用的 `tool_call_id` 都是新的。**两层分工**与 ADR-DOC-01 D4.3 一致：`tool_call_id` / `run_id` 只用于可信调用关联与审计（写进操作日志），**业务幂等只看上表的业务键**，DOC-1 没有传输层去重。页面遇到“结果未知”（`request_abandoned`、`upstream_timeout`）时用同一个键重发；代理不会重试 POST（`proxy.rs:1546-1556`）。
 6. **上传**：状态在 `uploads/<upload_id>/` 和 `uploads` 表里，**不在 `tmp/`**，启动清理和孤儿 GC 都不碰它；最后一个块到达 24 h 后过期。每块带 `Upload-Offset` 和 `Chunk-Sha256`：
    - `offset` 等于已接收长度 → 追加并 fsync；这一段已接收且哈希相同 → 200 重放；其他情况 → 409 `upload_offset_mismatch`（`details.received_offset`）。
+   - 上传仍在接收、且 `offset` 等于已接收长度的新块：`Chunk-Sha256` 与块内容不符，或会超出 `total_size` → 400 `invalid_request`。已接收的那一段只按存下的哈希判断（见上一条）；已收齐或已导入的上传不再接受新块，先返回 409（同上）。
    - import 时校验整个文件的 sha256，不符 → 422 `upload_checksum_mismatch`。
 
 7. **幂等验收**（#740 要求，记录到 #708）：
@@ -206,6 +207,7 @@
 - **完成**：结果行与 `status = succeeded` 在**同一个事务**里写入。
 - **取消**：`POST /jobs/{id}/cancel` 幂等。`running` 置 `cancelling`，工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出；没有工作线程在跑的 `queued` / `failed` / `interrupted` 直接置 `cancelled`，带 `cancelled` 标记（`failed` 原有的错误码被它替换），之后键命中也不会复活；其余状态不变。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
 - **崩溃恢复**：OS 启动时 `running` → `interrupted`，`queued` 也 → `interrupted`（进程重启后已没有处理它的工作线程；否则按键命中规则它会一直停在 `queued`），`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
+- **输入**：job 的 `input`（重新入队或重试时据此再次运行）只能写入一次，写入后不可再改；迁移前的旧 job 为 NULL，之后仍可补写一次。
 - **事件**：manifest 申请 `events`，经 `_a24/events/emit` 发出，`payload.module = documents`，`kind` 取 `job.progress`、`job.finished`、`document.imported`、`revision.committed`。
   - **整个模块合计 ≤ 2 次/秒**（低于内核的每秒 5 次），进度按 job 合并只发最新一条；被 `rate_limited` 拒绝的进度事件直接丢弃。**终态事件**（`job.finished`、`revision.committed`）优先发送，被限流时短暂退避后重发一次；最终仍以 job 行为准。
   - **payload 只带 id、stage、计数、status、错误码**，不带标题、文件名、查询或内容：`EventsHub` 广播给所有 WS 客户端，D8 的资料处理政策管不到这条通道。

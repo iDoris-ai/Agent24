@@ -935,7 +935,7 @@ export interface paths {
         put?: never;
         /**
          * Start a chunked upload (ADR-DOC-02 §5.6)
-         * @description Idempotent on `Idempotency-Key` (kind `upload`, §5.4): the same key with the same body returns the existing upload; with a different body, `idempotency_key_reused`.
+         * @description Idempotent on `Idempotency-Key` (kind `upload`, §5.4): the same key with the same body returns the existing upload; with a different body, `idempotency_key_reused`. The body is checked before the key is looked up, so an invalid body is 400 `invalid_request` even under a used key.
          */
         post: operations["documentsCreateUpload"];
         delete?: never;
@@ -1906,7 +1906,7 @@ export interface components {
                 code?: "idempotency_key_reused" | "upload_checksum_mismatch" | "unsupported_format";
             };
         };
-        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. */
+        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. The rule holds wherever this schema is used: the 500 response and, through `DocumentsUnavailable`, the 503 one. */
         ModuleProxyError: components["schemas"]["Error"] & unknown & {
             error?: {
                 code?: unknown;
@@ -2447,7 +2447,7 @@ export interface components {
         DocumentsCursor: string;
         UploadId: string;
         JobId: components["schemas"]["JobIdString"];
-        /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces, as an HTTP header value carries it. */
+        /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces: a deliberate subset of what an HTTP header value may carry. */
         DocumentsIdempotencyKey: string;
         RevisionNumber: number;
         /** @description Turn a partial parse into 422 `partial_parse` instead of a result status. */
@@ -4303,7 +4303,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces, as an HTTP header value carries it. */
+                /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces: a deliberate subset of what an HTTP header value may carry. */
                 "Idempotency-Key": components["parameters"]["DocumentsIdempotencyKey"];
             };
             path?: never;
