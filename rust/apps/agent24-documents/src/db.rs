@@ -47,6 +47,16 @@ impl Db {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        // SQLite opens a read-only file read-only without an error, and a
+        // migrated database has nothing left to write. Rewrite a header field
+        // to its own value so an unwritable database fails here, not on the
+        // user's first save.
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        sqlx::query(&format!("PRAGMA user_version = {version}"))
+            .execute(&pool)
+            .await?;
         Ok(Self { pool })
     }
 
