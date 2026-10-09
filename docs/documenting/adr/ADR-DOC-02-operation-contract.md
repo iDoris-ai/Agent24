@@ -113,7 +113,7 @@
   - `find` 的位置是页号、页内的块序号加块内的命中序号，同时绑定查询的哈希。所以一个块里超过一页的命中，也能从块中间接着翻。
   - 换了查询，或者游标指向另一个文本层，回 400 `invalid_request`。
   - 翻页过程中总是读游标里那个已钉住的文本层，即使期间有了新引擎版本的文本层。
-- **文本层 blob**：一份 JSON（`v: 1`），包含引擎、config、`parse_status`、`unparsed_regions`，以及块、行和矩形。存进 blob 区，`text_layer_sha256` 就是它的 blob 地址。`text_layers` 表登记 `(content_sha256, engine, version, config_sha256)`，同一组合只解析一次。没有游标的请求，用当前引擎和 config 的那一层。
+- **文本层 blob**：一份 JSON（`v: 1`），包含源内容的 `content_sha256`（所以两份读出来一样的文件不会共用一个文本层地址）、物理页数（含空白页）、引擎、config、`parse_status`、`unparsed_regions`，以及块、行和矩形。config 只能是扁平对象：ASCII 键，值为字符串、整数或布尔；这样按键排序的 JSON 就是规范形式。存进 blob 区，`text_layer_sha256` 就是它的 blob 地址。`text_layers` 表登记 `(content_sha256, engine, version, config_sha256)`，同一组合只解析一次。没有游标的请求，用当前引擎和 config 的那一层。
 - **find 的匹配**：只在单个块内匹配，不跨块。
   - 匹配的是存储的原文，只放宽两点，而且这两点都不改变偏移的对应关系：ASCII 字母不区分大小写；查询里的一段空白，可以匹配原文里任意一段空白（包括换行）。
   - 查询不能只由空白组成（400 `invalid_request`）。

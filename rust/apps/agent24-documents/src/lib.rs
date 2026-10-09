@@ -18,6 +18,7 @@ pub mod idem;
 pub mod imports;
 pub mod jobs;
 pub mod state;
+pub mod text_layer;
 pub mod timestamp;
 pub mod uploads;
 
