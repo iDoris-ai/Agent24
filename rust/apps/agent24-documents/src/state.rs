@@ -22,6 +22,7 @@ use sqlx::migrate::MigrateError;
 use crate::blob::{BlobError, BlobStore};
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, StorageCause};
+use crate::events::Events;
 
 /// How often a request may retry opening storage that failed to open.
 pub const REOPEN_INTERVAL: Duration = Duration::from_secs(2);
@@ -32,6 +33,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Storage {
     pub blobs: BlobStore,
     pub db: Db,
+    pub events: Events,
     data_dir: PathBuf,
     /// One request-time probe at a time.
     probing: Arc<tokio::sync::Semaphore>,
@@ -106,6 +108,7 @@ pub struct AppState(Arc<Inner>);
 
 struct Inner {
     data_dir: PathBuf,
+    events: Events,
     reopen_interval: Duration,
     current: Mutex<Opened>,
     /// When the last reopen started. Held during a reopen, so one request
@@ -122,10 +125,20 @@ impl AppState {
         Self::open_with(data_dir, REOPEN_INTERVAL).await
     }
 
+    /// [`AppState::open`], telling WS clients about jobs through `events`.
+    pub async fn open_with_events(data_dir: &Path, events: Events) -> Self {
+        Self::opened(data_dir, REOPEN_INTERVAL, events).await
+    }
+
     pub(crate) async fn open_with(data_dir: &Path, reopen_interval: Duration) -> Self {
-        let current = open_storage(data_dir).await;
+        Self::opened(data_dir, reopen_interval, Events::default()).await
+    }
+
+    async fn opened(data_dir: &Path, reopen_interval: Duration, events: Events) -> Self {
+        let current = open_storage(data_dir, &events).await;
         Self(Arc::new(Inner {
             data_dir: data_dir.to_owned(),
+            events,
             reopen_interval,
             current: Mutex::new(current),
             last_attempt: tokio::sync::Mutex::new(Instant::now()),
@@ -144,6 +157,7 @@ impl AppState {
     pub(crate) fn failed(data_dir: &Path, cause: StorageCause, reopen_interval: Duration) -> Self {
         Self(Arc::new(Inner {
             data_dir: data_dir.to_owned(),
+            events: Events::default(),
             reopen_interval,
             current: Mutex::new(Err(cause)),
             last_attempt: tokio::sync::Mutex::new(Instant::now()),
@@ -179,7 +193,7 @@ impl AppState {
         *last = Instant::now();
         #[cfg(test)]
         self.0.reopens.fetch_add(1, Ordering::SeqCst);
-        let reopened = open_storage(&self.0.data_dir).await;
+        let reopened = open_storage(&self.0.data_dir, &self.0.events).await;
         *self
             .0
             .current
@@ -191,7 +205,7 @@ impl AppState {
 
 /// Opens both stores. On a database failure the blob store is dropped, which
 /// releases its lock, so a reopen can take it again.
-async fn open_storage(data_dir: &Path) -> Opened {
+async fn open_storage(data_dir: &Path, events: &Events) -> Opened {
     // The blob store's lock comes first: it makes this the only instance, so
     // the `recover` below never interrupts jobs another live instance runs.
     let dir = data_dir.to_owned();
@@ -202,21 +216,33 @@ async fn open_storage(data_dir: &Path) -> Opened {
     let opened = match Db::open(data_dir).await {
         Ok(db) => crate::jobs::recover(&db)
             .await
-            .map(|()| db)
+            .map(|ids| (db, ids))
             .map_err(DbError::from),
         Err(e) => Err(e),
     };
-    let db = match opened {
-        Ok(db) => db,
+    let (db, recovered) = match opened {
+        Ok(opened) => opened,
         Err(e) => {
             tracing::error!(error = %e, "documents: database unavailable");
             let dir = data_dir.to_owned();
             return Err(blocking(move || db_cause(&e, &mut || probe_write(&dir))).await);
         }
     };
+    for job in &recovered {
+        let cancelled = job.status == "cancelled";
+        events.ended(&crate::events::Ended {
+            job_id: &job.id,
+            kind: &job.kind,
+            status: &job.status,
+            attempt: job.attempt,
+            error_code: cancelled.then_some("cancelled"),
+            document: None,
+        });
+    }
     Ok(Arc::new(Storage {
         blobs,
         db,
+        events: events.clone(),
         data_dir: data_dir.to_owned(),
         probing: Arc::new(tokio::sync::Semaphore::new(1)),
     }))

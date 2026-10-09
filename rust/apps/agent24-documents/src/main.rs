@@ -6,6 +6,9 @@
 
 use std::process::ExitCode;
 
+use std::sync::Arc;
+
+use agent24_documents::events::Events;
 use agent24_documents::state::AppState;
 use agent24_os_sdk::Module;
 use tracing_subscriber::EnvFilter;
@@ -31,8 +34,21 @@ async fn main() -> ExitCode {
     };
     tracing::info!(data_dir = %module.data_dir().display(), "documents: connected");
 
+    // Taken before `serve`, which consumes the module. Without the grant
+    // (it is in domain-os.yml) jobs are simply not announced.
+    let events = module.events().map_or_else(Events::default, |client| {
+        Events::start(Arc::new(move |kind, payload| {
+            let client = client.clone();
+            Box::pin(async move {
+                client
+                    .emit(kind, payload, None)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }))
+    });
     // A storage failure is logged and reported by the routes, not fatal.
-    let state = AppState::open(module.data_dir()).await;
+    let state = AppState::open_with_events(module.data_dir(), events).await;
     match module.serve(agent24_documents::router(state)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

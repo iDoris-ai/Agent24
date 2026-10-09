@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 use tower::ServiceExt;
 
 use super::media_type;
+use crate::events::tests::{JOB, recorder, sent};
 use crate::state::AppState;
 use crate::uploads::chunks::MAX_CHUNK;
 
@@ -525,4 +526,169 @@ async fn two_imports_of_one_upload_make_one_document() {
         assert_eq!(count(&env.state, table).await, 1, "{table}");
     }
     assert_eq!(upload_status(&env.state, &id).await, "imported");
+}
+
+// ---- events (ADR-DOC-02 §7) ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_import_announces_its_end_and_its_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let (events, seen) = recorder(Duration::ZERO, 0);
+    let state = AppState::open_with_events(dir.path(), events).await;
+    let id = upload(&state, PDF, "通告.pdf").await;
+    let job_id = queue(&state, &id, None).await;
+    let job = settled(&state, &job_id).await;
+    let doc = job["result"]["document_id"].clone();
+    assert_eq!(
+        sent(&seen, 2).await,
+        [
+            (
+                "job.finished".to_owned(),
+                json!({ "job_id": job_id, "kind": "import", "status": "succeeded", "attempt": 1, "error_code": null, "document_id": doc, "revision": 1 })
+            ),
+            (
+                "document.imported".to_owned(),
+                json!({ "document_id": doc, "revision": 1, "job_id": job_id })
+            ),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_that_ends_a_job_announces_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (events, seen) = recorder(Duration::ZERO, 0);
+    let state = AppState::open_with_events(dir.path(), events).await;
+    exec(&state, &format!("INSERT INTO jobs (id, kind, status, origin) VALUES ('{JOB}', 'import', 'failed', '{{\"kind\":\"page\"}}')")).await;
+    exec(&state, &format!("UPDATE jobs SET error = json_object('code', 'storage_unavailable', 'message', 'm') WHERE id = '{JOB}'")).await;
+    for _ in 0..2 {
+        let req = Request::post(format!("/jobs/{JOB}/cancel"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&state, req).await.1["status"], "cancelled");
+    }
+    assert_eq!(sent(&seen, 1).await[0].1["error_code"], "cancelled");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "a second cancel changes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobs_ended_by_a_restart_are_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path()).await;
+    for (id, status) in [
+        (JOB, "running"),
+        ("job_01K75A0B1C2D3E4F5G6H7J8K9N", "cancelling"),
+    ] {
+        exec(&state, &format!("INSERT INTO jobs (id, kind, status, origin) VALUES ('{id}', 'import', '{status}', '{{\"kind\":\"page\"}}')")).await;
+    }
+    drop(state);
+    let (events, seen) = recorder(Duration::ZERO, 0);
+    let _state = AppState::open_with_events(dir.path(), events).await;
+    let sent = sent(&seen, 2).await;
+    let ends: Vec<_> = sent
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str(),
+                v["status"].as_str().unwrap(),
+                v["error_code"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            ("job.finished", "interrupted", Value::Null),
+            ("job.finished", "cancelled", json!("cancelled"))
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_attempt_and_its_retry_are_each_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (events, seen) = recorder(Duration::ZERO, 0);
+    let state = AppState::open_with_events(dir.path(), events).await;
+    let id = upload(&state, PDF, "a.pdf").await;
+    let job_id = queue_with(&state, &id, None, &[("after_document", 1)]).await;
+    settled(&state, &job_id).await;
+    let req = Request::post(format!("/jobs/{job_id}/retry"))
+        .body(Body::empty())
+        .unwrap();
+    send(&state, req).await;
+    settled(&state, &job_id).await;
+    let ends: Vec<_> = sent(&seen, 3)
+        .await
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k,
+                v["status"].clone(),
+                v["attempt"].clone(),
+                v["error_code"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            (
+                "job.finished".to_owned(),
+                json!("failed"),
+                json!(1),
+                json!("storage_unavailable")
+            ),
+            (
+                "job.finished".to_owned(),
+                json!("succeeded"),
+                json!(2),
+                Value::Null
+            ),
+            (
+                "document.imported".to_owned(),
+                Value::Null,
+                Value::Null,
+                Value::Null
+            ),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_announces_a_bounded_number_of_the_jobs_it_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path()).await;
+    let n = crate::jobs::RECOVERED_SHOWN + 20;
+    let values: Vec<_> = (0..n)
+        .map(|_| {
+            format!(
+                "('{}', 'import', 'running', '{{\"kind\":\"page\"}}')",
+                crate::id::new_id(crate::id::IdKind::Job).unwrap()
+            )
+        })
+        .collect();
+    exec(
+        &state,
+        &format!(
+            "INSERT INTO jobs (id, kind, status, origin) VALUES {}",
+            values.join(",")
+        ),
+    )
+    .await;
+    drop(state);
+    let (events, seen) = recorder(Duration::ZERO, 0);
+    let state = AppState::open_with_events(dir.path(), events).await;
+    sent(&seen, crate::jobs::RECOVERED_SHOWN).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(seen.lock().unwrap().len(), crate::jobs::RECOVERED_SHOWN);
+    // All of them were ended, announced or not.
+    assert_eq!(
+        count(&state, "jobs WHERE status = 'interrupted'").await,
+        n as i64
+    );
 }

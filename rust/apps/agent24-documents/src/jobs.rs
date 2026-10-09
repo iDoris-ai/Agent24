@@ -159,9 +159,18 @@ pub async fn load<'e, E: sqlx::SqliteExecutor<'e>>(
 /// At startup, before any worker runs: a job that was queued or running
 /// has no worker any more and becomes `interrupted` (the next call with its
 /// key re-queues it, §7); one that was cancelling ends `cancelled`, with no
-/// output committed (its result and status share a transaction).
-pub async fn recover(db: &Db) -> Result<(), sqlx::Error> {
-    // One statement, so one atomic step.
+/// output committed (its result and status share a transaction). Returns
+/// up to [`RECOVERED_SHOWN`] of the jobs it ended, to announce.
+pub async fn recover(db: &Db) -> Result<Vec<Recovered>, sqlx::Error> {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await?;
+    let ended = sqlx::query_as(&format!(
+        "SELECT id, kind, attempt,
+                CASE status WHEN 'cancelling' THEN 'cancelled' ELSE 'interrupted' END AS status
+         FROM jobs
+         WHERE status IN ('queued', 'running', 'cancelling') ORDER BY id LIMIT {RECOVERED_SHOWN}"
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query(&format!(
         "UPDATE jobs SET updated_at = {NOW},
                 status = CASE status WHEN 'cancelling' THEN 'cancelled' ELSE 'interrupted' END,
@@ -170,9 +179,36 @@ pub async fn recover(db: &Db) -> Result<(), sqlx::Error> {
                         ELSE error END
          WHERE status IN ('queued', 'running', 'cancelling')"
     ))
-    .execute(db.pool())
-    .await
-    .map(|_| ())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(ended)
+}
+
+/// Jobs a restart ended that are announced: as many as the event queue
+/// holds. The rest are not (events are hints; clients read the jobs).
+pub const RECOVERED_SHOWN: usize = 256;
+
+/// A job a restart ended, with the status it ended in.
+#[derive(sqlx::FromRow)]
+pub struct Recovered {
+    pub id: String,
+    pub kind: String,
+    pub attempt: i64,
+    pub status: String,
+}
+
+/// The job as the open transaction `executor` sees it, for an event once it
+/// commits; `None` (and a warning) if it cannot be read: an event is never
+/// worth failing the transition it reports.
+pub(crate) async fn snapshot<'e, E: sqlx::SqliteExecutor<'e>>(
+    executor: E,
+    id: &str,
+) -> Option<Job> {
+    load(executor, id).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, job = id, "documents: cannot read a job to announce it");
+        None
+    })
 }
 
 fn job_id(id: &str) -> Result<(), ApiError> {
@@ -185,11 +221,12 @@ fn job_id(id: &str) -> Result<(), ApiError> {
 
 /// A read-then-write on one job, under the write lock: `change` maps the
 /// current status to the update to make (`None`: leave the job as it is).
+/// With the job, whether it changed.
 async fn transition(
     storage: &Storage,
     id: &str,
     change: fn(&str) -> Result<Option<&'static str>, ApiError>,
-) -> Result<Job, ApiError> {
+) -> Result<(Job, bool), ApiError> {
     let result = async {
         let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
         let Some(job) = load(&mut *tx, id).await? else {
@@ -199,6 +236,7 @@ async fn transition(
             Ok(update) => update,
             Err(e) => return Ok(Err(e)),
         };
+        let changed = update.is_some();
         if let Some(set) = update {
             sqlx::query(&format!(
                 "UPDATE jobs SET {set}, updated_at = {NOW} WHERE id = ?"
@@ -209,7 +247,9 @@ async fn transition(
         }
         let job = load(&mut *tx, id).await?;
         tx.commit().await?;
-        Ok(job.ok_or_else(|| ApiError::not_found("no such job")))
+        Ok(job
+            .map(|job| (job, changed))
+            .ok_or_else(|| ApiError::not_found("no such job")))
     }
     .await;
     match result {
@@ -248,7 +288,13 @@ pub async fn cancel_job(
         })
     })
     .await
-    .map(Json)
+    .map(|(job, changed)| {
+        // A running job ends cancelled later, when its worker settles it.
+        if changed && job.status == "cancelled" {
+            storage.events.finished(&job);
+        }
+        Json(job)
+    })
 }
 
 /// The explicit restart (§7): failed, interrupted or cancelled → queued,
@@ -271,7 +317,8 @@ pub async fn retry_job(
                     .with_detail("status", other.to_owned()),
             ),
         })
-        .await?;
+        .await?
+        .0;
         #[cfg(test)]
         tests::after_retry_commit(&id).await;
         // Queued again: start its worker (the only kind with one so far).
