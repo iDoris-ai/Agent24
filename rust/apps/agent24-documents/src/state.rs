@@ -197,7 +197,14 @@ async fn open_storage(data_dir: &Path) -> Opened {
         tracing::error!(error = %e, "documents: blob store unavailable");
         blob_cause(&e)
     })?;
-    let db = match Db::open(data_dir).await {
+    let opened = match Db::open(data_dir).await {
+        Ok(db) => crate::jobs::recover(&db)
+            .await
+            .map(|()| db)
+            .map_err(DbError::from),
+        Err(e) => Err(e),
+    };
+    let db = match opened {
         Ok(db) => db,
         Err(e) => {
             tracing::error!(error = %e, "documents: database unavailable");

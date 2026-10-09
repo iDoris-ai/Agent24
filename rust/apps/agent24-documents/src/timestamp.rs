@@ -1,9 +1,9 @@
 //! Timestamps as the OS stores them (`strftime('%Y-%m-%dT%H:%M:%fZ')`).
 
-/// A timestamp in the one form the OS writes, `strftime('%Y-%m-%dT%H:%M:%fZ')`,
-/// that is also a real RFC 3339 date-time. Checked here, not by SQLite: its
-/// date functions keep some impossible dates (hour 24, signed years, 29
-/// February 300).
+/// A timestamp in the one form the OS writes, `strftime('%Y-%m-%dT%H:%M:%fZ')`
+/// on `'now'` (other inputs can come back as hour 24 or a signed year), that is
+/// a real RFC 3339 date-time without leap seconds. Checked here, not by SQLite,
+/// which keeps or rolls over impossible dates (hour 24; 29 February 300).
 pub fn is_timestamp(s: &str) -> bool {
     let b = s.as_bytes();
     let shape = b.len() == 24
