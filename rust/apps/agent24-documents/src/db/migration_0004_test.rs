@@ -20,9 +20,9 @@ async fn exec(db: &Db, sql: &str) -> Result<(), sqlx::Error> {
 }
 
 /// The trigger's own message, so a test cannot pass on some other failure.
-/// `message` may list alternatives as `a|b`: when two guards both refuse a
-/// statement (0005's insert guards stand behind these delete guards), either
-/// may fire first.
+/// `message` may list alternatives as `a|b`. A REPLACE is refused by 0005's
+/// BEFORE INSERT guards before SQLite deletes anything, so their message is
+/// the one seen; the delete guard's message is what it would be without 0005.
 async fn refused(db: &Db, sql: &str, message: &str) {
     let err = exec(db, sql).await.expect_err(sql);
     let text = err.to_string();

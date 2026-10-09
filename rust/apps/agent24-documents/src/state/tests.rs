@@ -110,6 +110,30 @@ async fn a_second_instance_is_locked_until_the_first_exits() {
 }
 
 #[tokio::test]
+async fn a_second_instance_never_recovers_the_first_ones_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = AppState::open(dir.path()).await;
+    let storage = first.storage().await.unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, status, origin)
+         VALUES ('job_01K75A0B1C2D3E4F5G6H7J8K9M', 'import', 'running', '{\"kind\":\"page\"}')",
+    )
+    .execute(storage.db.pool())
+    .await
+    .unwrap();
+    let second = AppState::open(dir.path()).await;
+    assert_eq!(cause(&second), Some(StorageCause::Locked));
+    let status: String = sqlx::query_scalar("SELECT status FROM jobs")
+        .fetch_one(storage.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        status, "running",
+        "still the first instance's job (#831 review)"
+    );
+}
+
+#[tokio::test]
 async fn a_database_that_is_not_sqlite_is_corrupt_and_releases_the_blob_lock() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join(crate::db::DB_FILE);

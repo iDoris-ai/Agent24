@@ -177,7 +177,21 @@ async fn cancel_is_idempotent_and_never_revives_or_undoes() {
         } else {
             add_job(&env.state, from).await;
         }
-        for _ in 0..2 {
+        for round in 0..2 {
+            // A no-op leaves the whole row alone, `updated_at` too (#831
+            // review): from an old `updated_at`, so a write cannot hide in the
+            // same millisecond.
+            let no_op = round == 1 || from == to;
+            let before = if no_op {
+                exec(
+                    &env.state,
+                    "UPDATE jobs SET updated_at = '2000-01-01T00:00:00.000Z'",
+                )
+                .await;
+                Some(call(&env.state, "GET", &format!("/jobs/{JOB}")).await.1)
+            } else {
+                None
+            };
             let (status, v) = call(&env.state, "POST", &format!("/jobs/{JOB}/cancel")).await;
             assert_eq!(status, StatusCode::OK, "{from}");
             assert_eq!(v["status"], to, "{from}");
@@ -185,6 +199,9 @@ async fn cancel_is_idempotent_and_never_revives_or_undoes() {
                 assert_eq!(v["error"]["code"], "cancelled", "{from}");
             } else {
                 assert_eq!(v["error"], Value::Null, "{from}");
+            }
+            if let Some(before) = before {
+                assert_eq!(v, before, "{from}");
             }
         }
     }

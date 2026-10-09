@@ -57,17 +57,15 @@ async fn a_job_input_once_set_is_fixed() {
             "{set}: {err}"
         );
     }
-    // Codex: REPLACE deletes first, so it is refused as a delete.
+    // REPLACE is refused before SQLite deletes anything: 0005's BEFORE INSERT
+    // guard fires first, whatever recursive_triggers says (#832 review).
     let replace = format!(
         "INSERT OR REPLACE INTO jobs (id, kind, status, origin, input)
          VALUES ('{JOB}', 'import', 'queued', '{{\"kind\":\"page\"}}', json_object('upload_id', 'b'))"
     );
     let err = sqlx::query(&replace).execute(db.pool()).await.unwrap_err();
     let text = err.to_string();
-    assert!(
-        text.contains("jobs are never deleted") || text.contains("a job id is never reused"),
-        "{err}"
-    );
+    assert!(text.contains("a job id is never reused"), "{err}");
     let err = sqlx::query("DELETE FROM jobs")
         .execute(db.pool())
         .await
