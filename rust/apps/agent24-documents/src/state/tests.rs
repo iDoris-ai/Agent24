@@ -430,6 +430,7 @@ fn during_a_request_only_availability_errors_are_storage_unavailable() {
         (1, None),    // a generic SQL error
         (19, None),   // a constraint: a bug, not storage
         (2067, None), // CONSTRAINT_UNIQUE
+        (3082, None), // IOERR_NOMEM: out of memory, not storage (#824 review)
     ] {
         assert_eq!(
             availability_cause(&sqlite(code), &mut probe),

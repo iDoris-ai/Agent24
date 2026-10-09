@@ -249,7 +249,9 @@ static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// SQLite's I/O errors do not say why (a full disk can surface as
 /// `SQLITE_IOERR_SHMSIZE` or `_WRITE`). Writing a probe the size of a WAL
 /// index page tells a full disk from an unwritable directory; if the probe
-/// succeeds the device failed some other way, which the user also has to fix.
+/// succeeds the device failed some other way, which the user also has to fix,
+/// so a successful probe still answers `not_writable`: every I/O error that
+/// reaches the probe is reported as storage.
 fn probe_write(data_dir: &Path) -> StorageCause {
     let n = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = data_dir.join(format!(".write-probe-{}-{n}", std::process::id()));
@@ -300,19 +302,18 @@ fn availability_cause(
     Some(match e {
         sqlx::Error::Database(d) => {
             // sqlx reports the extended result code; the primary code is its low byte.
-            let primary = d
-                .code()
-                .and_then(|c| c.parse::<i32>().ok())
-                .map(|c| c & 0xff);
-            match primary {
+            let code = d.code().and_then(|c| c.parse::<i32>().ok());
+            match code.map(|c| c & 0xff) {
                 // BUSY (incl. _RECOVERY, _SNAPSHOT, _TIMEOUT); PROTOCOL is a
                 // lost WAL locking race, also contention.
                 Some(5 | 15) => StorageCause::Busy,
                 Some(6) => StorageCause::Locked,           // LOCKED
                 Some(13) => StorageCause::DiskFull,        // FULL
                 Some(8 | 14) => StorageCause::NotWritable, // READONLY, CANTOPEN
-                Some(10) => probe(),                       // IOERR
-                Some(11 | 26) => StorageCause::Corrupt,    // CORRUPT, NOTADB
+                // IOERR_NOMEM: the I/O layer ran out of memory, not storage.
+                Some(10) if code == Some(3082) => return None,
+                Some(10) => probe(),                    // IOERR
+                Some(11 | 26) => StorageCause::Corrupt, // CORRUPT, NOTADB
                 _ => return None,
             }
         }
