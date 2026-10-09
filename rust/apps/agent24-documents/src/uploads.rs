@@ -1,6 +1,7 @@
 //! Chunked uploads (ADR-DOC-02 §5.6): `POST /uploads` starts one;
-//! [`data`] holds an upload's bytes on disk.
+//! [`chunks`] appends to it, writing through [`data`].
 
+pub mod chunks;
 pub mod data;
 
 use axum::Json;
