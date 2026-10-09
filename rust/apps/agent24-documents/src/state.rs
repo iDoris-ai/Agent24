@@ -26,9 +26,71 @@ use crate::error::{ApiError, StorageCause};
 /// How often a request may retry opening storage that failed to open.
 pub const REOPEN_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long a request waits for the write probe after an I/O error.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct Storage {
     pub blobs: BlobStore,
     pub db: Db,
+    data_dir: PathBuf,
+    /// One request-time probe at a time.
+    probing: Arc<tokio::sync::Semaphore>,
+}
+
+impl Storage {
+    /// A database error during a request. Storage that stops working after
+    /// it opened (busy, full, read-only, corrupt) is 503 with the cause; any
+    /// other failure is unexpected, 500.
+    pub async fn db_failure(&self, e: sqlx::Error) -> ApiError {
+        tracing::error!(error = %e, "documents: database error");
+        let mut io_error = false;
+        let cause = availability_cause(&e, &mut || {
+            io_error = true;
+            StorageCause::NotWritable
+        });
+        let cause = match cause {
+            Some(_) if io_error => Some(self.probe().await),
+            cause => cause,
+        };
+        match cause {
+            Some(cause) => ApiError::storage_unavailable(cause),
+            None => ApiError::internal("the document database failed"),
+        }
+    }
+
+    async fn probe(&self) -> StorageCause {
+        let dir = self.data_dir.clone();
+        bounded_probe(&self.probing, PROBE_TIMEOUT, move || probe_write(&dir)).await
+    }
+}
+
+/// Runs `probe` for a request without letting a stalled filesystem hold the
+/// response: a request that finds a probe already running does not start
+/// another, and none waits longer than `timeout`. The stalled probe keeps its
+/// permit until it returns, so stalls do not pile up. Either way the answer
+/// is `not_writable`, the probe's own answer for a device that fails in a way
+/// it cannot name.
+async fn bounded_probe(
+    probing: &Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+    probe: impl FnOnce() -> StorageCause + Send + 'static,
+) -> StorageCause {
+    let Ok(permit) = Arc::clone(probing).try_acquire_owned() else {
+        return StorageCause::NotWritable;
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        probe()
+    });
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(cause)) => cause,
+        Ok(Err(e)) => match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // Cancelled: the runtime is shutting down.
+            Err(_) => StorageCause::NotWritable,
+        },
+        Err(_) => StorageCause::NotWritable,
+    }
 }
 
 type Opened = Result<Arc<Storage>, StorageCause>;
@@ -105,6 +167,9 @@ impl AppState {
         if current.is_ok() || last.elapsed() < self.0.reopen_interval {
             return current;
         }
+        // Counted before the attempt: a request dropped mid-reopen still uses
+        // up this interval, so a client that keeps cancelling cannot make the
+        // service reopen on every request.
         *last = Instant::now();
         #[cfg(test)]
         self.0.reopens.fetch_add(1, Ordering::SeqCst);
@@ -134,7 +199,12 @@ async fn open_storage(data_dir: &Path) -> Opened {
             return Err(blocking(move || db_cause(&e, &mut || probe_write(&dir))).await);
         }
     };
-    Ok(Arc::new(Storage { blobs, db }))
+    Ok(Arc::new(Storage {
+        blobs,
+        db,
+        data_dir: data_dir.to_owned(),
+        probing: Arc::new(tokio::sync::Semaphore::new(1)),
+    }))
 }
 
 /// Runs filesystem work (directory fsyncs, the probe) off the async workers.
@@ -210,9 +280,24 @@ fn blob_cause(e: &BlobError) -> StorageCause {
     }
 }
 
-/// `probe` is asked only for an I/O error, the one code that needs it.
+/// At open, any failure means storage is unavailable; one that is not about
+/// availability is reported as `corrupt`, telling the user to check the file
+/// rather than retry.
 fn sqlx_cause(e: &sqlx::Error, probe: &mut dyn FnMut() -> StorageCause) -> StorageCause {
     match e {
+        sqlx::Error::Io(e) => io_cause(e),
+        e => availability_cause(e, probe).unwrap_or(StorageCause::Corrupt),
+    }
+}
+
+/// The availability cause of a database error, or `None` for an error that
+/// is not about storage (a constraint, a decode failure: a bug). `probe` is
+/// asked only for an I/O error, the one code that needs it.
+fn availability_cause(
+    e: &sqlx::Error,
+    probe: &mut dyn FnMut() -> StorageCause,
+) -> Option<StorageCause> {
+    Some(match e {
         sqlx::Error::Database(d) => {
             // sqlx reports the extended result code; the primary code is its low byte.
             let primary = d
@@ -227,15 +312,23 @@ fn sqlx_cause(e: &sqlx::Error, probe: &mut dyn FnMut() -> StorageCause) -> Stora
                 Some(13) => StorageCause::DiskFull,        // FULL
                 Some(8 | 14) => StorageCause::NotWritable, // READONLY, CANTOPEN
                 Some(10) => probe(),                       // IOERR
-                // CORRUPT, NOTADB, and anything unknown: refuse writes and tell
-                // the user to check the file rather than retry.
-                _ => StorageCause::Corrupt,
+                Some(11 | 26) => StorageCause::Corrupt,    // CORRUPT, NOTADB
+                _ => return None,
             }
+        }
+        // Out of memory or threads is the process, not storage.
+        sqlx::Error::Io(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::OutOfMemory | io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            return None;
         }
         sqlx::Error::Io(e) => io_cause(e),
         sqlx::Error::PoolTimedOut => StorageCause::Busy,
-        _ => StorageCause::Corrupt,
-    }
+        _ => return None,
+    })
 }
 
 fn db_cause(e: &DbError, probe: &mut dyn FnMut() -> StorageCause) -> StorageCause {
@@ -252,5 +345,6 @@ fn db_cause(e: &DbError, probe: &mut dyn FnMut() -> StorageCause) -> StorageCaus
     }
 }
 
-#[cfg(test)]
+// The tests use Unix permissions, symlinks and FIFOs.
+#[cfg(all(test, unix))]
 mod tests;

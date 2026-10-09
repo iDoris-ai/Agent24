@@ -419,6 +419,93 @@ fn the_probe_writes_only_a_file_of_its_own() {
 }
 
 #[test]
+fn during_a_request_only_availability_errors_are_storage_unavailable() {
+    let mut probe = || StorageCause::DiskFull;
+    for (code, want) in [
+        (517, Some(StorageCause::Busy)),
+        (13, Some(StorageCause::DiskFull)),
+        (4874, Some(StorageCause::DiskFull)), // via the probe
+        (11, Some(StorageCause::Corrupt)),
+        (26, Some(StorageCause::Corrupt)),
+        (1, None),    // a generic SQL error
+        (19, None),   // a constraint: a bug, not storage
+        (2067, None), // CONSTRAINT_UNIQUE
+    ] {
+        assert_eq!(
+            availability_cause(&sqlite(code), &mut probe),
+            want,
+            "code {code}"
+        );
+    }
+    assert_eq!(
+        availability_cause(&sqlx::Error::RowNotFound, &mut probe),
+        None
+    );
+    assert_eq!(
+        availability_cause(&sqlx::Error::PoolTimedOut, &mut probe),
+        Some(StorageCause::Busy)
+    );
+    // Running out of memory or threads is the process, not storage: 500.
+    let io = |k| sqlx::Error::Io(io::Error::from(k));
+    for kind in [
+        io::ErrorKind::OutOfMemory,
+        io::ErrorKind::WouldBlock,
+        io::ErrorKind::Interrupted,
+    ] {
+        assert_eq!(availability_cause(&io(kind), &mut probe), None, "{kind:?}");
+    }
+    assert_eq!(
+        availability_cause(&io(io::ErrorKind::PermissionDenied), &mut probe),
+        Some(StorageCause::NotWritable)
+    );
+    assert_eq!(
+        availability_cause(&io(io::ErrorKind::StorageFull), &mut probe),
+        Some(StorageCause::DiskFull)
+    );
+}
+
+#[tokio::test]
+async fn a_request_time_probe_is_bounded_and_one_at_a_time() {
+    let probing = Arc::new(tokio::sync::Semaphore::new(1));
+    assert_eq!(
+        bounded_probe(&probing, Duration::from_secs(5), || StorageCause::DiskFull).await,
+        StorageCause::DiskFull
+    );
+    // A stalled probe: the request answers at the timeout, and the probe
+    // keeps its permit, so the next request does not start a second one.
+    let (release, stalled) = std::sync::mpsc::channel::<()>();
+    let started = Instant::now();
+    let cause = bounded_probe(&probing, Duration::from_millis(100), move || {
+        let _ = stalled.recv();
+        StorageCause::DiskFull
+    })
+    .await;
+    assert_eq!(cause, StorageCause::NotWritable);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let cause = bounded_probe(&probing, Duration::from_secs(5), || {
+        panic!("a second probe started while one is stalled")
+    })
+    .await;
+    assert_eq!(cause, StorageCause::NotWritable);
+    release.send(()).unwrap();
+    let _ = probing.acquire().await.unwrap(); // the stalled probe returned
+}
+
+#[tokio::test]
+async fn a_request_failure_is_503_for_storage_and_500_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path()).await;
+    let storage = state.storage().await.unwrap();
+    let e = storage.db_failure(sqlite(5)).await;
+    assert_eq!(
+        (e.status().as_u16(), e.code()),
+        (503, "storage_unavailable")
+    );
+    let e = storage.db_failure(sqlite(2067)).await;
+    assert_eq!((e.status().as_u16(), e.code()), (500, "internal"));
+}
+
+#[test]
 fn io_and_migration_failures_map_to_their_cause() {
     let mut dir = || panic!("no probe");
     let io = |k| sqlx::Error::Io(io::Error::from(k));

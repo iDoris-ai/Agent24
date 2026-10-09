@@ -72,6 +72,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The safe-integer argument above assumes serde_json's
+    /// `arbitrary_precision` feature is off anywhere in the build, so a
+    /// `Number` is a u64, an i64 or an f64. With it on, a number keeps its
+    /// source spelling and this fails (#822 review).
+    #[test]
+    fn numbers_are_parsed_not_kept_as_written() {
+        let v: Value = serde_json::from_str("1E2").unwrap();
+        assert_eq!(v.to_string(), "100.0");
+    }
+
     fn canonical(v: &Value) -> String {
         let mut out = String::new();
         write_canonical(v, &mut out).unwrap();

@@ -96,6 +96,20 @@ impl ApiError {
         )
     }
 
+    /// 500 for a failure the OS did not expect (a bug, not storage). Not in
+    /// the closed §6 set: it is the kernel's generic `internal` code, in the
+    /// envelope of the documents 500 response (`ModuleProxyError`), and
+    /// clients treat it by §6's default rule (outcome unknown, resend).
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            message.into(),
+            false,
+        )
+    }
+
     #[must_use]
     pub fn status(&self) -> StatusCode {
         self.status
@@ -166,10 +180,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reused_key_is_422_and_not_retryable() {
+    async fn a_reused_key_is_422_and_an_unexpected_failure_is_500_internal() {
         let (status, v) = body(ApiError::idempotency_key_reused()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(v["error"]["code"], "idempotency_key_reused");
         assert_eq!(v["error"]["details"], json!({ "retryable": false }));
+        let (status, v) = body(ApiError::internal("boom")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["error"]["code"], "internal");
+        assert_eq!(v["error"]["message"], "boom");
     }
 }
