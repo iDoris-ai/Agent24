@@ -144,7 +144,7 @@
 
 ## 6. 类型化错误
 
-`documents` 命名空间的错误码是**闭集**，新增需修改本 ADR。
+`documents` 命名空间的错误码是**闭集**，新增需修改本 ADR。唯一的例外是下文的“OS 的意外故障”。
 
 - **信封**：沿用现有信封；每个错误都带 `details.retryable`。**客户端按 `code` 分支，不按 HTTP 状态分支**。
 - **工具路径**：映射成 `ToolError`，`code` 作为消息前缀。**任何模块响应都不得映射成 `ToolError::Cancelled`**，因为那会取消整个 run（§1）。
@@ -182,6 +182,10 @@
 | `disk_full` | `false` | 磁盘已满，释放空间后由用户重试 |
 
 界面对 `retryable: false` 的情况给出处理提示，不自动重试。
+
+**OS 的意外故障：共用内核码的唯一例外**：失败既不在上表、也不是存储不可用（例如数据库约束被触发，说明 OS 自身有 bug）时，OS 自己返回 500，用内核通用信封的 `internal` 码，`details.retryable: false`。这是唯一一个由 OS 产生、却不在本命名空间闭集里的码；OpenAPI 中 documents 路由的 500 响应和 `ModuleProxyError` 的说明里都注明了这一点。
+- 工具路径映射成 `ToolError::Failed`，`internal` 作为消息前缀；
+- 不自动重试；结果未知，用户重试时按下面的“默认规则”用同一个键重发。
 
 **会看到但不属于本命名空间的内核 / 代理码**：
 

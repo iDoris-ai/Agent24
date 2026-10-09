@@ -1906,8 +1906,8 @@ export interface components {
                 code?: "idempotency_key_reused" | "upload_checksum_mismatch" | "unsupported_format";
             };
         };
-        /** @description An error produced by the kernel or its proxy, not by the OS: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. */
-        ModuleProxyError: components["schemas"]["Error"] & {
+        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. */
+        ModuleProxyError: components["schemas"]["Error"] & unknown & {
             error?: {
                 code?: unknown;
             };
@@ -1967,10 +1967,11 @@ export interface components {
         };
         JobIdString: string;
         DocumentsUploadRequest: {
+            /** @description Written as a JSON integer literal: a fraction or exponent spelling (`10.0`, `1e1`) is refused with 400 even when its value is whole, because parsing such a spelling can round it. JSON Schema's `integer` cannot express a spelling, so this rule is the OS's, checked on the raw body. */
             total_size: number;
             /** @description Whole-file hash, checked at import (`upload_checksum_mismatch`). */
             sha256: components["schemas"]["Sha256Address"];
-            /** @description Display name only, used as the default title. A base name, never a path (ADR-001): no `/` or `\`. */
+            /** @description Display name only, used as the default title. A base name, never a path (ADR-001): no `/` or `\`, and no NUL. */
             filename?: string;
         };
         DocumentsUpload: {
@@ -2429,7 +2430,7 @@ export interface components {
                 "application/json": components["schemas"]["DocumentsUnavailableError"] | components["schemas"]["ModuleProxyError"];
             };
         };
-        /** @description The kernel proxy could not complete the call: 500 (module failure), 502 (`upstream_unavailable`, `upstream_connection_closed`, `request_abandoned`, …) or 504 (`upstream_timeout`). The module may have executed; resend with the same idempotency key (ADR-DOC-02 §6). */
+        /** @description The kernel proxy could not complete the call: 500 (module failure), 502 (`upstream_unavailable`, `upstream_connection_closed`, `request_abandoned`, …) or 504 (`upstream_timeout`). A 500 may also be the OS's own `internal`, for a failure it did not expect. In every case the module may have executed; resend with the same idempotency key (ADR-DOC-02 §6). */
         DocumentsProxyFailure: {
             headers: {
                 [name: string]: unknown;
@@ -2446,7 +2447,7 @@ export interface components {
         DocumentsCursor: string;
         UploadId: string;
         JobId: components["schemas"]["JobIdString"];
-        /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). */
+        /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces, as an HTTP header value carries it. */
         DocumentsIdempotencyKey: string;
         RevisionNumber: number;
         /** @description Turn a partial parse into 422 `partial_parse` instead of a result status. */
@@ -4302,7 +4303,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). */
+                /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces, as an HTTP header value carries it. */
                 "Idempotency-Key": components["parameters"]["DocumentsIdempotencyKey"];
             };
             path?: never;
@@ -4615,7 +4616,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Required with `rerun: true`; ignored otherwise. */
+                /** @description Required with `rerun: true`; ignored otherwise. Visible ASCII without spaces, like every documents Idempotency-Key. */
                 "Idempotency-Key"?: string;
             };
             path: {
