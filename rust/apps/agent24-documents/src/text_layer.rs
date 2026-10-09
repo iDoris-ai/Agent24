@@ -291,5 +291,7 @@ pub async fn load(
     Ok(layer)
 }
 
+pub mod build;
+
 #[cfg(test)]
 mod tests;
