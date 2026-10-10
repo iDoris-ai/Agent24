@@ -95,7 +95,7 @@ const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("get", Needs::Storage, true),
     ("list", Needs::Storage, true),
     ("job", Needs::Storage, true),
-    ("render", Needs::Engine, false),
+    ("render", Needs::Engine, true),
     ("read_range", Needs::Engine, true),
     ("find", Needs::Engine, true),
     ("extract", Needs::Engine, false),
@@ -119,13 +119,17 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
                 "unavailable"
             },
         },
-        engines: vec![EngineStatus {
-            id: engine::pdfkit::ENGINE_ID,
-            kind: "parse",
-            formats: engine::pdfkit::FORMATS.to_vec(),
-            state: if engine_ready { "ready" } else { "absent" },
-            version: engine,
-        }],
+        // One helper both parses and renders.
+        engines: ["parse", "render"]
+            .into_iter()
+            .map(|kind| EngineStatus {
+                id: engine::pdfkit::ENGINE_ID,
+                kind,
+                formats: engine::pdfkit::FORMATS.to_vec(),
+                state: if engine_ready { "ready" } else { "absent" },
+                version: engine.clone(),
+            })
+            .collect(),
         knowledge: KnowledgeStatus {
             setting: "on",
             state: "unavailable",
@@ -161,6 +165,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/documents/{document_id}/revisions/{revision}/text",
             get(read::text::read_text),
+        )
+        .route(
+            "/documents/{document_id}/revisions/{revision}/pages/{page}",
+            get(read::render::render_page),
         )
         .route("/documents/{document_id}/find", post(read::find::find))
         .route("/imports", post(imports::handler::import))
@@ -283,8 +291,9 @@ mod tests {
         // The read engine is reported even when it is not here.
         assert_eq!(
             body["engines"],
-            serde_json::json!([{ "id": "apple-pdfkit", "kind": "parse", "state": "absent", "version": null,
-                "formats": ["application/pdf", "image/jpeg", "image/png"] }])
+            serde_json::json!(["parse", "render"].map(|kind| serde_json::json!(
+                { "id": "apple-pdfkit", "kind": kind, "state": "absent", "version": null,
+                  "formats": ["application/pdf", "image/jpeg", "image/png"] })))
         );
         assert_eq!(body["knowledge"]["setting"], "on");
         assert_eq!(body["knowledge"]["state"], "unavailable");
