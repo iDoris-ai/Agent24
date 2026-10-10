@@ -4544,7 +4544,7 @@ export interface operations {
         parameters: {
             query?: {
                 scale?: number;
-                /** @description `x0,y0,x1,y1`: corners in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame and order as an anchor's `rects` (David, 2026-10-10); for a JPEG or PNG, pixels after EXIF orientation. `x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`, and one partly off the page is clipped to it (its top-left corner stays). */
+                /** @description `x0,y0,x1,y1`: corners in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame and order as an anchor's `rects` (David, 2026-10-10); for a JPEG or PNG, pixels after EXIF orientation. `x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`, and one partly off the page is clipped to it (its top-left corner stays). Each corner is a non-negative number as JSON writes it, exponent included, so an anchor's rect can be passed as it is (`1e-7`). */
                 region?: string;
             };
             header?: never;

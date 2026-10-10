@@ -72,8 +72,12 @@ describe('page render', () => {
     expect(said).toMatch(/`x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`/)
     expect(said).toMatch(/pixels after EXIF orientation/)
     expect(said).toMatch(/one partly off the page is clipped to it \(its top-left corner stays\)/)
-    for (const good of ['0,0,612,792', '10.5,20,100.25,50']) expect(region.test(good), good).toBe(true)
-    for (const bad of ['1,2,3', '-1,0,1,1', 'a,b,c,d', '1,2,3,4,5']) expect(region.test(bad), bad).toBe(false)
+    for (const good of ['0,0,612,792', '10.5,20,100.25,50', '1e-7,0,612,792', '0,0,1.5E2,7e+1'])
+      expect(region.test(good), good).toBe(true)
+    for (const bad of ['1,2,3', '-1,0,1,1', 'a,b,c,d', '1,2,3,4,5', '1e,0,1,1', '.5,0,1,1', '1.,0,2,2'])
+      expect(region.test(bad), bad).toBe(false)
+    // As JSON writes an anchor's rect, so it can be passed as it is.
+    expect(said).toMatch(/a non-negative number as JSON writes it, exponent included/)
   })
 
   it('413 is payload_too_large only; a render 422 is unsupported_format or parse_failed', () => {
