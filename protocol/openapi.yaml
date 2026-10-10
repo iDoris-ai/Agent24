@@ -4143,6 +4143,12 @@ components:
       type: object
       required: [value, normalized, anchors]
       additionalProperties: false
+      description: >-
+        One side of a conflict. Like a present value, its anchors are empty
+        only when its evidence could not be verified, and then
+        `unsourced_reason` says why: the candidate is kept rather than
+        dropped, so the conflict is never resolved by the extractor
+        (ADR-DOC-02 §3.2; David, 2026-10-10).
       properties:
         value: { type: string, description: As written in the source. }
         normalized:
@@ -4150,7 +4156,18 @@ components:
           description: >-
             For comparison only. Required here: candidates conflict because
             their normalized forms differ.
-        anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+        anchors:
+          type: array
+          maxItems: 16
+          items: { $ref: "#/components/schemas/DocumentsAnchor" }
+        unsourced_reason: { type: string, minLength: 1 }
+      if: { properties: { anchors: { maxItems: 0 } } }
+      then:
+        required: [unsourced_reason]
+      else:
+        properties:
+          anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+          unsourced_reason: false
     DocumentsExtractedValue:
       type: object
       required: [key, status]
@@ -4178,7 +4195,7 @@ components:
         unsourced_reason: { type: string, minLength: 1 }
         missing_reason:
           type: string
-          enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+          enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope, unread]
         candidates:
           type: array
           minItems: 2
@@ -4211,7 +4228,7 @@ components:
             properties:
               missing_reason:
                 type: string
-                enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+                enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope, unread]
               value: false
               normalized: false
               anchors: false

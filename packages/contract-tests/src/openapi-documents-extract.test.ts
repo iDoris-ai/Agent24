@@ -175,6 +175,8 @@ describe('extracted values (S01 gold shape)', () => {
     expect(v.DocumentsExtractedValue({ ...missing, value: '全部纳税人' })).toBe(false)
     expect(v.DocumentsExtractedValue({ ...missing, anchors: [anchor()] })).toBe(false)
     expect(v.DocumentsExtractedValue({ ...missing, missing_reason: 'guessed' })).toBe(false)
+    // Not read is not absent: a layer with unread regions says so (Q18; David, 2026-10-10).
+    ok('DocumentsExtractedValue', { ...missing, missing_reason: 'unread' })
   })
 
   it('conflict: every candidate with its anchor, none chosen', () => {
@@ -194,7 +196,11 @@ describe('extracted values (S01 gold shape)', () => {
     ok('DocumentsExtractedValue', { ...conflict, candidates: [{ ...c('a', 'a'), anchors: sixteen }, c('b', 'b')] })
     expect(v.DocumentsExtractedValue({ ...conflict, candidates: [{ ...c('a', 'a'), anchors: [...sixteen, anchor()] }, c('b', 'b')] }), '17 anchors').toBe(false)
     const [first, second] = conflict.candidates
-    for (const [name, bad] of [['no anchors', { value: 'b', normalized: 'b' }], ['empty anchors', { ...second, anchors: [] }],
+    // A candidate whose evidence could not be verified is kept, saying why;
+    // the conflict is never resolved by dropping it (Q17; David, 2026-10-10).
+    ok('DocumentsExtractedValue', { ...conflict, candidates: [first, { ...second, anchors: [], unsourced_reason: 'the quote is not in the block' }] })
+    expect(v.DocumentsExtractedValue({ ...conflict, candidates: [first, { ...second, unsourced_reason: 'x' }] }), 'anchors and an unsourced reason').toBe(false)
+    for (const [name, bad] of [['no anchors', { value: 'b', normalized: 'b' }], ['empty anchors, no reason', { ...second, anchors: [] }],
       ['no normalized', { value: 'b', anchors: [anchor()] }], ['no raw value', { normalized: 'b', anchors: [anchor()] }]] as const) {
       expect(v.DocumentsExtractedValue({ ...conflict, candidates: [first, bad] }), `candidate with ${name}`).toBe(false)
     }

@@ -2167,12 +2167,14 @@ export interface components {
         };
         /** @description Anchors that together cover the whole proposition: the value and what decides its meaning — condition, audience, negation, table row label and column header (samples README §4.2). They may span blocks and pages. */
         DocumentsEvidence: components["schemas"]["DocumentsAnchor"][];
+        /** @description One side of a conflict. Like a present value, its anchors are empty only when its evidence could not be verified, and then `unsourced_reason` says why: the candidate is kept rather than dropped, so the conflict is never resolved by the extractor (ADR-DOC-02 §3.2; David, 2026-10-10). */
         DocumentsExtractCandidate: {
             /** @description As written in the source. */
             value: string;
             /** @description For comparison only. Required here: candidates conflict because their normalized forms differ. */
             normalized: string;
-            anchors: components["schemas"]["DocumentsEvidence"];
+            anchors: components["schemas"]["DocumentsAnchor"][];
+            unsourced_reason?: string;
         };
         DocumentsExtractedValue: {
             /** @description The `key` of the requested field. */
@@ -2187,7 +2189,7 @@ export interface components {
             anchors?: components["schemas"]["DocumentsAnchor"][];
             unsourced_reason?: string;
             /** @enum {string} */
-            missing_reason?: "blank_in_template" | "not_in_document" | "referenced_but_absent" | "outside_page_scope";
+            missing_reason?: "blank_in_template" | "not_in_document" | "referenced_but_absent" | "outside_page_scope" | "unread";
             candidates?: components["schemas"]["DocumentsExtractCandidate"][];
         } & (unknown & unknown & unknown);
         DocumentsExtraction: {

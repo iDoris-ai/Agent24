@@ -122,7 +122,7 @@
   - 不做 Unicode 规范化，不做全角/半角折叠。中文原文不受这两点影响。
   - 结果按块的阅读顺序排列；一个块内的多处命中，按出现顺序各自成为一个锚点，互不重叠。
 
-### 3.2 第 1 片抽取的落地（建议，待 David 确认，2026-10-10）
+### 3.2 第 1 片抽取的落地（David 确认，2026-10-10）
 
 **模型调用**
 - 经内核的 `_a24/model/complete`（`agent24-os-sdk` 的 `ModelClient`）。清单声明 `models` 和 `model_access: local_only`，内核按模块强制只用本地模型（ADR-DOC-01 D8.1）。后台调用不带发起请求的 `request_id`（那个请求早已结束）。
@@ -168,7 +168,7 @@
 
 **冲突从不由抽取器裁决**
 - 冲突的候选，证据定位失败时，候选照样保留，只是没有锚点、带 `unsourced_reason`。**不会**因此把冲突变成 `present`，也不会变成 `missing`。
-  - 这需要契约放宽：`DocumentsExtractCandidate` 允许 `anchors: []` 加 `unsourced_reason`，规则与 `present` 值相同（Q17）。
+  - 这需要契约放宽：`DocumentsExtractCandidate` 允许 `anchors: []` 加 `unsourced_reason`，规则与 `present` 值相同（Q17，已定）。
 
 **合并多个窗口**（一次给全时只有一个窗口，不用合并）
 - 每个字段把各窗口的 `present` 值和 `conflict` 候选摊平成一个候选表，按 `normalized` 分组；没有 `normalized` 的按 `value` 原文分组。分组结果：
@@ -178,7 +178,7 @@
   - 超过 8 组：取文档顺序最早的 8 组，其余丢弃。一个字段有 8 个以上不同的值，说明字段本身问得太宽。已知局限，在 job 的 `progress` 里记一条说明。
 - 所有窗口都是 `missing` 时：
   - 有窗口给出具体原因（`blank_in_template`、`referenced_but_absent`、`outside_page_scope`），取第一个，否则是 `not_in_document`；
-  - 文本层有未读出的区域时，依赖「文件里没有」的两种原因（`not_in_document`、`referenced_but_absent`，被引用的内容可能正在没读出的区域里）都改为新值 `unread`，表示「有区域没读出来，不能断定文件里没有」（Q18，需在 `missing_reason` 的枚举里增加）；`blank_in_template`（空白看得见）和 `outside_page_scope`（与读没读出无关）不变。
+  - 文本层有未读出的区域时，依赖「文件里没有」的两种原因（`not_in_document`、`referenced_but_absent`，被引用的内容可能正在没读出的区域里）都改为新值 `unread`，表示「有区域没读出来，不能断定文件里没有」（Q18，已定，已加入 `missing_reason` 的枚举）；`blank_in_template`（空白看得见）和 `outside_page_scope`（与读没读出无关）不变。
 
 **抽取器版本**
 - `extractor_version` 是指令、回答 Schema、分窗、分批和合并规则的版本号，任何一项变了就加一。它在业务键里，变了以后同样的请求会重新抽取。
@@ -358,10 +358,10 @@
 | Q12 | 块的切分与 `block_id`（`p{页}/b{序号}`，按行距和左缘把相邻行合并成段落，每块 ≤ 16 KiB、≤ 64 行），几何只做到整行；部分解析按页判断，每个图像区域都做 OCR，失败的区域标为未解析；分页按页推进，一次最多 100 页，`parse_status` 描述本次覆盖的页（§3.1） | 建议如左 | David |
 | Q13 | 文本层在导入后尽力预解析；读取或查找时缺了就后台解析，最多等 8 s，否则回 503 `engine_unavailable`（可重试）（§3.1） | 建议如左 | David |
 | Q14 | find 的匹配规则：块内匹配，只放宽 ASCII 大小写和空白，原文换行可跳过，不做 Unicode 规范化；读取引擎把排版连字（U+FB00–FB06）读成字母、把伪粗体的重复只留一份（§3.1、docs/documenting/engine-pdfkit.md） | 建议如左 | David |
-| Q15 | 第 1 片抽取的做法：经内核只用本地模型；文本层 ≤ 32 KiB 时一次给全，更长的按页分窗（≤ 32 KiB，带前一页重叠）；字段每批 ≤ 20 个，截断时对半拆；模型只给值和 `{block_id, quote}` 证据，OS 只在指名的块里定位，恰好出现一次、且值在引文里才算来源，一个值的证据有一条失败就整体没有锚点（§3.2） | 建议如左 | David |
-| Q16 | 多窗口合并：按 `normalized` 分组，1 组为 `present`，多组为冲突（≤ 8 个候选，超出取最早的 8 个），不裁决；同一 job 里模型换了、或没有返回模型 id，就失败、可重试（§3.2） | 建议如左 | David |
-| Q17 | 契约放宽：冲突的候选允许 `anchors: []` 加 `unsourced_reason`，与 `present` 值相同，让证据定位失败的候选照样保留，冲突不被悄悄裁决（§3.2） | 建议如左 | David |
-| Q18 | 契约增补：`missing_reason` 增加 `unread`，文本层有未读出的区域时，用它代替 `not_in_document`（§3.2） | 建议如左 | David |
+| Q15 | 第 1 片抽取的做法：经内核只用本地模型；文本层 ≤ 32 KiB 时一次给全，更长的按页分窗（≤ 32 KiB，带前一页重叠）；字段每批 ≤ 20 个，截断时对半拆；模型只给值和 `{block_id, quote}` 证据，OS 只在指名的块里定位，恰好出现一次、且值在引文里才算来源，一个值的证据有一条失败就整体没有锚点（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
+| Q16 | 多窗口合并：按 `normalized` 分组，1 组为 `present`，多组为冲突（≤ 8 个候选，超出取最早的 8 个），不裁决；同一 job 里模型换了、或没有返回模型 id，就失败、可重试（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
+| Q17 | 契约放宽：冲突的候选允许 `anchors: []` 加 `unsourced_reason`，与 `present` 值相同，让证据定位失败的候选照样保留，冲突不被悄悄裁决（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
+| Q18 | 契约增补：`missing_reason` 增加 `unread`，文本层有未读出的区域时，用它代替 `not_in_document`（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
 
 **2026-10-10 David 按建议拍板的契约细节**（#861）：
 - 渲染的 `region` 用角点对 `x0,y0,x1,y1`，与锚点的 `rects` 同一参照系、同一顺序（原为 `x,y,width,height`；渲染尚未实现，改动没有兼容负担）。
