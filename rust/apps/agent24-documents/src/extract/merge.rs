@@ -73,11 +73,23 @@ pub fn said(src: &Source<'_>, window: &Window, a: &AnswerValue) -> Said {
     }
 }
 
-/// Claims that are one value: the first wording, and evidence from each
-/// window that grounded it, whole, while it fits.
+/// What claims are compared on: the normal form, or the wording when
+/// there is none. One key, so a value one window normalizes and another
+/// does not is still one value (PR-Daemon, #889).
+fn compared_on(claim: &Claim) -> &str {
+    if claim.normalized.is_empty() {
+        &claim.value
+    } else {
+        &claim.normalized
+    }
+}
+
+/// Claims that are one value: the key they share, the first wording, the
+/// first normal form any gave, and evidence from each window that grounded
+/// it, whole, while it fits.
 struct Group {
     at: (usize, u64),
-    by_normal: bool,
+    key: String,
     value: String,
     normalized: String,
     anchors: Vec<Anchor>,
@@ -87,6 +99,9 @@ struct Group {
 impl Group {
     fn add(&mut self, claim: &Claim) {
         self.at = self.at.min(claim.at);
+        if self.normalized.is_empty() {
+            self.normalized.clone_from(&claim.normalized);
+        }
         match &claim.anchors {
             Ok(set) => {
                 let mut new: Vec<&Anchor> = Vec::new();
@@ -142,23 +157,14 @@ pub fn merge(key: &str, said: &[Said], partial: bool, max_bytes: usize) -> Resul
         })
         .flatten()
     {
-        let by_normal = !claim.normalized.is_empty();
-        let same = |g: &&mut Group| {
-            g.by_normal == by_normal
-                && if by_normal {
-                    g.normalized == claim.normalized
-                } else {
-                    g.value == claim.value
-                }
-        };
-        if let Some(g) = groups.iter_mut().find(|g| same(g)) {
+        if let Some(g) = groups.iter_mut().find(|g| g.key == compared_on(claim)) {
             g.add(claim);
         } else {
             let mut g = Group {
                 at: claim.at,
-                by_normal,
+                key: compared_on(claim).to_owned(),
                 value: claim.value.clone(),
-                normalized: claim.normalized.clone(),
+                normalized: String::new(),
                 anchors: vec![],
                 unsourced: None,
             };
@@ -186,18 +192,17 @@ pub fn merge(key: &str, said: &[Said], partial: bool, max_bytes: usize) -> Resul
             let (anchors, why) = g.evidence();
             v.status = Status::Present;
             v.value = Some(g.value.clone());
-            v.normalized = g.by_normal.then(|| g.normalized.clone());
+            v.normalized = (!g.normalized.is_empty()).then(|| g.normalized.clone());
             (v.anchors, v.unsourced_reason) = (Some(anchors), why);
         }
         many => {
             v.status = Status::Conflict;
             let candidates = many.iter().map(|g| {
                 let (anchors, unsourced_reason) = g.evidence();
-                // A candidate always has a normal form: its wording, if none.
-                let normalized = if g.by_normal { &g.normalized } else { &g.value };
+                // A candidate's normal form is what it was compared on.
                 Candidate {
                     value: g.value.clone(),
-                    normalized: normalized.clone(),
+                    normalized: g.key.clone(),
                     anchors,
                     unsourced_reason,
                 }

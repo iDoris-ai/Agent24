@@ -419,3 +419,50 @@ fn an_answer_says_what_its_status_says() {
         Said::Missing("blank_in_template".into())
     );
 }
+
+/// PR-Daemon, #889: one window normalizes "全天" and another does not; it
+/// is still one value, not a conflict of two identical candidates.
+#[test]
+fn a_value_with_and_without_a_normal_form_is_one_value() {
+    let v = merged(
+        &[
+            one(claim("全天", "", Ok(vec![anchor(1, 0)]))),
+            one(claim("全天", "全天", Ok(vec![anchor(2, 0)]))),
+        ],
+        false,
+    );
+    assert_eq!(
+        (v.status, v.value.as_deref(), v.normalized.as_deref()),
+        (Status::Present, Some("全天"), Some("全天"))
+    );
+    assert_eq!(v.anchors.unwrap().len(), 2);
+    // Both normalized alike: present too.
+    let v = merged(
+        &[
+            one(claim("10月12日", "2026-10-12", Err("x"))),
+            one(claim("2026年10月12日", "2026-10-12", Err("x"))),
+        ],
+        false,
+    );
+    assert_eq!(v.status, Status::Present);
+    // One window's conflict whose candidates share a normal form is one value.
+    let both = Said::Values(vec![
+        claim("10月12日", "2026-10-12", Err("x")),
+        claim("10/12", "2026-10-12", Err("x")),
+    ]);
+    assert_eq!(merged(&[both], false).status, Status::Present);
+    // A candidate's normal form is what it was compared on.
+    let c = merged(
+        &[
+            one(claim("甲", "", Err("x"))),
+            one(claim("乙", "B", Err("x"))),
+        ],
+        false,
+    )
+    .candidates
+    .unwrap();
+    assert_eq!(
+        c.iter().map(|c| c.normalized.as_str()).collect::<Vec<_>>(),
+        ["甲", "B"]
+    );
+}
