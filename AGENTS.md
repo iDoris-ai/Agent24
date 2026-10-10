@@ -2,6 +2,9 @@
 
 > 2026-10-03 起 Agent24 的全部任务（派发、编译、测试、验收）都在**笔记本**上执行；B 机（Mac mini ab-codex）因磁盘不足不再构建 Agent24，下文已去掉 B 端专属约定。
 
+## 限时授权记录（2026-10-10）
+- 用户仅授权 D1-2a L1 `Unavailable` 契约提案：可为该文档创建隔离 `ab/decide` task 分支、提交、推送并开 PR 供 PR-Daemon 审查。**不包含生产代码/测试实现、合并、发布或其他 PR；不是可复用的常设授权。**后续执行仍受 PR-Daemon 与项目门禁约束。
+
 ## 分支规则
 - 集成分支：`ab/<里程碑或方向>`（例如 `ab/m1-memory`、`ab/decide`），规则见下节「里程碑方向分支工作流」。**每个 task PR 的 base 必须是对应的 `ab/*` 集成分支**，绝不能是 `main`。
 - task 分支：`ab/<里程碑>-NN-<短名>`，每个 task 一个 git worktree，放在 `~/Dev/auraai/` 下（笔记本 Agent24 主 checkout 是 `~/Dev/auraai/Agent24`）。
