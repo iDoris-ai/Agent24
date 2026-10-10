@@ -1,15 +1,20 @@
 // agent24-documents-pdfkit: the slice-1 read engine of the Documenting OS
-// (ADR-DOC-01 D6 amendment, ADR-DOC-02 §3.1). One run reads one file and
-// writes what it found to stdout as one JSON object; the OS turns that into
-// blocks and pins the text layer. No network, no files written.
+// (ADR-DOC-01 D6 amendment, ADR-DOC-02 §3.1, §4). One run reads one file.
+// No network, no files written.
 //
 //   agent24-documents-pdfkit parse <path> <media-type>
+//   agent24-documents-pdfkit render <path> <media-type> <page> <scale> <max-bytes> [x0,y0,x1,y1]
 //
-// Output (protocol 1, only on exit 0): each page's size and its lines in
-// reading order, each a text and a rectangle in CropBox points, origin top
-// left of the page as displayed (after /Rotate); and the regions not read.
+// `parse` (protocol 1, only on exit 0) writes one JSON object: each page's
+// size and its lines in reading order, each a text and a rectangle in CropBox
+// points, origin top left of the page as displayed (after /Rotate); and the
+// regions not read. The OS turns that into blocks and pins the text layer.
+// `render` (only on exit 0) writes one JSON line, the scale used and the
+// image's size, then a PNG of at most <max-bytes> (render.swift).
 // Exit 2: not a format this engine reads. Exit 3: a file of that format that
-// could not be read (stderr says why). Exit 64: usage.
+// could not be read (stderr says why). Render only: exit 4, no such page;
+// 5, the region is empty or off the page; 6, too large even at the smallest
+// scale. Exit 64: usage.
 
 import AppKit
 import Foundation
@@ -19,7 +24,7 @@ struct Line: Encodable { let text: String; let rect: [Double] }
 struct Page: Encodable { let page: Int; let width: Double; let height: Double; let lines: [Line] }
 struct Unparsed: Encodable { let page: Int; let rects: [[Double]]; let reason: String }
 struct Output: Encodable { let `protocol`: Int; let os_version: String; let pages: [Page]; let unparsed: [Unparsed] }
-enum Failure: Error { case unsupported(String), failed(String) }
+enum Failure: Error { case unsupported(String), failed(String), noPage, offPage, tooLarge }
 
 /// Typographic ligatures (U+FB00–U+FB06) are how a PDF draws letters, not
 /// text: they are read as the letters, so "shut-oﬀ" is found as "shut-off".
@@ -116,8 +121,15 @@ func fail(_ code: Int32, _ why: String) -> Never {
   exit(code)
 }
 
+let usage = """
+  usage: agent24-documents-pdfkit parse <path> <media-type>
+         agent24-documents-pdfkit render <path> <media-type> <page> <scale> <max-bytes> [x0,y0,x1,y1]
+  """
 let args = CommandLine.arguments
-if args.count != 4 || args[1] != "parse" { fail(64, "usage: agent24-documents-pdfkit parse <path> <media-type>") }
+let command = args.count > 1 ? args[1] : ""
+if !(command == "parse" && args.count == 4) && !(command == "render" && (7...8).contains(args.count)) {
+  fail(64, usage)
+}
 // Made absolute: PDFKit does not resolve a relative file URL.
 let url = URL(
   fileURLWithPath: args[2],
@@ -129,6 +141,10 @@ do {
     throw Failure.unsupported("media type \(media)")
   }
   guard try sniff(url) == media else { throw Failure.unsupported("the file is not \(media)") }
+  if command == "render" {
+    try FileHandle.standardOutput.write(contentsOf: try renderCommand(url, media: media, args: Array(args[4...])))
+    exit(0)
+  }
   let (pages, unparsed) = media == "application/pdf" ? try readPDF(url) : try readImage(url)
   let v = ProcessInfo.processInfo.operatingSystemVersion
   let os = "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
@@ -141,6 +157,12 @@ do {
   fail(2, why)
 } catch Failure.failed(let why) {
   fail(3, why)
+} catch Failure.noPage {
+  fail(4, "no such page")
+} catch Failure.offPage {
+  fail(5, "the region is empty or off the page")
+} catch Failure.tooLarge {
+  fail(6, "too large even at the smallest scale")
 } catch {
   fail(3, error.localizedDescription)
 }

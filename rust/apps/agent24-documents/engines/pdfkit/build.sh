@@ -6,5 +6,5 @@ out="${1:-.}"
 here="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$out"
 xcrun swiftc -O -swift-version 5 \
-  -framework PDFKit -framework Vision -framework AppKit \
-  -o "$out/agent24-documents-pdfkit" "$here/main.swift" "$here/ocr.swift"
+  -framework PDFKit -framework Vision -framework AppKit -framework CoreImage \
+  -o "$out/agent24-documents-pdfkit" "$here/main.swift" "$here/ocr.swift" "$here/render.swift"

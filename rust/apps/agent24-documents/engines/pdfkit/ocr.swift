@@ -140,14 +140,28 @@ func readByOCR(_ page: PDFPage, ref: CGPDFPage, number: Int, size: CGSize, lines
   }
 }
 
+/// Pixels in an image the engine decodes, at most: about 400 MB decoded.
+let maxImagePixels = 100_000_000.0
+
+/// A JPEG or PNG decoded, and its EXIF orientation (1 to 8). Its size is
+/// checked before it is decoded: a small file can hold a huge image.
+func decoded(_ url: URL) throws -> (CGImage, UInt32) {
+  guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+    let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+    let w = props[kCGImagePropertyPixelWidth] as? Double, let h = props[kCGImagePropertyPixelHeight] as? Double
+  else { throw Failure.failed("the image cannot be decoded") }
+  guard w * h <= maxImagePixels else { throw Failure.failed("the image is over 100 megapixels") }
+  guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    throw Failure.failed("the image cannot be decoded")
+  }
+  let raw = (props[kCGImagePropertyOrientation] as? UInt32) ?? 1
+  return (image, (1...8).contains(raw) ? raw : 1)
+}
+
 /// A JPEG or PNG: one page as displayed (EXIF orientation applied), its
 /// pixels taken as points.
 func readImage(_ url: URL) throws -> ([Page], [Unparsed]) {
-  guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-    let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-  else { throw Failure.failed("the image cannot be decoded") }
-  let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
-  let raw = (props?[kCGImagePropertyOrientation] as? UInt32) ?? 1
+  let (image, raw) = try decoded(url)
   let orientation = CGImagePropertyOrientation(rawValue: raw) ?? .up
   let size = (5...8).contains(raw)
     ? CGSize(width: image.height, height: image.width) : CGSize(width: image.width, height: image.height)
