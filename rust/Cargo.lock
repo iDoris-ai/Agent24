@@ -18,6 +18,7 @@ name = "agent24-agent"
 version = "0.5.1"
 dependencies = [
  "agent24-core",
+ "agent24-domain",
  "agent24-memory",
  "agent24-models",
  "agent24-policy",
@@ -120,6 +121,7 @@ dependencies = [
 name = "agent24-mcp"
 version = "0.5.1"
 dependencies = [
+ "agent24-domain",
  "agent24-protocol",
  "agent24-tools",
  "async-trait",
@@ -155,6 +157,7 @@ dependencies = [
 name = "agent24-models"
 version = "0.5.1"
 dependencies = [
+ "agent24-domain",
  "agent24-protocol",
  "async-trait",
  "reqwest",

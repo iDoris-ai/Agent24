@@ -23,11 +23,10 @@
 //!    provider a LocalOnly call may use is down → `unavailable`/`no_provider`
 //!    — and the remote stub's count is still 0 (a LocalOnly call must never
 //!    reach a remote provider, health or no health).
-//! 3. **Positive control**: `m_remote` (`model_access: remote_allowed`) with
-//!    `complexity: "complex"` → routed to the remote-labelled stub (bound to
-//!    `OLLAMA_URL=http://[::ffff:127.0.0.1]:<port>`, which J16/§2.3 must
-//!    judge Remote even though the bytes land on the loopback interface) →
-//!    `tier: "remote"`, remote stub count 1.
+//! 3. `m_remote` (`model_access: remote_allowed`) with `complexity: "complex"`
+//!    is eligible for remote routing, but without a host egress policy the
+//!    remote-labelled stub is not dialled; the request falls back to the local
+//!    stub and reports `tier: "local"`.
 //! 4. A module that never requested `models` (`m_none`) calling
 //!    `_a24/model/complete` → `forbidden` — the method is registered
 //!    unconditionally (design §2.4/J2), so this is the handler's own check,
@@ -842,8 +841,9 @@ fn model_complete_blackbox_round_trip() {
     );
     local_stub.set_mode("ok");
 
-    // ── scenario 3: positive control — remote_allowed + complex routes to
-    //    the remote-labelled stub. ───────────────────────────────────────
+    // ── scenario 3: remote_allowed permits remote routing, but cannot
+    //    replace the missing host egress policy; the local provider serves
+    //    the fallback and the remote stub remains untouched. ─────────────
     let r3 = call_model(
         d1.port,
         &d1.token,
@@ -851,12 +851,17 @@ fn model_complete_blackbox_round_trip() {
         r#"{"complexity":"complex"}"#,
     );
     assert!(r3.get("error").is_none(), "{r3}");
-    assert_eq!(r3["result"]["tier"], "remote", "{r3}");
-    assert_eq!(r3["result"]["model_id"], "stub-model-remote", "{r3}");
+    assert_eq!(r3["result"]["tier"], "local", "{r3}");
+    assert_eq!(r3["result"]["model_id"], "stub-model-local", "{r3}");
     assert_eq!(
         remote_stub.request_count(),
-        1,
-        "the positive control must be the remote stub's first and only request so far: {r3}"
+        0,
+        "remote_allowed alone must not dial the remote stub without host egress: {r3}"
+    );
+    assert_eq!(
+        local_stub.request_count(),
+        3,
+        "the local stub serves the remote route's fail-closed fallback: {r3}"
     );
 
     // ── scenario 4: a module that never requested `models` is forbidden —
@@ -908,11 +913,19 @@ fn model_complete_blackbox_round_trip() {
         d1.port,
         &d1.token,
         "m_remote",
-        |u| u["by_served"]["remote"]["calls_ok"] == 1,
+        |u| u["by_served"]["local"]["calls_ok"] == 1,
         || d1.recent_stderr(),
     );
     assert_eq!(usage_remote["totals"]["calls_ok"], 1, "{usage_remote}");
     assert_eq!(usage_remote["totals"]["calls_failed"], 0, "{usage_remote}");
+    assert_eq!(
+        usage_remote["by_served"]["local"]["calls_ok"], 1,
+        "{usage_remote}"
+    );
+    assert_eq!(
+        usage_remote["by_served"]["remote"]["calls_ok"], 0,
+        "{usage_remote}"
+    );
 
     let usage_none = get_usage(d1.port, &d1.token, "m_none");
     assert_eq!(
@@ -941,7 +954,7 @@ fn model_complete_blackbox_round_trip() {
     // ── L4: the OTHER two modules' usage rows persisted across the restart
     //    exactly as well — `m_none`'s forbidden call left nothing at all
     //    (still true after a restart, not merely before one), and
-    //    `m_remote`'s single successful remote call is still there. ───────
+    //    `m_remote`'s single local fallback is still there. ────────────────
     let usage_none_after_restart = get_usage(d2.port, &d2.token, "m_none");
     assert_eq!(
         usage_none_after_restart["totals"]["calls_ok"], 0,
@@ -965,7 +978,11 @@ fn model_complete_blackbox_round_trip() {
         "{usage_remote_after_restart}"
     );
     assert_eq!(
-        usage_remote_after_restart["by_served"]["remote"]["calls_ok"], 1,
+        usage_remote_after_restart["by_served"]["local"]["calls_ok"], 1,
+        "{usage_remote_after_restart}"
+    );
+    assert_eq!(
+        usage_remote_after_restart["by_served"]["remote"]["calls_ok"], 0,
         "{usage_remote_after_restart}"
     );
 

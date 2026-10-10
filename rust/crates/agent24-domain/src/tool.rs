@@ -462,6 +462,7 @@ impl ModuleToolRegistry {
             if view.module_ready(module).await
                 && view.operation_available(module, operation).await
                 && view.has_current_consent(module, operation).await
+                && view.outbound_gate_ready(module, operation).await
                 && !view.blocked_by_remote_tier_guard(module, operation).await
             {
                 adverts.push(ModuleToolAdvert {
@@ -572,7 +573,8 @@ impl ModuleToolAdvert {
 /// Every gate is awaited fresh for every registered tool. Defaults fail closed;
 /// agent24d supplies live supervisor state, registered manifest operations,
 /// ConsentGate lookups, and the remote-tier/document guard. Gate 5 only narrows
-/// what gates 1-4 allow.
+/// what gates 1-4 allow. Gate 6 also withholds tools until K1-5.3 invokes
+/// through the live egress gate.
 #[async_trait::async_trait]
 pub trait ModuleToolAdvertView: Send + Sync {
     /// Gates 1+2 (ADR-K1-01 §2.2): `module` is registered and its current
@@ -598,6 +600,15 @@ pub trait ModuleToolAdvertView: Send + Sync {
     /// third-party module self-reporting `Read`/`local_only` — never
     /// substitutes for this. Default: unauthorized (fail-closed).
     async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
+        false
+    }
+
+    /// Gate 6 (K1-6b.3): whether this operation's invocation path is wired to
+    /// the host-owned live egress decision API. This is only an advert readiness
+    /// gate; K1-5.3 must pass source policy, purpose, exact destination and
+    /// authorization generation into the checker immediately before invoking.
+    /// Until that call path lands, this defaults false and suppresses adverts.
+    async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
         false
     }
 
@@ -871,6 +882,7 @@ mod tests {
         operation_available: bool,
         authorized: bool,
         remote_tier_blocked: bool,
+        outbound_ready: bool,
     }
 
     impl TestView {
@@ -880,6 +892,7 @@ mod tests {
                 operation_available: true,
                 authorized: true,
                 remote_tier_blocked: false,
+                outbound_ready: true,
             }
         }
     }
@@ -896,6 +909,10 @@ mod tests {
 
         async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
             self.authorized
+        }
+
+        async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
+            self.outbound_ready
         }
 
         async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
@@ -945,6 +962,14 @@ mod tests {
             adverts[0].input_schema(),
             &serde_json::json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[tokio::test]
+    async fn a_tool_without_a_live_egress_call_path_is_not_advertised() {
+        let reg = registry_with_one_tool();
+        let mut view = TestView::all_pass();
+        view.outbound_ready = false;
+        assert!(reg.adverts(&view).await.is_empty());
     }
 
     // ---- ADR-K1-01 §5(4): disabled/breaker/backoff/draining/crashed or
@@ -1079,6 +1104,9 @@ mod tests {
                 true
             }
             async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
+                true
+            }
+            async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
             async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
