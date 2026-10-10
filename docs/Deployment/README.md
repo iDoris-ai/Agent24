@@ -7,6 +7,7 @@
 |---|---|
 | [`RESEARCH.md`](RESEARCH.md) | 现状实查（含 sidecar-host 线、daemon 单例锁）、各平台可行性、打包选型、风险 |
 | [`TASKS.md`](TASKS.md) | A（现在就能做）/ B（Apple 账号到位后）/ C（依赖其他）三个阶段；每个任务写明依赖、执行者、规模、可证伪的验收；文末附评审处置表 |
+| [`HYPHAE-NETWORK-DELIVERY.md`](HYPHAE-NETWORK-DELIVERY.md) | Hyphae 跨仓交付契约：标准包携带客户端，可选本机节点、离线包与服务器发行；当前缺口、双锁信任、安装/回滚、三种引导与验收。实现须等 Hyphae M1 发布门关闭，任务见 TASKS 的 DEP-HN 系列与既有 C8/C9；文档不代表交付完成 |
 
 ## 一句话结论
 
