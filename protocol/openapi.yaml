@@ -2086,9 +2086,9 @@ paths:
         running or when a failed or interrupted job is re-queued (same job_id,
         attempt + 1); 200 once it has succeeded (with `result.extraction_id`)
         or was cancelled (it stays cancelled). To extract again on purpose,
-        send `rerun: true` with a new `Idempotency-Key`: that key joins the
-        business key, so resending it replays the same rerun and a new key
-        runs again; `rerun: true` without the header is 400
+        send `rerun: true` with a new `Idempotency-Key`: that key names the
+        rerun within the document, so resending it replays the same rerun
+        and a new key runs again; `rerun: true` without the header is 400
         `invalid_request`, and the same key with a different request — the
         JCS hash of the whole request body differs (§5.4; David, 2026-10-10)
         — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise).
