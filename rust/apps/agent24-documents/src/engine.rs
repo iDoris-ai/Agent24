@@ -18,7 +18,8 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::{Semaphore, watch};
 
-use crate::state::Storage;
+use crate::error::StorageCause;
+use crate::state::{Storage, blob_cause, unavailable_cause};
 use crate::text_layer::{self, EngineRef, LayerError, TextLayer, config_sha256};
 
 /// Engines parsing at once.
@@ -62,8 +63,10 @@ pub enum LayerFailure {
     Pending,
     #[error(transparent)]
     Engine(EngineError),
-    #[error("storage failed while building the text layer: {0}")]
-    Storage(String),
+    /// Storage failed: with its cause when it is unavailable (§6), none
+    /// when the failure is unexpected.
+    #[error("storage failed while building the text layer: {1}")]
+    Storage(Option<StorageCause>, String),
 }
 
 type Outcome = Option<Result<String, LayerFailure>>;
@@ -199,7 +202,7 @@ impl LayerKey {
     async fn pinned(&self, storage: &Storage) -> Result<Option<String>, LayerFailure> {
         text_layer::pinned(storage, &self.content, &self.engine, &self.config)
             .await
-            .map_err(|e| LayerFailure::Storage(e.to_string()))
+            .map_err(|e| LayerFailure::Storage(unavailable_cause(&e), e.to_string()))
     }
 }
 
@@ -222,7 +225,7 @@ async fn build(
     let path = storage
         .blobs
         .path_of(&key.content)
-        .map_err(|e| LayerFailure::Storage(e.to_string()))?;
+        .map_err(|e| LayerFailure::Storage(Some(blob_cause(&e)), e.to_string()))?;
     let layer = engine
         .parse(&key.content, &media_type, &path)
         .await
@@ -234,7 +237,8 @@ async fn build(
         .await
         .map_err(|e| match e {
             LayerError::Invalid(why) => failed(&why),
-            other => LayerFailure::Storage(other.to_string()),
+            LayerError::Blob(e) => LayerFailure::Storage(Some(blob_cause(&e)), e.to_string()),
+            LayerError::Db(e) => LayerFailure::Storage(unavailable_cause(&e), e.to_string()),
         })
 }
 
