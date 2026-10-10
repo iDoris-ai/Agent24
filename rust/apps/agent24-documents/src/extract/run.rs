@@ -27,6 +27,8 @@ use super::window::{BATCH, BUDGET, Window, batches, windows};
 
 /// What the model may write in one answer, at most (the kernel's limit).
 const MAX_TOKENS: u32 = 4096;
+/// A model id's bytes, at most, as migration 0006 keeps it (and no NUL).
+const MAX_MODEL_ID: usize = 256;
 /// How a busy kernel is waited out: first pause, doubling to at most 30 s,
 /// for at most two minutes a call.
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +165,11 @@ impl Run<'_> {
         let Some(id) = done.model_id.filter(|id| !id.is_empty()) else {
             return engine("the model did not say which it is");
         };
+        // Checked at its first answer, not when the extraction is written:
+        // an id that cannot be kept would waste every call after it.
+        if id.len() > MAX_MODEL_ID || id.contains('\0') {
+            return engine("the model's id cannot be kept");
+        }
         match &self.model_id {
             Some(known) if *known != id => engine("the local model changed during the extraction"),
             _ => {
