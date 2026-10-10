@@ -5643,7 +5643,19 @@ while f.readline():
                 .await
                 .unwrap_or_else(|e| panic!("call {i} must succeed: {e:?}"));
         }
-        let err = call_list(&methods1, 300).await.unwrap_err();
+        // Drain until the bucket actually refuses a call. The bucket refills one
+        // token per *real* second (it has no injected clock), so a loaded runner
+        // can hand back a token or two while these 300 awaits are in flight; the
+        // old "call 301 must fail" assertion was really asserting wall-clock luck.
+        // The bound stays far below the 300-token capacity, so a bucket that had
+        // reset would still be caught.
+        let mut err = call_list(&methods1, 300).await;
+        let mut next_id = 301;
+        while err.is_ok() && next_id < 350 {
+            err = call_list(&methods1, next_id).await;
+            next_id += 1;
+        }
+        let err = err.unwrap_err();
         assert_eq!(
             err.kind,
             Some(agent24_os_proto::rpc::ErrorKind::RateLimited)
@@ -5656,7 +5668,15 @@ while f.readline():
             agent24_os_proto::drain::Generation::serving_at("/tmp/does-not-need-to-exist".into());
         assert!(gen2.ready());
         let methods2 = methods_for(&gen2);
-        let err2 = call_list(&methods2, 0).await.unwrap_err();
+        // Still exhausted after the "restart" — bounded the same way, and far
+        // below the capacity, so a bucket that reset inside the closure fails here.
+        let mut err2 = call_list(&methods2, 0).await;
+        let mut id2 = 1;
+        while err2.is_ok() && id2 < 10 {
+            err2 = call_list(&methods2, id2).await;
+            id2 += 1;
+        }
+        let err2 = err2.unwrap_err();
         assert_eq!(
             err2.kind,
             Some(agent24_os_proto::rpc::ErrorKind::RateLimited),

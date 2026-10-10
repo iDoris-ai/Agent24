@@ -236,12 +236,6 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
     ) -> Result<agent24_tools::ModuleToolGrantContext, agent24_domain::tool::ModuleToolCallError>
     {
         use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode};
-        let denied = || ModuleToolCallError::Module {
-            code: ModuleToolErrorCode::PermissionDenied,
-            retryable: false,
-            details: None,
-            unknown_code: None,
-        };
         match self.decision(module, operation).await {
             ConsentGateDecision::Allow {
                 grant_ref,
@@ -254,7 +248,16 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
                 ),
                 per_call_approval,
             }),
-            ConsentGateDecision::Deny { .. } => Err(denied()),
+            ConsentGateDecision::Deny { reason } => {
+                let details = matches!(reason, ConsentDenyReason::Revoked(_))
+                    .then(|| serde_json::json!({"reason": reason.reason_code()}));
+                Err(ModuleToolCallError::Module {
+                    code: ModuleToolErrorCode::PermissionDenied,
+                    retryable: false,
+                    details,
+                    unknown_code: None,
+                })
+            }
         }
     }
 

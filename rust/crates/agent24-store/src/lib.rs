@@ -77,9 +77,10 @@ pub use legacy_recovery::{
 };
 pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
 pub use module_audit_event::{
-    ActorRef, AuditRef, AuditTimestamp, AuthorizationRef, DurationMs,
-    MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId, ModuleToolAuditEvent, ModuleToolAuditRelation,
-    ModuleToolResultCode, OperationId, ResourceRef, RunId, SessionRef, SizeBytes, ToolCallId,
+    ActorRef, AttemptId, AuditRef, AuditTimestamp, AuthorizationRef, DurationMs,
+    InterruptedTerminalOutcome, MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId, ModuleToolAuditEvent,
+    ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef, RunId, SessionRef,
+    SizeBytes, ToolCallId,
 };
 pub use module_consents::{
     ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentRecord,
@@ -143,6 +144,8 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     pool: SqlitePool,
     module_consent_revocations: tokio::sync::broadcast::Sender<ModuleConsentRevocation>,
+    terminal_commit_ack_gate:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>>,
 }
 
 impl Store {
@@ -165,6 +168,7 @@ impl Store {
         Ok(Self {
             pool,
             module_consent_revocations,
+            terminal_commit_ack_gate: std::sync::Arc::default(),
         })
     }
 
@@ -183,6 +187,7 @@ impl Store {
         Ok(Self {
             pool,
             module_consent_revocations,
+            terminal_commit_ack_gate: std::sync::Arc::default(),
         })
     }
 
@@ -195,8 +200,35 @@ impl Store {
 /// tampering). Not part of the supported API.
 #[doc(hidden)]
 pub mod test_hooks {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
     pub fn pool(store: &super::Store) -> &sqlx::SqlitePool {
         store.pool()
+    }
+
+    /// Pause the next typed terminal append after SQLite has committed but
+    /// before the append future acknowledges completion to its caller.
+    pub fn pause_next_terminal_commit_ack(store: &super::Store) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        let mut configured_gate = store
+            .terminal_commit_ack_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) async fn terminal_commit_ack_boundary(store: &super::Store) {
+        let gate = store
+            .terminal_commit_ack_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.notify_one();
+            gate.notified().await;
+        }
     }
 
     /// Build a `Store` around an already-migrated pool a test built by hand
@@ -213,6 +245,7 @@ pub mod test_hooks {
         super::Store {
             pool,
             module_consent_revocations,
+            terminal_commit_ack_gate: std::sync::Arc::default(),
         }
     }
 
