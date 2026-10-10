@@ -253,7 +253,8 @@ impl Extraction {
 mod value;
 
 pub use value::{
-    Anchor, Candidate, Engine, ExtractedValue, Geometry, MissingReason, Status, TextRange, has_null,
+    Anchor, Candidate, Engine, ExtractedValue, Geometry, MissingReason, Status, TextRange,
+    has_null, is_field_key,
 };
 
 #[cfg(test)]

@@ -89,7 +89,7 @@ impl UploadRequest {
 
 /// The `Idempotency-Key` header: 1 to 200 characters of visible ASCII
 /// without spaces (`DocumentsIdempotencyKey`).
-fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
     let key = headers
         .get("idempotency-key")
         .ok_or_else(|| ApiError::invalid_request("the Idempotency-Key header is required"))?

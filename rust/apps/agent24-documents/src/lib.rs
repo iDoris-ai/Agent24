@@ -85,6 +85,8 @@ pub struct OperationStatus {
 enum Needs {
     Storage,
     Engine,
+    /// The read engine and a model from the kernel.
+    Model,
 }
 
 /// Slice-1 operations (ADR-DOC-02 §4): what each needs, and whether this
@@ -100,7 +102,7 @@ const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("render", Needs::Engine, true),
     ("read_range", Needs::Engine, true),
     ("find", Needs::Engine, true),
-    ("extract", Needs::Engine, false),
+    ("extract", Needs::Model, true),
 ];
 
 /// What this build can do right now. The read engine is reported whether it
@@ -112,6 +114,7 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
     let storage_ready = state.storage().await.is_ok();
     let engine = state.layers().engine().map(|e| e.engine().version);
     let engine_ready = engine.is_some();
+    let model_ready = state.model().is_some();
     Capabilities {
         os_version: env!("CARGO_PKG_VERSION"),
         storage: StorageStatus {
@@ -142,6 +145,7 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
                 let (ready, code) = match needs {
                     Needs::Storage => (storage_ready, "storage_unavailable"),
                     Needs::Engine => (engine_ready, "engine_unavailable"),
+                    Needs::Model => (engine_ready && model_ready, "engine_unavailable"),
                 };
                 let available = routed && ready;
                 OperationStatus {
@@ -173,6 +177,10 @@ pub fn router(state: AppState) -> Router {
             get(read::render::render_page),
         )
         .route("/documents/{document_id}/find", post(read::find::find))
+        .route(
+            "/documents/{document_id}/extractions",
+            post(extract::handler::extract),
+        )
         .route(
             "/extractions/{extraction_id}",
             get(extractions::get_extraction),
