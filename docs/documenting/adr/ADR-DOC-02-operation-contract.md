@@ -122,6 +122,67 @@
   - 不做 Unicode 规范化，不做全角/半角折叠。中文原文不受这两点影响。
   - 结果按块的阅读顺序排列；一个块内的多处命中，按出现顺序各自成为一个锚点，互不重叠。
 
+### 3.2 第 1 片抽取的落地（David 确认，2026-10-10）
+
+**模型调用**
+- 经内核的 `_a24/model/complete`（`agent24-os-sdk` 的 `ModelClient`）。清单声明 `models` 和 `model_access: local_only`，内核按模块强制只用本地模型（ADR-DOC-01 D8.1）。后台调用不带发起请求的 `request_id`（那个请求早已结束）。
+- `max_tokens` 显式设为 4096（内核上限；不设只有 1024）。
+- 一个 job 同一时刻只有一次调用；整个模块最多 2 次（内核对每个模块的上限）。
+- 内核回 `busy` / `rate_limited` 时退避重试，同一次调用的等待累计不超过 2 分钟；回 `timeout` 时重试一次。
+- 失败一律落在 §6 的闭集里：
+  - 模型相关的失败都是 `engine_unavailable`，按 §6 一律可重试（包括 `forbidden`、`backend_config`：配置改好后重试就能成）；
+  - `details.engine` 写 `local-model`（这时还没有模型 id）；
+  - 用户取消让 job 进入 `cancelled`；内核在关机时回的 `cancelled` 不是用户取消，job 记为 `interrupted`，同一个键再来会自动重新排队（§7）。
+- 收到 `POST` 时，内核没有给本模块提供模型接口（握手里没有 `_a24/model/`）→ 503 `engine_unavailable`。有没有可用的本地模型，只有调用时才知道：没有时 job 以 `engine_unavailable` 失败、可重试，按 §5.4 同一个键再来会自动重新排队（OpenAPI 同步此说法）。
+- `model_id` 取调用返回的实际模型 id。以下两种情况 job 都以 `engine_unavailable` 失败，不编造模型 id，也不混用两个模型的结果：
+  - 某次调用没有返回模型 id；
+  - 同一个 job 里各次调用的模型 id 不一致。
+
+**输入与分窗**
+- 输入是当前引擎钉住的文本层，按块给出，每块前标 `block_id`。字段说明和文档文本都是不可信数据，放在固定的抽取指令之后，指令写明不执行其中的任何指令。
+- 文本层有未读出的区域（`partial`）时，照样抽取，但「找不到」不能说成「文件里没有」：见下文的 `unread`。
+- 整份文本层不超过 24 KiB 块文本时，一次给全（S01 的样本都是这样）。
+- 更长的按页切成窗口，每窗 ≤ 24 KiB，并尽量带上前一页作为重叠，让跨页的条件、续表的表头落在同一窗里：
+  - 前一页整页放不下时，只带它末尾能放下的那些块；
+  - 一页本身超过 24 KiB，就按块再切，切开的各段之间不重叠。
+- 每次请求的总字节都在内核 RPC 的 256 KiB 之内。
+- 本地模型的上下文长度事先不知道。24 KiB 的文本（中文约 8k token）加上指令、Schema 和 4096 的输出，需要至少约 16k token 的上下文。内核回 `unavailable` / `request_rejected`（通常是输入超出了模型的上下文）时，窗口减半重试，减到单个块仍被拒，job 以 `engine_unavailable` 失败。
+- 已知局限：相隔一页以上的条件和命题，以及被切开的超长页的前后段，可能连不起来。由 S01 评测衡量，不靠合并补救。
+- 字段每批最多 20 个。回答被截断（不是完整的 JSON）时，这一批对半拆开重试，拆到 1 个仍不行，job 以 `parse_failed` 失败。回答是完整 JSON 但不符合 Schema 时，重试一次，仍不行也是 `parse_failed`。
+
+**模型的回答**
+- 用 `response_format` 的 JSON Schema 约束（strict），每个字段给出：
+  - `status`：`present` / `missing` / `conflict`；
+  - `value`（原文写法）和可选的 `normalized`；
+  - 证据：`{block_id, quote}` 的列表，最多 16 条；`quote` 必须是该块原文中连续的一段；
+  - `missing_reason`，或冲突的各个候选（各自带值、`normalized` 和证据，最多 8 个）。
+
+**锚点由 OS 定位，不信模型**
+- 每条证据只在它指名的块里，用 `find` 的匹配规则（§3.1、Q14）找 `quote`：
+  - 不在全文里退而求其次，否则一个指错块的 “40元” 会锚到另一行的 40 元；
+  - 在块里恰好出现一次才算定位成功；出现多次是歧义，算失败（模型应给更长的引文）。
+- **一个值（或一个候选）的证据全部定位成功，才得到锚点；有一条失败，这个值就整体没有锚点。** 只留下部分证据，可能漏掉条件或否定词，使锚点看似支持一个它并不支持的命题。
+- 有证据的值，它的 `value` 必须（按同样的匹配规则）出现在某条证据的引文里，否则也整体没有锚点。
+- 没有锚点的值：`anchors: []` 加 `unsourced_reason`，例如「引文在指名的块里找不到」「引文有歧义」「值不在引文里」。
+- OS 能核验的只有两点：引文确实在文件里，值确实在引文里。它核验不了引文是否支持这个命题。所以锚点要逐值给人看（README §11.4），准确率由 S01 评测衡量。
+
+**冲突从不由抽取器裁决**
+- 冲突的候选，证据定位失败时，候选照样保留，只是没有锚点、带 `unsourced_reason`。**不会**因此把冲突变成 `present`，也不会变成 `missing`。
+  - 这需要契约放宽：`DocumentsExtractCandidate` 允许 `anchors: []` 加 `unsourced_reason`，规则与 `present` 值相同（Q17，已定）。
+
+**合并多个窗口**（一次给全时只有一个窗口，不用合并）
+- 每个字段把各窗口的 `present` 值和 `conflict` 候选摊平成一个候选表，按 `normalized` 分组；没有 `normalized` 的按 `value` 原文分组。分组结果：
+  - 0 组：`missing`，原因见下；
+  - 1 组：`present`。每个窗口的证据各自完整地覆盖命题，所以按窗口整组合并锚点，加上去会超过 16 个时，不再加下一整组；
+  - 2–8 组：`conflict`，每组一个候选，保留最早出现的原文写法；
+  - 超过 8 组：取文档顺序最早的 8 组，其余丢弃。一个字段有 8 个以上不同的值，说明字段本身问得太宽。已知局限，在 job 的 `progress` 里记一条说明。
+- 所有窗口都是 `missing` 时：
+  - 有窗口给出具体原因（`blank_in_template`、`referenced_but_absent`、`outside_page_scope`），取第一个，否则是 `not_in_document`；
+  - 文本层有未读出的区域时，依赖「文件里没有」的两种原因（`not_in_document`、`referenced_but_absent`，被引用的内容可能正在没读出的区域里）都改为新值 `unread`，表示「有区域没读出来，不能断定文件里没有」（Q18，已定，已加入 `missing_reason` 的枚举）；`blank_in_template`（空白看得见）和 `outside_page_scope`（与读没读出无关）不变。
+
+**抽取器版本**
+- `extractor_version` 是指令、回答 Schema、分窗、分批和合并规则的版本号，任何一项变了就加一。它在业务键里，变了以后同样的请求会重新抽取。
+
 ## 4. 操作清单（DOC-1）
 
 - **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
@@ -169,7 +230,7 @@
      |---|---|
      | `upload` | 页面的 `Idempotency-Key` |
      | `import` | `upload_id` |
-     | `extract` | `(document_id, revision, schema_sha256, extractor_version, model_id)`，键用实际的模型 id，不用 profile；需要重新抽取时，页面可以显式带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，并入上面的业务键，所以它只在同一组业务坐标内有效，换了 schema 或实际模型就是另一个键（2026-10-09 澄清） |
+     | `extract` | `(document_id, revision, schema_sha256, extractor_version)`。实际用的模型由内核路由器在调用时决定，事先问不到，所以不进键，而是记在结果的 `model_id` 里；本地模型换了以后，同样的请求仍重放旧结果，要用新模型就显式重新抽取（David，2026-10-10，原为键里带实际模型 id）。需要重新抽取时，页面带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，并入上面的业务键，所以它只在同一组业务坐标内有效，换了 schema 就是另一个键（2026-10-09 澄清） |
      | `propose` | `(document_id, base_revision, ops_sha256)` |
      | `export` | `(document_id, revision, format, options_sha256)` |
      | `commit` | `commit_key` |
@@ -297,6 +358,10 @@
 | Q12 | 块的切分与 `block_id`（`p{页}/b{序号}`，按行距和左缘把相邻行合并成段落，每块 ≤ 16 KiB、≤ 64 行），几何只做到整行；部分解析按页判断，每个图像区域都做 OCR，失败的区域标为未解析；分页按页推进，一次最多 100 页，`parse_status` 描述本次覆盖的页（§3.1） | 建议如左 | David |
 | Q13 | 文本层在导入后尽力预解析；读取或查找时缺了就后台解析，最多等 8 s，否则回 503 `engine_unavailable`（可重试）（§3.1） | 建议如左 | David |
 | Q14 | find 的匹配规则：块内匹配，只放宽 ASCII 大小写和空白，原文换行可跳过，不做 Unicode 规范化；读取引擎把排版连字（U+FB00–FB06）读成字母、把伪粗体的重复只留一份（§3.1、docs/documenting/engine-pdfkit.md） | 建议如左 | David |
+| Q15 | 第 1 片抽取的做法：经内核只用本地模型；文本层 ≤ 32 KiB 时一次给全，更长的按页分窗（≤ 32 KiB，带前一页重叠）；字段每批 ≤ 20 个，截断时对半拆；模型只给值和 `{block_id, quote}` 证据，OS 只在指名的块里定位，恰好出现一次、且值在引文里才算来源，一个值的证据有一条失败就整体没有锚点（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
+| Q16 | 多窗口合并：按 `normalized` 分组，1 组为 `present`，多组为冲突（≤ 8 个候选，超出取最早的 8 个），不裁决；同一 job 里模型换了、或没有返回模型 id，就失败、可重试（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
+| Q17 | 契约放宽：冲突的候选允许 `anchors: []` 加 `unsourced_reason`，与 `present` 值相同，让证据定位失败的候选照样保留，冲突不被悄悄裁决（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
+| Q18 | 契约增补：`missing_reason` 增加 `unread`，文本层有未读出的区域时，用它代替 `not_in_document`（§3.2） | **已定（David，2026-10-10）**：按建议 | David |
 
 **2026-10-10 David 按建议拍板的契约细节**（#861）：
 - 渲染的 `region` 用角点对 `x0,y0,x1,y1`，与锚点的 `rects` 同一参照系、同一顺序（原为 `x,y,width,height`；渲染尚未实现，改动没有兼容负担）。
@@ -304,3 +369,4 @@
 - 每个抽取值最多 16 个锚点（`DocumentsEvidence`、`anchors`），冲突的候选最多 8 个。
 - `GET text` 同时给 `block` 和 `cursor` 是 400（游标已带位置）。
 - 抽取的 rerun 键被复用时，比较整个请求体的 JCS 哈希，不同就是 422 `idempotency_key_reused`（与上传、导入一致，§5.4）。
+- 抽取的业务键去掉 `model_id`：内核路由器在调用时才选模型，事先问不到；实际模型记在结果里，换模型用 rerun（§5.4，#863）。

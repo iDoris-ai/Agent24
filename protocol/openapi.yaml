@@ -2079,8 +2079,10 @@ paths:
       summary: Extract fields from one revision, each value with its provenance; starts a job
       description: >-
         Idempotent on the business key (document_id, revision, schema_sha256,
-        extractor_version, model_id) — the actual model id, not a profile
-        (§5.4). The replay statuses are those of import: 202 while queued or
+        extractor_version) (§5.4). The model the kernel's router picks is not
+        known before the call, so it is not in the key: it is recorded in the
+        result's `model_id`, and a new local model is used by extracting
+        again with `rerun` (David, 2026-10-10). The replay statuses are those of import: 202 while queued or
         running or when a failed or interrupted job is re-queued (same job_id,
         attempt + 1); 200 once it has succeeded (with `result.extraction_id`)
         or was cancelled (it stays cancelled). To extract again on purpose,
@@ -2093,9 +2095,11 @@ paths:
         Field descriptions and the document text are untrusted data: the OS
         passes them to the model under a fixed extraction instruction and
         never follows instructions found in them. The model is called through the kernel under
-        `LocalOnly` (ADR-DOC-01 D8); with no local model available the
-        answer is 503 `engine_unavailable` with `details.engine` naming the
-        model.
+        `LocalOnly` (ADR-DOC-01 D8). When the kernel gives this module no
+        model access, the answer is 503 `engine_unavailable`. Whether a local
+        model is available is only known when the job calls it: if none is,
+        the job fails with `engine_unavailable` (retryable; the same key
+        re-queues it). `details.engine` is `local-model` (§3.2).
       parameters:
         - $ref: "#/components/parameters/DocumentId"
         - name: Idempotency-Key
@@ -4139,6 +4143,12 @@ components:
       type: object
       required: [value, normalized, anchors]
       additionalProperties: false
+      description: >-
+        One side of a conflict. Like a present value, its anchors are empty
+        only when its evidence could not be verified, and then
+        `unsourced_reason` says why: the candidate is kept rather than
+        dropped, so the conflict is never resolved by the extractor
+        (ADR-DOC-02 §3.2; David, 2026-10-10).
       properties:
         value: { type: string, description: As written in the source. }
         normalized:
@@ -4146,7 +4156,18 @@ components:
           description: >-
             For comparison only. Required here: candidates conflict because
             their normalized forms differ.
-        anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+        anchors:
+          type: array
+          maxItems: 16
+          items: { $ref: "#/components/schemas/DocumentsAnchor" }
+        unsourced_reason: { type: string, minLength: 1 }
+      if: { properties: { anchors: { maxItems: 0 } } }
+      then:
+        required: [unsourced_reason]
+      else:
+        properties:
+          anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+          unsourced_reason: false
     DocumentsExtractedValue:
       type: object
       required: [key, status]
@@ -4174,7 +4195,7 @@ components:
         unsourced_reason: { type: string, minLength: 1 }
         missing_reason:
           type: string
-          enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+          enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope, unread]
         candidates:
           type: array
           minItems: 2
@@ -4207,7 +4228,7 @@ components:
             properties:
               missing_reason:
                 type: string
-                enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+                enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope, unread]
               value: false
               normalized: false
               anchors: false
