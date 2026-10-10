@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod ground;
+pub mod job;
 pub mod merge;
 pub mod prompt;
 pub mod run;

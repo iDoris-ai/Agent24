@@ -12,7 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::extract::{FromRef, FromRequestParts};
@@ -24,6 +24,7 @@ use crate::db::{Db, DbError};
 use crate::engine::Layers;
 use crate::error::{ApiError, StorageCause};
 use crate::events::Events;
+use crate::extract::run::Model;
 
 /// How often a request may retry opening storage that failed to open.
 pub const REOPEN_INTERVAL: Duration = Duration::from_secs(2);
@@ -112,6 +113,8 @@ struct Inner {
     events: Events,
     /// Text layers, and the engine that reads them (none on Linux).
     layers: Arc<Layers>,
+    /// The model extractions ask: the kernel's, once it has offered one.
+    model: OnceLock<Arc<dyn Model>>,
     reopen_interval: Duration,
     current: Mutex<Opened>,
     /// When the last reopen started. Held during a reopen, so one request
@@ -159,6 +162,7 @@ impl AppState {
             data_dir: data_dir.to_owned(),
             events,
             layers,
+            model: OnceLock::new(),
             reopen_interval,
             current: Mutex::new(current),
             last_attempt: tokio::sync::Mutex::new(Instant::now()),
@@ -179,6 +183,7 @@ impl AppState {
             data_dir: data_dir.to_owned(),
             events: Events::default(),
             layers: Layers::new(None),
+            model: OnceLock::new(),
             reopen_interval,
             current: Mutex::new(Err(cause)),
             last_attempt: tokio::sync::Mutex::new(Instant::now()),
@@ -191,6 +196,17 @@ impl AppState {
     #[must_use]
     pub fn layers(&self) -> &Arc<Layers> {
         &self.0.layers
+    }
+
+    /// The model extractions ask, if the kernel offered this module one.
+    #[must_use]
+    pub fn model(&self) -> Option<&Arc<dyn Model>> {
+        self.0.model.get()
+    }
+
+    /// Sets the model, once: a second is ignored.
+    pub fn set_model(&self, model: Arc<dyn Model>) {
+        let _ = self.0.model.set(model);
     }
 
     fn current(&self) -> Opened {
