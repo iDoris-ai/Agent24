@@ -23,15 +23,20 @@ pub struct RenderParams {
     region: Option<String>,
 }
 
-/// `x0,y0,x1,y1`: four plain decimals, `x0 < x1` and `y0 < y1`.
+/// `x0,y0,x1,y1`: four non-negative numbers as JSON writes them, exponent
+/// included (an anchor's rect, passed as it is), `x0 < x1` and `y0 < y1`.
 fn region(s: &str) -> Option<[f64; 4]> {
     let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
     let plain = |f: &str| match f.split_once('.') {
         Some((whole, part)) => digits(whole) && digits(part),
         None => digits(f),
     };
+    let number = |f: &str| match f.split_once(['e', 'E']) {
+        Some((m, e)) => plain(m) && digits(e.strip_prefix(['+', '-']).unwrap_or(e)),
+        None => plain(f),
+    };
     let fields: Vec<&str> = s.split(',').collect();
-    if fields.len() != 4 || !fields.iter().all(|f| plain(f)) {
+    if fields.len() != 4 || !fields.iter().all(|f| number(f)) {
         return None;
     }
     let v: Vec<f64> = fields

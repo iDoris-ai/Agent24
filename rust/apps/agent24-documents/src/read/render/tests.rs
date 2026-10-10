@@ -180,6 +180,10 @@ async fn a_page_is_a_png_with_the_scale_used() {
     get(&e.state, &page("1", "")).await;
     let asked = e.painter.asked.lock().unwrap()[1].2;
     assert_eq!((asked.page, asked.scale, asked.region), (1, 1.0, None));
+    // An anchor's rect as JSON writes it, exponent included (`+` is %2B).
+    get(&e.state, &page("1", "?region=1e-7,0,1.5E2,7e%2B1")).await;
+    let asked = e.painter.asked.lock().unwrap()[2].2;
+    assert_eq!(asked.region, Some([1e-7, 0.0, 150.0, 70.0]));
 }
 
 #[tokio::test]
@@ -196,7 +200,9 @@ async fn bad_requests_are_refused_before_the_engine() {
         page("1", "?region=1,2,3"),
         page("1", "?region=1,2,3,4,5"),
         page("1", "?region=-1,0,10,10"),
-        page("1", "?region=1e2,0,300,10"),
+        page("1", "?region=1e,0,300,10"),
+        page("1", "?region=1e%2B,0,300,10"),
+        page("1", "?region=0,0,1e999,10"),
         page("1", "?region=.5,0,1,1"),
         page("1", "?region=1.,0,2,2"),
         page("1", "?region=10,0,5,10"),
