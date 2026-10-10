@@ -400,9 +400,17 @@ async fn every_call_names_one_local_model() {
     remote.as_mut().unwrap().tier = ServedTier::Remote;
     let mut nameless = from("m", a.clone());
     nameless.as_mut().unwrap().model_id = None;
+    let long = "m".repeat(257);
     for (replies, what) in [
         (vec![remote], "remote"),
         (vec![nameless], "no id"),
+        (vec![from(&long, a.clone())], "an id over 256 bytes"),
+        // Bytes, not characters: 86 of 模 are 258 bytes.
+        (
+            vec![from(&"模".repeat(86), a.clone())],
+            "a short id over 256 bytes",
+        ),
+        (vec![from("m\0", a.clone())], "an id with a NUL"),
         (
             vec![from("m1", a.clone()), from("m2", a.clone())],
             "changed",
@@ -417,13 +425,17 @@ async fn every_call_names_one_local_model() {
         );
     }
     let out = go(
-        &Script::new(vec![from("m1", a.clone()), from("m1", a)]),
+        &Script::new(vec![from("m1", a.clone()), from("m1", a.clone())]),
         &l,
         &[field("a")],
     )
     .await
     .unwrap();
     assert_eq!(out.model_id, "m1");
+    let longest = "模".repeat(85) + "m";
+    let replies = vec![from(&longest, a.clone()), from(&longest, a)];
+    let out = go(&Script::new(replies), &l, &[field("a")]).await;
+    assert_eq!(out.map(|e| e.model_id), Ok(longest));
 }
 
 #[tokio::test]
