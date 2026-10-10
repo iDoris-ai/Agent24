@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::json;
@@ -11,11 +12,29 @@ use crate::text_layer::ParseStatus;
 
 const CONTENT: &str = "sha256:4f26fc6d4e157f4c2eb6c72b4faa687467ea3331634a21c65fc4b1162c6008ce";
 
+/// Writes `script` to `path`, executable, from a child process. Written
+/// here, the file would be open for writing in this process, and a test
+/// on another thread that forks before closing it would hold it open:
+/// running it would then fail with "Text file busy" (ETXTBSY, Linux).
+fn install(path: &Path, script: &str) {
+    let mut sh = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    sh.stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(sh.wait().unwrap().success());
+}
+
 /// A stand-in helper: a shell script with `body`, in `dir`.
 fn helper(dir: &Path, body: &str) -> PdfKit {
     let path = dir.join(HELPER);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    install(&path, &format!("#!/bin/sh\n{body}\n"));
     PdfKit::at(path, "26.6.2")
 }
 
@@ -51,11 +70,10 @@ async fn a_report_becomes_a_layer_of_this_engine_and_this_content() {
 async fn a_version_without_its_zero_patch_is_the_same_macos() {
     let dir = tempfile::tempdir().unwrap();
     let path = helper(dir.path(), "true").path;
-    std::fs::write(
+    install(
         &path,
-        format!("#!/bin/sh\ncat <<'J'\n{}\nJ\n", report("26.6.0")),
-    )
-    .unwrap();
+        &format!("#!/bin/sh\ncat <<'J'\n{}\nJ\n", report("26.6.0")),
+    );
     // `sw_vers` says "26.6"; the helper says "26.6.0".
     let e = PdfKit::at(path, "26.6");
     assert_eq!(e.engine().version, "26.6.0");
