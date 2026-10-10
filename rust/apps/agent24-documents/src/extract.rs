@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod prompt;
 pub mod window;
 
 /// The version of the instruction, the answer's schema, windows, batches
