@@ -191,3 +191,273 @@ async fn the_real_helper_reads_the_s01_samples() {
         .await;
     assert_eq!(unsupported.err(), Some(EngineError::Unsupported));
 }
+
+const PNG_BYTES: &str = r"\211PNG\r\n\032\n";
+
+fn ask(region: Option<[f64; 4]>) -> RenderAsk {
+    RenderAsk {
+        page: 2,
+        scale: 1.5,
+        region,
+        max_bytes: 1 << 20,
+    }
+}
+
+async fn render(e: &PdfKit, ask: RenderAsk) -> Result<Rendered, RenderError> {
+    e.render("application/pdf", Path::new("/x.pdf"), ask).await
+}
+
+#[tokio::test]
+async fn a_render_gets_the_page_scale_size_and_region_and_says_the_scale_it_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = dir.path().join("args");
+    let e = helper(
+        dir.path(),
+        &format!(
+            "echo \"$@\" > {}\nprintf '{{\"protocol\":1,\"scale\":1.25,\"width\":9,\"height\":9}}\\n{PNG_BYTES}IDAT'",
+            args.display()
+        ),
+    );
+    let out = render(&e, ask(Some([0.0, 10.5, 300.0, 400.25])))
+        .await
+        .unwrap();
+    assert_eq!(out.scale, 1.25);
+    assert_eq!(out.png, b"\x89PNG\r\n\x1a\nIDAT");
+    assert_eq!(
+        std::fs::read_to_string(&args).unwrap().trim(),
+        "render /x.pdf application/pdf 2 1.5 1048576 0,10.5,300,400.25"
+    );
+    render(&e, ask(None)).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&args).unwrap().trim(),
+        "render /x.pdf application/pdf 2 1.5 1048576"
+    );
+}
+
+#[tokio::test]
+async fn each_exit_of_a_render_is_its_own_error() {
+    let dir = tempfile::tempdir().unwrap();
+    for (body, want) in [
+        ("exit 2", RenderError::Unsupported),
+        ("exit 4", RenderError::NoPage),
+        ("exit 5", RenderError::OffPage),
+        ("exit 6", RenderError::TooLarge),
+    ] {
+        let e = helper(dir.path(), body);
+        assert_eq!(render(&e, ask(None)).await, Err(want), "{body}");
+    }
+    let e = helper(dir.path(), "echo 'cannot open' >&2; exit 3");
+    let failed = render(&e, ask(None)).await;
+    assert!(
+        matches!(&failed, Err(RenderError::Failed(m)) if m.contains("(3): cannot open")),
+        "{failed:?}"
+    );
+    let e = helper(dir.path(), "kill -9 $$");
+    assert!(
+        matches!(render(&e, ask(None)).await, Err(RenderError::Failed(m)) if m.contains("stopped"))
+    );
+}
+
+#[tokio::test]
+async fn a_render_that_is_not_what_was_asked_for_is_a_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = |protocol: u32, scale: f64| format!("{{\"protocol\":{protocol},\"scale\":{scale}}}");
+    for (what, out) in [
+        ("no header", PNG_BYTES.to_string()),
+        ("not json", format!("scale 1\\n{PNG_BYTES}")),
+        (
+            "another protocol",
+            format!("{}\\n{PNG_BYTES}", head(2, 1.0)),
+        ),
+        (
+            "above the scale asked",
+            format!("{}\\n{PNG_BYTES}", head(1, 1.501)),
+        ),
+        (
+            "below the smallest",
+            format!("{}\\n{PNG_BYTES}", head(1, 0.249)),
+        ),
+        ("not a PNG", format!("{}\\nGIF89a", head(1, 1.0))),
+    ] {
+        let e = helper(dir.path(), &format!("printf '{out}'"));
+        assert!(
+            matches!(render(&e, ask(None)).await, Err(RenderError::Failed(_))),
+            "{what}"
+        );
+    }
+    // Over the size asked for, but within the header's allowance.
+    let e = helper(
+        dir.path(),
+        &format!(
+            "printf '{}\\n{PNG_BYTES}'; head -c 20 /dev/zero",
+            head(1, 1.0)
+        ),
+    );
+    let small = RenderAsk {
+        max_bytes: 16,
+        ..ask(None)
+    };
+    assert!(
+        matches!(render(&e, small).await, Err(RenderError::Failed(m)) if m.contains("within the size"))
+    );
+    // Far over it: stopped as it writes.
+    let e = helper(dir.path(), "head -c 100000000 /dev/zero; sleep 30");
+    let start = std::time::Instant::now();
+    assert!(
+        matches!(render(&e, small).await, Err(RenderError::Failed(m)) if m.contains("too large"))
+    );
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn a_render_that_runs_too_long_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let slow = helper(dir.path(), "sleep 30").limited(Duration::from_millis(300), 1 << 20);
+    let start = std::time::Instant::now();
+    assert_eq!(render(&slow, ask(None)).await, Err(RenderError::TooSlow));
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+/// A render given up on (dropped) stops its helper.
+#[tokio::test]
+async fn a_render_given_up_on_stops_its_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid = dir.path().join("pid");
+    let e = helper(
+        dir.path(),
+        &format!("echo $$ > {}\nexec sleep 30", pid.display()),
+    );
+    // Given up once the helper is running (a first run can be slow to start).
+    let running = async {
+        while !pid.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        out = render(&e, ask(None)) => panic!("the render ended: {out:?}"),
+        () = running => {}
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let pid = std::fs::read_to_string(&pid).unwrap().trim().to_owned();
+    // Killed, then reaped by tokio: soon no such process.
+    let mut alive = true;
+    for _ in 0..50 {
+        let probe = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .output()
+            .unwrap();
+        alive = probe.status.success();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!alive, "the helper {pid} still runs");
+}
+
+/// The real helper's renders of an S01 sample (macOS only).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_real_helper_renders_pages_and_regions() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = tempfile::tempdir().unwrap();
+    let built = std::process::Command::new(root.join("engines/pdfkit/build.sh"))
+        .arg(out.path())
+        .status()
+        .unwrap();
+    assert!(built.success(), "the helper did not build");
+    let e = PdfKit::at(out.path().join(HELPER), "26.6.2");
+    let pdf =
+        root.join("../../../docs/documenting/samples/s01/s01-02-en-epa-boil-water/source.pdf");
+    let jpg =
+        root.join("../../../docs/documenting/samples/s01/s01-06-zh-holiday-2026-scan/source.jpg");
+    let page = |page, scale, region, max_bytes| RenderAsk {
+        page,
+        scale,
+        region,
+        max_bytes,
+    };
+    let whole = e
+        .render("application/pdf", &pdf, page(1, 1.0, None, 1 << 20))
+        .await
+        .unwrap();
+    assert_eq!((whole.scale, &whole.png[..8]), (1.0, PNG));
+    // Lowered until it fits; the scale used is said.
+    let fitted = e
+        .render("application/pdf", &pdf, page(1, 4.0, None, 100_000))
+        .await
+        .unwrap();
+    assert!(
+        fitted.scale < 4.0 && fitted.png.len() <= 100_000,
+        "{}",
+        fitted.scale
+    );
+    let line = e
+        .render(
+            "application/pdf",
+            &pdf,
+            page(1, 2.0, Some([152.0, 98.0, 467.0, 119.0]), 1 << 20),
+        )
+        .await
+        .unwrap();
+    assert!(line.png.len() < whole.png.len());
+    // A scale with no short decimal is used and said at most as asked.
+    for scale in [0.280_999_999_999_999_97, 1.246_999_999_999_999_9] {
+        let tile = e
+            .render(
+                "application/pdf",
+                &pdf,
+                page(1, scale, Some([0.0, 0.0, 20.0, 20.0]), 1 << 20),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tile.scale <= scale && tile.scale > scale - 0.002,
+            "{scale}: {}",
+            tile.scale
+        );
+    }
+    let image = e
+        .render("image/jpeg", &jpg, page(1, 1.0, None, 1 << 20))
+        .await
+        .unwrap();
+    assert_eq!(&image.png[..8], PNG);
+    for (media, file, ask, want) in [
+        (
+            "application/pdf",
+            &pdf,
+            page(4, 1.0, None, 1 << 20),
+            RenderError::NoPage,
+        ),
+        (
+            "image/jpeg",
+            &jpg,
+            page(2, 1.0, None, 1 << 20),
+            RenderError::NoPage,
+        ),
+        (
+            "application/pdf",
+            &pdf,
+            page(1, 1.0, Some([900.0, 900.0, 950.0, 950.0]), 1 << 20),
+            RenderError::OffPage,
+        ),
+        (
+            "application/pdf",
+            &pdf,
+            page(1, 1.0, None, 2_000),
+            RenderError::TooLarge,
+        ),
+        (
+            "image/png",
+            &pdf,
+            page(1, 1.0, None, 1 << 20),
+            RenderError::Unsupported,
+        ),
+    ] {
+        assert_eq!(
+            e.render(media, file, ask).await.err(),
+            Some(want.clone()),
+            "{want:?}"
+        );
+    }
+}
