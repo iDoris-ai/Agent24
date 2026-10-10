@@ -93,7 +93,7 @@ pub async fn extract(
     if let Some(why) = bad_fields(&req.schema.fields) {
         return Err(ApiError::invalid_request(why));
     }
-    // A rerun names itself: its key joins the business key (§5.4).
+    // A rerun names itself: it is keyed by its Idempotency-Key (§5.4).
     let rerun = if req.rerun {
         Some(idempotency_key(&headers)?)
     } else {
