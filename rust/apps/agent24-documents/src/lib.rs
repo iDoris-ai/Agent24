@@ -97,7 +97,7 @@ const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("job", Needs::Storage, true),
     ("render", Needs::Engine, false),
     ("read_range", Needs::Engine, true),
-    ("find", Needs::Engine, false),
+    ("find", Needs::Engine, true),
     ("extract", Needs::Engine, false),
 ];
 
@@ -162,6 +162,7 @@ pub fn router(state: AppState) -> Router {
             "/documents/{document_id}/revisions/{revision}/text",
             get(read::text::read_text),
         )
+        .route("/documents/{document_id}/find", post(read::find::find))
         .route("/imports", post(imports::handler::import))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
