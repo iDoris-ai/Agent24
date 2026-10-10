@@ -20,6 +20,7 @@ import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
 import CreativePage from './pages/Creative'
 import MemoryPage from './pages/Memory'
+import DocumentsPage from './pages/documents/Documents'
 import logoSidebar from './assets/logo-sidebar.png'
 
 // Static module route map — M2 will replace this with dynamic import()
@@ -36,6 +37,7 @@ type BuiltinPage =
   | 'schedules'
   | 'communication'
   | 'approvals'
+  | 'documents'
   | 'voice'
   | 'creative'
   | 'models'
@@ -47,6 +49,8 @@ type Page = BuiltinPage | string  // string = module route
 const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'chat',            icon: '💬', label: '对话' },
   { id: 'workbench',       icon: '🔧', label: '工作台' },
+  // ADR-DOC-01 D3: the Documenting OS's page (#705).
+  { id: 'documents',       icon: '📄', label: '文档' },
   { id: 'runs',            icon: '📋', label: '任务' },
   { id: 'schedules',       icon: '⏰', label: '调度' },
   { id: 'communication',   icon: '🪢', label: '通信' },
@@ -62,7 +66,7 @@ const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
 
 const BUILTIN_TITLES: Record<BuiltinPage, string> = {
   chat: '对话', workbench: '工作台', runs: '运行任务',
-  schedules: '定时调度', approvals: '待审批', voice: '语音',
+  schedules: '定时调度', approvals: '待审批', voice: '语音', documents: '文档',
   communication: '通信概览',
   creative: 'Design', models: '模型管理', 'modules-manager': '模块管理',
   memory: '记忆', settings: '设置',
@@ -306,6 +310,7 @@ export function App(): JSX.Element {
           <ChatPage />
         </div>
         {page === 'workbench'        && <WorkbenchPage />}
+        {page === 'documents'        && <DocumentsPage />}
         {page === 'runs'             && <RunsPage />}
         {page === 'schedules'        && <SchedulesPage />}
         {page === 'communication'    && <CommunicationPage />}

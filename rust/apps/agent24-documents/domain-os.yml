@@ -1,0 +1,14 @@
+# Documenting domain OS (ADR-DOC-01 D3). Identity is derived from `name`:
+# namespace /api/v1/documents, data dir ~/.agent24/os/documents/, events with module `documents`.
+name: documents
+version: "0.1.0"
+route_namespace: /api/v1/documents
+event_module: documents
+data_dir: ~/.agent24/os/documents/
+# events: job progress (ADR-DOC-02 §7). models: extraction runs on the kernel's model router.
+kernel_capabilities: [events, models]
+# ADR-DOC-01 D8: written out even though it is the default.
+model_access: local_only
+impl_kind: out_of_process_provider
+spawn:
+  command: bin/agent24-documents

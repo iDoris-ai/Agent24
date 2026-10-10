@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import {
   parseAgentEarFrame,
   parseModelCallFrame,
+  parseModuleFrame,
   nextBackoffMs,
   AGENTEAR_MODULE_NAME,
   AGENTEAR_EVENT_KIND,
@@ -233,6 +234,40 @@ describe('AgentEarEventBridge — dispatches each frame to its own callback (ME4
     bridge.start()
     const socket = (bridge as unknown as { socket: FakeWebSocket }).socket
     expect(() => socket.emit('message', Buffer.from(modelCallFrame()))).not.toThrow()
+    bridge.stop()
+  })
+})
+
+describe('parseModuleFrame: any module\'s event', () => {
+  it('unwraps module, kind and payload, whichever module sent it', () => {
+    const payload = { job_id: 'job_1' }
+    expect(parseModuleFrame(moduleFrame({ module: 'documents', kind: 'job.finished', payload }))).toEqual({
+      module: 'documents',
+      kind: 'job.finished',
+      payload,
+    })
+    expect(parseModuleFrame(moduleFrame())).toEqual({ module: AGENTEAR_MODULE_NAME, kind: AGENTEAR_EVENT_KIND, payload: AGENTEAR_ENVELOPE })
+  })
+
+  it('returns null for anything else', () => {
+    expect(parseModuleFrame('{')).toBeNull()
+    expect(parseModuleFrame(moduleFrame({ type: 'run.started' }))).toBeNull()
+    expect(parseModuleFrame(moduleFrame({ payload: [1] }))).toBeNull()
+    expect(parseModuleFrame(moduleFrame({ payload: null }))).toBeNull()
+    expect(parseModuleFrame(JSON.stringify({ type: 'module', payload: { module: 1, kind: 'k', payload: {} } }))).toBeNull()
+    expect(parseModuleFrame(JSON.stringify({ type: 'module', payload: { module: 'm', payload: {} } }))).toBeNull()
+  })
+
+  it('the bridge hands every module event to onModuleEvent, and AgentEar\'s still to onEnvelope', () => {
+    const onEnvelope = vi.fn()
+    const onModuleEvent = vi.fn()
+    const bridge = new AgentEarEventBridge(onEnvelope, undefined, onModuleEvent)
+    bridge.start()
+    const socket = (bridge as unknown as { socket: FakeWebSocket }).socket
+    socket.emit('message', Buffer.from(moduleFrame({ module: 'documents', kind: 'job.finished', payload: { job_id: 'j' } })))
+    socket.emit('message', Buffer.from(moduleFrame()))
+    expect(onModuleEvent.mock.calls.map(([e]) => e.module)).toEqual(['documents', AGENTEAR_MODULE_NAME])
+    expect(onEnvelope).toHaveBeenCalledTimes(1)
     bridge.stop()
   })
 })

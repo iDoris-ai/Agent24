@@ -5,6 +5,13 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [Unreleased]
 
+- **DOC-1 第 1 片骨架（Documenting，`docs/documenting/`，ADR-DOC-01 / ADR-DOC-02）**：新增
+  `agent24-documents` crate —— 第一方进程外 domain OS `documents`（`domain-os.yml`：
+  `events` + `models`，`model_access: local_only`，不申请 `memory`），目前只有
+  `GET /api/v1/documents/capabilities`，所有第 1 片操作都报不可用并给出类型化原因。
+  **不随安装包分发、不默认安装**，开发期用 `agent24 os install` 手动安装；版本号 `0.1.0`
+  是这个 OS 自己的起始版本，不代表一次发布。
+
 - **D0-1（决策服务，`docs/agent/PLAN-DECIDE.md`，ADR-033）**：新增 `agent24-decide` crate
   —— `DecisionRequest`/`Question`/`Decision` 等类型、`DecisionBackend` trait、`RuleBackend`、
   级联 `DecisionService`。只是接口与一个确定性规则后端，**不接入 `agent24d`，不改任何现有

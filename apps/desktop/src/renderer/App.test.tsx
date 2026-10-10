@@ -176,6 +176,28 @@ describe('App', () => {
     })
   })
 
+  it('the Documents nav entry opens the documents page through its typed channel (#705)', async () => {
+    const request = vi.fn((req: { op: string }) =>
+      Promise.resolve(
+        req.op === 'list'
+          ? { ok: true, status: 200, data: { documents: [], next_cursor: null } }
+          : { ok: true, status: 200, data: { storage: { state: 'ready' } } },
+      ),
+    )
+    ;(window.agent24 as unknown as Record<string, unknown>).documents = {
+      request,
+      importFile: vi.fn(),
+      onImportProgress: () => () => {},
+      onEvent: () => () => {},
+    }
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getByRole('button', { name: /文档/ }))
+    await waitFor(() => expect(screen.getByText('还没有文档。')).toBeInTheDocument())
+    expect(request).toHaveBeenCalledWith({ op: 'list' })
+    // The page never falls back to the generic proxy for documents.
+    expect(mockBackendProxy.mock.calls.some(([r]) => String(r.path).includes('/documents'))).toBe(false)
+  })
+
   it('toggles sidebar collapse', async () => {
     await act(async () => { render(<App />) })
     const collapseBtn = screen.getByText('‹')

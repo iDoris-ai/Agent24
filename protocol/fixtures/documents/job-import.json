@@ -1,0 +1,11 @@
+{
+  "job_id": "job_01K75A0B1C2D3E4F5G6H7J8K9M",
+  "kind": "import",
+  "status": "succeeded",
+  "attempt": 1,
+  "progress": { "stage": "store", "done": 1, "total": 1, "unit": "file" },
+  "error": null,
+  "result": { "document_id": "doc_01K74Z3QJ8V5N2W9RTX6YB4MCD", "revision": 1 },
+  "created_at": "2026-10-09T09:00:00.000Z",
+  "updated_at": "2026-10-09T09:00:01.000Z"
+}

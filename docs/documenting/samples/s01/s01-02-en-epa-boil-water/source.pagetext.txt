@@ -1,0 +1,94 @@
+=== page 1 ===
+DRINKING WATER WARNING
+______________________________ water is Contaminated with E. coli
+(Name of Water System)
+BOIL YOUR WATER BEFORE USING
+What should I do?
+DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST. Bring all water to a boil, let it boil for
+three (3) minutes, and let it cool before using or use bottled water. Boiled or bottled water should be used for
+drinking, making ice, brushing teeth, washing dishes, and food preparation until further notice. Boiling kills
+bacteria and other organisms in the water.
+What does this mean?
+Inadequately treated or inadequately protected water may contain disease-causing organisms. These organisms can cause
+symptoms such as diarrhea, nausea, cramps and associated headaches. E. coli are bacteria whose presence indicates that
+the water may be contaminated with human or animal wastes. Human pathogens in these wastes can cause short-term
+effects, such as diarrhea, cramps, nausea, headaches, or other symptoms. They may pose a greater health risk for infants,
+young children, some of the elderly, and people with severely-compromised immune systems. These symptoms are not
+caused only by organisms in drinking water. If you experience any of these symptoms and they persist, you may want to
+seek medical advice.
+What happened? What is being done?
+Our water system detected E. coli bacteria in a pipe of our distribution system. As our customers, you have a right to know
+what happened and what we are doing to correct this situation. On (date) __________, we learned that coliform bacteria
+were present in at least one of our routine samples collected on (date) ______________. As required by the Revised Total
+Coliform Rule, one of our follow-up steps was to collect repeat samples at and near the location where the positive sample
+was originally taken. On (date) __________, we learned that coliform bacteria were also present in at least one of our repeat
+samples collected on (date) ______________. Our water system had a combination of routine and repeat positive samples
+where at least one of the positive coliform bacteria samples was also E. coli positive, which resulted in an E. coli maximum
+contaminant level (MCL) violation. We are now conducting a thorough investigation to determine the source of the
+contamination.
+Corrective action being taken includes (e.g., location of alternative water):
+___________________________________________________________________________________________________
+___________________________________________________________________________________________________
+___________________________________________________________________________________________________
+We will inform you when tests show no bacteria and you no longer need to boil your water. We anticipate resolving the
+problem within _______________ (estimated time frame). For more information, please contact______________________
+(name of contact) at ______________________ (phone number) or ____________________________________________
+(mailing address).
+General guidelines on ways to lessen the risk of infection by microbes are available from the EPA Safe Drinking Water
+Hotline at 1-800-426-4791.
+Please share this information with all the other people who drink this water, especially those who may not have received
+this notice directly (for example, people in apartments, nursing homes, schools, and businesses). You can do this by posting
+this notice in a public place or distributing copies by hand or mail. Updated 6/10/25
+ATTENTION: PWS OPERATOR/RESPONSIBLE PARTY
+=== page 2 ===
+Since exceeding the E. coli maximum contaminant level is a violation that requires Tier 1 public notification, you
+must provide public notice to persons served as soon as practical but within 24 hours after you learn of the
+violation (141.202(b)). During this same 24-hour period, you must also contact the Region 8 EPA Revised Total
+Coliform Rule Manager at 303-312-6072. If the emergency occurs after-hours or on the weekend, please call
+303-312-6327. You should also coordinate with your local health department. You may also have to modify this
+template for your particular circumstances.
+You must use one or more of the following methods to deliver the notice to consumers (141.202(c)):
+• Radio
+• Television
+• Hand or direct delivery
+• Posting in conspicuous locations
+You may need to use additional methods (e.g., newspaper, delivery of multiple copies to hospitals, clinics or
+apartments) since notice must be provided in a manner reasonably calculated to reach all persons served.
+This notice template is appropriate for hand delivery or newspaper publication. However, you may wish to
+modify it before using it for a radio or TV broadcast. If you do, you must still include all required PN elements
+and leave the health effects language in italics unchanged. This language is mandatory (141.205(d)). If you post
+or hand deliver the notice, you can print your notice on your water system letterhead.
+Corrective Action
+In your notice, describe corrective actions you are taking. Listed below are some steps commonly taken by water
+systems with E. coli violations. You can use one or more of the following actions, if appropriate, or develop your
+own:
+• We are chlorinating and flushing the water system.
+• We are switching to an alternate drinking water source.
+• We are increasing sampling for coliform bacteria to determine the source of the contamination.
+• We are repairing the wellhead seal.
+• We are restricting water intake from the river/lake/reservoir to prevent additional bacteria from
+entering the water system and restricting water use to emergencies.
+After Issuing the Notice
+Please send the copy of your public notice and certification using one of the following methods:
+Email: R8DWU@epa.gov
+Fax: 303-312-7517
+Mail: RTCR Manager
+US EPA REGION 8, Drinking Water Program (8WD-SDR)
+1595 Wynkoop Street
+Denver, CO 80202-1129.
+If you have questions about your Revised Total Coliform Rule violation, please call Jamie Harris, the RTCR
+Manager at 303-312-6072.
+It is recommended that you notify health professionals in the area of the violation. People may call their doctors
+with questions about how the violation may affect their health, and the doctors should have the information they
+need to respond appropriately.
+CERTIFICATION OF PUBLIC NOTIFICATION
+=== page 3 ===
+I _____________________________ certify that the attached public notice was issued from
+(PWS Operator/Responsible Party)
+________________________ to ___________________. The notice attached was issued by
+(Date) (Date)
+___________________________________ for the RTCR Violation that occurred on ______________.
+(Method of delivery – by hand, mail, etc) (Date)
+Signature __________________________________________ Date ____________________________
+Public Water System Name: ___________________________ PWS ID Number: _________________
+Rev. 06/10/2025

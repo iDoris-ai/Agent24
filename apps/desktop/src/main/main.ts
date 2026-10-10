@@ -5,6 +5,7 @@ import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
 import { AgentEarEventBridge } from './agentear-events'
+import { documentsEvent } from './documents'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
@@ -39,6 +40,12 @@ const modelCallLog = new ModelCallLog()
 const agentEarBridge = new AgentEarEventBridge(
   (envelope) => agentEarLog.ingest(envelope),
   (call) => modelCallLog.ingest(call),
+  // The Documenting OS's events go to the renderer as they come (ADR-DOC-01
+  // D5); hints only, so nothing is kept for a window that is not there.
+  (event) => {
+    const doc = documentsEvent(event)
+    if (doc && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.DocumentsEvent, doc)
+  },
 )
 
 // FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken

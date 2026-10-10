@@ -75,6 +75,12 @@ tags:
       is never a request parameter.
   - name: sin90
     description: The Sin90 Personal-OS module (own store; degrades independently).
+  - name: documents
+    description: >-
+      The Documenting domain OS (ADR-DOC-01 / ADR-DOC-02), an out-of-process
+      module served under `/api/v1/documents`. Every error carries
+      `details.retryable`; clients branch on `error.code`, never on the HTTP
+      status. Single local user (ADR-DOC-01 §3).
 
 paths:
   /health:
@@ -1672,6 +1678,489 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
+  /documents/capabilities:
+    get:
+      operationId: documentsGetCapabilities
+      tags: [documents]
+      summary: What the Documenting OS can do right now (ADR-DOC-02 §8)
+      responses:
+        "200":
+          description: Storage, engine and knowledge state, and per-operation availability
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsCapabilities" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents:
+    get:
+      operationId: documentsListDocuments
+      tags: [documents]
+      summary: List documents, newest first
+      parameters:
+        - $ref: "#/components/parameters/DocumentsCursor"
+        - $ref: "#/components/parameters/DocumentsLimit"
+      responses:
+        "200":
+          description: One page of documents
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentList" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents/{document_id}:
+    get:
+      operationId: documentsGetDocument
+      tags: [documents]
+      summary: Get one document and its head revision
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: The document
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentDetail" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/uploads:
+    post:
+      operationId: documentsCreateUpload
+      tags: [documents]
+      summary: Start a chunked upload (ADR-DOC-02 §5.6)
+      description: >-
+        Idempotent on `Idempotency-Key` (kind `upload`, §5.4): the same key
+        with the same body returns the existing upload; with a different
+        body, `idempotency_key_reused`. The body is checked before the key
+        is looked up, so an invalid body is 400 `invalid_request` even under
+        a used key.
+      parameters:
+        - $ref: "#/components/parameters/DocumentsIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentsUploadRequest" }
+      responses:
+        "200":
+          description: Replay of an existing upload with the same key and body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsUpload" }
+        "201":
+          description: Upload created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsUpload" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "422": { $ref: "#/components/responses/DocumentsUploadUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/uploads/{upload_id}/chunks:
+    post:
+      operationId: documentsAppendUploadChunk
+      tags: [documents]
+      summary: Append one chunk of raw bytes at the given offset
+      description: >-
+        At most 786432 bytes (768 KiB) of raw body per chunk, counted in
+        bytes by the OS, leaving room under the 1 MiB proxy body limit. An
+        offset equal to the bytes received so far appends; a chunk already
+        received with the same hash is a 200 replay; anything else is
+        `upload_offset_mismatch` with `details.received_offset` (§5.6). The
+        checks run in that order: for a new chunk (offset equal to the bytes
+        received so far), a `Chunk-Sha256` that does not match the body's
+        bytes is 400 `invalid_request`; for a range already received, any
+        hash other than the stored one is the 409 above, as §5.6 requires.
+        An upload that is complete or imported takes no new chunk: 409
+        `upload_offset_mismatch` with `details.received_offset`, decided
+        before the `total_size` and `Chunk-Sha256` checks (a received chunk
+        still replays). For an upload still receiving, a new chunk that would
+        run past `total_size` is 400 `invalid_request`. An unknown upload, or one
+        24 h after its last chunk, is 404 `not_found`. A body over 768 KiB
+        is 413 `payload_too_large`.
+      parameters:
+        - $ref: "#/components/parameters/UploadId"
+        - name: Upload-Offset
+          in: header
+          required: true
+          schema: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        - name: Chunk-Sha256
+          in: header
+          required: true
+          schema: { $ref: "#/components/schemas/Sha256Address" }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary, maxLength: 786432 }
+      responses:
+        "200":
+          description: The upload after this chunk
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsUpload" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/DocumentsConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/imports:
+    post:
+      operationId: documentsImport
+      tags: [documents]
+      summary: Import a completed upload as a new document (r1); starts a job
+      description: >-
+        Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on
+        `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job —
+        202 while it is queued, running or cancelling, and 202 again when a
+        failed or interrupted job is re-queued (same job_id, attempt + 1);
+        200 once it has succeeded (with `result`) or was cancelled (it stays
+        cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it).
+        The same `upload_id` with a different `title` — including a `title`
+        added or left out — is 422 `idempotency_key_reused`; an empty `title`
+        is 400, never the same as none. An unknown upload, or one past its 24 h
+        (§5.6), is 404 `not_found`; one that is not complete is 400
+        `invalid_request` with `details.received`. The whole file's hash and
+        its format are checked before the job starts: 422
+        `upload_checksum_mismatch` or `unsupported_format`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentsImportRequest" }
+      responses:
+        "200":
+          description: Replay of a job that already succeeded or was cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "202":
+          description: The import job, new, still running, or re-queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "422": { $ref: "#/components/responses/DocumentsImportUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/jobs/{job_id}:
+    get:
+      operationId: documentsGetJob
+      tags: [documents]
+      summary: Get a job; the row, not any event, is the authority (§7)
+      description: >-
+        One job, not paginated. A job's result, when it is a collection (e.g.
+        extraction values), is paginated by its own resource (ADR-DOC-02 §4).
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/jobs/{job_id}/cancel:
+    post:
+      operationId: documentsCancelJob
+      tags: [documents]
+      summary: Cancel a job (idempotent); a cancelled job is never revived by a replay
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job, now cancelling, cancelled, or already finished
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/jobs/{job_id}/retry:
+    post:
+      operationId: documentsRetryJob
+      tags: [documents]
+      summary: Explicitly restart a failed, interrupted or cancelled job (attempt + 1)
+      description: >-
+        A job that is queued, running, cancelling or succeeded cannot be
+        retried: 400 `invalid_request` with `details.status`. The route has
+        no idempotency key, so a retry whose outcome is unknown must not be
+        repeated blindly — repeating it after it landed and the job failed
+        again restarts the job a second time. Instead GET the job and compare
+        `attempt` with its value before the retry: a higher `attempt` means
+        the job was restarted (by this retry or by an import replay). An
+        unchanged `attempt` does not prove the retry was lost: it may still
+        be in flight, so read the job again before deciding. It answers 200
+        with the job,
+        where an import replay that re-queues answers 202: there the 202
+        says the import is still to be done, here the request itself is
+        the restart.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job, queued again
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents/{document_id}/revisions/{revision}/pages/{page}:
+    get:
+      operationId: documentsRenderPage
+      tags: [documents]
+      summary: Render one page of a revision as PNG (ADR-DOC-02 §4)
+      description: >-
+        The image is at most 1 MiB. The OS lowers `scale` until it fits and
+        reports the scale it used in `Documents-Render-Scale`. If the
+        requested area does not fit even at scale 0.25, the response is 413
+        `payload_too_large`: request smaller tiles with `region`. Renders are
+        a cache derived from the revision and can be rebuilt (§3). A page past
+        the revision's last page is 404 `not_found`; a flowing format (DOCX)
+        has no pages and is 422 `unsupported_format`.
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+        - $ref: "#/components/parameters/RevisionNumber"
+        - name: page
+          in: path
+          required: true
+          description: 1-based physical page.
+          schema: { type: integer, minimum: 1 }
+        - name: scale
+          in: query
+          required: false
+          schema: { type: number, minimum: 0.25, maximum: 4, default: 1 }
+        - name: region
+          in: query
+          required: false
+          description: >-
+            `x0,y0,x1,y1`: corners in CropBox points, origin at the top-left
+            of the displayed (rotated) page — the same frame and order as an
+            anchor's `rects` (David, 2026-10-10); for a JPEG or PNG, pixels
+            after EXIF orientation. `x0 < x1` and `y0 < y1`; an empty or
+            off-page region is 400 `invalid_request`.
+          schema:
+            type: string
+            pattern: "^[0-9]+(\\.[0-9]+)?(,[0-9]+(\\.[0-9]+)?){3}$"
+      responses:
+        "200":
+          description: The rendered page or region
+          headers:
+            Documents-Render-Scale:
+              description: The scale actually used, at most the one requested.
+              required: true
+              schema: { type: number, minimum: 0.25, maximum: 4 }
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "413": { $ref: "#/components/responses/DocumentsTooLarge" }
+        "422": { $ref: "#/components/responses/DocumentsRenderUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents/{document_id}/revisions/{revision}/text:
+    get:
+      operationId: documentsReadText
+      tags: [documents]
+      summary: Read the text layer of a revision, one page of blocks at a time
+      description: >-
+        Blocks come from the revision's pinned text layer; their text is stored
+        as parsed, not normalized, so anchor offsets stay valid (§3). A page
+        holds at most `limit` blocks and at most 512 KiB of serialized JSON;
+        the OS ends the page early to stay under that and continues from
+        `next_cursor` (§4). By
+        default a partial parse is reported in `parse_status`; with
+        `require_complete=true` it is 422 `partial_parse` (§6, Q8).
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+        - $ref: "#/components/parameters/RevisionNumber"
+        - name: block
+          in: query
+          required: false
+          description: >-
+            Start at this block id instead of the first one. Not with
+            `cursor`, which already holds the position: both is 400
+            `invalid_request` (David, 2026-10-10).
+          schema: { type: string, minLength: 1 }
+        - $ref: "#/components/parameters/DocumentsCursor"
+        - $ref: "#/components/parameters/DocumentsLimit"
+        - $ref: "#/components/parameters/DocumentsRequireComplete"
+      responses:
+        "200":
+          description: One page of blocks
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsTextPage" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "422": { $ref: "#/components/responses/DocumentsReadUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents/{document_id}/find:
+    post:
+      operationId: documentsFind
+      tags: [documents]
+      summary: Find text inside one revision; every match is an anchor
+      description: >-
+        A page holds at most `limit` matches and at most 512 KiB of serialized
+        JSON, then continues from `next_cursor` (§4). A partial parse is
+        reported with the regions that were not searched, or is 422
+        `partial_parse` with `require_complete` (§6).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentsFindRequest" }
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: One page of matches
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsFindResult" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "422": { $ref: "#/components/responses/DocumentsReadUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/documents/{document_id}/extractions:
+    post:
+      operationId: documentsExtract
+      tags: [documents]
+      summary: Extract fields from one revision, each value with its provenance; starts a job
+      description: >-
+        Idempotent on the business key (document_id, revision, schema_sha256,
+        extractor_version, model_id) — the actual model id, not a profile
+        (§5.4). The replay statuses are those of import: 202 while queued or
+        running or when a failed or interrupted job is re-queued (same job_id,
+        attempt + 1); 200 once it has succeeded (with `result.extraction_id`)
+        or was cancelled (it stays cancelled). To extract again on purpose,
+        send `rerun: true` with a new `Idempotency-Key`: that key joins the
+        business key, so resending it replays the same rerun and a new key
+        runs again; `rerun: true` without the header is 400
+        `invalid_request`, and the same key with a different request — the
+        JCS hash of the whole request body differs (§5.4; David, 2026-10-10)
+        — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise).
+        Field descriptions and the document text are untrusted data: the OS
+        passes them to the model under a fixed extraction instruction and
+        never follows instructions found in them. The model is called through the kernel under
+        `LocalOnly` (ADR-DOC-01 D8); with no local model available the
+        answer is 503 `engine_unavailable` with `details.engine` naming the
+        model.
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: >-
+            Required with `rerun: true`; ignored otherwise. Visible ASCII
+            without spaces, like every documents Idempotency-Key.
+          schema: { type: string, minLength: 1, maxLength: 200, pattern: "^[\\x21-\\x7E]+$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentsExtractRequest" }
+      responses:
+        "200":
+          description: Replay of an extraction job that already succeeded or was cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "202":
+          description: The extraction job, new, still running, or re-queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsJob" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "422": { $ref: "#/components/responses/DocumentsExtractUnprocessable" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
+  /documents/extractions/{extraction_id}:
+    get:
+      operationId: documentsGetExtraction
+      tags: [documents]
+      summary: Get an extraction's values, one page at a time
+      description: >-
+        Values follow the S01 gold-label shape (docs/documenting/samples):
+        `present` with `anchors[]` that together cover the whole proposition
+        (or `anchors: []` and `unsourced_reason` when there is no verifiable
+        source), `missing` with `missing_reason`, or `conflict` with every
+        candidate and its own `anchors[]`; a conflict is never resolved by the
+        extractor. A page holds at most
+        `limit` values and at most 512 KiB of serialized JSON (§4).
+      parameters:
+        - name: extraction_id
+          in: path
+          required: true
+          schema: { $ref: "#/components/schemas/ExtractionIdString" }
+        - $ref: "#/components/parameters/DocumentsCursor"
+        - $ref: "#/components/parameters/DocumentsLimit"
+      responses:
+        "200":
+          description: The extraction and one page of its values
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentsExtraction" }
+        "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
+        "503": { $ref: "#/components/responses/DocumentsUnavailable" }
+        "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1690,6 +2179,52 @@ components:
       required: true
       schema:
         type: string
+    DocumentId:
+      name: document_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/DocumentIdString" }
+    DocumentsCursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque `next_cursor` from the previous page (ADR-DOC-02 §4).
+      schema: { type: string }
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$" }
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/JobIdString" }
+    DocumentsIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Client-chosen key; reused on retry after an unknown outcome (§5.5).
+        Visible ASCII without spaces: a deliberate subset of what an HTTP
+        header value may carry.
+      schema: { type: string, minLength: 1, maxLength: 200, pattern: "^[\\x21-\\x7E]+$" }
+    RevisionNumber:
+      name: revision
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    DocumentsRequireComplete:
+      name: require_complete
+      in: query
+      required: false
+      description: Turn a partial parse into 422 `partial_parse` instead of a result status.
+      schema: { type: boolean, default: false }
+    DocumentsLimit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
 
   responses:
     Internal:
@@ -1729,6 +2264,101 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
 
+    DocumentsBadRequest:
+      description: >-
+        `invalid_request` from the OS (DocumentsError, with details), or
+        `invalid_request` / `invalid_request_path` from the kernel proxy (no
+        details).
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/DocumentsInvalidRequestError"
+              - allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties: { code: { enum: [invalid_request, invalid_request_path] }, details: false }
+    DocumentsNotFound:
+      description: >-
+        `not_found`: the document, revision, job or upload does not exist or
+        has expired (DocumentsError), or the kernel has no such route
+        (generic Error).
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/DocumentsNotFoundError"
+              - allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties: { code: { enum: [not_found] }, details: false }
+    DocumentsConflict:
+      description: "`upload_offset_mismatch` with `details.received_offset` (§5.6)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsConflictError" }
+    DocumentsTooLarge:
+      description: "`payload_too_large`: the render does not fit in 1 MiB even at scale 0.25; request a smaller `region`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsTooLargeError" }
+    DocumentsRenderUnprocessable:
+      description: "`unsupported_format` or `parse_failed` (§6); render has no `require_complete`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsRenderUnprocessableError" }
+    DocumentsExtractUnprocessable:
+      description: >-
+        `unsupported_format`, `parse_failed`, or `idempotency_key_reused` when
+        a rerun key is reused with a different request (§5.4, §6).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsExtractUnprocessableError" }
+    DocumentsReadUnprocessable:
+      description: >-
+        Text and find: `unsupported_format`, `parse_failed`, or
+        `partial_parse` when `require_complete` was set (§6).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsReadUnprocessableError" }
+    DocumentsUploadUnprocessable:
+      description: "`idempotency_key_reused`: the same key with a different body (§5.4)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsUploadUnprocessableError" }
+    DocumentsImportUnprocessable:
+      description: >-
+        `idempotency_key_reused`, `upload_checksum_mismatch` (whole-file hash
+        checked at import, §5.6) or `unsupported_format`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DocumentsImportUnprocessableError" }
+    DocumentsUnavailable:
+      description: >-
+        Exactly one of: the OS reports `storage_unavailable`,
+        `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or
+        the kernel proxy reports the module unreachable (`module_not_ready`,
+        `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists
+        which proxy codes are safe to retry.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/DocumentsUnavailableError"
+              - $ref: "#/components/schemas/ModuleProxyError"
+    DocumentsProxyFailure:
+      description: >-
+        The kernel proxy could not complete the call: 500 (module failure),
+        502 (`upstream_unavailable`, `upstream_connection_closed`,
+        `request_abandoned`, …) or 504 (`upstream_timeout`). A 500 may also
+        be the OS's own `internal`, for a failure it did not expect. In every
+        case the module may have executed; resend with the same idempotency
+        key (ADR-DOC-02 §6).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ModuleProxyError" }
   schemas:
     DomainOsView:
       type: object
@@ -2753,6 +3383,877 @@ components:
       properties:
         error:
           $ref: "#/components/schemas/ErrorBody"
+
+    # ---- Documenting OS (ADR-DOC-02) ----
+    DocumentIdString:
+      type: string
+      description: >-
+        `doc_` + ULID, generated by the OS (ADR-DOC-02 §3). The first ULID
+        character is 0–7: larger values overflow 128 bits.
+      pattern: "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    Sha256Address:
+      type: string
+      pattern: "^sha256:[0-9a-f]{64}$"
+    DocumentsErrorCode:
+      type: string
+      description: Closed set; adding a code requires amending ADR-DOC-02 §6.
+      enum:
+        - invalid_request
+        - not_found
+        - payload_too_large
+        - unsupported_format
+        - parse_failed
+        - partial_parse
+        - idempotency_key_reused
+        - change_set_incomplete
+        - upload_checksum_mismatch
+        - knowledge_disabled
+        - revision_conflict
+        - change_set_stale
+        - change_set_committed
+        - upload_offset_mismatch
+        - stale_index
+        - permission_denied
+        - knowledge_unavailable
+        - engine_unavailable
+        - storage_unavailable
+    DocumentsError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code: { $ref: "#/components/schemas/DocumentsErrorCode" }
+            message: { type: string }
+            hint: { type: string }
+            details:
+              type: object
+              required: [retryable]
+              properties:
+                retryable: { type: boolean }
+              additionalProperties: true
+          # Code-specific details (ADR-DOC-02 §6).
+          allOf:
+            - if: { properties: { code: { const: engine_unavailable } } }
+              then:
+                properties:
+                  details:
+                    required: [engine]
+                    properties: { retryable: { const: true }, engine: { type: string } }
+            - if: { properties: { code: { const: knowledge_unavailable } } }
+              then:
+                properties: { details: { properties: { retryable: { const: true } } } }
+            - if: { properties: { code: { const: revision_conflict } } }
+              then:
+                properties:
+                  details:
+                    required: [current_revision]
+                    properties: { current_revision: { type: integer, minimum: 1 } }
+            - if: { properties: { code: { const: change_set_committed } } }
+              then:
+                properties:
+                  details:
+                    required: [revision]
+                    properties: { revision: { type: integer, minimum: 1 } }
+            - if: { properties: { code: { const: upload_offset_mismatch } } }
+              then:
+                properties:
+                  details:
+                    required: [received_offset]
+                    properties: { received_offset: { type: integer, minimum: 0, maximum: 9007199254740991 } }
+            # storage_unavailable: retryable depends on the cause (ADR-DOC-02 §6,
+            # David 2026-10-08) — only lock contention is worth an automatic retry.
+            - if: { properties: { code: { const: storage_unavailable } } }
+              then:
+                properties:
+                  details:
+                    required: [cause]
+                    properties:
+                      cause: { enum: [locked, busy, corrupt, not_writable, disk_full] }
+                    allOf:
+                      - if: { properties: { cause: { enum: [locked, busy] } } }
+                        then: { properties: { retryable: { const: true } } }
+                        else: { properties: { retryable: { const: false } } }
+    DocumentsUnavailableError:
+      description: The three availability codes a 503 from the OS itself may carry.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [storage_unavailable, engine_unavailable, knowledge_unavailable] }
+    DocumentsInvalidRequestError:
+      description: A 400 from the OS itself.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [invalid_request] }
+    DocumentsNotFoundError:
+      description: A 404 from the OS itself.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [not_found] }
+    DocumentsConflictError:
+      description: The 409s of the slice-1 upload routes.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [upload_offset_mismatch] }
+    DocumentsTooLargeError:
+      description: A 413 from the OS itself.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [payload_too_large] }
+    DocumentsRenderUnprocessableError:
+      description: The 422s of render.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [unsupported_format, parse_failed] }
+    DocumentsExtractUnprocessableError:
+      description: The 422s of extraction.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [unsupported_format, parse_failed, idempotency_key_reused] }
+    DocumentsReadUnprocessableError:
+      description: The 422s of text and find.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [unsupported_format, parse_failed, partial_parse] }
+    DocumentsUploadUnprocessableError:
+      description: The 422 of upload creation.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [idempotency_key_reused] }
+    DocumentsImportUnprocessableError:
+      description: The 422s of import.
+      allOf:
+        - $ref: "#/components/schemas/DocumentsError"
+        - type: object
+          properties:
+            error:
+              properties:
+                code: { enum: [idempotency_key_reused, upload_checksum_mismatch, unsupported_format] }
+    ModuleProxyError:
+      description: >-
+        An error produced by the kernel or its proxy: the generic envelope,
+        with any code except the ones only the Documenting OS uses.
+        `invalid_request`, `not_found` and `payload_too_large` are shared with
+        the kernel and stay allowed. One exception comes from the OS itself: a
+        500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The
+        OS's `internal` always has `details.retryable: false`; a kernel
+        `internal` may have no details, but an `internal` is never retryable.
+        The rule holds wherever this schema is used: the 500 response and,
+        through `DocumentsUnavailable`, the 503 one.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - if: { properties: { error: { required: [code], properties: { code: { const: internal } } } } }
+          then:
+            properties:
+              error:
+                properties:
+                  details:
+                    required: [retryable]
+                    properties: { retryable: { const: false } }
+        - type: object
+          properties:
+            error:
+              properties:
+                code:
+                  not:
+                    enum:
+                      - unsupported_format
+                      - parse_failed
+                      - partial_parse
+                      - idempotency_key_reused
+                      - change_set_incomplete
+                      - upload_checksum_mismatch
+                      - knowledge_disabled
+                      - revision_conflict
+                      - change_set_stale
+                      - change_set_committed
+                      - upload_offset_mismatch
+                      - stale_index
+                      - permission_denied
+                      - knowledge_unavailable
+                      - engine_unavailable
+                      - storage_unavailable
+    DocumentsOperationStatus:
+      oneOf:
+        - type: object
+          required: [op, available]
+          properties:
+            op: { type: string }
+            available: { type: boolean, const: true }
+            reason: { type: "null" }
+        - type: object
+          required: [op, available, reason]
+          properties:
+            op: { type: string }
+            available: { type: boolean, const: false }
+            reason: { $ref: "#/components/schemas/DocumentsErrorCode" }
+    DocumentsCapabilities:
+      type: object
+      required: [os_version, storage, engines, knowledge, operations]
+      properties:
+        os_version: { type: string }
+        storage:
+          type: object
+          required: [state]
+          properties:
+            state: { type: string, enum: [ready, degraded, unavailable] }
+        engines:
+          type: array
+          items:
+            type: object
+            required: [id, kind, formats, state]
+            properties:
+              id: { type: string }
+              kind: { type: string, enum: [parse, ocr, render, export] }
+              formats: { type: array, items: { type: string } }
+              state: { type: string, enum: [absent, installing, ready, failed] }
+              version: { type: [string, "null"] }
+        knowledge:
+          type: object
+          required: [setting, state]
+          properties:
+            setting: { type: string, enum: ["on", "off"] }
+            state:
+              type: string
+              enum: [registered, loading, ready, degraded, unavailable, disabled]
+        operations:
+          type: array
+          items: { $ref: "#/components/schemas/DocumentsOperationStatus" }
+    DocumentRevisionSummary:
+      type: object
+      required: [revision, content_sha256, size, media_type]
+      properties:
+        revision: { type: integer, minimum: 1 }
+        content_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        size: { type: integer, minimum: 0 }
+        media_type: { $ref: "#/components/schemas/DocumentsMediaType" }
+    Document:
+      type: object
+      required: [document_id, title, media_type, head_revision, created_at, updated_at]
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        title: { type: string }
+        media_type: { $ref: "#/components/schemas/DocumentsMediaType" }
+        head_revision: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    DocumentDetail:
+      allOf:
+        - $ref: "#/components/schemas/Document"
+        - type: object
+          required: [head]
+          properties:
+            head: { $ref: "#/components/schemas/DocumentRevisionSummary" }
+    JobIdString:
+      type: string
+      pattern: "^job_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    DocumentsUploadRequest:
+      type: object
+      required: [total_size, sha256]
+      additionalProperties: false
+      properties:
+        total_size:
+          type: integer
+          description: >-
+            Written as a JSON integer literal: a fraction or exponent spelling
+            (`10.0`, `1e1`) is refused with 400 even when its value is whole,
+            because parsing such a spelling can round it. JSON Schema's
+            `integer` cannot express a spelling, so this rule is the OS's,
+            checked on the raw body.
+          minimum: 1
+          # 2^53 − 1, the largest JavaScript safe integer. The OS hashes requests
+          # in JCS (ADR-DOC-02 §5.4) and supports integers only in this range,
+          # where JCS writes them as plain decimal.
+          maximum: 9007199254740991
+        sha256:
+          $ref: "#/components/schemas/Sha256Address"
+          description: Whole-file hash, checked at import (`upload_checksum_mismatch`).
+        filename:
+          type: string
+          description: >-
+            Display name only, used as the default title. A base name, never a
+            path (ADR-001): no `/` or `\`, and no NUL.
+          minLength: 1
+          maxLength: 255
+          pattern: "^[^/\\\\\\u0000]+$"
+    DocumentsUpload:
+      type: object
+      required: [upload_id, total_size, sha256, received, status, expires_at]
+      properties:
+        upload_id: { type: string, pattern: "^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$" }
+        total_size: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        sha256: { $ref: "#/components/schemas/Sha256Address" }
+        received: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        status: { type: string, enum: [receiving, complete, imported, expired] }
+        expires_at:
+          type: string
+          format: date-time
+          description: 24 h after the last chunk arrived (§5.6).
+    DocumentsImportRequest:
+      type: object
+      required: [upload_id]
+      additionalProperties: false
+      properties:
+        upload_id: { type: string, pattern: "^upl_[0-7][0-9A-HJKMNP-TV-Z]{25}$" }
+        title: { type: string, minLength: 1, maxLength: 500 }
+    DocumentsJob:
+      type: object
+      required: [job_id, kind, status, attempt, created_at, updated_at]
+      properties:
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+        kind:
+          type: string
+          description: >-
+            `import` and `extract` in slice 1; later slices add more (e.g.
+            `export`), so clients must tolerate unknown kinds.
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+        status:
+          type: string
+          enum: [queued, running, cancelling, succeeded, failed, cancelled, interrupted]
+        attempt: { type: integer, minimum: 1 }
+        progress:
+          type: [object, "null"]
+          required: [stage, done, total, unit]
+          properties:
+            stage: { type: string }
+            done: { type: integer, minimum: 0 }
+            total: { type: [integer, "null"], minimum: 0 }
+            unit: { type: string }
+        error:
+          type: [object, "null"]
+          required: [code, message]
+          description: >-
+            Set when `failed`; `cancelled` appears only here, never as an HTTP
+            error (§6).
+          properties:
+            code:
+              anyOf:
+                - $ref: "#/components/schemas/DocumentsErrorCode"
+                - const: cancelled
+            message: { type: string }
+        result:
+          type: [object, "null"]
+          description: Set when `succeeded`, e.g. the imported document and its r1, or the extraction.
+          properties:
+            document_id: { $ref: "#/components/schemas/DocumentIdString" }
+            revision: { type: integer, minimum: 1 }
+            extraction_id: { $ref: "#/components/schemas/ExtractionIdString" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      allOf:
+        # failed: carries an error from the closed set (never "cancelled").
+        - if: { properties: { status: { const: failed } } }
+          then:
+            required: [error]
+            properties:
+              error:
+                type: object
+                properties: { code: { $ref: "#/components/schemas/DocumentsErrorCode" } }
+        # cancelled: no error, or the "cancelled" marker only.
+        - if: { properties: { status: { const: cancelled } } }
+          then:
+            properties:
+              error:
+                anyOf:
+                  - type: "null"
+                  - type: object
+                    properties: { code: { const: cancelled } }
+        # still working, interrupted by a restart, or succeeded: no error.
+        - if: { properties: { status: { enum: [queued, running, cancelling, interrupted, succeeded] } } }
+          then: { properties: { error: { type: "null" } } }
+        # only a succeeded job has a result.
+        - if: { properties: { status: { enum: [queued, running, cancelling, failed, cancelled, interrupted] } } }
+          then: { properties: { result: { type: "null" } } }
+        # a succeeded extraction names its result.
+        - if:
+            properties: { status: { const: succeeded }, kind: { const: extract } }
+            required: [status, kind]
+          then:
+            required: [result]
+            properties:
+              result:
+                type: object
+                required: [extraction_id]
+                properties:
+                  extraction_id: { $ref: "#/components/schemas/ExtractionIdString" }
+        # a succeeded import names its document and r1.
+        - if:
+            properties: { status: { const: succeeded }, kind: { const: import } }
+            required: [status, kind]
+          then:
+            required: [result]
+            properties:
+              result:
+                type: object
+                required: [document_id, revision]
+                properties:
+                  document_id: { $ref: "#/components/schemas/DocumentIdString" }
+                  revision: { const: 1 }
+    # ── Documents events (ADR-DOC-02 §7) ──
+    # The OS sends these through `_a24/events/emit`; on the WS stream each is
+    # a `type: "module"` event (events.schema.json `ModuleEventPayload`) with
+    # `module: "documents"`, the `kind` named below and this object as its
+    # `payload`. The stream reaches every WS client, so a payload carries ids,
+    # stage, counts, status and error codes only: never a title, a file name,
+    # a query or content. Events are hints: the job row is the authority, and
+    # a client that reconnects or misses one reads `GET /jobs/{job_id}`.
+    # The OS sends exactly these fields (closed, so a contract test catches a
+    # leak); clients still ignore kinds and fields they do not know, which a
+    # later version may add.
+    DocumentsJobProgressEvent:
+      description: >-
+        kind `job.progress`: a job's latest progress. Coalesced per job, at
+        most 2 events a second for the whole module; one dropped by the rate
+        limit is not sent again.
+      type: object
+      required: [job_id, kind, stage, done, total, unit]
+      additionalProperties: false
+      properties:
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+        kind: { type: string, description: "The job's kind, as in DocumentsJob." }
+        stage: { type: string }
+        done: { type: integer, minimum: 0 }
+        total: { type: [integer, "null"], minimum: 0 }
+        unit: { type: string }
+    DocumentsJobFinishedEvent:
+      description: >-
+        kind `job.finished`: a job reached an end state. Sent ahead of
+        progress and, if rate-limited, once more after a short backoff. A job
+        that is started again by its key or by `retry` finishes again with
+        a higher `attempt`. Jobs that startup recovery ends (`interrupted`,
+        `cancelled`) are announced once too, best effort and at most 256
+        (David, 2026-10-10).
+      type: object
+      required: [job_id, kind, status, attempt, error_code]
+      additionalProperties: false
+      properties:
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+        kind: { type: string, description: "The job's kind, as in DocumentsJob." }
+        status: { type: string, enum: [succeeded, failed, cancelled, interrupted] }
+        attempt: { type: integer, minimum: 1 }
+        error_code:
+          description: The job's `error.code` when `failed` or `cancelled`, else null.
+          anyOf:
+            - type: "null"
+            - $ref: "#/components/schemas/DocumentsErrorCode"
+            - const: cancelled
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+      allOf:
+        # As in DocumentsJob: failed has a code from the closed set, cancelled
+        # has none or the "cancelled" marker, the others have none.
+        - if: { properties: { status: { const: failed } } }
+          then: { properties: { error_code: { $ref: "#/components/schemas/DocumentsErrorCode" } } }
+        - if: { properties: { status: { const: cancelled } } }
+          then: { properties: { error_code: { enum: [null, cancelled] } } }
+        - if: { properties: { status: { enum: [succeeded, interrupted] } } }
+          then: { properties: { error_code: { type: "null" } } }
+    DocumentsDocumentImportedEvent:
+      description: >-
+        kind `document.imported`: an import committed a new document and its
+        first revision. Sent with the import job's `job.finished`.
+      type: object
+      required: [document_id, revision, job_id]
+      additionalProperties: false
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { const: 1 }
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+    DocumentsRevisionCommittedEvent:
+      description: >-
+        kind `revision.committed`: a commit made a new head revision (slice 2;
+        slice 1 never sends it). Sent ahead of progress, like `job.finished`.
+      type: object
+      required: [document_id, revision]
+      additionalProperties: false
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 2 }
+        job_id: { $ref: "#/components/schemas/JobIdString" }
+    DocumentsEngineRef:
+      type: object
+      required: [id, version]
+      properties:
+        id: { type: string, minLength: 1 }
+        version: { type: string, minLength: 1 }
+    DocumentsGeometry:
+      type: object
+      description: >-
+        PDF CropBox frame, in points multiplied by UserUnit, origin at the
+        top-left of the page as displayed after /Rotate (§3). Each rect is
+        [x0, y0, x1, y1] with x0 ≤ x1 and y0 ≤ y1 (checked by the OS, not
+        expressible here); several rects cover a span across lines or columns.
+        A JPEG or PNG is one page: its frame is the image as displayed after
+        its EXIF orientation, 1 pixel = 1 pt (David, 2026-10-10).
+      required: [box, unit, origin, rects]
+      properties:
+        box: { type: string, const: CropBox }
+        unit: { type: string, const: pt }
+        origin: { type: string, const: top-left-rotated }
+        rects:
+          type: array
+          minItems: 1
+          items:
+            type: array
+            minItems: 4
+            maxItems: 4
+            items: { type: number, minimum: 0 }
+    DocumentsMediaType:
+      type: string
+      description: >-
+        Lowercase `type/subtype` without parameters, as the OS records it at
+        import (`application/pdf`, not `Application/PDF; x=y`).
+      pattern: "^[a-z0-9.+-]+/[a-z0-9.+-]+$"
+    DocumentsPaginatedMediaType:
+      description: >-
+        The paginated formats: their anchors and blocks have a page and
+        geometry; every other format is flowing and has neither (§3).
+      type: string
+      enum: [application/pdf, image/jpeg, image/png]
+    DocumentsTextRange:
+      type: object
+      description: >-
+        UTF-8 byte offsets into the block text, half-open [start, end) with
+        start ≤ end ≤ the block's byte length, in logical (stored) order;
+        both on character boundaries (§3). The OS checks these; a client that
+        finds the quote or hashes no longer match shows the anchor as stale
+        ("定位失效") instead of guessing a position.
+      required: [unit, start, end]
+      properties:
+        unit: { type: string, const: utf8 }
+        start: { type: integer, minimum: 0 }
+        end: { type: integer, minimum: 0 }
+    DocumentsAnchor:
+      type: object
+      description: >-
+        Per-value provenance (ADR-DOC-02 §3). Bound to the pinned text layer,
+        never migrated across revisions; `block_text_sha256` + `quote` +
+        `rects` let a client detect a stale anchor instead of guessing.
+      required: [document_id, revision, content_sha256, media_type, text_layer_sha256, engine, block_id, block_text_sha256, text_range, quote]
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+        content_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        media_type:
+          $ref: "#/components/schemas/DocumentsMediaType"
+          description: >-
+            Media type of the anchored revision. It tells a client, and this
+            schema, whether the source is paginated (PDF, images) or flowing
+            (e.g. DOCX in slice 2).
+        text_layer_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        engine: { $ref: "#/components/schemas/DocumentsEngineRef" }
+        block_id: { type: string, minLength: 1 }
+        page:
+          type: integer
+          minimum: 1
+          description: 1-based physical page; omitted for flowing formats such as DOCX.
+        block_text_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        text_range: { $ref: "#/components/schemas/DocumentsTextRange" }
+        geometry: { $ref: "#/components/schemas/DocumentsGeometry" }
+        quote: { type: string, minLength: 1 }
+      # Paginated sources (PDF, scans) always give a page and its geometry;
+      # flowing ones (DOCX) give neither (§3).
+      if:
+        properties: { media_type: { $ref: "#/components/schemas/DocumentsPaginatedMediaType" } }
+        required: [media_type]
+      then:
+        required: [page, geometry]
+        properties: { page: { type: integer, minimum: 1 }, geometry: { $ref: "#/components/schemas/DocumentsGeometry" } }
+      else:
+        properties: { page: false, geometry: false }
+    DocumentsTextBlock:
+      type: object
+      required: [block_id, text, text_sha256]
+      properties:
+        block_id: { type: string, minLength: 1 }
+        page: { type: integer, minimum: 1 }
+        text: { type: string }
+        text_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        geometry: { $ref: "#/components/schemas/DocumentsGeometry" }
+      dependentRequired:
+        page: [geometry]
+        geometry: [page]
+    DocumentsUnparsedRegion:
+      type: object
+      required: [reason]
+      properties:
+        page: { type: integer, minimum: 1 }
+        geometry: { $ref: "#/components/schemas/DocumentsGeometry" }
+        reason: { type: string, minLength: 1 }
+    DocumentsTextPage:
+      type: object
+      required: [document_id, revision, content_sha256, media_type, text_layer_sha256, engine, parse_status, blocks, next_cursor]
+      properties:
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+        content_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        media_type:
+          $ref: "#/components/schemas/DocumentsMediaType"
+          description: Media type of the revision; see DocumentsAnchor.media_type.
+        text_layer_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        engine: { $ref: "#/components/schemas/DocumentsEngineRef" }
+        parse_status: { type: string, enum: [complete, partial] }
+        unparsed_regions:
+          type: array
+          items: { $ref: "#/components/schemas/DocumentsUnparsedRegion" }
+        blocks:
+          type: array
+          maxItems: 200
+          items: { $ref: "#/components/schemas/DocumentsTextBlock" }
+        next_cursor: { type: [string, "null"] }
+      allOf:
+        - if: { properties: { parse_status: { const: partial } } }
+          then: { required: [unparsed_regions], properties: { unparsed_regions: { minItems: 1 } } }
+          else: { properties: { unparsed_regions: { maxItems: 0 } } }
+        # every block of a paginated source has a page and its geometry; a
+        # flowing source's blocks have neither (§3)
+        - if:
+            properties: { media_type: { $ref: "#/components/schemas/DocumentsPaginatedMediaType" } }
+            required: [media_type]
+          then:
+            properties:
+              blocks:
+                items:
+                  required: [page, geometry]
+                  properties: { page: { type: integer, minimum: 1 }, geometry: { $ref: "#/components/schemas/DocumentsGeometry" } }
+          else:
+            properties:
+              blocks:
+                items:
+                  properties: { page: false, geometry: false }
+    DocumentsFindRequest:
+      type: object
+      required: [revision, query]
+      additionalProperties: false
+      properties:
+        revision: { type: integer, minimum: 1 }
+        query: { type: string, minLength: 1, maxLength: 500 }
+        cursor: { type: string }
+        limit: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        require_complete: { type: boolean, default: false }
+    DocumentsFindResult:
+      type: object
+      required: [parse_status, matches, next_cursor]
+      properties:
+        parse_status: { type: string, enum: [complete, partial] }
+        unparsed_regions:
+          type: array
+          description: The regions that were not searched, so "no match" is not mistaken for "not there".
+          items: { $ref: "#/components/schemas/DocumentsUnparsedRegion" }
+        matches:
+          type: array
+          maxItems: 200
+          items: { $ref: "#/components/schemas/DocumentsAnchor" }
+        next_cursor: { type: [string, "null"] }
+      if: { properties: { parse_status: { const: partial } } }
+      then: { required: [unparsed_regions], properties: { unparsed_regions: { minItems: 1 } } }
+      else: { properties: { unparsed_regions: { maxItems: 0 } } }
+    ExtractionIdString:
+      type: string
+      pattern: "^ext_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    DocumentsExtractField:
+      type: object
+      required: [key, description]
+      additionalProperties: false
+      properties:
+        key: { type: string, pattern: "^[a-z][a-z0-9_]{0,63}$" }
+        description:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: What to find, in the reader's words.
+        type:
+          type: string
+          enum: [text, date, datetime, amount, number, identifier, boolean]
+          description: A hint for the extractor; values keep the source wording either way.
+    DocumentsExtractRequest:
+      type: object
+      required: [revision, schema]
+      additionalProperties: false
+      properties:
+        revision:
+          type: integer
+          minimum: 1
+          # Hashed for the rerun key (§5.4 JCS), which takes safe integers only.
+          maximum: 9007199254740991
+        schema:
+          type: object
+          required: [fields]
+          additionalProperties: false
+          properties:
+            fields:
+              type: array
+              minItems: 1
+              maxItems: 100
+              items: { $ref: "#/components/schemas/DocumentsExtractField" }
+        rerun: { type: boolean, default: false }
+    DocumentsEvidence:
+      type: array
+      minItems: 1
+      maxItems: 16
+      description: >-
+        Anchors that together cover the whole proposition: the value and what
+        decides its meaning — condition, audience, negation, table row label
+        and column header (samples README §4.2). They may span blocks and pages.
+      items: { $ref: "#/components/schemas/DocumentsAnchor" }
+    DocumentsExtractCandidate:
+      type: object
+      required: [value, normalized, anchors]
+      additionalProperties: false
+      properties:
+        value: { type: string, description: As written in the source. }
+        normalized:
+          type: string
+          description: >-
+            For comparison only. Required here: candidates conflict because
+            their normalized forms differ.
+        anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+    DocumentsExtractedValue:
+      type: object
+      required: [key, status]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,63}$"
+          description: The `key` of the requested field.
+        status: { type: string, enum: [present, missing, conflict] }
+        value: { type: string, description: As written in the source; never rewritten. }
+        normalized:
+          type: string
+          description: >-
+            For comparison only. Optional on a present value: some values
+            (free text) have no normal form.
+        anchors:
+          type: array
+          description: >-
+            Evidence for a present value (see DocumentsEvidence). Empty only
+            when the value has no verifiable source, and then
+            `unsourced_reason` says why (ADR-DOC-02 §3). At most 16.
+          maxItems: 16
+          items: { $ref: "#/components/schemas/DocumentsAnchor" }
+        unsourced_reason: { type: string, minLength: 1 }
+        missing_reason:
+          type: string
+          enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+        candidates:
+          type: array
+          minItems: 2
+          maxItems: 8
+          items: { $ref: "#/components/schemas/DocumentsExtractCandidate" }
+      allOf:
+        # present: a value, and evidence or the reason there is none (§3).
+        - if: { properties: { status: { const: present } } }
+          then:
+            required: [value, anchors]
+            properties:
+              value: { type: string }
+              anchors: { type: array, items: { $ref: "#/components/schemas/DocumentsAnchor" } }
+              candidates: false
+              missing_reason: false
+            # no anchors: say why; anchors: they are the evidence, and
+            # there is nothing to excuse.
+            if: { properties: { anchors: { maxItems: 0 } } }
+            then:
+              required: [unsourced_reason]
+              properties: { unsourced_reason: { type: string, minLength: 1 } }
+            else:
+              properties:
+                anchors: { $ref: "#/components/schemas/DocumentsEvidence" }
+                unsourced_reason: false
+        # missing: why, and nothing asserted.
+        - if: { properties: { status: { const: missing } } }
+          then:
+            required: [missing_reason]
+            properties:
+              missing_reason:
+                type: string
+                enum: [blank_in_template, not_in_document, referenced_but_absent, outside_page_scope]
+              value: false
+              normalized: false
+              anchors: false
+              candidates: false
+              unsourced_reason: false
+        # conflict: every candidate with its evidence, none chosen.
+        - if: { properties: { status: { const: conflict } } }
+          then:
+            required: [candidates]
+            properties:
+              candidates:
+                type: array
+                minItems: 2
+                items: { $ref: "#/components/schemas/DocumentsExtractCandidate" }
+              value: false
+              normalized: false
+              anchors: false
+              missing_reason: false
+              unsourced_reason: false
+    DocumentsExtraction:
+      type: object
+      required: [extraction_id, document_id, revision, content_sha256, schema_sha256, extractor_version, model_id, created_at, values, next_cursor]
+      properties:
+        extraction_id: { $ref: "#/components/schemas/ExtractionIdString" }
+        document_id: { $ref: "#/components/schemas/DocumentIdString" }
+        revision: { type: integer, minimum: 1 }
+        content_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        schema_sha256: { $ref: "#/components/schemas/Sha256Address" }
+        extractor_version: { type: string, minLength: 1 }
+        model_id:
+          type: string
+          minLength: 1
+          description: The model actually used (§5.4), always a local one (ADR-DOC-01 D8).
+        created_at: { type: string, format: date-time }
+        values:
+          type: array
+          maxItems: 200
+          items: { $ref: "#/components/schemas/DocumentsExtractedValue" }
+        next_cursor: { type: [string, "null"] }
+    DocumentList:
+      type: object
+      required: [documents, next_cursor]
+      properties:
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/Document" }
+        next_cursor: { type: [string, "null"] }
 
     # ---- Sin90 module (SIN90-domain.md) ----
     Sin90DirectionStatus:

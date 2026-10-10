@@ -59,7 +59,7 @@
 **锚点**（README §8 / §11.4 逐值溯源）：
 
 ```json
-{ "document_id": "doc_…", "revision": 1, "content_sha256": "sha256:…",
+{ "document_id": "doc_…", "revision": 1, "content_sha256": "sha256:…", "media_type": "application/pdf",
   "text_layer_sha256": "sha256:…", "engine": { "id": "…", "version": "…" },
   "block_id": "p3/b12", "page": 3, "block_text_sha256": "sha256:…",
   "text_range": { "unit": "utf8", "start": 120, "end": 168 },
@@ -68,18 +68,62 @@
   "quote": "原文片段" }
 ```
 
-- **定位**：`block_id` 是结构路径，DOCX 等流式格式用它定位，`page` 可省略；PDF / 扫描件给出 1 起的物理页号。`geometry` 以 PDF **CropBox** 为参照框，单位为乘过 `UserUnit` 的点，原点在应用 `/Rotate` 后显示页面的左上角；`rects[]` 覆盖跨行、跨栏的片段。
+- **定位**：`block_id` 是结构路径，DOCX 等流式格式只用它定位，不给 `page`；PDF / 扫描件给出 1 起的物理页号。`media_type` 标明锚点所在 revision 的格式：分页格式（PDF、JPEG、PNG）必须同时给出 `page` 和 `geometry`，流式格式两者都不给（2026-10-09 增补，让锚点能自我说明是否分页，回应 OpenAPI B2a 的审查）。`geometry` 以 PDF **CropBox** 为参照框，单位为乘过 `UserUnit` 的点，原点在应用 `/Rotate` 后显示页面的左上角；`rects[]` 覆盖跨行、跨栏的片段，每个矩形是角点对 `[x0, y0, x1, y1]`。图片（JPEG、PNG）只有一页，按 EXIF 方向显示后，1 像素记为 1 点（David，2026-10-10）。
 - **偏移**：单位是 **UTF-8 字节**，相对块文本，半开区间 `[start, end)`，按**逻辑（存储）顺序**计，不按双向文本的视觉顺序；起止必须落在字符边界，否则 `invalid_request`。
   - 理由：OS 和引擎都是 Rust/UTF-8；块文本原样存储、不做规范化，偏移因此确定。渲染进程统一经 `api-client` 的换算函数转成 UTF-16。
   - 高亮时界面扩展到**字素簇边界**（UAX #29：泰文、组合符、ZWJ 序列），存储的偏移不变。
 - **重新解析与 OCR**：锚点绑定 `text_layer_sha256`，不要求 OCR 可复现。即使用同一个钉住版本重跑，也不假定逐字节一致，解析始终用那份存储的文本层。`block_text_sha256` + `quote` + `rects` 用于校验，不一致时显示“定位失效”，**不猜位置**。
 - **不跨 revision 迁移**：r1 的锚点永远指向 r1。要在 r2 上定位，只能重新抽取。
-- **无来源**：没有可核验来源的值，`anchor: null` 并附 `unsourced_reason`。
+- **无来源**：没有可核验来源的值，`anchors` 为空并附 `unsourced_reason`。有来源的值可以带多个锚点（`anchors[]`），共同覆盖整句命题：值本身，以及决定含义的条件、对象、否定词、表格行列标题，可跨块、跨页（与 `samples/README.md` §4.2 的金标结构一致；2026-10-09 由单个 `anchor` 改为数组，回应 OpenAPI B2b 的审查）。
+
+### 3.1 第 1 片文本层的落地（建议，待 David 确认，2026-10-10）
+
+第 1 片读取引擎是 PDFKit + Vision（ADR-DOC-01 D6 修订）。以下是落地细节的建议，实现按它做；David 改了哪条，就按改后的版本调整实现。对应 §9 的 Q11–Q14。
+
+- **辅助进程**：`agent24-documents-pdfkit`，单个 Swift 源文件，用 `swiftc` 构建，随 OS package 放在 `bin/agent24-documents` 旁边。
+  - 每次解析启动一次：`parse <文件路径>`，结果以一份 JSON 写到 stdout。非零退出码表示整份失败（`parse_failed`）；部分页失败不算整份失败，见下面的「部分解析」。
+  - Rust 侧限时（每份 120 s）、限输出（64 MiB），超时或超限就杀掉进程，记为 `parse_failed`。
+  - 整个 OS 同时最多运行 2 个辅助进程，再来的排队等待（最多 16 个），队列满就回 503 `engine_unavailable`（`retryable: true`）。
+  - 签名和公证跟随 OS package 的发布流程（jason）。开发期不签名。
+  - Linux 上没有这个辅助进程：`engines[]` 报 `absent`，读取类操作报 `engine_unavailable`（D10）。
+- **引擎标识**：`engine.id = apple-pdfkit`，`engine.version` 是 macOS 的版本号（如 `26.6`），因为 PDFKit 的行为随系统版本变化。辅助进程自身的协议版本、切分规则版本和下面的各项上限写进 config，参与 `config_sha256`（canonical JSON 的 sha256）。
+- **何时解析**：
+  - 导入成功后，导入 job 尽力而为地多做一步：用当前引擎解析出文本层并钉住。这一步失败不影响导入，导入不依赖引擎（Linux 上照常成功）。
+  - `read_range` / `find` 找不到当前引擎和 config 的文本层时，就在后台开始解析，并最多等 8 s（内核代理要求 10 s 内返回响应头）。到时还没完成，回 503 `engine_unavailable`（`retryable: true`），解析继续进行，客户端稍后重试即可。
+  - 同一组 `(content_sha256, engine, version, config_sha256)` 同时只解析一次，等待者共享结果。
+- **块**：每页按 PDFKit 给出的行，在阅读顺序上把相邻行合并成段落；行距明显变大，或者左缘不对齐，就开始新段落。
+  - 上限：块文本 ≤ 16 KiB（UTF-8），每块 ≤ 64 行。超出就在行边界拆成下一个块；单行本身超长，就在字符边界拆开。拆分在分配 `block_id`、计算哈希之前完成，所以任何一个块序列化后都远小于响应的 512 KiB 上限。
+  - `block_id` 是 `p{页}/b{序号}`，序号在页内从 1 起按阅读顺序编号。图片（JPEG、PNG）只有第 1 页。
+  - 块文本按引擎原样存储，不做规范化（§3）。行与行之间用 `\n` 连接，这个 `\n` 算作**前一行**的一部分，所以块文本里每个字节都属于某一行。
+- **几何**：每个块记录它的每一行，包括这一行在块文本里的 UTF-8 范围（含行尾的 `\n`）和它的矩形。
+  - 块的 `geometry.rects` 是这些行的矩形。
+  - 命中的锚点取它覆盖到的那些**整行**的矩形，至少一个。第 1 片不做字符级的矩形，高亮可能比原文宽，但不会漏掉。
+- **部分解析**：按页判断。
+  - 页上的每个图像区域（扫描页、有页脚文字的扫描页、印章、截图）都用 Vision 做 OCR，与 PDFKit 读出的文字不重叠的行照常组成块；OCR 没读出文字的图像，按无文字处理。
+  - OCR 失败，或者这页没法渲染：未能读出的区域记进 `unparsed_regions`（`page` + 区域的 `geometry` + `reason`），每页最多一项：多个区域合并成一个 `rects` 列表，最多 16 个矩形，超过就改用整页的一个矩形（宁宽勿漏）；`reason` 取自一个短的固定集合（如 `ocr_failed`、`render_failed`）。按 README §11 第 7 条明确标出，不被当作“没有内容”。
+  - 既没有文字也没有图像的空白页：不算未解析，结果里就是没有块。
+  - 图片（JPEG、PNG）直接用 Vision OCR，失败就是整份 `parse_failed`。
+  - 文本层记录整份是否完整。`require_complete` 时，只要有未解析页就回 422 `partial_parse`，不返回内容。
+- **分页**：`read_range` 和 `find` 都按页向前推进。
+  - 一次响应最多覆盖 100 页，并按序列化字节数截断（同 `list`）；被截断的页，下次从这页中间的那个块（或那个命中）接着来。
+  - 响应里的 `parse_status` 和 `unparsed_regions` 只描述**这次响应覆盖的页**：这些页里有未解析的区域就是 `partial`，并列出这些区域。整份是否完整，用 `require_complete` 判断。
+  - 一次响应可以没有块或命中（比如覆盖的页全是未解析页，或者都没有命中），只要还没到最后一页，`next_cursor` 就不为空。所以全是扫描页的文档同样能翻完，`unparsed_regions` 也不会超过 100 项。
+- **游标**：不透明。它绑定 `(document_id, revision, text_layer_sha256)` 和下一个位置：
+  - `read_range` 的位置是页号加页内的块序号；
+  - `find` 的位置是页号、页内的块序号加块内的命中序号，同时绑定查询的哈希。所以一个块里超过一页的命中，也能从块中间接着翻。
+  - 换了查询，或者游标指向另一个文本层，回 400 `invalid_request`。
+  - 翻页过程中总是读游标里那个已钉住的文本层，即使期间有了新引擎版本的文本层。
+- **文本层 blob**：一份 JSON（`v: 1`），包含源内容的 `content_sha256`（所以两份读出来一样的文件不会共用一个文本层地址）、物理页数（含空白页）、引擎、config、`parse_status`、`unparsed_regions`，以及块、行和矩形。config 只能是扁平对象：ASCII 键，值为字符串、整数或布尔；这样按键排序的 JSON 就是规范形式。存进 blob 区，`text_layer_sha256` 就是它的 blob 地址。`text_layers` 表登记 `(content_sha256, engine, version, config_sha256)`，同一组合只解析一次。没有游标的请求，用当前引擎和 config 的那一层。
+- **find 的匹配**：只在单个块内匹配，不跨块。
+  - 匹配的是存储的原文，只放宽三点，而且都不改变偏移的对应关系：ASCII 字母不区分大小写；查询里的一段空白，可以匹配原文里任意一段空白（包括换行）；原文里的换行也可以被跳过——中文在行尾断开时没有空格，「端午\n节」要能按「端午节」找到（2026-10-10 增补，实现文本层时发现）。
+  - 查询不能只由空白组成（400 `invalid_request`）。
+  - 不做 Unicode 规范化，不做全角/半角折叠。中文原文不受这两点影响。
+  - 结果按块的阅读顺序排列；一个块内的多处命中，按出现顺序各自成为一个锚点，互不重叠。
 
 ## 4. 操作清单（DOC-1）
 
 - **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
-- **分页**：`list`、`find`、`read_range`、抽取结果、`job.get` 统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；单页响应 ≤ 512 KiB，给 1 MiB 上限留余量。
+- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；单页响应 ≤ 512 KiB，给 1 MiB 上限留余量。`job.get` 返回单个 job，不分页；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。
 - **风险映射**（用户确认后的内核 `RiskClass`，`types.rs:1036-1050`）：read → `Read`；create-record / mutate-draft / commit / create-artifact → `WriteLocal`；handoff → `External`。**DOC-1 没有第一方默认安装，所有工具实际按 `External` 处理、每次审批**，除非用户在启用时逐个确认（D4.2）。
 
 | 片 | 操作 | REST | 工具 | 知识类 | 业务风险 |
@@ -87,7 +131,7 @@
 | 1 | upload | `POST /uploads`（`Idempotency-Key`）；`POST /uploads/{id}/chunks`（≤768 KiB） | 不通告 | free | create-record |
 | 1 | import | `POST /imports {upload_id}` → 202 job | **不通告**（Q4 已定：只从页面经原生文件对话框导入） | free | create-record |
 | 1 | get / list | `GET /documents[/{id}]` | `documents.list`、`documents.get` | free | read |
-| 1 | render | `GET /documents/{id}/revisions/{rev}/pages/{n}?scale=`（≤ 1 MiB；超出时自动降低 scale，仍超出则按瓦片分块） | 不通告 | free | read |
+| 1 | render | `GET /documents/{id}/revisions/{rev}/pages/{n}?scale=`（≤ 1 MiB；超出时自动降低 scale，降到 0.25 仍超出则 413，由客户端用 `region` 分块请求） | 不通告 | free | read |
 | 1 | read_range | `GET /documents/{id}/revisions/{rev}/text?block=&cursor=` | `documents.read_range` | free | read |
 | 1 | find | `POST /documents/{id}/find {revision, query, cursor}` | `documents.find` | free | read |
 | 1 | extract | `POST /documents/{id}/extractions {revision, schema}` → 202 job；`GET /extractions/{id}` | `documents.extract` | free（显式给定文档） | read |
@@ -123,18 +167,20 @@
      |---|---|
      | `upload` | 页面的 `Idempotency-Key` |
      | `import` | `upload_id` |
-     | `extract` | `(document_id, revision, schema_sha256, extractor_version, model_id)`，键用实际的模型 id，不用 profile；需要重新抽取时，页面可以显式带 `rerun: true`，同时换一个新键 |
+     | `extract` | `(document_id, revision, schema_sha256, extractor_version, model_id)`，键用实际的模型 id，不用 profile；需要重新抽取时，页面可以显式带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，并入上面的业务键，所以它只在同一组业务坐标内有效，换了 schema 或实际模型就是另一个键（2026-10-09 澄清） |
      | `propose` | `(document_id, base_revision, ops_sha256)` |
      | `export` | `(document_id, revision, format, options_sha256)` |
      | `commit` | `commit_key` |
 
    - 同一个键对应的 `request_sha256` 不同 → 422 `idempotency_key_reused`。
    - **`request_sha256` 的规范化范围**：只覆盖**有效业务参数**，经 RFC 8785（JCS）规范化后计算 SHA-256。仅用于追踪的易变字段一律排除：`tool_call_id`、`run_id`、`x-a24-*` 请求 id、`Idempotency-Key` 头本身、时间戳、客户端版本。这样，同一个业务请求即使带着新的追踪 id，也不会被误报为 `idempotency_key_reused`。
+   - **`extract` 的 rerun 键**：请求体是闭集（`revision`、`schema`、`rerun`），只有业务参数，追踪字段都在请求头里；所以它的 `request_sha256` 就是整个请求体的 JCS 哈希，不再挑字段（David，2026-10-10）。
    - **授权每次都重新检查**：键命中时，先做本次调用的授权与可用性检查，再返回已有结果。幂等命中不能跳过授权。
    - 占键在 `BEGIN IMMEDIATE` 内完成，由 SQLite 单写者串行化。若仍遇到 UNIQUE 冲突（其他连接），回滚后重读该行并按命中处理。
 5. **agent 路径**：内核不重试，每次调用的 `tool_call_id` 都是新的。**两层分工**与 ADR-DOC-01 D4.3 一致：`tool_call_id` / `run_id` 只用于可信调用关联与审计（写进操作日志），**业务幂等只看上表的业务键**，DOC-1 没有传输层去重。页面遇到“结果未知”（`request_abandoned`、`upstream_timeout`）时用同一个键重发；代理不会重试 POST（`proxy.rs:1546-1556`）。
 6. **上传**：状态在 `uploads/<upload_id>/` 和 `uploads` 表里，**不在 `tmp/`**，启动清理和孤儿 GC 都不碰它；最后一个块到达 24 h 后过期。每块带 `Upload-Offset` 和 `Chunk-Sha256`：
    - `offset` 等于已接收长度 → 追加并 fsync；这一段已接收且哈希相同 → 200 重放；其他情况 → 409 `upload_offset_mismatch`（`details.received_offset`）。
+   - 上传仍在接收、且 `offset` 等于已接收长度的新块：`Chunk-Sha256` 与块内容不符，或会超出 `total_size` → 400 `invalid_request`。已接收的那一段只按存下的哈希判断（见上一条）；已收齐或已导入的上传不再接受新块，先返回 409（同上）。
    - import 时校验整个文件的 sha256，不符 → 422 `upload_checksum_mismatch`。
 
 7. **幂等验收**（#740 要求，记录到 #708）：
@@ -144,7 +190,7 @@
 
 ## 6. 类型化错误
 
-`documents` 命名空间的错误码是**闭集**，新增需修改本 ADR。
+`documents` 命名空间的错误码是**闭集**，新增需修改本 ADR。唯一的例外是下文的“OS 的意外故障”。
 
 - **信封**：沿用现有信封；每个错误都带 `details.retryable`。**客户端按 `code` 分支，不按 HTTP 状态分支**。
 - **工具路径**：映射成 `ToolError`，`code` 作为消息前缀。**任何模块响应都不得映射成 `ToolError::Cancelled`**，因为那会取消整个 run（§1）。
@@ -170,7 +216,22 @@
 | `permission_denied` | 403 | `Denied` | OS 侧拒绝 |
 | `knowledge_unavailable` | 503 | `Failed` | `retryable: true` |
 | `engine_unavailable` | 503 | `Failed` | `details.engine`；`retryable: true` |
-| `storage_unavailable` | 503 | `Failed` | `data_dir` 或 DB 不可用；与知识关闭是不同状态 |
+| `storage_unavailable` | 503 | `Failed` | `data_dir` 或 DB 不可用；与知识关闭是不同状态。`details.cause` 说明原因；`retryable` **按原因定**（见表下说明） |
+
+**`storage_unavailable` 的 `retryable`**（David，2026-10-08，回应 #803 评审）：不像 `engine_unavailable` / `knowledge_unavailable` 那样固定为 `true`，而是由 OS 按原因决定。这是有意的不对称，不要统一改成 `true`。
+
+| `details.cause` | `retryable` | 含义 |
+|---|---|---|
+| `locked` / `busy` | `true` | DB 被锁或暂时打不开，稍后重试即可 |
+| `corrupt` | `false` | DB 或 blob 区校验失败，需要用户处理 |
+| `not_writable` | `false` | `data_dir` 不可写（权限、只读卷） |
+| `disk_full` | `false` | 磁盘已满，释放空间后由用户重试 |
+
+界面对 `retryable: false` 的情况给出处理提示，不自动重试。
+
+**OS 的意外故障：共用内核码的唯一例外**：失败既不在上表、也不是存储不可用（例如数据库约束被触发，说明 OS 自身有 bug）时，OS 自己返回 500，用内核通用信封的 `internal` 码，`details.retryable: false`。这是唯一一个由 OS 产生、却不在本命名空间闭集里的码；OpenAPI 中 documents 路由的 500 响应和 `ModuleProxyError` 的说明里都注明了这一点。
+- 工具路径映射成 `ToolError::Failed`，`internal` 作为消息前缀；
+- 不自动重试；结果未知，用户重试时按下面的“默认规则”用同一个键重发。
 
 **会看到但不属于本命名空间的内核 / 代理码**：
 
@@ -189,12 +250,14 @@
 - **键命中时**：`queued` / `running` → 返回该 job；`succeeded` → 返回结果；`failed` / `interrupted` → **自动重新启用**（同一个 `job_id`，`attempt + 1`，回到 `queued`）。**`cancelled` 不会因键命中而重启**，返回原 job 及其 `cancelled` 状态，只能由用户显式调用 `POST /jobs/{id}/retry` 重启。这样，内容推导的键（例如 agent 调用 `extract` / `export`）不会悄悄撤销用户的取消。`POST /jobs/{id}/retry` 是同一动作的显式形式。
 - **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具调用最多等 manifest 声明的 `inline_wait_ms`（**严格小于**注册的超时，至少留 5 s 余量），到期返回 `{job_id, status}`，agent 用 `documents.job.get` 查询。
 - **完成**：结果行与 `status = succeeded` 在**同一个事务**里写入。
-- **取消**：`POST /jobs/{id}/cancel` 幂等，置 `cancelling`；工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
-- **崩溃恢复**：OS 启动时 `running` → `interrupted`，`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
+- **取消**：`POST /jobs/{id}/cancel` 幂等。`running` 置 `cancelling`，工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出；没有工作线程在跑的 `queued` / `failed` / `interrupted` 直接置 `cancelled`，带 `cancelled` 标记（`failed` 原有的错误码被它替换），之后键命中也不会复活；其余状态不变。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
+- **崩溃恢复**：OS 启动时 `running` → `interrupted`，`queued` 也 → `interrupted`（进程重启后已没有处理它的工作线程；否则按键命中规则它会一直停在 `queued`），`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
+- **输入**：job 的 `input`（重新入队或重试时据此再次运行）只能写入一次，写入后不可再改；迁移前的旧 job 为 NULL，之后仍可补写一次。
 - **事件**：manifest 申请 `events`，经 `_a24/events/emit` 发出，`payload.module = documents`，`kind` 取 `job.progress`、`job.finished`、`document.imported`、`revision.committed`。
   - **整个模块合计 ≤ 2 次/秒**（低于内核的每秒 5 次），进度按 job 合并只发最新一条；被 `rate_limited` 拒绝的进度事件直接丢弃。**终态事件**（`job.finished`、`revision.committed`）优先发送，被限流时短暂退避后重发一次；最终仍以 job 行为准。
   - **payload 只带 id、stage、计数、status、错误码**，不带标题、文件名、查询或内容：`EventsHub` 广播给所有 WS 客户端，D8 的资料处理政策管不到这条通道。
   - 事件只是提示，**job 行才是权威**；断线后用 `GET /jobs/{id}` 对账。
+  - **payload 结构**（#705）：见 `openapi.yaml` 的 `DocumentsJobProgressEvent`、`DocumentsJobFinishedEvent`、`DocumentsDocumentImportedEvent`、`DocumentsRevisionCommittedEvent`；字段是闭集，客户端仍忽略不认识的 kind 与字段。`job.finished` 带 `attempt` 与 `error_code`（取值同 job 的 `error.code`）；启动恢复置为 `interrupted` / `cancelled` 的 job 也发一次（尽力而为，受同样的限流，最多 256 条；David 确认，2026-10-10）。
 - **agent run 取消**：内核目前不会通知模块。run 取消后 job 继续运行，结果保留（Q7）。
 
 ## 8. 可用性与发现（README §10.3）
@@ -228,3 +291,14 @@
 | Q8 | `partial_parse` / `stale_index` 何时作为结果状态、何时作为错误 | 默认作为结果状态，只在显式要求时报错 | David |
 | Q9 | 是否向 agent 通告 `job.cancel` / `job.retry` | DOC-1 不通告；如果通告，按 `WriteLocal` 处理，且只能操作同一个 run 启动的 job | David |
 | Q10 | commit 的内联预算（5 s）和 `inline_wait_ms` 的取值 | 先按 5 s，等第 2 片的 DOCX/PDF 实测后再调 | David |
+| Q11 | 第 1 片 PDFKit 辅助进程的形态：每次解析启动一次、stdout 一份 JSON、每份限时 120 s、同时最多 2 个；用 `swiftc` 构建并随 OS package 分发，签名和公证跟随发布流程（§3.1） | 建议如左 | David；签名和打包：jason |
+| Q12 | 块的切分与 `block_id`（`p{页}/b{序号}`，按行距和左缘把相邻行合并成段落，每块 ≤ 16 KiB、≤ 64 行），几何只做到整行；部分解析按页判断，每个图像区域都做 OCR，失败的区域标为未解析；分页按页推进，一次最多 100 页，`parse_status` 描述本次覆盖的页（§3.1） | 建议如左 | David |
+| Q13 | 文本层在导入后尽力预解析；读取或查找时缺了就后台解析，最多等 8 s，否则回 503 `engine_unavailable`（可重试）（§3.1） | 建议如左 | David |
+| Q14 | find 的匹配规则：块内匹配，只放宽 ASCII 大小写和空白，原文换行可跳过，不做 Unicode 规范化；读取引擎把排版连字（U+FB00–FB06）读成字母、把伪粗体的重复只留一份（§3.1、docs/documenting/engine-pdfkit.md） | 建议如左 | David |
+
+**2026-10-10 David 按建议拍板的契约细节**（#861）：
+- 渲染的 `region` 用角点对 `x0,y0,x1,y1`，与锚点的 `rects` 同一参照系、同一顺序（原为 `x,y,width,height`；渲染尚未实现，改动没有兼容负担）。
+- 图片几何：1 像素记为 1 点，先按 EXIF 方向显示（§3）。
+- 每个抽取值最多 16 个锚点（`DocumentsEvidence`、`anchors`），冲突的候选最多 8 个。
+- `GET text` 同时给 `block` 和 `cursor` 是 400（游标已带位置）。
+- 抽取的 rerun 键被复用时，比较整个请求体的 JCS 哈希，不同就是 422 `idempotency_key_reused`（与上传、导入一致，§5.4）。

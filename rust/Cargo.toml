@@ -25,6 +25,7 @@ members = [
     "crates/agent24-worker",
     "apps/agent24d",
     "apps/agent24-cli",
+    "apps/agent24-documents",
 ]
 
 [workspace.package]

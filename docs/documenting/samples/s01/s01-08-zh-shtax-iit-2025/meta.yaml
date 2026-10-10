@@ -1,0 +1,28 @@
+id: "s01-08-zh-shtax-iit-2025"
+title: "关于2025年度个人所得税综合所得汇算清缴预约办理时间的通告（国家税务总局通告2026年第1号）"
+lang: "zh"
+kind: "text_pdf"
+pages: 1
+source_url: "https://shanghai.chinatax.gov.cn/zcfw/zcfgk/grsds/202602/t479400.html"
+publisher: "国家税务总局（国家税务总局上海市税务局网站转载）"
+retrieved_at: "2026-10-08"
+license: "CN-Copyright-Art5"
+sha256_original: "4f26fc6d4e157f4c2eb6c72b4faa687467ea3331634a21c65fc4b1162c6008ce"
+sha256_stored: "4f26fc6d4e157f4c2eb6c72b4faa687467ea3331634a21c65fc4b1162c6008ce"
+redactions: []
+public_officials: []
+covers:
+  C1: [filing_period]
+  C5: [filing_period, early_period_booking_open_date]
+  C6: [late_period_no_booking]
+  C9: [who_must_file, late_filing_penalty_amount]
+reader: "需要办理 2025 年度个人所得税综合所得汇算、想知道什么时候办、要不要预约的纳税人"
+questions: [Q1, Q2, Q3, Q4, Q5, Q6]
+extraction_notes:
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "左侧“热词”栏逐字一行抽出"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "正文相邻行交错，如“提 / 以自2月25日起通过个人所得税APP / 提 / 前预约；…… / 供预约办理 / 服务。”；按交错规则分段锚"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "“国家税 / 务总局”在行内断开（L2 命中）"}
+derived_from: null
+sha256_parent: null
+derivation: []
+notes: "国家税务总局通告，取自国家税务总局上海市税务局网站的转载页，经 Chrome 无头打印（临时 user-data-dir）。总局原页由脚本渲染、打印时右侧被裁，所以改用上海转载页。页脚的 021-12366 是网站主办单位电话，通告正文没有给咨询方式。"

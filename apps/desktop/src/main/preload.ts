@@ -6,6 +6,10 @@ import { contextBridge, ipcRenderer } from 'electron'
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type DocumentsEvent,
+  type DocumentsImportProgress,
+  type DocumentsRequest,
+  type DocumentsResponse,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type CreativeViewBounds,
@@ -99,6 +103,25 @@ const api = {
   },
   modelCallSnapshot: (): Promise<ModelCallEnvelope[]> =>
     ipcRenderer.invoke(IpcChannels.ModelCallSnapshot),
+  // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
+  documents: {
+    request: <R extends DocumentsRequest>(req: R): Promise<DocumentsResponse<R['op']>> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsRequest, req),
+    /** Picks a PDF, JPEG or PNG and imports it; null if the user cancels. */
+    importFile: (): Promise<DocumentsResponse<'job'> | null> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsImportFile),
+    onImportProgress: (cb: (p: DocumentsImportProgress) => void): (() => void) => {
+      const listener = (_event: unknown, p: DocumentsImportProgress): void => cb(p)
+      ipcRenderer.on(IpcChannels.DocumentsImportProgress, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.DocumentsImportProgress, listener)
+    },
+    /** The OS's job and document events (hints: read the job or list again). */
+    onEvent: (cb: (e: DocumentsEvent) => void): (() => void) => {
+      const listener = (_event: unknown, e: DocumentsEvent): void => cb(e)
+      ipcRenderer.on(IpcChannels.DocumentsEvent, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.DocumentsEvent, listener)
+    },
+  },
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)
