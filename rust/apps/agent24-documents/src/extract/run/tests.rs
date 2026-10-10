@@ -315,18 +315,34 @@ async fn a_busy_kernel_is_waited_out_for_a_while_and_a_timeout_retried_once() {
         start.elapsed() >= Duration::from_millis(30),
         "10 ms, then 20"
     );
-    // Waits of 10, 20, 40, 40, 40, 40 and the 10 left make 200 ms: the
-    // eighth answer is the last.
+    // Codex R1: the last wait is what is left of the budget. With pauses of
+    // 10, 20, 40, 80, 160 and then 400, the sixth is cut to 190: 500 ms in
+    // all, where an uncut one would make 630. The gap is wide enough for a
+    // busy machine's late wake-ups.
+    let budget = Pace {
+        first: Duration::from_millis(10),
+        longest: Duration::from_millis(400),
+        max_wait: Duration::from_millis(500),
+    };
     let m = Script::new((0..20).map(|_| busy()).collect());
     let start = std::time::Instant::now();
-    assert!(matches!(fast(&m, &l).await, Err(Failure::Engine(_))));
-    // Codex R1: 10 + 20 + 40 × 4 + the 10 left is 200, never 230.
+    let out = paced(
+        budget,
+        &Steps::default(),
+        &m,
+        &source(&l),
+        &[field("a")],
+        false,
+        MAX,
+    )
+    .await;
+    assert!(matches!(out, Err(Failure::Engine(_))));
     let waited = start.elapsed();
     assert!(
-        waited >= FAST.max_wait && waited < FAST.max_wait + Duration::from_millis(25),
+        waited >= budget.max_wait && waited < Duration::from_millis(600),
         "{waited:?}"
     );
-    assert_eq!(m.asked().len(), 8);
+    assert_eq!(m.asked().len(), 7);
     let timeout = || Err(ClientError::Timeout("t".into()));
     assert!(fast(&Script::new(vec![timeout(), ok()]), &l).await.is_ok());
     assert!(matches!(
