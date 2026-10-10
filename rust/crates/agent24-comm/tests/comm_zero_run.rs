@@ -25,6 +25,7 @@ const SAMPLES: &str = include_str!("fixtures/comm_inbound_six.json");
 const COUNTER: &str = r#"
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
 count = 0
 class Handler(BaseHTTPRequestHandler):
  def log_message(self, *args): pass
@@ -38,7 +39,14 @@ class Handler(BaseHTTPRequestHandler):
   self.rfile.read(int(self.headers.get('Content-Length', 0)))
   count += 1
   self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'{}')
-server = HTTPServer(('127.0.0.1', 0), Handler)
+class CounterHTTPServer(HTTPServer):
+ def server_bind(self):
+  # HTTPServer.server_bind calls socket.getfqdn(), which can block on reverse
+  # DNS. Bind directly through TCPServer and set the fields HTTPServer needs.
+  socketserver.TCPServer.server_bind(self)
+  self.server_name = 'localhost'
+  self.server_port = self.server_address[1]
+server = CounterHTTPServer(('127.0.0.1', 0), Handler)
 print(server.server_port, flush=True)
 server.serve_forever()
 "#;
@@ -236,12 +244,24 @@ fn six_inbound_shapes_and_read_routes_do_not_dispatch_work() {
         BufReader::new(stdout).read_line(&mut line).unwrap();
         tx.send(line).unwrap();
     });
-    let port: u16 = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("counter readiness")
-        .trim()
-        .parse()
-        .unwrap();
+    let readiness_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let port_line = loop {
+        let remaining = readiness_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "counter readiness timeout");
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(line) => break line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                assert!(
+                    counter.0.try_wait().unwrap().is_none(),
+                    "counter exited before readiness"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("counter readiness reader disconnected")
+            }
+        }
+    };
+    let port: u16 = port_line.trim().parse().expect("counter readiness port");
     assert_eq!(stub_request(port, "GET", "/counts")["requests"], 0);
     let root = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap());

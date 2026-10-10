@@ -89,8 +89,8 @@ linux-x64 的 SHA256 为 `8faf3f8e3b6baa0c310501fe7c35a4261316138ab78abd973ba8f6
 在 Agent24 仓库根目录执行（先设置上文的 ulimit 与共享 target）：
 
 ```sh
-HYPHAE_SOURCE_DIR=/Users/jason/Dev/auraai/Hyphae-comm-65d \
-A24_HYPHAE_BIN=/tmp/hyphae-65d-darwin-arm64 \
+HYPHAE_SOURCE_DIR=<hyphae-checkout> \
+A24_HYPHAE_BIN=<bin-path> \
   cargo test --locked --manifest-path rust/Cargo.toml -p agent24d --test comm_blackbox -- --include-ignored --nocapture
 ```
 
