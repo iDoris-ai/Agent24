@@ -8,6 +8,8 @@ use std::process::ExitCode;
 
 use std::sync::Arc;
 
+use agent24_documents::engine::pdfkit::PdfKit;
+use agent24_documents::engine::{Engine, Layers};
 use agent24_documents::events::Events;
 use agent24_documents::state::AppState;
 use agent24_os_sdk::Module;
@@ -47,8 +49,12 @@ async fn main() -> ExitCode {
             })
         }))
     });
+    // The read engine ships next to this binary on macOS (§3.1); without it
+    // read operations report engine_unavailable.
+    let engine = PdfKit::find().map(|e| Arc::new(e) as Arc<dyn Engine>);
+    tracing::info!(engine = engine.is_some(), "documents: read engine");
     // A storage failure is logged and reported by the routes, not fatal.
-    let state = AppState::open_with_events(module.data_dir(), events).await;
+    let state = AppState::open_serving(module.data_dir(), events, Layers::new(engine)).await;
     match module.serve(agent24_documents::router(state)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

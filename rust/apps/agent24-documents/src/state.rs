@@ -21,6 +21,7 @@ use sqlx::migrate::MigrateError;
 
 use crate::blob::{BlobError, BlobStore};
 use crate::db::{Db, DbError};
+use crate::engine::Layers;
 use crate::error::{ApiError, StorageCause};
 use crate::events::Events;
 
@@ -109,6 +110,8 @@ pub struct AppState(Arc<Inner>);
 struct Inner {
     data_dir: PathBuf,
     events: Events,
+    /// Text layers, and the engine that reads them (none on Linux).
+    layers: Arc<Layers>,
     reopen_interval: Duration,
     current: Mutex<Opened>,
     /// When the last reopen started. Held during a reopen, so one request
@@ -127,18 +130,35 @@ impl AppState {
 
     /// [`AppState::open`], telling WS clients about jobs through `events`.
     pub async fn open_with_events(data_dir: &Path, events: Events) -> Self {
-        Self::opened(data_dir, REOPEN_INTERVAL, events).await
+        Self::opened(data_dir, REOPEN_INTERVAL, events, Layers::new(None)).await
+    }
+
+    /// [`AppState::open_with_events`], reading documents with `layers`.
+    pub async fn open_serving(data_dir: &Path, events: Events, layers: Arc<Layers>) -> Self {
+        Self::opened(data_dir, REOPEN_INTERVAL, events, layers).await
     }
 
     pub(crate) async fn open_with(data_dir: &Path, reopen_interval: Duration) -> Self {
-        Self::opened(data_dir, reopen_interval, Events::default()).await
+        Self::opened(
+            data_dir,
+            reopen_interval,
+            Events::default(),
+            Layers::new(None),
+        )
+        .await
     }
 
-    async fn opened(data_dir: &Path, reopen_interval: Duration, events: Events) -> Self {
+    async fn opened(
+        data_dir: &Path,
+        reopen_interval: Duration,
+        events: Events,
+        layers: Arc<Layers>,
+    ) -> Self {
         let current = open_storage(data_dir, &events).await;
         Self(Arc::new(Inner {
             data_dir: data_dir.to_owned(),
             events,
+            layers,
             reopen_interval,
             current: Mutex::new(current),
             last_attempt: tokio::sync::Mutex::new(Instant::now()),
@@ -158,12 +178,19 @@ impl AppState {
         Self(Arc::new(Inner {
             data_dir: data_dir.to_owned(),
             events: Events::default(),
+            layers: Layers::new(None),
             reopen_interval,
             current: Mutex::new(Err(cause)),
             last_attempt: tokio::sync::Mutex::new(Instant::now()),
             #[cfg(test)]
             reopens: std::sync::atomic::AtomicUsize::new(0),
         }))
+    }
+
+    /// Where text layers come from.
+    #[must_use]
+    pub fn layers(&self) -> &Arc<Layers> {
+        &self.0.layers
     }
 
     fn current(&self) -> Opened {
