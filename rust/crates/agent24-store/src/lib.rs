@@ -93,7 +93,8 @@ pub use run_workspace_authority::RunWorkspaceAuthoritySnapshot;
 pub use run_workspace_orphan::WorkspaceOrphanSweep;
 pub use run_workspace_terminal::RunTerminalTransition;
 pub use source_policy::{
-    PolicySnapshot, SOURCE_TAG_SCHEMA_VERSION, SourceKind, SourceMode, SourceRef, StoredSourceTag,
+    PolicySnapshot, SOURCE_TAG_SCHEMA_VERSION, SourceClassification, SourceKind, SourceMode,
+    SourceRef, StoredSourceTag,
 };
 
 use sqlx::SqlitePool;
