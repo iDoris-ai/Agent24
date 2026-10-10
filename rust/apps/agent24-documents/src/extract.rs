@@ -22,6 +22,13 @@ pub const EXTRACTOR_VERSION: &str = "1";
 pub struct Field {
     pub key: String,
     pub description: String,
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    /// Absent or one of the contract's types; `null` is refused, not taken
+    /// for absent.
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "crate::uploads::present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub kind: Option<String>,
 }

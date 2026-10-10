@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::Field;
@@ -29,7 +29,7 @@ const LAYER_WAIT: Duration = Duration::from_secs(10 * 60);
 const LAYER_POLL: Duration = Duration::from_secs(1);
 
 /// What an extract job works on, as written when it was created.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Input {
     pub document_id: String,
@@ -269,4 +269,4 @@ async fn commit(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

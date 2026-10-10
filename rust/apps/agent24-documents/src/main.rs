@@ -11,6 +11,7 @@ use std::sync::Arc;
 use agent24_documents::engine::pdfkit::PdfKit;
 use agent24_documents::engine::{Engine, Layers};
 use agent24_documents::events::Events;
+use agent24_documents::extract::run::Kernel;
 use agent24_documents::state::AppState;
 use agent24_os_sdk::Module;
 use tracing_subscriber::EnvFilter;
@@ -55,6 +56,14 @@ async fn main() -> ExitCode {
     tracing::info!(engine = engine.is_some(), "documents: read engine");
     // A storage failure is logged and reported by the routes, not fatal.
     let state = AppState::open_serving(module.data_dir(), events, Layers::new(engine)).await;
+    // Extractions ask the kernel's model router, which runs only local
+    // models for this module (domain-os.yml: models, local_only). Without
+    // the offer, extract answers engine_unavailable.
+    let model = module.model();
+    tracing::info!(model = model.is_some(), "documents: model");
+    if let Some(client) = model {
+        state.set_model(Arc::new(Kernel(Arc::new(client))));
+    }
     match module.serve(agent24_documents::router(state)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
