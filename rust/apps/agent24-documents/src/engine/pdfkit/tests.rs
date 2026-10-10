@@ -461,3 +461,73 @@ async fn the_real_helper_renders_pages_and_regions() {
         );
     }
 }
+
+/// On a page turned by /Rotate 0, 90, 180 or 270, the region of the line
+/// `parse` reads holds its ink, and a region of the same size elsewhere is
+/// blank: renders and line rectangles share one frame (macOS only).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_real_helper_renders_where_parse_reads_on_turned_pages() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = tempfile::tempdir().unwrap();
+    let built = std::process::Command::new(root.join("engines/pdfkit/build.sh"))
+        .arg(out.path())
+        .status()
+        .unwrap();
+    assert!(built.success(), "the helper did not build");
+    let os = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .unwrap();
+    let e = PdfKit::at(
+        out.path().join(HELPER),
+        String::from_utf8(os.stdout).unwrap().trim(),
+    );
+    for rotation in [0, 90, 180, 270] {
+        let pdf = root.join(format!("tests/fixtures/pdfkit/render/rot{rotation}.pdf"));
+        let layer = e.parse(CONTENT, "application/pdf", &pdf).await.unwrap();
+        let block = &layer.blocks[0];
+        assert_eq!(block.text, "MARK", "{rotation}");
+        let [x0, y0, x1, y1] = block.lines[0].rect;
+        // The page as displayed: turned a quarter, it lies on its side.
+        let (w, h) = if rotation % 180 == 0 {
+            (612.0, 792.0)
+        } else {
+            (792.0, 612.0)
+        };
+        let blank = [
+            w - (x1 - x0) - 10.0,
+            h - (y1 - y0) - 10.0,
+            w - 10.0,
+            h - 10.0,
+        ];
+        let mut sizes = Vec::new();
+        for region in [[x0, y0, x1, y1], blank] {
+            let ask = RenderAsk {
+                page: 1,
+                scale: 2.0,
+                region: Some(region),
+                max_bytes: 1 << 20,
+            };
+            let png = e.render("application/pdf", &pdf, ask).await.unwrap().png;
+            sizes.push(png.len());
+        }
+        assert!(
+            sizes[0] > 2 * sizes[1],
+            "{rotation}: ink {} vs blank {}",
+            sizes[0],
+            sizes[1]
+        );
+        // A region starting left of or above the page is refused, not moved.
+        let ask = RenderAsk {
+            page: 1,
+            scale: 1.0,
+            region: Some([-20.0, y0, x1, y1]),
+            max_bytes: 1 << 20,
+        };
+        assert_eq!(
+            e.render("application/pdf", &pdf, ask).await.err(),
+            Some(RenderError::OffPage)
+        );
+    }
+}
