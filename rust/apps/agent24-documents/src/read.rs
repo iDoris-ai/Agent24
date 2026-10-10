@@ -13,6 +13,8 @@ use crate::id::{IdKind, is_id};
 use crate::state::{AppState, Storage, blob_cause};
 use crate::text_layer::{self, LayerError, ParseStatus, Region, TextLayer};
 
+pub mod text;
+
 /// A response's serialized JSON stays under this (§4).
 pub const PAGE_BYTES: usize = 512 * 1024;
 /// Pages one response covers, at most (§3.1).

@@ -4580,7 +4580,7 @@ export interface operations {
     documentsReadText: {
         parameters: {
             query?: {
-                /** @description Start at this block id instead of the first one. */
+                /** @description Start at this block id instead of the first one. Not with `cursor`, which already holds the position: both is 400 `invalid_request` (David, 2026-10-10). */
                 block?: string;
                 /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
                 cursor?: components["parameters"]["DocumentsCursor"];
