@@ -15,6 +15,7 @@ pub mod documents;
 pub mod engine;
 pub mod error;
 pub mod events;
+pub mod extractions;
 pub mod id;
 pub mod idem;
 pub mod imports;
