@@ -127,7 +127,9 @@ impl TextLayer {
     /// Why this layer breaks §3.1, if it does. Slice 1 reads paginated
     /// formats only (PDF, JPEG, PNG), so every block has a page.
     pub fn check(&self) -> Result<(), String> {
-        if self.v != 1 || self.engine.id.is_empty() || self.engine.version.is_empty() {
+        // Short names: they go into every read's response (§4's 512 KiB).
+        let name = |s: &str| (1..=64).contains(&s.len());
+        if self.v != 1 || !name(&self.engine.id) || !name(&self.engine.version) {
             return Err("not a v1 layer from a named engine".into());
         }
         if !config_ok(&self.config) {

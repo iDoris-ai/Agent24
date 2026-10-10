@@ -61,6 +61,10 @@ fn a_well_formed_layer_passes_and_each_rule_is_checked() {
     type Break = Box<dyn Fn(&mut TextLayer)>;
     let broken: Vec<(&str, Break)> = vec![
         ("v2", Box::new(|l| l.v = 2)),
+        (
+            "an engine version over 64 bytes",
+            Box::new(|l| l.engine.version = "9".repeat(65)),
+        ),
         ("config not an object", Box::new(|l| l.config = json!([1]))),
         (
             "a float in config",

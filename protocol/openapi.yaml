@@ -2017,7 +2017,10 @@ paths:
         - name: block
           in: query
           required: false
-          description: Start at this block id instead of the first one.
+          description: >-
+            Start at this block id instead of the first one. Not with
+            `cursor`, which already holds the position: both is 400
+            `invalid_request` (David, 2026-10-10).
           schema: { type: string, minLength: 1 }
         - $ref: "#/components/parameters/DocumentsCursor"
         - $ref: "#/components/parameters/DocumentsLimit"
