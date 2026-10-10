@@ -58,6 +58,7 @@ pub struct Candidate {
     predicate: String,
     object: Value,
     evidence: Vec<String>,
+    source_ref: Option<Value>,
     origin: Origin,
     explicit_remember: bool,
 }
@@ -79,6 +80,7 @@ impl Candidate {
             predicate: predicate.into(),
             object,
             evidence: Vec::new(),
+            source_ref: None,
             origin,
             explicit_remember: false,
         }
@@ -87,6 +89,12 @@ impl Candidate {
     /// requires at least one.
     pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
         self.evidence = evidence;
+        self
+    }
+    /// Attach the host-authored provenance persisted atomically with this
+    /// assertion. Callers must not derive it from the assertion id.
+    pub fn with_source_ref(mut self, source_ref: Value) -> Self {
+        self.source_ref = Some(source_ref);
         self
     }
     /// The user explicitly asked to remember this. Only meaningful for `UserSaid`;
@@ -206,6 +214,7 @@ impl WriteGate {
             c.evidence.clone(),
         );
         a.qualified = qualified;
+        a.source_ref = c.source_ref.clone();
         a.writer_version = "md4".to_owned();
         a.modality = match c.origin.trust {
             Trust::ToolOutput => Modality::Observed,
@@ -296,7 +305,7 @@ impl WriteGate {
 
             let existing = sqlx::query(
                 "SELECT scope_owner, scope, subject, predicate, object, qualified,
-                        valid_from, valid_to, recorded_from, recorded_to, evidence
+                        valid_from, valid_to, recorded_from, recorded_to, evidence, source_ref
                  FROM mem_assertions WHERE id = ?",
             )
             .bind(&c.id)
@@ -390,10 +399,11 @@ impl WriteGate {
                 let recorded_to: Option<String> = row.get("recorded_to");
                 if content_matches && recorded_to.is_some() {
                     sqlx::query(
-                        "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, qualified = 1
+                        "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, source_ref = ?, qualified = 1
                          WHERE id = ?",
                     )
                     .bind(serde_json::to_string(&c.evidence)?)
+                    .bind(c.source_ref.as_ref().map(serde_json::to_string).transpose()?)
                     .bind(&c.id)
                     .execute(&mut *tx)
                     .await?;
@@ -543,6 +553,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assertion_source_reference_commits_with_content_and_audit() {
+        let (kv, gate) = gate().await;
+        let source = json!({
+            "source_id": "user_input:event-1",
+            "revision_digest": "sha256:abc",
+            "classification": "ordinary",
+            "kind": "user_input",
+            "mode": "local_only"
+        });
+        gate.propose(vec![
+            cand("c_source", "u1", "fact", Trust::UserSaid)
+                .with_source_ref(source.clone())
+                .remember(),
+        ])
+        .await
+        .unwrap();
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&source));
+        let audit = audits(&kv, "u1").await;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].event.body["verdict"], "commit");
+    }
+
+    #[tokio::test]
     async fn user_said_without_remember_is_held_out_of_recall() {
         let (kv, g) = gate().await;
         let d = g
@@ -626,7 +660,9 @@ mod tests {
         // collides. The whole transaction must roll back — the belief must NOT
         // land without its governance record.
         let (kv, g) = gate().await;
-        let c = cand("X", "u1", "trusted-subject", Trust::UserSaid).remember();
+        let c = cand("X", "u1", "trusted-subject", Trust::UserSaid)
+            .with_source_ref(json!({"classification":"ordinary"}))
+            .remember();
         let audit = WriteGate::audit_event(&c, "commit", None);
         let clash = MemEvent::new(
             audit.id.clone(),

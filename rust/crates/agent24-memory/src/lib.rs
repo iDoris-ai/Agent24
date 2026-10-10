@@ -1758,7 +1758,7 @@ mod tests {
                 .fetch_one(&upgraded.pool)
                 .await
                 .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);
