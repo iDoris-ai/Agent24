@@ -816,6 +816,65 @@ for line in sys.stdin:
         seen,
         "did not receive all dynamically generated peer events: {event_ids:?}"
     );
+
+    // Hyphae reserves this namespace for strict group protocol envelopes.
+    // COMM's DM inbox has no group handler, so the reserved payload must fail
+    // closed instead of appearing as an ordinary history row or triggering a
+    // run. Keep this outside the six direct-message compatibility samples.
+    let reserved_group_body = "hyphae.group/v99\n{\"secret\":\"reserved-group-body\"}";
+    let reserved_group = b_run(
+        &bin,
+        &b_home,
+        &[
+            "agent",
+            "msg",
+            "--from",
+            "b",
+            "--to",
+            &npub,
+            "--content",
+            reserved_group_body,
+        ],
+        Some(password),
+    );
+    let reserved_group_id = reserved_group["data"]["event_id"]
+        .as_str()
+        .expect("reserved group event id")
+        .to_owned();
+    let (s, pull_error) = http(
+        &base,
+        "POST",
+        "/api/v1/comm/inbox/pull",
+        &token,
+        Some(&json!({"as":"a"})),
+    );
+    assert_eq!(
+        s, 502,
+        "DM inbox must reject reserved group content: {pull_error}"
+    );
+    assert_eq!(
+        pull_error["error"], "partial",
+        "Hyphae must reject the group payload while retaining usable DMs: {pull_error}"
+    );
+    assert!(
+        !pull_error.to_string().contains("reserved-group-body"),
+        "reserved group plaintext must not be reflected: {pull_error}"
+    );
+    assert_eq!(
+        pull_error["data"].as_array().map(Vec::len),
+        Some(samples.len()),
+        "partial result must preserve the six usable direct messages"
+    );
+    let (s, h) = http(&base, "GET", history_path, &token, None);
+    assert_eq!(s, 200, "history after rejected group message: {h}");
+    let rows = h["data"]
+        .as_array()
+        .unwrap_or_else(|| h["data"]["messages"].as_array().expect("history array"));
+    assert!(
+        !rows.iter().any(|row| row["id"] == reserved_group_id),
+        "reserved group event must not enter DM history"
+    );
+
     for _ in 0..20 {
         for path in [
             history_path,
@@ -832,7 +891,7 @@ for line in sys.stdin:
     assert_eq!(
         runs(&base, &token).len(),
         positive_runs,
-        "six inbound messages and reads must not create runs"
+        "six direct messages, rejected group content, and reads must not create runs"
     );
     assert_eq!(
         counter.counts(),
@@ -854,6 +913,6 @@ for line in sys.stdin:
         "stop/shutdown must remain passive"
     );
     eprintln!(
-        "COMM-5b T3 PASS: positive runs delta=1, models={base_models}, modules={base_modules}; six real peer events; passive runs delta=0, model/module delta=0"
+        "COMM-5b T3 PASS: positive runs delta=1, models={base_models}, modules={base_modules}; six real peer events plus rejected reserved group content; passive runs delta=0, model/module delta=0"
     );
 }

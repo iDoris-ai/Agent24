@@ -68,7 +68,9 @@ T3 校验源码 SHA、query/response fixture hash 和二进制 hash，构建本�
 正对照通过 sessions/runs 真正执行一条 run 并调用模型及 MCP 模块：runs Δ=1，
 模型与模块计数均增加且 run 必须 completed。随后以实际发布的 event id 和
 原样正文确认六类消息全部入站，读取各接口 20 次后 runs Δ=0、模型/模块请求 Δ=0，
-停止与关机也不得增加计数。计数桩只排除没有任何 HTTP 字节的 TCP 连接和测试自身的
+停止与关机也不得增加计数。六类样本之外，T3 还发送一个 `hyphae.group/` 保留前缀
+消息；COMM 的 DM inbox 返回 `partial`，仅保留六条可用 DM，且不把组消息写入 history。
+计数桩只排除没有任何 HTTP 字节的 TCP 连接和测试自身的
 `/__ready`、`/counts` 请求，未知 HTTP 路径仍计数；普通 workspace 内的
 `counter_counts_http_requests_but_not_empty_tcp_connections` 为此提供独立回归。
 修复前该测试 exit 101（空连接错误计为 `(1, 0)`），修复仅为测试桩跳过空 header。
@@ -78,16 +80,17 @@ T3 校验源码 SHA、query/response fixture hash 和二进制 hash，构建本�
 使用 lock-built Linux x64 二进制；workspace 测试中的 ignored 不等于 T3 通过。
 缺环境变量、缺 Python/Go、源码/hash 不符、正对照为零、消息未收齐或命令超时均失败。
 
-## 本机 T3 实测（2026-10-09）
+## 本机 T3 实测（2026-10-10）
 
-macOS arm64，Hyphae `671c584f9e9eb807a15968e2aa42fd7507e178b8`，
-Go `go1.26.4`，二进制 SHA256 为
-`d1171421e91ae62c40374bd00049cd51dd6ac1135b6cd7b31908968b9158df60`。
+macOS arm64，Hyphae 当前 main `65d27380b8dc0c03ff03bf950b540a8c44fd417e`，
+Go `go1.26.4`。按 lock 配方构建的 darwin-arm64 SHA256 为
+`94b5ec3e1398d5668930d215b941b9b73b62b7c97ab3eb9d288921b419b2b0e0`；同机交叉构建
+linux-x64 的 SHA256 为 `8faf3f8e3b6baa0c310501fe7c35a4261316138ab78abd973ba8f626301d1b52`。
 在 Agent24 仓库根目录执行（先设置上文的 ulimit 与共享 target）：
 
 ```sh
-HYPHAE_SOURCE_DIR=/tmp/comm5b-hyphae-ctx245b71b \
-A24_HYPHAE_BIN=/tmp/comm5b-hyphae-ctx245b71b/hyphae \
+HYPHAE_SOURCE_DIR=/Users/jason/Dev/auraai/Hyphae-comm-65d \
+A24_HYPHAE_BIN=/tmp/hyphae-65d-darwin-arm64 \
   cargo test --locked --manifest-path rust/Cargo.toml -p agent24d --test comm_blackbox -- --include-ignored --nocapture
 ```
 
@@ -95,8 +98,8 @@ A24_HYPHAE_BIN=/tmp/comm5b-hyphae-ctx245b71b/hyphae \
 实际输出：
 
 ```text
-COMM-5b T3 PASS: positive runs delta=1, models=2, modules=1; six real peer events; passive runs delta=0, model/module delta=0
+COMM-5b T3 PASS: positive runs delta=1, models=2, modules=1; six real peer events plus rejected reserved group content; passive runs delta=0, model/module delta=0
 ```
 
-本机结果证明 darwin-arm64 场景；linux-x64 使用上文 CI 显式入口运行，
-不能由本机结果或 workspace 内的 ignored 状态代替。
+本机结果证明 darwin-arm64 场景；linux-x64 的锁内 hash 已在本机交叉构建，仍由
+上文 CI 显式入口验证 T3，不以本机结果或 workspace 内 ignored 状态代替。
