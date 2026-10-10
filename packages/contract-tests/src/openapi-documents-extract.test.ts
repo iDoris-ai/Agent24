@@ -61,7 +61,9 @@ describe('extraction routes', () => {
   it('states the key, replay, rerun, availability and untrusted-input rules', () => {
     const op = openapi.paths[EXTRACT].post
     const d = op.description.replace(/\s+/g, ' ')
-    expect(d).toMatch(/schema_sha256, extractor_version, model_id/)
+    // The model is not known before the call, so not in the key (David, 2026-10-10).
+    expect(d).toMatch(/\(document_id, revision, schema_sha256, extractor_version\) \(§5\.4\)/)
+    expect(d).toMatch(/recorded in the result's `model_id`/)
     expect(d).toMatch(/202 while queued or running/)
     expect(d).toMatch(/attempt \+ 1/)
     expect(d).toMatch(/200 once it has succeeded/)
@@ -69,7 +71,9 @@ describe('extraction routes', () => {
     expect(d).toMatch(/`rerun: true` with a new `Idempotency-Key`/)
     expect(d).toMatch(/without the header is 400/)
     expect(d).toMatch(/`LocalOnly`/)
-    expect(d).toMatch(/503 `engine_unavailable` with `details.engine`/)
+    // No model access is 503 at once; no local model is known only when the job runs.
+    expect(d).toMatch(/no\s+model access, the answer is 503 `engine_unavailable`/)
+    expect(d).toMatch(/the\s+job fails with `engine_unavailable` \(retryable; the same key\s+re-queues it\)/)
     expect(d).toMatch(/untrusted data/)
     expect(op.requestBody.required).toBe(true)
     expect(op.requestBody.content['application/json'].schema.$ref).toBe('#/components/schemas/DocumentsExtractRequest')
