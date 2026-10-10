@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub mod ground;
 pub mod merge;
 pub mod prompt;
+pub mod run;
 pub mod window;
 
 /// The version of the instruction, the answer's schema, windows, batches
