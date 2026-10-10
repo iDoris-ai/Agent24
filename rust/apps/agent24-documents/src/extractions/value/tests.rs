@@ -123,6 +123,16 @@ fn each_status_has_its_shape() {
         ("missing, unread", unread),
         ("conflict", conflict(vec![candidate("a"), candidate("b")])),
         (
+            "conflict, one wording",
+            conflict(vec![
+                candidate("a"),
+                Candidate {
+                    value: "a".into(),
+                    ..candidate("b")
+                },
+            ]),
+        ),
+        (
             "conflict, one unsourced",
             conflict(vec![candidate("a"), unsourced]),
         ),
@@ -246,6 +256,27 @@ fn a_value_that_breaks_the_contract_is_refused() {
                 value: Some("a".into()),
                 ..conflict(vec![candidate("a"), candidate("b")])
             },
+        ),
+        (
+            "candidates, one normal form",
+            conflict(vec![
+                candidate("a"),
+                Candidate {
+                    value: "A".into(),
+                    ..candidate("a")
+                },
+            ]),
+        ),
+        (
+            "candidates, one normal form, apart",
+            conflict(vec![
+                candidate("a"),
+                candidate("b"),
+                Candidate {
+                    value: "A".into(),
+                    ..candidate("a")
+                },
+            ]),
         ),
         (
             "candidate, no anchors, no reason",

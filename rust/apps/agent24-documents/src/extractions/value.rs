@@ -269,9 +269,16 @@ impl ExtractedValue {
                 if !CANDIDATES.contains(&candidates.len()) {
                     return Err(format!("{}: {} candidates", self.key, candidates.len()));
                 }
-                for c in candidates {
+                for (i, c) in candidates.iter().enumerate() {
                     evidence(&c.anchors, c.unsourced_reason.as_ref())
                         .map_err(|e| format!("{}: {e}", self.key))?;
+                    // Candidates conflict because their normal forms differ.
+                    if candidates[..i].iter().any(|d| d.normalized == c.normalized) {
+                        return Err(format!(
+                            "{}: two candidates normalize to {:?}",
+                            self.key, c.normalized
+                        ));
+                    }
                 }
                 none(&[
                     self.value.is_some(),
