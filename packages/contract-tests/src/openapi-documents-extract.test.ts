@@ -77,6 +77,7 @@ describe('extraction routes', () => {
     const getDoc = openapi.paths[GET].get.description.replace(/\s+/g, ' ')
     expect(getDoc).toMatch(/at most 512 KiB/)
     expect(getDoc).toMatch(/`anchors: \[\]` and `unsourced_reason`/)
+    expect(op.description).toMatch(/JCS hash of the whole request body/)
     expect(getDoc).not.toMatch(/`anchor`|null anchor/)
     const key = op.parameters.find((p: any) => p.name === 'Idempotency-Key')
     expect(key).toMatchObject({ in: 'header', required: false })
@@ -141,6 +142,8 @@ describe('extracted values (S01 gold shape)', () => {
     expect(v.DocumentsExtractedValue(noAnchors), 'no anchors field').toBe(false)
     expect(v.DocumentsExtractedValue({ ...present(), anchors: [] }), 'no evidence, no reason').toBe(false)
     ok('DocumentsExtractedValue', { ...present(), anchors: [], unsourced_reason: 'inferred from the page header' })
+    ok('DocumentsExtractedValue', { ...present(), anchors: Array.from({ length: 16 }, () => anchor()) })
+    expect(v.DocumentsExtractedValue({ ...present(), anchors: Array.from({ length: 17 }, () => anchor()) }), '17 anchors').toBe(false)
     const { value: _v, ...noValue } = present()
     expect(v.DocumentsExtractedValue(noValue), 'no value').toBe(false)
     const pair = [{ value: 'a', normalized: 'a', anchors: [anchor()] }, { value: 'b', normalized: 'b', anchors: [anchor()] }]
@@ -179,6 +182,13 @@ describe('extracted values (S01 gold shape)', () => {
     expect(v.DocumentsExtractedValue({ ...conflict, candidates: [c('10月13日', '2026-10-13')] }), 'one candidate').toBe(false)
     expect(v.DocumentsExtractedValue({ ...conflict, value: '2026年10月12日' }), 'a chosen value').toBe(false)
     expect(v.DocumentsExtractedValue({ ...conflict, anchors: [anchor()] }), 'chosen evidence').toBe(false)
+    // At most 8 candidates, and 16 anchors each (David, 2026-10-10).
+    const many = Array.from({ length: 8 }, (_, i) => c(`v${i}`, `n${i}`))
+    ok('DocumentsExtractedValue', { ...conflict, candidates: many })
+    expect(v.DocumentsExtractedValue({ ...conflict, candidates: [...many, c('v8', 'n8')] }), '9 candidates').toBe(false)
+    const sixteen = Array.from({ length: 16 }, () => anchor())
+    ok('DocumentsExtractedValue', { ...conflict, candidates: [{ ...c('a', 'a'), anchors: sixteen }, c('b', 'b')] })
+    expect(v.DocumentsExtractedValue({ ...conflict, candidates: [{ ...c('a', 'a'), anchors: [...sixteen, anchor()] }, c('b', 'b')] }), '17 anchors').toBe(false)
     const [first, second] = conflict.candidates
     for (const [name, bad] of [['no anchors', { value: 'b', normalized: 'b' }], ['empty anchors', { ...second, anchors: [] }],
       ['no normalized', { value: 'b', anchors: [anchor()] }], ['no raw value', { normalized: 'b', anchors: [anchor()] }]] as const) {

@@ -66,6 +66,11 @@ describe('page render', () => {
     expect(p.page.schema).toEqual({ type: 'integer', minimum: 1 })
     expect(p.scale.schema).toEqual({ type: 'number', minimum: 0.25, maximum: 4, default: 1 })
     const region = new RegExp(p.region.schema.pattern)
+    // Corners, as anchor rects are (David, 2026-10-10).
+    const said = p.region.description.replace(/\s+/g, ' ')
+    expect(said).toMatch(/`x0,y0,x1,y1`/)
+    expect(said).toMatch(/`x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`/)
+    expect(said).toMatch(/pixels after EXIF orientation/)
     for (const good of ['0,0,612,792', '10.5,20,100.25,50']) expect(region.test(good), good).toBe(true)
     for (const bad of ['1,2,3', '-1,0,1,1', 'a,b,c,d', '1,2,3,4,5']) expect(region.test(bad), bad).toBe(false)
   })
