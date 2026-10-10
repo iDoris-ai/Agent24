@@ -1,0 +1,847 @@
+{
+"os_version": "26.6.2",
+"unparsed": [],
+"protocol": 1,
+"pages": [
+{
+"height": 792,
+"lines": [
+{
+"rect": [
+178.58,
+35.99199999999996,
+440.5999999999999,
+55.918000000000006
+],
+"text": "DRINKING WATER WARNING"
+},
+{
+"rect": [
+119.30000000000001,
+64.05599999999993,
+500.092,
+79.55399999999997
+],
+"text": "______________________________ water is Contaminated with E. coli"
+},
+{
+"rect": [
+144.05,
+79.61999999999989,
+244.43000000000004,
+90.68999999999994
+],
+"text": "(Name of Water System)"
+},
+{
+"rect": [
+152.08,
+98.49199999999996,
+467.02599999999995,
+118.418
+],
+"text": "BOIL YOUR WATER BEFORE USING"
+},
+{
+"rect": [
+36.025,
+133.85799999999995,
+131.22100000000003,
+147.14199999999994
+],
+"text": "What should I do?"
+},
+{
+"rect": [
+36.025,
+149.10799999999995,
+562.0800000000002,
+162.39199999999994
+],
+"text": "DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST. Bring all water to a boil, let it boil for"
+},
+{
+"rect": [
+36.025,
+164.35799999999995,
+560.902,
+177.64199999999994
+],
+"text": "three (3) minutes, and let it cool before using or use bottled water. Boiled or bottled water should be used for"
+},
+{
+"rect": [
+36.025,
+179.60799999999995,
+561.614,
+192.89199999999994
+],
+"text": "drinking, making ice, brushing teeth, washing dishes, and food preparation until further notice. Boiling kills"
+},
+{
+"rect": [
+36.025,
+194.88800000000003,
+236.65300000000002,
+208.17200000000003
+],
+"text": "bacteria and other organisms in the water."
+},
+{
+"rect": [
+36.025,
+224.279,
+139.689,
+236.45600000000002
+],
+"text": "What does this mean?"
+},
+{
+"rect": [
+36.025,
+238.279,
+568.988,
+250.45600000000002
+],
+"text": "Inadequately treated or inadequately protected water may contain disease-causing organisms. These organisms can cause"
+},
+{
+"rect": [
+36.025,
+252.2689999999999,
+567.4159999999999,
+264.4459999999999
+],
+"text": "symptoms such as diarrhea, nausea, cramps and associated headaches. E. coli are bacteria whose presence indicates that"
+},
+{
+"rect": [
+36.025,
+266.299,
+556.9459999999999,
+278.476
+],
+"text": "the water may be contaminated with human or animal wastes. Human pathogens in these wastes can cause short-term"
+},
+{
+"rect": [
+36.025,
+280.2989999999999,
+572.2160000000001,
+292.47599999999994
+],
+"text": "effects, such as diarrhea, cramps, nausea, headaches, or other symptoms. They may pose a greater health risk for infants,"
+},
+{
+"rect": [
+36.025,
+294.2989999999999,
+555.699,
+306.47599999999994
+],
+"text": "young children, some of the elderly, and people with severely-compromised immune systems. These symptoms are not"
+},
+{
+"rect": [
+36.025,
+308.2989999999999,
+565.517,
+320.47599999999994
+],
+"text": "caused only by organisms in drinking water. If you experience any of these symptoms and they persist, you may want to"
+},
+{
+"rect": [
+36.025,
+322.2989999999999,
+127.501,
+334.47599999999994
+],
+"text": "seek medical advice."
+},
+{
+"rect": [
+36.025,
+350.31899999999996,
+214.863,
+362.496
+],
+"text": "What happened? What is being done?"
+},
+{
+"rect": [
+36.025,
+364.31899999999996,
+576.4,
+376.496
+],
+"text": "Our water system detected E. coli bacteria in a pipe of our distribution system. As our customers, you have a right to know"
+},
+{
+"rect": [
+36.025,
+378.31899999999996,
+564.2449999999997,
+390.496
+],
+"text": "what happened and what we are doing to correct this situation. On (date) __________, we learned that coliform bacteria"
+},
+{
+"rect": [
+36.025,
+392.31899999999996,
+572.5619999999999,
+404.496
+],
+"text": "were present in at least one of our routine samples collected on (date) ______________. As required by the Revised Total"
+},
+{
+"rect": [
+36.025,
+406.31899999999996,
+575.0840000000001,
+418.496
+],
+"text": "Coliform Rule, one of our follow-up steps was to collect repeat samples at and near the location where the positive sample"
+},
+{
+"rect": [
+36.025,
+420.31899999999996,
+582.9029999999998,
+432.496
+],
+"text": "was originally taken. On (date) __________, we learned that coliform bacteria were also present in at least one of our repeat"
+},
+{
+"rect": [
+36.025,
+434.34899999999993,
+572.6269999999997,
+446.52599999999995
+],
+"text": "samples collected on (date) ______________. Our water system had a combination of routine and repeat positive samples"
+},
+{
+"rect": [
+36.025,
+448.34899999999993,
+580.0310000000002,
+460.52599999999995
+],
+"text": "where at least one of the positive coliform bacteria samples was also E. coli positive, which resulted in an E. coli maximum"
+},
+{
+"rect": [
+36.025,
+462.34899999999993,
+544.0379999999997,
+474.52599999999995
+],
+"text": "contaminant level (MCL) violation. We are now conducting a thorough investigation to determine the source of the"
+},
+{
+"rect": [
+36.025,
+476.34899999999993,
+101.77199999999999,
+488.52599999999995
+],
+"text": "contamination."
+},
+{
+"rect": [
+36.025,
+504.36899999999997,
+363.708,
+516.546
+],
+"text": "Corrective action being taken includes (e.g., location of alternative water):"
+},
+{
+"rect": [
+36.025,
+518.3689999999999,
+580.525,
+530.546
+],
+"text": "___________________________________________________________________________________________________"
+},
+{
+"rect": [
+36.025,
+532.3689999999999,
+580.525,
+544.546
+],
+"text": "___________________________________________________________________________________________________"
+},
+{
+"rect": [
+36.025,
+546.369,
+580.6,
+558.546
+],
+"text": "___________________________________________________________________________________________________"
+},
+{
+"rect": [
+36.025,
+574.369,
+562.2099999999996,
+586.546
+],
+"text": "We will inform you when tests show no bacteria and you no longer need to boil your water. We anticipate resolving the"
+},
+{
+"rect": [
+36.025,
+588.649,
+580.8989999999999,
+600.826
+],
+"text": "problem within _______________ (estimated time frame). For more information, please contact______________________"
+},
+{
+"rect": [
+36.025,
+602.649,
+578.1469999999999,
+614.826
+],
+"text": "(name of contact) at ______________________ (phone number) or ____________________________________________"
+},
+{
+"rect": [
+36.025,
+616.649,
+115.74200000000002,
+628.826
+],
+"text": "(mailing address)."
+},
+{
+"rect": [
+36.025,
+644.649,
+561.7369999999994,
+656.826
+],
+"text": "General guidelines on ways to lessen the risk of infection by microbes are available from the EPA Safe Drinking Water"
+},
+{
+"rect": [
+36.025,
+658.649,
+157.05,
+670.826
+],
+"text": "Hotline at 1-800-426-4791."
+},
+{
+"rect": [
+36.025,
+686.674,
+568.0060000000001,
+698.851
+],
+"text": "Please share this information with all the other people who drink this water, especially those who may not have received"
+},
+{
+"rect": [
+36.025,
+700.674,
+579.8979999999999,
+712.851
+],
+"text": "this notice directly (for example, people in apartments, nursing homes, schools, and businesses). You can do this by posting"
+},
+{
+"rect": [
+36.025,
+714.674,
+521.664,
+726.851
+],
+"text": "this notice in a public place or distributing copies by hand or mail. Updated 6/10/25"
+},
+{
+"rect": [
+36.025,
+728.783,
+343.77700000000016,
+742.067
+],
+"text": "ATTENTION: PWS OPERATOR/RESPONSIBLE PARTY"
+}
+],
+"page": 1,
+"width": 612
+},
+{
+"page": 2,
+"width": 612,
+"lines": [
+{
+"rect": [
+36.025,
+36.087999999999965,
+581.47,
+49.37199999999996
+],
+"text": "Since exceeding the E. coli maximum contaminant level is a violation that requires Tier 1 public notification, you"
+},
+{
+"rect": [
+36.025,
+49.337999999999965,
+549.7360000000001,
+62.62199999999996
+],
+"text": "must provide public notice to persons served as soon as practical but within 24 hours after you learn of the"
+},
+{
+"rect": [
+36.025,
+62.587999999999965,
+575.3039999999999,
+75.87199999999996
+],
+"text": "violation (141.202(b)). During this same 24-hour period, you must also contact the Region 8 EPA Revised Total"
+},
+{
+"rect": [
+36.025,
+75.83799999999997,
+558.73,
+89.12199999999996
+],
+"text": "Coliform Rule Manager at 303-312-6072. If the emergency occurs after-hours or on the weekend, please call"
+},
+{
+"rect": [
+36.025,
+89.33799999999997,
+574.9899999999998,
+102.62199999999996
+],
+"text": "303-312-6327. You should also coordinate with your local health department. You may also have to modify this"
+},
+{
+"rect": [
+36.025,
+102.58799999999997,
+241.9210000000001,
+115.87199999999996
+],
+"text": "template for your particular circumstances."
+},
+{
+"rect": [
+36.025,
+123.85799999999995,
+520.7719999999997,
+137.14199999999994
+],
+"text": "You must use one or more of the following methods to deliver the notice to consumers (141.202(c)):"
+},
+{
+"rect": [
+72.025,
+137.10799999999995,
+107.761,
+150.39199999999994
+],
+"text": "• Radio"
+},
+{
+"rect": [
+72.025,
+150.35799999999995,
+129.493,
+163.64199999999994
+],
+"text": "• Television"
+},
+{
+"rect": [
+72.025,
+163.60799999999995,
+190.46500000000003,
+176.89199999999994
+],
+"text": "• Hand or direct delivery"
+},
+{
+"rect": [
+72.025,
+177.10799999999995,
+235.87300000000005,
+190.39199999999994
+],
+"text": "• Posting in conspicuous locations"
+},
+{
+"rect": [
+36.025,
+203.63800000000003,
+556.777,
+216.92200000000003
+],
+"text": "You may need to use additional methods (e.g., newspaper, delivery of multiple copies to hospitals, clinics or"
+},
+{
+"rect": [
+36.025,
+216.88800000000003,
+537.973,
+230.17200000000003
+],
+"text": "apartments) since notice must be provided in a manner reasonably calculated to reach all persons served."
+},
+{
+"rect": [
+36.025,
+243.38800000000003,
+548.0049999999999,
+256.672
+],
+"text": "This notice template is appropriate for hand delivery or newspaper publication. However, you may wish to"
+},
+{
+"rect": [
+36.025,
+256.88800000000003,
+567.9620000000001,
+270.172
+],
+"text": "modify it before using it for a radio or TV broadcast. If you do, you must still include all required PN elements"
+},
+{
+"rect": [
+36.025,
+270.1579999999999,
+572.8799999999999,
+283.44199999999995
+],
+"text": "and leave the health effects language in italics unchanged. This language is mandatory (141.205(d)). If you post"
+},
+{
+"rect": [
+36.025,
+283.40799999999996,
+444.39000000000004,
+296.69199999999995
+],
+"text": "or hand deliver the notice, you can print your notice on your water system letterhead."
+},
+{
+"rect": [
+36.025,
+309.90799999999996,
+127.369,
+323.19199999999995
+],
+"text": "Corrective Action"
+},
+{
+"rect": [
+36.025,
+323.15799999999996,
+577.8689999999997,
+336.44199999999995
+],
+"text": "In your notice, describe corrective actions you are taking. Listed below are some steps commonly taken by water"
+},
+{
+"rect": [
+36.025,
+336.40799999999996,
+579.3699999999997,
+349.69199999999995
+],
+"text": "systems with E. coli violations. You can use one or more of the following actions, if appropriate, or develop your"
+},
+{
+"rect": [
+36.025,
+349.928,
+60.097,
+363.212
+],
+"text": "own:"
+},
+{
+"rect": [
+72.025,
+363.178,
+334.16599999999994,
+376.462
+],
+"text": "• We are chlorinating and flushing the water system."
+},
+{
+"rect": [
+72.025,
+376.428,
+355.38200000000006,
+389.712
+],
+"text": "• We are switching to an alternate drinking water source."
+},
+{
+"rect": [
+72.025,
+389.678,
+546.0619999999997,
+402.962
+],
+"text": "• We are increasing sampling for coliform bacteria to determine the source of the contamination."
+},
+{
+"rect": [
+72.025,
+402.928,
+259.01200000000006,
+416.212
+],
+"text": "• We are repairing the wellhead seal."
+},
+{
+"rect": [
+72.025,
+416.178,
+546.1219999999996,
+429.462
+],
+"text": "• We are restricting water intake from the river/lake/reservoir to prevent additional bacteria from"
+},
+{
+"rect": [
+90.05,
+429.70799999999997,
+411.57799999999975,
+442.99199999999996
+],
+"text": "entering the water system and restricting water use to emergencies."
+},
+{
+"rect": [
+36.025,
+456.20799999999997,
+157.75300000000004,
+469.49199999999996
+],
+"text": "After Issuing the Notice"
+},
+{
+"rect": [
+36.025,
+482.70799999999997,
+497.03600000000006,
+495.99199999999996
+],
+"text": "Please send the copy of your public notice and certification using one of the following methods:"
+},
+{
+"rect": [
+72.025,
+503.978,
+199.262,
+517.262
+],
+"text": "Email: R8DWU@epa.gov"
+},
+{
+"rect": [
+72.025,
+526.4780000000001,
+176.08,
+539.762
+],
+"text": "Fax: 303-312-7517"
+},
+{
+"rect": [
+72.025,
+548.7280000000001,
+184.76600000000002,
+562.012
+],
+"text": "Mail: RTCR Manager"
+},
+{
+"rect": [
+108.05,
+561.9780000000001,
+397.166,
+575.262
+],
+"text": "US EPA REGION 8, Drinking Water Program (8WD-SDR)"
+},
+{
+"rect": [
+108.05,
+575.2280000000001,
+213.122,
+588.512
+],
+"text": "1595 Wynkoop Street"
+},
+{
+"rect": [
+108.05,
+588.758,
+230.10000000000002,
+602.042
+],
+"text": "Denver, CO 80202-1129."
+},
+{
+"rect": [
+36.025,
+615.258,
+557.0499999999997,
+628.542
+],
+"text": "If you have questions about your Revised Total Coliform Rule violation, please call Jamie Harris, the RTCR"
+},
+{
+"rect": [
+36.025,
+628.508,
+164.05,
+641.792
+],
+"text": "Manager at 303-312-6072."
+},
+{
+"rect": [
+36.025,
+655.008,
+572.4370000000001,
+668.292
+],
+"text": "It is recommended that you notify health professionals in the area of the violation. People may call their doctors"
+},
+{
+"rect": [
+36.025,
+668.278,
+574.0449999999998,
+681.562
+],
+"text": "with questions about how the violation may affect their health, and the doctors should have the information they"
+},
+{
+"rect": [
+36.025,
+681.783,
+181.82999999999998,
+695.067
+],
+"text": "need to respond appropriately."
+},
+{
+"rect": [
+54.025,
+748.058,
+313.51300000000003,
+761.342
+],
+"text": "CERTIFICATION OF PUBLIC NOTIFICATION"
+}
+],
+"height": 792
+},
+{
+"height": 792,
+"lines": [
+{
+"rect": [
+54.025,
+36.087999999999965,
+497.0969999999995,
+49.37199999999996
+],
+"text": "I _____________________________ certify that the attached public notice was issued from"
+},
+{
+"rect": [
+90.05,
+49.40199999999993,
+202.35400000000004,
+58.257999999999925
+],
+"text": "(PWS Operator/Responsible Party)"
+},
+{
+"rect": [
+54.025,
+66.33799999999997,
+496.6569999999999,
+79.62199999999996
+],
+"text": "________________________ to ___________________. The notice attached was issued by"
+},
+{
+"rect": [
+108.05,
+79.65199999999993,
+272.49199999999996,
+88.50799999999992
+],
+"text": "(Date) (Date)"
+},
+{
+"rect": [
+54.025,
+96.33799999999997,
+552.2049999999997,
+109.62199999999996
+],
+"text": "___________________________________ for the RTCR Violation that occurred on ______________."
+},
+{
+"rect": [
+72.025,
+109.42199999999991,
+526.5920000000001,
+118.2779999999999
+],
+"text": "(Method of delivery – by hand, mail, etc) (Date)"
+},
+{
+"rect": [
+54.025,
+131.85799999999995,
+551.485,
+145.14199999999994
+],
+"text": "Signature __________________________________________ Date ____________________________"
+},
+{
+"rect": [
+54.025,
+167.35799999999995,
+549.121,
+180.64199999999994
+],
+"text": "Public Water System Name: ___________________________ PWS ID Number: _________________"
+},
+{
+"rect": [
+54.025,
+257.35800000000006,
+128.615,
+270.58000000000004
+],
+"text": "Rev. 06/10/2025"
+}
+],
+"page": 3,
+"width": 612
+}
+]
+}
