@@ -340,7 +340,7 @@ fn probe_write(data_dir: &Path) -> StorageCause {
         .map_or(StorageCause::NotWritable, |e| io_cause(&e))
 }
 
-fn blob_cause(e: &BlobError) -> StorageCause {
+pub(crate) fn blob_cause(e: &BlobError) -> StorageCause {
     match e {
         BlobError::Locked => StorageCause::Locked,
         BlobError::Io(e) => io_cause(e),
@@ -363,6 +363,12 @@ fn sqlx_cause(e: &sqlx::Error, probe: &mut dyn FnMut() -> StorageCause) -> Stora
 /// The availability cause of a database error, or `None` for an error that
 /// is not about storage (a constraint, a decode failure: a bug). `probe` is
 /// asked only for an I/O error, the one code that needs it.
+/// Why `e` means storage is unavailable, if it does; an I/O error counts as
+/// not writable, without the probe a request may run.
+pub(crate) fn unavailable_cause(e: &sqlx::Error) -> Option<StorageCause> {
+    availability_cause(e, &mut || StorageCause::NotWritable)
+}
+
 fn availability_cause(
     e: &sqlx::Error,
     probe: &mut dyn FnMut() -> StorageCause,

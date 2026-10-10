@@ -86,7 +86,7 @@ pub struct Line {
     pub rect: Rect,
 }
 
-fn sha256_address(bytes: &[u8]) -> String {
+pub(crate) fn sha256_address(bytes: &[u8]) -> String {
     let hex: String = Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))

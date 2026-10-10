@@ -134,6 +134,19 @@ impl ApiError {
         e
     }
 
+    /// 503: the read engine is not here (Linux, D10), busy, or still
+    /// building the text layer; retry later (§6, §3.1).
+    #[must_use]
+    pub fn engine_unavailable(engine: &str, message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_unavailable",
+            message.into(),
+            true,
+        )
+        .with_detail("engine", engine.to_owned())
+    }
+
     /// 422 with a code from the closed set: a request the OS understood but
     /// cannot carry out, e.g. `unsupported_format` (§6).
     #[must_use]
