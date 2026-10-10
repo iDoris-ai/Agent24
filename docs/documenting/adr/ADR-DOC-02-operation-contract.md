@@ -233,7 +233,7 @@
      |---|---|
      | `upload` | 页面的 `Idempotency-Key` |
      | `import` | `upload_id` |
-     | `extract` | `(document_id, revision, schema_sha256, extractor_version)`。实际用的模型由内核路由器在调用时决定，事先问不到，所以不进键，而是记在结果的 `model_id` 里；本地模型换了以后，同样的请求仍重放旧结果，要用新模型就显式重新抽取（David，2026-10-10，原为键里带实际模型 id）。需要重新抽取时，页面带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，在这个文档内标识这一次重新抽取，同一个键再来就重放它；同一个键换了请求体（整个请求体的 JCS 哈希不同）是 422 `idempotency_key_reused`（David，2026-10-10；取代 2026-10-09「并入业务键、换了 schema 就是另一个键」的写法，那样 422 永远不会出现） |
+     | `extract` | `(document_id, revision, schema_sha256, extractor_version)`。实际用的模型由内核路由器在调用时决定，事先问不到，所以不进键，而是记在结果的 `model_id` 里；本地模型换了以后，同样的请求仍重放旧结果，要用新模型就显式重新抽取（David，2026-10-10，原为键里带实际模型 id）。需要重新抽取时，页面带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，在这个文档内标识这一次重新抽取，同一个键再来就重放它；同一个键换了请求体（整个请求体的 JCS 哈希不同）是 422 `idempotency_key_reused`。`idempotency` 表里两种行的 `key` 形状不同、不会相混：首次抽取存 `{document_id}/{revision}/{schema_sha256}/{extractor_version}`，rerun 存 `{document_id}/rerun/{Idempotency-Key}`；请求体里没有 `document_id`，所以作用域靠存键里的 `document_id`：同一个键用在另一份文档上，是那份文档的另一次重新抽取，不会重放这份文档的 job（回应 PR-Daemon 对 #894 的审查）（David，2026-10-10；取代 2026-10-09「并入业务键、换了 schema 就是另一个键」的写法，那样 422 永远不会出现） |
      | `propose` | `(document_id, base_revision, ops_sha256)` |
      | `export` | `(document_id, revision, format, options_sha256)` |
      | `commit` | `commit_key` |
