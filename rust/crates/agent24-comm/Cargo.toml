@@ -69,6 +69,9 @@ tracing = "0.1"
 zeroize = "1"
 
 [dev-dependencies]
+# COMM-5b parses state types rather than matching comments or field spellings.
+syn = { version = "2", features = ["full"] }
+quote = "1"
 # Mirrors agent24-os-proto's `test-util` pattern: depending on ourselves with
 # the feature on means `cargo test -p agent24-comm` (no extra flags) already
 # runs the lock-override-gated tests.
