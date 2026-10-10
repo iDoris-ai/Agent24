@@ -66,7 +66,7 @@ impl Engine for Fake {
     fn config(&self) -> Value {
         json!({ "blocks": "whole" })
     }
-    fn parse(&self, _media_type: &str, path: &Path) -> Parse {
+    fn parse(&self, _content_sha256: &str, _media_type: &str, path: &Path) -> Parse {
         assert!(!self.panic.load(SeqCst), "the engine crashed");
         self.parses.fetch_add(1, SeqCst);
         let now = self.running.fetch_add(1, SeqCst) + 1;

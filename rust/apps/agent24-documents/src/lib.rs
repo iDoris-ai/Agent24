@@ -100,12 +100,15 @@ const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("extract", Needs::Engine, false),
 ];
 
-/// What this build can do right now. Engines are not wired yet, so engine
-/// operations are always unavailable.
+/// What this build can do right now. The read engine is reported whether it
+/// is here or not (absent on Linux, D10); engine operations stay unavailable
+/// until their routes land.
 #[must_use]
 pub async fn capabilities(state: &AppState) -> Capabilities {
     // Asking also retries storage that failed to open (see `state`).
     let storage_ready = state.storage().await.is_ok();
+    let engine = state.layers().engine().map(|e| e.engine().version);
+    let engine_ready = engine.is_some();
     Capabilities {
         os_version: env!("CARGO_PKG_VERSION"),
         storage: StorageStatus {
@@ -115,7 +118,13 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
                 "unavailable"
             },
         },
-        engines: Vec::new(),
+        engines: vec![EngineStatus {
+            id: engine::pdfkit::ENGINE_ID,
+            kind: "parse",
+            formats: engine::pdfkit::FORMATS.to_vec(),
+            state: if engine_ready { "ready" } else { "absent" },
+            version: engine,
+        }],
         knowledge: KnowledgeStatus {
             setting: "on",
             state: "unavailable",
@@ -125,7 +134,7 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
             .map(|&(op, needs, routed)| {
                 let (ready, code) = match needs {
                     Needs::Storage => (storage_ready, "storage_unavailable"),
-                    Needs::Engine => (false, "engine_unavailable"),
+                    Needs::Engine => (engine_ready, "engine_unavailable"),
                 };
                 let available = routed && ready;
                 OperationStatus {
@@ -265,7 +274,12 @@ mod tests {
             body["storage"],
             serde_json::json!({ "state": "unavailable" })
         );
-        assert_eq!(body["engines"], serde_json::json!([]));
+        // The read engine is reported even when it is not here.
+        assert_eq!(
+            body["engines"],
+            serde_json::json!([{ "id": "apple-pdfkit", "kind": "parse", "state": "absent", "version": null,
+                "formats": ["application/pdf", "image/jpeg", "image/png"] }])
+        );
         assert_eq!(body["knowledge"]["setting"], "on");
         assert_eq!(body["knowledge"]["state"], "unavailable");
         assert_operations(&body, &[]);

@@ -37,7 +37,7 @@ pub type Parse = Pin<Box<dyn Future<Output = Result<TextLayer, EngineError>> + S
 pub trait Engine: Send + Sync {
     fn engine(&self) -> EngineRef;
     fn config(&self) -> Value;
-    fn parse(&self, media_type: &str, path: &Path) -> Parse;
+    fn parse(&self, content_sha256: &str, media_type: &str, path: &Path) -> Parse;
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -76,6 +76,12 @@ pub struct Layers {
 }
 
 impl Layers {
+    /// The engine layers are built with, if this platform has one.
+    #[must_use]
+    pub fn engine(&self) -> Option<&Arc<dyn Engine>> {
+        self.engine.as_ref()
+    }
+
     #[must_use]
     pub fn new(engine: Option<Arc<dyn Engine>>) -> Arc<Self> {
         Arc::new(Self {
@@ -218,7 +224,7 @@ async fn build(
         .path_of(&key.content)
         .map_err(|e| LayerFailure::Storage(e.to_string()))?;
     let layer = engine
-        .parse(&media_type, &path)
+        .parse(&key.content, &media_type, &path)
         .await
         .map_err(LayerFailure::Engine)?;
     if layer.engine != key.engine || layer.config != engine.config() {
@@ -234,3 +240,5 @@ async fn build(
 
 #[cfg(test)]
 mod tests;
+
+pub mod pdfkit;
