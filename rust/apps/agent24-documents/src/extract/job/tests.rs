@@ -16,10 +16,10 @@ use crate::events::Events;
 use crate::extract::run::{Call, Model};
 use crate::text_layer::{Block, EngineRef, Line, TextLayer};
 
-const DOC: &str = "doc_01K74Z3QJ8V5N2W9RTX6YB4M00";
+pub(crate) const DOC: &str = "doc_01K74Z3QJ8V5N2W9RTX6YB4M00";
 
 /// A text engine that reads one block, "停水 10月12日".
-struct OneBlock;
+pub(crate) struct OneBlock;
 
 impl Engine for OneBlock {
     fn engine(&self) -> EngineRef {
@@ -60,9 +60,9 @@ impl Engine for OneBlock {
 
 /// A model that answers from a script; it can mark the job cancelling
 /// before it answers.
-struct Script {
-    replies: Mutex<VecDeque<Result<CompleteResult, ClientError>>>,
-    cancel: Mutex<Option<(Arc<Storage>, String)>>,
+pub(crate) struct Script {
+    pub(crate) replies: Mutex<VecDeque<Result<CompleteResult, ClientError>>>,
+    pub(crate) cancel: Mutex<Option<(Arc<Storage>, String)>>,
 }
 
 impl Model for Script {
@@ -87,7 +87,7 @@ impl Model for Script {
     }
 }
 
-fn answer(status: &str) -> Result<CompleteResult, ClientError> {
+pub(crate) fn answer(status: &str) -> Result<CompleteResult, ClientError> {
     let value = match status {
         "present" => {
             json!({ "key": "date", "status": "present", "value": "10月12日", "normalized": "2026-10-12",
@@ -109,14 +109,14 @@ fn answer(status: &str) -> Result<CompleteResult, ClientError> {
     })
 }
 
-struct Env {
-    _dir: tempfile::TempDir,
-    state: AppState,
-    storage: Arc<Storage>,
+pub(crate) struct Env {
+    pub(crate) _dir: tempfile::TempDir,
+    pub(crate) state: AppState,
+    pub(crate) storage: Arc<Storage>,
 }
 
 /// A document with r1, a text engine, and (if given) a model.
-async fn env(model: Option<Arc<Script>>) -> Env {
+pub(crate) async fn env(model: Option<Arc<Script>>) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::open_serving(
         dir.path(),
@@ -148,14 +148,14 @@ async fn env(model: Option<Arc<Script>>) -> Env {
     }
 }
 
-fn script(replies: Vec<Result<CompleteResult, ClientError>>) -> Arc<Script> {
+pub(crate) fn script(replies: Vec<Result<CompleteResult, ClientError>>) -> Arc<Script> {
     Arc::new(Script {
         replies: Mutex::new(replies.into()),
         cancel: Mutex::default(),
     })
 }
 
-fn input() -> Value {
+pub(crate) fn input() -> Value {
     let fields = vec![Field {
         key: "date".into(),
         description: "停水日期".into(),
@@ -165,7 +165,7 @@ fn input() -> Value {
 }
 
 /// A queued extract job with `input`, its worker started.
-async fn start(env: &Env, input: &Value) -> String {
+pub(crate) async fn start(env: &Env, input: &Value) -> String {
     let id = new_id(IdKind::Job).unwrap();
     sqlx::query(
         "INSERT INTO jobs (id, kind, document_id, revision, status, origin, input)
@@ -182,7 +182,7 @@ async fn start(env: &Env, input: &Value) -> String {
 }
 
 /// The job once it has ended: status, error code, result.
-async fn ended(env: &Env, id: &str) -> (String, Option<String>, Option<String>) {
+pub(crate) async fn ended(env: &Env, id: &str) -> (String, Option<String>, Option<String>) {
     let start = Instant::now();
     loop {
         let row: (String, Option<String>, Option<String>) =
@@ -434,4 +434,26 @@ async fn a_job_waiting_for_its_layer_sees_its_cancel() {
         "{:?}",
         cancelled.elapsed()
     );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_extract_job_runs_again() {
+    let model = script(vec![
+        Err(ClientError::Forbidden("f".into())),
+        answer("missing"),
+    ]);
+    let env = env(Some(model)).await;
+    let id = start(&env, &input()).await;
+    assert_eq!(ended(&env, &id).await.0, "failed");
+    let res = crate::router(env.state.clone())
+        .oneshot(
+            Request::post(format!("/jobs/{id}/retry"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let (status, _, result) = ended(&env, &id).await;
+    assert_eq!(status, "succeeded");
+    assert!(result.is_some());
 }

@@ -4,14 +4,14 @@
 pub mod runner;
 
 use axum::Json;
-use axum::extract::Path as UrlPath;
+use axum::extract::{Path as UrlPath, State};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::db::Db;
 use crate::error::{ApiError, CODES};
 use crate::id::{IdKind, is_id};
-use crate::state::{Ready, Storage};
+use crate::state::{AppState, Ready, Storage};
 use crate::timestamp::is_timestamp;
 
 /// `DocumentsJob`.
@@ -300,6 +300,7 @@ pub async fn cancel_job(
 /// The explicit restart (§7): failed, interrupted or cancelled → queued,
 /// attempt + 1. Anything else is 400 with `details.status`.
 pub async fn retry_job(
+    State(state): State<AppState>,
     Ready(storage): Ready,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Job>, ApiError> {
@@ -321,9 +322,11 @@ pub async fn retry_job(
         .0;
         #[cfg(test)]
         tests::after_retry_commit(&id).await;
-        // Queued again: start its worker (the only kind with one so far).
-        if job.kind == "import" {
-            crate::imports::worker::spawn(storage, id, job.attempt);
+        // Queued again: start its kind's worker.
+        match job.kind.as_str() {
+            "import" => crate::imports::worker::spawn(storage, id, job.attempt),
+            "extract" => crate::extract::job::spawn(state, storage, id, job.attempt),
+            _ => {}
         }
         Ok(job)
     });
