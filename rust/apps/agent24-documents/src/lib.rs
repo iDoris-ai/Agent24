@@ -172,6 +172,10 @@ pub fn router(state: AppState) -> Router {
             get(read::render::render_page),
         )
         .route("/documents/{document_id}/find", post(read::find::find))
+        .route(
+            "/extractions/{extraction_id}",
+            get(extractions::get_extraction),
+        )
         .route("/imports", post(imports::handler::import))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
