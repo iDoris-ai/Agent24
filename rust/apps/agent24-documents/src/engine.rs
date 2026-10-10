@@ -1,6 +1,7 @@
 //! Text engines and building the text layer (ADR-DOC-01 D6, ADR-DOC-02
-//! §3.1). The OS depends only on [`Engine`]; slice 1's is the PDFKit helper,
-//! and a later cross-platform one plugs in the same way.
+//! §3.1), and page renders (§4). The OS depends only on [`Engine`]; slice
+//! 1's is the PDFKit helper, and a later cross-platform one plugs in the
+//! same way.
 //!
 //! A read that needs a layer the OS has not pinned starts building it and
 //! waits a bounded time: the engine keeps going in the background, so a
@@ -31,6 +32,11 @@ pub const QUEUE: usize = 16;
 pub const WAIT: Duration = Duration::from_secs(8);
 
 pub type Parse = Pin<Box<dyn Future<Output = Result<TextLayer, EngineError>> + Send>>;
+pub type Render = Pin<Box<dyn Future<Output = Result<Rendered, RenderError>> + Send>>;
+
+/// The scales a render may use (§4).
+pub const MIN_SCALE: f64 = 0.25;
+pub const MAX_SCALE: f64 = 4.0;
 
 /// A text engine: who it is, what it is asked to do, and a parse of the
 /// file at `path` (a stored blob) into a layer from exactly that engine and
@@ -39,6 +45,47 @@ pub trait Engine: Send + Sync {
     fn engine(&self) -> EngineRef;
     fn config(&self) -> Value;
     fn parse(&self, content_sha256: &str, media_type: &str, path: &Path) -> Parse;
+
+    /// A page of the file at `path`, or a region of it, as a PNG (§4). An
+    /// engine that does not render renders no format.
+    fn render(&self, _media_type: &str, _path: &Path, _ask: RenderAsk) -> Render {
+        Box::pin(async { Err(RenderError::Unsupported) })
+    }
+}
+
+/// A render asked for: a 1-based page; a scale from [`MIN_SCALE`] to
+/// [`MAX_SCALE`], which the engine may lower until the PNG fits in
+/// `max_bytes`; and a region, as corners in the frame of anchor rects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderAsk {
+    pub page: u32,
+    pub scale: f64,
+    pub region: Option<[f64; 4]>,
+    pub max_bytes: usize,
+}
+
+/// A PNG, and the scale it was drawn at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rendered {
+    pub scale: f64,
+    pub png: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum RenderError {
+    #[error("the engine does not render this format")]
+    Unsupported,
+    #[error("the file has no such page")]
+    NoPage,
+    #[error("the region is empty or off the page")]
+    OffPage,
+    #[error("the render does not fit even at the smallest scale")]
+    TooLarge,
+    /// Still rendering when its time ran out; it was stopped.
+    #[error("the engine took too long to render")]
+    TooSlow,
+    #[error("the engine could not render the file: {0}")]
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
