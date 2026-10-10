@@ -90,8 +90,11 @@ func imageSource(_ url: URL, page number: Int) throws -> Source {
 }
 
 /// `region` drawn at `scale`, as a PNG, on white.
+/// Pixels for `points` at `scale`: rounded up, at least one.
+func pixels(_ points: Double, _ scale: Double) -> Int { max(1, Int((points * scale).rounded(.up))) }
+
 func png(_ source: Source, _ region: CGRect, _ scale: Double) throws -> (Data, Int, Int) {
-  let (w, h) = (max(1, Int((region.width * scale).rounded(.up))), max(1, Int((region.height * scale).rounded(.up))))
+  let (w, h) = (pixels(region.width, scale), pixels(region.height, scale))
   guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
     space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
   else { throw Failure.failed("no memory for a \(w)x\(h) render") }
@@ -107,15 +110,19 @@ func png(_ source: Source, _ region: CGRect, _ scale: Double) throws -> (Data, I
   return (data as Data, w, h)
 }
 
-/// The region asked for, clipped to the page; none is the whole page. One
-/// that is empty or lies wholly off the page is refused (exit 5): only here
-/// is the page's size known.
+/// The region asked for, clipped to the page; none is the whole page. Its
+/// top-left corner must be on the page (0 or more, like a line's rectangle),
+/// so clipping only trims the right and bottom and the corner stays where it
+/// was asked for: pixels map back to the page from it. One that is not four
+/// numbers, is empty, starts left of or above the page, or lies wholly off
+/// it is refused (exit 5): only here is the page's size known.
 func clipped(_ asked: String?, to size: CGSize) throws -> CGRect {
   let page = CGRect(origin: .zero, size: size)
   guard let asked else { return page }
   let fields = asked.split(separator: ",", omittingEmptySubsequences: false)
   let v = fields.compactMap { Double($0) }
-  guard fields.count == 4, v.count == 4, v.allSatisfy({ $0.isFinite }), v[0] < v[2], v[1] < v[3] else {
+  guard fields.count == 4, v.count == 4, v.allSatisfy({ $0.isFinite && $0 >= 0 }), v[0] < v[2], v[1] < v[3]
+  else {
     throw Failure.offPage
   }
   let r = CGRect(x: v[0], y: v[1], width: v[2] - v[0], height: v[3] - v[1]).intersection(page)
@@ -123,16 +130,19 @@ func clipped(_ asked: String?, to size: CGSize) throws -> CGRect {
   return r
 }
 
-/// The largest scale, up to `asked`, whose PNG fits in `maxBytes` and whose
-/// pixels stay within the budget. Each try that is too large sets the next
-/// by how much it was over, at least 10% lower; the eighth is 0.25. So it is
-/// too large (exit 6) only when 0.25 was tried, or is over the budget.
+/// A PNG within `maxBytes` and the pixel budget, from the scale asked for
+/// down: each try that is too large sets the next by how much it was over,
+/// at least 10% lower; the eighth is 0.25. It never searches back up. So it
+/// is too large (exit 6) only when 0.25 was tried, or is over the budget.
 func render(_ source: Source, region: CGRect, asked: Double, maxBytes: Int) throws -> (Rendered, Data) {
   let area = Double(region.width * region.height)
   var scale = min(asked, (maxPixels / area).squareRoot())
   for tries in 1... {
     scale = max(minScale, stepped(scale))
-    guard scale * scale * area <= maxPixels else { throw Failure.tooLarge }
+    // The bitmap's real size: each side rounded up, as `png` makes it.
+    guard Double(pixels(region.width, scale) * pixels(region.height, scale)) <= maxPixels else {
+      throw Failure.tooLarge
+    }
     let (data, w, h) = try autoreleasepool { try png(source, region, scale) }
     if data.count <= maxBytes { return (Rendered(protocol: 1, scale: scale, width: w, height: h), data) }
     if scale == minScale { throw Failure.tooLarge }

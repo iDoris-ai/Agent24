@@ -13,8 +13,9 @@
 // image's size, then a PNG of at most <max-bytes> (render.swift).
 // Exit 2: not a format this engine reads. Exit 3: a file of that format that
 // could not be read (stderr says why). Render only: exit 4, no such page;
-// 5, the region is empty or off the page; 6, too large even at the smallest
-// scale. Exit 64: usage.
+// 5, the region is not four numbers, is empty, starts off the page or lies
+// wholly off it; 6, too large even at the smallest scale (over the byte limit
+// at 0.25, or over 40 megapixels there). Exit 64: usage.
 
 import AppKit
 import Foundation
@@ -160,9 +161,9 @@ do {
 } catch Failure.noPage {
   fail(4, "no such page")
 } catch Failure.offPage {
-  fail(5, "the region is empty or off the page")
+  fail(5, "the region is not four numbers, is empty, or is off the page")
 } catch Failure.tooLarge {
-  fail(6, "too large even at the smallest scale")
+  fail(6, "too large even at scale 0.25: over the byte limit or 40 megapixels")
 } catch {
   fail(3, error.localizedDescription)
 }
