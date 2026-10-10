@@ -419,7 +419,7 @@ async fn settling_is_fenced_by_attempt_and_by_claim() {
     settle(
         &env.storage,
         &at(1, Mine::Unclaimed),
-        "storage_unavailable",
+        Some("storage_unavailable"),
         "x",
     )
     .await
@@ -429,7 +429,7 @@ async fn settling_is_fenced_by_attempt_and_by_claim() {
     settle(
         &env.storage,
         &at(1, Mine::Claimed),
-        "storage_unavailable",
+        Some("storage_unavailable"),
         "x",
     )
     .await
@@ -439,7 +439,7 @@ async fn settling_is_fenced_by_attempt_and_by_claim() {
     settle(
         &env.storage,
         &at(2, Mine::Unclaimed),
-        "storage_unavailable",
+        Some("storage_unavailable"),
         "x",
     )
     .await
@@ -449,7 +449,7 @@ async fn settling_is_fenced_by_attempt_and_by_claim() {
     settle(
         &env.storage,
         &at(2, Mine::Claimed),
-        "storage_unavailable",
+        Some("storage_unavailable"),
         "x",
     )
     .await
@@ -587,4 +587,126 @@ async fn each_attempt_announces_its_own_end_and_a_late_supervisor_nothing() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(seen.lock().unwrap().len(), 1, "attempt 1 ended nothing");
+}
+
+/// Work cut off from outside ends interrupted, no error, so its key queues
+/// it again; one being cancelled still ends cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_cut_off_from_outside_ends_interrupted() {
+    let env = env().await;
+    let id = add_job(&env, 1).await;
+    spawn(
+        env.storage.clone(),
+        id.clone(),
+        1,
+        |storage, claim| async move { claim.interrupt(&storage, "the kernel is stopping").await },
+    );
+    assert_eq!(finished(&env, &id, 1).await, row_of("interrupted", 1, None));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let cancelling = add_job(&env, 1).await;
+    spawn(env.storage.clone(), cancelling.clone(), 1, {
+        let gate = gate.clone();
+        move |storage, claim| async move {
+            gate.notified().await;
+            claim.interrupt(&storage, "the kernel is stopping").await
+        }
+    });
+    let start = Instant::now();
+    while row(&env, &cancelling).await.0 != "running" {
+        assert!(start.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    exec(
+        &env,
+        &format!("UPDATE jobs SET status = 'cancelling' WHERE id = '{cancelling}'"),
+    )
+    .await;
+    gate.notify_one();
+    assert_eq!(
+        finished(&env, &cancelling, 1).await,
+        row_of("cancelled", 1, Some("cancelled"))
+    );
+}
+
+/// A success can name its result row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_success_names_its_result() {
+    let env = env().await;
+    let id = add_job(&env, 1).await;
+    spawn(
+        env.storage.clone(),
+        id.clone(),
+        1,
+        |storage, claim| async move {
+            let commit = claim.begin_commit(&storage).await?.unwrap();
+            commit
+                .succeed_with(None, None, None, Some("result-1"))
+                .await
+        },
+    );
+    assert_eq!(finished(&env, &id, 1).await, row_of("succeeded", 1, None));
+    let result: Option<String> = sqlx::query_scalar("SELECT result_ref FROM jobs WHERE id = ?")
+        .bind(&id)
+        .fetch_one(env.storage.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(result.as_deref(), Some("result-1"));
+}
+
+/// Long work asks whether it is still running, and records its progress
+/// only while it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_work_sees_a_cancel_and_records_its_progress() {
+    let env = env().await;
+    let id = add_job(&env, 1).await;
+    let (ready, go) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    spawn(env.storage.clone(), id.clone(), 1, {
+        let (ready, go, seen) = (ready.clone(), go.clone(), seen.clone());
+        move |storage, claim| async move {
+            let p = json!({ "stage": "s", "done": 1, "total": 2, "unit": "u" });
+            claim.progress(&storage, &p).await?;
+            let running = claim.is_running(&storage).await?;
+            seen.lock().unwrap().push(running);
+            ready.notify_one();
+            go.notified().await;
+            let running = claim.is_running(&storage).await?;
+            seen.lock().unwrap().push(running);
+            claim
+                .progress(
+                    &storage,
+                    &json!({ "stage": "late", "done": 2, "total": 2, "unit": "u" }),
+                )
+                .await
+        }
+    });
+    ready.notified().await;
+    let progress: String =
+        sqlx::query_scalar("SELECT progress ->> '$.stage' FROM jobs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(env.storage.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(progress, "s");
+    exec(
+        &env,
+        &format!("UPDATE jobs SET status = 'cancelling' WHERE id = '{id}'"),
+    )
+    .await;
+    go.notify_one();
+    assert_eq!(
+        finished(&env, &id, 1).await,
+        row_of("cancelled", 1, Some("cancelled"))
+    );
+    assert_eq!(*seen.lock().unwrap(), [true, false]);
+    let progress: String =
+        sqlx::query_scalar("SELECT progress ->> '$.stage' FROM jobs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(env.storage.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(progress, "s", "not written once it stopped running");
 }

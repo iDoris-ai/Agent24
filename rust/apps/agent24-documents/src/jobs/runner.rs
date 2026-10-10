@@ -112,7 +112,7 @@ where
             mine,
         };
         let mut wait = Duration::from_millis(100);
-        while let Err(e) = settle(&storage, &me, "storage_unavailable", why).await {
+        while let Err(e) = settle(&storage, &me, Some("storage_unavailable"), why).await {
             tracing::error!(error = %e, job = me.job_id, "documents: cannot settle a job yet");
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(Duration::from_secs(60));
@@ -198,7 +198,42 @@ impl Claim {
         code: &str,
         message: &str,
     ) -> Result<(), sqlx::Error> {
-        settle(storage, &self.attempt, code, message).await
+        settle(storage, &self.attempt, Some(code), message).await
+    }
+
+    /// Whether this attempt is still the job's, and running: not being
+    /// cancelled, ended or superseded. Long work asks between its steps.
+    pub async fn is_running(&self, storage: &Storage) -> Result<bool, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE id = ? AND attempt = ? AND status = 'running'",
+        )
+        .bind(&self.attempt.job_id)
+        .bind(self.attempt.attempt)
+        .fetch_one(storage.db.pool())
+        .await?;
+        Ok(n == 1)
+    }
+
+    /// Records how far this attempt has got (`DocumentsJob.progress`), while
+    /// it is running.
+    pub async fn progress(&self, storage: &Storage, progress: &Value) -> Result<(), sqlx::Error> {
+        sqlx::query(&format!(
+            "UPDATE jobs SET progress = ?, updated_at = {NOW}
+             WHERE id = ? AND attempt = ? AND status = 'running'"
+        ))
+        .bind(progress.to_string())
+        .bind(&self.attempt.job_id)
+        .bind(self.attempt.attempt)
+        .execute(storage.db.pool())
+        .await
+        .map(|_| ())
+    }
+
+    /// Ends this attempt interrupted: its work was cut off from outside
+    /// (the kernel stopping), not wrong, and the next call with its key
+    /// queues it again (§7). Cancelled if it was being cancelled.
+    pub async fn interrupt(&self, storage: &Storage, message: &str) -> Result<(), sqlx::Error> {
+        settle(storage, &self.attempt, None, message).await
     }
 
     /// Takes the write lock to end this attempt with a result. `None` if the
@@ -237,14 +272,26 @@ impl Commit {
     /// Marks the attempt succeeded, with what it produced, and commits it
     /// with the result rows written through [`Commit::conn`].
     pub async fn succeed(
-        mut self,
+        self,
         document_id: Option<&str>,
         revision: Option<i64>,
         progress: Option<&Value>,
     ) -> Result<(), sqlx::Error> {
+        self.succeed_with(document_id, revision, progress, None)
+            .await
+    }
+
+    /// The same, naming the result row by `result_ref` (an extraction's id).
+    pub async fn succeed_with(
+        mut self,
+        document_id: Option<&str>,
+        revision: Option<i64>,
+        progress: Option<&Value>,
+        result_ref: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         let done = sqlx::query(&format!(
             "UPDATE jobs SET status = 'succeeded', document_id = ?1, revision = ?2,
-                    progress = ?3, updated_at = {NOW}
+                    progress = ?3, result_ref = ?6, updated_at = {NOW}
              WHERE id = ?4 AND attempt = ?5 AND status = 'running'"
         ))
         .bind(document_id)
@@ -252,6 +299,7 @@ impl Commit {
         .bind(progress.map(Value::to_string))
         .bind(&self.attempt.job_id)
         .bind(self.attempt.attempt)
+        .bind(result_ref)
         .execute(&mut *self.tx)
         .await?
         .rows_affected();
@@ -271,12 +319,13 @@ impl Commit {
 }
 
 /// Ends an unfinished attempt: failed with `code` (from the closed §6 set),
-/// or cancelled if it was being cancelled. Announced only when it is what
-/// ended the attempt, so a late supervisor never speaks for another one.
+/// interrupted without one, or cancelled if it was being cancelled.
+/// Announced only when it is what ended the attempt, so a late supervisor
+/// never speaks for another one.
 async fn settle(
     storage: &Storage,
     me: &Attempt,
-    code: &str,
+    code: Option<&str>,
     message: &str,
 ) -> Result<(), sqlx::Error> {
     #[cfg(test)]
@@ -290,10 +339,12 @@ async fn settle(
     let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
     let ended = sqlx::query(&format!(
         "UPDATE jobs SET updated_at = {NOW},
-                status = CASE status WHEN 'cancelling' THEN 'cancelled' ELSE 'failed' END,
-                error = CASE status WHEN 'cancelling'
-                        THEN json_object('code', 'cancelled', 'message', 'cancelled by the user')
-                        ELSE json_object('code', ?1, 'message', ?2) END
+                status = CASE WHEN status = 'cancelling' THEN 'cancelled'
+                              WHEN ?1 IS NULL THEN 'interrupted' ELSE 'failed' END,
+                error = CASE WHEN status = 'cancelling'
+                             THEN json_object('code', 'cancelled', 'message', 'cancelled by the user')
+                             WHEN ?1 IS NULL THEN NULL
+                             ELSE json_object('code', ?1, 'message', ?2) END
          WHERE id = ?3 AND attempt = ?4 AND status IN {states}"
     ))
     .bind(code)
