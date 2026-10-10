@@ -19,14 +19,15 @@ pub use net::HttpFetchTool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult};
 use agent24_protocol::{Decision, RiskClass, ToolInfo};
 use agent24_store::{
-    ActorRef, AuditTimestamp, AuthorizationRef, DurationMs, ModuleId, ModuleToolAuditEvent,
-    ModuleToolAuditRelation, ModuleToolResultCode, OperationId, RunId, SessionRef, Store,
-    ToolCallId,
+    ActorRef, AttemptId, AuditTimestamp, AuthorizationRef, DurationMs, ModuleId,
+    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, RunId,
+    SessionRef, Store, ToolCallId,
 };
 use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
@@ -134,6 +135,122 @@ impl ToolContext {
             tool_call_id: tool_call_id.into(),
             workspace: self.workspace.clone(),
         }
+    }
+}
+
+fn fresh_attempt_id() -> Result<AttemptId, ToolError> {
+    static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ToolError::Failed("could not create invocation identity".into()))?
+        .as_nanos();
+    AttemptId::new(format!(
+        "attempt-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+    ))
+    .map_err(|_| ToolError::Failed("could not create invocation identity".into()))
+}
+
+#[derive(Clone)]
+struct ModuleToolOwnerToken(Arc<()>);
+
+impl ModuleToolOwnerToken {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationLifecycle {
+    Fresh,
+    Active,
+    Interrupted,
+    Completed,
+    Settled,
+}
+
+struct InvocationState {
+    lifecycle: InvocationLifecycle,
+    relation: Option<ModuleToolAuditRelation>,
+}
+
+struct ModuleInvocationCapability {
+    owner_token: ModuleToolOwnerToken,
+    attempt_id: AttemptId,
+    state: std::sync::Mutex<InvocationState>,
+}
+
+struct InvocationExecutionGuard {
+    capability: Arc<ModuleInvocationCapability>,
+    completed: bool,
+}
+
+impl InvocationExecutionGuard {
+    fn mark_completed(&mut self) {
+        self.completed = true;
+        if let Ok(mut state) = self.capability.state.lock() {
+            state.lifecycle = InvocationLifecycle::Completed;
+        }
+    }
+}
+
+impl Drop for InvocationExecutionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            match self.capability.state.lock() {
+                Ok(mut state) if state.lifecycle == InvocationLifecycle::Active => {
+                    state.lifecycle = InvocationLifecycle::Interrupted;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl ModuleInvocationCapability {
+    fn claim_for_execution(self: &Arc<Self>) -> Result<InvocationExecutionGuard, ToolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unknown_module_outcome("result_unknown"))?;
+        if state.lifecycle != InvocationLifecycle::Fresh {
+            return Err(unknown_module_outcome("result_unknown"));
+        }
+        state.lifecycle = InvocationLifecycle::Active;
+        Ok(InvocationExecutionGuard {
+            capability: Arc::clone(self),
+            completed: false,
+        })
+    }
+}
+
+/// Opaque invocation-only settlement authority. Authorization adapters receive
+/// only `ToolContext`, so cloning it cannot copy this capability.
+pub struct ToolInvocation {
+    module: Option<Arc<ModuleInvocationCapability>>,
+}
+
+impl ToolInvocation {
+    fn unbound() -> Self {
+        Self { module: None }
+    }
+
+    fn module(owner_token: ModuleToolOwnerToken) -> Result<Self, ToolError> {
+        Ok(Self {
+            module: Some(Arc::new(ModuleInvocationCapability {
+                owner_token,
+                attempt_id: fresh_attempt_id()?,
+                state: std::sync::Mutex::new(InvocationState {
+                    lifecycle: InvocationLifecycle::Fresh,
+                    relation: None,
+                }),
+            })),
+        })
     }
 }
 
@@ -306,11 +423,49 @@ pub trait Tool: Send + Sync {
         cancel: &CancellationToken,
     ) -> Result<String, ToolError>;
 
+    /// Prepare invocation-only state. Defaults preserve custom Tool source
+    /// compatibility and carry no module settlement authority.
+    #[doc(hidden)]
+    fn prepare_invocation(&self, _ctx: &ToolContext) -> Result<ToolInvocation, ToolError> {
+        Ok(ToolInvocation::unbound())
+    }
+
+    /// Registry call path for tools that need settlement state kept separate
+    /// from the reusable context visible to external adapters.
+    #[doc(hidden)]
+    async fn call_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        _invocation: &ToolInvocation,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        self.call(ctx, input, cancel).await
+    }
+
     /// Record a kernel-side refusal that happens before `call` (for example,
     /// a capability or approval-gate denial). Ordinary tools have no module
     /// audit stream, so their default is a no-op.
     async fn audit_denied(&self, _ctx: &ToolContext) -> Result<(), ToolError> {
         Ok(())
+    }
+
+    /// Preserve a typed terminal if a cancellation grace period expires and
+    /// the call future must finally be dropped.
+    async fn audit_interrupted(
+        &self,
+        _ctx: &ToolContext,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        Ok(None)
+    }
+
+    #[doc(hidden)]
+    async fn audit_interrupted_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        _invocation: &ToolInvocation,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        self.audit_interrupted(ctx).await
     }
 }
 
@@ -389,6 +544,7 @@ pub trait ModuleToolRuntime: Send + Sync {
 }
 
 pub struct ModuleTool {
+    owner_token: ModuleToolOwnerToken,
     module: String,
     operation: String,
     name: String,
@@ -409,8 +565,10 @@ impl ModuleTool {
         &self,
         ctx: &ToolContext,
         authorization_ref: &str,
+        attempt_id: &AttemptId,
     ) -> Result<ModuleToolAuditRelation, ToolError> {
         Ok(ModuleToolAuditRelation {
+            attempt_id: Some(attempt_id.clone()),
             actor: ActorRef::new(self.audit_actor.clone()).map_err(|_| audit_unavailable())?,
             run_id: RunId::new(ctx.run_id()).map_err(|_| audit_unavailable())?,
             session_ref: ctx
@@ -429,6 +587,8 @@ impl ModuleTool {
     }
 
     async fn audit_refusal(&self, ctx: &ToolContext) -> Result<(), ToolError> {
+        let invocation = ToolInvocation::module(self.owner_token.clone())?;
+        let capability = invocation.module.as_ref().ok_or_else(audit_unavailable)?;
         let authorization_ref = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
@@ -437,7 +597,7 @@ impl ModuleTool {
             .map_or_else(denied_authorization_ref, |grant| {
                 grant.authorization_ref.clone()
             });
-        let relation = self.audit_relation(ctx, &authorization_ref)?;
+        let relation = self.audit_relation(ctx, &authorization_ref, &capability.attempt_id)?;
         self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
             .await?;
         self.finish_audit(
@@ -469,6 +629,7 @@ impl ModuleTool {
         let module = module.into();
         let operation = operation.into();
         Ok(Self {
+            owner_token: ModuleToolOwnerToken::new(),
             name: format!("{module}.{operation}"),
             module,
             operation,
@@ -526,12 +687,112 @@ impl Tool for ModuleTool {
         self.audit_refusal(ctx).await
     }
 
+    async fn audit_interrupted(
+        &self,
+        _ctx: &ToolContext,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        // Settlement without the exact registry-owned capability is never
+        // allowed to query prior attempts.
+        Ok(Some(Err(unknown_module_outcome("result_unknown"))))
+    }
+
+    fn prepare_invocation(&self, _ctx: &ToolContext) -> Result<ToolInvocation, ToolError> {
+        ToolInvocation::module(self.owner_token.clone())
+    }
+
+    async fn audit_interrupted_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        invocation: &ToolInvocation,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        let Some(capability) = invocation.module.as_ref() else {
+            return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+        };
+        if !self.owner_token.matches(&capability.owner_token) {
+            return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+        }
+        let relation = {
+            let mut state = capability
+                .state
+                .lock()
+                .map_err(|_| unknown_module_outcome("module_tool_audit_degraded_result_unknown"))?;
+            if state.lifecycle != InvocationLifecycle::Interrupted {
+                return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+            }
+            let Some(relation) = state.relation.clone() else {
+                state.lifecycle = InvocationLifecycle::Settled;
+                return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+            };
+            state.lifecycle = InvocationLifecycle::Settled;
+            relation
+        };
+        if relation.run_id.as_str() != ctx.run_id()
+            || relation.tool_call_id.as_str() != ctx.tool_call_id()
+            || relation
+                .session_ref
+                .as_ref()
+                .map(|session| session.as_str())
+                != ctx.session_id()
+            || relation.module_id.as_str() != self.module
+            || relation.operation_id.as_str() != self.operation
+            || relation.actor.as_str() != self.audit_actor
+        {
+            return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+        }
+        let timestamp = AuditTimestamp::new(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .map_err(|_| unknown_module_outcome("module_tool_audit_degraded_result_unknown"))?;
+        self.audit_store
+            .append_interrupted_module_tool_terminal_for_relation(&timestamp, &relation)
+            .await
+            .map(|outcome| match outcome {
+                agent24_store::InterruptedTerminalOutcome::NotFound => {
+                    Some(Err(unknown_module_outcome("result_unknown")))
+                }
+                agent24_store::InterruptedTerminalOutcome::AppendedUnknown => {
+                    Some(Err(unknown_module_outcome("result_unknown")))
+                }
+                agent24_store::InterruptedTerminalOutcome::Existing(
+                    agent24_store::ModuleToolResultCode::Success,
+                ) => Some(Ok(serde_json::json!({
+                    "completed": true,
+                    "response_available": false,
+                })
+                .to_string())),
+                agent24_store::InterruptedTerminalOutcome::Existing(result) => {
+                    Some(Err(persisted_terminal_error(result)))
+                }
+            })
+            .map_err(|_| unknown_module_outcome("module_tool_audit_degraded_result_unknown"))
+    }
+
     async fn call(
         &self,
         ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        let invocation = ToolInvocation::module(self.owner_token.clone())?;
+        self.call_with_invocation(ctx, &invocation, input, cancel)
+            .await
+    }
+
+    async fn call_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        invocation: &ToolInvocation,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let Some(capability) = invocation.module.as_ref() else {
+            return Err(unknown_module_outcome("result_unknown"));
+        };
+        if !self.owner_token.matches(&capability.owner_token) {
+            return Err(unknown_module_outcome("result_unknown"));
+        }
+        let mut execution_guard = capability.claim_for_execution()?;
+
         let authorized = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
@@ -541,21 +802,39 @@ impl Tool for ModuleTool {
             .map_or_else(denied_authorization_ref, |grant| {
                 grant.authorization_ref.clone()
             });
-        let relation = self.audit_relation(ctx, &authorization_ref)?;
+        let relation = self.audit_relation(ctx, &authorization_ref, &capability.attempt_id)?;
+        {
+            let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
+            state.relation = Some(relation.clone());
+        }
         self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
             .await?;
+        if cancel.is_cancelled() {
+            self.finish_audit(
+                &relation,
+                ModuleToolResultCode::Cancelled,
+                std::time::Instant::now(),
+            )
+            .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(
+                ModuleToolCallError::Cancelled,
+            )));
+        }
         let started = std::time::Instant::now();
         let grant = match authorized {
             Ok(grant) => grant,
             Err(error) => {
                 self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
                     .await?;
+                execution_guard.mark_completed();
                 return Err(ToolError::Failed(module_error_json(error)));
             }
         };
         if grant.per_call_approval && !self.risk.requires_approval() {
             self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
                 .await?;
+            execution_guard.mark_completed();
             return Err(ToolError::Failed(module_error_json(permission_denied())));
         }
         if let Err(error) = self
@@ -565,7 +844,16 @@ impl Tool for ModuleTool {
         {
             self.finish_audit(&relation, result_code(&error), started)
                 .await?;
+            execution_guard.mark_completed();
             return Err(ToolError::Failed(module_error_json(error)));
+        }
+        if cancel.is_cancelled() {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(
+                ModuleToolCallError::Cancelled,
+            )));
         }
         let context = ModuleToolContext {
             run_id: ctx.run_id().to_owned(),
@@ -589,6 +877,7 @@ impl Tool for ModuleTool {
                 call_cancel.cancel();
                 self.finish_audit(&relation, ModuleToolResultCode::ResultUnknown, started)
                     .await?;
+                execution_guard.mark_completed();
                 return Err(ToolError::Failed(module_error_json(
                     ModuleToolCallError::ResultUnknown,
                 )));
@@ -600,17 +889,41 @@ impl Tool for ModuleTool {
             Err(error) => result_code(error),
         };
         self.finish_audit(&relation, code, started).await?;
+        execution_guard.mark_completed();
         match result {
             Ok(ModuleToolResult::Completed { payload, replayed }) => Ok(serde_json::json!({
                 "kind":"completed", "payload":payload, "replayed":replayed
             })
             .to_string()),
             Ok(ModuleToolResult::Pending { .. }) => Err(ToolError::Failed(module_error_json(
-                ModuleToolCallError::InvalidResult,
+                ModuleToolCallError::ResultUnknown,
             ))),
             Err(failure) => Err(ToolError::Failed(module_error_json(failure))),
         }
     }
+}
+
+fn persisted_terminal_error(result: agent24_store::ModuleToolResultCode) -> ToolError {
+    use agent24_store::ModuleToolResultCode as Terminal;
+    let failure = match result {
+        Terminal::Failed => ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::ModuleError,
+            retryable: false,
+            details: None,
+            unknown_code: None,
+        },
+        Terminal::Denied => ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::PermissionDenied,
+            retryable: false,
+            details: None,
+            unknown_code: None,
+        },
+        Terminal::Timeout => ModuleToolCallError::Timeout,
+        Terminal::Cancelled => ModuleToolCallError::Cancelled,
+        Terminal::ResultUnknown => ModuleToolCallError::ResultUnknown,
+        Terminal::Success => unreachable!("success has a recovered response"),
+    };
+    ToolError::Failed(module_error_json(failure))
 }
 
 fn audit_unavailable() -> ToolError {
@@ -635,7 +948,7 @@ fn result_code(error: &ModuleToolCallError) -> ModuleToolResultCode {
         ModuleToolCallError::Module {
             code: ModuleToolErrorCode::PermissionDenied,
             ..
-        } => ModuleToolResultCode::Denied,
+        } => ModuleToolResultCode::Failed,
         ModuleToolCallError::Module {
             code: ModuleToolErrorCode::Cancelled,
             ..
@@ -691,33 +1004,37 @@ impl ModuleTool {
             duration_ms: Some(DurationMs::new(duration).map_err(|_| audit_unavailable())?),
             size_bytes: None,
         };
-        self.append_audit(&event).await
+        self.append_audit(&event).await.map_err(|error| {
+            if result == ModuleToolResultCode::Denied {
+                error
+            } else {
+                unknown_module_outcome("module_tool_audit_degraded_result_unknown")
+            }
+        })
     }
 }
 
 fn module_error_json(failure: ModuleToolCallError) -> String {
-    let (code, retryable, unknown, result_unknown) = match failure {
+    let result_unknown = result_code(&failure) == ModuleToolResultCode::ResultUnknown;
+    let (code, retryable, unknown) = match failure {
         ModuleToolCallError::Module {
             code,
             retryable,
             unknown_code,
             ..
-        } => (code, retryable, unknown_code, false),
-        ModuleToolCallError::InvalidResult => {
-            (ModuleToolErrorCode::InvalidResult, false, None, false)
-        }
-        ModuleToolCallError::ResultUnknown => {
-            (ModuleToolErrorCode::ResultUnknown, false, None, true)
-        }
+        } => (code, retryable, unknown_code),
+        ModuleToolCallError::InvalidResult => (ModuleToolErrorCode::InvalidResult, false, None),
+        ModuleToolCallError::ResultUnknown => (ModuleToolErrorCode::ResultUnknown, false, None),
         ModuleToolCallError::ResponseTooLarge => {
-            (ModuleToolErrorCode::ResponseTooLarge, false, None, true)
+            (ModuleToolErrorCode::ResponseTooLarge, false, None)
         }
-        ModuleToolCallError::Cancelled => (ModuleToolErrorCode::Cancelled, false, None, false),
-        ModuleToolCallError::Timeout => (ModuleToolErrorCode::Timeout, false, None, false),
+        ModuleToolCallError::Cancelled => (ModuleToolErrorCode::Cancelled, false, None),
+        ModuleToolCallError::Timeout => (ModuleToolErrorCode::Timeout, false, None),
         ModuleToolCallError::ModuleUnavailable => {
-            (ModuleToolErrorCode::ModuleUnavailable, false, None, false)
+            (ModuleToolErrorCode::ModuleUnavailable, false, None)
         }
     };
+    let retryable = retryable && !result_unknown;
     let module_code = unknown.map(|raw| {
         raw.chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
@@ -1172,31 +1489,55 @@ impl ToolRegistry {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        // Mint opaque settlement authority before constructing the call future.
+        // Authorization receives only the reusable ToolContext.
+        let invocation = tool.prepare_invocation(ctx)?;
         let budget = tool.timeout();
+        const CANCELLATION_SETTLE_GRACE: Duration = Duration::from_secs(5);
+        const INTERRUPTED_AUDIT_BUDGET: Duration = Duration::from_secs(5);
         let call_cancel = if tool.isolates_cancellation() {
             cancel.child_token()
         } else {
             cancel.clone()
         };
-        tokio::select! {
-            r = tokio::time::timeout(budget, tool.call(ctx, input, &call_cancel)) => {
-                match r {
-                    Ok(result) => result,
-                    Err(_) if tool.isolates_cancellation() => {
-                        call_cancel.cancel();
-                        Err(unknown_module_outcome("timeout"))
+        let abandoned_reason = {
+            let call = tool.call_with_invocation(ctx, &invocation, input, &call_cancel);
+            tokio::pin!(call);
+            let reason = tokio::select! {
+                result = &mut call => return result,
+                () = tokio::time::sleep(budget) => {
+                    if !tool.isolates_cancellation() {
+                        return Err(ToolError::Timeout(budget));
                     }
-                    Err(_) => Err(ToolError::Timeout(budget)),
+                    call_cancel.cancel();
+                    "timeout"
                 }
-            }
-            () = cancel.cancelled() => {
-                call_cancel.cancel();
-                if tool.isolates_cancellation() {
-                    Err(unknown_module_outcome("cancelled"))
-                } else {
-                    Err(ToolError::Cancelled)
+                () = cancel.cancelled() => {
+                    if !tool.isolates_cancellation() {
+                        return Err(ToolError::Cancelled);
+                    }
+                    call_cancel.cancel();
+                    "cancelled"
                 }
+            };
+            match tokio::time::timeout(CANCELLATION_SETTLE_GRACE, &mut call).await {
+                Ok(result) => return result,
+                Err(_) => reason,
             }
+        };
+        // The call future is dropped before this hook runs. It recovers the
+        // persisted PreDispatch relation and writes one ResultUnknown terminal.
+        match tokio::time::timeout(
+            INTERRUPTED_AUDIT_BUDGET,
+            tool.audit_interrupted_with_invocation(ctx, &invocation),
+        )
+        .await
+        {
+            Ok(Ok(Some(result))) => result,
+            Ok(Ok(None)) => Err(unknown_module_outcome(abandoned_reason)),
+            Ok(Err(_)) | Err(_) => Err(unknown_module_outcome(
+                "module_tool_audit_degraded_result_unknown",
+            )),
         }
     }
 }
@@ -1266,6 +1607,66 @@ mod tests {
                 () = cancel.cancelled() => Err(ToolError::Cancelled),
             }
         }
+    }
+
+    struct StalledInterruptedAudit;
+
+    #[async_trait]
+    impl Tool for StalledInterruptedAudit {
+        fn info(&self) -> ToolInfo {
+            ToolInfo::new("stalled_audit", "module", "stalled audit", RiskClass::Read)
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn timeout(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+        fn isolates_cancellation(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &Map<String, Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            std::future::pending().await
+        }
+        async fn audit_interrupted(
+            &self,
+            _: &ToolContext,
+        ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_interrupted_audit_is_bounded_and_non_retryable() {
+        let registry = ToolRegistry::new().with(Arc::new(StalledInterruptedAudit));
+        let result = tokio::time::timeout(
+            Duration::from_secs(11),
+            registry.dispatch(
+                "stalled_audit",
+                &ctx(),
+                &Map::new(),
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+        let ToolError::Failed(message) = result
+            .expect("interrupted audit fallback hung")
+            .unwrap_err()
+        else {
+            panic!("expected explicit degraded result_unknown");
+        };
+        let json: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(
+            json["error"]["code"],
+            "module_tool_audit_degraded_result_unknown"
+        );
+        assert_eq!(json["error"]["retryable"], false);
+        assert_eq!(json["error"]["result_unknown"], true);
     }
 
     fn ctx() -> ToolContext {
