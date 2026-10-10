@@ -720,7 +720,7 @@ impl RunManager {
         };
         let mut prelude = Vec::new();
         match memory.recall(prompt).await {
-            Ok(Some((msg, ids))) => {
+            Ok(Some((msg, ids, _sources))) => {
                 self.sink
                     .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
                         run_id: run_id.to_owned(),
@@ -1489,8 +1489,12 @@ impl RunManager {
         let prior_context_len = prior_context.len();
         let mut snapshot = Vec::with_capacity(prior_context_len + 3);
         let mut recalled_ids = None;
-        if let Some((recalled, ids)) = recall {
+        let mut recalled_sources = Vec::new();
+        let mut recall_seq = None;
+        if let Some((recalled, ids, sources)) = recall {
+            recall_seq = Some(snapshot.len() as i64);
             recalled_ids = Some(ids);
+            recalled_sources = sources;
             snapshot.push(recalled);
         }
         if write_skipped {
@@ -1541,6 +1545,26 @@ impl RunManager {
             )
             .await;
             return;
+        }
+        // Recall labels join the run's model-context upper bound. These
+        // references were persisted with their assertions, not rebuilt from
+        // assertion ids.
+        if let Some(seq) = recall_seq {
+            for source in &recalled_sources {
+                if let Err(err) = self
+                    .store
+                    .tag_run_source(&run_id, seq, source, &now_iso8601())
+                    .await
+                {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to persist recalled source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
         // K1-6b.1 (ADR-K1-02 §6, §2.1): tag the run's user input at entry.
         let user_source_tag = agent24_store::SourceRef::user_input(&run_id, now_iso8601());

@@ -244,7 +244,13 @@ pub(super) async fn persist(
         json!(object),
         origin,
     )
-    .with_evidence(vec![evidence])
+    .with_evidence(vec![evidence.clone()])
+    .with_source_ref(serde_json::to_value({
+        let mut source =
+            agent24_store::SourceRef::user_input(&evidence, agent24_core::util::now_iso8601());
+        source.revision_digest = Some(format!("sha256:{}", checksum(object)));
+        source
+    })?)
     .remember();
 
     let decisions = kv.write_gate().propose(vec![candidate]).await?;

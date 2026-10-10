@@ -143,7 +143,7 @@ impl SessionMemory {
     pub(crate) async fn recall(
         &self,
         prompt: &str,
-    ) -> agent24_memory::Result<Option<(Msg, Vec<String>)>> {
+    ) -> agent24_memory::Result<Option<(Msg, Vec<String>, Vec<agent24_store::SourceRef>)>> {
         self.check_owner()?;
         if self.recall_budget == 0 {
             return Ok(None);
@@ -172,6 +172,7 @@ impl SessionMemory {
             return Ok(None);
         }
         let mut ids = Vec::new();
+        let mut sources = Vec::new();
         for hit in hits {
             let fact = hit
                 .assertion
@@ -199,6 +200,15 @@ impl SessionMemory {
             content.push_str(&line);
             used = used.saturating_add(line_cost);
             ids.push(hit.assertion.id.to_string());
+            let mut source = hit
+                .assertion
+                .source_ref
+                .and_then(|value| serde_json::from_value::<agent24_store::SourceRef>(value).ok())
+                .unwrap_or_else(|| {
+                    agent24_store::SourceRef::unknown_memory(hit.assertion.recorded_from.clone())
+                });
+            source.kind = agent24_store::SourceKind::MemoryRecall;
+            sources.push(source);
         }
         if ids.is_empty() {
             Ok(None)
@@ -209,7 +219,7 @@ impl SessionMemory {
             // `system`, and nothing downstream parses message CONTENT to
             // decide tool authorization — only `role: "system"` carries
             // elevated trust in that sense, which recall must never use.
-            Ok(Some((Msg::user(content), ids)))
+            Ok(Some((Msg::user(content), ids, sources)))
         }
     }
 

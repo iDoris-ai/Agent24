@@ -3,6 +3,7 @@ use super::*;
 use agent24_memory::KvStore;
 use agent24_memory::event::{EventQuery, EventStore, MemEvent, Origin, Scope, Trust};
 use agent24_memory::session::CanonicalSession;
+use agent24_memory::writer::{Candidate, MemoryWriter};
 use agent24_models::router::Tier;
 use async_trait::async_trait;
 use std::sync::{
@@ -66,7 +67,58 @@ fn policy(max_recent: usize) -> CompactionPolicy {
     }
 }
 
-async fn run_completed(manager: &Arc<RunManager>, store: &Store, session: &str, prompt: &str) {
+#[tokio::test]
+async fn recall_returns_persisted_source_ref_as_memory_recall() {
+    let kv = KvStore::open_memory().await.unwrap();
+    let mut source = agent24_store::SourceRef::user_input("event-123", "t");
+    source.revision_digest = Some("sha256:body".into());
+    let source_json = serde_json::to_value(&source).unwrap();
+    let candidate = Candidate::new(
+        "assertion-1",
+        Scope::owner(OWNER),
+        "favorite color",
+        "is",
+        serde_json::json!("blue"),
+        Origin { source: "user".into(), trust: Trust::UserSaid },
+    )
+    .with_evidence(vec!["event-123".into()])
+    .with_source_ref(source_json)
+    .remember();
+    kv.write_gate().propose(vec![candidate]).await.unwrap();
+
+    let memory = SessionMemory::new(kv.clone(), Arc::new(CaptureSummarizer(StdMutex::new(vec![]))))
+        .with_owner(OWNER.to_owned());
+    let (_, ids, sources) = memory.recall("favorite color").await.unwrap().unwrap();
+    assert_eq!(ids, vec!["assertion-1"]);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].source_id, source.source_id);
+    assert_eq!(sources[0].revision_digest, source.revision_digest);
+    assert_eq!(sources[0].kind, agent24_store::SourceKind::MemoryRecall);
+    assert_eq!(sources[0].classification, agent24_store::SourceClassification::Ordinary);
+    assert_eq!(sources[0].mode, agent24_store::SourceMode::LocalOnly);
+
+    let manager = memory_manager(
+        kv,
+        Arc::new(CaptureSummarizer(StdMutex::new(vec![]))),
+        policy(100),
+    )
+    .await;
+    let store = manager.store.clone();
+    seed_session(&store, "memory-recall").await;
+    let run_id = run_completed(&manager, &store, "memory-recall", "What is my favorite color?").await;
+    let tags = store.list_run_source_tags(&run_id).await.unwrap();
+    assert!(tags.iter().any(|tag| {
+        tag.source.kind == agent24_store::SourceKind::MemoryRecall
+            && tag.source.source_id == source.source_id
+            && tag.source.mode == agent24_store::SourceMode::LocalOnly
+    }));
+    assert_eq!(
+        store.run_policy_snapshot(&run_id).await.unwrap().effective_mode,
+        agent24_store::SourceMode::LocalOnly
+    );
+}
+
+async fn run_completed(manager: &Arc<RunManager>, store: &Store, session: &str, prompt: &str) -> String {
     let run = manager
         .start_run(RunCreate {
             workspace_id: None,
@@ -85,7 +137,7 @@ async fn run_completed(manager: &Arc<RunManager>, store: &Store, session: &str, 
                 RunStatus::Completed,
                 "run must complete successfully"
             );
-            return;
+            return run.id;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
