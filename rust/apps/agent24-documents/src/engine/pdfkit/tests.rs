@@ -480,9 +480,10 @@ async fn the_real_helper_renders_pages_and_regions() {
     }
 }
 
-/// On a page turned by /Rotate 0, 90, 180 or 270, the region of the line
-/// `parse` reads holds its ink, and a region of the same size elsewhere is
-/// blank: renders and line rectangles share one frame (macOS only).
+/// On a page turned by /Rotate 0, 90, 180 or 270, its CropBox at the
+/// MediaBox's origin or not, the region of the line `parse` reads holds its
+/// ink, and a region of the same size elsewhere is blank: renders and line
+/// rectangles share one frame (macOS only).
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn the_real_helper_renders_where_parse_reads_on_turned_pages() {
@@ -501,24 +502,34 @@ async fn the_real_helper_renders_where_parse_reads_on_turned_pages() {
         out.path().join(HELPER),
         String::from_utf8(os.stdout).unwrap().trim(),
     );
-    for rotation in [0, 90, 180, 270] {
-        let pdf = root.join(format!("tests/fixtures/pdfkit/render/rot{rotation}.pdf"));
+    // The fixture, and its CropBox's size: US Letter, or 540 by 712 from (36, 48).
+    let fixtures = [0, 90, 180, 270]
+        .into_iter()
+        .flat_map(|r| [("rot", r, (612.0, 792.0)), ("crop", r, (540.0, 712.0))]);
+    for (kind, rotation, (cw, ch)) in fixtures {
+        let pdf = root.join(format!("tests/fixtures/pdfkit/render/{kind}{rotation}.pdf"));
+        let name = format!("{kind}{rotation}");
         let layer = e.parse(CONTENT, "application/pdf", &pdf).await.unwrap();
         let block = &layer.blocks[0];
-        assert_eq!(block.text, "MARK", "{rotation}");
+        assert_eq!(block.text, "MARK", "{name}");
         let [x0, y0, x1, y1] = block.lines[0].rect;
         // The page as displayed: turned a quarter, it lies on its side.
         let (w, h) = if rotation % 180 == 0 {
-            (612.0, 792.0)
+            (cw, ch)
         } else {
-            (792.0, 612.0)
+            (ch, cw)
         };
-        let blank = [
-            w - (x1 - x0) - 10.0,
-            h - (y1 - y0) - 10.0,
-            w - 10.0,
-            h - 10.0,
-        ];
+        // The line's mirror through the page's centre: MARK sits near a
+        // corner, so this is near the opposite one, on the page and apart.
+        let blank = [w - x1, h - y1, w - x0, h - y0];
+        assert!(
+            blank[0] >= 0.0 && blank[1] >= 0.0 && blank[2] <= w && blank[3] <= h,
+            "{name}: {blank:?} is off the page"
+        );
+        assert!(
+            blank[0] >= x1 || blank[2] <= x0 || blank[1] >= y1 || blank[3] <= y0,
+            "{name}: {blank:?} meets the line"
+        );
         let mut sizes = Vec::new();
         for region in [[x0, y0, x1, y1], blank] {
             let ask = RenderAsk {
@@ -532,7 +543,7 @@ async fn the_real_helper_renders_where_parse_reads_on_turned_pages() {
         }
         assert!(
             sizes[0] > 2 * sizes[1],
-            "{rotation}: ink {} vs blank {}",
+            "{name}: ink {} vs blank {}",
             sizes[0],
             sizes[1]
         );
