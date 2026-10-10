@@ -83,7 +83,9 @@
 - **辅助进程**：`agent24-documents-pdfkit`，单个 Swift 源文件，用 `swiftc` 构建，随 OS package 放在 `bin/agent24-documents` 旁边。
   - 每次解析启动一次：`parse <文件路径>`，结果以一份 JSON 写到 stdout。非零退出码表示整份失败（`parse_failed`）；部分页失败不算整份失败，见下面的「部分解析」。
   - Rust 侧限时（每份 120 s）、限输出（64 MiB），超时或超限就杀掉进程，记为 `parse_failed`。
-  - 整个 OS 同时最多运行 2 个辅助进程，再来的排队等待（最多 16 个），队列满就回 503 `engine_unavailable`（`retryable: true`）。
+  - 整个 OS 同时最多运行 2 个解析，再来的排队等待（最多 16 个），队列满就回 503 `engine_unavailable`（`retryable: true`）。
+  - 页面渲染（§4）另有 2 个名额和 16 个排队位置，不与解析共用：解析一份大文件可能要几分钟，共用的话，导入后的预解析会让页面长时间渲染不出来。渲染每次在 4000 万像素以内，通常不到 1 s。所以同一时刻最多 4 个辅助进程（David 确认，2026-10-10）。
+  - 渲染的等待和执行共用一个 8 s 截止时间，从收到请求算起，落在内核代理等待响应头的 10 s 之内。超时或排不上都回 503 `engine_unavailable`。
   - 签名和公证跟随 OS package 的发布流程（jason）。开发期不签名。
   - Linux 上没有这个辅助进程：`engines[]` 报 `absent`，读取类操作报 `engine_unavailable`（D10）。
 - **引擎标识**：`engine.id = apple-pdfkit`，`engine.version` 是 macOS 的版本号（如 `26.6`），因为 PDFKit 的行为随系统版本变化。辅助进程自身的协议版本、切分规则版本和下面的各项上限写进 config，参与 `config_sha256`（canonical JSON 的 sha256）。
@@ -291,7 +293,7 @@
 | Q8 | `partial_parse` / `stale_index` 何时作为结果状态、何时作为错误 | 默认作为结果状态，只在显式要求时报错 | David |
 | Q9 | 是否向 agent 通告 `job.cancel` / `job.retry` | DOC-1 不通告；如果通告，按 `WriteLocal` 处理，且只能操作同一个 run 启动的 job | David |
 | Q10 | commit 的内联预算（5 s）和 `inline_wait_ms` 的取值 | 先按 5 s，等第 2 片的 DOCX/PDF 实测后再调 | David |
-| Q11 | 第 1 片 PDFKit 辅助进程的形态：每次解析启动一次、stdout 一份 JSON、每份限时 120 s、同时最多 2 个；用 `swiftc` 构建并随 OS package 分发，签名和公证跟随发布流程（§3.1） | 建议如左 | David；签名和打包：jason |
+| Q11 | 第 1 片 PDFKit 辅助进程的形态：每次解析启动一次、stdout 一份 JSON、每份限时 120 s、同时最多 2 个解析；渲染另有 2 个名额，每次限时 8 s（这一点 David 已确认，2026-10-10）；用 `swiftc` 构建并随 OS package 分发，签名和公证跟随发布流程（§3.1） | 建议如左 | David；签名和打包：jason |
 | Q12 | 块的切分与 `block_id`（`p{页}/b{序号}`，按行距和左缘把相邻行合并成段落，每块 ≤ 16 KiB、≤ 64 行），几何只做到整行；部分解析按页判断，每个图像区域都做 OCR，失败的区域标为未解析；分页按页推进，一次最多 100 页，`parse_status` 描述本次覆盖的页（§3.1） | 建议如左 | David |
 | Q13 | 文本层在导入后尽力预解析；读取或查找时缺了就后台解析，最多等 8 s，否则回 503 `engine_unavailable`（可重试）（§3.1） | 建议如左 | David |
 | Q14 | find 的匹配规则：块内匹配，只放宽 ASCII 大小写和空白，原文换行可跳过，不做 Unicode 规范化；读取引擎把排版连字（U+FB00–FB06）读成字母、把伪粗体的重复只留一份（§3.1、docs/documenting/engine-pdfkit.md） | 建议如左 | David |
