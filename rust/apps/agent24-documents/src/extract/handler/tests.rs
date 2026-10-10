@@ -93,6 +93,46 @@ async fn a_rerun_is_a_new_job_under_its_own_key() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rerun_key_names_a_rerun_of_one_document() {
+    const DOC2: &str = "doc_01K74Z3QJ8V5N2W9RTX6YB4M01";
+    let env = env(Some(script(vec![answer("present"), answer("present")]))).await;
+    for sql in [
+        format!(
+            "INSERT INTO documents (id, title, media_type, head_revision)
+             SELECT '{DOC2}', title, media_type, head_revision FROM documents WHERE id = '{DOC}'"
+        ),
+        format!(
+            "INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+             SELECT '{DOC2}', revision, content_sha256, size, media_type, origin
+             FROM revisions WHERE document_id = '{DOC}'"
+        ),
+    ] {
+        sqlx::query(&sql)
+            .execute(env.storage.db.pool())
+            .await
+            .unwrap();
+    }
+    let (_, one) = post(&env, DOC, &body(true), Some("rerun-1")).await;
+    let one = one["job_id"].as_str().unwrap().to_owned();
+    assert_eq!(ended(&env, &one).await.0, "succeeded");
+    // The same key and body on another document: that document's rerun,
+    // not a replay of this one's job (§5.4).
+    let (status, two) = post(&env, DOC2, &body(true), Some("rerun-1")).await;
+    assert_eq!(
+        (status, &two["document_id"]),
+        (StatusCode::ACCEPTED, &json!(DOC2)),
+        "{two}"
+    );
+    let two = two["job_id"].as_str().unwrap().to_owned();
+    assert_ne!(two, one);
+    assert_eq!(ended(&env, &two).await.0, "succeeded");
+    for (doc, job) in [(DOC, &one), (DOC2, &two)] {
+        let (status, again) = post(&env, doc, &body(true), Some("rerun-1")).await;
+        assert_eq!((status, &again["job_id"]), (StatusCode::OK, &json!(job)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_job_is_queued_again_by_its_key() {
     let env = env(Some(script(vec![
         Err(agent24_os_sdk::ClientError::Forbidden("f".into())),
