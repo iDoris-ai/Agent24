@@ -6,11 +6,15 @@
 //! depends on callers supplying host-generated identifiers only.
 //!
 //! Writing still goes through [`Store::append_audit`]'s existing
-//! `BEGIN IMMEDIATE` chain (ADR-K1-04 §2.2). Not wired to any dispatch
-//! path yet (K1-7.2); [`MODULE_TOOL_AUDIT_RETENTION_DAYS`] is defined but
-//! not enforced (K1-7.4).
+//! `BEGIN IMMEDIATE` chain (ADR-K1-04 §2.2). Historical relations without an
+//! attempt id remain readable, while new writes require one. On downgrade, a
+//! runtime that cannot validate the invocation capability must report an
+//! interrupted call as `result_unknown`, never infer completion from a legacy
+//! relation. [`MODULE_TOOL_AUDIT_RETENTION_DAYS`] is defined but not enforced
+//! (K1-7.4).
 
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use crate::{AuditEntry, Result, Store, StoreError};
 
@@ -276,6 +280,10 @@ audit_ref_newtype!(
     ToolCallId
 );
 audit_ref_newtype!(
+    /// Fresh identity for one host-side invocation, separate from run/tool ids.
+    AttemptId
+);
+audit_ref_newtype!(
     /// Verified module-manifest id (ADR-K1-01 §2.2).
     ModuleId
 );
@@ -369,6 +377,10 @@ pub enum ModuleToolResultCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleToolAuditRelation {
+    /// Absent only on historical rows written before invocation identities
+    /// were introduced. New typed writes and recovery require it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub attempt_id: Option<AttemptId>,
     pub actor: ActorRef,
     pub run_id: RunId,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -402,9 +414,20 @@ pub enum ModuleToolAuditEvent {
     },
 }
 
+/// Result of reconciling a dropped module call with its persisted terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptedTerminalOutcome {
+    AppendedUnknown,
+    Existing(ModuleToolResultCode),
+    NotFound,
+}
+
 impl ModuleToolAuditEvent {
     fn validate_refs_for_write(&self) -> Result<()> {
         let relation = self.relation();
+        if relation.attempt_id.is_none() {
+            return Err(invalid("new module audit events require an attempt id"));
+        }
         let mut refs = vec![
             relation.actor.as_str(),
             relation.run_id.as_str(),
@@ -413,6 +436,9 @@ impl ModuleToolAuditEvent {
             relation.operation_id.as_str(),
             relation.authorization_ref.as_str(),
         ];
+        if let Some(attempt_id) = &relation.attempt_id {
+            refs.push(attempt_id.as_str());
+        }
         if let Some(session_ref) = &relation.session_ref {
             refs.push(session_ref.as_str());
         }
@@ -458,8 +484,165 @@ impl Store {
         event.validate_refs_for_write()?;
         let actor = event.relation().actor.as_str().to_owned();
         let detail = serde_json::to_value(event)?;
-        self.append_audit(ts.as_str(), &actor, event.action(), &detail)
-            .await
+        // Hold the write lock across verification and append. A separate
+        // verify-then-append pair would let another writer alter/extend the
+        // chain between the check and this event.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        Store::verify_audit_chain_tx(&mut tx).await?;
+        let entry =
+            Store::append_verified_audit_tx(&mut tx, ts.as_str(), &actor, event.action(), &detail)
+                .await?;
+        tx.commit().await?;
+        if matches!(event, ModuleToolAuditEvent::Terminal { .. }) {
+            crate::test_hooks::terminal_commit_ack_boundary(self).await;
+        }
+        Ok(entry)
+    }
+
+    /// Complete a persisted pre-dispatch event after the caller had to drop
+    /// its tool future. The lookup and terminal append share one write lock,
+    /// and an existing terminal makes this operation idempotent.
+    pub async fn append_interrupted_module_tool_terminal(
+        &self,
+        ts: &AuditTimestamp,
+        run_id: &str,
+        tool_call_id: &str,
+        attempt_id: &AttemptId,
+    ) -> Result<InterruptedTerminalOutcome> {
+        self.append_interrupted_module_tool_terminal_matching(
+            ts,
+            run_id,
+            tool_call_id,
+            attempt_id,
+            None,
+        )
+        .await
+    }
+
+    /// Settle only the exact relation held by the current invocation
+    /// capability, including its actor, module, operation, and authorization.
+    pub async fn append_interrupted_module_tool_terminal_for_relation(
+        &self,
+        ts: &AuditTimestamp,
+        expected: &ModuleToolAuditRelation,
+    ) -> Result<InterruptedTerminalOutcome> {
+        let attempt_id = expected
+            .attempt_id
+            .as_ref()
+            .ok_or_else(|| StoreError::Conflict("module attempt identity is missing".to_owned()))?;
+        self.append_interrupted_module_tool_terminal_matching(
+            ts,
+            expected.run_id.as_str(),
+            expected.tool_call_id.as_str(),
+            attempt_id,
+            Some(expected),
+        )
+        .await
+    }
+
+    async fn append_interrupted_module_tool_terminal_matching(
+        &self,
+        ts: &AuditTimestamp,
+        run_id: &str,
+        tool_call_id: &str,
+        attempt_id: &AttemptId,
+        expected: Option<&ModuleToolAuditRelation>,
+    ) -> Result<InterruptedTerminalOutcome> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        Store::verify_audit_chain_tx(&mut tx).await?;
+        // Select by either typed location without trusting the action label.
+        // Otherwise an action/variant mismatch can hide contradictory
+        // evidence and let recovery borrow an older success.
+        let candidates = sqlx::query(
+            "SELECT seq, actor, action, detail FROM audit_log
+             WHERE json_extract(detail, '$.pre_dispatch.attempt_id')=?
+                OR json_extract(detail, '$.terminal.relation.attempt_id')=?
+             ORDER BY seq",
+        )
+        .bind(attempt_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        if candidates.is_empty() {
+            tx.commit().await?;
+            return Ok(InterruptedTerminalOutcome::NotFound);
+        }
+        let mut pre_dispatch: Option<(i64, String, ModuleToolAuditRelation)> = None;
+        let mut terminal: Option<(i64, String, ModuleToolAuditRelation, ModuleToolResultCode)> =
+            None;
+        for row in candidates {
+            let seq: i64 = row.try_get("seq")?;
+            let actor: String = row.try_get("actor")?;
+            let action: String = row.try_get("action")?;
+            let detail: String = row.try_get("detail")?;
+            let stored: ModuleToolAuditEvent = serde_json::from_str(&detail)?;
+            let relation = stored.relation().clone();
+            if relation.attempt_id.as_ref() != Some(attempt_id)
+                || relation.run_id.as_str() != run_id
+                || relation.tool_call_id.as_str() != tool_call_id
+                || relation.actor.as_str() != actor
+                || expected.is_some_and(|expected| expected != &relation)
+            {
+                return Err(StoreError::Conflict(
+                    "module attempt evidence does not match lookup or actor".to_owned(),
+                ));
+            }
+            match stored {
+                ModuleToolAuditEvent::PreDispatch(relation) => {
+                    if action != "k1.module_tool.pre_dispatch" || pre_dispatch.is_some() {
+                        return Err(StoreError::Conflict(
+                            "contradictory or duplicate module pre-dispatch evidence".to_owned(),
+                        ));
+                    }
+                    pre_dispatch = Some((seq, actor, relation));
+                }
+                ModuleToolAuditEvent::Terminal {
+                    relation, result, ..
+                } => {
+                    if action != "k1.module_tool.terminal" || terminal.is_some() {
+                        return Err(StoreError::Conflict(
+                            "contradictory or duplicate module terminal evidence".to_owned(),
+                        ));
+                    }
+                    terminal = Some((seq, actor, relation, result));
+                }
+            }
+        }
+        let Some((pre_dispatch_seq, _, relation)) = pre_dispatch else {
+            return Err(StoreError::Conflict(
+                "module attempt has no valid pre-dispatch evidence".to_owned(),
+            ));
+        };
+        if let Some((terminal_seq, terminal_actor, terminal_relation, result)) = terminal {
+            if terminal_seq <= pre_dispatch_seq
+                || terminal_relation != relation
+                || terminal_actor != terminal_relation.actor.as_str()
+            {
+                return Err(StoreError::Conflict(
+                    "module terminal relation or ordering mismatch".to_owned(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(InterruptedTerminalOutcome::Existing(result));
+        }
+        let event = ModuleToolAuditEvent::Terminal {
+            relation: relation.clone(),
+            result: ModuleToolResultCode::ResultUnknown,
+            duration_ms: None,
+            size_bytes: None,
+        };
+        event.validate_refs_for_write()?;
+        let detail = serde_json::to_value(&event)?;
+        Store::append_verified_audit_tx(
+            &mut tx,
+            ts.as_str(),
+            relation.actor.as_str(),
+            event.action(),
+            &detail,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(InterruptedTerminalOutcome::AppendedUnknown)
     }
 }
 
@@ -471,6 +654,7 @@ mod tests {
 
     fn relation() -> ModuleToolAuditRelation {
         ModuleToolAuditRelation {
+            attempt_id: Some(AttemptId::new("attempt-1").unwrap()),
             actor: ActorRef::new("user:jason").unwrap(),
             run_id: RunId::new("run-1").unwrap(),
             session_ref: Some(SessionRef::new("session-1").unwrap()),
@@ -715,6 +899,553 @@ mod tests {
                 assert_eq!(size_bytes.unwrap().get(), 128);
             }
             ModuleToolAuditEvent::PreDispatch(_) => panic!("expected Terminal"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_append_rejects_hash_mismatch_in_middle_or_tail() {
+        for corrupted_seq in [1_i64, 2] {
+            let store = Store::open_memory().await.unwrap();
+            let pre = ModuleToolAuditEvent::PreDispatch(relation());
+            let terminal = ModuleToolAuditEvent::Terminal {
+                relation: relation(),
+                result: ModuleToolResultCode::Success,
+                duration_ms: None,
+                size_bytes: None,
+            };
+            for (event, second) in [(pre, false), (terminal, true)] {
+                let ts = if second {
+                    "2026-10-08T00:00:01.000Z"
+                } else {
+                    "2026-10-08T00:00:00.000Z"
+                };
+                store
+                    .append_module_tool_audit_event(&AuditTimestamp::new(ts).unwrap(), &event)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("UPDATE audit_log SET hash='tampered' WHERE seq=?")
+                .bind(corrupted_seq)
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+
+            let attempted = store
+                .append_module_tool_audit_event(
+                    &AuditTimestamp::new("2026-10-08T00:00:02.000Z").unwrap(),
+                    &ModuleToolAuditEvent::PreDispatch(relation()),
+                )
+                .await;
+            assert!(
+                attempted.is_err(),
+                "corrupt seq {corrupted_seq} was extended"
+            );
+            assert_eq!(store.list_audit().await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_append_rejects_deleted_valid_tail() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .append_module_tool_audit_event(
+                &AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap(),
+                &ModuleToolAuditEvent::PreDispatch(relation()),
+            )
+            .await
+            .unwrap();
+        store
+            .append_audit(
+                "2026-10-08T00:00:01.000Z",
+                "test",
+                "tail",
+                &serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+        // Deleting the newest row leaves a chain that is internally valid but
+        // shorter than the AUTOINCREMENT high-water mark.
+        sqlx::query("DELETE FROM audit_log WHERE seq=2")
+            .execute(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert!(
+            store.verify_audit_chain().await.is_err(),
+            "deleted valid tail verified as intact"
+        );
+
+        let attempted = store
+            .append_module_tool_audit_event(
+                &AuditTimestamp::new("2026-10-08T00:00:02.000Z").unwrap(),
+                &ModuleToolAuditEvent::PreDispatch(relation()),
+            )
+            .await;
+        assert!(attempted.is_err(), "deleted tail was extended");
+        let interrupted = store
+            .append_interrupted_module_tool_terminal(
+                &AuditTimestamp::new("2026-10-08T00:00:03.000Z").unwrap(),
+                "run-1",
+                "call-1",
+                &AttemptId::new("attempt-1").unwrap(),
+            )
+            .await;
+        assert!(interrupted.is_err(), "deleted tail got a terminal");
+        assert_eq!(store.list_audit().await.unwrap().len(), 1);
+    }
+
+    async fn assert_insert_trigger_rolls_back(trigger: &str, interrupted: bool) {
+        let store = Store::open_memory().await.unwrap();
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+        let pre = ModuleToolAuditEvent::PreDispatch(relation());
+        if interrupted {
+            store
+                .append_module_tool_audit_event(&ts, &pre)
+                .await
+                .unwrap();
+        }
+        sqlx::query(trigger)
+            .execute(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let result = if interrupted {
+            store
+                .append_interrupted_module_tool_terminal(
+                    &ts,
+                    "run-1",
+                    "call-1",
+                    &AttemptId::new("attempt-1").unwrap(),
+                )
+                .await
+                .map(|_| ())
+        } else {
+            store
+                .append_module_tool_audit_event(&ts, &pre)
+                .await
+                .map(|_| ())
+        };
+        assert!(result.is_err(), "trigger-altered insert committed");
+        assert_eq!(
+            store.list_audit().await.unwrap().len(),
+            usize::from(interrupted)
+        );
+        // Both the insert and its trigger's sequence mutation must roll back.
+        let high_water: Option<i64> =
+            sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name='audit_log'")
+                .fetch_optional(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(high_water, interrupted.then_some(1));
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_insert_deleted_by_trigger_rolls_back() {
+        assert_insert_trigger_rolls_back("CREATE TRIGGER delete_insert AFTER INSERT ON audit_log BEGIN DELETE FROM audit_log WHERE seq=NEW.seq; END", false).await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_terminal_insert_deleted_by_trigger_rolls_back() {
+        assert_insert_trigger_rolls_back("CREATE TRIGGER delete_insert AFTER INSERT ON audit_log WHEN NEW.action='k1.module_tool.terminal' BEGIN DELETE FROM audit_log WHERE seq=NEW.seq; END", true).await;
+    }
+
+    #[tokio::test]
+    async fn typed_insert_rejects_transaction_visible_sequence_high_water() {
+        for interrupted in [false, true] {
+            assert_insert_trigger_rolls_back("CREATE TRIGGER bump_sequence AFTER INSERT ON audit_log BEGIN INSERT INTO audit_log(seq,ts,actor,action,detail,prev_hash,hash) VALUES(NEW.seq+10,NEW.ts,NEW.actor,NEW.action,NEW.detail,NEW.prev_hash,NEW.hash); DELETE FROM audit_log WHERE seq=NEW.seq+10; END", interrupted).await;
+        }
+    }
+
+    async fn assert_valid_replacement_rolls_back(interrupted: bool) {
+        let control = Store::open_memory().await.unwrap();
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+        let pre = ModuleToolAuditEvent::PreDispatch(relation());
+        control
+            .append_module_tool_audit_event(&ts, &pre)
+            .await
+            .unwrap();
+        if interrupted {
+            control
+                .append_interrupted_module_tool_terminal(
+                    &ts,
+                    "run-1",
+                    "call-1",
+                    &AttemptId::new("attempt-1").unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        // Read the exact bytes persisted by the real writer, which serializes
+        // through Value rather than directly from the typed event.
+        let row = sqlx::query("SELECT seq, actor, action, detail, prev_hash, hash FROM audit_log ORDER BY seq DESC LIMIT 1")
+            .fetch_one(crate::test_hooks::pool(&control)).await.unwrap();
+        let actor: String = row.get("actor");
+        let action: String = row.get("action");
+        let detail: String = row.get("detail");
+        let prev_hash: String = row.get("prev_hash");
+        assert_eq!(
+            crate::audit::entry_hash(&prev_hash, ts.as_str(), &actor, &action, &detail),
+            row.get::<String, _>("hash"),
+        );
+        let alternate_ts = "2026-10-08T00:00:01.000Z";
+        let hash = crate::audit::entry_hash(&prev_hash, alternate_ts, &actor, &action, &detail);
+        sqlx::query("UPDATE audit_log SET ts=?, hash=? WHERE seq=?")
+            .bind(alternate_ts)
+            .bind(&hash)
+            .bind(row.get::<i64, _>("seq"))
+            .execute(crate::test_hooks::pool(&control))
+            .await
+            .unwrap();
+        // Positive control: chain/hash verification accepts this alternate
+        // row, so rejection below must come from expected-row equality.
+        control.verify_audit_chain().await.unwrap();
+        let trigger = format!(
+            "CREATE TRIGGER replace_insert AFTER INSERT ON audit_log WHEN NEW.action='{action}' BEGIN UPDATE audit_log SET ts='{alternate_ts}', hash='{hash}' WHERE seq=NEW.seq; END"
+        );
+        assert_insert_trigger_rolls_back(&trigger, interrupted).await;
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_insert_replaced_by_valid_row_rolls_back() {
+        assert_valid_replacement_rolls_back(false).await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_terminal_insert_replaced_by_valid_row_rolls_back() {
+        assert_valid_replacement_rolls_back(true).await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_call_gets_one_result_unknown_terminal() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .append_module_tool_audit_event(
+                &AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap(),
+                &ModuleToolAuditEvent::PreDispatch(relation()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .append_interrupted_module_tool_terminal(
+                    &AuditTimestamp::new("2026-10-08T00:00:01.000Z").unwrap(),
+                    "run-1",
+                    "call-1",
+                    &AttemptId::new("attempt-1").unwrap(),
+                )
+                .await
+                .unwrap(),
+            InterruptedTerminalOutcome::AppendedUnknown
+        );
+        assert_eq!(
+            store
+                .append_interrupted_module_tool_terminal(
+                    &AuditTimestamp::new("2026-10-08T00:00:02.000Z").unwrap(),
+                    "run-1",
+                    "call-1",
+                    &AttemptId::new("attempt-1").unwrap(),
+                )
+                .await
+                .unwrap(),
+            InterruptedTerminalOutcome::Existing(ModuleToolResultCode::ResultUnknown)
+        );
+
+        let entries = store.list_audit().await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].detail["terminal"]["result"], "result_unknown");
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_repeated_relation_does_not_reuse_stale_terminal() {
+        for previous_result in [
+            ModuleToolResultCode::Success,
+            ModuleToolResultCode::Failed,
+            ModuleToolResultCode::Denied,
+        ] {
+            let store = Store::open_memory().await.unwrap();
+            for (timestamp, event) in [
+                (
+                    "2026-10-08T00:00:00.000Z",
+                    ModuleToolAuditEvent::PreDispatch(relation()),
+                ),
+                (
+                    "2026-10-08T00:00:01.000Z",
+                    ModuleToolAuditEvent::Terminal {
+                        relation: relation(),
+                        result: previous_result,
+                        duration_ms: None,
+                        size_bytes: None,
+                    },
+                ),
+                (
+                    "2026-10-08T00:00:02.000Z",
+                    ModuleToolAuditEvent::PreDispatch({
+                        let mut relation = relation();
+                        relation.attempt_id = Some(AttemptId::new("attempt-2").unwrap());
+                        relation
+                    }),
+                ),
+            ] {
+                store
+                    .append_module_tool_audit_event(
+                        &AuditTimestamp::new(timestamp).unwrap(),
+                        &event,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(
+                store
+                    .append_interrupted_module_tool_terminal(
+                        &AuditTimestamp::new("2026-10-08T00:00:03.000Z").unwrap(),
+                        "run-1",
+                        "call-1",
+                        &AttemptId::new("attempt-2").unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                InterruptedTerminalOutcome::AppendedUnknown,
+                "stale {previous_result:?} terminal was reused"
+            );
+            let entries = store.list_audit().await.unwrap();
+            assert_eq!(entries.len(), 4);
+            assert_eq!(
+                entries[1].detail["terminal"]["result"],
+                serde_json::to_value(previous_result).unwrap()
+            );
+            assert_eq!(entries[3].action, "k1.module_tool.terminal");
+            assert_eq!(entries[3].detail["terminal"]["result"], "result_unknown");
+            store.verify_audit_chain().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_requires_the_current_attempt_and_never_borrows_prior_success() {
+        let store = Store::open_memory().await.unwrap();
+        let ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+        let prior = relation();
+        store
+            .append_module_tool_audit_event(&ts, &ModuleToolAuditEvent::PreDispatch(prior.clone()))
+            .await
+            .unwrap();
+        store
+            .append_module_tool_audit_event(
+                &ts,
+                &ModuleToolAuditEvent::Terminal {
+                    relation: prior,
+                    result: ModuleToolResultCode::Success,
+                    duration_ms: None,
+                    size_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .append_interrupted_module_tool_terminal(
+                    &ts,
+                    "run-1",
+                    "call-1",
+                    &AttemptId::new("attempt-2").unwrap(),
+                )
+                .await
+                .unwrap(),
+            InterruptedTerminalOutcome::NotFound
+        );
+        assert_eq!(store.list_audit().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_row_actor_mismatch_for_pre_dispatch_and_terminal() {
+        for mismatch_terminal in [false, true] {
+            let store = Store::open_memory().await.unwrap();
+            let ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+            let expected = relation();
+            if mismatch_terminal {
+                store
+                    .append_module_tool_audit_event(
+                        &ts,
+                        &ModuleToolAuditEvent::PreDispatch(expected.clone()),
+                    )
+                    .await
+                    .unwrap();
+                let terminal = ModuleToolAuditEvent::Terminal {
+                    relation: expected.clone(),
+                    result: ModuleToolResultCode::Success,
+                    duration_ms: None,
+                    size_bytes: None,
+                };
+                store
+                    .append_audit(
+                        ts.as_str(),
+                        "different-actor",
+                        terminal.action(),
+                        &serde_json::to_value(terminal).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let pre = ModuleToolAuditEvent::PreDispatch(expected.clone());
+                store
+                    .append_audit(
+                        ts.as_str(),
+                        "different-actor",
+                        pre.action(),
+                        &serde_json::to_value(pre).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            store.verify_audit_chain().await.unwrap();
+            let before = store.list_audit().await.unwrap().len();
+            assert!(
+                store
+                    .append_interrupted_module_tool_terminal(
+                        &ts,
+                        expected.run_id.as_str(),
+                        expected.tool_call_id.as_str(),
+                        expected.attempt_id.as_ref().unwrap(),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.list_audit().await.unwrap().len(), before);
+            store.verify_audit_chain().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_hash_chained_action_variant_contradictions() {
+        for (action, detail) in [
+            (
+                "k1.module_tool.pre_dispatch",
+                ModuleToolAuditEvent::Terminal {
+                    relation: relation(),
+                    result: ModuleToolResultCode::ResultUnknown,
+                    duration_ms: None,
+                    size_bytes: None,
+                },
+            ),
+            (
+                "k1.module_tool.terminal",
+                ModuleToolAuditEvent::PreDispatch(relation()),
+            ),
+        ] {
+            let store = Store::open_memory().await.unwrap();
+            let ts = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+            let expected = relation();
+            store
+                .append_module_tool_audit_event(
+                    &ts,
+                    &ModuleToolAuditEvent::PreDispatch(expected.clone()),
+                )
+                .await
+                .unwrap();
+            store
+                .append_module_tool_audit_event(
+                    &ts,
+                    &ModuleToolAuditEvent::Terminal {
+                        relation: expected.clone(),
+                        result: ModuleToolResultCode::Success,
+                        duration_ms: None,
+                        size_bytes: None,
+                    },
+                )
+                .await
+                .unwrap();
+            // `append_audit` gives this contradictory row a valid chain hash.
+            store
+                .append_audit(
+                    ts.as_str(),
+                    expected.actor.as_str(),
+                    action,
+                    &serde_json::to_value(detail).unwrap(),
+                )
+                .await
+                .unwrap();
+            store.verify_audit_chain().await.unwrap();
+
+            let outcome = store
+                .append_interrupted_module_tool_terminal(
+                    &ts,
+                    expected.run_id.as_str(),
+                    expected.tool_call_id.as_str(),
+                    expected.attempt_id.as_ref().unwrap(),
+                )
+                .await;
+            assert!(outcome.is_err(), "accepted contradictory row for {action}");
+            assert_eq!(store.list_audit().await.unwrap().len(), 3);
+            store.verify_audit_chain().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_relation_is_readable_but_cannot_be_written_as_a_new_event() {
+        let mut historical = serde_json::to_value(relation()).unwrap();
+        historical.as_object_mut().unwrap().remove("attempt_id");
+        let parsed: ModuleToolAuditRelation = serde_json::from_value(historical).unwrap();
+        assert!(parsed.attempt_id.is_none());
+        assert!(
+            Store::open_memory()
+                .await
+                .unwrap()
+                .append_module_tool_audit_event(
+                    &AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap(),
+                    &ModuleToolAuditEvent::PreDispatch(parsed),
+                )
+                .await
+                .is_err()
+        );
+        let mut malformed = serde_json::to_value(relation()).unwrap();
+        malformed["attempt_id"] = serde_json::json!({"unexpected": "shape"});
+        let parsed: std::result::Result<ModuleToolAuditRelation, _> =
+            serde_json::from_value(malformed);
+        assert!(parsed.is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupted_call_reads_existing_failed_and_denied_terminals() {
+        for result in [ModuleToolResultCode::Failed, ModuleToolResultCode::Denied] {
+            let store = Store::open_memory().await.unwrap();
+            let timestamp = AuditTimestamp::new("2026-10-08T00:00:00.000Z").unwrap();
+            store
+                .append_module_tool_audit_event(
+                    &timestamp,
+                    &ModuleToolAuditEvent::PreDispatch(relation()),
+                )
+                .await
+                .unwrap();
+            store
+                .append_module_tool_audit_event(
+                    &timestamp,
+                    &ModuleToolAuditEvent::Terminal {
+                        relation: relation(),
+                        result,
+                        duration_ms: None,
+                        size_bytes: None,
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .append_interrupted_module_tool_terminal(
+                        &timestamp,
+                        "run-1",
+                        "call-1",
+                        &AttemptId::new("attempt-1").unwrap()
+                    )
+                    .await
+                    .unwrap(),
+                InterruptedTerminalOutcome::Existing(result)
+            );
+            assert_eq!(store.list_audit().await.unwrap().len(), 2);
+            store.verify_audit_chain().await.unwrap();
         }
     }
 

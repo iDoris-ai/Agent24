@@ -1634,6 +1634,8 @@ pub async fn serve(
             StdArc::clone(&advert_view_dyn),
             StdArc::clone(authorization),
             StdArc::clone(&module_tool_runtime_dyn),
+            store.clone(),
+            "agent24d",
         ) {
             Ok(tool) => {
                 if let Err(error) = tools.register_module_tool(StdArc::new(tool)) {
