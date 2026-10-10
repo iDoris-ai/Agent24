@@ -13,11 +13,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::error::StorageCause;
 use crate::state::{Storage, blob_cause, unavailable_cause};
@@ -27,6 +28,9 @@ use crate::text_layer::{self, EngineRef, LayerError, TextLayer, config_sha256};
 pub const PARALLEL: usize = 2;
 /// Builds waiting for an engine; more are refused as busy.
 pub const QUEUE: usize = 16;
+/// Renders running at once, and [`QUEUE`] more waiting: apart from parses,
+/// which can take minutes (§3.1).
+pub const RENDERS: usize = 2;
 /// How long a read waits for a layer: inside the kernel proxy's 10 s for a
 /// response's head.
 pub const WAIT: Duration = Duration::from_secs(8);
@@ -121,6 +125,9 @@ type Outcome = Option<Result<String, LayerFailure>>;
 pub struct Layers {
     engine: Option<Arc<dyn Engine>>,
     slots: Arc<Semaphore>,
+    renders: Arc<Semaphore>,
+    /// Renders waiting for a slot.
+    render_queue: AtomicUsize,
     /// Builds started and not finished, by layer key.
     building: Mutex<HashMap<String, watch::Receiver<Outcome>>>,
 }
@@ -132,11 +139,37 @@ impl Layers {
         self.engine.as_ref()
     }
 
+    /// A slot to render in, if one is free by `deadline`; none at once if
+    /// [`QUEUE`] renders are already waiting.
+    pub async fn render_slot(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<OwnedSemaphorePermit> {
+        if let Ok(slot) = self.renders.clone().try_acquire_owned() {
+            return Some(slot);
+        }
+        struct InLine<'a>(&'a AtomicUsize);
+        impl Drop for InLine<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let ahead = self.render_queue.fetch_add(1, Ordering::SeqCst);
+        let _in_line = InLine(&self.render_queue);
+        if ahead >= QUEUE {
+            return None;
+        }
+        let slot = self.renders.clone().acquire_owned();
+        tokio::time::timeout_at(deadline, slot).await.ok()?.ok()
+    }
+
     #[must_use]
     pub fn new(engine: Option<Arc<dyn Engine>>) -> Arc<Self> {
         Arc::new(Self {
             engine,
             slots: Arc::new(Semaphore::new(PARALLEL)),
+            renders: Arc::new(Semaphore::new(RENDERS)),
+            render_queue: AtomicUsize::new(0),
             building: Mutex::default(),
         })
     }

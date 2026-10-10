@@ -119,6 +119,18 @@ impl ApiError {
         )
     }
 
+    /// 413: a render that does not fit in its limit even at the smallest
+    /// scale (§4).
+    #[must_use]
+    pub fn render_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "the render does not fit in 1 MiB even at scale 0.25; ask for a smaller region".into(),
+            false,
+        )
+    }
+
     /// 409: a chunk that neither appends nor replays (§5.6). `received_offset`
     /// is the upload's `received`, which 0001's CHECK keeps ≥ 0.
     #[must_use]
