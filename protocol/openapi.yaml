@@ -2079,15 +2079,18 @@ paths:
       summary: Extract fields from one revision, each value with its provenance; starts a job
       description: >-
         Idempotent on the business key (document_id, revision, schema_sha256,
-        extractor_version) (§5.4). The model the kernel's router picks is not
+        extractor_version) (§5.4); a rerun is keyed instead by the document
+        and its `Idempotency-Key`, so a key is never shared between
+        documents. The model the kernel's router picks is not
         known before the call, so it is not in the key: it is recorded in the
         result's `model_id`, and a new local model is used by extracting
         again with `rerun` (David, 2026-10-10). The replay statuses are those of import: 202 while queued or
         running or when a failed or interrupted job is re-queued (same job_id,
         attempt + 1); 200 once it has succeeded (with `result.extraction_id`)
         or was cancelled (it stays cancelled). To extract again on purpose,
-        send `rerun: true` with a new `Idempotency-Key`: that key joins the
-        business key, so resending it replays the same rerun and a new key
+        send `rerun: true` with a new `Idempotency-Key`: that key names the
+        rerun within the document (the same key on another document is
+        another rerun), so resending it replays the same rerun and a new key
         runs again; `rerun: true` without the header is 400
         `invalid_request`, and the same key with a different request — the
         JCS hash of the whole request body differs (§5.4; David, 2026-10-10)

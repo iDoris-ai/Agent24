@@ -69,6 +69,10 @@ describe('extraction routes', () => {
     expect(d).toMatch(/200 once it has succeeded/)
     expect(d).toMatch(/stays cancelled/)
     expect(d).toMatch(/`rerun: true` with a new `Idempotency-Key`/)
+    // The key names the rerun within the document; another body under it is 422 (David, 2026-10-10).
+    expect(d).toMatch(/names the rerun within the document/)
+    expect(d).toMatch(/a rerun is keyed instead by the document and its `Idempotency-Key`, so a key is never shared between documents/)
+    expect(d).toMatch(/the same key on another document is another rerun/)
     expect(d).toMatch(/without the header is 400/)
     expect(d).toMatch(/`LocalOnly`/)
     // No model access is 503 at once; no local model is known only when the job runs.
