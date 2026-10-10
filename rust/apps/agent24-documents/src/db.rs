@@ -645,3 +645,5 @@ mod tests {
 mod migration_0004_test;
 #[cfg(test)]
 mod migration_0005_test;
+#[cfg(test)]
+mod migration_0006_test;
