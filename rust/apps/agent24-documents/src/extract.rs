@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod ground;
 pub mod prompt;
 pub mod window;
 
