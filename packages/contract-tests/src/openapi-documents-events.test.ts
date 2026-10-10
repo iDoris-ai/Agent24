@@ -13,10 +13,12 @@ import { parse } from 'yaml'
 type Validator = ((doc: unknown) => boolean) & { errors?: unknown }
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const v: Record<string, Validator> = {}
+let schemas: Record<string, any>
 const NAMES = ['DocumentsJobProgressEvent', 'DocumentsJobFinishedEvent', 'DocumentsDocumentImportedEvent', 'DocumentsRevisionCommittedEvent']
 
 beforeAll(() => {
   const openapi = parse(readFileSync(join(repoRoot, 'protocol', 'openapi.yaml'), 'utf8')) as Record<string, any>
+  schemas = openapi.components.schemas
   const ajv = new Ajv2020.default({ strict: false, allErrors: true })
   addFormats.default(ajv)
   for (const name of NAMES) v[name] = ajv.compile({ ...openapi, $ref: `#/components/schemas/${name}` }) as Validator
@@ -53,6 +55,9 @@ describe('documents event payloads', () => {
     no('DocumentsJobFinishedEvent', { ...f, status: 'cancelled', error_code: 'unsupported_format' })
     no('DocumentsJobFinishedEvent', { ...f, message: 'the file /Users/x/a.pdf' })
     no('DocumentsJobFinishedEvent', { ...f, error_code: undefined })
+    // Jobs a restart ends are announced too, at most 256 (ADR §7; David, 2026-10-10).
+    const said = schemas.DocumentsJobFinishedEvent.description.replace(/\s+/g, ' ')
+    expect(said).toMatch(/startup recovery ends \(`interrupted`, `cancelled`\) are announced once too, best effort and at most 256/)
   })
 
   it('document.imported: a new document at revision 1', () => {

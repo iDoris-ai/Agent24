@@ -1112,7 +1112,7 @@ export interface paths {
         put?: never;
         /**
          * Extract fields from one revision, each value with its provenance; starts a job
-         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version, model_id) — the actual model id, not a profile (§5.4). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key joins the business key, so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8); with no local model available the answer is 503 `engine_unavailable` with `details.engine` naming the model.
+         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version, model_id) — the actual model id, not a profile (§5.4). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key joins the business key, so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request — the JCS hash of the whole request body differs (§5.4; David, 2026-10-10) — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8); with no local model available the answer is 503 `engine_unavailable` with `details.engine` naming the model.
          */
         post: operations["documentsExtract"];
         delete?: never;
@@ -2032,7 +2032,7 @@ export interface components {
             total: number | null;
             unit: string;
         };
-        /** @description kind `job.finished`: a job reached an end state. Sent ahead of progress and, if rate-limited, once more after a short backoff. A job that is started again by its key or by `retry` finishes again with a higher `attempt`. */
+        /** @description kind `job.finished`: a job reached an end state. Sent ahead of progress and, if rate-limited, once more after a short backoff. A job that is started again by its key or by `retry` finishes again with a higher `attempt`. Jobs that startup recovery ends (`interrupted`, `cancelled`) are announced once too, best effort and at most 256 (David, 2026-10-10). */
         DocumentsJobFinishedEvent: {
             job_id: components["schemas"]["JobIdString"];
             /** @description The job's kind, as in DocumentsJob. */
@@ -2062,7 +2062,7 @@ export interface components {
             id: string;
             version: string;
         };
-        /** @description PDF CropBox frame, in points multiplied by UserUnit, origin at the top-left of the page as displayed after /Rotate (§3). Each rect is [x0, y0, x1, y1] with x0 ≤ x1 and y0 ≤ y1 (checked by the OS, not expressible here); several rects cover a span across lines or columns. */
+        /** @description PDF CropBox frame, in points multiplied by UserUnit, origin at the top-left of the page as displayed after /Rotate (§3). Each rect is [x0, y0, x1, y1] with x0 ≤ x1 and y0 ≤ y1 (checked by the OS, not expressible here); several rects cover a span across lines or columns. A JPEG or PNG is one page: its frame is the image as displayed after its EXIF orientation, 1 pixel = 1 pt (David, 2026-10-10). */
         DocumentsGeometry: {
             /** @constant */
             box: "CropBox";
@@ -2183,7 +2183,7 @@ export interface components {
             value?: string;
             /** @description For comparison only. Optional on a present value: some values (free text) have no normal form. */
             normalized?: string;
-            /** @description Evidence for a present value (see DocumentsEvidence). Empty only when the value has no verifiable source, and then `unsourced_reason` says why (ADR-DOC-02 §3). */
+            /** @description Evidence for a present value (see DocumentsEvidence). Empty only when the value has no verifiable source, and then `unsourced_reason` says why (ADR-DOC-02 §3). At most 16. */
             anchors?: components["schemas"]["DocumentsAnchor"][];
             unsourced_reason?: string;
             /** @enum {string} */
@@ -4542,7 +4542,7 @@ export interface operations {
         parameters: {
             query?: {
                 scale?: number;
-                /** @description `x,y,width,height` in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame as anchor geometry. Width and height must be greater than 0; an empty or off-page region is 400 `invalid_request`. */
+                /** @description `x0,y0,x1,y1`: corners in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame and order as an anchor's `rects` (David, 2026-10-10); for a JPEG or PNG, pixels after EXIF orientation. `x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`. */
                 region?: string;
             };
             header?: never;

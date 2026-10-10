@@ -68,7 +68,7 @@
   "quote": "原文片段" }
 ```
 
-- **定位**：`block_id` 是结构路径，DOCX 等流式格式只用它定位，不给 `page`；PDF / 扫描件给出 1 起的物理页号。`media_type` 标明锚点所在 revision 的格式：分页格式（PDF、JPEG、PNG）必须同时给出 `page` 和 `geometry`，流式格式两者都不给（2026-10-09 增补，让锚点能自我说明是否分页，回应 OpenAPI B2a 的审查）。`geometry` 以 PDF **CropBox** 为参照框，单位为乘过 `UserUnit` 的点，原点在应用 `/Rotate` 后显示页面的左上角；`rects[]` 覆盖跨行、跨栏的片段。
+- **定位**：`block_id` 是结构路径，DOCX 等流式格式只用它定位，不给 `page`；PDF / 扫描件给出 1 起的物理页号。`media_type` 标明锚点所在 revision 的格式：分页格式（PDF、JPEG、PNG）必须同时给出 `page` 和 `geometry`，流式格式两者都不给（2026-10-09 增补，让锚点能自我说明是否分页，回应 OpenAPI B2a 的审查）。`geometry` 以 PDF **CropBox** 为参照框，单位为乘过 `UserUnit` 的点，原点在应用 `/Rotate` 后显示页面的左上角；`rects[]` 覆盖跨行、跨栏的片段，每个矩形是角点对 `[x0, y0, x1, y1]`。图片（JPEG、PNG）只有一页，按 EXIF 方向显示后，1 像素记为 1 点（David，2026-10-10）。
 - **偏移**：单位是 **UTF-8 字节**，相对块文本，半开区间 `[start, end)`，按**逻辑（存储）顺序**计，不按双向文本的视觉顺序；起止必须落在字符边界，否则 `invalid_request`。
   - 理由：OS 和引擎都是 Rust/UTF-8；块文本原样存储、不做规范化，偏移因此确定。渲染进程统一经 `api-client` 的换算函数转成 UTF-16。
   - 高亮时界面扩展到**字素簇边界**（UAX #29：泰文、组合符、ZWJ 序列），存储的偏移不变。
@@ -174,6 +174,7 @@
 
    - 同一个键对应的 `request_sha256` 不同 → 422 `idempotency_key_reused`。
    - **`request_sha256` 的规范化范围**：只覆盖**有效业务参数**，经 RFC 8785（JCS）规范化后计算 SHA-256。仅用于追踪的易变字段一律排除：`tool_call_id`、`run_id`、`x-a24-*` 请求 id、`Idempotency-Key` 头本身、时间戳、客户端版本。这样，同一个业务请求即使带着新的追踪 id，也不会被误报为 `idempotency_key_reused`。
+   - **`extract` 的 rerun 键**：请求体是闭集（`revision`、`schema`、`rerun`），只有业务参数，追踪字段都在请求头里；所以它的 `request_sha256` 就是整个请求体的 JCS 哈希，不再挑字段（David，2026-10-10）。
    - **授权每次都重新检查**：键命中时，先做本次调用的授权与可用性检查，再返回已有结果。幂等命中不能跳过授权。
    - 占键在 `BEGIN IMMEDIATE` 内完成，由 SQLite 单写者串行化。若仍遇到 UNIQUE 冲突（其他连接），回滚后重读该行并按命中处理。
 5. **agent 路径**：内核不重试，每次调用的 `tool_call_id` 都是新的。**两层分工**与 ADR-DOC-01 D4.3 一致：`tool_call_id` / `run_id` 只用于可信调用关联与审计（写进操作日志），**业务幂等只看上表的业务键**，DOC-1 没有传输层去重。页面遇到“结果未知”（`request_abandoned`、`upstream_timeout`）时用同一个键重发；代理不会重试 POST（`proxy.rs:1546-1556`）。
@@ -256,7 +257,7 @@
   - **整个模块合计 ≤ 2 次/秒**（低于内核的每秒 5 次），进度按 job 合并只发最新一条；被 `rate_limited` 拒绝的进度事件直接丢弃。**终态事件**（`job.finished`、`revision.committed`）优先发送，被限流时短暂退避后重发一次；最终仍以 job 行为准。
   - **payload 只带 id、stage、计数、status、错误码**，不带标题、文件名、查询或内容：`EventsHub` 广播给所有 WS 客户端，D8 的资料处理政策管不到这条通道。
   - 事件只是提示，**job 行才是权威**；断线后用 `GET /jobs/{id}` 对账。
-  - **payload 结构**（#705）：见 `openapi.yaml` 的 `DocumentsJobProgressEvent`、`DocumentsJobFinishedEvent`、`DocumentsDocumentImportedEvent`、`DocumentsRevisionCommittedEvent`；字段是闭集，客户端仍忽略不认识的 kind 与字段。`job.finished` 带 `attempt` 与 `error_code`（取值同 job 的 `error.code`）；启动恢复置为 `interrupted` / `cancelled` 的 job 也发一次（尽力而为，受同样的限流）。
+  - **payload 结构**（#705）：见 `openapi.yaml` 的 `DocumentsJobProgressEvent`、`DocumentsJobFinishedEvent`、`DocumentsDocumentImportedEvent`、`DocumentsRevisionCommittedEvent`；字段是闭集，客户端仍忽略不认识的 kind 与字段。`job.finished` 带 `attempt` 与 `error_code`（取值同 job 的 `error.code`）；启动恢复置为 `interrupted` / `cancelled` 的 job 也发一次（尽力而为，受同样的限流，最多 256 条；David 确认，2026-10-10）。
 - **agent run 取消**：内核目前不会通知模块。run 取消后 job 继续运行，结果保留（Q7）。
 
 ## 8. 可用性与发现（README §10.3）
@@ -294,3 +295,10 @@
 | Q12 | 块的切分与 `block_id`（`p{页}/b{序号}`，按行距和左缘把相邻行合并成段落，每块 ≤ 16 KiB、≤ 64 行），几何只做到整行；部分解析按页判断，每个图像区域都做 OCR，失败的区域标为未解析；分页按页推进，一次最多 100 页，`parse_status` 描述本次覆盖的页（§3.1） | 建议如左 | David |
 | Q13 | 文本层在导入后尽力预解析；读取或查找时缺了就后台解析，最多等 8 s，否则回 503 `engine_unavailable`（可重试）（§3.1） | 建议如左 | David |
 | Q14 | find 的匹配规则：块内匹配，只放宽 ASCII 大小写和空白，原文换行可跳过，不做 Unicode 规范化；读取引擎把排版连字（U+FB00–FB06）读成字母、把伪粗体的重复只留一份（§3.1、docs/documenting/engine-pdfkit.md） | 建议如左 | David |
+
+**2026-10-10 David 按建议拍板的契约细节**（#861）：
+- 渲染的 `region` 用角点对 `x0,y0,x1,y1`，与锚点的 `rects` 同一参照系、同一顺序（原为 `x,y,width,height`；渲染尚未实现，改动没有兼容负担）。
+- 图片几何：1 像素记为 1 点，先按 EXIF 方向显示（§3）。
+- 每个抽取值最多 16 个锚点（`DocumentsEvidence`、`anchors`），冲突的候选最多 8 个。
+- `GET text` 同时给 `block` 和 `cursor` 是 400（游标已带位置）。
+- 抽取的 rerun 键被复用时，比较整个请求体的 JCS 哈希，不同就是 422 `idempotency_key_reused`（与上传、导入一致，§5.4）。

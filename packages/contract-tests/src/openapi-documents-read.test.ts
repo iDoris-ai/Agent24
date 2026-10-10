@@ -67,6 +67,8 @@ describe('read routes', () => {
       expect(refs, path).toContain('#/components/parameters/DocumentId')
       expect(refs, path).toContain('#/components/parameters/RevisionNumber')
     }
+    const block = openapi.paths[TEXT].get.parameters.find((x: any) => x.name === 'block')
+    expect(block.description.replace(/\s+/g, ' ')).toMatch(/Not with `cursor`, which already holds the position: both is 400 `invalid_request`/)
     for (const schema of ['DocumentsTextPage', 'DocumentsFindResult']) {
       const list = schema === 'DocumentsTextPage' ? 'blocks' : 'matches'
       expect(openapi.components.schemas[schema].properties[list].maxItems, schema).toBe(200)
@@ -93,6 +95,9 @@ describe('anchors (§3)', () => {
   })
 
   it('pin the frame, the unit and the shape of every field', () => {
+    // An image is one page, in pixels after EXIF orientation (David, 2026-10-10).
+    const frame = openapi.components.schemas.DocumentsGeometry.description.replace(/\s+/g, ' ')
+    expect(frame).toMatch(/JPEG or PNG is one page: its frame is the image as displayed after its EXIF orientation, 1 pixel = 1 pt/)
     const a = fixture('find.json').matches[0]
     const bad: Array<[string, (x: any) => void]> = [
       ['utf16 offsets', (x) => { x.text_range.unit = 'utf16' }],
