@@ -40,7 +40,7 @@ impl DecisionService {
         let mut floor_answers: Vec<Answer> = Vec::new();
         let mut floor_backend: Option<BackendKind> = None;
 
-        for backend in &self.backends {
+        for (index, backend) in self.backends.iter().enumerate() {
             let kind = backend.kind();
             match backend.evaluate(request).await {
                 BackendOutcome::Decided(answers) => {
@@ -65,7 +65,11 @@ impl DecisionService {
                         backend: floor_backend.unwrap_or(kind),
                         model: None,
                         latency_ms: elapsed_ms(start),
-                        outcome: Outcome::Unavailable { reason },
+                        outcome: Outcome::Unavailable {
+                            reason,
+                            failed_stage_index: index,
+                            failed_backend_kind: kind,
+                        },
                     };
                 }
             }
@@ -235,7 +239,9 @@ mod tests {
         assert_eq!(
             decision.outcome,
             Outcome::Unavailable {
-                reason: "model not downloaded".to_owned()
+                reason: "model not downloaded".to_owned(),
+                failed_stage_index: 1,
+                failed_backend_kind: BackendKind::Encoder,
             }
         );
         assert!(
@@ -296,7 +302,9 @@ mod tests {
         assert_eq!(
             decision.outcome,
             Outcome::Unavailable {
-                reason: "runtime crashed".to_owned()
+                reason: "runtime crashed".to_owned(),
+                failed_stage_index: 1,
+                failed_backend_kind: BackendKind::Deep,
             }
         );
         assert_eq!(
@@ -329,7 +337,9 @@ mod tests {
         assert_eq!(
             decision.outcome,
             Outcome::Unavailable {
-                reason: "model not downloaded".to_owned()
+                reason: "model not downloaded".to_owned(),
+                failed_stage_index: 1,
+                failed_backend_kind: BackendKind::Encoder,
             }
         );
     }
@@ -383,5 +393,324 @@ mod tests {
 
         assert!(matches!(decision.outcome, Outcome::Abstain { .. }));
         assert!(decision.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn matrix_case_1_first_attempted_layer_unavailable() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let first = CountingBackend {
+            kind: BackendKind::Rule,
+            calls: first_calls.clone(),
+            outcome: BackendOutcome::Unavailable {
+                reason: "rule engine uninitialized".to_owned(),
+            },
+        };
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let second = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: second_calls.clone(),
+            outcome: BackendOutcome::Decided(vec![]),
+        };
+        let service = DecisionService::new(vec![Arc::new(first), Arc::new(second)]);
+        let decision = service.decide(&request()).await;
+
+        assert!(
+            decision.answers.is_empty(),
+            "empty answers on first unavailable"
+        );
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "no later backend called"
+        );
+
+        let outcome_val = serde_json::to_value(&decision.outcome).expect("serialize outcome");
+        assert_eq!(outcome_val["kind"], "unavailable");
+        assert_eq!(outcome_val["reason"], "rule engine uninitialized");
+        assert_eq!(outcome_val["failed_stage_index"], 0);
+        assert_eq!(outcome_val["failed_backend_kind"], "rule");
+    }
+
+    #[tokio::test]
+    async fn matrix_case_2_floor_then_unavailable() {
+        let floor_calls = Arc::new(AtomicUsize::new(0));
+        let floor_backend = CountingBackend {
+            kind: BackendKind::Rule,
+            calls: floor_calls.clone(),
+            outcome: BackendOutcome::NoConclusion {
+                floor: vec![Answer::new(
+                    "is_remember",
+                    AnswerValue::Bool(true),
+                    Some(0.6),
+                    BackendKind::Rule,
+                    true,
+                )],
+            },
+        };
+        let unavail_calls = Arc::new(AtomicUsize::new(0));
+        let unavail_backend = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: unavail_calls.clone(),
+            outcome: BackendOutcome::Unavailable {
+                reason: "encoder unavailable".to_owned(),
+            },
+        };
+        let later_calls = Arc::new(AtomicUsize::new(0));
+        let later_backend = CountingBackend {
+            kind: BackendKind::Deep,
+            calls: later_calls.clone(),
+            outcome: BackendOutcome::Decided(vec![]),
+        };
+
+        let service = DecisionService::new(vec![
+            Arc::new(floor_backend),
+            Arc::new(unavail_backend),
+            Arc::new(later_backend),
+        ]);
+        let decision = service.decide(&request()).await;
+
+        assert_eq!(
+            decision.backend,
+            BackendKind::Rule,
+            "preserves floor backend"
+        );
+        assert_eq!(decision.answers.len(), 1, "preserves floor answers");
+        assert_eq!(decision.answers[0].question_id(), "is_remember");
+        assert_eq!(floor_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(unavail_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            later_calls.load(Ordering::SeqCst),
+            0,
+            "no later backend called"
+        );
+
+        let outcome_val = serde_json::to_value(&decision.outcome).expect("serialize outcome");
+        assert_eq!(outcome_val["kind"], "unavailable");
+        assert_eq!(outcome_val["reason"], "encoder unavailable");
+        assert_eq!(outcome_val["failed_stage_index"], 1);
+        assert_eq!(outcome_val["failed_backend_kind"], "encoder");
+    }
+
+    #[tokio::test]
+    async fn matrix_case_3_empty_after_floor_then_unavailable() {
+        let floor_backend = CountingBackend {
+            kind: BackendKind::Rule,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::NoConclusion {
+                floor: vec![Answer::new(
+                    "is_remember",
+                    AnswerValue::Bool(false),
+                    Some(0.55),
+                    BackendKind::Rule,
+                    true,
+                )],
+            },
+        };
+        let empty_backend = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::NoConclusion { floor: vec![] },
+        };
+        let unavail_backend = CountingBackend {
+            kind: BackendKind::Deep,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::Unavailable {
+                reason: "deep backend offline".to_owned(),
+            },
+        };
+
+        let service = DecisionService::new(vec![
+            Arc::new(floor_backend),
+            Arc::new(empty_backend),
+            Arc::new(unavail_backend),
+        ]);
+        let decision = service.decide(&request()).await;
+
+        assert_eq!(
+            decision.backend,
+            BackendKind::Rule,
+            "retains prior non-empty floor backend"
+        );
+        assert_eq!(
+            decision.answers.len(),
+            1,
+            "retains prior non-empty floor answers"
+        );
+        let outcome_val = serde_json::to_value(&decision.outcome).expect("serialize outcome");
+        assert_eq!(outcome_val["kind"], "unavailable");
+        assert_eq!(outcome_val["failed_stage_index"], 2);
+        assert_eq!(outcome_val["failed_backend_kind"], "deep");
+    }
+
+    #[tokio::test]
+    async fn matrix_case_4_multiple_non_empty_floors_then_unavailable() {
+        let floor1 = CountingBackend {
+            kind: BackendKind::Rule,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::NoConclusion {
+                floor: vec![Answer::new(
+                    "is_remember",
+                    AnswerValue::Bool(false),
+                    Some(0.3),
+                    BackendKind::Rule,
+                    true,
+                )],
+            },
+        };
+        let floor2 = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::NoConclusion {
+                floor: vec![Answer::new(
+                    "is_remember",
+                    AnswerValue::Bool(true),
+                    Some(0.7),
+                    BackendKind::Encoder,
+                    true,
+                )],
+            },
+        };
+        let unavail = CountingBackend {
+            kind: BackendKind::Deep,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::Unavailable {
+                reason: "deep oom".to_owned(),
+            },
+        };
+
+        let service =
+            DecisionService::new(vec![Arc::new(floor1), Arc::new(floor2), Arc::new(unavail)]);
+        let decision = service.decide(&request()).await;
+
+        assert_eq!(
+            decision.backend,
+            BackendKind::Encoder,
+            "preserves most recent non-empty floor source"
+        );
+        assert_eq!(decision.answers.len(), 1);
+        assert_eq!(decision.answers[0].value(), &AnswerValue::Bool(true));
+        assert_eq!(decision.answers[0].p(), Some(0.7));
+
+        let outcome_val = serde_json::to_value(&decision.outcome).expect("serialize outcome");
+        assert_eq!(outcome_val["kind"], "unavailable");
+        assert_eq!(outcome_val["failed_stage_index"], 2);
+        assert_eq!(outcome_val["failed_backend_kind"], "deep");
+    }
+
+    #[tokio::test]
+    async fn matrix_case_5_duplicate_backend_kinds_distinguished_by_index() {
+        let first_encoder = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::NoConclusion { floor: vec![] },
+        };
+        let second_encoder = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::Unavailable {
+                reason: "second encoder unavailable".to_owned(),
+            },
+        };
+
+        let service = DecisionService::new(vec![Arc::new(first_encoder), Arc::new(second_encoder)]);
+        let decision = service.decide(&request()).await;
+
+        let outcome_val = serde_json::to_value(&decision.outcome).expect("serialize outcome");
+        assert_eq!(outcome_val["kind"], "unavailable");
+        assert_eq!(
+            outcome_val["failed_stage_index"], 1,
+            "distinguishes second entry by index"
+        );
+        assert_eq!(outcome_val["failed_backend_kind"], "encoder");
+    }
+
+    #[tokio::test]
+    async fn matrix_case_6_exact_call_boundary_and_no_later_execution() {
+        let calls_before = Arc::new(AtomicUsize::new(0));
+        let before = CountingBackend {
+            kind: BackendKind::Rule,
+            calls: calls_before.clone(),
+            outcome: BackendOutcome::NoConclusion { floor: vec![] },
+        };
+        let calls_failed = Arc::new(AtomicUsize::new(0));
+        let failed = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: calls_failed.clone(),
+            outcome: BackendOutcome::Unavailable {
+                reason: "failed stage".to_owned(),
+            },
+        };
+        let calls_after = Arc::new(AtomicUsize::new(0));
+        let after = CountingBackend {
+            kind: BackendKind::Deep,
+            calls: calls_after.clone(),
+            outcome: BackendOutcome::Decided(vec![]),
+        };
+
+        let service =
+            DecisionService::new(vec![Arc::new(before), Arc::new(failed), Arc::new(after)]);
+        let decision = service.decide(&request()).await;
+
+        assert_eq!(
+            calls_before.load(Ordering::SeqCst),
+            1,
+            "prior entry called exactly once"
+        );
+        assert_eq!(
+            calls_failed.load(Ordering::SeqCst),
+            1,
+            "failed entry called exactly once"
+        );
+        assert_eq!(
+            calls_after.load(Ordering::SeqCst),
+            0,
+            "later entry called zero times"
+        );
+
+        let outcome_val = serde_json::to_value(&decision.outcome).expect("serialize outcome");
+        assert_eq!(outcome_val["kind"], "unavailable");
+        assert_eq!(outcome_val["failed_stage_index"], 1);
+        assert_eq!(outcome_val["failed_backend_kind"], "encoder");
+    }
+
+    #[tokio::test]
+    async fn matrix_case_7_serialization_preserves_unaffected_decided_and_abstain_json() {
+        // 1. Decided JSON remains unchanged
+        let decided_outcome = Outcome::Decided;
+        assert_eq!(
+            serde_json::to_value(&decided_outcome).expect("serialize decided"),
+            json!({ "kind": "decided" })
+        );
+
+        // 2. Abstain JSON remains unchanged
+        let abstain_outcome = Outcome::Abstain {
+            reason: "low confidence".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&abstain_outcome).expect("serialize abstain"),
+            json!({ "kind": "abstain", "reason": "low confidence" })
+        );
+
+        // 3. Unavailable JSON produced by service contains new fields
+        let unavailable = CountingBackend {
+            kind: BackendKind::Encoder,
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: BackendOutcome::Unavailable {
+                reason: "encoder unavailable".to_owned(),
+            },
+        };
+        let service = DecisionService::new(vec![Arc::new(unavailable)]);
+        let decision = service.decide(&request()).await;
+        let unavail_val = serde_json::to_value(&decision.outcome).expect("serialize unavailable");
+        assert_eq!(
+            unavail_val,
+            json!({
+                "kind": "unavailable",
+                "reason": "encoder unavailable",
+                "failed_stage_index": 0,
+                "failed_backend_kind": "encoder"
+            })
+        );
     }
 }

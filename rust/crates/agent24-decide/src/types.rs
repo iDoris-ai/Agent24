@@ -237,6 +237,8 @@ pub enum Outcome {
     /// `docs/agent/PLAN-DECIDE.md` §0.
     Unavailable {
         reason: String,
+        failed_stage_index: usize,
+        failed_backend_kind: BackendKind,
     },
 }
 
