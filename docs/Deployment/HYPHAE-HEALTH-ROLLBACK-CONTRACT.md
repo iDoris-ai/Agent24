@@ -36,7 +36,7 @@ Agent24 实查 `ab125de262827bd0f1c6680b427d9c241ccff785`。Hyphae 在 `/Users/j
 | relay local_ready | 精确 hash/tuple；只有已授权地址/端口的监听且属于该进程；指定数据目录独占打开；存储完整性与已知事件读取成立；本地协议请求可响应 | spawn 后 20s；单次请求 5s。仅端口打开/HTTP 200/打印 listening 均不充分；冲突为 blocked，不杀外部服务 |
 | relay_reachable（每个配置端点） | 对精确端点完成 WS（跨机 WSS 完整 TLS 校验）及协议查询，记录端点结果 | 每端点 5s，一轮并行总计 10s；失败为 network_degraded/TLS_error，不证明本地 binary 坏 |
 | synthetic_encrypted_exchange | 隔离 A/B 合成身份 A→B 解密校验 nonce/event ID，再 B→A 加密回复并解密校验；对应存储记录恰一次、无未知 queue 状态；relay ACK 仅是中间证据 | 每次完整双向 20s，最多 2 次，间隔 5s，总计 45s；重试复用原签名事件/ID，不能生成新消息掩盖失败 |
-| 启动/更新综合健康 | 先 relay（如受管），再 client local_ready，再合成往返；各层独立输出，不以一项覆盖另一项 | 总计 90s；远端不可达或无获授权探测对端，结束为 installed_degraded、exchange=unknown，不无限等待 |
+| 启动/更新综合健康 | 先 relay（如受管），再 client local_ready，再合成往返；各层独立输出，不以一项覆盖另一项 | 总计 90s；远端不可达结束为 installed_degraded、exchange=unknown；未配置获授权探测对端时必须在 prepare 前告知并阻断更新，不能切换后才发现缺少探测条件 |
 | 正常运行健康 | 本地响应与 relay 可达每 30s 一轮；三轮连续本地失败才报 local_unhealthy，成功清该计数；进程退出立即报告 | 每轮至多 10s，最迟首次失败后 70s 可见；外网失败只更新网络维度，不计本地重启失败数。合成往返仅首启/更新/用户触发，不暗发周期消息 |
 | stop（client/relay，各自） | 冻结新请求，停所有受管写入进程；验证身份后 TERM 5s，未退出再 KILL；确认整个组消失、回收和释放锁 | 总计 10s/组件，组合顺序停 client 再 relay ≤20s；未确认则 stop_unconfirmed，禁止替换/恢复数据或启动另一代 |
 
@@ -46,7 +46,7 @@ Agent24 实查 `ab125de262827bd0f1c6680b427d9c241ccff785`。Hyphae 在 `/Users/j
 
 ## 3. 受信任兼容清单与准入矩阵
 
-必须由可信 Agent24 发行内嵌独立 client/relay pins 及组合准入清单；标准、外部路径、离线包和服务器制品同规则。源 SHA/版本号/同包 checksum/本地 marker 均不能授权执行。签名根目前未建立：冻结采用独立 pin 路径；未来若声明签名，须预先经评审固定 root identity 并额外验签，不接受随资产下发的新根。
+Agent24 管理的组件必须由可信 Agent24 发行内嵌独立 client/relay pins 及组合准入清单；标准、外部 binary 路径和离线包同规则。独立服务器 relay 不依赖 Agent24 build：运营者须通过预先信任的签名根或独立固定的预期 hash 验证资产，并使用绑定 relay/source/存储依赖及迁移证据的服务器兼容清单，不能把同包 checksum 当信任根。本文 Agent24 tuple 与自动回滚权限仅适用于 Agent24 受管组件；服务器流程采用相同数据安全规则但由运营者独立授权。源 SHA/版本号/同包 checksum/本地 marker 均不能授权执行。签名根目前未建立：冻结采用独立 pin 路径；未来若声明签名，须预先经评审固定 root identity 并额外验签，不接受随资产下发的新根。
 
 tuple 精确绑定 Agent24 build、平台、client binary/lock、relay binary/lock（client-only 明确 null）与配置约束；client/relay 各自升级不意味着任意笛卡尔积可运行。当前 Agent24 build 必须同时授权 candidate/current/previous 的**完整 tuple 和有向转换边**，旧 Agent24 发行曾接受过不够。每次 spawn 均重验 hash，不能绕开 VerifiedBinary 或开生产 override；单一 embedded lock 在 HN4 完成此能力前禁止自动旧 hash 回滚。
 
@@ -110,10 +110,10 @@ tuple 精确绑定 Agent24 build、平台、client binary/lock、relay binary/lo
 一次 operation 持跨进程锁，拒绝并发升级/改配置/导入/写入；同意绑定完整 tuple、数据范围、停机、migration id、自动回滚范围与监听约束。持久日志每次转移 fsync，记录 §3 的绑定字段和阶段结果，目录 0700、文件 0600；秘密不得入日志。计划读取不执行候选。磁盘必须容纳完整备份、迁移副本、恢复副本及两代 binary，否则在停机前拒绝。
 
 1. **prepare**：下载至多 600s、校验/安装 staging 至多 60s，总计 660s；先验包再验 binary，安全解包，同文件系统 fsync/不覆盖提交。失败/取消保留 active。此时只安装，不切 active、不迁移。
-2. **quiesce**：停止 client、relay（仅受影响者），组件各 10s、组合 20s；阻止所有 daemon/CLI/UI/outbox retry/群 fanout/外部服务写入。拿到 outbox.lock 不证明 SQLite 或其他写入者已停；锁持有关系须由 Hyphae 支持。停不净就停止事务，不备份、不切换。
+2. **quiesce**：停止 client、relay（仅受影响者），组件各 10s、组合 20s；阻止所有会写入受影响本地存储的 daemon/CLI/UI/outbox retry/群 fanout/外部本机服务。仅受管 relay 才冻结其写入；client-only 更新不得要求停止或恢复不归 Agent24 管理的外部 relay。拿到 outbox.lock 不证明 SQLite 或其他写入者已停；锁持有关系须由 Hyphae 支持。停不净就停止事务，不备份、不切换。
 3. **backup_verified**：至多 120s。全量 client HOME 持久数据与受影响 relay data-dir 一致快照；包括 keystore、relays、outbox、messages.db 及 WAL、legacy messages.json/.backup、其他持久配置与未知文件。SQLite 先一致 checkpoint/关闭，不能活拷 DB 漏 WAL；relay 正常关库后完整复制 events.db/配置，不套 SQLite 恢复命令。锁/PID 是运行元数据，记录但不当活锁/PID 恢复。发现未知文件先保全，再阻断未说明的迁移。
 4. **restore rehearsal / migrate**：backup 阶段的 120s 内，在另一受保护目录核对所有文件大小/完整 hash/权限，恢复并用受信任旧组合做不联网的读校验与 SQLite integrity_check/外键、relay 后端完整性/事件读取，形成 restore_verified。随后迁移阶段至多 120s，仅在副本执行已登记 migration；成功后验证输出指纹、语义不变量并 fsync。大库超时保留 current，走另行评审的离线维护计划，不静默延长期限。
-5. **switch / check**：原子切换 tuple+数据代际指针至多 10s；跨目录不能假称一个 rename 原子完成，日志加唯一提交记录决定恢复方向，完成前禁止启动混合代际。按 §2 至多 90s 检查，期间禁止接受/发送真实业务，含后台补收、重试和 relay 外部写入；只允许隔离合成流量。缺 maintenance/隔离能力则本升级路径 blocked，不以当前 daemon 直接试跑用户库。
+5. **switch / check**：原子切换 tuple+数据代际指针至多 10s；跨目录不能假称一个 rename 原子完成，日志加唯一提交记录决定恢复方向，完成前禁止启动混合代际。按 §2 至多 90s 检查，期间禁止受影响本地组件接受/发送真实业务，含后台补收、重试以及受管 relay 的外部写入；只允许隔离合成流量。外部 relay 可持续接收其他节点事件：在本机事务内持久保存补收边界和已签名待发 event ID，commit/rollback 后用原 ID 去重恢复补收与重试；不恢复外部 relay 快照、不撤销已发事件。relay 无法证明保存完整历史时明确报告潜在补收缺口，不能声称消息零丢失。缺 maintenance/隔离能力则本升级路径 blocked，不以当前 daemon 直接试跑用户库。
 6. **commit**：本地健康、合成往返通过才记 healthy；仅网络失败可提交 installed_degraded 并解封业务，保留 exchange=unknown 与旧备份，不能把它晋升为新的 known-good。一旦解封真实业务，旧快照自动恢复窗口关闭；后续降级须新计划，不能抹掉已接收事件/已发送记账。
 7. **rollback**：只在该 operation 的预授权范围且无新业务写入时执行一次。先停候选并确认退出，再核对旧 tuple 仍被当前清单允许，隔离失败数据，恢复绑定快照到新目录、验证后切指针，再以旧 tuple 检查；有可验证双向读写证据的 unchanged-schema 可复用数据。恢复缺失/损坏、权限变化、布局不匹配或停止未确认均 fail-closed；不覆盖唯一备份、不重建空库、不循环切换。
 

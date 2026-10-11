@@ -88,7 +88,7 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 | ID | 归属仓库 / 负责人 | 依赖 | 交付及可观察验收 | 估算人日 |
 |---|---|---|---|---|
 | DEP-HN0 | Agent24 + Hyphae / 双方维护者 | —（只写文档） | 待跨仓配套 follow-up 评审；[冻结契约](HYPHAE-HEALTH-ROLLBACK-CONTRACT.md) 已给出 SKU 依据、pin/签名根策略、健康时限、真实存储/回滚矩阵与责任，双方互链合并才完成；没有根不能声称验签 | 0.5–1 |
-| DEP-HN1 | Hyphae / 上游发布负责人 | HN0、M1 发布门 | tag 发布及四平台 client/relay 分包、两类 manifest/lock；固定版本安全安装器；Linux 双架构容器/持久卷指南；实际下载验证来源、完整 hash 与真实 relay smoke，坏资产拒绝 | 4–6 |
+| DEP-HN1 | Hyphae / 上游发布负责人 | HN0、M1 发布门 | tag 发布及四平台 client/relay 分包、两类 manifest/lock；固定版本安全安装器；Linux 双架构容器/持久卷指南；结构化 client/relay readiness、受影响本地存储停写/维护隔离及可确认停机能力，按健康契约证明 15/20/10s 界限与故障负例；实际下载验证来源、完整 hash 与真实 relay smoke，坏资产拒绝；上述能力/证据缺任一项则不解锁 C8 | 4–6 |
 | DEP-C8 | Agent24 / comm 维护者 | HN1 | lock-promotion PR 固定双方 SHA；四平台按配方重建匹配下载资产；client/relay 组合、daemon.lock 占用、身份/联系人/收发/离线/重启/zero-run 通过；不兼容附 Hyphae issue/PR | 1–2 |
 | DEP-HN2 | Agent24 / 安装器维护者 | C8 | client 与 relay 共用安全安装语义；staging/fsync/不覆盖原子提交、现有副本重验；断电模拟、满盘、篡改/并发/归档逃逸均不执行半成品、不覆盖异常目标 | 2–3 |
 | DEP-C9 | Agent24 / 发布负责人 | C8、HN2 | CLI 与桌面包内 client 匹配锁，relay 不在标准包；四平台 Release 下载 smoke；无源码/Go/PATH 外部 hyphae 的干净环境能使用通信 | 1–2 |
