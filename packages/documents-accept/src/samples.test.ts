@@ -65,12 +65,11 @@ describe('the S01 samples in this repository', () => {
 })
 
 describe('the ask.json files in this repository', () => {
-  const asked = fs.readdirSync(S01).map((d) => path.join(S01, d)).filter((d) => fs.existsSync(path.join(d, 'ask.json')))
+  const samples = fs.readdirSync(S01).filter((d) => d.startsWith('s01-')).map((d) => loadSample(path.join(S01, d)))
 
-  it('ask for every field of their gold, and give no answer away', () => {
-    expect(asked.length).toBeGreaterThanOrEqual(4)
-    // loadAsk throws with the list of what is wrong.
-    for (const dir of asked) expect(loadAsk(loadSample(dir)).length, dir).toBeGreaterThan(0)
+  it('are there for every sample, ask for every field of its gold, and give no answer away', () => {
+    // loadAsk throws when a sample has no ask.json, and with the list of what is wrong with one.
+    for (const sample of samples) expect(loadAsk(sample), sample.id).toHaveLength(sample.gold.fields.length)
   })
 })
 
