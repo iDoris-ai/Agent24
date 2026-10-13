@@ -16,9 +16,10 @@ export interface CheckResult {
   id: string
   sample?: string
   /** `unmet`: the environment cannot run the checks, which is not a failure of
-   *  the product. `skipped`: the check found nothing to exercise (§3, ACC-IDEM-3). */
-  outcome: 'passed' | 'failed' | 'unmet' | 'skipped'
-  /** What was wrong, one line each; empty when passed. */
+   *  the product. `skipped`: the check found nothing to exercise (§3, ACC-IDEM-3).
+   *  `blocked`: it was not run, because a check it needs did not pass. */
+  outcome: 'passed' | 'failed' | 'unmet' | 'skipped' | 'blocked'
+  /** What was wrong, one line each; empty when passed. For `blocked`, why. */
   problems: string[]
   ms: number
 }
