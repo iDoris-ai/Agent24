@@ -1,0 +1,20 @@
+{
+  "name": "@agent24/documents-accept",
+  "version": "0.5.1",
+  "private": true,
+  "description": "DOC-1-09: the Documenting acceptance harness. Runs the S01 samples through the documents routes of a real daemon, scores the results against the gold labels and records the evidence (docs/documenting/acceptance/README.md).",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.5"
+  }
+}

@@ -44,7 +44,7 @@ harness 把 S01 的样本经**已注册的操作**跑一遍，对照金标打分
 ```
 
 - `key` 与 `gold.json` 的字段一一对应，必答项和背景项（`role: context`）都问。harness 启动时校验两边的 `key` 集合相同，不同就不跑。
-- `description` 用读者的话写要找什么，**不得带出答案**。harness 启动时机械检查：每个字段的 `description` 里，不得出现这个字段金标的 `value`、`normalized` 或任一候选的 `value`（两边都先做 §4.1 的 L2）。
+- `description` 用读者的话写要找什么，**不得带出答案**。harness 启动时机械检查：每个字段的 `description` 里，不得出现这个字段金标的 `value`、`normalized`，或任一候选的 `value`、`normalized`（两边都先做 §4.1 的 L2，再不分大小写、去掉全部空格）。
 - `type` 取 OpenAPI 的枚举（`text`、`date`、`datetime`、`amount`、`number`、`identifier`、`boolean`）。
 - 由 Claude 起草，随 PR 评审。改 `ask.json` 等于换了一组问题，之前的抽取结果不能再和新的比；报告记录每份 `ask.json` 的 sha256。
 
