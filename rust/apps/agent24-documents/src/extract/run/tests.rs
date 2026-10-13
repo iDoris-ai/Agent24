@@ -76,18 +76,20 @@ fn from(model: &str, text: String) -> Result<CompleteResult, ClientError> {
     })
 }
 
-fn present(key: &str, value: &str, block: &str, quote: &str) -> Value {
-    json!({ "key": key, "status": "present", "value": value, "normalized": "", "evidence": [{ "block_id": block, "quote": quote }],
-            "missing_reason": "", "candidates": [] })
+fn present(key: &str, value: &str, block: &str, quote: &str) -> (String, Value) {
+    let said = json!({ "value": value, "normalized": "", "evidence": [{ "block_id": block, "quote": quote }] });
+    (key.into(), json!({ "present": said }))
 }
 
-fn missing(key: &str) -> Value {
-    json!({ "key": key, "status": "missing", "value": "", "normalized": "", "evidence": [],
-            "missing_reason": "not_in_document", "candidates": [] })
+fn missing(key: &str) -> (String, Value) {
+    (
+        key.into(),
+        json!({ "missing": { "reason": "not_in_document" } }),
+    )
 }
 
-fn answer(values: Vec<Value>) -> String {
-    json!({ "values": values }).to_string()
+fn answer(values: Vec<(String, Value)>) -> String {
+    json!({ "values": values.into_iter().collect::<serde_json::Map<_, _>>() }).to_string()
 }
 
 fn field(key: &str) -> Field {
@@ -532,7 +534,8 @@ async fn windows_and_batches_each_answer_and_merge_per_field() {
     let batch = |keys: &[Field]| answer(keys.iter().map(|f| missing(&f.key)).collect());
     let mut replies = Vec::new();
     for w in 0..3 {
-        let mut first: Vec<Value> = fields[..20].iter().map(|f| missing(&f.key)).collect();
+        let mut first: Vec<(String, Value)> =
+            fields[..20].iter().map(|f| missing(&f.key)).collect();
         if w == 2 {
             first[0] = present("f0", "x", "p3/b1", "xxxx");
         }

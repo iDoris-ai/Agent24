@@ -90,16 +90,13 @@ impl Model for Script {
 pub(crate) fn answer(status: &str) -> Result<CompleteResult, ClientError> {
     let value = match status {
         "present" => {
-            json!({ "key": "date", "status": "present", "value": "10月12日", "normalized": "2026-10-12",
-                             "evidence": [{ "block_id": "p1/b1", "quote": "停水 10月12日" }], "missing_reason": "", "candidates": [] })
+            json!({ "present": { "value": "10月12日", "normalized": "2026-10-12",
+                                 "evidence": [{ "block_id": "p1/b1", "quote": "停水 10月12日" }] } })
         }
-        _ => {
-            json!({ "key": "date", "status": "missing", "value": "", "normalized": "", "evidence": [],
-                     "missing_reason": "not_in_document", "candidates": [] })
-        }
+        _ => json!({ "missing": { "reason": "not_in_document" } }),
     };
     Ok(CompleteResult {
-        text: json!({ "values": [value] }).to_string(),
+        text: json!({ "values": { "date": value } }).to_string(),
         model_id: Some("qwen3-8b".into()),
         tier: ServedTier::Local,
         usage: Usage {
@@ -232,7 +229,7 @@ async fn a_job_writes_its_extraction_with_its_success() {
             &body["schema_sha256"],
             &body["extractor_version"]
         ),
-        (&json!("qwen3-8b"), &input()["schema_sha256"], &json!("1"))
+        (&json!("qwen3-8b"), &input()["schema_sha256"], &json!("2"))
     );
     let v = &body["values"][0];
     assert_eq!(

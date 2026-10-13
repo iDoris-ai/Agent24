@@ -151,11 +151,11 @@
 - 字段每批最多 20 个。回答被截断（不是完整的 JSON）时，这一批对半拆开重试，拆到 1 个仍不行，job 以 `parse_failed` 失败。回答是完整 JSON 但不符合 Schema 时，重试一次，仍不行也是 `parse_failed`。
 
 **模型的回答**
-- 用 `response_format` 的 JSON Schema 约束（strict），每个字段给出：
-  - `status`：`present` / `missing` / `conflict`；
-  - `value`（原文写法）和可选的 `normalized`；
-  - 证据：`{block_id, quote}` 的列表，最多 16 条；`quote` 必须是该块原文中连续的一段；
-  - `missing_reason`，或冲突的各个候选（各自带值、`normalized` 和证据，最多 8 个）。
+- 用 `response_format` 的 JSON Schema 约束（strict）。`values` 以字段的 `key` 为键，每个字段恰好一个回答；回答是只有一个属性的对象，属性名就是状态：
+  - `present`：`value`（原文写法）、`normalized`（没有时为空串）和证据。证据是 `{block_id, quote}` 的列表，最多 16 条，`quote` 必须是该块原文中连续的一段；
+  - `missing`：`reason`，取 `blank_in_template`、`referenced_but_absent`、`outside_page_scope`、`not_in_document` 之一；
+  - `conflict`：2–8 个候选，各自带值、`normalized` 和证据。
+- Schema 不依赖属性的顺序。受 Schema 约束的模型按属性在 Schema 里的顺序输出，而这里的顺序按名称排序。原先三种状态共用一个对象，模型被迫在写 `status` 之前先写 `candidates`，本地模型（qwen2.5 3B / 7B / 14B）每次都把值抄成候选，回答全被判为不合格。改成以状态为属性名后，模型为一个字段写下的第一个词就是它的判断（David，2026-10-13，`extractor_version` 2）。
 
 **锚点由 OS 定位，不信模型**
 - 每条证据只在它指名的块里，用 `find` 的匹配规则（§3.1、Q14）找 `quote`：
