@@ -250,6 +250,11 @@ fn what_is_not_an_answer_says_why() {
     for (what, text) in [
         ("not json", "values: none".to_owned()),
         ("a list of answers", json!({ "values": [] }).to_string()),
+        (
+            "the answer as a list",
+            // Positionally: `[values]`, where `values` is the object it should be.
+            json!([{ "a": missing("a").1, "b": missing("b").1 }]).to_string(),
+        ),
         ("a field missing", answer(&[missing("a")])),
         (
             "a field twice",
