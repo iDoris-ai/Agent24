@@ -61,15 +61,23 @@ describe('extraction routes', () => {
   it('states the key, replay, rerun, availability and untrusted-input rules', () => {
     const op = openapi.paths[EXTRACT].post
     const d = op.description.replace(/\s+/g, ' ')
-    expect(d).toMatch(/schema_sha256, extractor_version, model_id/)
+    // The model is not known before the call, so not in the key (David, 2026-10-10).
+    expect(d).toMatch(/\(document_id, revision, schema_sha256, extractor_version\) \(§5\.4\)/)
+    expect(d).toMatch(/recorded in the result's `model_id`/)
     expect(d).toMatch(/202 while queued or running/)
     expect(d).toMatch(/attempt \+ 1/)
     expect(d).toMatch(/200 once it has succeeded/)
     expect(d).toMatch(/stays cancelled/)
     expect(d).toMatch(/`rerun: true` with a new `Idempotency-Key`/)
+    // The key names the rerun within the document; another body under it is 422 (David, 2026-10-10).
+    expect(d).toMatch(/names the rerun within the document/)
+    expect(d).toMatch(/a rerun is keyed instead by the document and its `Idempotency-Key`, so a key is never shared between documents/)
+    expect(d).toMatch(/the same key on another document is another rerun/)
     expect(d).toMatch(/without the header is 400/)
     expect(d).toMatch(/`LocalOnly`/)
-    expect(d).toMatch(/503 `engine_unavailable` with `details.engine`/)
+    // No model access is 503 at once; no local model is known only when the job runs.
+    expect(d).toMatch(/no\s+model access, the answer is 503 `engine_unavailable`/)
+    expect(d).toMatch(/the\s+job fails with `engine_unavailable` \(retryable; the same key\s+re-queues it\)/)
     expect(d).toMatch(/untrusted data/)
     expect(op.requestBody.required).toBe(true)
     expect(op.requestBody.content['application/json'].schema.$ref).toBe('#/components/schemas/DocumentsExtractRequest')
@@ -171,6 +179,8 @@ describe('extracted values (S01 gold shape)', () => {
     expect(v.DocumentsExtractedValue({ ...missing, value: '全部纳税人' })).toBe(false)
     expect(v.DocumentsExtractedValue({ ...missing, anchors: [anchor()] })).toBe(false)
     expect(v.DocumentsExtractedValue({ ...missing, missing_reason: 'guessed' })).toBe(false)
+    // Not read is not absent: a layer with unread regions says so (Q18; David, 2026-10-10).
+    ok('DocumentsExtractedValue', { ...missing, missing_reason: 'unread' })
   })
 
   it('conflict: every candidate with its anchor, none chosen', () => {
@@ -190,7 +200,11 @@ describe('extracted values (S01 gold shape)', () => {
     ok('DocumentsExtractedValue', { ...conflict, candidates: [{ ...c('a', 'a'), anchors: sixteen }, c('b', 'b')] })
     expect(v.DocumentsExtractedValue({ ...conflict, candidates: [{ ...c('a', 'a'), anchors: [...sixteen, anchor()] }, c('b', 'b')] }), '17 anchors').toBe(false)
     const [first, second] = conflict.candidates
-    for (const [name, bad] of [['no anchors', { value: 'b', normalized: 'b' }], ['empty anchors', { ...second, anchors: [] }],
+    // A candidate whose evidence could not be verified is kept, saying why;
+    // the conflict is never resolved by dropping it (Q17; David, 2026-10-10).
+    ok('DocumentsExtractedValue', { ...conflict, candidates: [first, { ...second, anchors: [], unsourced_reason: 'the quote is not in the block' }] })
+    expect(v.DocumentsExtractedValue({ ...conflict, candidates: [first, { ...second, unsourced_reason: 'x' }] }), 'anchors and an unsourced reason').toBe(false)
+    for (const [name, bad] of [['no anchors', { value: 'b', normalized: 'b' }], ['empty anchors, no reason', { ...second, anchors: [] }],
       ['no normalized', { value: 'b', anchors: [anchor()] }], ['no raw value', { normalized: 'b', anchors: [anchor()] }]] as const) {
       expect(v.DocumentsExtractedValue({ ...conflict, candidates: [first, bad] }), `candidate with ${name}`).toBe(false)
     }

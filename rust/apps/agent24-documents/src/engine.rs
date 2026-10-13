@@ -1,6 +1,7 @@
 //! Text engines and building the text layer (ADR-DOC-01 D6, ADR-DOC-02
-//! §3.1). The OS depends only on [`Engine`]; slice 1's is the PDFKit helper,
-//! and a later cross-platform one plugs in the same way.
+//! §3.1), and page renders (§4). The OS depends only on [`Engine`]; slice
+//! 1's is the PDFKit helper, and a later cross-platform one plugs in the
+//! same way.
 //!
 //! A read that needs a layer the OS has not pinned starts building it and
 //! waits a bounded time: the engine keeps going in the background, so a
@@ -12,11 +13,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::error::StorageCause;
 use crate::state::{Storage, blob_cause, unavailable_cause};
@@ -26,11 +28,19 @@ use crate::text_layer::{self, EngineRef, LayerError, TextLayer, config_sha256};
 pub const PARALLEL: usize = 2;
 /// Builds waiting for an engine; more are refused as busy.
 pub const QUEUE: usize = 16;
+/// Renders running at once, and [`QUEUE`] more waiting: apart from parses,
+/// which can take minutes (§3.1).
+pub const RENDERS: usize = 2;
 /// How long a read waits for a layer: inside the kernel proxy's 10 s for a
 /// response's head.
 pub const WAIT: Duration = Duration::from_secs(8);
 
 pub type Parse = Pin<Box<dyn Future<Output = Result<TextLayer, EngineError>> + Send>>;
+pub type Render = Pin<Box<dyn Future<Output = Result<Rendered, RenderError>> + Send>>;
+
+/// The scales a render may use (§4).
+pub const MIN_SCALE: f64 = 0.25;
+pub const MAX_SCALE: f64 = 4.0;
 
 /// A text engine: who it is, what it is asked to do, and a parse of the
 /// file at `path` (a stored blob) into a layer from exactly that engine and
@@ -39,6 +49,47 @@ pub trait Engine: Send + Sync {
     fn engine(&self) -> EngineRef;
     fn config(&self) -> Value;
     fn parse(&self, content_sha256: &str, media_type: &str, path: &Path) -> Parse;
+
+    /// A page of the file at `path`, or a region of it, as a PNG (§4). An
+    /// engine that does not render renders no format.
+    fn render(&self, _media_type: &str, _path: &Path, _ask: RenderAsk) -> Render {
+        Box::pin(async { Err(RenderError::Unsupported) })
+    }
+}
+
+/// A render asked for: a 1-based page; a scale from [`MIN_SCALE`] to
+/// [`MAX_SCALE`], which the engine may lower until the PNG fits in
+/// `max_bytes`; and a region, as corners in the frame of anchor rects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderAsk {
+    pub page: u32,
+    pub scale: f64,
+    pub region: Option<[f64; 4]>,
+    pub max_bytes: usize,
+}
+
+/// A PNG, and the scale it was drawn at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rendered {
+    pub scale: f64,
+    pub png: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum RenderError {
+    #[error("the engine does not render this format")]
+    Unsupported,
+    #[error("the file has no such page")]
+    NoPage,
+    #[error("the region is empty or off the page")]
+    OffPage,
+    #[error("the render does not fit even at the smallest scale")]
+    TooLarge,
+    /// Still rendering when its time ran out; it was stopped.
+    #[error("the engine took too long to render")]
+    TooSlow,
+    #[error("the engine could not render the file: {0}")]
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -74,6 +125,9 @@ type Outcome = Option<Result<String, LayerFailure>>;
 pub struct Layers {
     engine: Option<Arc<dyn Engine>>,
     slots: Arc<Semaphore>,
+    renders: Arc<Semaphore>,
+    /// Renders waiting for a slot.
+    render_queue: AtomicUsize,
     /// Builds started and not finished, by layer key.
     building: Mutex<HashMap<String, watch::Receiver<Outcome>>>,
 }
@@ -85,11 +139,37 @@ impl Layers {
         self.engine.as_ref()
     }
 
+    /// A slot to render in, if one is free by `deadline`; none at once if
+    /// [`QUEUE`] renders are already waiting.
+    pub async fn render_slot(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<OwnedSemaphorePermit> {
+        if let Ok(slot) = self.renders.clone().try_acquire_owned() {
+            return Some(slot);
+        }
+        struct InLine<'a>(&'a AtomicUsize);
+        impl Drop for InLine<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let ahead = self.render_queue.fetch_add(1, Ordering::SeqCst);
+        let _in_line = InLine(&self.render_queue);
+        if ahead >= QUEUE {
+            return None;
+        }
+        let slot = self.renders.clone().acquire_owned();
+        tokio::time::timeout_at(deadline, slot).await.ok()?.ok()
+    }
+
     #[must_use]
     pub fn new(engine: Option<Arc<dyn Engine>>) -> Arc<Self> {
         Arc::new(Self {
             engine,
             slots: Arc::new(Semaphore::new(PARALLEL)),
+            renders: Arc::new(Semaphore::new(RENDERS)),
+            render_queue: AtomicUsize::new(0),
             building: Mutex::default(),
         })
     }

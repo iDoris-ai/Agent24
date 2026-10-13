@@ -15,6 +15,7 @@ use crate::text_layer::{self, LayerError, ParseStatus, Region, TextLayer};
 
 pub mod find;
 pub mod matcher;
+pub mod render;
 pub mod text;
 
 /// A response's serialized JSON stays under this (§4).

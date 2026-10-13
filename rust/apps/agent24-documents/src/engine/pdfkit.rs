@@ -3,15 +3,18 @@
 //! per file. Its report becomes a text layer through `text_layer::build`.
 //! The helper is macOS only; elsewhere there is no engine (D10).
 
+use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use super::{Engine, EngineError, Parse};
+use super::{Engine, EngineError, MIN_SCALE, Parse, Render, RenderAsk, RenderError, Rendered};
 use crate::text_layer::build::{self, Read};
 use crate::text_layer::{EngineRef, MAX_BLOCK_BYTES, MAX_LINES};
 
@@ -21,6 +24,11 @@ pub const FORMATS: [&str; 3] = ["application/pdf", "image/jpeg", "image/png"];
 
 /// One parse, from start to exit (§3.1).
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// One render: within the kernel proxy's 10 s for a response's head (§4).
+const RENDER_TIMEOUT: Duration = Duration::from_secs(8);
+/// A render's header line, at most.
+const MAX_HEAD: usize = 1 << 10;
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 /// The report, at most; and what is kept of its error output.
 const MAX_OUTPUT: usize = 64 << 20;
 const MAX_STDERR: usize = 4 << 10;
@@ -30,6 +38,7 @@ pub struct PdfKit {
     /// The macOS version: PDFKit reads differently from one to the next.
     os: String,
     timeout: Duration,
+    render_timeout: Duration,
     max_output: usize,
 }
 
@@ -58,13 +67,14 @@ impl PdfKit {
             path,
             os: canonical(os).unwrap_or_else(|| os.to_owned()),
             timeout: TIMEOUT,
+            render_timeout: RENDER_TIMEOUT,
             max_output: MAX_OUTPUT,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn limited(mut self, timeout: Duration, max_output: usize) -> Self {
-        (self.timeout, self.max_output) = (timeout, max_output);
+        (self.timeout, self.render_timeout, self.max_output) = (timeout, timeout, max_output);
         self
     }
 }
@@ -118,24 +128,143 @@ impl Engine for PdfKit {
 
     fn parse(&self, content_sha256: &str, media_type: &str, path: &Path) -> Parse {
         let (engine, config) = (self.engine(), self.config());
-        let (content, os, max) = (content_sha256.to_owned(), self.os.clone(), self.max_output);
+        let (content, os) = (content_sha256.to_owned(), self.os.clone());
+        let args = [
+            OsStr::new("parse"),
+            path.as_os_str(),
+            OsStr::new(media_type),
+        ];
+        let run = self.run(&args, self.timeout, self.max_output);
+        Box::pin(async move {
+            let failed = EngineError::Failed;
+            let ran = run.await.map_err(|e| failed(e.to_string()))?;
+            match ran.code {
+                Some(0) => {
+                    let read: Read = serde_json::from_slice(&ran.out)
+                        .map_err(|e| failed(format!("the engine's report is not one: {e}")))?;
+                    if read.os_version != os {
+                        return Err(failed(
+                            "macOS changed under the engine; restart the OS".into(),
+                        ));
+                    }
+                    build::layer(&content, engine, config, read).map_err(failed)
+                }
+                Some(2) => Err(EngineError::Unsupported),
+                Some(code) => Err(failed(format!(
+                    "the engine could not read the file ({code}): {}",
+                    ran.said
+                ))),
+                None => Err(failed("the engine stopped".into())),
+            }
+        })
+    }
+
+    fn render(&self, media_type: &str, path: &Path, ask: RenderAsk) -> Render {
+        let mut args: Vec<OsString> = vec![
+            "render".into(),
+            path.into(),
+            media_type.into(),
+            ask.page.to_string().into(),
+            ask.scale.to_string().into(),
+            ask.max_bytes.to_string().into(),
+        ];
+        if let Some([x0, y0, x1, y1]) = ask.region {
+            args.push(format!("{x0},{y0},{x1},{y1}").into());
+        }
+        let run = self.run(&args, self.render_timeout, ask.max_bytes + MAX_HEAD);
+        Box::pin(async move {
+            let failed = RenderError::Failed;
+            let ran = run.await.map_err(|e| match e {
+                RunError::TooLong => RenderError::TooSlow,
+                RunError::Other(why) => failed(why),
+            })?;
+            match ran.code {
+                Some(0) => rendered(&ran.out, &ask).map_err(failed),
+                Some(2) => Err(RenderError::Unsupported),
+                Some(4) => Err(RenderError::NoPage),
+                Some(5) => Err(RenderError::OffPage),
+                Some(6) => Err(RenderError::TooLarge),
+                Some(code) => Err(failed(format!(
+                    "the engine could not render the file ({code}): {}",
+                    ran.said
+                ))),
+                None => Err(failed("the engine stopped".into())),
+            }
+        })
+    }
+}
+
+/// What `render` wrote, checked against what was asked: a line saying the
+/// scale it used, then a PNG within the size asked for.
+fn rendered(out: &[u8], ask: &RenderAsk) -> Result<Rendered, String> {
+    #[derive(Deserialize)]
+    struct Head {
+        protocol: u32,
+        scale: f64,
+    }
+    let at = out
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or("the engine's render has no header")?;
+    let head: Head = serde_json::from_slice(&out[..at])
+        .map_err(|e| format!("the engine's render header is not one: {e}"))?;
+    let png = &out[at + 1..];
+    if head.protocol != 1 {
+        return Err(format!("the engine speaks protocol {}", head.protocol));
+    }
+    if !(MIN_SCALE..=ask.scale).contains(&head.scale) {
+        return Err(format!("the engine rendered at scale {}", head.scale));
+    }
+    if png.len() > ask.max_bytes || !png.starts_with(PNG) {
+        return Err("the engine's render is not a PNG within the size asked for".into());
+    }
+    Ok(Rendered {
+        scale: head.scale,
+        png: png.to_vec(),
+    })
+}
+
+/// Why a run of the helper left nothing to read.
+#[derive(Debug, thiserror::Error)]
+enum RunError {
+    #[error("the engine took too long")]
+    TooLong,
+    #[error("{0}")]
+    Other(String),
+}
+
+/// A run of the helper: its output, its exit code (none if a signal stopped
+/// it) and the first line of its error output.
+struct Ran {
+    out: Vec<u8>,
+    code: Option<i32>,
+    said: String,
+}
+
+impl PdfKit {
+    /// Runs the helper with `args`. Running past `timeout`, or writing more
+    /// than `max` bytes, fails the run and stops the helper at once.
+    fn run(
+        &self,
+        args: &[impl AsRef<OsStr>],
+        timeout: Duration,
+        max: usize,
+    ) -> impl Future<Output = Result<Ran, RunError>> + Send + 'static {
         let mut command = Command::new(&self.path);
-        command.arg("parse").arg(path).arg(media_type);
         command
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let timeout = self.timeout;
-        Box::pin(async move {
-            let failed = |why: String| EngineError::Failed(why);
+        async move {
             let mut child = command
                 .spawn()
-                .map_err(|e| failed(format!("the engine did not start: {e}")))?;
+                .map_err(|e| RunError::Other(format!("the engine did not start: {e}")))?;
             let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
-                return Err(failed("the engine's output is not piped".into()));
+                return Err(RunError::Other("the engine's output is not piped".into()));
             };
-            // A report over the cap stops the helper at once; its error
+            // Output over the cap stops the helper at once; its error
             // output is kept to a few KiB and the rest read away.
             let run = async {
                 let report = async {
@@ -152,34 +281,24 @@ impl Engine for PdfKit {
             // On timeout the child is dropped, and killed with it.
             let ((out, over), (err, _), status) = tokio::time::timeout(timeout, run)
                 .await
-                .map_err(|_| failed("the engine took too long".into()))?
-                .map_err(|e| failed(format!("the engine's output could not be read: {e}")))?;
+                .map_err(|_| RunError::TooLong)?
+                .map_err(|e| {
+                    RunError::Other(format!("the engine's output could not be read: {e}"))
+                })?;
+            if over {
+                return Err(RunError::Other("the engine's output is too large".into()));
+            }
             let said = String::from_utf8_lossy(&err)
                 .lines()
                 .next()
                 .unwrap_or_default()
                 .to_owned();
-            if over {
-                return Err(failed("the engine's report is too large".into()));
-            }
-            match status.code() {
-                Some(0) => {
-                    let read: Read = serde_json::from_slice(&out)
-                        .map_err(|e| failed(format!("the engine's report is not one: {e}")))?;
-                    if read.os_version != os {
-                        return Err(failed(
-                            "macOS changed under the engine; restart the OS".into(),
-                        ));
-                    }
-                    build::layer(&content, engine, config, read).map_err(failed)
-                }
-                Some(2) => Err(EngineError::Unsupported),
-                Some(code) => Err(failed(format!(
-                    "the engine could not read the file ({code}): {said}"
-                ))),
-                None => Err(failed("the engine stopped".into())),
-            }
-        })
+            Ok(Ran {
+                out,
+                code: status.code(),
+                said,
+            })
+        }
     }
 }
 
