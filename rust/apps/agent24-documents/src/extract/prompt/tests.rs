@@ -269,7 +269,48 @@ fn what_is_not_an_answer_says_why() {
                 missing("a"),
                 (
                     "b",
-                    json!({ "missing": { "reason": "not_in_document" }, "present": {} }),
+                    json!({ "missing": missing("b").1["missing"], "present": present("b").1["present"] }),
+                ),
+            ]),
+        ),
+        (
+            "two statuses, the other way round",
+            format!(
+                "{{\"values\":{{\"a\":{},\"b\":{{\"present\":{},\"missing\":{}}}}}}}",
+                missing("a").1,
+                present("b").1["present"],
+                missing("b").1["missing"]
+            ),
+        ),
+        (
+            "a reason as a list",
+            answer(&[
+                missing("a"),
+                ("b", json!({ "missing": ["not_in_document"] })),
+            ]),
+        ),
+        (
+            "a present value as a list",
+            answer(&[
+                missing("a"),
+                ("b", json!({ "present": ["10月12日", "", []] })),
+            ]),
+        ),
+        (
+            "a candidate as a list",
+            answer(&[
+                missing("a"),
+                with(conflict("b"), "/conflict/1", json!(["20元", "20元", []])),
+            ]),
+        ),
+        (
+            "evidence as a list",
+            answer(&[
+                missing("a"),
+                with(
+                    present("b"),
+                    "/present/evidence/0",
+                    json!(["p2/b1", "10月12日停水"]),
                 ),
             ]),
         ),

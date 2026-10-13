@@ -9,7 +9,7 @@ use std::fmt;
 
 use agent24_os_sdk::{JsonSchemaFormat, ModelMessage, ModelRole};
 use serde::Deserialize;
-use serde::de::{Deserializer, MapAccess, Visitor};
+use serde::de::{DeserializeOwned, Deserializer, Error as _, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 
 use super::Field;
@@ -119,6 +119,26 @@ pub fn answer_format(fields: &[Field]) -> JsonSchemaFormat {
     }
 }
 
+/// A `T` read only from a JSON object: serde's derived structs also take a
+/// list of their fields in order, which the schema does not allow.
+struct Obj<T>(T);
+
+impl<'de, T: DeserializeOwned> Deserialize<'de> for Obj<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let object = Map::<String, Value>::deserialize(d)?;
+        T::deserialize(Value::Object(object))
+            .map(Obj)
+            .map_err(D::Error::custom)
+    }
+}
+
+fn objects<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    Ok(Vec::<Obj<T>>::deserialize(d)?
+        .into_iter()
+        .map(|o| o.0)
+        .collect())
+}
+
 /// A quote of a named block.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +152,7 @@ pub struct Evidence {
 pub struct AnswerCandidate {
     pub value: String,
     pub normalized: String,
+    #[serde(deserialize_with = "objects")]
     pub evidence: Vec<Evidence>,
 }
 
@@ -166,9 +187,9 @@ struct Reason {
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Said {
-    Present(AnswerCandidate),
-    Missing(Reason),
-    Conflict(Vec<AnswerCandidate>),
+    Present(Obj<AnswerCandidate>),
+    Missing(Obj<Reason>),
+    Conflict(#[serde(deserialize_with = "objects")] Vec<AnswerCandidate>),
 }
 
 impl Said {
@@ -183,10 +204,12 @@ impl Said {
             candidates: Vec::new(),
         };
         match self {
-            Said::Present(c) => {
+            Said::Present(Obj(c)) => {
                 (v.value, v.normalized, v.evidence) = (c.value, c.normalized, c.evidence)
             }
-            Said::Missing(r) => (v.status, v.missing_reason) = (AnswerStatus::Missing, r.reason),
+            Said::Missing(Obj(r)) => {
+                (v.status, v.missing_reason) = (AnswerStatus::Missing, r.reason)
+            }
             Said::Conflict(cs) => (v.status, v.candidates) = (AnswerStatus::Conflict, cs),
         }
         v
