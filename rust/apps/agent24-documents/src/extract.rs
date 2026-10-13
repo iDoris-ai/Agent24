@@ -15,7 +15,7 @@ pub mod window;
 
 /// The version of the instruction, the answer's schema, windows, batches
 /// and merging (§3.2): part of the business key, so a change re-extracts.
-pub const EXTRACTOR_VERSION: &str = "1";
+pub const EXTRACTOR_VERSION: &str = "2";
 
 /// A requested field (`DocumentsExtractField`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
