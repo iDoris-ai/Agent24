@@ -64,6 +64,16 @@ describe('the S01 samples in this repository', () => {
   })
 })
 
+describe('the ask.json files in this repository', () => {
+  const asked = fs.readdirSync(S01).map((d) => path.join(S01, d)).filter((d) => fs.existsSync(path.join(d, 'ask.json')))
+
+  it('ask for every field of their gold, and give no answer away', () => {
+    expect(asked.length).toBeGreaterThanOrEqual(4)
+    // loadAsk throws with the list of what is wrong.
+    for (const dir of asked) expect(loadAsk(loadSample(dir)).length, dir).toBeGreaterThan(0)
+  })
+})
+
 describe('loadSample refuses', () => {
   const refused = (change: Parameters<typeof copy>[0], name?: string) => () => loadSample(copy(change, name))
 

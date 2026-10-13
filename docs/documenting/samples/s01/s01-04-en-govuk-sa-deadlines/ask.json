@@ -1,0 +1,22 @@
+{"fields":[
+ {"key":"tax_year","description":"Which tax year these deadlines are for","type":"date"},
+ {"key":"receipt_requirement","description":"Whether sending the return and the payment by the deadline is enough, or they must arrive by then","type":"text"},
+ {"key":"profit_unknown_still_required","description":"What to do when you do not yet know your profit for the whole tax year","type":"text"},
+ {"key":"register_deadline","description":"The date by which you must tell HMRC that you need to send a tax return, if you did not send one last year","type":"date"},
+ {"key":"register_action","description":"How to tell HMRC that you need to send a tax return, if you did not send one last year","type":"text"},
+ {"key":"late_registration_filing_deadline","description":"How long you have to send your return if you registered after the registration deadline","type":"text"},
+ {"key":"late_registration_payment_deadline","description":"When the tax must be paid if you registered after the registration deadline","type":"datetime"},
+ {"key":"paper_return_deadline","description":"The deadline for an individual to send a paper tax return","type":"datetime"},
+ {"key":"return_submission_open_date","description":"The earliest date you can send your tax return for this tax year","type":"date"},
+ {"key":"online_return_deadline","description":"The deadline for an individual to send an online tax return","type":"datetime"},
+ {"key":"tax_code_submission_deadline","description":"The deadline for sending an online return if you want HMRC to collect the tax you owe through your tax code","type":"datetime"},
+ {"key":"tax_code_deadline_missed","description":"What happens if you miss the deadline for paying through your tax code","type":"text"},
+ {"key":"payment_deadline","description":"The deadline for paying the tax you owe","type":"datetime"},
+ {"key":"payments_on_account_second_deadline","description":"When the second payment is due if you make payments on account","type":"date"},
+ {"key":"special_entities_paper_deadline","description":"The paper return deadline for a trustee of a registered pension scheme or a non-resident company","type":"date"},
+ {"key":"special_entities_cannot_file_online","description":"Whether a trustee of a registered pension scheme or a non-resident company may send the return online","type":"text"},
+ {"key":"partnership_company_partner_online_deadline","description":"The online return deadline for a partnership that has a limited company as a partner","type":"text"},
+ {"key":"partnership_company_partner_paper_deadline","description":"The paper return deadline for a partnership that has a limited company as a partner","type":"text"},
+ {"key":"penalty_amount","description":"How much the penalty for sending the return late is","type":"amount"},
+ {"key":"tax_bill_amount","description":"How much tax you owe","type":"amount"}
+]}
