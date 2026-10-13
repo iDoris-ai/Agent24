@@ -142,6 +142,8 @@ describe('loadSample refuses', () => {
   it('a conflict with one candidate, or a candidate without its normalized form or anchors', () => {
     expect(refused((g) => void field(g, 'shutoff_date').candidates?.splice(1))).toThrow(/a conflict has two or more candidates/)
     expect(refused((g) => void (field(g, 'shutoff_date').candidates![0]!.normalized = ''))).toThrow(/candidate 1 lacks a value or its normalized form/)
+    // Blank is as good as nothing: the scoring groups candidates by this form.
+    expect(refused((g) => void (field(g, 'shutoff_date').candidates![0]!.normalized = ' '))).toThrow(/candidate 1 lacks a value or its normalized form/)
     expect(refused((g) => void (field(g, 'shutoff_date').candidates![0]!.value = 13 as never))).toThrow(/candidate 1 lacks a value or its normalized form/)
     expect(refused((g) => void (field(g, 'shutoff_date').candidates![1]!.anchors = []))).toThrow(/shutoff_date candidate 2: no anchors/)
   })
