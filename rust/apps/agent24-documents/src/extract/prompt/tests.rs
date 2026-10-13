@@ -283,6 +283,14 @@ fn what_is_not_an_answer_says_why() {
             ),
         ),
         (
+            "a reason given twice",
+            // The last is a good reason: read as a map, it would pass.
+            format!(
+                r#"{{"values":{{"a":{},"b":{{"missing":{{"reason":"unread","reason":"not_in_document"}}}}}}}}"#,
+                missing("a").1
+            ),
+        ),
+        (
             "a reason as a list",
             answer(&[
                 missing("a"),

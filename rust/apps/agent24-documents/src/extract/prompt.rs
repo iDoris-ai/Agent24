@@ -6,10 +6,12 @@
 //! candidates. The OS, not the model, locates each quote.
 
 use std::fmt;
+use std::marker::PhantomData;
 
 use agent24_os_sdk::{JsonSchemaFormat, ModelMessage, ModelRole};
 use serde::Deserialize;
-use serde::de::{DeserializeOwned, Deserializer, Error as _, MapAccess, Visitor};
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 
 use super::Field;
@@ -120,19 +122,28 @@ pub fn answer_format(fields: &[Field]) -> JsonSchemaFormat {
 }
 
 /// A `T` read only from a JSON object: serde's derived structs also take a
-/// list of their fields in order, which the schema does not allow.
+/// list of their fields in order, which the schema does not allow. The
+/// object goes to `T` as written, so a property given twice is still an
+/// error.
 struct Obj<T>(T);
 
-impl<'de, T: DeserializeOwned> Deserialize<'de> for Obj<T> {
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let object = Map::<String, Value>::deserialize(d)?;
-        T::deserialize(Value::Object(object))
-            .map(Obj)
-            .map_err(D::Error::custom)
+        struct Object<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Object<T> {
+            type Value = Obj<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Obj<T>, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(Obj)
+            }
+        }
+        d.deserialize_map(Object(PhantomData))
     }
 }
 
-fn objects<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+fn objects<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
     Ok(Vec::<Obj<T>>::deserialize(d)?
         .into_iter()
         .map(|o| o.0)
