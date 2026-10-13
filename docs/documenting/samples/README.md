@@ -181,7 +181,7 @@ v1 的问题来自 2026-10-08 的 Codex 审阅：适用对象表达不了、相�
 2.5. **独立审阅**（v2）：由 Codex 按本规范逐条审阅，确认 L1/L2 锚点命中、问题集都已覆盖、`must_not_assert` 可以判定。审阅意见处理完后，才进入第 3 步。
 3. **人工核对（必须）**：David 逐项对照原件核对。核对后 `verified_by` 填 `david`，改动直接写进 `gold.json`。**未核对的金标不进入验收统计。**
 4. **入库**：每个样本目录都通过 PR 合入 `ab/documenting`。之后要修改金标，必须在 PR 里说明原因，旧版本由 git 追溯。
-5. **使用**：#708 的验收 harness 读取 `gold.json`，分别统计：字段正确率、`missing` / `conflict` 判对率、锚点命中率、严重错误数（单独列出），以及 `must_not_assert` 违规数。
+5. **使用**：#708 的验收 harness 读取 `gold.json`，分别统计：字段正确率、`missing` / `conflict` 判对率、锚点命中率、严重错误数（单独列出），以及 `must_not_assert` 违规数。打分规则见 [验收 harness](../acceptance/README.md) §4。
 
 ## 6.5 S01 样本索引（v2，2026-10-08）
 
