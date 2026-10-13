@@ -34,17 +34,21 @@ export async function check(id: string, sample: string | undefined, body: () => 
   return { id, ...(sample ? { sample } : {}), outcome: problems.length === 0 ? 'passed' : 'failed', problems, ms: Date.now() - start }
 }
 
+export const MAX_PAGES = 1000
 /** Every page of a paginated route, from the first to the one whose
- *  `next_cursor` is null. A cursor that comes twice, or is neither a cursor nor
- *  null, is an error: a route that breaks the contract must not hang a run. */
+ *  `next_cursor` is null. A route that breaks the contract must not hang a
+ *  run: a cursor that is neither a cursor nor null, one that comes twice, or
+ *  more pages than any run has is an error, found before the page is handed on. */
 export async function* pages<T extends { next_cursor: string | null }>(page: (cursor: string) => Promise<T>): AsyncGenerator<T> {
-  const seen = new Set<string>()
+  const seen = new Set<string>([''])
   for (let cursor: string | null = ''; cursor !== null; ) {
-    if (seen.has(cursor)) throw new Error(`the pages do not end: cursor ${cursor} came twice`)
-    seen.add(cursor)
     const got: T = await page(cursor)
+    const next: unknown = got.next_cursor
+    if (next !== null && typeof next !== 'string') throw new Error('next_cursor is neither a cursor nor null')
+    if (next !== null && seen.has(next)) throw new Error(`the pages do not end: cursor ${next} came twice`)
+    if (seen.size > MAX_PAGES) throw new Error(`the pages do not end: more than ${MAX_PAGES}`)
+    if (next !== null) seen.add(next)
     yield got
-    if (got.next_cursor !== null && typeof got.next_cursor !== 'string') throw new Error('next_cursor is neither a cursor nor null')
     cursor = got.next_cursor
   }
 }
@@ -57,7 +61,7 @@ export async function checkCapabilities(client: Client): Promise<CheckResult & {
   let capabilities: Schemas['DocumentsCapabilities'] | undefined
   let lacking = false
   const result = await check('ACC-CAP', undefined, async () => {
-    capabilities = await client.json<Schemas['DocumentsCapabilities']>('GET', '/capabilities')
+    capabilities = await client.json<Schemas['DocumentsCapabilities']>('GET', '/capabilities', 'DocumentsCapabilities')
     const ready = (kind: string) => capabilities?.engines.some((e) => e.kind === kind && e.state === 'ready')
     const missing: string[] = []
     if (capabilities.storage.state !== 'ready') missing.push(`storage is ${capabilities.storage.state}`)
@@ -67,7 +71,6 @@ export async function checkCapabilities(client: Client): Promise<CheckResult & {
     lacking = missing.length > 0
     return missing
   })
-  // An answer that could not be read at all is the product's failure, not the environment's.
   return { ...result, outcome: lacking ? 'unmet' : result.outcome, capabilities }
 }
 
@@ -85,7 +88,8 @@ export async function waitForJob(client: Client, jobId: string, wait: JobWait = 
   const sleep = wait.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)))
   const deadline = Date.now() + (wait.timeoutMs ?? 10 * 60_000)
   for (;;) {
-    const job = await client.json<Schemas['DocumentsJob']>('GET', `/jobs/${jobId}`)
+    const job = await client.json<Schemas['DocumentsJob']>('GET', `/jobs/${jobId}`, 'DocumentsJob')
+    if (job.job_id !== jobId) throw new Error(`asked for job ${jobId}, answered with ${job.job_id}`)
     if (!['queued', 'running', 'cancelling'].includes(job.status)) return job
     if (Date.now() >= deadline) throw new Error(`job ${jobId} is still ${job.status}`)
     await sleep(wait.pollMs ?? 500)
@@ -98,14 +102,14 @@ export async function checkImport(client: Client, sample: Sample, wait: JobWait 
   let documentId: string | undefined
   const result = await check('ACC-IMPORT', sample.id, async () => {
     const bytes = fs.readFileSync(sample.source)
-    const upload = await client.json<Schemas['DocumentsUpload']>('POST', '/uploads', {
+    const upload = await client.json<Schemas['DocumentsUpload']>('POST', '/uploads', 'DocumentsUpload', {
       json: { total_size: bytes.length, sha256: sha256(bytes), filename: path.basename(sample.source) },
       headers: { 'idempotency-key': crypto.randomUUID() },
     })
     let received = upload
     for (let offset = 0; offset < bytes.length; offset += CHUNK) {
       const chunk = bytes.subarray(offset, offset + CHUNK)
-      received = await client.json<Schemas['DocumentsUpload']>('POST', `/uploads/${upload.upload_id}/chunks`, {
+      received = await client.json<Schemas['DocumentsUpload']>('POST', `/uploads/${upload.upload_id}/chunks`, 'DocumentsUpload', {
         bytes: chunk,
         headers: { 'upload-offset': String(offset), 'chunk-sha256': sha256(chunk) },
       })
@@ -113,7 +117,7 @@ export async function checkImport(client: Client, sample: Sample, wait: JobWait 
     if (received.status !== 'complete' || received.received !== bytes.length) {
       return [`the upload is ${received.status} after its last chunk, with ${received.received} of ${bytes.length} bytes`]
     }
-    const started = await client.json<Schemas['DocumentsJob']>('POST', '/imports', { json: { upload_id: upload.upload_id, title: sample.id } })
+    const started = await client.json<Schemas['DocumentsJob']>('POST', '/imports', 'DocumentsJob', { json: { upload_id: upload.upload_id, title: sample.id } })
     const job = await waitForJob(client, started.job_id, wait)
     if (job.status !== 'succeeded') return [`the import job is ${job.status}: ${job.error?.code ?? 'no error code'}`]
     documentId = job.result?.document_id
@@ -127,12 +131,13 @@ export async function checkImport(client: Client, sample: Sample, wait: JobWait 
 export async function checkGet(client: Client, sample: Sample, documentId: string): Promise<CheckResult> {
   return check('ACC-GET', sample.id, async () => {
     const problems: string[] = []
-    const document = await client.json<Schemas['DocumentDetail']>('GET', `/documents/${documentId}`)
+    const document = await client.json<Schemas['DocumentDetail']>('GET', `/documents/${documentId}`, 'DocumentDetail')
+    if (document.document_id !== documentId) problems.push(`asked for ${documentId}, answered with ${document.document_id}`)
     if (document.head_revision !== 1) problems.push(`head_revision is ${document.head_revision}`)
     if (document.head?.content_sha256 !== `sha256:${sample.meta.sha256_stored}`) {
       problems.push(`the stored content is ${document.head?.content_sha256}, not the sample's sha256_stored`)
     }
-    const list = (cursor: string) => client.json<Schemas['DocumentList']>('GET', `/documents${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`)
+    const list = (cursor: string) => client.json<Schemas['DocumentList']>('GET', `/documents${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`, 'DocumentList')
     for await (const page of pages(list)) if (page.documents.some((d) => d.document_id === documentId)) return problems
     return [...problems, 'the document is not in the list']
   })

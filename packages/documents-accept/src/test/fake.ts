@@ -1,5 +1,6 @@
 // A stand-in for the daemon in unit tests: a `Client` whose requests go to a
-// function, which sees each one as the routes would.
+// function, which sees each one as the routes would. The builders below give
+// answers the contract accepts, so a test changes only what it is about.
 
 import { Client, type ClientOptions } from '../client'
 
@@ -10,6 +11,8 @@ export interface Call {
   headers: Record<string, string>
   json?: unknown
   bytes?: Uint8Array
+  /** Whether the request carried a deadline. */
+  timed: boolean
 }
 
 export const answer = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>
@@ -17,6 +20,25 @@ export const answer = (body: unknown, status = 200, headers: Record<string, stri
 
 export const refuse = (status: number, code: string, retryable = false): Response =>
   answer({ error: { code, message: `it is ${code}`, details: { retryable } } }, status)
+
+/** An id as the contract shapes it: a kind, then a ULID. */
+export const id = (kind: 'job' | 'doc' | 'upl' | 'ext', n = 1): string => `${kind}_0${String(n).padStart(25, '0')}`
+export const sha = (digit = '0'): string => `sha256:${digit.repeat(64)}`
+const AT = '2026-10-14T00:00:00.000Z'
+
+export const job = (more: object = {}) => ({ job_id: id('job'), kind: 'extract', status: 'queued', attempt: 1, progress: null, error: null, result: null, created_at: AT, updated_at: AT, ...more })
+export const failed = (code = 'engine_unavailable', more: object = {}) => job({ status: 'failed', error: { code, message: code }, ...more })
+export const upload = (more: object = {}) => ({ upload_id: id('upl'), total_size: 1, sha256: sha(), received: 0, status: 'receiving', expires_at: AT, ...more })
+export const document = (more: object = {}) => ({
+  document_id: id('doc'),
+  title: 'a sample',
+  media_type: 'application/pdf',
+  head_revision: 1,
+  created_at: AT,
+  updated_at: AT,
+  head: { revision: 1, content_sha256: sha(), size: 1, media_type: 'application/pdf' },
+  ...more,
+})
 
 const BASE = 'http://127.0.0.1:1/api/v1/documents'
 
@@ -29,6 +51,7 @@ export function fakeClient(daemon: (call: Call, calls: Call[]) => Response, opti
       method: init.method ?? 'GET',
       route: String(url).slice(BASE.length),
       headers: init.headers as Record<string, string>,
+      timed: init.signal instanceof AbortSignal,
       ...(typeof body === 'string' ? { json: JSON.parse(body) as unknown } : {}),
       ...(body instanceof Uint8Array ? { bytes: body } : {}),
     }

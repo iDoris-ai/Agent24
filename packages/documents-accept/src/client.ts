@@ -5,6 +5,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { conform } from './contract'
 
 export interface Connection {
   /** `http://127.0.0.1:<port>/api/v1/documents` */
@@ -14,8 +15,14 @@ export interface Connection {
 
 /** Reads the daemon's state file: `~/.agent24/daemon.json`, or the one named. */
 export function connect(daemonJson = path.join(os.homedir(), '.agent24', 'daemon.json')): Connection {
-  const state = JSON.parse(fs.readFileSync(daemonJson, 'utf8')) as { port?: unknown; token?: unknown }
-  if (!Number.isInteger(state?.port) || typeof state.token !== 'string' || state.token === '') {
+  let state: { port?: unknown; token?: unknown } | null
+  try {
+    state = JSON.parse(fs.readFileSync(daemonJson, 'utf8')) as typeof state
+  } catch {
+    // Said without what was read: the file holds the bearer.
+    throw new Error(`${daemonJson}: not a daemon state file that can be read`)
+  }
+  if (!Number.isInteger(state?.port) || typeof state?.token !== 'string' || state.token === '') {
     throw new Error(`${daemonJson}: no port and bearer token (a daemon in capability mode has no token)`)
   }
   return { base: `http://127.0.0.1:${String(state.port)}/api/v1/documents`, token: state.token }
@@ -33,8 +40,7 @@ export class ApiError extends Error {
   }
 }
 
-/** What the kernel answers with a 503 before a request reached the module:
- *  nothing happened, so asking again is safe (ADR-DOC-02 §6). */
+/** The kernel's 503s for a request that never reached the module: safe to ask again (ADR-DOC-02 §6). */
 const NOT_DISPATCHED = ['module_overloaded', 'module_stopping', 'module_not_ready', 'module_draining', 'duplicate_request_id']
 
 export interface Request {
@@ -52,6 +58,9 @@ export interface ClientOptions {
   retries?: number
   retryMs?: number
 }
+
+/** How long one request may take, headers and body. The kernel gives a documents route 30 s. */
+const TIMEOUT_MS = 60_000
 
 export class Client {
   private readonly fetch: typeof fetch
@@ -79,7 +88,7 @@ export class Client {
     if (request.bytes !== undefined) headers['content-type'] = 'application/octet-stream'
     const body = request.json !== undefined ? JSON.stringify(request.json) : request.bytes
     for (let attempt = 0; ; attempt += 1) {
-      const response = await this.fetch(this.connection.base + route, { method, headers, body })
+      const response = await this.fetch(this.connection.base + route, { method, headers, body, signal: AbortSignal.timeout(TIMEOUT_MS) })
       if (response.ok) return response
       const error = await failure(response)
       const again = error.status === 503 && (error.retryable || NOT_DISPATCHED.includes(error.code))
@@ -88,8 +97,9 @@ export class Client {
     }
   }
 
-  async json<T>(method: string, route: string, request: Request = {}): Promise<T> {
-    return (await (await this.send(method, route, request)).json()) as T
+  /** A 2xx answer as the contract's `schema`; one that is not is thrown (`conform`). */
+  async json<T>(method: string, route: string, schema: string, request: Request = {}): Promise<T> {
+    return conform<T>(schema, await (await this.send(method, route, request)).json())
   }
 }
 

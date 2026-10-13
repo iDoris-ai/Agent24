@@ -4,19 +4,56 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
-import { checkCapabilities, checkGet, checkImport, waitForJob } from './checks'
+import { MAX_PAGES, checkCapabilities, checkGet, checkImport, pages, waitForJob } from './checks'
 import { type Sample, loadSample } from './samples'
-import { type Call, answer, fakeClient, refuse } from './test/fake'
+import { type Call, answer, document, failed, fakeClient, id, job, refuse, upload } from './test/fake'
 
 const S01 = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'docs', 'documenting', 'samples', 's01')
 const NOTICE = loadSample(path.join(S01, 's01-07-mixed-building-notice'))
 /** Polls a job without waiting in between. */
 const QUICK = { sleep: async () => {} }
 const sha = (bytes: Uint8Array) => `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`
+const UPLOAD = id('upl')
+const JOB = id('job')
+const DOC = id('doc')
+const NOT_A = (schema: string) => expect.stringContaining(`the answer is not a ${schema}`)
 
 const made: string[] = []
 afterEach(() => {
   for (const dir of made.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
+})
+
+describe('pages', () => {
+  const read = async (cursors: unknown[]) => {
+    const got: string[] = []
+    const page = async (cursor: string) => ({ at: cursor, next_cursor: cursors.shift() as string | null })
+    for await (const p of pages(page)) got.push(p.at)
+    return got
+  }
+
+  it('hands on every page, from the first to the one with no cursor', async () => {
+    expect(await read(['a', 'b', null])).toEqual(['', 'a', 'b'])
+    expect(await read([null])).toEqual([''])
+  })
+
+  it('refuses a cursor that comes twice, or is not one, before it hands the page on', async () => {
+    await expect(read(['a', 'b', 'a'])).rejects.toThrow('the pages do not end: cursor a came twice')
+    await expect(read([''])).rejects.toThrow('the pages do not end: cursor  came twice')
+    await expect(read([undefined])).rejects.toThrow('next_cursor is neither a cursor nor null')
+    await expect(read([7])).rejects.toThrow('next_cursor is neither a cursor nor null')
+    // Nothing of a page with a bad cursor is seen.
+    const seen: string[] = []
+    const bad = pages(async (cursor: string) => ({ at: cursor, next_cursor: 7 as never }))
+    await expect((async () => { for await (const p of bad) seen.push(p.at) })()).rejects.toThrow()
+    expect(seen).toEqual([])
+  })
+
+  it('stops a route whose every page names another', async () => {
+    let n = 0
+    const endless = pages(async () => ({ next_cursor: String((n += 1)) }))
+    await expect((async () => { for await (const _ of endless) void _ })()).rejects.toThrow(`the pages do not end: more than ${MAX_PAGES}`)
+    expect(n).toBe(MAX_PAGES + 1)
+  })
 })
 
 describe('ACC-CAP', () => {
@@ -54,17 +91,24 @@ describe('ACC-CAP', () => {
   })
 
   it('fails, and is not unmet, when the answer is not what the contract says', async () => {
-    for (const broken of [{}, { storage: { state: 'ready' }, engines: 'none', operations: [] }, null]) {
-      const result = await checkCapabilities(fakeClient(() => answer(broken)).client)
-      expect(result.outcome, JSON.stringify(broken)).toBe('failed')
-      expect(result.problems).toHaveLength(1)
+    const broken: ((c: Record<string, any>) => void)[] = [
+      (c) => void (c.storage.state = 'banana'),
+      (c) => void (c.storage = {}),
+      (c) => void (c.engines[0].state = 'banana'),
+      (c) => void (c.operations[1].available = 'true'),
+      (c) => void (c.engines = 'none'),
+      (c) => void delete c.operations,
+    ]
+    for (const change of broken) {
+      const result = await run(change)
+      expect(result, JSON.stringify(capabilities(change))).toMatchObject({ outcome: 'failed', problems: [NOT_A('DocumentsCapabilities')] })
+      expect(result.capabilities).toBeUndefined()
     }
+    expect((await checkCapabilities(fakeClient(() => answer(null)).client)).outcome).toBe('failed')
   })
 
   it('fails when the daemon does not answer at all', async () => {
-    const result = await checkCapabilities(fakeClient(() => refuse(404, 'not_found')).client)
-    expect(result).toMatchObject({ outcome: 'failed', problems: ['404 not_found: it is not_found'] })
-    expect(result.capabilities).toBeUndefined()
+    expect(await checkCapabilities(fakeClient(() => refuse(404, 'not_found')).client)).toMatchObject({ outcome: 'failed', problems: ['404 not_found: it is not_found'] })
   })
 })
 
@@ -72,22 +116,21 @@ describe('ACC-CAP', () => {
 function importing(change: { upload?: object; job?: object } = {}) {
   let received = 0
   let polls = 0
-  const total = (call: Call) => (call.json as { total_size: number }).total_size
   let size = 0
   return (call: Call): Response => {
     if (call.route === '/uploads') {
-      size = total(call)
-      return answer({ upload_id: 'upl_1', received: 0, status: 'receiving' }, 201)
+      size = (call.json as { total_size: number }).total_size
+      return answer(upload({ total_size: size }), 201)
     }
-    if (call.route === '/uploads/upl_1/chunks') {
+    if (call.route === `/uploads/${UPLOAD}/chunks`) {
       received += call.bytes?.length ?? 0
-      return answer({ upload_id: 'upl_1', received, status: received === size ? 'complete' : 'receiving', ...change.upload })
+      return answer(upload({ total_size: size, received, status: received === size ? 'complete' : 'receiving', ...change.upload }))
     }
-    if (call.route === '/imports') return answer({ job_id: 'job_1', status: 'queued' }, 202)
-    if (call.route === '/jobs/job_1') {
+    if (call.route === '/imports') return answer(job({ kind: 'import' }), 202)
+    if (call.route === `/jobs/${JOB}`) {
       polls += 1
-      if (polls < 3) return answer({ job_id: 'job_1', status: polls === 1 ? 'queued' : 'running' })
-      return answer({ job_id: 'job_1', status: 'succeeded', result: { document_id: 'doc_1', revision: 1 }, ...change.job })
+      if (polls < 3) return answer(job({ kind: 'import', status: polls === 1 ? 'queued' : 'running' }))
+      return answer(job({ kind: 'import', status: 'succeeded', result: { document_id: DOC, revision: 1 }, ...change.job }))
     }
     return refuse(404, 'not_found')
   }
@@ -97,11 +140,12 @@ describe('ACC-IMPORT', () => {
   it('uploads the source in one chunk when it fits, imports it, and waits for the job', async () => {
     const { client, calls } = fakeClient(importing())
     const bytes = fs.readFileSync(NOTICE.source)
-    expect(await checkImport(client, NOTICE, QUICK)).toMatchObject({ id: 'ACC-IMPORT', sample: NOTICE.id, outcome: 'passed', problems: [], documentId: 'doc_1' })
-    expect(calls.map((c) => `${c.method} ${c.route}`)).toEqual(['POST /uploads', 'POST /uploads/upl_1/chunks', 'POST /imports', 'GET /jobs/job_1', 'GET /jobs/job_1', 'GET /jobs/job_1'])
+    expect(await checkImport(client, NOTICE, QUICK)).toMatchObject({ id: 'ACC-IMPORT', sample: NOTICE.id, outcome: 'passed', problems: [], documentId: DOC })
+    const poll = `GET /jobs/${JOB}`
+    expect(calls.map((c) => `${c.method} ${c.route}`)).toEqual(['POST /uploads', `POST /uploads/${UPLOAD}/chunks`, 'POST /imports', poll, poll, poll])
     expect(calls[0]?.json).toEqual({ total_size: bytes.length, sha256: sha(bytes), filename: 'source.pdf' })
     expect(calls[1]?.headers).toMatchObject({ 'upload-offset': '0', 'chunk-sha256': sha(bytes) })
-    expect(calls[2]?.json).toEqual({ upload_id: 'upl_1', title: NOTICE.id })
+    expect(calls[2]?.json).toEqual({ upload_id: UPLOAD, title: NOTICE.id })
   })
 
   it('cuts a larger source into chunks of 768 KiB, each with its offset and its own hash', async () => {
@@ -129,61 +173,91 @@ describe('ACC-IMPORT', () => {
     expect(keys[0]).not.toBe(keys[1])
   })
 
-  it('fails with what went wrong: an upload left incomplete, a job that did not succeed, no document', async () => {
-    const failed = async (change: Parameters<typeof importing>[0]) => (await checkImport(fakeClient(importing(change)).client, NOTICE, QUICK)).problems
-    expect(await failed({ upload: { status: 'receiving', received: 10 } })).toEqual([expect.stringMatching(/the upload is receiving after its last chunk, with 10 of \d+ bytes/)])
-    expect(await failed({ upload: { status: 'complete', received: 10 } })).toEqual([expect.stringMatching(/the upload is complete after its last chunk, with 10 of \d+ bytes/)])
-    expect(await failed({ job: { status: 'failed', error: { code: 'upload_checksum_mismatch', message: 'x' } } })).toEqual(['the import job is failed: upload_checksum_mismatch'])
-    expect(await failed({ job: { status: 'interrupted' } })).toEqual(['the import job is interrupted: no error code'])
-    expect(await failed({ job: { result: null } })).toEqual(['the import job succeeded without a document_id'])
+  it('fails with what went wrong: an upload left incomplete, or a job that did not succeed', async () => {
+    const problems = async (change: Parameters<typeof importing>[0]) => (await checkImport(fakeClient(importing(change)).client, NOTICE, QUICK)).problems
+    expect(await problems({ upload: { status: 'receiving', received: 10 } })).toEqual([expect.stringMatching(/the upload is receiving after its last chunk, with 10 of \d+ bytes/)])
+    expect(await problems({ upload: { status: 'complete', received: 10 } })).toEqual([expect.stringMatching(/the upload is complete after its last chunk, with 10 of \d+ bytes/)])
+    expect(await problems({ job: failed('upload_checksum_mismatch', { kind: 'import' }) })).toEqual(['the import job is failed: upload_checksum_mismatch'])
+    expect(await problems({ job: { status: 'interrupted', result: null } })).toEqual(['the import job is interrupted: no error code'])
     const refused = await checkImport(fakeClient(() => refuse(503, 'storage_unavailable')).client, NOTICE, QUICK)
     expect(refused).toMatchObject({ outcome: 'failed', problems: ['503 storage_unavailable: it is storage_unavailable'] })
     expect(refused.documentId).toBeUndefined()
+  })
+
+  it('fails, and names no document, when the job it waited for is not what the contract says', async () => {
+    for (const result of [{ document_id: 5, revision: 1 }, { document_id: { x: 1 }, revision: 1 }, { document_id: 'doc_1', revision: 1 }, { revision: 1 }, null]) {
+      const imported = await checkImport(fakeClient(importing({ job: { result } })).client, NOTICE, QUICK)
+      expect(imported, JSON.stringify(result)).toMatchObject({ outcome: 'failed', problems: [NOT_A('DocumentsJob')] })
+      expect(imported.documentId).toBeUndefined()
+    }
+    const odd = async (change: Parameters<typeof importing>[0]) => (await checkImport(fakeClient(importing(change)).client, NOTICE, QUICK)).problems
+    expect(await odd({ job: { status: 'done' } })).toEqual([NOT_A('DocumentsJob')])
+    expect(await odd({ job: { error: { code: 'internal', message: 'x' } } })).toEqual([NOT_A('DocumentsJob')])
+    expect(await odd({ upload: { status: 'done' } })).toEqual([NOT_A('DocumentsUpload')])
   })
 })
 
 describe('waitForJob', () => {
   it('goes on asking while the job is queued, running or cancelling, and no longer than it may', async () => {
     const states = ['queued', 'running', 'cancelling', 'cancelled']
-    const { client, calls } = fakeClient((_c, all) => answer({ job_id: 'j', status: states[all.length - 1] }))
-    expect((await waitForJob(client, 'j', { sleep: async () => {} })).status).toBe('cancelled')
+    const { client, calls } = fakeClient((_c, all) => answer(job({ status: states[all.length - 1] })))
+    expect((await waitForJob(client, JOB, QUICK)).status).toBe('cancelled')
     expect(calls).toHaveLength(4)
-    const stuck = fakeClient(() => answer({ job_id: 'j', status: 'running' }))
-    await expect(waitForJob(stuck.client, 'j', { sleep: async () => {}, timeoutMs: 0 })).rejects.toThrow(/job j is still running/)
+    const stuck = fakeClient(() => answer(job({ status: 'running' })))
+    await expect(waitForJob(stuck.client, JOB, { ...QUICK, timeoutMs: 0 })).rejects.toThrow(`job ${JOB} is still running`)
+  })
+
+  it('refuses the answer for another job', async () => {
+    const other = fakeClient(() => answer(job({ job_id: id('job', 2), status: 'succeeded', result: { extraction_id: id('ext') } })))
+    await expect(waitForJob(other.client, JOB, QUICK)).rejects.toThrow(`asked for job ${JOB}, answered with ${id('job', 2)}`)
   })
 })
 
 describe('ACC-GET', () => {
   const stored = `sha256:${NOTICE.meta.sha256_stored}`
-  const daemon = (document: object, pages: string[][]) => (call: Call) => {
-    if (call.route === '/documents/doc_1') return answer({ document_id: 'doc_1', head_revision: 1, head: { revision: 1, content_sha256: stored }, ...document })
+  const mine = (more: Record<string, unknown> = {}) => document({ document_id: DOC, ...more, head: { revision: 1, content_sha256: stored, size: 1, media_type: 'application/pdf', ...(more.head as object) } })
+  const daemon = (detail: object, listed: string[][], cursor = (at: number) => String(at)) => (call: Call) => {
+    if (call.route === `/documents/${DOC}`) return answer(detail)
     const at = call.route === '/documents' ? 0 : Number(new URLSearchParams(call.route.split('?')[1]).get('cursor'))
-    return answer({ documents: pages[at]!.map((document_id) => ({ document_id })), next_cursor: at + 1 < pages.length ? String(at + 1) : null })
+    return answer({ documents: listed[at]!.map((document_id) => document({ document_id })), next_cursor: at + 1 < listed.length ? cursor(at + 1) : null })
   }
-  const run = async (document: object = {}, pages = [['doc_0', 'doc_1']]) => checkGet(fakeClient(daemon(document, pages)).client, NOTICE, 'doc_1')
+  const run = async (detail: object = mine(), listed = [[id('doc', 9), DOC]]) => checkGet(fakeClient(daemon(detail, listed)).client, NOTICE, DOC)
 
   it('passes when the document is there at revision 1, holds the source byte for byte, and is listed', async () => {
     expect(await run()).toMatchObject({ id: 'ACC-GET', sample: NOTICE.id, outcome: 'passed', problems: [] })
   })
 
   it('looks through every page of the list', async () => {
-    const { client, calls } = fakeClient(daemon({}, [['doc_8'], ['doc_9'], ['doc_1'], ['doc_2']]))
-    expect((await checkGet(client, NOTICE, 'doc_1')).outcome).toBe('passed')
-    expect(calls.map((c) => c.route)).toEqual(['/documents/doc_1', '/documents', '/documents?cursor=1', '/documents?cursor=2'])
-    expect((await run({}, [['doc_8'], ['doc_9']])).problems).toEqual(['the document is not in the list'])
+    const { client, calls } = fakeClient(daemon(mine(), [[id('doc', 8)], [id('doc', 9)], [DOC], [id('doc', 2)]]))
+    expect((await checkGet(client, NOTICE, DOC)).outcome).toBe('passed')
+    expect(calls.map((c) => c.route)).toEqual([`/documents/${DOC}`, '/documents', '/documents?cursor=1', '/documents?cursor=2'])
+    expect((await run(mine(), [[id('doc', 8)], [id('doc', 9)]])).problems).toEqual(['the document is not in the list'])
+  })
+
+  it('fails on another document, another revision, or content that is not the sample', async () => {
+    expect((await run(mine({ document_id: id('doc', 4) }))).problems).toEqual([`asked for ${DOC}, answered with ${id('doc', 4)}`])
+    expect((await run(mine({ head_revision: 2 }))).problems).toEqual(['head_revision is 2'])
+    expect((await run(mine({ head: { content_sha256: `sha256:${'0'.repeat(64)}` } }))).problems).toEqual([`the stored content is sha256:${'0'.repeat(64)}, not the sample's sha256_stored`])
+  })
+
+  it('fails on a document or a list that is not what the contract says', async () => {
+    expect((await run({ ...mine(), head: undefined })).problems).toEqual([NOT_A('DocumentDetail')])
+    expect((await run(mine({ head_revision: '1' }))).problems).toEqual([NOT_A('DocumentDetail')])
+    const broken = (call: Call) => (call.route === `/documents/${DOC}` ? answer(mine()) : answer({ documents: 'none', next_cursor: null }))
+    expect((await checkGet(fakeClient(broken).client, NOTICE, DOC)).problems).toEqual([NOT_A('DocumentList')])
   })
 
   it('fails, and does not go on for ever, on a list whose pages do not end', async () => {
-    const turning = (next: unknown) => (call: Call) => (call.route === '/documents/doc_1' ? answer({ head_revision: 1, head: { content_sha256: stored } }) : answer({ documents: [], next_cursor: next }))
-    const failed = async (next: unknown) => (await checkGet(fakeClient(turning(next)).client, NOTICE, 'doc_1')).problems
-    expect(await failed('again')).toEqual(['the pages do not end: cursor again came twice'])
-    expect(await failed(undefined)).toEqual(['next_cursor is neither a cursor nor null'])
-    expect(await failed(7)).toEqual(['next_cursor is neither a cursor nor null'])
-  })
-
-  it('fails on another revision, or on content that is not the sample', async () => {
-    expect((await run({ head_revision: 2 })).problems).toEqual(['head_revision is 2'])
-    expect((await run({ head: { content_sha256: 'sha256:00' } })).problems).toEqual(["the stored content is sha256:00, not the sample's sha256_stored"])
-    expect((await run({ head: undefined, head_revision: 3 }, [[]])).problems).toHaveLength(3)
+    const turning = (next: unknown, documents: object[] = []) => (call: Call) => (call.route === `/documents/${DOC}` ? answer(mine()) : answer({ documents, next_cursor: next }))
+    const problems = async (next: unknown, documents?: object[]) => (await checkGet(fakeClient(turning(next, documents)).client, NOTICE, DOC)).problems
+    // The first page is asked for without a cursor, so the cursor 'again' is given twice.
+    expect(await problems('again')).toEqual(['the pages do not end: cursor again came twice'])
+    expect(await problems(undefined)).toEqual([NOT_A('DocumentList')])
+    expect(await problems(7)).toEqual([NOT_A('DocumentList')])
+    // A page with a cursor that is none is not read, though the document is on it.
+    expect(await problems(7, [document({ document_id: DOC })])).toEqual([NOT_A('DocumentList')])
+    let n = 0
+    const endless = fakeClient((call) => (call.route === `/documents/${DOC}` ? answer(mine()) : answer({ documents: [], next_cursor: String((n += 1)) })))
+    expect((await checkGet(endless.client, NOTICE, DOC)).problems).toEqual([`the pages do not end: more than ${MAX_PAGES}`])
   })
 })

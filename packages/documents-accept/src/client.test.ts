@@ -3,7 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ApiError, connect } from './client'
-import { answer, fakeClient, refuse } from './test/fake'
+import { ContractError } from './contract'
+import { answer, document, fakeClient, job, refuse } from './test/fake'
 
 const made: string[] = []
 afterEach(() => {
@@ -28,22 +29,52 @@ describe('connect', () => {
     expect(() => connect(stateFile({ port: '51234', token: 'abc' }))).toThrow(/no port and bearer token/)
     expect(() => connect(stateFile(null))).toThrow(/no port and bearer token/)
   })
+
+  it('says nothing of what a state file it cannot read holds', () => {
+    const file = stateFile({})
+    fs.writeFileSync(file, '{"port": 51234, "token": "s3cr3t-bearer"')
+    const error = (() => {
+      try {
+        connect(file)
+      } catch (e) {
+        return String(e)
+      }
+    })()
+    expect(error).toContain('not a daemon state file that can be read')
+    expect(error).not.toContain('s3cr3t')
+  })
 })
 
 describe('Client', () => {
   it('sends the bearer, and JSON or bytes as what they are', async () => {
-    const { client, calls } = fakeClient(() => answer({ ok: true }))
-    expect(await client.json('GET', '/capabilities')).toEqual({ ok: true })
-    await client.json('POST', '/imports', { json: { upload_id: 'u' }, headers: { 'idempotency-key': 'k' } })
+    const { client, calls } = fakeClient(() => answer(job()))
+    expect(await client.json('GET', '/jobs/j', 'DocumentsJob')).toEqual(job())
+    await client.json('POST', '/imports', 'DocumentsJob', { json: { upload_id: 'u' }, headers: { 'idempotency-key': 'k' } })
     await client.send('POST', '/uploads/u/chunks', { bytes: new Uint8Array([1, 2, 3]) })
     expect(calls.map((c) => [c.method, c.route, c.headers['content-type']])).toEqual([
-      ['GET', '/capabilities', undefined],
+      ['GET', '/jobs/j', undefined],
       ['POST', '/imports', 'application/json'],
       ['POST', '/uploads/u/chunks', 'application/octet-stream'],
     ])
     expect(calls.every((c) => c.headers.authorization === 'Bearer secret')).toBe(true)
     expect(calls[1]).toMatchObject({ json: { upload_id: 'u' }, headers: { 'idempotency-key': 'k' } })
     expect(calls[2]?.bytes).toEqual(new Uint8Array([1, 2, 3]))
+    // No request may wait for ever.
+    expect(calls.every((c) => c.timed)).toBe(true)
+  })
+
+  it('reads no answer that is not what the contract says it is', async () => {
+    const got = async (body: unknown, schema: string) => fakeClient(() => answer(body)).client.json('GET', '/x', schema).catch((e: unknown) => e)
+    expect(await got(document(), 'DocumentDetail')).toEqual(document())
+    for (const broken of [{}, null, 'a job', job({ status: 'done' }), job({ job_id: 5 }), job({ status: 'succeeded' }), job({ status: 'succeeded', kind: 'import', result: { document_id: 5, revision: 1 } })]) {
+      const error = await got(broken, 'DocumentsJob')
+      expect(error, JSON.stringify(broken)).toBeInstanceOf(ContractError)
+      expect(String(error)).toContain('the answer is not a DocumentsJob')
+    }
+    // A job that succeeded carries no error, and one that failed says why.
+    expect(await got(job({ status: 'succeeded', result: { extraction_id: 'ext_00000000000000000000000001' }, error: { code: 'internal', message: 'x' } }), 'DocumentsJob')).toBeInstanceOf(ContractError)
+    expect(await got(job({ status: 'failed' }), 'DocumentsJob')).toBeInstanceOf(ContractError)
+    await expect(got(job(), 'NoSuchSchema')).resolves.toMatchObject({ message: 'the contract has no schema NoSuchSchema' })
   })
 
   it('throws what a route refused with: its status, its code, and whether to ask again', async () => {
@@ -62,11 +93,11 @@ describe('Client', () => {
 
   it('asks a retryable 503 again, the same request, until it is answered', async () => {
     const waits: number[] = []
-    const { client, calls } = fakeClient((_call, all) => (all.length < 3 ? refuse(503, 'engine_unavailable', true) : answer({ blocks: [] })), {
+    const { client, calls } = fakeClient((_call, all) => (all.length < 3 ? refuse(503, 'engine_unavailable', true) : answer(job())), {
       sleep: async (ms) => void waits.push(ms),
       retryMs: 250,
     })
-    expect(await client.json('POST', '/documents/d/find', { json: { query: 'q' } })).toEqual({ blocks: [] })
+    expect(await client.json('POST', '/documents/d/extractions', 'DocumentsJob', { json: { revision: 1 } })).toEqual(job())
     expect(calls).toHaveLength(3)
     expect(new Set(calls.map((c) => JSON.stringify(c)))).toHaveLength(1)
     expect(waits).toEqual([250, 250])
