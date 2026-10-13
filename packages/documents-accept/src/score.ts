@@ -52,28 +52,37 @@ export function compareValues(gold: Said, result: Said): 'same' | 'review' | 'di
   return overlap || form ? 'review' : 'different'
 }
 
-/** The candidates of a conflict, by normalized form (§4.3): what keeps the two
- *  sets from matching, or nothing when they match. */
+function groups<T extends Said>(said: T[]): Map<string, T[]> {
+  const by = new Map<string, T[]>()
+  for (const c of said) {
+    // What is not an object says nothing: it is a candidate of no form and no value.
+    const candidate = typeof c === 'object' && c !== null ? c : ({} as T)
+    const form = text(candidate.normalized).trim()
+    by.set(form, [...(by.get(form) ?? []), candidate])
+  }
+  return by
+}
+
+/** The candidates of a conflict, grouped by normalized form (§4.3). A gold
+ *  group and the result's group of the same form match when a candidate of one
+ *  holds, or is held by, a candidate of the other. */
+export function matchedGroups<T extends Said>(gold: GoldCandidate[], result: T[]): { gold: GoldCandidate[]; result: T[] }[] {
+  const got = groups(result)
+  return [...groups(gold)].flatMap(([form, golds]) => {
+    const ours = got.get(form) ?? []
+    return golds.some((g) => ours.some((r) => overlaps(g.value, r.value))) ? [{ gold: golds, result: ours }] : []
+  })
+}
+
+/** What keeps the candidates of the two sides from matching (§4.3), or nothing when they match. */
 export function compareCandidates(gold: GoldCandidate[], result: Said[]): CandidateNote[] {
-  const groups = (said: Said[]): Map<string, Said[]> => {
-    const by = new Map<string, Said[]>()
-    for (const c of said) {
-      // What is not an object says nothing: it is a candidate of no form and no value.
-      const candidate = typeof c === 'object' && c !== null ? c : {}
-      const form = text(candidate.normalized).trim()
-      by.set(form, [...(by.get(form) ?? []), candidate])
-    }
-    return by
-  }
   const [wanted, got] = [groups(gold), groups(result)]
-  const notes = new Set<CandidateNote>()
-  for (const [form, golds] of wanted) {
-    const ours = got.get(form)
-    if (ours === undefined) notes.add('incomplete')
-    else if (!golds.some((g) => ours.some((r) => overlaps(g.value, r.value)))) notes.add('normalized_only')
-  }
-  if ([...got.keys()].some((form) => !wanted.has(form))) notes.add('extra')
-  return [...notes]
+  const matched = matchedGroups(gold, result).length
+  const notes: CandidateNote[] = []
+  if ([...wanted.keys()].some((form) => !got.has(form))) notes.push('incomplete')
+  if ([...wanted.keys()].filter((form) => got.has(form)).length > matched) notes.push('normalized_only')
+  if ([...got.keys()].some((form) => !wanted.has(form))) notes.push('extra')
+  return notes
 }
 
 /** `unread` stands for "not in the document" when part of it was not read (ADR-DOC-02 §3.2). */
