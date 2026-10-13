@@ -82,7 +82,7 @@ const MAX_ASKED = 100
 
 // The files are hand-written, so nothing about their shape is taken on trust.
 const broken = (x: unknown): boolean => typeof x !== 'object' || x === null || Array.isArray(x)
-const isText = (x: unknown): x is string => typeof x === 'string' && x !== ''
+const isText = (x: unknown): x is string => typeof x === 'string' && x.trim() !== ''
 
 /** Only gold that David has checked counts (samples README §5, step 3). */
 export function isVerified(gold: Gold): boolean {

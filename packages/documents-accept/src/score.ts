@@ -28,6 +28,8 @@ interface Said {
   normalized?: string
 }
 
+const STATUSES: unknown[] = ['present', 'missing', 'conflict']
+
 /** A result comes over HTTP: what should be text and is not counts as no text. */
 const text = (x: unknown): string => (typeof x === 'string' ? x : '')
 
@@ -56,8 +58,10 @@ export function compareCandidates(gold: GoldCandidate[], result: Said[]): Candid
   const groups = (said: Said[]): Map<string, Said[]> => {
     const by = new Map<string, Said[]>()
     for (const c of said) {
-      const form = text(c?.normalized).trim()
-      by.set(form, [...(by.get(form) ?? []), c])
+      // What is not an object says nothing: it is a candidate of no form and no value.
+      const candidate = typeof c === 'object' && c !== null ? c : {}
+      const form = text(candidate.normalized).trim()
+      by.set(form, [...(by.get(form) ?? []), candidate])
     }
     return by
   }
@@ -80,8 +84,10 @@ function reasonsAgree(gold: string | undefined, result: string | undefined, part
 
 /** One gold field against the value extracted for its key, if any (§4.2).
  *  `partial`: the text layer had regions that were not read. */
-export function scoreField(gold: GoldField, result: Extracted | undefined, partial = false): FieldScore {
+export function scoreField(gold: GoldField, answer: Extracted | null | undefined, partial = false): FieldScore {
   const key = gold.key
+  // An answer of no status the contract has is no answer: its value is not looked at.
+  const result = typeof answer === 'object' && answer !== null && STATUSES.includes(answer.status) ? answer : undefined
   if (gold.status === 'missing') {
     if (result === undefined) return { key, verdict: 'unanswered' }
     if (result.status !== 'missing') return { key, verdict: 'fabricated' }
@@ -90,7 +96,7 @@ export function scoreField(gold: GoldField, result: Extracted | undefined, parti
   if (result === undefined || result.status === 'missing') return { key, verdict: 'missed' }
   if (gold.status === 'conflict') {
     if (result.status === 'present') return { key, verdict: 'chose_one' }
-    const candidates = compareCandidates(gold.candidates ?? [], result.candidates ?? [])
+    const candidates = compareCandidates(gold.candidates ?? [], Array.isArray(result.candidates) ? result.candidates : [])
     return candidates.length === 0 ? { key, verdict: 'correct' } : { key, verdict: 'review', candidates }
   }
   if (result.status === 'conflict') return { key, verdict: 'false_conflict' }

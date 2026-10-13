@@ -88,7 +88,7 @@ describe('scoreField: the status table', () => {
   const order = gold(NOTICE, 'work_order') // present
   const phone = gold(NOTICE, 'contact_phone') // missing, not in the document
   const date = gold(NOTICE, 'shutoff_date') // conflict
-  const verdict = (g: GoldField, r: Extracted | undefined) => scoreField(g, r).verdict
+  const verdict = (g: GoldField, r: Extracted | null | undefined) => scoreField(g, r).verdict
 
   it('a present gold field', () => {
     expect(verdict(order, present('work_order', 'WO-000731'))).toBe('correct')
@@ -118,13 +118,33 @@ describe('scoreField: the status table', () => {
     })
   })
 
+  it('an answer whose status the contract does not have is no answer, whatever else it says', () => {
+    const right = { key: 'work_order', value: order.value, anchors: [] }
+    expect(verdict(order, { ...right, status: 'absent' } as never)).toBe('missed')
+    expect(verdict(order, right as never)).toBe('missed')
+    expect(verdict(date, { key: 'shutoff_date', status: 'absent', candidates: date.candidates } as never)).toBe('missed')
+    expect(verdict(date, { key: 'shutoff_date', candidates: date.candidates } as never)).toBe('missed')
+    expect(verdict(phone, { key: 'contact_phone', status: 'absent' } as never)).toBe('unanswered')
+    expect(verdict(phone, { key: 'contact_phone', missing_reason: 'not_in_document' } as never)).toBe('unanswered')
+    expect(verdict(order, null)).toBe('missed')
+    expect(verdict(phone, null)).toBe('unanswered')
+    expect(verdict(order, 'present' as never)).toBe('missed')
+  })
+
   it('a result that breaks the contract is never correct, and never a crash', () => {
     expect(verdict(order, { key: 'work_order', status: 'present' })).toBe('mismatch')
     expect(verdict(order, { key: 'work_order', status: 'present', value: 731 } as never)).toBe('mismatch')
     expect(verdict(order, { key: 'work_order', status: 'present', value: 'WO-731', normalized: 731 } as never)).toBe('mismatch')
-    expect(verdict(date, { key: 'shutoff_date', status: 'conflict', candidates: [{ value: 12, normalized: 12 }, null] } as never)).toBe('review')
-    expect(verdict(phone, { key: 'contact_phone', status: 'absent' } as never)).toBe('fabricated')
     expect(verdict(date, { key: 'shutoff_date', status: 'conflict' })).toBe('review')
+    expect(verdict(date, { key: 'shutoff_date', status: 'conflict', candidates: [{ value: 12, normalized: 12 }, null] } as never)).toBe('review')
+    expect(verdict(date, { key: 'shutoff_date', status: 'conflict', candidates: {} } as never)).toBe('review')
+    expect(verdict(date, { key: 'shutoff_date', status: 'conflict', candidates: '2026-10-12' } as never)).toBe('review')
+  })
+
+  it('a candidate that is not an object matches no gold group, even one whose form is blank', () => {
+    const blank = [{ value: '10月12日', normalized: ' ', anchors: [] }, { value: '10月13日', normalized: '2026-10-13', anchors: [] }]
+    expect(compareCandidates(blank, [null, { value: '10月13日', normalized: '2026-10-13' }] as never)).toEqual(['normalized_only'])
+    expect(compareCandidates(date.candidates!, [null, 7, 'x'] as never)).toEqual(['incomplete', 'extra'])
   })
 })
 
