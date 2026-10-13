@@ -72,13 +72,14 @@ pub fn messages(fields: &[Field], layer: &TextLayer, window: &Window) -> Vec<Mod
 }
 
 /// The answer's JSON Schema for `fields`: strict, every property required.
-/// Nothing in it rests on the order of properties. A model held to a schema
-/// writes them in its order, and here that order is by name (`json!` sorts
-/// them): when one object held all three statuses, a model wrote
-/// `candidates` before `status` and filled them in every answer. So
-/// `values` holds each field under its key, and each answer is an object of
-/// one property, its status: the first thing written for a field is what
-/// was found (David, 2026-10-13).
+/// A model held to a schema writes properties in its order, and here that
+/// order is by name (`json!` sorts them): when one object held all three
+/// statuses, a model wrote `candidates` before `status` and filled them in
+/// every answer. So `values` holds each field under its key, and each answer
+/// is an object of one property, its status: the first thing written for a
+/// field is what was found (David, 2026-10-13). Inside a claim the order is
+/// still by name (`evidence`, `normalized`, `value`); by then the status is
+/// written.
 #[must_use]
 pub fn answer_format(fields: &[Field]) -> JsonSchemaFormat {
     let keys: Vec<&str> = fields.iter().map(|f| f.key.as_str()).collect();
@@ -314,7 +315,7 @@ pub fn parse(fields: &[Field], text: &str) -> Result<Vec<AnswerValue>, Unanswere
     }
     // From the text, not a `Value`, which would keep only the last of a key
     // given twice.
-    let answer: Answer =
+    let Obj(answer): Obj<Answer> =
         serde_json::from_str(text).map_err(|e| Unanswered::Malformed(e.to_string()))?;
     let mut given: Vec<Option<AnswerValue>> = (answer.values.0.into_iter())
         .map(|(key, said)| Some(said.value(key)))
