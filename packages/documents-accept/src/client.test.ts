@@ -117,6 +117,8 @@ describe('Client', () => {
     // The client's own bearer is taken out before the cut, of a body of any length.
     const echoed = await fakeClient(() => new Response(`no: Bearer secret ${'b '.repeat(120)}`, { status: 502 })).client.send('GET', '/x').catch((e: unknown) => e)
     expect((echoed as Error).message).toMatch(/^502 unknown: no: Bearer <redacted> b b/)
+    const enveloped = await fakeClient(() => answer({ error: { code: 'internal', message: 'bad bearer Secret', details: { retryable: false } } }, 500)).client.send('GET', '/x').catch((e: unknown) => e)
+    expect((enveloped as Error).message).toBe('500 internal: bad bearer <redacted>')
     const status = await fakeClient(() => new Response('a SECRET', { status: 201 })).client.json('GET', '/jobs/x', 'DocumentsJob').catch((e: unknown) => e)
     expect(String(status)).toBe('Error: GET /jobs/x answered 201, not 200: a <redacted>')
   })
