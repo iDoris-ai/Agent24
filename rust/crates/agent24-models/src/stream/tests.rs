@@ -561,3 +561,76 @@ async fn a_backend_that_ignores_stream_is_read_whole() {
     .await;
     assert!(m.contains("no output for"), "{m}");
 }
+
+#[tokio::test]
+async fn a_chunk_of_many_lines_is_read_in_one_pass() {
+    // 2 MiB of blank lines in one frame, then the backend goes: read line by
+    // line with a move of the rest each time, this alone took over 4s.
+    let url = chunked(vec!["\n".repeat(2 << 20)], false).await;
+    let started = Instant::now();
+    let m = unavailable(
+        provider(url)
+            .complete(
+                &req(Some(progress(5000, 5000, 5000))),
+                &CancellationToken::new(),
+            )
+            .await,
+    )
+    .await;
+    assert!(m.contains("broke off") || m.contains("ended before"), "{m}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_while_an_error_is_read_is_a_cancel() {
+    // The error body stops on the cancel too; which one wins must not be luck.
+    for _ in 0..20 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let _ = request(&mut s).await;
+            let head = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n5\r\n{\"err\r\n";
+            s.write_all(head.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c.cancel();
+        });
+        let r = provider(url)
+            .complete(&req(Some(progress(1000, 1000, 5000))), &cancel)
+            .await;
+        assert!(matches!(r, Err(ModelError::Cancelled)), "{r:?}");
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_request_with_tools_is_refused_before_it_is_sent() {
+    // Nothing listens there: a request that went out would be Unavailable.
+    let mut r = req(Some(progress(1000, 1000, 5000)));
+    r.tools = vec![crate::ToolSpec {
+        name: "t".to_owned(),
+        description: "d".to_owned(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    let got = provider("http://127.0.0.1:9".to_owned())
+        .complete(&r, &CancellationToken::new())
+        .await;
+    assert!(
+        matches!(&got, Err(ModelError::Provider(m)) if m.contains("tools")),
+        "{got:?}"
+    );
+    r.tools.clear();
+    let got = provider("http://127.0.0.1:9".to_owned())
+        .complete(&r, &CancellationToken::new())
+        .await;
+    assert!(matches!(got, Err(ModelError::Unavailable(_))), "{got:?}");
+}

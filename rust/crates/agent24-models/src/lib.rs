@@ -122,6 +122,8 @@ pub struct CompletionRequest {
     /// of within one fixed `chat_timeout`. `None` = today's request, byte for
     /// byte. To be set only by `_a24/model/complete`; the router hands the same
     /// value to every provider it tries, so its deadline is the call's.
+    /// Not with `tools`: a streamed answer carries no tool calls, so a request
+    /// with both is refused rather than answered without them.
     pub progress: Option<Progress>,
 }
 
@@ -738,6 +740,12 @@ impl ModelProvider for OpenAiCompatProvider {
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
         }
         if let Some(p) = &req.progress {
+            if !req.tools.is_empty() {
+                return Err(ModelError::Provider(format!(
+                    "{}: a streamed request cannot carry tools",
+                    self.name
+                )));
+            }
             return self.complete_streamed(body, p, cancel).await;
         }
         let fut = self

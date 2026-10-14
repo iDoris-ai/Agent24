@@ -108,6 +108,8 @@ pub struct Progress {
 - **出错**：三个计时任一到点都是 `ModelError::Unavailable`，文案写明是哪一个，例如 `ollama: no output for 60s`。和今天超时一样，路由器照常冷却、尝试下一个 provider。
 - **字节上限不变**：原始流字节和拼出的内容都受 `MAX_CHAT_RESPONSE_BYTES`（8 MiB）约束，超出即 `Provider` 错误。
 - **取消不变**：读循环在 `select!` 里同时等 `cancel`（同 `read_json_capped`）；ME4-S2 §3.3 表的五条 drop 路径照样会打断 HTTP 连接。
+  同时就绪时，取消先于计时，计时先于读到的数据：被取消的调用总是 `Cancelled`，一直就绪的注释行也越不过截止时间（#960 之后补）。
+- **不带 tools**：流式接收不解析 `delta.tool_calls`，所以 `progress` 与非空 `tools` 同时出现时，请求发出之前就报 `Provider` 错误，而不是悄悄丢掉工具调用（#960 之后补）。`_a24/model/complete` 本来就不带 tools。
 - **非 2xx**：照旧 `read_error_body` + `friendly_http_error`。
 - **后端无视 `stream: true`**，回 `application/json`：按非流式应答读，时限取截止时间。**限制**：这种后端要等整段答案生成完才发应答头，而等应答头算在首段里，所以生成超过 `first_chunk`（300s）的调用仍会在首段到点。我们接受这一点：这类后端就按「第一个事件就是整段答案」来对待，建议换用支持流式的后端（v2 M3）。
 
