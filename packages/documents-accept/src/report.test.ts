@@ -77,6 +77,17 @@ describe('buildReport', () => {
     expect(field('shutoff_date').gold).toEqual({ status: 'conflict', candidates: gold.candidates!.map(({ value, normalized }) => ({ value, normalized })) })
   })
 
+  it('sets beside a key answered twice the answer that was scored, whichever came first', async () => {
+    const at = [anchor(1, 'p1/b1', 0, 4, { content_sha256: `sha256:${NOTICE.meta.sha256_stored}` })]
+    const order = { key: 'work_order', status: 'present', value: 'WO-000731', anchors: at }
+    const wrong = { key: 'work_order', status: 'present', value: 'WO-999999', normalized: 'WO-999999', anchors: at }
+    for (const twice of [[order, wrong], [wrong, order]]) {
+      const values = [...loadAsk(NOTICE).filter((f) => f.key !== 'work_order').map((f) => ({ key: f.key, status: 'missing', missing_reason: 'not_in_document' })), ...twice]
+      const [notice] = buildReport(await ran({ values }), SAMPLES, RAN).samples
+      expect(notice!.fields.find((f) => f.key === 'work_order')).toMatchObject({ result: wrong, score: { verdict: 'mismatch' } })
+    }
+  })
+
   it('lists what the gold forbids to assert, numbered from 1 and not yet judged', async () => {
     const [notice] = buildReport(await ran(), SAMPLES, RAN).samples
     const gold = NOTICE.gold.must_not_assert
@@ -242,10 +253,15 @@ describe('what a report must not hold (§5)', () => {
     expect(scrub(`ENOENT: open '${home}/Library/Application Support/agent24/data/doc_1/r1.pdf'`, [home])).toBe("ENOENT: open '<path>'")
     expect(scrub('open /Library/Application Support/agent24/My Data/r1.pdf failed', [])).toBe('open <path> failed')
     expect(scrub('cannot read /tmp/a.pdf nor /tmp/b.pdf at all', [])).toBe('cannot read <path> nor <path> at all')
+    // In any case, with its slashes escaped as JSON may write them, and from the roots of other systems.
+    expect(scrub('open /users/x/y.pdf and /VOLUMES/z', [])).toBe('open <path> and <path>')
+    expect(scrub('{"path":"\\/Users\\/x\\/y.pdf"}', [])).toBe('{"path":"<path>"}')
+    expect(scrub('see /nix/store/abc-x, /run/user/501/s and /data/x.', [])).toBe('see <path>, <path> and <path>.')
     expect(scrub('<home /tmp/x>', [])).toBe('<home <path>>')
     // A secret in another case, or with its slashes escaped, is the same secret; one that only looks like a pattern is taken as it is.
     expect(scrub('at mac-mini-nicolas.local and MAC-MINI-NICOLAS', ['Mac-mini-Nicolas'])).toBe('at <redacted>.local and <redacted>')
-    expect(scrub('{"path":"\\/users\\/DavidXu\\/x"}', [home])).toBe('{"path":"<redacted>\\/x"}')
+    expect(scrub('{"path":"\\/users\\/DavidXu\\/x"}', [home])).toBe('{"path":"<path>"}')
+    expect(scrub('{"who":"Team\\/A and team/a"}', ['team/a'])).toBe('{"who":"<redacted> and <redacted>"}')
     expect(scrub('a.b and a+b and axb', ['a.b', 'a+b'])).toBe('<redacted> and <redacted> and axb')
   })
 
