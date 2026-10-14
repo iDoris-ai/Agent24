@@ -90,7 +90,7 @@ export class Client {
     for (let attempt = 0; ; attempt += 1) {
       const response = await this.fetch(this.connection.base + route, { method, headers, body, signal: AbortSignal.timeout(TIMEOUT_MS) })
       if (response.ok) return response
-      const error = await failure(response)
+      const error = await failure(response, this.connection.token)
       const again = error.status === 503 && (error.retryable || NOT_DISPATCHED.includes(error.code))
       if (!again || attempt >= this.retries) throw error
       await this.sleep(this.retryMs)
@@ -102,35 +102,37 @@ export class Client {
    *  is thrown. Thrown for another status, it says how the body began. */
   async json<T>(method: string, route: string, schema: string, request: Request = {}, status = 200): Promise<T> {
     const response = await this.send(method, route, request)
-    if (response.status !== status) throw new ContractError(`${method} ${route.split('?')[0]} answered ${response.status}, not ${status}: ${await began(response)}`)
+    if (response.status !== status) throw new ContractError(`${method} ${route.split('?')[0]} answered ${response.status}, not ${status}: ${await began(response, this.connection.token)}`)
     return conform<T>(schema, await response.json())
   }
 }
 
 /** The first 200 characters of a body, on one line; it goes into a problem, and is scrubbed with it.
  *  A body that breaks off is said to, and is no error of its own: the status is what is wrong. */
-async function began(response: Response): Promise<string> {
+async function began(response: Response, token: string): Promise<string> {
   const read = await response.text().catch(() => undefined)
   if (read === undefined) return 'a body that could not be read'
-  const text = excerpt(read)
+  const text = excerpt(read, token)
   return text === '' ? 'no body' : text
 }
 
 /** What ends a piece of a body: white space, or the punctuation of JSON, a query or a header. */
 const BETWEEN = `\\s"',:;{}[\\]()<>=&?`
-/** At most 200 characters of a body, on one line. Where the cut falls inside
- *  a piece, the piece is left out whole: a secret is said whole, for `scrub`
- *  to take out, or not at all. */
-export function excerpt(body: string): string {
-  const text = body.replace(/\s+/g, ' ').trim()
+/** At most 200 characters of a body, on one line, without the bearer. The
+ *  bearer goes before the cut, whatever its form (`…==`). Where the cut falls
+ *  inside another piece, the piece is left out whole: a name of this machine
+ *  is said whole, for `scrub` to take out, or not at all. */
+export function excerpt(body: string, token = ''): string {
+  const bare = token === '' ? body : body.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '<redacted>')
+  const text = bare.replace(/\s+/g, ' ').trim()
   if (text.length <= 200) return text
   const cut = text.slice(0, 200)
-  const kept = new RegExp(`[${BETWEEN}]`).test(text[200]!) ? cut : cut.replace(new RegExp(`[^${BETWEEN}]*$`), '')
-  // Of a body that is one piece so far, how long it is says more than nothing.
-  return kept === '' ? `one piece of ${text.length} characters` : `${kept}…`
+  const kept = (new RegExp(`[${BETWEEN}]`).test(text[200]!) ? cut : cut.replace(new RegExp(`[^${BETWEEN}]*$`), '')).trimEnd()
+  // Of a body with no break in its first 200 characters, how long it is says more than nothing.
+  return kept === '' ? `${text.length} characters, with no break in the first 200` : `${kept}…`
 }
 
-async function failure(response: Response): Promise<ApiError> {
+async function failure(response: Response, token: string): Promise<ApiError> {
   const text = await response.text()
   let error: { code?: unknown; message?: unknown; details?: { retryable?: unknown } } | undefined
   try {
@@ -139,6 +141,6 @@ async function failure(response: Response): Promise<ApiError> {
     // Not the envelope: the text itself is all there is to say.
   }
   const code = typeof error?.code === 'string' ? error.code : 'unknown'
-  const message = typeof error?.message === 'string' ? error.message : excerpt(text)
+  const message = typeof error?.message === 'string' ? error.message : excerpt(text, token)
   return new ApiError(response.status, code, error?.details?.retryable === true, message)
 }
