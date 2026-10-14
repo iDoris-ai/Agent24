@@ -83,7 +83,7 @@ pub struct Progress {
 ```
 
 - 只有 `ModelCompleteHandler` 设它：调用通过准入之后、交给路由器之前，算一次 `deadline = now + model_call_budget(max_tokens)`。
-  这时 `max_tokens` 一定有值：超过上限的请求已被 `validate` 拒绝（`model_callback.rs:127-133`），没给的已补上缺省值 1024（`:149`、`:181`）。
+  这时 `max_tokens` 一定有值：超过上限的请求已被 `validate` 拒绝（`model_callback.rs:127-133`），没给的已补上缺省值 1024（`:149`、`:182`）。
 - `Instant` 的类型与 `router.rs:18` 统一用一种（实现时定，`tokio::time::Instant` 便于 `sleep_until`）。
 - **剩余时间不够就不再换 provider**：前一个 provider 失败后，若离截止时间不足 `MODEL_STALL_TIMEOUT`，路由器不再尝试下一个，直接返回 `Unavailable`。否则下一个 provider 刚加载完模型就会被切断，白占一次。
 - 路由器（`router.rs:428-448`）把同一个请求原样交给每个 provider，**不重算**。第一个 provider 在首段卡住，第二个 provider 拿到的是剩下的时间，不会多出一个 300 秒。
@@ -133,7 +133,8 @@ pub struct Progress {
 今天一次瞬时卡顿（模型重新加载、别的进程占了 GPU）会让 RPC 计时先到，模块收到 `timeout` 并重试一次。
 改完以后，卡顿在 provider 层就成了 `unavailable` / `no_provider`（`retryable: true`）。`run.rs:154` 收到它会立即让 job 失败，那一次重试也就没了。所以：
 
-- 对 `Unavailable { cause: NoProvider, retryable: true }`，抽取器等 60s 后重试**一次**。60s 是路由器冷却的上限（`router.rs:270`，`route()` 用严格的 `now < until`，`:359`），等过这么久，冷却一定已经结束；
+- 对 `Unavailable { cause: NoProvider, retryable: true }`，抽取器等 60s 后重试**一次**。60s 是路由器冷却的上限（`router.rs:270`，`route()` 用严格的 `now < until`，`:359`），等过这么久，冷却一定已经结束。
+  这个上限今天只是 `with_defaults` 里的一个数，`new()` 能接受到 24h：实现时由 `agent24-models` 导出一个具名常量（如 `MAX_COOLDOWN`），`with_defaults` 和抽取器都用它，J14 断言两者相等；
 - 等待期间和等忙时一样先问 `go_on()`（`run.rs:132-133`），被取消的 job 不会白等 60s；
 - 代价：根本没有可用 provider（比如 Ollama 没在运行）时，回的也是同一个 `no_provider`（`router.rs:417-424`），所以这种失败要多等 60s 才以 `engine_unavailable` 结束；
 - `Timeout` 的重试规则不变（现在只剩内核自身卡住这一种来源）；
@@ -221,3 +222,5 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
 - M2：选 (A) 时用编译期断言防止夹紧值又落到兜底值之下 → §2.4，J13。
 - L1 `const` 里改用 `saturating_add` / `saturating_mul`；L2 截止时间统一写成「准入之后、路由之前」，`max_tokens` 超限是被拒绝而不是夹紧；L3 `finish_reason` 只看有没有；
   L4 PR 1 正文点名 R7；L5 SDK 的两个重导出路径保留；L6 剩余时间不足 `MODEL_STALL_TIMEOUT` 时不再换 provider（J16）；L7 补全 PR 2 要改的行。
+
+**v2.1 → v2.2**（PR-Daemon 在 #948 的两条非阻塞项）：冷却上限改为由 `agent24-models` 导出的具名常量，抽取器的等待与之相同（§2.6）；`model_callback.rs:181` → `:182`。
