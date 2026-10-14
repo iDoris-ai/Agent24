@@ -195,6 +195,8 @@ harness 把 S01 的样本经**已注册的操作**跑一遍，对照金标打分
 
 报告不含 token、主机名、本机路径和用户数据。样本都是公开文件，结果里的引文可以入库。
 
+跑证据的内核用一个空的数据目录（单独的 `HOME`），里面只有这次导入的样本。应答不合契约时，报告会摘录应答正文的开头（最多 200 个字符），所以内核里不能有日常使用的文档。
+
 ## 6. harness 不覆盖的（第 1 片）
 
 前三项目前靠手工验收。上一次是用预发布 [`documenting-r3-rc1`](https://github.com/iDoris-ai/Agent24/releases/tag/documenting-r3-rc1) 的附件 `documenting-r3-kit.tar.gz` 做的，里面有分步指南和一个 curl 脚本；这份指南不在仓库里。
