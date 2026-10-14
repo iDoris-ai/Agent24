@@ -3,7 +3,7 @@
 // is in `report.json`; nothing is decided here.
 
 import type { CheckResult } from './checks'
-import type { Report, TraceRow } from './report'
+import type { FieldReport, Report, TraceRow } from './report'
 import type { Reviewed } from './review'
 import type { Verdict } from './score'
 import type { Totals } from './summary'
@@ -68,7 +68,7 @@ function summary(report: Report, review?: Reviewed): string[] {
     `- \`must_not_assert\`：共 ${asserted} 条，违规 ${review?.must_not_assert.violated ?? 0} 条，未评审 ${review?.must_not_assert.unreviewed ?? asserted} 条。`,
     `- \`find\` 的可达率：${ratio(report.find.reachable, report.find.anchors)}。${report.find.unread > 0 ? `其中 ${report.find.unread} 份样本的 \`find\` 没有读到，它们的金标锚点按未达计。` : ''}`,
     // Each quote find did not reach, and why, as report.json has it (§4.4).
-    ...report.samples.flatMap((s) => (s.find?.unreached ?? []).map((u) => `  - \`find\` 没有找到：${line(s.sample)} · 第 ${u.page} 页 “${line(u.quote)}”${u.refused ? `（被拒绝：${line(u.refused)}）` : (u.unparsed?.length ?? 0) > 0 ? '（文档有没有解析的区域）' : ''}`)),
+    ...report.samples.flatMap((s) => (s.find?.unreached ?? []).map((u) => `  - \`find\` 没有找到：${line(s.sample)} · 第 ${u.page} 页 “${line(u.quote)}”${u.refused ? `（被拒绝：${line(u.refused)}）` : (u.unparsed?.length ?? 0) > 0 ? '（文档有未解析的区域）' : ''}`)),
     ...(review ? [`- 人工复核：${line(review.reviewer)}，采用 ${review.applied} 条，未采用 ${review.unused.length} 条。`] : ['- 还没有人工复核；字段正确率在复核之前是下限。']),
     '',
   ]
@@ -84,6 +84,8 @@ export function renderMarkdown(report: Report & { review?: Reviewed }): string {
   const answers = fields.filter((f) => f.role === 'answer')
   const wrong = (f: (typeof fields)[number]) => f.severity === 'critical' && f.verdict !== 'correct' && f.verdict !== 'review'
   const named = (f: (typeof fields)[number]) => `${f.sample} · \`${f.key}\`：${VERDICT[f.verdict]}${f.unread ? '（没有读到抽取结果）' : ''}${f.review ? `（${line(f.review.reviewer)} 复核；机械结论：${VERDICT[f.score.verdict]}）` : ''}`
+  // What a person settled as correct, of what the machine had found wrong.
+  const overturned = (role: FieldReport['role']) => fields.filter((f) => f.role === role && f.severity === 'critical' && f.review && !wrong(f) && f.score.verdict !== 'correct' && f.score.verdict !== 'review').map(named)
   const said = (f: (typeof fields)[number]) => `金标 ${f.gold.status}${f.gold.value ? ` “${line(f.gold.value)}”` : ''}，结果 ${f.result?.status ?? '无'}${f.result?.value ? ` “${line(f.result.value)}”` : ''}`
   const waiting = fields.filter((f) => f.verdict === 'review').sort((a, b) => Number(b.severity === 'critical') - Number(a.severity === 'critical'))
   // The number of an anchor is its place among the field's anchors in report.json: what a review names it by (§4.7).
@@ -134,7 +136,7 @@ export function renderMarkdown(report: Report & { review?: Reviewed }): string {
     '背景字段（不计入）：',
     '',
     ...list(fields.filter((f) => f.role === 'context' && wrong(f)).map(named)),
-    ...(review ? ['复核改判为不算错的：', '', ...list(fields.filter((f) => f.severity === 'critical' && f.review && !wrong(f) && f.score.verdict !== 'correct' && f.score.verdict !== 'review').map(named))] : []),
+    ...(review ? ['复核改判为不算错的必答字段：', '', ...list(overturned('answer')), '复核改判为不算错的背景字段（不计入）：', '', ...list(overturned('context'))] : []),
     '`must_not_assert` 违规：',
     '',
     ...list(report.samples.flatMap((s) => s.must_not_assert.filter((m) => m.review?.verdict === 'violated').map((m) => `${line(s.sample)} · 第 ${m.n} 条：${line(m.proposition)}${m.review?.note ? `（${line(m.review.note)}）` : ''}`))),

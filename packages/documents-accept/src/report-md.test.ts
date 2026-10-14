@@ -212,14 +212,18 @@ describe('renderMarkdown', () => {
     expect(errors.slice(errors.indexOf('背景字段（不计入）：') + 1, errors.indexOf('`must_not_assert` 违规：'))).toEqual([`- ${S} · \`notice_reference\`：漏掉`, `- ${S} · \`notice_date\`：漏掉`])
     expect(errors.slice(-2)).toEqual(['`must_not_assert` 违规：', '无。'])
     // Settled as right too: a major field that was wrong, and a critical one the machine had right.
-    const after = section(renderMarkdown(reviewed(before, [on({ field: 'lift_in_service', verdict: 'mismatch' }), on({ field: 'contact_phone' }), on({ field: 'store_water_in_advance' }), on({ field: 'work_order' }), on({ must_not_assert: 1, verdict: 'not_violated' }), on({ must_not_assert: 6, verdict: 'violated', note: '把两处的\n时刻拼在一起' })])), '## 严重错误')
+    const after = section(renderMarkdown(reviewed(before, [on({ field: 'lift_in_service', verdict: 'mismatch' }), on({ field: 'contact_phone' }), on({ field: 'store_water_in_advance' }), on({ field: 'work_order' }), on({ field: 'notice_reference' }), on({ must_not_assert: 1, verdict: 'not_violated' }), on({ must_not_assert: 6, verdict: 'violated', note: '把两处的\n时刻拼在一起' })])), '## 严重错误')
     expect(after[0]).toBe('按复核后的结论列出。')
     expect(after).toContain(`- ${S} · \`lift_in_service\`：值不符（david 复核；机械结论：待复核）`)
-    // What a person found not to be an error is listed apart, with what the machine had said.
-    expect(after.slice(after.indexOf('复核改判为不算错的：') + 1, after.indexOf('`must_not_assert` 违规：'))).toEqual([`- ${S} · \`contact_phone\`：判对（david 复核；机械结论：编造）`])
+    // What a person found not to be an error is listed apart, with what the machine had said, and the context fields apart again.
+    expect(after.slice(after.indexOf('复核改判为不算错的必答字段：') + 1, after.indexOf('`must_not_assert` 违规：'))).toEqual([
+      `- ${S} · \`contact_phone\`：判对（david 复核；机械结论：编造）`,
+      '复核改判为不算错的背景字段（不计入）：',
+      `- ${S} · \`notice_reference\`：判对（david 复核；机械结论：漏掉）`,
+    ])
     // One that waited for a person was no error to overturn.
     const settled = section(renderMarkdown(reviewed(before, [on({ field: 'lift_in_service' })])), '## 严重错误')
-    expect(settled.slice(settled.indexOf('复核改判为不算错的：') + 1, settled.indexOf('`must_not_assert` 违规：'))).toEqual(['无。'])
+    expect(settled.slice(settled.indexOf('复核改判为不算错的必答字段：') + 1, settled.indexOf('`must_not_assert` 违规：'))).toEqual(['无。', '复核改判为不算错的背景字段（不计入）：', '无。'])
     expect(after.slice(-2)).toEqual(['`must_not_assert` 违规：', `- ${S} · 第 6 条：${NOTICE.gold.must_not_assert[5]!.proposition}（把两处的 时刻拼在一起）`])
   })
 
@@ -290,6 +294,12 @@ describe('renderMarkdown', () => {
     const shown = section(renderMarkdown(missed), '## 汇总（验收设计 §4.8）').filter((l) => l.startsWith('  - `find` 没有找到：'))
     expect(shown).toEqual(unreached.map((u) => `  - \`find\` 没有找到：${S} · 第 ${u.page} 页 “${line(u.quote)}”${u.refused ? `（被拒绝：${line(u.refused)}）` : ''}`))
     expect(section(renderMarkdown(await report()), '## 汇总（验收设计 §4.8）').some((l) => l.includes('没有找到'))).toBe(false)
+    // A quote not reached in a document of which some was not parsed says so.
+    const partial = await report({ values, find: () => answer({ parse_status: 'partial', unparsed_regions: [{ page: 1, reason: 'ocr_failed' }], matches: [], next_cursor: null }) })
+    const unparsed = section(renderMarkdown(partial), '## 汇总（验收设计 §4.8）').filter((l) => l.startsWith('  - `find` 没有找到：'))
+    expect(unparsed).toHaveLength(partial.samples[0]!.find!.unreached.length)
+    expect(unparsed.length).toBeGreaterThan(0)
+    expect(unparsed.every((l) => l.endsWith('”（文档有未解析的区域）'))).toBe(true)
   })
 
   it('lists the decisions of a review that changed nothing, with why, and has no such section without them', async () => {

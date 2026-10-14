@@ -269,16 +269,23 @@ describe('readReport', () => {
 
   it('says a report is none of this harness only when a part of it is of no shape it writes; any other error is said as it is', async () => {
     const written = JSON.parse(JSON.stringify(await report())) as Report
+    // The error comes from a getter, not from a part of no shape: this pins which errors are converted, not what raises one.
     const failing = (error: Error) => Object.defineProperty({ ...written }, 'totals', { enumerable: true, get: () => { throw error } })
-    const odd = new TypeError('a part of no shape')
-    expect(() => readReport(failing(odd))).toThrow('report.json is not a report of this harness (documents-accept-report-v1)')
-    try {
-      readReport(failing(odd))
-    } catch (error) {
-      expect((error as Error).cause).toBe(odd)
+    const thrown = (error: Error): unknown => {
+      try {
+        readReport(failing(error))
+      } catch (caught) {
+        return caught
+      }
+      return 'nothing was thrown'
     }
+    const odd = new TypeError('a part of no shape')
+    const converted = thrown(odd)
+    expect(converted).toBeInstanceOf(Error)
+    expect((converted as Error).message).toBe('report.json is not a report of this harness (documents-accept-report-v1)')
+    expect((converted as Error).cause).toBe(odd)
     const other = new RangeError('something else went wrong')
-    expect(() => readReport(failing(other))).toThrow(other)
+    expect(thrown(other)).toBe(other)
   })
 
   it('reads none of what a review merged in, whatever was made of it', async () => {
