@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 pub mod router;
+mod stream;
 
 /// A tool advertised to the model (OpenAI function-calling wire shape is
 /// produced by the adapter; this stays provider-neutral).
@@ -326,6 +327,79 @@ impl OpenAiCompatProvider {
         })
     }
 
+    /// ME4-S2a §2.3: the answer read as it is written, under `p`'s timers. No
+    /// total request timeout: the timers are all there is. A backend that
+    /// ignored `stream` sends its whole answer at once; it is read by the
+    /// deadline, but its headers come only when the answer is done, so they
+    /// fall under the first-chunk timer.
+    async fn complete_streamed(
+        &self,
+        mut body: Value,
+        p: &Progress,
+        cancel: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        let started = std::time::Instant::now();
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+        let send = self
+            .authed(
+                self.client
+                    .post(format!("{}/v1/chat/completions", self.base_url)),
+            )
+            .json(&body)
+            .send();
+        let (first, what) = if let Some(at) = started.checked_add(p.first_chunk)
+            && at < p.deadline
+        {
+            (at, format!("no output within {}s", p.first_chunk.as_secs()))
+        } else {
+            (p.deadline, "past the call's deadline".to_owned())
+        };
+        let Some(sent) = stream::until(send, first, cancel).await? else {
+            return Err(ModelError::Unavailable(format!("{}: {what}", self.name)));
+        };
+        let response = sent.map_err(|e| classify(&e))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            // Its error body too is read by the deadline: no request timeout bounds it here.
+            let body = stream::until(read_error_body(response, cancel), p.deadline, cancel)
+                .await?
+                .unwrap_or_default();
+            return Err(friendly_http_error(&self.name, status, &body));
+        }
+        let streamed = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        if !streamed {
+            let whole = read_json_capped::<OaChatResponse>(
+                response,
+                MAX_CHAT_RESPONSE_BYTES,
+                cancel,
+                &self.name,
+            );
+            let Some(parsed) = stream::until(whole, p.deadline, cancel).await? else {
+                return Err(ModelError::Unavailable(format!(
+                    "{}: past the call's deadline",
+                    self.name
+                )));
+            };
+            return self.answer(parsed?);
+        }
+        let s = stream::read(response, p, started, cancel, &self.name).await?;
+        Ok(CompletionResponse {
+            message: Msg {
+                role: "assistant".to_owned(),
+                content: Some(s.content),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            usage: usage_of(s.usage),
+            model_id: s.model,
+        })
+    }
+
     fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.api_key {
             Some(key) if !key.is_empty() => rb.bearer_auth(key),
@@ -414,7 +488,7 @@ struct OaChoice {
     message: OaMessage,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 struct OaUsage {
     #[serde(default)]
     prompt_tokens: u64,
@@ -662,6 +736,9 @@ impl ModelProvider for OpenAiCompatProvider {
         // OpenAI contract it actually speaks.
         if req.disable_thinking && self.supports_chat_template_kwargs {
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+        }
+        if let Some(p) = &req.progress {
+            return self.complete_streamed(body, p, cancel).await;
         }
         let fut = self
             .authed(
@@ -1109,6 +1186,48 @@ mod tests {
         assert!(
             body.get("chat_template_kwargs").is_none(),
             "a provider that never opted in must never see this field, even when disable_thinking is true"
+        );
+    }
+
+    /// The answer of a whole response: what a streamed one's end and the
+    /// non-streaming fallback both go through.
+    #[test]
+    fn a_whole_answer_takes_its_first_choice_a_named_model_and_its_usage() {
+        let p = OpenAiCompatProvider::new("ollama", "http://127.0.0.1:1", None, "local", "m");
+        let parsed = |v: Value| serde_json::from_value::<OaChatResponse>(v).unwrap();
+        let msg = serde_json::json!({ "role": "assistant", "content": "x" });
+        // An empty model is no model.
+        let r = p
+            .answer(parsed(
+                serde_json::json!({ "model": "", "choices": [{ "message": msg }] }),
+            ))
+            .unwrap();
+        assert_eq!(r.model_id, None);
+        // No choices is an error, named for the provider.
+        match p.answer(parsed(serde_json::json!({ "model": "m", "choices": [] }))) {
+            Err(ModelError::Provider(m)) => assert_eq!(m, "ollama returned no choices"),
+            other => panic!("{other:?}"),
+        }
+        // No usage is zeros, and a cost is never claimed.
+        let zero = usage_of(None);
+        assert_eq!(
+            (
+                zero.prompt_tokens,
+                zero.completion_tokens,
+                zero.total_tokens,
+                zero.cost_usd
+            ),
+            (0, 0, 0, 0.0)
+        );
+        let r = p.answer(parsed(serde_json::json!({ "choices": [{ "message": msg }], "usage": { "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 } }))).unwrap();
+        assert_eq!(
+            (
+                r.usage.prompt_tokens,
+                r.usage.completion_tokens,
+                r.usage.total_tokens,
+                r.usage.cost_usd
+            ),
+            (3, 4, 7, 0.0)
         );
     }
 

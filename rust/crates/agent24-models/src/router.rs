@@ -425,7 +425,16 @@ impl ModelRouter {
         // Accumulate per-provider reasons so an all-unavailable error names
         // which providers were tried and why (review D2 minor).
         let mut tried: Vec<String> = Vec::new();
-        for idx in route {
+        for (n, idx) in route.into_iter().enumerate() {
+            // ME4-S2a: the providers share the call's deadline. With less of it
+            // left than one stall, the next would load its model only to be cut.
+            if let Some(p) = &req.progress
+                && n > 0
+                && crate::stream::left(p, Instant::now()) < p.stall
+            {
+                tried.push("no time left for another provider".to_owned());
+                break;
+            }
             let r = &self.providers[idx];
             match r.provider.complete(req, cancel).await {
                 Ok(response) => {
@@ -438,7 +447,13 @@ impl ModelRouter {
                 }
                 Err(ModelError::Unavailable(msg)) => {
                     tracing::debug!("provider {} unavailable: {msg}", r.provider.name());
-                    self.record_failure(r.provider.name(), Instant::now());
+                    // Cut at the call's shared deadline is no fault of the provider: no cooldown.
+                    let cut = req
+                        .progress
+                        .is_some_and(|p| crate::stream::left(&p, Instant::now()).is_zero());
+                    if !cut {
+                        self.record_failure(r.provider.name(), Instant::now());
+                    }
                     tried.push(format!("{}: {msg}", r.provider.name()));
                 }
                 // A reachable-but-failed call or a cancellation is terminal —
@@ -593,6 +608,105 @@ mod tests {
 
     fn router(providers: Vec<(Arc<dyn ModelProvider>, Tier)>) -> ModelRouter {
         ModelRouter::new(providers, Duration::from_secs(10), Duration::from_secs(60))
+    }
+
+    /// A local backend that takes requests and never answers; how many it took.
+    async fn silent_backend() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = taken.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _held = s;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (url, taken)
+    }
+
+    fn progressing(first_ms: u64, stall_ms: u64, deadline_ms: u64) -> CompletionRequest {
+        CompletionRequest {
+            progress: Some(crate::Progress {
+                deadline: Instant::now() + Duration::from_millis(deadline_ms),
+                first_chunk: Duration::from_millis(first_ms),
+                stall: Duration::from_millis(stall_ms),
+            }),
+            ..req()
+        }
+    }
+
+    async fn two_silent(
+        r: &CompletionRequest,
+    ) -> (Duration, Result<Served, ModelError>, usize, Vec<usize>) {
+        let ((a, _), (b, taken_b)) = (silent_backend().await, silent_backend().await);
+        let providers: Vec<(Arc<dyn ModelProvider>, Tier)> = vec![
+            (
+                Arc::new(crate::OpenAiCompatProvider::new(
+                    "omlx", a, None, "local", "m",
+                )),
+                Tier::Local,
+            ),
+            (
+                Arc::new(crate::OpenAiCompatProvider::new(
+                    "ollama", b, None, "local", "m",
+                )),
+                Tier::Local,
+            ),
+        ];
+        let started = Instant::now();
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            complexity: Complexity::Simple,
+        };
+        let rt = router(providers);
+        let out = rt
+            .complete_served(profile, r, &CancellationToken::new())
+            .await;
+        (
+            started.elapsed(),
+            out,
+            taken_b.load(std::sync::atomic::Ordering::SeqCst),
+            rt.route(profile, Instant::now()),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_providers_share_the_calls_deadline() {
+        // The first stalls at its 400ms first chunk; the second has only what is left of 800ms.
+        let (took, out, second, _) = two_silent(&progressing(400, 50, 800)).await;
+        assert!(matches!(out, Err(ModelError::Unavailable(_))));
+        assert_eq!(second, 1, "the second was tried");
+        assert!(
+            took >= Duration::from_millis(750) && took < Duration::from_millis(1100),
+            "{took:?}"
+        );
+        // The first failed on its own (no first chunk) and cools down; the second
+        // was cut at the shared deadline, which is no fault of its own.
+        let (_, _, _, after) = two_silent(&progressing(400, 50, 800)).await;
+        assert_eq!(
+            after,
+            vec![1],
+            "only the one cut at the deadline is routed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_provider_is_tried_with_less_left_than_one_stall() {
+        // 50ms left after the first's 400ms: less than the 100ms stall.
+        let (took, out, second, _) = two_silent(&progressing(400, 100, 450)).await;
+        match out {
+            Err(ModelError::Unavailable(m)) => assert!(m.contains("no time left"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(second, 0, "the second was not tried");
+        assert!(took < Duration::from_millis(600), "{took:?}");
+        // Positive control: with time left, it is.
+        let (_, _, second, _) = two_silent(&progressing(400, 100, 700)).await;
+        assert_eq!(second, 1);
     }
 
     #[test]
