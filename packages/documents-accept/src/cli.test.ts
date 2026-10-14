@@ -106,6 +106,27 @@ describe('writeEvidence', () => {
     expect(() => writeEvidence(dir, { ...quoted, samples: quoted.samples.map((s) => ({ ...s, document_id: 'tok"9\\f', checks: [] })) }, ['tok"9\\f'])).toThrow('secret 1 of 1')
     expect(fs.existsSync(dir)).toBe(false)
   })
+
+  it('finds a secret in whichever text of the report it is, and then writes nothing', async () => {
+    const dir = path.join(temp(), 'evidence')
+    const clean = JSON.parse(JSON.stringify(await report({}, { cancelOn: NOTICE.id, replayOn: NOTICE.id })))
+    // Every place in the report that holds text.
+    const places: (string | number)[][] = []
+    const walk = (x: unknown, at: (string | number)[]) => {
+      if (typeof x === 'string') places.push(at)
+      else if (Array.isArray(x)) x.forEach((y, i) => walk(y, [...at, i]))
+      else if (typeof x === 'object' && x !== null) for (const [k, y] of Object.entries(x)) walk(y, [...at, k])
+    }
+    walk(clean, [])
+    expect(places.length).toBeGreaterThan(100)
+    for (const at of places) {
+      const planted = structuredClone(clean)
+      const parent = at.slice(0, -1).reduce((x, k) => x[k], planted)
+      parent[at.at(-1)!] = `${parent[at.at(-1)!]} on Mac-mini-Nicolas.local`
+      expect(() => writeEvidence(dir, planted, ['s3cret-tok', 'mac-mini-nicolas']), at.join('.')).toThrow('secret 2 of 2')
+    }
+    expect(fs.existsSync(dir)).toBe(false)
+  })
 })
 
 describe('main', () => {
