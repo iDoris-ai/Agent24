@@ -229,7 +229,11 @@ async fn a_job_writes_its_extraction_with_its_success() {
             &body["schema_sha256"],
             &body["extractor_version"]
         ),
-        (&json!("qwen3-8b"), &input()["schema_sha256"], &json!("2"))
+        (
+            &json!("qwen3-8b"),
+            &input()["schema_sha256"],
+            &json!(crate::extract::EXTRACTOR_VERSION)
+        )
     );
     let v = &body["values"][0];
     assert_eq!(

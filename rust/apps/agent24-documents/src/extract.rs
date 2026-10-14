@@ -13,9 +13,11 @@ pub mod prompt;
 pub mod run;
 pub mod window;
 
-/// The version of the instruction, the answer's schema, windows, batches
-/// and merging (§3.2): part of the business key, so a change re-extracts.
-pub const EXTRACTOR_VERSION: &str = "2";
+/// The version of the instruction, the answer's schema, windows, batches,
+/// where quotes are looked for, and merging (§3.2): part of the business
+/// key, so a change re-extracts. 3: a quote not in the block it names is
+/// looked for in the other blocks shown (2026-10-15).
+pub const EXTRACTOR_VERSION: &str = "3";
 
 /// A requested field (`DocumentsExtractField`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
