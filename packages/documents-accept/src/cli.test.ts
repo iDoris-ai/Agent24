@@ -8,7 +8,7 @@ import { applyReview } from './review'
 import { run } from './run'
 import { loadAsk } from './samples'
 import { HOLIDAYS, NOTICE, type Odd, capabilities, daemon } from './test/daemon'
-import { type Call, answer, failed, fakeClient, fakeFetch, id } from './test/fake'
+import { type Call, anchor, answer, failed, fakeClient, fakeFetch, id } from './test/fake'
 
 const RAN: Ran = { commit: 'abc1234', machine: { model: 'Mac16,10', os: 'macOS 15.2' }, at: new Date('2026-10-14T08:00:00Z'), secrets: [] }
 const both = [NOTICE, HOLIDAYS].map((sample) => ({ sample, ask: loadAsk(sample) }))
@@ -193,9 +193,13 @@ describe('writeEvidence', () => {
     clean.capabilities.problems = ['a problem']
     clean.samples[0].checks[0].problems = ['a problem']
     clean.samples[0].fields[0].anchors = { verdict: 'none', anchors: [{ gold: { page: 1, quote: 'a quote' }, unlocated: false, review: { verdict: 'covered', reviewer: 'david', note: 'ok' } }] }
+    // A value the model gave with evidence, one without, and a conflict it found.
+    clean.samples[0].fields[3].result = { key: clean.samples[0].fields[3].key, status: 'present', value: 'a value', normalized: 'a value', anchors: [anchor(1, 'p1/b1')] }
+    clean.samples[0].fields[1].result = { key: clean.samples[0].fields[1].key, status: 'present', value: 'a value', anchors: [], unsourced_reason: 'no block' }
+    clean.samples[0].fields[2].result = { key: clean.samples[0].fields[2].key, status: 'conflict', candidates: ['one', 'two'].map((value) => ({ value, normalized: value, anchors: [anchor(1, 'p1/b1')], unsourced_reason: 'r' })) }
     clean.samples[0].text.unparsed = [{ page: 1, reason: 'ocr_failed' }]
     clean.samples[0].find.unreached = [{ page: 1, quote: 'a quote', refused: 'invalid_request', unparsed: [{ page: 1, reason: 'ocr_failed' }] }]
-    const SAID = [/^environment\.(os_version|engines|model_ids|extractor_versions)\./, /^environment\.os_version$/, /^capabilities\.problems\./, /^review\.reviewer$/, /^review\.unused\.\d+\.(item\.|why$)/, /^samples\.\d+\.text\.unparsed\./, /^samples\.\d+\.(document_id|extraction_id|model_id|extractor_version)$/, /^samples\.\d+\.checks\.\d+\.problems\./, /^samples\.\d+\.find\.unreached\.\d+\.(refused|unparsed)/, /^samples\.\d+\.fields\.\d+\.(result|review)\./, /^samples\.\d+\.fields\.\d+\.anchors\.anchors\.\d+\.review\./, /^samples\.\d+\.must_not_assert\.\d+\.review\./]
+    const SAID = [/^environment\.(model_ids|extractor_versions)\./, /^environment\.engines\.\d+\.(id|version)$/, /^environment\.os_version$/, /^capabilities\.problems\./, /^review\.reviewer$/, /^review\.unused\.\d+\.(item\.|why$)/, /^samples\.\d+\.text\.unparsed\./, /^samples\.\d+\.(document_id|extraction_id|model_id|extractor_version)$/, /^samples\.\d+\.checks\.\d+\.problems\./, /^samples\.\d+\.find\.unreached\.\d+\.(refused|unparsed)/, /^samples\.\d+\.fields\.\d+\.result\.(value|normalized|unsourced_reason)$/, /^samples\.\d+\.fields\.\d+\.result\.anchors\.\d+\.(quote|block_id)$/, /^samples\.\d+\.fields\.\d+\.result\.candidates\.\d+\.(value|normalized|unsourced_reason|anchors\.\d+\.(quote|block_id))$/, /^samples\.\d+\.fields\.\d+\.review\./, /^samples\.\d+\.fields\.\d+\.anchors\.anchors\.\d+\.review\./, /^samples\.\d+\.must_not_assert\.\d+\.review\./]
     const places: (string | number)[][] = []
     const walk = (x: unknown, at: (string | number)[]) => {
       if (typeof x === 'string') places.push(at)

@@ -19,6 +19,7 @@ import { renderMarkdown } from './report-md'
 import { type ReviewItem, type Reviewed, applyReview, readReport, readReview } from './review'
 import { run } from './run'
 import { loadAsk, loadSample } from './samples'
+import type { Extracted } from './score'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const USAGE = 'usage: accept run --out <dir> [--samples <dir>] [--daemon <daemon.json>] [--only <id,id>] [--replay-on <id>] [--cancel-on <id>] [--job-minutes <n>]\n       accept review --out <dir> [--daemon <daemon.json>]'
@@ -70,14 +71,28 @@ export function parseArgs(argv: string[]): Args {
 /** A secret wherever it is, glued to a word or not (`Bearer%20<token>`), whatever its case. */
 const anywhere = (secret: string): RegExp => new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
 
-/** What of a report the daemon or a reviewer said: the only text a name of
- *  this machine can come back in. The rest the harness wrote: from the samples
- *  (ids, keys, gold), in its own words (checks, verdicts, the trace), and from
- *  what it read of the machine itself (`Mac16` is in `Mac16,10`). */
+/** Of anchors, what the daemon wrote: the quote and the block, not the shas and the engine it echoes. */
+const evidence = (anchors: { quote: string; block_id: string }[] | undefined) => anchors?.map(({ quote, block_id }) => ({ quote, block_id }))
+/** Of an extracted value, what the model wrote: not the key it was asked for, nor a word of the contract (`status`, `missing_reason`). */
+const written = (r: Extracted | undefined) =>
+  r && {
+    value: r.value,
+    normalized: r.normalized,
+    unsourced_reason: r.unsourced_reason,
+    anchors: evidence(r.anchors),
+    candidates: r.candidates?.map((c) => ({ value: c.value, normalized: c.normalized, unsourced_reason: c.unsourced_reason, anchors: evidence(c.anchors) })),
+  }
+
+/** What of a report the daemon or a reviewer said in their own words: the
+ *  only text a name of this machine can come back in. The rest the harness
+ *  wrote: from the samples (ids, keys, gold), in its own words (checks,
+ *  verdicts, the trace), in the words of the contract (statuses, kinds,
+ *  reasons), and from what it read of the machine itself (`Mac16` is in
+ *  `Mac16,10`). */
 function saidBack(report: Report & { review?: Reviewed }): unknown {
   const e = report.environment
   return {
-    environment: { os_version: e.os_version, engines: e.engines, model_ids: e.model_ids, extractor_versions: e.extractor_versions },
+    environment: { os_version: e.os_version, engines: e.engines.map(({ id, version }) => ({ id, version })), model_ids: e.model_ids, extractor_versions: e.extractor_versions },
     capabilities: { problems: report.capabilities.problems },
     review: report.review && { reviewer: report.review.reviewer, unused: report.review.unused },
     samples: report.samples.map((s) => ({
@@ -88,7 +103,7 @@ function saidBack(report: Report & { review?: Reviewed }): unknown {
       checks: s.checks.map((c) => ({ problems: c.problems })),
       text: s.text && { unparsed: s.text.unparsed },
       find: s.find && { unreached: s.find.unreached.map((u) => ({ refused: u.refused, unparsed: u.unparsed })) },
-      fields: s.fields.map((f) => ({ result: f.result, review: f.review, anchors: f.anchors && { anchors: f.anchors.anchors.map((a) => ({ review: a.review })) } })),
+      fields: s.fields.map((f) => ({ result: written(f.result), review: f.review, anchors: f.anchors && { anchors: f.anchors.anchors.map((a) => ({ review: a.review })) } })),
       must_not_assert: s.must_not_assert.map((m) => ({ review: m.review })),
     })),
   }
