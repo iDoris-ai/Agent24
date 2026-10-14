@@ -94,10 +94,9 @@ export const extraction = (keys: string[], next_cursor: string | null, more: obj
 
 const BASE = 'http://127.0.0.1:1/api/v1/documents'
 
-/** A client answered by `daemon`, and every call it made, in order. */
-export function fakeClient(daemon: (call: Call, calls: Call[]) => Response, options: ClientOptions = {}): { client: Client; calls: Call[] } {
-  const calls: Call[] = []
-  const fetch = (async (url: string, init: RequestInit = {}) => {
+/** `fetch` as a daemon at BASE would answer it, and every call made, in order. */
+export function fakeFetch(daemon: (call: Call, calls: Call[]) => Response, calls: Call[] = []): typeof globalThis.fetch {
+  return (async (url: string, init: RequestInit = {}) => {
     const body = init.body
     const call: Call = {
       method: init.method ?? 'GET',
@@ -110,6 +109,11 @@ export function fakeClient(daemon: (call: Call, calls: Call[]) => Response, opti
     calls.push(call)
     return daemon(call, calls)
   }) as unknown as typeof globalThis.fetch
-  const client = new Client({ base: BASE, token: 'secret' }, { fetch, sleep: async () => {}, ...options })
+}
+
+/** A client answered by `daemon`, and every call it made, in order. */
+export function fakeClient(daemon: (call: Call, calls: Call[]) => Response, options: ClientOptions = {}): { client: Client; calls: Call[] } {
+  const calls: Call[] = []
+  const client = new Client({ base: BASE, token: 'secret' }, { fetch: fakeFetch(daemon, calls), sleep: async () => {}, ...options })
   return { client, calls }
 }

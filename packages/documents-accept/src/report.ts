@@ -15,7 +15,7 @@ import type { Totals } from './summary'
 
 /** What only the one who ran it knows of a run. */
 export interface Ran {
-  /** The commit the harness and the daemon were built from. */
+  /** The commit of the checkout the harness ran from. A run that is evidence builds the daemon from the same one. */
   commit: string
   machine: { model: string; os: string }
   at: Date
