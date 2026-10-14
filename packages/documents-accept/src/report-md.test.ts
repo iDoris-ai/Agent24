@@ -298,6 +298,7 @@ describe('renderMarkdown', () => {
     const partial = await report({ values, find: () => answer({ parse_status: 'partial', unparsed_regions: [{ page: 1, reason: 'ocr_failed' }], matches: [], next_cursor: null }) })
     const unparsed = section(renderMarkdown(partial), '## 汇总（验收设计 §4.8）').filter((l) => l.startsWith('  - `find` 没有找到：'))
     expect(unparsed).toHaveLength(partial.samples[0]!.find!.unreached.length)
+    expect(unparsed.length).toBeGreaterThan(0)
     expect(unparsed.every((l) => l.endsWith('”（文档有未解析的区域）'))).toBe(true)
   })
 

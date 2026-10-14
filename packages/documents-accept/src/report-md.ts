@@ -84,7 +84,7 @@ export function renderMarkdown(report: Report & { review?: Reviewed }): string {
   const answers = fields.filter((f) => f.role === 'answer')
   const wrong = (f: (typeof fields)[number]) => f.severity === 'critical' && f.verdict !== 'correct' && f.verdict !== 'review'
   const named = (f: (typeof fields)[number]) => `${f.sample} · \`${f.key}\`：${VERDICT[f.verdict]}${f.unread ? '（没有读到抽取结果）' : ''}${f.review ? `（${line(f.review.reviewer)} 复核；机械结论：${VERDICT[f.score.verdict]}）` : ''}`
-  // What a person found no error, of what the machine had found one.
+  // What a person settled as correct, of what the machine had found wrong.
   const overturned = (role: FieldReport['role']) => fields.filter((f) => f.role === role && f.severity === 'critical' && f.review && !wrong(f) && f.score.verdict !== 'correct' && f.score.verdict !== 'review').map(named)
   const said = (f: (typeof fields)[number]) => `金标 ${f.gold.status}${f.gold.value ? ` “${line(f.gold.value)}”` : ''}，结果 ${f.result?.status ?? '无'}${f.result?.value ? ` “${line(f.result.value)}”` : ''}`
   const waiting = fields.filter((f) => f.verdict === 'review').sort((a, b) => Number(b.severity === 'critical') - Number(a.severity === 'critical'))
