@@ -1660,6 +1660,8 @@ mod handler_tests {
         saw_cancel: Arc<AtomicBool>,
         /// ME4-S2a: the timers of the last request it was handed.
         progress: Mutex<Option<agent24_models::Progress>>,
+        /// ME4-S2b: the temperature of the last request it was handed.
+        temperature: Mutex<Option<f64>>,
     }
 
     #[async_trait::async_trait]
@@ -1675,6 +1677,7 @@ mod handler_tests {
         ) -> Result<CompletionResponse, ModelError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.progress.lock().unwrap() = r.progress;
+            *self.temperature.lock().unwrap() = r.temperature;
             let b = *self.behave.lock().unwrap();
             let text = match b {
                 Behave::Hang => {
@@ -1720,6 +1723,7 @@ mod handler_tests {
             behave: Mutex::new(b),
             saw_cancel: Arc::default(),
             progress: Mutex::new(None),
+            temperature: Mutex::new(None),
         })
     }
 
@@ -2446,7 +2450,7 @@ mod handler_tests {
     #[tokio::test]
     async fn sdk_wire_parity_model_complete() {
         let local = stub("l", Behave::Ok);
-        let (d, _sink) = deps(router(vec![(local, Tier::Local)]));
+        let (d, _sink) = deps(router(vec![(local.clone(), Tier::Local)]));
         let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
 
         let (conn, mut peer) =
@@ -2460,6 +2464,8 @@ mod handler_tests {
             response_format: None,
             max_tokens: None,
             complexity: None,
+            // ME4-S2b J10: the SDK's number reaches the provider as that number.
+            temperature: Some(0.7),
         };
 
         let (result, ()) = tokio::join!(client.complete(&req, None), async {
@@ -2470,5 +2476,6 @@ mod handler_tests {
         let result = result.expect("SDK complete must succeed against the real handler");
         assert_eq!(result.text, "ok");
         assert_eq!(result.tier, agent24_os_sdk::ServedTier::Local);
+        assert_eq!(*local.temperature.lock().unwrap(), Some(0.7));
     }
 }

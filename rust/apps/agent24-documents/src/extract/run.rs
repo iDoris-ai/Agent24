@@ -132,6 +132,7 @@ impl Run<'_> {
                 response_format: Some(answer_format(batch)),
                 max_tokens: Some(MAX_TOKENS),
                 complexity: None,
+                temperature: None,
             };
             let engine = |why: String| Refused::Failed(Failure::Engine(why));
             match self.model.complete(req).await {
