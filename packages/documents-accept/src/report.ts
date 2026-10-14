@@ -5,12 +5,12 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { AnchorScore } from './anchors'
+import type { AnchorCover, AnchorScore } from './anchors'
 import type { CheckResult } from './checks'
 import type { TextRead } from './read-checks'
 import type { Run, SampleRun } from './run'
 import type { GoldField, Sample } from './samples'
-import type { Extracted, FieldScore } from './score'
+import type { Extracted, FieldScore, Verdict } from './score'
 import type { Totals } from './summary'
 
 /** What only the one who ran it knows of a run. */
@@ -37,6 +37,13 @@ export interface TraceRow {
   results: Partial<Record<Outcome, number>>
 }
 
+/** What a person decided in review, beside the mechanical verdict it is about (§4.7). */
+export interface Decided<V extends string> {
+  verdict: V
+  reviewer: string
+  note?: string
+}
+
 export interface FieldReport {
   key: string
   role: 'answer' | 'context'
@@ -45,7 +52,8 @@ export interface FieldReport {
   /** What the extraction said for this key, as it said it; absent when it said nothing. */
   result?: Extracted
   score: FieldScore
-  anchors?: AnchorScore
+  anchors?: Omit<AnchorScore, 'anchors'> & { anchors: (AnchorCover & { review?: Decided<'covered' | 'uncovered'> })[] }
+  review?: Decided<Verdict>
 }
 
 export interface SampleReport {
@@ -75,7 +83,7 @@ export interface SampleReport {
   covers: Record<string, string[]>
   coverage: SampleRun['coverage']
   /** Every proposition the gold forbids, numbered from 1: for a person to judge (§4.6). */
-  must_not_assert: { n: number; proposition: string; unless?: string; verdict: 'unreviewed' }[]
+  must_not_assert: { n: number; proposition: string; unless?: string; verdict: 'unreviewed'; review?: Decided<'violated' | 'not_violated'> }[]
 }
 
 export interface Report {
