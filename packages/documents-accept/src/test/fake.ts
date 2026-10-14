@@ -40,6 +40,41 @@ export const document = (more: object = {}) => ({
   ...more,
 })
 
+const GEOMETRY = { box: 'CropBox', unit: 'pt', origin: 'top-left-rotated', rects: [[0, 0, 10, 10]] }
+/** A block of a text layer, on `page`. */
+export const block = (block_id: string, page = 1) => ({ block_id, page, text: 'x', text_sha256: sha('b'), geometry: GEOMETRY })
+/** One page of a reading of the text. */
+export const textPage = (blocks: object[], next_cursor: string | null, more: object = {}) => ({
+  document_id: id('doc'),
+  revision: 1,
+  content_sha256: sha(),
+  media_type: 'application/pdf',
+  text_layer_sha256: sha('a'),
+  engine: { id: 'apple-pdfkit', version: '15.2.0' },
+  parse_status: 'complete',
+  blocks,
+  next_cursor,
+  ...more,
+})
+/** An anchor: bytes `start` to `end` of a block on `page`. */
+export const anchor = (page: number, block_id: string, start = 0, end = 4, more: object = {}) => ({
+  document_id: id('doc'),
+  revision: 1,
+  content_sha256: sha(),
+  media_type: 'application/pdf',
+  text_layer_sha256: sha('a'),
+  engine: { id: 'apple-pdfkit', version: '15.2.0' },
+  block_id,
+  page,
+  block_text_sha256: sha('b'),
+  text_range: { unit: 'utf8', start, end },
+  geometry: GEOMETRY,
+  quote: 'x',
+  ...more,
+})
+/** One page of the matches of a `find`. */
+export const found = (matches: object[], next_cursor: string | null = null) => ({ parse_status: 'complete', matches, next_cursor })
+
 const BASE = 'http://127.0.0.1:1/api/v1/documents'
 
 /** A client answered by `daemon`, and every call it made, in order. */
