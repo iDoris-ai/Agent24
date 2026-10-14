@@ -15,8 +15,9 @@ export interface CheckResult {
   /** The check's id in the trace chain, e.g. `ACC-IMPORT`. */
   id: string
   sample?: string
-  /** `unmet`: the environment cannot run the checks, which is not a failure of the product. */
-  outcome: 'passed' | 'failed' | 'unmet'
+  /** `unmet`: the environment cannot run the checks, which is not a failure of
+   *  the product. `skipped`: the check found nothing to exercise (§3, ACC-IDEM-3). */
+  outcome: 'passed' | 'failed' | 'unmet' | 'skipped'
   /** What was wrong, one line each; empty when passed. */
   problems: string[]
   ms: number

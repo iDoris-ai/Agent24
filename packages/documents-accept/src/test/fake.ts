@@ -75,6 +75,23 @@ export const anchor = (page: number, block_id: string, start = 0, end = 4, more:
 /** One page of the matches of a `find`. */
 export const found = (matches: object[], next_cursor: string | null = null) => ({ parse_status: 'complete', matches, next_cursor })
 
+/** A job that succeeded with an extraction. */
+export const extracted = (more: object = {}) => job({ status: 'succeeded', result: { extraction_id: id('ext') }, ...more })
+/** One page of an extraction's values; `missing` is the plainest value the contract has. */
+export const extraction = (keys: string[], next_cursor: string | null, more: object = {}) => ({
+  extraction_id: id('ext'),
+  document_id: id('doc'),
+  revision: 1,
+  content_sha256: sha(),
+  schema_sha256: sha('5'),
+  extractor_version: '2',
+  model_id: 'qwen2.5:7b',
+  created_at: AT,
+  values: keys.map((key) => ({ key, status: 'missing', missing_reason: 'not_in_document' })),
+  next_cursor,
+  ...more,
+})
+
 const BASE = 'http://127.0.0.1:1/api/v1/documents'
 
 /** A client answered by `daemon`, and every call it made, in order. */
