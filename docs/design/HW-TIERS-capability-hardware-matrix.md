@@ -134,7 +134,7 @@ usable(RAM)         = min(RAM × 0.66, RAM − reserve) − app_overhead     # �
 | 文档文字提取（PDF / 网页转 Markdown） | 原生 PDFKit / 解析器，不用模型 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 看图 / OCR | Qwen2.5-VL-3B（~2GB，按需）| ☁ | ◐ 按需加载、需先卸主力 | ✅ 按需 | ✅ | ✅ |
 | 代码沙箱（BoxLite VM） | 微 VM 2–4GB | ✕ | ◐ 单个、小内存 | ✅ | ✅ | ✅ |
-| 深度推理 / 本地 coding agent | Qwen3.8-27B Q4（~21.8GB）/ Qwen3.6-35B-A3B（~24.5GB）| ☁ | ☁ | ☁ | ☁（32/36GB 可用 20.1/22.8GB，放不下 27B 的 ~21.8GB——36GB 也只余 1GB，不推荐）；◐ 48GB 需驱逐主力 | ✅ 35B-A3B 与主力共存 |
+| 深度推理 / 本地 coding agent | Qwen3.8-27B Q4（~21.8GB）/ Qwen3.6-35B-A3B（~24.5GB）| ☁ | ☁ | ☁ | ☁（按扣掉 core 能力后的 LLM 分配预算判断：core 约 1.5GB，32GB 分到 ~18.6GB、36GB 分到 ~21.3GB，都放不下 27B 的 ~21.8GB）；◐ 48GB 需驱逐主力 | ✅ 35B-A3B 与主力共存 |
 | Open Design（可选组件，按需下载） | 见 OD 组件清单 | ☁ | ◐ | ✅ | ✅ | ✅ |
 | 本地个人模型微调（LoRA） | 训练峰值内存 | ✕ | ✕ | ✕ | ◐ 小模型 | ✅ |
 
@@ -167,14 +167,14 @@ rungs:
     needs:
       models: [qwen3.5-9b-q4]          # 引用模型目录
       accelerator: [metal, cuda]
-      min_usable_bytes: 10.5GB         # 草案；HW-5 实测后回填
+      min_usable_bytes: 10500000000    # 整数字节（10.5GB 十进制）；草案，HW-5 实测后回填
       context_tokens: 32768
   - id: local-4b-chunked
     quality: degraded
     degraded_note: 分段摘要，长文质量下降、耗时约 3 倍
     needs:
       models: [qwen3.5-4b-q4]
-      min_usable_bytes: 7GB
+      min_usable_bytes: 7000000000     # 整数字节
   - id: cloud
     quality: full
     needs: { cloud: true }             # 用户开启云端且请求非 LocalOnly
@@ -183,6 +183,7 @@ rungs:
 ```
 
 要点：
+- 所有 `*_bytes` 字段都是**整数字节**，不接受 `"10GB"` 这类字符串，解析时直接拒绝，免得 GB/GiB 混用。
 - `needs` 只写**需求**，不写「适用于哪一档」。档位列是解析器算出来的，能力作者不需要知道 1–6 档是什么——这样 18GB、36GB 机器也自然得到正确结果。
 - 资源数字有两个来源，按优先级：本机实测缓存 > 模型目录实测值 > 声明值。声明值只是兜底。
 - `priority: core` 的能力（如意图判断、语音输入）在预算里先占位，不会被别的能力驱逐。
