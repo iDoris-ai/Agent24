@@ -23,6 +23,7 @@ const temp = (): string => {
 }
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
   for (const dir of made.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -183,6 +184,36 @@ describe('main', () => {
     const json = fs.readFileSync(path.join(out, 'report.json'), 'utf8')
     expect(json).toContain('422 parse_failed: no text for bearer <redacted>')
     expect(json + fs.readFileSync(path.join(out, 'report.md'), 'utf8')).not.toContain('tok-9f3a1c')
+  })
+
+  it('keeps this machine out of the evidence: its name, with and without its domain, and the home, whatever the daemon says', async () => {
+    vi.spyOn(os, 'hostname').mockReturnValue('Mac-mini-Nicolas.local')
+    vi.spyOn(os, 'homedir').mockReturnValue('/srv2/dx')
+    const echo = () => answer({ error: { code: 'parse_failed', message: 'no text on Mac-mini-Nicolas.local, Mac-mini-Nicolas, in /srv2/dx/x', details: { retryable: false } } }, 422)
+    const { state } = serve({ text: echo })
+    const out = path.join(temp(), 'evidence')
+    await lines(['run', '--out', out, '--daemon', state, '--only', NOTICE.id])
+    const json = fs.readFileSync(path.join(out, 'report.json'), 'utf8')
+    expect(json).toContain('422 parse_failed: no text on <redacted>, <redacted>, in <redacted>/x')
+    // What a review merges in is held to the same: then nothing is written.
+    const before = json + fs.readFileSync(path.join(out, 'report.md'), 'utf8')
+    fs.writeFileSync(path.join(out, 'review.json'), JSON.stringify({ reviewer: 'david', items: [{ sample: NOTICE.id, extraction_id: id('ext'), field: 'notice_reference', verdict: 'correct', note: 'read on mac-mini-nicolas' }] }))
+    await expect(main(['review', '--out', out])).rejects.toThrow('the report holds what it must not')
+    expect(fs.readFileSync(path.join(out, 'report.json'), 'utf8') + fs.readFileSync(path.join(out, 'report.md'), 'utf8')).toBe(before)
+    // A short name says too little to be looked for: it would be found in any report.
+    vi.spyOn(os, 'hostname').mockReturnValue('pass.local')
+    const plain = path.join(temp(), 'evidence')
+    expect((await lines(['run', '--out', plain, '--daemon', serve().state, '--only', NOTICE.id, '--cancel-on', NOTICE.id])).code).toBe(0)
+  })
+
+  it('takes as samples only the directories that have a gold.json', async () => {
+    const samples = temp()
+    fs.cpSync(NOTICE.dir, path.join(samples, NOTICE.id), { recursive: true })
+    fs.mkdirSync(path.join(samples, 'notes'))
+    const { state } = serve()
+    const out = path.join(temp(), 'evidence')
+    expect((await lines(['run', '--out', out, '--daemon', state, '--samples', samples, '--cancel-on', NOTICE.id])).code).toBe(0)
+    expect((JSON.parse(fs.readFileSync(path.join(out, 'report.json'), 'utf8')) as Report).samples.map((s) => s.sample)).toEqual([NOTICE.id])
   })
 
   it('refuses a sample it does not have, a directory without samples, and a daemon it cannot find, before it asks anything', async () => {
