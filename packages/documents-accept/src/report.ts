@@ -144,6 +144,9 @@ const END = `'"\`)\\],;<>，。；：、）】》”’`
  *  start inside a word, so the path of a URL is left alone, escaped or not;
  *  after a character JSON escapes (`\n`) it is a path again. */
 const PATH = new RegExp(`(?:(?<!\\\\)(?<!(?<!\\\\)[\\w.])(?:~|\\\\?/(?:Users|Volumes|home|root|private|tmp|var|opt|etc|usr|mnt|srv|nix|run|data|Library|Applications|System))\\\\?/|(?<![\\w.])\\b[A-Z]:\\\\)[^\\s${END}]*(?: [^\\s/${END}]+/[^\\s${END}]*)*`, 'gi')
+/** Whether a text holds a path of this machine, as `scrub` would find it. */
+export const holdsPath = (text: string): boolean => new RegExp(PATH.source, 'i').test(text)
+
 /** A problem as it may be written down: without the paths of this machine,
  *  and without the secrets. The paths go first: a secret may be the start of
  *  one (the home), and what is left of a path with its start taken out is no

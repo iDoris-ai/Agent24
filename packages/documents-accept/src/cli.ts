@@ -2,7 +2,7 @@
 //
 //   accept run --out <dir> [--samples <dir>] [--daemon <daemon.json>] [--only <id,id>]
 //              [--replay-on <id>] [--cancel-on <id>] [--job-minutes <n>]
-//   accept review --out <dir>
+//   accept review --out <dir> [--daemon <daemon.json>]
 //
 // `run` puts the samples through a running daemon and writes report.json and
 // report.md into <dir>; `review` merges <dir>/review.json into them (§4.7).
@@ -13,14 +13,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Client, connect } from './client'
-import { type Ran, type Report, buildReport } from './report'
+import { type Ran, type Report, buildReport, holdsPath } from './report'
 import { renderMarkdown } from './report-md'
-import { type Reviewed, applyReview, readReport, readReview } from './review'
+import { type ReviewItem, type Reviewed, applyReview, readReport, readReview } from './review'
 import { run } from './run'
 import { loadAsk, loadSample } from './samples'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const USAGE = 'usage: accept run --out <dir> [--samples <dir>] [--daemon <daemon.json>] [--only <id,id>] [--replay-on <id>] [--cancel-on <id>] [--job-minutes <n>]\n       accept review --out <dir>'
+const USAGE = 'usage: accept run --out <dir> [--samples <dir>] [--daemon <daemon.json>] [--only <id,id>] [--replay-on <id>] [--cancel-on <id>] [--job-minutes <n>]\n       accept review --out <dir> [--daemon <daemon.json>]'
 
 export interface Args {
   command: 'run' | 'review'
@@ -46,7 +46,7 @@ export function parseArgs(argv: string[]): Args {
   for (let i = 0; i < rest.length; i += 2) {
     const [flag, value] = [rest[i] ?? '', rest[i + 1]]
     const name = FLAGS[flag]
-    if (name === undefined || (command === 'review' && name !== 'out')) return fail(`${flag} is no option of ${command}`)
+    if (name === undefined || (command === 'review' && name !== 'out' && name !== 'daemon')) return fail(`${flag} is no option of ${command}`)
     if (value === undefined || value === '' || value.startsWith('--')) return fail(`${flag} needs a value`)
     if (name in given) return fail(`${flag} is given twice`)
     given[name] = value
@@ -66,18 +66,48 @@ export function parseArgs(argv: string[]): Args {
   }
 }
 
-/** Writes report.json and report.md, unless the report holds a secret (§5):
- *  then nothing is written, and the secret is not said. */
+/** A secret where it stands as a whole: not inside a longer name (`MacBook`
+ *  in `MacBookPro18,3`), whatever its case. */
+const word = (secret: string): RegExp =>
+  new RegExp(`${/^[a-z0-9]/i.test(secret) ? '(?<![a-z0-9])' : ''}${secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${/[a-z0-9]$/i.test(secret) ? '(?![a-z0-9])' : ''}`, 'i')
+
+/** Where in the report the first text is that `holds` it, by its keys and
+ *  never by what it says; or report.md, when only the text made of it there does. */
+function where(report: unknown, holds: (text: string) => boolean): string {
+  const found = (x: unknown, at: string): string | undefined => {
+    if (typeof x === 'string') return holds(x) ? at : undefined
+    if (typeof x !== 'object' || x === null) return undefined
+    for (const [k, y] of Object.entries(x)) {
+      const inside = found(y, at === '' ? k : `${at}.${k}`)
+      if (inside !== undefined) return inside
+    }
+    return undefined
+  }
+  return found(report, '') ?? 'report.md'
+}
+
+/** Writes report.json and report.md, unless either holds a secret or a path
+ *  of this machine (§5): then nothing is written, and neither is said, only where it is. Both
+ *  are checked: report.md says the text of report.json with its white space
+ *  made one space, and a path written with a tab in report.json is written
+ *  with a space in report.md. Each is written beside its place and then moved
+ *  into it, so that no file is left half written; what was not moved is taken away. */
 export function writeEvidence(dir: string, report: Report & { review?: Reviewed }, secrets: string[]): void {
   const json = `${JSON.stringify(report, null, 2)}\n`
   const markdown = `${renderMarkdown(report)}\n`
-  // A secret is looked for as it is and as JSON writes it, whatever its case.
-  const written = (json + markdown).toLowerCase()
-  const leak = secrets.findIndex((s) => s !== '' && [s, JSON.stringify(s).slice(1, -1)].some((as) => written.includes(as.toLowerCase())))
-  if (leak !== -1) throw new Error(`the report holds what it must not (secret ${leak + 1} of ${secrets.length}): nothing was written`)
+  // A secret is looked for as it is and as JSON writes it.
+  const leak = secrets.findIndex((s) => s !== '' && [s, JSON.stringify(s).slice(1, -1)].some((as) => word(as).test(json) || word(as).test(markdown)))
+  if (leak !== -1) throw new Error(`the report holds what it must not (secret ${leak + 1} of ${secrets.length}, at ${where(report, (t) => word(secrets[leak]!).test(t))}): nothing was written`)
+  if (holdsPath(json) || holdsPath(markdown)) throw new Error(`the report holds a path of this machine (at ${where(report, holdsPath)}): nothing was written`)
   fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, 'report.json'), json)
-  fs.writeFileSync(path.join(dir, 'report.md'), markdown)
+  const files = [['report.json', json], ['report.md', markdown]] as const
+  try {
+    for (const [name, text] of files) fs.writeFileSync(path.join(dir, `.${name}.tmp`), text)
+    for (const [name] of files) fs.renameSync(path.join(dir, `.${name}.tmp`), path.join(dir, name))
+  } catch (error) {
+    for (const [name] of files) fs.rmSync(path.join(dir, `.${name}.tmp`), { force: true })
+    throw error
+  }
 }
 
 /** 0: every check passed or had nothing to do. 2: the daemon could not run them. 1: anything else. */
@@ -94,12 +124,29 @@ const tool = (command: string, args: string[]): string => {
   }
 }
 
-/** What of this machine must not be in a report: its name, with and without its domain, and the user's home. */
+/** What of this machine must not be in a report: its name, with and without
+ *  its domain, and the user's home. A name of fewer than 6 characters (`mac`)
+ *  says too little to be looked for: it would be found in every report. */
 function ofThisMachine(): string[] {
   const host = os.hostname()
-  const label = host.split('.')[0] ?? ''
-  return [host, label.length >= 6 ? label : '', os.homedir()]
+  const names = [...new Set([host, host.split('.')[0] ?? ''])].filter((name) => name.length >= 6)
+  return [...names, os.homedir()]
 }
+
+/** The daemon's bearer, for a review to be held to it too: from the state file
+ *  named, or else from the usual one, where there is one with a bearer. */
+function bearer(daemon: string | undefined): string {
+  if (daemon !== undefined) return connect(daemon).token
+  try {
+    return connect().token
+  } catch {
+    return ''
+  }
+}
+
+/** An item of a review by what it is about, without its verdict or note: what the reviewer wrote is not said back. */
+const about = (item: ReviewItem): string =>
+  [item.sample, item.field, item.anchor === undefined ? undefined : `anchor ${item.anchor}`, item.must_not_assert === undefined ? undefined : `must_not_assert ${item.must_not_assert}`].filter((x) => x !== undefined).join(' · ')
 
 /** What this machine and this checkout are, as §5 asks; a tree with changes is said to be dirty. */
 function ran(token: string): Ran {
@@ -120,9 +167,9 @@ export async function main(argv: string[], print: (line: string) => void = conso
   if (args.command === 'review') {
     const report = readReport(JSON.parse(fs.readFileSync(path.join(args.out, 'report.json'), 'utf8')))
     const merged = applyReview(report, readReview(JSON.parse(fs.readFileSync(path.join(args.out, 'review.json'), 'utf8'))))
-    writeEvidence(args.out, merged, ofThisMachine())
+    writeEvidence(args.out, merged, [bearer(args.daemon), ...ofThisMachine()])
     print(`merged the review of ${merged.review.reviewer}: ${merged.review.applied} decisions applied, ${merged.review.unused.length} not`)
-    for (const u of merged.review.unused) print(`  not applied: ${JSON.stringify(u.item)} (${u.why})`)
+    for (const u of merged.review.unused) print(`  not applied: ${about(u.item)} (${u.why})`)
     return 0
   }
   const ids = fs.readdirSync(args.samples).filter((d) => fs.existsSync(path.join(args.samples, d, 'gold.json'))).sort()

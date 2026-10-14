@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { CheckResult } from './checks'
-import { type Ran, buildReport, scrub } from './report'
+import { type Ran, buildReport, holdsPath, scrub } from './report'
 import { type Run, run } from './run'
 import { loadAsk } from './samples'
 import { HOLIDAYS, NOTICE, type Odd, capabilities, daemon } from './test/daemon'
@@ -273,6 +273,12 @@ describe('what a report must not hold (§5)', () => {
     expect(scrub('{"path":"\\/users\\/DavidXu\\/x"}', [home])).toBe('{"path":"<path>"}')
     expect(scrub('{"who":"Team\\/A and team/a"}', ['team/a'])).toBe('{"who":"<redacted> and <redacted>"}')
     expect(scrub('a.b and a+b and axb', ['a.b', 'a+b'])).toBe('<redacted> and <redacted> and axb')
+  })
+
+  it('finds a path where scrub would take one out, however often it is asked', () => {
+    const text = 'the model in /Volumes/Data/models/qwen'
+    expect([holdsPath(text), holdsPath(text)]).toEqual([true, true])
+    expect(holdsPath('mlx-community/Qwen2.5-7B, https://example.org/Users/x')).toBe(false)
   })
 
   it('writes no problem down as the daemon gave it, and nothing of where the samples lie', async () => {
