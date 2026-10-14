@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { type Ran, type Report, buildReport } from './report'
-import { renderMarkdown } from './report-md'
+import { line, ratio, renderMarkdown } from './report-md'
 import { type ReviewItem, applyReview } from './review'
 import { run } from './run'
 import { loadAsk } from './samples'
@@ -64,7 +64,10 @@ describe('renderMarkdown', () => {
     const fast = await report({ values, slow: undefined }, both.slice(0, 1), { cancelOn: S })
     expect(idem(renderMarkdown(fast))).toBe(`- 幂等检查：\`ACC-IDEM-1\`、\`ACC-IDEM-2\` 没有指定样本；\`ACC-IDEM-3\` 在 ${S} 上，取消到达时 job 已经成功，未执行。`)
     const refused = await report({ values, retry: () => refuse(409, 'job_not_retryable') }, both.slice(0, 1), { cancelOn: S })
-    expect(idem(renderMarkdown(refused))).toBe(`- 幂等检查：\`ACC-IDEM-1\`、\`ACC-IDEM-2\` 没有指定样本；\`ACC-IDEM-3\` 在 ${S} 上，取消时 job 没有在运行。`)
+    expect(idem(renderMarkdown(refused))).toBe(`- 幂等检查：\`ACC-IDEM-1\`、\`ACC-IDEM-2\` 没有指定样本；\`ACC-IDEM-3\` 在 ${S} 上，取消的检查没有通过，见“没有通过的检查”。`)
+    // Of a replay that did not pass, nothing is said of what it met: the check says what went wrong.
+    const replayFailed: Report = { ...one, samples: one.samples.map((s) => ({ ...s, requeued: false, checks: s.checks.map((c) => (c.id === 'ACC-IDEM-1' ? { ...c, outcome: 'failed' as const } : c)) })) }
+    expect(idem(renderMarkdown(replayFailed))).toContain(`在 ${S} 上，重放没有通过，见“没有通过的检查”；`)
     const unread = await report({ values, imported: failed('unsupported_format', { job_id: id('job', 9), kind: 'import' }) }, both.slice(0, 1), { cancelOn: S })
     expect(idem(renderMarkdown(unread))).toBe(`- 幂等检查：\`ACC-IDEM-1\`、\`ACC-IDEM-2\` 没有指定样本；\`ACC-IDEM-3\` 在 ${S} 上，没有取消到 job。`)
     const failedRun = await report({ ends: failed('engine_unavailable') }, both.slice(0, 1), { replayOn: S })
@@ -208,10 +211,15 @@ describe('renderMarkdown', () => {
     expect(errors.join('\n')).not.toMatch(/store_water_in_advance|lift_in_service|contact_party/)
     expect(errors.slice(errors.indexOf('背景字段（不计入）：') + 1, errors.indexOf('`must_not_assert` 违规：'))).toEqual([`- ${S} · \`notice_reference\`：漏掉`, `- ${S} · \`notice_date\`：漏掉`])
     expect(errors.slice(-2)).toEqual(['`must_not_assert` 违规：', '无。'])
-    const after = section(renderMarkdown(reviewed(before, [on({ field: 'lift_in_service', verdict: 'mismatch' }), on({ field: 'contact_phone' }), on({ must_not_assert: 1, verdict: 'not_violated' }), on({ must_not_assert: 6, verdict: 'violated', note: '把两处的\n时刻拼在一起' })])), '## 严重错误')
+    // Settled as right too: a major field that was wrong, and a critical one the machine had right.
+    const after = section(renderMarkdown(reviewed(before, [on({ field: 'lift_in_service', verdict: 'mismatch' }), on({ field: 'contact_phone' }), on({ field: 'store_water_in_advance' }), on({ field: 'work_order' }), on({ must_not_assert: 1, verdict: 'not_violated' }), on({ must_not_assert: 6, verdict: 'violated', note: '把两处的\n时刻拼在一起' })])), '## 严重错误')
     expect(after[0]).toBe('按复核后的结论列出。')
     expect(after).toContain(`- ${S} · \`lift_in_service\`：值不符（david 复核；机械结论：待复核）`)
-    expect(after.join('\n')).not.toContain('contact_phone')
+    // What a person found not to be an error is listed apart, with what the machine had said.
+    expect(after.slice(after.indexOf('复核改判为不算错的：') + 1, after.indexOf('`must_not_assert` 违规：'))).toEqual([`- ${S} · \`contact_phone\`：判对（david 复核；机械结论：编造）`])
+    // One that waited for a person was no error to overturn.
+    const settled = section(renderMarkdown(reviewed(before, [on({ field: 'lift_in_service' })])), '## 严重错误')
+    expect(settled.slice(settled.indexOf('复核改判为不算错的：') + 1, settled.indexOf('`must_not_assert` 违规：'))).toEqual(['无。'])
     expect(after.slice(-2)).toEqual(['`must_not_assert` 违规：', `- ${S} · 第 6 条：${NOTICE.gold.must_not_assert[5]!.proposition}（把两处的 时刻拼在一起）`])
   })
 
@@ -237,6 +245,17 @@ describe('renderMarkdown', () => {
     expect(after.slice(after.indexOf('`must_not_assert`（未评审的）：') + 1)).toHaveLength(10)
   })
 
+  it('keeps a backslash from undoing what is escaped after it', () => {
+    /** The cells of a table row: a pipe is a border unless an odd number of backslashes stands before it. */
+    const cells = (row: string) => row.split('').filter((c, i) => c === '|' && (row.slice(0, i).match(/\\*$/)?.[0].length ?? 0) % 2 === 0).length - 1
+    expect(cells(`| ${line('X\\|Y')} | ${line('\\\\|Z')} |`)).toBe(2)
+    expect(line('a\\<img src=x>')).toBe('a\\\\\\<img src=x>')
+  })
+
+  it('says a share as a share: rounded, but never 100.0% short of the whole, nor 0.0% above nothing', () => {
+    expect([ratio(2, 3), ratio(3, 3), ratio(0, 3), ratio(9999, 10000), ratio(1, 10000), ratio(0, 0)]).toEqual(['2 / 3（66.7%）', '3 / 3（100.0%）', '0 / 3（0.0%）', '9999 / 10000（99.9%）', '1 / 10000（0.1%）', '0 / 0'])
+  })
+
   it('lists the critical fields that wait before the others, whatever their order in the gold', async () => {
     // In the gold the major field comes first; each answer says a little more than the gold.
     const keys = ['drinking_water_registration_location', 'drinking_water_limit']
@@ -259,6 +278,18 @@ describe('renderMarkdown', () => {
     expect(waiting).toContain(`- **严重** ${S} · \`shutoff_date\`：金标 conflict，结果 conflict；候选：incomplete、extra`)
     expect(waiting.some((l) => l.endsWith('（`find` 定位不到）'))).toBe(true)
     expect(waiting.some((l) => l.includes('第 1 页') && !l.endsWith('（`find` 定位不到）'))).toBe(true)
+  })
+
+  it('lists every quote find did not reach under its share, with why, as report.json has it', async () => {
+    let asked = 0
+    const refusing = () => ((asked += 1) === 3 ? refuse(400, 'invalid_request') : (asked > 40 ? answer({ parse_status: 'complete', matches: [], next_cursor: null }) : answer({ parse_status: 'complete', matches: [here('p1/b1')], next_cursor: null })))
+    const missed = await report({ values, find: refusing })
+    const unreached = missed.samples[0]!.find!.unreached
+    expect(unreached.length).toBeGreaterThan(1)
+    expect(unreached.some((u) => u.refused !== undefined)).toBe(true)
+    const shown = section(renderMarkdown(missed), '## 汇总（验收设计 §4.8）').filter((l) => l.startsWith('  - `find` 没有找到：'))
+    expect(shown).toEqual(unreached.map((u) => `  - \`find\` 没有找到：${S} · 第 ${u.page} 页 “${line(u.quote)}”${u.refused ? `（被拒绝：${line(u.refused)}）` : ''}`))
+    expect(section(renderMarkdown(await report()), '## 汇总（验收设计 §4.8）').some((l) => l.includes('没有找到'))).toBe(false)
   })
 
   it('lists the decisions of a review that changed nothing, with why, and has no such section without them', async () => {
