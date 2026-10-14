@@ -112,8 +112,22 @@ export class Client {
 async function began(response: Response): Promise<string> {
   const read = await response.text().catch(() => undefined)
   if (read === undefined) return 'a body that could not be read'
-  const text = read.replace(/\s+/g, ' ').trim()
-  return text === '' ? 'no body' : text.length > 200 ? `${text.slice(0, 200)}…` : text
+  const text = excerpt(read)
+  return text === '' ? 'no body' : text
+}
+
+/** What ends a piece of a body: white space, or the punctuation of JSON, a query or a header. */
+const BETWEEN = `\\s"',:;{}[\\]()<>=&?`
+/** At most 200 characters of a body, on one line. Where the cut falls inside
+ *  a piece, the piece is left out whole: a secret is said whole, for `scrub`
+ *  to take out, or not at all. */
+export function excerpt(body: string): string {
+  const text = body.replace(/\s+/g, ' ').trim()
+  if (text.length <= 200) return text
+  const cut = text.slice(0, 200)
+  const kept = new RegExp(`[${BETWEEN}]`).test(text[200]!) ? cut : cut.replace(new RegExp(`[^${BETWEEN}]*$`), '')
+  // Of a body that is one piece so far, how long it is says more than nothing.
+  return kept === '' ? `one piece of ${text.length} characters` : `${kept}…`
 }
 
 async function failure(response: Response): Promise<ApiError> {
@@ -125,6 +139,6 @@ async function failure(response: Response): Promise<ApiError> {
     // Not the envelope: the text itself is all there is to say.
   }
   const code = typeof error?.code === 'string' ? error.code : 'unknown'
-  const message = typeof error?.message === 'string' ? error.message : text.slice(0, 200)
+  const message = typeof error?.message === 'string' ? error.message : excerpt(text)
   return new ApiError(response.status, code, error?.details?.retryable === true, message)
 }

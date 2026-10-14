@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ApiError, connect } from './client'
+import { ApiError, connect, excerpt } from './client'
 import { ContractError } from './contract'
 import { answer, document, fakeClient, job, refuse } from './test/fake'
 
@@ -85,12 +85,12 @@ describe('Client', () => {
       const error = await got(http, status)
       expect(error, `${http} for ${status}`).toBeInstanceOf(ContractError)
       // Said without the query: a cursor is the daemon's, and may be long.
-      expect(String(error)).toContain(`GET /jobs/x answered ${http}, not ${status ?? 200}: ${JSON.stringify(job()).slice(0, 200)}…`)
+      expect(String(error)).toContain(`GET /jobs/x answered ${http}, not ${status ?? 200}: ${excerpt(JSON.stringify(job()))}`)
     }
     // How the body began, on one line and no longer than 200 characters; or that there was none.
     const said = async (body: string) => String(await fakeClient(() => new Response(body, { status: 201 })).client.json('GET', '/jobs/x', 'DocumentsJob').catch((e: unknown) => e))
     expect(await said('a\n\t b')).toBe('Error: GET /jobs/x answered 201, not 200: a b')
-    expect(await said('x'.repeat(201))).toBe(`Error: GET /jobs/x answered 201, not 200: ${'x'.repeat(200)}…`)
+    expect(await said(`${'x'.repeat(200)} y`)).toBe(`Error: GET /jobs/x answered 201, not 200: ${'x'.repeat(200)}…`)
     expect(await said('x'.repeat(200))).toBe(`Error: GET /jobs/x answered 201, not 200: ${'x'.repeat(200)}`)
     expect(await said('')).toBe('Error: GET /jobs/x answered 201, not 200: no body')
     // A body that breaks off is no other error: the status is what is wrong.
@@ -110,6 +110,26 @@ describe('Client', () => {
     expect(await client.send('GET', '/x').catch((e: unknown) => e)).toMatchObject({ status: 502, code: 'unknown', retryable: false, message: '502 unknown: upstream went away' })
     const odd = fakeClient(() => answer({ error: 'no' }, 500))
     expect(await odd.client.send('GET', '/x').catch((e: unknown) => e)).toMatchObject({ status: 500, code: 'unknown', retryable: false })
+    // Of a long one, as much as an excerpt says: no piece cut in two.
+    const long = `<html>${'a '.repeat(96)} Bearer tok-9f3a1c went away</html>`
+    expect(await fakeClient(() => new Response(long, { status: 502 })).client.send('GET', '/x').catch((e: unknown) => e)).toMatchObject({ message: `502 unknown: ${excerpt(long)}` })
+    expect(excerpt(long)).not.toContain('tok')
+  })
+
+  it('cuts a long body without cutting a piece of it in two: a secret is said whole, or not at all', () => {
+    expect(excerpt('a\n\t b')).toBe('a b')
+    expect(excerpt('x'.repeat(200))).toBe('x'.repeat(200))
+    // A token across the cut is left out, with what it is glued to.
+    expect(excerpt(`${'a'.repeat(195)} tok-9f3a1c`)).toBe(`${'a'.repeat(195)} …`)
+    expect(excerpt(`${'a'.repeat(190)} Bearer%20tok-9f3a1c`)).toBe(`${'a'.repeat(190)} …`)
+    expect(excerpt(`{"m":"${'a'.repeat(181)}","token":"tok-9f3a1c"}`)).toBe(`{"m":"${'a'.repeat(181)}","token":"…`)
+    // A cut that falls between pieces keeps all 200 characters.
+    expect(excerpt(`${'a'.repeat(200)} tok-9f3a1c`)).toBe(`${'a'.repeat(200)}…`)
+    expect(excerpt(`${'a'.repeat(199)}"tok-9f3a1c`)).toBe(`${'a'.repeat(199)}"…`)
+    expect(excerpt(`${'a'.repeat(189)} tok-9f3a1c"}`)).toBe(`${'a'.repeat(189)} tok-9f3a1c…`)
+    expect(excerpt(`${'a'.repeat(189)} tok-9f3a1c&x=1`)).toBe(`${'a'.repeat(189)} tok-9f3a1c…`)
+    // A body of one piece says how long it is.
+    expect(excerpt('x'.repeat(201))).toBe('one piece of 201 characters')
   })
 
   it('asks a retryable 503 again, the same request, until it is answered', async () => {

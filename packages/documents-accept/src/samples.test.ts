@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -82,6 +83,14 @@ describe('loadSample refuses', () => {
 
   it('a source file that is not the one meta.yaml records', () => {
     expect(refused((_g, _m, dir) => fs.appendFileSync(path.join(dir, 'source.pdf'), 'x'))).toThrow(/sha256_stored is not the source file's/)
+  })
+
+  it('a source file that is empty', () => {
+    const empty = crypto.createHash('sha256').update('').digest('hex')
+    expect(refused((_g, m, dir) => {
+      fs.writeFileSync(path.join(dir, 'source.pdf'), '')
+      m.sha256_stored = empty
+    })).toThrow(/:\n {2}source\.pdf is empty$/)
   })
 
   it('two source files, or none', () => {
