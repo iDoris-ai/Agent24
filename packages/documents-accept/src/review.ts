@@ -139,9 +139,10 @@ export function readReport(json: unknown): Report {
     plain = unreviewed(report)
     const fields = plain.samples.flatMap(reviewedFields)
     follows = isDeepStrictEqual(summarize(fields), plain.totals) && plain.samples.every((s) => isDeepStrictEqual(coverage(s.sample, s.covers, fields), s.coverage))
-  } catch {
-    // A field or a mark of a shape the harness does not write.
-    throw new Error(NOT_A_REPORT)
+  } catch (error) {
+    // A field or a mark of a shape the harness does not write; anything else is no fault of the file.
+    if (error instanceof TypeError) throw new Error(NOT_A_REPORT, { cause: error })
+    throw error
   }
   if (!follows) throw new Error('report.json: its totals or coverage points do not follow from its fields; it was changed after it was written')
   return plain
