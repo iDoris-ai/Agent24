@@ -125,7 +125,9 @@ export function excerpt(body: string): string {
   const text = body.replace(/\s+/g, ' ').trim()
   if (text.length <= 200) return text
   const cut = text.slice(0, 200)
-  return `${new RegExp(`[${BETWEEN}]`).test(text[200]!) ? cut : cut.replace(new RegExp(`[^${BETWEEN}]*$`), '')}…`
+  const kept = new RegExp(`[${BETWEEN}]`).test(text[200]!) ? cut : cut.replace(new RegExp(`[^${BETWEEN}]*$`), '')
+  // Of a body that is one piece so far, how long it is says more than nothing.
+  return kept === '' ? `one piece of ${text.length} characters` : `${kept}…`
 }
 
 async function failure(response: Response): Promise<ApiError> {

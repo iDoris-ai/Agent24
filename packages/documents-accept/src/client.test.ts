@@ -128,8 +128,8 @@ describe('Client', () => {
     expect(excerpt(`${'a'.repeat(199)}"tok-9f3a1c`)).toBe(`${'a'.repeat(199)}"…`)
     expect(excerpt(`${'a'.repeat(189)} tok-9f3a1c"}`)).toBe(`${'a'.repeat(189)} tok-9f3a1c…`)
     expect(excerpt(`${'a'.repeat(189)} tok-9f3a1c&x=1`)).toBe(`${'a'.repeat(189)} tok-9f3a1c…`)
-    // A body of one piece says only that it was cut.
-    expect(excerpt('x'.repeat(201))).toBe('…')
+    // A body of one piece says how long it is.
+    expect(excerpt('x'.repeat(201))).toBe('one piece of 201 characters')
   })
 
   it('asks a retryable 503 again, the same request, until it is answered', async () => {
