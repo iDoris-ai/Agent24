@@ -260,6 +260,11 @@ describe('what a report must not hold (§5)', () => {
     // A drive after a backslash is a drive all the same; a path after an escaped character of JSON is a path.
     expect(scrub('open \\\\?\\C:\\Users\\j\\x.pdf and x\\C:\\Users\\j failed', [])).toBe('open \\\\?\\<path> and x\\<path> failed')
     expect(scrub('build 2.C:\\x and abc:\\x', [])).toBe('build 2.C:\\x and abc:\\x')
+    // Not taken out yet, as before: a path after an escaped backslash (one character behind cannot count
+    // a run of them), or after an escaped character of four hex digits. The secrets still go.
+    expect(scrub('{"e":"foo\\\\/Users/j/x"}', [])).toBe('{"e":"foo\\\\/Users/j/x"}')
+    expect(scrub('{"e":"caf\\u00e9/Users/j/x"}', [])).toBe('{"e":"caf\\u00e9/Users/j/x"}')
+    expect(scrub('{"e":"caf\\u00e9/Users/j/x"}', ['/Users/j'])).toBe('{"e":"caf\\u00e9<redacted>/x"}')
     expect(scrub('{"error":"cannot read\\n/Users/j/x.pdf, nor\\t/tmp/y"}', [])).toBe('{"error":"cannot read\\n<path>, nor\\t<path>"}')
     expect(scrub('see /nix/store/abc-x, /run/user/501/s and /data/x.', [])).toBe('see <path>, <path> and <path>.')
     expect(scrub('<home /tmp/x>', [])).toBe('<home <path>>')
