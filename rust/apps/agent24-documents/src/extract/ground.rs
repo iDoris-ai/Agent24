@@ -3,7 +3,8 @@
 //! (§3.1, Q14), only among the blocks the model was shown. The block named
 //! is where it looks first; when the quote is not there, it looks in all of
 //! them, for the model may name the wrong one. A quote found exactly once
-//! is an anchor; found nowhere, or more than once, it is not. A value's
+//! in the block named, or else exactly once among the blocks shown, is an
+//! anchor; found nowhere, or more than once, it is not. A value's
 //! evidence counts whole or not at all: a
 //! value keeps no partial evidence, which could drop the condition or the
 //! negation that decides its meaning. And the value itself must be in one
