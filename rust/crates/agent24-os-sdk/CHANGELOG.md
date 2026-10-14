@@ -7,6 +7,17 @@ separate from the Agent24 product version (`agent24d`/`agent24-cli`) — see
 `agent24-os-sdk-v<version>` and pushed on the `main` merge commit that
 contains the corresponding change (J-S14).
 
+## [Unreleased]
+
+### 变更
+
+- `clients::MODEL_RESPONSE_TIMEOUT`（也从 `agent24_os_sdk::MODEL_RESPONSE_TIMEOUT` 导出，两个路径都保留）
+  由 125s 改为 4461s，改为从 `agent24_os_proto::model_budget` 导入，与内核同一个数（ME4-S2a，
+  `docs/design/ME4-S2a-model-call-progress-timeout.md`）。内核对一次模型调用改为按进展计时：
+  截止时间 300s + `max_tokens` × 1s，首段 300s、间隔 60s 判定卡住；方法超时只是 4456s 的兜底。
+  - 行为上只是 SDK 等得更久，不是不兼容。配老内核时，内核仍在 120s 回 `timeout`，SDK 照常收到。
+  - 直接断言这个常量等于 125s 的测试要跟着改（ME4-S3 §5.2 第 4 条提到的 Sin90 单测）。
+
 ## [0.1.0] — 2026-09-28
 
 **最低内核版本 = agent24 0.4.0.** 这是 SDK 与 `agent24-os-fd` 的首个原型版本，

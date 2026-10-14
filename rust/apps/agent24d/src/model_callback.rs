@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use agent24_domain::{Capability, Grants, ModelAccess};
 use agent24_models::router::{Complexity, ModelRouter, Privacy, TaskProfile, Tier};
-use agent24_models::{CompletionRequest, ModelError, Msg, ResponseFormat};
+use agent24_models::{CompletionRequest, ModelError, Msg, Progress, ResponseFormat};
 use agent24_os_proto::drain::{Generation, LifecycleTimeout, bind_to_lifecycle};
+use agent24_os_proto::model_budget;
 use agent24_os_proto::rpc::{CallFuture, ErrorKind, Handler, RpcError};
 use agent24_protocol::{EventBody, ModelCallPayload};
 use serde::{Deserialize, Serialize};
@@ -30,10 +31,10 @@ use crate::events_emit::{RateLimiter, refused_error};
 
 // ---- §5.2 numbers (⚖️ = chosen, not derived) ----
 
-/// §3 decision M2: this method's own budget (== the provider's own
-/// `chat_timeout`, `agent24-models/src/lib.rs:206`). Consumed by
-/// `Handler::call_timeout` in 4.2.2b1b.
-pub const MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// §3 decision M2, ME4-S2a §2.4: this method's own budget, the backstop. A
+/// call is bounded by its own deadline (set at admission, from its
+/// `max_tokens`), which the provider keeps; this only stops a kernel that hangs.
+pub const MODEL_CALL_TIMEOUT: Duration = model_budget::MODEL_CALL_BACKSTOP;
 /// ⚖️ §5: per-module in-flight ceiling (PLAN S2-5 suggests 2).
 pub const MODEL_MAX_IN_FLIGHT_PER_MODULE: usize = 2;
 /// ⚖️ §5: daemon-wide ceiling across ALL modules' model calls.
@@ -43,7 +44,7 @@ pub const MODEL_RATE_CAPACITY: f64 = 30.0;
 pub const MODEL_RATE_REFILL_PER_SEC: f64 = 0.5;
 /// ⚖️ §4.2: `max_tokens` bounds for a module call. Consumed by
 /// `ModelCompleteParams::validate` in 4.2.2b1b.
-pub const MODEL_MAX_TOKENS_CEILING: u32 = 4096;
+pub const MODEL_MAX_TOKENS_CEILING: u32 = model_budget::MODEL_MAX_TOKENS_CEILING;
 pub const MODEL_DEFAULT_MAX_TOKENS: u32 = 1024;
 /// ⚖️ §4.2: message count bound (string bytes are already bounded by
 /// `dispatch()`'s 256 KiB params budget). Consumed by 4.2.2b1b.
@@ -191,6 +192,23 @@ impl ModelCompleteParams {
         };
         (request, complexity, self.request_id)
     }
+}
+
+/// ME4-S2a §2.2: the call's one deadline, set once it is admitted and before
+/// it is routed, from the tokens it may write. Every provider the router
+/// tries reads the answer as it is written under it.
+fn with_progress(mut request: CompletionRequest, now: std::time::Instant) -> CompletionRequest {
+    // `into_request` always sets `max_tokens`; the default here only keeps a
+    // request built some other way from getting no deadline.
+    let max = request
+        .max_tokens
+        .map_or(MODEL_DEFAULT_MAX_TOKENS, NonZeroU32::get);
+    request.progress = Some(Progress {
+        deadline: now + model_budget::model_call_budget(max),
+        first_chunk: model_budget::MODEL_FIRST_CHUNK_TIMEOUT,
+        stall: model_budget::MODEL_STALL_TIMEOUT,
+    });
+    request
 }
 
 // ---- §4.3 result ----
@@ -774,6 +792,7 @@ impl Handler for ModelCompleteHandler {
                 ));
             }
 
+            let request = with_progress(request, std::time::Instant::now());
             let profile = TaskProfile {
                 privacy: grant.privacy,
                 complexity,
@@ -1008,7 +1027,7 @@ mod tests {
     /// which does not exist yet in this increment.
     #[test]
     fn design_constants_match_the_frozen_numbers_table() {
-        assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(4456));
         assert_eq!(MODEL_MAX_TOKENS_CEILING, 4096);
         assert_eq!(MODEL_DEFAULT_MAX_TOKENS, 1024);
         assert_eq!(MODEL_MAX_MESSAGES, 64);
@@ -1539,7 +1558,8 @@ mod handler_tests {
         );
     }
 
-    /// `Handler::call_timeout` reports the literal 120s (§5.2). The
+    /// `Handler::call_timeout` reports the RPC backstop, `MODEL_CALL_BACKSTOP`
+    /// (ME4-S2a §3): strictly after any call's own deadline. The
     /// end-to-end proof that this OVERRIDES a real connection's 30s default
     /// (J6, `... sleeps 31s → success`) needs a real `serve()`/`Conn` on a
     /// duplex socket, which nothing in this crate's unit tests builds yet;
@@ -1548,7 +1568,7 @@ mod handler_tests {
     /// (declared vs. connection-level vs. `MAX_METHOD_CALL_TIMEOUT`) is
     /// already pinned by J5 in `agent24-os-proto` (ME4-4.2.2-0).
     #[test]
-    fn call_timeout_is_the_frozen_120s() {
+    fn call_timeout_is_the_backstop() {
         let h = ModelCompleteHandler {
             generation: running(),
             grant: None,
@@ -1577,6 +1597,8 @@ mod handler_tests {
         calls: AtomicUsize,
         behave: Mutex<Behave>,
         saw_cancel: Arc<AtomicBool>,
+        /// ME4-S2a: the timers of the last request it was handed.
+        progress: Mutex<Option<agent24_models::Progress>>,
     }
 
     #[async_trait::async_trait]
@@ -1587,10 +1609,11 @@ mod handler_tests {
 
         async fn complete(
             &self,
-            _r: &CompletionRequest,
+            r: &CompletionRequest,
             cancel: &CancellationToken,
         ) -> Result<CompletionResponse, ModelError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.progress.lock().unwrap() = r.progress;
             let b = *self.behave.lock().unwrap();
             let text = match b {
                 Behave::Hang => {
@@ -1635,7 +1658,36 @@ mod handler_tests {
             calls: AtomicUsize::new(0),
             behave: Mutex::new(b),
             saw_cancel: Arc::default(),
+            progress: Mutex::new(None),
         })
+    }
+
+    /// J12 (ME4-S2a): a module's call reaches the router with one deadline,
+    /// from its own `max_tokens`, and the shared first-chunk and stall timers.
+    #[tokio::test]
+    async fn a_module_call_is_timed_by_its_progress_from_its_own_tokens() {
+        let local = stub("local", Behave::Ok);
+        let (d, _sink) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
+        for (asked, budget) in [(Some(100), 400), (None, 1324)] {
+            let mut p = ok_params();
+            if let Some(n) = asked {
+                p["max_tokens"] = json!(n);
+            }
+            let before = std::time::Instant::now();
+            h.call(p).await.unwrap();
+            let after = std::time::Instant::now();
+            let got = local.progress.lock().unwrap().expect("progress set");
+            let budget = Duration::from_secs(budget);
+            assert!(
+                got.deadline >= before + budget && got.deadline <= after + budget,
+                "{asked:?}"
+            );
+            assert_eq!(
+                (got.first_chunk, got.stall),
+                (Duration::from_secs(300), Duration::from_secs(60))
+            );
+        }
     }
 
     fn deps(router: Arc<ModelRouter>) -> (ModelCallbackDeps, Arc<MemoryUsageSink>) {

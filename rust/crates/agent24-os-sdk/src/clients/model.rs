@@ -1,6 +1,6 @@
 //! ME4-S3 §2.4/§2.7/§3.5 — `ModelClient` (`_a24/model/complete`). The one
-//! client with its own response deadline: [`MODEL_RESPONSE_TIMEOUT`] (125s)
-//! exceeds the kernel's own `MODEL_CALL_TIMEOUT` (120s) so the kernel's
+//! client with its own response deadline: [`MODEL_RESPONSE_TIMEOUT`] (4461s)
+//! exceeds the kernel's own `MODEL_CALL_TIMEOUT` (4456s) so the kernel's
 //! specific answer — including `unavailable`'s cause — wins the race instead
 //! of the connection's generic 35s fallback timing it out first.
 
@@ -19,10 +19,11 @@ pub const COMPLETE: &str = "_a24/model/complete";
 pub(crate) const METHODS: [&str; 1] = [COMPLETE];
 const OFFER_PREFIX: &str = "_a24/model/";
 
-/// Exceeds the kernel's own `_a24/model/complete` timeout (120s) so the
+/// Exceeds the kernel's own `_a24/model/complete` backstop (4456s) so the
 /// kernel's specific error reaches the caller before the connection's
-/// generic fallback would (§2.7).
-pub const MODEL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(125);
+/// generic fallback would (§2.7). The same number the kernel uses
+/// (ME4-S2a §2.1), so the two cannot drift.
+pub const MODEL_RESPONSE_TIMEOUT: Duration = agent24_os_proto::model_budget::MODEL_RESPONSE_TIMEOUT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
