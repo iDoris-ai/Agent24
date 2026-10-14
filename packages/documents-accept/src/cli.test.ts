@@ -92,7 +92,7 @@ describe('writeEvidence', () => {
     const dir = path.join(temp(), 'evidence')
     const clean = await report()
     const inJson: Report = { ...clean, samples: clean.samples.map((s) => ({ ...s, document_id: 'tok-123' })) }
-    expect(() => writeEvidence(dir, inJson, ['absent', 'tok-123'])).toThrow('the report holds what it must not (secret 2 of 2): nothing was written')
+    expect(() => writeEvidence(dir, inJson, ['absent', 'tok-123'])).toThrow('the report holds what it must not (secret 2 of 2, at samples.0.document_id): nothing was written')
     const inBoth: Report = { ...clean, environment: { ...clean.environment, commit: 'Mac-mini-X' } }
     let said = ''
     try {
@@ -114,7 +114,7 @@ describe('writeEvidence', () => {
     const clean = await report()
     for (const space of ['\t', '  ', '\n']) {
       const spaced: Report = { ...clean, environment: { ...clean.environment, machine: { model: `/srv2/My${space}Drive/dx`, os: 'macOS 15.2' } } }
-      expect(() => writeEvidence(dir, spaced, ['/srv2/My Drive/dx']), JSON.stringify(space)).toThrow('secret 1 of 1')
+      expect(() => writeEvidence(dir, spaced, ['/srv2/My Drive/dx']), JSON.stringify(space)).toThrow('secret 1 of 1, at report.md')
     }
     expect(fs.existsSync(dir)).toBe(false)
   })
@@ -124,13 +124,25 @@ describe('writeEvidence', () => {
     const clean = await report()
     const model = (id: string): Report => ({ ...clean, environment: { ...clean.environment, model_ids: [id] }, samples: clean.samples.map((s) => ({ ...s, model_id: id })) })
     for (const local of ['/Volumes/Data/models/qwen', '/opt/models/qwen.gguf', '~/models/qwen']) {
-      expect(() => writeEvidence(dir, model(local), []), local).toThrow('the report holds a path of this machine: nothing was written')
+      expect(() => writeEvidence(dir, model(local), []), local).toThrow('the report holds a path of this machine (at environment.model_ids.0): nothing was written')
     }
     // report.md does not say the model of each sample: only report.json has it there.
-    expect(() => writeEvidence(dir, { ...clean, samples: clean.samples.map((s) => ({ ...s, model_id: '/Volumes/Data/models/qwen' })) }, [])).toThrow('a path of this machine')
+    expect(() => writeEvidence(dir, { ...clean, samples: clean.samples.map((s) => ({ ...s, model_id: '/Volumes/Data/models/qwen' })) }, [])).toThrow('a path of this machine (at samples.0.model_id)')
     expect(fs.existsSync(dir)).toBe(false)
     writeEvidence(dir, model('mlx-community/Qwen2.5-7B'), [])
     expect(fs.readFileSync(path.join(dir, 'report.md'), 'utf8')).toContain('mlx-community/Qwen2.5-7B')
+  })
+
+  it('leaves no file half written behind when it cannot write', async () => {
+    const dir = path.join(temp(), 'evidence')
+    const clean = await report()
+    writeEvidence(dir, clean, [])
+    // report.md cannot be put in place: a directory stands there.
+    fs.rmSync(path.join(dir, 'report.md'))
+    fs.mkdirSync(path.join(dir, 'report.md'))
+    fs.writeFileSync(path.join(dir, 'report.md', 'x'), '')
+    expect(() => writeEvidence(dir, { ...clean, generated_at: '2026-10-15T00:00:00.000Z' }, [])).toThrow()
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([])
   })
 
   it('takes a secret where it stands as a whole, not inside a longer name', async () => {

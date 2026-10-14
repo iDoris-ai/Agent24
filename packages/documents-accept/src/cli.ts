@@ -71,23 +71,43 @@ export function parseArgs(argv: string[]): Args {
 const word = (secret: string): RegExp =>
   new RegExp(`${/^[a-z0-9]/i.test(secret) ? '(?<![a-z0-9])' : ''}${secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${/[a-z0-9]$/i.test(secret) ? '(?![a-z0-9])' : ''}`, 'i')
 
+/** Where in the report the first text is that `holds` it, by its keys and
+ *  never by what it says; or report.md, when only the text made of it there does. */
+function where(report: unknown, holds: (text: string) => boolean): string {
+  const found = (x: unknown, at: string): string | undefined => {
+    if (typeof x === 'string') return holds(x) ? at : undefined
+    if (typeof x !== 'object' || x === null) return undefined
+    for (const [k, y] of Object.entries(x)) {
+      const inside = found(y, at === '' ? k : `${at}.${k}`)
+      if (inside !== undefined) return inside
+    }
+    return undefined
+  }
+  return found(report, '') ?? 'report.md'
+}
+
 /** Writes report.json and report.md, unless either holds a secret or a path
- *  of this machine (§5): then nothing is written, and neither is said. Both
+ *  of this machine (§5): then nothing is written, and neither is said, only where it is. Both
  *  are checked: report.md says the text of report.json with its white space
  *  made one space, and a path written with a tab in report.json is written
  *  with a space in report.md. Each is written beside its place and then moved
- *  into it, so that no file is left half written. */
+ *  into it, so that no file is left half written; what was not moved is taken away. */
 export function writeEvidence(dir: string, report: Report & { review?: Reviewed }, secrets: string[]): void {
   const json = `${JSON.stringify(report, null, 2)}\n`
   const markdown = `${renderMarkdown(report)}\n`
   // A secret is looked for as it is and as JSON writes it.
   const leak = secrets.findIndex((s) => s !== '' && [s, JSON.stringify(s).slice(1, -1)].some((as) => word(as).test(json) || word(as).test(markdown)))
-  if (leak !== -1) throw new Error(`the report holds what it must not (secret ${leak + 1} of ${secrets.length}): nothing was written`)
-  if (holdsPath(json) || holdsPath(markdown)) throw new Error('the report holds a path of this machine: nothing was written')
+  if (leak !== -1) throw new Error(`the report holds what it must not (secret ${leak + 1} of ${secrets.length}, at ${where(report, (t) => word(secrets[leak]!).test(t))}): nothing was written`)
+  if (holdsPath(json) || holdsPath(markdown)) throw new Error(`the report holds a path of this machine (at ${where(report, holdsPath)}): nothing was written`)
   fs.mkdirSync(dir, { recursive: true })
   const files = [['report.json', json], ['report.md', markdown]] as const
-  for (const [name, text] of files) fs.writeFileSync(path.join(dir, `.${name}.tmp`), text)
-  for (const [name] of files) fs.renameSync(path.join(dir, `.${name}.tmp`), path.join(dir, name))
+  try {
+    for (const [name, text] of files) fs.writeFileSync(path.join(dir, `.${name}.tmp`), text)
+    for (const [name] of files) fs.renameSync(path.join(dir, `.${name}.tmp`), path.join(dir, name))
+  } catch (error) {
+    for (const [name] of files) fs.rmSync(path.join(dir, `.${name}.tmp`), { force: true })
+    throw error
+  }
 }
 
 /** 0: every check passed or had nothing to do. 2: the daemon could not run them. 1: anything else. */
