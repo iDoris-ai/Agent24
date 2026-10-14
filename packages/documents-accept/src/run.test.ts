@@ -343,4 +343,21 @@ describe('scoreSample', () => {
     expect([gold(only('18:00')), gold(only('17:00'))]).toEqual([4, 1])
     for (const twice of [[only('18:00'), only('17:00')], [only('17:00'), only('18:00')]]) expect(gold(...twice)).toBe(4)
   })
+
+  it('compares the anchors of two answers by the share of gold anchors they cover, not by how many', () => {
+    // A cites the one gold quote of 17:00 (1 of 1); B cites two of the four of 18:00 (2 of 4), and the two it
+    // leaves out are neither inside nor around a quote it cites.
+    const field = NOTICE.gold.fields.find((f) => f.key === 'shutoff_end_time')!
+    const cites = (normalized: string, which: number[]): Extracted => {
+      const quotes = field.candidates!.filter((c) => c.normalized === normalized).flatMap((c) => c.anchors).filter((_, i) => which.includes(i))
+      return { key: field.key, status: 'conflict', candidates: [{ value: normalized, normalized, anchors: quotes.map((q) => ({ ...anchor(q.page, 'p1/b1'), quote: q.quote })) }] } as Extracted
+    }
+    const share = (...values: Extracted[]) => {
+      const a = scoreSample(NOTICE, values, undefined, false).find((s) => s.gold.key === field.key)!.anchors!.anchors
+      return `${a.filter((x) => x.by !== undefined).length}/${a.length}`
+    }
+    const [a, b] = [cites('17:00', [0]), cites('18:00', [0, 2])]
+    expect([share(a), share(b)]).toEqual(['1/1', '2/4'])
+    expect([share(a, b), share(b, a)]).toEqual(['2/4', '2/4'])
+  })
 })

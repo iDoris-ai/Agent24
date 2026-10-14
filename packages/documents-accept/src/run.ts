@@ -61,14 +61,19 @@ const plain = ({ id, sample, outcome, problems, ms }: CheckResult): CheckResult 
 /** Every gold field of a sample against the values of its extraction (§4.2–§4.4).
  *  A key answered more than once (ACC-EXTRACT fails it) is right only if every
  *  answer is: the worst of them is scored, whatever order they came in. Its
- *  anchors are those of the answer that covers the fewest, of all its answers
- *  that have anchors to score: none of them makes the coverage look better. */
+ *  anchors are those of the answer that covers the smallest share of its gold
+ *  anchors (of equal shares, the one with more of them), of all its answers
+ *  that have anchors to score: none of them makes the field's coverage look
+ *  better. So the verdict and the anchors of such a key may be of different answers. */
 export function scoreSample(sample: Sample, values: Extracted[], find: FindRead | undefined, partial: boolean): Scored[] {
   const locate = locator(find?.located ?? [])
   const rank = (s: FieldScore) => (s.verdict === 'correct' ? 0 : s.verdict === 'review' ? 1 : 2)
   const covered = (a: AnchorScore) => a.anchors.filter((c) => c.by !== undefined).length
-  // Fewer covered is worse; as many covered of more gold anchors is worse too.
-  const fewer = (a: AnchorScore, b: AnchorScore) => covered(a) < covered(b) || (covered(a) === covered(b) && a.anchors.length > b.anchors.length)
+  // A smaller share covered is worse (compared without dividing); of equal shares, the one of more gold anchors.
+  const fewer = (a: AnchorScore, b: AnchorScore) => {
+    const [x, y] = [covered(a) * b.anchors.length, covered(b) * a.anchors.length]
+    return x < y || (x === y && a.anchors.length > b.anchors.length)
+  }
   return sample.gold.fields.map((gold) => {
     const answers: (Extracted | undefined)[] = values.filter((v) => v.key === gold.key)
     const scored = (answers.length > 0 ? answers : [undefined]).map((value) => ({ value, score: scoreField(gold, value, partial) }))

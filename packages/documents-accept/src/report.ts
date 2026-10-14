@@ -141,8 +141,9 @@ const END = `'"\`)\\],;<>，。；：、）】》”’`
 /** A path of this machine: from a root, or the home, or a drive, over the
  *  single spaces a directory's name may have (`Application Support/…`), in
  *  any case and with its slashes escaped as JSON may write them. It does not
- *  start inside a word, so the path of a URL is left alone. */
-const PATH = new RegExp(`(?<![\\w.\\\\])(?:(?:~|\\\\?/(?:Users|Volumes|home|root|private|tmp|var|opt|etc|usr|mnt|srv|nix|run|data|Library|Applications|System))\\\\?/|\\b[A-Z]:\\\\)[^\\s${END}]*(?: [^\\s/${END}]+/[^\\s${END}]*)*`, 'gi')
+ *  start inside a word, so the path of a URL is left alone, escaped or not;
+ *  after a character JSON escapes (`\n`) it is a path again. */
+const PATH = new RegExp(`(?:(?<!\\\\)(?<!(?<!\\\\)[\\w.])(?:~|\\\\?/(?:Users|Volumes|home|root|private|tmp|var|opt|etc|usr|mnt|srv|nix|run|data|Library|Applications|System))\\\\?/|(?<![\\w.])\\b[A-Z]:\\\\)[^\\s${END}]*(?: [^\\s/${END}]+/[^\\s${END}]*)*`, 'gi')
 /** A problem as it may be written down: without the paths of this machine,
  *  and without the secrets. The paths go first: a secret may be the start of
  *  one (the home), and what is left of a path with its start taken out is no

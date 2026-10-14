@@ -257,6 +257,10 @@ describe('what a report must not hold (§5)', () => {
     expect(scrub('open /users/x/y.pdf and /VOLUMES/z', [])).toBe('open <path> and <path>')
     expect(scrub('{"path":"\\/Users\\/x\\/y.pdf"}', [])).toBe('{"path":"<path>"}')
     expect(scrub('{"url":"https:\\/\\/a.com\\/Users\\/x"}', [])).toBe('{"url":"https:\\/\\/a.com\\/Users\\/x"}')
+    // A drive after a backslash is a drive all the same; a path after an escaped character of JSON is a path.
+    expect(scrub('open \\\\?\\C:\\Users\\j\\x.pdf and x\\C:\\Users\\j failed', [])).toBe('open \\\\?\\<path> and x\\<path> failed')
+    expect(scrub('build 2.C:\\x and abc:\\x', [])).toBe('build 2.C:\\x and abc:\\x')
+    expect(scrub('{"error":"cannot read\\n/Users/j/x.pdf, nor\\t/tmp/y"}', [])).toBe('{"error":"cannot read\\n<path>, nor\\t<path>"}')
     expect(scrub('see /nix/store/abc-x, /run/user/501/s and /data/x.', [])).toBe('see <path>, <path> and <path>.')
     expect(scrub('<home /tmp/x>', [])).toBe('<home <path>>')
     // A secret in another case, or with its slashes escaped, is the same secret; one that only looks like a pattern is taken as it is.
