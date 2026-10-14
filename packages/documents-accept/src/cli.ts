@@ -79,13 +79,14 @@ function saidBack(report: Report & { review?: Reviewed }): unknown {
   return {
     environment: { os_version: e.os_version, engines: e.engines, model_ids: e.model_ids, extractor_versions: e.extractor_versions },
     capabilities: { problems: report.capabilities.problems },
-    review: report.review && { reviewer: report.review.reviewer, unused: report.review.unused.map((u) => ({ item: { note: u.item.note } })) },
+    review: report.review && { reviewer: report.review.reviewer, unused: report.review.unused },
     samples: report.samples.map((s) => ({
       document_id: s.document_id,
       extraction_id: s.extraction_id,
       model_id: s.model_id,
       extractor_version: s.extractor_version,
       checks: s.checks.map((c) => ({ problems: c.problems })),
+      text: s.text && { unparsed: s.text.unparsed },
       find: s.find && { unreached: s.find.unreached.map((u) => ({ refused: u.refused, unparsed: u.unparsed })) },
       fields: s.fields.map((f) => ({ result: f.result, review: f.review, anchors: f.anchors && { anchors: f.anchors.anchors.map((a) => ({ review: a.review })) } })),
       must_not_assert: s.must_not_assert.map((m) => ({ review: m.review })),
