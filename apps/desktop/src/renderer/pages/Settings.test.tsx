@@ -162,3 +162,12 @@ describe('SettingsPage', () => {
     expect(screen.getByTitle('Hide')).toBeInTheDocument()
   })
 })
+
+describe('SettingsPage English default', () => {
+  it('shows the English service section', async () => {
+    mockOmlxDetect.mockResolvedValue(null)
+    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'not found' })
+    await act(async () => { render(<SettingsPage />) })
+    expect(screen.getByText('AI Model Service')).toBeInTheDocument()
+  })
+})

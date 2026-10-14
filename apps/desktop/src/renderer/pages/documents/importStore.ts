@@ -3,6 +3,8 @@
 
 import type { components } from '@agent24/api-client'
 import type { DocumentsImportProgress, DocumentsResponse } from '../../../shared/ipc-types'
+import { translate } from '../../i18n'
+import { documentsMessages } from './Documents.i18n'
 
 type Job = components['schemas']['DocumentsJob']
 type Api = Window['agent24']['documents']
@@ -47,7 +49,11 @@ export function resetImportStore(): void {
 
 export function describeError(res: DocumentsResponse & { ok: false }): string {
   const cause = res.error.details?.['cause']
-  return `${res.error.message}（${res.error.code}${typeof cause === 'string' ? `：${cause}` : ''}）`
+  return translate(documentsMessages, 'error.details', {
+    message: res.error.message,
+    code: res.error.code,
+    cause: typeof cause === 'string' ? translate(documentsMessages, 'error.cause', { cause }) : '',
+  })
 }
 
 /** A failed read worth trying again: the daemon or the OS was briefly away.
@@ -110,7 +116,7 @@ async function follow(api: Api, first: Job): Promise<void> {
       }
       failures++
       if (failures >= MAX_FAILURES) {
-        set({ error: `无法读取导入状态：${describeError(res)}` })
+        set({ error: translate(documentsMessages, 'error.readStatus', { error: describeError(res) }) })
         return
       }
       continue

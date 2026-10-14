@@ -176,7 +176,7 @@ describe('App', () => {
     const navBtns = screen.getAllByText('设置')
     fireEvent.click(navBtns[0])
     await waitFor(() => {
-      expect(screen.getByText('Settings')).toBeInTheDocument()
+      expect(screen.getByText('配置 AI 模型服务、后端守护进程和应用偏好')).toBeInTheDocument()
     })
   })
 
