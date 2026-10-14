@@ -275,6 +275,10 @@ describe('what a report must not hold (§5)', () => {
     expect(scrub('a.b and a+b and axb', ['a.b', 'a+b'])).toBe('<redacted> and <redacted> and axb')
   })
 
+  it('takes a name of the machine out of a problem only where it stands as a whole word', () => {
+    expect(scrub('passed on macOS 15.2; mac said: MAC is busy', [], ['mac', 'pass'])).toBe('passed on macOS 15.2; <redacted> said: <redacted> is busy')
+  })
+
   it('finds a path where scrub would take one out, however often it is asked', () => {
     const text = 'the model in /Volumes/Data/models/qwen'
     expect([holdsPath(text), holdsPath(text)]).toEqual([true, true])
