@@ -178,8 +178,8 @@ describe('ACC-IMPORT', () => {
 
   it('fails with what went wrong: an upload left incomplete, or a job that did not succeed', async () => {
     const problems = async (change: Parameters<typeof importing>[0]) => (await checkImport(fakeClient(importing(change)).client, NOTICE, QUICK)).problems
-    expect(await problems({ upload: { status: 'receiving', received: 10 } })).toEqual([expect.stringMatching(/the upload is receiving after its last chunk, with 10 of \d+ bytes/)])
-    expect(await problems({ upload: { status: 'complete', received: 10 } })).toEqual([expect.stringMatching(/the upload is complete after its last chunk, with 10 of \d+ bytes/)])
+    expect(await problems({ upload: { status: 'receiving', received: 10 } })).toEqual([expect.stringMatching(/^the upload is receiving with 10 bytes after (\d+) of \1 were sent$/)])
+    expect(await problems({ upload: { status: 'complete', received: 10 } })).toEqual([expect.stringMatching(/^the upload is complete with 10 bytes after (\d+) of \1 were sent$/)])
     expect(await problems({ job: failed('upload_checksum_mismatch', { kind: 'import' }) })).toEqual(['the import job is failed: upload_checksum_mismatch'])
     expect(await problems({ job: { status: 'interrupted', result: null } })).toEqual(['the import job is interrupted: no error code'])
     const refused = await checkImport(fakeClient(() => refuse(503, 'storage_unavailable')).client, NOTICE, QUICK)
@@ -212,6 +212,13 @@ describe('ACC-IMPORT', () => {
     expect(await problems({ created: { total_size: size + 1 } })).toEqual([`the upload is of ${size + 1} bytes, sha256:${NOTICE.meta.sha256_stored}: not what was announced`])
     expect(await problems({ created: { sha256: `sha256:${'c'.repeat(64)}` } })).toEqual([`the upload is of ${size} bytes, sha256:${'c'.repeat(64)}: not what was announced`])
     expect(await problems({ upload: { upload_id: id('upl', 2) } })).toEqual([`a chunk of ${UPLOAD} was answered with ${id('upl', 2)}`])
+    expect(await problems({ upload: { total_size: 1 } })).toEqual([`a chunk of ${UPLOAD} was answered with an upload of 1 bytes, sha256:${NOTICE.meta.sha256_stored}`])
+    expect(await problems({ upload: { sha256: `sha256:${'c'.repeat(64)}` } })).toEqual([`a chunk of ${UPLOAD} was answered with an upload of ${size} bytes, sha256:${'c'.repeat(64)}`])
+    // A new upload holds nothing yet; after each chunk it holds what was sent, and is complete only at the end.
+    expect(await problems({ created: { received: 7 } })).toEqual(['a new upload is receiving with 7 bytes'])
+    expect(await problems({ created: { status: 'complete' } })).toEqual(['a new upload is complete with 0 bytes'])
+    expect(await problems({ upload: { received: size - 1 } })).toEqual([`the upload is complete with ${size - 1} bytes after ${size} of ${size} were sent`])
+    expect(await problems({ upload: { status: 'receiving' } })).toEqual([`the upload is receiving with ${size} bytes after ${size} of ${size} were sent`])
     expect(await problems({ job: { kind: 'extract', result: { extraction_id: id('ext') } } })).toEqual(['the import job is of kind extract'])
   })
 

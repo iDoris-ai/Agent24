@@ -108,6 +108,7 @@ export async function checkImport(client: Client, sample: Sample, wait: JobWait 
     // Under a key nobody has used the upload is new: 201, and of the bytes that were announced.
     const upload = await client.json<Schemas['DocumentsUpload']>('POST', '/uploads', 'DocumentsUpload', { json: { total_size: bytes.length, sha256: sha256(bytes), filename: path.basename(sample.source) }, headers: { 'idempotency-key': crypto.randomUUID() } }, 201)
     if (upload.total_size !== bytes.length || upload.sha256 !== sha256(bytes)) return [`the upload is of ${upload.total_size} bytes, ${upload.sha256}: not what was announced`]
+    if (upload.received !== 0 || upload.status !== 'receiving') return [`a new upload is ${upload.status} with ${upload.received} bytes`]
     let received = upload
     for (let offset = 0; offset < bytes.length; offset += CHUNK) {
       const chunk = bytes.subarray(offset, offset + CHUNK)
@@ -115,7 +116,13 @@ export async function checkImport(client: Client, sample: Sample, wait: JobWait 
         bytes: chunk,
         headers: { 'upload-offset': String(offset), 'chunk-sha256': sha256(chunk) },
       })
+      // Each chunk is answered with the same upload, holding the bytes sent so far.
+      const sent = offset + chunk.length
       if (received.upload_id !== upload.upload_id) return [`a chunk of ${upload.upload_id} was answered with ${received.upload_id}`]
+      if (received.total_size !== upload.total_size || received.sha256 !== upload.sha256) return [`a chunk of ${upload.upload_id} was answered with an upload of ${received.total_size} bytes, ${received.sha256}`]
+      if (received.received !== sent || received.status !== (sent === bytes.length ? 'complete' : 'receiving')) {
+        return [`the upload is ${received.status} with ${received.received} bytes after ${sent} of ${bytes.length} were sent`]
+      }
     }
     if (received.status !== 'complete' || received.received !== bytes.length) {
       return [`the upload is ${received.status} after its last chunk, with ${received.received} of ${bytes.length} bytes`]
