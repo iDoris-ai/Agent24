@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { exitCode, main, parseArgs, writeEvidence } from './cli'
 import { type Ran, type Report, buildReport } from './report'
+import { applyReview } from './review'
 import { run } from './run'
 import { loadAsk } from './samples'
 import { HOLIDAYS, NOTICE, type Odd, capabilities, daemon } from './test/daemon'
@@ -169,23 +170,48 @@ describe('writeEvidence', () => {
     expect(fs.existsSync(dir)).toBe(false)
   })
 
-  it('takes a name of this machine where it stands as a whole, however short, and not in the machine the harness read itself', async () => {
+  it('takes a name of this machine where it stands as a whole, however short, in what the daemon said', async () => {
     const dir = path.join(temp(), 'evidence')
     const clean = await report()
-    const at = (commit: string, model = 'Mac16,10'): Report => ({ ...clean, environment: { ...clean.environment, commit, machine: { model, os: 'macOS 15.2' } } })
-    for (const said of ['MacBook', 'on macbook.local', 'MacBook-2,', '(macbook)']) expect(() => writeEvidence(dir, at(said), [], ['MacBook']), said).toThrow('secret 1 of 1, at environment.commit')
-    expect(() => writeEvidence(dir, at('Mac16'), ['absent'], ['Mac16'])).toThrow('secret 2 of 2, at environment.commit')
+    const said = (os_version: string): Report => ({ ...clean, environment: { ...clean.environment, os_version } })
+    for (const as of ['MacBook', 'on macbook.local', 'MacBook-2,', '(macbook)']) expect(() => writeEvidence(dir, said(as), [], ['MacBook']), as).toThrow('secret 1 of 1, at environment.os_version')
+    expect(() => writeEvidence(dir, said('Mac16'), ['absent'], ['Mac16'])).toThrow('secret 2 of 2, at environment.os_version')
+    // After whatever JSON writes as an escape, in a field report.md does not show.
+    for (const as of ['ok\nMac16', 'ok\tMac16', '\u001fMac16', '\ud800Mac16']) {
+      expect(() => writeEvidence(dir, { ...clean, samples: clean.samples.map((s) => ({ ...s, document_id: as })) }, [], ['Mac16']), JSON.stringify(as)).toThrow('secret 1 of 1, at samples.0.document_id')
+    }
     expect(fs.existsSync(dir)).toBe(false)
-    writeEvidence(dir, at('MacBookPro18,3'), [], ['MacBook'])
-    writeEvidence(dir, at('iMacBook'), [], ['MacBook'])
-    // Said where JSON writes it after an escape (`\\nMac16`), it is found in report.md, where it stands alone.
-    expect(() => writeEvidence(dir, at('ok\nMac16'), [], ['Mac16'])).toThrow('secret 1 of 1, at environment.commit')
-    // Where it is said is where it is said back, not where the harness read the machine.
-    expect(() => writeEvidence(dir, { ...at('abc1234'), samples: clean.samples.map((s) => ({ ...s, document_id: 'Mac16' })) }, [], ['Mac16'])).toThrow('secret 1 of 1, at samples.0.document_id')
-    // The machine is what the harness read off it: `Mac16` in `Mac16,10`, `mac` in `macOS`, are not the name said back.
-    writeEvidence(dir, at('abc1234', 'Mac16,10'), [], ['Mac16', 'mac'])
-    expect(fs.readFileSync(path.join(dir, 'report.json'), 'utf8')).toContain('"model": "Mac16,10"')
+    writeEvidence(dir, said('MacBookPro18,3'), [], ['MacBook'])
+    writeEvidence(dir, said('iMacBook'), [], ['MacBook'])
     expect(fs.readdirSync(dir).sort()).toEqual(['report.json', 'report.md'])
+  })
+
+  it('looks for a name in every text the daemon or a reviewer said, and in none the harness wrote', async () => {
+    const dir = path.join(temp(), 'evidence')
+    const clean = JSON.parse(JSON.stringify(applyReview(await report({}, { cancelOn: NOTICE.id, replayOn: NOTICE.id }), { reviewer: 'david', items: [{ sample: NOTICE.id, extraction_id: id('ext'), field: 'notice_reference', verdict: 'correct', note: 'ok' }, { sample: NOTICE.id, extraction_id: id('ext'), must_not_assert: 1, verdict: 'not_violated', note: 'ok' }, { sample: NOTICE.id, extraction_id: id('ext', 9), field: 'x', verdict: 'correct', note: 'ok' }] })))
+    // What a daemon says when something goes wrong, filled in here: this run went well.
+    clean.capabilities.problems = ['a problem']
+    clean.samples[0].checks[0].problems = ['a problem']
+    clean.samples[0].fields[0].anchors = { verdict: 'none', anchors: [{ gold: { page: 1, quote: 'a quote' }, unlocated: false, review: { verdict: 'covered', reviewer: 'david', note: 'ok' } }] }
+    clean.samples[0].find.unreached = [{ page: 1, quote: 'a quote', refused: 'invalid_request', unparsed: [{ page: 1, reason: 'ocr_failed' }] }]
+    const SAID = [/^environment\.(os_version|engines|model_ids|extractor_versions)\./, /^environment\.os_version$/, /^capabilities\.problems\./, /^review\.reviewer$/, /^review\.unused\.\d+\.item\.note$/, /^samples\.\d+\.(document_id|extraction_id|model_id|extractor_version)$/, /^samples\.\d+\.checks\.\d+\.problems\./, /^samples\.\d+\.find\.unreached\.\d+\.(refused|unparsed)/, /^samples\.\d+\.fields\.\d+\.(result|review)\./, /^samples\.\d+\.fields\.\d+\.anchors\.anchors\.\d+\.review\./, /^samples\.\d+\.must_not_assert\.\d+\.review\./]
+    const places: (string | number)[][] = []
+    const walk = (x: unknown, at: (string | number)[]) => {
+      if (typeof x === 'string') places.push(at)
+      else if (Array.isArray(x)) x.forEach((y, i) => walk(y, [...at, i]))
+      else if (typeof x === 'object' && x !== null) for (const [k, y] of Object.entries(x)) walk(y, [...at, k])
+    }
+    walk(clean, [])
+    const said = places.filter((at) => SAID.some((p) => p.test(at.join('.'))))
+    // Every kind of place the daemon or a reviewer fills is in this report.
+    expect(SAID.filter((p) => !said.some((at) => p.test(at.join('.'))))).toEqual([])
+    for (const at of places) {
+      const planted = structuredClone(clean)
+      const parent = at.slice(0, -1).reduce((x, k) => x[k], planted)
+      parent[at.at(-1)!] = `${parent[at.at(-1)!]} on Mac16`
+      if (said.includes(at)) expect(() => writeEvidence(dir, planted, [], ['Mac16']), at.join('.')).toThrow(`secret 1 of 1, at ${at.join('.')}`)
+      else expect(() => writeEvidence(dir, planted, [], ['Mac16']), at.join('.')).not.toThrow()
+    }
   })
 
   it('finds a secret in whichever text of the report it is, and then writes nothing', async () => {
@@ -205,10 +231,6 @@ describe('writeEvidence', () => {
       const parent = at.slice(0, -1).reduce((x, k) => x[k], planted)
       parent[at.at(-1)!] = `${parent[at.at(-1)!]} on Mac-mini-Nicolas.local`
       expect(() => writeEvidence(dir, planted, ['s3cret-tok', 'mac-mini-nicolas']), at.join('.')).toThrow('secret 2 of 2')
-      // A short name too, anywhere but in the machine the harness read.
-      if (at[0] === 'environment' && at[1] === 'machine') continue
-      parent[at.at(-1)!] = `${parent[at.at(-1)!]} on Mac16`
-      expect(() => writeEvidence(dir, planted, [], ['Mac16']), at.join('.')).toThrow('secret 1 of 1')
     }
     expect(fs.existsSync(dir)).toBe(false)
   })

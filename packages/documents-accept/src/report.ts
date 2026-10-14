@@ -19,8 +19,10 @@ export interface Ran {
   commit: string
   machine: { model: string; os: string }
   at: Date
-  /** Text that must not be in a report: the token, the host's name, the user's home. */
+  /** Text that must not be in a report: the token, the user's home. */
   secrets: string[]
+  /** The names of this machine: taken out of a problem where each stands as a whole word. */
+  names?: string[]
 }
 
 type Outcome = CheckResult['outcome']
@@ -147,15 +149,22 @@ const PATH = new RegExp(`(?:(?<!\\\\)(?<!(?<!\\\\)[\\w.])(?:~|\\\\?/(?:Users|Vol
 /** Whether a text holds a path of this machine, as `scrub` would find it. */
 export const holdsPath = (text: string): boolean => new RegExp(PATH.source, 'i').test(text)
 
+const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** A name where it stands as a whole: not inside a longer word (`mac` in
+ *  `macOS`, `MacBook` in `MacBookPro18,3`), whatever its case. */
+export const asWord = (name: string, flags = 'i'): RegExp =>
+  new RegExp(`${/^[a-z0-9]/i.test(name) ? '(?<![a-z0-9])' : ''}${escape(name)}${/[a-z0-9]$/i.test(name) ? '(?![a-z0-9])' : ''}`, flags)
+
 /** A problem as it may be written down: without the paths of this machine,
  *  and without the secrets. The paths go first: a secret may be the start of
  *  one (the home), and what is left of a path with its start taken out is no
  *  longer seen as one. */
-export function scrub(text: string, secrets: string[]): string {
+export function scrub(text: string, secrets: string[], names: string[] = []): string {
   // The colon or full stop a path ends on belongs to the sentence.
   let out = text.replace(PATH, (found) => `<path>${/[:.]+$/.exec(found)?.[0] ?? ''}`)
   // A secret goes whatever its case (a host's name is said in any), and with its slashes escaped as JSON may write them.
-  for (const secret of secrets) if (secret !== '') out = out.replace(new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('/', '\\\\?/'), 'gi'), '<redacted>')
+  for (const secret of secrets) if (secret !== '') out = out.replace(new RegExp(escape(secret).replaceAll('/', '\\\\?/'), 'gi'), '<redacted>')
+  for (const name of names) if (name !== '') out = out.replace(asWord(name, 'gi'), '<redacted>')
   return out
 }
 
@@ -194,7 +203,7 @@ function sampleReport(run: SampleRun, sample: Sample, clean: (c: CheckResult) =>
 
 /** The report of a run on these samples. */
 export function buildReport(run: Run, samples: Sample[], ran: Ran): Report {
-  const clean = (c: CheckResult): CheckResult => ({ ...c, problems: c.problems.map((p) => scrub(p, ran.secrets)) })
+  const clean = (c: CheckResult): CheckResult => ({ ...c, problems: c.problems.map((p) => scrub(p, ran.secrets, ran.names)) })
   const reports = run.samples.map((s) => {
     const sample = samples.find((x) => x.id === s.sample)
     if (!sample) throw new Error(`the run has a sample that was not given: ${s.sample}`)

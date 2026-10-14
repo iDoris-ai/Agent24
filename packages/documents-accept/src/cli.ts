@@ -14,7 +14,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Client, connect } from './client'
-import { type Ran, type Report, buildReport, holdsPath } from './report'
+import { type Ran, type Report, asWord, buildReport, holdsPath } from './report'
 import { renderMarkdown } from './report-md'
 import { type ReviewItem, type Reviewed, applyReview, readReport, readReview } from './review'
 import { run } from './run'
@@ -67,16 +67,35 @@ export function parseArgs(argv: string[]): Args {
   }
 }
 
-const escaped = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 /** A secret wherever it is, glued to a word or not (`Bearer%20<token>`), whatever its case. */
-const anywhere = (secret: string): RegExp => new RegExp(escaped(secret), 'i')
-/** A name where it stands as a whole: not inside a longer name (`MacBook` in
- *  `MacBookPro18,3`), whatever its case. */
-const word = (name: string): RegExp => new RegExp(`${/^[a-z0-9]/i.test(name) ? '(?<![a-z0-9])' : ''}${escaped(name)}${/[a-z0-9]$/i.test(name) ? '(?![a-z0-9])' : ''}`, 'i')
+const anywhere = (secret: string): RegExp => new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+
+/** What of a report the daemon or a reviewer said: the only text a name of
+ *  this machine can come back in. The rest the harness wrote: from the samples
+ *  (ids, keys, gold), in its own words (checks, verdicts, the trace), and from
+ *  what it read of the machine itself (`Mac16` is in `Mac16,10`). */
+function saidBack(report: Report & { review?: Reviewed }): unknown {
+  const e = report.environment
+  return {
+    environment: { os_version: e.os_version, engines: e.engines, model_ids: e.model_ids, extractor_versions: e.extractor_versions },
+    capabilities: { problems: report.capabilities.problems },
+    review: report.review && { reviewer: report.review.reviewer, unused: report.review.unused.map((u) => ({ item: { note: u.item.note } })) },
+    samples: report.samples.map((s) => ({
+      document_id: s.document_id,
+      extraction_id: s.extraction_id,
+      model_id: s.model_id,
+      extractor_version: s.extractor_version,
+      checks: s.checks.map((c) => ({ problems: c.problems })),
+      find: s.find && { unreached: s.find.unreached.map((u) => ({ refused: u.refused, unparsed: u.unparsed })) },
+      fields: s.fields.map((f) => ({ result: f.result, review: f.review, anchors: f.anchors && { anchors: f.anchors.anchors.map((a) => ({ review: a.review })) } })),
+      must_not_assert: s.must_not_assert.map((m) => ({ review: m.review })),
+    })),
+  }
+}
 
 /** Where in the report the first text is that `holds` it, by its keys and
  *  never by what it says; or report.md, when only the text made of it there does. */
-function where(report: unknown, holds: (text: string) => boolean): string {
+function where(report: unknown, holds: (text: string) => boolean): string | undefined {
   const found = (x: unknown, at: string): string | undefined => {
     if (typeof x === 'string') return holds(x) ? at : undefined
     if (typeof x !== 'object' || x === null) return undefined
@@ -86,34 +105,31 @@ function where(report: unknown, holds: (text: string) => boolean): string {
     }
     return undefined
   }
-  return found(report, '') ?? 'report.md'
+  return found(report, '')
 }
 
 /** Writes report.json and report.md, unless either holds a secret, a name of
  *  this machine or a path of it (§5): then nothing is written, and neither is
- *  said, only where it is. A secret (the bearer, the home) is found anywhere; a
- *  name only as a whole word, and not in `environment.machine`, which the
- *  harness reads off this machine itself (`Mac16` is in `Mac16,10`). Both files
- *  are checked: report.md says the text of report.json with its white space
- *  made one space, and a path written with a tab in report.json is written
- *  with a space in report.md. Each is written beside its place under a name of
- *  its own and then moved into it, so that no file is left half written; what
- *  was not moved is taken away. */
+ *  said, only where it is. A secret (the bearer, the home) is looked for
+ *  anywhere in both files, as written and as JSON writes it: report.md says
+ *  the text of report.json with its white space made one space, and a home
+ *  written with a tab in report.json is written with a space in report.md. A
+ *  name is looked for as a whole word, in each text the daemon or a reviewer
+ *  said: in the text itself, where an escape JSON writes before it is no part
+ *  of the word. Each file is written beside its place under a name of its own
+ *  and then moved into it, so that no file is left half written; what was not
+ *  moved is taken away. */
 export function writeEvidence(dir: string, report: Report & { review?: Reviewed }, secrets: string[], names: string[] = []): void {
   const json = `${JSON.stringify(report, null, 2)}\n`
   const markdown = `${renderMarkdown(report)}\n`
-  const unnamed = { ...report, environment: { ...report.environment, machine: { model: '', os: '' } } }
-  const looked = [
-    ...secrets.map((s) => ({ s, find: anywhere, in: report, texts: [json, markdown] })),
-    ...names.map((s) => ({ s, find: word, in: unnamed, texts: [JSON.stringify(unnamed, null, 2), renderMarkdown(unnamed)] })),
+  const said = saidBack(report)
+  const at = [
+    ...secrets.map((s) => (s !== '' && [s, JSON.stringify(s).slice(1, -1)].some((as) => anywhere(as).test(json) || anywhere(as).test(markdown)) ? (where(report, (t) => anywhere(s).test(t)) ?? 'report.md') : undefined)),
+    ...names.map((n) => (n === '' ? undefined : where(said, (t) => asWord(n).test(t)))),
   ]
-  // Each is looked for as it is and as JSON writes it.
-  const leak = looked.findIndex(({ s, find, texts }) => s !== '' && [s, JSON.stringify(s).slice(1, -1)].some((as) => texts.some((t) => find(as).test(t))))
-  if (leak !== -1) {
-    const { s, find, in: of } = looked[leak]!
-    throw new Error(`the report holds what it must not (secret ${leak + 1} of ${looked.length}, at ${where(of, (t) => find(s).test(t))}): nothing was written`)
-  }
-  if (holdsPath(json) || holdsPath(markdown)) throw new Error(`the report holds a path of this machine (at ${where(report, holdsPath)}): nothing was written`)
+  const leak = at.findIndex((a) => a !== undefined)
+  if (leak !== -1) throw new Error(`the report holds what it must not (secret ${leak + 1} of ${at.length}, at ${at[leak]}): nothing was written`)
+  if (holdsPath(json) || holdsPath(markdown)) throw new Error(`the report holds a path of this machine (at ${where(report, holdsPath) ?? 'report.md'}): nothing was written`)
   fs.mkdirSync(dir, { recursive: true })
   const files = [['report.json', json], ['report.md', markdown]].map(([name, text]) => ({ name: name!, text: text!, temp: path.join(dir, `.${name}.${crypto.randomUUID()}.tmp`) }))
   try {
@@ -175,7 +191,8 @@ function ran(token: string): Ran {
     commit: dirty ? `${commit}-dirty` : commit,
     machine: { model: tool('sysctl', ['-n', 'hw.model']) || os.arch(), os: version ? `macOS ${version}` : `${os.type()} ${os.release()}` },
     at: new Date(),
-    secrets: [token, ...ofThisMachine().secrets, ...ofThisMachine().names],
+    secrets: [token, ...ofThisMachine().secrets],
+    names: ofThisMachine().names,
   }
 }
 
