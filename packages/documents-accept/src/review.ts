@@ -131,7 +131,7 @@ const NOT_A_REPORT = 'report.json is not a report of this harness (documents-acc
 export function readReport(json: unknown): Report {
   const report = json as Report | null
   const covers = (c: unknown) => typeof c === 'object' && c !== null && Object.values(c).every((keys) => Array.isArray(keys) && keys.every((k) => typeof k === 'string'))
-  const shaped = typeof report === 'object' && report !== null && report.schema === 'documents-accept-report-v1' && Array.isArray(report.samples) && report.samples.every((s) => typeof s === 'object' && s !== null && Array.isArray(s.fields) && Array.isArray(s.must_not_assert) && covers(s.covers))
+  const shaped = typeof report === 'object' && report !== null && report.schema === 'documents-accept-report-v1' && Array.isArray(report.samples) && report.samples.every((s) => typeof s === 'object' && s !== null && Array.isArray(s.fields) && s.fields.every((f) => f?.role === 'answer' || f?.role === 'context') && Array.isArray(s.must_not_assert) && covers(s.covers))
   if (!shaped) throw new Error(NOT_A_REPORT)
   let plain: Report
   let follows: boolean

@@ -40,6 +40,7 @@ describe('parseArgs', () => {
     const argv = ['run', '--samples', 's', '--daemon', 'd.json', '--only', 'a,b', '--replay-on', 'a', '--cancel-on', 'b', '--job-minutes', '5', '--out', 'o']
     expect(parseArgs(argv)).toEqual({ command: 'run', out: 'o', samples: 's', daemon: 'd.json', only: ['a', 'b'], replayOn: 'a', cancelOn: 'b', jobMinutes: 5 })
     expect(parseArgs(['review', '--out', 'o'])).toMatchObject({ command: 'review', out: 'o' })
+    expect(parseArgs(['review', '--out', 'o', '--daemon', 'd.json'])).toMatchObject({ command: 'review', out: 'o', daemon: 'd.json' })
   })
 
   it('refuses what it does not know, with the usage', () => {
@@ -106,6 +107,40 @@ describe('writeEvidence', () => {
     const quoted: Report = { ...clean, samples: clean.samples.map((s) => ({ ...s, checks: [{ id: 'ACC-GET', outcome: 'failed' as const, problems: ['bad bearer tok"9\\f'], ms: 0 }] })) }
     expect(() => writeEvidence(dir, { ...quoted, samples: quoted.samples.map((s) => ({ ...s, document_id: 'tok"9\\f', checks: [] })) }, ['tok"9\\f'])).toThrow('secret 1 of 1')
     expect(fs.existsSync(dir)).toBe(false)
+  })
+
+  it('looks in report.md too: there white space is one space, and a home with a tab in report.json is said as it is', async () => {
+    const dir = path.join(temp(), 'evidence')
+    const clean = await report()
+    for (const space of ['\t', '  ', '\n']) {
+      const spaced: Report = { ...clean, environment: { ...clean.environment, machine: { model: `/srv2/My${space}Drive/dx`, os: 'macOS 15.2' } } }
+      expect(() => writeEvidence(dir, spaced, ['/srv2/My Drive/dx']), JSON.stringify(space)).toThrow('secret 1 of 1')
+    }
+    expect(fs.existsSync(dir)).toBe(false)
+  })
+
+  it('writes nothing that holds a path of this machine, wherever it came from; a name with a slash is no path', async () => {
+    const dir = path.join(temp(), 'evidence')
+    const clean = await report()
+    const model = (id: string): Report => ({ ...clean, environment: { ...clean.environment, model_ids: [id] }, samples: clean.samples.map((s) => ({ ...s, model_id: id })) })
+    for (const local of ['/Volumes/Data/models/qwen', '/opt/models/qwen.gguf', '~/models/qwen']) {
+      expect(() => writeEvidence(dir, model(local), []), local).toThrow('the report holds a path of this machine: nothing was written')
+    }
+    // report.md does not say the model of each sample: only report.json has it there.
+    expect(() => writeEvidence(dir, { ...clean, samples: clean.samples.map((s) => ({ ...s, model_id: '/Volumes/Data/models/qwen' })) }, [])).toThrow('a path of this machine')
+    expect(fs.existsSync(dir)).toBe(false)
+    writeEvidence(dir, model('mlx-community/Qwen2.5-7B'), [])
+    expect(fs.readFileSync(path.join(dir, 'report.md'), 'utf8')).toContain('mlx-community/Qwen2.5-7B')
+  })
+
+  it('takes a secret where it stands as a whole, not inside a longer name', async () => {
+    const dir = path.join(temp(), 'evidence')
+    const clean = await report()
+    const on = (model: string): Report => ({ ...clean, environment: { ...clean.environment, machine: { model, os: 'macOS 15.2' } } })
+    for (const said of ['MacBook', 'on macbook.local', 'MacBook-2,', '(macbook)']) expect(() => writeEvidence(dir, on(said), ['MacBook']), said).toThrow('secret 1 of 1')
+    writeEvidence(dir, on('MacBookPro18,3'), ['MacBook'])
+    writeEvidence(dir, on('iMacBook'), ['MacBook'])
+    expect(fs.readdirSync(dir).sort()).toEqual(['report.json', 'report.md'])
   })
 
   it('finds a secret in whichever text of the report it is, and then writes nothing', async () => {
@@ -204,6 +239,11 @@ describe('main', () => {
     vi.spyOn(os, 'hostname').mockReturnValue('pass.local')
     const plain = path.join(temp(), 'evidence')
     expect((await lines(['run', '--out', plain, '--daemon', serve().state, '--only', NOTICE.id, '--cancel-on', NOTICE.id])).code).toBe(0)
+    // So too without a domain, where the name is the whole of it.
+    vi.spyOn(os, 'hostname').mockReturnValue('Mac16')
+    const short = path.join(temp(), 'evidence')
+    await lines(['run', '--out', short, '--daemon', serve({ text: () => answer({ error: { code: 'parse_failed', message: 'no text on Mac16', details: { retryable: false } } }, 422) }).state, '--only', NOTICE.id])
+    expect(fs.readFileSync(path.join(short, 'report.json'), 'utf8')).toContain('no text on Mac16')
   })
 
   it('takes as samples only the directories that have a gold.json', async () => {
@@ -248,7 +288,8 @@ describe('main', () => {
     const review = { reviewer: 'david', items: [{ sample: NOTICE.id, extraction_id: id('ext'), field: 'notice_reference', verdict: 'correct', note: '编号一致' }, stale] }
     fs.writeFileSync(path.join(out, 'review.json'), JSON.stringify(review))
     const first = await lines(['review', '--out', out])
-    expect(first).toEqual({ code: 0, printed: ['merged the review of david: 1 decisions applied, 1 not', `  not applied: ${JSON.stringify(stale)} (it is about extraction ${id('ext', 7)}, and the report is of ${id('ext')})`] })
+    // What it did not apply is said by what it is about, not as it was written.
+    expect(first).toEqual({ code: 0, printed: ['merged the review of david: 1 decisions applied, 1 not', `  not applied: ${NOTICE.id} · work_order (it is about extraction ${id('ext', 7)}, and the report is of ${id('ext')})`] })
     const merged = fs.readFileSync(path.join(out, 'report.md'), 'utf8')
     expect(merged).toContain('| 指标 | 必答字段 | 背景字段 | 必答字段（复核后） | 背景字段（复核后） |')
     expect(merged).toContain('- 人工复核：david，采用 1 条，未采用 1 条。')
@@ -260,6 +301,25 @@ describe('main', () => {
     fs.writeFileSync(path.join(out, 'review.json'), JSON.stringify({ reviewer: 'david', items: [] }))
     await lines(['review', '--out', out])
     expect((JSON.parse(fs.readFileSync(path.join(out, 'report.json'), 'utf8')) as Report).samples[0]!.fields.find((f) => f.key === 'notice_reference')?.review).toBeUndefined()
+  })
+
+  it('holds a review to the bearer too: of the daemon named, or else of the usual state file where there is one', async () => {
+    const { state } = serve()
+    const out = path.join(temp(), 'evidence')
+    await lines(['run', '--out', out, '--daemon', state, '--only', NOTICE.id])
+    const before = fs.readFileSync(path.join(out, 'report.json'), 'utf8')
+    fs.writeFileSync(path.join(out, 'review.json'), JSON.stringify({ reviewer: 'david', items: [{ sample: NOTICE.id, extraction_id: id('ext'), field: 'notice_reference', verdict: 'correct', note: 'Bearer tok-9f3a1c' }] }))
+    await expect(main(['review', '--out', out, '--daemon', state])).rejects.toThrow('the report holds what it must not (secret 1 of')
+    await expect(main(['review', '--out', out, '--daemon', path.join(out, 'none.json')])).rejects.toThrow('not a daemon state file that can be read')
+    // Without --daemon, ~/.agent24/daemon.json, where there is one.
+    const home = temp()
+    vi.spyOn(os, 'homedir').mockReturnValue(home)
+    fs.mkdirSync(path.join(home, '.agent24'))
+    fs.copyFileSync(state, path.join(home, '.agent24', 'daemon.json'))
+    await expect(main(['review', '--out', out])).rejects.toThrow('the report holds what it must not (secret 1 of')
+    expect(fs.readFileSync(path.join(out, 'report.json'), 'utf8')).toBe(before)
+    fs.rmSync(path.join(home, '.agent24'), { recursive: true })
+    expect((await lines(['review', '--out', out])).code).toBe(0)
   })
 
   it('refuses a review it cannot read, and leaves the evidence as it was', async () => {
