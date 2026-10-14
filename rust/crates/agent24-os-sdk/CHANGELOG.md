@@ -20,6 +20,8 @@ contains the corresponding change (J-S14).
 
 ### 变更
 
+- `PROTOCOL_MAX` 由 1 改为 2（ME4-S2b）：握手声明 `{min: 1, max: 2}`。v2 内核与 v1 的区别只是 `_a24/model/complete` 收 `temperature`；
+  v1 内核照样协商到 1。用了 `temperature` 的模块要在 manifest 里写 `min_daemon_protocol: 2`，老内核在安装和挂载时就会拒绝它。
 - `clients::MODEL_RESPONSE_TIMEOUT`（也从 `agent24_os_sdk::MODEL_RESPONSE_TIMEOUT` 导出，两个路径都保留）
   由 125s 改为 4461s，改为从 `agent24_os_proto::model_budget` 导入，与内核同一个数（ME4-S2a，
   `docs/design/ME4-S2a-model-call-progress-timeout.md`）。内核对一次模型调用改为按进展计时：

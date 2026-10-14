@@ -401,7 +401,12 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// The kernel↔module PROTOCOL version this build speaks. Separate from the schema
 /// version: a manifest can be v1 while the protocol moves, and vice versa.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 (ME4-S2b): `_a24/model/complete` takes `temperature`. Nothing else
+/// differs, so a v2 kernel still speaks 1 to a module that only knows 1 (see
+/// `agent24_os_proto::version::kernel_range`); a module that sends
+/// `temperature` asks for 2 in its manifest (`min_daemon_protocol: 2`).
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 
 /// The wire shape of `domain-os.yml`. PRIVATE, and the only MANIFEST type that
 /// derives `Deserialize`, so a caller cannot skip validation by deserializing
