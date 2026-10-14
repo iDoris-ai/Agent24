@@ -237,6 +237,19 @@ describe('renderMarkdown', () => {
     expect(after.slice(after.indexOf('`must_not_assert`（未评审的）：') + 1)).toHaveLength(10)
   })
 
+  it('lists the critical fields that wait before the others, whatever their order in the gold', async () => {
+    // In the gold the major field comes first; each answer says a little more than the gold.
+    const keys = ['drinking_water_registration_location', 'drinking_water_limit']
+    const more = loadAsk(NOTICE).map((f) => {
+      const gold = NOTICE.gold.fields.find((g) => g.key === f.key)!
+      return keys.includes(f.key) ? { key: f.key, status: 'present', value: `${gold.value}（另）`, anchors: [here('p1/b1')] } : { key: f.key, status: 'missing', missing_reason: 'not_in_document' }
+    })
+    const waiting = section(renderMarkdown(await report({ values: more })), '## 待复核')
+    const fields = waiting.slice(1, waiting.indexOf('未覆盖的金标锚点：'))
+    expect(fields.map((l) => keys.find((k) => l.includes(`\`${k}\``)))).toEqual(['drinking_water_limit', 'drinking_water_registration_location'])
+    expect(fields[0]).toMatch(/^- \*\*严重\*\* /)
+  })
+
   it('marks the anchors find could not place, and names why the candidates of a conflict wait', async () => {
     const side = (value: string, normalized: string) => ({ value, normalized, anchors: [here('p1/b1')] })
     const conflict = { key: 'shutoff_date', status: 'conflict', candidates: [side('10月12日', '2026-10-12'), side('10月14日', '2026-10-14')] }
