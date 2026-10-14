@@ -322,3 +322,21 @@ fn a_longer_quote_settles_what_a_short_one_cannot() {
         "one line"
     );
 }
+
+#[test]
+fn a_quote_once_in_another_block_is_anchored_there_even_if_the_row_meant_reads_otherwise() {
+    // The residual risk ADR-DOC-02 §3.2 states: the row the model meant has
+    // full-width digits, which `find` does not fold; another row has the quote
+    // once. The anchor goes where the quote is; the OS cannot tell which row was
+    // meant, and the reader sees the anchor.
+    let mut l = layer();
+    l.blocks[0].text = "临时身份证 ４０元/证\n仅限本人".into();
+    let src = source(&l);
+    let a = src
+        .ground(&Window(vec![0, 1, 2]), "40元", &[ev("p1/b1", "40元/证，")])
+        .unwrap();
+    assert_eq!(
+        (a[0].block_id.as_str(), a[0].quote.as_str()),
+        ("p1/b2", "40元/证，")
+    );
+}
