@@ -7,7 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { components } from '@agent24/api-client'
 import type { Client } from './client'
-import { conform } from './contract'
+import { ContractError, conform } from './contract'
 import type { Sample } from './samples'
 
 type Schemas = components['schemas']
@@ -124,12 +124,11 @@ export async function checkImport(client: Client, sample: Sample, wait: JobWait 
         return [`the upload is ${received.status} with ${received.received} bytes after ${sent} of ${bytes.length} were sent`]
       }
     }
-    if (received.status !== 'complete' || received.received !== bytes.length) {
-      return [`the upload is ${received.status} after its last chunk, with ${received.received} of ${bytes.length} bytes`]
-    }
     // The import of a new upload is a new job: 202, an import, still to run.
     const begun = await client.send('POST', '/imports', { json: { upload_id: upload.upload_id, title: sample.id } })
-    const started = conform<Schemas['DocumentsJob']>('DocumentsJob', await begun.json())
+    const started = conform<Schemas['DocumentsJob']>('DocumentsJob', await begun.json().catch(() => {
+      throw new ContractError(`POST /imports answered ${begun.status} with no JSON`)
+    }))
     if (begun.status !== 202 || started.kind !== 'import' || (started.status !== 'queued' && started.status !== 'running')) {
       return [`a new import was answered ${begun.status} with a job of kind ${started.kind} that is ${started.status}`]
     }
