@@ -355,11 +355,16 @@ describe('ACC-IDEM-2', () => {
 })
 
 describe('ACC-IDEM-3', () => {
-  /** A job as the routes move it: cancelling, then cancelled; a replay leaves it; a retry queues it again. */
-  const daemon = (odd: { cancel?: object; cancelStatus?: number; ends?: object; replay?: object; replayStatus?: number; retry?: object; retryStatus?: number } = {}) => {
+  /** A job as the routes move it: running at attempt 3, then cancelling, then cancelled; a replay leaves it; a retry queues it again. */
+  const daemon = (odd: { before?: () => Response; cancel?: object; cancelStatus?: number; ends?: object; replay?: object; replayStatus?: number; retry?: object; retryStatus?: number } = {}) => {
     let polls = 0
+    let asked = false
     return (call: Call): Response => {
-      if (call.route === `/jobs/${JOB}/cancel`) return answer(odd.cancel ?? job({ status: 'cancelling', attempt: 3 }), odd.cancelStatus ?? 200)
+      if (call.route === `/jobs/${JOB}/cancel`) {
+        asked = true
+        return answer(odd.cancel ?? job({ status: 'cancelling', attempt: 3 }), odd.cancelStatus ?? 200)
+      }
+      if (call.route === `/jobs/${JOB}` && !asked) return odd.before?.() ?? answer(job({ status: 'running', attempt: 3 }))
       if (call.route === `/jobs/${JOB}`) return answer((polls += 1) < 3 ? job({ status: 'cancelling', attempt: 3 }) : (odd.ends ?? job({ status: 'cancelled', attempt: 3 })))
       if (call.route === EXTRACTIONS) return answer(odd.replay ?? job({ status: 'cancelled', attempt: 3 }), odd.replayStatus ?? 200)
       if (call.route === `/jobs/${JOB}/retry`) return answer(odd.retry ?? job({ status: 'queued', attempt: 4 }), odd.retryStatus ?? 200)
@@ -375,7 +380,7 @@ describe('ACC-IDEM-3', () => {
   it('cancels, waits for the job to stop, replays the request, and only then retries', async () => {
     const { result, routes } = await run()
     expect(result).toMatchObject({ id: 'ACC-IDEM-3', sample: NOTICE.id, outcome: 'passed', problems: [], interrupted: true })
-    expect(routes).toEqual([`POST /jobs/${JOB}/cancel`, poll, poll, poll, `POST ${EXTRACTIONS}`, `POST /jobs/${JOB}/retry`])
+    expect(routes).toEqual([poll, `POST /jobs/${JOB}/cancel`, poll, poll, poll, `POST ${EXTRACTIONS}`, `POST /jobs/${JOB}/retry`])
   })
 
   it('says when the job it cancelled was not running', async () => {
@@ -386,7 +391,7 @@ describe('ACC-IDEM-3', () => {
     const { result, routes } = await run({ cancel: extracted({ attempt: 3 }) })
     expect(result).toMatchObject({ outcome: 'skipped', problems: [] })
     expect(result.interrupted).toBeUndefined()
-    expect(routes).toEqual([`POST /jobs/${JOB}/cancel`])
+    expect(routes).toEqual([poll, `POST /jobs/${JOB}/cancel`])
   })
 
   it('fails when a job that took the cancel ends as anything but cancelled, success included', async () => {
@@ -408,6 +413,37 @@ describe('ACC-IDEM-3', () => {
     expect((await run({ replay: { status: 'cancelled' } })).result.problems).toEqual([NOT_A('DocumentsJob')])
   })
 
+  it('holds the attempt the job was at before the cancel, until the retry: an attempt that moves on the way is not hidden by what came after', async () => {
+    // Running at 3, cancelled at 4, replayed at 4, retried to 5: every step agrees with the one before, and the job ran once more than it may.
+    const moved = await run({ cancel: job({ status: 'cancelling', attempt: 4 }), ends: job({ status: 'cancelled', attempt: 4 }), replay: job({ status: 'cancelled', attempt: 4 }), retry: job({ status: 'queued', attempt: 5 }) })
+    expect(moved.result).toMatchObject({ outcome: 'failed', problems: ['the cancel changed the attempt from 3 to 4'] })
+    expect(moved.result.interrupted).toBeUndefined()
+    expect(moved.routes).toEqual([poll, `POST /jobs/${JOB}/cancel`])
+    // The same, with the cancel finding the job succeeded: that is no skip.
+    expect((await run({ cancel: extracted({ attempt: 4 }) })).result).toMatchObject({ outcome: 'failed', problems: ['the cancel changed the attempt from 3 to 4'] })
+    // The cancel answers the attempt it found, and the job stops at the next.
+    const later = await run({ ends: job({ status: 'cancelled', attempt: 4 }), replay: job({ status: 'cancelled', attempt: 4 }), retry: job({ status: 'queued', attempt: 5 }) })
+    expect(later.result.problems).toEqual(['the job was cancelled at attempt 4, not at the 3 it was at', 'the replay changed the attempt from 3 to 4', 'after the retry the job is queued at attempt 5, not queued at 4'])
+    // Whatever attempt it was at is the one held to.
+    const seventh = { before: () => answer(job({ status: 'running', attempt: 7 })), cancel: job({ status: 'cancelling', attempt: 7 }), ends: job({ status: 'cancelled', attempt: 7 }), replay: job({ status: 'cancelled', attempt: 7 }) }
+    expect((await run({ ...seventh, retry: job({ status: 'queued', attempt: 8 }) })).result).toMatchObject({ outcome: 'passed', problems: [] })
+    expect((await run(seventh)).result.problems).toEqual(['after the retry the job is queued at attempt 4, not queued at 8'])
+  })
+
+  it('fails, and is not skipped, when the job cannot be read before the cancel, or is not this extraction: nothing is cancelled then', async () => {
+    const first = async (before: () => Response) => {
+      const { result, routes } = await run({ before })
+      expect(routes).toEqual([poll])
+      expect(result.outcome).toBe('failed')
+      expect(result.interrupted).toBeUndefined()
+      return result.problems
+    }
+    expect(await first(() => refuse(404, 'not_found'))).toEqual(['404 not_found: it is not_found'])
+    expect(await first(() => answer({ status: 'running' }))).toEqual([NOT_A('DocumentsJob')])
+    expect(await first(() => answer(job({ job_id: RERUN, status: 'running', attempt: 3 })))).toEqual([`asked for job ${JOB}, answered with ${RERUN}`])
+    for (const other of [{ kind: 'export' }, { document_id: id('doc', 2) }, { revision: 2 }]) expect(await first(() => answer(job({ status: 'running', attempt: 3, ...other })))).toEqual([NOT_OURS])
+  })
+
   it('fails when the retry does not queue the job again at the next attempt', async () => {
     expect((await run({ retry: job({ status: 'cancelled', attempt: 4 }) })).result.problems).toEqual(['after the retry the job is cancelled at attempt 4, not queued at 4'])
     expect((await run({ retry: job({ status: 'queued', attempt: 3 }) })).result.problems).toEqual(['after the retry the job is queued at attempt 3, not queued at 4'])
@@ -424,7 +460,7 @@ describe('ACC-IDEM-3', () => {
       const { result, routes } = await run({ cancel: status === 'failed' ? failed('engine_unavailable', { attempt: 3 }) : job({ status, attempt: 3 }) })
       expect(result).toMatchObject({ outcome: 'failed', problems: [`the job is still ${status} after its cancel`] })
       expect(result.interrupted).toBeUndefined()
-      expect(routes).toEqual([`POST /jobs/${JOB}/cancel`])
+      expect(routes).toEqual([poll, `POST /jobs/${JOB}/cancel`])
     }
     expect((await run({ cancelStatus: 202 })).result).toMatchObject({ outcome: 'failed', problems: ['the cancel answered 202, not 200'] })
     for (const other of [{ kind: 'export' }, { document_id: id('doc', 2) }, { revision: 2 }]) {
@@ -442,7 +478,7 @@ describe('ACC-IDEM-3', () => {
     const wrong = [`asked to cancel ${JOB}, answered with ${RERUN}`]
     const succeeded = await run({ cancel: extracted({ job_id: RERUN, attempt: 3 }) })
     expect(succeeded.result).toMatchObject({ outcome: 'failed', problems: wrong })
-    expect(succeeded.routes).toEqual([`POST /jobs/${JOB}/cancel`])
+    expect(succeeded.routes).toEqual([poll, `POST /jobs/${JOB}/cancel`])
     const cancelling = (await run({ cancel: job({ job_id: RERUN, status: 'cancelling', attempt: 3 }) })).result
     expect(cancelling).toMatchObject({ outcome: 'failed', problems: wrong })
     expect(cancelling.interrupted).toBeUndefined()

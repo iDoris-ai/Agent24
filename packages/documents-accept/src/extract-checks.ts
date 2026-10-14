@@ -183,25 +183,33 @@ export async function checkRerunKey(client: Client, sample: Sample, documentId: 
 
 /** ACC-IDEM-3: a cancelled job is not revived by its request, only by an
  *  explicit retry (§5.7, third rule; §7). Cancels `job` and leaves it queued
- *  again: the job to wait for and score. `skipped` when the cancel found the
- *  job already succeeded. `interrupted` says whether the cancel stopped a job
- *  that was running, or one that was only queued or had failed. */
+ *  again: the job to wait for and score. Its attempt is read before the
+ *  cancel, and stays that one until the retry makes it the next. `skipped`
+ *  when the cancel found the job already succeeded. `interrupted` says
+ *  whether the cancel stopped a job that was running, or one that was only
+ *  queued or had failed. */
 export async function checkCancelledStays(client: Client, sample: Sample, documentId: string, ask: AskField[], job: Job, wait: JobWait = {}): Promise<CheckResult & { interrupted?: boolean }> {
   let cancelled: Job | undefined
   const result = await check('ACC-IDEM-3', sample.id, async () => {
-    cancelled = await cancel(client, documentId, job.job_id)
+    const before = ours(await client.json<Job>('GET', `/jobs/${job.job_id}`, 'DocumentsJob'), documentId)
+    if (before.job_id !== job.job_id) return [`asked for job ${job.job_id}, answered with ${before.job_id}`]
+    const { attempt } = before
+    const answered = await cancel(client, documentId, job.job_id)
+    if (answered.attempt !== attempt) return [`the cancel changed the attempt from ${attempt} to ${answered.attempt}`]
+    cancelled = answered
     if (cancelled.status === 'succeeded') return []
     // A running job is cancelling until its worker next looks: wait for the end of that.
     const stopped = await waitForJob(client, job.job_id, wait)
     if (stopped.status !== 'cancelled') return [`the job was ${cancelled.status} when cancelled, and then ended ${stopped.status}`]
     const problems: string[] = []
+    if (stopped.attempt !== attempt) problems.push(`the job was cancelled at attempt ${stopped.attempt}, not at the ${attempt} it was at`)
     const { job: replayed } = await extract(client, documentId, request(ask))
     if (replayed.job_id !== job.job_id) problems.push(`the replay started another job: ${replayed.job_id}`)
     if (replayed.status !== 'cancelled') problems.push(`the replay made the cancelled job ${replayed.status}`)
-    if (replayed.attempt !== stopped.attempt) problems.push(`the replay changed the attempt from ${stopped.attempt} to ${replayed.attempt}`)
+    if (replayed.attempt !== attempt) problems.push(`the replay changed the attempt from ${attempt} to ${replayed.attempt}`)
     const retried = await onJob(client, documentId, job.job_id, 'retry')
-    if (retried.status !== 'queued' || retried.attempt !== stopped.attempt + 1) {
-      problems.push(`after the retry the job is ${retried.status} at attempt ${retried.attempt}, not queued at ${stopped.attempt + 1}`)
+    if (retried.status !== 'queued' || retried.attempt !== attempt + 1) {
+      problems.push(`after the retry the job is ${retried.status} at attempt ${retried.attempt}, not queued at ${attempt + 1}`)
     }
     return problems
   })
