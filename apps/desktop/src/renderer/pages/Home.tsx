@@ -42,6 +42,15 @@ export default function HomePage({ backendOk, backendPort, moduleCount, onNaviga
   const last = useRef<number | null>(null)
   const t = useT(homeMessages)
 
+  // Turning on reduced motion while the page is open stops the machine too.
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const onChange = (e: MediaQueryListEvent) => { if (e.matches) setPlaying(false) }
+    mq.addEventListener?.('change', onChange)
+    return () => mq.removeEventListener?.('change', onChange)
+  }, [])
+
   useEffect(() => {
     if (!running || typeof requestAnimationFrame !== 'function') return
     let id = 0
@@ -101,7 +110,9 @@ export default function HomePage({ backendOk, backendPort, moduleCount, onNaviga
               <span className="home-step">{status === 'online' ? `${s.stageIndex + 1} / ${STAGES.length}` : '— / —'}</span>
               <span className="home-run">{t('readout.run', { n: s.runNo + 1 })}</span>
             </div>
-            <div className="home-caption" aria-live="polite">{caption}</div>
+            {/* Announce only steps the user asked for — an autoplaying loop would
+                otherwise queue a screen-reader announcement every couple of seconds. */}
+            <div className="home-caption" aria-live={playing && status === 'online' ? 'off' : 'polite'}>{caption}</div>
             <div className="home-progress" aria-hidden="true">
               {STAGES.map((st, i) => (
                 <span key={st.id} className={i < s.stageIndex ? 'done' : i === s.stageIndex ? 'now' : ''} />

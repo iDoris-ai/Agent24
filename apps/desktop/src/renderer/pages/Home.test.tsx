@@ -48,4 +48,30 @@ describe('HomePage', () => {
     act(() => { setLocale('th') })
     expect(screen.getByText('ภาพรวม Agent24')).toBeInTheDocument()
   })
+
+  it('keeps the caption quiet for screen readers while autoplaying, and announces manual steps', () => {
+    render(<HomePage backendOk={true} {...props} />)
+    const caption = screen.getByText(/A desktop chat starts a run/)
+    expect(caption).toHaveAttribute('aria-live', 'off')
+    act(() => { fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' }) })
+    expect(screen.getByText(/agent24d creates the run/)).toHaveAttribute('aria-live', 'polite')
+  })
+
+  it('stops when reduced motion is switched on while the page is open', () => {
+    let listener: ((e: { matches: boolean }) => void) | undefined
+    const original = window.matchMedia
+    window.matchMedia = ((q: string) => ({
+      matches: false, media: q,
+      addEventListener: (_: string, fn: typeof listener) => { listener = fn },
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia
+    try {
+      render(<HomePage backendOk={true} {...props} />)
+      expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument()
+      act(() => { listener?.({ matches: true }) })
+      expect(screen.getByRole('button', { name: 'Play' })).toBeInTheDocument()
+    } finally {
+      window.matchMedia = original
+    }
+  })
 })
