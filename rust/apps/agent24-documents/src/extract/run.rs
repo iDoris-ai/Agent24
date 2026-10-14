@@ -132,7 +132,9 @@ impl Run<'_> {
                 response_format: Some(answer_format(batch)),
                 max_tokens: Some(MAX_TOKENS),
                 complexity: None,
-                temperature: None,
+                // Copying text and naming blocks wants no chance: the same
+                // request, the same answer (ME4-S2b; Ollama uses 1.0 otherwise).
+                temperature: Some(0.0),
             };
             let engine = |why: String| Refused::Failed(Failure::Engine(why));
             match self.model.complete(req).await {
