@@ -224,3 +224,5 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
   L4 PR 1 正文点名 R7；L5 SDK 的两个重导出路径保留；L6 剩余时间不足 `MODEL_STALL_TIMEOUT` 时不再换 provider（J16）；L7 补全 PR 2 要改的行。
 
 **v2.1 → v2.2**（PR-Daemon 在 #948 的两条非阻塞项）：冷却上限改为由 `agent24-models` 导出的具名常量，抽取器的等待与之相同（§2.6）；`model_callback.rs:181` → `:182`。
+
+**v2.2 → 已定**：§7 四个问题由 David 按建议定（2026-10-15）；jason 在 #948 知会。
