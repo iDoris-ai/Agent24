@@ -129,7 +129,7 @@ function trace(checks: CheckResult[]): TraceRow[] {
 }
 
 /** What ends a path, besides white space. */
-const END = `'"\`)\\],;，。；：、）】》”’`
+const END = `'"\`)\\],;<>，。；：、）】》”’`
 /** A path of this machine: from a root, or the home, or a drive, over the
  *  single spaces a directory's name may have (`Application Support/…`). It
  *  does not start inside a word, so the path of a URL is left alone. */
@@ -141,7 +141,8 @@ const PATH = new RegExp(`(?<![\\w.])(?:(?:~|/(?:Users|Volumes|home|root|private|
 export function scrub(text: string, secrets: string[]): string {
   // The colon or full stop a path ends on belongs to the sentence.
   let out = text.replace(PATH, (found) => `<path>${/[:.]+$/.exec(found)?.[0] ?? ''}`)
-  for (const secret of secrets) if (secret !== '') out = out.split(secret).join('<redacted>')
+  // A secret goes whatever its case (a host's name is said in any), and with its slashes escaped as JSON may write them.
+  for (const secret of secrets) if (secret !== '') out = out.replace(new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('/', '\\\\?/'), 'gi'), '<redacted>')
   return out
 }
 

@@ -242,6 +242,11 @@ describe('what a report must not hold (§5)', () => {
     expect(scrub(`ENOENT: open '${home}/Library/Application Support/agent24/data/doc_1/r1.pdf'`, [home])).toBe("ENOENT: open '<path>'")
     expect(scrub('open /Library/Application Support/agent24/My Data/r1.pdf failed', [])).toBe('open <path> failed')
     expect(scrub('cannot read /tmp/a.pdf nor /tmp/b.pdf at all', [])).toBe('cannot read <path> nor <path> at all')
+    expect(scrub('<home /tmp/x>', [])).toBe('<home <path>>')
+    // A secret in another case, or with its slashes escaped, is the same secret; one that only looks like a pattern is taken as it is.
+    expect(scrub('at mac-mini-nicolas.local and MAC-MINI-NICOLAS', ['Mac-mini-Nicolas'])).toBe('at <redacted>.local and <redacted>')
+    expect(scrub('{"path":"\\/users\\/DavidXu\\/x"}', [home])).toBe('{"path":"<redacted>\\/x"}')
+    expect(scrub('a.b and a+b and axb', ['a.b', 'a+b'])).toBe('<redacted> and <redacted> and axb')
   })
 
   it('writes no problem down as the daemon gave it, and nothing of where the samples lie', async () => {
