@@ -21,6 +21,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{CompletionRequest, CompletionResponse, ModelError, ModelProvider};
 
+/// The longest a provider stays cooled by default. A module waits as long
+/// before it asks again after `no_provider` (ME4-S2a §2.6); the kernel's
+/// tests hold the two equal.
+pub const DEFAULT_MAX_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Routing tier. `Lora` is a locally-served fine-tune, so it counts as local
 /// for privacy purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,9 +270,11 @@ impl ModelRouter {
     }
 
     /// Convenience default: 2s base, 60s cap. Same PRIVACY CONTRACT as
-    /// [`Self::new`]: Local providers must be `loopback_only()`.
+    /// [`Self::new`]: Local providers must be `loopback_only()`. The cap is a
+    /// contract with modules too (ME4-S2a §2.6): they wait it out after
+    /// `no_provider`, so the daemon's router must keep [`DEFAULT_MAX_COOLDOWN`].
     pub fn with_defaults(providers: Vec<(Arc<dyn ModelProvider>, Tier)>) -> Self {
-        Self::new(providers, Duration::from_secs(2), Duration::from_secs(60))
+        Self::new(providers, Duration::from_secs(2), DEFAULT_MAX_COOLDOWN)
     }
 
     /// The default local chain as tiered providers: oMLX (8088) and Ollama
