@@ -449,6 +449,36 @@ describe('ACC-IDEM-3', () => {
     expect((await run(seventh)).result.problems).toEqual(['after the retry the job is queued at attempt 4, not queued at 8'])
   })
 
+  it('fails when the cancel makes of the job what it cannot: a job that had succeeded stays succeeded', async () => {
+    // Succeeded, then cancelled by the cancel, replayed as cancelled and retried: every later step agrees, and a result was unwound.
+    const before = () => answer(extracted({ attempt: 3 }))
+    const unwound = await run({ before, cancel: job({ status: 'cancelled', attempt: 3 }) })
+    expect(unwound.result).toMatchObject({ outcome: 'failed', problems: ['the cancel made a job that was succeeded cancelled'] })
+    expect(unwound.result.interrupted).toBeUndefined()
+    expect(unwound.routes).toEqual([poll, `POST /jobs/${JOB}/cancel`])
+    expect((await run({ before, cancel: job({ status: 'cancelling', attempt: 3 }) })).result.problems).toEqual(['the cancel made a job that was succeeded cancelling'])
+    // Left succeeded, there was nothing to cancel: not run, as when the job succeeds between the reading and the cancel.
+    expect((await run({ before, cancel: extracted({ attempt: 3 }) })).result).toMatchObject({ outcome: 'skipped', problems: [] })
+    expect((await run({ cancel: extracted({ attempt: 3 }) })).result).toMatchObject({ outcome: 'skipped', problems: [] })
+  })
+
+  it('fails when a job with no worker is not cancelled at once, or comes out of the cancel succeeded', async () => {
+    const was = (status: string) => () => answer(status === 'failed' ? failed('engine_unavailable', { attempt: 3 }) : job({ status, attempt: 3 }))
+    for (const status of ['failed', 'interrupted', 'cancelled']) {
+      expect((await run({ before: was(status), cancel: job({ status: 'cancelling', attempt: 3 }) })).result.problems, status).toEqual([`the cancel made a job that was ${status} cancelling`])
+      expect((await run({ before: was(status), cancel: extracted({ attempt: 3 }) })).result, status).toMatchObject({ outcome: 'failed', problems: [`the cancel made a job that was ${status} succeeded`] })
+      expect((await run({ before: was(status), cancel: job({ status: 'cancelled', attempt: 3 }) })).result, status).toMatchObject({ outcome: 'passed', interrupted: false })
+    }
+    // One that was stopping does not come out succeeded either; one that was queued or running may have got anywhere.
+    expect((await run({ before: was('cancelling'), cancel: extracted({ attempt: 3 }) })).result.problems).toEqual(['the cancel made a job that was cancelling succeeded'])
+    expect((await run({ before: was('cancelling') })).result).toMatchObject({ outcome: 'passed', interrupted: true })
+    for (const status of ['queued', 'running']) {
+      expect((await run({ before: was(status) })).result, status).toMatchObject({ outcome: 'passed', interrupted: true })
+      expect((await run({ before: was(status), cancel: job({ status: 'cancelled', attempt: 3 }) })).result, status).toMatchObject({ outcome: 'passed', interrupted: false })
+      expect((await run({ before: was(status), cancel: extracted({ attempt: 3 }) })).result.outcome, status).toBe('skipped')
+    }
+  })
+
   it('fails, and is not skipped, when the job cannot be read before the cancel, or is not this extraction: nothing is cancelled then', async () => {
     const first = async (before: () => Response) => {
       const { result, routes } = await run({ before })

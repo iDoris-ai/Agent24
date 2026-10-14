@@ -182,11 +182,26 @@ export async function checkRerunKey(client: Client, sample: Sample, documentId: 
   })
 }
 
+/** What a cancel may make of a job, by what the job was just before (§7).
+ *  One that succeeded stays so; one with no worker (failed, interrupted,
+ *  cancelled) is cancelled at once; one that was queued or running may have
+ *  moved on in between, to any end a cancel can find. */
+const AFTER_CANCEL: Record<Job['status'], Job['status'][]> = {
+  queued: ['cancelling', 'cancelled', 'succeeded'],
+  running: ['cancelling', 'cancelled', 'succeeded'],
+  cancelling: ['cancelling', 'cancelled'],
+  succeeded: ['succeeded'],
+  failed: ['cancelled'],
+  interrupted: ['cancelled'],
+  cancelled: ['cancelled'],
+}
+
 /** ACC-IDEM-3: a cancelled job is not revived by its request, only by an
  *  explicit retry (§5.7, third rule; §7). Cancels `job` and leaves it queued
- *  again: the job to wait for and score. Its attempt is read before the
- *  cancel, and stays that one until the retry makes it the next. `skipped`
- *  when the cancel found the job already succeeded. `interrupted` says
+ *  again: the job to wait for and score. The job is read before the cancel:
+ *  its attempt stays that one until the retry makes it the next, and what it
+ *  was decides what the cancel may make of it. `skipped` when the cancel
+ *  found the job already succeeded. `interrupted` says
  *  whether the cancel stopped a job that was running, or one that was only
  *  queued or had failed. */
 export async function checkCancelledStays(client: Client, sample: Sample, documentId: string, ask: AskField[], job: Job, wait: JobWait = {}): Promise<CheckResult & { interrupted?: boolean }> {
@@ -197,6 +212,7 @@ export async function checkCancelledStays(client: Client, sample: Sample, docume
     const { attempt } = before
     const answered = await cancel(client, documentId, job.job_id)
     if (answered.attempt !== attempt) return [`the cancel changed the attempt from ${attempt} to ${answered.attempt}`]
+    if (!AFTER_CANCEL[before.status].includes(answered.status)) return [`the cancel made a job that was ${before.status} ${answered.status}`]
     cancelled = answered
     if (cancelled.status === 'succeeded') return []
     // A running job is cancelling until its worker next looks: wait for the end of that.
