@@ -29,11 +29,15 @@ const OUTCOME: Record<TraceRow['conclusion'], string> = {
 
 /** Text from elsewhere as one cell of a table or one line of a list: it cannot
  *  start a line, close a cell, open a code span or a tag of its own. */
-const line = (text: string): string => text.replace(/\s+/g, ' ').replace(/[|`<]/g, '\\$&').trim()
+export const line = (text: string): string => text.replace(/\s+/g, ' ').replace(/[\\|`<]/g, '\\$&').trim()
 /** Text from elsewhere as code. */
 const code = (text: string): string => `\`${text.replace(/\s+/g, ' ').replace(/`/g, "'").trim()}\``
 const STATE = { passed: '通过', review: '待复核', failed: '失败' }
-const ratio = (part: number, whole: number): string => (whole === 0 ? '0 / 0' : `${part} / ${whole}（${((100 * part) / whole).toFixed(1)}%）`)
+/** Rounded, but never to 100.0% short of the whole, nor to 0.0% above nothing. */
+export const ratio = (part: number, whole: number): string => {
+  const share = Math.round((1000 * part) / whole) / 10
+  return whole === 0 ? '0 / 0' : `${part} / ${whole}（${(part > 0 && part < whole ? Math.min(Math.max(share, 0.1), 99.9) : share).toFixed(1)}%）`
+}
 const table = (head: string[], rows: string[][]): string[] => [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`, ...rows.map((r) => `| ${r.join(' | ')} |`), '']
 const list = (items: string[]): string[] => (items.length === 0 ? ['无。', ''] : [...items.map((i) => `- ${i}`), ''])
 
@@ -63,6 +67,8 @@ function summary(report: Report, review?: Reviewed): string[] {
     ...table(['指标', ...columns.map(([name]) => name)], ROWS.map((name, i) => [name, ...cells.map((c) => c[i] ?? '')])),
     `- \`must_not_assert\`：共 ${asserted} 条，违规 ${review?.must_not_assert.violated ?? 0} 条，未评审 ${review?.must_not_assert.unreviewed ?? asserted} 条。`,
     `- \`find\` 的可达率：${ratio(report.find.reachable, report.find.anchors)}。${report.find.unread > 0 ? `其中 ${report.find.unread} 份样本的 \`find\` 没有读到，它们的金标锚点按未达计。` : ''}`,
+    // Each quote find did not reach, and why, as report.json has it (§4.4).
+    ...report.samples.flatMap((s) => (s.find?.unreached ?? []).map((u) => `  - \`find\` 没有找到：${line(s.sample)} · 第 ${u.page} 页 “${line(u.quote)}”${u.refused ? `（被拒绝：${line(u.refused)}）` : (u.unparsed?.length ?? 0) > 0 ? '（文档有没有解析的区域）' : ''}`)),
     ...(review ? [`- 人工复核：${line(review.reviewer)}，采用 ${review.applied} 条，未采用 ${review.unused.length} 条。`] : ['- 还没有人工复核；字段正确率在复核之前是下限。']),
     '',
   ]
@@ -87,9 +93,11 @@ export function renderMarkdown(report: Report & { review?: Reviewed }): string {
     const sample = report.samples.find((s) => s.sample === id)
     return id === undefined ? '没有指定样本' : sample ? `在 ${line(id)} 上，${met(sample)}` : `指定在 ${line(id)} 上，这次没有跑这份样本`
   }
-  const replayed = ran(report.idempotency.replayOn, (s) => (s.requeued === undefined ? '没有做成' : s.requeued ? '重放时 job 已失败，被重新排队' : '重放时 job 已结束，原样返回'))
+  // What the replay met is said only of one that passed: of one that failed, the check says what went wrong.
+  const outcome = (s: Report['samples'][number], id: string) => s.checks.find((c) => c.id === id)?.outcome
+  const replayed = ran(report.idempotency.replayOn, (s) => (outcome(s, 'ACC-IDEM-1') === 'failed' ? '重放没有通过，见“没有通过的检查”' : s.requeued === undefined ? '没有做成' : s.requeued ? '重放时 job 已失败，被重新排队' : '重放时 job 已结束，原样返回'))
   const skipped = (s: Report['samples'][number]) => s.checks.some((c) => c.id === 'ACC-IDEM-3' && c.outcome === 'skipped')
-  const cancelled = ran(report.idempotency.cancelOn, (s) => (skipped(s) ? '取消到达时 job 已经成功，未执行' : s.interrupted === undefined ? '没有取消到 job' : s.interrupted ? '取消时 job 正在运行' : '取消时 job 没有在运行'))
+  const cancelled = ran(report.idempotency.cancelOn, (s) => (outcome(s, 'ACC-IDEM-3') === 'failed' ? '取消的检查没有通过，见“没有通过的检查”' : skipped(s) ? '取消到达时 job 已经成功，未执行' : s.interrupted === undefined ? '没有取消到 job' : s.interrupted ? '取消时 job 正在运行' : '取消时 job 没有在运行'))
   const checks = [report.capabilities, ...report.samples.flatMap((s) => s.checks)]
   return [
     '# Documenting S01 验收报告',
@@ -126,6 +134,7 @@ export function renderMarkdown(report: Report & { review?: Reviewed }): string {
     '背景字段（不计入）：',
     '',
     ...list(fields.filter((f) => f.role === 'context' && wrong(f)).map(named)),
+    ...(review ? ['复核改判为不算错的：', '', ...list(fields.filter((f) => f.severity === 'critical' && f.review && !wrong(f) && f.score.verdict !== 'correct' && f.score.verdict !== 'review').map(named))] : []),
     '`must_not_assert` 违规：',
     '',
     ...list(report.samples.flatMap((s) => s.must_not_assert.filter((m) => m.review?.verdict === 'violated').map((m) => `${line(s.sample)} · 第 ${m.n} 条：${line(m.proposition)}${m.review?.note ? `（${line(m.review.note)}）` : ''}`))),
