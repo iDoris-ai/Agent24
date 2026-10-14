@@ -252,7 +252,7 @@ describe('main', () => {
     put({ ...written, schema: 'something-else-v9' })
     await expect(main(['review', '--out', out])).rejects.toThrow('report.json is not a report of this harness')
     put({ ...written, totals: { ...written.totals, answer: { ...written.totals.answer, correct: written.totals.answer.fields } } })
-    await expect(main(['review', '--out', out])).rejects.toThrow('report.json: its totals do not follow from its fields')
+    await expect(main(['review', '--out', out])).rejects.toThrow('report.json: its totals or coverage points do not follow from its fields')
     expect(fs.readFileSync(path.join(out, 'report.md'), 'utf8')).toContain('还没有人工复核')
     put(written)
     expect((await lines(['review', '--out', out])).code).toBe(0)
