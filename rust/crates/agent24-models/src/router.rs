@@ -609,6 +609,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
             progress: None,
         }
     }
@@ -637,6 +638,7 @@ mod tests {
 
     fn progressing(first_ms: u64, stall_ms: u64, deadline_ms: u64) -> CompletionRequest {
         CompletionRequest {
+            temperature: None,
             progress: Some(crate::Progress {
                 deadline: Instant::now() + Duration::from_millis(deadline_ms),
                 first_chunk: Duration::from_millis(first_ms),
@@ -1065,6 +1067,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
             progress: None,
         }
     }
@@ -1154,6 +1157,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
             progress: None,
         };
         let c = CancellationToken::new();
