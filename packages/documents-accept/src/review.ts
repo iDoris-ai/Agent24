@@ -110,25 +110,41 @@ function reviewedFields(s: SampleReport): Scored[] {
   })
 }
 
-/** A report without the marks of a review: as the harness wrote it. */
-function unreviewed<R extends Report>(report: R): R {
-  const plain = structuredClone(report)
+/** A report without a review, nor its marks: as the harness wrote it. */
+function unreviewed(report: Report & { review?: Reviewed }): Report {
+  const { review: _, ...plain } = structuredClone(report)
   for (const sample of plain.samples) {
     for (const marked of [...sample.fields, ...sample.fields.flatMap((f) => f.anchors?.anchors ?? []), ...sample.must_not_assert]) delete marked.review
   }
   return plain
 }
 
-/** A `report.json` read back, or an error: it must be a report of this
- *  harness, and its totals must still follow from its fields. That finds a
+const NOT_A_REPORT = 'report.json is not a report of this harness (documents-accept-report-v1)'
+
+/** A `report.json` read back as the harness wrote it, or an error: it must be
+ *  a report of this harness, and its totals and coverage points must still
+ *  follow from its fields. A review merged into it is left out, marks and
+ *  numbers: what a person decided is merged again from `review.json` (§4.7),
+ *  so the numbers of a review are only ever counted, never read. That finds a
  *  file of another shape or one edited in one place; it is no seal: the
  *  evidence is in git, and a change to it is reviewed there. */
-export function readReport(json: unknown): Report & { review?: Reviewed } {
-  const report = json as (Report & { review?: Reviewed }) | null
-  const shaped = typeof report === 'object' && report !== null && report.schema === 'documents-accept-report-v1' && Array.isArray(report.samples) && report.samples.every((s) => typeof s === 'object' && s !== null && Array.isArray(s.fields) && Array.isArray(s.must_not_assert) && typeof s.covers === 'object' && s.covers !== null)
-  if (!shaped) throw new Error('report.json is not a report of this harness (documents-accept-report-v1)')
-  if (!isDeepStrictEqual(summarize(unreviewed(report).samples.flatMap(reviewedFields)), report.totals)) throw new Error('report.json: its totals do not follow from its fields; it was changed after it was written')
-  return report
+export function readReport(json: unknown): Report {
+  const report = json as Report | null
+  const covers = (c: unknown) => typeof c === 'object' && c !== null && Object.values(c).every((keys) => Array.isArray(keys) && keys.every((k) => typeof k === 'string'))
+  const shaped = typeof report === 'object' && report !== null && report.schema === 'documents-accept-report-v1' && Array.isArray(report.samples) && report.samples.every((s) => typeof s === 'object' && s !== null && Array.isArray(s.fields) && Array.isArray(s.must_not_assert) && covers(s.covers))
+  if (!shaped) throw new Error(NOT_A_REPORT)
+  let plain: Report
+  let follows: boolean
+  try {
+    plain = unreviewed(report)
+    const fields = plain.samples.flatMap(reviewedFields)
+    follows = isDeepStrictEqual(summarize(fields), plain.totals) && plain.samples.every((s) => isDeepStrictEqual(coverage(s.sample, s.covers, fields), s.coverage))
+  } catch {
+    // A field or a mark of a shape the harness does not write.
+    throw new Error(NOT_A_REPORT)
+  }
+  if (!follows) throw new Error('report.json: its totals or coverage points do not follow from its fields; it was changed after it was written')
+  return plain
 }
 
 /** The report with these decisions merged in, and no earlier ones: merging

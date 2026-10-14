@@ -24,6 +24,9 @@ const report = async (odd: Odd = { values }): Promise<Report> => {
 const on = (more: Partial<ReviewItem>): ReviewItem => ({ sample: NOTICE.id, extraction_id: EXT, verdict: 'correct', ...more })
 const review = (items: ReviewItem[]) => ({ reviewer: 'david', items })
 const field = (r: Report, key: string) => r.samples[0]!.fields.find((f) => f.key === key)!
+/** How many marks of a review a report holds: the review itself, and one on each field, anchor or must_not_assert decided. */
+const reviews = (r: Report): number =>
+  ('review' in r ? 1 : 0) + r.samples.flatMap((s) => [...s.fields, ...s.fields.flatMap((f) => f.anchors?.anchors ?? []), ...s.must_not_assert]).filter((m) => 'review' in m).length
 
 describe('applyReview', () => {
   it('sets what a person decided beside the mechanical verdict, and counts the totals once more', async () => {
@@ -222,11 +225,16 @@ describe('readReview', () => {
 })
 
 describe('readReport', () => {
-  it('takes a report as the harness wrote it, reviewed or not', async () => {
-    const written = JSON.parse(JSON.stringify(await report())) as unknown
-    expect(readReport(written)).toBe(written)
-    const reviewed = JSON.parse(JSON.stringify(applyReview(await report(), review([on({ field: 'lift_in_service' }), on({ field: 'work_order', anchor: 1, verdict: 'uncovered' })])))) as unknown
-    expect(readReport(reviewed)).toBe(reviewed)
+  it('takes a report as the harness wrote it, and of a reviewed one leaves the review out', async () => {
+    const written = JSON.parse(JSON.stringify(await report())) as Report
+    expect(readReport(written)).toEqual(written)
+    const decided = review([on({ field: 'lift_in_service' }), on({ field: 'work_order', anchor: 1, verdict: 'uncovered' }), on({ must_not_assert: 1, verdict: 'violated' })])
+    const reviewed = JSON.parse(JSON.stringify(applyReview(written, decided))) as Report
+    expect(reviews(reviewed)).toBe(4)
+    expect(reviews(readReport(reviewed))).toBe(0)
+    expect(readReport(reviewed)).toEqual(written)
+    // What a person decided is merged again, to the same numbers.
+    expect(JSON.parse(JSON.stringify(applyReview(readReport(reviewed), decided)))).toEqual(reviewed)
     expect(readReport(JSON.parse(JSON.stringify(await report({ ends: failed('engine_unavailable') }))))).toMatchObject({ samples: [{ sample: NOTICE.id }] })
     // One of a run that ran nothing is a report all the same.
     const unmet = buildReport(await run(fakeClient(daemon({ capabilities: () => refuse(404, 'not_found') })).client, [], { sleep: async () => {} }), [], RAN)
@@ -236,14 +244,14 @@ describe('readReport', () => {
   it('refuses what is no report of this harness', async () => {
     const written = JSON.parse(JSON.stringify(await report())) as Report
     const NOT = 'report.json is not a report of this harness (documents-accept-report-v1)'
-    for (const bad of [null, 'x', [], {}, { schema: 'documents-accept-report-v1' }, { ...written, schema: 'something-else-v9' }, { ...written, samples: {} }, { ...written, samples: [null] }, { ...written, samples: [{ ...written.samples[0], fields: undefined }] }, { ...written, samples: [{ ...written.samples[0], must_not_assert: undefined }] }, { ...written, samples: [{ ...written.samples[0], covers: undefined }] }, { ...written, samples: [{ ...written.samples[0], covers: null }] }]) {
+    for (const bad of [null, 'x', [], {}, { schema: 'documents-accept-report-v1' }, { ...written, schema: 'something-else-v9' }, { ...written, samples: {} }, { ...written, samples: [null] }, { ...written, samples: [{ ...written.samples[0], fields: undefined }] }, { ...written, samples: [{ ...written.samples[0], must_not_assert: undefined }] }, { ...written, samples: [{ ...written.samples[0], covers: undefined }] }, { ...written, samples: [{ ...written.samples[0], covers: null }] }, { ...written, samples: [{ ...written.samples[0], covers: { C9: null } }] }, { ...written, samples: [{ ...written.samples[0], covers: { C9: [1] } }] }, { ...written, samples: [{ ...written.samples[0], fields: [null] }] }, { ...written, samples: [{ ...written.samples[0], fields: [{ key: 'x' }] }] }]) {
       expect(() => readReport(bad)).toThrow(NOT)
     }
   })
 
-  it('refuses a report whose totals no longer follow from its fields', async () => {
+  it('refuses a report whose totals or coverage points no longer follow from its fields', async () => {
     const written = JSON.parse(JSON.stringify(await report())) as Report
-    const CHANGED = 'report.json: its totals do not follow from its fields; it was changed after it was written'
+    const CHANGED = 'report.json: its totals or coverage points do not follow from its fields; it was changed after it was written'
     const answers = written.totals.answer
     expect(() => readReport({ ...written, totals: { ...written.totals, answer: { ...answers, correct: answers.fields } } })).toThrow(CHANGED)
     expect(() => readReport({ ...written, totals: { ...written.totals, answer: { ...answers, critical: [] } } })).toThrow(CHANGED)
@@ -253,5 +261,22 @@ describe('readReport', () => {
     const covered = structuredClone(written)
     covered.samples[0]!.fields.find((f) => f.key === 'lift_in_service')!.anchors!.anchors[0]!.by = 'place'
     expect(() => readReport(covered)).toThrow(CHANGED)
+    const passed = structuredClone(written)
+    const point = Object.keys(passed.samples[0]!.coverage).find((p) => passed.samples[0]!.coverage[p] !== 'passed')!
+    passed.samples[0]!.coverage[point] = 'passed'
+    expect(() => readReport(passed)).toThrow(CHANGED)
+  })
+
+  it('reads none of what a review merged in, whatever was made of it', async () => {
+    const reviewed = JSON.parse(JSON.stringify(applyReview(await report(), review([on({ field: 'lift_in_service' })])))) as Report & { review: { totals: { answer: { correct: number; critical: unknown[] } } } }
+    const kinder = structuredClone(reviewed)
+    kinder.review.totals.answer.correct = 999
+    kinder.review.totals.answer.critical = []
+    const relabelled = structuredClone(reviewed)
+    field(relabelled, 'lift_in_service').review!.verdict = 'fabricated'
+    const garbage = { ...structuredClone(reviewed), review: 'garbage' }
+    const nonsense = structuredClone(reviewed)
+    field(nonsense, 'work_order').review = { verdict: 'nonsense' as never, reviewer: 'x' }
+    for (const edited of [kinder, relabelled, garbage, nonsense]) expect(reviews(readReport(edited))).toBe(0)
   })
 })
