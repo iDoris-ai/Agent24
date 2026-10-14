@@ -83,7 +83,8 @@ export interface FindRead {
 
 /** ACC-FIND: every gold quote is looked up once. Whether it is found is
  *  recorded, not judged: it measures the read engine and the matching rule.
- *  A quote `find` refuses as a query (400) is recorded as not found. */
+ *  A quote `find` refuses as a query (a 400 to the first request for it) is
+ *  recorded as not found; a 400 to a later page of its matches is a failure. */
 export async function checkFind(client: Client, sample: Sample, documentId: string): Promise<CheckResult & { find?: FindRead }> {
   let find: FindRead | undefined
   const result = await check('ACC-FIND', sample.id, async () => {
@@ -92,7 +93,11 @@ export async function checkFind(client: Client, sample: Sample, documentId: stri
     for (const { page, quote } of anchors) {
       if (located.some((l) => l.page === page && l.quote === quote)) continue
       const found: Anchor[] = []
-      const ask = (cursor: string) => client.json<Schemas['DocumentsFindResult']>('POST', `/documents/${documentId}/find`, 'DocumentsFindResult', { json: { revision: 1, query: quote, ...(cursor ? { cursor } : {}) } })
+      let asked = 0
+      const ask = (cursor: string) => {
+        asked += 1
+        return client.json<Schemas['DocumentsFindResult']>('POST', `/documents/${documentId}/find`, 'DocumentsFindResult', { json: { revision: 1, query: quote, ...(cursor ? { cursor } : {}) } })
+      }
       try {
         for await (const hits of pages(ask)) {
           if (hits.matches.some((m) => m.document_id !== documentId)) throw new Error(`find answered ${documentId} with matches of another document`)
@@ -100,7 +105,7 @@ export async function checkFind(client: Client, sample: Sample, documentId: stri
         }
         located.push({ page, quote, found })
       } catch (error) {
-        if (!(error instanceof ApiError && error.status === 400)) throw error
+        if (!(error instanceof ApiError && error.status === 400 && asked === 1)) throw error
         located.push({ page, quote, found: [], refused: error.code })
       }
     }

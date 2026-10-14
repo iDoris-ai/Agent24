@@ -144,6 +144,17 @@ describe('ACC-FIND', () => {
     expect(result.find).toMatchObject({ anchors: anchors.length, reachable: anchors.length - 1 })
   })
 
+  it('fails when a later page of matches is refused: the quote was a query, and its matches are not to be lost', async () => {
+    const { client } = fakeClient((call) => {
+      const { query, cursor } = call.json as { query: string; cursor?: string }
+      if (query !== lost) return answer(found([anchor(1, 'p1/b1')]))
+      return cursor === undefined ? answer(found([anchor(1, 'p1/b2')], 'more')) : refuse(400, 'invalid_request')
+    })
+    const result = await checkFind(client, NOTICE, DOC)
+    expect(result).toMatchObject({ outcome: 'failed', problems: ['400 invalid_request: it is invalid_request'] })
+    expect(result.find).toBeUndefined()
+  })
+
   it('fails when find takes no quote at all: then it is the request that is wrong', async () => {
     const result = await checkFind(fakeClient(() => refuse(400, 'invalid_request')).client, NOTICE, DOC)
     expect(result).toMatchObject({ outcome: 'failed', problems: ['find refused every quote as a query (invalid_request)'] })
