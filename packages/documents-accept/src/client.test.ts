@@ -95,7 +95,7 @@ describe('Client', () => {
     expect(await said('')).toBe('Error: GET /jobs/x answered 201, not 200: no body')
     // A body that breaks off is no other error: the status is what is wrong.
     const cut = new ReadableStream({ start: (c) => c.error(new Error('cut')) })
-    expect(String(await fakeClient(() => new Response(cut, { status: 201 })).client.json('GET', '/jobs/x', 'DocumentsJob').catch((e: unknown) => e))).toBe('Error: GET /jobs/x answered 201, not 200: no body')
+    expect(String(await fakeClient(() => new Response(cut, { status: 201 })).client.json('GET', '/jobs/x', 'DocumentsJob').catch((e: unknown) => e))).toBe('Error: GET /jobs/x answered 201, not 200: a body that could not be read')
   })
 
   it('throws what a route refused with: its status, its code, and whether to ask again', async () => {
