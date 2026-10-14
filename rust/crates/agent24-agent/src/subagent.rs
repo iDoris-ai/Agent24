@@ -191,6 +191,7 @@ impl ExplorerSubagent {
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
+                progress: None,
             };
             // Privacy note: the explorer uses the SAME (default) profile as a
             // normal run. It is not more privileged than the main agent w.r.t.

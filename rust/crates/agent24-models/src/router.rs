@@ -587,6 +587,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            progress: None,
         }
     }
 
@@ -924,6 +925,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            progress: None,
         }
     }
 
@@ -1012,6 +1014,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            progress: None,
         };
         let c = CancellationToken::new();
         let (tp, _) = thread_stub(redirect.clone());

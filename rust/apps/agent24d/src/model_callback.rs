@@ -187,6 +187,7 @@ impl ModelCompleteParams {
             // that (see `disable_thinking` above), never on which module is
             // calling, and never on an absent/defaulted complexity.
             disable_thinking,
+            progress: None,
         };
         (request, complexity, self.request_id)
     }
@@ -1289,6 +1290,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            progress: None,
         }
     }
 

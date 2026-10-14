@@ -117,6 +117,21 @@ pub struct CompletionRequest {
     /// decides when to set this (`_a24/model/complete`'s handler, gated on
     /// `complexity: simple`) — this crate has no opinion on complexity.
     pub disable_thinking: bool,
+    /// ME4-S2a: read the answer as it is written, under these timers, instead
+    /// of within one fixed `chat_timeout`. `None` = today's request, byte for
+    /// byte. To be set only by `_a24/model/complete`; the router hands the same
+    /// value to every provider it tries, so its deadline is the call's.
+    pub progress: Option<Progress>,
+}
+
+/// How long a call may take while it makes progress (ME4-S2a §2.2): its first
+/// chunk within `first_chunk`, then one within every `stall`, and all of it
+/// by `deadline`, which is absolute and set once for the whole call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub deadline: std::time::Instant,
+    pub first_chunk: Duration,
+    pub stall: Duration,
 }
 
 /// Structured-output request, mirroring the OpenAI `response_format` wire shape
@@ -918,6 +933,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            progress: None,
         }
     }
 
