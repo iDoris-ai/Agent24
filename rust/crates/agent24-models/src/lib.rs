@@ -312,6 +312,20 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// A whole (non-streamed) answer as a response.
+    fn answer(&self, parsed: OaChatResponse) -> Result<CompletionResponse, ModelError> {
+        let model_id = parsed.model.filter(|m| !m.is_empty());
+        let choice =
+            parsed.choices.into_iter().next().ok_or_else(|| {
+                ModelError::Provider(format!("{} returned no choices", self.name))
+            })?;
+        Ok(CompletionResponse {
+            message: choice.message.into(),
+            usage: usage_of(parsed.usage),
+            model_id,
+        })
+    }
+
     fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.api_key {
             Some(key) if !key.is_empty() => rb.bearer_auth(key),
@@ -573,6 +587,23 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
         .map_err(|e| ModelError::Provider(format!("{name} returned invalid JSON: {e}")))
 }
 
+fn usage_of(u: Option<OaUsage>) -> Usage {
+    u.map_or(
+        Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+        },
+        |u| Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cost_usd: 0.0,
+        },
+    )
+}
+
 fn classify(err: &reqwest::Error) -> ModelError {
     if err.is_connect() || err.is_timeout() {
         ModelError::Unavailable(err.to_string())
@@ -651,30 +682,7 @@ impl ModelProvider for OpenAiCompatProvider {
         }
         let parsed: OaChatResponse =
             read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
-        let model_id = parsed.model.filter(|m| !m.is_empty());
-        let choice =
-            parsed.choices.into_iter().next().ok_or_else(|| {
-                ModelError::Provider(format!("{} returned no choices", self.name))
-            })?;
-        let usage = parsed.usage.map_or(
-            Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                cost_usd: 0.0,
-            },
-            |u| Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                cost_usd: 0.0,
-            },
-        );
-        Ok(CompletionResponse {
-            message: choice.message.into(),
-            usage,
-            model_id,
-        })
+        self.answer(parsed)
     }
 
     async fn models(&self, cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
