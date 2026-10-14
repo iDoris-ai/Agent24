@@ -77,6 +77,18 @@ describe('Client', () => {
     await expect(got(job(), 'NoSuchSchema')).resolves.toMatchObject({ message: 'the contract has no schema NoSuchSchema' })
   })
 
+  it('reads no answer that has not the status the route gives for it: 200, unless another is said', async () => {
+    const got = async (http: number, status?: number) => fakeClient(() => answer(job(), http)).client.json('GET', '/jobs/x?cursor=secret', 'DocumentsJob', {}, status).catch((e: unknown) => e)
+    expect(await got(200)).toEqual(job())
+    expect(await got(202, 202)).toEqual(job())
+    for (const [http, status] of [[201, undefined], [202, undefined], [206, undefined], [200, 202], [201, 202]] as const) {
+      const error = await got(http, status)
+      expect(error, `${http} for ${status}`).toBeInstanceOf(ContractError)
+      // Said without the query: a cursor is the daemon's, and may be long.
+      expect(String(error)).toContain(`GET /jobs/x answered ${http}, not ${status ?? 200}`)
+    }
+  })
+
   it('throws what a route refused with: its status, its code, and whether to ask again', async () => {
     const { client } = fakeClient(() => refuse(404, 'not_found'))
     const error = await client.send('GET', '/jobs/j').catch((e: unknown) => e)

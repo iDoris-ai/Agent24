@@ -109,6 +109,9 @@ describe('ACC-EXTRACT', () => {
       expect(result.extraction).toBeUndefined()
     }
     expect((await run(daemon(extracted(), [page([], 'c1'), page([], 'c1')]))).problems).toEqual(['the pages do not end: cursor c1 came twice'])
+    // A page of values comes with 200: another 2xx is no answer of the route.
+    const accepted = (call: Call) => (call.route.startsWith('/extractions/') ? answer(page(asked, null), 202) : answer(extracted()))
+    expect((await run(accepted)).problems).toEqual([`GET /extractions/${EXT} answered 202, not 200`])
   })
 
   it('fails when the extraction is another than the job names, or of another document, revision or content', async () => {
