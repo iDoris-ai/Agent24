@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { type SampleRun, run } from './run'
+import { type SampleRun, run, scoreSample } from './run'
 import { loadAsk } from './samples'
+import type { Extracted } from './score'
 import { HOLIDAYS, IMPORT, JOB, NOTICE, type Odd, RERUN, capabilities, daemon } from './test/daemon'
 import { anchor, answer, block, extraction, failed, fakeClient, id, refuse, textPage } from './test/fake'
 
@@ -295,5 +296,27 @@ describe('run, with the idempotency checks', () => {
     const { did } = await go({}, one, { replayOn: HOLIDAYS.id, cancelOn: HOLIDAYS.id })
     expect(did.filter((d) => d === 'POST /documents/DOC/extractions')).toHaveLength(1)
     expect(did.some((d) => d.endsWith('/cancel') || d.endsWith('/retry'))).toBe(false)
+  })
+})
+
+describe('scoreSample', () => {
+  it('scores a key answered more than once by its worst answer, whatever order they came in', () => {
+    const field = NOTICE.gold.fields.find((f) => f.status === 'present' && f.value && f.normalized)!
+    const said = (value: string, normalized?: string): Extracted => ({ key: field.key, status: 'present', value, normalized, anchors: [] })
+    const right = said(field.value!, field.normalized)
+    const unsure = said('—', field.normalized)
+    const wrong = said('—', '—')
+    const verdict = (...values: Extracted[]) => scoreSample(NOTICE, values, undefined, false).find((s) => s.gold.key === field.key)?.score.verdict
+    expect([verdict(), verdict(right), verdict(unsure), verdict(wrong)]).toEqual(['missed', 'correct', 'review', 'mismatch'])
+    expect(verdict(right, right)).toBe('correct')
+    for (const [a, b] of [[right, unsure], [unsure, right]]) expect(verdict(a!, b!)).toBe('review')
+    for (const [a, b] of [[right, wrong], [wrong, right], [unsure, wrong], [wrong, unsure]]) expect(verdict(a!, b!)).toBe('mismatch')
+    // Of two answers as bad as each other the first is scored; the anchors are those of the answer that is scored.
+    const absent: Extracted = { key: field.key, status: 'missing', missing_reason: 'not_in_document' }
+    expect([verdict(wrong, absent), verdict(absent, wrong)]).toEqual(['mismatch', 'missed'])
+    const anchors = (...values: Extracted[]) => scoreSample(NOTICE, values, undefined, false).find((s) => s.gold.key === field.key)?.anchors
+    expect(anchors(right)).toBeDefined()
+    expect(anchors(right, absent)).toBeUndefined()
+    expect(scoreSample(NOTICE, [right, absent], undefined, false).find((s) => s.gold.key === field.key)?.result).toEqual(absent)
   })
 })

@@ -131,9 +131,10 @@ function trace(checks: CheckResult[]): TraceRow[] {
 /** What ends a path, besides white space. */
 const END = `'"\`)\\],;<>，。；：、）】》”’`
 /** A path of this machine: from a root, or the home, or a drive, over the
- *  single spaces a directory's name may have (`Application Support/…`). It
- *  does not start inside a word, so the path of a URL is left alone. */
-const PATH = new RegExp(`(?<![\\w.])(?:(?:~|/(?:Users|Volumes|home|root|private|tmp|var|opt|etc|usr|mnt|srv|Library|Applications|System))/|\\b[A-Za-z]:\\\\)[^\\s${END}]*(?: [^\\s/${END}]+/[^\\s${END}]*)*`, 'g')
+ *  single spaces a directory's name may have (`Application Support/…`), in
+ *  any case and with its slashes escaped as JSON may write them. It does not
+ *  start inside a word, so the path of a URL is left alone. */
+const PATH = new RegExp(`(?<![\\w.])(?:(?:~|\\\\?/(?:Users|Volumes|home|root|private|tmp|var|opt|etc|usr|mnt|srv|nix|run|data|Library|Applications|System))\\\\?/|\\b[A-Z]:\\\\)[^\\s${END}]*(?: [^\\s/${END}]+/[^\\s${END}]*)*`, 'gi')
 /** A problem as it may be written down: without the paths of this machine,
  *  and without the secrets. The paths go first: a secret may be the start of
  *  one (the home), and what is left of a path with its start taken out is no
@@ -164,12 +165,12 @@ function sampleReport(run: SampleRun, sample: Sample, clean: (c: CheckResult) =>
     interrupted: run.interrupted,
     text: run.text,
     ...(find ? { find: { anchors: find.anchors, reachable: find.reachable, unreached: find.located.filter((l) => l.found.length === 0).map(({ found: _, ...rest }) => rest) } } : {}),
-    fields: run.scored.map(({ gold, score, anchors }) => ({
+    fields: run.scored.map(({ gold, score, result, anchors }) => ({
       key: gold.key,
       role: gold.role ?? 'answer',
       severity: gold.severity,
       gold: { status: gold.status, value: gold.value, normalized: gold.normalized, missing_reason: gold.missing_reason, candidates: gold.candidates?.map(({ value, normalized }) => ({ value, normalized })) },
-      result: run.extraction?.values.find((v) => v.key === gold.key),
+      result,
       score,
       anchors,
     })),
