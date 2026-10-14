@@ -157,6 +157,12 @@ harness 把 S01 的样本经**已注册的操作**跑一遍，对照金标打分
 ```
 
 - 复核只针对**这一次**的抽取结果，所以每条都带 `extraction_id`，换了结果就失效。
+- 一条复核针对三样东西之一：
+  - 一个字段的结论：`field` 加 `verdict`（不能再写成“待复核”）。能用的词按金标的状态来，就是 §4.2 那张表里这一行有的：金标 `present` 用 `correct`、`mismatch`、`missed`、`false_conflict`；金标 `missing` 用 `correct`、`fabricated`、`unanswered`；金标 `conflict` 用 `correct`、`mismatch`、`missed`、`chose_one`；
+  - 一条金标锚点是否被覆盖（§4.4 第 4 步的改判）：`field` 加 `anchor` 加 `verdict`，取 `covered` 或 `uncovered`。`anchor` 是这条锚点在 `report.json` 里这个字段的 `anchors.anchors` 中排第几（从 1 起）；`report.md` 的“未覆盖的金标锚点”清单里每条都标着这个编号。冲突字段的锚点是按候选组排的，顺序和 `gold.json` 里不一样，以报告为准；
+  - 一条 `must_not_assert`：`must_not_assert`（第几条，从 1 起）加 `verdict`，取 `violated` 或 `not_violated`。
+- 对不上的条目（样本或字段不存在、`extraction_id` 不是报告里的那一次、结论不是上面的词、同一样东西判了两次时的后一条——即使前一条本身没生效）不生效，在报告里逐条列出原因。条目里不能有上面没提到的成员。
+- 人改判的锚点，覆盖了就算覆盖，也不再算“`find` 定位不到”。覆盖点（§3）按人的结论再算一遍，和机械结论并列。
 - 人可以推翻任何机械结论，报告同时保留机械结论、人的结论和复核人。
 
 ### 4.8 汇总
