@@ -143,15 +143,48 @@ describe('writeEvidence', () => {
     fs.writeFileSync(path.join(dir, 'report.md', 'x'), '')
     expect(() => writeEvidence(dir, { ...clean, generated_at: '2026-10-15T00:00:00.000Z' }, [])).toThrow()
     expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([])
+    // What could not be taken away does not hide why it failed.
+    vi.spyOn(fs, 'rmSync').mockImplementation(() => {
+      throw new Error('busy')
+    })
+    expect(() => writeEvidence(dir, clean, [])).toThrow(/EISDIR|ENOTEMPTY|EEXIST|EPERM/)
   })
 
-  it('takes a secret where it stands as a whole, not inside a longer name', async () => {
+  it('writes beside its place under a name of its own, so that one writing does not take another in its place', async () => {
+    const dir = path.join(temp(), 'evidence')
+    fs.mkdirSync(path.join(dir, '.report.json.tmp'), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.report.md.tmp'))
+    writeEvidence(dir, await report(), [])
+    expect(fs.readdirSync(dir).sort()).toEqual(['.report.json.tmp', '.report.md.tmp', 'report.json', 'report.md'])
+  })
+
+  it('finds a secret glued to a word too, as an encoded URL has it', async () => {
     const dir = path.join(temp(), 'evidence')
     const clean = await report()
-    const on = (model: string): Report => ({ ...clean, environment: { ...clean.environment, machine: { model, os: 'macOS 15.2' } } })
-    for (const said of ['MacBook', 'on macbook.local', 'MacBook-2,', '(macbook)']) expect(() => writeEvidence(dir, on(said), ['MacBook']), said).toThrow('secret 1 of 1')
-    writeEvidence(dir, on('MacBookPro18,3'), ['MacBook'])
-    writeEvidence(dir, on('iMacBook'), ['MacBook'])
+    for (const said of ['Bearer%20tok-9f3a1c', 'token%3Dtok-9f3a1c&x', 'xTOK-9F3A1Cx']) {
+      expect(() => writeEvidence(dir, { ...clean, environment: { ...clean.environment, commit: said } }, ['tok-9f3a1c']), said).toThrow('secret 1 of 1, at environment.commit')
+    }
+    // A secret is no name of the machine: what the harness read of it is looked through too.
+    expect(() => writeEvidence(dir, { ...clean, environment: { ...clean.environment, machine: { model: '/srv2/dx', os: 'macOS 15.2' } } }, ['/srv2/dx'])).toThrow('secret 1 of 1, at environment.machine.model')
+    expect(fs.existsSync(dir)).toBe(false)
+  })
+
+  it('takes a name of this machine where it stands as a whole, however short, and not in the machine the harness read itself', async () => {
+    const dir = path.join(temp(), 'evidence')
+    const clean = await report()
+    const at = (commit: string, model = 'Mac16,10'): Report => ({ ...clean, environment: { ...clean.environment, commit, machine: { model, os: 'macOS 15.2' } } })
+    for (const said of ['MacBook', 'on macbook.local', 'MacBook-2,', '(macbook)']) expect(() => writeEvidence(dir, at(said), [], ['MacBook']), said).toThrow('secret 1 of 1, at environment.commit')
+    expect(() => writeEvidence(dir, at('Mac16'), ['absent'], ['Mac16'])).toThrow('secret 2 of 2, at environment.commit')
+    expect(fs.existsSync(dir)).toBe(false)
+    writeEvidence(dir, at('MacBookPro18,3'), [], ['MacBook'])
+    writeEvidence(dir, at('iMacBook'), [], ['MacBook'])
+    // Said where JSON writes it after an escape (`\\nMac16`), it is found in report.md, where it stands alone.
+    expect(() => writeEvidence(dir, at('ok\nMac16'), [], ['Mac16'])).toThrow('secret 1 of 1, at environment.commit')
+    // Where it is said is where it is said back, not where the harness read the machine.
+    expect(() => writeEvidence(dir, { ...at('abc1234'), samples: clean.samples.map((s) => ({ ...s, document_id: 'Mac16' })) }, [], ['Mac16'])).toThrow('secret 1 of 1, at samples.0.document_id')
+    // The machine is what the harness read off it: `Mac16` in `Mac16,10`, `mac` in `macOS`, are not the name said back.
+    writeEvidence(dir, at('abc1234', 'Mac16,10'), [], ['Mac16', 'mac'])
+    expect(fs.readFileSync(path.join(dir, 'report.json'), 'utf8')).toContain('"model": "Mac16,10"')
     expect(fs.readdirSync(dir).sort()).toEqual(['report.json', 'report.md'])
   })
 
@@ -172,6 +205,10 @@ describe('writeEvidence', () => {
       const parent = at.slice(0, -1).reduce((x, k) => x[k], planted)
       parent[at.at(-1)!] = `${parent[at.at(-1)!]} on Mac-mini-Nicolas.local`
       expect(() => writeEvidence(dir, planted, ['s3cret-tok', 'mac-mini-nicolas']), at.join('.')).toThrow('secret 2 of 2')
+      // A short name too, anywhere but in the machine the harness read.
+      if (at[0] === 'environment' && at[1] === 'machine') continue
+      parent[at.at(-1)!] = `${parent[at.at(-1)!]} on Mac16`
+      expect(() => writeEvidence(dir, planted, [], ['Mac16']), at.join('.')).toThrow('secret 1 of 1')
     }
     expect(fs.existsSync(dir)).toBe(false)
   })
@@ -247,15 +284,20 @@ describe('main', () => {
     fs.writeFileSync(path.join(out, 'review.json'), JSON.stringify({ reviewer: 'david', items: [{ sample: NOTICE.id, extraction_id: id('ext'), field: 'notice_reference', verdict: 'correct', note: 'read on mac-mini-nicolas' }] }))
     await expect(main(['review', '--out', out])).rejects.toThrow('the report holds what it must not')
     expect(fs.readFileSync(path.join(out, 'report.json'), 'utf8') + fs.readFileSync(path.join(out, 'report.md'), 'utf8')).toBe(before)
-    // A short name says too little to be looked for: it would be found in any report.
+    // A short name is looked for as a whole word: `pass` is not in `passed`, so a run that passed is written.
     vi.spyOn(os, 'hostname').mockReturnValue('pass.local')
     const plain = path.join(temp(), 'evidence')
     expect((await lines(['run', '--out', plain, '--daemon', serve().state, '--only', NOTICE.id, '--cancel-on', NOTICE.id])).code).toBe(0)
-    // So too without a domain, where the name is the whole of it.
+    // A name without a domain, however short, is taken out too.
     vi.spyOn(os, 'hostname').mockReturnValue('Mac16')
     const short = path.join(temp(), 'evidence')
     await lines(['run', '--out', short, '--daemon', serve({ text: () => answer({ error: { code: 'parse_failed', message: 'no text on Mac16', details: { retryable: false } } }, 422) }).state, '--only', NOTICE.id])
-    expect(fs.readFileSync(path.join(short, 'report.json'), 'utf8')).toContain('no text on Mac16')
+    expect(fs.readFileSync(path.join(short, 'report.json'), 'utf8')).toContain('no text on <redacted>')
+    // Said back where no problem is, the name is not taken out, and nothing is written.
+    const said = serve({ capabilities: () => answer({ ...capabilities(), os_version: 'Mac16 0.1.0' }) })
+    const named = path.join(temp(), 'evidence')
+    await expect(main(['run', '--out', named, '--daemon', said.state, '--only', NOTICE.id])).rejects.toThrow('at environment.os_version')
+    expect(fs.existsSync(named)).toBe(false)
   })
 
   it('takes as samples only the directories that have a gold.json', async () => {

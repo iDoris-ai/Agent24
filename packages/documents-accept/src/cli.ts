@@ -8,6 +8,7 @@
 // report.md into <dir>; `review` merges <dir>/review.json into them (§4.7).
 
 import { execFileSync } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -66,10 +67,12 @@ export function parseArgs(argv: string[]): Args {
   }
 }
 
-/** A secret where it stands as a whole: not inside a longer name (`MacBook`
- *  in `MacBookPro18,3`), whatever its case. */
-const word = (secret: string): RegExp =>
-  new RegExp(`${/^[a-z0-9]/i.test(secret) ? '(?<![a-z0-9])' : ''}${secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${/[a-z0-9]$/i.test(secret) ? '(?![a-z0-9])' : ''}`, 'i')
+const escaped = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** A secret wherever it is, glued to a word or not (`Bearer%20<token>`), whatever its case. */
+const anywhere = (secret: string): RegExp => new RegExp(escaped(secret), 'i')
+/** A name where it stands as a whole: not inside a longer name (`MacBook` in
+ *  `MacBookPro18,3`), whatever its case. */
+const word = (name: string): RegExp => new RegExp(`${/^[a-z0-9]/i.test(name) ? '(?<![a-z0-9])' : ''}${escaped(name)}${/[a-z0-9]$/i.test(name) ? '(?![a-z0-9])' : ''}`, 'i')
 
 /** Where in the report the first text is that `holds` it, by its keys and
  *  never by what it says; or report.md, when only the text made of it there does. */
@@ -86,26 +89,43 @@ function where(report: unknown, holds: (text: string) => boolean): string {
   return found(report, '') ?? 'report.md'
 }
 
-/** Writes report.json and report.md, unless either holds a secret or a path
- *  of this machine (§5): then nothing is written, and neither is said, only where it is. Both
+/** Writes report.json and report.md, unless either holds a secret, a name of
+ *  this machine or a path of it (§5): then nothing is written, and neither is
+ *  said, only where it is. A secret (the bearer, the home) is found anywhere; a
+ *  name only as a whole word, and not in `environment.machine`, which the
+ *  harness reads off this machine itself (`Mac16` is in `Mac16,10`). Both files
  *  are checked: report.md says the text of report.json with its white space
  *  made one space, and a path written with a tab in report.json is written
- *  with a space in report.md. Each is written beside its place and then moved
- *  into it, so that no file is left half written; what was not moved is taken away. */
-export function writeEvidence(dir: string, report: Report & { review?: Reviewed }, secrets: string[]): void {
+ *  with a space in report.md. Each is written beside its place under a name of
+ *  its own and then moved into it, so that no file is left half written; what
+ *  was not moved is taken away. */
+export function writeEvidence(dir: string, report: Report & { review?: Reviewed }, secrets: string[], names: string[] = []): void {
   const json = `${JSON.stringify(report, null, 2)}\n`
   const markdown = `${renderMarkdown(report)}\n`
-  // A secret is looked for as it is and as JSON writes it.
-  const leak = secrets.findIndex((s) => s !== '' && [s, JSON.stringify(s).slice(1, -1)].some((as) => word(as).test(json) || word(as).test(markdown)))
-  if (leak !== -1) throw new Error(`the report holds what it must not (secret ${leak + 1} of ${secrets.length}, at ${where(report, (t) => word(secrets[leak]!).test(t))}): nothing was written`)
+  const unnamed = { ...report, environment: { ...report.environment, machine: { model: '', os: '' } } }
+  const looked = [
+    ...secrets.map((s) => ({ s, find: anywhere, in: report, texts: [json, markdown] })),
+    ...names.map((s) => ({ s, find: word, in: unnamed, texts: [JSON.stringify(unnamed, null, 2), renderMarkdown(unnamed)] })),
+  ]
+  // Each is looked for as it is and as JSON writes it.
+  const leak = looked.findIndex(({ s, find, texts }) => s !== '' && [s, JSON.stringify(s).slice(1, -1)].some((as) => texts.some((t) => find(as).test(t))))
+  if (leak !== -1) {
+    const { s, find, in: of } = looked[leak]!
+    throw new Error(`the report holds what it must not (secret ${leak + 1} of ${looked.length}, at ${where(of, (t) => find(s).test(t))}): nothing was written`)
+  }
   if (holdsPath(json) || holdsPath(markdown)) throw new Error(`the report holds a path of this machine (at ${where(report, holdsPath)}): nothing was written`)
   fs.mkdirSync(dir, { recursive: true })
-  const files = [['report.json', json], ['report.md', markdown]] as const
+  const files = [['report.json', json], ['report.md', markdown]].map(([name, text]) => ({ name: name!, text: text!, temp: path.join(dir, `.${name}.${crypto.randomUUID()}.tmp`) }))
   try {
-    for (const [name, text] of files) fs.writeFileSync(path.join(dir, `.${name}.tmp`), text)
-    for (const [name] of files) fs.renameSync(path.join(dir, `.${name}.tmp`), path.join(dir, name))
+    for (const f of files) fs.writeFileSync(f.temp, f.text)
+    for (const f of files) fs.renameSync(f.temp, path.join(dir, f.name))
   } catch (error) {
-    for (const [name] of files) fs.rmSync(path.join(dir, `.${name}.tmp`), { force: true })
+    // What could not be taken away does not hide why the writing failed.
+    for (const f of files) {
+      try {
+        fs.rmSync(f.temp, { force: true })
+      } catch {}
+    }
     throw error
   }
 }
@@ -124,13 +144,11 @@ const tool = (command: string, args: string[]): string => {
   }
 }
 
-/** What of this machine must not be in a report: its name, with and without
- *  its domain, and the user's home. A name of fewer than 6 characters (`mac`)
- *  says too little to be looked for: it would be found in every report. */
-function ofThisMachine(): string[] {
+/** What of this machine must not be in a report: the user's home, and its
+ *  name, with and without its domain, however short. */
+function ofThisMachine(): { secrets: string[]; names: string[] } {
   const host = os.hostname()
-  const names = [...new Set([host, host.split('.')[0] ?? ''])].filter((name) => name.length >= 6)
-  return [...names, os.homedir()]
+  return { secrets: [os.homedir()], names: [...new Set([host, host.split('.')[0] ?? ''])].filter((name) => name !== '') }
 }
 
 /** The daemon's bearer, for a review to be held to it too: from the state file
@@ -157,7 +175,7 @@ function ran(token: string): Ran {
     commit: dirty ? `${commit}-dirty` : commit,
     machine: { model: tool('sysctl', ['-n', 'hw.model']) || os.arch(), os: version ? `macOS ${version}` : `${os.type()} ${os.release()}` },
     at: new Date(),
-    secrets: [token, ...ofThisMachine()],
+    secrets: [token, ...ofThisMachine().secrets, ...ofThisMachine().names],
   }
 }
 
@@ -167,7 +185,8 @@ export async function main(argv: string[], print: (line: string) => void = conso
   if (args.command === 'review') {
     const report = readReport(JSON.parse(fs.readFileSync(path.join(args.out, 'report.json'), 'utf8')))
     const merged = applyReview(report, readReview(JSON.parse(fs.readFileSync(path.join(args.out, 'review.json'), 'utf8'))))
-    writeEvidence(args.out, merged, [bearer(args.daemon), ...ofThisMachine()])
+    const machine = ofThisMachine()
+    writeEvidence(args.out, merged, [bearer(args.daemon), ...machine.secrets], machine.names)
     print(`merged the review of ${merged.review.reviewer}: ${merged.review.applied} decisions applied, ${merged.review.unused.length} not`)
     for (const u of merged.review.unused) print(`  not applied: ${about(u.item)} (${u.why})`)
     return 0
@@ -184,7 +203,8 @@ export async function main(argv: string[], print: (line: string) => void = conso
   const done = await run(new Client(connection), samples.map((sample) => ({ sample, ask: loadAsk(sample) })), { replayOn: args.replayOn, cancelOn: args.cancelOn, timeoutMs: args.jobMinutes * 60_000 })
   const by = ran(connection.token)
   const report = buildReport(done, samples, by)
-  writeEvidence(args.out, report, by.secrets)
+  const machine = ofThisMachine()
+  writeEvidence(args.out, report, [connection.token, ...machine.secrets], machine.names)
   for (const t of report.trace) print(`${t.check.padEnd(12)} ${t.conclusion}`)
   print(`report.json and report.md are in ${args.out}`)
   return exitCode(report)
