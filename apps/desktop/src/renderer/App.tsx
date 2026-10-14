@@ -6,6 +6,7 @@ declare global {
   interface Window { agent24: Agent24API }
 }
 import ChatPage from './pages/Chat'
+import HomePage from './pages/Home'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
@@ -33,6 +34,7 @@ const MODULE_PAGES: Record<string, React.ComponentType> = {
 }
 
 type BuiltinPage =
+  | 'home'
   | 'chat'
   | 'workbench'
   | 'runs'
@@ -49,6 +51,8 @@ type BuiltinPage =
 type Page = BuiltinPage | string  // string = module route
 
 const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
+  // The landing page: an isometric machine showing how one run moves through the components.
+  { id: 'home',            icon: '🏠' },
   { id: 'chat',            icon: '💬' },
   { id: 'workbench',       icon: '🔧' },
   // ADR-DOC-01 D3: the Documenting OS's page (#705).
@@ -109,7 +113,7 @@ export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): 
 }
 
 export function App(): JSX.Element {
-  const [page, setPage] = useState<Page>('chat')
+  const [page, setPage] = useState<Page>('home')
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
@@ -283,7 +287,7 @@ export function App(): JSX.Element {
       <div className={`main${sidebarOpen ? '' : ' sidebar-hidden'}`}>
         <div className="topbar">
           <span className="topbar-title">{pageTitle}</span>
-          {page === 'chat' && (
+          {(page === 'chat' || page === 'home') && (
             <span className="topbar-sub">{llmLabel}</span>
           )}
           <button
@@ -313,6 +317,14 @@ export function App(): JSX.Element {
         >
           <ChatPage />
         </div>
+        {page === 'home' && (
+          <HomePage
+            backendOk={backendOk}
+            backendPort={backendPort}
+            moduleCount={modules.length}
+            onNavigate={setPage}
+          />
+        )}
         {page === 'workbench'        && <WorkbenchPage />}
         {page === 'documents'        && <DocumentsPage />}
         {page === 'runs'             && <RunsPage />}

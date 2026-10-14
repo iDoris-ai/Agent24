@@ -2,6 +2,7 @@ import { defineMessages } from './i18n'
 
 export const appMessages = defineMessages({
   en: {
+    'nav.home': 'Overview', 'title.home': 'Overview',
     'nav.chat': 'Chat', 'nav.workbench': 'Workbench', 'nav.documents': 'Documents', 'nav.runs': 'Runs',
     'nav.schedules': 'Schedules', 'nav.communication': 'Comms', 'nav.approvals': 'Approvals',
     'nav.voice': 'Voice', 'nav.creative': 'Design', 'nav.models': 'Models',
@@ -25,6 +26,7 @@ export const appMessages = defineMessages({
     'module.notRegistered': 'Component not registered in MODULE_PAGES.',
   },
   zh: {
+    'nav.home': '总览', 'title.home': '总览',
     'nav.chat': '对话', 'nav.workbench': '工作台', 'nav.documents': '文档', 'nav.runs': '任务',
     'nav.schedules': '调度', 'nav.communication': '通信', 'nav.approvals': '审批',
     'nav.voice': '语音', 'nav.creative': 'Design', 'nav.models': '模型',
@@ -48,6 +50,7 @@ export const appMessages = defineMessages({
     'module.notRegistered': '组件未在 MODULE_PAGES 中注册。',
   },
   th: {
+    'nav.home': 'ภาพรวม', 'title.home': 'ภาพรวม',
     'nav.chat': 'แชท', 'nav.workbench': 'โต๊ะทำงาน', 'nav.documents': 'เอกสาร', 'nav.runs': 'งาน',
     'nav.schedules': 'ตารางเวลา', 'nav.communication': 'การสื่อสาร', 'nav.approvals': 'การอนุมัติ',
     'nav.voice': 'เสียง', 'nav.creative': 'Design', 'nav.models': 'โมเดล',
