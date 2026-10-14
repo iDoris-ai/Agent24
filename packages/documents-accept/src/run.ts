@@ -9,7 +9,7 @@ import type { Client } from './client'
 import { type Extraction, checkCancelledStays, checkExtract, checkReplay, checkRerunKey, startExtraction } from './extract-checks'
 import { type FindRead, type TextRead, checkFind, checkRender, checkText, locator } from './read-checks'
 import { type AskField, type Sample, isVerified } from './samples'
-import { type Extracted, scoreField } from './score'
+import { type Extracted, type FieldScore, scoreField } from './score'
 import { type Scored, type Totals, coverage, summarize } from './summary'
 
 type Schemas = components['schemas']
@@ -17,7 +17,8 @@ type Schemas = components['schemas']
 export interface SampleRun {
   sample: string
   documentId?: string
-  /** Every check of this sample, in the order of §3; one that could not be run is `blocked`. */
+  /** Every check of this sample, in the order the notes to §3 give (ACC-IDEM-3
+   *  before ACC-EXTRACT, ACC-IDEM-1 and -2 after it); one that could not be run is `blocked`. */
   checks: CheckResult[]
   text?: TextRead
   find?: FindRead
@@ -57,13 +58,18 @@ const REPLAYS = ['ACC-IDEM-1', 'ACC-IDEM-2']
 /** A check's result without what it read on the way: that has its own place in the run. */
 const plain = ({ id, sample, outcome, problems, ms }: CheckResult): CheckResult => ({ id, ...(sample === undefined ? {} : { sample }), outcome, problems, ms })
 
-/** Every gold field of a sample against the values of its extraction (§4.2–§4.4). */
+/** Every gold field of a sample against the values of its extraction (§4.2–§4.4).
+ *  A key answered more than once (ACC-EXTRACT fails it) is right only if every
+ *  answer is: the worst of them is scored, whatever order they came in. */
 export function scoreSample(sample: Sample, values: Extracted[], find: FindRead | undefined, partial: boolean): Scored[] {
   const locate = locator(find?.located ?? [])
+  const rank = (s: FieldScore) => (s.verdict === 'correct' ? 0 : s.verdict === 'review' ? 1 : 2)
   return sample.gold.fields.map((gold) => {
-    const value = values.find((v) => v.key === gold.key)
+    const answers: (Extracted | undefined)[] = values.filter((v) => v.key === gold.key)
+    const scored = (answers.length > 0 ? answers : [undefined]).map((value) => ({ value, score: scoreField(gold, value, partial) }))
+    const { value, score } = scored.reduce((worst, s) => (rank(s.score) > rank(worst.score) ? s : worst))
     const anchors = fieldAnchors(gold, value, locate)
-    return { sample: sample.id, gold, score: scoreField(gold, value, partial), ...(anchors ? { anchors } : {}) }
+    return { sample: sample.id, gold, score, ...(value ? { result: value } : {}), ...(anchors ? { anchors } : {}) }
   })
 }
 
@@ -113,6 +119,8 @@ async function check(client: Client, sample: Sample, ask: AskField[], options: R
   if (replays.length === 0) return
   if (run.extraction === undefined) return block(replays, 'no extraction was read to replay')
   const replayed = await checkReplay(client, sample, documentId, ask, job, options)
+  // The checks run one after another, never two on this document at once:
+  // ACC-IDEM-3 counts on no other cancel or retry of its job (AFTER_CANCEL).
   done(replayed, await checkRerunKey(client, sample, documentId, ask, job))
   if (replayed.requeued !== undefined) run.requeued = replayed.requeued
 }

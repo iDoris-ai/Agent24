@@ -4,13 +4,15 @@
 
 import type { AnchorScore } from './anchors'
 import type { GoldField } from './samples'
-import type { FieldScore, Verdict } from './score'
+import type { Extracted, FieldScore, Verdict } from './score'
 
 /** One gold field of one sample, scored. */
 export interface Scored {
   sample: string
   gold: GoldField
   score: FieldScore
+  /** The answer that was scored: of a key answered more than once, the worst. */
+  result?: Extracted
   /** Present when both the gold and the result have a value. */
   anchors?: AnchorScore
 }
