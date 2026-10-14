@@ -116,6 +116,9 @@ async function began(response: Response, token: string): Promise<string> {
   return text === '' ? 'no body' : text
 }
 
+/** A text without the bearer, whatever its case. */
+const redact = (text: string, token: string): string => (token === '' ? text : text.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '<redacted>'))
+
 /** What ends a piece of a body: white space, or the punctuation of JSON, a query or a header. */
 const BETWEEN = `\\s"',:;{}[\\]()<>=&?`
 /** At most 200 characters of a body, on one line, without the bearer. The
@@ -123,8 +126,7 @@ const BETWEEN = `\\s"',:;{}[\\]()<>=&?`
  *  inside another piece, the piece is left out whole: a name of this machine
  *  is said whole, for `scrub` to take out, or not at all. */
 export function excerpt(body: string, token = ''): string {
-  const bare = token === '' ? body : body.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '<redacted>')
-  const text = bare.replace(/\s+/g, ' ').trim()
+  const text = redact(body, token).replace(/\s+/g, ' ').trim()
   if (text.length <= 200) return text
   const cut = text.slice(0, 200)
   const kept = (new RegExp(`[${BETWEEN}]`).test(text[200]!) ? cut : cut.replace(new RegExp(`[^${BETWEEN}]*$`), '')).trimEnd()
@@ -141,6 +143,6 @@ async function failure(response: Response, token: string): Promise<ApiError> {
     // Not the envelope: the text itself is all there is to say.
   }
   const code = typeof error?.code === 'string' ? error.code : 'unknown'
-  const message = typeof error?.message === 'string' ? error.message : excerpt(text, token)
+  const message = typeof error?.message === 'string' ? redact(error.message, token) : excerpt(text, token)
   return new ApiError(response.status, code, error?.details?.retryable === true, message)
 }
