@@ -67,16 +67,20 @@ fn due(p: &Progress, started: Instant, last: Option<Instant>) -> (Instant, Strin
     }
 }
 
-/// Waits for `fut` until `until`, or for `cancel`.
+/// Waits for `fut` until `until`, or for `cancel`. When more than one is
+/// ready, a cancel wins, then the time: a `fut` that stops early on a cancel
+/// (as `read_error_body` does) still ends the call as `Cancelled`, and one
+/// that is always ready cannot outrun the deadline.
 pub(crate) async fn until<T>(
     fut: impl Future<Output = T>,
     until: Instant,
     cancel: &CancellationToken,
 ) -> Result<Option<T>, ModelError> {
     tokio::select! {
-        v = fut => Ok(Some(v)),
-        () = tokio::time::sleep_until(until.into()) => Ok(None),
+        biased;
         () = cancel.cancelled() => Err(ModelError::Cancelled),
+        () = tokio::time::sleep_until(until.into()) => Ok(None),
+        v = fut => Ok(Some(v)),
     }
 }
 
@@ -122,12 +126,16 @@ pub(crate) async fn read(
             )));
         }
         pending.extend_from_slice(&bytes);
+        // Where the next line starts. The lines read are dropped once a chunk,
+        // not once a line, which would move the rest of `pending` each time.
+        let mut start = 0usize;
         while let Some(i) = pending[scanned..].iter().position(|&b| b == b'\n') {
-            let raw: Vec<u8> = pending.drain(..=scanned + i).collect();
-            scanned = 0;
+            let end = scanned + i + 1;
+            let raw = &pending[start..end];
+            (start, scanned) = (end, end);
             // A line is decoded whole, so a character split across chunks is not
             // broken; bytes that are no UTF-8 become U+FFFD rather than an error.
-            let line = String::from_utf8_lossy(&raw);
+            let line = String::from_utf8_lossy(raw);
             let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
                 // A blank line ends an event: only one with data counts.
@@ -153,6 +161,7 @@ pub(crate) async fn read(
             }
             // A comment, `event:`, `id:` or `retry:` line says nothing of the answer.
         }
+        pending.drain(..start);
         scanned = pending.len();
     }
 }
