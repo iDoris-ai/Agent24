@@ -1,6 +1,6 @@
 # ME4-S2b —— 模块推理回调开放 `temperature`（修订 ME4-S2 §4.2）
 
-> 状态：**草案 v2.1，待 jason 审**。起草：Documenting 线（DOC-1-09 第 9 步，2026-10-15；David 同意开放温度参数）。
+> 状态：**v2.1，已定（David，2026-10-15）**，§9 的三个问题按建议定。改的是内核与模块之间的接口，jason 在 #954 知会；他有意见可以在 `ab/documenting` → `main` 的发布 PR 之前提。起草：Documenting 线（DOC-1-09 第 9 步，2026-10-15；David 同意开放温度参数）。
 > 设计审查：Fable 5.1 代审（codex 本机未装），第 1 轮 REQUEST_CHANGES（1 H / 6 M / 4 L），第 2 轮 REQUEST_CHANGES（1 M / 4 L），第 3 轮 APPROVE，都已采纳，见文末「改动记录」。
 > 修订对象：`docs/design/ME4-S2-model-callback.md` §4.2（params 的确切形状，以及「`temperature` 等采样参数本轮不开（最小集），将来加是**加字段**」那一条）；
 > `docs/specs/WIRE-OOP-MODULE.md` §5.5；`docs/design/ME4-S3-os-sdk.md` 里 `CompleteRequest` 的形状。
@@ -71,7 +71,7 @@
 
 ## 4. 版本兼容：一个新模块装在老内核上
 
-老内核的 `deny_unknown_fields` 会把带 `temperature` 的调用回 `-32602`。今天这种错配**不是边角情况**：文档模块没有第一方安装，开发时用 `agent24 os install` 手装（`rust/apps/agent24-documents/README.md:7`、`:28`）；`install` 只校验 manifest 的形状（`agent24-os-packages/src/install.rs:89-99`）；装好的包会留在 packages 目录里，跨内核升降级一直在。两种做法，**请 jason 选（Q1）**：
+老内核的 `deny_unknown_fields` 会把带 `temperature` 的调用回 `-32602`。今天这种错配**不是边角情况**：文档模块没有第一方安装，开发时用 `agent24 os install` 手装（`rust/apps/agent24-documents/README.md:7`、`:28`）；`install` 只校验 manifest 的形状（`agent24-os-packages/src/install.rs:89-99`）；装好的包会留在 packages 目录里，跨内核升降级一直在。两种做法，**已选 (B)**（Q1）：
 
 - **(A) 只加字段，不升协议版本**：
   - 老内核回 `-32602`，SDK 报 `ClientError::InvalidParams`（`agent24-os-sdk/src/error.rs:166-167`）。今天抽取器会落到兜底分支（`extract/run.rs:149`），以 `engine_unavailable` 失败，`message` 是「the local model: invalid params: unknown field `temperature` …」；
@@ -86,7 +86,7 @@
     - SDK 的 `PROTOCOL_MAX`（`agent24-os-sdk/src/module.rs:24-25`）改为 2；
     - 握手测试跟着改，manifest 加一行。
 
-我原先倾向 (A)；把 (B) 简化成上面的样子以后，**改为倾向 (B)**：代价只是版本范围加一，换来的是错配在安装时就暴露。这对「手装模块」这个现状正合适。这件事是 jason 的接口，请他定。
+我原先倾向 (A)；把 (B) 简化成上面的样子以后，**改为倾向 (B)**：代价只是版本范围加一，换来的是错配在安装时就暴露。这对「手装模块」这个现状正合适。David 按此选了 (B)。
 
 ## 5. SDK 与文档模块
 
@@ -99,7 +99,7 @@
   - `ab/documenting-129-ground-by-quote`（改法 A，引文按原文定位）已经把版本从 2 改成 3，两者都碰 `extract.rs:18` 和 ADR §3.2 的版本条目。**合并时取下一个没用过的号，后合并的一方重新编号**，ADR 按同样的格式加一条「N：抽取以温度 0 调用模型（日期）」；
   - ADR-DOC-02 §3.2 补一句「抽取以温度 0 调用模型」。
 
-## 6. 切法（每个 ≤ 300 行，不计测试；base 为 `ab/documenting`；请 jason 审）
+## 6. 切法（每个 ≤ 300 行，不计测试；base 为 `ab/documenting`）
 
 1. **`agent24-models` + `agent24d`**：§2、§3，J1–J6。
 2. **`agent24-os-sdk`**：§5 的 SDK 部分与 CHANGELOG，J7、J10。
@@ -133,13 +133,13 @@ J1 只断言 `temperature` 这个键的有无和值，不断言整个请求体�
 | R-a | 温度 0 也不保证不同硬件、不同后端版本之间逐字节一致（llama.cpp 的批处理、浮点顺序） | 同一台机器上实测三次一致；验收证据本来就记录机器、后端和模型 |
 | R-b | 温度 0 时，个别模型会陷入重复输出 | `max_tokens` 上限兜底；抽取器对截断的回答有拆半重问的规则 |
 | R-c | 选 (A) 时，新模块装在老内核上，要到 job 运行才失败 | 报错写明要升级；或者选 (B)，在挂载时就拒绝 |
-| R-d | oMLX 对 `temperature` 的处理没有验证 | OpenAI 兼容接口的标准字段；请 jason 在 oMLX 上试一次 |
+| R-d | oMLX 对 `temperature` 的处理没有验证 | OpenAI 兼容接口的标准字段；实现时若手上没有 oMLX，请 jason 在 oMLX 上试一次 |
 
-## 9. 请 jason 定
+## 9. 决定（David，2026-10-15）
 
-- **Q1** 版本兼容用 (A) 还是 (B)（§4）。
-- **Q2** 本轮只开 `temperature`、`seed` 暂缓（§1），是否同意。
-- **Q3** `temperature` 的范围 0–2 是否合适。
+- **Q1** 版本兼容选 (B)：协议版本 1 → 2，不按连接区分，文档模块的 manifest 写 `min_daemon_protocol: 2`，在安装和挂载时把关（§4）。所以 §6 的第 3 片要做，文档模块不加 `InvalidParams` 分支。
+- **Q2** 本轮只开 `temperature`，`seed` 暂缓（§1）。
+- **Q3** `temperature` 的范围 0–2。
 
 ## 改动记录
 
