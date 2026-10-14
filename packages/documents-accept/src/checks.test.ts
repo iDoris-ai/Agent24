@@ -163,6 +163,9 @@ describe('ACC-IMPORT', () => {
     expect(chunks.map((c) => [c.headers['upload-offset'], c.bytes?.length])).toEqual([['0', 786432], ['786432', 786432], ['1572864', 5]])
     expect(chunks.map((c) => c.headers['chunk-sha256'])).toEqual(chunks.map((c) => sha(c.bytes!)))
     expect(Buffer.concat(chunks.map((c) => c.bytes!)).equals(bytes)).toBe(true)
+    // Before its last chunk the upload is still receiving.
+    const early = await checkImport(fakeClient(importing({ upload: { status: 'complete' } })).client, big, QUICK)
+    expect(early.problems).toEqual([`the upload is complete with 786432 bytes after 786432 of ${bytes.length} were sent`])
   })
 
   it('uploads under a new key every time, so that every run gets a new document', async () => {
