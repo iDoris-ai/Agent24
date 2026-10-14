@@ -256,6 +256,7 @@ describe('what a report must not hold (§5)', () => {
     // In any case, with its slashes escaped as JSON may write them, and from the roots of other systems.
     expect(scrub('open /users/x/y.pdf and /VOLUMES/z', [])).toBe('open <path> and <path>')
     expect(scrub('{"path":"\\/Users\\/x\\/y.pdf"}', [])).toBe('{"path":"<path>"}')
+    expect(scrub('{"url":"https:\\/\\/a.com\\/Users\\/x"}', [])).toBe('{"url":"https:\\/\\/a.com\\/Users\\/x"}')
     expect(scrub('see /nix/store/abc-x, /run/user/501/s and /data/x.', [])).toBe('see <path>, <path> and <path>.')
     expect(scrub('<home /tmp/x>', [])).toBe('<home <path>>')
     // A secret in another case, or with its slashes escaped, is the same secret; one that only looks like a pattern is taken as it is.

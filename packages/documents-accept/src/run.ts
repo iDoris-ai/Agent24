@@ -3,7 +3,7 @@
 // here; the report is made from what this returns.
 
 import type { components } from '@agent24/api-client'
-import { fieldAnchors } from './anchors'
+import { type AnchorScore, fieldAnchors } from './anchors'
 import { type CheckResult, type JobWait, checkCapabilities, checkGet, checkImport } from './checks'
 import type { Client } from './client'
 import { type Extraction, checkCancelledStays, checkExtract, checkReplay, checkRerunKey, startExtraction } from './extract-checks'
@@ -60,15 +60,20 @@ const plain = ({ id, sample, outcome, problems, ms }: CheckResult): CheckResult 
 
 /** Every gold field of a sample against the values of its extraction (§4.2–§4.4).
  *  A key answered more than once (ACC-EXTRACT fails it) is right only if every
- *  answer is: the worst of them is scored, whatever order they came in. */
+ *  answer is: the worst of them is scored, whatever order they came in. Its
+ *  anchors are those of the answer that covers the fewest, of all its answers
+ *  that have anchors to score: none of them makes the coverage look better. */
 export function scoreSample(sample: Sample, values: Extracted[], find: FindRead | undefined, partial: boolean): Scored[] {
   const locate = locator(find?.located ?? [])
   const rank = (s: FieldScore) => (s.verdict === 'correct' ? 0 : s.verdict === 'review' ? 1 : 2)
+  const covered = (a: AnchorScore) => a.anchors.filter((c) => c.by !== undefined).length
+  // Fewer covered is worse; as many covered of more gold anchors is worse too.
+  const fewer = (a: AnchorScore, b: AnchorScore) => covered(a) < covered(b) || (covered(a) === covered(b) && a.anchors.length > b.anchors.length)
   return sample.gold.fields.map((gold) => {
     const answers: (Extracted | undefined)[] = values.filter((v) => v.key === gold.key)
     const scored = (answers.length > 0 ? answers : [undefined]).map((value) => ({ value, score: scoreField(gold, value, partial) }))
     const { value, score } = scored.reduce((worst, s) => (rank(s.score) > rank(worst.score) ? s : worst))
-    const anchors = fieldAnchors(gold, value, locate)
+    const anchors = scored.map((s) => fieldAnchors(gold, s.value, locate)).reduce<AnchorScore | undefined>((worst, a) => (a !== undefined && (worst === undefined || fewer(a, worst)) ? a : worst), undefined)
     return { sample: sample.id, gold, score, ...(value ? { result: value } : {}), ...(anchors ? { anchors } : {}) }
   })
 }

@@ -314,9 +314,33 @@ describe('scoreSample', () => {
     // Of two answers as bad as each other the first is scored; the anchors are those of the answer that is scored.
     const absent: Extracted = { key: field.key, status: 'missing', missing_reason: 'not_in_document' }
     expect([verdict(wrong, absent), verdict(absent, wrong)]).toEqual(['mismatch', 'missed'])
-    const anchors = (...values: Extracted[]) => scoreSample(NOTICE, values, undefined, false).find((s) => s.gold.key === field.key)?.anchors
-    expect(anchors(right)).toBeDefined()
-    expect(anchors(right, absent)).toBeUndefined()
     expect(scoreSample(NOTICE, [right, absent], undefined, false).find((s) => s.gold.key === field.key)?.result).toEqual(absent)
+  })
+
+  it('scores the anchors of a key answered more than once by the answer that covers the fewest, whatever order they came in', () => {
+    const field = NOTICE.gold.fields.find((f) => f.status === 'present' && f.value && f.normalized && (f.anchors?.length ?? 0) > 0)!
+    const gold = field.anchors![0]!
+    const sourced = [{ ...anchor(gold.page, 'p1/b1'), quote: gold.quote }]
+    const said = (value: string, anchors: object[]): Extracted => ({ key: field.key, status: 'present', value, normalized: field.normalized, anchors } as Extracted)
+    const covering = said(field.value!, sourced)
+    const bare = said(field.value!, [])
+    const wrong = { ...said('—', sourced), normalized: '—' }
+    const absent: Extracted = { key: field.key, status: 'missing', missing_reason: 'not_in_document' }
+    const anchors = (...values: Extracted[]) => scoreSample(NOTICE, values, undefined, false).find((s) => s.gold.key === field.key)?.anchors
+    const covered = (...values: Extracted[]) => anchors(...values)?.anchors.filter((a) => a.by !== undefined).length
+    expect([covered(covering), covered(bare), anchors(absent)]).toEqual([1, 0, undefined])
+    // The verdict is wrong's, the anchors bare's: neither answer makes the coverage better.
+    for (const twice of [[bare, wrong], [wrong, bare], [covering, bare], [bare, covering]]) expect(anchors(...twice)?.verdict, JSON.stringify(twice.map((t) => t.anchors?.length))).toBe('unsourced')
+    // An answer with no value to anchor does not take away the anchors of one that has.
+    for (const twice of [[covering, absent], [absent, covering]]) expect(covered(...twice)).toBe(1)
+    for (const twice of [[bare, absent], [absent, bare]]) expect(covered(...twice)).toBe(0)
+  })
+
+  it('of two answers that cover as few, scores the anchors of the one with more gold anchors to cover', () => {
+    // shutoff_end_time: 4 gold anchors stand on 18:00, 1 on 17:00.
+    const only = (normalized: string): Extracted => ({ key: 'shutoff_end_time', status: 'conflict', candidates: [{ value: normalized, normalized, anchors: [] }] } as Extracted)
+    const gold = (...values: Extracted[]) => scoreSample(NOTICE, values, undefined, false).find((s) => s.gold.key === 'shutoff_end_time')?.anchors?.anchors.length
+    expect([gold(only('18:00')), gold(only('17:00'))]).toEqual([4, 1])
+    for (const twice of [[only('18:00'), only('17:00')], [only('17:00'), only('18:00')]]) expect(gold(...twice)).toBe(4)
   })
 })
