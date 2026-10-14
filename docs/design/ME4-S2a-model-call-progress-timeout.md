@@ -1,6 +1,6 @@
 # ME4-S2a —— 模块推理回调的时限按进展算（修订 ME4-S2 决策 M2 的数值）
 
-> 状态：**草案 v2.1，待 jason 审**。起草：Documenting 线（DOC-1-09 第 9 步真实验收时发现，2026-10-14）。
+> 状态：**v2.2，已定（David，2026-10-15）**，§7 的四个问题按建议定。改的是内核与模块之间的接口，jason 在 #948 知会；他有意见可以在 `ab/documenting` → `main` 的发布 PR 之前提。起草：Documenting 线（DOC-1-09 第 9 步真实验收时发现，2026-10-14）。
 > 设计审查：Fable 5.1 代审（codex 本机未装）。第 1 轮 REQUEST_CHANGES（3 H / 5 M / 6 L），第 2 轮 APPROVE（0 H / 2 M / 7 L），都已采纳，见文末「改动记录」。
 >
 > **修订对象**：
@@ -117,7 +117,7 @@ pub struct Progress {
 ### 2.4 内核与 RPC
 
 - `ModelCompleteHandler`：入口设 `progress`（§2.2）。`call_timeout()` 返回 `MODEL_CALL_BACKSTOP`。
-- `rpc.rs` 的夹紧值 `MAX_METHOD_CALL_TIMEOUT`（300s）要容得下兜底值，否则 `effective_call_timeout`（`rpc.rs:1256`）会悄悄把兜底值夹到截止时间之前，§0 的问题就又回来了。**请 jason 选（Q2）**：
+- `rpc.rs` 的夹紧值 `MAX_METHOD_CALL_TIMEOUT`（300s）要容得下兜底值，否则 `effective_call_timeout`（`rpc.rs:1256`）会悄悄把兜底值夹到截止时间之前，§0 的问题就又回来了。**已选 (A)**（Q2）：
   - **(A，推荐)** 把 `MAX_METHOD_CALL_TIMEOUT` 提到 `MODEL_CALL_BACKSTOP`。今天只有 `_a24/model/complete` 声明了方法级时限，其他方法仍用连接级 30s；
     这个常量的含义改写成「声明了方法级时限的方法，最多能拿到的值」，并加编译期 `assert!(MAX_METHOD_CALL_TIMEOUT >= MODEL_CALL_BACKSTOP)`（同 `module.rs:268` 的写法）。
   - (B) 保留 300s 作为通用夹紧，另加一个只对模型方法放行的常量。代码多一处分支，但「方法级时限 ≤ 300s」这条承诺字面不变。
@@ -177,7 +177,7 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
 
 变异：去掉任一个计时、让注释行推动计时、把断流当成完成、每个 provider 重算截止时间、`progress` 为 `None` 也走流式，各自至少一条测试变红。
 
-## 5. 切法（每个 ≤ 300 行，不计测试；base 为 `ab/documenting`，因为 Documenting 的验收在等它；请 jason 审）
+## 5. 切法（每个 ≤ 300 行，不计测试；base 为 `ab/documenting`，因为 Documenting 的验收在等它）
 
 1. **`agent24-os-proto` + `agent24-models`**：§2.1 的常量、`Progress` 字段、流式读与三个计时（§2.3），J1–J11、J13。
    这时还没有任何调用方设 `progress`，所以这个 PR 合进去，运行行为不变。
@@ -192,17 +192,17 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
 |---|---|---|
 | R-a | 其他 `complete()` 调用方（§1 的表）仍是固定 120s、非流式 | 它们的输出通常很短；要不要开启，另行决定（Q4） |
 | R-b | 串行后端（Ollama 默认 `NUM_PARALLEL=1`）里排队的调用，排队时间算在首段里：前面有一个长调用时，后面的可能在 300s 时以 `no_provider` 失败 | 和今天一样（今天是 120s）；全局 4 个在途的上限不变；文档模块一个 job 一次只发一个调用 |
-| R-c | oMLX 对 `stream: true` + `json_schema` + `stream_options` 的支持，本文没有验证 | 请 jason 在 oMLX 上跑 J1 的手工版；不支持流式时走 §2.3 最后一条的回退，但会受那里写的限制 |
+| R-c | oMLX 对 `stream: true` + `json_schema` + `stream_options` 的支持，本文没有验证 | 实现时若手上没有 oMLX，请 jason 在 oMLX 上跑一次 J1 的手工版；不支持流式时走 §2.3 最后一条的回退，但会受那里写的限制 |
 | R-d | 一次调用占着回调槽和模型准入名额的时间，最长从 120s 变为约 74 分钟（ME4-S2 R1）。出字之后卡住，60s 内就会被发现；但首段最长要等 300s，而一个只有 1 token/s 的后端会一直占到截止时间 | 本地推理本来就是串行的；每模块 2、全局 4 的上限不变 |
 | R-e | 结果在连接断开后仍取不回（ME4-S2 R1 后半） | 不变 |
 | R-f | 不支持流式的后端，生成超过 300s 的调用仍会失败（§2.3 最后一条） | 本机已知的后端（Ollama）支持流式；oMLX 见 R-c |
 
-## 7. 请 jason 定
+## 7. 决定（David，2026-10-15）
 
-- **Q1** 三个数（300s / 60s / 每 token 1s）是否合适。
-- **Q2** 夹紧值用 (A) 还是 (B)（§2.4）。
-- **Q3** 约 74 分钟的兜底值，是否仍算守住了「任何方法都不能把一次调用变成实际无界」：它有界，而且是从 `max_tokens` 的上限推出来的，不是随手选的数。
-- **Q4** §1 表里的其他调用方，要不要以后也开启按进展计时（R-a）。
+- **Q1** 三个数：按建议，首段 300s、间隔 60s、每 token 1s。
+- **Q2** 夹紧值：(A)，把 `MAX_METHOD_CALL_TIMEOUT` 提到 `MODEL_CALL_BACKSTOP`，并加编译期断言（§2.4，J13）。
+- **Q3** 约 74 分钟的兜底值算守住了「任何方法都不能把一次调用变成实际无界」：它有界，而且是从 `max_tokens` 的上限推出来的。
+- **Q4** §1 表里的其他调用方这次不开启，等有调用方撞上再议（R-a）。
 
 ## 改动记录
 
