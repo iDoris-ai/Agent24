@@ -267,6 +267,20 @@ describe('readReport', () => {
     expect(() => readReport(passed)).toThrow(CHANGED)
   })
 
+  it('says a report is none of this harness only when a part of it is of no shape it writes; any other error is said as it is', async () => {
+    const written = JSON.parse(JSON.stringify(await report())) as Report
+    const failing = (error: Error) => Object.defineProperty({ ...written }, 'totals', { enumerable: true, get: () => { throw error } })
+    const odd = new TypeError('a part of no shape')
+    expect(() => readReport(failing(odd))).toThrow('report.json is not a report of this harness (documents-accept-report-v1)')
+    try {
+      readReport(failing(odd))
+    } catch (error) {
+      expect((error as Error).cause).toBe(odd)
+    }
+    const other = new RangeError('something else went wrong')
+    expect(() => readReport(failing(other))).toThrow(other)
+  })
+
   it('reads none of what a review merged in, whatever was made of it', async () => {
     const reviewed = JSON.parse(JSON.stringify(applyReview(await report(), review([on({ field: 'lift_in_service' })])))) as Report & { review: { totals: { answer: { correct: number; critical: unknown[] } } } }
     const kinder = structuredClone(reviewed)
