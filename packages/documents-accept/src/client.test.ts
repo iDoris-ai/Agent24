@@ -85,8 +85,17 @@ describe('Client', () => {
       const error = await got(http, status)
       expect(error, `${http} for ${status}`).toBeInstanceOf(ContractError)
       // Said without the query: a cursor is the daemon's, and may be long.
-      expect(String(error)).toContain(`GET /jobs/x answered ${http}, not ${status ?? 200}`)
+      expect(String(error)).toContain(`GET /jobs/x answered ${http}, not ${status ?? 200}: ${JSON.stringify(job()).slice(0, 200)}…`)
     }
+    // How the body began, on one line and no longer than 200 characters; or that there was none.
+    const said = async (body: string) => String(await fakeClient(() => new Response(body, { status: 201 })).client.json('GET', '/jobs/x', 'DocumentsJob').catch((e: unknown) => e))
+    expect(await said('a\n\t b')).toBe('Error: GET /jobs/x answered 201, not 200: a b')
+    expect(await said('x'.repeat(201))).toBe(`Error: GET /jobs/x answered 201, not 200: ${'x'.repeat(200)}…`)
+    expect(await said('x'.repeat(200))).toBe(`Error: GET /jobs/x answered 201, not 200: ${'x'.repeat(200)}`)
+    expect(await said('')).toBe('Error: GET /jobs/x answered 201, not 200: no body')
+    // A body that breaks off is no other error: the status is what is wrong.
+    const cut = new ReadableStream({ start: (c) => c.error(new Error('cut')) })
+    expect(String(await fakeClient(() => new Response(cut, { status: 201 })).client.json('GET', '/jobs/x', 'DocumentsJob').catch((e: unknown) => e))).toBe('Error: GET /jobs/x answered 201, not 200: a body that could not be read')
   })
 
   it('throws what a route refused with: its status, its code, and whether to ask again', async () => {

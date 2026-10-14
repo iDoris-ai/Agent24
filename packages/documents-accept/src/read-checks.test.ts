@@ -50,8 +50,8 @@ describe('ACC-TEXT', () => {
   })
 
   it('fails on a page that comes with another status than 200', async () => {
-    expect((await checkText(fakeClient(() => answer(textPage([], null), 206)).client, FEES, DOC)).problems).toEqual([`GET ${TEXT} answered 206, not 200`])
-    expect((await checkFind(fakeClient(() => answer(found([anchor(1, 'p1/b1')]), 201)).client, NOTICE, DOC)).problems).toEqual([`POST /documents/${DOC}/find answered 201, not 200`])
+    expect((await checkText(fakeClient(() => answer(textPage([], null), 206)).client, FEES, DOC)).problems).toEqual([expect.stringContaining(`GET ${TEXT} answered 206, not 200: `)])
+    expect((await checkFind(fakeClient(() => answer(found([anchor(1, 'p1/b1')]), 201)).client, NOTICE, DOC)).problems).toEqual([expect.stringContaining(`POST /documents/${DOC}/find answered 201, not 200: `)])
   })
 
   it('fails on a page that is not what the contract says', async () => {

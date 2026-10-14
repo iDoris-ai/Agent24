@@ -113,7 +113,7 @@ describe('ACC-CAP', () => {
 })
 
 /** A daemon that takes an upload chunk by chunk and imports it, as the routes do. */
-function importing(change: { created?: object; createdStatus?: number; upload?: object; chunkStatus?: number; started?: object; startedStatus?: number; job?: object } = {}) {
+function importing(change: { created?: object; createdStatus?: number; upload?: object; chunkStatus?: number; started?: object; startedStatus?: number; startedRaw?: () => Response; job?: object } = {}) {
   let received = 0
   let polls = 0
   let size = 0
@@ -129,7 +129,7 @@ function importing(change: { created?: object; createdStatus?: number; upload?: 
       received += call.bytes?.length ?? 0
       return answer(upload({ total_size: size, sha256: hash, received, status: received === size ? 'complete' : 'receiving', ...change.upload }), change.chunkStatus ?? 200)
     }
-    if (call.route === '/imports') return answer(change.started ?? job({ kind: 'import' }), change.startedStatus ?? 202)
+    if (call.route === '/imports') return change.startedRaw?.() ?? answer(change.started ?? job({ kind: 'import' }), change.startedStatus ?? 202)
     if (call.route === `/jobs/${JOB}`) {
       polls += 1
       if (polls < 3) return answer(job({ kind: 'import', status: polls === 1 ? 'queued' : 'running' }))
@@ -196,9 +196,9 @@ describe('ACC-IMPORT', () => {
       if (imported.problems.length > 0) expect(imported.documentId).toBeUndefined()
       return imported.problems
     }
-    expect(await problems({ createdStatus: 200 })).toEqual(['POST /uploads answered 200, not 201'])
-    expect(await problems({ createdStatus: 202 })).toEqual(['POST /uploads answered 202, not 201'])
-    expect(await problems({ chunkStatus: 201 })).toEqual([`POST /uploads/${UPLOAD}/chunks answered 201, not 200`])
+    expect(await problems({ createdStatus: 200 })).toEqual([expect.stringContaining(`POST /uploads answered 200, not 201: `)])
+    expect(await problems({ createdStatus: 202 })).toEqual([expect.stringContaining(`POST /uploads answered 202, not 201: `)])
+    expect(await problems({ chunkStatus: 201 })).toEqual([expect.stringContaining(`POST /uploads/${UPLOAD}/chunks answered 201, not 200: `)])
     expect(await problems({ startedStatus: 200 })).toEqual(['a new import was answered 200 with a job of kind import that is queued'])
     expect(await problems({ startedStatus: 201 })).toEqual(['a new import was answered 201 with a job of kind import that is queued'])
     // A new import is a job still to run, and an import.
@@ -207,6 +207,7 @@ describe('ACC-IMPORT', () => {
     expect(await problems({ started: job({ kind: 'extract' }) })).toEqual(['a new import was answered 202 with a job of kind extract that is queued'])
     expect(await problems({ started: job({ kind: 'import', status: 'running' }) })).toEqual([])
     expect(await problems({ started: { status: 'queued' } })).toEqual([NOT_A('DocumentsJob')])
+    expect(await problems({ startedRaw: () => new Response(null, { status: 204 }) })).toEqual(['POST /imports answered 204 with no JSON'])
   })
 
   it('fails when the upload is not of the bytes that were announced, a chunk is answered with another upload, or the job that ran is no import', async () => {
@@ -245,12 +246,12 @@ describe('the status of an answer', () => {
       return call.route.split('?')[0] === route ? new Response(real.body, { status, headers: real.headers }) : real
     }
     const caps = await checkCapabilities(fakeClient(() => answer({ os_version: '0.1.0', storage: { state: 'ready' }, engines: [], knowledge: { setting: 'on', state: 'ready' }, operations: [] }, 203)).client)
-    expect(caps).toMatchObject({ outcome: 'failed', problems: ['GET /capabilities answered 203, not 200'] })
-    expect((await checkImport(fakeClient(off(`/jobs/${JOB}`, 202, importing())).client, NOTICE, QUICK)).problems).toEqual([`GET /jobs/${JOB} answered 202, not 200`])
+    expect(caps).toMatchObject({ outcome: 'failed', problems: [expect.stringContaining(`GET /capabilities answered 203, not 200: `)] })
+    expect((await checkImport(fakeClient(off(`/jobs/${JOB}`, 202, importing())).client, NOTICE, QUICK)).problems).toEqual([expect.stringContaining(`GET /jobs/${JOB} answered 202, not 200: `)])
     const stored = (call: Call) => (call.route.startsWith('/documents?') || call.route === '/documents' ? answer({ documents: [document({ document_id: DOC })], next_cursor: null }) : answer(document({ document_id: DOC, head: { revision: 1, content_sha256: `sha256:${NOTICE.meta.sha256_stored}`, size: 1, media_type: 'application/pdf' } })))
     expect((await checkGet(fakeClient(stored).client, NOTICE, DOC)).problems).toEqual([])
-    expect((await checkGet(fakeClient(off(`/documents/${DOC}`, 203, stored)).client, NOTICE, DOC)).problems).toEqual([`GET /documents/${DOC} answered 203, not 200`])
-    expect((await checkGet(fakeClient(off('/documents', 206, stored)).client, NOTICE, DOC)).problems).toEqual(['GET /documents answered 206, not 200'])
+    expect((await checkGet(fakeClient(off(`/documents/${DOC}`, 203, stored)).client, NOTICE, DOC)).problems).toEqual([expect.stringContaining(`GET /documents/${DOC} answered 203, not 200: `)])
+    expect((await checkGet(fakeClient(off('/documents', 206, stored)).client, NOTICE, DOC)).problems).toEqual([expect.stringContaining(`GET /documents answered 206, not 200: `)])
   })
 })
 

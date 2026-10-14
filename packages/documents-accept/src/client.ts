@@ -99,12 +99,21 @@ export class Client {
 
   /** An answer with the status the route gives for it (200, unless said) as
    *  the contract's `schema`; another 2xx, or a body that is not that schema,
-   *  is thrown. */
+   *  is thrown. Thrown for another status, it says how the body began. */
   async json<T>(method: string, route: string, schema: string, request: Request = {}, status = 200): Promise<T> {
     const response = await this.send(method, route, request)
-    if (response.status !== status) throw new ContractError(`${method} ${route.split('?')[0]} answered ${response.status}, not ${status}`)
+    if (response.status !== status) throw new ContractError(`${method} ${route.split('?')[0]} answered ${response.status}, not ${status}: ${await began(response)}`)
     return conform<T>(schema, await response.json())
   }
+}
+
+/** The first 200 characters of a body, on one line; it goes into a problem, and is scrubbed with it.
+ *  A body that breaks off is said to, and is no error of its own: the status is what is wrong. */
+async function began(response: Response): Promise<string> {
+  const read = await response.text().catch(() => undefined)
+  if (read === undefined) return 'a body that could not be read'
+  const text = read.replace(/\s+/g, ' ').trim()
+  return text === '' ? 'no body' : text.length > 200 ? `${text.slice(0, 200)}…` : text
 }
 
 async function failure(response: Response): Promise<ApiError> {
