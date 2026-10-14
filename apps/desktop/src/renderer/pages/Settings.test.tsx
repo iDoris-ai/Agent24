@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import SettingsPage from './Settings'
+import { setLocale } from '../i18n'
 
 const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
@@ -169,5 +170,14 @@ describe('SettingsPage English default', () => {
     mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'not found' })
     await act(async () => { render(<SettingsPage />) })
     expect(screen.getByText('AI Model Service')).toBeInTheDocument()
+  })
+
+  it('relabels a detection error when the language changes (not frozen in the old language)', async () => {
+    mockOmlxDetect.mockResolvedValue(null)
+    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'not found' })
+    await act(async () => { render(<SettingsPage />) })
+    await waitFor(() => expect(screen.getByText(/Could not start or connect/)).toBeInTheDocument())
+    await act(async () => { setLocale('zh') })
+    expect(screen.getByText(/无法启动或连接 AI 模型服务/)).toBeInTheDocument()
   })
 })

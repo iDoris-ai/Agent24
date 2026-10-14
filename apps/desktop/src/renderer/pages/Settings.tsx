@@ -5,6 +5,10 @@ import { settingsMessages } from './Settings.i18n'
 type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
 type ModelCategory = 'resident' | 'ondemand'
 type TestResult = { ok: boolean; msg: string } | null
+// Our own errors are stored as keys so a later language switch relabels them
+// (and an init request finishing after the switch can't bake in the old
+// language); errors reported by the service are shown verbatim.
+type DetectError = { key: keyof typeof settingsMessages.en } | { raw: string } | null
 
 const CATEGORIES_KEY = 'agent24:model-categories'
 const AUTO_START_PORT = 8088
@@ -27,7 +31,7 @@ export default function SettingsPage() {
   const [omlxPort, setOmlxPort] = useState(String(AUTO_START_PORT))
   const [categories, setCategories] = useState<Record<string, ModelCategory>>(loadCategories)
   const [warmingUp, setWarmingUp] = useState<Record<string, boolean>>({})
-  const [detectError, setDetectError] = useState('')
+  const [detectError, setDetectError] = useState<DetectError>(null)
   const [testResult, setTestResult] = useState<TestResult>(null)
   const testTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const initDone = useRef(false)
@@ -42,7 +46,7 @@ export default function SettingsPage() {
 
   async function initialize() {
     setOmlxStatus('detecting')
-    setDetectError('')
+    setDetectError(null)
     let detected = await window.agent24.omlxDetect()
     if (!detected) {
       // Auto-start oMLX
@@ -64,7 +68,7 @@ export default function SettingsPage() {
       applyDetected(detected.url, detected.apiKey, detected.models)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError(t('error.startConnect'))
+      setDetectError({ key: 'error.startConnect' })
     }
   }
 
@@ -98,7 +102,7 @@ export default function SettingsPage() {
 
   async function autoDetect() {
     setOmlxStatus('detecting')
-    setDetectError('')
+    setDetectError(null)
     const result = await window.agent24.omlxDetect()
     if (result) {
       setOmlxUrl(result.url)
@@ -106,13 +110,13 @@ export default function SettingsPage() {
       applyDetected(result.url, result.apiKey, result.models)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError(t('error.noService'))
+      setDetectError({ key: 'error.noService' })
     }
   }
 
   async function testConnection() {
     setTestResult(null)
-    setDetectError('')
+    setDetectError(null)
     setOmlxStatus('detecting')
     const result = await window.agent24.omlxModels(omlxUrl, omlxApiKey)
     if (result.ok) {
@@ -126,7 +130,7 @@ export default function SettingsPage() {
 
   async function startServer() {
     setOmlxStatus('starting')
-    setDetectError('')
+    setDetectError(null)
     const port = parseInt(omlxPort, 10) || AUTO_START_PORT
     const result = await window.agent24.omlxStart(port, omlxApiKey)
     if (result.ok) {
@@ -136,12 +140,12 @@ export default function SettingsPage() {
         const r = await window.agent24.omlxModels(result.url, omlxApiKey)
         if (r.ok) { applyDetected(result.url, omlxApiKey, r.models) }
         else if (++attempts < 5) setTimeout(poll, 2000)
-        else { setOmlxStatus('disconnected'); setDetectError(t('error.startedUnresponsive')) }
+        else { setOmlxStatus('disconnected'); setDetectError({ key: 'error.startedUnresponsive' }) }
       }
       setTimeout(poll, 2000)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError(result.error ?? t('error.startFailed'))
+      setDetectError(result.error ? { raw: result.error } : { key: 'error.startFailed' })
     }
   }
 
@@ -219,7 +223,7 @@ export default function SettingsPage() {
 
         {detectError && (
           <div style={{ fontSize: 12, color: '#f44336', padding: '6px 18px', marginBottom: 2, background: 'rgba(244,67,54,0.08)', borderRadius: 6 }}>
-            {detectError}
+            {'key' in detectError ? t(detectError.key) : detectError.raw}
           </div>
         )}
 
