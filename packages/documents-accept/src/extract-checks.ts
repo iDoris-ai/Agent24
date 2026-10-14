@@ -185,7 +185,9 @@ export async function checkRerunKey(client: Client, sample: Sample, documentId: 
 /** What a cancel may make of a job, by what the job was just before (§7).
  *  One that succeeded stays so; one with no worker (failed, interrupted,
  *  cancelled) is cancelled at once; one that was queued or running may have
- *  moved on in between, to any end a cancel can find. */
+ *  moved on in between, to any end a cancel can find. The table holds while
+ *  nobody else retries or replays the job between the read and the cancel:
+ *  in a run, nobody else touches the jobs of its own new document. */
 const AFTER_CANCEL: Record<Job['status'], Job['status'][]> = {
   queued: ['cancelling', 'cancelled', 'succeeded'],
   running: ['cancelling', 'cancelled', 'succeeded'],
@@ -202,14 +204,16 @@ const AFTER_CANCEL: Record<Job['status'], Job['status'][]> = {
  *  its attempt stays that one until the retry makes it the next, and what it
  *  was decides what the cancel may make of it. `skipped` when the cancel
  *  found the job already succeeded. `interrupted` says
- *  whether the cancel stopped a job that was running, or one that was only
- *  queued or had failed. */
+ *  whether this cancel stopped a job that was running, or one that was only
+ *  queued, had failed, or was being stopped already. */
 export async function checkCancelledStays(client: Client, sample: Sample, documentId: string, ask: AskField[], job: Job, wait: JobWait = {}): Promise<CheckResult & { interrupted?: boolean }> {
   let cancelled: Job | undefined
+  let stopping = false
   const result = await check('ACC-IDEM-3', sample.id, async () => {
     const before = ours(await client.json<Job>('GET', `/jobs/${job.job_id}`, 'DocumentsJob'), documentId)
     if (before.job_id !== job.job_id) return [`asked for job ${job.job_id}, answered with ${before.job_id}`]
     const { attempt } = before
+    stopping = before.status === 'cancelling'
     const answered = await cancel(client, documentId, job.job_id)
     if (answered.attempt !== attempt) return [`the cancel changed the attempt from ${attempt} to ${answered.attempt}`]
     if (!AFTER_CANCEL[before.status].includes(answered.status)) return [`the cancel made a job that was ${before.status} ${answered.status}`]
@@ -232,5 +236,5 @@ export async function checkCancelledStays(client: Client, sample: Sample, docume
   })
   if (cancelled === undefined) return result
   if (cancelled.status === 'succeeded') return { ...result, outcome: 'skipped' }
-  return { ...result, interrupted: cancelled.status === 'cancelling' }
+  return { ...result, interrupted: !stopping && cancelled.status === 'cancelling' }
 }

@@ -471,7 +471,8 @@ describe('ACC-IDEM-3', () => {
     }
     // One that was stopping does not come out succeeded either; one that was queued or running may have got anywhere.
     expect((await run({ before: was('cancelling'), cancel: extracted({ attempt: 3 }) })).result.problems).toEqual(['the cancel made a job that was cancelling succeeded'])
-    expect((await run({ before: was('cancelling') })).result).toMatchObject({ outcome: 'passed', interrupted: true })
+    // A job that was being stopped already was not stopped by this cancel.
+    expect((await run({ before: was('cancelling') })).result).toMatchObject({ outcome: 'passed', interrupted: false })
     for (const status of ['queued', 'running']) {
       expect((await run({ before: was(status) })).result, status).toMatchObject({ outcome: 'passed', interrupted: true })
       expect((await run({ before: was(status), cancel: job({ status: 'cancelled', attempt: 3 }) })).result, status).toMatchObject({ outcome: 'passed', interrupted: false })
