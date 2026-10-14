@@ -71,7 +71,10 @@ export function parseArgs(argv: string[]): Args {
 /** A secret wherever it is, glued to a word or not (`Bearer%20<token>`), whatever its case. */
 const anywhere = (secret: string): RegExp => new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
 
-/** Of anchors, what the daemon wrote: the quote and the block, not the shas and the engine it echoes. */
+/** Of anchors, what the daemon wrote: the quote and the block, not the shas
+ *  and the engine it echoes. The engine's id and version are looked for in
+ *  `environment.engines`, which holds every engine /capabilities lists: an
+ *  anchor naming one it does not list would go unsearched. */
 const evidence = (anchors: { quote: string; block_id: string }[] | undefined) => anchors?.map(({ quote, block_id }) => ({ quote, block_id }))
 /** Of an extracted value, what the model wrote: not the key it was asked for, nor a word of the contract (`status`, `missing_reason`). */
 const written = (r: Extracted | undefined) =>

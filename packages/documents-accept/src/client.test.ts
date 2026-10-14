@@ -114,22 +114,35 @@ describe('Client', () => {
     const long = `<html>${'a '.repeat(96)} Bearer tok-9f3a1c went away</html>`
     expect(await fakeClient(() => new Response(long, { status: 502 })).client.send('GET', '/x').catch((e: unknown) => e)).toMatchObject({ message: `502 unknown: ${excerpt(long)}` })
     expect(excerpt(long)).not.toContain('tok')
+    // The client's own bearer is taken out before the cut, of a body of any length.
+    const echoed = await fakeClient(() => new Response(`no: Bearer secret ${'b '.repeat(120)}`, { status: 502 })).client.send('GET', '/x').catch((e: unknown) => e)
+    expect((echoed as Error).message).toMatch(/^502 unknown: no: Bearer <redacted> b b/)
+    const status = await fakeClient(() => new Response('a SECRET', { status: 201 })).client.json('GET', '/jobs/x', 'DocumentsJob').catch((e: unknown) => e)
+    expect(String(status)).toBe('Error: GET /jobs/x answered 201, not 200: a <redacted>')
   })
 
   it('cuts a long body without cutting a piece of it in two: a secret is said whole, or not at all', () => {
     expect(excerpt('a\n\t b')).toBe('a b')
     expect(excerpt('x'.repeat(200))).toBe('x'.repeat(200))
     // A token across the cut is left out, with what it is glued to.
-    expect(excerpt(`${'a'.repeat(195)} tok-9f3a1c`)).toBe(`${'a'.repeat(195)} …`)
-    expect(excerpt(`${'a'.repeat(190)} Bearer%20tok-9f3a1c`)).toBe(`${'a'.repeat(190)} …`)
+    expect(excerpt(`${'a'.repeat(195)} tok-9f3a1c`)).toBe(`${'a'.repeat(195)}…`)
+    expect(excerpt(`${'a'.repeat(190)} Bearer%20tok-9f3a1c`)).toBe(`${'a'.repeat(190)}…`)
     expect(excerpt(`{"m":"${'a'.repeat(181)}","token":"tok-9f3a1c"}`)).toBe(`{"m":"${'a'.repeat(181)}","token":"…`)
     // A cut that falls between pieces keeps all 200 characters.
     expect(excerpt(`${'a'.repeat(200)} tok-9f3a1c`)).toBe(`${'a'.repeat(200)}…`)
     expect(excerpt(`${'a'.repeat(199)}"tok-9f3a1c`)).toBe(`${'a'.repeat(199)}"…`)
     expect(excerpt(`${'a'.repeat(189)} tok-9f3a1c"}`)).toBe(`${'a'.repeat(189)} tok-9f3a1c…`)
     expect(excerpt(`${'a'.repeat(189)} tok-9f3a1c&x=1`)).toBe(`${'a'.repeat(189)} tok-9f3a1c…`)
-    // A body of one piece says how long it is.
-    expect(excerpt('x'.repeat(201))).toBe('one piece of 201 characters')
+    // A body with no break in its first 200 characters says how long it is.
+    expect(excerpt(`${'x'.repeat(250)} y z`)).toBe('254 characters, with no break in the first 200')
+    // The bearer goes before the cut, whatever its form: a cut inside it can leave none of it.
+    const b64 = 'QUJDREVGR0hJSktMTU5PUA=='
+    for (let at = 180; at <= 200; at += 1) {
+      const said = excerpt(`${'a '.repeat(at / 2)}${at % 2 ? 'x' : ''}Bearer ${b64.toLowerCase()} more`, b64)
+      expect(said, String(at)).not.toMatch(/QUJD|qujd/i)
+    }
+    expect(excerpt(`token=${b64}`, b64)).toBe('token=<redacted>')
+    expect(excerpt('token=ab+c/d==', 'ab+c/d==')).toBe('token=<redacted>')
   })
 
   it('asks a retryable 503 again, the same request, until it is answered', async () => {
