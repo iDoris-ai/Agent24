@@ -1189,6 +1189,48 @@ mod tests {
         );
     }
 
+    /// The answer of a whole response: what a streamed one's end and the
+    /// non-streaming fallback both go through.
+    #[test]
+    fn a_whole_answer_takes_its_first_choice_a_named_model_and_its_usage() {
+        let p = OpenAiCompatProvider::new("ollama", "http://127.0.0.1:1", None, "local", "m");
+        let parsed = |v: Value| serde_json::from_value::<OaChatResponse>(v).unwrap();
+        let msg = serde_json::json!({ "role": "assistant", "content": "x" });
+        // An empty model is no model.
+        let r = p
+            .answer(parsed(
+                serde_json::json!({ "model": "", "choices": [{ "message": msg }] }),
+            ))
+            .unwrap();
+        assert_eq!(r.model_id, None);
+        // No choices is an error, named for the provider.
+        match p.answer(parsed(serde_json::json!({ "model": "m", "choices": [] }))) {
+            Err(ModelError::Provider(m)) => assert_eq!(m, "ollama returned no choices"),
+            other => panic!("{other:?}"),
+        }
+        // No usage is zeros, and a cost is never claimed.
+        let zero = usage_of(None);
+        assert_eq!(
+            (
+                zero.prompt_tokens,
+                zero.completion_tokens,
+                zero.total_tokens,
+                zero.cost_usd
+            ),
+            (0, 0, 0, 0.0)
+        );
+        let r = p.answer(parsed(serde_json::json!({ "choices": [{ "message": msg }], "usage": { "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 } }))).unwrap();
+        assert_eq!(
+            (
+                r.usage.prompt_tokens,
+                r.usage.completion_tokens,
+                r.usage.total_tokens,
+                r.usage.cost_usd
+            ),
+            (3, 4, 7, 0.0)
+        );
+    }
+
     #[tokio::test]
     async fn a_provider_that_omits_the_model_field_reports_no_model_id() {
         use tokio::io::AsyncWriteExt;
