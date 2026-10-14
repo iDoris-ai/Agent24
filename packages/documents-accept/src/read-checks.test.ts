@@ -45,6 +45,8 @@ describe('ACC-TEXT', () => {
     expect(await problems(() => answer(textPage([block('p2/b1', 2)], null)), NOTICE)).toEqual(['block p2/b1 is on page 2 of a document of 1'])
     expect(await problems(() => refuse(422, 'parse_failed'))).toEqual(['422 parse_failed: it is parse_failed'])
     expect(await problems(() => answer(textPage([], null, { document_id: id('doc', 2) })))).toEqual([`asked for the text of ${DOC}, answered with ${id('doc', 2)}`])
+    expect(await problems(() => answer(textPage([], null, { revision: 2 })))).toEqual(['asked for the text of revision 1, answered with revision 2'])
+    expect(await problems((call) => answer(cursorOf(call) ? textPage([], null, { revision: 2 }) : textPage([], 'c1')))).toEqual(['asked for the text of revision 1, answered with revision 2'])
   })
 
   it('fails on a page that is not what the contract says', async () => {
@@ -60,10 +62,14 @@ describe('ACC-TEXT', () => {
 })
 
 describe('ACC-RENDER', () => {
-  const png = (more: { magic?: number[]; type?: string; scale?: string | null } = {}) => {
+  // A PNG as far as its header chunk: the signature, then IHDR with a width and a height.
+  const SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+  const IHDR = [0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]
+  const PICTURE = [...SIGNATURE, ...IHDR, 0, 0, 2, 100, 0, 0, 3, 24]
+  const png = (more: { bytes?: number[]; type?: string; scale?: string | null; status?: number } = {}) => {
     const headers: Record<string, string> = { 'content-type': more.type ?? 'image/png' }
     if (more.scale !== null) headers['documents-render-scale'] = more.scale ?? '1'
-    return new Response(new Uint8Array(more.magic ?? [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2]), { headers })
+    return new Response(new Uint8Array(more.bytes ?? PICTURE), { status: more.status ?? 200, headers })
   }
   const pageOf = (call: Call) => Number(call.route.match(/\/pages\/(\d+)\?scale=1$/)?.[1])
   const daemon = (pages: number, first = png()) => (call: Call) => (pageOf(call) > pages ? refuse(404, 'not_found') : pageOf(call) === 1 ? first : png())
@@ -78,13 +84,28 @@ describe('ACC-RENDER', () => {
     expect((await run(NOTICE, daemon(1))).pages).toEqual([1, 2])
   })
 
-  it('fails on a page that is not a PNG, or does not say its scale', async () => {
-    const problems = async (first: Response) => (await run(NOTICE, daemon(1, first))).result.problems
-    expect(await problems(png({ magic: [0xff, 0xd8, 0xff] }))).toEqual(['page 1 is not a PNG'])
-    expect(await problems(png({ type: 'application/json' }))).toEqual(['page 1 is not a PNG'])
-    expect(await problems(png({ scale: null }))).toEqual(['page 1 does not say the scale it was rendered at'])
-    expect(await problems(png({ scale: '9' }))).toEqual(['page 1 does not say the scale it was rendered at'])
-    expect(await problems(png({ scale: '0.25' }))).toEqual([])
+  const problems = async (first: Response) => (await run(NOTICE, daemon(1, first))).result.problems
+
+  it('fails on a page that is not a PNG', async () => {
+    const NOT_PNG = ['page 1 is not a PNG']
+    expect(await problems(png({ bytes: [0xff, 0xd8, 0xff] }))).toEqual(NOT_PNG)
+    // The signature alone, with no header chunk, with another chunk first, or with no size.
+    expect(await problems(png({ bytes: SIGNATURE }))).toEqual(NOT_PNG)
+    expect(await problems(png({ bytes: PICTURE.slice(0, 23) }))).toEqual(NOT_PNG)
+    expect(await problems(png({ bytes: [...SIGNATURE, 0, 0, 0, 13, 0x49, 0x44, 0x41, 0x54, ...PICTURE.slice(16)] }))).toEqual(NOT_PNG)
+    expect(await problems(png({ bytes: [...SIGNATURE, ...IHDR, 0, 0, 0, 0, 0, 0, 3, 24] }))).toEqual(NOT_PNG)
+    expect(await problems(png({ bytes: [...SIGNATURE, ...IHDR, 0, 0, 2, 100, 0, 0, 0, 0] }))).toEqual(NOT_PNG)
+    expect(await problems(png({ type: 'application/json' }))).toEqual(NOT_PNG)
+    expect(await problems(png({ type: 'image/pngx' }))).toEqual(NOT_PNG)
+    expect(await problems(png({ type: 'image/png; q=1' }))).toEqual([])
+    expect(await problems(png({ status: 206 }))).toEqual(['page 1 was answered with 206, not 200'])
+  })
+
+  it('fails on a page that does not say its scale, or was rendered above the scale asked for', async () => {
+    const UNSAID = ['page 1 does not say the scale it was rendered at']
+    for (const scale of [null, '', '9', '0.2', '0x1', 'one', '1,5', '-1']) expect(await problems(png({ scale })), String(scale)).toEqual(UNSAID)
+    for (const scale of ['2', '4', '1.01']) expect(await problems(png({ scale }))).toEqual([`page 1 was rendered at scale ${scale}, above the 1 asked for`])
+    for (const scale of ['0.25', '0.5', '1', '1.0', '1e0']) expect(await problems(png({ scale })), scale).toEqual([])
   })
 
   it('fails when the page past the last is rendered, or refused for another reason', async () => {
@@ -118,6 +139,17 @@ describe('ACC-FIND', () => {
     expect(locate({ page: 1, quote: 'a quote that was never looked up' })).toEqual([])
     // The same words asked for on another page are another anchor.
     expect(locate({ page: 2, quote: another.quote })).toEqual([])
+  })
+
+  it('records the regions find did not search, with the quote it looked up there', async () => {
+    const unread = { page: 1, reason: 'ocr_failed' }
+    const { client } = fakeClient((call) => {
+      const { query } = call.json as { query: string }
+      return answer(query === lost ? { ...found([]), parse_status: 'partial', unparsed_regions: [unread] } : found([anchor(1, 'p1/b1')]))
+    })
+    const { located } = (await checkFind(client, NOTICE, DOC)).find!
+    expect(located.find((l) => l.quote === lost)).toEqual({ page: 1, quote: lost, found: [], unparsed: [unread] })
+    expect(located.filter((l) => l.unparsed !== undefined)).toHaveLength(1)
   })
 
   it('reads every page of matches', async () => {
@@ -167,6 +199,9 @@ describe('ACC-FIND', () => {
     expect(result.find).toBeUndefined()
     const problems = async (body: object) => (await checkFind(fakeClient(() => answer(body)).client, NOTICE, DOC)).problems
     expect(await problems(found([anchor(1, 'p1/b1', 0, 4, { document_id: id('doc', 2) })]))).toEqual([`find answered ${DOC} with matches of another document`])
+    // Of another revision, on the anchor's own page or on any other.
+    expect(await problems(found([anchor(1, 'p1/b1', 0, 4, { revision: 2 })]))).toEqual(['find answered revision 1 with matches of another revision'])
+    expect(await problems(found([anchor(1, 'p1/b1'), anchor(9, 'p9/b1', 0, 4, { revision: 2 })]))).toEqual(['find answered revision 1 with matches of another revision'])
     expect(await problems({ matches: [], next_cursor: null })).toEqual([NOT_A('DocumentsFindResult')])
     expect(await problems(found([{ page: 1, block_id: 'p1/b1' }]))).toEqual([NOT_A('DocumentsFindResult')])
     expect(await problems(found([anchor(1, 'p1/b1', 0, 4, { text_range: { unit: 'utf16', start: 0, end: 4 } })]))).toEqual([NOT_A('DocumentsFindResult')])

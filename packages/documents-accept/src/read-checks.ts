@@ -26,6 +26,7 @@ export async function checkText(client: Client, sample: Sample, documentId: stri
     const route = `/documents/${documentId}/revisions/1/text`
     for await (const page of pages((cursor) => client.json<Schemas['DocumentsTextPage']>('GET', cursor ? `${route}?cursor=${encodeURIComponent(cursor)}` : route, 'DocumentsTextPage'))) {
       if (page.document_id !== documentId) return [`asked for the text of ${documentId}, answered with ${page.document_id}`]
+      if (page.revision !== 1) return [`asked for the text of revision 1, answered with revision ${page.revision}`]
       if (read.textLayer !== '' && page.text_layer_sha256 !== read.textLayer) return ['the text layer changed between two pages of one reading']
       read.textLayer = page.text_layer_sha256
       read.blocks += page.blocks.length
@@ -41,19 +42,30 @@ export async function checkText(client: Client, sample: Sample, documentId: stri
 }
 
 const PNG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+/** A PNG begins with its signature, then the header chunk with its size in pixels. */
+function isPng(bytes: Uint8Array): boolean {
+  if (bytes.length < 24 || !PNG.every((b, i) => bytes[i] === b) || String.fromCharCode(...bytes.subarray(12, 16)) !== 'IHDR') return false
+  const size = new DataView(bytes.buffer, bytes.byteOffset, bytes.length)
+  return size.getUint32(16) > 0 && size.getUint32(20) > 0
+}
+const NUMBER = /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/
 
 /** ACC-RENDER: the first and the last page come back as PNG, with the scale
- *  that was used; the page after the last is not found. */
+ *  that was used, which is at most the one asked for; the page after the last
+ *  is not found. */
 export async function checkRender(client: Client, sample: Sample, documentId: string): Promise<CheckResult> {
   const route = (page: number) => `/documents/${documentId}/revisions/1/pages/${page}?scale=1`
   return check('ACC-RENDER', sample.id, async () => {
     const problems: string[] = []
     for (const page of new Set([1, sample.meta.pages])) {
       const response = await client.send('GET', route(page))
-      const bytes = new Uint8Array(await response.arrayBuffer())
-      if (!response.headers.get('content-type')?.startsWith('image/png') || !PNG.every((b, i) => bytes[i] === b)) problems.push(`page ${page} is not a PNG`)
-      const scale = Number(response.headers.get('documents-render-scale'))
+      if (response.status !== 200) problems.push(`page ${page} was answered with ${response.status}, not 200`)
+      const type = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase()
+      if (type !== 'image/png' || !isPng(new Uint8Array(await response.arrayBuffer()))) problems.push(`page ${page} is not a PNG`)
+      const said = response.headers.get('documents-render-scale') ?? ''
+      const scale = NUMBER.test(said) ? Number(said) : Number.NaN
       if (!(scale >= 0.25 && scale <= 4)) problems.push(`page ${page} does not say the scale it was rendered at`)
+      else if (scale > 1) problems.push(`page ${page} was rendered at scale ${scale}, above the 1 asked for`)
     }
     try {
       await client.send('GET', route(sample.meta.pages + 1))
@@ -72,6 +84,8 @@ export interface Located {
   found: Anchor[]
   /** The error code, when `find` would not take this quote as a query. */
   refused?: string
+  /** The regions `find` did not search: there, not found is not the same as not there. */
+  unparsed?: Schemas['DocumentsUnparsedRegion'][]
 }
 
 export interface FindRead {
@@ -93,6 +107,7 @@ export async function checkFind(client: Client, sample: Sample, documentId: stri
     for (const { page, quote } of anchors) {
       if (located.some((l) => l.page === page && l.quote === quote)) continue
       const found: Anchor[] = []
+      const unparsed: Schemas['DocumentsUnparsedRegion'][] = []
       let asked = 0
       const ask = (cursor: string) => {
         asked += 1
@@ -101,9 +116,11 @@ export async function checkFind(client: Client, sample: Sample, documentId: stri
       try {
         for await (const hits of pages(ask)) {
           if (hits.matches.some((m) => m.document_id !== documentId)) throw new Error(`find answered ${documentId} with matches of another document`)
+          if (hits.matches.some((m) => m.revision !== 1)) throw new Error('find answered revision 1 with matches of another revision')
           found.push(...hits.matches.filter((m) => m.page === page))
+          if (asked === 1) unparsed.push(...(hits.unparsed_regions ?? []))
         }
-        located.push({ page, quote, found })
+        located.push({ page, quote, found, ...(unparsed.length > 0 ? { unparsed } : {}) })
       } catch (error) {
         if (!(error instanceof ApiError && error.status === 400 && asked === 1)) throw error
         located.push({ page, quote, found: [], refused: error.code })
