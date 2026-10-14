@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import { LOCALES, isLocale, setLocale, useLocale, useT } from '../i18n'
+import { settingsMessages } from './Settings.i18n'
 
 type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
 type ModelCategory = 'resident' | 'ondemand'
@@ -29,6 +31,8 @@ export default function SettingsPage() {
   const [testResult, setTestResult] = useState<TestResult>(null)
   const testTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const initDone = useRef(false)
+  const locale = useLocale()
+  const t = useT(settingsMessages)
 
   useEffect(() => {
     if (initDone.current) return
@@ -327,6 +331,18 @@ export default function SettingsPage() {
             <span style={{ fontSize: 12, color: 'var(--muted)' }}>Connect to list and configure models</span>
           </div>
         )}
+      </div>
+
+      {/* ── Appearance ── the one global language setting every page follows. */}
+      <div className="settings-section">
+        <h3>{t('appearance.title')}</h3>
+        <div className="setting-row">
+          <div><label htmlFor="settings-language">{t('appearance.language')}</label><p>{t('appearance.languageHint')}</p></div>
+          <select id="settings-language" value={locale}
+            onChange={(e) => { if (isLocale(e.target.value)) setLocale(e.target.value) }}>
+            {LOCALES.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+          </select>
+        </div>
       </div>
 
       {/*
