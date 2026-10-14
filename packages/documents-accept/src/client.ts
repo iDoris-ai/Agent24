@@ -5,7 +5,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { conform } from './contract'
+import { ContractError, conform } from './contract'
 
 export interface Connection {
   /** `http://127.0.0.1:<port>/api/v1/documents` */
@@ -97,9 +97,13 @@ export class Client {
     }
   }
 
-  /** A 2xx answer as the contract's `schema`; one that is not is thrown (`conform`). */
-  async json<T>(method: string, route: string, schema: string, request: Request = {}): Promise<T> {
-    return conform<T>(schema, await (await this.send(method, route, request)).json())
+  /** An answer with the status the route gives for it (200, unless said) as
+   *  the contract's `schema`; another 2xx, or a body that is not that schema,
+   *  is thrown. */
+  async json<T>(method: string, route: string, schema: string, request: Request = {}, status = 200): Promise<T> {
+    const response = await this.send(method, route, request)
+    if (response.status !== status) throw new ContractError(`${method} ${route.split('?')[0]} answered ${response.status}, not ${status}`)
+    return conform<T>(schema, await response.json())
   }
 }
 

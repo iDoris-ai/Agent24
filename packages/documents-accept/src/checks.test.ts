@@ -113,20 +113,23 @@ describe('ACC-CAP', () => {
 })
 
 /** A daemon that takes an upload chunk by chunk and imports it, as the routes do. */
-function importing(change: { upload?: object; job?: object } = {}) {
+function importing(change: { created?: object; createdStatus?: number; upload?: object; chunkStatus?: number; started?: object; startedStatus?: number; job?: object } = {}) {
   let received = 0
   let polls = 0
   let size = 0
+  let hash = ''
   return (call: Call): Response => {
     if (call.route === '/uploads') {
-      size = (call.json as { total_size: number }).total_size
-      return answer(upload({ total_size: size }), 201)
+      const asked = call.json as { total_size: number; sha256: string }
+      size = asked.total_size
+      hash = asked.sha256
+      return answer(upload({ total_size: size, sha256: hash, ...change.created }), change.createdStatus ?? 201)
     }
     if (call.route === `/uploads/${UPLOAD}/chunks`) {
       received += call.bytes?.length ?? 0
-      return answer(upload({ total_size: size, received, status: received === size ? 'complete' : 'receiving', ...change.upload }))
+      return answer(upload({ total_size: size, sha256: hash, received, status: received === size ? 'complete' : 'receiving', ...change.upload }), change.chunkStatus ?? 200)
     }
-    if (call.route === '/imports') return answer(job({ kind: 'import' }), 202)
+    if (call.route === '/imports') return answer(change.started ?? job({ kind: 'import' }), change.startedStatus ?? 202)
     if (call.route === `/jobs/${JOB}`) {
       polls += 1
       if (polls < 3) return answer(job({ kind: 'import', status: polls === 1 ? 'queued' : 'running' }))
@@ -160,6 +163,9 @@ describe('ACC-IMPORT', () => {
     expect(chunks.map((c) => [c.headers['upload-offset'], c.bytes?.length])).toEqual([['0', 786432], ['786432', 786432], ['1572864', 5]])
     expect(chunks.map((c) => c.headers['chunk-sha256'])).toEqual(chunks.map((c) => sha(c.bytes!)))
     expect(Buffer.concat(chunks.map((c) => c.bytes!)).equals(bytes)).toBe(true)
+    // Before its last chunk the upload is still receiving.
+    const early = await checkImport(fakeClient(importing({ upload: { status: 'complete' } })).client, big, QUICK)
+    expect(early.problems).toEqual([`the upload is complete with 786432 bytes after 786432 of ${bytes.length} were sent`])
   })
 
   it('uploads under a new key every time, so that every run gets a new document', async () => {
@@ -175,13 +181,48 @@ describe('ACC-IMPORT', () => {
 
   it('fails with what went wrong: an upload left incomplete, or a job that did not succeed', async () => {
     const problems = async (change: Parameters<typeof importing>[0]) => (await checkImport(fakeClient(importing(change)).client, NOTICE, QUICK)).problems
-    expect(await problems({ upload: { status: 'receiving', received: 10 } })).toEqual([expect.stringMatching(/the upload is receiving after its last chunk, with 10 of \d+ bytes/)])
-    expect(await problems({ upload: { status: 'complete', received: 10 } })).toEqual([expect.stringMatching(/the upload is complete after its last chunk, with 10 of \d+ bytes/)])
+    expect(await problems({ upload: { status: 'receiving', received: 10 } })).toEqual([expect.stringMatching(/^the upload is receiving with 10 bytes after (\d+) of \1 were sent$/)])
+    expect(await problems({ upload: { status: 'complete', received: 10 } })).toEqual([expect.stringMatching(/^the upload is complete with 10 bytes after (\d+) of \1 were sent$/)])
     expect(await problems({ job: failed('upload_checksum_mismatch', { kind: 'import' }) })).toEqual(['the import job is failed: upload_checksum_mismatch'])
     expect(await problems({ job: { status: 'interrupted', result: null } })).toEqual(['the import job is interrupted: no error code'])
     const refused = await checkImport(fakeClient(() => refuse(503, 'storage_unavailable')).client, NOTICE, QUICK)
     expect(refused).toMatchObject({ outcome: 'failed', problems: ['503 storage_unavailable: it is storage_unavailable'] })
     expect(refused.documentId).toBeUndefined()
+  })
+
+  it('fails when a route answers with a status it does not give: a new upload is 201, a chunk 200, a new import 202', async () => {
+    const problems = async (change: Parameters<typeof importing>[0]) => {
+      const imported = await checkImport(fakeClient(importing(change)).client, NOTICE, QUICK)
+      if (imported.problems.length > 0) expect(imported.documentId).toBeUndefined()
+      return imported.problems
+    }
+    expect(await problems({ createdStatus: 200 })).toEqual(['POST /uploads answered 200, not 201'])
+    expect(await problems({ createdStatus: 202 })).toEqual(['POST /uploads answered 202, not 201'])
+    expect(await problems({ chunkStatus: 201 })).toEqual([`POST /uploads/${UPLOAD}/chunks answered 201, not 200`])
+    expect(await problems({ startedStatus: 200 })).toEqual(['a new import was answered 200 with a job of kind import that is queued'])
+    expect(await problems({ startedStatus: 201 })).toEqual(['a new import was answered 201 with a job of kind import that is queued'])
+    // A new import is a job still to run, and an import.
+    expect(await problems({ started: job({ kind: 'import', status: 'succeeded', result: { document_id: DOC, revision: 1 } }) })).toEqual(['a new import was answered 202 with a job of kind import that is succeeded'])
+    expect(await problems({ started: job({ kind: 'import', status: 'cancelled' }), startedStatus: 200 })).toEqual(['a new import was answered 200 with a job of kind import that is cancelled'])
+    expect(await problems({ started: job({ kind: 'extract' }) })).toEqual(['a new import was answered 202 with a job of kind extract that is queued'])
+    expect(await problems({ started: job({ kind: 'import', status: 'running' }) })).toEqual([])
+    expect(await problems({ started: { status: 'queued' } })).toEqual([NOT_A('DocumentsJob')])
+  })
+
+  it('fails when the upload is not of the bytes that were announced, a chunk is answered with another upload, or the job that ran is no import', async () => {
+    const problems = async (change: Parameters<typeof importing>[0]) => (await checkImport(fakeClient(importing(change)).client, NOTICE, QUICK)).problems
+    const size = fs.statSync(NOTICE.source).size
+    expect(await problems({ created: { total_size: size + 1 } })).toEqual([`the upload is of ${size + 1} bytes, sha256:${NOTICE.meta.sha256_stored}: not what was announced`])
+    expect(await problems({ created: { sha256: `sha256:${'c'.repeat(64)}` } })).toEqual([`the upload is of ${size} bytes, sha256:${'c'.repeat(64)}: not what was announced`])
+    expect(await problems({ upload: { upload_id: id('upl', 2) } })).toEqual([`a chunk of ${UPLOAD} was answered with ${id('upl', 2)}`])
+    expect(await problems({ upload: { total_size: 1 } })).toEqual([`a chunk of ${UPLOAD} was answered with an upload of 1 bytes, sha256:${NOTICE.meta.sha256_stored}`])
+    expect(await problems({ upload: { sha256: `sha256:${'c'.repeat(64)}` } })).toEqual([`a chunk of ${UPLOAD} was answered with an upload of ${size} bytes, sha256:${'c'.repeat(64)}`])
+    // A new upload holds nothing yet; after each chunk it holds what was sent, and is complete only at the end.
+    expect(await problems({ created: { received: 7 } })).toEqual(['a new upload is receiving with 7 bytes'])
+    expect(await problems({ created: { status: 'complete' } })).toEqual(['a new upload is complete with 0 bytes'])
+    expect(await problems({ upload: { received: size - 1 } })).toEqual([`the upload is complete with ${size - 1} bytes after ${size} of ${size} were sent`])
+    expect(await problems({ upload: { status: 'receiving' } })).toEqual([`the upload is receiving with ${size} bytes after ${size} of ${size} were sent`])
+    expect(await problems({ job: { kind: 'extract', result: { extraction_id: id('ext') } } })).toEqual(['the import job is of kind extract'])
   })
 
   it('fails, and names no document, when the job it waited for is not what the contract says', async () => {
@@ -194,6 +235,22 @@ describe('ACC-IMPORT', () => {
     expect(await odd({ job: { status: 'done' } })).toEqual([NOT_A('DocumentsJob')])
     expect(await odd({ job: { error: { code: 'internal', message: 'x' } } })).toEqual([NOT_A('DocumentsJob')])
     expect(await odd({ upload: { status: 'done' } })).toEqual([NOT_A('DocumentsUpload')])
+  })
+})
+
+describe('the status of an answer', () => {
+  it('fails every check whose route answers 2xx, but not the one the route gives', async () => {
+    const off = (route: string, status: number, d: (call: Call) => Response) => (call: Call) => {
+      const real = d(call)
+      return call.route.split('?')[0] === route ? new Response(real.body, { status, headers: real.headers }) : real
+    }
+    const caps = await checkCapabilities(fakeClient(() => answer({ os_version: '0.1.0', storage: { state: 'ready' }, engines: [], knowledge: { setting: 'on', state: 'ready' }, operations: [] }, 203)).client)
+    expect(caps).toMatchObject({ outcome: 'failed', problems: ['GET /capabilities answered 203, not 200'] })
+    expect((await checkImport(fakeClient(off(`/jobs/${JOB}`, 202, importing())).client, NOTICE, QUICK)).problems).toEqual([`GET /jobs/${JOB} answered 202, not 200`])
+    const stored = (call: Call) => (call.route.startsWith('/documents?') || call.route === '/documents' ? answer({ documents: [document({ document_id: DOC })], next_cursor: null }) : answer(document({ document_id: DOC, head: { revision: 1, content_sha256: `sha256:${NOTICE.meta.sha256_stored}`, size: 1, media_type: 'application/pdf' } })))
+    expect((await checkGet(fakeClient(stored).client, NOTICE, DOC)).problems).toEqual([])
+    expect((await checkGet(fakeClient(off(`/documents/${DOC}`, 203, stored)).client, NOTICE, DOC)).problems).toEqual([`GET /documents/${DOC} answered 203, not 200`])
+    expect((await checkGet(fakeClient(off('/documents', 206, stored)).client, NOTICE, DOC)).problems).toEqual(['GET /documents answered 206, not 200'])
   })
 })
 
