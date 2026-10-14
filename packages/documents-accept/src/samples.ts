@@ -178,10 +178,13 @@ export function loadSample(dir: string): Sample {
   const sources = fs.readdirSync(dir).filter((f) => /^source\.(pdf|png|jpg)$/.test(f))
   if (sources.length !== 1) refuse(id, [`expected one source.pdf, source.png or source.jpg, found ${sources.length}`])
   const source = path.join(dir, sources[0] ?? '')
-  const sha256 = crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex')
+  const bytes = fs.readFileSync(source)
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
   const meta = yaml.load(fs.readFileSync(path.join(dir, 'meta.yaml'), 'utf8')) as Meta
   const gold = JSON.parse(fs.readFileSync(path.join(dir, 'gold.json'), 'utf8')) as Gold
   const problems = metaProblems(meta, id, sha256)
+  // An upload is of one byte at least (the contract): an empty source could not be imported.
+  if (bytes.length === 0) problems.unshift(`${path.basename(source)} is empty`)
   // The gold checks read meta.yaml's pages, questions and covers: with those
   // unusable, only meta.yaml's own problems are listed.
   const usable = !broken(meta) && Number.isInteger(meta.pages) && meta.pages >= 1 && Array.isArray(meta.questions) && !broken(meta.covers)
