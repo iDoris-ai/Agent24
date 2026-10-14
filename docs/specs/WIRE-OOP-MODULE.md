@@ -251,7 +251,9 @@ doc 明确引用"用户裁决 D1"。）
 | `auth_token` | string | ✅ | 必须等于 `A24_HANDSHAKE_TOKEN`；不符 → `auth_failed` |
 | `capabilities` | `[string]` | 否（缺省 `[]`） | 模块请求的能力；内核只会**给交集**（manifest 请求 ∩ 内核愿意给），见 §5 开头的 offer 语义 |
 
-**今天的协议版本区间只有 `1..=1`**——`protocol_versions: {"min": 1, "max": 1}` 是唯一能协商成功的值。
+**内核今天讲 `1..=2`**（ME4-S2b 起；之前只有 1）。协商结果是 `min(模块的 max, 2)`，所以只声明 `{"min": 1, "max": 1}` 的模块照样得到 1。
+v2 与 v1 的区别只有一条：`_a24/model/complete` 收 `temperature`（§5.5）。内核不按连接区分两者，v1 模块只是不发这个字段；
+用了它的模块在 manifest 里写 `min_daemon_protocol: 2`，老内核在安装和挂载时就拒绝这个包。
 
 成功响应（`InitializeResult`，`initialize.rs:150-157`）：
 
@@ -662,6 +664,7 @@ cron 规则：恰好 5 段（无秒段，即便 REST 路径接受 6 段这里也
 | `response_format` | `{"type":"json_schema","json_schema":{name,schema,strict?}}` | 否 | — |
 | `max_tokens` | u32 | 否 | 1..=4096，缺省 1024 |
 | `complexity` | `"simple"\|"complex"` | 否 | 仅是偏好，最终选哪个 provider 由内核决定 |
+| `temperature` | number | 否 | 0..=2（ME4-S2b，协议 v2）；越界 `-32602`；写 `null` 等同不写。不写时请求里不带，后端用它自己的缺省（Ollama 的 OpenAI 兼容层是 1.0）。其余采样参数（`seed`、`top_p`、惩罚参数）都是 unknown field |
 | `request_id` | string | 否 | — |
 
 **没有任何字段能改隐私、选具体模型或开 tools**——`privacy`/`model`/`tools`/`provider` 都不是这个

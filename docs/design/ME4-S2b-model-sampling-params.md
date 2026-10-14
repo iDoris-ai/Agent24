@@ -61,7 +61,7 @@
 - **`CompletionRequest`**（`agent24-models/src/lib.rs:93`，派生 `Debug, Clone, PartialEq`，没有 `Eq`）加 `temperature: Option<f64>`。全程用 f64：f32 会把 0.7 写成 `0.699999988079071`，后端收到的就不是模块给的值了。
 - **`OpenAiCompatProvider`**：只在 `Some` 时写进请求体，和 `max_tokens` 的「只在有值时发」同一条规则（`lib.rs:607-609`）。`None` 时请求体逐字节不变，其他调用方不受影响。
 - **`into_request`**（`model_callback.rs:148`）：原样带进 `CompletionRequest`。
-- **结构体字面量**：`CompletionRequest` 没有 `Default`，加字段要改全部 17 处构造点：
+- **结构体字面量**：`CompletionRequest` 没有 `Default`，加字段要改全部 17 处构造点（实现时更正：S2a 合并后显式写出全部字段的是 13 处，另有几处用 `..req()` 继承，不用改；见第 1 片的 PR）：
   - `agent24-agent/src/lib.rs:219`、`:1663`，`agent24-agent/src/subagent.rs:187`；
   - `agent24-models/src/lib.rs:914`、`:927`、`:1026`、`:1030`、`:1079`，`agent24-models/src/router.rs:578`、`:920`、`:1008`；
   - `agent24-policy/src/guardian.rs:223`；
@@ -134,6 +134,7 @@ J1 只断言 `temperature` 这个键的有无和值，不断言整个请求体�
 | R-b | 温度 0 时，个别模型会陷入重复输出 | `max_tokens` 上限兜底；抽取器对截断的回答有拆半重问的规则 |
 | R-c | 选 (A) 时，新模块装在老内核上，要到 job 运行才失败 | 报错写明要升级；或者选 (B)，在挂载时就拒绝 |
 | R-d | oMLX 对 `temperature` 的处理没有验证 | OpenAI 兼容接口的标准字段；实现时若手上没有 oMLX，请 jason 在 oMLX 上试一次 |
+| R-e | 远端的推理类端点（OpenAI o 系列、gpt-5 等）会以 400 拒绝不等于 1 的 `temperature`。内核会把它记成 `RequestRejected`，抽取器就当成「输入太长」去拆窗，和 §1 推迟 `seed` 的理由相同（PR-Daemon 在 #971） | 文档模块是 `model_access: local_only`，碰不到远端。以后有不是 `local_only` 的模块传温度时，要先让内核区分这种 400，或者对这类 provider 不发温度 |
 
 ## 9. 决定（David，2026-10-15）
 
