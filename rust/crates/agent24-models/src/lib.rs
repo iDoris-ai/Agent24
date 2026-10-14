@@ -120,7 +120,7 @@ pub struct CompletionRequest {
     pub disable_thinking: bool,
     /// ME4-S2a: read the answer as it is written, under these timers, instead
     /// of within one fixed `chat_timeout`. `None` = today's request, byte for
-    /// byte. Set only by `_a24/model/complete`; the router hands the same
+    /// byte. To be set only by `_a24/model/complete`; the router hands the same
     /// value to every provider it tries, so its deadline is the call's.
     pub progress: Option<Progress>,
 }

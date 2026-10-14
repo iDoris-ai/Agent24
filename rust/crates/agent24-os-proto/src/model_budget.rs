@@ -54,6 +54,7 @@ mod tests {
         );
         assert_eq!(MODEL_CALL_BACKSTOP, Duration::from_secs(4456));
         assert_eq!(MODEL_RESPONSE_TIMEOUT, Duration::from_secs(4461));
+        assert_eq!(MODEL_STALL_TIMEOUT, Duration::from_secs(60));
         assert_eq!(
             model_call_budget(u32::MAX),
             MODEL_FIRST_CHUNK_TIMEOUT + Duration::from_secs(u64::from(u32::MAX))

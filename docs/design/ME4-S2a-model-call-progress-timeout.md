@@ -182,6 +182,7 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
 1. **`agent24-os-proto` + `agent24-models`**：§2.1 的常量、`Progress` 字段、流式读与三个计时（§2.3），J1–J11、J13。
    这时还没有任何调用方设 `progress`，所以这个 PR 合进去，运行行为不变。
    `CompletionRequest` 加字段，对外部直接写结构体字面量的 crate 是源码不兼容（ME4-S2 R7，Sin90），PR 正文点名。J16 也在这个 PR。
+   **实际拆分（2026-10-15）**：超出规模，拆成 4 个 PR：常量（#956）、`progress` 字段（#957）、`answer()` 重构（#958）、流式接收与路由器。
 2. **`agent24d` + `agent24-os-proto` 的 `rpc.rs` + `agent24-os-sdk`**：handler 开启 `progress`、兜底值与夹紧（按 Q2 的选择）、SDK 常量（§2.4–2.5），J12。
    同一个 PR 改文首「修订对象」里列出的文档和注释，以及 `model_callback.rs:46`、`:128-131`、`:1010-1011`、`:1549`（`MODEL_MAX_TOKENS_CEILING` 搬走与断言）。从这个 PR 起行为才真正改变。
 3. **`agent24-documents`**：`no_provider` 重试一次（§2.6）与注释，J14；附 J15 的实测记录。
