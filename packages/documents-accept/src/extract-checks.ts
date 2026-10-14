@@ -24,9 +24,10 @@ const route = (documentId: string) => `/documents/${documentId}/extractions`
 const request = (ask: AskField[]) => ({ revision: 1, schema: { fields: ask } })
 const said = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
-/** A job answered for this document must be an extraction of its revision 1. */
+/** A job answered for this document must be an extraction of its revision 1, wherever it says of what it is: on itself, and in its result. */
 function ours(job: Job, documentId: string): Job {
-  if (job.kind !== 'extract' || (job.document_id ?? documentId) !== documentId || (job.revision ?? 1) !== 1) throw new Error(`job ${job.job_id} is not an extraction of revision 1 of this document`)
+  const of = [job, job.result ?? {}]
+  if (job.kind !== 'extract' || of.some((x) => (x.document_id ?? documentId) !== documentId || (x.revision ?? 1) !== 1)) throw new Error(`job ${job.job_id} is not an extraction of revision 1 of this document`)
   return job
 }
 
@@ -124,7 +125,7 @@ export async function checkExtract(client: Client, sample: Sample, documentId: s
 export async function checkReplay(client: Client, sample: Sample, documentId: string, ask: AskField[], job: Job, wait: JobWait = {}): Promise<CheckResult & { requeued?: boolean }> {
   let requeued: boolean | undefined
   const result = await check('ACC-IDEM-1', sample.id, async () => {
-    const before = await waitForJob(client, job.job_id, wait)
+    const before = ours(await waitForJob(client, job.job_id, wait), documentId)
     const { job: after, http } = await extract(client, documentId, request(ask))
     if (after.job_id !== before.job_id) return [`the same request started another job: ${after.job_id}, not ${before.job_id}`]
     requeued = before.status === 'failed' || before.status === 'interrupted'
@@ -199,7 +200,7 @@ export async function checkCancelledStays(client: Client, sample: Sample, docume
     cancelled = answered
     if (cancelled.status === 'succeeded') return []
     // A running job is cancelling until its worker next looks: wait for the end of that.
-    const stopped = await waitForJob(client, job.job_id, wait)
+    const stopped = ours(await waitForJob(client, job.job_id, wait), documentId)
     if (stopped.status !== 'cancelled') return [`the job was ${cancelled.status} when cancelled, and then ended ${stopped.status}`]
     const problems: string[] = []
     if (stopped.attempt !== attempt) problems.push(`the job was cancelled at attempt ${stopped.attempt}, not at the ${attempt} it was at`)

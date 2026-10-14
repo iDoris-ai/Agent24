@@ -91,6 +91,12 @@ describe('ACC-EXTRACT', () => {
     expect((await run(daemon(extracted({ document_id: id('doc', 2) })))).problems).toEqual([NOT_OURS])
     expect((await run(daemon(extracted({ revision: 2 })))).problems).toEqual([NOT_OURS])
     expect((await run(daemon(failed('engine_unavailable', { kind: 'export' })))).problems).toEqual([NOT_OURS])
+    // Nor when its result says it is of another document or revision, though the job itself says nothing or the right thing.
+    for (const other of [{ document_id: id('doc', 2) }, { revision: 2 }]) {
+      expect((await run(daemon(extracted({ result: { extraction_id: EXT, ...other } })))).problems, JSON.stringify(other)).toEqual([NOT_OURS])
+      expect((await run(daemon(extracted({ document_id: DOC, revision: 1, result: { extraction_id: EXT, ...other } })))).problems).toEqual([NOT_OURS])
+    }
+    expect((await run(daemon(extracted({ result: { extraction_id: EXT, document_id: DOC, revision: 1 } })))).problems).toEqual([])
     expect((await run(daemon(extracted({ document_id: DOC, revision: 1 })))).problems).toEqual([])
   })
 
@@ -191,6 +197,19 @@ describe('ACC-IDEM-1', () => {
     expect((await run(DONE, { ...DONE, status: 'done' })).result.problems).toEqual([NOT_A('DocumentsJob')])
     // The same id on a job that is not this extraction is not the same job.
     for (const other of [{ kind: 'export' }, { document_id: id('doc', 2) }, { revision: 2 }]) expect((await run(DONE, { ...DONE, ...other })).result.problems).toEqual([NOT_OURS])
+  })
+
+  it('fails when the job it waited for is not this extraction, though the replay then agrees with it in everything else', async () => {
+    // Cancelled at attempt 3 for another document, and replayed as the same job, cancelled at attempt 3, for this one.
+    for (const other of [{ document_id: id('doc', 2) }, { revision: 2 }, { kind: 'export' }]) {
+      const ended = job({ status: 'cancelled', attempt: 3, ...other })
+      const { result, calls } = await run(ended, job({ status: 'cancelled', attempt: 3, document_id: DOC, revision: 1 }))
+      expect(result, JSON.stringify(other)).toMatchObject({ outcome: 'failed', problems: [NOT_OURS] })
+      expect(result.requeued).toBeUndefined()
+      // Nothing is replayed for a job that is another's.
+      expect(calls.some((c) => c.method === 'POST')).toBe(false)
+    }
+    expect((await run(job({ status: 'cancelled', attempt: 3, document_id: DOC, revision: 1 }))).result).toMatchObject({ outcome: 'passed', requeued: false })
   })
 
   it('fails when the replay runs a finished job again: the same job is not enough', async () => {
@@ -442,6 +461,14 @@ describe('ACC-IDEM-3', () => {
     expect(await first(() => answer({ status: 'running' }))).toEqual([NOT_A('DocumentsJob')])
     expect(await first(() => answer(job({ job_id: RERUN, status: 'running', attempt: 3 })))).toEqual([`asked for job ${JOB}, answered with ${RERUN}`])
     for (const other of [{ kind: 'export' }, { document_id: id('doc', 2) }, { revision: 2 }]) expect(await first(() => answer(job({ status: 'running', attempt: 3, ...other })))).toEqual([NOT_OURS])
+  })
+
+  it('fails when the job that stopped is not this extraction, though all else agrees', async () => {
+    for (const other of [{ document_id: id('doc', 2) }, { revision: 2 }, { kind: 'export' }]) {
+      const { result, routes } = await run({ ends: job({ status: 'cancelled', attempt: 3, ...other }) })
+      expect(result, JSON.stringify(other)).toMatchObject({ outcome: 'failed', problems: [NOT_OURS] })
+      expect(routes.some((r) => r.startsWith(`POST ${EXTRACTIONS}`) || r.endsWith('/retry'))).toBe(false)
+    }
   })
 
   it('fails when the retry does not queue the job again at the next attempt', async () => {
