@@ -101,6 +101,7 @@ export interface OpenDesignComponentManifest {
 export type OpenDesignComponentState =
   | 'not-installed'
   | 'downloading'
+  | 'paused'
   | 'verifying'
   | 'installed'
   | 'failed'
@@ -114,6 +115,14 @@ export interface OpenDesignComponentStatus {
   dir?: string
   error?: string
   reason?: string
+  /** SD-01: rolling-window transfer rate while `downloading`, in bytes/sec.
+   * `0` (not absent) means "no recent progress" — the renderer shows
+   * "等待网络" rather than a bogus 0 B/s. */
+  bytesPerSecond?: number
+  /** SD-01: estimated seconds remaining at the current rate; `null` when
+   * the rate is unknown or zero (renderer shows "等待网络" instead of an
+   * infinite/garbage ETA). Absent outside `downloading`. */
+  etaSeconds?: number | null
 }
 
 type FetchFn = typeof fetch
@@ -208,6 +217,22 @@ interface ComponentMarker {
 
 function sha256OfFile(filePath: string): string {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
+}
+
+/** SD-01: streamed (not `readFileSync`'d whole) because this hashes the
+ * downloaded tarball itself — potentially hundreds of MB — and, unlike
+ * sha256OfFile's small entry-file use, is also what makes resuming across
+ * process restarts correct: the hash is always computed from what's
+ * actually on disk now, never from an in-memory accumulator that would
+ * only have seen the bytes THIS process wrote. */
+async function sha256OfFileStreamed(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256')
+    fs.createReadStream(filePath)
+      .on('data', (chunk) => hash.update(chunk as Buffer))
+      .on('error', reject)
+      .on('end', () => resolve(hash.digest('hex')))
+  })
 }
 
 function readComponentMarker(dir: string): ComponentMarker | null {
@@ -487,6 +512,92 @@ function cleanupStalePartials(componentsRoot: string): void {
   }
 }
 
+// SD-01: resumable download state. Deliberately a DIFFERENT name prefix
+// (`.download-`) than the `.partial-` extraction scratch dirs above —
+// `cleanupStalePartials` must never sweep these, since (unlike the
+// extraction scratch dir) they are meant to survive a quit/crash/pause so a
+// later install() can resume them. Keyed by the manifest's sha256, not a
+// random token: that's what lets a brand-new installer instance (e.g.
+// after an app restart) recognize "this file on disk is a prefix of THIS
+// exact asset" without guessing. The sidecar metadata is the actual
+// resume-eligibility check — see readMatchingDownloadMeta.
+interface DownloadMeta { version: string; url: string; sha256: string; total: number }
+
+function downloadFilePath(componentsRoot: string, manifest: OpenDesignComponentManifest): string {
+  return path.join(componentsRoot, `.download-${manifest.sha256}.part`)
+}
+
+function downloadMetaPath(componentsRoot: string, manifest: OpenDesignComponentManifest): string {
+  return path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`)
+}
+
+function writeDownloadMeta(metaPath: string, manifest: OpenDesignComponentManifest): void {
+  const meta: DownloadMeta = { version: manifest.version, url: manifest.url, sha256: manifest.sha256, total: manifest.size }
+  fs.writeFileSync(metaPath, JSON.stringify(meta))
+}
+
+/** Only a file whose sidecar metadata matches EVERY one of version/url/
+ * sha256/total against the CURRENT manifest is reused — any mismatch (or a
+ * missing/corrupt sidecar, e.g. a pre-SD-01 random `.partial-*` leftover)
+ * is discarded and the download restarts from byte 0. This is what keeps
+ * resume from ever guessing which asset an unrelated partial belongs to. */
+function readMatchingDownloadMeta(filePath: string, metaPath: string, manifest: OpenDesignComponentManifest): number {
+  const size = fs.statSync(filePath, { throwIfNoEntry: false })?.size
+  if (size == null || size <= 0 || size > manifest.size) return 0
+  try {
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as Partial<DownloadMeta>
+    if (meta.version === manifest.version && meta.url === manifest.url && meta.sha256 === manifest.sha256 && meta.total === manifest.size) {
+      return size
+    }
+  } catch {
+    // missing/corrupt sidecar — fall through to "not resumable"
+  }
+  return 0
+}
+
+function discardDownloadFile(filePath: string, metaPath: string): void {
+  fs.rmSync(filePath, { force: true })
+  fs.rmSync(metaPath, { force: true })
+}
+
+/** Thrown when the server's response to a Range request doesn't agree with
+ * what we asked for (206 with a mismatched Content-Range, or 416 while we
+ * are NOT already holding the full file) — signals installOnce to discard
+ * the local prefix and retry exactly once from byte 0, never looping. */
+class RangeResetRequiredError extends Error {}
+
+/** Parses a `Content-Range: bytes <start>-<end>/<total>` response header.
+ * Returns `null` for anything that doesn't parse as that exact shape —
+ * callers treat an unparsable header the same as a mismatched one. */
+function parseContentRange(header: string | null): { start: number; end: number; total: number } | null {
+  const match = header?.match(/^bytes (\d+)-(\d+)\/(\d+)$/)
+  if (!match) return null
+  return { start: Number(match[1]), end: Number(match[2]), total: Number(match[3]) }
+}
+
+const SPEED_WINDOW_MS = 3_000
+
+/** Rolling-window speed/ETA estimator (SD-01) — no stats library, just a
+ * capped FIFO of recent (time, bytesOnDisk) samples. Returns `bytesPerSecond:
+ * 0, etaSeconds: null` ("等待网络") until there are at least two samples
+ * spanning a non-zero amount of time. */
+class SpeedEstimator {
+  private samples: Array<{ t: number; bytes: number }> = []
+
+  /** `remaining` is the number of bytes still left to transfer, used only to
+   * turn the measured rate into an ETA — the estimator itself tracks rate. */
+  sample(bytes: number, remaining: number): { bytesPerSecond: number; etaSeconds: number | null } {
+    const now = Date.now()
+    this.samples.push({ t: now, bytes })
+    while (this.samples.length > 1 && now - this.samples[0]!.t > SPEED_WINDOW_MS) this.samples.shift()
+    const oldest = this.samples[0]!
+    const elapsedMs = now - oldest.t
+    const bytesPerSecond = elapsedMs > 0 ? ((bytes - oldest.bytes) / elapsedMs) * 1_000 : 0
+    if (bytesPerSecond <= 0) return { bytesPerSecond: 0, etaSeconds: null }
+    return { bytesPerSecond, etaSeconds: remaining / bytesPerSecond }
+  }
+}
+
 export interface OpenDesignComponentInstallerOptions {
   manifest?: OpenDesignComponentManifest | null
   resourcesPath?: string
@@ -516,6 +627,12 @@ export class OpenDesignComponentInstaller {
   private current: OpenDesignComponentStatus
   private installing: Promise<OpenDesignComponentStatus> | null = null
   private activeAbort: AbortController | null = null
+  /** SD-01: set by `pause()` right before aborting, so installOnce's catch
+   * block can tell "the user asked to pause" apart from every other abort
+   * reason (quit, idle-timeout, a real network error) — only the former
+   * reports `paused` (shows "继续下载"); every other reason reports
+   * `failed` (shows "重试"). Both paths now preserve the on-disk prefix. */
+  private pauseRequested = false
   private readonly listeners = new Set<(status: OpenDesignComponentStatus) => void>()
 
   constructor(options: OpenDesignComponentInstallerOptions = {}, fetchFn: FetchFn = fetch) {
@@ -548,6 +665,17 @@ export class OpenDesignComponentInstaller {
     }
     const dir = openDesignComponentInstallDir(this.componentsRoot, this.manifest)
     if (quickValidateInstalledComponent(dir, this.manifest.sha256)) return { state: 'installed', dir }
+    // SD-01: a quit/pause/network-interruption from a PREVIOUS process can
+    // have left a resumable prefix on disk — surface it as `paused` (with
+    // its saved byte count) rather than `not-installed`, so re-opening the
+    // page or switching tabs after a restart shows "已保存 X / Y MiB" +
+    // "继续下载" instead of silently forgetting the progress.
+    const resumable = readMatchingDownloadMeta(
+      downloadFilePath(this.componentsRoot, this.manifest),
+      downloadMetaPath(this.componentsRoot, this.manifest),
+      this.manifest,
+    )
+    if (resumable > 0 && resumable < this.manifest.size) return { state: 'paused', received: resumable, total: this.manifest.size }
     return { state: 'not-installed', size: this.manifest.size }
   }
 
@@ -584,6 +712,17 @@ export class OpenDesignComponentInstaller {
     this.activeAbort?.abort(new Error(reason))
   }
 
+  /** SD-01: user-facing pause — unlike `abort()` (quit path), this reports
+   * `paused` rather than `failed`. A no-op unless a download is actually in
+   * flight. The already-written prefix is kept on disk either way; a later
+   * `install()` call (the renderer's existing "继续下载"/"下载" button)
+   * resumes it via HTTP Range. */
+  pause(reason = 'Open Design component download paused by user'): void {
+    if (this.status().state !== 'downloading') return
+    this.pauseRequested = true
+    this.activeAbort?.abort(new Error(reason))
+  }
+
   install(): Promise<OpenDesignComponentStatus> {
     if (!this.manifest) return Promise.resolve(this.status())
     if (this.status().state === 'installed') return Promise.resolve(this.status())
@@ -597,7 +736,7 @@ export class OpenDesignComponentInstaller {
     return pending
   }
 
-  private async installOnce(manifest: OpenDesignComponentManifest): Promise<OpenDesignComponentStatus> {
+  private async installOnce(manifest: OpenDesignComponentManifest, alreadyReset = false): Promise<OpenDesignComponentStatus> {
     if (!manifest.url.startsWith('https://')) {
       this.setStatus({ state: 'failed', error: 'Open Design component manifest URL must use HTTPS' })
       return this.status()
@@ -631,13 +770,30 @@ export class OpenDesignComponentInstaller {
     cleanupStalePartials(this.componentsRoot)
     const token = crypto.randomBytes(6).toString('hex')
     const partialDir = path.join(this.componentsRoot, `.partial-${token}`)
-    const tarballPath = path.join(this.componentsRoot, `.partial-${token}.tar.gz`)
+    // SD-01: the download itself now lands in a deterministic, sha256-keyed
+    // file (NOT this random partialDir) so it survives across install()
+    // calls — including a fresh OpenDesignComponentInstaller after a quit —
+    // and can be resumed via Range instead of restarted from byte 0.
+    const tarballPath = downloadFilePath(this.componentsRoot, manifest)
+    const metaPath = downloadMetaPath(this.componentsRoot, manifest)
+    const resumeFromBytes = readMatchingDownloadMeta(tarballPath, metaPath, manifest)
+    if (resumeFromBytes === 0) discardDownloadFile(tarballPath, metaPath)
+    writeDownloadMeta(metaPath, manifest)
     const controller = new AbortController()
     this.activeAbort = controller
+    // SD-01: once the full, hash-verified bytes are in hand, a failure
+    // during verify/extract (unsafe tar member, bad contract, a corrupt
+    // archive) is NOT a network interruption — pause() is also a no-op past
+    // this point (it only acts while `downloading`; see pause()'s own
+    // guard). Retrying would just re-run the same doomed verification
+    // against the same bytes, so the download file is discarded rather
+    // than kept around as a false "resumable" match.
+    let downloadComplete = false
 
     try {
-      this.setStatus({ state: 'downloading', received: 0, total: manifest.size })
-      await this.download(manifest, tarballPath, controller)
+      this.setStatus({ state: 'downloading', received: resumeFromBytes, total: manifest.size })
+      await this.download(manifest, tarballPath, metaPath, controller, resumeFromBytes)
+      downloadComplete = true
 
       this.setStatus({ state: 'verifying' })
       await assertSafeTarMembers(this.tarBinary, tarballPath)
@@ -671,23 +827,44 @@ export class OpenDesignComponentInstaller {
       // location — nothing (including this process) can change its
       // content again short of deleting and reinstalling it.
       makeInstalledTreeReadOnly(finalDir)
+      // The downloaded tarball is only needed up to extraction — once the
+      // final tree is published, drop it (and its resume sidecar) rather
+      // than leaving it to be rediscovered as a false "resumable" match.
+      discardDownloadFile(tarballPath, metaPath)
       this.setStatus({ state: 'installed', dir: finalDir })
       return this.status()
     } catch (error) {
       fs.rmSync(partialDir, { recursive: true, force: true })
+      if (downloadComplete) discardDownloadFile(tarballPath, metaPath)
+      // SD-01: the server disagreed with our Range request in a way
+      // download() couldn't safely recover from inline (it already
+      // discarded the now-untrustworthy local prefix) — retry exactly once
+      // from byte 0, never recursing further.
+      if (error instanceof RangeResetRequiredError && !alreadyReset) {
+        return this.installOnce(manifest, true)
+      }
+      // SD-01: pause() preserves the on-disk prefix (unlike a genuine
+      // failure below, which still preserves it too — see download() —
+      // but reports `paused` so the renderer offers "继续下载" instead of
+      // "重试"). quit/idle-timeout/network errors fall through to `failed`.
+      if (this.pauseRequested) {
+        this.pauseRequested = false
+        const onDisk = fs.statSync(tarballPath, { throwIfNoEntry: false })?.size ?? 0
+        this.setStatus({ state: 'paused', received: onDisk, total: manifest.size })
+        return this.status()
+      }
       const message = error instanceof Error ? error.message : String(error)
       this.setStatus({ state: 'failed', error: message })
       return this.status()
     } finally {
       if (this.activeAbort === controller) this.activeAbort = null
-      fs.rmSync(tarballPath, { force: true })
     }
   }
 
   /** L3: follows redirects manually, re-checking HTTPS + the host allowlist
    * at every hop — fetch's automatic `redirect: 'follow'` would trust
    * wherever the server points next without either check. */
-  private async fetchWithAllowedRedirects(initialUrl: string, signal: AbortSignal): Promise<Response> {
+  private async fetchWithAllowedRedirects(initialUrl: string, signal: AbortSignal, headers?: Record<string, string>): Promise<Response> {
     let current = initialUrl
     for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
       const parsed = new URL(current)
@@ -697,7 +874,7 @@ export class OpenDesignComponentInstaller {
       if (!this.allowedHosts.has(parsed.hostname)) {
         throw new Error(`Open Design component download host is not allow-listed: ${parsed.hostname}`)
       }
-      const response = await this.fetchFn(current, { signal, redirect: 'manual' })
+      const response = await this.fetchFn(current, { signal, redirect: 'manual', headers })
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location')
         if (!location) throw new Error('Open Design component download redirect is missing a Location header')
@@ -709,7 +886,26 @@ export class OpenDesignComponentInstaller {
     throw new Error('Open Design component download exceeded the redirect hop limit')
   }
 
-  private async download(manifest: OpenDesignComponentManifest, destination: string, controller: AbortController): Promise<void> {
+  private async download(
+    manifest: OpenDesignComponentManifest,
+    destination: string,
+    metaPath: string,
+    controller: AbortController,
+    resumeFromBytes: number,
+  ): Promise<void> {
+    // SD-01: the sidecar metadata already matched this exact manifest and
+    // the file on disk already has every byte — nothing left to transfer
+    // (e.g. a previous run completed the download but crashed before
+    // extraction). Skip the network entirely and just re-verify.
+    if (resumeFromBytes === manifest.size) {
+      const digest = await sha256OfFileStreamed(destination)
+      if (digest !== manifest.sha256) {
+        discardDownloadFile(destination, metaPath)
+        throw new Error(`Open Design component sha256 mismatch: expected ${manifest.sha256}, got ${digest}`)
+      }
+      return
+    }
+
     let idleTimer: NodeJS.Timeout | undefined
     const resetIdleTimer = (): void => {
       clearTimeout(idleTimer)
@@ -720,20 +916,47 @@ export class OpenDesignComponentInstaller {
       idleTimer.unref?.()
     }
 
+    const sentRange = resumeFromBytes > 0
     resetIdleTimer()
     let response: Response
     try {
-      response = await this.fetchWithAllowedRedirects(manifest.url, controller.signal)
+      response = await this.fetchWithAllowedRedirects(
+        manifest.url, controller.signal, sentRange ? { Range: `bytes=${resumeFromBytes}-` } : undefined,
+      )
     } finally {
       clearTimeout(idleTimer)
     }
-    if (!response.ok) throw new Error(`Open Design component download failed: HTTP ${response.status}`)
+
+    // SD-01: a Range request can come back three ways — 206 (resume
+    // accepted: must re-check the server actually agrees on WHERE it's
+    // resuming from and the total size), 200 (server ignored Range and is
+    // sending the whole thing again: must reset the local file to byte 0,
+    // never append a second copy onto it), or 416 (server rejects the
+    // range outright: our local prefix can no longer be trusted against
+    // this server/asset — discard and retry once from byte 0). Any other
+    // status is a plain HTTP failure, same as a non-resumed request.
+    let onDiskReceived = 0
+    let appendMode = false
+    if (sentRange && response.status === 416) {
+      discardDownloadFile(destination, metaPath)
+      throw new RangeResetRequiredError('Open Design component download: server rejected the resume Range request')
+    }
+    if (sentRange && response.status === 206) {
+      const range = parseContentRange(response.headers.get('content-range'))
+      if (!range || range.start !== resumeFromBytes || range.total !== manifest.size) {
+        discardDownloadFile(destination, metaPath)
+        throw new RangeResetRequiredError('Open Design component download: server returned an unexpected Content-Range for the resume request')
+      }
+      onDiskReceived = resumeFromBytes
+      appendMode = true
+    } else if (!response.ok) {
+      throw new Error(`Open Design component download failed: HTTP ${response.status}`)
+    }
     if (!response.body) throw new Error('Open Design component download returned no body')
 
-    const hash = crypto.createHash('sha256')
-    let received = 0
     let lastEmit = 0
-    const file = fs.createWriteStream(destination)
+    const speed = new SpeedEstimator()
+    const file = fs.createWriteStream(destination, { flags: appendMode ? 'a' : 'w' })
     // H2 (review finding, 2026-10-05): a write error while we're `await`ing
     // 'drain' used to hang installOnce() forever — the no-op 'error'
     // listener below swallowed it, and a stream that has errored never
@@ -752,11 +975,10 @@ export class OpenDesignComponentInstaller {
       resetIdleTimer()
       for await (const chunk of nodeStream as AsyncIterable<Buffer>) {
         resetIdleTimer()
-        received += chunk.length
-        if (received > manifest.size) {
+        onDiskReceived += chunk.length
+        if (onDiskReceived > manifest.size) {
           throw new Error('Open Design component download exceeded the manifest-declared size')
         }
-        hash.update(chunk)
         if (!file.write(chunk)) {
           try {
             await once(file, 'drain', { signal: controller.signal })
@@ -769,8 +991,9 @@ export class OpenDesignComponentInstaller {
           }
         }
         const now = Date.now()
-        if (received === manifest.size || now - lastEmit >= PROGRESS_THROTTLE_MS) {
-          this.setStatus({ state: 'downloading', received, total: manifest.size })
+        if (onDiskReceived === manifest.size || now - lastEmit >= PROGRESS_THROTTLE_MS) {
+          const { bytesPerSecond, etaSeconds } = speed.sample(onDiskReceived, manifest.size - onDiskReceived)
+          this.setStatus({ state: 'downloading', received: onDiskReceived, total: manifest.size, bytesPerSecond, etaSeconds })
           lastEmit = now
         }
       }
@@ -778,21 +1001,27 @@ export class OpenDesignComponentInstaller {
         file.end((error: unknown) => (error ? reject(error) : resolve()))
       })
     } catch (error) {
-      // Wait for the fd to actually close before the caller deletes this
-      // path — fs.WriteStream.destroy() can leave an in-flight open/write
-      // that still touches the path after we return.
+      // Wait for the fd to actually close before anything else touches
+      // this path — fs.WriteStream.destroy() can leave an in-flight
+      // open/write that still touches the path after we return.
       await new Promise<void>((resolve) => file.close(() => resolve()))
       void response.body?.cancel?.().catch(() => {})
+      // Overflow means THIS attempt's bytes can no longer be trusted as a
+      // valid prefix of the declared size — discard rather than "resume"
+      // garbage next time. Every other error (pause/quit-abort/idle-timeout/
+      // network/write-stream) leaves the already-flushed prefix in place.
+      if (onDiskReceived > manifest.size) discardDownloadFile(destination, metaPath)
       throw error
     } finally {
       clearTimeout(idleTimer)
     }
 
-    if (received !== manifest.size) {
-      throw new Error(`Open Design component download size mismatch: expected ${manifest.size}, got ${received}`)
+    if (onDiskReceived !== manifest.size) {
+      throw new Error(`Open Design component download size mismatch: expected ${manifest.size}, got ${onDiskReceived}`)
     }
-    const digest = hash.digest('hex')
+    const digest = await sha256OfFileStreamed(destination)
     if (digest !== manifest.sha256) {
+      discardDownloadFile(destination, metaPath)
       throw new Error(`Open Design component sha256 mismatch: expected ${manifest.sha256}, got ${digest}`)
     }
   }

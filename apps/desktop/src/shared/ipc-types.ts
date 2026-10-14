@@ -17,6 +17,9 @@ export const IpcChannels = {
   // only starts the already-installed component.
   OpenDesignComponentStatus: 'open-design-component:status',
   OpenDesignComponentInstall: 'open-design-component:install',
+  // SD-01: pauses (not cancels — the on-disk prefix is kept) the current
+  // in-flight download. Resuming reuses OpenDesignComponentInstall itself.
+  OpenDesignComponentPause: 'open-design-component:pause',
   // Push channel only (main -> renderer), mirrors AgentEarEvent's pattern.
   OpenDesignComponentProgress: 'open-design-component:progress',
   OmlxDetect: 'omlx:detect',
@@ -100,13 +103,19 @@ export interface CreativeViewResult {
  * duplicated here (not imported) because this file is the main/renderer
  * boundary and must stay free of main-process-only modules. */
 export interface OpenDesignComponentStatusResult {
-  state: 'not-installed' | 'downloading' | 'verifying' | 'installed' | 'failed' | 'unavailable'
+  state: 'not-installed' | 'downloading' | 'paused' | 'verifying' | 'installed' | 'failed' | 'unavailable'
   received?: number
   total?: number
   size?: number
   dir?: string
   error?: string
   reason?: string
+  /** SD-01: rolling-window transfer rate while `downloading`, bytes/sec; `0`
+   * (not absent) means "waiting for network". */
+  bytesPerSecond?: number
+  /** SD-01: estimated seconds remaining; `null` while the rate is unknown
+   * or zero. */
+  etaSeconds?: number | null
 }
 
 export interface OmlxDetectResult {

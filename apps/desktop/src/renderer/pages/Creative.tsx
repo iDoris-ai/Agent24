@@ -11,7 +11,25 @@ function formatMb(bytes: number | undefined): string {
   return Math.max(1, Math.round(bytes / (1024 * 1024))).toString()
 }
 
-const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'verifying', 'failed'])
+/** SD-01: user-visible transfer rate — "等待网络" (not a bogus "0 KiB/s")
+ * whenever the rolling-window estimator has no recent progress to measure. */
+function formatSpeed(bytesPerSecond: number | undefined): string {
+  if (!bytesPerSecond || bytesPerSecond <= 0) return '等待网络'
+  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MiB/s`
+  return `${Math.max(1, Math.round(bytesPerSecond / 1024))} KiB/s`
+}
+
+/** SD-01: '' (not a misleading ETA) whenever the rate is unknown/zero — the
+ * speed text alone already says "等待网络" in that case. */
+function formatEta(etaSeconds: number | null | undefined): string {
+  if (etaSeconds == null || !Number.isFinite(etaSeconds) || etaSeconds <= 0) return ''
+  const totalSeconds = Math.round(etaSeconds)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return minutes > 0 ? `约剩 ${minutes} 分 ${seconds} 秒` : `约剩 ${seconds} 秒`
+}
+
+const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'paused', 'verifying', 'failed'])
 
 /** The on-demand iDoris Design component card — shown instead of the Creative
  * WebContentsView whenever the component isn't installed yet. User-facing
@@ -26,19 +44,40 @@ const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'verifying
 function ComponentCard({
   status,
   onInstall,
+  onPause,
 }: {
   status: OpenDesignComponentStatusResult
   onInstall: () => void
+  onPause: () => void
 }): JSX.Element {
   if (status.state === 'downloading') {
     const total = status.total ?? 0
     const received = status.received ?? 0
     const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0
+    const etaText = formatEta(status.etaSeconds)
     return (
       <div className="creative-download">
         <div>正在下载 iDoris Design 组件…</div>
         <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%` }} /></div>
-        <div className="creative-download-hint">{formatMb(received)} / {formatMb(total)} MB（{pct}%）</div>
+        <div className="creative-download-hint">
+          {formatMb(received)} / {formatMb(total)} MiB（{pct}%）· {formatSpeed(status.bytesPerSecond)}
+          {etaText && ` · ${etaText}`}
+        </div>
+        <button className="btn" type="button" onClick={onPause}>暂停下载（保留进度）</button>
+      </div>
+    )
+  }
+
+  if (status.state === 'paused') {
+    const total = status.total ?? 0
+    const received = status.received ?? 0
+    return (
+      <div className="creative-download">
+        <div>
+          已暂停下载 iDoris Design 组件：已保存 {formatMb(received)} / {formatMb(total)} MiB
+          （尚未安装，不影响已安装的运行版本）
+        </div>
+        <button className="btn btn-primary" type="button" onClick={onInstall}>继续下载</button>
       </div>
     )
   }
@@ -88,6 +127,10 @@ export default function CreativePage(): JSX.Element {
 
   const installComponent = (): void => {
     void window.agent24.openDesignComponentInstall().then(applyComponentStatus)
+  }
+
+  const pauseComponent = (): void => {
+    void window.agent24.openDesignComponentPause().then(applyComponentStatus)
   }
 
   useEffect(() => {
@@ -165,7 +208,7 @@ export default function CreativePage(): JSX.Element {
 
   return (
     <div ref={hostRef} className="creative-host">
-      {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} />}
+      {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} onPause={pauseComponent} />}
       {tryCreative && error && (
         <div className="creative-error">
           <div>iDoris Design 暂不可用：{error}</div>

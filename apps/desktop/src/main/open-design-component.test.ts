@@ -828,7 +828,13 @@ describe('OpenDesignComponentInstaller', () => {
     const result = await installer.install()
     expect(result.state).toBe('failed')
     expect(result.error).toContain('idle-timed-out')
-    expect(fs.readdirSync(componentsRoot)).toEqual([])
+    // SD-01: an idle-timeout is a network interruption, not corruption — the
+    // 1 already-flushed byte and its resume sidecar are kept on disk (not
+    // wiped, as before this change) so a later install() can Range-resume
+    // instead of restarting the whole download.
+    const partPath = path.join(componentsRoot, `.download-${manifest.sha256}.part`)
+    expect(fs.statSync(partPath).size).toBe(1)
+    expect(fs.existsSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`))).toBe(true)
 
     // Retryable: a fresh install() against a server that now responds fully succeeds.
     hangRequest = false
@@ -859,12 +865,18 @@ describe('OpenDesignComponentInstaller', () => {
       localFetch,
     )
     const pending = installer.install()
-    await vi.waitFor(() => expect(installer.status().state).toBe('downloading'))
+    // Wait for the first chunk to actually land (not just the `downloading`
+    // status set synchronously at the very start) so the preserved-prefix
+    // assertion below is deterministic rather than racing the fetch.
+    await vi.waitFor(() => expect(installer.status().received).toBe(1))
     installer.abort('test aborted it')
     const result = await pending
     expect(result.state).toBe('failed')
     expect(result.error).toContain('test aborted it')
-    expect(fs.readdirSync(componentsRoot)).toEqual([])
+    // SD-01: abort() (the quit path) also preserves the on-disk prefix now —
+    // only pause()-driven aborts report `paused`, but every abort reason
+    // keeps the bytes so a restart can still resume them.
+    expect(fs.statSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`)).size).toBe(1)
   })
 
   it('H2: a write-stream error during backpressure fails promptly (does not hang forever) and is retryable', async () => {
@@ -897,11 +909,221 @@ describe('OpenDesignComponentInstaller', () => {
     const result = await pending
     expect(result.state).toBe('failed')
     expect(result.error).toContain('simulated disk write failure')
-    expect(fs.readdirSync(componentsRoot)).toEqual([])
+    // The fake write stream never touches the real filesystem, so unlike
+    // the idle-timeout/abort cases above there is no real `.part` file to
+    // preserve here — only the resume sidecar (written before any network
+    // call) exists.
+    expect(fs.readdirSync(componentsRoot)).toEqual([`.download-${manifest.sha256}.meta.json`])
 
     // Retryable: a fresh install() with the real fs restored succeeds.
     createWriteStreamSpy.mockRestore()
     const retried = await installer.install()
     expect(retried.state).toBe('installed')
+  })
+
+  describe('SD-01: pause/resume via HTTP Range', () => {
+    function metaFileContents(manifest: OpenDesignComponentManifest, overrides: Partial<OpenDesignComponentManifest> = {}): string {
+      const m = { ...manifest, ...overrides }
+      return JSON.stringify({ version: m.version, url: m.url, sha256: m.sha256, total: m.size })
+    }
+
+    it('pause() preserves the on-disk prefix (not `failed`), and a BRAND NEW installer instance resumes it with a byte-exact Range request', async () => {
+      const stage = seedTreeFor('a24-od-stage-pause-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      expect(bytes.length).toBeGreaterThan(4)
+
+      let hangFreshRequests = true
+      const rangeHeaders: Array<string | undefined> = []
+      const server = http.createServer((req, res) => {
+        rangeHeaders.push(req.headers.range)
+        if (req.headers.range) {
+          const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range)![1])
+          res.writeHead(206, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+            'Content-Length': String(bytes.length - start),
+          })
+          res.end(bytes.subarray(start))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+        if (hangFreshRequests) { res.write(bytes.subarray(0, 2)); return }
+        res.end(bytes)
+      })
+      servers.push(server)
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const { port } = server.address() as AddressInfo
+      manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+      const componentsRoot = tmpDir('a24-od-root-pause-')
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const pending = installer.install()
+      await vi.waitFor(() => expect(installer.status().received).toBe(2))
+      installer.pause()
+      const result = await pending
+      expect(result.state).toBe('paused')
+      expect(result.received).toBe(2)
+      expect(fs.statSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`)).size).toBe(2)
+      // No final marker / installed dir — a paused download is never mistaken for installed.
+      expect(fs.existsSync(openDesignComponentInstallDir(componentsRoot, manifest))).toBe(false)
+
+      hangFreshRequests = false
+      const restarted = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      expect(restarted.status().state).toBe('paused')
+      expect(restarted.status().received).toBe(2)
+      const resumed = await restarted.install()
+      expect(resumed.state).toBe('installed')
+      expect(rangeHeaders[rangeHeaders.length - 1]).toBe('bytes=2-')
+    })
+
+    it('a prefix already at full size with matching metadata skips the network entirely and verifies by hash alone', async () => {
+      const stage = seedTreeFor('a24-od-stage-skipnet-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+
+      const componentsRoot = tmpDir('a24-od-root-skipnet-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes)
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+      expect(requestCount()).toBe(0)
+    })
+
+    it('416 while the saved prefix is still short forces a controlled reset (retries once from byte 0, does not loop)', async () => {
+      const stage = seedTreeFor('a24-od-stage-416-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+
+      let requests = 0
+      const server = http.createServer((req, res) => {
+        requests += 1
+        if (req.headers.range) {
+          res.writeHead(416, { 'Content-Range': `bytes */${bytes.length}` })
+          res.end()
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+        res.end(bytes)
+      })
+      servers.push(server)
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const { port } = server.address() as AddressInfo
+      manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+      const componentsRoot = tmpDir('a24-od-root-416-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+      expect(requests).toBe(2) // the rejected Range attempt, then exactly one full retry — never more.
+    })
+
+    it('206 with a Content-Range that disagrees with the requested start forces a controlled reset', async () => {
+      const stage = seedTreeFor('a24-od-stage-mismatch206-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+
+      const server = http.createServer((req, res) => {
+        if (req.headers.range) {
+          // Lies about where this response actually starts.
+          res.writeHead(206, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Range': `bytes 0-${bytes.length - 1}/${bytes.length}`,
+            'Content-Length': String(bytes.length),
+          })
+          res.end(bytes)
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+        res.end(bytes)
+      })
+      servers.push(server)
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const { port } = server.address() as AddressInfo
+      manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+      const componentsRoot = tmpDir('a24-od-root-mismatch206-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+    })
+
+    it('a 200 response to a Range request (server ignoring Range) resets the local file from byte 0 instead of corrupting it', async () => {
+      const stage = seedTreeFor('a24-od-stage-200fallback-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      const { url } = await startServer(tarPath) // always replies 200 + full body, ignoring any Range header
+
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-200fallback-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      // A passing install here proves the file was truncated-and-rewritten
+      // rather than appended-onto — an append would fail the final size/hash
+      // check instead of reaching `installed`.
+      expect(result.state).toBe('installed')
+    })
+
+    it('an on-disk prefix whose sidecar metadata does not match the current manifest (e.g. a different url) is never reused', async () => {
+      const stage = seedTreeFor('a24-od-stage-wrongmeta-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+
+      const componentsRoot = tmpDir('a24-od-root-wrongmeta-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(
+        path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`),
+        metaFileContents(manifest, { url: 'https://example.invalid/other.tar.gz' }),
+      )
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+      expect(requestCount()).toBe(1) // one full fresh request — the 3-byte "match" was never trusted or Range-resumed.
+    })
+
+    it('a pre-existing INSTALLED component is left untouched when a later install() call runs (same manifest, nothing to do)', async () => {
+      const stage = seedTreeFor('a24-od-stage-installed-noop-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      manifest.url = httpsManifestUrl((await startServer(tarPath)).url)
+      const componentsRoot = tmpDir('a24-od-root-installed-noop-')
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const first = await installer.install()
+      expect(first.state).toBe('installed')
+      const finalDir = first.dir!
+      const markerBefore = fs.readFileSync(path.join(finalDir, '.agent24-component.json'), 'utf8')
+
+      const second = await installer.install()
+      expect(second.state).toBe('installed')
+      expect(second.dir).toBe(finalDir)
+      expect(fs.readFileSync(path.join(finalDir, '.agent24-component.json'), 'utf8')).toBe(markerBefore)
+    })
   })
 })
