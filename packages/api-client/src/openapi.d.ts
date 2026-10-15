@@ -1666,14 +1666,37 @@ export interface components {
             cpu_cores: number;
             /** @enum {string} */
             accelerator: "metal" | "cuda" | "none";
-            free_disk_bytes: number;
             /**
              * @example macos
              * @example linux
              * @example windows
              */
             os: string;
-            /** @description Null when the platform/probe cannot tell — not implemented for any OS yet (sysinfo has no power-source API) */
+            os_version?: string | null;
+            chip?: string | null;
+            unified_memory?: boolean;
+            gpu_wired_limit_bytes?: number | null;
+            discrete_gpus?: {
+                name: string;
+                vram_bytes?: number | null;
+            }[];
+            /** @description All user-visible mounted volumes (internal and external); read-only system volumes and APFS helper volumes are filtered out */
+            disks?: {
+                name: string;
+                mount_point: string;
+                total_bytes: number;
+                free_bytes: number;
+                removable: boolean;
+                read_only: boolean;
+            }[];
+            /** @description Free bytes on the disk holding the models directory; null when it cannot be determined (replaces the removed free_disk_bytes, which was the cwd disk) */
+            models_dir_free_bytes?: number | null;
+            /** @description Reserved; not probed yet (HW-1) */
+            runtimes?: {
+                name: string;
+                version?: string | null;
+            }[];
+            /** @description Null when the platform/probe cannot tell (macOS pmset / Linux power_supply otherwise) */
             on_battery?: boolean | null;
         };
         DecideProfile: {
