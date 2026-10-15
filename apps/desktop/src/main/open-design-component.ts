@@ -564,15 +564,15 @@ function openRegularFileNoFollow(filePath: string, flags: number, mode?: number)
  * without ever following it, so a pre-planted symlink can't redirect the
  * write outside componentsRoot. */
 function writeDownloadMeta(metaPath: string, manifest: OpenDesignComponentManifest): void {
-  const meta: DownloadMeta = { version: manifest.version, url: manifest.url, sha256: manifest.sha256, total: manifest.size }
+  const payload = JSON.stringify({ version: manifest.version, url: manifest.url, sha256: manifest.sha256, total: manifest.size } satisfies DownloadMeta)
   const tempPath = path.join(path.dirname(metaPath), `.download-meta-${crypto.randomBytes(6).toString('hex')}.tmp`)
-  const fd = fs.openSync(tempPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600)
   try {
-    fs.writeSync(fd, JSON.stringify(meta))
-  } finally {
-    fs.closeSync(fd)
+    fs.writeFileSync(tempPath, payload, { flag: 'wx', mode: 0o600 }) // wx = O_CREAT|O_EXCL, never follows/reuses an existing entry; writeFileSync loops over short writes and always closes, even on error.
+    fs.renameSync(tempPath, metaPath) // nothing after this can throw, so a renamed-away temp never reaches the rm below.
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).syscall !== 'open') fs.rmSync(tempPath, { force: true }) // failed open means the temp isn't ours (EEXIST/EMFILE/...) — never delete it.
+    throw error
   }
-  fs.renameSync(tempPath, metaPath)
 }
 
 /** Only a file whose sidecar metadata matches EVERY one of version/url/
@@ -872,9 +872,6 @@ export class OpenDesignComponentInstaller {
     // and can be resumed via Range instead of restarted from byte 0.
     const tarballPath = downloadFilePath(this.componentsRoot, manifest)
     const metaPath = downloadMetaPath(this.componentsRoot, manifest)
-    const resumeFromBytes = readMatchingDownloadMeta(tarballPath, metaPath, manifest)
-    if (resumeFromBytes === 0) discardDownloadFile(tarballPath, metaPath)
-    writeDownloadMeta(metaPath, manifest)
     const controller = new AbortController()
     this.activeAbort = controller
     // SD-01: once the full, hash-verified bytes are in hand, a failure
@@ -887,6 +884,10 @@ export class OpenDesignComponentInstaller {
     let downloadComplete = false
 
     try {
+      // F1 (external review #967): moved inside the try — a metadata ENOSPC here now reports `failed` like any other step below.
+      const resumeFromBytes = readMatchingDownloadMeta(tarballPath, metaPath, manifest)
+      if (resumeFromBytes === 0) discardDownloadFile(tarballPath, metaPath)
+      writeDownloadMeta(metaPath, manifest)
       this.setStatus({ state: 'downloading', received: resumeFromBytes, total: manifest.size })
       await this.download(manifest, tarballPath, metaPath, controller, resumeFromBytes)
       downloadComplete = true
