@@ -65,6 +65,10 @@ pub struct CompleteRequest {
     pub response_format: Option<JsonSchemaFormat>,
     pub max_tokens: Option<u32>,
     pub complexity: Option<Complexity>,
+    /// ME4-S2b: the sampling temperature, 0..=2; `None` sends none. Not
+    /// finite (NaN, infinity) is refused here: JSON would carry it as `null`,
+    /// and the call would go out with no temperature at all.
+    pub temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -103,6 +107,13 @@ impl ModelClient {
         req: &CompleteRequest,
         request_id: Option<&RequestId>,
     ) -> Result<CompleteResult, ClientError> {
+        if let Some(t) = req.temperature
+            && !t.is_finite()
+        {
+            return Err(ClientError::InvalidParams(format!(
+                "temperature must be a finite number, not {t}"
+            )));
+        }
         let messages: Vec<Value> = req
             .messages
             .iter()
@@ -130,6 +141,7 @@ impl ModelClient {
             }),
         );
         set_opt(&mut params, "max_tokens", req.max_tokens.map(Value::from));
+        set_opt(&mut params, "temperature", req.temperature.map(Value::from));
         set_opt(
             &mut params,
             "complexity",
@@ -174,6 +186,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             complexity: None,
+            temperature: None,
         };
         let call = tokio::spawn(async move { client.complete(&req, None).await });
         let sent = testing::read_request(&mut peer).await;
@@ -194,6 +207,14 @@ mod tests {
                 .get("complexity")
                 .is_none()
         );
+        // ME4-S2b J7: no temperature, none written.
+        assert!(
+            sent["params"]
+                .as_object()
+                .unwrap()
+                .get("temperature")
+                .is_none()
+        );
         testing::respond(
             &mut peer,
             &sent,
@@ -209,5 +230,56 @@ mod tests {
         assert_eq!(result.text, "hello back");
         assert_eq!(result.tier, ServedTier::Local);
         assert_eq!(result.usage.prompt_tokens, 3);
+    }
+
+    fn at(temperature: Option<f64>) -> CompleteRequest {
+        CompleteRequest {
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: "hi".to_owned(),
+            }],
+            response_format: None,
+            max_tokens: None,
+            complexity: None,
+            temperature,
+        }
+    }
+
+    /// ME4-S2b J7, J10: a temperature goes out as the number it is; one that
+    /// is not finite never goes out.
+    #[tokio::test]
+    async fn a_temperature_is_sent_as_given_and_one_not_finite_is_refused_here() {
+        let (conn, mut peer) = testing::fake_kernel(vec![OFFER_PREFIX.to_owned()]).await;
+        let client = Arc::new(ModelClient::new(&conn).expect("offer covers model"));
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // Refused at once: one that went out would wait for a reply that never comes.
+            let r = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.complete(&at(Some(bad)), None),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{bad} went out to the kernel"));
+            assert!(
+                matches!(r, Err(ClientError::InvalidParams(_))),
+                "{bad}: {r:?}"
+            );
+        }
+        let c = client.clone();
+        let call = tokio::spawn(async move { c.complete(&at(Some(0.0)), None).await });
+        // The first request the kernel sees is this one: none of the above went out.
+        let sent = testing::read_request(&mut peer).await;
+        assert_eq!(sent["params"]["temperature"].as_f64(), Some(0.0));
+        testing::respond(
+            &mut peer,
+            &sent,
+            json!({
+                "text": "x",
+                "model_id": null,
+                "tier": "local",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }),
+        )
+        .await;
+        call.await.unwrap().unwrap();
     }
 }

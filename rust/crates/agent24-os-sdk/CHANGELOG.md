@@ -14,6 +14,9 @@ contains the corresponding change (J-S14).
 - `clients::MODEL_NO_PROVIDER_WAIT`（也从 `agent24_os_sdk::MODEL_NO_PROVIDER_WAIT` 导出）= 60s，
   即内核路由器冷却 provider 的最长时间（ME4-S2a §2.6）。模块收到 `unavailable` / `no_provider` 后等这么久再试，
   被冷却的 provider 就都会被再试一次。内核测试断言它与路由器的 `DEFAULT_MAX_COOLDOWN` 相等。
+- `CompleteRequest.temperature: Option<f64>`（ME4-S2b）：采样温度，内核接受 0–2；`None` 时 params 里不写，请求与以前相同。
+  NaN、无穷大在本地报 `ClientError::InvalidParams`，不发出。**需要协议版本 2 的内核**，老内核会以 unknown field 拒绝带温度的调用。
+  公开结构体加字段，直接写结构体字面量的调用方（如 Sin90）要补上这个字段，源码不兼容（同 ME4-S2 R7）。
 
 ### 变更
 
