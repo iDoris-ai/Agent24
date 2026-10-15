@@ -93,7 +93,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 50 * 1024 * 1024 })
     render(<CreativePage />)
 
-    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 50 MB）/)).toBeTruthy()
+    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 50 MiB）/)).toBeTruthy()
     expect(screen.getByRole('button', { name: '下载' })).toBeTruthy()
     expect(creativeShow).not.toHaveBeenCalled()
   })
@@ -119,7 +119,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     creativeShow.mockResolvedValue({ ok: false, needsDownload: true, size: 20 * 1024 * 1024 })
     render(<CreativePage />)
 
-    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 20 MB）/)).toBeTruthy()
+    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 20 MiB）/)).toBeTruthy()
     expect(screen.getByRole('button', { name: '下载' })).toBeTruthy()
   })
 

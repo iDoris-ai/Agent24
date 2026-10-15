@@ -102,7 +102,7 @@ function ComponentCard({
   // 'not-installed' (also the synthesized shape for a needs-download result)
   return (
     <div className="creative-download">
-      <div>Design 需要额外下载 iDoris Design 组件（约 {formatMb(status.size)} MB），下载完成后即可使用。</div>
+      <div>Design 需要额外下载 iDoris Design 组件（约 {formatMb(status.size)} MiB），下载完成后即可使用。</div>
       <button className="btn btn-primary" type="button" onClick={onInstall}>下载</button>
     </div>
   )
