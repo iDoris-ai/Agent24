@@ -3,35 +3,147 @@
   "schema_version": 1,
   "task_id": "a24-wal-race-20261015-104002",
   "attempt_id": "0e0350a8-9dcc-4683-8aa7-c318d41b93a9",
-  "sequence": 2,
-  "status": "progress",
-  "state": "progress",
+  "sequence": 3,
+  "status": "completed",
+  "state": "completed",
   "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
   "base_branch": "ab/preview-hw-23-probe-disk",
   "actual_branch": "baton/grokbot-a24-20261015-104002-wal-race-r2",
   "repo": "iDoris-ai/Agent24",
-  "result_sha": "2f3c225f6448d9008ebf5af9cb949c99ad346907",
-  "summary": "RED：抽出原 exists→copy 辅助（语义不变），新增确定性测试：在 exists(-wal) 与 fs::copy 之间关闭源库最后连接，SQLite 检查点并删除 WAL，旧辅助 20/20 次报 Os code 2 NotFound；另一测试证明旧辅助对缺失主库静默返回 Ok。",
-  "outcome": "RED：抽出原 exists→copy 辅助（语义不变），新增确定性测试：在 exists(-wal) 与 fs::copy 之间关闭源库最后连接，SQLite 检查点并删除 WAL，旧辅助 20/20 次报 Os code 2 NotFound；另一测试证明旧辅助对缺失主库静默返回 Ok。",
+  "result_sha": "335c25858d217f5e54630282e0df3192c5d9195d",
+  "summary": "已证明 CI os error 2 为测试复制辅助的竞态而非生产数据损坏：sqlx 0.8.6 Pool::close 可在仍有连接打开时返回，该连接随后在 worker 线程异步关闭并由 SQLite 检查点后删除 -wal，与 exists()→fs::copy 无先后约束。RED(2f3c225) 用最后连接在竞态点关闭的确定性夹具 20/20 复现 Os code 2；GREEN(408d414) 改用 SQLite VACUUM INTO 一致快照+设回 WAL，所有错误原样上报（缺失源库、目标目录缺失均报错），原 NotWritable 断言保留。仅改 tests.rs。",
+  "outcome": "已证明 CI os error 2 为测试复制辅助的竞态而非生产数据损坏：sqlx 0.8.6 Pool::close 可在仍有连接打开时返回，该连接随后在 worker 线程异步关闭并由 SQLite 检查点后删除 -wal，与 exists()→fs::copy 无先后约束。RED(2f3c225) 用最后连接在竞态点关闭的确定性夹具 20/20 复现 Os code 2；GREEN(408d414) 改用 SQLite VACUUM INTO 一致快照+设回 WAL，所有错误原样上报（缺失源库、目标目录缺失均报错），原 NotWritable 断言保留。仅改 tests.rs。",
   "tests": [
     {
-      "command": "cargo test -p agent24-documents --locked --lib state::tests",
-      "exit_code": 101,
-      "note": "RED：2 个新测试失败，符合预期"
+      "command": "cargo test -p agent24-documents --locked (base a9b36ce)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-documents --locked --lib state::tests (RED 2f3c225)",
+      "exit_code": 101
+    },
+    {
+      "command": "cargo test -p agent24-documents --locked --lib state::tests (GREEN)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt -p agent24-documents -- --check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy -p agent24-documents --locked --all-targets -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-documents --locked (GREEN)",
+      "exit_code": 0
     }
   ],
-  "commands": [],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "agent24-documents",
+        "--locked",
+        "--lib",
+        "a_wal_closed_away"
+      ],
+      "exit": 101,
+      "counts": {
+        "runs": 20,
+        "failed_with_os_error_2": 20,
+        "phase": "RED"
+      }
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "agent24-documents",
+        "--locked",
+        "--lib",
+        "--",
+        "a_wal_closed_away",
+        "copying_",
+        "a_read_only_database_file"
+      ],
+      "exit": 0,
+      "counts": {
+        "runs": 20,
+        "passed": 20,
+        "phase": "GREEN"
+      }
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "agent24-documents",
+        "--locked",
+        "--lib",
+        "zz_probe_wal_after_close"
+      ],
+      "exit": 0,
+      "counts": {
+        "iterations": 300,
+        "wal_present_after_close": 241,
+        "wal_vanished_within_20ms": 215,
+        "note": "临时探针，未提交"
+      }
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "agent24-documents",
+        "--locked",
+        "--lib",
+        "zz_probe_real_pool_close_then_copy"
+      ],
+      "exit": 0,
+      "counts": {
+        "iterations": 300,
+        "wal_present_after_close": 261,
+        "copies_ok": 300,
+        "note": "临时探针，未提交，GREEN 辅助"
+      }
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "agent24-documents",
+        "--locked"
+      ],
+      "exit": 0,
+      "counts": {
+        "passed": 334,
+        "failed": 0
+      }
+    }
+  ],
   "touched_paths": [
     "rust/apps/agent24-documents/src/state/tests.rs",
+    "docs/agent/cloud-wave37/a24-wal-race-20261015-104002.md",
     "baton-result.json",
     "baton-decisions.tsv"
   ],
   "limitations": [
     "Linux云端，非macOS验收",
-    "test-only不是产品批准"
+    "test-only不是产品批准",
+    "确定性复现依赖夹具模拟“最后连接在竞态点关闭”，未原样复现CI时序",
+    "观察到 sqlx 0.8.6 Pool::close 可能遗留异步关闭的连接，生产代码可能受影响，按约束未改"
   ],
   "blocker": null,
-  "next": "GREEN：改用 SQLite VACUUM INTO 一致快照",
-  "next_action": "GREEN：改用 SQLite VACUUM INTO 一致快照",
-  "updated_at": "2026-10-15T10:55:22+00:00"
+  "next": null,
+  "next_action": null,
+  "updated_at": "2026-10-15T10:58:12+00:00",
+  "red_sha": "2f3c225f6448d9008ebf5af9cb949c99ad346907",
+  "green_sha": "408d414d09a29d0d569eaa3573de3b6e6ffb75af"
 }

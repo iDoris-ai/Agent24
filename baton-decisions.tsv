@@ -1,3 +1,4 @@
 updated_at	task_id	attempt_id	sequence	status	decision
 2026-10-15T10:49:13+00:00	a24-wal-race-20261015-104002	0e0350a8-9dcc-4683-8aa7-c318d41b93a9	1	started	开始：克隆 iDoris-ai/Agent24，验证 HEAD==a9b36ce，创建 -r2 分支；旧 fork 分支已取消不触碰
 2026-10-15T10:55:22+00:00	a24-wal-race-20261015-104002	0e0350a8-9dcc-4683-8aa7-c318d41b93a9	2	progress	RED 提交 2f3c225f6448d9008ebf5af9cb949c99ad346907：确定性复现 TOCTOU（20/20），根因为 sqlx 0.8.6 Pool::close 可能留下未关闭连接、由 worker 线程异步关闭并删除 WAL
+2026-10-15T10:58:12+00:00	a24-wal-race-20261015-104002	0e0350a8-9dcc-4683-8aa7-c318d41b93a9	3	completed	完成：GREEN 408d414 + 报告 335c258；test/fmt/clippy 全部 exit 0；仅推送分支
