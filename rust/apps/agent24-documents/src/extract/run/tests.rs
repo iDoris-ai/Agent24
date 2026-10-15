@@ -36,6 +36,8 @@ impl Script {
 
 impl Model for Script {
     fn complete(&self, req: CompleteRequest) -> Call {
+        // ME4-S2b J8: every extraction call, first or retried, at temperature 0.
+        assert_eq!(req.temperature, Some(0.0));
         let data: Value = serde_json::from_str(&req.messages[1].content).unwrap();
         let keys = data["fields"]
             .as_array()

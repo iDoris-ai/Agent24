@@ -231,6 +231,15 @@ mod tests {
         );
         let spawn = m.spawn().expect("out-of-process module needs spawn");
         assert_eq!(spawn.command, "bin/agent24-documents");
+        // ME4-S2b J8: extraction sends `temperature`, so the package asks for
+        // protocol 2, and a kernel that speaks less refuses it at install or
+        // mount (`min > DAEMON_PROTOCOL_VERSION`), not when a job first runs.
+        let min = MANIFEST_YAML
+            .lines()
+            .find_map(|l| l.strip_prefix("min_daemon_protocol:"))
+            .map(|v| v.trim().parse::<u32>().unwrap());
+        assert_eq!(min, Some(2));
+        // And this kernel is new enough: `from_yaml` above accepted it.
     }
 
     #[test]

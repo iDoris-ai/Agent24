@@ -16,8 +16,9 @@ pub mod window;
 /// The version of the instruction, the answer's schema, windows, batches,
 /// where quotes are looked for, and merging (§3.2): part of the business
 /// key, so a change re-extracts. 3: a quote not in the block it names is
-/// looked for in the other blocks shown (2026-10-15).
-pub const EXTRACTOR_VERSION: &str = "3";
+/// looked for in the other blocks shown (2026-10-15). 4: the model is asked
+/// at temperature 0 (2026-10-15).
+pub const EXTRACTOR_VERSION: &str = "4";
 
 /// A requested field (`DocumentsExtractField`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
