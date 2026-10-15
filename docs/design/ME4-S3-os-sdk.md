@@ -249,7 +249,7 @@ PLAN S3-2 与 ME4-5.1.2b 原文列的五种是 **Events / Memory / Approval / Sc
 - **SDK 自身**：SemVer 从 `0.1.0` 起（PLAN S3-3）。发布方式：Agent24 仓库打 tag `agent24-os-sdk-v0.1.0`，外部仓库 `agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }`。0.x 期间 minor 升级即可破坏兼容；新增错误 `kind` 属于破坏性变化（§8 Q6）。
 - **CHANGELOG**：按 §8 Q9，每个 SDK tag 在 `rust/crates/agent24-os-sdk/CHANGELOG.md` 有独立小节，写明「最低内核版本」；`v0.1.0` 这一节随 c2（打 tag 的那个 PR）写入（L10）。
 - **工具链**（L5 更正 v1 的错误陈述）：Agent24 CI 装的是 **stable**（`.github/workflows/ci.yml:61`、`:195`：`rustup toolchain install stable`），不是 1.98.0；`1.98.0` 是本仓库判据命令与本地验证钉的版本（`cargo +1.98.0 …`）。Sin90 CI 同样用 stable（`dtolnay/rust-toolchain@stable`，`.github/workflows/ci.yml:24-25`）。edition 2024 + agentd 已用 let-chains（`model_callback.rs:126-127`、`133-134`）要求 Rust ≥ 1.88。SDK `Cargo.toml` 写 `rust-version = "1.88"`，并在 a3-skel 的 CI 步骤里加一条 `rustup toolchain install 1.88 --profile minimal && cargo +1.88 check -p agent24-os-sdk`，防止 SDK 无意中抬高 MSRV 打坏钉旧工具链的下游（v1 把「要不要这条作业」留给评审，v2 定为要：一次 `check` 的成本很低）。
-- **wire 协议版本**：SDK 在 `initialize` 里声明的范围。Sin90 今天是 `1..=1000`（`mod.rs:73-74`），内核 `negotiate` 取 `min(module.max, kernel.max)`（`version.rs:175-189`），内核是 v1（`agent24-domain lib.rs:397`）→ 今天两种写法结果都是 1。但 `1..=1000` 意味着将来 v2 内核会和只懂 v1 的 SDK「协商成功」地讲 v2。**已拍板**：SDK 只声明它实际实现的范围 `1..=1`（§8 Q7）；scratch 常量已改为 `PROTOCOL_MAX = 1`（L1），J-S11 断言握手里是 `{min:1,max:1}`。proto 另外校验内核回的 `protocol_version` 落在声明范围内，否则 `ConnectError::Protocol`。
+- **wire 协议版本**：SDK 在 `initialize` 里声明的范围。Sin90 今天是 `1..=1000`（`mod.rs:73-74`），内核 `negotiate` 取 `min(module.max, kernel.max)`（`version.rs:175-189`），内核是 v1（`agent24-domain lib.rs:397`）→ 今天两种写法结果都是 1。但 `1..=1000` 意味着将来 v2 内核会和只懂 v1 的 SDK「协商成功」地讲 v2。**已拍板**：SDK 只声明它实际实现的范围 `1..=1`（§8 Q7）；scratch 常量已改为 `PROTOCOL_MAX = 1`（L1），J-S11 断言握手里是 `{min:1,max:1}`。proto 另外校验内核回的 `protocol_version` 落在声明范围内，否则 `ConnectError::Protocol`。（ME4-S2b 修订：SDK 实现了 `temperature`，声明范围改为 `1..=2`，内核接受 `1..=2`，见 §8 Q7。）
 - **内核加字段**：响应类型宽松解析（含握手响应，§4.1），不破坏旧模块。**内核加必填参数**：属于 wire 破坏，SPEC 与 SDK 同 PR 改，SDK minor 升。**内核加错误 kind**：落 `Other` 直到 SDK 升级（deny by default），不 panic。
 - **manifest 加字段**：SDK 只读三个字段、忽略其余（`ManifestFacts` 不带 `deny_unknown_fields`，L4）。manifest 的合法性由内核在安装时校验，SDK 不做第二遍校验。
 
@@ -306,7 +306,7 @@ SDK 的 `[features]`：`test-util = ["agent24-os-proto/test-util"]`（转发，L
 ```rust
 /// Protocol range this SDK version implements — exactly what it speaks (§8 Q7).
 pub const PROTOCOL_MIN: u32 = 1;
-pub const PROTOCOL_MAX: u32 = 1;
+pub const PROTOCOL_MAX: u32 = 1;   // ME4-S2b 起为 2，编译期断言不超过内核的 KERNEL_PROTOCOL_MAX
 
 pub struct ModuleBuilder { /* manifest_yaml: Cow<'static, str>, on_fatal: Option<FatalHook>, env: Option<ModuleEnv> */ }
 
@@ -477,7 +477,8 @@ impl SchedulerClient {
 
 pub const MODEL_RESPONSE_TIMEOUT: Duration = agent24_os_proto::model_budget::MODEL_RESPONSE_TIMEOUT;   // 4461s（ME4-S2a；原 from_secs(125)）
 pub struct CompleteRequest { pub messages: Vec<ModelMessage>, pub response_format: Option<JsonSchemaFormat>,
-                             pub max_tokens: Option<u32>, pub complexity: Option<Complexity> }
+                             pub max_tokens: Option<u32>, pub complexity: Option<Complexity>,
+                             pub temperature: Option<f64> }   // ME4-S2b：0..=2，非有限值本地拒绝
 impl ModelClient {
     pub fn new(conn: &Arc<Connection>) -> Option<Self> { … }
     pub async fn complete(&self, req: &CompleteRequest,
@@ -746,7 +747,7 @@ Sin90 的 `clients/test_support.rs`（`135ddb7`）导出的 API 与签名，prot
 | J-S8 | transport 语义 | a2-core、a2-cancel | Sin90 `transport.rs:686-1378` 的 16 条测试移植到 proto（第 65 个在途 `Busy`、drop 发**逐字节**正确的 cancel 帧、正常完成不发 cancel、迟到响应被丢且连接继续可用、断连 → 在途 `ConnectionLost` 且钩子恰好一次、关闭后调用 `NotSent`、超大帧在写任务前被拒、恰好 1 MiB 可过、响应超时 → `Timeout`+cancel、写超时 → 钩子一次、非 JSON 帧/超大入帧触发钩子、`slot_wait` 成功与超时）；前 8 条随 a2-core，后 8 条随 a2-cancel | 各测试原有的变异说明随迁移保留；新增：把 `CallGuard::drop` 里的 cancel 删掉 → cancel 帧测试红 | |
 | J-S9 | 超时关系 | a2-cancel（前半）、b3b（后半） | proto 编译期断言 `DEFAULT_RESPONSE_TIMEOUT > rpc::CALL_TIMEOUT`；后半原为 agentd 测试断言 `MODEL_RESPONSE_TIMEOUT > MODEL_CALL_TIMEOUT`；ME4-S2a 起两者都从 `agent24_os_proto::model_budget` 导入，这条关系改由 `model_budget.rs` 的编译期断言保证 | 把 35 改成 30 → 编译失败；把 `MODEL_RESPONSE_TIMEOUT` 的 `+5s` 改成 `+0s` → 编译失败 | ✅ 前半的 `const _: () = assert!(…)` 已写在 scratch proto 并编译 |
 | J-S10 | fired 提取器 | c1b（(b) 用到的 `FiredBody` 在 c1a 挪进 proto） | (a) SDK 测试：合法请求 200；缺 `X-A24-Fire-Id` 400；body 多一个字段 400；时间戳非定宽 400；`Result<FiredDelivery, FiredRejection>` 可自定义形状。(b) **内核真实发出的字节**被 SDK 接受（M7）：`scheduler_deliver.rs` 的 `deliver_on_posts_the_declared_namespace_path_and_the_fired_body_shape`（`:262-388`）在已有断言之后，把 mock 上游收到的 `head`（`x-a24-fire-id`/`x-a24-schedule-key` 头）与 `body` 字节原样组成 `axum::http::Request`，喂给 `FiredDelivery::from_request`，断言 `Ok` 且 `fire_id`/`schedule_key`/`body.key`/`body.trigger` 等于本次投递的值 | (a) 去掉 `deny_unknown_fields` → 多字段例红；(b) 把内核 `fmt_iso` 改成带毫秒、或把 `FiredBody` 某字段改名 → 该测试红（v1 自审第 5 条的耦合由它钉住） | ✅ (a) 4 条；(b) 的 SDK 半边：按 agentd 私有 `FiredBody<'a>` 逐字段复刻的序列化结果被提取器接受（`kernel_shaped_fired_body_is_accepted`） |
-| J-S11 | 握手内容来自 manifest，协议范围是 `{1,1}` | **a3-module**（M3：v1 放在 a1，但它测的是 `Module::connect`，a3 才有） | `testing::FakeEndpoint::bind(tmp)` 得到 `(env, ep)`；`Module::builder(manifest).with_env(env, recording_hook().0).connect()` 与 `ep.accept_initialize(reply)` 并发；断言捕获的 params：`module == manifest.name`、`capabilities == manifest.kernel_capabilities`、`protocol_versions == {"min":1,"max":1}`（L1）、`manifest_digest == manifest_digest(manifest 字节)` | 在 SDK 里硬编码 `capabilities` → 用一份能力不同的 manifest（运行时拼的 `String`，§3.2）跑 → 红；把 `PROTOCOL_MAX` 改回 1000 → 红 | ✅ 形状编译通过（`js11_shape`，scratch 的 proto 是桩，不运行） |
+| J-S11 | 握手内容来自 manifest，协议范围是 SDK 实际实现的范围（原为 `{1,1}`，ME4-S2b 起 `{1,2}`） | **a3-module**（M3：v1 放在 a1，但它测的是 `Module::connect`，a3 才有） | `testing::FakeEndpoint::bind(tmp)` 得到 `(env, ep)`；`Module::builder(manifest).with_env(env, recording_hook().0).connect()` 与 `ep.accept_initialize(reply)` 并发；断言捕获的 params：`module == manifest.name`、`capabilities == manifest.kernel_capabilities`、`protocol_versions == {"min":1,"max":1}`（L1；ME4-S2b 起为 `{"min":1,"max":2}`）、`manifest_digest == manifest_digest(manifest 字节)` | 在 SDK 里硬编码 `capabilities` → 用一份能力不同的 manifest（运行时拼的 `String`，§3.2）跑 → 红；把 `PROTOCOL_MAX` 改回 1000 → 红 | ✅ 形状编译通过（`js11_shape`，scratch 的 proto 是桩，不运行） |
 | J-S12 | 握手后残字节 | a1 | proto 内部测试：本地 `UnixListener` 充当内核，在 `initialize` 响应后同一次写入里多塞一行 → `connect_from_env` 返回 `ConnectError::Protocol` | 删掉该检查 → 红 | |
 | J-S13 | example 挂载冒烟 | c2 | `rust/apps/agent24d/tests/me4_sdk_minimal_blackbox.rs`：构建 `examples/minimal`、`os install`、`os list` 为 `mounted`、经代理 GET `/api/v1/minimal/hello` 得 200 且 `bound: true`、事件流看到 `hello.seen`、一次 `run_now` 后看到 `minimal.fired`；`--list` 断言 1 条 | 把 example 的 `route_namespace` 改错 → 代理 404 → 红 | |
 | J-S14 | 发布 | c2 合并**之后**的发布步骤（v3，L5：tag 只能打在已合并的 main 提交上，不是 c2 PR 里能跑的判据） | c2 PR 内：`CHANGELOG.md` 有 `0.1.0` 小节且含「最低内核版本」一行（L10）。c2 合并后：在 main 的合并提交上打 `agent24-os-sdk-v0.1.0` 并推送，`git ls-remote --tags origin agent24-os-sdk-v0.1.0` 非空且指向该提交；探针 `4c SDK` 为 ●；tasks.md 的 c2 行在这两步做完后才标 DONE | — | |
@@ -848,6 +849,7 @@ v1 按「非注释代码行」估算，与 PR-Daemon 的 SZ-1 口径不符（M10
 
 **Q7（兼容策略）——SDK 在 `initialize` 声明的协议范围：`1..=1000`（Sin90 现状）还是 `1..=1`？** 内核取 `min(模块上限, 内核上限)`：声明 1000 时，将来的 v2 内核会跟只懂 v1 的模块「成功」协商成 v2。今天内核是 v1，两种写法行为相同。
 - **决策**：`1..=1`。SDK 只声明它实际实现的范围，实现时常量写 1，不沿用 Sin90 现状的 1000。
+- **ME4-S2b 修订（2026-10-15）**：SDK 实现了 `CompleteRequest.temperature`，协议版本随之到 2，SDK 声明 `1..=2`（`PROTOCOL_MAX = 2`，编译期断言它不超过内核的 `KERNEL_PROTOCOL_MAX`）；J-S11 的断言随之改为 `{1,2}`。
 - 拍板人：jason。日期：2026-09-26。
 - 理由：避免将来 v2 内核与只懂 v1 的 SDK「协商成功」讲 v2；新协议版本随 SDK 升级一起放开。Sin90 迁移后这是握手 params 里唯一有意的变化（§5.2 第 2 条单列）。
 - v2 落实（L1）：scratch 常量已改为 `PROTOCOL_MAX = 1`，J-S11 断言 `{min:1,max:1}`。

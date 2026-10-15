@@ -514,6 +514,8 @@ struct WireJsonSchema { name: String, schema: Map<String, Value>, #[serde(defaul
   （「max_tokens must be between 1 and 4096」——不能过度脱敏，同 T8.5c-W-wire 判据 10）；`json_schema.name` 非空；`schema` 必须是对象（类型保证）。
 - **不存在的字段**：`privacy`、`model`、`tools`、`tool_calls`、`provider`、`tier`、`temperature`… 一律 `-32602`。`temperature` 等采样参数本轮不开（最小集），
   将来加是**加字段**，老模块不受影响。
+  （ME4-S2b 修订，2026-10-15：开放了 `temperature`，可选，0 ≤ t ≤ 2，越界 `-32602`「temperature must be between 0 and 2」；`seed`、`top_p`、各种惩罚参数仍是 unknown field。
+  同时协议版本 1 → 2，用它的模块在 manifest 里写 `min_daemon_protocol: 2`。见 `docs/design/ME4-S2b-model-sampling-params.md`。）
 - 字节上限不另立：`dispatch()` 的 256 KiB 字符串预算已先于解析生效（§1 第 13 条）。
 - `into_request`：`model: None`、`tools: vec![]`、`max_tokens: NonZeroU32::new(max_tokens.unwrap_or(1024))`。
 
