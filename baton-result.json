@@ -4,13 +4,61 @@
   "attempt_id": "0b11b0e7-4ea2-4893-a183-2db1a27e8d7c",
   "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
   "actual_branch": "ab/apple-preview-cloud-20261015-104002-v1-guard",
-  "state": "started",
-  "sequence": 1,
-  "outcome": "started: 已验证 base SHA，新建独占 branch，尚未开展实现",
+  "state": "blocked",
+  "sequence": 2,
+  "outcome": "工作完成但 push 被阻塞：git proxy 403，仓库不在本 session 授权集合。checker 与 14 项单测全绿；真实 6072→a9b 按预期 RED（free_disk_bytes required/property 被删）。提交仅在本地。",
   "commands": [
-    {"argv": ["git", "rev-parse", "HEAD"], "exit": 0, "counts": {"head_matches_base": 1}}
+    {
+      "argv": [
+        "scripts/contract-v1-hardware/test.sh"
+      ],
+      "exit": 0,
+      "counts": {
+        "tests": 14,
+        "pass": 14,
+        "fail": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "argv": [
+        "scripts/contract-v1-hardware/run-history.sh"
+      ],
+      "exit": 1,
+      "counts": {
+        "violations": 2,
+        "expected_red": 1
+      }
+    },
+    {
+      "argv": [
+        "git",
+        "push",
+        "-u",
+        "origin",
+        "ab/apple-preview-cloud-20261015-104002-v1-guard"
+      ],
+      "exit": 128,
+      "counts": {
+        "http_403": 1
+      }
+    }
   ],
-  "touched_paths": ["baton-result.json"],
-  "limitations": ["Linux 云端隔离任务，不是 macOS 验收", "test-only，不是产品批准"],
-  "next_action": "检查 CI 覆盖，编写 v1 硬件 schema 兼容 checker 与单测"
+  "touched_paths": [
+    "baton-result.json",
+    "scripts/contract-v1-hardware/checker.mjs",
+    "scripts/contract-v1-hardware/cli.mjs",
+    "scripts/contract-v1-hardware/checker.test.mjs",
+    "scripts/contract-v1-hardware/test.sh",
+    "scripts/contract-v1-hardware/run-history.sh",
+    "docs/agent/cloud-wave37/a24-v1-guard-20261015-104002.md"
+  ],
+  "limitations": [
+    "push 403：started 与终态 commit 均未到达远端",
+    "Linux 云端，不是 macOS 验收",
+    "test-only，不是产品批准",
+    "未部署 CI、未修复 API",
+    "checker 仅覆盖 GET /decide/profile 200 响应"
+  ],
+  "next_action": "Parent 将仓库加入 session sources 后从本地 branch 推送，或取 bundle；随后做不同模型验收。恢复候选用 run-history.sh <openapi> 绑定。"
 }
