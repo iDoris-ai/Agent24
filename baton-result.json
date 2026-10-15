@@ -1,36 +1,16 @@
 {
   "schema_version": 1,
-  "task_id": "a24-rustdoc-20261015-104002",
-  "attempt_id": "6ab0e10b-6a45-4f76-8706-48d85957eb92",
-  "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
-  "actual_branch": "ab/apple-preview-cloud-20261015-104002-rustdoc",
-  "state": "completed",
-  "sequence": 2,
-  "outcome": "Linux通用复现：两source路径共target产生同名产物且cargo测试阶段不持build-dir锁；测试窗口内外部写者可致仅doctest失败(E0460/E0463)，--doc单跑为绿。本机真实根因仍unknown。push被proxy 403拒绝，仅本地commit。",
+  "task_id": "a24-rustdoc-safe-monitor-20261015-w38",
+  "attempt_id": "eda1da56-0049-4f8c-acbe-ede77156bd5a",
+  "base_sha": "c57e17e9fe989da732b15f307f657e89f36aae62",
+  "actual_branch": "ab/apple-preview-cloud-20261015-w38-rustdoc-safe-monitor",
+  "state": "started",
+  "sequence": 1,
+  "outcome": "started：已核对 base c57e17e 并新建独占分支，尚未执行修复",
   "commands": [
-    {"argv": ["git", "ls-remote", "https://github.com/iDoris-ai/Agent24.git", "refs/heads/ab/preview-hw-23-probe-disk"], "exit": 0, "counts": {"sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5"}},
-    {"argv": ["git", "push", "-u", "origin", "ab/apple-preview-cloud-20261015-104002-rustdoc"], "exit": 128, "counts": {"http": 403, "reason": "repo not in session authorized set"}},
-    {"argv": ["rustup", "toolchain", "install", "1.95.0", "--profile", "minimal"], "exit": 0, "counts": {"rustc": "1.95.0 (59807616e 2026-04-14)"}},
-    {"argv": ["bash", "tools/qa/rustdoc-repro/run-experiments.sh", "/tmp/claude-0/rdrepro", "1.95.0"], "exit": 0, "counts": {"experiments": 14, "pass_exit0": ["E1","E2","E3","E4","E5","E6","E8","E10","E11"], "fail_expected": {"E7": "extern location does not exist", "E9": "E0460", "E12": "rlib format required", "E12b": "E0463"}}},
-    {"argv": ["bash", "tools/qa/rustdoc-repro/run-experiments.sh", "/tmp/claude-0/rdrepro197", "stable"], "exit": 0, "counts": {"rustc": "1.97.0", "result": "与1.95.0逐项一致"}},
-    {"argv": ["tools/qa/rustdoc-repro/target-window-watch.sh", "<fixture target>", "/tmp/claude-0/watch.log", "fx_store", "fake_async_trait"], "exit": 0, "counts": {"CHANGE_events": 2, "detected": "libfx_store rlib 新inode"}}
+    {"argv": ["git", "fetch", "origin", "ab/apple-preview-cloud-20261015-104002-rustdoc"], "exit": 0, "counts": {"fetch_head": "c57e17e9fe989da732b15f307f657e89f36aae62"}}
   ],
-  "touched_paths": [
-    "baton-result.json",
-    "tools/qa/rustdoc-repro/README.md",
-    "tools/qa/rustdoc-repro/make-fixture.sh",
-    "tools/qa/rustdoc-repro/run-experiments.sh",
-    "tools/qa/rustdoc-repro/target-window-watch.sh",
-    "docs/agent/cloud-wave37/a24-rustdoc-20261015-104002.md",
-    "docs/agent/cloud-wave37/a24-rustdoc-20261015-104002.linux-1.95.0.out",
-    "docs/agent/cloud-wave37/a24-rustdoc-20261015-104002.linux-1.97.0.out"
-  ],
-  "limitations": [
-    "Linux不是macOS验收；test-only不是产品批准",
-    "未复制25私有组合，未跑Agent24全workspace",
-    "通用复现≠本机根因；race/编译器错配均未证",
-    "rustup 1.95.0非Homebrew构建",
-    "push 403（canonical不在session授权集），started与终态回执仅本地commit"
-  ],
-  "next_action": "本机原样cargo test --workspace --offline --locked -vv并旁挂target-window-watch.sh；窗口内CHANGE支持外部写者，无CHANGE则推翻并转查macOS dylib/编译器；保存完整E0463 stderr"
+  "touched_paths": ["baton-result.json"],
+  "limitations": ["started 回执，不代表任何修复或测试结果"],
+  "next_action": "旧脚本 fail-closed、写安全负控、实现只读观察器"
 }
