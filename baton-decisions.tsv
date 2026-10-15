@@ -1,0 +1,2 @@
+updated_at	task_id	attempt_id	sequence	status	decision
+2026-10-15T10:49:13+00:00	a24-wal-race-20261015-104002	0e0350a8-9dcc-4683-8aa7-c318d41b93a9	1	started	开始：克隆 iDoris-ai/Agent24，验证 HEAD==a9b36ce，创建 -r2 分支；旧 fork 分支已取消不触碰

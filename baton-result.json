@@ -1,0 +1,30 @@
+{
+  "schema": "baton-result/v1",
+  "schema_version": 1,
+  "task_id": "a24-wal-race-20261015-104002",
+  "attempt_id": "0e0350a8-9dcc-4683-8aa7-c318d41b93a9",
+  "sequence": 1,
+  "status": "started",
+  "state": "started",
+  "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
+  "base_branch": "ab/preview-hw-23-probe-disk",
+  "actual_branch": "baton/grokbot-a24-20261015-104002-wal-race-r2",
+  "repo": "iDoris-ai/Agent24",
+  "result_sha": null,
+  "summary": "已在 iDoris-ai/Agent24 基于 a9b36ce 创建独占分支 -r2，开始调查 WAL exists/copy TOCTOU。",
+  "outcome": "已在 iDoris-ai/Agent24 基于 a9b36ce 创建独占分支 -r2，开始调查 WAL exists/copy TOCTOU。",
+  "tests": [],
+  "commands": [],
+  "touched_paths": [
+    "baton-result.json",
+    "baton-decisions.tsv"
+  ],
+  "limitations": [
+    "Linux云端，非macOS验收",
+    "test-only不是产品批准"
+  ],
+  "blocker": null,
+  "next": "检查 apps/agent24-documents/src/state/tests.rs ~171 的 WAL 复制辅助函数",
+  "next_action": "检查 apps/agent24-documents/src/state/tests.rs ~171 的 WAL 复制辅助函数",
+  "updated_at": "2026-10-15T10:49:13+00:00"
+}
