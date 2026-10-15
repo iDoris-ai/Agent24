@@ -1,34 +1,17 @@
 {
   "schema_version": 1,
-  "task_id": "a24-rustdoc-safe-monitor-20261015-w38",
-  "attempt_id": "eda1da56-0049-4f8c-acbe-ede77156bd5a",
-  "base_sha": "c57e17e9fe989da732b15f307f657e89f36aae62",
-  "actual_branch": "ab/apple-preview-cloud-20261015-w38-rustdoc-safe-monitor",
-  "state": "completed",
-  "sequence": 2,
-  "result_sha": "4ab4591ba3fb4719e73427e1aba31a1f07193142",
-  "outcome": "历史脚本 fail-closed（首行 exit 3、无后门）；新增只读 artifact 观察器（298 行）与 21 项安全/行为测试，RED(1F/20E, exit1)→GREEN(21/21, exit0)；w37 无依据结论已逐项撤回。本机根因仍 unknown。",
+  "task_id": "a24-rustdoc-safe-monitor-r3-20261015-w40",
+  "attempt_id": "632bfa51-ea1d-49ff-ad24-99ecbb4fb784",
+  "base_sha": "aa81db1e3eae27ac3974d5493a04f19fc6ac1e86",
+  "actual_branch": "ab/apple-preview-cloud-20261015-w40-rustdoc-safe-monitor-r3",
+  "state": "started",
+  "sequence": 1,
+  "outcome": "started: native origin=iDoris-ai/agent24 已验证、工作树 clean、base 已 fetch 并确认为 w38 分支 tip，新分支已从 base 创建；尚未改代码",
   "commands": [
-    {"argv": ["python3", "-I", "-m", "unittest", "discover", "-s", "tools/qa/rustdoc-repro/tests", "-v"], "phase": "RED", "exit": 1, "counts": {"tests": 21, "failures": 1, "errors": 20}, "raw": "docs/agent/cloud-wave38/raw/01-red.txt"},
-    {"argv": ["bash", "-n", "tools/qa/rustdoc-repro/*.sh"], "exit": 0, "counts": {"files": 4}, "raw": "docs/agent/cloud-wave38/raw/02-syntax.txt"},
-    {"argv": ["python3", "-I", "-m", "py_compile", "artifact_observer.py", "tests/test_safety.py"], "exit": 0, "counts": {"files": 2}, "raw": "docs/agent/cloud-wave38/raw/02-syntax.txt"},
-    {"argv": ["python3", "-I", "-m", "unittest", "discover", "-s", "tools/qa/rustdoc-repro/tests", "-v"], "phase": "GREEN", "exit": 0, "counts": {"tests": 21, "passed": 21}, "raw": "docs/agent/cloud-wave38/raw/03-green.txt"},
-    {"argv": ["git", "diff", "c57e17e", "--", ".", ":!tools/qa/rustdoc-repro", ":!docs/agent/cloud-wave38", ":!baton-result.json", ":!baton-decisions.tsv"], "exit": 0, "counts": {"diff_lines": 0, "cloud_wave37_diff_lines": 0}, "raw": "docs/agent/cloud-wave38/raw/04-scope.txt"}
+    {"argv": ["git", "status", "--porcelain"], "exit": 0, "counts": {"dirty_files": 0}},
+    {"argv": ["git", "fetch", "origin", "ab/apple-preview-cloud-20261015-w38-rustdoc-safe-monitor"], "exit": 0, "counts": {"fetch_head_matches_base": 1}}
   ],
-  "touched_paths": [
-    "baton-result.json", "baton-decisions.tsv",
-    "tools/qa/rustdoc-repro/README.md", "tools/qa/rustdoc-repro/run-experiments.sh", "tools/qa/rustdoc-repro/make-fixture.sh", "tools/qa/rustdoc-repro/target-window-watch.sh",
-    "tools/qa/rustdoc-repro/artifact_observer.py", "tools/qa/rustdoc-repro/observe-artifacts.sh", "tools/qa/rustdoc-repro/tests/test_safety.py",
-    "docs/agent/cloud-wave38/a24-rustdoc-safe-monitor-20261015-w38.md", "docs/agent/cloud-wave38/raw/01-red.txt", "docs/agent/cloud-wave38/raw/02-syntax.txt", "docs/agent/cloud-wave38/raw/03-green.txt", "docs/agent/cloud-wave38/raw/04-scope.txt"
-  ],
-  "limitations": [
-    "Linux 云端 test-only；不是 macOS 验收，也不是产品批准",
-    "测试以 root 运行：属主校验、macOS 的 .dylib 与 /private 路径未实际验证",
-    "部分拒绝测试只断言 exit 2 且 victim 未变，未断言具体错误码",
-    "观察器采样之间的短瞬态可能漏检；未观测到变化不等于没有变化；不推断写者或因果",
-    "w37 的 .out 只是摘要，完整原始日志已随旧容器丢失",
-    "Parent 不同模型验收之前，不得把观察器用于本机目标",
-    "本机根因仍为 unknown"
-  ],
-  "next_action": "Parent 不同模型验收；通过后，仅在确认写者排它的窗口内，捕获失败 rustdoc 的准确 argv/extern、调用前后的精确路径 hash 与完整 stderr"
+  "touched_paths": ["baton-result.json"],
+  "limitations": ["Linux 云端 test-only；不是 macOS 验收，也不是产品批准"],
+  "next_action": "对 base 添加 R1–R4 真实行为 RED 负控，最小修复 artifact_observer.py"
 }
