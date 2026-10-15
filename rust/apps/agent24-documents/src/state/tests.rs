@@ -182,29 +182,50 @@ async fn a_read_only_database_file_is_not_writable() {
     }
 }
 
-/// Copies `documents.db` from `from` into the empty directory `to`.
+/// Copies `documents.db` from `from` into the empty directory `to`, as one
+/// self-contained file: a new inode in WAL mode with no sidecar files.
 ///
 /// `closing`, when given, is a connection on `from` that is closed at the
 /// worst moment for the copy. It stands in for a connection that
 /// `Pool::close` returned without closing: sqlx drops it later on its worker
 /// thread, and as the last connection SQLite then checkpoints and deletes the
-/// WAL (#964 CI, `os error 2`).
+/// WAL (#964 CI, `os error 2`). Copying the database and its WAL as two files
+/// cannot be made safe against that, so SQLite takes the snapshot itself:
+/// `VACUUM INTO` reads one consistent view through its own connection, WAL
+/// included, while the closing connection is no longer the last one. Every
+/// error, a missing source included, is returned.
 async fn copy_database(
     from: &Path,
     to: &Path,
     closing: Option<sqlx::SqliteConnection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut closing = closing;
-    for suffix in ["", "-wal"] {
-        let name = format!("{}{suffix}", crate::db::DB_FILE);
-        if from.join(&name).exists() {
-            if suffix == "-wal" {
-                if let Some(conn) = closing.take() {
-                    conn.close().await?;
-                }
-            }
-            fs::copy(from.join(&name), to.join(&name))?;
-        }
+    let source = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(from.join(crate::db::DB_FILE))
+        .create_if_missing(false);
+    let mut source = sqlx::SqliteConnection::connect_with(&source).await?;
+    if let Some(conn) = closing {
+        conn.close().await?;
+    }
+    let target = to.join(crate::db::DB_FILE);
+    let target_name = target.to_str().ok_or("copy target is not UTF-8")?;
+    sqlx::query("VACUUM INTO ?")
+        .bind(target_name)
+        .execute(&mut source)
+        .await?;
+    source.close().await?;
+    // `VACUUM INTO` writes a rollback-journal file; make it the WAL database
+    // the application opens. This connection is the copy's only one, so its
+    // close removes the WAL and shared-memory files it made.
+    let target = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&target)
+        .create_if_missing(false);
+    let mut copy = sqlx::SqliteConnection::connect_with(&target).await?;
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+        .fetch_one(&mut copy)
+        .await?;
+    copy.close().await?;
+    if mode != "wal" {
+        return Err(format!("copy journal mode is {mode}, not wal").into());
     }
     Ok(())
 }
