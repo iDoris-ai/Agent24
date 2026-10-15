@@ -1074,15 +1074,13 @@ export class OpenDesignComponentInstaller {
     // arrives — this job-owned timer re-emits once per idle onset so
     // onProgress listeners see "等待网络" without polling status().
     let idlePushedIdle = false
-    const idlePushTimer: NodeJS.Timeout = setInterval(() => {
-      const reading = this.speedEstimator!.currentReading(Date.now())
-      if (reading.bytesPerSecond > 0) idlePushedIdle = false
-      else if (!idlePushedIdle) {
-        idlePushedIdle = true
-        this.setStatus({ state: 'downloading', received: onDiskReceived, total: manifest.size, ...reading })
-      }
-    }, 1_000)
-    idlePushTimer.unref?.()
+    // R3 (independent review, 2026-10-15): the timer handle is only
+    // DECLARED here — created below, once the write-open has actually
+    // succeeded. Creating it this early used to leave it running past an
+    // `openRegularFileNoFollow` rejection (that throw sits before the
+    // try/finally that clears it), so the orphaned tick would overwrite an
+    // already-`failed` status back to `downloading` a second later.
+    let idlePushTimer: NodeJS.Timeout | undefined
     // R1: hand createWriteStream an already-open, O_NOFOLLOW-verified fd
     // instead of a path — a symlink planted at `destination` since
     // readMatchingDownloadMeta's check can no longer be opened at all.
@@ -1108,6 +1106,17 @@ export class OpenDesignComponentInstaller {
     const nodeStream = Readable.fromWeb(response.body as never)
 
     try {
+      // R3: created only now, inside the protection that clears it in
+      // `finally` below — never before the fileFd check above.
+      idlePushTimer = setInterval(() => {
+        const reading = this.speedEstimator!.currentReading(Date.now())
+        if (reading.bytesPerSecond > 0) idlePushedIdle = false
+        else if (!idlePushedIdle) {
+          idlePushedIdle = true
+          this.setStatus({ state: 'downloading', received: onDiskReceived, total: manifest.size, ...reading })
+        }
+      }, 1_000)
+      idlePushTimer.unref?.()
       resetIdleTimer()
       for await (const chunk of nodeStream as AsyncIterable<Buffer>) {
         resetIdleTimer()

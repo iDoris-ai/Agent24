@@ -925,6 +925,48 @@ describe('OpenDesignComponentInstaller', () => {
     expect(retried.state).toBe('installed')
   })
 
+  it('R3 (independent review, 2026-10-15): a write-open rejection does not leave an orphaned idle-push timer that revives a failed download', async () => {
+    // A symlink/FIFO planted at the `.part` destination gets cleaned up by
+    // installOnce's own pre-download discard (it isn't a resumable regular
+    // file either), so it never reaches download()'s write-open. Inject the
+    // rejection precisely where the brief asks — the write-open itself —
+    // by rejecting only the exact O_CREAT call download() makes against
+    // this download's `.part` path; every other fs.openSync call (temp
+    // meta file, the real server, etc.) passes straight through.
+    const stage = seedTreeFor('a24-od-stage-timer-finally-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+    const componentsRoot = tmpDir('a24-od-root-timer-finally-')
+    const partPath = path.join(componentsRoot, `.download-${manifest.sha256}.part`)
+
+    const realOpenSync = fs.openSync.bind(fs)
+    const openSyncSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+      if (filePath === partPath && typeof flags === 'number' && (flags & fs.constants.O_CREAT) !== 0) {
+        const error = new Error('EPERM: simulated write-open rejection (R3 regression test)') as NodeJS.ErrnoException
+        error.code = 'EPERM'
+        throw error
+      }
+      return realOpenSync(filePath as fs.PathLike, flags as number, mode as number)
+    })
+
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    openSyncSpy.mockRestore()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('non-regular file')
+
+    // Before the fix: the idle-push timer was created before this
+    // write-open throws, and that throw happens outside the try/finally
+    // that clears it — the orphaned 1s interval survives install()'s
+    // rejection and, more than one tick later, calls
+    // setStatus({ state: 'downloading', ... }), silently reviving a job
+    // that has already failed with no way to retry.
+    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    expect(installer.status().state).toBe('failed')
+  })
+
   describe('SD-01: pause/resume via HTTP Range', () => {
     function metaFileContents(manifest: OpenDesignComponentManifest, overrides: Partial<OpenDesignComponentManifest> = {}): string {
       const m = { ...manifest, ...overrides }
