@@ -968,6 +968,25 @@ mod tests {
         assert_eq!(r.route(profile, t0 + Duration::from_secs(61)).len(), 1);
     }
 
+    /// ME4-S2a §2.6 (PR-Daemon on #969): the daemon's router, built by
+    /// `with_defaults`, cools a provider for at most `DEFAULT_MAX_COOLDOWN`, the
+    /// number modules wait after `no_provider`; waiting exactly that is enough.
+    #[test]
+    fn the_default_router_cools_for_at_most_the_shared_cap() {
+        let r = ModelRouter::with_defaults(vec![(
+            StubProvider::down("p") as Arc<dyn ModelProvider>,
+            Tier::Local,
+        )]);
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            r.record_failure("p", t0);
+        }
+        let profile = TaskProfile::default();
+        let just_before = DEFAULT_MAX_COOLDOWN - Duration::from_millis(1);
+        assert!(r.route(profile, t0 + just_before).is_empty());
+        assert_eq!(r.route(profile, t0 + DEFAULT_MAX_COOLDOWN).len(), 1);
+    }
+
     #[test]
     fn env_local_tier_uses_the_http_clients_own_parser() {
         // Positive controls.

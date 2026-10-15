@@ -129,6 +129,7 @@
 - `max_tokens` 显式设为 4096（内核上限；不设只有 1024）。
 - 一个 job 同一时刻只有一次调用；整个模块最多 2 次（内核对每个模块的上限）。
 - 内核回 `busy` / `rate_limited` 时退避重试，同一次调用的等待累计不超过 2 分钟；回 `timeout` 时重试一次。
+- 回 `unavailable`（`no_provider`）时，等路由器冷却的上限（60 秒，`MODEL_NO_PROVIDER_WAIT`）后重试，同一次调用的这种等待累计不超过 3 分钟（2026-10-15，ME4-S2a §2.6；David 定为多次重试，不是一次）：内核按进展计时以后，模型卡住、重新加载、显卡被别的进程占用，报的都是这一个。等一次通常就够；但模块里另一个 job 的调用在这期间失败，会让 provider 重新冷却，所以允许再等。等待期间 job 被取消就立即结束。根本没有可用的本地模型时，3 分钟后以 `engine_unavailable` 失败。
 - 失败一律落在 §6 的闭集里：
   - 模型相关的失败都是 `engine_unavailable`，按 §6 一律可重试（包括 `forbidden`、`backend_config`：配置改好后重试就能成）；
   - `details.engine` 写 `local-model`（这时还没有模型 id）；

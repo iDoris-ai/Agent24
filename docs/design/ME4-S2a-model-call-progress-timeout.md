@@ -63,6 +63,8 @@ pub const fn model_call_budget(max_tokens: u32) -> Duration {
     MODEL_FIRST_CHUNK_TIMEOUT.saturating_add(MODEL_PER_TOKEN_BUDGET.saturating_mul(max_tokens))
 }
 pub const MODEL_ROUTING_MARGIN: Duration = Duration::from_secs(60);         // ⚖️
+/// The router's longest cooldown; a module waits this long after `no_provider` (§2.6).
+pub const MODEL_ROUTER_MAX_COOLDOWN: Duration = Duration::from_secs(60);    // ⚖️
 /// The RPC backstop: strictly after any call's deadline.
 pub const MODEL_CALL_BACKSTOP: Duration = model_call_budget(MODEL_MAX_TOKENS_CEILING).saturating_add(MODEL_ROUTING_MARGIN);
 /// What the SDK waits for a reply: the backstop and 5s, as 125 = 120 + 5 today.
@@ -136,9 +138,10 @@ pub struct Progress {
 改完以后，卡顿在 provider 层就成了 `unavailable` / `no_provider`（`retryable: true`）。`run.rs:154` 收到它会立即让 job 失败，那一次重试也就没了。所以：
 
 - 对 `Unavailable { cause: NoProvider, retryable: true }`，抽取器等 60s 后重试**一次**。60s 是路由器冷却的上限（`router.rs:270`，`route()` 用严格的 `now < until`，`:359`），等过这么久，冷却一定已经结束。
-  这个上限今天只是 `with_defaults` 里的一个数，`new()` 能接受到 24h：实现时由 `agent24-models` 导出一个具名常量（如 `MAX_COOLDOWN`），`with_defaults` 和抽取器都用它，J14 断言两者相等；
+  （实现时修订，David 定：这只在模块只有一个在途调用时成立。模块里另一个调用在等待期间失败，会让 provider 重新冷却。所以改为每次等 60s 后重试，同一次调用累计最多等 3 分钟。见文末改动记录。）
+  这个上限今天只是 `with_defaults` 里的一个数，`new()` 能接受到 24h：实现时由 `agent24-models` 导出一个具名常量（如 `MAX_COOLDOWN`），`with_defaults` 和抽取器都用它，J14 断言两者相等；（实现时的做法：文档模块不依赖 `agent24-models`，所以抽取器用的是 `agent24-os-proto` 的 `MODEL_ROUTER_MAX_COOLDOWN`，经 SDK 的 `MODEL_NO_PROVIDER_WAIT` 导出；`agent24-models` 的 `DEFAULT_MAX_COOLDOWN` 给 `with_defaults` 用；agent24d 的测试断言两者相等，即 J14。）
 - 等待期间和等忙时一样先问 `go_on()`（`run.rs:132-133`），被取消的 job 不会白等 60s；
-- 代价：根本没有可用 provider（比如 Ollama 没在运行）时，回的也是同一个 `no_provider`（`router.rs:417-424`），所以这种失败要多等 60s 才以 `engine_unavailable` 结束；
+- 代价：根本没有可用 provider（比如 Ollama 没在运行）时，回的也是同一个 `no_provider`（`router.rs:417-424`），所以这种失败要多等 60s 才以 `engine_unavailable` 结束（实现时修订：累计最多等 3 分钟，所以是多等 180s）；
 - `Timeout` 的重试规则不变（现在只剩内核自身卡住这一种来源）；
 - `run.rs:9` 的注释同步改写。
 
@@ -153,6 +156,8 @@ pub struct Progress {
 | `MODEL_ROUTING_MARGIN` ⚖️ | 60s | handler 入口之前的排队、准入；保证兜底值严格晚于截止时间 |
 | `MODEL_CALL_BACKSTOP` | 300 + 4096 + 60 = 4456s | 约 74 分钟 |
 | `MODEL_RESPONSE_TIMEOUT`（SDK） | 4461s | 兜底值 + 5s |
+| `MODEL_ROUTER_MAX_COOLDOWN` ⚖️ | 60s | 路由器冷却 provider 的最长时间；SDK 以 `MODEL_NO_PROVIDER_WAIT` 导出，模块遇到 `no_provider` 后等这么久再试（§2.6） |
+| 抽取器每次调用的 `no_provider` 等待上限 ⚖️ | 180s | 3 次冷却上限：模块里另一个调用失败会让 provider 重新冷却（§2.6 的实现时修订） |
 
 ## 4. 判据（每条带正对照；`cargo test <过滤>` 先 `-- --list` 断言非空）
 
@@ -173,7 +178,7 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
 | J11 | 路由器两个 provider：第一个在首段卡住，第二个仍受同一个截止时间约束，总耗时 ≤ 截止时间，模块看到 `no_provider` | 每个 provider 各自重算截止时间的变异 → 总耗时超过截止时间，变红 |
 | J12 | 内核：handler 的 `call_timeout()` 等于 `MODEL_CALL_BACKSTOP`，夹紧后不变；`rpc.rs:1721-1724` 的夹紧断言随 Q2 改写 | 没有声明的方法仍是连接级 30s |
 | J13 | 编译期 `assert!`：`MODEL_RESPONSE_TIMEOUT > MODEL_CALL_BACKSTOP > model_call_budget(MODEL_MAX_TOKENS_CEILING)`（`agent24-os-proto`）；选 (A) 时另有 `MAX_METHOD_CALL_TIMEOUT >= MODEL_CALL_BACKSTOP` | — |
-| J14 | 文档模块：`no_provider` 等 60s 后重试一次，第二次仍失败才让 job 失败；等待中取消，立即结束；没有任何 provider 时也是重试一次后失败 | 第一次就成功则不等 |
+| J14 | 文档模块：`no_provider` 等 60s 后重试，累计最多等 3 分钟（实现时修订，原为一次），预算用完仍失败才让 job 失败；等待中取消，立即结束；没有任何 provider 时 3 分钟后失败 | 第一次就成功则不等 |
 | J16 | 路由器：前一个 provider 失败时离截止时间不足 `MODEL_STALL_TIMEOUT`，不再尝试下一个 | 剩余充足时照常尝试 |
 | J15 | 实测（记进 PR）：同一台 M4、`qwen2.5:7b`，DOC-1-09 验收跑 8 份，Ollama 日志里没有 `2m0s` 的 500，`s01-08` 抽取完成 | 本文 §0 的那次运行 |
 
@@ -187,7 +192,7 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
    **实际拆分（2026-10-15）**：超出规模，拆成 4 个 PR：常量（#956）、`progress` 字段（#957）、`answer()` 重构（#958）、流式接收与路由器。
 2. **`agent24d` + `agent24-os-proto` 的 `rpc.rs` + `agent24-os-sdk`**：handler 开启 `progress`、兜底值与夹紧（按 Q2 的选择）、SDK 常量（§2.4–2.5），J12。
    同一个 PR 改文首「修订对象」里列出的文档和注释，以及 `model_callback.rs:46`、`:128-131`、`:1010-1011`、`:1549`（`MODEL_MAX_TOKENS_CEILING` 搬走与断言）。从这个 PR 起行为才真正改变。
-3. **`agent24-documents`**：`no_provider` 重试一次（§2.6）与注释，J14；附 J15 的实测记录。
+3. **`agent24-documents`**：`no_provider` 等冷却上限后重试（§2.6；实现时修订为同一次调用累计最多等 3 分钟）与注释，J14；附 J15 的实测记录。
 
 ## 6. 残余风险
 
@@ -229,3 +234,7 @@ provider 测试用本地 TCP 桩发 SSE，`Progress` 里的三个时长缩到百
 **v2.1 → v2.2**（PR-Daemon 在 #948 的两条非阻塞项）：冷却上限改为由 `agent24-models` 导出的具名常量，抽取器的等待与之相同（§2.6）；`model_callback.rs:181` → `:182`。
 
 **v2.2 → 已定**：§7 四个问题由 David 按建议定（2026-10-15）；jason 在 #948 知会。
+
+**实现时的修订**（Grok 在第 6 片的评审，David 定）：只重试一次时，模块里两个 job 并发，另一个 job 的失败会把冷却往后推，等满 60s 的重试仍可能拿到 `no_provider`，job 提前失败。改为每次等 60s、同一次调用累计最多 3 分钟（§2.6、J14）。
+
+**实现时的更正**（Fable 在第 6 片的评审）：冷却上限的常量放在 `agent24-os-proto`（`MODEL_ROUTER_MAX_COOLDOWN`），不是 `agent24-models`，因为文档模块只依赖 SDK；§2.6 与 §3 的常量表已补。

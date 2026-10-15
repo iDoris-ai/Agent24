@@ -6,7 +6,9 @@
 //! again in two halves of its batch; one not in the schema's shape is asked
 //! once more. A window the model rejects (most likely too long for its
 //! context) is asked again in two halves. A busy or rate-limited kernel is
-//! waited out, up to two minutes a call; a timeout is retried once. Every
+//! waited out, up to two minutes a call; a timeout is retried once; no local
+//! model to answer is asked again after the router's longest cooldown, up to
+//! three minutes of such waiting a call. Every
 //! call must name the model that answered, and it must be the same model
 //! throughout: an extraction never mixes two.
 
@@ -16,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_os_sdk::{
-    ClientError, CompleteRequest, CompleteResult, ModelClient, ServedTier, UnavailableCause,
+    ClientError, CompleteRequest, CompleteResult, MODEL_NO_PROVIDER_WAIT, ModelClient, ServedTier,
+    UnavailableCause,
 };
 
 use super::Field;
@@ -30,18 +33,24 @@ const MAX_TOKENS: u32 = 4096;
 /// A model id's bytes, at most, as migration 0006 keeps it (and no NUL).
 const MAX_MODEL_ID: usize = 256;
 /// How a busy kernel is waited out: first pause, doubling to at most 30 s,
-/// for at most two minutes a call.
+/// for at most two minutes a call. And how long to wait after no local model
+/// answered: the router's longest cooldown each time (ME4-S2a §2.6), for at
+/// most three of them a call.
 #[derive(Debug, Clone, Copy)]
 struct Pace {
     first: Duration,
     longest: Duration,
     max_wait: Duration,
+    no_provider: Duration,
+    no_provider_max: Duration,
 }
 
 const PACE: Pace = Pace {
     first: Duration::from_secs(1),
     longest: Duration::from_secs(30),
     max_wait: Duration::from_secs(120),
+    no_provider: MODEL_NO_PROVIDER_WAIT,
+    no_provider_max: MODEL_NO_PROVIDER_WAIT.saturating_mul(3),
 };
 
 pub type Call = Pin<Box<dyn Future<Output = Result<CompleteResult, ClientError>> + Send>>;
@@ -113,6 +122,7 @@ impl Run<'_> {
         let mut waited = Duration::ZERO;
         let mut pause = self.pace.first;
         let mut timeouts = 0;
+        let mut no_provider = Duration::ZERO;
         loop {
             if !self.job.go_on().await {
                 return Err(Refused::Failed(Failure::Cancelled));
@@ -139,6 +149,24 @@ impl Run<'_> {
                     pause = (pause * 2).min(self.pace.longest);
                 }
                 Err(ClientError::Timeout(_)) if timeouts == 0 => timeouts += 1,
+                // A stall the kernel caught, a model reloading, the GPU taken
+                // for a while: asked again once every cooled provider is back.
+                // Another call of this module failing meanwhile cools one
+                // again, so this goes on for up to three cooldowns. No
+                // provider at all fails the same way, three minutes later.
+                Err(ClientError::Unavailable {
+                    cause: UnavailableCause::NoProvider,
+                    ..
+                }) if no_provider < self.pace.no_provider_max => {
+                    let wait = self
+                        .pace
+                        .no_provider
+                        .min(self.pace.no_provider_max - no_provider);
+                    no_provider += wait;
+                    if !self.wait(wait).await {
+                        return Err(Refused::Failed(Failure::Cancelled));
+                    }
+                }
                 Err(ClientError::Unavailable {
                     cause: UnavailableCause::RequestRejected,
                     ..
@@ -154,6 +182,23 @@ impl Run<'_> {
                 Err(e) => return Err(engine(format!("the local model: {e}"))),
             }
         }
+    }
+
+    /// Waits `total`, asking every `first` whether the job goes on: a job
+    /// cancelled while it waits ends then, not when the wait is over.
+    /// The caller asks once more before its next call, so this does not.
+    async fn wait(&self, total: Duration) -> bool {
+        debug_assert!(!self.pace.first.is_zero(), "a zero step never ends");
+        let mut left = total;
+        while !left.is_zero() {
+            if !self.job.go_on().await {
+                return false;
+            }
+            let step = left.min(self.pace.first);
+            tokio::time::sleep(step).await;
+            left -= step;
+        }
+        true
     }
 
     /// The answer's text, once its model is known to be the one, local.
