@@ -541,11 +541,14 @@ function downloadMetaPath(componentsRoot: string, manifest: OpenDesignComponentM
 /** R1: opens with O_NOFOLLOW so a part/meta symlink can never be read or
  * written through — open() itself fails (ELOOP) instead of following it,
  * closing the TOCTOU window a separate lstat-then-open check would leave.
- * `null` means "doesn't exist / is a symlink / isn't a regular file". */
+ * `null` means "doesn't exist / is a symlink / isn't a regular file".
+ * R2: also O_NONBLOCK — a planted FIFO otherwise blocks this synchronous
+ * open() (and the whole main event loop) forever before fstat ever runs;
+ * O_NONBLOCK is a no-op for a real regular file, so fstat below still gates. */
 function openRegularFileNoFollow(filePath: string, flags: number, mode?: number): number | null {
   let fd: number
   try {
-    fd = fs.openSync(filePath, flags | fs.constants.O_NOFOLLOW, mode)
+    fd = fs.openSync(filePath, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, mode)
   } catch {
     return null
   }
@@ -1067,6 +1070,19 @@ export class OpenDesignComponentInstaller {
 
     let lastEmit = 0
     this.speedEstimator = new SpeedEstimator()
+    // R5: status() recomputes live, but nothing PUSHES while no chunk
+    // arrives — this job-owned timer re-emits once per idle onset so
+    // onProgress listeners see "等待网络" without polling status().
+    let idlePushedIdle = false
+    const idlePushTimer: NodeJS.Timeout = setInterval(() => {
+      const reading = this.speedEstimator!.currentReading(Date.now())
+      if (reading.bytesPerSecond > 0) idlePushedIdle = false
+      else if (!idlePushedIdle) {
+        idlePushedIdle = true
+        this.setStatus({ state: 'downloading', received: onDiskReceived, total: manifest.size, ...reading })
+      }
+    }, 1_000)
+    idlePushTimer.unref?.()
     // R1: hand createWriteStream an already-open, O_NOFOLLOW-verified fd
     // instead of a path — a symlink planted at `destination` since
     // readMatchingDownloadMeta's check can no longer be opened at all.
@@ -1134,6 +1150,7 @@ export class OpenDesignComponentInstaller {
       throw error
     } finally {
       clearTimeout(idleTimer)
+      clearInterval(idlePushTimer)
     }
 
     if (onDiskReceived !== manifest.size) {
