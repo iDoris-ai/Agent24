@@ -792,6 +792,8 @@ impl Handler for ModelCompleteHandler {
                 ));
             }
 
+            // ME4-S2a §2.2: no `.await` from here until the router has the
+            // request. A wait here would eat into the first-chunk window.
             let request = with_progress(request, std::time::Instant::now());
             let profile = TaskProfile {
                 privacy: grant.privacy,
@@ -1028,6 +1030,12 @@ mod tests {
     #[test]
     fn design_constants_match_the_frozen_numbers_table() {
         assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(4456));
+        // J14 (ME4-S2a §2.6): what a module waits after `no_provider` is the
+        // router's longest cooldown, so one wait outlasts any one cooldown.
+        assert_eq!(
+            agent24_models::router::DEFAULT_MAX_COOLDOWN,
+            model_budget::MODEL_ROUTER_MAX_COOLDOWN
+        );
         assert_eq!(MODEL_MAX_TOKENS_CEILING, 4096);
         assert_eq!(MODEL_DEFAULT_MAX_TOKENS, 1024);
         assert_eq!(MODEL_MAX_MESSAGES, 64);

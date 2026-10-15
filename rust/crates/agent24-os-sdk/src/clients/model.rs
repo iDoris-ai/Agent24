@@ -25,6 +25,12 @@ const OFFER_PREFIX: &str = "_a24/model/";
 /// (ME4-S2a §2.1), so the two cannot drift.
 pub const MODEL_RESPONSE_TIMEOUT: Duration = agent24_os_proto::model_budget::MODEL_RESPONSE_TIMEOUT;
 
+/// How long to wait after `unavailable` / `no_provider` before asking once
+/// more: the kernel router's longest cooldown, so every provider it cooled is
+/// tried again (ME4-S2a §2.6).
+pub const MODEL_NO_PROVIDER_WAIT: Duration =
+    agent24_os_proto::model_budget::MODEL_ROUTER_MAX_COOLDOWN;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {

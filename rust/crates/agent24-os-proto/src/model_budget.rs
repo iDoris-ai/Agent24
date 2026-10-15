@@ -18,6 +18,10 @@ pub const MODEL_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MODEL_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Each token at the slowest pace allowed, one a second. ⚖️
 pub const MODEL_PER_TOKEN_BUDGET: Duration = Duration::from_secs(1);
+/// The longest a kernel's router keeps a provider cooled after it was
+/// unavailable. A module that hears `no_provider` and waits this long finds
+/// every cooled provider tried again (ME4-S2a §2.6). ⚖️
+pub const MODEL_ROUTER_MAX_COOLDOWN: Duration = Duration::from_secs(60);
 /// Admission and routing before a call's deadline is set. ⚖️
 pub const MODEL_ROUTING_MARGIN: Duration = Duration::from_secs(60);
 
