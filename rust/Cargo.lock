@@ -39,6 +39,7 @@ dependencies = [
 name = "agent24-cli"
 version = "0.5.1"
 dependencies = [
+ "agent24-hw",
  "agent24-mcp",
  "agent24-os-packages",
  "agent24-protocol",
@@ -93,10 +94,10 @@ dependencies = [
 name = "agent24-decide"
 version = "0.5.1"
 dependencies = [
+ "agent24-hw",
  "async-trait",
  "serde",
  "serde_json",
- "sysinfo",
  "thiserror 2.0.19",
  "tokio",
 ]
@@ -134,6 +135,15 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "agent24-hw"
+version = "0.5.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sysinfo",
 ]
 
 [[package]]
@@ -401,6 +411,7 @@ dependencies = [
  "agent24-core",
  "agent24-decide",
  "agent24-domain",
+ "agent24-hw",
  "agent24-mcp",
  "agent24-memory",
  "agent24-models",

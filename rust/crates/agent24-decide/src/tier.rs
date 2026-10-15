@@ -12,20 +12,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hw::{Accelerator, HardwareProfile};
+use crate::hw::{Accelerator, HardwareProfile, HwLevel};
 
 /// Below this free disk space, D0-3's rule is "don't even try" — see
 /// `PLAN-DECIDE.md` §1.1 T0 row ("磁盘不足").
 const MIN_FREE_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Below this total RAM, T0 (rules only) regardless of anything else.
-const MIN_MEM_T1_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// At/above this total RAM (plus an accelerator), T2 is reachable.
-const MIN_MEM_T2_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-
-/// At/above this total RAM (plus an accelerator), T3 is reachable.
-const MIN_MEM_T3_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 /// A hardware/capability tier. Order matters: `T0 < T1 < T2 < T3`, so
 /// "user override can only downgrade" is just a comparison, not a lookup
@@ -107,28 +98,36 @@ impl TierPolicy {
     fn hardware_tier(profile: &HardwareProfile) -> (Tier, Vec<String>) {
         let mut reasons = Vec::new();
 
-        if profile.free_disk_bytes < MIN_FREE_DISK_BYTES {
+        match profile.models_dir_free_bytes {
+            None => {
+                reasons.push("无法确认模型目录所在磁盘的可用空间：不允许新下载，T0".to_owned());
+                return (Tier::T0, reasons);
+            }
+            Some(free) if free < MIN_FREE_DISK_BYTES => {
+                reasons.push(format!(
+                    "可用磁盘 {free} bytes < {MIN_FREE_DISK_BYTES} bytes（2GB）：T0"
+                ));
+                return (Tier::T0, reasons);
+            }
+            Some(_) => {}
+        }
+
+        // Memory thresholds come from HW-1's HwLevel (agent24-hw), not
+        // constants here: L1→T0, L2→T1, L3/L4→T2, L5/L6→T3.
+        let level = HwLevel::from_total_bytes(profile.total_mem_bytes);
+        if level == HwLevel::L1 {
             reasons.push(format!(
-                "可用磁盘 {} bytes < {} bytes（2GB）：T0",
-                profile.free_disk_bytes, MIN_FREE_DISK_BYTES
+                "总内存 {} bytes < 8GB（{level:?}）：T0",
+                profile.total_mem_bytes
             ));
             return (Tier::T0, reasons);
         }
 
-        if profile.total_mem_bytes < MIN_MEM_T1_BYTES {
-            reasons.push(format!(
-                "总内存 {} bytes < {} bytes（8GB）：T0",
-                profile.total_mem_bytes, MIN_MEM_T1_BYTES
-            ));
-            return (Tier::T0, reasons);
-        }
-
-        let mem_tier = if profile.total_mem_bytes >= MIN_MEM_T3_BYTES {
-            Tier::T3
-        } else if profile.total_mem_bytes >= MIN_MEM_T2_BYTES {
-            Tier::T2
-        } else {
-            Tier::T1
+        let mem_tier = match level {
+            HwLevel::L1 => Tier::T0,
+            HwLevel::L2 => Tier::T1,
+            HwLevel::L3 | HwLevel::L4 => Tier::T2,
+            HwLevel::L5 | HwLevel::L6 => Tier::T3,
         };
         reasons.push(format!(
             "内存档位 {mem_tier:?}（总内存 {} bytes）",
@@ -174,9 +173,16 @@ mod tests {
             arch: "aarch64".to_owned(),
             cpu_cores: 8,
             accelerator,
-            free_disk_bytes: free_disk_gb * 1024 * 1024 * 1024,
             os: "macos".to_owned(),
+            os_version: None,
+            chip: None,
+            unified_memory: true,
+            gpu_wired_limit_bytes: None,
+            discrete_gpus: vec![],
+            disks: vec![],
+            models_dir_free_bytes: Some(free_disk_gb * 1024 * 1024 * 1024),
             on_battery,
+            runtimes: vec![],
         }
     }
 
@@ -203,6 +209,14 @@ mod tests {
         let d = TierPolicy::decide(&p, DownloadConsent::Granted, None);
         assert_eq!(d.hardware_tier, Tier::T0);
         assert_eq!(d.effective_tier, Tier::T0);
+    }
+
+    #[test]
+    fn unknown_models_dir_disk_is_t0_no_new_downloads() {
+        let mut p = profile(64, Accelerator::Metal, 500, Some(false));
+        p.models_dir_free_bytes = None;
+        let d = TierPolicy::decide(&p, DownloadConsent::Granted, None);
+        assert_eq!(d.hardware_tier, Tier::T0);
     }
 
     #[test]
