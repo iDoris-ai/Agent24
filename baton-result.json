@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": "a24-linux-hw-20261015-104002",
+  "attempt_id": "1f583711-dfd5-4ed7-a882-0d3961a011b9",
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
+  "result_sha": null,
+  "summary": "已在iDoris-ai/Agent24精确基线a9b36cee创建专属分支，开始Linux硬件运行时验证（agent24-hw）",
+  "tests": [],
+  "blocker": null,
+  "next": null,
+  "updated_at": "2026-10-15T10:48:51Z"
+}

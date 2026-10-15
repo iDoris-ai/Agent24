@@ -1,0 +1,2 @@
+timestamp	task_id	attempt_id	decision	reason
+2026-10-15T10:48:51Z	a24-linux-hw-20261015-104002	1f583711-dfd5-4ed7-a882-0d3961a011b9	started	canonical repo基线SHA校验通过；仅推本分支；45分钟上限
