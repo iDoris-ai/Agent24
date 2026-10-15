@@ -909,11 +909,15 @@ describe('OpenDesignComponentInstaller', () => {
     const result = await pending
     expect(result.state).toBe('failed')
     expect(result.error).toContain('simulated disk write failure')
-    // The fake write stream never touches the real filesystem, so unlike
-    // the idle-timeout/abort cases above there is no real `.part` file to
-    // preserve here — only the resume sidecar (written before any network
-    // call) exists.
-    expect(fs.readdirSync(componentsRoot)).toEqual([`.download-${manifest.sha256}.meta.json`])
+    // R1 (independent review, 2026-10-15): the download destination is now
+    // opened with O_NOFOLLOW + an fd regular-file check *before* the write
+    // stream this test fakes ever runs — so a real, empty `.part`
+    // placeholder exists on disk (created by that open) alongside the
+    // resume sidecar, even though the fake stream itself never touches the
+    // filesystem.
+    expect(fs.readdirSync(componentsRoot).sort()).toEqual(
+      [`.download-${manifest.sha256}.meta.json`, `.download-${manifest.sha256}.part`].sort(),
+    )
 
     // Retryable: a fresh install() with the real fs restored succeeds.
     createWriteStreamSpy.mockRestore()
