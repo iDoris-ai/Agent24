@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "task_id": "a24-rustdoc-20261015-104002",
+  "attempt_id": "6ab0e10b-6a45-4f76-8706-48d85957eb92",
+  "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
+  "actual_branch": "ab/apple-preview-cloud-20261015-104002-rustdoc",
+  "state": "started",
+  "sequence": 1,
+  "outcome": "started: 已验证base SHA并新建独占branch，尚未执行研究",
+  "commands": [
+    {"argv": ["git", "rev-parse", "HEAD"], "exit": 0, "counts": {"note": "a9b36ceee8a74f0c477b37836506933b09aafcf5"}}
+  ],
+  "touched_paths": ["baton-result.json"],
+  "limitations": ["started 回执，不代表任何执行结果"],
+  "next_action": "阅读 agent24-agent 依赖/测试布局并构建 /tmp 最小 fixture"
+}
