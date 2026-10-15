@@ -1,0 +1,193 @@
+# toolchain: rustdoc 1.95.0 (59807616e 2026-04-14)
+# uname: Linux x86_64
+## E1 ws_a test --doc exit=0
+         Running `CARGO=/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo CARGO_CRATE_NAME=fx_core CARGO_MANIFEST_DIR=/tmp/claude-0/rdrepro/fx/ws_a/core CARGO_MANIFEST_PATH=/tmp/claude-0/rdrepro/fx/ws_a/core/Cargo.toml CARGO_PKG_AUTHORS='' CARGO_PKG_DESCRIPTION='' CARGO_PKG_HOMEPAGE='' CARGO_PKG_LICENSE='' CARGO_PKG_LICENSE_FILE='' CARGO_PKG_NAME=fx_core CARGO_PKG_README='' CARGO_PKG_REPOSITORY='' CARGO_PKG_RUST_VERSION='' CARGO_PKG_VERSION=0.1.0 CARGO_PKG_VERSION_MAJOR=0 CARGO_PKG_VERSION_MINOR=1 CARGO_PKG_VERSION_PATCH=0 CARGO_PKG_VERSION_PRE='' CARGO_PRIMARY_PACKAGE=1 LD_LIBRARY_PATH='/tmp/claude-0/rdrepro/shared-target/debug/deps:/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib' /root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name fx_core --edition=2021 core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=29ae45ce0b9f8c04 -C extra-filename=-5e620ac9ac82cb92 --out-dir /tmp/claude-0/rdrepro/shared-target/debug/deps -C incremental=/tmp/claude-0/rdrepro/shared-target/debug/incremental -L dependency=/tmp/claude-0/rdrepro/shared-target/debug/deps`
+         Running `CARGO=/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo CARGO_CRATE_NAME=fake_async_trait CARGO_MANIFEST_DIR=/tmp/claude-0/rdrepro/fx/shared/fake_async_trait CARGO_MANIFEST_PATH=/tmp/claude-0/rdrepro/fx/shared/fake_async_trait/Cargo.toml CARGO_PKG_AUTHORS='' CARGO_PKG_DESCRIPTION='' CARGO_PKG_HOMEPAGE='' CARGO_PKG_LICENSE='' CARGO_PKG_LICENSE_FILE='' CARGO_PKG_NAME=fake_async_trait CARGO_PKG_README='' CARGO_PKG_REPOSITORY='' CARGO_PKG_RUST_VERSION='' CARGO_PKG_VERSION=0.1.0 CARGO_PKG_VERSION_MAJOR=0 CARGO_PKG_VERSION_MINOR=1 CARGO_PKG_VERSION_PATCH=0 CARGO_PKG_VERSION_PRE='' LD_LIBRARY_PATH='/tmp/claude-0/rdrepro/shared-target/debug/deps:/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib' /root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name fake_async_trait --edition=2021 /tmp/claude-0/rdrepro/fx/shared/fake_async_trait/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type proc-macro --emit=dep-info,link -C prefer-dynamic -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=1a0fbb50db2670bb -C extra-filename=-3cf1e0b92cff6b06 --out-dir /tmp/claude-0/rdrepro/shared-target/debug/deps -C incremental=/tmp/claude-0/rdrepro/shared-target/debug/incremental -L dependency=/tmp/claude-0/rdrepro/shared-target/debug/deps --extern proc_macro`
+         Running `CARGO=/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo CARGO_CRATE_NAME=fx_store CARGO_MANIFEST_DIR=/tmp/claude-0/rdrepro/fx/ws_a/store CARGO_MANIFEST_PATH=/tmp/claude-0/rdrepro/fx/ws_a/store/Cargo.toml CARGO_PKG_AUTHORS='' CARGO_PKG_DESCRIPTION='' CARGO_PKG_HOMEPAGE='' CARGO_PKG_LICENSE='' CARGO_PKG_LICENSE_FILE='' CARGO_PKG_NAME=fx_store CARGO_PKG_README='' CARGO_PKG_REPOSITORY='' CARGO_PKG_RUST_VERSION='' CARGO_PKG_VERSION=0.1.0 CARGO_PKG_VERSION_MAJOR=0 CARGO_PKG_VERSION_MINOR=1 CARGO_PKG_VERSION_PATCH=0 CARGO_PKG_VERSION_PRE='' CARGO_PRIMARY_PACKAGE=1 LD_LIBRARY_PATH='/tmp/claude-0/rdrepro/shared-target/debug/deps:/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib' /root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name fx_store --edition=2021 store/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=afe7e59ed2d9a42f -C extra-filename=-90f8b9cafe4170eb --out-dir /tmp/claude-0/rdrepro/shared-target/debug/deps -C incremental=/tmp/claude-0/rdrepro/shared-target/debug/incremental -L dependency=/tmp/claude-0/rdrepro/shared-target/debug/deps --extern fake_async_trait=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so --extern fx_core=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_core-5e620ac9ac82cb92.rmeta`
+         Running `CARGO=/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo CARGO_CRATE_NAME=fx_agent CARGO_MANIFEST_DIR=/tmp/claude-0/rdrepro/fx/ws_a/agent CARGO_MANIFEST_PATH=/tmp/claude-0/rdrepro/fx/ws_a/agent/Cargo.toml CARGO_PKG_AUTHORS='' CARGO_PKG_DESCRIPTION='' CARGO_PKG_HOMEPAGE='' CARGO_PKG_LICENSE='' CARGO_PKG_LICENSE_FILE='' CARGO_PKG_NAME=fx_agent CARGO_PKG_README='' CARGO_PKG_REPOSITORY='' CARGO_PKG_RUST_VERSION='' CARGO_PKG_VERSION=0.1.0 CARGO_PKG_VERSION_MAJOR=0 CARGO_PKG_VERSION_MINOR=1 CARGO_PKG_VERSION_PATCH=0 CARGO_PKG_VERSION_PRE='' CARGO_PRIMARY_PACKAGE=1 LD_LIBRARY_PATH='/tmp/claude-0/rdrepro/shared-target/debug/deps:/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib' /root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name fx_agent --edition=2021 agent/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=90805bae349e2dc4 -C extra-filename=-0380f728c1c0b9a7 --out-dir /tmp/claude-0/rdrepro/shared-target/debug/deps -C incremental=/tmp/claude-0/rdrepro/shared-target/debug/incremental -L dependency=/tmp/claude-0/rdrepro/shared-target/debug/deps --extern fake_async_trait=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so --extern fx_store=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_store-90f8b9cafe4170eb.rmeta`
+       Doc-tests fx_agent
+         Running `CARGO=/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo CARGO_CRATE_NAME=fx_agent CARGO_MANIFEST_DIR=/tmp/claude-0/rdrepro/fx/ws_a/agent CARGO_MANIFEST_PATH=/tmp/claude-0/rdrepro/fx/ws_a/agent/Cargo.toml CARGO_PKG_AUTHORS='' CARGO_PKG_DESCRIPTION='' CARGO_PKG_HOMEPAGE='' CARGO_PKG_LICENSE='' CARGO_PKG_LICENSE_FILE='' CARGO_PKG_NAME=fx_agent CARGO_PKG_README='' CARGO_PKG_REPOSITORY='' CARGO_PKG_RUST_VERSION='' CARGO_PKG_VERSION=0.1.0 CARGO_PKG_VERSION_MAJOR=0 CARGO_PKG_VERSION_MINOR=1 CARGO_PKG_VERSION_PATCH=0 CARGO_PKG_VERSION_PRE='' LD_LIBRARY_PATH='/tmp/claude-0/rdrepro/shared-target/debug/deps:/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib' /root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2021 --crate-type lib --color never --crate-name fx_agent --test agent/src/lib.rs --test-run-directory /tmp/claude-0/rdrepro/fx/ws_a/agent --extern fake_async_trait=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so --extern fx_agent=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_agent-0380f728c1c0b9a7.rlib --extern fx_store=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_store-90f8b9cafe4170eb.rlib -L dependency=/tmp/claude-0/rdrepro/shared-target/debug/deps -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+       Doc-tests fx_core
+         Running `CARGO=/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo CARGO_CRATE_NAME=fx_core CARGO_MANIFEST_DIR=/tmp/claude-0/rdrepro/fx/ws_a/core CARGO_MANIFEST_PATH=/tmp/claude-0/rdrepro/fx/ws_a/core/Cargo.toml CARGO_PKG_AUTHORS='' CARGO_PKG_DESCRIPTION='' CARGO_PKG_HOMEPAGE='' CARGO_PKG_LICENSE='' CARGO_PKG_LICENSE_FILE='' CARGO_PKG_NAME=fx_core CARGO_PKG_README='' CARGO_PKG_REPOSITORY='' CARGO_PKG_RUST_VERSION='' CARGO_PKG_VERSION=0.1.0 CARGO_PKG_VERSION_MAJOR=0 CARGO_PKG_VERSION_MINOR=1 CARGO_PKG_VERSION_PATCH=0 CARGO_PKG_VERSION_PRE='' LD_LIBRARY_PATH='/tmp/claude-0/rdrepro/shared-target/debug/deps:/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib' /root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2021 --crate-type lib --color never --crate-name fx_core --test core/src/lib.rs --test-run-directory /tmp/claude-0/rdrepro/fx/ws_a/core --extern fx_core=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_core-5e620ac9ac82cb92.rlib -L dependency=/tmp/claude-0/rdrepro/shared-target/debug/deps -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+         Running `CARGO=/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo CARGO_CRATE_NAME=fx_store CARGO_MANIFEST_DIR=/tmp/claude-0/rdrepro/fx/ws_a/store CARGO_MANIFEST_PATH=/tmp/claude-0/rdrepro/fx/ws_a/store/Cargo.toml CARGO_PKG_AUTHORS='' CARGO_PKG_DESCRIPTION='' CARGO_PKG_HOMEPAGE='' CARGO_PKG_LICENSE='' CARGO_PKG_LICENSE_FILE='' CARGO_PKG_NAME=fx_store CARGO_PKG_README='' CARGO_PKG_REPOSITORY='' CARGO_PKG_RUST_VERSION='' CARGO_PKG_VERSION=0.1.0 CARGO_PKG_VERSION_MAJOR=0 CARGO_PKG_VERSION_MINOR=1 CARGO_PKG_VERSION_PATCH=0 CARGO_PKG_VERSION_PRE='' LD_LIBRARY_PATH='/tmp/claude-0/rdrepro/shared-target/debug/deps:/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib' /root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2021 --crate-type lib --color never --crate-name fx_store --test store/src/lib.rs --test-run-directory /tmp/claude-0/rdrepro/fx/ws_a/store --extern fake_async_trait=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so --extern fx_core=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_core-5e620ac9ac82cb92.rlib --extern fx_store=/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_store-90f8b9cafe4170eb.rlib -L dependency=/tmp/claude-0/rdrepro/shared-target/debug/deps -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E2 ws_a test(full) exit=0
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E3 ws_b test(full) shared target exit=0
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E3 deps 文件（同名=共享产物，可被另一 source 路径的 cargo 覆写）:
+    libfake_async_trait-3cf1e0b92cff6b06.so
+    libfx_agent-0380f728c1c0b9a7.rlib
+    libfx_agent-0380f728c1c0b9a7.rmeta
+    libfx_store-90f8b9cafe4170eb.rlib
+    libfx_store-90f8b9cafe4170eb.rmeta
+## E4 hook_seen=yes ws_b build exit=0 took=.032909769s (若≈0s 且无 Blocking => 测试执行阶段未持有 build-dir 锁)
+## E4 ws_a test(full,sleep8) exit=0
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E5 before: /tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so ino=1630359
+## E5 ws_b RUSTFLAGS=--cfg fx_other build exit=0 during window
+## E5 after-writer: /tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so ino=1630359
+/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-42d7c7973332926d.so ino=1632085
+## E5 ws_a test(full) with concurrent RUSTFLAGS writer exit=0
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E6 ws_b rebuild with changed shared pm source exit=0; after: /tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so ino=1632116
+/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-42d7c7973332926d.so ino=1632085
+## E6 ws_a test(full) with concurrent pm-source writer exit=0
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E7 ws_a test(full) with store rlib removed in window (/tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_store-90f8b9cafe4170eb.rlib) exit=1
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    error: extern location for fx_store does not exist: /tmp/claude-0/rdrepro/shared-target/debug/deps/libfx_store-90f8b9cafe4170eb.rlib
+## E9 ws_b build -p fx_store (skewed source) exit=0: 1 compiled
+## E9 ws_a test(full) with skewed same-name store rlib exit=101
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    error[E0460]: found possibly newer version of crate `fx_store` which `fx_agent` depends on
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+## E10 ws_b build -p fake_async_trait exit=0; after: /tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-3cf1e0b92cff6b06.so ino=1632116
+/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-42d7c7973332926d.so ino=1632085
+/tmp/claude-0/rdrepro/shared-target/debug/deps/libfake_async_trait-b55b0c28283dec1c.so ino=1631968
+## E10 ws_a test(full) with skewed same-name proc-macro dylib exit=0
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E11 ws_a test --doc after same skew (writer finished first) exit=0
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## E12 ws_a test(full) with transitive fx_core rlib absent in window exit=101
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+## E12b ws_a test(full) with transitive fx_core rlib absent in window exit=1
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    error[E0463]: can't find crate for `fx_store`
+## E13 rebuild probe libfake_async_trait-*.so: samples=34 missing=0 inodes=[ 1632181 1632085 1632074 ]
+## E13 rebuild probe libfx_core-*.rlib: samples=32 missing=0 inodes=[ 1632050 ]
+## E8 ws_a test(full,sleep3) no writer exit=0
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_agent-07217fc4d5991c5a)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running tests/slow.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/slow-f9d504c2872ae06f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_core-ff4aebe13f40cab3)
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+         Running unittests src/lib.rs (/tmp/claude-0/rdrepro/shared-target/debug/deps/fx_store-ac2a6ef85e0b011f)
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_agent
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+       Doc-tests fx_core
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+       Doc-tests fx_store
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+# logs: /tmp/claude-0/rdrepro/logs
