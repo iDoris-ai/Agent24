@@ -4,6 +4,12 @@
 // non-UTC timezone is selected the preview is flagged `approximate` because
 // the browser cannot reproduce the server's tz/DST math exactly.
 
+import { translate } from '../../i18n'
+import { cronPreviewMessages } from './cronPreview.i18n'
+
+type MsgKey = keyof typeof cronPreviewMessages.en
+const tr = (key: MsgKey, vars?: Record<string, string | number>) => translate(cronPreviewMessages, key, vars)
+
 export interface ScheduleSpecInput {
   type: 'cron' | 'every' | 'at'
   expr?: string
@@ -146,7 +152,7 @@ export function previewNextFire(spec: ScheduleSpecInput, now: Date): PreviewResu
       if (!Number.isInteger(secs) || secs < MIN_EVERY_SECS || secs > MAX_EVERY_SECS) {
         return {
           next: null,
-          message: `每隔秒数须为 ${MIN_EVERY_SECS}–${MAX_EVERY_SECS}`,
+          message: tr('every.range', { min: MIN_EVERY_SECS, max: MAX_EVERY_SECS }),
           isError: true,
           approximate: false,
         }
@@ -162,19 +168,19 @@ export function previewNextFire(spec: ScheduleSpecInput, now: Date): PreviewResu
       const ts = spec.ts ?? ''
       const at = new Date(ts)
       if (Number.isNaN(at.getTime())) {
-        return { next: null, message: '时间格式无效（需 ISO 8601）', isError: true, approximate: false }
+        return { next: null, message: tr('at.invalid'), isError: true, approximate: false }
       }
       if (at.getTime() <= now.getTime()) {
-        return { next: null, message: '该时间已过', isError: true, approximate: false }
+        return { next: null, message: tr('at.past'), isError: true, approximate: false }
       }
       return { next: at, message: null, isError: false, approximate: false }
     }
     case 'cron': {
       const expr = (spec.expr ?? '').trim()
-      if (!expr) return { next: null, message: '请输入 cron 表达式', isError: true, approximate: false }
+      if (!expr) return { next: null, message: tr('cron.empty'), isError: true, approximate: false }
       // Syntax validity gates creation; the search window only gates display.
       if (!parseCron(expr)) {
-        return { next: null, message: 'cron 表达式无效', isError: true, approximate: false }
+        return { next: null, message: tr('cron.invalid'), isError: true, approximate: false }
       }
       const tz = spec.tz?.trim()
       const approximate = !!tz && tz !== 'UTC' && tz !== 'Etc/UTC'
@@ -184,7 +190,7 @@ export function previewNextFire(spec: ScheduleSpecInput, now: Date): PreviewResu
         // NOT an error — the server computes the real next_run_at on save.
         return {
           next: null,
-          message: '一年内不触发（服务端将计算下次时间）',
+          message: tr('cron.noFire'),
           isError: false,
           approximate,
         }
@@ -192,7 +198,7 @@ export function previewNextFire(spec: ScheduleSpecInput, now: Date): PreviewResu
       return { next, message: null, isError: false, approximate }
     }
     default:
-      return { next: null, message: '未知调度类型', isError: true, approximate: false }
+      return { next: null, message: tr('unknownType'), isError: true, approximate: false }
   }
 }
 

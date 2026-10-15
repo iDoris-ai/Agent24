@@ -2,8 +2,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import ModelsPage from './Models'
+import { setLocale } from '../i18n'
 
 describe('ModelsPage', () => {
+  beforeEach(() => { setLocale('zh') })
   beforeEach(() => {
     window.agent24 = {
       backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
@@ -93,7 +95,18 @@ describe('ModelsPage', () => {
       }),
     } as never
     render(<ModelsPage />)
-    expect(await screen.findByTestId('idoris-status-available')).toHaveTextContent('v1.2.3 · 4 components · 2 runtimes · capacity observed')
-    expect(screen.getByTestId('idoris-status-resources')).toHaveTextContent('2 backends · 3 models')
+    expect(await screen.findByTestId('idoris-status-available')).toHaveTextContent('v1.2.3 · 4 个组件 · 2 个运行时 · 容量 已观测')
+    expect(screen.getByTestId('idoris-status-resources')).toHaveTextContent('2 个后端 · 3 个模型')
+  })
+})
+
+describe('ModelsPage English default', () => {
+  it('shows the English page title', () => {
+    window.agent24 = {
+      backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
+      idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' }),
+    } as never
+    render(<ModelsPage />)
+    expect(screen.getByText('Model management')).toBeInTheDocument()
   })
 })

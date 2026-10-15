@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import DocumentsPage from './Documents'
 import { getImportState, resetImportStore } from './importStore'
+import { setLocale } from '../../i18n'
 
 const doc = (n: number) => ({
   document_id: `doc_01K74Z3QJ8V5N2W9RTX6YB4M${String(n).padStart(2, '0')}`,
@@ -83,7 +84,14 @@ const tick = (ms: number) => act(async () => {
   await vi.advanceTimersByTimeAsync(ms)
 })
 
+it('renders the English documents title by default', () => {
+  mount({})
+  render(<DocumentsPage />)
+  expect(screen.getByRole('heading', { name: 'Documents' })).toBeInTheDocument()
+})
+
 describe('DocumentsPage: the list', () => {
+  beforeEach(() => { setLocale('zh') })
   it('lists documents and loads the next page once, however often it is clicked', async () => {
     let release: () => void = () => {}
     const m = mount({
@@ -160,6 +168,7 @@ describe('DocumentsPage: the list', () => {
 })
 
 describe('DocumentsPage: importing', () => {
+  beforeEach(() => { setLocale('zh') })
   it('shows progress, follows the job to the end, then shows the new list', async () => {
     const m = mount({ lists: [page([]), page([9])], jobs: [() => ok(job('running')), () => ok(job('succeeded'))] })
     let resolveImport: (v: unknown) => void = () => {}
@@ -257,6 +266,7 @@ describe('DocumentsPage: importing', () => {
 })
 
 describe('DocumentsPage: OS events (hints only)', () => {
+  beforeEach(() => { setLocale('zh') })
   it('an event about the job being followed reads it at once; one about another job does not', async () => {
     const m = mount({ lists: [page([]), page([9])], jobs: [() => ok(job('succeeded'))] })
     m.importFile.mockImplementation(() => ok(job('queued')))
