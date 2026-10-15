@@ -3,19 +3,26 @@
   "schema_version": 1,
   "task_id": "a24-wal-race-20261015-104002",
   "attempt_id": "0e0350a8-9dcc-4683-8aa7-c318d41b93a9",
-  "sequence": 1,
-  "status": "started",
-  "state": "started",
+  "sequence": 2,
+  "status": "progress",
+  "state": "progress",
   "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
   "base_branch": "ab/preview-hw-23-probe-disk",
   "actual_branch": "baton/grokbot-a24-20261015-104002-wal-race-r2",
   "repo": "iDoris-ai/Agent24",
-  "result_sha": null,
-  "summary": "已在 iDoris-ai/Agent24 基于 a9b36ce 创建独占分支 -r2，开始调查 WAL exists/copy TOCTOU。",
-  "outcome": "已在 iDoris-ai/Agent24 基于 a9b36ce 创建独占分支 -r2，开始调查 WAL exists/copy TOCTOU。",
-  "tests": [],
+  "result_sha": "2f3c225f6448d9008ebf5af9cb949c99ad346907",
+  "summary": "RED：抽出原 exists→copy 辅助（语义不变），新增确定性测试：在 exists(-wal) 与 fs::copy 之间关闭源库最后连接，SQLite 检查点并删除 WAL，旧辅助 20/20 次报 Os code 2 NotFound；另一测试证明旧辅助对缺失主库静默返回 Ok。",
+  "outcome": "RED：抽出原 exists→copy 辅助（语义不变），新增确定性测试：在 exists(-wal) 与 fs::copy 之间关闭源库最后连接，SQLite 检查点并删除 WAL，旧辅助 20/20 次报 Os code 2 NotFound；另一测试证明旧辅助对缺失主库静默返回 Ok。",
+  "tests": [
+    {
+      "command": "cargo test -p agent24-documents --locked --lib state::tests",
+      "exit_code": 101,
+      "note": "RED：2 个新测试失败，符合预期"
+    }
+  ],
   "commands": [],
   "touched_paths": [
+    "rust/apps/agent24-documents/src/state/tests.rs",
     "baton-result.json",
     "baton-decisions.tsv"
   ],
@@ -24,7 +31,7 @@
     "test-only不是产品批准"
   ],
   "blocker": null,
-  "next": "检查 apps/agent24-documents/src/state/tests.rs ~171 的 WAL 复制辅助函数",
-  "next_action": "检查 apps/agent24-documents/src/state/tests.rs ~171 的 WAL 复制辅助函数",
-  "updated_at": "2026-10-15T10:49:13+00:00"
+  "next": "GREEN：改用 SQLite VACUUM INTO 一致快照",
+  "next_action": "GREEN：改用 SQLite VACUUM INTO 一致快照",
+  "updated_at": "2026-10-15T10:55:22+00:00"
 }
