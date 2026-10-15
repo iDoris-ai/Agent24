@@ -11,6 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 async fn endpoint(content: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    endpoint_with_redirect(content, None).await
+}
+
+async fn endpoint_with_redirect(
+    content: &'static str,
+    redirect: Option<String>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -18,6 +25,7 @@ async fn endpoint(content: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             let captured = captured.clone();
+            let redirect = redirect.clone();
             tokio::spawn(async move {
                 let mut bytes = Vec::new();
                 let mut chunk = [0_u8; 4096];
@@ -45,11 +53,22 @@ async fn endpoint(content: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
                 let request = String::from_utf8(bytes).unwrap();
                 let health = request.starts_with("GET /health ");
                 captured.lock().unwrap().push(request);
-                let body = if health {
+                let mut body = if health {
                     serde_json::json!({"service":"idoris","version":"0.3.0","contract_version":"1.0.1","instance_id":"00000000-0000-4000-8000-000000000001","dev_no_key_enabled":false})
                 } else {
                     serde_json::json!({"model":"fixture-model","choices":[{"message":{"role":"assistant","content":content}}],"usage":{"prompt_tokens":1,"completion_tokens":4,"total_tokens":5}})
-                }.to_string();
+                };
+                if health {
+                    match content {
+                        "wrong-service" => body["service"] = serde_json::json!("unrelated"),
+                        "wrong-contract" => body["contract_version"] = serde_json::json!("0"),
+                        "dev-mode" => body["dev_no_key_enabled"] = serde_json::json!(true),
+                        _ => {}
+                    }
+                } else if content == "missing-model" {
+                    body.as_object_mut().unwrap().remove("model");
+                }
+                let body = body.to_string();
                 let record = if content == "missing-record" {
                     ""
                 } else {
@@ -61,12 +80,16 @@ async fn endpoint(content: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
                     "lan" => "x-idoris-served-locality: lan\r\n",
                     _ => "x-idoris-served-locality: loopback\r\n",
                 };
-                let cache = if content == "cached-no-origin" {
+                let cache = if content == "invalid-cache" {
+                    "x-idoris-cached: maybe\r\n"
+                } else if content == "cached-no-origin" {
                     "x-idoris-cached: true\r\n"
                 } else {
                     ""
                 };
-                let status = if health {
+                let status = if content == "redirect" && !health {
+                    "307 Temporary Redirect"
+                } else if health {
                     "200 OK"
                 } else {
                     match content {
@@ -75,8 +98,12 @@ async fn endpoint(content: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
                         _ => "200 OK",
                     }
                 };
+                let location = redirect
+                    .as_ref()
+                    .map(|url| format!("location: {url}/v1/chat/completions\r\n"))
+                    .unwrap_or_default();
                 let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{record}{locality}{cache}content-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{record}{locality}{cache}{location}content-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -121,7 +148,7 @@ async fn configured_gateway_is_the_only_http_target() {
                 &cancel,
             )
             .await;
-        if !case.is_empty() {
+        if !case.is_empty() && case != "proxy" {
             assert!(result.is_err(), "case={case}");
             if ["unavailable", "disconnected"].contains(&case.as_str()) {
                 assert!(matches!(
@@ -148,7 +175,10 @@ async fn configured_gateway_is_the_only_http_target() {
         assert!(!evidence.cached);
         assert_eq!(evidence.origin_record_id, None);
         assert_eq!(served.response.model_id.as_deref(), Some("fixture-model"));
-        assert_eq!(served.response.message.content.as_deref(), Some("gateway"));
+        assert_eq!(
+            served.response.message.content.as_deref(),
+            Some(if case == "proxy" { "proxy" } else { "gateway" })
+        );
         return;
     }
     let (gateway, received) = endpoint("gateway").await;
@@ -206,6 +236,12 @@ async fn configured_gateway_is_the_only_http_target() {
     assert!(lower.contains("x-idoris-complexity: complex"));
     assert!(lower.contains("x-idoris-request-id:"));
     assert!(lower.contains("authorization: bearer idk_"));
+    assert!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("GET /health "))
+            .all(|r| !r.to_ascii_lowercase().contains("authorization:"))
+    );
     let body: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(body["model"], "idoris/deep");
     assert_eq!(body["max_tokens"], 512);
@@ -217,6 +253,16 @@ async fn configured_gateway_is_the_only_http_target() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_evidence_and_credentials_never_fall_back() {
     for case in [
+        "non-loopback",
+        "userinfo",
+        "path",
+        "redirect",
+        "wrong-service",
+        "wrong-contract",
+        "dev-mode",
+        "missing-model",
+        "invalid-cache",
+        "proxy",
         "missing-locality",
         "remote",
         "lan",
@@ -229,7 +275,14 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
         "admin-key",
         "cancelled",
     ] {
-        let (mut gateway, received) = endpoint(case).await;
+        let (trap, trapped) = endpoint("forbidden").await;
+        let (mut gateway, received) = endpoint_with_redirect(case, Some(trap.clone())).await;
+        match case {
+            "non-loopback" => gateway = gateway.replace("127.0.0.1", "0.0.0.0"),
+            "userinfo" => gateway = gateway.replace("http://", "http://fixture:credential@"),
+            "path" => gateway.push_str("/unexpected"),
+            _ => {}
+        }
         if case == "disconnected" {
             let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             gateway = format!("http://{}", socket.local_addr().unwrap());
@@ -238,6 +291,21 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
         let (direct, bypassed) = endpoint("bypass").await;
         let result = tokio::task::spawn_blocking(move || {
             let mut cmd = Command::new(std::env::current_exe().unwrap());
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                cmd.env_remove(name);
+            }
+            if case == "proxy" {
+                cmd.env("HTTP_PROXY", &trap).env("ALL_PROXY", &trap);
+            }
             cmd.args([
                 "--exact",
                 "configured_gateway_is_the_only_http_target",
@@ -273,9 +341,30 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(bypassed.lock().unwrap().is_empty(), "{case}");
+        assert!(
+            trapped.lock().unwrap().is_empty(),
+            "forbidden endpoint reached: {case}"
+        );
         let requests = received.lock().unwrap();
-        if ["missing-key", "admin-key", "cancelled", "disconnected"].contains(&case) {
+        if [
+            "missing-key",
+            "admin-key",
+            "cancelled",
+            "disconnected",
+            "non-loopback",
+            "userinfo",
+            "path",
+        ]
+        .contains(&case)
+        {
             assert!(requests.is_empty(), "{case}");
+        } else if ["wrong-service", "wrong-contract", "dev-mode"].contains(&case) {
+            assert_eq!(requests.len(), 1, "{case}");
+            assert!(requests[0].starts_with("GET /health "));
+            assert!(
+                !requests[0].to_ascii_lowercase().contains("authorization:"),
+                "{case}"
+            );
         } else {
             assert_eq!(
                 requests.iter().filter(|r| r.starts_with("POST ")).count(),
