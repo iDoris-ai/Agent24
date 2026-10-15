@@ -61,14 +61,29 @@ pub fn disk_for_path<'a>(disks: &'a [DiskInfo], path: &Path) -> Option<&'a DiskI
         .max_by_key(|d| Path::new(&d.mount_point).components().count())
 }
 
-/// Free bytes on the disk holding `path`. Prefers the user-visible list; if
-/// none matches (e.g. macOS `/Users/...` where only `/` — the read-only
-/// sealed snapshot of the same container — contains it, and it was
-/// filtered), falls back to the unfiltered list.
+/// Free bytes on the disk holding `path`. Chooses the longest component-wise
+/// mount point match between `visible` and `all`. If mount point component
+/// lengths tie, prefers the user-visible list; falls back to `all` when `all`
+/// has a strictly longer mount point match (e.g. a filtered read-only child
+/// mount) or when `visible` has no match (e.g. macOS `/Users/...` where only
+/// `/` — the read-only sealed snapshot of the same container — contains it).
 pub fn free_bytes_for_path(visible: &[DiskInfo], all: &[DiskInfo], path: &Path) -> Option<u64> {
-    disk_for_path(visible, path)
-        .or_else(|| disk_for_path(all, path))
-        .map(|d| d.free_bytes)
+    let v_disk = disk_for_path(visible, path);
+    let a_disk = disk_for_path(all, path);
+    match (v_disk, a_disk) {
+        (Some(v), Some(a)) => {
+            let v_len = Path::new(&v.mount_point).components().count();
+            let a_len = Path::new(&a.mount_point).components().count();
+            if a_len > v_len {
+                Some(a.free_bytes)
+            } else {
+                Some(v.free_bytes)
+            }
+        }
+        (Some(v), None) => Some(v.free_bytes),
+        (None, Some(a)) => Some(a.free_bytes),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -175,5 +190,66 @@ mod tests {
         assert_eq!(disk_for_path(&visible, p), None);
         assert_eq!(free_bytes_for_path(&visible, &all, p), Some(9));
         assert_eq!(free_bytes_for_path(&[], &[], p), None);
+    }
+
+    #[test]
+    fn gap_disk_longest_mount_must_win_even_if_filtered() {
+        let root = d("/", 50 * 1024 * 1024 * 1024);
+        let mut nested = d("/mnt/readonly", 0);
+        nested.read_only = true;
+        let visible = vec![root.clone()];
+        let all = vec![root, nested];
+        let p = Path::new("/mnt/readonly/models");
+        assert_eq!(free_bytes_for_path(&visible, &all, p), Some(0));
+    }
+
+    #[test]
+    fn deeper_filtered_writable_volume_wins() {
+        let root = d("/", 50);
+        let mut sub = d("/var/filtered_writable", 12);
+        sub.read_only = false;
+        let visible = vec![root.clone()];
+        let all = vec![root, sub];
+        let p = Path::new("/var/filtered_writable/models");
+        assert_eq!(free_bytes_for_path(&visible, &all, p), Some(12));
+    }
+
+    #[test]
+    fn component_boundary_foo_vs_foobar() {
+        let root = d("/", 50);
+        let foo = d("/mnt/foo", 20);
+        let visible = vec![root.clone(), foo.clone()];
+        let all = vec![root, foo];
+        let p = Path::new("/mnt/foobar/models");
+        // /mnt/foobar is not under /mnt/foo, so / should be the longest component match
+        assert_eq!(free_bytes_for_path(&visible, &all, p), Some(50));
+    }
+
+    #[test]
+    fn no_match_and_same_mount_depth() {
+        let visible = vec![d("/mnt/data", 30)];
+        let all = vec![d("/mnt/data", 30)];
+        let p_same = Path::new("/mnt/data/models");
+        assert_eq!(free_bytes_for_path(&visible, &all, p_same), Some(30));
+
+        let p_relative = Path::new("relative/path/models");
+        assert_eq!(free_bytes_for_path(&visible, &all, p_relative), None);
+    }
+
+    #[test]
+    fn macos_firmlink_and_apfs_root_fallback() {
+        // Simulates macOS where / is filtered (read-only sealed snapshot with free space)
+        // and /System/Volumes/Data is visible. User path /Users/jason/... is not under
+        // /System/Volumes/Data directly, but matches / in all.
+        let mut root_sealed = d("/", 200 * 1024 * 1024 * 1024);
+        root_sealed.read_only = true;
+        let data_vol = d(MACOS_DATA_VOLUME, 200 * 1024 * 1024 * 1024);
+        let visible = vec![data_vol.clone()];
+        let all = vec![root_sealed, data_vol];
+        let p = Path::new("/Users/jason/.cache/models");
+        assert_eq!(
+            free_bytes_for_path(&visible, &all, p),
+            Some(200 * 1024 * 1024 * 1024)
+        );
     }
 }
