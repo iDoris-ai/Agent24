@@ -135,6 +135,7 @@ J1 只断言 `temperature` 这个键的有无和值，不断言整个请求体�
 | R-c | 选 (A) 时，新模块装在老内核上，要到 job 运行才失败 | 报错写明要升级；或者选 (B)，在挂载时就拒绝 |
 | R-d | oMLX 对 `temperature` 的处理没有验证 | OpenAI 兼容接口的标准字段；实现时若手上没有 oMLX，请 jason 在 oMLX 上试一次 |
 | R-e | 远端的推理类端点（OpenAI o 系列、gpt-5 等）会以 400 拒绝不等于 1 的 `temperature`。内核会把它记成 `RequestRejected`，抽取器就当成「输入太长」去拆窗，和 §1 推迟 `seed` 的理由相同（PR-Daemon 在 #971） | 文档模块是 `model_access: local_only`，碰不到远端。以后有不是 `local_only` 的模块传温度时，要先让内核区分这种 400，或者对这类 provider 不发温度 |
+| R-f | 同一台机器、同一个后端，温度 0 的结果也会随 Ollama（llama-server）的 prompt cache 状态而变：缓存前缀命中与否，计算路径不同，贪心解码在个别位置选中不同的词。2026-10-15 实测，`s01-07` 重抽 3 次逐字节相同，但与验收时那一次有 12 个字段不同（证据 `docs/documenting/evidence/2026-10-15-s01-release-temp0/`） | `extractor_version` 和业务键保证同样的请求重放同一个结果，不会重新抽取；比较两次运行时看分数，不逐字节比对 |
 
 ## 9. 决定（David，2026-10-15）
 
