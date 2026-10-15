@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ---- fail-closed（w38）：历史研究脚本，未通过安全验收（见 docs/agent/cloud-wave38）。----
+# 已知缺陷：无校验 rm -rf / 复用已有目录 / 删除预存 stop / 跟随 OUT 符号链接覆写。
+# 没有任何环境变量或参数可以解除此拒绝；只能作为阅读材料保留。
+echo "refused: 历史脚本 $(basename "$0") 已停用（未安全验收），不执行任何操作" >&2
+exit 3
+# ---- 以下为历史内容，保持原样，永不执行 ----
 # 只读诊断：在原样运行 `cargo test --workspace --offline --locked -vv` 的同时，监视共享 target 中
 # 指定 crate 的 rlib/rmeta/dylib/.d 与 .fingerprint 目录的 inode/mtime/size。runner 自己在编译结束后
 # 不会再写这些文件；测试执行窗口内出现的任何变化 = 外部写者重建了“同名单元”。

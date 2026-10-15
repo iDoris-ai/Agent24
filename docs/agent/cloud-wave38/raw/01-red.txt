@@ -1,0 +1,454 @@
+test_make_fixture_refuses_existing_root (test_safety.LegacyFailClosed.test_make_fixture_refuses_existing_root) ... FAIL
+test_run_experiments_refuses_and_keeps_workdir (test_safety.LegacyFailClosed.test_run_experiments_refuses_and_keeps_workdir) ... ERROR
+test_window_watch_refuses_and_keeps_stop_and_symlink_victim (test_safety.LegacyFailClosed.test_window_watch_refuses_and_keeps_stop_and_symlink_victim) ... ERROR
+test_artifact_outside_target (test_safety.ObserverRejects.test_artifact_outside_target) ... ERROR
+test_artifact_symlink_escape (test_safety.ObserverRejects.test_artifact_symlink_escape) ... ERROR
+test_dotdot_artifact (test_safety.ObserverRejects.test_dotdot_artifact) ... ERROR
+test_existing_out_dir (test_safety.ObserverRejects.test_existing_out_dir) ... ERROR
+test_illegal_prefix (test_safety.ObserverRejects.test_illegal_prefix) ... ERROR
+test_missing_target (test_safety.ObserverRejects.test_missing_target) ... ERROR
+test_no_artifacts (test_safety.ObserverRejects.test_no_artifacts) ... ERROR
+test_out_inside_target (test_safety.ObserverRejects.test_out_inside_target) ... ERROR
+test_out_parent_group_writable (test_safety.ObserverRejects.test_out_parent_group_writable) ... ERROR
+test_out_parent_not_writable (test_safety.ObserverRejects.test_out_parent_not_writable) ... ERROR
+test_symlink_ancestor_of_out (test_safety.ObserverRejects.test_symlink_ancestor_of_out) ... ERROR
+test_symlink_out_dir (test_safety.ObserverRejects.test_symlink_out_dir) ... ERROR
+test_target_inside_out_parent_overlap (test_safety.ObserverRejects.test_target_inside_out_parent_overlap) ... ERROR
+test_target_subdir_symlink_escape (test_safety.ObserverRejects.test_target_subdir_symlink_escape) ... ERROR
+test_artifact_vanishes_recorded (test_safety.ObserverRuns.test_artifact_vanishes_recorded) ... ERROR
+/usr/lib/python3.13/subprocess.py:1141: ResourceWarning: subprocess 445 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/unittest/case.py:650: ResourceWarning: unclosed file <_io.TextIOWrapper name=3 encoding='utf-8'>
+  with outcome.testPartExecutor(self):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/unittest/case.py:650: ResourceWarning: unclosed file <_io.TextIOWrapper name=5 encoding='utf-8'>
+  with outcome.testPartExecutor(self):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+test_change_events_and_stop (test_safety.ObserverRuns.test_change_events_and_stop) ... ERROR
+/usr/lib/python3.13/subprocess.py:1141: ResourceWarning: subprocess 446 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+test_sigterm_stops_cleanly (test_safety.ObserverRuns.test_sigterm_stops_cleanly) ... ERROR
+/usr/lib/python3.13/subprocess.py:1141: ResourceWarning: subprocess 447 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+test_time_limit_exit_4 (test_safety.ObserverRuns.test_time_limit_exit_4) ... ERROR
+/usr/lib/python3.13/subprocess.py:1141: ResourceWarning: subprocess 448 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+
+======================================================================
+ERROR: test_run_experiments_refuses_and_keeps_workdir (test_safety.LegacyFailClosed.test_run_experiments_refuses_and_keeps_workdir)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 72, in test_run_experiments_refuses_and_keeps_workdir
+    p = self.run_legacy("run-experiments.sh", self.victim, "1.95.0")
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 68, in run_legacy
+    return subprocess.run(["bash", str(HERE / name), *map(str, args)], env=env(self.home),
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                          capture_output=True, text=True, timeout=5)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 557, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1223, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 2156, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1270, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['bash', '/home/user/repo/tools/qa/rustdoc-repro/run-experiments.sh', '/tmp/a24obs-gnvkbc0r/victim', '1.95.0']' timed out after 5 seconds
+
+======================================================================
+ERROR: test_window_watch_refuses_and_keeps_stop_and_symlink_victim (test_safety.LegacyFailClosed.test_window_watch_refuses_and_keeps_stop_and_symlink_victim)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 85, in test_window_watch_refuses_and_keeps_stop_and_symlink_victim
+    p = self.run_legacy("target-window-watch.sh", self.target, out, "fx_store")
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 68, in run_legacy
+    return subprocess.run(["bash", str(HERE / name), *map(str, args)], env=env(self.home),
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                          capture_output=True, text=True, timeout=5)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 557, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1223, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 2156, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1270, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['bash', '/home/user/repo/tools/qa/rustdoc-repro/target-window-watch.sh', '/tmp/a24obs-0p81zmr2/target', '/tmp/a24obs-0p81zmr2/out.log', 'fx_store']' timed out after 5 seconds
+
+======================================================================
+ERROR: test_artifact_outside_target (test_safety.ObserverRejects.test_artifact_outside_target)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 135, in test_artifact_outside_target
+    self.reject("--target", self.target, "--out-dir", self.root / "o", "--artifact", self.victim / "keep.txt")
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_artifact_symlink_escape (test_safety.ObserverRejects.test_artifact_symlink_escape)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 125, in test_artifact_symlink_escape
+    self.reject("--target", self.target, "--out-dir", self.root / "o", "--artifact", esc)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_dotdot_artifact (test_safety.ObserverRejects.test_dotdot_artifact)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 138, in test_dotdot_artifact
+    self.reject("--target", self.target, "--out-dir", self.root / "o",
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                "--artifact", f"{self.deps}/../deps/libfx_store-{H}.rlib")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_existing_out_dir (test_safety.ObserverRejects.test_existing_out_dir)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 95, in test_existing_out_dir
+    self.reject("--target", self.target, "--out-dir", self.victim, *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_illegal_prefix (test_safety.ObserverRejects.test_illegal_prefix)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 144, in test_illegal_prefix
+    self.reject("--target", self.target, "--out-dir", self.root / "o", "--artifact", bad)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_missing_target (test_safety.ObserverRejects.test_missing_target)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 119, in test_missing_target
+    self.reject("--target", self.root / "nope", "--out-dir", self.root / "o", *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_no_artifacts (test_safety.ObserverRejects.test_no_artifacts)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 159, in test_no_artifacts
+    self.reject("--target", self.target, "--out-dir", self.root / "o")
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_out_inside_target (test_safety.ObserverRejects.test_out_inside_target)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 111, in test_out_inside_target
+    self.reject("--target", self.target, "--out-dir", self.target / "obs", *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_out_parent_group_writable (test_safety.ObserverRejects.test_out_parent_group_writable)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 156, in test_out_parent_group_writable
+    self.reject("--target", self.target, "--out-dir", gw / "o", *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_out_parent_not_writable (test_safety.ObserverRejects.test_out_parent_not_writable)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 149, in test_out_parent_not_writable
+    self.reject("--target", self.target, "--out-dir", ro / "o", *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_symlink_ancestor_of_out (test_safety.ObserverRejects.test_symlink_ancestor_of_out)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 107, in test_symlink_ancestor_of_out
+    self.reject("--target", self.target, "--out-dir", link / "new", *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_symlink_out_dir (test_safety.ObserverRejects.test_symlink_out_dir)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 101, in test_symlink_out_dir
+    self.reject("--target", self.target, "--out-dir", link, *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_target_inside_out_parent_overlap (test_safety.ObserverRejects.test_target_inside_out_parent_overlap)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 116, in test_target_inside_out_parent_overlap
+    self.reject("--target", self.target, "--out-dir", self.root, *self.a())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_target_subdir_symlink_escape (test_safety.ObserverRejects.test_target_subdir_symlink_escape)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 131, in test_target_subdir_symlink_escape
+    self.reject("--target", self.target, "--out-dir", self.root / "o", "--artifact", bad)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 59, in reject
+    err = json.loads(p.stderr.strip().splitlines()[-1])
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_artifact_vanishes_recorded (test_safety.ObserverRuns.test_artifact_vanishes_recorded)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 216, in test_artifact_vanishes_recorded
+    p, out = self.start("--max-seconds", "20")
+             ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 169, in start
+    self.assertEqual(json.loads(line)["status"], "ready", line + p.stderr.read() if not line else line)
+                     ~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_change_events_and_stop (test_safety.ObserverRuns.test_change_events_and_stop)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 178, in test_change_events_and_stop
+    p, out = self.start("--max-seconds", "20")
+             ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 169, in start
+    self.assertEqual(json.loads(line)["status"], "ready", line + p.stderr.read() if not line else line)
+                     ~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_sigterm_stops_cleanly (test_safety.ObserverRuns.test_sigterm_stops_cleanly)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 203, in test_sigterm_stops_cleanly
+    p, out = self.start("--max-seconds", "20")
+             ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 169, in start
+    self.assertEqual(json.loads(line)["status"], "ready", line + p.stderr.read() if not line else line)
+                     ~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+ERROR: test_time_limit_exit_4 (test_safety.ObserverRuns.test_time_limit_exit_4)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 210, in test_time_limit_exit_4
+    p, out = self.start("--max-seconds", "1")
+             ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 169, in start
+    self.assertEqual(json.loads(line)["status"], "ready", line + p.stderr.read() if not line else line)
+                     ~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+======================================================================
+FAIL: test_make_fixture_refuses_existing_root (test_safety.LegacyFailClosed.test_make_fixture_refuses_existing_root)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/repo/tools/qa/rustdoc-repro/tests/test_safety.py", line 78, in test_make_fixture_refuses_existing_root
+    self.assertNotEqual(p.returncode, 0)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0
+
+----------------------------------------------------------------------
+Ran 21 tests in 10.746s
+
+FAILED (failures=1, errors=20)
+exit=1

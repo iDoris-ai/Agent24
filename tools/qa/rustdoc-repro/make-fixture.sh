@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ---- fail-closed（w38）：历史研究脚本，未通过安全验收（见 docs/agent/cloud-wave38）。----
+# 已知缺陷：无校验 rm -rf / 复用已有目录 / 删除预存 stop / 跟随 OUT 符号链接覆写。
+# 没有任何环境变量或参数可以解除此拒绝；只能作为阅读材料保留。
+echo "refused: 历史脚本 $(basename "$0") 已停用（未安全验收），不执行任何操作" >&2
+exit 3
+# ---- 以下为历史内容，保持原样，永不执行 ----
 # 生成最小 Rust fixture：一个共享 proc-macro（模拟 registry 的 async-trait：两个 workspace 引用同一 PackageId），
 # 两个 source 路径不同、内容相同的 workspace（ws_a / ws_b），结构模拟 agent24-agent -> agent24-store -> async-trait。
 # 用法: make-fixture.sh <ROOT>   （ROOT 必须是空目录或不存在，建议在 /tmp 或 scratchpad 下）

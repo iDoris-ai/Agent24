@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ---- fail-closed（w38）：历史研究脚本，未通过安全验收（见 docs/agent/cloud-wave38）。----
+# 已知缺陷：无校验 rm -rf / 复用已有目录 / 删除预存 stop / 跟随 OUT 符号链接覆写。
+# 没有任何环境变量或参数可以解除此拒绝；只能作为阅读材料保留。
+echo "refused: 历史脚本 $(basename "$0") 已停用（未安全验收），不执行任何操作" >&2
+exit 3
+# ---- 以下为历史内容，保持原样，永不执行 ----
 # 运行 rustdoc E0463 区分性实验。所有 cargo 子进程走 env -i allowlist + 假 HOME/CARGO_HOME/XDG/TMP。
 # 用法: run-experiments.sh <WORKDIR> [TOOLCHAIN]   例: run-experiments.sh /tmp/rdrepro 1.95.0
 # 不读取用户 Cargo config/credentials；fixture 无外部依赖，全部 --offline。

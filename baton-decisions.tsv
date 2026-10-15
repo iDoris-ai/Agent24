@@ -1,0 +1,8 @@
+decision	rationale
+旧脚本首行exit3且无后门	F3：比修补rm/复用/stop/symlink风险更简单且fail-closed
+out-dir必须新建0700且父目录私有	避免覆写既有输出与删预存stop
+artifact只收精确路径+cargo文件名正则	F6：不用任意glob
+每级openat O_NOFOLLOW	拒绝任意symlink组件；macOS需传/private真实路径
+退出码0/4/2/3分离	F4：失败不得为0
+不内置Cargo、不杀进程、不删target	任务约束
+不推断写者/因果	F2
