@@ -144,10 +144,12 @@ async fn an_answer_that_keeps_coming_is_read_whole_however_long_it_takes() {
     let (url, asked) = backend("text/event-stream", script).await;
     let started = Instant::now();
     // The provider's own total timeout is 300ms: a streamed call is not bound by it.
+    // The stall timer is far above the 50ms between tokens, so a slow CI
+    // machine's late writes cannot pass for a stall (it did, at 150ms).
     let r = provider(url)
         .with_timeouts(Duration::from_millis(300), Duration::from_millis(300))
         .complete(
-            &req(Some(progress(300, 150, 5000))),
+            &req(Some(progress(1000, 1000, 10_000))),
             &CancellationToken::new(),
         )
         .await
@@ -229,14 +231,16 @@ async fn no_first_chunk_is_found_within_the_first_chunk_timer() {
 
 #[tokio::test]
 async fn output_that_trickles_on_past_the_deadline_is_cut_there() {
-    // Every 100ms, within the 150ms stall, for 3s: the 600ms deadline ends it.
-    let script: Vec<Step> = (0..30).map(|i| (100, token(&i.to_string()))).collect();
+    // Every 100ms, well within the 1s stall, for 6s: the 3s deadline ends it.
+    // Both timers stay below the deadline, so a stream that stalled or never
+    // started would be named so, not cut at the deadline.
+    let script: Vec<Step> = (0..60).map(|i| (100, token(&i.to_string()))).collect();
     let (url, _) = backend("text/event-stream", script).await;
     let started = Instant::now();
     let m = unavailable(
         provider(url)
             .complete(
-                &req(Some(progress(300, 150, 600))),
+                &req(Some(progress(2000, 1000, 3000))),
                 &CancellationToken::new(),
             )
             .await,
@@ -245,7 +249,7 @@ async fn output_that_trickles_on_past_the_deadline_is_cut_there() {
     assert!(m.contains("deadline"), "{m}");
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_millis(550) && took < Duration::from_millis(1000),
+        took >= Duration::from_millis(2950) && took < Duration::from_millis(5000),
         "{took:?}"
     );
 }
@@ -506,7 +510,7 @@ async fn the_formats_backends_write_are_read() {
     });
     let r = provider(url)
         .complete(
-            &req(Some(progress(300, 150, 5000))),
+            &req(Some(progress(1000, 1000, 5000))),
             &CancellationToken::new(),
         )
         .await
