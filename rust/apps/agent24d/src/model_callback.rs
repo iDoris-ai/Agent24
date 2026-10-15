@@ -787,7 +787,12 @@ impl Handler for ModelCompleteHandler {
 
             let served = match bind_to_lifecycle(
                 lifecycle,
-                grant.router.complete_served(profile, &request, &cancel), // v2 H2
+                grant.router.complete_served_with_request_id(
+                    profile,
+                    &request,
+                    &cancel,
+                    request_id.as_deref(),
+                ), // v2 H2
             )
             .await
             {
@@ -2050,6 +2055,78 @@ mod handler_tests {
     }
 
     // ---- J8: lifecycle binding ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_request_id_reaches_the_actual_idoris_http_request() {
+        const TEST: &str = "model_callback::handler_tests::admitted_request_id_reaches_the_actual_idoris_http_request";
+        const REQUEST_ID: &str = "req_idoris_lifecycle_09";
+        const FIXTURE_KEY: &str = "idk_fixture_only_09";
+        if std::env::var("IDORIS_API_KEY").as_deref() == Ok(FIXTURE_KEY) {
+            let (d, _) = deps(Arc::new(ModelRouter::from_env()));
+            let generation = running();
+            let in_flight = generation
+                .admit_request(
+                    REQUEST_ID.into(),
+                    [0u8; 32],
+                    std::time::Instant::now(),
+                    Duration::from_secs(30),
+                )
+                .unwrap();
+            let h = ModelCompleteHandler {
+                generation,
+                grant: Some(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d)),
+            };
+            let mut params = ok_params();
+            params["request_id"] = json!(REQUEST_ID);
+            assert!(h.call(params).await.is_ok());
+            in_flight.finish().unwrap();
+            return;
+        }
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = seen.clone();
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async {
+                axum::Json(json!({"service":"idoris", "version":"0.3.1",
+                    "contract_version":"1.0.1", "instance_id":"fixture", "dev_no_key_enabled":false}))
+            }))
+            .route("/v1/chat/completions", axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(headers.get("x-idoris-request-id")
+                        .and_then(|v| v.to_str().ok()).unwrap_or("").to_owned());
+                    ([("x-idoris-served-locality", "loopback"), ("x-idoris-record-id", "fixture_record_09")],
+                     axum::Json(json!({"model":"fixture-model", "choices":[{"message":{"role":"assistant", "content":"ok"}}],
+                        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let child = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("IDORIS_URL", url)
+                .env("IDORIS_API_KEY", FIXTURE_KEY)
+                .args(["--exact", TEST, "--nocapture"])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            child.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(String::from_utf8_lossy(&child.stdout).contains("1 passed"));
+        assert_eq!(*seen.lock().unwrap(), [REQUEST_ID]);
+    }
 
     #[tokio::test]
     async fn an_unknown_request_id_is_refused_not_run_unbound() {

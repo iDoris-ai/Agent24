@@ -81,7 +81,7 @@ impl IdorisClient {
         let response = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
-            response = request.header(AUTHORIZATION, self.key.clone()).send() =>
+            response = request.send() =>
                 response.map_err(|_| ModelError::Unavailable("iDoris unavailable".into()))?,
         };
         let status = response.status();
@@ -134,10 +134,11 @@ impl IdorisClient {
         profile: TaskProfile,
         req: &CompletionRequest,
         cancel: &CancellationToken,
+        request_id: Option<&str>,
     ) -> Result<Served, ModelError> {
         tokio::time::timeout(
             self.request_timeout,
-            self.complete_inner(profile, req, cancel),
+            self.complete_inner(profile, req, cancel, request_id),
         )
         .await
         .map_err(|_| ModelError::Unavailable("iDoris request timed out".into()))?
@@ -148,6 +149,7 @@ impl IdorisClient {
         profile: TaskProfile,
         req: &CompletionRequest,
         cancel: &CancellationToken,
+        request_id: Option<&str>,
     ) -> Result<Served, ModelError> {
         self.identity(cancel).await?;
         let (complexity, role) = match profile.complexity {
@@ -160,9 +162,15 @@ impl IdorisClient {
             .send(
                 self.client
                     .post(self.endpoint("/v1/chat/completions"))
+                    .header(AUTHORIZATION, self.key.clone())
                     .header("X-iDoris-Privacy", "local_only")
                     .header("X-iDoris-Complexity", complexity)
-                    .header("X-iDoris-Request-Id", uuid::Uuid::new_v4().to_string())
+                    .header(
+                        "X-iDoris-Request-Id",
+                        request_id
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    )
                     .json(&body),
                 cancel,
             )
@@ -232,6 +240,7 @@ impl IdorisClient {
             .send(
                 self.client
                     .get(self.endpoint("/v1/models"))
+                    .header(AUTHORIZATION, self.key.clone())
                     .timeout(Duration::from_secs(2)),
                 cancel,
             )
@@ -342,6 +351,7 @@ mod tests {
                 },
                 &request,
                 &cancel,
+                None,
             )
             .await
     }
