@@ -111,6 +111,7 @@ fn req(p: Option<Progress>) -> CompletionRequest {
         response_format: None,
         max_tokens: None,
         disable_thinking: false,
+        temperature: None,
         progress: p,
     }
 }
@@ -633,4 +634,28 @@ async fn a_streamed_request_with_tools_is_refused_before_it_is_sent() {
         .complete(&r, &CancellationToken::new())
         .await;
     assert!(matches!(got, Err(ModelError::Unavailable(_))), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_streamed_request_carries_its_temperature() {
+    // ME4-S2b: the temperature goes out with the stream keys, not instead of them.
+    let script = vec![
+        (0, token("x")),
+        (0, finish()),
+        (0, "data: [DONE]\n\n".to_owned()),
+    ];
+    let (url, asked) = backend("text/event-stream", script).await;
+    let r = CompletionRequest {
+        temperature: Some(0.0),
+        ..req(Some(progress(1000, 1000, 5000)))
+    };
+    provider(url)
+        .complete(&r, &CancellationToken::new())
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&asked.await.unwrap()).unwrap();
+    assert_eq!(
+        (body["stream"].as_bool(), body["temperature"].as_f64()),
+        (Some(true), Some(0.0))
+    );
 }

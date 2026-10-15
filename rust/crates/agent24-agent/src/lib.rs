@@ -223,6 +223,7 @@ impl Summarizer for RouterSummarizer {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
             progress: None,
         };
         let (_provider, res) = self
@@ -1668,6 +1669,7 @@ impl RunManager {
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
+                temperature: None,
                 progress: None,
             };
             let outcome = tokio::select! {

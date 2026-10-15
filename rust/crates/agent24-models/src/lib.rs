@@ -118,6 +118,10 @@ pub struct CompletionRequest {
     /// decides when to set this (`_a24/model/complete`'s handler, gated on
     /// `complexity: simple`) — this crate has no opinion on complexity.
     pub disable_thinking: bool,
+    /// ME4-S2b: the sampling temperature, sent only when set. `None` leaves
+    /// the body byte for byte as before (and Ollama's OpenAI layer then uses
+    /// 1.0, over the model's own default). f64 end to end, so 0.7 stays 0.7.
+    pub temperature: Option<f64>,
     /// ME4-S2a: read the answer as it is written, under these timers, instead
     /// of within one fixed `chat_timeout`. `None` = today's request, byte for
     /// byte. To be set only by `_a24/model/complete`; the router hands the same
@@ -729,6 +733,10 @@ impl ModelProvider for OpenAiCompatProvider {
         if let Some(n) = req.max_tokens {
             body["max_tokens"] = Value::from(n.get());
         }
+        // ME4-S2b: the same "only when set" rule.
+        if let Some(t) = req.temperature {
+            body["temperature"] = Value::from(t);
+        }
         // ME4-S2-thinking / review H2: same "only when set" rule — an unset
         // flag, OR a provider that never opted into this oMLX-specific
         // extension, keeps the body byte-for-byte unchanged. Gating on
@@ -1026,6 +1034,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
             progress: None,
         }
     }
@@ -1106,6 +1115,59 @@ mod tests {
             second.get("max_tokens").is_none(),
             "absent → not sent (/chat unchanged)"
         );
+    }
+
+    // ── ME4-S2b J1, J5, J6: temperature sent only when set, by value ─────────
+
+    #[tokio::test]
+    async fn temperature_is_sent_only_when_set_and_no_penalty_ever_is() {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = vec![];
+            for _ in 0..3 {
+                let (mut s, _) = l.accept().await.unwrap();
+                bodies.push(read_request(&mut s).await);
+                let body = r#"{"model":"stub","choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen2.5:7b");
+        let c = CancellationToken::new();
+        let at = |t: Option<f64>| CompletionRequest {
+            temperature: t,
+            ..req()
+        };
+        for t in [Some(0.7), Some(0.0), None] {
+            let _ = p.complete(&at(t), &c).await.unwrap();
+        }
+        let bodies: Vec<Value> = server
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        // By value: 0.7 is not 0.699999988…, and 0 is written as 0.0.
+        assert_eq!(bodies[0]["temperature"].as_f64(), Some(0.7));
+        assert_eq!(bodies[1]["temperature"].as_f64(), Some(0.0));
+        assert!(
+            bodies[2].get("temperature").is_none(),
+            "absent → not sent: every other caller's body is unchanged"
+        );
+        for b in &bodies {
+            for k in ["frequency_penalty", "presence_penalty", "repeat_penalty"] {
+                assert!(b.get(k).is_none(), "{k} in {b}");
+            }
+        }
+        // J5: requests that differ only in temperature are not equal.
+        assert_ne!(at(Some(0.0)), at(None));
+        assert_eq!(at(Some(0.0)), at(Some(0.0)));
     }
 
     // ── ME4-S2-thinking: disable_thinking → chat_template_kwargs, gated ──────

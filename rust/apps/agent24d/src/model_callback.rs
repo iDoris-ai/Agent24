@@ -75,6 +75,9 @@ pub(crate) struct ModelCompleteParams {
     max_tokens: Option<u32>,
     #[serde(default)]
     complexity: Option<WireComplexity>,
+    /// ME4-S2b: the only sampling parameter a module may set, 0..=2.
+    #[serde(default)]
+    temperature: Option<f64>,
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
@@ -137,6 +140,12 @@ impl ModelCompleteParams {
         {
             return Err("response_format.json_schema.name must not be empty".to_owned());
         }
+        // JSON holds no NaN or infinity, so only the range can be wrong here.
+        if let Some(t) = self.temperature
+            && !(0.0..=2.0).contains(&t)
+        {
+            return Err("temperature must be between 0 and 2".to_owned());
+        }
         Ok(())
     }
 
@@ -188,6 +197,7 @@ impl ModelCompleteParams {
             // that (see `disable_thinking` above), never on which module is
             // calling, and never on an absent/defaulted complexity.
             disable_thinking,
+            temperature: self.temperature,
             progress: None,
         };
         (request, complexity, self.request_id)
@@ -1317,6 +1327,7 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
             progress: None,
         }
     }
@@ -1523,6 +1534,48 @@ mod handler_tests {
         let mut p = ok_params();
         p["response_format"] = json!({"type": "json_object"});
         assert!(ModelCompleteParams::parse(p).is_err());
+    }
+
+    /// ME4-S2b J2, J3: `temperature` is taken in 0..=2 and carried as given;
+    /// no other sampling parameter is.
+    #[test]
+    fn temperature_is_taken_in_its_range_and_no_other_sampling_parameter_is() {
+        let with = |t: Value| {
+            let mut p = ok_params();
+            p["temperature"] = t;
+            ModelCompleteParams::parse(p)
+        };
+        for t in [json!(-0.1), json!(2.1)] {
+            assert_eq!(with(t).unwrap_err(), "temperature must be between 0 and 2");
+        }
+        assert!(with(json!("0")).unwrap_err().contains("invalid type"));
+        // Too large for an f64: the frame itself does not parse (-32700),
+        // before any handler sees it.
+        assert!(serde_json::from_str::<Value>(r#"{"temperature":1e309}"#).is_err());
+        for (t, want) in [
+            (json!(0), 0.0),
+            (json!(-0.0), 0.0),
+            (json!(0.7), 0.7),
+            (json!(2), 2.0),
+            (json!(1), 1.0),
+        ] {
+            let (req, _, _) = with(t).unwrap().into_request();
+            assert_eq!(req.temperature, Some(want));
+        }
+        let (req, _, _) = ModelCompleteParams::parse(ok_params())
+            .unwrap()
+            .into_request();
+        assert_eq!(req.temperature, None, "absent → not set");
+        for k in ["seed", "top_p", "frequency_penalty"] {
+            let mut p = ok_params();
+            p[k] = json!(0);
+            assert!(
+                ModelCompleteParams::parse(p)
+                    .unwrap_err()
+                    .contains("unknown field"),
+                "{k}"
+            );
+        }
     }
 
     // ---- review M1: disable_thinking requires an EXPLICIT complexity: "simple" ----
