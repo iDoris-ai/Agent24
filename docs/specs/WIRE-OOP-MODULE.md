@@ -334,8 +334,8 @@ digest 是不是自己给的那份，这一步不泄露秘密，可以放在 tok
 ### 4.4 超时
 
 - 连接级默认：**`CALL_TIMEOUT = 30s`**（`rpc.rs:75-82`）。
-- 方法可声明自己的上限（不得超过 `MAX_METHOD_CALL_TIMEOUT = 300s`）；今天唯一声明了非默认超时的方法
-  是 `_a24/model/complete = 120s`（§5.5）。
+- 方法可声明自己的上限（不得超过 `MAX_METHOD_CALL_TIMEOUT`）；今天唯一声明了非默认超时的方法
+  是 `_a24/model/complete`，它的兜底值 4456s 就是这个上限（§5.5，ME4-S2a）。
 - 到点 → `-32000` + `data.kind: "timeout"`，**不重试**（回调可能已有副作用）。
 - 另有一条**写响应超时** `WRITE_TIMEOUT = 10s`——对端（模块）如果不读走内核写回来的响应，整条连接
   会被内核判定为对端不读、直接断开，防止模块拖死内核的写循环。这条是内核→模块方向的自我保护，
@@ -689,7 +689,7 @@ cron 规则：恰好 5 段（无秒段，即便 REST 路径接受 6 段这里也
 ```
 只有 `no_provider` 的 `retryable` 为 `true`；其余三个恒为 `false`。
 
-**方法专属超时**：120 秒（比连接级默认的 30 秒长，`Handler::call_timeout()` 声明值）。
+**时限**（ME4-S2a）：一次调用受它自己的截止时间约束：300 秒 + `max_tokens` × 1 秒（没写 `max_tokens` 按 1024 算），准入后设一次。内核流式读模型的回答，对每个 provider 各自计时：300 秒内没有收到第一个非空 `data:` 事件，或者此后 60 秒没有新事件（只带 `role`、内容为空的事件也算一个），就判定这个 provider 卡住、放弃它；截止时间还剩至少 60 秒时换下一个 provider（各 provider 共用同一个截止时间）。所有 provider 都失败、或到了截止时间，模块收到 `unavailable`（`no_provider`，`retryable: true`）。一直有输出、但到了截止时间还没写完，回的也是这个；这时用同样的 `max_tokens` 重试多半还会超时，应调低 `max_tokens` 或拆小请求。`Handler::call_timeout()` 声明的方法超时是兜底值 4456 秒，只防内核自身卡住；SDK 的 `MODEL_RESPONSE_TIMEOUT` 是 4461 秒。
 
 **并发/限流**：每模块同时在途 ≤2，全 daemon 所有模块合计 ≤4——超出当场 `busy`，不排队。token
 bucket 容量 30、每秒回填 0.5（约每分钟 30 次）。
