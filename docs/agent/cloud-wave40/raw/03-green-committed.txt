@@ -1,0 +1,45 @@
+# argv: /usr/bin/python3 -I -B -m unittest discover -s tools/qa/rustdoc-repro/tests -v
+# cwd: /home/user/agent24
+# env: PATH=/usr/bin:/bin:/opt/node22/bin HOME=<0700 fake> TMPDIR=<fake> CFFIXED_USER_HOME=<fake> XDG_*=<fake> LC_ALL=C
+# exit: 0
+## stdout
+## stderr
+test_parent_dir_renamed_and_replaced (test_r3_hardening.R1ParentReplaced.test_parent_dir_renamed_and_replaced) ... ok
+test_parent_dir_renamed_away (test_r3_hardening.R1ParentReplaced.test_parent_dir_renamed_away) ... ok
+test_fifo_artifacts_file_rejected_immediately (test_r3_hardening.R3ListFile.test_fifo_artifacts_file_rejected_immediately) ... ok
+test_max_seconds_range (test_r3_hardening.R3ListFile.test_max_seconds_range) ... ok
+test_non_utf8_list_rejected (test_r3_hardening.R3ListFile.test_non_utf8_list_rejected) ... ok
+test_oversize_list_rejected (test_r3_hardening.R3ListFile.test_oversize_list_rejected) ... ok
+test_too_many_lines_rejected (test_r3_hardening.R3ListFile.test_too_many_lines_rejected) ... ok
+test_valid_list_still_works (test_r3_hardening.R3ListFile.test_valid_list_still_works) ... ok
+test_trailing_newline_and_control_names_rejected (test_r3_hardening.R4Names.test_trailing_newline_and_control_names_rejected) ... ok
+test_atomic_replace_after_open_is_unstable_not_stable_old (test_r3_hardening.SnapSchedule.test_atomic_replace_after_open_is_unstable_not_stable_old) ... ok
+test_atomic_replace_between_meta_and_open_is_not_mixed (test_r3_hardening.SnapSchedule.test_atomic_replace_between_meta_and_open_is_not_mixed) ... ok
+test_in_place_write_during_hash_is_unstable_not_mixed (test_r3_hardening.SnapSchedule.test_in_place_write_during_hash_is_unstable_not_mixed) ... ok
+test_parent_swapped_during_snapshot_is_flagged (test_r3_hardening.SnapSchedule.test_parent_swapped_during_snapshot_is_flagged) ... ok
+test_make_fixture_refuses_existing_root (test_safety.LegacyFailClosed.test_make_fixture_refuses_existing_root) ... ok
+test_run_experiments_refuses_and_keeps_workdir (test_safety.LegacyFailClosed.test_run_experiments_refuses_and_keeps_workdir) ... ok
+test_window_watch_refuses_and_keeps_stop_and_symlink_victim (test_safety.LegacyFailClosed.test_window_watch_refuses_and_keeps_stop_and_symlink_victim) ... ok
+test_artifact_outside_target (test_safety.ObserverRejects.test_artifact_outside_target) ... ok
+test_artifact_symlink_escape (test_safety.ObserverRejects.test_artifact_symlink_escape) ... ok
+test_dotdot_artifact (test_safety.ObserverRejects.test_dotdot_artifact) ... ok
+test_existing_out_dir (test_safety.ObserverRejects.test_existing_out_dir) ... ok
+test_illegal_prefix (test_safety.ObserverRejects.test_illegal_prefix) ... ok
+test_missing_target (test_safety.ObserverRejects.test_missing_target) ... ok
+test_no_artifacts (test_safety.ObserverRejects.test_no_artifacts) ... ok
+test_out_inside_target (test_safety.ObserverRejects.test_out_inside_target) ... ok
+test_out_parent_group_writable (test_safety.ObserverRejects.test_out_parent_group_writable) ... ok
+test_out_parent_not_writable (test_safety.ObserverRejects.test_out_parent_not_writable) ... ok
+test_symlink_ancestor_of_out (test_safety.ObserverRejects.test_symlink_ancestor_of_out) ... ok
+test_symlink_out_dir (test_safety.ObserverRejects.test_symlink_out_dir) ... ok
+test_target_inside_out_parent_overlap (test_safety.ObserverRejects.test_target_inside_out_parent_overlap) ... ok
+test_target_subdir_symlink_escape (test_safety.ObserverRejects.test_target_subdir_symlink_escape) ... ok
+test_artifact_vanishes_recorded (test_safety.ObserverRuns.test_artifact_vanishes_recorded) ... ok
+test_change_events_and_stop (test_safety.ObserverRuns.test_change_events_and_stop) ... ok
+test_sigterm_stops_cleanly (test_safety.ObserverRuns.test_sigterm_stops_cleanly) ... ok
+test_time_limit_exit_4 (test_safety.ObserverRuns.test_time_limit_exit_4) ... ok
+
+----------------------------------------------------------------------
+Ran 34 tests in 4.534s
+
+OK

@@ -1,0 +1,30 @@
+# 范围与库存校验（只用 rev-parse/ls-files --stage/diff；未用 git write-tree）
+## 相对 base 的改动文件
+M	baton-result.json
+A	docs/agent/cloud-wave40/raw/01-red-base.txt
+A	docs/agent/cloud-wave40/raw/02-green-final.txt
+M	tools/qa/rustdoc-repro/README.md
+A	tools/qa/rustdoc-repro/__pycache__/artifact_observer.cpython-313.pyc
+M	tools/qa/rustdoc-repro/artifact_observer.py
+A	tools/qa/rustdoc-repro/tests/test_r3_hardening.py
+## 范围外 diff 行数（应为 0）
+0
+## 旧历史/原始 raw/legacy 脚本/原测试 diff 行数（应为 0）
+0
+## 生产 diff numstat
+139	49	tools/qa/rustdoc-repro/artifact_observer.py
+## 源库存 ls-files --stage(范围外) sha256: base vs HEAD
+fatal: :!tools/qa/rustdoc-repro: pathspec magic not supported by this command: 'exclude' (mnemonic: '!')
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -
+fatal: :!tools/qa/rustdoc-repro: pathspec magic not supported by this command: 'exclude' (mnemonic: '!')
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -
+## tree
+ad68185f083cffee039e91b209ebb3d126a9d995
+78b7ebbf3d527f3fb843d89536fd8437edaa1e2d
+## 未跟踪/忽略文件（应为空，-B 无 pycache）
+?? docs/agent/cloud-wave40/raw/03-green-committed.txt
+?? docs/agent/cloud-wave40/raw/04-syntax.txt
+?? docs/agent/cloud-wave40/raw/05-scope.txt
+1
+## 旧危险入口 fail-closed 头部仍为 exit 3
+6:exit 3
