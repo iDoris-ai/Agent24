@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
@@ -35,6 +36,7 @@ function success() {
 afterEach(() => { cleanup(); vi.clearAllMocks() })
 
 describe('CommunicationPage', () => {
+  beforeEach(() => { setLocale('zh') })
   it('renders identities, contacts, relay source, and independent status dimensions', async () => {
     success()
     render(<CommunicationPage />)
@@ -143,5 +145,13 @@ describe('CommunicationPage', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(storageSet).not.toHaveBeenCalled()
     expect(screen.queryByText('do-not-store')).not.toBeInTheDocument()
+  })
+})
+
+describe('CommunicationPage English default', () => {
+  it('shows the English page heading', async () => {
+    success()
+    render(<CommunicationPage />)
+    expect(screen.getByRole('heading', { name: 'Communication overview' })).toBeInTheDocument()
   })
 })

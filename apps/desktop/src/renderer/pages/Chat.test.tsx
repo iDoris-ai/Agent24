@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import ChatPage from './Chat'
+import { setLocale } from '../i18n'
 
 const mockBackendProxy = vi.fn()
 
@@ -15,6 +16,7 @@ beforeEach(() => {
 })
 
 describe('ChatPage', () => {
+  beforeEach(() => { setLocale('zh') })
   it('renders empty state with suggestions', () => {
     render(<ChatPage />)
     expect(screen.getByText('Agent24')).toBeInTheDocument()
@@ -246,5 +248,12 @@ describe('ChatPage', () => {
     await waitFor(() => {
       expect(mockBackendProxy).toHaveBeenCalled()
     })
+  })
+})
+
+describe('ChatPage English default', () => {
+  it('shows the English welcome copy', () => {
+    render(<ChatPage />)
+    expect(screen.getByText('Your local AI assistant. Your data stays on this device.')).toBeInTheDocument()
   })
 })
