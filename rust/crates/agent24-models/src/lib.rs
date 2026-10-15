@@ -566,6 +566,85 @@ fn classify(err: &reqwest::Error) -> ModelError {
     }
 }
 
+fn completion_body(
+    req: &CompletionRequest,
+    default_model: &str,
+    supports_chat_template_kwargs: bool,
+) -> Value {
+    let messages: Vec<OaMessage> = req.messages.iter().map(OaMessage::from).collect();
+    let mut body = serde_json::json!({
+        "model": req.model.as_deref().unwrap_or(default_model),
+        "messages": messages,
+        "stream": false,
+    });
+    if !req.tools.is_empty() {
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(rf) = &req.response_format {
+        body["response_format"] = rf.to_wire();
+    }
+    // ME4-4.2.2a: only when set — an absent key keeps /chat's body unchanged.
+    if let Some(n) = req.max_tokens {
+        body["max_tokens"] = Value::from(n.get());
+    }
+    // ME4-S2-thinking / review H2: same "only when set" rule — an unset
+    // flag, OR a provider that never opted into this oMLX-specific
+    // extension, keeps the body byte-for-byte unchanged. Gating on
+    // `supports_chat_template_kwargs` (not `self.tier`) means a
+    // hosted/managed OpenAI-compatible endpoint — even one some future
+    // config mislabels `local` — never receives a field outside the
+    // OpenAI contract it actually speaks.
+    if req.disable_thinking && supports_chat_template_kwargs {
+        body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+    }
+    body
+}
+
+fn completion_response(
+    parsed: OaChatResponse,
+    name: &str,
+) -> Result<CompletionResponse, ModelError> {
+    let model_id = parsed.model.filter(|m| !m.is_empty());
+    let choice = parsed
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| ModelError::Provider(format!("{} returned no choices", name)))?;
+    let usage = parsed.usage.map_or(
+        Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+        },
+        |u| Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cost_usd: 0.0,
+        },
+    );
+    Ok(CompletionResponse {
+        message: choice.message.into(),
+        usage,
+        model_id,
+    })
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiCompatProvider {
     fn name(&self) -> &str {
@@ -577,46 +656,7 @@ impl ModelProvider for OpenAiCompatProvider {
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<CompletionResponse, ModelError> {
-        let messages: Vec<OaMessage> = req.messages.iter().map(OaMessage::from).collect();
-        let mut body = serde_json::json!({
-            "model": req.model.as_deref().unwrap_or(&self.default_model),
-            "messages": messages,
-            "stream": false,
-        });
-        if !req.tools.is_empty() {
-            body["tools"] = Value::Array(
-                req.tools
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "type": "function",
-                            "function": {
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.parameters,
-                            }
-                        })
-                    })
-                    .collect(),
-            );
-        }
-        if let Some(rf) = &req.response_format {
-            body["response_format"] = rf.to_wire();
-        }
-        // ME4-4.2.2a: only when set — an absent key keeps /chat's body unchanged.
-        if let Some(n) = req.max_tokens {
-            body["max_tokens"] = Value::from(n.get());
-        }
-        // ME4-S2-thinking / review H2: same "only when set" rule — an unset
-        // flag, OR a provider that never opted into this oMLX-specific
-        // extension, keeps the body byte-for-byte unchanged. Gating on
-        // `self.supports_chat_template_kwargs` (not `self.tier`) means a
-        // hosted/managed OpenAI-compatible endpoint — even one some future
-        // config mislabels `local` — never receives a field outside the
-        // OpenAI contract it actually speaks.
-        if req.disable_thinking && self.supports_chat_template_kwargs {
-            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
-        }
+        let body = completion_body(req, &self.default_model, self.supports_chat_template_kwargs);
         let fut = self
             .authed(
                 self.client
@@ -636,30 +676,7 @@ impl ModelProvider for OpenAiCompatProvider {
         }
         let parsed: OaChatResponse =
             read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
-        let model_id = parsed.model.filter(|m| !m.is_empty());
-        let choice =
-            parsed.choices.into_iter().next().ok_or_else(|| {
-                ModelError::Provider(format!("{} returned no choices", self.name))
-            })?;
-        let usage = parsed.usage.map_or(
-            Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                cost_usd: 0.0,
-            },
-            |u| Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                cost_usd: 0.0,
-            },
-        );
-        Ok(CompletionResponse {
-            message: choice.message.into(),
-            usage,
-            model_id,
-        })
+        completion_response(parsed, &self.name)
     }
 
     async fn models(&self, cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
