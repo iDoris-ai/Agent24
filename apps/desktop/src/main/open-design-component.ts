@@ -1074,12 +1074,11 @@ export class OpenDesignComponentInstaller {
     // arrives — this job-owned timer re-emits once per idle onset so
     // onProgress listeners see "等待网络" without polling status().
     let idlePushedIdle = false
-    // R3 (independent review, 2026-10-15): the timer handle is only
-    // DECLARED here — created below, once the write-open has actually
-    // succeeded. Creating it this early used to leave it running past an
-    // `openRegularFileNoFollow` rejection (that throw sits before the
-    // try/finally that clears it), so the orphaned tick would overwrite an
-    // already-`failed` status back to `downloading` a second later.
+    // R3 (independent review, 2026-10-15): only declared here — created
+    // below, inside the try/finally that clears it, once the write-open
+    // has succeeded. Created this early before, it used to outlive an
+    // `openRegularFileNoFollow` rejection and overwrite the resulting
+    // `failed` status back to `downloading` a second later.
     let idlePushTimer: NodeJS.Timeout | undefined
     // R1: hand createWriteStream an already-open, O_NOFOLLOW-verified fd
     // instead of a path — a symlink planted at `destination` since
@@ -1106,8 +1105,6 @@ export class OpenDesignComponentInstaller {
     const nodeStream = Readable.fromWeb(response.body as never)
 
     try {
-      // R3: created only now, inside the protection that clears it in
-      // `finally` below — never before the fileFd check above.
       idlePushTimer = setInterval(() => {
         const reading = this.speedEstimator!.currentReading(Date.now())
         if (reading.bytesPerSecond > 0) idlePushedIdle = false
