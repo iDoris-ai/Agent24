@@ -1,2 +1,3 @@
 timestamp	task_id	attempt_id	decision	reason
 2026-10-15T10:48:51Z	a24-linux-hw-20261015-104002	1f583711-dfd5-4ed7-a882-0d3961a011b9	started	canonical repo基线SHA校验通过；仅推本分支；45分钟上限
+2026-10-15T10:52:19Z	a24-linux-hw-20261015-104002	1f583711-dfd5-4ed7-a882-0d3961a011b9	completed	39测试通过，clippy/fmt exit0，生产段sha256前后一致，Cargo.lock未改；仅推本分支

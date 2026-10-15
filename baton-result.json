@@ -2,13 +2,42 @@
   "schema": "baton-result/v1",
   "task_id": "a24-linux-hw-20261015-104002",
   "attempt_id": "1f583711-dfd5-4ed7-a882-0d3961a011b9",
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "a9b36ceee8a74f0c477b37836506933b09aafcf5",
-  "result_sha": null,
-  "summary": "已在iDoris-ai/Agent24精确基线a9b36cee创建专属分支，开始Linux硬件运行时验证（agent24-hw）",
-  "tests": [],
+  "result_sha": "5fb5e12f1a74eb770272b9e5287ed947d484ef48",
+  "summary": "在精确基线上仅于probe.rs/disks.rs既有cfg(test)模块新增Linux运行时正向对照：工厂System CPU>0/RAM>0/零进程；SystemProbe::probe与HardwareReport::from_env绑定工厂CPU/RAM；生产源码仅一处工厂构造；真实符号链接models目录解析；磁盘Linux绝对路径边界反例/同长度visible优先/更深过滤挂载。生产段字节不变(diff 0)，原Cargo.lock。Linux非macOS验收；仅测试层，非产品批准；completed仅为云端交付。",
+  "tests": [
+    {
+      "command": "cargo test -p agent24-hw --locked (改动前基线)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy -p agent24-hw --locked --all-targets -- -D warnings (改动前基线)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy -p agent24-hw --locked --all-targets -- -D warnings (首版测试含expect，已修)",
+      "exit_code": 101
+    },
+    {
+      "command": "cargo fmt -p agent24-hw -- --check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-hw --locked",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-hw --locked -- --nocapture --test-threads=1",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy -p agent24-hw --locked --all-targets -- -D warnings",
+      "exit_code": 0
+    }
+  ],
   "blocker": null,
-  "next": null,
-  "updated_at": "2026-10-15T10:48:51Z"
+  "next": "协调者审阅分支；macOS/Windows真机验收另行安排",
+  "updated_at": "2026-10-15T10:52:19Z"
 }
