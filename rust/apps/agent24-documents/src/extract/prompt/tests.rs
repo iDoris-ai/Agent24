@@ -102,9 +102,14 @@ fn what_is_added_to_the_instruction_by_window_and_pass() {
     let one = &format.schema["properties"]["values"]["properties"]["a"];
     assert!(shape().contains(&one.to_string()));
     assert!(shape().contains("never write a status such as \"missing\" as a value"));
-    let example = r#"{"values": {"a": {"missing": {"reason": "not_in_document"}}}}"#;
-    assert!(shape().contains(r#"{"missing": {"reason": "not_in_document"}}"#));
-    assert!(parse(&[field("a")], example).is_ok());
+    for one in [
+        r#"{"missing": {"reason": "not_in_document"}}"#,
+        r#"{"present": {"evidence": [{"block_id": "p1/b2", "quote": "..."}], "normalized": "", "value": "..."}}"#,
+    ] {
+        assert!(shape().contains(one), "{one}");
+        let example = format!(r#"{{"values": {{"a": {one}}}}}"#);
+        assert!(parse(&[field("a")], &example).is_ok(), "{example}");
+    }
 }
 
 /// J6 (ME4-S2c): the answer inside thinking and a code fence.
@@ -122,8 +127,13 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
         format!("\n\n```json\n{a}\n```\n"),
         format!("```json\n{a}\n```\nThat is every field."),
         format!("```json\n{a}"),
-        // A template that opened the thinking leaves only its end.
+        // A template that opened the thinking leaves only its end, even
+        // when the thinking wrote the shape out.
         format!("it says nothing of a\n</think>\n{a}"),
+        format!("so {{\"a\": {{\"missing\": ...}}}}\n</think>\n{a}"),
+        // The fence and the answer on one line.
+        format!("```json {a}```"),
+        format!("```{a}```"),
     ] {
         assert_eq!(unwrapped(&wrapped), Ok(a), "{wrapped}");
         assert!(parse(&[field("a")], unwrapped(&wrapped).unwrap()).is_ok());

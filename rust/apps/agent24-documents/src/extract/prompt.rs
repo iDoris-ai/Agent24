@@ -1,12 +1,11 @@
 //! What one model call is told, and the shape of its answer (§3.2). The
-//! instruction is fixed, with a part added for a window of a longer document
-//! and one for a call's first pass; the fields and the document's blocks
-//! follow it as JSON data, which the instruction says never to obey. The
-//! answer has one shape: per field one status, and with it the value as
-//! written and evidence as quotes of named blocks, a reason, or the
-//! conflicting candidates. A call's second pass is held to it by a JSON
-//! Schema, its first is told it (ME4-S2c §5); both are read by [`parse`].
-//! The OS, not the model, locates each quote.
+//! instruction is fixed, with parts added for a window of a longer document
+//! and a call's first pass; the fields and the document's blocks follow it
+//! as JSON data, which the instruction says never to obey. The answer, told
+//! to the first pass and held to a JSON Schema in the second (ME4-S2c §5):
+//! per field one status, and with it the value as written and evidence as
+//! quotes of named blocks, a reason, or the conflicting candidates. The OS,
+//! not the model, locates each quote.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -54,10 +53,8 @@ exactly from one block, names that block's `block_id`, is at most 500 characters
 another block. The value must appear in one of its quotes. Never make up a quote: a value you cannot quote has \
 no evidence.";
 
-/// Added to the instruction when the window is part of a longer document:
-/// what each window says is merged, so a value made up for a field the
-/// window does not state contradicts the one found elsewhere (S01 on
-/// qwen3.8: every field of s01-01 a false conflict).
+/// Added for a window of part of the document: a value made up there
+/// contradicts the one found elsewhere (S01 on qwen3.8: s01-01 all conflicts).
 const PART: &str = "
 
 These blocks are only one part of a longer document; the other parts are read separately and the answers \
@@ -75,9 +72,8 @@ pub enum Pass {
     Held,
 }
 
-/// Added for the first pass, after [`PART`]: the shape no schema holds it to.
-/// Without it a thinking model wrote `"status": "missing"`, and its second
-/// pass copied that into values (S01, 2026-10-15).
+/// Added for the first pass, after [`PART`]: the shape no schema holds it to
+/// (without it, values of "missing": S01, 2026-10-15).
 fn shape() -> String {
     format!(
         "\n\nWrite your final answer as JSON of the form {{\"values\": {{<field key>: <answer>, ...}}}} with every \
@@ -356,11 +352,9 @@ pub enum Unanswered {
     Malformed(String),
 }
 
-/// The answer inside what the model wrote (ME4-S2c §5.1): thinking written
-/// into it (oMLX's Qwen3) and a Markdown code fence taken off. A thinking
-/// left open is an answer cut off. A template that opens the thinking itself
-/// leaves only its end, so a `</think>` before any `{` ends it too. Text after
-/// a closing fence is not the answer.
+/// The answer inside what the model wrote (ME4-S2c §5.1), its thinking
+/// (oMLX's Qwen3; left open, it was cut off; opened by the template, only its
+/// last `</think>` shows) and a Markdown code fence, text after it too, taken off.
 ///
 /// # Errors
 /// [`Unanswered::Truncated`] when the thinking was never closed.
@@ -371,13 +365,14 @@ pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
             return Err(Unanswered::Truncated);
         };
         t = after.trim();
-    } else if let Some((before, after)) = t.split_once("</think>")
-        && !before.contains('{')
+    } else if !t.starts_with(['{', '`'])
+        && let Some((_, after)) = t.rsplit_once("</think>")
     {
         t = after.trim();
     }
     if let Some(rest) = t.strip_prefix("```") {
-        let body = rest.split_once('\n').map_or("", |(_, b)| b);
+        // Its language, then the answer, on the next line or the same one.
+        let body = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric());
         t = body.rsplit_once("```").map_or(body, |(b, _)| b).trim();
     }
     Ok(t)

@@ -291,6 +291,16 @@ async fn a_cut_off_answer_is_asked_held_then_in_two_halves() {
     ]);
     assert!(go(&m, &l, &fields).await.is_ok());
     assert_eq!(m.passes(), [Free, Held, Held, Held]);
+    // Nothing after its thinking, short of the limit, is malformed, not cut
+    // off: cut off held, the halves start again at the first pass.
+    let m = Script::new(vec![
+        reply("<think>none of them</think>".into()),
+        cut(),
+        reply(answer(vec![missing("a")])),
+        reply(answer(vec![missing("b"), missing("c")])),
+    ]);
+    assert!(go(&m, &l, &fields).await.is_ok());
+    assert_eq!(m.passes(), [Free, Held, Free, Free]);
     // Malformed first, cut off held: the halves start again at the first pass.
     let m = Script::new(vec![
         reply("{\"values\": 1}".into()),
@@ -404,6 +414,20 @@ async fn a_window_the_model_rejects_is_asked_held_then_in_halves() {
         reply(both[..10].to_owned()),
         rejected(),
     ]);
+    assert!(matches!(go(&m, &l, &fields).await, Err(Failure::Engine(_))));
+    assert_eq!(m.passes(), [Free, Held, Held]);
+    // Rejected first, then taken held (malformed), then rejected held: not
+    // a window too long either.
+    let m = Script::new(vec![
+        rejected(),
+        reply("{\"values\": 1}".into()),
+        rejected(),
+    ]);
+    assert!(matches!(go(&m, &l, &fields).await, Err(Failure::Engine(_))));
+    assert_eq!(m.passes(), [Free, Held, Held]);
+    // Rejected first, cut off held, so its halves stay held: one rejected
+    // there fails too, for this window took a second pass.
+    let m = Script::new(vec![rejected(), reply(both[..10].to_owned()), rejected()]);
     assert!(matches!(go(&m, &l, &fields).await, Err(Failure::Engine(_))));
     assert_eq!(m.passes(), [Free, Held, Held]);
     // Timed out twice in the first pass: a failure, not a second pass.

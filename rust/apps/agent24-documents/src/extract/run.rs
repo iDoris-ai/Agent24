@@ -2,14 +2,12 @@
 //! fields, through the kernel's model router, which runs only local models
 //! for this module. What each call answers is grounded and merged per field.
 //!
-//! Calls go one at a time, each in up to two passes (ME4-S2c §5.1): first
-//! the model answers as it will, thinking if it does; an answer cut off at
-//! the token limit or not in the answer's shape, or a request rejected, is
-//! asked again held to the schema with thinking off. There an answer cut off
-//! is asked again in two halves of its batch, and one not in the shape once
-//! more. A window both passes reject (most likely too long for the model's
-//! context) is asked again in two halves; a second pass rejected after its
-//! first was taken fails the extraction. A busy or rate-limited kernel is
+//! Calls go one at a time, in two passes (ME4-S2c §5.1): the model answers
+//! as it will; what is not an answer is asked again held to the schema,
+//! thinking off. There an answer cut off at the token limit is asked again
+//! in two halves of its batch, one not in the shape once more. A window
+//! rejected (most likely too long for the model's context) in both passes
+//! is asked in two halves. A busy or rate-limited kernel is
 //! waited out, up to two minutes a call; a timeout is retried once; no local
 //! model to answer is asked again after the router's longest cooldown, up to
 //! three minutes of such waiting a call. Every
@@ -206,6 +204,23 @@ impl Run<'_> {
         }
     }
 
+    /// A call of `pass`, logged when it does not come back.
+    async fn ask(
+        &mut self,
+        w: &Window,
+        batch: &[Field],
+        pass: Pass,
+        fell: Option<Fell>,
+    ) -> Result<(String, u64), Refused> {
+        let got = self.call(w, batch, pass).await;
+        match &got {
+            Err(Refused::TooLong) => log(w, batch.len(), pass, None, "rejected", fell),
+            Err(Refused::Failed(f)) => log(w, batch.len(), pass, None, &format!("{f:?}"), fell),
+            Ok(_) => {}
+        }
+        got
+    }
+
     /// Waits `total`, asking every `first` whether the job goes on: a job
     /// cancelled while it waits ends then, not when the wait is over.
     /// The caller asks once more before its next call, so this does not.
@@ -223,8 +238,7 @@ impl Run<'_> {
         true
     }
 
-    /// The answer's text and the tokens it took, once its model is known to
-    /// be the one, local.
+    /// The answer's text and tokens, once its model is known to be the one, local.
     fn answered(&mut self, done: CompleteResult) -> Result<(String, u64), Failure> {
         let engine = |why: &str| Err(Failure::Engine(why.into()));
         if done.tier != ServedTier::Local {
@@ -258,12 +272,9 @@ impl Run<'_> {
         Box::pin(async move {
             let fell = match fell {
                 Some(fell) => fell,
-                None => match self.call(&window, &batch, Pass::Free).await {
+                None => match self.ask(&window, &batch, Pass::Free, None).await {
                     Err(Refused::Failed(f)) => return Err(f),
-                    Err(Refused::TooLong) => {
-                        log(&window, &batch, Pass::Free, None, "rejected", None);
-                        Fell::Rejected
-                    }
+                    Err(Refused::TooLong) => Fell::Rejected,
                     Ok(done) => match read(&window, &batch, Pass::Free, None, done) {
                         Ok(values) => return Ok(vec![(window, values)]),
                         Err(Unanswered::Truncated) => Fell::Truncated,
@@ -271,16 +282,15 @@ impl Run<'_> {
                     },
                 },
             };
-            let mut malformed = None;
+            let (mut malformed, mut taken) = (None, false);
             for _ in 0..2 {
-                let done = match self.call(&window, &batch, Pass::Held).await {
+                let done = match self.ask(&window, &batch, Pass::Held, Some(fell)).await {
                     Ok(done) => done,
                     Err(Refused::Failed(f)) => return Err(f),
                     Err(Refused::TooLong) => {
-                        log(&window, &batch, Pass::Held, None, "rejected", Some(fell));
-                        // Its first pass, longer, was taken: not a window
-                        // too long, and a smaller one would answer otherwise.
-                        if fell != Fell::Rejected {
+                        // A pass on this window was taken: not a window too
+                        // long, and a smaller one would answer otherwise.
+                        if fell != Fell::Rejected || taken {
                             return Err(Failure::Engine(
                                 "the local model rejected the second pass".into(),
                             ));
@@ -295,14 +305,14 @@ impl Run<'_> {
                         return Ok(out);
                     }
                 };
+                taken = true;
                 match read(&window, &batch, Pass::Held, Some(fell), done) {
                     Ok(values) => return Ok(vec![(window, values)]),
                     Err(Unanswered::Truncated) if batch.len() > 1 => {
                         // Halves of a batch that thought too long, or was
-                        // rejected, would again: they start at the second
-                        // pass. One whose answer was malformed may answer
-                        // well with fewer fields.
-                        let next = (fell != Fell::Malformed).then_some(fell);
+                        // rejected, would again: they stay held. Fewer
+                        // fields may answer well where many were malformed.
+                        let next = (fell != Fell::Malformed).then_some(Fell::Truncated);
                         let (a, b) = batch.split_at(batch.len() / 2);
                         let mut out = self.answer(window.clone(), a.to_vec(), next).await?;
                         out.extend(self.answer(window, b.to_vec(), next).await?);
@@ -319,10 +329,8 @@ impl Run<'_> {
     }
 }
 
-/// The answers in what a call of `pass` wrote and the tokens it took, logged
-/// with why its batch came to the second pass (`fell`). A call that used all
-/// it may write was cut off, even if what it wrote reads whole (thinking
-/// counts, and may have filled it).
+/// The answers in what a call of `pass` wrote, logged. A call that used all
+/// its tokens was cut off, even if it reads whole: thinking counts.
 fn read(
     window: &Window,
     batch: &[Field],
@@ -330,32 +338,25 @@ fn read(
     fell: Option<Fell>,
     (text, tokens): (String, u64),
 ) -> Result<Vec<AnswerValue>, Unanswered> {
-    let read = if tokens >= u64::from(MAX_TOKENS) {
-        Err(Unanswered::Truncated)
-    } else {
-        unwrapped(&text).and_then(|t| parse(batch, t))
+    let read = match unwrapped(&text) {
+        _ if tokens >= u64::from(MAX_TOKENS) => Err(Unanswered::Truncated),
+        Ok("") if tokens > 0 => Err(Unanswered::Malformed("nothing written".into())),
+        t => t.and_then(|t| parse(batch, t)),
     };
     let outcome = match &read {
         Ok(_) => "answered",
         Err(Unanswered::Truncated) => "truncated",
         Err(Unanswered::Malformed(_)) => "malformed",
     };
-    log(window, batch, pass, Some(tokens), outcome, fell);
+    log(window, batch.len(), pass, Some(tokens), outcome, fell);
     read
 }
 
-/// One call, as the info log has it (ME4-S2c §5.1 step 5).
-fn log(
-    window: &Window,
-    batch: &[Field],
-    pass: Pass,
-    tokens: Option<u64>,
-    outcome: &str,
-    fell: Option<Fell>,
-) {
-    tracing::info!(window = ?window.0.first(), blocks = window.0.len(), fields = batch.len(),
-        pass = ?pass, completion_tokens = tokens, max_tokens = MAX_TOKENS, fell = ?fell,
-        "extraction call: {outcome}");
+/// One call, as the info log has it (ME4-S2c §5.1 step 5); `fell`: why its
+/// batch came to the second pass.
+fn log(w: &Window, n: usize, pass: Pass, tokens: Option<u64>, outcome: &str, fell: Option<Fell>) {
+    tracing::info!(window = ?w.0.first(), blocks = w.0.len(), fields = n, pass = ?pass,
+        completion_tokens = tokens, max_tokens = MAX_TOKENS, fell = ?fell, "extraction call: {outcome}");
 }
 
 /// Extracts `fields` from the layer in `src` for `job`: asked before every
