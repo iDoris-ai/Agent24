@@ -33,6 +33,19 @@
 
 报告 §7 明确留给作者的决定，本文**只列成待拍板清单（§7）**，不预设答案：第一版服务谁、第一个真实连接器（邮件或 Notion）及其账号与测试目的地、入口形态、是否含社区群发/LINE 自动回复、逐项确认与有界委托如何平衡。
 
+### 0.4 已定决策（作者拍板，2026-10-16）
+
+| # | 决策 | 含义与影响 |
+|---|---|---|
+| **D-A** | **挂点采用 B**：新建第一方**进程外领域 OS 模块 `office`**（与 `rust/apps/agent24-documents/` 同构）承载业务状态 | 业务记录（workflow/plan 版本、artifact 版本、人工编辑、SOP、回执的业务投影、mock 连接器）落在 `office` 自己的 `data_dir`；**不进内核 store、不引入 store 迁移**。先例：`docs/documenting/adr/ADR-DOC-01-placement-and-integration.md` 对 Documenting 的同类裁定（已 Accepted） |
+| **D-B** | **有外部效果的动作仍由内核执行**；模块与内核之间新增内核门 **OA-K** | OA-K 接受 `(tool, 确切 input, request_id)`，内核对它跑完整流水线（consent → 逐次人审 → 出站门 → 超时执行 → 审计）并返回类型化结果与回执；**内核不自动重试**。详细设计见 [`OA-K-KERNEL-GATE-DESIGN.md`](OA-K-KERNEL-GATE-DESIGN.md)；须 ADR，建议**并入 #735**（Documenting、Cos72 同样需要它） |
+| **D-C** | OA-K **不是** OfficeAssistant 专属 | 因此它的 ADR 与实现不应挂在 OA 线的时间表上；**OA-M2 等它** |
+
+**随之调整三项**：
+- `OA-M1-04` 的落点由“内核 store + 迁移”改为“**`office` 模块自己的 `data_dir`**”（风险级由高降为中等；不再触发 PR-Daemon 的“存储迁移”类必审）。
+- `OA-M1-05` 由“接入 run”改为“**走 `Models` 回调**（本地模型、LocalOnly）”；如果非要接入 run，需另行论证（内核今天只有模型驱动的工具调用入口）。
+- `OA-M2` 的前置**增加“OA-K 落地”**（原先只有 consent 授予入口与出站判定两项）。
+
 ---
 
 ## 1. 产品定位与边界
@@ -142,8 +155,8 @@ OfficeAssistant 是 **Agent24 基础办公套件里的助手能力层**：把用
 | OA-M1-01 | 语义说明一页：七项语义 × 现有 run/approval 形状的映射、新增字段、不可声称清单 | 规划者起草，jason 评审 | 设计（先评审再写码） |
 | OA-M1-02 | 合成转录与金标准（含泰/英/中各至少一份，见 §5） | 实习生为主 | 低（纯数据，必须标「合成」） |
 | OA-M1-03 | 抽取评测脚本：漏项、无依据承诺、待确认标注、出处正确率逐项比对 | 实习生 + 规划者评审 | 低 |
-| OA-M1-04 | workflow/action/artifact/receipt 记录（内核 store 内，含迁移） | 核心开发 | **高**（存储迁移，须 PR-Daemon APPROVE） |
-| OA-M1-05 | 抽取步骤接入 run（本地模型、LocalOnly） | 核心开发 | 中 |
+| OA-M1-04 | workflow/action/artifact/receipt 记录（**落在 `office` 模块自己的 `data_dir`**，不进内核 store、无迁移；见 §0.4 D-A） | 核心开发 | 中（不再涉及存储迁移） |
+| OA-M1-05 | 抽取步骤走 `Models` 回调（本地模型、LocalOnly；不接入 run，见 §0.4 D-A） | 核心开发 | 中 |
 | OA-M1-06 | 确认卡 + payload 版本绑定（mock 动作） | 核心开发 | **高**（审批语义） |
 | OA-M1-07 | mock connector + 回执分层 | 核心开发；实习生写负例测试 | 中 |
 | OA-M1-08 | 取消/重试/重启恢复负例测试 | 实习生写用例，核心开发修 | 中 |
