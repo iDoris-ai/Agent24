@@ -50,6 +50,8 @@ const api = {
     ipcRenderer.invoke(IpcChannels.OpenDesignComponentStatus),
   openDesignComponentInstall: (): Promise<OpenDesignComponentStatusResult> =>
     ipcRenderer.invoke(IpcChannels.OpenDesignComponentInstall),
+  openDesignComponentPause: (): Promise<OpenDesignComponentStatusResult> =>
+    ipcRenderer.invoke(IpcChannels.OpenDesignComponentPause),
   onOpenDesignComponentProgress: (cb: (status: OpenDesignComponentStatusResult) => void): (() => void) => {
     const listener = (_event: unknown, status: OpenDesignComponentStatusResult): void => cb(status)
     ipcRenderer.on(IpcChannels.OpenDesignComponentProgress, listener)
