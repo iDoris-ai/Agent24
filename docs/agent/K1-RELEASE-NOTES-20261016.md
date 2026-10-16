@@ -4,7 +4,7 @@
 - PR head：`815c526cd72785973fc466c94c4c7d197266c344`（`gh pr view 1022 --json headRefOid,mergeCommit`）。它的树是 `4957d29db21280c7334213e3acadae1e41e99ab4`，与 squash **不是同一棵树**。`815c526` 不是 `56264ef9` 的祖先。批准该 head 时，评审写的 main 基线是 `729a715`；实际 squash 落在已经前进的 `600baba0` 上。下文行号一律指 `56264ef9`，不要用 `refs/pull/1022/head` 对行号。两棵树上内容不同、因而行号不能互换的文件有：`rust/crates/agent24-agent/src/lib.rs`、`rust/crates/agent24-agent/src/subagent.rs`、`rust/crates/agent24-models/src/router.rs`、`rust/crates/agent24-models/src/lib.rs`、`rust/crates/agent24-domain/src/lib.rs`、`rust/apps/agent24d/src/model_callback.rs`、`rust/apps/agent24d/src/routes.rs`。
 - 写本文时的 `origin/main` 尖端是 `ebc9b6e74ffaa05316cd1fd2043dab8ecf925d65`（`#1026`）。`56264ef9` 与这个尖端之间还有 `#1024`、`#1025`、`#1027`、`#1023`。上一条列出的、在两棵树上行号不能互换的文件，以及 `os_routes.rs`、`agent24-cli/src/main.rs`、`server.rs`、`os_config.rs`、`state_file.rs`、`Chat.tsx`、`Chat.i18n.ts`、`install.rs`、迁移、PLAN、ADR 与 `APPROVAL.md`，在 `ebc9b6e7` 上的 blob 与 `56264ef9` 相同，所以行号在这个尖端上也成立。尖端之后的新提交不在本文范围内。
 - 范围：给已经合入 main 的 K1 写发布说明。停用/卸载时 consent 撤销失败的行为，以 `56264ef9` 上的代码为准。`docs/agent/REVIEW-kernel-to-main-20261016.md` 不在 main 上，也不在 `56264ef9` 上（`git cat-file -e` 对这两处都失败）。它只在 `origin/baton/grokbot-20261016-a24-k1review`（文档提交 `e24b2c84`，分支尖端 `3008c5aa`）。该报告针对的是修复前的 `571190cb`，其 `:21`、`:60` 写的是「只记日志、返回成功、fail-open」。这个结论提出的 fail-open 已在 `#1022` 内修复，见下文「fail-closed」。不要再把那份报告当作现行行为的依据。
-- 本文是可复核的事实，不是审批，也不代替 PR-Daemon。法律流程两条路并列，待 jason 决定。
+- 本文是可复核的事实，不是审批，也不代替 PR-Daemon。法律流程的补救路径已由 jason 2026-10-16 选定为路径 1，执行 PR 为 #1031（见第三部分）。
 
 ---
 
@@ -122,7 +122,7 @@ A  0017_module_consent_revocations.sql
 
 ### 用户能感知的其它变化
 
-1. **桌面主对话和 `/api/v1/chat` 不再向外回退。** 桌面聊天页把本轮消息和 `session_id` POST 到 `/api/v1/chat`（`apps/desktop/src/renderer/pages/Chat.tsx:68-74`）。该接口不再使用「先本地、不行再远端」的默认画像，见第二部分。本地档都不可用时，HTTP 503，`code` 为 `provider_unavailable`，正文是 `All LLM providers unavailable. Last error: …`（`rust/apps/agent24d/src/routes.rs:682-686`）。桌面不把这段 `message` 原样当作唯一文案：`Chat.tsx:76-87` 先把它放进 `Error`，`Chat.tsx:111-116` 再套上 `reply.connectionError`。中文是「常见原因是本地模型服务未运行——请检查 oMLX（端口 8088）或 Ollama（端口 11434）」，服务器原文接在「错误：」后面（`Chat.i18n.ts:30`）。局域网或域名 URL 被标成 Remote 时，模型服务可以仍在跑，这句「未运行」会误导。请看错误尾部：出现 `no local provider available for a local-only task` 时，去查 `OMLX_URL` / `OLLAMA_URL` 的主机是不是 loopback，而不是先假定进程没起来。
+1. **桌面主对话和 `/api/v1/chat` 不再向外回退。** 桌面聊天页把本轮消息和 `session_id` POST 到 `/api/v1/chat`（`apps/desktop/src/renderer/pages/Chat.tsx:68-74`）。该接口不再使用「先本地、不行再远端」的默认画像，见第二部分。本地档都不可用时，HTTP 503，`code` 为 `provider_unavailable`，正文是 `All LLM providers unavailable. Last error: …`（`rust/apps/agent24d/src/routes.rs:682-686`）。桌面不把这段 `message` 原样当作唯一文案：`Chat.tsx:76-87` 先把它放进 `Error`，`Chat.tsx:111-116` 再套上 `reply.connectionError`。中文是「常见原因是本地模型服务未运行——请检查 oMLX（端口 8088）或 Ollama（端口 11434）」，服务器原文接在「错误：」后面（`Chat.i18n.ts:30`）。局域网或域名 URL 被标成 Remote 时，模型服务可以仍在跑，这句「未运行」会误导。请看错误尾部：出现 `no local provider available for a local-only task` 时，先去查 `OMLX_URL` / `OLLAMA_URL` 的主机是不是 loopback；**但这句不是「主机不是 loopback」的充分证据**——loopback 上的 Local 档一旦宕机就会进入冷却（`router.rs:362-380` 跳过冷却中的 provider，`:462-470` 记一次失败，`from_env` 的冷却从 2s 起、最长 60s，见 `router.rs:284`），冷却期内第二次调用也会报同一句。所以顺序是：先看进程/健康（本机 oMLX 是否在听），再看 URL 主机，不要只凭这句就断定是主机标错了。
 2. **带会话的长对话可能停止压缩。** 压缩模型调用被固定成 LocalOnly。压缩失败不会把已经生成的回答作废，但摘要不会写入。条件见第二部分。
 3. **agent run 同样不再向外回退。** 模型不可用时 run 以 `provider_unavailable` 失败，消息前缀是 `No provider could serve this request.`（`rust/crates/agent24-agent/src/lib.rs:1747-1750`）。
 4. **explorer 子代理同样收窄。** 模型错误变成工具失败 `explorer model call: …`（`rust/crates/agent24-agent/src/subagent.rs:236-237`）。
@@ -264,7 +264,7 @@ A  0017_module_consent_revocations.sql
 
 ---
 
-## 第三部分：法律文本（合入之后的事实，待 jason 决定）
+## 第三部分：法律文本（合入之后的事实：jason 2026-10-16 选定路径 1，执行 PR 为 #1031）
 
 `#1022` 已经合入。下面不再写「先于 #1022 合一个法律 PR」。那样做的基线（当时的 `origin/main` `72c2a580`）已经过时，而且会在 PLAN 里留下「法律文本由独立 PR 进入 main」的假记录。
 
@@ -314,7 +314,7 @@ ADR 把实质决定和流程分开写了：
 
 分发路径仍然不提供草稿核验（`server.rs:1601-1604`）。法律文本把例外收窄到一组宿主核验都成立的情况；这条装配路径不提供该结构，所以合入本身不改变现在的逐次审批行为。
 
-### 两条补救路径（待 jason 决定）
+### 补救路径（已定：jason 2026-10-16 选定路径 1，由 #1031 执行）
 
 本文不选路，不改 `PLAN-KERNEL-K1.md`，不改 `docs/laws/`，也不开下面任何一个 PR。
 
@@ -323,17 +323,17 @@ ADR 把实质决定和流程分开写了：
 针对 blob `16db448916d984277314e66ea54eaa80e531e059` → `244429b037bb4a11de4ed0794823ea4ef6da139b` 这段 diff 单独开一个 PR，让 PR-Daemon 评审的是法律文本本身。
 
 - 证据就是上一节的 blob 表：改前是 `62218c31` 的父提交，也是 squash 的父提交；改后是 `62218c31` 的结果，也是现在 main 上的文件。
-- 从当前 main 拉分支之后，`docs/laws/APPROVAL.md` 已经是 `244429b0`。再执行 `git checkout 62218c31 -- docs/laws/APPROVAL.md` 不会产生差异。GitHub 上的 PR diff 是空的。
+- 从当前 main 拉分支之后，`docs/laws/APPROVAL.md` 已经是 `244429b0`。**路径 1 的实际执行（PR #1031）并不是空操作**：它在 `APPROVAL.md` 的 L-APPR-5 「今天靠什么保证」之后新增了一段溯源记录，blob 从 `244429b0` 变为 `38de9810`。**L-APPR-5 的 MUST 表述本身没有被改动**；变的只是新增的那段记录。
 - 评审材料要写在 PR 正文里，例如 `git diff 600baba0 56264ef9 -- docs/laws/APPROVAL.md`，或 `git show 62218c31 -- docs/laws/APPROVAL.md`。正文应写明：文本最初出现在实现提交 `62218c31`，随 `#1022`（`56264ef9`）进入 main；本 PR 是事后补上的独立法律评审；jason 2026-10-08 的实质授权见 ADR-K1-03:120；本 PR 不包含 `consent_gate.rs`。
-- 合入后是空操作：文件不变，main 的历史仍然显示这段文本第一次进入 main 是 `#1022`。不要在 PLAN 里写成「已由该法律 PR 单独评审后进入 main」，那句话是假的。若走这条路，PLAN 上能写的是「文本随 #1022 进入 main，事后由该 PR 补做评审」。
+- 事后补的是评审记录，不是内容：main 的历史仍然显示这段 MUST 表述第一次进入 main 是 `#1022`。**不要在 PLAN 里写成「已由该法律 PR 单独评审后进入 main」**——那句话是假的。能写的是「文本随 #1022 进入 main，事后由 #1031 补做独立评审」。
 
-**路径 2：jason 书面接受，并记入 PLAN。**
+**路径 2（未采用）：jason 书面接受，并记入 PLAN。**
 
 在 `docs/agent/PLAN-KERNEL-K1.md` 的 `:24` 和 `:84` 附近各加一句流程记录：L-APPR-5 的修订已随 `#1022`（squash `56264ef92bd08b7bdcebc7aa45a78e8b7065bd9a`）进入 main，jason 于某日书面接受这次不单独评审该 diff。日期由 jason 写，本文不填。这句话只记录接受，不要和内核实现放在同一个提交。
 
 2026-10-08 的 ADR 授权不是这条接受。ADR-K1-03:105 写明 ADR 不代替法律流程。
 
-**待 jason 决定。** 两条路都承认同一件事：`#1022` 没有满足「法律变更必须单独 PR」。路径 1 补的是事后的评审记录，合入不改变文件。路径 2 把「这次不单独评审」写成 jason 的书面接受。选哪条由 jason 定。
+**已定（2026-10-16）：走路径 1，执行 PR 为 #1031。** 两条路都承认同一件事：`#1022` 没有满足「法律变更必须单独 PR」。路径 1 补的是事后的独立评审记录（在 `APPROVAL.md` 里新增一段溯源，MUST 表述不变）；路径 2（写成 jason 的书面接受）**未采用**。
 
 ### 涉及的精确文件与提交
 
@@ -349,7 +349,7 @@ ADR 把实质决定和流程分开写了：
 | 把该 blob 带上 main 的提交 | `56264ef92bd08b7bdcebc7aa45a78e8b7065bd9a`（`#1022`） |
 | 规则出处 | `docs/agent/PLAN-KERNEL-K1.md:24`、`:84`（在 `56264ef9` 与当前 main 上） |
 | 实质授权出处 | `docs/adr/ADR-K1-03-enable-authorization-trust-revocation.md:105`、`:118-127` |
-| 路径选择 | 待 jason 决定 |
+| 路径选择 | jason 2026-10-16 选定路径 1；执行 PR 为 #1031（在 `APPROVAL.md` 新增一段溯源，MUST 表述不变） |
 
 ---
 
