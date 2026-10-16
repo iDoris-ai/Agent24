@@ -283,6 +283,17 @@ async fn a_cut_off_answer_is_asked_held_then_in_two_halves() {
         assert_eq!(keys(&m), ["a,b,c", "a,b,c", "a", "b,c"]);
         assert_eq!(m.passes(), [Free, Held, Held, Held]);
     }
+    // Nothing written and no usage told: cut off, as `parse` reads it.
+    let mut none = reply("<think>none of them</think>".into());
+    none.as_mut().unwrap().usage.completion_tokens = 0;
+    let m = Script::new(vec![
+        none,
+        cut(),
+        reply(answer(vec![missing("a")])),
+        reply(answer(vec![missing("b"), missing("c")])),
+    ]);
+    assert!(go(&m, &l, &fields).await.is_ok());
+    assert_eq!(m.passes(), [Free, Held, Held, Held]);
     // #1041 L4: the second pass is cut off by its tokens too.
     let m = Script::new(vec![
         cut(),

@@ -19,7 +19,7 @@ pub mod window;
 /// not in the block it names is looked for in the other blocks shown
 /// (2026-10-15). 4: the model is asked at temperature 0 (2026-10-15). 5: a
 /// call answers freely first, held to the schema only when that is not an
-/// answer (ME4-S2c, 2026-10-17).
+/// answer, and a window of part of the document is told so (2026-10-17).
 pub const EXTRACTOR_VERSION: &str = "5";
 
 /// A requested field (`DocumentsExtractField`).

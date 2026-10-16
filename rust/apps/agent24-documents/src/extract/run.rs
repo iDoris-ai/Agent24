@@ -5,9 +5,10 @@
 //! Calls go one at a time, in two passes (ME4-S2c §5.1): the model answers
 //! as it will; what is not an answer is asked again held to the schema,
 //! thinking off. There an answer cut off at the token limit is asked again
-//! in two halves of its batch, one not in the shape once more. A window
-//! rejected (most likely too long for the model's context) in both passes,
-//! none taken there before, is asked in two halves. A busy or rate-limited kernel is
+//! in two halves of its batch, one not in the shape once more. A window the
+//! model rejects (most likely too long for its context) in both passes is
+//! asked in two halves, unless it took a call before: then the rejection
+//! fails the extraction. A busy or rate-limited kernel is
 //! waited out, up to two minutes a call; a timeout is retried once; no local
 //! model to answer is asked again after the router's longest cooldown, up to
 //! three minutes of such waiting a call. Every
@@ -238,7 +239,7 @@ impl Run<'_> {
         true
     }
 
-    /// The answer's text and tokens, once its model is known to be the one, local.
+    /// The text and tokens of an answer whose model is the one, local.
     fn answered(&mut self, done: CompleteResult) -> Result<(String, u64), Failure> {
         let engine = |why: &str| Err(Failure::Engine(why.into()));
         if done.tier != ServedTier::Local {
@@ -291,8 +292,7 @@ impl Run<'_> {
                     Ok(done) => done,
                     Err(Refused::Failed(f)) => return Err(f),
                     Err(Refused::TooLong) => {
-                        // A pass on this window was taken: not a window too
-                        // long, and a smaller one would answer otherwise.
+                        // A call on this window was taken: it is not too long.
                         if taken {
                             return Err(Failure::Engine(
                                 "the local model rejected the second pass".into(),
@@ -331,7 +331,7 @@ impl Run<'_> {
     }
 }
 
-/// The answers in what a call wrote, logged; all its tokens used is cut off (thinking counts).
+/// The answers in what a call wrote, logged; all tokens used is cut off.
 fn read(
     window: &Window,
     batch: &[Field],
@@ -353,8 +353,7 @@ fn read(
     read
 }
 
-/// One call, as the info log has it (ME4-S2c §5.1 step 5); `fell`: why its
-/// batch came to the second pass.
+/// One call in the info log (§5.1 step 5); `fell`: why its batch was held.
 fn log(w: &Window, n: usize, pass: Pass, tokens: Option<u64>, outcome: &str, fell: Option<Fell>) {
     tracing::info!(window = ?w.0.first(), blocks = w.0.len(), fields = n, pass = ?pass,
         completion_tokens = tokens, max_tokens = MAX_TOKENS, fell = ?fell, "extraction call: {outcome}");

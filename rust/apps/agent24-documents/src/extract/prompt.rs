@@ -63,12 +63,11 @@ combined. Answer from these blocks only. When these blocks do not state a field,
 another item, row, fee or date because it looks similar: here a wrong `present` is worse than `missing`, for \
 it contradicts the right value found in another part.";
 
-/// Which of a call's two passes (ME4-S2c §5.1).
+/// Which of a call's two passes (ME4-S2c §5.1): the model answering as it
+/// will, told the shape; or held to the answer's JSON Schema, thinking off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pass {
-    /// The model answers as it will, thinking if it does, told the shape.
     Free,
-    /// Held to the answer's JSON Schema, thinking off.
     Held,
 }
 
@@ -352,11 +351,9 @@ pub enum Unanswered {
     Malformed(String),
 }
 
-/// The answer in what the model wrote (ME4-S2c §5.1): its thinking (left open: cut off; opened by
-/// the template: up to its last `</think>`) and a code fence, text after it too, taken off.
-///
-/// # Errors
-/// [`Unanswered::Truncated`] when the thinking was never closed.
+/// The answer in what the model wrote (ME4-S2c §5.1): its thinking (left
+/// open: [`Unanswered::Truncated`]; opened by the template: up to its last
+/// `</think>`) and a code fence, with what follows the answer in it, cut off.
 pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
     let mut t = text.trim();
     if let Some(rest) = t.strip_prefix("<think>") {
@@ -364,16 +361,21 @@ pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
             return Err(Unanswered::Truncated);
         };
         t = after.trim();
-    } else if !t.starts_with(['{', '`'])
+    }
+    if !t.starts_with('{')
+        && !t.starts_with("```")
         && let Some((_, after)) = t.rsplit_once("</think>")
     {
         t = after.trim();
     }
     if let Some(rest) = t.strip_prefix("```") {
-        // Its language; closed on a line of its own, or at the answer's end.
-        let body = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric());
-        let body = body.split_once("\n```").map_or(body, |(b, _)| b);
-        t = body.trim().trim_end_matches("```").trim_end();
+        // After its language, the answer ends where its JSON does.
+        let body = rest.trim_start_matches(char::is_alphanumeric).trim_start();
+        let mut one = serde_json::Deserializer::from_str(body).into_iter::<serde::de::IgnoredAny>();
+        t = one
+            .next()
+            .and_then(Result::ok)
+            .map_or(body, |_| &body[..one.byte_offset()]);
     }
     Ok(t)
 }

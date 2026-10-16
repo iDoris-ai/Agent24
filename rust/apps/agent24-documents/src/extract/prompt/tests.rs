@@ -134,8 +134,13 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
         // The fence and the answer on one line.
         format!("```json {a}```"),
         format!("```{a}```"),
-        // Another code block in the words after it.
+        // Another code block in the words after it; the fence closed on
+        // the answer's line, then words.
         format!("```json\n{a}\n```\nOr write ```{{}}``` for none."),
+        format!("```json\n{a}```\nThat is every field."),
+        // Thinking that starts with a quote mark, or quotes `</think>`.
+        format!("`status` is a property name</think>\n{a}"),
+        format!("<think>I close with </think> then</think>\n{a}"),
     ] {
         assert_eq!(unwrapped(&wrapped), Ok(a), "{wrapped}");
         assert!(parse(&[field("a")], unwrapped(&wrapped).unwrap()).is_ok());
