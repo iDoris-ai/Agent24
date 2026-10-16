@@ -3,7 +3,8 @@
 //! Design rules (ADR-026 §6.5, openfang lessons):
 //! - The [`ModelProvider`] trait stays MINIMAL — retry, cooldown, routing and
 //!   health feedback live ABOVE the trait (M-D `ModelRouter`), never inside a
-//!   provider.
+//!   provider. One exception: [`OpenAiCompatProvider`] asks once more without
+//!   a thinking switch the backend refused (ME4-S2c §4).
 //! - Every async call takes a [`CancellationToken`] — cancellation is a
 //!   first-class citizen from the first line (never retrofit).
 //! - Providers are registered in an ordered registry (no if/else factory).
@@ -886,15 +887,18 @@ impl ModelProvider for OpenAiCompatProvider {
                 // A refusal whose error body a cancel cut short is a cancel.
                 // Without the time for another answer, it stays the refusal
                 // it is: a streamed call by the router's rule for trying the
-                // next provider (less than a stall left), a whole one when
-                // its own timeout already ran out reading it. A whole call
-                // asked again has what is left of that timeout, not another.
+                // next provider (less than a stall left), a whole one with
+                // less of its timeout left than the quick timeout. A whole
+                // call asked again has what is left of that timeout, not
+                // another.
                 if cancel.is_cancelled() {
                     return Err(ModelError::Cancelled);
                 }
                 let no_time = match &req.progress {
                     Some(p) => stream::left(p, std::time::Instant::now()) < p.stall,
-                    None => started.elapsed() >= self.chat_timeout,
+                    None => {
+                        self.chat_timeout.saturating_sub(started.elapsed()) < self.quick_timeout
+                    }
                 };
                 if no_time {
                     return Err(e);
@@ -1803,7 +1807,7 @@ mod tests {
         });
         let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
             .supports_reasoning_effort()
-            .with_timeouts(Duration::from_millis(600), Duration::from_secs(1));
+            .with_timeouts(Duration::from_millis(600), Duration::from_millis(100));
         let started = std::time::Instant::now();
         let got = p
             .complete(&thinking_off(None), &CancellationToken::new())
@@ -1811,6 +1815,60 @@ mod tests {
         assert!(matches!(got, Err(ModelError::Unavailable(_))), "{got:?}");
         let took = started.elapsed();
         assert!(took < Duration::from_millis(900), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_whole_refusal_with_little_of_its_timeout_left_is_not_asked_again() {
+        // Refused at 400ms of a 600ms timeout, with a 300ms quick timeout:
+        // 200ms is too little for another answer.
+        let (url, count) = refuses_after(400, true).await;
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort()
+            .with_timeouts(Duration::from_millis(600), Duration::from_millis(300));
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(None), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_call_asked_again_starts_its_first_chunk_timer_anew() {
+        // L2: each request answers its first chunk at 300ms, under a 400ms
+        // first-chunk timer. Together they take 600ms: the second answer is in
+        // time only by a timer of its own.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let reply = if std::mem::take(&mut first) {
+                    refused("400 Bad Request")
+                } else {
+                    ok_streamed()
+                };
+                s.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let progress = Some(Progress {
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            first_chunk: Duration::from_millis(400),
+            stall: Duration::from_secs(1),
+        });
+        let got = p
+            .complete(&thinking_off(progress), &CancellationToken::new())
+            .await;
+        assert_eq!(got.unwrap().message.content.as_deref(), Some("x"));
     }
 
     /// The answer of a whole response: what a streamed one's end and the
