@@ -427,8 +427,9 @@ impl ModelRouter {
             .await
     }
 
-    /// Preserve a caller's admitted lifecycle ID in the iDoris request.
-    /// Background calls without an ID receive a fresh transport correlation ID.
+    /// Carry an admitted lifecycle id on `X-iDoris-Trace-Id` when iDoris accepts it.
+    /// `X-iDoris-Request-Id` is a fresh idempotency key on every call, with or
+    /// without that id. A missing or rejected id omits the trace header.
     pub async fn complete_served_with_request_id(
         &self,
         profile: TaskProfile,

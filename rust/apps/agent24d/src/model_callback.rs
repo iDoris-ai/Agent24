@@ -2076,24 +2076,41 @@ mod handler_tests {
                 generation,
                 grant: Some(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d)),
             };
-            let mut params = ok_params();
-            params["request_id"] = json!(REQUEST_ID);
-            assert!(h.call(params).await.is_ok());
+            // One in-flight id binds both calls (`admit_callback_bound` looks up
+            // and does not consume). The prompts differ so a replayed body would
+            // not satisfy iDoris's idempotency key.
+            for prompt in ["prompt-one", "prompt-two"] {
+                let mut params = ok_params();
+                params["request_id"] = json!(REQUEST_ID);
+                params["messages"][0]["content"] = json!(prompt);
+                assert!(h.call(params).await.is_ok(), "{prompt}");
+            }
             in_flight.finish().unwrap();
             return;
         }
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        #[derive(Debug)]
+        struct SeenCall {
+            request_id: String,
+            trace_id: String,
+            prompt: String,
+        }
+        let seen = Arc::new(Mutex::new(Vec::<SeenCall>::new()));
         let captured = seen.clone();
         let app = axum::Router::new()
             .route("/health", axum::routing::get(|| async {
                 axum::Json(json!({"service":"idoris", "version":"0.3.1",
                     "contract_version":"1.0.1", "instance_id":"fixture", "dev_no_key_enabled":false}))
             }))
-            .route("/v1/chat/completions", axum::routing::post(move |headers: axum::http::HeaderMap| {
+            .route("/v1/chat/completions", axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(headers.get("x-idoris-request-id")
-                        .and_then(|v| v.to_str().ok()).unwrap_or("").to_owned());
+                    captured.lock().unwrap().push(SeenCall {
+                        request_id: headers.get("x-idoris-request-id")
+                            .and_then(|v| v.to_str().ok()).unwrap_or("").to_owned(),
+                        trace_id: headers.get("x-idoris-trace-id")
+                            .and_then(|v| v.to_str().ok()).unwrap_or("").to_owned(),
+                        prompt: body["messages"][0]["content"].as_str().unwrap_or("").to_owned(),
+                    });
                     ([("x-idoris-served-locality", "loopback"), ("x-idoris-record-id", "fixture_record_09")],
                      axum::Json(json!({"model":"fixture-model", "choices":[{"message":{"role":"assistant", "content":"ok"}}],
                         "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})))
@@ -2125,7 +2142,18 @@ mod handler_tests {
             String::from_utf8_lossy(&child.stderr)
         );
         assert!(String::from_utf8_lossy(&child.stdout).contains("1 passed"));
-        assert_eq!(*seen.lock().unwrap(), [REQUEST_ID]);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_ne!(seen[0].prompt, seen[1].prompt);
+        assert_eq!(
+            [seen[0].prompt.as_str(), seen[1].prompt.as_str()],
+            ["prompt-one", "prompt-two"]
+        );
+        assert_ne!(seen[0].request_id, seen[1].request_id);
+        assert_ne!(seen[0].request_id, REQUEST_ID);
+        assert_ne!(seen[1].request_id, REQUEST_ID);
+        assert_eq!(seen[0].trace_id, REQUEST_ID);
+        assert_eq!(seen[1].trace_id, REQUEST_ID);
     }
 
     #[tokio::test]
