@@ -1,9 +1,10 @@
 //! KB-CT-02b (#1012): Knowledge v1 fixture lockstep. `protocol/knowledge/fixtures/v1`
 //! is registered here explicitly (`fixtures_roundtrip.rs` only reads
 //! `protocol/fixtures/events`). The manifest, and through it every fixture's
-//! version and sha256, is pinned (CONTRACT-READONLY-v1 r8). Every error envelope
-//! and partial failure decodes into strict types (unknown fields rejected,
-//! required fields present, `null` only where the contract allows it).
+//! version and sha256, is pinned (CONTRACT-READONLY-v1 r8). Every error envelope,
+//! hit, segment and partial failure decodes into strict types (unknown fields
+//! rejected, required fields present, `null` only where the contract allows it),
+//! and the fields a client branches on decode into their v1 values (R6.2).
 //! `packages/contract-tests/src/knowledge-v1.test.ts` validates the same files
 //! against the full `protocol/knowledge/v1` schemas.
 
@@ -263,6 +264,160 @@ enum FailReason {
     IndexFailed,
 }
 
+// ---- success bodies (contract §3, §4, §8) ----
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Completeness {
+    Complete,
+    Partial,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IndexState {
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ChunkType {
+    Text,
+}
+
+/// `operations.*.state` (R8.2).
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationState {
+    Ready,
+    NotReady,
+    Disabled,
+}
+
+/// Per-KB `search` / `read` state (R8.4): never `disabled`.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum KbState {
+    Ready,
+    NotReady,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Hit {
+    rank: usize,
+    knowledge_base_id: String,
+    knowledge_id: String,
+    chunk_id: String,
+    chunk_type: ChunkType,
+    revision: HitRevision,
+    locator: Locator,
+    index_state: IndexState,
+    score: f64,
+    score_space: String,
+    snippet: Snippet,
+    #[serde(default, deserialize_with = "present")]
+    display: Option<Display>,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HitRevision {
+    source_revision: String,
+    index_build_id: String,
+    #[serde(deserialize_with = "nullable")]
+    chunk_revision: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Locator {
+    valid: bool,
+    #[serde(default, deserialize_with = "present")]
+    start: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    end: Option<u64>,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snippet {
+    text: String,
+    truncated: bool,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Display {
+    #[serde(default, deserialize_with = "present")]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    file_name: Option<String>,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Segment {
+    chunk_id: String,
+    chunk_type: ChunkType,
+    chunk_revision: u64,
+    text: String,
+}
+
+/// Decode a success body. `scoped`: the request carried scope (R8.2).
+fn success(file: &str, op: &str, body: &Value, scoped: bool) {
+    match op {
+        "knowledge.search" => {
+            decode::<Completeness>(file, &body["completeness"]);
+            if let Some(failures) = body.get("partial_failures") {
+                decode::<Vec<PartialFailure>>(file, failures);
+            }
+            let hits: Vec<Hit> = decode(file, &body["hits"]);
+            // R3.6: authoritative order with rank 1..n, one score_space per response.
+            for (i, hit) in hits.iter().enumerate() {
+                assert_eq!(hit.rank, i + 1, "{file}: rank");
+                if hit.locator.valid {
+                    // R3.10: a valid locator carries a non-empty [start, end).
+                    let missing = || panic!("{file}: valid locator without start or end");
+                    let start = hit.locator.start.unwrap_or_else(missing);
+                    let end = hit.locator.end.unwrap_or_else(missing);
+                    assert!(end > start, "{file}: locator {start}..{end}");
+                }
+            }
+            let spaces: BTreeSet<&str> = hits.iter().map(|h| h.score_space.as_str()).collect();
+            assert!(spaces.len() <= 1, "{file}: score_space {spaces:?}");
+        }
+        "knowledge.read" => {
+            decode::<Vec<Segment>>(file, &body["segments"]);
+        }
+        "knowledge.ready" => {
+            let ops = &body["operations"];
+            for op in ["search", "read", "ingest"] {
+                decode::<OperationState>(file, &ops[op]["state"]);
+            }
+            // Per-KB entries exactly when the request carried scope.
+            let kbs = body.get("knowledge_bases");
+            assert_eq!(kbs.is_some(), scoped, "{file}: knowledge_bases");
+            for kb in kbs
+                .map(|v| decode::<Vec<Value>>(file, v))
+                .unwrap_or_default()
+            {
+                decode::<KbState>(file, &kb["search"]["state"]);
+                decode::<KbState>(file, &kb["read"]["state"]);
+            }
+        }
+        "system.capabilities" => {}
+        op => panic!("{file}: unknown op {op}"),
+    }
+}
+
 // ---- tests ----
 
 #[test]
@@ -323,6 +478,10 @@ fn every_knowledge_fixture_decodes_strictly() {
         let body = &fx.response.body;
         assert_eq!(fx.request.is_none(), e.request_valid.is_none(), "{file}");
         assert_eq!(fx.local.is_some(), !e.server_handler, "{file}");
+        let scoped = fx
+            .request
+            .as_ref()
+            .is_some_and(|r| r.get("scope").is_some());
         // Malformed requests still carry the ids the error must echo; a raw,
         // unparseable body (a string) has nothing to echo (R6.1).
         let echo = fx
@@ -345,6 +504,7 @@ fn every_knowledge_fixture_decodes_strictly() {
         let echoed = match e.class.as_str() {
             "accept" => {
                 assert_eq!(fx.response.status, 200, "{file}");
+                success(file, &fx.op, body, scoped);
                 body
             }
             "reject" => {
@@ -406,6 +566,7 @@ fn late_response_fixture_is_consistent() {
     let current_generation = local["current_generation"].as_u64().unwrap();
     let request: Echo = decode(file, &fx.request.unwrap());
     let late: Echo = decode(file, &fx.response.body);
+    success(file, &fx.op, &fx.response.body, true);
     let result = decode::<ErrorEnvelope>(file, &local["result"]).error;
 
     assert_eq!(late, request, "the response answers the in-flight request");
