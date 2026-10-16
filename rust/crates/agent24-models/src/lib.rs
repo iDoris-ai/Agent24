@@ -875,9 +875,16 @@ impl ModelProvider for OpenAiCompatProvider {
         let switched = SWITCHES.iter().any(|k| body.get(k).is_some());
         match self.send(&body, req.progress.as_ref(), cancel).await {
             Err(e @ ModelError::Rejected { status: 400, .. }) if switched => {
-                // A refusal whose error body a cancel cut short is a cancel.
+                // A refusal whose error body a cancel cut short is a cancel;
+                // one the call's deadline cut short stays the refusal it is,
+                // as there is no time left to ask again.
                 if cancel.is_cancelled() {
                     return Err(ModelError::Cancelled);
+                }
+                if let Some(p) = &req.progress
+                    && stream::left(p, std::time::Instant::now()).is_zero()
+                {
+                    return Err(e);
                 }
                 tracing::warn!("{e}; asking again without the thinking switch");
                 if let Some(fields) = body.as_object_mut() {
@@ -1644,6 +1651,44 @@ mod tests {
         assert!(matches!(got, Err(ModelError::Cancelled)), "{got:?}");
         assert_eq!(logs.retries(), 0, "a cancel is no refusal to retry");
         tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_cut_short_by_the_deadline_is_not_asked_again() {
+        // Its error body never ends; the call's deadline comes first. That is
+        // still the refusal, not a backend gone away.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":";
+                s.write_all(head.as_bytes()).await.unwrap();
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let progress = Some(Progress {
+            deadline: std::time::Instant::now() + Duration::from_millis(300),
+            first_chunk: Duration::from_millis(200),
+            stall: Duration::from_millis(200),
+        });
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(progress), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

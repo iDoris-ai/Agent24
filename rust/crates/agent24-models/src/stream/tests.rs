@@ -759,9 +759,10 @@ async fn a_streamed_request_carries_its_temperature() {
 #[tokio::test]
 async fn a_backend_that_hangs_up_while_a_large_prompt_is_written_is_unavailable() {
     // #1021 L1: the write meets the hang-up, as `BrokenPipe` or
-    // `ConnectionReset`, whichever comes first (it varies run to run). This
-    // pins the path through `hung_up`'s io branch, which no hyper predicate
-    // matches here; that both kinds count is pinned by `went_away`'s own test.
+    // `ConnectionReset`, whichever comes first: on macOS, 400 calls met 385
+    // resets and 15 broken pipes, all through `hung_up`'s io branch and none
+    // through a hyper predicate. That both kinds count is pinned by
+    // `went_away`'s own test.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move {
