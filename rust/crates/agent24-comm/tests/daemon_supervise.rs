@@ -4,6 +4,8 @@
 //! `daemon_joint.rs`, `#[ignore]`d.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::future::Future;
+use std::ops::Deref;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -152,6 +154,61 @@ const TEST_READY_AFTER: Duration = Duration::from_millis(150);
 /// TERM, so this only bounds how long a stop/shutdown call can take.
 const TEST_GRACE: Duration = Duration::from_millis(500);
 
+/// Keep the actor alive through fixture teardown, including assertion unwinding.
+/// Scheduling shutdown on the test runtime is insufficient: that runtime may
+/// cancel the actor before it can signal and reap its owned process group.
+struct FixtureSupervisor {
+    supervisor: HyphaeDaemonSupervisor,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+impl FixtureSupervisor {
+    fn spawn(ctx: DaemonCtx) -> Self {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let supervisor = {
+            let _entered = runtime.enter();
+            HyphaeDaemonSupervisor::spawn(ctx)
+        };
+        Self {
+            supervisor,
+            runtime: Some(runtime),
+        }
+    }
+}
+
+impl Deref for FixtureSupervisor {
+    type Target = HyphaeDaemonSupervisor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.supervisor
+    }
+}
+
+impl Drop for FixtureSupervisor {
+    fn drop(&mut self) {
+        let runtime = self.runtime.take().unwrap();
+        let supervisor = self.supervisor.clone();
+        // Runtime shutdown/block_on must run outside the caller's Tokio runtime.
+        let cleanup = std::thread::spawn(move || {
+            runtime.block_on(supervisor.shutdown(tokio::time::Instant::now() + TEST_GRACE * 4));
+        })
+        .join();
+        if cleanup.is_err() {
+            if std::thread::panicking() {
+                eprintln!("fixture supervisor cleanup panicked during test unwinding");
+            } else {
+                panic!("fixture supervisor cleanup panicked");
+            }
+        }
+    }
+}
+
 async fn install(dir: &Path, script: &str) -> VerifiedBinary {
     let source = dir.join("hyphae-fake.sh");
     tokio::fs::write(&source, script).await.unwrap();
@@ -275,7 +332,7 @@ async fn exit_code_3_is_locked_and_never_retried() {
     tokio::fs::write(ctx.home.join(".hyphae").join("exit_code"), b"3")
         .await
         .unwrap();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "locked", Duration::from_secs(2)).await);
@@ -298,7 +355,7 @@ async fn exit_code_1_is_gave_up_and_never_retried() {
     tokio::fs::write(ctx.home.join(".hyphae").join("exit_code"), b"1")
         .await
         .unwrap();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "gave_up", Duration::from_secs(2)).await);
@@ -342,7 +399,7 @@ esac
         ready_after: TEST_READY_AFTER,
     };
     let pid_path = dir.join("hyphae-daemon.pid");
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
     let err = sup.start().await.unwrap_err();
     assert!(matches!(err, DaemonStartError::NotConfigured(_)), "{err:?}");
     assert_eq!(sup.status().state, "not_configured");
@@ -361,7 +418,7 @@ async fn config_change_bumps_generation_without_touching_failures() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx(tmp.path()).await;
     let pid_path = ctx.pid_path.clone();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
@@ -407,7 +464,7 @@ async fn kill_minus_9_backs_off_then_trips_the_breaker_at_five() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx(tmp.path()).await;
     let pid_path = ctx.pid_path.clone();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
@@ -472,7 +529,7 @@ async fn shutdown_stops_the_whole_group_and_clears_the_pid_file() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx(tmp.path()).await;
     let pid_path = ctx.pid_path.clone();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
@@ -599,7 +656,7 @@ async fn stop_kills_a_helper_the_leader_left_behind_in_its_group() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_HELPER_STAYS).await;
     let marker = ctx.home.join(".hyphae").join("helper-alive");
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(
@@ -622,7 +679,7 @@ async fn shutdown_kills_a_helper_the_leader_left_behind_in_its_group() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_HELPER_STAYS).await;
     let marker = ctx.home.join(".hyphae").join("helper-alive");
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(
@@ -652,7 +709,7 @@ async fn a_natural_leader_exit_still_cleans_up_a_descendant_it_left_running() {
     let ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_HELPER_THEN_EXIT).await;
     let pid_path = ctx.pid_path.clone();
     let marker = ctx.home.join(".hyphae").join("helper-alive");
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(
@@ -692,7 +749,7 @@ async fn an_exit_before_ready_after_is_classified_but_never_reported_as_running(
     // Comfortably longer than the fixture's 0.3s sleep: the exit must land
     // well inside `starting`.
     ctx.ready_after = Duration::from_millis(1500);
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert_eq!(
@@ -728,7 +785,7 @@ async fn an_exit_before_ready_after_is_classified_but_never_reported_as_running(
 async fn surviving_ready_after_promotes_starting_to_running() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx(tmp.path()).await;
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert_eq!(sup.status().state, "starting");
@@ -744,7 +801,7 @@ async fn manual_start_resets_the_breaker_after_it_trips() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx(tmp.path()).await;
     let pid_path = ctx.pid_path.clone();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
@@ -811,7 +868,7 @@ async fn manual_start_persists_autostart_true_and_stop_persists_false() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = make_ctx(tmp.path()).await;
     let autostart_path = ctx.autostart_path.clone();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     assert!(
         !agent24_comm::read_autostart(&autostart_path).await,
@@ -852,7 +909,7 @@ async fn manual_start_that_fails_before_running_does_not_persist_autostart() {
         .await
         .unwrap();
     let autostart_path = ctx.autostart_path.clone();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "locked", Duration::from_secs(2)).await);
@@ -885,7 +942,7 @@ async fn leader_exiting_promptly_on_term_is_exited_in_grace_not_killed_after_gra
     let grace = Duration::from_secs(2);
     let mut ctx = make_ctx(tmp.path()).await;
     ctx.grace = grace;
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
@@ -940,7 +997,7 @@ async fn shutdown_preempts_an_in_flight_config_restart_and_forbids_a_new_spawn()
     let mut ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_IGNORES_TERM).await;
     ctx.grace = grace;
     let pid_path = ctx.pid_path.clone();
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
 
     sup.start().await.unwrap();
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
@@ -986,6 +1043,15 @@ async fn shutdown_preempts_an_in_flight_config_restart_and_forbids_a_new_spawn()
 // ---------------------------------------------------------------------
 // PR #642 review round 3 (Codex challenge, B 端 gpt-6-astra)
 // ---------------------------------------------------------------------
+
+// A failed entered assertion must also unblock the actor before fixture teardown.
+struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
 
 /// Wraps a [`MemoryPasswordStore`] but `get` blocks on `release` until the
 /// test signals it — the one controllable point inside `try_start`'s own
@@ -1048,7 +1114,8 @@ async fn shutdown_during_a_blocked_start_leaves_no_process_and_never_reports_run
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
     });
-    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+    let sup = FixtureSupervisor::spawn(ctx);
+    let _release_on_drop = ReleaseOnDrop(Arc::clone(&release));
 
     let sup_for_start = sup.clone();
     let start = tokio::spawn(async move { sup_for_start.start().await });
@@ -1061,16 +1128,15 @@ async fn shutdown_during_a_blocked_start_leaves_no_process_and_never_reports_run
     // Shutdown lands WHILE the start is still blocked — exactly the window
     // the three call sites' own pre-checks (all evaluated before
     // `spawn_and_record` was ever invoked) could not see.
-    let sup_for_shutdown = sup.clone();
-    let shutdown = tokio::spawn(async move {
-        sup_for_shutdown
-            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
-            .await
-    });
-    // `shutdown()` records its deadline synchronously before its first
-    // `.await`, but the task still has to actually get scheduled — give it
-    // a comfortable moment before releasing the block.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut shutdown =
+        std::pin::pin!(sup.shutdown(tokio::time::Instant::now() + Duration::from_secs(5)));
+    // Poll through deadline publication before releasing the blocked start.
+    // The actor cannot acknowledge shutdown while password_store.get is pending.
+    std::future::poll_fn(|cx| {
+        assert!(shutdown.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
     release.notify_one();
 
     let start_result = start.await.unwrap();
@@ -1078,7 +1144,7 @@ async fn shutdown_during_a_blocked_start_leaves_no_process_and_never_reports_run
         start_result.is_err(),
         "a start that raced a shutdown to completion must not report success"
     );
-    let _ = shutdown.await.unwrap();
+    let _ = shutdown.await;
 
     // Give any cleanup the discarded spawn kicked off a moment to finish.
     assert!(
@@ -1089,4 +1155,45 @@ async fn shutdown_during_a_blocked_start_leaves_no_process_and_never_reports_run
         !pid_path.exists(),
         "a spawn that lost the race with shutdown must never be recorded in the pid file"
     );
+}
+
+#[tokio::test]
+async fn fixture_guard_reaps_the_leader_and_helper_after_a_test_panics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_HELPER_STAYS).await;
+    let pid_path = ctx.pid_path.clone();
+    let marker = ctx.home.join(".hyphae/helper-alive");
+    let fixture = FixtureSupervisor::spawn(ctx);
+    fixture.start().await.unwrap();
+    assert!(wait_until(|| marker.exists(), Duration::from_secs(2)).await);
+    let pid = read_pid(&pid_path).await;
+
+    // Retain a cleanup path even in the negative control with guard shutdown
+    // removed: a deliberately red test must not itself leak its process group.
+    let runtime = Arc::clone(fixture.runtime.as_ref().unwrap());
+    let cleanup = fixture.supervisor.clone();
+    let failure = tokio::spawn(async move {
+        let _fixture = fixture;
+        panic!("simulated fixture assertion failure");
+    })
+    .await
+    .expect_err("the fixture body must panic");
+    assert!(failure.is_panic());
+    let leader_gone = !is_alive(pid);
+    let helper_stopped = marker_stopped_advancing(&marker).await;
+    let pid_removed = !pid_path.exists();
+
+    cleanup
+        .shutdown(tokio::time::Instant::now() + TEST_GRACE * 4)
+        .await;
+    std::thread::spawn(move || drop(runtime)).join().unwrap();
+    assert!(
+        leader_gone,
+        "fixture teardown leaked its leader after a panic"
+    );
+    assert!(
+        helper_stopped,
+        "fixture teardown leaked its TERM-ignoring helper"
+    );
+    assert!(pid_removed, "fixture teardown left its pid file behind");
 }

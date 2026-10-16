@@ -117,7 +117,11 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 18] = [
+pub const PASSTHROUGH_VARS: [&str; 19] = [
+    // Keep exclusive gateway selection after service installation. The data key
+    // is never written to a plist; v0.3.1 supports manual startup until separate
+    // credential delivery is implemented. Missing key fails closed.
+    "IDORIS_URL",
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -370,6 +374,12 @@ mod tests {
         assert!(!p.contains("exec&<fs"));
     }
 
+    #[test]
+    fn service_snapshot_never_persists_idoris_data_key() {
+        assert!(!PASSTHROUGH_VARS.contains(&"IDORIS_API_KEY"));
+        assert!(capture_env().iter().all(|(key, _)| key != "IDORIS_API_KEY"));
+    }
+
     /// Every environment variable the daemon side READS must be in
     /// `PASSTHROUGH_VARS`, because launchd hands a LaunchAgent none of the login
     /// shell's environment.
@@ -460,6 +470,8 @@ mod tests {
                     // Two names are handled elsewhere and must not be demanded
                     // of `PASSTHROUGH_VARS`:
                     //
+                    // - IDORIS_API_KEY: never persist the data key in a plist.
+                    //   Configured gateway startup without its key fails closed.
                     // - HOME: launchd sets it itself.
                     // - PATH: captured separately in `snapshot_env` because it
                     //   needs the LOGIN shell's value rather than whatever the
@@ -473,7 +485,7 @@ mod tests {
                             && name
                                 .chars()
                                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-                        if shouty && !matches!(name.as_str(), "HOME" | "PATH") {
+                        if shouty && !matches!(name.as_str(), "HOME" | "PATH" | "IDORIS_API_KEY") {
                             found.push(name);
                         }
                     }
