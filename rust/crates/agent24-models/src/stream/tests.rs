@@ -516,29 +516,36 @@ async fn a_backend_that_hangs_up_before_it_answers_is_unavailable() {
 }
 
 #[tokio::test]
-async fn a_whole_answer_that_breaks_off_is_unavailable_and_one_that_is_not_json_is_not() {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
-    tokio::spawn(async move {
-        let (mut s, _) = l.accept().await.unwrap();
-        let _ = request(&mut s).await;
-        let head =
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n";
-        s.write_all(head.as_bytes()).await.unwrap();
-        s.write_all(br#"{"choices":"#).await.unwrap();
-    });
-    let m = unavailable(
-        provider(url)
-            .complete(&req(None), &CancellationToken::new())
-            .await,
-    )
-    .await;
-    assert!(m.contains("broke off"), "{m}");
-    // Control: an answer that ends whole but is no JSON is the backend's fault.
+async fn a_whole_answer_that_breaks_off_is_unavailable_and_a_malformed_one_is_not() {
+    /// A backend that answers 200 with `head` and `body`, then closes.
+    async fn answers(head: &'static str, body: &'static str) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let _ = request(&mut s).await;
+            let all =
+                format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{head}\r\n{body}");
+            s.write_all(all.as_bytes()).await.unwrap();
+        });
+        url
+    }
+    let c = CancellationToken::new();
+    for (head, body) in [
+        ("content-length: 100\r\n", r#"{"choices":"#),
+        ("transfer-encoding: chunked\r\n", "b\r\n{\"choices\":\r\n"),
+    ] {
+        let url = answers(head, body).await;
+        let m = unavailable(provider(url).complete(&req(None), &c).await).await;
+        assert!(m.contains("broke off"), "{head}: {m}");
+    }
+    // Controls: the backend's fault, not it going away. A chunk size that is
+    // no number, and an answer that ends whole but is no JSON.
+    let url = answers("transfer-encoding: chunked\r\n", "ZZ\r\n{}\r\n0\r\n\r\n").await;
+    let got = provider(url).complete(&req(None), &c).await;
+    assert!(matches!(got, Err(ModelError::Provider(_))), "{got:?}");
     let (url, _) = backend("application/json", vec![(0, "not json".to_owned())]).await;
-    let got = provider(url)
-        .complete(&req(None), &CancellationToken::new())
-        .await;
+    let got = provider(url).complete(&req(None), &c).await;
     assert!(matches!(got, Err(ModelError::Provider(_))), "{got:?}");
 }
 

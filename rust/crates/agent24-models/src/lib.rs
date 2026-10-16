@@ -651,12 +651,18 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
 ) -> Result<T, ModelError> {
     let mut body = Vec::new();
     // A body that breaks off is the backend going away, as in a stream
-    // (`stream.rs`). reqwest reports it as `is_decode`, not `is_body`.
-    let broke_off =
-        |e: reqwest::Error| ModelError::Unavailable(format!("{name}: the answer broke off: {e}"));
+    // (`stream.rs`); one framed wrongly is not. reqwest reports both as
+    // `is_decode`, so `classify` alone cannot tell them apart.
+    let read_error = |e: reqwest::Error| {
+        if hung_up(&e) {
+            ModelError::Unavailable(format!("{name}: the answer broke off: {e}"))
+        } else {
+            classify(&e)
+        }
+    };
     loop {
         let chunk = tokio::select! {
-            c = response.chunk() => c.map_err(broke_off)?,
+            c = response.chunk() => c.map_err(read_error)?,
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
         };
         let Some(chunk) = chunk else { break };
