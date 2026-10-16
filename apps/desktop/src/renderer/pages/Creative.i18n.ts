@@ -1,0 +1,40 @@
+import { defineMessages } from '../i18n'
+
+export const creativeMessages = defineMessages({
+  en: {
+    'download.progress': 'Downloading iDoris Design component…',
+    'download.size': '{received} / {total} MB ({percent}%)',
+    'download.verifying': 'Verifying…',
+    'download.failed': 'iDoris Design component download failed: {error}',
+    'download.unknownError': 'Unknown error',
+    'download.prompt': 'Design needs an additional iDoris Design component (about {size} MB). You can use it after downloading.',
+    'action.retry': 'Retry', 'action.download': 'Download',
+    'error.start': 'Could not start iDoris Design',
+    'error.unavailable': 'iDoris Design is unavailable: {error}',
+    'action.starting': 'Starting iDoris Design…',
+  },
+  zh: {
+    'download.progress': '正在下载 iDoris Design 组件…',
+    'download.size': '{received} / {total} MB（{percent}%）',
+    'download.verifying': '正在校验…',
+    'download.failed': 'iDoris Design 组件下载失败：{error}',
+    'download.unknownError': '未知错误',
+    'download.prompt': 'Design 需要额外下载 iDoris Design 组件（约 {size} MB），下载完成后即可使用。',
+    'action.retry': '重试', 'action.download': '下载',
+    'error.start': 'iDoris Design 启动失败',
+    'error.unavailable': 'iDoris Design 暂不可用：{error}',
+    'action.starting': '正在启动 iDoris Design…',
+  },
+  th: {
+    'download.progress': 'กำลังดาวน์โหลดคอมโพเนนต์ iDoris Design…',
+    'download.size': '{received} / {total} MB ({percent}%)',
+    'download.verifying': 'กำลังตรวจสอบ…',
+    'download.failed': 'ดาวน์โหลดคอมโพเนนต์ iDoris Design ไม่สำเร็จ: {error}',
+    'download.unknownError': 'ข้อผิดพลาดที่ไม่ทราบสาเหตุ',
+    'download.prompt': 'Design ต้องดาวน์โหลดคอมโพเนนต์ iDoris Design เพิ่มเติม (ประมาณ {size} MB) จึงจะใช้งานได้',
+    'action.retry': 'ลองอีกครั้ง', 'action.download': 'ดาวน์โหลด',
+    'error.start': 'เริ่ม iDoris Design ไม่สำเร็จ',
+    'error.unavailable': 'iDoris Design ใช้งานไม่ได้: {error}',
+    'action.starting': 'กำลังเริ่ม iDoris Design…',
+  },
+})

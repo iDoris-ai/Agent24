@@ -3,8 +3,10 @@
 
 import http from 'node:http'
 import { execFile, type ChildProcess } from 'node:child_process'
-import { app, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { getBackendEndpoint } from '../backend-manager'
+import { documentsCall, httpSender } from '../documents'
+import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
   BackendEndpointResult,
@@ -13,6 +15,7 @@ import type {
   DiscoverFilter,
   DiscoveredModule,
   LlmStatusResult,
+  IdorisStatusResult,
   ModuleInfo,
   ModuleInstallResult,
   ModuleUninstallResult,
@@ -130,7 +133,7 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
   )
 }
 
-export function registerIpcHandlers(): void {
+export function registerIpcHandlers(options: { idorisStatus?: () => Promise<IdorisStatusResult> } = {}): void {
   // oMLX: auto-detect running server
   ipcMain.handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | null> => {
     for (const candidate of OMLX_PROBE_CANDIDATES) {
@@ -268,6 +271,10 @@ export function registerIpcHandlers(): void {
     return { provider: 'none', url: '', model: '' }
   })
 
+  ipcMain.handle(IpcChannels.IdorisStatus, (): Promise<IdorisStatusResult> =>
+    options.idorisStatus?.() ?? Promise.resolve({ state: 'unavailable', reason: 'handoff-missing' }),
+  )
+
   ipcMain.handle(IpcChannels.AppPing, () => 'pong')
   ipcMain.handle(IpcChannels.AppVersion, () => app.getVersion())
   ipcMain.handle(IpcChannels.ShellOpenExternal, (_event, url: unknown) => {
@@ -283,6 +290,28 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.BackendEndpoint, (): BackendEndpointResult | null => {
     const endpoint = getBackendEndpoint()
     return endpoint ? { port: endpoint.port } : null
+  })
+  const sendToDocuments = httpSender(getBackendEndpoint, BACKEND_HOST)
+  ipcMain.handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
+    documentsCall(req, sendToDocuments),
+  )
+  ipcMain.handle(IpcChannels.DocumentsImportFile, async (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.OpenDialogOptions = {
+      properties: ['openFile'],
+      filters: [{ name: 'PDF, JPEG, PNG', extensions: ['pdf', 'jpg', 'jpeg', 'png'] }],
+    }
+    let picked: Electron.OpenDialogReturnValue
+    try {
+      picked = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options)
+    } catch {
+      return { ok: false, status: 500, error: { code: 'dialog_failed', message: 'the file dialog could not open' } }
+    }
+    const path = picked.filePaths[0]
+    if (picked.canceled || !path) return null
+    return importFile(path, sendToDocuments, (p) => {
+      if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.DocumentsImportProgress, p)
+    })
   })
   ipcMain.handle(IpcChannels.BackendProxy, (_event, req: unknown) => {
     if (!isBackendProxyRequest(req)) {

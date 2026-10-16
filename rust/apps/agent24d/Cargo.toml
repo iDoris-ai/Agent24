@@ -14,6 +14,7 @@ agent24-core = { path = "../../crates/agent24-core" }
 # D0-3: `GET /api/v1/decide/profile` only — hardware probe + tier policy,
 # not the decision cascade itself (that is D1, still unwired).
 agent24-decide = { path = "../../crates/agent24-decide" }
+agent24-hw = { path = "../../crates/agent24-hw" }
 agent24-domain = { path = "../../crates/agent24-domain" }
 agent24-os-packages = { path = "../../crates/agent24-os-packages" }
 agent24-mcp = { path = "../../crates/agent24-mcp" }

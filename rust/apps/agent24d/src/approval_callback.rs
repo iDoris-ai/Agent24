@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use agent24_domain::{Capability, Grants};
-use agent24_os_proto::drain::{ApprovalCallbackRefused, Generation};
+use agent24_os_proto::drain::{
+    ApprovalCallbackRefused, CallbackRefused, Generation, LifecycleTimeout, bind_to_lifecycle,
+};
 use agent24_os_proto::rpc::{CallFuture, ErrorKind, Handler, RpcError};
 use agent24_protocol::{ApprovalAnswer, ApprovalRequestError, ModuleApprovalKind};
 use serde::Deserialize;
@@ -83,6 +85,19 @@ fn refused_error(refused: ApprovalCallbackRefused) -> RpcError {
         ApprovalCallbackRefused::TokenInvalid => RpcError::application(
             ErrorKind::TokenInvalid,
             "request_id/approval_token did not admit this submission",
+        ),
+    }
+}
+
+fn lifecycle_timeout_error(err: LifecycleTimeout) -> RpcError {
+    match err {
+        LifecycleTimeout::BudgetExhausted => RpcError::application(
+            ErrorKind::Timeout,
+            "this callback's request-bound time budget was exhausted",
+        ),
+        LifecycleTimeout::RequestEnded => RpcError::application(
+            ErrorKind::Timeout,
+            "the request this callback was bound to has already ended",
         ),
     }
 }
@@ -194,31 +209,66 @@ impl Handler for ApprovalSubmitHandler {
                 Err(err) => return Err(request_error(err)),
             }
 
-            // Step 4: token admission — ONLY reached when no existing row
-            // was found, and only once per (module, request_id, kind).
-            if let Err(refused) =
-                generation.admit_approval_callback(&parsed.request_id, &parsed.approval_token)
-            {
-                return Err(refused_error(refused));
+            // Step 4: bind token admission and the write to the owning
+            // request. `request_id` is mandatory for approval submissions;
+            // while Running, an unknown/finished id otherwise yields None
+            // and must not degrade into unbound work.
+            let lifecycle = match generation.admit_callback_bound(Some(&parsed.request_id)) {
+                Ok(Some(lifecycle)) => lifecycle,
+                Ok(None) => {
+                    return Err(refused_error(ApprovalCallbackRefused::TokenInvalid));
+                }
+                Err(CallbackRefused::NotReady) => {
+                    return Err(refused_error(ApprovalCallbackRefused::NotReady));
+                }
+                Err(CallbackRefused::Revoked) => {
+                    return Err(refused_error(ApprovalCallbackRefused::Revoked));
+                }
+                Err(CallbackRefused::DrainingUnknownRequest)
+                | Err(CallbackRefused::DrainingWithoutRequest) => {
+                    return Err(refused_error(ApprovalCallbackRefused::TokenInvalid));
+                }
+            };
+
+            // Step 5: token admission and insert are one lifecycle-bound
+            // operation. If the owner ends while the write is pending, the
+            // store future is cancelled. If storage committed just before
+            // cancellation, the timeout fallback below re-announces the
+            // durable row before reporting success.
+            let request_id = parsed.request_id;
+            let approval_token = parsed.approval_token;
+            let action = parsed.action;
+            let target = parsed.target;
+            let payload = parsed.payload;
+            let lookup_module = module.clone();
+            let lookup_request_id = request_id.clone();
+            let insert_broker = broker.clone();
+            let submit = async move {
+                if let Err(refused) =
+                    generation.admit_approval_callback(&request_id, &approval_token)
+                {
+                    return Err(refused_error(refused));
+                }
+                let answer = insert_broker
+                    .insert(&module, &request_id, kind, action, target, payload)
+                    .await
+                    .map_err(request_error)?;
+                Ok(answer_json(&answer))
+            };
+            match bind_to_lifecycle(Some(lifecycle), submit).await {
+                Ok(result) => result,
+                Err(timeout) => match broker
+                    .announce_existing_required(&lookup_module, &lookup_request_id, kind)
+                    .await
+                {
+                    // The write may have committed as the lifecycle expired.
+                    // Ensure its REQUEST event is delivered before reporting
+                    // that durable result as success.
+                    Ok(Some(existing)) => Ok(answer_json(&existing)),
+                    Ok(None) => Err(lifecycle_timeout_error(timeout)),
+                    Err(err) => Err(request_error(err)),
+                },
             }
-
-            // Step 5: insert + push `module-approval.required`.
-            let answer = broker
-                .insert(
-                    &module,
-                    &parsed.request_id,
-                    kind,
-                    parsed.action,
-                    parsed.target,
-                    parsed.payload,
-                )
-                .await
-                .map_err(request_error)?;
-
-            // Step 6: return. T7c/ME-3e: `gate` CAN reach this line now, for
-            // `schedule_callback` — step 2 only returns early for an action
-            // outside the closed set or a bad `target`.
-            Ok(answer_json(&answer))
         })
     }
 }
@@ -471,6 +521,142 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(1),
             "submit took {:?}, which looks like it waited for something",
             start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_budget_expiring_while_insert_is_blocked_rejects_without_a_row() {
+        let broker = test_broker().await;
+        let (insert_started, resume_insert) = broker.gate_next_insert().await;
+
+        let g = running_generation();
+        let in_flight = g
+            .admit_request(
+                "req-1".to_owned(),
+                {
+                    use sha2::Digest;
+                    sha2::Sha256::digest(b"secret-1").into()
+                },
+                std::time::Instant::now(),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap();
+        let h = submit_handler(g, true, ModuleApprovalKind::Advise, broker.clone());
+        let task = tokio::spawn(async move { h.call(good_params()).await });
+
+        // This test-only storage gate confirms insert has started but keeps
+        // it before any database write. The owning request's 300ms budget
+        // expires while that write is outstanding.
+        tokio::time::timeout(std::time::Duration::from_secs(1), insert_started)
+            .await
+            .expect("approval insert must reach the delayed storage stub")
+            .unwrap();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("request timeout must cancel the blocked approval write")
+            .unwrap()
+            .unwrap_err();
+        drop(in_flight);
+        assert_eq!(err.kind, Some(ErrorKind::Timeout));
+        assert!(
+            broker.list(None).await.unwrap().is_empty(),
+            "a callback whose request ended must not persist an approval"
+        );
+        assert!(
+            resume_insert.send(()).is_err(),
+            "the timed-out insert future must be dropped before storage resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_expiry_after_commit_still_broadcasts_required_event() {
+        let events = crate::events::EventsHub::default();
+        let mut received_events = events.subscribe();
+        let broker =
+            ModuleApprovalBroker::new(agent24_store::Store::open_memory().await.unwrap(), events);
+        let (write_committed, resume_broadcast) = broker.gate_next_broadcast().await;
+        let (g, in_flight) = generation_with_good_params_admitted();
+        let h = submit_handler(g, true, ModuleApprovalKind::Advise, broker.clone());
+        let submission = tokio::spawn(async move { h.call(good_params()).await });
+
+        // Pause after SQLite committed the row but before insert() broadcasts.
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_committed)
+            .await
+            .expect("the approval row must be committed before the broadcast gate")
+            .unwrap();
+        drop(in_flight);
+
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(1), submission)
+            .await
+            .expect("lifecycle expiry should let the callback return via its durable-row fallback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer["decision"], "pending");
+        assert_eq!(broker.list(None).await.unwrap().len(), 1);
+        assert!(
+            resume_broadcast.send(()).is_err(),
+            "lifecycle expiry must cancel the paused insert before fallback announces the row"
+        );
+
+        let (_, event) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), received_events.recv())
+                .await
+                .expect("a successful persisted approval must emit its required event")
+                .unwrap();
+        assert!(matches!(
+            event,
+            agent24_protocol::EventBody::ModuleApprovalRequired(_)
+        ));
+        broker
+            .announce_existing_required("probe", "req-1", ModuleApprovalKind::Advise)
+            .await
+            .unwrap();
+        assert!(
+            received_events.try_recv().is_err(),
+            "re-announcing the same approval must be deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_submissions_cannot_consume_one_request_token_twice() {
+        let broker = test_broker().await;
+        let (insert_started, resume_insert) = broker.gate_next_insert().await;
+        let (g, _in_flight) = generation_with_good_params_admitted();
+        let first = submit_handler(g.clone(), true, ModuleApprovalKind::Advise, broker.clone());
+        let first = tokio::spawn(async move { first.call(good_params()).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), insert_started)
+            .await
+            .expect("the first submission must reach the insert gate")
+            .unwrap();
+
+        let second = submit_handler(g, true, ModuleApprovalKind::Advise, broker.clone());
+        let second_err = second.call(good_params()).await.unwrap_err();
+        assert_eq!(second_err.kind, Some(ErrorKind::TokenInvalid));
+        assert!(broker.list(None).await.unwrap().is_empty());
+
+        resume_insert.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .expect("the first submission should finish after storage resumes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(broker.list(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_callback_arriving_after_its_request_ended_is_refused_without_a_row() {
+        let broker = test_broker().await;
+        let g = running_generation();
+        let in_flight = admit(&g, "req-1", "secret-1");
+        drop(in_flight);
+
+        let h = submit_handler(g, true, ModuleApprovalKind::Advise, broker.clone());
+        let err = h.call(good_params()).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::TokenInvalid));
+        assert!(
+            broker.list(None).await.unwrap().is_empty(),
+            "a late callback must not create an approval after request end"
         );
     }
 

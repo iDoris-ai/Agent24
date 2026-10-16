@@ -1,0 +1,40 @@
+import { defineMessages } from '../../i18n'
+
+export const documentsMessages = defineMessages({
+  en: {
+    'title': 'Documents', 'subtitle': 'Local single-user storage: documents stay on this computer.',
+    'storage.unavailable': 'Document storage is temporarily unavailable',
+    'import.button': 'Import file (PDF, JPEG, PNG)', 'import.uploading': 'Uploading {percent}%',
+    'status.queued': 'Queued', 'status.running': 'Importing', 'status.cancelling': 'Cancelling',
+    'status.succeeded': 'Imported', 'status.failed': 'Import failed', 'status.cancelled': 'Cancelled',
+    'status.interrupted': 'Interrupted', 'status.error': '{status}: {error}',
+    'list.empty': 'No documents yet.', 'list.title': 'Title', 'list.format': 'Format',
+    'list.importedAt': 'Imported', 'list.loadMore': 'Load more',
+    'error.details': '{message} ({code}{cause})', 'error.cause': ': {cause}',
+    'error.readStatus': 'Could not read import status: {error}',
+  },
+  zh: {
+    'title': '文档', 'subtitle': '本地单用户：文档只保存在这台电脑上。',
+    'storage.unavailable': '文档存储暂不可用',
+    'import.button': '导入文件（PDF、JPEG、PNG）', 'import.uploading': '上传 {percent}%',
+    'status.queued': '排队中', 'status.running': '导入中', 'status.cancelling': '取消中',
+    'status.succeeded': '已导入', 'status.failed': '导入失败', 'status.cancelled': '已取消',
+    'status.interrupted': '已中断', 'status.error': '{status}：{error}',
+    'list.empty': '还没有文档。', 'list.title': '标题', 'list.format': '格式',
+    'list.importedAt': '导入时间', 'list.loadMore': '加载更多',
+    'error.details': '{message}（{code}{cause}）', 'error.cause': '：{cause}',
+    'error.readStatus': '无法读取导入状态：{error}',
+  },
+  th: {
+    'title': 'เอกสาร', 'subtitle': 'จัดเก็บสำหรับผู้ใช้คนเดียว: เอกสารอยู่บนคอมพิวเตอร์เครื่องนี้เท่านั้น',
+    'storage.unavailable': 'ที่เก็บเอกสารไม่พร้อมใช้งานชั่วคราว',
+    'import.button': 'นำเข้าไฟล์ (PDF, JPEG, PNG)', 'import.uploading': 'กำลังอัปโหลด {percent}%',
+    'status.queued': 'รอคิว', 'status.running': 'กำลังนำเข้า', 'status.cancelling': 'กำลังยกเลิก',
+    'status.succeeded': 'นำเข้าแล้ว', 'status.failed': 'นำเข้าไม่สำเร็จ', 'status.cancelled': 'ยกเลิกแล้ว',
+    'status.interrupted': 'ถูกขัดจังหวะ', 'status.error': '{status}: {error}',
+    'list.empty': 'ยังไม่มีเอกสาร', 'list.title': 'ชื่อ', 'list.format': 'รูปแบบ',
+    'list.importedAt': 'นำเข้าเมื่อ', 'list.loadMore': 'โหลดเพิ่ม',
+    'error.details': '{message} ({code}{cause})', 'error.cause': ': {cause}',
+    'error.readStatus': 'อ่านสถานะการนำเข้าไม่ได้: {error}',
+  },
+})
