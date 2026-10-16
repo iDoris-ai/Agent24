@@ -6,7 +6,7 @@
 
 | 文档 | 中文版 | 英文版 |
 |---|---|---|
-| T007 调研报告 | `research/T007-office-assistant-report.zh-CN.md`（本 worktree 中为未跟踪文件，来源未在此核实） | `research/T007-office-assistant-report.md`：英文原报告，**英文术语基准** |
+| T007 调研报告 | `research/T007-office-assistant-report.zh-CN.md`（**来源：`jhfnetboy/researcher` 的 `topics/T007-office-assistant/report.zh-CN.md`**，与本目录英文版同源；由协调者取回后随本 PR 入库） | `research/T007-office-assistant-report.md`：英文原报告，**英文术语基准** |
 | 主计划 | `PLAN-OFFICE-ASSISTANT.md`：原文，由 Opus 5.5 起草（#1036） | `PLAN-OFFICE-ASSISTANT.en.md`：由 Opus 5.5 机器起草的译文，待母语者审校 |
 | 技术方案 | `OFFICE-ASSISTANT-TECH-DESIGN.md`：原文，由 Opus 5.5 起草（#1036） | `OFFICE-ASSISTANT-TECH-DESIGN.en.md`：机器起草译文，待审校 |
 | 设计讨论 | `OFFICE-ASSISTANT-DESIGN-DISCUSSION.md`：前四节由协调者起草，第五节由 Opus 5.5 撰写 | `OFFICE-ASSISTANT-DESIGN-DISCUSSION.en.md`：机器起草译文，待审校 |

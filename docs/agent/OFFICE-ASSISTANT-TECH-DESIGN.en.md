@@ -82,7 +82,7 @@
 | Connector layer | Protocol details with external services, how idempotency keys are applied, reconciliation queries | Authorization (credentials establish technical identity only and do not replace business authorization; report §5 "Four capabilities", first paragraph); self-reported risk does not lower the host risk level (ADR-K1-03 decision 1, risk row) |
 | UI projection layer | Presentation, editing input, initiating requests | Authoritative state; must not maintain its own set of approval results (report §4, last sentence of the paragraph after the table); after disconnection must not infer success from local animation (report §3 Status row) |
 
-**Where it lives** (pending ADR): the business orchestration layer can be (a) a thin crate compiled into the kernel, or (b) a supervised out-of-process module connected to the kernel through os-proto callbacks (report §4 table, row 2). This document leans toward starting with (a) — OA-M1 does not need independent releases, and (b) would introduce a prerequisite on the manifest/consent grant path (see §4.6). Either way, no side channel that bypasses model/tool controls may be opened.
+**Where it lives (decided — see [`PLAN-OFFICE-ASSISTANT.en.md`](PLAN-OFFICE-ASSISTANT.en.md) §0.4 D-A)**: option **(b), a supervised first-party out-of-process domain-OS module `office`** connected to the kernel through os-proto callbacks (report §4 table, row 2). The two reasons this document previously gave for leaning toward (a) do not hold up: M1 does not advertise tools to the agent loop, so no consent prerequisite is involved; and (a) would drag domain nouns plus irreversible kernel migrations into the kernel. Either way, no side channel that bypasses model/tool controls may be opened.
 
 **Naming**: backend IDs are kept distinct and explicitly related: `workflow_id`, `run_id`, `workspace_id`, `artifact_id` (report §1 "Distinct meanings of Workspace" paragraph 2); the UI uses "task", and file-location settings use "file workspace".
 
@@ -122,8 +122,8 @@ run：每个 step 关联一个或多个内核 run（新 attempt = 新 run，不�
 
 ### 3.3 Storage and migration
 
-- Use SQLite (same database as the kernel or a separate database, pending ADR); new tables/projections need an ADR to decide the schema, migrations, restart recovery, and boundary with the main store (report §4, paragraph after the table).
-- Note: kernel migrations run forward automatically at `Store::open` and **cannot be rolled back by version** (`K1-RELEASE-NOTES-20261016.md` lines 89–121). OfficeAssistant migration PRs fall into the "storage migration" category and require PR-Daemon APPROVE (`AGENTS.md`).
+- Business state lives in **the `office` module's own database and `data_dir`** (**not** in the kernel's `agent24-store`). The module may carry its own module-level `migrations/`, exactly as `rust/apps/agent24-documents/` does: its schema, upgrades, and restart recovery belong to the module itself (report §4, paragraph after the table; the details of module-owned migrations are outside this topic and must be settled in that module's own ADR).
+- Consequently this topic **introduces no kernel store migration** and does not trigger the "storage migration" mandatory review. **If we later decide to put the business tables in the kernel**, note that `Store::open` migrations run forward and **cannot be rolled back by version** (`K1-RELEASE-NOTES-20261016.md` lines 89–121); that would fall into the "storage migration" category and require PR-Daemon APPROVE (`AGENTS.md`).
 
 ---
 
@@ -198,7 +198,7 @@ run：每个 step 关联一个或多个内核 run（新 attempt = 新 run，不�
 2. **Host grant entry point for module consent** (if connectors are provided as module tools): release notes lines 27, 59 — production code has no grant route; the first PR that adds a grant path must handle F1/F3/F6 at the same time. This belongs to the K1 track; OfficeAssistant only consumes it and does not implement it in passing within this topic.
 3. **Wiring the connector egress decision**: 6b.3 of ADR-K1-02 §6 (unified egress decision API); this topic's connectors are one of its consumers.
 4. **Product entry point for "material × purpose × destination" authorization**: ADR-K1-02 §2.3 / ADR-K1-03 decision 2; there is currently no `CloudAuthorized` production write point. Note: sending outbound to Notion/email ≠ cloud model processing, but in ADR-K1-02 both go through the same egress gate; whether to reuse the same authorization record shape is pending ADR.
-5. **New business-layer tables**: `agent24-store/migrations/` (new migrations) — cannot be rolled back.
+5. **New business-layer records**: they live in the `office` module's own `data_dir` (module-owned migrations; see §0.4 D-A); they do **not** go into `agent24-store`.
 6. **Laws**: if bounded delegation (report §5) needs standing authorization wider than `tool → exact target` or with different dimensions, or needs read authorization to be stored, `docs/laws/APPROVAL.md` (L-APPR-5/7) must first be changed in a separate PR, then implemented (`../laws/README.md`).
 
 ### 5.3 Must not be bypassed

@@ -39,7 +39,7 @@ The decisions that report §7 explicitly leaves to the author are **only listed 
 
 | # | Decision | Meaning and impact |
 |---|---|---|
-| **D-A** | **Hang point is option B**: create a first-party **out-of-process domain-OS module `office`** (isomorphic to `rust/apps/agent24-documents/`) to hold the business state | Business records (workflow/plan versions, artifact versions, human edits, SOPs, receipt projections, mock connectors) live in the `office` module's own `data_dir`; **they do not enter the kernel store, and no store migration is introduced**. Precedent: `docs/documenting/adr/ADR-DOC-01-placement-and-integration.md` ruled the same way for Documenting (Accepted) |
+| **D-A** | **The attachment point is option B**: create a first-party **out-of-process domain-OS module `office`** (isomorphic to `rust/apps/agent24-documents/`) to hold the business state | Business records (workflow/plan versions, artifact versions, human edits, SOPs, receipt projections, mock connectors) live in the `office` module's own `data_dir`; **they do not enter the kernel store, and no store migration is introduced**. Precedent: `docs/documenting/adr/ADR-DOC-01-placement-and-integration.md` ruled the same way for Documenting (Accepted) |
 | **D-B** | **Actions with external effects stay in the kernel**; a new kernel gate **OA-K** sits between the module and the kernel | OA-K accepts `(tool, exact input, request_id)`; the kernel runs the full pipeline for it (consent → per-call human review → egress gate → timed execution → audit) and returns a typed result plus a receipt. **The kernel never retries automatically.** Detailed design: [`OA-K-KERNEL-GATE-DESIGN.md`](OA-K-KERNEL-GATE-DESIGN.md); it needs an ADR and should be **folded into #735** (Documenting and Cos72 need it too) |
 | **D-C** | OA-K is **not** specific to OfficeAssistant | Its ADR and implementation therefore must not sit on the OA timeline; **OA-M2 waits for it** |
 
@@ -113,7 +113,7 @@ The "preparation" phase still presupposes that the user has requested it and has
 | Milestone | Corresponding report phase | One-sentence goal | External accounts | Prerequisites |
 |---|---|---|---|---|
 | **OA-M1 Local-loop skeleton** | R0 + R1 | Synthetic/authorized transcript → minutes + action items → item-by-item provenance → human edits preserved → local delivery/receipt | None; mock connector | jason approves the project; does not crowd out the mainline |
-| **OA-M2 One real connector** | R2 | The email or Notion connector selected by the author: read-only → remote draft → **one** real write under explicit authorization | One; test account and destination specified by the author | OA-M1 DoD; §7 decision items D1–D3; kernel egress/grant prerequisites (§4.3) |
+| **OA-M2 One real connector** | R2 | The email or Notion connector selected by the author: read-only → remote draft → **one** real write under explicit authorization | One; test account and destination specified by the author | OA-M1 DoD; §7 decision items D1–D3; kernel egress/grant prerequisites (§4.3); **the kernel gate OA-K must have landed** (§0.4 D-B/D-C) |
 | **OA-M3 Reuse and boundary expansion** | R3 + report §5 bounded delegation | The same action/approval/receipt structure carries a second workflow; bounded delegation design and acceptance plan; entry-condition evaluation for extensions | Carried over from M2, no new ones (unless decided otherwise) | OA-M2 DoD |
 
 Milestone IDs use the `OA-M*` prefix to avoid confusion with the repository's existing M1 (memory) and M2 (`PLAN-M2.md`).
@@ -218,7 +218,7 @@ Milestone IDs use the `OA-M*` prefix to avoid confusion with the repository's ex
 | Sub-task | Content | Owner | Risk level |
 |---|---|---|---|
 | OA-M2-00 | Author decides D1–D3 (§7) | jason | Gate |
-| OA-M2-01 | Kernel prerequisite check: status of the module consent grant entry point and the egress decision (ADR-K1-02 6b.3), and the minimal dependency slice for this topic (see "Dependencies" below) | Planner + core developer | Design |
+| OA-M2-01 | Kernel prerequisite check: status of the module consent grant entry point, the egress decision (ADR-K1-02 6b.3), and **the ADR plus implementation of the kernel gate OA-K** (§0.4 D-B); plus the minimal dependency slice for this topic (see "Dependencies" below) | Planner + core developer | Design |
 | OA-M2-02 | Connector integration ADR + list of affected laws (§6) | Drafted by planner, decided by jason | Design |
 | OA-M2-03 | Read-only connector (test account) | Core developer | **High** (credentials/egress) |
 | OA-M2-04 | Remote draft + confirmation card | Core developer | **High** |
@@ -335,7 +335,7 @@ English is the collaboration language; one fixed weekly sync (suggested) + an as
 | Task PR ≤300 lines | `AGENTS.md` "branch rules", "PR size" | If exceeded, the PR body must explain why it cannot be split |
 | Local gates | `AGENTS.md` "gates" | Rust: fmt/clippy/test; if `apps/` changed, run pnpm typecheck/lint/test; if `protocol/` changed, run `lint:openapi` and `gen:api` with no diff |
 | pre-pr-check | `HANDOFF-ORCA-2026-10-08.md` line 44 | Before opening a PR run `pre-pr-check.sh --base origin/<base>`, and respond item by item by number in the PR body |
-| PR-Daemon | `AGENTS.md` "review and merge thresholds" | Ordinary task PRs: CI fully green + pre-pr-check responses + local gates are enough to merge into the integration branch; **PRs touching security/permissions/authorization, data-write semantics, storage migrations, or external protocols require PR-Daemon APPROVE** (in this topic, OA-M1-04/06 and OA-M2-03..05 all fall into this category). Approval applies to the PR's exact head; pushing commits after approval invalidates the approval (a team convention recorded in collaboration memory; no written clause was found in the repository files; listed as "not verified") |
+| PR-Daemon | `AGENTS.md` "review and merge thresholds" | Ordinary task PRs: CI fully green + pre-pr-check responses + local gates are enough to merge into the integration branch; **PRs touching security/permissions/authorization, data-write semantics, storage migrations, or external protocols require PR-Daemon APPROVE** (in this topic, OA-M1-06 and OA-M2-03..05 fall into this category; OA-M1-04 now lands in the `office` module's own `data_dir` and is **no longer** in the "storage migration" category — see §0.4 D-A). Approval applies to the PR's exact head; pushing commits after approval invalidates the approval (a team convention recorded in collaboration memory; no written clause was found in the repository files; listed as "not verified") |
 | Release PR | Same | `ab/office-assistant → main` requires PR-Daemon APPROVE + jason's real-device acceptance; opened and reviewed by humans |
 | Law loop | `../laws/README.md` | PRs that change observable behavior name the affected laws; law changes are in a separate PR, not in the same PR as the implementation (part three of the K1 release notes records a remediation after this rule was violated once; this should not be repeated) |
 | Semantics note before state machines | `tasks.md` line 288 | OA-M1-01 and OA-M3-01 are reviewed before code is written |
