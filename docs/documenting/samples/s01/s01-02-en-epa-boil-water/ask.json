@@ -1,0 +1,16 @@
+{"fields":[
+ {"key":"affected_water_system_name","description":"Which water system this notice is about","type":"text"},
+ {"key":"do_not_drink_without_boiling","description":"Whether the tap water can be drunk as it is","type":"text"},
+ {"key":"water_preparation","description":"How to treat the water before using it","type":"text"},
+ {"key":"safe_water_uses","description":"Which uses need boiled or bottled water","type":"text"},
+ {"key":"safe_water_instruction_end_condition","description":"How long to keep using boiled or bottled water","type":"text"},
+ {"key":"seek_medical_advice","description":"What to do if you get symptoms and they do not go away","type":"text"},
+ {"key":"share_notice","description":"Who else should be told about this notice, and how to reach them","type":"text"},
+ {"key":"investigation_under_way","description":"What the water system is doing to find the cause","type":"text"},
+ {"key":"contamination_dates","description":"The dates the contamination was found or the samples were collected","type":"date"},
+ {"key":"expected_resolution","description":"When the problem is expected to be resolved","type":"text"},
+ {"key":"corrective_action_section_details","description":"The specific corrective measures the notice fills in after 'Corrective action being taken includes'","type":"text"},
+ {"key":"water_system_contact","description":"Who to contact at the water system, and how","type":"text"},
+ {"key":"epa_hotline","description":"The phone number of the EPA hotline for advice on lowering the risk of infection","type":"identifier"},
+ {"key":"operator_public_notice_deadline","description":"How soon the water system operator must notify the public once it knows of the violation","type":"text"}
+]}

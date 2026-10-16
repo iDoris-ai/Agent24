@@ -20,9 +20,12 @@ use crate::clients::{ApprovalClient, EventsClient, MemoryClient, ModelClient, Sc
 
 /// Protocol range this SDK version implements (§8 Q7): exactly what it
 /// speaks, not the widest range a future kernel might one day negotiate
-/// down to.
+/// down to. 2 (ME4-S2b): `CompleteRequest.temperature`; a module that sets it
+/// asks for 2 in its manifest (`min_daemon_protocol: 2`).
 pub const PROTOCOL_MIN: u32 = 1;
-pub const PROTOCOL_MAX: u32 = 1;
+pub const PROTOCOL_MAX: u32 = 2;
+// The SDK speaks no further than the kernel it is built with.
+const _: () = assert!(PROTOCOL_MAX <= agent24_os_proto::version::KERNEL_PROTOCOL_MAX);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
@@ -256,11 +259,12 @@ mod tests {
         "name: minimal\nroute_namespace: /api/v1/minimal\nkernel_capabilities: [events]\n";
 
     // J-S11: the handshake carries the manifest-derived name/capabilities and
-    // the declared protocol range is exactly {1,1} (§8 Q7) — never the
-    // 1..=1000 Sin90's pre-migration code used, which would let a future v2
-    // kernel "successfully" negotiate a version this SDK does not speak.
+    // the declared protocol range is exactly what this SDK speaks, {1,2} since
+    // ME4-S2b (§8 Q7) — never the 1..=1000 Sin90's pre-migration code used,
+    // which would let a future v3 kernel "successfully" negotiate a version
+    // this SDK does not speak.
     #[tokio::test]
-    async fn connect_derives_hello_from_the_manifest_and_declares_protocol_one_to_one() {
+    async fn connect_derives_hello_from_the_manifest_and_declares_what_it_speaks() {
         let dir = tempdir();
         let (env, endpoint) = testing::FakeEndpoint::bind(dir.path());
         let accept = endpoint.accept_initialize(json!({
@@ -273,7 +277,7 @@ mod tests {
         let module = module_result.expect("handshake must succeed");
         assert_eq!(params["module"], "minimal");
         assert_eq!(params["capabilities"], json!(["events"]));
-        assert_eq!(params["protocol_versions"], json!({"min": 1, "max": 1}));
+        assert_eq!(params["protocol_versions"], json!({"min": 1, "max": 2}));
         assert!(module.events().is_some());
         assert!(module.memory().is_none(), "not granted; offer excludes it");
     }

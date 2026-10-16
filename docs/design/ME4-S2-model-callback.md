@@ -1,5 +1,8 @@
 # ME4-S2 —— 推理回调 `_a24/model/*`（ME4-4.1.1 设计）
 
+> **2026-10-15 修订（ME4-S2a）**：模块推理回调的时限改为按进展计时，见 `docs/design/ME4-S2a-model-call-progress-timeout.md`。本文规定性的数值随之改变：`MODEL_CALL_TIMEOUT` 由 120s 改为兜底值 4456s（约 74 分钟），`MAX_METHOD_CALL_TIMEOUT` 由 300s 改为同一个兜底值，SDK 的 `MODEL_RESPONSE_TIMEOUT` 由 125s 改为 4461s；一次调用实际受它自己的截止时间约束（300s + `max_tokens` × 1s），卡住由首段 300s、间隔 60s 发现。§3.2、§3.3、§3.4、§4.4、§5.2、§8、§11 里相应的数已改；评审记录与 §1 的「现状」保留原文。
+
+
 > **设计已冻结（v3.1，2026-09-24）**。第 3 轮评审 **APPROVE**（0 C / 0 H / 2 M / 7 L），M/L 全部折入 v3.1（见「v3 → v3.1 改动记录」）。
 > **全部三轮都是 Tier 2 本地评审**（全新上下文 Opus 子代理；Codex 额度耗尽），记 **ME4-CODEX-DEBT-3**：额度恢复后请 Codex 补审，重点
 > ① reqwest / hyper-util 在别的平台与特性组合下的代理行为（`no_proxy()` 是否覆盖系统代理设置、macOS 以外的实现）；② J19 在真实停机时序下是否 flaky。
@@ -99,7 +102,7 @@
 | S2 条 | 本文位置 | 一句话结论 |
 |---|---|---|
 | S2-1 隐私 | §2 决策 M1 | manifest 新字段 `model_access: local_only \| remote_allowed`，缺省 `local_only`；隐私**只**来自挂载时的 manifest，params 里没有任何能改它的字段（`deny_unknown_fields` 让 `privacy`/`model`/`tools` 都是 `-32602`） |
-| S2-4 超时与取消 | §3 决策 M2 | 选 **(a)**：`Handler` 加一个默认方法 `call_timeout()`，`_a24/model/complete` 声明 120s，连接级 30s 对其它方法不变；`$/cancelRequest` / 连接关闭 / 代次撤销 / 方法超时四条 drop 整个 handler future，所绑请求结束 drop 内层 work，handler 里持有 provider `CancellationToken` 的 `DropGuard`，于是统一到达 provider；daemon 停机经取消根（`modules_cut_off()` 时触发）直达 token |
+| S2-4 超时与取消 | §3 决策 M2 | 选 **(a)**：`Handler` 加一个默认方法 `call_timeout()`，`_a24/model/complete` 声明 120s（ME4-S2a 改为按进展计时，声明的是兜底值 4456s），连接级 30s 对其它方法不变；`$/cancelRequest` / 连接关闭 / 代次撤销 / 方法超时四条 drop 整个 handler future，所绑请求结束 drop 内层 work，handler 里持有 provider `CancellationToken` 的 `DropGuard`，于是统一到达 provider；daemon 停机经取消根（`modules_cut_off()` 时触发）直达 token |
 | S2-2 契约扩展 | §4.1 决策 M3 | `CompletionRequest.max_tokens: Option<NonZeroU32>`（`None` 不发字段，`/api/v1/chat` 字节不变）、`CompletionResponse.model_id: Option<String>`（取 OpenAI `response.model`，不回填）、`ModelRouter::complete_served` 返回 tier |
 | S2-3 方法最小集 | §4.2–§4.4 决策 M4 | 只有 `_a24/model/complete`，确切 params/result 见 §4.2/§4.3；不开 tools；**不做** `_a24/model/list` |
 | S2-5 限流 + 计量 | §5 决策 M5、§6 决策 M7 | 每模块并发 2、全 daemon 4（带公平规则）、每模块令牌桶（挂载级，跨 generation 不重置）、**每模块独立健康表**；新表 `module_model_usage`，失败/取消都计、被挡在路由器之前的不计、`cost_usd` 恒 `null` |
@@ -323,6 +326,7 @@ methods.with("_a24/model/complete",
 是**单次、秒级到几十秒**的补全。(a) 只动 `rpc.rs` 里三处（§3.2），复用既有的 drop 语义与 `bind_to_lifecycle`，不引入任何新状态。
 代价如实写：(a) 下一次调用最长占着一个回调槽 120s（每连接 64 槽，§5 又把模型调用压到每模块 2 个），且**结果不能在连接断开后取回**——
 Sin90 若需要「提交后离开、稍后取结果」，那是它自己 outbox 的事（它本来就有），不是内核的。
+（ME4-S2a 修订：一次调用不再以固定的 120s 为上限，而是受它自己的截止时间约束，300s + `max_tokens` × 1s，最长约 73 分钟；占槽的代价随之变长，并发上限不变。）
 
 **不调大全局 `CALL_TIMEOUT`**（S2-4 明文禁止）：连接级 30s 对 events/approval/memory 一字不变。
 
@@ -339,9 +343,9 @@ fn call_timeout(&self) -> Option<Duration> {
 }
 ```
 
-2. **新常量** `pub const MAX_METHOD_CALL_TIMEOUT: Duration = Duration::from_secs(300);`（紧跟 `CALL_TIMEOUT`，`rpc.rs:82` 之后）。
+2. **新常量** `pub const MAX_METHOD_CALL_TIMEOUT: Duration = Duration::from_secs(300);`（紧跟 `CALL_TIMEOUT`，`rpc.rs:82` 之后）。（ME4-S2a 修订：改为 `model_budget::MODEL_CALL_BACKSTOP`，并有编译期断言保证它不小于兜底值。）
    任何方法都不能把一次调用变成实际无界。
-3. **新私有纯函数**（为了不等 300s 就能单测夹紧）：
+3. **新私有纯函数**（为了不等夹紧值就能单测夹紧；原文写的是 300s）：
 
 ```rust
 fn effective_call_timeout(declared: Option<Duration>, default: Duration) -> Duration {
@@ -373,7 +377,7 @@ bind_to_lifecycle(lifecycle, grant.router.complete_served(profile, &request, &ca
 | `$/cancelRequest` | `handle.abort()` → 任务被取消 → handler future drop | drop 带走 provider future（hyper 关连接）+ `DropGuard` 取消 token | `cancelled`（由 `serve` 生成） |
 | 回调连接关闭 | `serve` 退出 → `handlers.shutdown().await` | 同上 | 无响应（连接没了，SPEC §3） |
 | 代次撤销 | `serve_until` 的 stop = `generation.revoked()` → 同上 | 同上 | 无响应 |
-| 方法超时 120s | `tokio::time::timeout` 到点 → drop 内层 future | 同上 | `timeout`，文案报 `120000ms` |
+| 方法超时（兜底 4456s，ME4-S2a） | `tokio::time::timeout` 到点 → drop 内层 future | 同上 | `timeout`，文案报实际生效的毫秒数 |
 | 所绑请求结束 / 预算耗尽 | `bind_to_lifecycle` 的 `select!` 另一臂胜出 → drop 的是**内层 `work`（router future）**，不是整个 handler future（v2 L10） | drop 带走 provider future；handler 随后返回，`DropGuard` 取消 token | `timeout`（`RequestEnded` / `BudgetExhausted` 两条文案，同 memory） |
 | daemon 停机 | **v2 M1**：停机开始时什么都不做——模块照 drain 规则运行（在途调用继续；generation 进入 Draining 后新的后台调用回 `draining`）；到 `Shutdown::modules_cut_off()`，`serve()` 里的一个任务取消 `cancel_root` → provider 在 `select!` 处返回 `ModelError::Cancelled`（若代次撤销先到，则按撤销那一行） | 取消根 token 直达 | `cancelled`（「the daemon is shutting down」） |
 
@@ -399,11 +403,11 @@ cut-off 是「模块本来就会被杀」的时刻，推理与它同生共死。
 
 | 调用形态 | 准入（`admit_callback_bound`，同 memory 的表） | 约束它的东西 |
 |---|---|---|
-| 带 `request_id`，该请求**在途** | Running / Draining 都放行 | 方法超时 120s、**该请求剩余预算**（被代理请求 ≤ 30s；调度 fired 投递的请求 ≤ ME4-S1 定的投递超时，建议 10s）、请求结束、`$/cancelRequest`、连接、撤销、取消根 |
+| 带 `request_id`，该请求**在途** | Running / Draining 都放行 | 方法超时（兜底 4456s）、**该请求剩余预算**（被代理请求 ≤ 30s；调度 fired 投递的请求 ≤ ME4-S1 定的投递超时，建议 10s）、请求结束、`$/cancelRequest`、连接、撤销、取消根 |
 | 带 `request_id`，该 id **不在途**（从未存在或已结束） | **本文比 memory 更严**：Running 下也**拒**，`timeout`「request_id is not (or no longer) in flight; send no request_id for background work」；Draining 下照既有表回 `draining` | ——（不会跑） |
-| **不带** `request_id`（后台任务、定时任务） | Running 放行；Starting → `not_ready`，Draining → `draining`，Revoked → `revoked` | 方法超时 120s、`$/cancelRequest`、回调连接关闭、**代次撤销**（在途的无绑定调用在 drain 结束、代次被撤销的那一刻被 drop）、取消根（停机时的 modules cut-off，§3.3） |
+| **不带** `request_id`（后台任务、定时任务） | Running 放行；Starting → `not_ready`，Draining → `draining`，Revoked → `revoked` | 一次调用自己的截止时间（ME4-S2a）、方法超时（兜底 4456s）、`$/cancelRequest`、回调连接关闭、**代次撤销**（在途的无绑定调用在 drain 结束、代次被撤销的那一刻被 drop）、取消根（停机时的 modules cut-off，§3.3） |
 
-为什么「不在途的 id」要拒而不是降级：memory 那样降级（§1 第 9 条），一个模块在请求刚结束时带着它的 id 发起的补全，会**静默**变成一个能跑 120s 的无绑定调用——
+为什么「不在途的 id」要拒而不是降级：memory 那样降级（§1 第 9 条），一个模块在请求刚结束时带着它的 id 发起的补全，会**静默**变成一个能跑到自己截止时间的无绑定调用——
 模块以为「请求没了它就停」，实际不停，而且 Running 时测不出来。拒掉之后，想要后台语义的模块必须**显式**不带 `request_id`。
 
 **对调用方的直接后果（写进 SPEC 方法表与 wire 文档）**：在一次被代理请求里内联推理，受 30s 代理总时限约束；在 scheduler fired 投递里内联推理，受投递超时约束。
@@ -510,6 +514,8 @@ struct WireJsonSchema { name: String, schema: Map<String, Value>, #[serde(defaul
   （「max_tokens must be between 1 and 4096」——不能过度脱敏，同 T8.5c-W-wire 判据 10）；`json_schema.name` 非空；`schema` 必须是对象（类型保证）。
 - **不存在的字段**：`privacy`、`model`、`tools`、`tool_calls`、`provider`、`tier`、`temperature`… 一律 `-32602`。`temperature` 等采样参数本轮不开（最小集），
   将来加是**加字段**，老模块不受影响。
+  （ME4-S2b 修订，2026-10-15：开放了 `temperature`，可选，0 ≤ t ≤ 2，越界 `-32602`「temperature must be between 0 and 2」；`seed`、`top_p`、各种惩罚参数仍是 unknown field。
+  同时协议版本 1 → 2，用它的模块在 manifest 里写 `min_daemon_protocol: 2`。见 `docs/design/ME4-S2b-model-sampling-params.md`。）
 - 字节上限不另立：`dispatch()` 的 256 KiB 字符串预算已先于解析生效（§1 第 13 条）。
 - `into_request`：`model: None`、`tools: vec![]`、`max_tokens: NonZeroU32::new(max_tokens.unwrap_or(1024))`。
 
@@ -553,7 +559,7 @@ impl Handler for ModelCompleteHandler {
     fn check_params(&self, params: &Value) -> Result<(), String> {
         ModelCompleteParams::parse(params.clone()).map(|_| ())
     }
-    fn call_timeout(&self) -> Option<Duration> { Some(MODEL_CALL_TIMEOUT) }   // 120s
+    fn call_timeout(&self) -> Option<Duration> { Some(MODEL_CALL_TIMEOUT) }   // 兜底 4456s（ME4-S2a；原 120s）
     fn call(&self, params: Value) -> CallFuture {
         let parsed = ModelCompleteParams::parse(params);
         let grant = self.grant.clone();
@@ -666,11 +672,11 @@ impl ModelGrant {
 
 | 常量 | 值 | 理由 |
 |---|---|---|
-| `MODEL_MAX_IN_FLIGHT_PER_MODULE` ⚖️ | 2 | PLAN 建议值。本地推理基本串行，更多并发只是在 oMLX 里排队、吃掉各自的 120s |
+| `MODEL_MAX_IN_FLIGHT_PER_MODULE` ⚖️ | 2 | PLAN 建议值。本地推理基本串行，更多并发只是在 oMLX 里排队、吃掉各自的首段时限（ME4-S2a：300s） |
 | `MODEL_MAX_IN_FLIGHT_GLOBAL` ⚖️ | 4 | 所有模块合计，带 §5.3 的公平规则。**不含** `/api/v1/chat` 与 agent loop——内核自己的用量不被模块挤占，但也因此不能保证 oMLX 不过载（R3） |
 | `MODEL_RATE_CAPACITY` / `MODEL_RATE_REFILL_PER_SEC` ⚖️ | 30 / 0.5 | 突发 30 次、持续 30 次/分钟。按次计，不按 token 计（token 在调用前未知） |
-| `MODEL_CALL_TIMEOUT` | 120s | = provider 自己的 `chat_timeout`（`lib.rs:206`）。**（v2 L2 改正方向）**两者几乎同时起算，**RPC 的计时先到点**（它在 handler 之前就开始计），所以模块看到的总是 `timeout` 而不是 provider 的超时；且路由器按序尝试多个 provider——**第一个慢 provider 可以吃完整个 120s**，后面的 provider 轮不到（R11） |
-| `MODEL_MAX_TOKENS_CEILING` / 缺省 ⚖️ | 4096 / 1024 | 4096 token 的文本远低于结果上限（~1 MiB 序列化后）；缺省给个上限，免得没写 `max_tokens` 的模块把 120s 跑满 |
+| `MODEL_CALL_TIMEOUT` | 4456s（ME4-S2a 修订；原 120s） | 兜底值：300s + 4096 × 1s + 60s。一次调用实际受它自己的截止时间约束（300s + `max_tokens` × 1s，准入后设一次，路由器的各 provider 共用），卡住由首段 300s、间隔 60s 发现；这个兜底只防内核自身卡住。原 v2 L2 的「RPC 计时先到点、第一个慢 provider 吃完整个预算」随之不再成立：provider 的计时先到，模块看到的是 `no_provider` |
+| `MODEL_MAX_TOKENS_CEILING` / 缺省 ⚖️ | 4096 / 1024 | 4096 token 的文本远低于结果上限（~1 MiB 序列化后）；缺省给个上限：没写 `max_tokens` 的模块，截止时间按 1024 算（约 22 分钟） |
 | `MODEL_MAX_MESSAGES` ⚖️ | 64 | 字节已由 dispatch 预算兜住，条数防病态的「一万条空消息」 |
 | `MODEL_MAX_RESULT_BYTES` / `RESULT_ENVELOPE_MARGIN` | 1 MiB − 4 KiB / 4 KiB | v3 N4，按序列化后字节判，见 §4.3（余量由编译期 `assert!` 与 `MAX_ID_BYTES` 绑定） |
 | `MODEL_MAX_MODEL_ID_BYTES` ⚖️ | 256 | v3 N4 |
@@ -861,7 +867,7 @@ impl UsageRecorder {
 | `ModelError::Cancelled`（取消根，即 cut-off） | `-32000` `cancelled` | 「the daemon is shutting down」 | — |
 | `LifecycleTimeout::{BudgetExhausted, RequestEnded}` | `-32000` `timeout` | 同 memory 的两条（`os_memory_page.rs:218-231`） | — |
 | `request_id` 不在途（§3.4） | `-32000` `timeout` | 「request_id is not (or no longer) in flight; …」 | **`retryable:false`**（v2 L4） |
-| 方法超时 | `-32000` `timeout`（`serve` 生成） | 「the kernel gave up after 120000ms; …」 | — |
+| 方法超时 | `-32000` `timeout`（`serve` 生成） | 「the kernel gave up after 4456000ms; …」（ME4-S2a；原 120000ms） | — |
 | `$/cancelRequest` | `-32000` `cancelled`（`serve` 生成） | 既有 | — |
 | 未授予 | `forbidden` | 「this module was not granted model access」 | — |
 | 准入拒绝 | `not_ready` / `draining` / `revoked` | `refused_error`（`events_emit.rs:273`） | — |
@@ -902,7 +908,7 @@ params 里放 `privacy`/`model`/`tools` → `-32602` 且桩计数 0；`_meta: {p
 （形状按 `server.rs` 的 `error_response` 实际输出填写，实现时先在 main 上跑一次录下，再改代码，断言不变）。（scratch `wire_tests` 已跑通前两部分；401/404/403 → `Rejected{status}` 的断言在 models 的既有测试里改写并通过。）
 
 **J5 按方法超时（4.2.2-0，`-p agent24-os-proto per_method_budget`）**：`Limits.call_timeout = 100ms`；声明 800ms 的 handler 睡 300ms → 成功；
-**正对照**：不声明 → `timeout` 且文案含 `100ms`；声明 400ms、睡 5s → `timeout` 且文案含 `400ms`。`effective_call_timeout`：`None → default`、`120s → 120s`、`1h → 300s`、`5ms → 5ms`。
+**正对照**：不声明 → `timeout` 且文案含 `100ms`；声明 400ms、睡 5s → `timeout` 且文案含 `400ms`。`effective_call_timeout`：`None → default`、`120s → 120s`、`1h → 300s`、`5ms → 5ms`。（ME4-S2a 修订：夹紧值改为兜底 4456s，测试改为「兜底值不被夹、5h → 兜底值」。）
 既有 rpc 测试全绿（回归）。变异：`on_frame` 改回读 `self.limits.call_timeout` → 第一条变红。（scratch：rpc 53 个测试全绿。）
 
 **J6 字面 30s（4.2.2b1，`-p agent24d model_callback_outlives_call_timeout`）**：真 `serve()` + `Limits::default()` + 进程内桩 provider 睡 31s → 成功。
@@ -1084,7 +1090,7 @@ scratch 实测：`model_callback.rs` 非测试部分 417 行（b1a 覆盖其中�
 
 | # | 风险 | 为什么接受 / 谁接 |
 |---|---|---|
-| R1 | 同步调用最长占一个回调槽 120s；推理结果在连接断开后取不回 | (a) 的固有代价（§3.1）；每模块 2 并发把它压住；需要「提交后离开」的模块用自己的 outbox |
+| R1 | 同步调用最长占一个回调槽到它自己的截止时间（ME4-S2a：300s + `max_tokens` × 1s，最长约 73 分钟；原 120s）；推理结果在连接断开后取不回 | (a) 的固有代价（§3.1）；每模块 2 并发把它压住；需要「提交后离开」的模块用自己的 outbox |
 | R2 | 被代理请求内联推理受 30s 代理总时限、fired 内联推理受投递超时约束 | 由 §3.4 的使用指引（先应答、再后台）承担，写进 SPEC 方法表与 T14 wire 文档 |
 | R3 | 全局 4 并发不含 `/api/v1/chat` 与 agent loop，本地 oMLX 仍可能过载；公平规则**只保证其他活跃模块 ≤ 2 个时新模块首调有槽**（v3 N3）——有 3 个其他活跃模块时可能 `busy`（反例 A1、A2、B1、C1 → D），≥ 4 个时第 5 个同样 `busy` | 内核自己的用量不该被模块挤占；两个模块占不满已由规则保证；更多模块同时推理是本机算力问题，不是分配问题 |
 | R4 | 用量记录在队列满、或停机硬上限（cut-off + 200ms）后仍排队时会丢；取消的远端调用费用未知 | `dropped` 计数、`lost` 日志可观测；不为用量延长停机；费用本来未知（§6.4） |
@@ -1094,7 +1100,7 @@ scratch 实测：`model_callback.rs` 非测试部分 417 行（b1a 覆盖其中�
 | R8 | ~~共享健康表~~ | **v2 已消除**（H2，§5.1） |
 | R9 | daemon 重启重置令牌桶 | 模块无法触发 daemon 重启（§0 同 UID 敌意进程除外） |
 | R10 | ~~原始长度判定低估转义膨胀~~ | **v3 已消除**（N4：按序列化后字节判定） |
-| R11 | 按序尝试多个 provider 时，第一个慢 provider 可吃完整个 120s（v2 L2） | 路由器的既有行为；冷却会让它下次被跳过（在本模块自己的健康表里） |
+| R11 | 按序尝试多个 provider 时，第一个慢 provider 可吃完整个 120s（v2 L2） | **ME4-S2a 已改**：各 provider 共用一次调用的截止时间，剩余不足一个间隔时限就不再换下一个 |
 | R12 | 模块不能从内核已知的冷却受益，会自己再撞一次不可用的 provider（v2 H2 的代价） | 最多多一次 connect 超时（2s）；换来的是模块无法操纵内核路由 |
 | R13 | **（v3 N1）`Local` 只说明「连到回环上的那个端点、不经代理、不被重定向」，不说明那个进程之后做什么**：127.0.0.1 上的本机网关（LiteLLM、自建反代）把请求转发到远端，任何标签都看不见 | 这是运维配置，不是内核能判定的事实；SPEC 措辞已收窄到机制能保证的范围。把这类网关指给 `OMLX_URL` 的用户须自知（写进 wire 文档与 `agent24 doctor` 的 followup 候选） |
 

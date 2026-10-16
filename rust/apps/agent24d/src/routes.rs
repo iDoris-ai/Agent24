@@ -538,6 +538,8 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         response_format: None,
         max_tokens: None,
         disable_thinking: false,
+        temperature: None,
+        progress: None,
     };
     state
         .events
