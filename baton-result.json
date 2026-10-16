@@ -2,13 +2,17 @@
   "schema": "baton-result/v1",
   "task_id": null,
   "attempt_id": null,
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "221cfd432e92bb45cc14a682d9f2465f0344f6db",
-  "result_sha": null,
-  "summary": "Starting F1 i18n regression fix for PR #1023 on ab/showcase-download",
-  "tests": [],
+  "result_sha": "5f638166a1f9df48ba4a71799c530f8b9f3574ff",
+  "summary": "F1 i18n done: pause/resume/waitingNetwork/ETA/speed via t(); MB→MiB; en describe asserts no CJK + unified unit; typecheck/lint/Creative.test green",
+  "tests": [
+    {"name": "pnpm typecheck (apps/desktop)", "exit_code": 0},
+    {"name": "pnpm lint (repo root)", "exit_code": 0},
+    {"name": "pnpm exec vitest run src/renderer/pages/Creative.test.tsx", "exit_code": 0, "detail": "15 passed"}
+  ],
   "blocker": null,
-  "next": null,
-  "updated_at": "2026-10-16T11:38:10Z"
+  "next": "Author/PR lane: cherry-pick or merge baton branch tip into ab/showcase-download / PR #1023; do not open PR from this baton branch",
+  "updated_at": "2026-10-16T11:40:32Z"
 }
