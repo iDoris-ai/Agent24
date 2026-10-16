@@ -96,7 +96,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 50 * 1024 * 1024 })
     render(<CreativePage />)
 
-    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 50 MB）/)).toBeTruthy()
+    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 50 MiB）/)).toBeTruthy()
     expect(screen.getByRole('button', { name: '下载' })).toBeTruthy()
     expect(creativeShow).not.toHaveBeenCalled()
   })
@@ -122,7 +122,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     creativeShow.mockResolvedValue({ ok: false, needsDownload: true, size: 20 * 1024 * 1024 })
     render(<CreativePage />)
 
-    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 20 MB）/)).toBeTruthy()
+    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 20 MiB）/)).toBeTruthy()
     expect(screen.getByRole('button', { name: '下载' })).toBeTruthy()
   })
 
@@ -152,7 +152,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
 
     act(() => progressListener?.({ state: 'downloading', received: 5 * 1024 * 1024, total: 10 * 1024 * 1024 }))
     expect(await screen.findByText(/正在下载 iDoris Design 组件/)).toBeTruthy()
-    expect(screen.getByText(/5 \/ 10 MB（50%）/)).toBeTruthy()
+    expect(screen.getByText(/5 \/ 10 MiB（50%）/)).toBeTruthy()
 
     act(() => progressListener?.({ state: 'verifying' }))
     expect(await screen.findByText('正在校验…')).toBeTruthy()
@@ -229,9 +229,52 @@ describe('CreativePage — on-demand iDoris Design component', () => {
   })
 })
 
-describe('CreativePage English default', () => {
-  it('shows the English download action', () => {
+describe('CreativePage — F1 i18n under English default', () => {
+  beforeEach(() => { setLocale('en') })
+
+  it('shows the English download action', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
     render(<CreativePage />)
-    expect(screen.getByRole('button', { name: 'Download' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Download' })).toBeInTheDocument()
+  })
+
+  // F1 acceptance (red on 221cfd43, green after i18n + MiB unification):
+  // en downloading/paused must contain no CJK, and both states share one size-unit token.
+  it('downloading and paused UI stay English with a unified size unit', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
+    openDesignComponentInstall.mockReturnValue(new Promise(() => {}))
+    const { container } = render(<CreativePage />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+    act(() => progressListener?.({
+      state: 'downloading',
+      received: 2 * 1024 * 1024,
+      total: 10 * 1024 * 1024,
+      bytesPerSecond: 3 * 1024 * 1024,
+      etaSeconds: 125,
+    }))
+
+    await screen.findByText(/3\.0 MiB\/s/)
+    const downloadingText = container.querySelector('.creative-download')?.textContent ?? ''
+    expect(downloadingText).not.toMatch(/[\u4e00-\u9fff]/)
+
+    act(() => progressListener?.({
+      state: 'paused',
+      received: 4 * 1024 * 1024,
+      total: 10 * 1024 * 1024,
+    }))
+    await screen.findByRole('button', { name: 'Resume download' })
+    const pausedText = container.querySelector('.creative-download')?.textContent ?? ''
+    expect(pausedText).not.toMatch(/[\u4e00-\u9fff]/)
+
+    const unitOf = (s: string): string | undefined => {
+      const m = s.match(/\d+\s*\/\s*\d+\s*(MiB|MB)\b/)
+      return m?.[1]
+    }
+    const downloadingUnit = unitOf(downloadingText)
+    const pausedUnit = unitOf(pausedText)
+    expect(downloadingUnit).toBeTruthy()
+    expect(pausedUnit).toBeTruthy()
+    expect(downloadingUnit).toBe(pausedUnit)
   })
 })
