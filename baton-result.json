@@ -2,13 +2,22 @@
   "schema": "baton-result/v1",
   "task_id": "a24-idoris-sync-20261016",
   "attempt_id": "9176366d-f4b9-4bc6-bf71-fd6dfd0c2022",
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "f315630fca1ff55936e3c432d2c2ec4ba06ae372",
-  "result_sha": "f315630fca1ff55936e3c432d2c2ec4ba06ae372",
-  "summary": "Started: absorb origin/main into ab/idoris-04-receipts and ab/idoris-11-pair-acceptance; reconcile PASSTHROUGH_VARS to 20 items (AGENT24_DATA_DIR + IDORIS_URL).",
-  "tests": [],
+  "result_sha": "fe7bf8faf423094bdd9a244591ab81eb4903df70",
+  "summary": "Absorbed origin/main into ab/idoris-04-receipts (bb39d2c) and ab/idoris-11-pair-acceptance (fe7bf8f). PASSTHROUGH_VARS now 20 items: AGENT24_DATA_DIR + IDORIS_URL + prior 18; IDORIS_API_KEY never in list (already excluded). fmt/clippy/agent24-cli tests passed on both. Pushed both heads only.",
+  "tests": [
+    {"command": "cargo fmt --all --check (04)", "exit_code": 0},
+    {"command": "cargo clippy --workspace --all-targets -- -D warnings (04)", "exit_code": 0},
+    {"command": "cargo test -p agent24-cli passthrough_list_matches_what_the_daemon_actually_reads (04)", "exit_code": 0},
+    {"command": "cargo test -p agent24-cli (04)", "exit_code": 0},
+    {"command": "cargo fmt --all --check (11)", "exit_code": 0},
+    {"command": "cargo clippy --workspace --all-targets -- -D warnings (11)", "exit_code": 0},
+    {"command": "cargo test -p agent24-cli passthrough_list_matches_what_the_daemon_actually_reads (11)", "exit_code": 0},
+    {"command": "cargo test -p agent24-cli (11)", "exit_code": 0}
+  ],
   "blocker": null,
-  "next": "Read review doc; merge main into both PR heads; fix PASSTHROUGH_VARS; run fmt/clippy/tests; push both branches.",
-  "updated_at": "2026-10-16T08:52:21Z"
+  "next": null,
+  "updated_at": "2026-10-16T08:59:03Z"
 }
