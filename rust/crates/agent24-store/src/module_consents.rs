@@ -430,9 +430,10 @@ impl Store {
         Ok(())
     }
 
-    /// Lifecycle invalidation for disable/uninstall/package replacement. The
-    /// operation is deliberately best-effort at call sites that already have
-    /// an established lifecycle result; failures are returned for logging.
+    /// Lifecycle invalidation for disable/uninstall/package replacement.
+    /// Callers must treat an `Err` as fail-closed (ADR-K1-03 §3): the
+    /// lifecycle step may still go ahead, but it must not be reported as a
+    /// success while the consent is still live.
     pub async fn invalidate_module_consents(&self, module: &str) -> Result<()> {
         self.revoke_module_consent(module, None, &Utc::now().to_rfc3339())
             .await
