@@ -4,11 +4,10 @@
 //!
 //! Calls go one at a time, in two passes (ME4-S2c §5.1): the model answers
 //! as it will; what is not an answer is asked again held to the schema,
-//! thinking off. There an answer cut off at the token limit is asked again
-//! in two halves of its batch, one not in the shape once more. A window the
-//! model rejects (most likely too long for its context) in both passes is
-//! asked in two halves, unless it took a call for the batch (or the one it
-//! was split from): then the rejection fails. A busy or rate-limited kernel is
+//! thinking off. There one cut off is asked in two halves of its batch, one
+//! not in the shape once more. A window rejected in both passes (most likely
+//! too long) is asked in halves, unless it took a call for the batch or the
+//! one it was split from: then that fails. A busy or rate-limited kernel is
 //! waited out, up to two minutes a call; a timeout is retried once; no local
 //! model to answer is asked again after the router's longest cooldown, up to
 //! three minutes of such waiting a call. Every
@@ -262,9 +261,8 @@ impl Run<'_> {
         }
     }
 
-    /// The answers for `batch` over `window`, as (window, answers) pieces in
-    /// window order, from its first pass or, `fell` there, its second
-    /// (`taken`: a pass for this batch, or the one it was split from, was taken).
+    /// The answers for `batch` over `window`, as pieces in window order: from
+    /// its first pass, or its second when it `fell` there; `taken`, see above.
     fn answer<'b>(
         &'b mut self,
         window: Window,
@@ -339,7 +337,7 @@ fn read(
     fell: Option<Fell>,
     (text, tokens): (String, u64),
 ) -> Result<Vec<AnswerValue>, Unanswered> {
-    let read = match unwrapped(&text) {
+    let read = match unwrapped(&text, pass) {
         _ if tokens >= u64::from(MAX_TOKENS) => Err(Unanswered::Truncated),
         Ok("") if tokens > 0 => Err(Unanswered::Malformed("nothing written".into())),
         t => t.and_then(|t| parse(batch, t)),

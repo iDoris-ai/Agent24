@@ -1,11 +1,10 @@
 //! What one model call is told, and the shape of its answer (§3.2). The
-//! instruction is fixed, with parts added for a window of a longer document
-//! and a call's first pass; the fields and the document's blocks follow it
-//! as JSON data, which the instruction says never to obey. The answer, told
-//! to the first pass and held to a JSON Schema in the second (ME4-S2c §5):
-//! per field one status, and with it the value as written and evidence as
-//! quotes of named blocks, a reason, or the conflicting candidates. The OS,
-//! not the model, locates each quote.
+//! instruction is fixed, with parts for a window of part of the document and
+//! a first pass; the fields and blocks follow as JSON data, which it says
+//! never to obey. The answer, told to the first pass and held to a JSON
+//! Schema in the second (ME4-S2c §5): per field one status, with the value
+//! as written and quotes of named blocks, a reason, or the conflicting
+//! candidates. The OS, not the model, locates each quote.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -351,10 +350,10 @@ pub enum Unanswered {
     Malformed(String),
 }
 
-/// The answer in what the model wrote (ME4-S2c §5.1): its thinking (left
-/// open: [`Unanswered::Truncated`]; else up to a last `</think>` an answer
-/// follows) and a code fence, with what follows the answer in it, cut off.
-pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
+/// The answer in what the model wrote in `pass` (ME4-S2c §5.1): its thinking
+/// (left open: [`Unanswered::Truncated`]; else up to a last `</think>` an
+/// answer follows) and a code fence, with what follows the answer in it, cut off.
+pub fn unwrapped(text: &str, pass: Pass) -> Result<&str, Unanswered> {
     let mut t = text.trim();
     if let Some(rest) = t.strip_prefix("<think>") {
         let Some((_, after)) = rest.split_once("</think>") else {
@@ -362,7 +361,11 @@ pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
         };
         t = after.trim();
     }
-    if let Some((_, after)) = t.rsplit_once("</think>")
+    // Only in the pass that thinks, and only in what is no answer as it
+    // stands: a value may quote `</think>` too.
+    if pass == Pass::Free
+        && serde_json::from_str::<serde::de::IgnoredAny>(t).is_err()
+        && let Some((_, after)) = t.rsplit_once("</think>")
         && after.trim_start().starts_with(['{', '`'])
     {
         t = after.trim();

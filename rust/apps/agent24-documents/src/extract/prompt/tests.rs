@@ -146,22 +146,38 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
         format!("```json\n{draft}\n```\nwait</think>\n{a}"),
         format!("{draft} no</think>\n```json\n{a}\n```"),
     ] {
-        assert_eq!(unwrapped(&wrapped), Ok(a), "{wrapped}");
-        assert!(parse(&[field("a")], unwrapped(&wrapped).unwrap()).is_ok());
+        assert_eq!(unwrapped(&wrapped, Pass::Free), Ok(a), "{wrapped}");
+        assert!(parse(&[field("a")], unwrapped(&wrapped, Pass::Free).unwrap()).is_ok());
     }
     // A thinking never closed is cut off; words are malformed.
-    assert_eq!(unwrapped("<think>still going"), Err(Unanswered::Truncated));
-    let words = unwrapped("The date is unknown.").unwrap();
+    assert_eq!(
+        unwrapped("<think>still going", Pass::Free),
+        Err(Unanswered::Truncated)
+    );
+    let words = unwrapped("The date is unknown.", Pass::Free).unwrap();
     assert!(matches!(
         parse(&[field("a")], words),
         Err(Unanswered::Malformed(_))
     ));
     // A fence never closed round an answer quoting one is not cut there.
     let quoting = r#"{"values": {"a": "```sh ls```"}}"#;
-    assert_eq!(unwrapped(&format!("```json\n{quoting}")), Ok(quoting));
+    assert_eq!(
+        unwrapped(&format!("```json\n{quoting}"), Pass::Free),
+        Ok(quoting)
+    );
     // A `</think>` after the answer begins is the answer's own text.
     let quoted = r#"{"values": {"a": "</think>"}}"#;
-    assert_eq!(unwrapped(quoted), Ok(quoted));
+    assert_eq!(unwrapped(quoted, Pass::Free), Ok(quoted));
+    // Nor in a value quoting `</think>` before a quote mark or a brace, in an
+    // answer that stands as it is, or in the pass that does not think.
+    for v in ["`<think>` and `</think>` tags", "</think>{"] {
+        let held = format!(
+            r#"{{"values": {{"a": {{"present": {{"evidence": [], "normalized": "", "value": "{v}"}}}}}}}}"#
+        );
+        assert_eq!(unwrapped(&held, Pass::Free), Ok(held.as_str()));
+        let fenced = format!("```json\n{held}\n```");
+        assert_eq!(unwrapped(&fenced, Pass::Held), Ok(held.as_str()));
+    }
 }
 
 #[test]

@@ -334,6 +334,20 @@ async fn a_cut_off_answer_is_asked_held_then_in_two_halves() {
     ));
 }
 
+/// A held answer whose value quotes `</think>` is that answer (round 5).
+#[tokio::test]
+async fn a_held_answer_quoting_the_end_of_thinking_is_taken() {
+    let quote = json!({ "present": { "value": "`</think>` tags", "normalized": "",
+        "evidence": [{ "block_id": "p1/b1", "quote": "停水" }] } });
+    let m = Script::new(vec![
+        reply("{\"values\": 1}".into()),
+        reply(answer(vec![("a".into(), quote)])),
+    ]);
+    let out = go(&m, &layer(1, 0), &[field("a")]).await.unwrap();
+    assert_eq!(out.values[0].value.status, Status::Present);
+    assert_eq!(m.passes(), [Free, Held]);
+}
+
 /// J8: malformed held, asked once more held, then a failure; the first
 /// pass's malformed answer is not that retry.
 #[tokio::test]
