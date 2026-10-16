@@ -13,22 +13,32 @@ function formatMb(bytes: number | undefined): string {
   return Math.max(1, Math.round(bytes / (1024 * 1024))).toString()
 }
 
-/** SD-01: user-visible transfer rate — "等待网络" (not a bogus "0 KiB/s")
+/** SD-01: user-visible transfer rate — waiting-for-network (not a bogus "0 KiB/s")
  * whenever the rolling-window estimator has no recent progress to measure. */
 function formatSpeed(bytesPerSecond: number | undefined): string {
-  if (!bytesPerSecond || bytesPerSecond <= 0) return '等待网络'
-  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MiB/s`
-  return `${Math.max(1, Math.round(bytesPerSecond / 1024))} KiB/s`
+  if (!bytesPerSecond || bytesPerSecond <= 0) {
+    return translate(creativeMessages, 'download.waitingNetwork')
+  }
+  if (bytesPerSecond >= 1024 * 1024) {
+    return translate(creativeMessages, 'download.speedMib', {
+      value: (bytesPerSecond / (1024 * 1024)).toFixed(1),
+    })
+  }
+  return translate(creativeMessages, 'download.speedKib', {
+    value: Math.max(1, Math.round(bytesPerSecond / 1024)),
+  })
 }
 
 /** SD-01: '' (not a misleading ETA) whenever the rate is unknown/zero — the
- * speed text alone already says "等待网络" in that case. */
+ * speed text alone already says waiting-for-network in that case. */
 function formatEta(etaSeconds: number | null | undefined): string {
   if (etaSeconds == null || !Number.isFinite(etaSeconds) || etaSeconds <= 0) return ''
   const totalSeconds = Math.round(etaSeconds)
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
-  return minutes > 0 ? `约剩 ${minutes} 分 ${seconds} 秒` : `约剩 ${seconds} 秒`
+  return minutes > 0
+    ? translate(creativeMessages, 'download.etaMinutesSeconds', { minutes, seconds })
+    : translate(creativeMessages, 'download.etaSecondsOnly', { seconds })
 }
 
 const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'paused', 'verifying', 'failed'])
@@ -67,7 +77,7 @@ function ComponentCard({
           {` · ${formatSpeed(status.bytesPerSecond)}`}
           {etaText ? ` · ${etaText}` : ''}
         </div>
-        <button className="btn" type="button" onClick={onPause}>暂停下载（保留进度）</button>
+        <button className="btn" type="button" onClick={onPause}>{t('action.pause')}</button>
       </div>
     )
   }
@@ -78,10 +88,9 @@ function ComponentCard({
     return (
       <div className="creative-download">
         <div>
-          已暂停下载 iDoris Design 组件：已保存 {formatMb(received)} / {formatMb(total)} MiB
-          （尚未安装，不影响已安装的运行版本）
+          {t('download.paused', { received: formatMb(received), total: formatMb(total) })}
         </div>
-        <button className="btn btn-primary" type="button" onClick={onInstall}>继续下载</button>
+        <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.resume')}</button>
       </div>
     )
   }
