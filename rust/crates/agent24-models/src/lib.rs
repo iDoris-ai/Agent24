@@ -910,7 +910,12 @@ impl ModelProvider for OpenAiCompatProvider {
                     }
                 }
                 let left = self.chat_timeout.saturating_sub(started.elapsed());
-                self.send(&body, req.progress.as_ref(), left, cancel).await
+                let again = self.send(&body, req.progress.as_ref(), left, cancel).await;
+                // The same for the second refusal (PR-Daemon #1045 L-b).
+                if matches!(again, Err(ModelError::Rejected { .. })) && cancel.is_cancelled() {
+                    return Err(ModelError::Cancelled);
+                }
+                again
             }
             answer => answer,
         }
@@ -1596,16 +1601,24 @@ mod tests {
                 assert_eq!(again.lock().unwrap().len(), 2, "{key}");
             }
             // Controls: no switch in the request, or a refusal that is not a
-            // 400 → no retry.
-            let (url, asked) = answers_in_turn(vec![refused("400 Bad Request")]).await;
-            let got = ollama(url)
-                .complete(&CompletionRequest { progress, ..req() }, &c)
-                .await;
-            assert!(
-                matches!(got, Err(ModelError::Rejected { status: 400, .. })),
-                "{got:?}"
-            );
-            assert_eq!(asked.lock().unwrap().len(), 1);
+            // 400 → no retry. No switch either from a provider that opted
+            // into none, thinking off or not (PR-Daemon #1045 L-a).
+            let remote = |url| OpenAiCompatProvider::new("remote", url, None, "remote", "gpt-x");
+            for (p, r) in [
+                (
+                    ollama as fn(String) -> OpenAiCompatProvider,
+                    CompletionRequest { progress, ..req() },
+                ),
+                (remote, thinking_off(progress)),
+            ] {
+                let (url, asked) = answers_in_turn(vec![refused("400 Bad Request")]).await;
+                let got = p(url).complete(&r, &c).await;
+                assert!(
+                    matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+                    "{got:?}"
+                );
+                assert_eq!(asked.lock().unwrap().len(), 1);
+            }
             let (url, asked) = answers_in_turn(vec![refused("422 Unprocessable Entity")]).await;
             let got = ollama(url).complete(&thinking_off(progress), &c).await;
             assert!(
@@ -1614,6 +1627,41 @@ mod tests {
             );
             assert_eq!(asked.lock().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn a_second_refusal_cut_short_by_a_cancel_is_a_cancel() {
+        // PR-Daemon #1045 L-b: refused at once, then asked again and refused
+        // with a body that never ends; cancelled while it is read.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                let reply = if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    refused("400 Bad Request")
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":".to_owned()
+                };
+                s.write_all(reply.as_bytes()).await.unwrap();
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let c = CancellationToken::new();
+        let later = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            later.cancel();
+        });
+        let got = p.complete(&thinking_off(None), &c).await;
+        assert!(matches!(got, Err(ModelError::Cancelled)), "{got:?}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
