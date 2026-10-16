@@ -55,7 +55,7 @@
 | 连接器层 | 与外部服务的协议细节、幂等键的落地方式、对账查询 | 授权（凭据只证明技术身份，不代替业务授权；报告 §5「Four capabilities」首段）；风险自报不降低宿主风险级（ADR-K1-03 决策 1 风险行） |
 | UI 投影层 | 呈现、编辑输入、发起请求 | 权威状态；不得自建一套审批结果（报告 §4 表后段末句）；断连后不得凭本地动画推断成功（报告 §3 Status 行） |
 
-**放在哪里**（待 ADR）：业务编排层可以 (a) 编译进内核的薄 crate，或 (b) 受监管的进程外模块经 os-proto 回调接内核（报告 §4 表第 2 行）。本文倾向 (a) 起步——OA-M1 不需要独立发布，且 (b) 会引入 manifest/consent 授予路径的前置（见 §4.6）。无论哪种，都不得开辟绕过模型/工具控制的旁路。
+**放在哪里（已定：见 [`PLAN-OFFICE-ASSISTANT.md`](PLAN-OFFICE-ASSISTANT.md) §0.4 D-A）**：采用 **(b) 受监管的进程外第一方领域 OS 模块 `office`**，经 os-proto 回调接内核（报告 §4 表第 2 行）。原先「倾向 (a) 编译进内核的薄 crate」的两条理由经复核不成立：M1 不向 agent loop 通告工具，用不到 consent 前置；而 (a) 会把领域名词与不可回退的内核迁移带进内核。无论哪种，都不得开辟绕过模型/工具控制的旁路。
 
 **命名**：后端 ID 分开且显式关联：`workflow_id`、`run_id`、`workspace_id`、`artifact_id`（报告 §1「Distinct meanings of Workspace」第 2 段）；UI 用「任务」，文件位置设置用「文件工作区」。
 
@@ -93,8 +93,8 @@ run：每个 step 关联一个或多个内核 run（新 attempt = 新 run，不�
 
 ### 3.3 存储与迁移
 
-- 用 SQLite（内核同库或独立库待 ADR），新增表/投影需 ADR 决定 schema、迁移、重启恢复、与主 store 的边界（报告 §4 表后段）。
-- 注意：内核迁移在 `Store::open` 时自动前向执行、**不可按版本回退**（`K1-RELEASE-NOTES-20261016.md` 第 89–121 行）。OfficeAssistant 的迁移 PR 属「存储迁移」类，必须 PR-Daemon APPROVE（`AGENTS.md`）。
+- 业务状态落在 **`office` 模块自己的库与 `data_dir`**（**不进内核 `agent24-store`**）。模块可以像 `rust/apps/agent24-documents/` 那样自带模块级 `migrations/`：其 schema、升级与重启恢复由模块自己负责（报告 §4 表后段；模块自带迁移的细节在本议题范围外，须在该模块自己的 ADR 里定）。
+- 因此本议题**不引入内核 store 迁移**，也不触发「存储迁移」类必审。**若将来改主意把业务表放进内核**：`Store::open` 的前向迁移**不可按版本回退**（`K1-RELEASE-NOTES-20261016.md` 第 89–121 行），届时属「存储迁移」类，必须 PR-Daemon APPROVE（`AGENTS.md`）。
 
 ---
 
@@ -169,7 +169,7 @@ run：每个 step 关联一个或多个内核 run（新 attempt = 新 run，不�
 2. **模块 consent 的宿主授予入口**（若连接器以模块工具形式提供）：发布说明第 27、59 行——生产代码无授予路由；第一个加授予路径的 PR 必须同时处理 F1/F3/F6。这属 K1 线范围，OfficeAssistant 只消费，不在本议题内顺手实现。
 3. **连接器出站判定接线**：ADR-K1-02 §6 的 6b.3（统一出站判定 API）；本议题的连接器是其消费者之一。
 4. **「资料 × 用途 × 目的地」授权的产品入口**：ADR-K1-02 §2.3 / ADR-K1-03 决策 2；当前无 `CloudAuthorized` 生产写入点。需注意：外发到 Notion/邮件 ≠ 云模型处理，但两者在 ADR-K1-02 中走同一出口门；是否复用同一授权记录形状待 ADR。
-5. **业务层新表**：`agent24-store/migrations/`（新迁移）——不可回退。
+5. **业务层新记录**：落在 `office` 模块自己的 `data_dir`（模块自带迁移，见 §0.4 D-A）；**不进 `agent24-store`**。
 6. **法律**：有界委托（报告 §5）若需要比 `tool → 确切目标` 更宽或维度不同的常驻授权，或需要存储读授权，须先单独 PR 修改 `docs/laws/APPROVAL.md`（L-APPR-5/7），再实现（`../laws/README.md`）。
 
 ### 5.3 不得绕过
