@@ -45,6 +45,10 @@
 空值或相对路径会被忽略，回落到默认。不设置时行为与以前完全一致。daemon、CLI 和桌面端读的是同一口径
 （`agent24_protocol::state_file::state_dir()` 与桌面端 `daemonStatePath()`），所以只要它们在同一个环境里启动，就会彼此找到。
 
+> ⚠️ 覆盖目录必须是**专用目录**（新建或空目录）：daemon 启动时会对它执行 `create_dir_all` 并设为 `0700`，
+> 然后往里写 `agent24.db`、`workspace/`、`os/`、`logs/`、`attach/` 等。不要指向 `$HOME`、`Documents` 这类已有目录。
+> 另：相对路径或空值会被**静默**忽略并回落到 `~/.agent24`，写错不会报错。
+
 典型场景：**预览包与开发环境共存**。开发构建（如 `ab/kernel` 线）可能已把 `~/.agent24/agent24.db` 迁移到更新的 schema，
 main 基线的预览包再打开它会报 `migration N was previously applied but is missing`。让预览包用自己的目录即可互不破坏：
 
@@ -59,7 +63,11 @@ AGENT24_DATA_DIR=/tmp/a24-x agent24 daemon status
 
 影响与注意：
 
-- 隔离实例**看不到原数据**：会话、记忆、已装模块、`attach` 注册都在新目录里从零开始；原 `~/.agent24` 不会被读取、迁移、复制或删除。
+- 隔离实例**看不到原数据**：会话、记忆、已装模块、`attach` 注册都在新目录里从零开始；原 `~/.agent24` 不会被迁移、复制或删除。
+- 还有少数调用点没有跟随这个开关，会继续读写原 `~/.agent24`（因此覆盖目录**不是**完整隔离）：
+  桌面端的 Open Design 组件（`apps/desktop/src/main/open-design-component.ts`，`~/.agent24/components`），
+  以及 `nostr-bridge` / `wechat-bridge` 的 `daemon.json` 与 token（`packages/*/src/config.ts`）——
+  它们会去连原始数据目录里的那个 daemon。
 - 两个数据目录各有自己的 daemon 单例锁和 `daemon.json`，可以同时运行（端口由各自 daemon 决定）；
   但 CLI / 桌面端只会连上与自己 `AGENT24_DATA_DIR` 相同的那个 daemon。
 - 想回到原数据，去掉这个变量重新启动即可；不需要也不应手动搬动 `agent24.db`。
