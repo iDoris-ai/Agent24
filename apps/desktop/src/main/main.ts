@@ -5,6 +5,7 @@ import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
 import { AgentEarEventBridge } from './agentear-events'
+import { documentsEvent } from './documents'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
@@ -17,9 +18,13 @@ import {
   classifyCreativeUrl,
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
+import { createIdorisStatusProvider } from './idoris-admin'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
+// Start the one-shot inherited-FD read immediately. The promise is awaited
+// before any managed child is spawned, so the secret-bearing FD is closed first.
+const idorisStatusProviderPromise = createIdorisStatusProvider()
 // A3-4 review M5: the sequenced/capped event log lives here, in main, so it
 // survives the renderer's VoicePanel unmounting when the user switches
 // sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
@@ -35,6 +40,12 @@ const modelCallLog = new ModelCallLog()
 const agentEarBridge = new AgentEarEventBridge(
   (envelope) => agentEarLog.ingest(envelope),
   (call) => modelCallLog.ingest(call),
+  // The Documenting OS's events go to the renderer as they come (ADR-DOC-01
+  // D5); hints only, so nothing is kept for a window that is not there.
+  (event) => {
+    const doc = documentsEvent(event)
+    if (doc && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.DocumentsEvent, doc)
+  },
 )
 
 // FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken
@@ -203,7 +214,8 @@ process.on('unhandledRejection', (reason) => {
   console.error('[main] unhandledRejection', reason)
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const idorisStatus = await idorisStatusProviderPromise
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
   // CreativeServeWeb only ever reads this accessor's current status — it
@@ -257,7 +269,7 @@ app.whenReady().then(() => {
     })
   })
 
-  registerIpcHandlers()
+  registerIpcHandlers({ idorisStatus })
   mainWin = createMainWindow()
   ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
   ipcMain.handle(IpcChannels.CreativeRestart, (_event, bounds: CreativeViewBounds) => restartCreativeView(bounds))

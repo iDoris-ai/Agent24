@@ -1,7 +1,16 @@
-import { describe, it, expect } from 'vitest'
+import { beforeEach, describe, it, expect } from 'vitest'
 import { formatReplySuffix, extractServerReported } from './chat-latency'
+import { setLocale } from '../i18n'
+
+describe('formatReplySuffix English default', () => {
+  it('shows English tier and timing labels', () => {
+    expect(formatReplySuffix({ modelName: 'model', tier: 'local', firstTokenMs: null, totalMs: 250 }))
+      .toBe('model · Local · Total 250 ms')
+  })
+})
 
 describe('formatReplySuffix', () => {
+  beforeEach(() => { setLocale('zh') })
   it('shows model, tier (local), and only 总计 when firstTokenMs is null (non-streaming)', () => {
     expect(
       formatReplySuffix({ modelName: 'Qwen3.6-35B-A3B-MLX-8bit', tier: 'local', firstTokenMs: null, totalMs: 1834 }),

@@ -1,0 +1,27 @@
+id: "s01-04-en-govuk-sa-deadlines"
+title: "Self Assessment tax returns: Deadlines (GOV.UK)"
+lang: "en"
+kind: "text_pdf"
+pages: 4
+source_url: "https://www.gov.uk/self-assessment-tax-returns/deadlines"
+publisher: "HM Revenue and Customs / GOV.UK"
+retrieved_at: "2026-10-07"
+license: "OGL-UK-3.0"
+sha256_original: "8e497af28f13c186a34d4343016ab9e932f5ef4b2f4c41115cc5cdfbad053df7"
+sha256_stored: "8e497af28f13c186a34d4343016ab9e932f5ef4b2f4c41115cc5cdfbad053df7"
+redactions: []
+public_officials: []
+covers:
+  C3: [online_return_deadline]
+  C5: [register_deadline, paper_return_deadline, return_submission_open_date]
+  C6: [profit_unknown_still_required, special_entities_cannot_file_online]
+  C9: [penalty_amount, tax_bill_amount]
+reader: "an individual (not a pension-scheme trustee, non-resident company or partnership) who needs to register for or send a Self Assessment return for tax year 2025 to 2026, and pay the tax"
+questions: [Q1, Q2, Q3, Q4]
+extraction_notes:
+  - {"extractor": "PDFKit (macOS 26.6.2)", "finding": "printed link targets appear as text in parentheses, e.g. “(/pay-self-assessment-tax-bill)”; they are displayed on the page and quoted as-is"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 3, "finding": "a wrapped link target leaves a space inside it: “(/pay-self- assessment-tax-bill/through-your-tax-code)”; that sentence is anchored in two pieces"}
+derived_from: null
+sha256_parent: null
+derivation: []
+notes: "Printed from the live page with headless Chrome; tax year 2025-26 as of retrieval. Penalty amounts are only on the linked Penalties page (missing_reason referenced_but_absent). The v1 reading-order note was wrong and has been removed."

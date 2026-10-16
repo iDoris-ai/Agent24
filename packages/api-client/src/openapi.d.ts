@@ -171,6 +171,150 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/os": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List domain OS modules and registry state */
+        get: operations["listDomainOs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Enable or disable a domain OS module */
+        patch: operations["updateDomainOs"];
+        trace?: never;
+    };
+    "/os/{name}/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stop a running domain OS module without changing os.json */
+        post: operations["stopDomainOs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/{name}/commands/{command}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Invoke a command declared by an attached module
+         * @description A JSON object body of at most 64 KiB is forwarded to the module; its object result is returned.
+         */
+        post: operations["invokeAttachedModuleCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attached": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List attached module registrations
+         * @description List fields expose public metadata without token credentials or token hashes.
+         */
+        get: operations["listAttachedModules"];
+        put?: never;
+        /** Register an attached module or rotate its token */
+        post: operations["registerAttachedModule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attached/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke an attached module registration */
+        delete: operations["revokeAttachedModule"];
+        options?: never;
+        head?: never;
+        /** Enable or disable an attached module */
+        patch: operations["updateAttachedModule"];
+        trace?: never;
+    };
+    "/timings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List model-call timing rows */
+        get: operations["listTimings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/timings/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Summarize timing totals by source, model, and step */
+        get: operations["summarizeTimings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/usage": {
         parameters: {
             query?: never;
@@ -814,10 +958,366 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/documents/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** What the Documenting OS can do right now (ADR-DOC-02 §8) */
+        get: operations["documentsGetCapabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/documents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List documents, newest first */
+        get: operations["documentsListDocuments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/documents/{document_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one document and its head revision */
+        get: operations["documentsGetDocument"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a chunked upload (ADR-DOC-02 §5.6)
+         * @description Idempotent on `Idempotency-Key` (kind `upload`, §5.4): the same key with the same body returns the existing upload; with a different body, `idempotency_key_reused`. The body is checked before the key is looked up, so an invalid body is 400 `invalid_request` even under a used key.
+         */
+        post: operations["documentsCreateUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/uploads/{upload_id}/chunks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Append one chunk of raw bytes at the given offset
+         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires. An upload that is complete or imported takes no new chunk: 409 `upload_offset_mismatch` with `details.received_offset`, decided before the `total_size` and `Chunk-Sha256` checks (a received chunk still replays). For an upload still receiving, a new chunk that would run past `total_size` is 400 `invalid_request`. An unknown upload, or one 24 h after its last chunk, is 404 `not_found`. A body over 768 KiB is 413 `payload_too_large`.
+         */
+        post: operations["documentsAppendUploadChunk"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import a completed upload as a new document (r1); starts a job
+         * @description Page-only in DOC-1 (Q4): not announced as an agent tool. Idempotent on `upload_id` (kind `import`, §5.4, §7): a repeat returns the same job — 202 while it is queued, running or cancelling, and 202 again when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result`) or was cancelled (it stays cancelled; only `POST /documents/jobs/{job_id}/retry` restarts it). The same `upload_id` with a different `title` — including a `title` added or left out — is 422 `idempotency_key_reused`; an empty `title` is 400, never the same as none. An unknown upload, or one past its 24 h (§5.6), is 404 `not_found`; one that is not complete is 400 `invalid_request` with `details.received`. The whole file's hash and its format are checked before the job starts: 422 `upload_checksum_mismatch` or `unsupported_format`.
+         */
+        post: operations["documentsImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a job; the row, not any event, is the authority (§7)
+         * @description One job, not paginated. A job's result, when it is a collection (e.g. extraction values), is paginated by its own resource (ADR-DOC-02 §4).
+         */
+        get: operations["documentsGetJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/jobs/{job_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a job (idempotent); a cancelled job is never revived by a replay */
+        post: operations["documentsCancelJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/jobs/{job_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Explicitly restart a failed, interrupted or cancelled job (attempt + 1)
+         * @description A job that is queued, running, cancelling or succeeded cannot be retried: 400 `invalid_request` with `details.status`. The route has no idempotency key, so a retry whose outcome is unknown must not be repeated blindly — repeating it after it landed and the job failed again restarts the job a second time. Instead GET the job and compare `attempt` with its value before the retry: a higher `attempt` means the job was restarted (by this retry or by an import replay). An unchanged `attempt` does not prove the retry was lost: it may still be in flight, so read the job again before deciding. It answers 200 with the job, where an import replay that re-queues answers 202: there the 202 says the import is still to be done, here the request itself is the restart.
+         */
+        post: operations["documentsRetryJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/documents/{document_id}/revisions/{revision}/pages/{page}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Render one page of a revision as PNG (ADR-DOC-02 §4)
+         * @description The image is at most 1 MiB. The OS lowers `scale` until it fits and reports the scale it used in `Documents-Render-Scale`. If the requested area does not fit even at scale 0.25, the response is 413 `payload_too_large`: request smaller tiles with `region`. Renders are a cache derived from the revision and can be rebuilt (§3). A page past the revision's last page is 404 `not_found`; a flowing format (DOCX) has no pages and is 422 `unsupported_format`.
+         */
+        get: operations["documentsRenderPage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/documents/{document_id}/revisions/{revision}/text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the text layer of a revision, one page of blocks at a time
+         * @description Blocks come from the revision's pinned text layer; their text is stored as parsed, not normalized, so anchor offsets stay valid (§3). A page holds at most `limit` blocks and at most 512 KiB of serialized JSON; the OS ends the page early to stay under that and continues from `next_cursor` (§4). By default a partial parse is reported in `parse_status`; with `require_complete=true` it is 422 `partial_parse` (§6, Q8).
+         */
+        get: operations["documentsReadText"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/documents/{document_id}/find": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Find text inside one revision; every match is an anchor
+         * @description A page holds at most `limit` matches and at most 512 KiB of serialized JSON, then continues from `next_cursor` (§4). A partial parse is reported with the regions that were not searched, or is 422 `partial_parse` with `require_complete` (§6).
+         */
+        post: operations["documentsFind"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/documents/{document_id}/extractions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Extract fields from one revision, each value with its provenance; starts a job
+         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version) (§5.4); a rerun is keyed instead by the document and its `Idempotency-Key`, so a key is never shared between documents. The model the kernel's router picks is not known before the call, so it is not in the key: it is recorded in the result's `model_id`, and a new local model is used by extracting again with `rerun` (David, 2026-10-10). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key names the rerun within the document (the same key on another document is another rerun), so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request — the JCS hash of the whole request body differs (§5.4; David, 2026-10-10) — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8). When the kernel gives this module no model access, the answer is 503 `engine_unavailable`. Whether a local model is available is only known when the job calls it: if none is, the job fails with `engine_unavailable` (retryable; the same key re-queues it). `details.engine` is `local-model` (§3.2).
+         */
+        post: operations["documentsExtract"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/documents/extractions/{extraction_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get an extraction's values, one page at a time
+         * @description Values follow the S01 gold-label shape (docs/documenting/samples): `present` with `anchors[]` that together cover the whole proposition (or `anchors: []` and `unsourced_reason` when there is no verifiable source), `missing` with `missing_reason`, or `conflict` with every candidate and its own `anchors[]`; a conflict is never resolved by the extractor. A page holds at most `limit` values and at most 512 KiB of serialized JSON (§4).
+         */
+        get: operations["documentsGetExtraction"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        DomainOsView: {
+            name: string;
+            namespace: string;
+            version: string;
+            enabled: boolean;
+            /** @description Open enum: mounted | disabled | degraded | refused. */
+            state: string;
+            detail?: string;
+            granted: string[];
+            missing_models: string[];
+            /** @description Open enum: ok | missing | unknown | not_checked. */
+            resources: string;
+            restart_required: boolean;
+        };
+        DomainOsList: {
+            modules: components["schemas"]["DomainOsView"][];
+            registry_error?: string;
+        };
+        DomainOsUpdate: {
+            enabled: boolean;
+        };
+        DomainOsStopResponse: {
+            name: string;
+            stopped: boolean;
+        };
+        DomainOsCommandResponse: {
+            result: {
+                [key: string]: unknown;
+            };
+        };
+        AttachedAddRequest: {
+            /** @description Exact domain-os.yml text stored by the daemon. */
+            manifest: string;
+            /** @default false */
+            allow_relax: boolean;
+        };
+        AttachedAddResponse: {
+            name: string;
+            manifest_digest: string;
+            /** @description One-time plaintext handshake token; save it now. */
+            token: string;
+            socket_path: string;
+            token_id: string;
+        };
+        AttachedView: {
+            name: string;
+            manifest_digest: string;
+            token_id: string;
+            /** Format: date-time */
+            created_at: string;
+            /** @description Open enum: detached | attached | disabled. */
+            attach_status: string;
+            /** @description Live generation number when attached. */
+            generation?: number;
+        };
+        AttachedList: {
+            modules: components["schemas"]["AttachedView"][];
+        };
+        AttachedUpdate: {
+            enabled: boolean;
+        };
+        Timing: {
+            id: number;
+            /** Format: date-time */
+            ts: string;
+            source: string;
+            model_id: string | null;
+            tier: string | null;
+            served_by: string | null;
+            ok: boolean;
+            error_kind: string | null;
+            step: string | null;
+            session_id: string | null;
+            seq: number | null;
+            first_token_ms: number | null;
+            total_ms: number;
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+        };
+        TimingSummary: {
+            source: string;
+            model_id: string;
+            step: string;
+            count: number;
+            p50_ms: number;
+            p95_ms: number;
+            max_ms: number;
+        };
         ShutdownReport: {
             /** @description An ephemeral daemon keeps no shutdown evidence. */
             ephemeral: boolean;
@@ -1251,14 +1751,37 @@ export interface components {
             cpu_cores: number;
             /** @enum {string} */
             accelerator: "metal" | "cuda" | "none";
-            free_disk_bytes: number;
             /**
              * @example macos
              * @example linux
              * @example windows
              */
             os: string;
-            /** @description Null when the platform/probe cannot tell — not implemented for any OS yet (sysinfo has no power-source API) */
+            os_version?: string | null;
+            chip?: string | null;
+            unified_memory?: boolean;
+            gpu_wired_limit_bytes?: number | null;
+            discrete_gpus?: {
+                name: string;
+                vram_bytes?: number | null;
+            }[];
+            /** @description All user-visible mounted volumes (internal and external); read-only system volumes and APFS helper volumes are filtered out */
+            disks?: {
+                name: string;
+                mount_point: string;
+                total_bytes: number;
+                free_bytes: number;
+                removable: boolean;
+                read_only: boolean;
+            }[];
+            /** @description Free bytes on the disk holding the models directory; null when it cannot be determined (replaces the removed free_disk_bytes, which was the cwd disk) */
+            models_dir_free_bytes?: number | null;
+            /** @description Reserved; not probed yet (HW-1) */
+            runtimes?: {
+                name: string;
+                version?: string | null;
+            }[];
+            /** @description Null when the platform/probe cannot tell (macOS pmset / Linux power_supply otherwise) */
             on_battery?: boolean | null;
         };
         DecideProfile: {
@@ -1401,6 +1924,400 @@ export interface components {
         Error: {
             error: components["schemas"]["ErrorBody"];
         };
+        /** @description `doc_` + ULID, generated by the OS (ADR-DOC-02 §3). The first ULID character is 0–7: larger values overflow 128 bits. */
+        DocumentIdString: string;
+        Sha256Address: string;
+        /**
+         * @description Closed set; adding a code requires amending ADR-DOC-02 §6.
+         * @enum {string}
+         */
+        DocumentsErrorCode: "invalid_request" | "not_found" | "payload_too_large" | "unsupported_format" | "parse_failed" | "partial_parse" | "idempotency_key_reused" | "change_set_incomplete" | "upload_checksum_mismatch" | "knowledge_disabled" | "revision_conflict" | "change_set_stale" | "change_set_committed" | "upload_offset_mismatch" | "stale_index" | "permission_denied" | "knowledge_unavailable" | "engine_unavailable" | "storage_unavailable";
+        DocumentsError: {
+            error: {
+                code: components["schemas"]["DocumentsErrorCode"];
+                message: string;
+                hint?: string;
+                details: {
+                    retryable: boolean;
+                } & {
+                    [key: string]: unknown;
+                };
+            } & (unknown & unknown & unknown & unknown & unknown & unknown);
+        };
+        /** @description The three availability codes a 503 from the OS itself may carry. */
+        DocumentsUnavailableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "storage_unavailable" | "engine_unavailable" | "knowledge_unavailable";
+            };
+        };
+        /** @description A 400 from the OS itself. */
+        DocumentsInvalidRequestError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "invalid_request";
+            };
+        };
+        /** @description A 404 from the OS itself. */
+        DocumentsNotFoundError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "not_found";
+            };
+        };
+        /** @description The 409s of the slice-1 upload routes. */
+        DocumentsConflictError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "upload_offset_mismatch";
+            };
+        };
+        /** @description A 413 from the OS itself. */
+        DocumentsTooLargeError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "payload_too_large";
+            };
+        };
+        /** @description The 422s of render. */
+        DocumentsRenderUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "unsupported_format" | "parse_failed";
+            };
+        };
+        /** @description The 422s of extraction. */
+        DocumentsExtractUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "unsupported_format" | "parse_failed" | "idempotency_key_reused";
+            };
+        };
+        /** @description The 422s of text and find. */
+        DocumentsReadUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "unsupported_format" | "parse_failed" | "partial_parse";
+            };
+        };
+        /** @description The 422 of upload creation. */
+        DocumentsUploadUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "idempotency_key_reused";
+            };
+        };
+        /** @description The 422s of import. */
+        DocumentsImportUnprocessableError: components["schemas"]["DocumentsError"] & {
+            error?: {
+                /** @enum {unknown} */
+                code?: "idempotency_key_reused" | "upload_checksum_mismatch" | "unsupported_format";
+            };
+        };
+        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. The rule holds wherever this schema is used: the 500 response and, through `DocumentsUnavailable`, the 503 one. */
+        ModuleProxyError: components["schemas"]["Error"] & unknown & {
+            error?: {
+                code?: unknown;
+            };
+        };
+        DocumentsOperationStatus: {
+            op: string;
+            /** @constant */
+            available: true;
+            reason?: null;
+        } | {
+            op: string;
+            /** @constant */
+            available: false;
+            reason: components["schemas"]["DocumentsErrorCode"];
+        };
+        DocumentsCapabilities: {
+            os_version: string;
+            storage: {
+                /** @enum {string} */
+                state: "ready" | "degraded" | "unavailable";
+            };
+            engines: {
+                id: string;
+                /** @enum {string} */
+                kind: "parse" | "ocr" | "render" | "export";
+                formats: string[];
+                /** @enum {string} */
+                state: "absent" | "installing" | "ready" | "failed";
+                version?: string | null;
+            }[];
+            knowledge: {
+                /** @enum {string} */
+                setting: "on" | "off";
+                /** @enum {string} */
+                state: "registered" | "loading" | "ready" | "degraded" | "unavailable" | "disabled";
+            };
+            operations: components["schemas"]["DocumentsOperationStatus"][];
+        };
+        DocumentRevisionSummary: {
+            revision: number;
+            content_sha256: components["schemas"]["Sha256Address"];
+            size: number;
+            media_type: components["schemas"]["DocumentsMediaType"];
+        };
+        Document: {
+            document_id: components["schemas"]["DocumentIdString"];
+            title: string;
+            media_type: components["schemas"]["DocumentsMediaType"];
+            head_revision: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        DocumentDetail: components["schemas"]["Document"] & {
+            head: components["schemas"]["DocumentRevisionSummary"];
+        };
+        JobIdString: string;
+        DocumentsUploadRequest: {
+            /** @description Written as a JSON integer literal: a fraction or exponent spelling (`10.0`, `1e1`) is refused with 400 even when its value is whole, because parsing such a spelling can round it. JSON Schema's `integer` cannot express a spelling, so this rule is the OS's, checked on the raw body. */
+            total_size: number;
+            /** @description Whole-file hash, checked at import (`upload_checksum_mismatch`). */
+            sha256: components["schemas"]["Sha256Address"];
+            /** @description Display name only, used as the default title. A base name, never a path (ADR-001): no `/` or `\`, and no NUL. */
+            filename?: string;
+        };
+        DocumentsUpload: {
+            upload_id: string;
+            total_size: number;
+            sha256: components["schemas"]["Sha256Address"];
+            received: number;
+            /** @enum {string} */
+            status: "receiving" | "complete" | "imported" | "expired";
+            /**
+             * Format: date-time
+             * @description 24 h after the last chunk arrived (§5.6).
+             */
+            expires_at: string;
+        };
+        DocumentsImportRequest: {
+            upload_id: string;
+            title?: string;
+        };
+        DocumentsJob: {
+            job_id: components["schemas"]["JobIdString"];
+            /** @description `import` and `extract` in slice 1; later slices add more (e.g. `export`), so clients must tolerate unknown kinds. */
+            kind: string;
+            document_id?: components["schemas"]["DocumentIdString"];
+            revision?: number;
+            /** @enum {string} */
+            status: "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "interrupted";
+            attempt: number;
+            progress?: {
+                stage: string;
+                done: number;
+                total: number | null;
+                unit: string;
+            } | null;
+            /** @description Set when `failed`; `cancelled` appears only here, never as an HTTP error (§6). */
+            error?: {
+                code: components["schemas"]["DocumentsErrorCode"] | "cancelled";
+                message: string;
+            } | null;
+            /** @description Set when `succeeded`, e.g. the imported document and its r1, or the extraction. */
+            result?: {
+                document_id?: components["schemas"]["DocumentIdString"];
+                revision?: number;
+                extraction_id?: components["schemas"]["ExtractionIdString"];
+            } | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        } & (unknown & unknown & unknown & unknown & unknown & unknown);
+        /** @description kind `job.progress`: a job's latest progress. Coalesced per job, at most 2 events a second for the whole module; one dropped by the rate limit is not sent again. */
+        DocumentsJobProgressEvent: {
+            job_id: components["schemas"]["JobIdString"];
+            /** @description The job's kind, as in DocumentsJob. */
+            kind: string;
+            stage: string;
+            done: number;
+            total: number | null;
+            unit: string;
+        };
+        /** @description kind `job.finished`: a job reached an end state. Sent ahead of progress and, if rate-limited, once more after a short backoff. A job that is started again by its key or by `retry` finishes again with a higher `attempt`. Jobs that startup recovery ends (`interrupted`, `cancelled`) are announced once too, best effort and at most 256 (David, 2026-10-10). */
+        DocumentsJobFinishedEvent: {
+            job_id: components["schemas"]["JobIdString"];
+            /** @description The job's kind, as in DocumentsJob. */
+            kind: string;
+            /** @enum {string} */
+            status: "succeeded" | "failed" | "cancelled" | "interrupted";
+            attempt: number;
+            /** @description The job's `error.code` when `failed` or `cancelled`, else null. */
+            error_code: null | components["schemas"]["DocumentsErrorCode"] | "cancelled";
+            document_id?: components["schemas"]["DocumentIdString"];
+            revision?: number;
+        } & (unknown & unknown & unknown);
+        /** @description kind `document.imported`: an import committed a new document and its first revision. Sent with the import job's `job.finished`. */
+        DocumentsDocumentImportedEvent: {
+            document_id: components["schemas"]["DocumentIdString"];
+            /** @constant */
+            revision: 1;
+            job_id: components["schemas"]["JobIdString"];
+        };
+        /** @description kind `revision.committed`: a commit made a new head revision (slice 2; slice 1 never sends it). Sent ahead of progress, like `job.finished`. */
+        DocumentsRevisionCommittedEvent: {
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            job_id?: components["schemas"]["JobIdString"];
+        };
+        DocumentsEngineRef: {
+            id: string;
+            version: string;
+        };
+        /** @description PDF CropBox frame, in points multiplied by UserUnit, origin at the top-left of the page as displayed after /Rotate (§3). Each rect is [x0, y0, x1, y1] with x0 ≤ x1 and y0 ≤ y1 (checked by the OS, not expressible here); several rects cover a span across lines or columns. A JPEG or PNG is one page: its frame is the image as displayed after its EXIF orientation, 1 pixel = 1 pt (David, 2026-10-10). */
+        DocumentsGeometry: {
+            /** @constant */
+            box: "CropBox";
+            /** @constant */
+            unit: "pt";
+            /** @constant */
+            origin: "top-left-rotated";
+            rects: number[][];
+        };
+        /** @description Lowercase `type/subtype` without parameters, as the OS records it at import (`application/pdf`, not `Application/PDF; x=y`). */
+        DocumentsMediaType: string;
+        /**
+         * @description The paginated formats: their anchors and blocks have a page and geometry; every other format is flowing and has neither (§3).
+         * @enum {string}
+         */
+        DocumentsPaginatedMediaType: "application/pdf" | "image/jpeg" | "image/png";
+        /** @description UTF-8 byte offsets into the block text, half-open [start, end) with start ≤ end ≤ the block's byte length, in logical (stored) order; both on character boundaries (§3). The OS checks these; a client that finds the quote or hashes no longer match shows the anchor as stale ("定位失效") instead of guessing a position. */
+        DocumentsTextRange: {
+            /** @constant */
+            unit: "utf8";
+            start: number;
+            end: number;
+        };
+        /** @description Per-value provenance (ADR-DOC-02 §3). Bound to the pinned text layer, never migrated across revisions; `block_text_sha256` + `quote` + `rects` let a client detect a stale anchor instead of guessing. */
+        DocumentsAnchor: {
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            content_sha256: components["schemas"]["Sha256Address"];
+            /** @description Media type of the anchored revision. It tells a client, and this schema, whether the source is paginated (PDF, images) or flowing (e.g. DOCX in slice 2). */
+            media_type: components["schemas"]["DocumentsMediaType"];
+            text_layer_sha256: components["schemas"]["Sha256Address"];
+            engine: components["schemas"]["DocumentsEngineRef"];
+            block_id: string;
+            /** @description 1-based physical page; omitted for flowing formats such as DOCX. */
+            page?: number;
+            block_text_sha256: components["schemas"]["Sha256Address"];
+            text_range: components["schemas"]["DocumentsTextRange"];
+            geometry?: components["schemas"]["DocumentsGeometry"];
+            quote: string;
+        };
+        DocumentsTextBlock: {
+            block_id: string;
+            page?: number;
+            text: string;
+            text_sha256: components["schemas"]["Sha256Address"];
+            geometry?: components["schemas"]["DocumentsGeometry"];
+        };
+        DocumentsUnparsedRegion: {
+            page?: number;
+            geometry?: components["schemas"]["DocumentsGeometry"];
+            reason: string;
+        };
+        DocumentsTextPage: {
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            content_sha256: components["schemas"]["Sha256Address"];
+            /** @description Media type of the revision; see DocumentsAnchor.media_type. */
+            media_type: components["schemas"]["DocumentsMediaType"];
+            text_layer_sha256: components["schemas"]["Sha256Address"];
+            engine: components["schemas"]["DocumentsEngineRef"];
+            /** @enum {string} */
+            parse_status: "complete" | "partial";
+            unparsed_regions?: components["schemas"]["DocumentsUnparsedRegion"][];
+            blocks: components["schemas"]["DocumentsTextBlock"][];
+            next_cursor: string | null;
+        } & (unknown & unknown);
+        DocumentsFindRequest: {
+            revision: number;
+            query: string;
+            cursor?: string;
+            /** @default 50 */
+            limit: number;
+            /** @default false */
+            require_complete: boolean;
+        };
+        DocumentsFindResult: {
+            /** @enum {string} */
+            parse_status: "complete" | "partial";
+            /** @description The regions that were not searched, so "no match" is not mistaken for "not there". */
+            unparsed_regions?: components["schemas"]["DocumentsUnparsedRegion"][];
+            matches: components["schemas"]["DocumentsAnchor"][];
+            next_cursor: string | null;
+        };
+        ExtractionIdString: string;
+        DocumentsExtractField: {
+            key: string;
+            /** @description What to find, in the reader's words. */
+            description: string;
+            /**
+             * @description A hint for the extractor; values keep the source wording either way.
+             * @enum {string}
+             */
+            type?: "text" | "date" | "datetime" | "amount" | "number" | "identifier" | "boolean";
+        };
+        DocumentsExtractRequest: {
+            revision: number;
+            schema: {
+                fields: components["schemas"]["DocumentsExtractField"][];
+            };
+            /** @default false */
+            rerun: boolean;
+        };
+        /** @description Anchors that together cover the whole proposition: the value and what decides its meaning — condition, audience, negation, table row label and column header (samples README §4.2). They may span blocks and pages. */
+        DocumentsEvidence: components["schemas"]["DocumentsAnchor"][];
+        /** @description One side of a conflict. Like a present value, its anchors are empty only when its evidence could not be verified, and then `unsourced_reason` says why: the candidate is kept rather than dropped, so the conflict is never resolved by the extractor (ADR-DOC-02 §3.2; David, 2026-10-10). */
+        DocumentsExtractCandidate: {
+            /** @description As written in the source. */
+            value: string;
+            /** @description For comparison only. Required here: candidates conflict because their normalized forms differ. */
+            normalized: string;
+            anchors: components["schemas"]["DocumentsAnchor"][];
+            unsourced_reason?: string;
+        };
+        DocumentsExtractedValue: {
+            /** @description The `key` of the requested field. */
+            key: string;
+            /** @enum {string} */
+            status: "present" | "missing" | "conflict";
+            /** @description As written in the source; never rewritten. */
+            value?: string;
+            /** @description For comparison only. Optional on a present value: some values (free text) have no normal form. */
+            normalized?: string;
+            /** @description Evidence for a present value (see DocumentsEvidence). Empty only when the value has no verifiable source, and then `unsourced_reason` says why (ADR-DOC-02 §3). At most 16. */
+            anchors?: components["schemas"]["DocumentsAnchor"][];
+            unsourced_reason?: string;
+            /** @enum {string} */
+            missing_reason?: "blank_in_template" | "not_in_document" | "referenced_but_absent" | "outside_page_scope" | "unread";
+            candidates?: components["schemas"]["DocumentsExtractCandidate"][];
+        } & (unknown & unknown & unknown);
+        DocumentsExtraction: {
+            extraction_id: components["schemas"]["ExtractionIdString"];
+            document_id: components["schemas"]["DocumentIdString"];
+            revision: number;
+            content_sha256: components["schemas"]["Sha256Address"];
+            schema_sha256: components["schemas"]["Sha256Address"];
+            extractor_version: string;
+            /** @description The model actually used (§5.4), always a local one (ADR-DOC-01 D8). */
+            model_id: string;
+            /** Format: date-time */
+            created_at: string;
+            values: components["schemas"]["DocumentsExtractedValue"][];
+            next_cursor: string | null;
+        };
+        DocumentList: {
+            documents: components["schemas"]["Document"][];
+            next_cursor: string | null;
+        };
         /** @enum {string} */
         Sin90DirectionStatus: "draft" | "active" | "paused" | "achieved" | "abandoned";
         /** @enum {string} */
@@ -1532,7 +2449,25 @@ export interface components {
         };
     };
     responses: {
-        /** @description Malformed or invalid request */
+        /** @description internal: the request could not be completed */
+        Internal: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+        PayloadTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description invalid_request: malformed or invalid request */
         BadRequest: {
             headers: {
                 [name: string]: unknown;
@@ -1550,7 +2485,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Resource not found */
+        /** @description not_found: resource not found */
         NotFound: {
             headers: {
                 [name: string]: unknown;
@@ -1568,9 +2503,131 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description `invalid_request` from the OS (DocumentsError, with details), or `invalid_request` / `invalid_request_path` from the kernel proxy (no details). */
+        DocumentsBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsInvalidRequestError"] | (components["schemas"]["Error"] & {
+                    error?: {
+                        /** @enum {unknown} */
+                        code?: "invalid_request" | "invalid_request_path";
+                        details?: never;
+                    };
+                });
+            };
+        };
+        /** @description `not_found`: the document, revision, job or upload does not exist or has expired (DocumentsError), or the kernel has no such route (generic Error). */
+        DocumentsNotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsNotFoundError"] | (components["schemas"]["Error"] & {
+                    error?: {
+                        /** @enum {unknown} */
+                        code?: "not_found";
+                        details?: never;
+                    };
+                });
+            };
+        };
+        /** @description `upload_offset_mismatch` with `details.received_offset` (§5.6) */
+        DocumentsConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsConflictError"];
+            };
+        };
+        /** @description `payload_too_large`: the render does not fit in 1 MiB even at scale 0.25; request a smaller `region` */
+        DocumentsTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsTooLargeError"];
+            };
+        };
+        /** @description `unsupported_format` or `parse_failed` (§6); render has no `require_complete` */
+        DocumentsRenderUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsRenderUnprocessableError"];
+            };
+        };
+        /** @description `unsupported_format`, `parse_failed`, or `idempotency_key_reused` when a rerun key is reused with a different request (§5.4, §6). */
+        DocumentsExtractUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsExtractUnprocessableError"];
+            };
+        };
+        /** @description Text and find: `unsupported_format`, `parse_failed`, or `partial_parse` when `require_complete` was set (§6). */
+        DocumentsReadUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsReadUnprocessableError"];
+            };
+        };
+        /** @description `idempotency_key_reused`: the same key with a different body (§5.4) */
+        DocumentsUploadUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsUploadUnprocessableError"];
+            };
+        };
+        /** @description `idempotency_key_reused`, `upload_checksum_mismatch` (whole-file hash checked at import, §5.6) or `unsupported_format`. */
+        DocumentsImportUnprocessable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsImportUnprocessableError"];
+            };
+        };
+        /** @description Exactly one of: the OS reports `storage_unavailable`, `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or the kernel proxy reports the module unreachable (`module_not_ready`, `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists which proxy codes are safe to retry. */
+        DocumentsUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DocumentsUnavailableError"] | components["schemas"]["ModuleProxyError"];
+            };
+        };
+        /** @description The kernel proxy could not complete the call: 500 (module failure), 502 (`upstream_unavailable`, `upstream_connection_closed`, `request_abandoned`, …) or 504 (`upstream_timeout`). A 500 may also be the OS's own `internal`, for a failure it did not expect. In every case the module may have executed; resend with the same idempotency key (ADR-DOC-02 §6). */
+        DocumentsProxyFailure: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ModuleProxyError"];
+            };
+        };
     };
     parameters: {
         PathId: string;
+        DocumentId: components["schemas"]["DocumentIdString"];
+        /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
+        DocumentsCursor: string;
+        UploadId: string;
+        JobId: components["schemas"]["JobIdString"];
+        /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces: a deliberate subset of what an HTTP header value may carry. */
+        DocumentsIdempotencyKey: string;
+        RevisionNumber: number;
+        /** @description Turn a partial parse into 422 `partial_parse` instead of a result status. */
+        DocumentsRequireComplete: boolean;
+        DocumentsLimit: number;
     };
     requestBodies: never;
     headers: never;
@@ -1804,6 +2861,408 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    listDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Module configuration, runtime state, and resource availability */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsList"];
+                };
+            };
+            /** @description registry_invalid: the os.json registry could not be read or parsed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DomainOsUpdate"];
+            };
+        };
+        responses: {
+            /** @description Updated module list and runtime state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description attached_module or admission_refused */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description internal or stop_failed: configuration write or module stop failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description registry_invalid or disable_pending */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    stopDomainOs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stop was requested and the module no longer admits requests */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsStopResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description stop_failed: the module supervisor could not stop cleanly */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description disable_pending: the module is still admitting requests */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    invokeAttachedModuleCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                command: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Command result from the attached module */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainOsCommandResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description forbidden: the command is not declared by the module manifest */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
+            /** @description busy: the module has reached its in-flight command limit */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description connection_lost or module_error: the module connection ended or returned an invalid response */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description module_not_ready: the module is not attached or its command was not sent */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description timeout: the module did not answer before the command deadline */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listAttachedModules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registrations and live attach status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedList"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
+    registerAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachedAddRequest"];
+            };
+        };
+        responses: {
+            /** @description Existing registration was rotated; includes the new one-time token */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedAddResponse"];
+                };
+            };
+            /** @description Registration created; includes the one-time token */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedAddResponse"];
+                };
+            };
+            /** @description invalid_request or invalid_manifest */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description relax_requires_confirmation: privacy widening needs allow_relax */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description name_taken: this name is already provided by another module */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
+    revokeAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registration revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    updateAttachedModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachedUpdate"];
+            };
+        };
+        responses: {
+            /** @description Updated registration list and live status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachedList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    listTimings: {
+        parameters: {
+            query?: {
+                source?: string;
+                /** @description Timestamp lower bound passed to the timing store. */
+                since?: string;
+                /** @description Defaults to 500, accepts u32 values, and caps results at 5000; invalid values return 400. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matching rows, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        timings: components["schemas"]["Timing"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["Internal"];
+        };
+    };
+    summarizeTimings: {
+        parameters: {
+            query?: {
+                /** @description Timestamp lower bound passed to the timing store. */
+                since?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Count, p50, p95, and maximum duration per group */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        summary: components["schemas"]["TimingSummary"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["Internal"];
         };
     };
     getUsage: {
@@ -3072,6 +4531,477 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    documentsGetCapabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Storage, engine and knowledge state, and per-operation availability */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsCapabilities"];
+                };
+            };
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsListDocuments: {
+        parameters: {
+            query?: {
+                /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
+                cursor?: components["parameters"]["DocumentsCursor"];
+                limit?: components["parameters"]["DocumentsLimit"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of documents */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentList"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsGetDocument: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The document */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentDetail"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsCreateUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Client-chosen key; reused on retry after an unknown outcome (§5.5). Visible ASCII without spaces: a deliberate subset of what an HTTP header value may carry. */
+                "Idempotency-Key": components["parameters"]["DocumentsIdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsUploadRequest"];
+            };
+        };
+        responses: {
+            /** @description Replay of an existing upload with the same key and body */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsUpload"];
+                };
+            };
+            /** @description Upload created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsUpload"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            422: components["responses"]["DocumentsUploadUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsAppendUploadChunk: {
+        parameters: {
+            query?: never;
+            header: {
+                "Upload-Offset": number;
+                "Chunk-Sha256": components["schemas"]["Sha256Address"];
+            };
+            path: {
+                upload_id: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description The upload after this chunk */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsUpload"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["DocumentsConflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsImport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Replay of a job that already succeeded or was cancelled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            /** @description The import job, new, still running, or re-queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsImportUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsGetJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: components["parameters"]["JobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsCancelJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: components["parameters"]["JobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job, now cancelling, cancelled, or already finished */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsRetryJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: components["parameters"]["JobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job, queued again */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsRenderPage: {
+        parameters: {
+            query?: {
+                scale?: number;
+                /** @description `x0,y0,x1,y1`: corners in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame and order as an anchor's `rects` (David, 2026-10-10); for a JPEG or PNG, pixels after EXIF orientation. `x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`, and one partly off the page is clipped to it (its top-left corner stays). Each corner is a non-negative number as JSON writes it, exponent included, so an anchor's rect can be passed as it is (`1e-7`). */
+                region?: string;
+            };
+            header?: never;
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+                revision: components["parameters"]["RevisionNumber"];
+                /** @description 1-based physical page. */
+                page: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The rendered page or region */
+            200: {
+                headers: {
+                    /** @description The scale actually used, at most the one requested. */
+                    "Documents-Render-Scale": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/png": string;
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            413: components["responses"]["DocumentsTooLarge"];
+            422: components["responses"]["DocumentsRenderUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsReadText: {
+        parameters: {
+            query?: {
+                /** @description Start at this block id instead of the first one. Not with `cursor`, which already holds the position: both is 400 `invalid_request` (David, 2026-10-10). */
+                block?: string;
+                /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
+                cursor?: components["parameters"]["DocumentsCursor"];
+                limit?: components["parameters"]["DocumentsLimit"];
+                /** @description Turn a partial parse into 422 `partial_parse` instead of a result status. */
+                require_complete?: components["parameters"]["DocumentsRequireComplete"];
+            };
+            header?: never;
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+                revision: components["parameters"]["RevisionNumber"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of blocks */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsTextPage"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsReadUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsFind: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsFindRequest"];
+            };
+        };
+        responses: {
+            /** @description One page of matches */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsFindResult"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsReadUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsExtract: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Required with `rerun: true`; ignored otherwise. Visible ASCII without spaces, like every documents Idempotency-Key. */
+                "Idempotency-Key"?: string;
+            };
+            path: {
+                document_id: components["parameters"]["DocumentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentsExtractRequest"];
+            };
+        };
+        responses: {
+            /** @description Replay of an extraction job that already succeeded or was cancelled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            /** @description The extraction job, new, still running, or re-queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsJob"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            422: components["responses"]["DocumentsExtractUnprocessable"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
+        };
+    };
+    documentsGetExtraction: {
+        parameters: {
+            query?: {
+                /** @description Opaque `next_cursor` from the previous page (ADR-DOC-02 §4). */
+                cursor?: components["parameters"]["DocumentsCursor"];
+                limit?: components["parameters"]["DocumentsLimit"];
+            };
+            header?: never;
+            path: {
+                extraction_id: components["schemas"]["ExtractionIdString"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The extraction and one page of its values */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentsExtraction"];
+                };
+            };
+            400: components["responses"]["DocumentsBadRequest"];
+            404: components["responses"]["DocumentsNotFound"];
+            500: components["responses"]["DocumentsProxyFailure"];
+            502: components["responses"]["DocumentsProxyFailure"];
+            503: components["responses"]["DocumentsUnavailable"];
+            504: components["responses"]["DocumentsProxyFailure"];
         };
     };
 }

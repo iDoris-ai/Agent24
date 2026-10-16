@@ -1,0 +1,4 @@
+{
+  "modules": [{"name":"sin90","namespace":"/api/v1/sin90","version":"0.2.1","enabled":true,"state":"mounted","granted":["events"],"missing_models":["ornith-9b"],"resources":"missing","restart_required":false}],
+  "registry_error": "os.json disables [\"sin09\"], which this build does not provide — so the module you meant to switch off is still running. Remove that entry (your other settings are fine), or set \"default\": \"disabled\" to use an allow-list. Restarting will not help until the file is fixed."
+}
