@@ -75,8 +75,16 @@ export default function ChatPage() {
       })
       if (!res.ok) {
         // v1 error envelope { error: { code, message } }
-        const err = (res.data as { error?: { message?: string } } | null)?.error
-        throw new Error(err?.message ?? `HTTP ${res.status}`)
+        const err = (res.data as { error?: { code?: string; message?: string } } | null)?.error
+        // The catch below picks its message by `code`. `proxyToBackend`
+        // answers `backend_not_ready` (503) whenever `getBackendEndpoint()`
+        // is null, i.e. the daemon's ready line never arrived
+        // (apps/desktop/src/main/ipc/index.ts). That is a daemon-startup
+        // failure, not an unreachable model service, so it must not read
+        // like one — 2026-10-16 install acceptance followed the wrong one.
+        const failure = new Error(err?.message ?? `HTTP ${res.status}`) as Error & { code?: string }
+        failure.code = err?.code
+        throw failure
       }
       const totalMs = performance.now() - sentAt
       const reply = (res.data as { message?: { content?: string } })?.message?.content ?? t('reply.empty')
@@ -101,10 +109,12 @@ export default function ChatPage() {
       }
       setMessages(prev => [...prev, { role: 'assistant', content: reply, suffix, memoryReceipt }])
     } catch (e) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: t('reply.connectionError', { error: String(e) }),
-      }])
+      // `failure.code` above is the only input: `backend_not_ready` gets the
+      // daemon-startup message, everything else the generic request failure.
+      const content = (e as { code?: string } | null)?.code === 'backend_not_ready'
+        ? t('reply.backendNotReady', { error: String(e) })
+        : t('reply.connectionError', { error: String(e) })
+      setMessages(prev => [...prev, { role: 'assistant', content }])
     } finally {
       setLoading(false)
     }

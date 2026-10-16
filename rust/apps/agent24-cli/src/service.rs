@@ -117,7 +117,13 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 19] = [
+pub const PASSTHROUGH_VARS: [&str; 20] = [
+    // MAINT-03: the data root (`daemon.json`, `agent24.db`, `logs/`, the tool
+    // workspace). Without it a LaunchAgent-started daemon keeps using
+    // `~/.agent24` while the CLI that ran `service install` and the desktop app
+    // look in the override directory, so neither ever finds the daemon. Caught
+    // by `passthrough_list_matches_what_the_daemon_actually_reads`.
+    "AGENT24_DATA_DIR",
     // Keep exclusive gateway selection after service installation. The data key
     // is never written to a plist; v0.3.1 supports manual startup until separate
     // credential delivery is implemented. Missing key fails closed.

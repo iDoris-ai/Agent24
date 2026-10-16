@@ -20,3 +20,5 @@
 
 执行任务、先后关系和验收只维护在 [ab/idoris执行计划](agent/PLAN-IDORIS-V031.md)。
 [07-30入口路由提案](iDoris-integration-and-entry-router.md) 与 [ADR-032集成材料](design/INTEGRATION-AGENTEAR-IDORIS.md) 保留历史价值，不作为当前API或已交付能力证明。
+
+接线成功时，聊天API转交经校验的 `X-iDoris-Record-Id`，CLI打印同一回执供查询/报障。直连调用不补造iDoris回执；此标识不是凭据，不替代实际模型与locality校验。
