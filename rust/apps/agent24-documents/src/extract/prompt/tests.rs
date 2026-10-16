@@ -183,8 +183,8 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
     // Two ends of thinking, none at its start: the last ends it (L3).
     let twice = format!("I close with </think> then</think>\n{a}");
     assert_eq!(unwrapped(&twice, Pass::Free), Ok(a));
-    // Nor in a value quoting `</think>` before a quote mark or a brace, in an
-    // answer that stands as it is, or in the pass that does not think.
+    // Nor in a value quoting `</think>`, in an answer that stands as it is,
+    // or in the pass that does not think; fenced, the first pass cuts it.
     for v in ["`<think>` and `</think>` tags", "</think>{"] {
         let held = format!(
             r#"{{"values": {{"a": {{"present": {{"evidence": [], "normalized": "", "value": "{v}"}}}}}}}}"#
@@ -192,6 +192,7 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
         assert_eq!(unwrapped(&held, Pass::Free), Ok(held.as_str()));
         let fenced = format!("```json\n{held}\n```");
         assert_eq!(unwrapped(&fenced, Pass::Held), Ok(held.as_str()));
+        assert_ne!(unwrapped(&fenced, Pass::Free), Ok(held.as_str()));
     }
 }
 
