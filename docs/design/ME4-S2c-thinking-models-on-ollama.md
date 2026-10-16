@@ -1,8 +1,8 @@
 # ME4-S2c —— Ollama 上的思考模型：抽取先自由作答，不合格再关思考、按 schema 重答
 
-> 状态：**v5**。§9 的 Q1–Q3 已定（David，2026-10-16）：采用 A + C，分段提示同片纳入，本轮不提高 `max_tokens` 上限。之后按评审补的规则（§4 的 400 后重发、§5.1 第 2–4 步）请 David 知悉。起草：Documenting 线（DOC-1-18，2026-10-16）。
+> 状态：**v5.1**。§9 的 Q1–Q3 已定（David，2026-10-16）：采用 A + C，分段提示同片纳入，本轮不提高 `max_tokens` 上限。之后按评审补的规则（§4 的 400 后重发、§5.1 第 2–4 步）请 David 知悉。起草：Documenting 线（DOC-1-18，2026-10-16）。
 > 设计审查：第 1 轮 Grok REJECT，已在 v2 采纳。第 2 轮 Grok 额度用完、Codex 用量要到 2026-10-22 才恢复，由 Sonnet 5.5 与 Opus 5.5 代审并互评，REJECT，已在 v3 采纳；第 3 轮同样代审，REJECT，已在 v4 采纳；第 4 轮两方 APPROVE，互评后剩下的低严重度意见已在 v5 采纳。见文末「改动记录」。
-> 改到内核的地方只有一处行为：Ollama provider 也要遵守已有的 `disable_thinking`（§4）。没有新的线上字段，协议版本不变。这一处会在 PR 里知会 jason。
+> 改到内核的地方有两处行为（§4）：Ollama provider 也要遵守已有的 `disable_thinking`；带关思考字段的请求回 400 时去掉该字段重发一次，这也影响 oMLX 上的调用。没有新的线上字段，协议版本不变。两处都会在 PR 里知会 jason。
 > 依据：2026-10-15、16 在 Modal L40S（Ollama 0.40.4，`qwen3.8:27b`）和本机 Mac mini M4（Ollama 0.40.4，`qwen2.5:7b`）上跑的 S01 全量验收，各组材料见 §2 的表注。
 > 本文只是设计，代码按 §6 另开 PR。
 
@@ -129,7 +129,7 @@ Ollama 0.40.4 上这个组合会出错。s01-01 第 4 个窗口（第 27–33 �
   - 同一个模型带 `"high"` 会被 400 拒绝（「does not support thinking」）。**所以只发 `"none"`，永远不发要求思考的值**；
   - 思考模型（`qwen3.8:27b`，Modal）带 `"none"` 不再思考：§2.1 的 A 那一组就是这样跑的。
 - **流式**：今天模块调用都走流式（ME4-S2a）。思考的增量（`delta.reasoning`）也是 `data:` 事件，照常推动计时器；内核只收集 `content`，思考文本不进回答，这一点不变。
-- **影响到的其他调用方**：只有显式传 `complexity: "simple"` 的模块会设 `disable_thinking`。据 `model_callback.rs` 的注释，这个开关（ME4-S2-thinking）是为 AgentEar 加的：语音场景里 Qwen3 会把整段思考念出来。这类调用在 oMLX 上已经关思考，在 Ollama 上今天仍会思考；改后在 Ollama 上也关，这正是 `complexity: "simple"` 原本的意思。PR 里知会 jason。
+- **影响到的其他调用方**：只有显式传 `complexity: "simple"` 的模块会设 `disable_thinking`。据 `model_callback.rs` 的注释，这个开关（ME4-S2-thinking）是为 AgentEar 加的：语音场景里 Qwen3 会把整段思考念出来。这类调用在 oMLX 上已经关思考，在 Ollama 上今天仍会思考；改后在 Ollama 上也关，这正是 `complexity: "simple"` 原本的意思。400 后重发也会改变 AgentEar 在 oMLX 上的行为：`OMLX_URL` 指向的本地服务不认 `chat_template_kwargs` 时，今天这类调用直接失败；改后去掉该字段重发，能作答，但模型开着思考，可能把思考念出来。David 定（2026-10-17）：保留重发，能作答好过失败。两处都在 PR 里知会 jason。
 - 路由不变：`complexity` 缺省时本来就按 `Simple` 选路（`model_callback.rs` 的 `into_request`），显式传 `"simple"` 只多了关思考这一个效果。
 - **oMLX**：`from_env` 先放 oMLX（`router.rs:339-346`），两者都在本地时先试 oMLX。文档模块在 oMLX 上的第二遍会经 `chat_template_kwargs` 关思考（已有行为），第一遍自由作答。oMLX 上的 Qwen3 可能把思考写进正文（AgentEar 就把整段 `<think>` 念了出来，`model_callback.rs:193-196`），所以 §5.1 第 2 步会先去掉开头的 `<think>…</think>`。S01 从没在 oMLX 上跑过，今天的做法也没有，所以这条路径的效果未知（R-g）。
 
@@ -193,7 +193,7 @@ Ollama 0.40.4 上这个组合会出错。s01-01 第 4 个窗口（第 27–33 �
 
 ## 6. 切法（每片 ≤ 300 行，不计测试；base 为 `ab/documenting`）
 
-1. **`agent24-models`**：§4，J1–J3。约 50 行。它改了内核发给 Ollama 和 oMLX 的请求体，按 AGENTS.md 算 wire 格式类，等 PR-Daemon APPROVE 再合。
+1. **`agent24-models`**：§4，J1–J3。约 50 行。它改了内核发给 Ollama 的请求体和 400 后的重发规则（oMLX 的请求体不变），按 AGENTS.md 算 wire 格式类，等 PR-Daemon APPROVE 再合。
 2. **`agent24-documents`**：§5，J4–J8。
 3. **证据**：
    - J9：本机 7B S01 全量重跑，写进 `docs/documenting/evidence/`，是门槛；
@@ -229,7 +229,7 @@ Ollama 0.40.4 上这个组合会出错。s01-01 第 4 个窗口（第 27–33 �
 | R-d | Ollama 以后修好了「思考 + schema」 | C 不依赖这个 bug，修好后可以再测「一遍带 schema」是否更好，再决定是否回到一遍 |
 | R-e | 各组都只跑了一次，温度 0 也会因 prompt cache 不同而略有出入（ME4-S2b R-f） | 差距（75 → 82）远大于以往重跑的波动；J9 再跑一次核对 |
 | R-f | 某个版本的 Ollama 或某个模型对 `reasoning_effort: "none"` 回 400，或第二遍遇到别的拒绝 | 内核去掉该字段重发一次（§4，J2b），调用方退回今天的行为：Ollama 上仍会思考，但不失败。重发后仍被拒，说明拒的是别的（例如 `response_format`）；第二遍按 §5.1 第 3 步不拆窗，整个 job 以 `engine_unavailable` 失败（`run.rs:312`：任何一批失败都终止 job）。408、409 这类偶发拒绝落在第二遍时也一样，今天它们会被当成输入太长去拆窗；Ollama 不会主动回这两种，接受。只在 0.40.4 上用 `qwen2.5:7b`、`qwen3.8:27b` 核实过「`none` 被接受」（§4），实现 PR 在 README 写明已验证的 Ollama 版本和模型 |
-| R-g | oMLX 上的效果没测过（§4）。若 Qwen3 的思考在正文里而 §5.1 第 2 步没能去干净，每批都会落到第二遍：质量同 A，耗时约为 A 的两倍 | 今天的做法在 oMLX 上也没测过。第 3 片在 oMLX 上跑一次 S01（本机没有 oMLX 时请 jason 跑），只记录，结果写进证据。`OMLX_URL` 指向不认 `chat_template_kwargs` 的本地服务时，由 §4 的 400 后重发兜住 |
+| R-g | oMLX 上的效果没测过（§4）。若 Qwen3 的思考在正文里而 §5.1 第 2 步没能去干净，每批都会落到第二遍：质量同 A，耗时约为 A 的两倍 | 今天的做法在 oMLX 上也没测过。第 3 片在 oMLX 上跑一次 S01（本机没有 oMLX 时请 jason 跑），只记录，结果写进证据。`OMLX_URL` 指向不认 `chat_template_kwargs` 的本地服务时，由 §4 的 400 后重发兜住：调用不再失败，但开着思考作答，AgentEar 可能把思考念出来（§4） |
 
 ## 9. 决定（David，2026-10-16）
 
@@ -240,6 +240,9 @@ Ollama 0.40.4 上这个组合会出错。s01-01 第 4 个窗口（第 27–33 �
 - **Q3** 本轮不提高 `max_tokens` 上限（R-a），等换模型时再议。
 
 ## 改动记录
+
+**v5 → v5.1**（第 5 轮，Sonnet 5.5 与 Opus 5.5 代审并互评，两方都 APPROVE，互评后只剩低。已到 5 轮上限，只改下面这一处行为相关的措辞，**未再审**；其余低问题记在 issue，见 PR 正文）：
+- 「改到内核的只有一处行为」漏了 400 后重发对 oMLX 的影响：不认 `chat_template_kwargs` 的服务上，AgentEar 的调用从失败变成开着思考作答 → David 定保留重发；状态说明、§4、R-g 写明，§6 第 1 片改为「请求体和重发规则」。
 
 **v4 → v5**（第 4 轮，Sonnet 5.5 与 Opus 5.5 代审并互评，两方都 APPROVE；互评后剩下的都是低，除一条被驳回外全部采纳）：
 - 「`completion_tokens` 由 J10 核实」在判据里没有；真实 Ollama 流式下的 `usage` 两组都没测到；日志不记 token 数 → 第 5 步日志加 `completion_tokens`、`max_tokens`；J9 加「`usage` 不为 0」，J10 加「截断的第一遍达到 4096」和分原因统计；§2.3 改写。
