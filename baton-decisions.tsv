@@ -1,0 +1,12 @@
+ts	lane	decision	reason
+2026-10-16T12:26:21Z	grokbot	从 origin/ab/decide@4acdc395 新建 baton/grokbot-20261016-a24-d1-2b	按 next 指示；只做 D1-2b，不动 ab/decide/main 与 mini 分支
+2026-10-16T12:26:21Z	grokbot	task_id/attempt_id 置 null	webhook body 未提供这两个字段，不自行编造
+2026-10-16T12:26:21Z	grokbot	decide 保持 async：pub async fn decide(&self, &DecisionRequest) -> Result<Decision, InvalidRequest>	DecisionBackend::evaluate 是 async，规格签名省略 async；返回类型与规格一致
+2026-10-16T12:26:21Z	grokbot	新增私有模块 validate.rs（validate_request / validate_answers），错误 code 为 &'static str，service 再包成 InvalidRequest/Outcome::InvalidResponse	规格要求的 14 个 code 逐字使用；只报首个错误；不裁剪/排序/转值/重归一化
+2026-10-16T12:26:21Z	grokbot	请求校验在调用任何 backend.kind()/evaluate() 之前；空 questions 在无后端时也报错	规格"非法请求不调用任何后端的 kind/evaluate"；测试用计数 fake 同时数 kind 与 evaluate
+2026-10-16T12:26:21Z	grokbot	Decided 与非空 floor 均整体校验；非法即 InvalidResponse(index,kind) 终止，保留旧有效非空 floor（无则 answers 空、backend=失败层）；空 floor 不校验、不清除	规格"错误与兼容性"段与 L1 身份一致
+2026-10-16T12:26:21Z	grokbot	InvalidRequest 只 derive Serialize（+Debug/Clone/PartialEq/Eq），不加 Display/Error/Deserialize	严格不扩范围
+2026-10-16T12:26:21Z	grokbot	反面对照：基线 4acdc395 上探针证明 Decided([])→Decided、畸形 floor 被保留、空 questions→Abstain	临时探针测试（未提交）输出 PROBE 行
+2026-10-16T12:26:21Z	grokbot	验收：tests/l2_validation.rs 23 个测试覆盖规格 fixtures 与矩阵（含 Decided/非空 floor 双模式、多错优先级、固定 latency 字节快照）	cargo test -p agent24-decide 61+23+1 通过
+2026-10-16T12:26:21Z	grokbot	门禁：cargo fmt --all --check exit 0；cargo clippy --workspace --all-targets -- -D warnings exit 0；cargo test -p agent24-decide exit 0	仅改 agent24-decide；仓内无其它 crate 消费 DecisionService/Outcome
+2026-10-16T12:26:21Z	grokbot	规格把实现拆为 V(≤180)/S(≤100) 两片；本棒按 predicate 一次实现（src 新增约 180 行（含注释与既有测试的 .expect 适配））	是否拆 PR 由协调者/PR-Daemon 决定；不开 PR、不合并

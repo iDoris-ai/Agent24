@@ -2,13 +2,26 @@
   "schema": "baton-result/v1",
   "task_id": null,
   "attempt_id": null,
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "4acdc3959c580b87485f137b32d65bfe477489e6",
-  "result_sha": null,
-  "summary": "Grok Bot 车道已开工：D1-2b（L2 答案校验），基线 origin/ab/decide 4acdc395",
-  "tests": [],
+  "result_sha": "b0e579a54f0573f73cd7bb718c446bd6e6782f29",
+  "summary": "实现 D1-2b L2 答案校验：decide 返回 Result<Decision, InvalidRequest>；新增 InvalidRequest{code}（crate 根导出，仅 Serialize）与 Outcome::InvalidResponse{code,failed_stage_index,failed_backend_kind}；14 个错误 code 逐字一致；请求非法时后端调用为 0，响应非法时不调用下一层；tests/l2_validation.rs 按规格 fixtures 与验收矩阵落成 23 个测试。",
+  "tests": [
+    {
+      "command": "cargo fmt --all --check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-decide",
+      "exit_code": 0
+    }
+  ],
   "blocker": null,
-  "next": "按 PLAN-DECIDE-D1-2B-L2-VALIDATION.md 实现并测试",
-  "updated_at": "2026-10-16T12:20:13+00:00"
+  "next": "等待外部 PR-Daemon 审查（接口变更类高风险）；是否拆成 V/S 两个 PR 由协调者决定。本车道不开 PR、不合并。",
+  "updated_at": "2026-10-16T12:26:33+00:00"
 }
