@@ -1,3 +1,7 @@
 ts	lane	decision	reason
 2026-10-16T07:26:53Z	grokbot	从 origin/merge/kernel-to-main-20261016@571190cb 新建 baton/grokbot-20261016-a24-k1review	按 next 指示；只读复核，不改生产代码
 2026-10-16T07:26:53Z	grokbot	task_id/attempt_id 置 null	webhook body 未提供这两个字段，不自行编造
+2026-10-16T07:35:24Z	grokbot	问1判定：生命周期 consent 撤销 fail-open（潜伏）；使用时仅靠运行时 generation=Running 间接 fail-closed	临时测试（未提交）证明撤销失败后 PATCH disable 返回200且 consent 仍 Granted；生产代码目前无 grant 写入路径故暂不可利用
+2026-10-16T07:35:24Z	grokbot	问2判定：migrations 目录 tree 与 ab/kernel 相同(0debd841)，0015-0017 逐 blob 一致，main 0001-0014 未改	git rev-parse / ls-tree / diff --name-status 输出
+2026-10-16T07:35:24Z	grokbot	问3判定：PASSTHROUGH_VARS=19、state_dir()、#1014、#1015 均保留；LocalOnly 默认化删除 main 远端回退、L-APPR-5 法律文本混在实现提交，列入合前清单	blob 比对 + diff 逐文件审读 + 定向 cargo test 全部 exit 0
+2026-10-16T07:35:24Z	grokbot	不改生产代码、不 merge、不碰 main/ab/*、不开 PR；报告写入 docs/agent/REVIEW-kernel-to-main-20261016.md	按 predicate 与 notes
