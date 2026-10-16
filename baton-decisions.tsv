@@ -1,0 +1,10 @@
+ts	lane	decision	reason
+2026-10-16T08:19:35Z	grokbot	从 origin/merge/kernel-to-main-20261016@571190cb 新建 baton/grokbot-20261016-a24-consent-fix	按 next 指示
+2026-10-16T08:19:35Z	grokbot	task_id/attempt_id 置 null	webhook body 未提供这两个字段，不自行编造
+2026-10-16T08:28:03Z	grokbot	判据(1) 选“返回非2xx”而不回滚 os.json：apply() 停用时先写 disabled 并 hand_off 停止，撤销失败返回 500 consent_revocation_failed；stop_now_os 撤销失败同样 500（仍 hand_off）	回滚会让 consent 仍有效的模块重新启用，更不闭合；注释写在 apply() 文档注释与 stop_now_os 内
+2026-10-16T08:28:03Z	grokbot	新增启用侧兜底：对 os.json 当前非 enabled 的模块启用前先撤销旧 consent，写入失败则拒绝启用且不改 os.json	满足判据(3)“重新启用后旧授权不复活”；只收紧不放宽（ADR-K1-03 6a.3 重同意）
+2026-10-16T08:28:03Z	grokbot	CLI：invalidate 改为返回 Result；state_dir()=None/打开库失败/写入失败都 eprint 并让 install/uninstall 以非零退出（文件变更与 hot stop 仍照做）	判据(2) 不得静默吞掉
+2026-10-16T08:28:03Z	grokbot	store：仅改 invalidate_module_consents 文档注释（调用方须 fail-closed），未改返回值与任何判定	predicate 允许范围内
+2026-10-16T08:28:03Z	grokbot	证据：cargo fmt --all --check=0；cargo clippy --workspace --all-targets -- -D warnings=0；cargo test -p agent24-cli=0；cargo test -p agent24-store=0	新测试 3 个 daemon + 3 个 CLI 全 ok
+2026-10-16T08:28:03Z	grokbot	cargo test -p agent24d 首跑=101，仅 tests/trampoline.rs 的 fd 断言失败（看到 "0 1 2 3"）；关闭云电脑 shell 继承的 fd3-5 后 cargo test -p agent24d --no-fail-fast 3>&- 4>&- 5>&- =0 全过	fd3 是云电脑执行环境泄漏的 socket，与本改动无关；如实记录两次结果
+2026-10-16T08:28:03Z	grokbot	代码提交 238a18aa38a9c0605f492e7db0e50e01e55a0668；未 merge、未 force-push、未动 main/ab/*/mini 分支、未改 docs/laws/	按 notes

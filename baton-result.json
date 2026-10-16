@@ -1,0 +1,39 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": null,
+  "attempt_id": null,
+  "sequence": 2,
+  "status": "completed",
+  "base_sha": "571190cb52bbd8f4f13b668c1ff6b4f50a44851d",
+  "result_sha": "238a18aa38a9c0605f492e7db0e50e01e55a0668",
+  "summary": "K1 生命周期 consent 撤销改为 fail-closed：停用/stop 撤销失败返回 500 consent_revocation_failed（os.json 保持 disabled、仍停止模块）；启用非启用模块前先撤销旧 consent，失败则拒绝启用；CLI install/uninstall 撤销失败（含 state_dir 为 None）可见且非零退出；新增 SQLite trigger 测试。",
+  "tests": [
+    {
+      "command": "cargo fmt --all --check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24d",
+      "exit_code": 101
+    },
+    {
+      "command": "cargo test -p agent24d --no-fail-fast (inherited sandbox fds 3-5 closed)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-cli",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-store",
+      "exit_code": 0
+    }
+  ],
+  "blocker": null,
+  "next": "待协调者/评审验收；agent24d 首跑唯一失败是 trampoline fd 断言受云电脑继承 fd3 影响，建议在 Mac 或 CI 复跑确认",
+  "updated_at": "2026-10-16T08:28:03+00:00"
+}
