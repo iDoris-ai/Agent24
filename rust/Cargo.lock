@@ -187,6 +187,7 @@ version = "0.5.1"
 dependencies = [
  "agent24-protocol",
  "async-trait",
+ "hyper",
  "reqwest",
  "serde",
  "serde_json",

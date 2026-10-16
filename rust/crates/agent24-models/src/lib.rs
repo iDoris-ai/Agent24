@@ -650,9 +650,19 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     name: &str,
 ) -> Result<T, ModelError> {
     let mut body = Vec::new();
+    // A body that breaks off is the backend going away, as in a stream
+    // (`stream.rs`); one framed wrongly is not. reqwest reports both as
+    // `is_decode`, so `classify` alone cannot tell them apart.
+    let read_error = |e: reqwest::Error| {
+        if hung_up(&e) {
+            ModelError::Unavailable(format!("{name}: the answer broke off: {e}"))
+        } else {
+            classify(&e)
+        }
+    };
     loop {
         let chunk = tokio::select! {
-            c = response.chunk() => c.map_err(|e| classify(&e))?,
+            c = response.chunk() => c.map_err(read_error)?,
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
         };
         let Some(chunk) = chunk else { break };
@@ -685,11 +695,37 @@ fn usage_of(u: Option<OaUsage>) -> Usage {
 }
 
 fn classify(err: &reqwest::Error) -> ModelError {
-    if err.is_connect() || err.is_timeout() {
+    if err.is_connect() || err.is_timeout() || (err.is_request() && hung_up(err)) {
         ModelError::Unavailable(err.to_string())
     } else {
         ModelError::Provider(err.to_string())
     }
+}
+
+/// A backend that hangs up after the request went out (Ollama stopped while
+/// it reads the prompt, or an idle pooled connection it had closed) is going
+/// away, like one that cannot be reached. An answer that is not HTTP is not
+/// that: it stays the backend's fault.
+fn hung_up(err: &reqwest::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+    let mut source = std::error::Error::source(err);
+    while let Some(e) = source {
+        if let Some(h) = e.downcast_ref::<hyper::Error>()
+            && (h.is_incomplete_message() || h.is_canceled() || h.is_closed())
+        {
+            return true;
+        }
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
+            )
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 #[async_trait]
