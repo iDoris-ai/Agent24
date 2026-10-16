@@ -110,6 +110,8 @@ struct Routed {
 /// usage ledger (`served_by`) and the LocalOnly tripwire both read.
 #[derive(Debug, Clone)]
 pub struct Served {
+    /// Validated gateway evidence; direct-provider calls have none.
+    pub idoris: Option<crate::IdorisEvidence>,
     pub provider: String,
     pub tier: Tier,
     pub response: CompletionResponse,
@@ -117,6 +119,7 @@ pub struct Served {
 
 /// Routes completions across tiered providers with a health/cooldown loop.
 pub struct ModelRouter {
+    idoris: Option<Result<Arc<crate::idoris::IdorisClient>, String>>,
     providers: Vec<Routed>,
     health: Mutex<HashMap<String, Health>>,
     base_cooldown: Duration,
@@ -142,7 +145,7 @@ const COOLDOWN_HARD_CAP: Duration = Duration::from_secs(24 * 3600);
 /// conservative: a Remote label on a host that happens to be local cannot
 /// leak); a domain: only `localhost`, exactly; anything that fails to parse,
 /// has no host, or is not http(s): not loopback.
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -218,6 +221,7 @@ impl ModelRouter {
             .min(max_cooldown)
             .max(Duration::from_millis(1));
         Self {
+            idoris: None,
             providers: providers
                 .into_iter()
                 .map(|(provider, tier)| Routed { provider, tier })
@@ -239,6 +243,7 @@ impl ModelRouter {
     #[must_use]
     pub fn with_separate_health(&self) -> Self {
         Self {
+            idoris: self.idoris.clone(),
             providers: self
                 .providers
                 .iter()
@@ -276,6 +281,11 @@ impl ModelRouter {
     /// added by the daemon when configured; with only local providers, a
     /// Complex task simply falls back to them.
     pub fn from_env() -> Self {
+        if std::env::var_os("IDORIS_URL").is_some() {
+            let mut router = Self::with_defaults(Vec::new());
+            router.idoris = Some(crate::idoris::IdorisClient::from_env().map(Arc::new));
+            return router;
+        }
         let omlx_url =
             std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
         let omlx_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
@@ -413,6 +423,27 @@ impl ModelRouter {
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<Served, ModelError> {
+        self.complete_served_with_request_id(profile, req, cancel, None)
+            .await
+    }
+
+    /// Carry an admitted lifecycle id on `X-iDoris-Trace-Id` when iDoris accepts it.
+    /// `X-iDoris-Request-Id` is a fresh idempotency key on every call, with or
+    /// without that id. A missing or rejected id omits the trace header.
+    pub async fn complete_served_with_request_id(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        request_id: Option<&str>,
+    ) -> Result<Served, ModelError> {
+        if let Some(gateway) = &self.idoris {
+            return gateway
+                .as_ref()
+                .map_err(|e| ModelError::Provider(e.clone()))?
+                .complete(profile, req, cancel, request_id)
+                .await;
+        }
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
             return Err(ModelError::Unavailable(match profile.privacy {
@@ -431,6 +462,7 @@ impl ModelRouter {
                 Ok(response) => {
                     self.record_success(r.provider.name());
                     return Ok(Served {
+                        idoris: None,
                         provider: r.provider.name().to_owned(),
                         tier: r.tier,
                         response,
@@ -468,6 +500,22 @@ impl ModelRouter {
     /// because their provider was briefly unreachable, is a confident wrong answer
     /// (ME-2's mount-time resource check).
     pub async fn models_detailed(&self, cancel: &CancellationToken) -> ModelInventory {
+        if let Some(gateway) = &self.idoris {
+            let result = match gateway {
+                Ok(gateway) => gateway.models(cancel).await,
+                Err(error) => Err(ModelError::Provider(error.clone())),
+            };
+            return match result {
+                Ok(models) => ModelInventory {
+                    models,
+                    failures: Vec::new(),
+                },
+                Err(error) => ModelInventory {
+                    models: Vec::new(),
+                    failures: vec![format!("idoris-local: {error}")],
+                },
+            };
+        }
         let mut inv = ModelInventory::default();
         for r in &self.providers {
             match r.provider.models(cancel).await {

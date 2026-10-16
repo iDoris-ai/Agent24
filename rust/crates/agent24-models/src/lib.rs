@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+mod idoris;
+pub use idoris::IdorisEvidence;
 pub mod router;
 
 /// A tool advertised to the model (OpenAI function-calling wire shape is
