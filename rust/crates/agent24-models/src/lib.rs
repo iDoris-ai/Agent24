@@ -1604,20 +1604,26 @@ mod tests {
             // 400 → no retry. No switch either from a provider that opted
             // into none, thinking off or not (PR-Daemon #1045 L-a).
             let remote = |url| OpenAiCompatProvider::new("remote", url, None, "remote", "gpt-x");
-            for (p, r) in [
+            for (what, p, r) in [
                 (
+                    "ollama, thinking on",
                     ollama as fn(String) -> OpenAiCompatProvider,
                     CompletionRequest { progress, ..req() },
                 ),
-                (remote, thinking_off(progress)),
+                ("remote, thinking off", remote, thinking_off(progress)),
             ] {
                 let (url, asked) = answers_in_turn(vec![refused("400 Bad Request")]).await;
                 let got = p(url).complete(&r, &c).await;
+                let streamed = progress.is_some();
                 assert!(
                     matches!(got, Err(ModelError::Rejected { status: 400, .. })),
-                    "{got:?}"
+                    "{what}, streamed {streamed}: {got:?}"
                 );
-                assert_eq!(asked.lock().unwrap().len(), 1);
+                assert_eq!(
+                    asked.lock().unwrap().len(),
+                    1,
+                    "{what}, streamed {streamed}"
+                );
             }
             let (url, asked) = answers_in_turn(vec![refused("422 Unprocessable Entity")]).await;
             let got = ollama(url).complete(&thinking_off(progress), &c).await;
@@ -1632,12 +1638,15 @@ mod tests {
     #[tokio::test]
     async fn a_second_refusal_cut_short_by_a_cancel_is_a_cancel() {
         // PR-Daemon #1045 L-b: refused at once, then asked again and refused
-        // with a body that never ends; cancelled while it is read.
+        // with a body that never ends; cancelled while it is read, once the
+        // backend has written that refusal's head.
         use tokio::io::AsyncWriteExt;
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = Arc::clone(&count);
+        let c = CancellationToken::new();
+        let later = c.clone();
         tokio::spawn(async move {
             let mut held = vec![];
             while let Ok((mut s, _)) = l.accept().await {
@@ -1648,19 +1657,19 @@ mod tests {
                     "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":".to_owned()
                 };
                 s.write_all(reply.as_bytes()).await.unwrap();
+                if held.len() == 1 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    later.cancel();
+                }
                 held.push(s);
             }
         });
         let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
             .supports_reasoning_effort();
-        let c = CancellationToken::new();
-        let later = c.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            later.cancel();
-        });
+        let (logs, _guard) = Logs::capture();
         let got = p.complete(&thinking_off(None), &c).await;
         assert!(matches!(got, Err(ModelError::Cancelled)), "{got:?}");
+        assert_eq!(logs.retries(), 1, "it was asked again");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
