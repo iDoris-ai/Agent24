@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": "a24-idoris-sync-20261016",
+  "attempt_id": "9176366d-f4b9-4bc6-bf71-fd6dfd0c2022",
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "f315630fca1ff55936e3c432d2c2ec4ba06ae372",
+  "result_sha": "f315630fca1ff55936e3c432d2c2ec4ba06ae372",
+  "summary": "Started: absorb origin/main into ab/idoris-04-receipts and ab/idoris-11-pair-acceptance; reconcile PASSTHROUGH_VARS to 20 items (AGENT24_DATA_DIR + IDORIS_URL).",
+  "tests": [],
+  "blocker": null,
+  "next": "Read review doc; merge main into both PR heads; fix PASSTHROUGH_VARS; run fmt/clippy/tests; push both branches.",
+  "updated_at": "2026-10-16T08:52:21Z"
+}
