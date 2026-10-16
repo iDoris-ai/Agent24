@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": null,
+  "attempt_id": null,
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "4acdc3959c580b87485f137b32d65bfe477489e6",
+  "result_sha": null,
+  "summary": "开始 D1-2c：只写 docs/agent/PLAN-DECIDE-D1-2C-L3-LAYERS.md 契约文档（提案，不改代码）。",
+  "tests": [],
+  "blocker": null,
+  "next": null,
+  "updated_at": "2026-10-16T13:04:17+00:00"
+}
