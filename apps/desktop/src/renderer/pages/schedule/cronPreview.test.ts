@@ -1,9 +1,17 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { previewNextFire, formatPreview } from './cronPreview'
+import { setLocale } from '../../i18n'
 
 const NOW = new Date('2026-07-24T10:00:00Z')
 
 describe('previewNextFire', () => {
+  beforeEach(() => { setLocale('zh') })
+
+  it('messages default to English', () => {
+    setLocale('en')
+    expect(previewNextFire({ type: 'at', ts: '2026-07-24T09:00:00Z' }, NOW).message).toBe('That time has already passed')
+  })
+
   it('every: now + secs, bounds enforced', () => {
     expect(formatPreview(previewNextFire({ type: 'every', secs: 3600 }, NOW).next!)).toBe(
       '2026-07-24 11:00:00 UTC',

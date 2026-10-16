@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import RunsPage from './Runs'
+import { setLocale } from '../i18n'
 
 function proxyMock(handler: (req: { method: string; path: string }) => unknown) {
   return vi.fn((req: { method: string; path: string }) =>
@@ -19,7 +20,14 @@ const RUN = {
   created_at: '2026-07-24T10:00:00Z',
 }
 
+it('renders the English runs title by default', () => {
+  window.agent24 = { backendProxy: proxyMock(() => ({ ok: true, status: 200, data: { runs: [] } })) } as never
+  render(<RunsPage />)
+  expect(screen.getByText('Runs')).toBeInTheDocument()
+})
+
 describe('RunsPage', () => {
+  beforeEach(() => { setLocale('zh') })
   it('renders the run list and selects a run to show detail + cancel', async () => {
     const proxy = proxyMock((req) => {
       if (req.path === '/api/v1/runs') return { ok: true, status: 200, data: { runs: [RUN] } }

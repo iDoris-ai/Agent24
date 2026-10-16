@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { App, pickChatModel, extractDaemonDefaultModel } from './App'
 import type { ModuleManifest } from '../shared/ipc-types'
+import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
 
 const mockBackendProxy = vi.fn()
 const mockModulesList = vi.fn()
@@ -46,6 +47,9 @@ beforeEach(() => {
 })
 
 describe('App', () => {
+  // These assertions predate i18n and are written against the zh copy.
+  beforeEach(() => { setLocale('zh') })
+
   it('renders built-in sidebar nav items', async () => {
     await act(async () => { render(<App />) })
     expect(screen.getAllByText('对话').length).toBeGreaterThan(0)
@@ -172,7 +176,7 @@ describe('App', () => {
     const navBtns = screen.getAllByText('设置')
     fireEvent.click(navBtns[0])
     await waitFor(() => {
-      expect(screen.getByText('Settings')).toBeInTheDocument()
+      expect(screen.getByText('配置 AI 模型服务、后端守护进程和应用偏好')).toBeInTheDocument()
     })
   })
 
@@ -250,7 +254,7 @@ describe('App', () => {
 
     await act(async () => { render(<App />) })
     await waitFor(() => {
-      expect(screen.getByText('No AI runtime')).toBeInTheDocument()
+      expect(screen.getByText('无 AI 运行时')).toBeInTheDocument()
     })
   })
 
@@ -308,6 +312,36 @@ describe('App', () => {
       (c) => c[0].path === '/api/v1/chat',
     )?.[0].body.session_id
     expect(secondSessionId).toBe(firstSessionId)
+  })
+})
+
+describe('App language', () => {
+  it('defaults to English when nothing is persisted', async () => {
+    await act(async () => { render(<App />) })
+    expect(screen.getAllByText('Chat').length).toBeGreaterThan(0)
+    expect(screen.getByText('Workbench')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText(/Backend running/)).toBeInTheDocument())
+    expect(document.documentElement.lang).toBe('en')
+  })
+
+  it('switches every label at once from Settings and persists the choice', async () => {
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('Settings')[0])
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('Language'), { target: { value: 'th' } })
+    })
+    expect(screen.getByText('โต๊ะทำงาน')).toBeInTheDocument()
+    expect(screen.getAllByText('ตั้งค่า').length).toBeGreaterThan(0)
+    expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('th')
+    expect(document.documentElement.lang).toBe('th')
+  })
+
+  it('relabels the fallback model message when the language changes', async () => {
+    mockOmlxDetect.mockResolvedValue({ ok: true, models: ['bge-m3'] })
+    await act(async () => { render(<App />) })
+    await waitFor(() => expect(screen.getByText(/No chat model available/)).toBeInTheDocument())
+    await act(async () => { setLocale('zh') })
+    expect(screen.getByText(/无可用对话模型/)).toBeInTheDocument()
   })
 })
 

@@ -1483,6 +1483,9 @@ pub async fn serve(
     } else {
         let dir = agent24_protocol::state_file::state_dir()
             .ok_or_else(|| std::io::Error::other("HOME not set"))?;
+        // HW-1: one hardware probe per start, persisted to hardware.json.
+        // Best-effort and off the startup path.
+        crate::hardware::spawn_startup_snapshot(dir.clone());
         Store::open(&dir.join("agent24.db"))
             .await
             .map_err(std::io::Error::other)?

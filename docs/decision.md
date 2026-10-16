@@ -1463,6 +1463,43 @@ argv 会暴露给 process listing；env 容易被继承/诊断 dump；0600 普�
 
 ---
 
+## ADR-036：硬件探测与整机内存账归 Agent24（`agent24-hw`），模型选型归 iDoris
+
+**日期**：2026-10-15
+**状态**：✅ 采纳（jason 2026-10-14 拍板；设计见 [`docs/design/HW-TIERS-capability-hardware-matrix.md`](design/HW-TIERS-capability-hardware-matrix.md)，#952，Codex 挑战 3 轮通过）
+
+### 背景
+
+硬件探测今天写在 `agent24-decide::hw`，只有决策服务会调用，daemon 开机并不探测；iDoris 另有自己的 `host_facts.rs`（只取总内存 + CPU 型号）和 `idoris-recommender`（LLM 常驻 / 临时准入）。两个进程各自以为整机可用内存归自己，会同时按「整机预算」装模型，合起来超载。同时产品需要「能力 × 硬件」的透明对照与零配置自动匹配（jason 2026-10-14 需求）。
+
+### 决策
+
+1. **硬件探测与整机内存账归 Agent24，新增 crate `agent24-hw`**，daemon 启动时探测并落盘，其他模块读它的结果。`agent24-hw` 不依赖任何其它内部 crate（L3 叶子，与 `comm`/`decide` 同类），iDoris 可直接依赖它。探测范围：内存、芯片、GPU / 独显显存、加速器、**全部内置与外接磁盘**、电池、OS、运行时；字段取不到时逐项按保守规则处理（设计 §3.2）。
+2. **模型相关（选型、量化、加载）归 iDoris**：iDoris 在 Agent24 分给它的 `allocated_budget_bytes` 内用 `idoris-recommender` 挑 LLM。`HostFacts.ram_gb` 保持真实物理内存，不得把剩余预算伪装成 RAM 传入（会重复扣系统保留，并扭曲 `min_ram_gb` 硬门槛）。该入参 iDoris 尚未提供，是 HW-3 的前置，由 iDoris 侧实现。iDoris 部署在别的机器时自探，但使用同一个 `agent24-hw`。
+3. **档位只用数字 1–6 档**（1 = <8GB、2 = 8、3 = 16、4 = 24、5 = 32–<64、6 = ≥64，GiB 口径），用于展示；准入按扣掉系统保留与 App 开销后的**整数字节预算**计算。跨边界一律传整数字节。
+4. **能力声明「能力梯」**：每个能力声明一条从好到差的梯级（硬件需求 + 质量），终止于 `cloud` 或 `unavailable`；第三方 domain OS 在 `domain-os.yml` 以同一 schema 声明，CI 准入。不声明的模块不得合入。
+5. **云端补位默认关，且开关必须由 `ModelRouter` 强制执行**，不能只在能力计划里过滤：今天 `Privacy::Any` 的请求在本地失败时会回退 Remote，路由器不知道这个开关。关闭时 `tier_order` 不含 Remote。验收：云端关 + 本地故障 + Remote 可用 → 必须拒绝。
+6. **降级自动、升级需确认**：内存不足时调用点临时降一级并透出 `served_rung`；换机或加内存后只推荐升级，下载仍走 `DownloadConsent`。本地模型加载经 agent24d 唯一准入点（lease，原型阶段串行），防并发加载同时越过预算。
+7. **`agent24-decide` 的 T0–T3 改读平台档位，其余规则原样保留**：1 档 → T0，2 → T1，3、4 → T2，5、6 → T3；模型目录所在盘 < 2GiB → T0、无加速器或电池 → 最多 T1、未同意下载锁 T0、用户覆盖只能降档、`hardware_tier` 与 `effective_tier` 分开记，全部不变。验收是 `tier.rs` 现有边界测试断言不改仍通过。
+
+### 对既有 ADR 的修订
+
+- **ADR-033 #2（`agent24-decide` 零内部依赖）**：新增唯一一条对 `agent24-hw` 的依赖，替换 decide 自带的 `hw` 模块。`agent24-hw` 本身零内部依赖，所以 decide 的依赖图仍无环、无向上边；D1 自由选择挂载点的前提不变。
+
+### 备选与取舍
+
+- **继续各探各的**：重复代码事小，真正的问题是双重记账。否决。
+- **由 iDoris 探测并管理整机内存**：iDoris 不一定与 Agent24 同机部署，且语音、沙箱、磁盘等非 LLM 能力只有 Agent24 关心，整机账不该放在只懂 LLM 的一方。否决。
+- **把剩余预算当作 `ram_gb` 传给推荐器**：见决策 2，语义错误。否决。
+
+### 代价与后果
+
+- iDoris 需要新增 `allocated_budget_bytes`（单独 issue，不在本仓库实现）；在它落地前 HW-3 的 LLM 对接用 Agent24 内置静态梯。
+- `ModelRouter` 要改一处（云端开关），属于 HW-4。
+- 表中体积与内存数字在 HW-5 实测前都是草案。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
