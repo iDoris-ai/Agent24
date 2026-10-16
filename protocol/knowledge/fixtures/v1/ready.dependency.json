@@ -1,0 +1,10 @@
+{ "$comment": "R8.2, R8.4 (r6): the vector store is down, so search is not ready and even the empty KB kb-e is not_ready/dependency.",
+  "op": "knowledge.ready",
+  "request": { "protocol_version": 1, "request_id": "01JB3T3D4E5F6G7H8J9K0M1N2P", "generation": 3,
+    "scope": { "knowledge_base_ids": ["kb-a", "kb-e"] } },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3T3D4E5F6G7H8J9K0M1N2P", "generation": 3, "live": true,
+    "operations": { "search": { "state": "not_ready", "reason": "vector_store_unavailable" }, "read": { "state": "ready" },
+      "ingest": { "state": "disabled", "reason": "read_only_v1" } },
+    "knowledge_bases": [
+      { "knowledge_base_id": "kb-a", "score_space": "emb-g1", "search": { "state": "not_ready", "reason": "dependency" }, "read": { "state": "ready" } },
+      { "knowledge_base_id": "kb-e", "score_space": "emb-g1", "search": { "state": "not_ready", "reason": "dependency" }, "read": { "state": "ready" } } ] } } }
