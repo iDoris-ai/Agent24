@@ -663,7 +663,7 @@ cron 规则：恰好 5 段（无秒段，即便 REST 路径接受 6 段这里也
 | `messages` | `[{role: "system"\|"user"\|"assistant", content: string}]` | ✅ | 1..=64 条 |
 | `response_format` | `{"type":"json_schema","json_schema":{name,schema,strict?}}` | 否 | — |
 | `max_tokens` | u32 | 否 | 1..=4096，缺省 1024 |
-| `complexity` | `"simple"\|"complex"` | 否 | 仅是偏好，最终选哪个 provider 由内核决定 |
+| `complexity` | `"simple"\|"complex"` | 否 | 选路的偏好，缺省按 `simple`，最终选哪个 provider 由内核决定。**显式**写 `"simple"` 还会让内核请本地后端关掉思考模型的思考（oMLX 发 `chat_template_kwargs`，Ollama 发 `reasoning_effort: "none"`，ME4-S2c §4）；后端不认这个字段、回 400 时，内核去掉它重发一次，模型照常思考。不写不关 |
 | `temperature` | number | 否 | 0..=2（ME4-S2b，协议 v2）；越界 `-32602`；写 `null` 等同不写。不写时请求里不带，后端用它自己的缺省（Ollama 的 OpenAI 兼容层是 1.0）。其余采样参数（`seed`、`top_p`、惩罚参数）都是 unknown field |
 | `request_id` | string | 否 | — |
 

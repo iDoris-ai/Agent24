@@ -755,3 +755,29 @@ async fn a_streamed_request_carries_its_temperature() {
         (Some(true), Some(0.0))
     );
 }
+
+#[tokio::test]
+async fn a_backend_that_hangs_up_while_a_large_prompt_is_written_is_unavailable() {
+    // #1021 L1: the write meets the hang-up, as `BrokenPipe` or
+    // `ConnectionReset` (it varies run to run; `went_away` pins both).
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let _ = s.read(&mut [0u8; 4096]).await;
+        }
+    });
+    let big = CompletionRequest {
+        messages: vec![Msg::user("x".repeat(16 << 20))],
+        ..req(None)
+    };
+    let streamed = CompletionRequest {
+        progress: Some(progress(1000, 1000, 5000)),
+        ..big.clone()
+    };
+    let p = provider(url);
+    for r in [big, streamed] {
+        let m = unavailable(p.complete(&r, &CancellationToken::new()).await).await;
+        assert!(m.contains("error sending request"), "{m}");
+    }
+}
