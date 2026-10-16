@@ -1,0 +1,15 @@
+[package]
+name = "agent24-hw"
+version = "0.5.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent24 hardware probe + memory budget (HW-1): HardwareProfile v2, HardwareProbe trait, HwLevel L1-L6, usable-bytes budget (docs/design/HW-TIERS-capability-hardware-matrix.md, docs/decision.md ADR-036)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+
+[lints]
+workspace = true

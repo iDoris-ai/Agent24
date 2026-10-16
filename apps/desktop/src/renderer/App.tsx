@@ -6,6 +6,7 @@ declare global {
   interface Window { agent24: Agent24API }
 }
 import ChatPage from './pages/Chat'
+import HomePage from './pages/Home'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
@@ -22,6 +23,8 @@ import CreativePage from './pages/Creative'
 import MemoryPage from './pages/Memory'
 import DocumentsPage from './pages/documents/Documents'
 import logoSidebar from './assets/logo-sidebar.png'
+import { useT } from './i18n'
+import { appMessages } from './App.i18n'
 
 // Static module route map — M2 will replace this with dynamic import()
 const MODULE_PAGES: Record<string, React.ComponentType> = {
@@ -31,6 +34,7 @@ const MODULE_PAGES: Record<string, React.ComponentType> = {
 }
 
 type BuiltinPage =
+  | 'home'
   | 'chat'
   | 'workbench'
   | 'runs'
@@ -46,31 +50,25 @@ type BuiltinPage =
   | 'modules-manager'
 type Page = BuiltinPage | string  // string = module route
 
-const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
-  { id: 'chat',            icon: '💬', label: '对话' },
-  { id: 'workbench',       icon: '🔧', label: '工作台' },
+const BUILTIN_NAV: { id: BuiltinPage; icon: string }[] = [
+  // The landing page: an isometric machine showing how one run moves through the components.
+  { id: 'home',            icon: '🏠' },
+  { id: 'chat',            icon: '💬' },
+  { id: 'workbench',       icon: '🔧' },
   // ADR-DOC-01 D3: the Documenting OS's page (#705).
-  { id: 'documents',       icon: '📄', label: '文档' },
-  { id: 'runs',            icon: '📋', label: '任务' },
-  { id: 'schedules',       icon: '⏰', label: '调度' },
-  { id: 'communication',   icon: '🪢', label: '通信' },
-  { id: 'approvals',       icon: '🔐', label: '审批' },
-  { id: 'voice',           icon: '🎙️', label: '语音' },
-  { id: 'creative',        icon: '🎨', label: 'Design' },
-  { id: 'models',          icon: '🤖', label: '模型' },
-  { id: 'modules-manager', icon: '🧩', label: '模块管理' },
+  { id: 'documents',       icon: '📄' },
+  { id: 'runs',            icon: '📋' },
+  { id: 'schedules',       icon: '⏰' },
+  { id: 'communication',   icon: '🪢' },
+  { id: 'approvals',       icon: '🔐' },
+  { id: 'voice',           icon: '🎙️' },
+  { id: 'creative',        icon: '🎨' },
+  { id: 'models',          icon: '🤖' },
+  { id: 'modules-manager', icon: '🧩' },
   // M1-T11: 记忆页紧挨设置，和它共享"这是你对 Agent24 的控制面"这同一个位置。
-  { id: 'memory',          icon: '🧠', label: '记忆' },
-  { id: 'settings',        icon: '⚙️', label: '设置' },
+  { id: 'memory',          icon: '🧠' },
+  { id: 'settings',        icon: '⚙️' },
 ]
-
-const BUILTIN_TITLES: Record<BuiltinPage, string> = {
-  chat: '对话', workbench: '工作台', runs: '运行任务',
-  schedules: '定时调度', approvals: '待审批', voice: '语音', documents: '文档',
-  communication: '通信概览',
-  creative: 'Design', models: '模型管理', 'modules-manager': '模块管理',
-  memory: '记忆', settings: '设置',
-}
 
 // FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
 // (see fetchOmlxModels in main/ipc/index.ts) — so a real "is this a chat
@@ -96,7 +94,11 @@ export function pickChatModel(models: string[]): string | undefined {
   return models.find((m) => !NON_CHAT_MODEL_PATTERNS.some((re) => re.test(m)))
 }
 
-const NO_CHAT_MODEL_LABEL = '无可用对话模型（仅检测到生图/嵌入等模型）'
+// Sentinels for the oMLX-derived fallback label; translated at render time so
+// switching language relabels them without re-detecting.
+const LLM_DETECTING = '\u0000detecting'
+const LLM_NO_RUNTIME = '\u0000no-runtime'
+const NO_CHAT_MODEL_LABEL = '\u0000no-chat-model'
 
 /** ME4-desktop-model-ui: `GET /api/v1/models`'s `default_model` field
  * (`rust/apps/agent24d/src/routes.rs`) — the daemon's own `DEFAULT_MODEL`
@@ -111,7 +113,7 @@ export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): 
 }
 
 export function App(): JSX.Element {
-  const [page, setPage] = useState<Page>('chat')
+  const [page, setPage] = useState<Page>('home')
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
@@ -120,7 +122,7 @@ export function App(): JSX.Element {
   // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
   // used when the daemon has no `default_model` to report. The topbar's
   // actual displayed label is the `llmLabel` derived value below.
-  const [fallbackLlmLabel, setFallbackLlmLabel] = useState('Detecting…')
+  const [fallbackLlmLabel, setFallbackLlmLabel] = useState(LLM_DETECTING)
   const [daemonDefaultModel, setDaemonDefaultModel] = useState<string | null>(null)
   const [backendPort, setBackendPort] = useState<number | null>(null)
   const initDone = useRef(false)
@@ -131,7 +133,12 @@ export function App(): JSX.Element {
   // NON_CHAT_MODEL_PATTERNS comment above). Falls back to the oMLX-derived
   // label only when the daemon has none to report (e.g. an older daemon
   // build, or the router was never built via `from_env`).
-  const llmLabel = daemonDefaultModel ? `${daemonDefaultModel} · Agent24 默认` : fallbackLlmLabel
+  const t = useT(appMessages)
+  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel' } as const
+  const fallbackKey = FALLBACK_KEYS[fallbackLlmLabel as keyof typeof FALLBACK_KEYS]
+  const llmLabel = daemonDefaultModel
+    ? t('llm.daemonDefault', { model: daemonDefaultModel })
+    : fallbackKey ? t(fallbackKey) : fallbackLlmLabel
 
   useEffect(() => {
     if (initDone.current) return
@@ -186,7 +193,7 @@ export function App(): JSX.Element {
           }
         }
       } else {
-        setFallbackLlmLabel('No AI runtime')
+        setFallbackLlmLabel(LLM_NO_RUNTIME)
       }
     })()
 
@@ -198,7 +205,8 @@ export function App(): JSX.Element {
     (m) => (m.type === 'ui' || m.type === 'hybrid') && m.navItem,
   )
 
-  const pageTitle = BUILTIN_TITLES[page as BuiltinPage]
+  const isBuiltin = BUILTIN_NAV.some((n) => n.id === page)
+  const pageTitle = (isBuiltin ? t(`title.${page as BuiltinPage}`) : undefined)
     ?? modules.find((m) => m.navItem?.route === page)?.name
     ?? page
 
@@ -227,14 +235,14 @@ export function App(): JSX.Element {
               onClick={() => setPage(item.id)}
             >
               <span className="icon">{item.icon}</span>
-              <span>{item.label}</span>
+              <span>{t(`nav.${item.id}`)}</span>
             </button>
           ))}
 
           {/* Dynamically injected UI module nav items */}
           {moduleNavItems.length > 0 && (
             <>
-              <div className="nav-section">能力模块</div>
+              <div className="nav-section">{t('nav.section.modules')}</div>
               {moduleNavItems.map((m) => (
                 <button
                   key={m.id}
@@ -250,14 +258,14 @@ export function App(): JSX.Element {
 
           {moduleNavItems.length === 0 && (
             <>
-              <div className="nav-section">能力模块</div>
+              <div className="nav-section">{t('nav.section.modules')}</div>
               <button
                 className="nav-item"
                 onClick={() => setPage('modules-manager')}
                 style={{ opacity: 0.7 }}
               >
                 <span className="icon">➕</span>
-                <span>安装模块</span>
+                <span>{t('nav.installModule')}</span>
               </button>
             </>
           )}
@@ -267,10 +275,10 @@ export function App(): JSX.Element {
           <div className="backend-status">
             <div className={`status-dot ${backendOk === true ? 'online' : backendOk === false ? 'offline' : ''}`} />
             {backendOk === true && (
-              <span>后端服务运行中{backendPort !== null ? ` :${backendPort}` : ''}</span>
+              <span>{t('backend.online')}{backendPort !== null ? ` :${backendPort}` : ''}</span>
             )}
-            {backendOk === false && <span>后端服务离线</span>}
-            {backendOk === null && <span>检测中…</span>}
+            {backendOk === false && <span>{t('backend.offline')}</span>}
+            {backendOk === null && <span>{t('backend.checking')}</span>}
           </div>
         </div>
       </aside>
@@ -279,13 +287,13 @@ export function App(): JSX.Element {
       <div className={`main${sidebarOpen ? '' : ' sidebar-hidden'}`}>
         <div className="topbar">
           <span className="topbar-title">{pageTitle}</span>
-          {page === 'chat' && (
+          {(page === 'chat' || page === 'home') && (
             <span className="topbar-sub">{llmLabel}</span>
           )}
           <button
             className="theme-toggle-btn"
             onClick={() => setDarkMode(d => !d)}
-            title={darkMode ? '切换白天模式' : '切换夜间模式'}
+            title={darkMode ? t('theme.toLight') : t('theme.toDark')}
           >
             {darkMode ? '🌙' : '☀️'}
           </button>
@@ -309,6 +317,14 @@ export function App(): JSX.Element {
         >
           <ChatPage />
         </div>
+        {page === 'home' && (
+          <HomePage
+            backendOk={backendOk}
+            backendPort={backendPort}
+            moduleCount={modules.length}
+            onNavigate={setPage}
+          />
+        )}
         {page === 'workbench'        && <WorkbenchPage />}
         {page === 'documents'        && <DocumentsPage />}
         {page === 'runs'             && <RunsPage />}
@@ -330,7 +346,7 @@ export function App(): JSX.Element {
             : (
               <div key={m.id} className="content">
                 <div className="page-title">{m.name}</div>
-                <p style={{ color: 'var(--muted)', fontSize: 13 }}>Component not registered in MODULE_PAGES.</p>
+                <p style={{ color: 'var(--muted)', fontSize: 13 }}>{t('module.notRegistered')}</p>
               </div>
             )
         })}

@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import VoicePanel, { MAX_EVENTS_IN_MEMORY, pushCapped, formatModelCall } from './VoicePanel'
 import type { AgentEarEventEnvelope, AttachedView, ModelCallEnvelope } from '../../../shared/ipc-types'
+import { setLocale } from '../../i18n'
 
 type BackendReq = { method: string; path: string; body?: unknown }
 type BackendRes = { ok: boolean; status: number; data: unknown }
@@ -110,7 +111,14 @@ beforeEach(() => {
   modelCallSnapshotCalls = []
 })
 
+it('renders the English voice title by default', () => {
+  mount()
+  render(<VoicePanel />)
+  expect(screen.getByText('Voice (AgentEar)')).toBeInTheDocument()
+})
+
 describe('VoicePanel — attach status', () => {
+  beforeEach(() => { setLocale('zh') })
   it('disables speak input and both buttons when the module is detached (no record)', async () => {
     mount()
     render(<VoicePanel />)
@@ -150,6 +158,7 @@ describe('VoicePanel — attach status', () => {
 })
 
 describe('VoicePanel — speak / stop commands', () => {
+  beforeEach(() => { setLocale('zh') })
   beforeEach(() => {
     attachModules = [attached()]
   })
@@ -196,6 +205,7 @@ describe('VoicePanel — speak / stop commands', () => {
 })
 
 describe('VoicePanel — live event display', () => {
+  beforeEach(() => { setLocale('zh') })
   beforeEach(() => {
     attachModules = [attached()]
   })
@@ -349,6 +359,7 @@ describe('VoicePanel — live event display', () => {
 })
 
 describe('VoicePanel — malformed AgentEar payloads (Codex follow-up)', () => {
+  beforeEach(() => { setLocale('zh') })
   // AgentEarEventEnvelope.payload is `Record<string, unknown>` off the wire
   // from a separate, untrusted process (main/preload.ts's onAgentEarEvent
   // callback is typed `(envelope: unknown) => void` — nothing validates the
@@ -467,6 +478,7 @@ describe('VoicePanel — malformed AgentEar payloads (Codex follow-up)', () => {
 })
 
 describe('VoicePanel — recent model calls (ME4-desktop-model-ui)', () => {
+  beforeEach(() => { setLocale('zh') })
   it('shows the main-process snapshot\'s model calls on mount, with a thousands-separated latency', async () => {
     modelCallSnapshotCalls = [modelCall({ model_id: 'Qwen3-8B-4bit', tier: 'remote', latency_ms: 1500 })]
     mount()
@@ -520,6 +532,7 @@ describe('VoicePanel — recent model calls (ME4-desktop-model-ui)', () => {
 })
 
 describe('formatModelCall', () => {
+  beforeEach(() => { setLocale('zh') })
   it('renders model id, a Chinese tier label, and latency (plain ms below 1000)', () => {
     expect(formatModelCall(modelCall({ model_id: 'm', tier: 'local', latency_ms: 10 }))).toBe('m · 本地 · 10 ms')
     expect(formatModelCall(modelCall({ model_id: 'm', tier: 'remote', latency_ms: 20 }))).toBe('m · 远端 · 20 ms')
@@ -556,6 +569,7 @@ describe('pushCapped — ring buffer unit', () => {
 })
 
 describe('VoicePanel — no persistence (design §7.3/Q4)', () => {
+  beforeEach(() => { setLocale('zh') })
   it('never writes to localStorage or sessionStorage across a full interaction', async () => {
     attachModules = [attached()]
     mount()

@@ -15,3 +15,14 @@ if (typeof window !== 'undefined' && typeof window.ResizeObserver === 'undefined
   }
   window.ResizeObserver = NoopResizeObserver as unknown as typeof ResizeObserver
 }
+
+// UI language: every test starts from the shipped default (English) with
+// nothing persisted; suites that assert another language opt in themselves.
+if (typeof window !== 'undefined') {
+  const { beforeEach } = await import('vitest')
+  const { DEFAULT_LOCALE, LOCALE_STORAGE_KEY, setLocale } = await import('./renderer/i18n')
+  beforeEach(() => {
+    setLocale(DEFAULT_LOCALE)
+    window.localStorage.removeItem(LOCALE_STORAGE_KEY)
+  })
+}

@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import MemoryPage from './Memory'
+import { setLocale } from '../i18n'
 
 const ASSERTION = {
   id: 'a1',
@@ -70,7 +71,14 @@ function mount(
   return proxy
 }
 
+it('renders the English memory title by default', () => {
+  mount([])
+  render(<MemoryPage />)
+  expect(screen.getByText('Memory')).toBeInTheDocument()
+})
+
 describe('MemoryPage', () => {
+  beforeEach(() => { setLocale('zh') })
   it('shows the empty state when there is nothing to remember', async () => {
     mount([])
     render(<MemoryPage />)

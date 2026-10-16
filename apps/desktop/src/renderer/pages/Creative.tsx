@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { OpenDesignComponentStatusResult } from '../../shared/ipc-types'
+import { translate, useT } from '../i18n'
+import { creativeMessages } from './Creative.i18n'
 
 function rectOf(el: HTMLElement): { x: number; y: number; width: number; height: number } {
   const rect = el.getBoundingClientRect()
@@ -50,6 +52,7 @@ function ComponentCard({
   onInstall: () => void
   onPause: () => void
 }): JSX.Element {
+  const t = useT(creativeMessages)
   if (status.state === 'downloading') {
     const total = status.total ?? 0
     const received = status.received ?? 0
@@ -57,11 +60,12 @@ function ComponentCard({
     const etaText = formatEta(status.etaSeconds)
     return (
       <div className="creative-download">
-        <div>正在下载 iDoris Design 组件…</div>
+        <div>{t('download.progress')}</div>
         <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%` }} /></div>
         <div className="creative-download-hint">
-          {formatMb(received)} / {formatMb(total)} MiB（{pct}%）· {formatSpeed(status.bytesPerSecond)}
-          {etaText && ` · ${etaText}`}
+          {t('download.size', { received: formatMb(received), total: formatMb(total), percent: pct })}
+          {` · ${formatSpeed(status.bytesPerSecond)}`}
+          {etaText ? ` · ${etaText}` : ''}
         </div>
         <button className="btn" type="button" onClick={onPause}>暂停下载（保留进度）</button>
       </div>
@@ -81,11 +85,14 @@ function ComponentCard({
       </div>
     )
   }
+      </div>
+    )
+  }
 
   if (status.state === 'verifying') {
     return (
       <div className="creative-download">
-        <div>正在校验…</div>
+        <div>{t('download.verifying')}</div>
       </div>
     )
   }
@@ -93,8 +100,8 @@ function ComponentCard({
   if (status.state === 'failed') {
     return (
       <div className="creative-download">
-        <div>iDoris Design 组件下载失败：{status.error ?? '未知错误'}</div>
-        <button className="btn btn-primary" type="button" onClick={onInstall}>重试</button>
+        <div>{t('download.failed', { error: status.error ?? t('download.unknownError') })}</div>
+        <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.retry')}</button>
       </div>
     )
   }
@@ -102,13 +109,14 @@ function ComponentCard({
   // 'not-installed' (also the synthesized shape for a needs-download result)
   return (
     <div className="creative-download">
-      <div>Design 需要额外下载 iDoris Design 组件（约 {formatMb(status.size)} MiB），下载完成后即可使用。</div>
-      <button className="btn btn-primary" type="button" onClick={onInstall}>下载</button>
+      <div>{t('download.prompt', { size: formatMb(status.size) })}</div>
+      <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.download')}</button>
     </div>
   )
 }
 
 export default function CreativePage(): JSX.Element {
+  const t = useT(creativeMessages)
   const hostRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
   const [restarting, setRestarting] = useState(false)
@@ -169,10 +177,10 @@ export default function CreativePage(): JSX.Element {
         if (cancelled) return
         if (result.ok) { setError(null); return }
         if (result.needsDownload) { setNeedsDownloadSize(result.size ?? 0); return }
-        setError(result.error ?? 'iDoris Design 启动失败')
+        setError(result.error ?? translate(creativeMessages, 'error.start'))
       },
       (reason) => {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : 'iDoris Design 启动失败')
+        if (!cancelled) setError(reason instanceof Error ? reason.message : translate(creativeMessages, 'error.start'))
       },
     )
 
@@ -191,9 +199,9 @@ export default function CreativePage(): JSX.Element {
     setRestarting(true)
     try {
       const result = await window.agent24.creativeRestart(rectOf(host))
-      setError(result.ok ? null : (result.error ?? 'iDoris Design 启动失败'))
+      setError(result.ok ? null : (result.error ?? translate(creativeMessages, 'error.start')))
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'iDoris Design 启动失败')
+      setError(reason instanceof Error ? reason.message : translate(creativeMessages, 'error.start'))
     } finally {
       setRestarting(false)
     }
@@ -211,9 +219,9 @@ export default function CreativePage(): JSX.Element {
       {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} onPause={pauseComponent} />}
       {tryCreative && error && (
         <div className="creative-error">
-          <div>iDoris Design 暂不可用：{error}</div>
+          <div>{t('error.unavailable', { error })}</div>
           <button className="btn btn-primary" type="button" disabled={restarting} onClick={() => void restart()}>
-            {restarting ? '正在启动 iDoris Design…' : '重试'}
+            {restarting ? t('action.starting') : t('action.retry')}
           </button>
         </div>
       )}

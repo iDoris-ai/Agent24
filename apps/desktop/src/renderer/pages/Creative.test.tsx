@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import CreativePage from './Creative'
+import { setLocale } from '../i18n'
 import type { OpenDesignComponentStatusResult } from '../../shared/ipc-types'
 
 const creativeShow = vi.fn()
@@ -47,6 +48,7 @@ beforeEach(() => {
 })
 
 describe('CreativePage', () => {
+  beforeEach(() => { setLocale('zh') })
   it('shows the native view, syncs resized bounds, and hides it on unmount', async () => {
     const { container, unmount } = render(<CreativePage />)
     const host = container.querySelector('.creative-host') as HTMLDivElement
@@ -89,6 +91,7 @@ describe('CreativePage', () => {
 })
 
 describe('CreativePage — on-demand iDoris Design component', () => {
+  beforeEach(() => { setLocale('zh') })
   it('shows the download card with the manifest size when not installed, without starting Creative', async () => {
     openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 50 * 1024 * 1024 })
     render(<CreativePage />)
@@ -223,5 +226,12 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     fireEvent.click(screen.getByRole('button', { name: '继续下载' }))
     await waitFor(() => expect(openDesignComponentInstall).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(creativeShow).toHaveBeenCalled())
+  })
+})
+
+describe('CreativePage English default', () => {
+  it('shows the English download action', () => {
+    render(<CreativePage />)
+    expect(screen.getByRole('button', { name: 'Download' })).toBeInTheDocument()
   })
 })
