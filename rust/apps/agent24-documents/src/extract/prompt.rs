@@ -352,9 +352,8 @@ pub enum Unanswered {
     Malformed(String),
 }
 
-/// The answer inside what the model wrote (ME4-S2c §5.1), its thinking
-/// (oMLX's Qwen3; left open, it was cut off; opened by the template, only its
-/// last `</think>` shows) and a Markdown code fence, text after it too, taken off.
+/// The answer in what the model wrote (ME4-S2c §5.1): its thinking (left open: cut off; opened by
+/// the template: up to its last `</think>`) and a code fence, text after it too, taken off.
 ///
 /// # Errors
 /// [`Unanswered::Truncated`] when the thinking was never closed.
@@ -371,9 +370,10 @@ pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
         t = after.trim();
     }
     if let Some(rest) = t.strip_prefix("```") {
-        // Its language, then the answer, on the next line or the same one.
+        // Its language; closed on a line of its own, or at the answer's end.
         let body = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric());
-        t = body.rsplit_once("```").map_or(body, |(b, _)| b).trim();
+        let body = body.split_once("\n```").map_or(body, |(b, _)| b);
+        t = body.trim().trim_end_matches("```").trim_end();
     }
     Ok(t)
 }

@@ -134,6 +134,8 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
         // The fence and the answer on one line.
         format!("```json {a}```"),
         format!("```{a}```"),
+        // Another code block in the words after it.
+        format!("```json\n{a}\n```\nOr write ```{{}}``` for none."),
     ] {
         assert_eq!(unwrapped(&wrapped), Ok(a), "{wrapped}");
         assert!(parse(&[field("a")], unwrapped(&wrapped).unwrap()).is_ok());
@@ -145,6 +147,9 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
         parse(&[field("a")], words),
         Err(Unanswered::Malformed(_))
     ));
+    // A fence never closed round an answer quoting one is not cut there.
+    let quoting = r#"{"values": {"a": "```sh ls```"}}"#;
+    assert_eq!(unwrapped(&format!("```json\n{quoting}")), Ok(quoting));
     // A `</think>` after the answer begins is the answer's own text.
     let quoted = r#"{"values": {"a": "</think>"}}"#;
     assert_eq!(unwrapped(quoted), Ok(quoted));

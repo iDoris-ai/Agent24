@@ -6,8 +6,8 @@
 //! as it will; what is not an answer is asked again held to the schema,
 //! thinking off. There an answer cut off at the token limit is asked again
 //! in two halves of its batch, one not in the shape once more. A window
-//! rejected (most likely too long for the model's context) in both passes
-//! is asked in two halves. A busy or rate-limited kernel is
+//! rejected (most likely too long for the model's context) in both passes,
+//! none taken there before, is asked in two halves. A busy or rate-limited kernel is
 //! waited out, up to two minutes a call; a timeout is retried once; no local
 //! model to answer is asked again after the router's longest cooldown, up to
 //! three minutes of such waiting a call. Every
@@ -262,12 +262,14 @@ impl Run<'_> {
     }
 
     /// The answers for `batch` over `window`, as (window, answers) pieces in
-    /// window order, from its first pass or, `fell` there before, its second.
+    /// window order, from its first pass or, `fell` there, its second
+    /// (`taken`: a pass on this window was taken).
     fn answer<'b>(
         &'b mut self,
         window: Window,
         batch: Vec<Field>,
         fell: Option<Fell>,
+        mut taken: bool,
     ) -> Pieces<'b> {
         Box::pin(async move {
             let fell = match fell {
@@ -282,7 +284,8 @@ impl Run<'_> {
                     },
                 },
             };
-            let (mut malformed, mut taken) = (None, false);
+            taken |= fell != Fell::Rejected;
+            let mut malformed = None;
             for _ in 0..2 {
                 let done = match self.ask(&window, &batch, Pass::Held, Some(fell)).await {
                     Ok(done) => done,
@@ -290,7 +293,7 @@ impl Run<'_> {
                     Err(Refused::TooLong) => {
                         // A pass on this window was taken: not a window too
                         // long, and a smaller one would answer otherwise.
-                        if fell != Fell::Rejected || taken {
+                        if taken {
                             return Err(Failure::Engine(
                                 "the local model rejected the second pass".into(),
                             ));
@@ -300,8 +303,8 @@ impl Run<'_> {
                                 "the local model rejects even one block".into(),
                             ));
                         };
-                        let mut out = self.answer(a, batch.clone(), None).await?;
-                        out.extend(self.answer(b, batch, None).await?);
+                        let mut out = self.answer(a, batch.clone(), None, false).await?;
+                        out.extend(self.answer(b, batch, None, false).await?);
                         return Ok(out);
                     }
                 };
@@ -309,13 +312,12 @@ impl Run<'_> {
                 match read(&window, &batch, Pass::Held, Some(fell), done) {
                     Ok(values) => return Ok(vec![(window, values)]),
                     Err(Unanswered::Truncated) if batch.len() > 1 => {
-                        // Halves of a batch that thought too long, or was
-                        // rejected, would again: they stay held. Fewer
-                        // fields may answer well where many were malformed.
-                        let next = (fell != Fell::Malformed).then_some(Fell::Truncated);
+                        // Fewer fields may answer well where many were
+                        // malformed; thinking too long, or rejected, would not.
+                        let next = (fell != Fell::Malformed).then_some(fell);
                         let (a, b) = batch.split_at(batch.len() / 2);
-                        let mut out = self.answer(window.clone(), a.to_vec(), next).await?;
-                        out.extend(self.answer(window, b.to_vec(), next).await?);
+                        let mut out = self.answer(window.clone(), a.to_vec(), next, true).await?;
+                        out.extend(self.answer(window, b.to_vec(), next, true).await?);
                         return Ok(out);
                     }
                     Err(Unanswered::Truncated) => {
@@ -329,8 +331,7 @@ impl Run<'_> {
     }
 }
 
-/// The answers in what a call of `pass` wrote, logged. A call that used all
-/// its tokens was cut off, even if it reads whole: thinking counts.
+/// The answers in what a call wrote, logged; all its tokens used is cut off (thinking counts).
 fn read(
     window: &Window,
     batch: &[Field],
@@ -401,7 +402,10 @@ async fn paced(
     let mut done = 0;
     for window in &windows {
         for batch in &batches {
-            for (piece, answers) in run.answer(window.clone(), batch.clone(), None).await? {
+            for (piece, answers) in run
+                .answer(window.clone(), batch.clone(), None, false)
+                .await?
+            {
                 for a in &answers {
                     if let Some(i) = fields.iter().position(|f| f.key == a.key) {
                         said_of[i].push(said(src, &piece, a));

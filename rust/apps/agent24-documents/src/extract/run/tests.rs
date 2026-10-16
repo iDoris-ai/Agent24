@@ -271,6 +271,7 @@ async fn a_cut_off_answer_is_asked_held_then_in_two_halves() {
         full(whole.clone()),
         full(String::new()),
         full("```json\n{".into()),
+        reply("<think>still going".into()),
     ] {
         let m = Script::new(vec![
             first,
@@ -376,6 +377,28 @@ async fn a_window_the_model_rejects_is_asked_held_then_in_halves() {
     assert_eq!(out.values[0].value.status, Status::Present);
     assert_eq!(blocks(&m), ["p1/b1,p2/b1", "p1/b1,p2/b1", "p1/b1", "p2/b1"]);
     assert_eq!(m.passes(), [Free, Held, Free, Free]);
+    // A half window starts afresh: rejected in both passes, it is halved
+    // again, for no pass was taken on it.
+    let m = Script::new(vec![
+        rejected(),
+        rejected(),
+        rejected(),
+        rejected(),
+        reply(answer(vec![missing("date")])),
+        reply(answer(vec![missing("date")])),
+        reply(answer(vec![missing("date")])),
+    ]);
+    assert!(go(&m, &layer(4, 0), &[field("date")]).await.is_ok());
+    assert_eq!(
+        blocks(&m)[2..],
+        [
+            "p1/b1,p2/b1",
+            "p1/b1,p2/b1",
+            "p1/b1",
+            "p2/b1",
+            "p3/b1,p4/b1"
+        ]
+    );
     // One block it still rejects: no model can read it.
     let m = Script::new(vec![rejected(), rejected()]);
     assert!(matches!(
@@ -430,6 +453,21 @@ async fn a_window_the_model_rejects_is_asked_held_then_in_halves() {
     let m = Script::new(vec![rejected(), reply(both[..10].to_owned()), rejected()]);
     assert!(matches!(go(&m, &l, &fields).await, Err(Failure::Engine(_))));
     assert_eq!(m.passes(), [Free, Held, Held]);
+    // Malformed, then cut off held: the halves start at the first pass, but
+    // this window took a pass, so a half rejected in both fails too.
+    let m = Script::new(vec![
+        reply("{\"values\": 1}".into()),
+        reply(both[..10].to_owned()),
+        rejected(),
+        rejected(),
+    ]);
+    assert_eq!(
+        go(&m, &l, &fields).await,
+        Err(Failure::Engine(
+            "the local model rejected the second pass".into()
+        ))
+    );
+    assert_eq!(m.passes(), [Free, Held, Free, Held]);
     // Timed out twice in the first pass: a failure, not a second pass.
     let timeout = || Err(ClientError::Timeout("t".into()));
     let m = Script::new(vec![timeout(), timeout()]);
