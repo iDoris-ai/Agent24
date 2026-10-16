@@ -123,8 +123,29 @@ impl DaemonState {
     }
 }
 
+/// Environment variable that overrides the data root (MAINT-03).
+pub const DATA_DIR_ENV: &str = "AGENT24_DATA_DIR";
+
+/// The single data root: `daemon.json`, `logs/`, `agent24.db`, `attach/` and
+/// the tool workspace all derive from it. `AGENT24_DATA_DIR` (non-empty,
+/// absolute) wins and is used as-is; otherwise `$HOME/.agent24`; no `HOME`
+/// → `None`. Unset, the result is exactly the pre-override behaviour.
 pub fn state_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agent24"))
+    state_dir_from(std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"))
+}
+
+/// Pure resolution behind [`state_dir`], so tests can exercise it without
+/// mutating the process environment (`set_var` is `unsafe` in edition 2024).
+fn state_dir_from(
+    data_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(dir) = data_dir.map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Some(dir);
+    }
+    home.map(|h| PathBuf::from(h).join(".agent24"))
 }
 
 pub fn state_path() -> Option<PathBuf> {
@@ -267,6 +288,48 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn os(s: &str) -> Option<std::ffi::OsString> {
+        Some(s.into())
+    }
+
+    #[test]
+    fn data_dir_unset_keeps_home_dot_agent24() {
+        assert_eq!(
+            state_dir_from(None, os("/home/u")),
+            Some(PathBuf::from("/home/u/.agent24"))
+        );
+        assert_eq!(state_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn data_dir_override_is_used_as_is() {
+        assert_eq!(
+            state_dir_from(os("/tmp/x"), os("/home/u")),
+            Some(PathBuf::from("/tmp/x"))
+        );
+        // No `.agent24` suffix, and HOME is not needed at all.
+        assert_eq!(
+            state_dir_from(os("/tmp/x"), None),
+            Some(PathBuf::from("/tmp/x"))
+        );
+    }
+
+    #[test]
+    fn empty_or_relative_data_dir_falls_back_to_home() {
+        let home = Some(PathBuf::from("/home/u/.agent24"));
+        assert_eq!(state_dir_from(os(""), os("/home/u")), home);
+        assert_eq!(state_dir_from(os("rel/dir"), os("/home/u")), home);
+        assert_eq!(state_dir_from(os(""), None), None);
+    }
+
+    #[test]
+    fn state_dir_reads_the_real_environment() {
+        assert_eq!(
+            state_dir(),
+            state_dir_from(std::env::var_os(DATA_DIR_ENV), std::env::var_os("HOME"))
+        );
+    }
 
     #[test]
     fn current_pid_is_alive() {

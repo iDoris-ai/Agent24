@@ -1,12 +1,16 @@
 import { useState, useEffect } from 'react'
+import { useT } from '../i18n'
+import { serviceBoxDemoMessages } from './ServiceBoxDemo.i18n'
 
 interface StatusResult { running: boolean; hostPort: number | null }
 interface EchoResult { echo: string; from: string }
 
 export default function ServiceBoxDemoPage() {
+  const t = useT(serviceBoxDemoMessages)
   const [status, setStatus] = useState<StatusResult | null>(null)
-  const [msg, setMsg] = useState('Hello from Agent24!')
+  const [msg, setMsg] = useState<string | null>(null)
   const [echoResult, setEchoResult] = useState('')
+  const [echoError, setEchoError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
@@ -23,16 +27,17 @@ export default function ServiceBoxDemoPage() {
   async function callEcho() {
     if (loading || !status?.running) return
     setLoading(true)
-    setEchoResult('调用中…')
+    setEchoResult('')
+    setEchoError(null)
     try {
       const res = await window.agent24.backendProxy({
         method: 'GET',
-        path: `/api/svc/example-service-box/api/echo?msg=${encodeURIComponent(msg)}`,
+        path: `/api/svc/example-service-box/api/echo?msg=${encodeURIComponent(msg ?? t('echo.defaultMessage'))}`,
       })
       const data = res.data as EchoResult
       setEchoResult(JSON.stringify(data, null, 2))
     } catch (err) {
-      setEchoResult(`Error: ${String(err)}`)
+      setEchoError(String(err))
     } finally {
       setLoading(false)
     }
@@ -41,29 +46,29 @@ export default function ServiceBoxDemoPage() {
   return (
     <div className="content">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-        <div className="page-title">服务容器示例</div>
+        <div className="page-title">{t('title')}</div>
         <span style={{ fontSize: 11, color: status?.running ? 'var(--accent)' : 'var(--muted)' }}>
-          {status === null ? '检测中…' : status.running ? `● 运行中 :${status.hostPort}` : '● 容器启动中…'}
+          {status === null ? t('status.checking') : status.running ? t('status.running', { port: String(status.hostPort) }) : t('status.starting')}
         </span>
       </div>
-      <div className="page-sub">BoxLite 长期服务容器 · python:slim · 请求通过 /api/svc/* 代理</div>
+      <div className="page-sub">{t('subtitle')}</div>
 
       {status !== null && !status.running && (
         <div style={{ fontSize: 12, color: 'var(--muted)', padding: '10px 0' }}>
-          容器正在启动，首次需拉取 python:slim 镜像（约 1-2 分钟）…
+          {t('startup.hint')}
         </div>
       )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 8 }}>
         <div>
           <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            Echo 接口测试
+            {t('echo.title')}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <input
-              value={msg}
+              value={msg ?? t('echo.defaultMessage')}
               onChange={(e) => setMsg(e.target.value)}
-              placeholder="输入消息…"
+              placeholder={t('echo.placeholder')}
               style={{
                 flex: 1, fontFamily: 'monospace', fontSize: 13,
                 padding: '8px 12px', background: 'var(--surface2)',
@@ -77,14 +82,14 @@ export default function ServiceBoxDemoPage() {
               onClick={() => void callEcho()}
               disabled={loading || !status?.running}
             >
-              {loading ? '调用中…' : '▶ 调用'}
+              {loading ? t('echo.calling') : t('echo.call')}
             </button>
           </div>
         </div>
 
         <div>
           <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            响应
+            {t('echo.response')}
           </div>
           <pre style={{
             minHeight: 80, padding: '10px 12px',
@@ -92,14 +97,14 @@ export default function ServiceBoxDemoPage() {
             borderRadius: 8, fontFamily: 'monospace', fontSize: 12,
             whiteSpace: 'pre-wrap', color: 'var(--text)', margin: 0,
           }}>
-            {echoResult || '点击"▶ 调用"发送请求到容器服务'}
+            {loading ? t('echo.calling') : echoError ? t('echo.error', { error: echoError }) : echoResult || t('echo.empty')}
           </pre>
         </div>
 
         <div style={{ fontSize: 11, color: 'var(--muted)', lineHeight: 1.8 }}>
-          <strong>路由路径：</strong> <code>/api/svc/example-service-box/api/echo?msg=…</code><br />
-          <strong>容器镜像：</strong> <code>python:slim</code> · 端口 <code>8000</code><br />
-          <strong>可用接口：</strong> <code>/health</code> · <code>/api/echo</code> · <code>/api/info</code>
+          <strong>{t('route.path')}</strong> <code>/api/svc/example-service-box/api/echo?msg=…</code><br />
+          <strong>{t('image.label')}</strong> <code>python:slim</code> · {t('image.port')} <code>8000</code><br />
+          <strong>{t('api.available')}</strong> <code>/health</code> · <code>/api/echo</code> · <code>/api/info</code>
         </div>
       </div>
     </div>

@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import ApprovalsPage from './Approvals'
+import { setLocale } from '../i18n'
 
 const APPROVAL = {
   id: 'apr_1',
@@ -45,6 +46,7 @@ beforeEach(() => {
 })
 
 describe('ApprovalsPage', () => {
+  beforeEach(() => { setLocale('zh') })
   it('renders pending approvals with their offered decisions', async () => {
     mount([APPROVAL])
     render(<ApprovalsPage />)
@@ -150,5 +152,13 @@ describe('ApprovalsPage', () => {
     render(<ApprovalsPage />)
     // renders without throwing despite a new approval
     await waitFor(() => expect(screen.getByText('run rm -rf /tmp/x')).toBeInTheDocument())
+  })
+})
+
+describe('ApprovalsPage English default', () => {
+  it('shows the English empty state', async () => {
+    mount([])
+    render(<ApprovalsPage />)
+    expect(await screen.findByText('No pending approvals')).toBeInTheDocument()
   })
 })

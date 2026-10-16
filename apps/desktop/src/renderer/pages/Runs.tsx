@@ -1,13 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { listRuns, cancelRun, type Run, type RunStatus } from './agent/api'
+import { useT } from '../i18n'
+import { runsMessages } from './Runs.i18n'
 
-const STATUS_LABELS: Record<RunStatus, { label: string; color: string }> = {
-  queued: { label: '排队', color: '#888' },
-  running: { label: '运行中', color: '#e0a020' },
-  awaiting_approval: { label: '待审批', color: '#b060d0' },
-  completed: { label: '已完成', color: '#4caf50' },
-  failed: { label: '失败', color: '#e05050' },
-  cancelled: { label: '已取消', color: '#666' },
+const STATUS_LABELS: Record<RunStatus, { label: 'status.queued' | 'status.running' | 'status.awaitingApproval' | 'status.completed' | 'status.failed' | 'status.cancelled'; color: string }> = {
+  queued: { label: 'status.queued', color: '#888' },
+  running: { label: 'status.running', color: '#e0a020' },
+  awaiting_approval: { label: 'status.awaitingApproval', color: '#b060d0' },
+  completed: { label: 'status.completed', color: '#4caf50' },
+  failed: { label: 'status.failed', color: '#e05050' },
+  cancelled: { label: 'status.cancelled', color: '#666' },
 }
 
 function isTerminal(s: RunStatus): boolean {
@@ -15,6 +17,7 @@ function isTerminal(s: RunStatus): boolean {
 }
 
 export default function RunsPage() {
+  const t = useT(runsMessages)
   const [runs, setRuns] = useState<Run[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -54,8 +57,8 @@ export default function RunsPage() {
 
   return (
     <div className="content">
-      <div className="page-title">运行任务</div>
-      <div className="page-sub">Agent 运行历史 · 每 3 秒刷新</div>
+      <div className="page-title">{t('title')}</div>
+      <div className="page-sub">{t('subtitle')}</div>
 
       {error && <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{error}</div>}
 
@@ -64,7 +67,7 @@ export default function RunsPage() {
         <div style={{ flex: '0 0 42%', display: 'flex', flexDirection: 'column', gap: 4 }}>
           {runs.length === 0 && (
             <div style={{ fontSize: 12, color: 'var(--muted)', padding: '8px 0' }}>
-              暂无运行任务
+              {t('list.empty')}
             </div>
           )}
           {runs.map((run) => {
@@ -85,12 +88,12 @@ export default function RunsPage() {
                 }}
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ color: st.color, fontSize: 11, fontWeight: 600 }}>{st.label}</span>
+                  <span style={{ color: st.color, fontSize: 11, fontWeight: 600 }}>{t(st.label)}</span>
                   {run.schedule_id && (
-                    <span title="由调度触发" style={{ fontSize: 10 }}>⏰</span>
+                    <span title={t('list.scheduled')} style={{ fontSize: 10 }}>⏰</span>
                   )}
                   <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--muted)' }}>
-                    {run.usage.total_tokens} tok
+                    {t('usage.short', { count: run.usage.total_tokens })}
                   </span>
                 </div>
                 <div
@@ -112,13 +115,13 @@ export default function RunsPage() {
         {/* Detail */}
         <div style={{ flex: 1, border: '1px solid var(--border)', borderRadius: 8, padding: 12 }}>
           {!selected && (
-            <div style={{ fontSize: 12, color: 'var(--muted)' }}>选择一个任务查看详情</div>
+            <div style={{ fontSize: 12, color: 'var(--muted)' }}>{t('detail.select')}</div>
           )}
           {selected && (
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                 <span style={{ color: STATUS_LABELS[selected.status].color, fontWeight: 600 }}>
-                  {STATUS_LABELS[selected.status].label}
+                  {t(STATUS_LABELS[selected.status].label)}
                 </span>
                 <code style={{ fontSize: 11, color: 'var(--muted)' }}>{selected.id}</code>
                 {!isTerminal(selected.status) && (
@@ -127,28 +130,28 @@ export default function RunsPage() {
                     style={{ marginLeft: 'auto', fontSize: 11 }}
                     onClick={() => onCancel(selected.id)}
                   >
-                    取消
+                    {t('detail.cancel')}
                   </button>
                 )}
               </div>
               <div style={{ fontSize: 12, marginBottom: 8 }}>
-                <strong>Prompt:</strong> {selected.input.prompt}
+                <strong>{t('detail.prompt')}</strong> {selected.input.prompt}
               </div>
               {selected.output && (
                 <div style={{ fontSize: 12, marginBottom: 8, whiteSpace: 'pre-wrap' }}>
-                  <strong>输出:</strong> {selected.output.text}
+                  <strong>{t('detail.output')}</strong> {selected.output.text}
                 </div>
               )}
               {selected.error && (
                 <div style={{ fontSize: 12, color: '#e05050', marginBottom: 8 }}>
-                  <strong>错误 [{selected.error.code}]:</strong> {selected.error.message}
+                  <strong>{t('detail.error', { code: selected.error.code })}</strong> {selected.error.message}
                 </div>
               )}
               <div style={{ fontSize: 11, color: 'var(--muted)' }}>
-                创建 {selected.created_at}
-                {selected.ended_at && ` · 结束 ${selected.ended_at}`}
+                {t('detail.created', { date: selected.created_at })}
+                {selected.ended_at && ` · ${t('detail.ended', { date: selected.ended_at })}`}
                 {' · '}
-                {selected.usage.total_tokens} tokens
+                {t('usage.full', { count: selected.usage.total_tokens })}
               </div>
             </div>
           )}

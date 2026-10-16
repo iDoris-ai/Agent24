@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
+import { useT } from '../i18n'
+import { codeSandboxMessages } from './CodeSandbox.i18n'
 
 interface StatusResult {
   available: boolean
@@ -17,14 +19,14 @@ print("Hello from BoxLite sandbox!")
 `
 
 function UnsupportedScreen({ error }: { error: string }) {
+  const t = useT(codeSandboxMessages)
   return (
     <div className="content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       <div style={{ textAlign: 'center', maxWidth: 420 }}>
         <div style={{ fontSize: 48, marginBottom: 16 }}>🖥️</div>
-        <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>此设备不支持 Python 沙箱</div>
+        <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>{t('unsupported.title')}</div>
         <div style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.7, marginBottom: 20 }}>
-          Python 沙箱需要 Apple Silicon（M1/M2/M3）macOS 12+ 的 Hypervisor.framework，
-          或 Linux x86_64/ARM64 with KVM。
+          {t('unsupported.body')}
         </div>
         <div style={{
           fontSize: 11,
@@ -45,8 +47,10 @@ function UnsupportedScreen({ error }: { error: string }) {
 }
 
 export default function CodeSandboxPage() {
+  const t = useT(codeSandboxMessages)
   const [code, setCode] = useState(PLACEHOLDER)
   const [output, setOutput] = useState('')
+  const [outputIsError, setOutputIsError] = useState(false)
   const [running, setRunning] = useState(false)
   const [status, setStatus] = useState<StatusResult | null>(null)
   const abortRef = useRef(false)
@@ -56,19 +60,20 @@ export default function CodeSandboxPage() {
       .then((res) => {
         if (res.ok) setStatus(res.data as StatusResult)
       })
-      .catch(() => setStatus({ available: false, error: 'Backend unavailable' }))
+      .catch(() => setStatus({ available: false, error: t('unsupported.backendUnavailable') }))
   }, [])
 
   // Not yet loaded — blank while checking
   if (status === null) return <div className="content" />
 
   // Hardware not supported — full-page notice, no degraded editor
-  if (!status.available) return <UnsupportedScreen error={status.error ?? '未知错误'} />
+  if (!status.available) return <UnsupportedScreen error={status.error ?? t('unsupported.unknown')} />
 
   async function run() {
     if (running) return
     setRunning(true)
-    setOutput('启动沙箱容器… (首次运行需拉取 python:slim 镜像，约需 1-2 分钟)')
+    setOutputIsError(false)
+    setOutput(t('starting'))
     abortRef.current = false
     try {
       const res = await window.agent24.backendProxy({
@@ -78,9 +83,13 @@ export default function CodeSandboxPage() {
       })
       if (abortRef.current) return
       const data = res.data as RunResult
-      setOutput(data.ok ? (data.output ?? '(no output)') : `Error: ${data.error ?? 'unknown'}`)
+      setOutputIsError(!data.ok)
+      setOutput(data.ok ? (data.output ?? t('noOutput')) : t('error', { msg: data.error ?? t('unknownError') }))
     } catch (err) {
-      if (!abortRef.current) setOutput(`Error: ${String(err)}`)
+      if (!abortRef.current) {
+        setOutputIsError(true)
+        setOutput(t('error', { msg: String(err) }))
+      }
     } finally {
       setRunning(false)
     }
@@ -89,22 +98,22 @@ export default function CodeSandboxPage() {
   return (
     <div className="content">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-        <div className="page-title">Python 沙箱</div>
+        <div className="page-title">{t('title')}</div>
         <button
           className="btn btn-primary"
           style={{ fontSize: 12 }}
           onClick={() => void run()}
           disabled={running}
         >
-          {running ? '运行中…' : '▶ 运行'}
+          {running ? t('running') : t('run')}
         </button>
       </div>
-      <div className="page-sub">BoxLite 硬件级 VM 隔离 · 每次运行独立容器 · Apple Silicon Hypervisor.framework</div>
+      <div className="page-sub">{t('sub')}</div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12, flex: 1 }}>
         <div>
           <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            代码
+            {t('code')}
           </div>
           <textarea
             value={code}
@@ -129,7 +138,7 @@ export default function CodeSandboxPage() {
 
         <div>
           <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            输出
+            {t('output')}
           </div>
           <pre
             style={{
@@ -142,11 +151,11 @@ export default function CodeSandboxPage() {
               fontSize: 12,
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-all',
-              color: output.startsWith('Error:') ? '#e57373' : 'var(--text)',
+              color: outputIsError ? '#e57373' : 'var(--text)',
               margin: 0,
             }}
           >
-            {output || '点击"▶ 运行"执行代码'}
+            {output || t('outputHint')}
           </pre>
         </div>
       </div>

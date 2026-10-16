@@ -1130,6 +1130,8 @@ Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清�
 > 记录；详见 ADR-031、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`、
 > `docs/agent/PLAN-ME4-OS-CAPABILITIES.md`。
 
+> **F3 裁决记录（jason，2026-10-07；M2 收口）**：继续使用 `/api/v1/<name>`，保留模块名保留段名单及其双向集合测试，F3 关闭。迁移到 `/api/v1/os/<name>` 会与内核现有 `/os/{name}` 路由冲突，并要求已发布模块 manifest、SDK、调度回调路径和桌面端协同迁移；现有保留段检查已把冲突后果从 daemon panic 降为该模块被拒绝。代价是内核新增顶层路由段会占用同名模块名，因此新路由优先挂在已有段下，新增顶层段须在 PR 说明理由。
+
 ### 与记忆（ADR-028）的关系
 
 记忆层保持**领域 OS 无关**：内核提供通用记忆（L0–L4），领域 OS **用但不拥有**它；领域态（Sin90 的 direction/proposal…）留在领域 OS 自己的 DB。换 OS 不动内核记忆。
@@ -1416,6 +1418,85 @@ D0-2 要求"在 `agent24-decide` 里定义写入/追加/导出/删除的 trait�
 
 - 两套 DTO（`agent24-decide::log::LogEntry` 与 `agent24-store::decision_log::NewDecisionLogEntry`）字段基本对应但类型不同（例如 `FinalAction` 枚举 vs 裸 `String`），D1 接线时需要写一层显式映射；这层映射目前不存在，也没有测试覆盖，因为没有调用方。
 - CLI 直接打开 `agent24.db`，意味着将来如果决策日志需要经过某种访问控制（例如多用户、远程 attach），现在的直接文件访问路径要重新考虑——D0-2 的隐私模型是单用户单机，这个前提目前成立，但不是永久保证。
+
+---
+
+## ADR-035：iDoris Admin session token 由可信 launcher 通过匿名 inherited FD/HANDLE 一次性交付
+
+**日期**：2026-10-08
+**状态**：✅ 采纳（jason 明确拍板；追踪 issue：Agent24 #765）
+
+### 背景
+
+iDoris M4 的 Admin v0 是独立 loopback listener，Bearer session token 只用于本机管理面。Agent24 只消费 iDoris，不拥有/拉起 iDoris，因此不能为了状态卡把 Agent24 改成 iDoris process owner；但 Electron main 又必须拿到同一枚 Admin token，且 renderer 永远不能拿到它。
+
+### 决策
+
+1. **macOS/Linux**：可信 parent launcher 每次启动生成一枚新的 64 位小写 hex Admin session token，通过两条独立的 **anonymous one-shot pipe** 分别交给 iDoris stdin（现有 `serve --admin-token-stdin`）和 Agent24 Electron main 的专用 inherited FD。argv 只允许出现非秘密的 FD 编号选择器；token 本身不得进入 argv/env/普通文件/stdout/stderr/log。
+2. **Windows**：保持同一权威模型，改用显式 allowlist 的 inherited HANDLE；不得用“继承全部 handles”的宽泛配置。
+3. Electron main 只读一次 65-byte canonical frame（64 hex + `\n`），有界超时，随后立即关闭 FD/HANDLE；token 只驻留 main-process memory。renderer/preload return value、browser storage、generic backend proxy 均不得得到 token。
+4. renderer 只获得零参数、固定功能的 `idorisStatus()`；renderer 不能提供 host/URL/path/header/port/token/FD selector。Admin HTTP client 固定 `127.0.0.1` + trusted non-secret port config，只访问冻结的 Admin route；M4 read path 不跟随 redirect、不使用 proxy、5s timeout、响应体 ≤256 KiB、错误只返回有限 typed state。
+5. token 为 per-launch session secret；launcher 在两条 pipe 完成写入后立即关闭写端并丢弃（可控内存中尽可能清零）自己的 token 副本；重启/轮换使旧 token 失效，不跨 launch 持久化或复用。
+
+### 信任边界与安全假设
+
+**信任**：token mint/handoff 时的 parent launcher、iDoris Admin listener/auth、消费 token 的 Agent24 Electron main。
+**不信任 token**：Electron renderer/web contents、preload 返回值、普通子进程、shell/argv/env diagnostics、文件/日志/crash text、远端或非 loopback host。
+
+安全保证依赖这些假设：launcher 使用 CSPRNG；只把每个 pipe 的读端继承给目标 child，并且只有在同时提供一个合法 selector 时才继承 secret FD；未使用端点立即关闭且默认 non-inheritable/CLOEXEC；Agent24 main 在继续 spawn descendant 前完成读取/关闭；非法/重复 selector 会在继续启动前关闭所有被参数明确声明且可安全识别的 token FD 候选；iDoris Admin 始终 loopback-only 且 bearer fail-closed；renderer IPC 保持 least-privilege、zero-arg、read-only。
+
+### 失陷情形 / 保证边界
+
+- **可信 launcher 在 mint/handoff 前或过程中被攻破**：这是 root-of-trust compromise。攻击者可读/替换 token 或启动恶意 consumer；pipe 无法保护生成 secret 的组件。恢复动作是终止受影响进程、轮换/重启 session、先恢复 launcher 完整性。
+- **launcher 在成功 handoff、关闭两条写端并丢弃 token 后才被攻破**：单凭 launcher 自身不应再能恢复已经交付的旧 token，因此不会自动泄露既有 session；但攻击者仍可控制未来 launch，若同时具备读取其它进程内存/FD 的 OS 权限，则落入下面的 OS-level attacker 情形。
+- **Electron main 被攻破**：攻击者可读 main memory 里的 token 或滥用 main 已有 Admin 权限。该方案保护 renderer compromise，不声称能保护已失陷的 trusted consumer。
+- **iDoris 被攻破**：Admin 权威和模型控制完整性失效，与 secret transport 无关。
+- **renderer 被攻破**：按本 ADR，renderer 仍拿不到 token；剩余风险是滥用 main 暴露的窄 IPC，因此 M4 IPC 必须固定、零参数、只读。
+- **root/admin/debugger，或同账号下具备 OS 授权的进程检查能力的 attacker**：可能直接读进程内存/handle 或篡改进程，超出本机制保护范围。
+- **crash/core dump**：main memory 中仍可能包含 token；禁止显式把 token 放进 error/crash payload，并保持 per-launch 生命周期。
+- **FD/HANDLE 误继承**：可能把 token 泄漏给 descendant；用 default non-inheritance/CLOEXEC、显式 allowlist、读后立即 close 和 bearing tests 防御。
+- **token 泄漏后的 replay**：仍存活的 session token 可在本机重放；用每次启动随机 token + restart/rotation invalidation 降低窗口。
+
+### 备选与取舍
+
+argv 会暴露给 process listing；env 容易被继承/诊断 dump；0600 普通文件虽然可接受但引入 at-rest、cleanup、backup/indexing 风险；OS keychain 更适合长期 credential；localhost bootstrap endpoint 又需要第二套 bootstrap auth。匿名 inherited pipe/FD/HANDLE 是成熟的 process-launch secret-handoff 模式之一，最匹配“一次启动 session secret”，但本 ADR **不**声称它零风险或是唯一行业标准。
+
+---
+
+## ADR-036：硬件探测与整机内存账归 Agent24（`agent24-hw`），模型选型归 iDoris
+
+**日期**：2026-10-15
+**状态**：✅ 采纳（jason 2026-10-14 拍板；设计见 [`docs/design/HW-TIERS-capability-hardware-matrix.md`](design/HW-TIERS-capability-hardware-matrix.md)，#952，Codex 挑战 3 轮通过）
+
+### 背景
+
+硬件探测今天写在 `agent24-decide::hw`，只有决策服务会调用，daemon 开机并不探测；iDoris 另有自己的 `host_facts.rs`（只取总内存 + CPU 型号）和 `idoris-recommender`（LLM 常驻 / 临时准入）。两个进程各自以为整机可用内存归自己，会同时按「整机预算」装模型，合起来超载。同时产品需要「能力 × 硬件」的透明对照与零配置自动匹配（jason 2026-10-14 需求）。
+
+### 决策
+
+1. **硬件探测与整机内存账归 Agent24，新增 crate `agent24-hw`**，daemon 启动时探测并落盘，其他模块读它的结果。`agent24-hw` 不依赖任何其它内部 crate（L3 叶子，与 `comm`/`decide` 同类），iDoris 可直接依赖它。探测范围：内存、芯片、GPU / 独显显存、加速器、**全部内置与外接磁盘**、电池、OS、运行时；字段取不到时逐项按保守规则处理（设计 §3.2）。
+2. **模型相关（选型、量化、加载）归 iDoris**：iDoris 在 Agent24 分给它的 `allocated_budget_bytes` 内用 `idoris-recommender` 挑 LLM。`HostFacts.ram_gb` 保持真实物理内存，不得把剩余预算伪装成 RAM 传入（会重复扣系统保留，并扭曲 `min_ram_gb` 硬门槛）。该入参 iDoris 尚未提供，是 HW-3 的前置，由 iDoris 侧实现。iDoris 部署在别的机器时自探，但使用同一个 `agent24-hw`。
+3. **档位只用数字 1–6 档**（1 = <8GB、2 = 8、3 = 16、4 = 24、5 = 32–<64、6 = ≥64，GiB 口径），用于展示；准入按扣掉系统保留与 App 开销后的**整数字节预算**计算。跨边界一律传整数字节。
+4. **能力声明「能力梯」**：每个能力声明一条从好到差的梯级（硬件需求 + 质量），终止于 `cloud` 或 `unavailable`；第三方 domain OS 在 `domain-os.yml` 以同一 schema 声明，CI 准入。不声明的模块不得合入。
+5. **云端补位默认关，且开关必须由 `ModelRouter` 强制执行**，不能只在能力计划里过滤：今天 `Privacy::Any` 的请求在本地失败时会回退 Remote，路由器不知道这个开关。关闭时 `tier_order` 不含 Remote。验收：云端关 + 本地故障 + Remote 可用 → 必须拒绝。
+6. **降级自动、升级需确认**：内存不足时调用点临时降一级并透出 `served_rung`；换机或加内存后只推荐升级，下载仍走 `DownloadConsent`。本地模型加载经 agent24d 唯一准入点（lease，原型阶段串行），防并发加载同时越过预算。
+7. **`agent24-decide` 的 T0–T3 改读平台档位，其余规则原样保留**：1 档 → T0，2 → T1，3、4 → T2，5、6 → T3；模型目录所在盘 < 2GiB → T0、无加速器或电池 → 最多 T1、未同意下载锁 T0、用户覆盖只能降档、`hardware_tier` 与 `effective_tier` 分开记，全部不变。验收是 `tier.rs` 现有边界测试断言不改仍通过。
+
+### 对既有 ADR 的修订
+
+- **ADR-033 #2（`agent24-decide` 零内部依赖）**：新增唯一一条对 `agent24-hw` 的依赖，替换 decide 自带的 `hw` 模块。`agent24-hw` 本身零内部依赖，所以 decide 的依赖图仍无环、无向上边；D1 自由选择挂载点的前提不变。
+
+### 备选与取舍
+
+- **继续各探各的**：重复代码事小，真正的问题是双重记账。否决。
+- **由 iDoris 探测并管理整机内存**：iDoris 不一定与 Agent24 同机部署，且语音、沙箱、磁盘等非 LLM 能力只有 Agent24 关心，整机账不该放在只懂 LLM 的一方。否决。
+- **把剩余预算当作 `ram_gb` 传给推荐器**：见决策 2，语义错误。否决。
+
+### 代价与后果
+
+- iDoris 需要新增 `allocated_budget_bytes`（单独 issue，不在本仓库实现）；在它落地前 HW-3 的 LLM 对接用 Agent24 内置静态梯。
+- `ModelRouter` 要改一处（云端开关），属于 HW-4。
+- 表中体积与内存数字在 HW-5 实测前都是草案。
 
 ---
 

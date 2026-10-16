@@ -1881,6 +1881,23 @@ mod tests {
         (st, dir, path)
     }
 
+    #[tokio::test]
+    async fn rendered_os_list_matches_the_openapi_contract_fixture() {
+        let (mut st, _dir, path) = t8_state().await;
+        let mut module = report("sin90", MountOutcome::Mounted);
+        module.resources = ResourceStatus::MissingModels(vec!["ornith-9b".to_owned()]);
+        st.os_reports = std::sync::Arc::new(vec![module]);
+        crate::os_config::OsConfig::set_enabled(&path, "sin09", false).unwrap();
+
+        let response = render_at(&st, Some(path));
+        assert_eq!(response.status(), StatusCode::OK);
+        let actual = body_json(response).await;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../protocol/fixtures/os/list.json"))
+                .unwrap();
+        assert_eq!(actual, fixture);
+    }
+
     /// Judgement criterion 1 — a `Refused` module's `enable` is blocked and
     /// `os.json` is left byte-for-byte as it was (not just "the requested
     /// name is absent" — code review round 1 Low 5: the finalized criterion

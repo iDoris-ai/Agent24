@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import ChatPage from './Chat'
+import { setLocale } from '../i18n'
 
 const mockBackendProxy = vi.fn()
 
@@ -15,6 +16,7 @@ beforeEach(() => {
 })
 
 describe('ChatPage', () => {
+  beforeEach(() => { setLocale('zh') })
   it('renders empty state with suggestions', () => {
     render(<ChatPage />)
     expect(screen.getByText('Agent24')).toBeInTheDocument()
@@ -138,8 +140,34 @@ describe('ChatPage', () => {
     fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'test' } })
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 
-    await waitFor(() => expect(screen.getByText(/无法连接到后端服务/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/对话请求失败/)).toBeInTheDocument())
     expect(screen.queryByText(/总计/)).not.toBeInTheDocument()
+  })
+
+  it('does not blame the model service when the backend daemon never became ready', async () => {
+    // `proxyToBackend` answers this exact shape while agent24d has not
+    // announced its ready line. The renderer must say so instead of telling
+    // the user to start a model service that was never the problem.
+    mockBackendProxy.mockResolvedValue({
+      ok: false,
+      status: 503,
+      data: {
+        error: {
+          code: 'backend_not_ready',
+          message: 'Backend daemon has not announced readiness yet',
+        },
+      },
+    })
+
+    render(<ChatPage />)
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'test' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
+
+    await waitFor(() => {
+      expect(screen.getByText(/Agent24 后端服务（agent24d）尚未就绪/)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/对话请求失败/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/11434/)).not.toBeInTheDocument()
   })
 
   it('shows error when backend returns non-ok', async () => {
@@ -155,7 +183,7 @@ describe('ChatPage', () => {
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
 
     await waitFor(() => {
-      expect(screen.getByText(/无法连接到后端服务/)).toBeInTheDocument()
+      expect(screen.getByText(/对话请求失败/)).toBeInTheDocument()
     })
   })
 
@@ -246,5 +274,12 @@ describe('ChatPage', () => {
     await waitFor(() => {
       expect(mockBackendProxy).toHaveBeenCalled()
     })
+  })
+})
+
+describe('ChatPage English default', () => {
+  it('shows the English welcome copy', () => {
+    render(<ChatPage />)
+    expect(screen.getByText('Your local AI assistant. Your data stays on this device.')).toBeInTheDocument()
   })
 })
