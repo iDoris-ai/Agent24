@@ -206,8 +206,10 @@ pub enum ModelError {
     Cancelled,
 }
 
-/// Minimal provider contract: request in, response out. No routing, no retry,
-/// no health logic here.
+/// Minimal provider contract: request in, response out. No routing, no
+/// health logic here, and no retry but one: [`OpenAiCompatProvider`] asks
+/// again, once, without a thinking switch the backend refused (ME4-S2c §4),
+/// so one `complete` may send two requests.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &str;
@@ -873,17 +875,22 @@ impl ModelProvider for OpenAiCompatProvider {
         // other reason costs one more refusal.
         const SWITCHES: [&str; 2] = ["chat_template_kwargs", "reasoning_effort"];
         let switched = SWITCHES.iter().any(|k| body.get(k).is_some());
+        let started = std::time::Instant::now();
         match self.send(&body, req.progress.as_ref(), cancel).await {
             Err(e @ ModelError::Rejected { status: 400, .. }) if switched => {
-                // A refusal whose error body a cancel cut short is a cancel;
-                // one the call's deadline cut short stays the refusal it is,
-                // as there is no time left to ask again.
+                // A refusal whose error body a cancel cut short is a cancel.
+                // Without the time for another answer, it stays the refusal
+                // it is: a streamed call by the router's rule for trying the
+                // next provider (less than a stall left), a whole one when
+                // its own timeout already ran out reading it.
                 if cancel.is_cancelled() {
                     return Err(ModelError::Cancelled);
                 }
-                if let Some(p) = &req.progress
-                    && stream::left(p, std::time::Instant::now()).is_zero()
-                {
+                let no_time = match &req.progress {
+                    Some(p) => stream::left(p, std::time::Instant::now()) < p.stall,
+                    None => started.elapsed() >= self.chat_timeout,
+                };
+                if no_time {
                     return Err(e);
                 }
                 tracing::warn!("{e}; asking again without the thinking switch");
@@ -1689,6 +1696,78 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(logs.retries(), 0);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A backend that refuses with a 400 after `wait` ms; with `whole`, the
+    /// refusal's body comes in full, else it never ends. How many it was asked.
+    async fn refuses_after(
+        wait: u64,
+        whole: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                let reply = if whole {
+                    refused("400 Bad Request")
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":".to_owned()
+                };
+                s.write_all(reply.as_bytes()).await.unwrap();
+                held.push(s);
+            }
+        });
+        (url, count)
+    }
+
+    #[tokio::test]
+    async fn a_refusal_with_less_than_a_stall_left_is_not_asked_again() {
+        // The router's rule for the next provider: less than a stall left is
+        // no time for another answer.
+        let (url, count) = refuses_after(450, true).await;
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let progress = Some(Progress {
+            deadline: std::time::Instant::now() + Duration::from_millis(600),
+            first_chunk: Duration::from_millis(1000),
+            stall: Duration::from_millis(300),
+        });
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(progress), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_whole_refusal_its_timeout_cut_short_is_not_asked_again() {
+        let (url, count) = refuses_after(0, false).await;
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort()
+            .with_timeouts(Duration::from_millis(300), Duration::from_secs(1));
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(None), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
