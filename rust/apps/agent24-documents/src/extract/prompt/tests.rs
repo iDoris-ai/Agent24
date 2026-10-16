@@ -168,6 +168,17 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
     // A `</think>` after the answer begins is the answer's own text.
     let quoted = r#"{"values": {"a": "</think>"}}"#;
     assert_eq!(unwrapped(quoted, Pass::Free), Ok(quoted));
+    // A draft in thinking the template opened is never the answer: words
+    // after its end, or nothing, are no answer (PR-Daemon #1047 M1).
+    for after in [format!("Final answer: {a}"), String::new()] {
+        for draft in [format!("```json\n{draft}\n```"), draft.to_owned()] {
+            let text = format!("{draft}\nwait</think>\n{after}");
+            assert_eq!(unwrapped(&text, Pass::Free), Ok(after.as_str()), "{text}");
+        }
+    }
+    // Two ends of thinking, none at its start: the last ends it (L3).
+    let twice = format!("I close with </think> then</think>\n{a}");
+    assert_eq!(unwrapped(&twice, Pass::Free), Ok(a));
     // Nor in a value quoting `</think>` before a quote mark or a brace, in an
     // answer that stands as it is, or in the pass that does not think.
     for v in ["`<think>` and `</think>` tags", "</think>{"] {

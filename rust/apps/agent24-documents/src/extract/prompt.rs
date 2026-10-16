@@ -351,8 +351,8 @@ pub enum Unanswered {
 }
 
 /// The answer in what the model wrote in `pass` (ME4-S2c §5.1): its thinking
-/// (left open: [`Unanswered::Truncated`]; else up to a last `</think>` an
-/// answer follows) and a code fence, with what follows the answer in it, cut off.
+/// (left open: [`Unanswered::Truncated`]; else up to its last `</think>`) and
+/// a code fence, with what follows the answer in it, cut off.
 pub fn unwrapped(text: &str, pass: Pass) -> Result<&str, Unanswered> {
     let mut t = text.trim();
     if let Some(rest) = t.strip_prefix("<think>") {
@@ -362,11 +362,11 @@ pub fn unwrapped(text: &str, pass: Pass) -> Result<&str, Unanswered> {
         t = after.trim();
     }
     // Only in the pass that thinks, and only in what is no answer as it
-    // stands: a value may quote `</think>` too.
+    // stands (a value may quote `</think>` too). Before its last end is
+    // thinking, a draft in it too: what follows, or nothing, is the answer.
     if pass == Pass::Free
         && serde_json::from_str::<serde::de::IgnoredAny>(t).is_err()
         && let Some((_, after)) = t.rsplit_once("</think>")
-        && after.trim_start().starts_with(['{', '`'])
     {
         t = after.trim();
     }

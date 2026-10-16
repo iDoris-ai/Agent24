@@ -155,7 +155,7 @@
   - 回答是完整 JSON 但不符合 Schema 时，重试一次，仍不行也是 `parse_failed`。第一遍的不合格不算这次重试。
 
 **模型的回答**
-- 第二遍用 `response_format` 的 JSON Schema 约束（strict），第一遍按指令里写明的形状作答，两遍都由模块按同一份 Schema 校验（`prompt::parse`），回答前后的思考段和代码块围栏先去掉。`values` 以字段的 `key` 为键，每个字段恰好一个回答；回答是只有一个属性的对象，属性名就是状态：
+- 第二遍用 `response_format` 的 JSON Schema 约束（strict），第一遍按指令里写明的形状作答，两遍都由模块按同一份 Schema 校验（`prompt::parse`），回答开头的思考段（第一遍还有模板替模型开了思考时留下的、到最后一个 `</think>` 为止的部分）和代码块围栏先去掉。`values` 以字段的 `key` 为键，每个字段恰好一个回答；回答是只有一个属性的对象，属性名就是状态：
   - `present`：`value`（原文写法）、`normalized`（没有时为空串）和证据。证据是 `{block_id, quote}` 的列表，最多 16 条，`quote` 必须是该块原文中连续的一段；
   - `missing`：`reason`，取 `blank_in_template`、`referenced_but_absent`、`outside_page_scope`、`not_in_document` 之一；
   - `conflict`：2–8 个候选，各自带值、`normalized` 和证据。
