@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import HelloModule from './HelloModule'
+import { setLocale } from '../../i18n'
 
 const mockBackendProxy = vi.fn()
 
@@ -15,6 +16,15 @@ beforeEach(() => {
 })
 
 describe('HelloModule', () => {
+  it('renders the English title by default and Chinese when switched', () => {
+    const { unmount } = render(<HelloModule />)
+    expect(screen.getByText('Module Info')).toBeInTheDocument()
+    unmount()
+    setLocale('zh')
+    render(<HelloModule />)
+    expect(screen.getByText('模块信息')).toBeInTheDocument()
+  })
+
   it('renders input and disabled greet button when no name', () => {
     render(<HelloModule />)
     expect(screen.getByPlaceholderText('e.g. Jason')).toBeInTheDocument()

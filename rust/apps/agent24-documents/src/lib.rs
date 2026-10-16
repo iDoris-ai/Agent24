@@ -15,6 +15,8 @@ pub mod documents;
 pub mod engine;
 pub mod error;
 pub mod events;
+pub mod extract;
+pub mod extractions;
 pub mod id;
 pub mod idem;
 pub mod imports;
@@ -83,6 +85,8 @@ pub struct OperationStatus {
 enum Needs {
     Storage,
     Engine,
+    /// The read engine and a model from the kernel.
+    Model,
 }
 
 /// Slice-1 operations (ADR-DOC-02 §4): what each needs, and whether this
@@ -95,10 +99,10 @@ const SLICE1_OPERATIONS: &[(&str, Needs, bool)] = &[
     ("get", Needs::Storage, true),
     ("list", Needs::Storage, true),
     ("job", Needs::Storage, true),
-    ("render", Needs::Engine, false),
+    ("render", Needs::Engine, true),
     ("read_range", Needs::Engine, true),
     ("find", Needs::Engine, true),
-    ("extract", Needs::Engine, false),
+    ("extract", Needs::Model, true),
 ];
 
 /// What this build can do right now. The read engine is reported whether it
@@ -110,6 +114,7 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
     let storage_ready = state.storage().await.is_ok();
     let engine = state.layers().engine().map(|e| e.engine().version);
     let engine_ready = engine.is_some();
+    let model_ready = state.model().is_some();
     Capabilities {
         os_version: env!("CARGO_PKG_VERSION"),
         storage: StorageStatus {
@@ -119,13 +124,17 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
                 "unavailable"
             },
         },
-        engines: vec![EngineStatus {
-            id: engine::pdfkit::ENGINE_ID,
-            kind: "parse",
-            formats: engine::pdfkit::FORMATS.to_vec(),
-            state: if engine_ready { "ready" } else { "absent" },
-            version: engine,
-        }],
+        // One helper both parses and renders.
+        engines: ["parse", "render"]
+            .into_iter()
+            .map(|kind| EngineStatus {
+                id: engine::pdfkit::ENGINE_ID,
+                kind,
+                formats: engine::pdfkit::FORMATS.to_vec(),
+                state: if engine_ready { "ready" } else { "absent" },
+                version: engine.clone(),
+            })
+            .collect(),
         knowledge: KnowledgeStatus {
             setting: "on",
             state: "unavailable",
@@ -136,6 +145,7 @@ pub async fn capabilities(state: &AppState) -> Capabilities {
                 let (ready, code) = match needs {
                     Needs::Storage => (storage_ready, "storage_unavailable"),
                     Needs::Engine => (engine_ready, "engine_unavailable"),
+                    Needs::Model => (engine_ready && model_ready, "engine_unavailable"),
                 };
                 let available = routed && ready;
                 OperationStatus {
@@ -162,7 +172,19 @@ pub fn router(state: AppState) -> Router {
             "/documents/{document_id}/revisions/{revision}/text",
             get(read::text::read_text),
         )
+        .route(
+            "/documents/{document_id}/revisions/{revision}/pages/{page}",
+            get(read::render::render_page),
+        )
         .route("/documents/{document_id}/find", post(read::find::find))
+        .route(
+            "/documents/{document_id}/extractions",
+            post(extract::handler::extract),
+        )
+        .route(
+            "/extractions/{extraction_id}",
+            get(extractions::get_extraction),
+        )
         .route("/imports", post(imports::handler::import))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
@@ -209,6 +231,15 @@ mod tests {
         );
         let spawn = m.spawn().expect("out-of-process module needs spawn");
         assert_eq!(spawn.command, "bin/agent24-documents");
+        // ME4-S2b J8: extraction sends `temperature`, so the package asks for
+        // protocol 2, and a kernel that speaks less refuses it at install or
+        // mount (`min > DAEMON_PROTOCOL_VERSION`), not when a job first runs.
+        let min = MANIFEST_YAML
+            .lines()
+            .find_map(|l| l.strip_prefix("min_daemon_protocol:"))
+            .map(|v| v.trim().parse::<u32>().unwrap());
+        assert_eq!(min, Some(2));
+        // And this kernel is new enough: `from_yaml` above accepted it.
     }
 
     #[test]
@@ -283,8 +314,9 @@ mod tests {
         // The read engine is reported even when it is not here.
         assert_eq!(
             body["engines"],
-            serde_json::json!([{ "id": "apple-pdfkit", "kind": "parse", "state": "absent", "version": null,
-                "formats": ["application/pdf", "image/jpeg", "image/png"] }])
+            serde_json::json!(["parse", "render"].map(|kind| serde_json::json!(
+                { "id": "apple-pdfkit", "kind": kind, "state": "absent", "version": null,
+                  "formats": ["application/pdf", "image/jpeg", "image/png"] })))
         );
         assert_eq!(body["knowledge"]["setting"], "on");
         assert_eq!(body["knowledge"]["state"], "unavailable");

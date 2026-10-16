@@ -86,16 +86,14 @@ MUST 只提供 `approve` / 定向的 `approve_for_target`（当且仅当资格�
 
 ### L-APPR-5 · 常驻授权必须窄到确切目标
 
-**由一次批准铸出的常驻授权 MUST 形如 `tool → 确切目标`；
-其资格 MUST 同时满足：① 有效风险为 `external`；② 工具声明了 target 参数；③ 该次调用真的填了 target。
-`exec` / `write_local` 类工具 MUST 永远逐次询问。**
+**由一次批准铸出的常驻授权 MUST 形如 `tool → 确切目标`；其资格 MUST 同时满足：① 有效风险为 `external`；② 工具声明了 target 参数；③ 该次调用真的填了 target。`exec` MUST 永远逐次询问；`write_local` MUST 逐次询问，但第一方工具的可逆草稿写入仅在启用时用户已明确同意该工具且当前权限指纹匹配、宿主确认操作只写模块私有存储并有修订历史且可撤回、不覆盖权威内容、不提交正式修订、不删除且不外发时，MAY 免逐次询问。**
 
 **挡的是什么**：常驻授权是「以后都不问」的承诺。把承诺从「这个工具」收窄到「这个工具对这个目标」，
-是唯一能让它可撤销、可解释的形态；否则一次点击等于授出一个开放代理。
+是唯一能让 external 授权可撤销、可解释的形态；否则一次点击等于授出一个开放代理。草稿例外只覆盖可审阅、可撤回且不改变权威内容的私有提议；正式 commit、覆盖权威内容、删除、Exec、External，以及来源、同意、指纹、修订历史、撤回性或数据路径无法核验的 WriteLocal 操作仍 MUST 逐次审批。
 
-**今天靠什么保证**：**机制**。匹配按 `(scope_kind, scope_id, tool, target)` 精确相等
-（`agent24-store/src/repo.rs:639-670`）；资格三重收窄在 `agent24-policy/src/lib.rs:238-242`
-（`standing_grant_eligible().then_some(standing_target).flatten()`）。
+**今天靠什么保证**：**部分靠机制**。external 匹配按 `(scope_kind, scope_id, tool, target)` 精确相等
+（`agent24-store/src/repo.rs:639-670`）；external 资格三重收窄在 `agent24-policy/src/lib.rs:238-242`
+（`standing_grant_eligible().then_some(standing_target).flatten()`）。K1-6a.5 的 `ConsentGate` 会把具备第一方来源、有效匹配同意和宿主核验语义的 `WriteLocal` 草稿标记为免逐次审批；manifest 的 `reversible_draft` 只是声明。当前工具分发路径尚未接入该核验结构，实际操作路径与可逆语义的宿主核验仍须由调用方提供，缺失时按普通 `WriteLocal` 逐次审批。
 
 ---
 

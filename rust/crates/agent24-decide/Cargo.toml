@@ -7,10 +7,10 @@ repository.workspace = true
 description = "Agent24 decision service (D0): DecisionRequest/Question/Decision types, DecisionBackend trait, RuleBackend, layered DecisionService — no silent downgrade, no global threshold default (docs/agent/PLAN-DECIDE.md, docs/decision.md ADR-033)"
 
 [dependencies]
+agent24-hw = { path = "../agent24-hw" }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
 thiserror = "2"
 
 [dev-dependencies]

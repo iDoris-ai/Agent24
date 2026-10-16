@@ -1,0 +1,189 @@
+# argv: /usr/bin/python3 -I -B -m unittest discover -s tools/qa/rustdoc-repro/tests -v
+# cwd: /home/user/agent24
+# env: PATH=/usr/bin:/bin:/opt/node22/bin HOME=<0700 fake> TMPDIR=<fake> CFFIXED_USER_HOME=<fake> XDG_*=<fake> LC_ALL=C
+# exit: 1
+## stdout
+## stderr
+test_parent_dir_renamed_and_replaced (test_r3_hardening.R1ParentReplaced.test_parent_dir_renamed_and_replaced) ... FAIL
+test_parent_dir_renamed_away (test_r3_hardening.R1ParentReplaced.test_parent_dir_renamed_away) ... FAIL
+test_fifo_artifacts_file_rejected_immediately (test_r3_hardening.R3ListFile.test_fifo_artifacts_file_rejected_immediately) ... FAIL
+test_max_seconds_range (test_r3_hardening.R3ListFile.test_max_seconds_range) ... ok
+test_non_utf8_list_rejected (test_r3_hardening.R3ListFile.test_non_utf8_list_rejected) ... FAIL
+test_oversize_list_rejected (test_r3_hardening.R3ListFile.test_oversize_list_rejected) ... FAIL
+test_too_many_lines_rejected (test_r3_hardening.R3ListFile.test_too_many_lines_rejected) ... FAIL
+test_valid_list_still_works (test_r3_hardening.R3ListFile.test_valid_list_still_works) ... ok
+test_trailing_newline_and_control_names_rejected (test_r3_hardening.R4Names.test_trailing_newline_and_control_names_rejected) ... FAIL
+test_atomic_replace_after_open_is_unstable_not_stable_old (test_r3_hardening.SnapSchedule.test_atomic_replace_after_open_is_unstable_not_stable_old) ... FAIL
+test_atomic_replace_between_meta_and_open_is_not_mixed (test_r3_hardening.SnapSchedule.test_atomic_replace_between_meta_and_open_is_not_mixed) ... FAIL
+test_in_place_write_during_hash_is_unstable_not_mixed (test_r3_hardening.SnapSchedule.test_in_place_write_during_hash_is_unstable_not_mixed) ... FAIL
+test_parent_swapped_during_snapshot_is_flagged (test_r3_hardening.SnapSchedule.test_parent_swapped_during_snapshot_is_flagged) ... FAIL
+test_make_fixture_refuses_existing_root (test_safety.LegacyFailClosed.test_make_fixture_refuses_existing_root) ... ok
+test_run_experiments_refuses_and_keeps_workdir (test_safety.LegacyFailClosed.test_run_experiments_refuses_and_keeps_workdir) ... ok
+test_window_watch_refuses_and_keeps_stop_and_symlink_victim (test_safety.LegacyFailClosed.test_window_watch_refuses_and_keeps_stop_and_symlink_victim) ... ok
+test_artifact_outside_target (test_safety.ObserverRejects.test_artifact_outside_target) ... ok
+test_artifact_symlink_escape (test_safety.ObserverRejects.test_artifact_symlink_escape) ... ok
+test_dotdot_artifact (test_safety.ObserverRejects.test_dotdot_artifact) ... ok
+test_existing_out_dir (test_safety.ObserverRejects.test_existing_out_dir) ... ok
+test_illegal_prefix (test_safety.ObserverRejects.test_illegal_prefix) ... ok
+test_missing_target (test_safety.ObserverRejects.test_missing_target) ... ok
+test_no_artifacts (test_safety.ObserverRejects.test_no_artifacts) ... ok
+test_out_inside_target (test_safety.ObserverRejects.test_out_inside_target) ... ok
+test_out_parent_group_writable (test_safety.ObserverRejects.test_out_parent_group_writable) ... ok
+test_out_parent_not_writable (test_safety.ObserverRejects.test_out_parent_not_writable) ... ok
+test_symlink_ancestor_of_out (test_safety.ObserverRejects.test_symlink_ancestor_of_out) ... ok
+test_symlink_out_dir (test_safety.ObserverRejects.test_symlink_out_dir) ... ok
+test_target_inside_out_parent_overlap (test_safety.ObserverRejects.test_target_inside_out_parent_overlap) ... ok
+test_target_subdir_symlink_escape (test_safety.ObserverRejects.test_target_subdir_symlink_escape) ... ok
+test_artifact_vanishes_recorded (test_safety.ObserverRuns.test_artifact_vanishes_recorded) ... ok
+test_change_events_and_stop (test_safety.ObserverRuns.test_change_events_and_stop) ... ok
+test_sigterm_stops_cleanly (test_safety.ObserverRuns.test_sigterm_stops_cleanly) ... ok
+test_time_limit_exit_4 (test_safety.ObserverRuns.test_time_limit_exit_4) ... ok
+
+======================================================================
+FAIL: test_parent_dir_renamed_and_replaced (test_r3_hardening.R1ParentReplaced.test_parent_dir_renamed_and_replaced)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 91, in test_parent_dir_renamed_and_replaced
+    self._run(True)
+    ~~~~~~~~~^^^^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 83, in _run
+    self.assertTrue(exited, detail)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+AssertionError: False is not true : persistent parent replacement: exited_before_stop=False exit=0 final_sha=['3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe'] old_dir_sha=3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe exact_path_sha_now=29de79142a8d6beed130db8999a928ed6b8c37afd6b8bd36a228ef2ebabc9302
+
+======================================================================
+FAIL: test_parent_dir_renamed_away (test_r3_hardening.R1ParentReplaced.test_parent_dir_renamed_away)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 94, in test_parent_dir_renamed_away
+    self._run(False)
+    ~~~~~~~~~^^^^^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 83, in _run
+    self.assertTrue(exited, detail)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+AssertionError: False is not true : persistent parent replacement: exited_before_stop=False exit=0 final_sha=['3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe'] old_dir_sha=3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe exact_path_sha_now=None
+
+======================================================================
+FAIL: test_fifo_artifacts_file_rejected_immediately (test_r3_hardening.R3ListFile.test_fifo_artifacts_file_rejected_immediately)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 193, in test_fifo_artifacts_file_rejected_immediately
+    err = self.code(p)
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 183, in code
+    self.assertTrue(self.wait_exit(p, 3), "启动阶段未在 3s 内返回（结构化错误/正常退出均未发生）")
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : 启动阶段未在 3s 内返回（结构化错误/正常退出均未发生）
+
+======================================================================
+FAIL: test_non_utf8_list_rejected (test_r3_hardening.R3ListFile.test_non_utf8_list_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 203, in test_non_utf8_list_rejected
+    self.assertEqual(self.code(p)["code"], "artifacts_file_not_utf8")
+                     ~~~~~~~~~^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 185, in code
+    self.assertEqual(p.returncode, 2, out + err)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 2 : Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/artifact_observer.py", line 298, in <module>
+    sys.exit(main(sys.argv[1:]))
+             ~~~~^^^^^^^^^^^^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/artifact_observer.py", line 276, in main
+    _tfd, arts, out = setup(a)
+                      ~~~~~^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/artifact_observer.py", line 212, in setup
+    paths = list(a.artifact) + (read_list(a.artifacts_file) if a.artifacts_file else [])
+                                ~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/artifact_observer.py", line 199, in read_list
+    return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+                                 ^
+  File "<frozen codecs>", line 325, in decode
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+
+
+======================================================================
+FAIL: test_oversize_list_rejected (test_r3_hardening.R3ListFile.test_oversize_list_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 211, in test_oversize_list_rejected
+    self.assertEqual(self.code(p)["code"], "artifacts_file_too_large")
+                     ~~~~~~~~~^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 185, in code
+    self.assertEqual(p.returncode, 2, out + err)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 4 != 2 : {"status": "ready", "out_dir": "/tmp/tmp.0glHDTbYuG/a24obs-zikk45dm/obs", "artifacts": 1}
+
+
+======================================================================
+FAIL: test_too_many_lines_rejected (test_r3_hardening.R3ListFile.test_too_many_lines_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 215, in test_too_many_lines_rejected
+    self.assertEqual(self.code(p)["code"], "artifacts_file_too_many_lines")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'duplicate' != 'artifacts_file_too_many_lines'
+- duplicate
++ artifacts_file_too_many_lines
+
+
+======================================================================
+FAIL: test_trailing_newline_and_control_names_rejected (test_r3_hardening.R4Names.test_trailing_newline_and_control_names_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 242, in test_trailing_newline_and_control_names_rejected
+    self.assertEqual(p.returncode, 2, f"{suffix!r}: {out}{err}")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 4 != 2 : '\n': {"status": "ready", "out_dir": "/tmp/tmp.0glHDTbYuG/a24obs-nygk_3p0/o0", "artifacts": 1}
+
+
+======================================================================
+FAIL: test_atomic_replace_after_open_is_unstable_not_stable_old (test_r3_hardening.SnapSchedule.test_atomic_replace_after_open_is_unstable_not_stable_old)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 156, in test_atomic_replace_after_open_is_unstable_not_stable_old
+    self.assert_not_mixed_or_stale(res, set())
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 146, in assert_not_mixed_or_stale
+    self.assertIn(pair, valid_pairs, f"混合快照: {val}")
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (1646654, 2, '3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe') not found in set() : 混合快照: {'exists': True, 'dev': 65024, 'ino': 1646654, 'mode': 33188, 'nlink': 1, 'size': 2, 'mtime_ns': 1792069164492813414, 'ctime_ns': 1792069164492813414, 'sha256': '3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe'}
+
+======================================================================
+FAIL: test_atomic_replace_between_meta_and_open_is_not_mixed (test_r3_hardening.SnapSchedule.test_atomic_replace_between_meta_and_open_is_not_mixed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 152, in test_atomic_replace_between_meta_and_open_is_not_mixed
+    self.assert_not_mixed_or_stale(res, {(os.stat(self.rlib).st_ino, len(new), sha(new))})
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 146, in assert_not_mixed_or_stale
+    self.assertIn(pair, valid_pairs, f"混合快照: {val}")
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (1646658, 2, 'dedcaec8af12f14f0f855a3cd07d2740f96df5c3307bedbdcdd5589c79644108') not found in {(1646672, 19, 'dedcaec8af12f14f0f855a3cd07d2740f96df5c3307bedbdcdd5589c79644108')} : 混合快照: {'exists': True, 'dev': 65024, 'ino': 1646658, 'mode': 33188, 'nlink': 1, 'size': 2, 'mtime_ns': 1792069164496125103, 'ctime_ns': 1792069164496125103, 'sha256': 'dedcaec8af12f14f0f855a3cd07d2740f96df5c3307bedbdcdd5589c79644108'}
+
+======================================================================
+FAIL: test_in_place_write_during_hash_is_unstable_not_mixed (test_r3_hardening.SnapSchedule.test_in_place_write_during_hash_is_unstable_not_mixed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 161, in test_in_place_write_during_hash_is_unstable_not_mixed
+    self.assert_not_mixed_or_stale(res, {(self.old_ino, len(new), sha(new))})
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 146, in assert_not_mixed_or_stale
+    self.assertIn(pair, valid_pairs, f"混合快照: {val}")
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (1646670, 2, '210d0569970b9d88a63678128e52fc9319bdf36a1aa10519a8032bf4ddaf1754') not found in {(1646670, 20, '210d0569970b9d88a63678128e52fc9319bdf36a1aa10519a8032bf4ddaf1754')} : 混合快照: {'exists': True, 'dev': 65024, 'ino': 1646670, 'mode': 33188, 'nlink': 1, 'size': 2, 'mtime_ns': 1792069164498837566, 'ctime_ns': 1792069164498837566, 'sha256': '210d0569970b9d88a63678128e52fc9319bdf36a1aa10519a8032bf4ddaf1754'}
+
+======================================================================
+FAIL: test_parent_swapped_during_snapshot_is_flagged (test_r3_hardening.SnapSchedule.test_parent_swapped_during_snapshot_is_flagged)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/agent24/tools/qa/rustdoc-repro/tests/test_r3_hardening.py", line 170, in test_parent_swapped_during_snapshot_is_flagged
+    self.assertTrue(res[0] == "raised" or "unstable" in res[1],
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    f"目录链在快照期间被替换，却返回稳定快照: {res}")
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : 目录链在快照期间被替换，却返回稳定快照: ('snap', {'exists': True, 'dev': 65024, 'ino': 1646675, 'mode': 33188, 'nlink': 1, 'size': 2, 'mtime_ns': 1792069164501687455, 'ctime_ns': 1792069164501687455, 'sha256': '3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe'})
+
+----------------------------------------------------------------------
+Ran 34 tests in 17.745s
+
+FAILED (failures=11)

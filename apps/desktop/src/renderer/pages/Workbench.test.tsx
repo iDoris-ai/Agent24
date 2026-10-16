@@ -1,9 +1,20 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import WorkbenchPage from './Workbench'
+import { setLocale } from '../i18n'
+
+describe('WorkbenchPage (English default)', () => {
+  it('renders the English title and coming-soon status', () => {
+    render(<WorkbenchPage />)
+    expect(screen.getByText('Workbench')).toBeInTheDocument()
+    expect(screen.getAllByText('Coming soon').length).toBe(9)
+  })
+})
 
 describe('WorkbenchPage', () => {
+  beforeEach(() => { setLocale('zh') })
+
   it('renders workbench title', () => {
     render(<WorkbenchPage />)
     expect(screen.getByText('工作台')).toBeInTheDocument()

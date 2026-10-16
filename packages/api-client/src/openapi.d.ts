@@ -4,6 +4,91 @@
  */
 
 export interface paths {
+    "/module-consents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List module tool authorizations
+         * @description Host identity is injected by agent24d. The response is limited to permission metadata and excludes tool input, output, message bodies, and credentials.
+         */
+        get: operations["listModuleConsents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export module tool authorizations as JSON
+         * @description Exports module, tool, scope, risk, source, validity, and status metadata. Audit history is exposed by the later audit export endpoint.
+         */
+        get: operations["exportModuleConsents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/modules/{module}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke every tool authorization for a module
+         * @description Persists revocation and broadcasts the 6a.3 revocation notice.
+         */
+        delete: operations["revokeModuleConsents"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/modules/{module}/tools/{tool}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one module tool authorization
+         * @description Persists revocation and broadcasts the 6a.3 revocation notice.
+         */
+        delete: operations["revokeModuleToolConsent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -1112,7 +1197,7 @@ export interface paths {
         put?: never;
         /**
          * Extract fields from one revision, each value with its provenance; starts a job
-         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version, model_id) — the actual model id, not a profile (§5.4). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key joins the business key, so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request — the JCS hash of the whole request body differs (§5.4; David, 2026-10-10) — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8); with no local model available the answer is 503 `engine_unavailable` with `details.engine` naming the model.
+         * @description Idempotent on the business key (document_id, revision, schema_sha256, extractor_version) (§5.4); a rerun is keyed instead by the document and its `Idempotency-Key`, so a key is never shared between documents. The model the kernel's router picks is not known before the call, so it is not in the key: it is recorded in the result's `model_id`, and a new local model is used by extracting again with `rerun` (David, 2026-10-10). The replay statuses are those of import: 202 while queued or running or when a failed or interrupted job is re-queued (same job_id, attempt + 1); 200 once it has succeeded (with `result.extraction_id`) or was cancelled (it stays cancelled). To extract again on purpose, send `rerun: true` with a new `Idempotency-Key`: that key names the rerun within the document (the same key on another document is another rerun), so resending it replays the same rerun and a new key runs again; `rerun: true` without the header is 400 `invalid_request`, and the same key with a different request — the JCS hash of the whole request body differs (§5.4; David, 2026-10-10) — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise). Field descriptions and the document text are untrusted data: the OS passes them to the model under a fixed extraction instruction and never follows instructions found in them. The model is called through the kernel under `LocalOnly` (ADR-DOC-01 D8). When the kernel gives this module no model access, the answer is 503 `engine_unavailable`. Whether a local model is available is only known when the job calls it: if none is, the job fails with `engine_unavailable` (retryable; the same key re-queues it). `details.engine` is `local-model` (§3.2).
          */
         post: operations["documentsExtract"];
         delete?: never;
@@ -1666,14 +1751,37 @@ export interface components {
             cpu_cores: number;
             /** @enum {string} */
             accelerator: "metal" | "cuda" | "none";
-            free_disk_bytes: number;
             /**
              * @example macos
              * @example linux
              * @example windows
              */
             os: string;
-            /** @description Null when the platform/probe cannot tell — not implemented for any OS yet (sysinfo has no power-source API) */
+            os_version?: string | null;
+            chip?: string | null;
+            unified_memory?: boolean;
+            gpu_wired_limit_bytes?: number | null;
+            discrete_gpus?: {
+                name: string;
+                vram_bytes?: number | null;
+            }[];
+            /** @description All user-visible mounted volumes (internal and external); read-only system volumes and APFS helper volumes are filtered out */
+            disks?: {
+                name: string;
+                mount_point: string;
+                total_bytes: number;
+                free_bytes: number;
+                removable: boolean;
+                read_only: boolean;
+            }[];
+            /** @description Free bytes on the disk holding the models directory; null when it cannot be determined (replaces the removed free_disk_bytes, which was the cwd disk) */
+            models_dir_free_bytes?: number | null;
+            /** @description Reserved; not probed yet (HW-1) */
+            runtimes?: {
+                name: string;
+                version?: string | null;
+            }[];
+            /** @description Null when the platform/probe cannot tell (macOS pmset / Linux power_supply otherwise) */
             on_battery?: boolean | null;
         };
         DecideProfile: {
@@ -2167,12 +2275,14 @@ export interface components {
         };
         /** @description Anchors that together cover the whole proposition: the value and what decides its meaning — condition, audience, negation, table row label and column header (samples README §4.2). They may span blocks and pages. */
         DocumentsEvidence: components["schemas"]["DocumentsAnchor"][];
+        /** @description One side of a conflict. Like a present value, its anchors are empty only when its evidence could not be verified, and then `unsourced_reason` says why: the candidate is kept rather than dropped, so the conflict is never resolved by the extractor (ADR-DOC-02 §3.2; David, 2026-10-10). */
         DocumentsExtractCandidate: {
             /** @description As written in the source. */
             value: string;
             /** @description For comparison only. Required here: candidates conflict because their normalized forms differ. */
             normalized: string;
-            anchors: components["schemas"]["DocumentsEvidence"];
+            anchors: components["schemas"]["DocumentsAnchor"][];
+            unsourced_reason?: string;
         };
         DocumentsExtractedValue: {
             /** @description The `key` of the requested field. */
@@ -2187,7 +2297,7 @@ export interface components {
             anchors?: components["schemas"]["DocumentsAnchor"][];
             unsourced_reason?: string;
             /** @enum {string} */
-            missing_reason?: "blank_in_template" | "not_in_document" | "referenced_but_absent" | "outside_page_scope";
+            missing_reason?: "blank_in_template" | "not_in_document" | "referenced_but_absent" | "outside_page_scope" | "unread";
             candidates?: components["schemas"]["DocumentsExtractCandidate"][];
         } & (unknown & unknown & unknown);
         DocumentsExtraction: {
@@ -2282,6 +2392,35 @@ export interface components {
             op: "carry_over_task";
             task_id: string;
             to_week: string;
+        };
+        ModuleAuthorizationList: {
+            authorizations: components["schemas"]["ModuleAuthorization"][];
+        };
+        ModuleAuthorization: {
+            module: string;
+            tool: string;
+            module_version: string;
+            scope_summary: {
+                readable: string | null;
+                writable: string | null;
+                external: string | null;
+            };
+            /** @enum {string} */
+            host_risk: "low" | "medium" | "high";
+            /** @enum {string} */
+            source: "first_party" | "manual_install";
+            /** Format: date-time */
+            decided_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** @enum {string} */
+            status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";
+        };
+        ModuleAuthorizationRevocation: {
+            module: string;
+            tool: string | null;
+            /** @constant */
+            status: "revoked";
         };
         /**
          * @description A batch of atomic ops. `status` MUST be `pending` on submit — the server
@@ -2496,6 +2635,146 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listModuleConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Persisted per-tool decisions, including revoked or expired entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationList"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    exportModuleConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Downloadable JSON export */
+            200: {
+                headers: {
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationList"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeModuleConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Module authorizations revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationRevocation"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeModuleToolConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tool authorization revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationRevocation"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getHealth: {
         parameters: {
             query?: never;
@@ -4542,7 +4821,7 @@ export interface operations {
         parameters: {
             query?: {
                 scale?: number;
-                /** @description `x0,y0,x1,y1`: corners in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame and order as an anchor's `rects` (David, 2026-10-10); for a JPEG or PNG, pixels after EXIF orientation. `x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`. */
+                /** @description `x0,y0,x1,y1`: corners in CropBox points, origin at the top-left of the displayed (rotated) page — the same frame and order as an anchor's `rects` (David, 2026-10-10); for a JPEG or PNG, pixels after EXIF orientation. `x0 < x1` and `y0 < y1`; an empty or off-page region is 400 `invalid_request`, and one partly off the page is clipped to it (its top-left corner stays). Each corner is a non-negative number as JSON writes it, exponent included, so an anchor's rect can be passed as it is (`1e-7`). */
                 region?: string;
             };
             header?: never;

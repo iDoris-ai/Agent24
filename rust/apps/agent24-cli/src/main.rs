@@ -85,6 +85,19 @@ enum Command {
         #[command(subcommand)]
         action: DecideAction,
     },
+    /// Local hardware inspection (HW-1). Does NOT go through the daemon.
+    Hw {
+        #[command(subcommand)]
+        action: HwAction,
+    },
+}
+
+/// `agent24 hw …` (HW-1).
+#[derive(Subcommand)]
+enum HwAction {
+    /// Probe this machine now and print JSON: profile, level, usable_bytes,
+    /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
+    Probe,
 }
 
 /// `agent24 decide …` (D0-2).
@@ -809,27 +822,44 @@ fn packages_root() -> Result<PathBuf, String> {
 /// whether one is already there. This function maps arguments onto that and
 /// prints the result. If it ever needs to compute a path or check for a duplicate
 /// itself, the seam is in the wrong place and that logic belongs in the library.
-fn os_local(action: &OsAction) -> Option<Result<(), String>> {
+async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
     let root = match packages_root() {
         Ok(root) => root,
         Err(e) => return Some(Err(e)),
     };
     match action {
-        OsAction::Install { path } => Some(
-            agent24_os_packages::install::install(path, &root)
-                .map(|dest| {
+        OsAction::Install { path } => {
+            Some(match agent24_os_packages::install::install(path, &root) {
+                Ok(dest) => {
+                    // Package replacement revokes earlier consent. A failure
+                    // is reported (and makes the command fail) only after the
+                    // lines below, which stay true either way: the files ARE
+                    // installed.
+                    let revoked = match dest.file_name().and_then(|n| n.to_str()) {
+                        Some(module) => invalidate_module_consents(module).await,
+                        None => Err(format!(
+                            "could not revoke module consent: {} has no usable module name",
+                            dest.display()
+                        )),
+                    };
                     println!("installed {}", dest.display());
-                    println!("  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start");
+                    println!(
+                        "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+                    );
                     // Said out loud because the isolation is deliberate and
                     // therefore permanent: an ephemeral daemon (`agent24 chat`
                     // with nothing running) resolves a different packages root
                     // and will never see this package. Without this line the two
                     // lines above are, for that user, a promise that never comes
                     // true.
-                    println!("  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)");
-                })
-                .map_err(|e| e.to_string()),
-        ),
+                    println!(
+                        "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
+                    );
+                    revoked.map_err(|e| consent_revocation_failed_message(&e))
+                }
+                Err(e) => Err(e.to_string()),
+            })
+        }
         // Handled before this function is ever called; see `cmd_uninstall`.
         OsAction::Uninstall { .. } => None,
         _ => None,
@@ -840,7 +870,10 @@ fn os_local(action: &OsAction) -> Option<Result<(), String>> {
 /// itself (unchanged contract: works with the daemon down); hot-disable
 /// (FU-61) is a best-effort step tried ONLY after a real removal, whose
 /// outcome can only add an informational line, never flip the `Result` this
-/// function already decided. This split (rather than folding into
+/// function already decided. The one thing that CAN turn a real removal
+/// into an `Err` is a failed consent revocation (ADR-K1-03 §3, fail-closed):
+/// the removal still stands and the hot stop is still tried, but the command
+/// must not report success while the consent may still be live. This split (rather than folding into
 /// `os_local`) exists because the daemon call needs the REAL `bool`
 /// `install::uninstall` returns (was something actually removed just now?)
 /// — `os_local`'s shared `Option<Result<(), String>>` shape has nowhere to
@@ -860,10 +893,52 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
         Ok(true) => {
             println!("removed {name}");
             println!("  it takes effect at the next daemon start");
+            let revoked = invalidate_module_consents(name).await;
+            // Still tried when the revocation failed: the module must stop
+            // serving either way.
             hot_disable_best_effort(name).await;
-            Ok(())
+            revoked.map_err(|e| consent_revocation_failed_message(&e))
         }
     }
+}
+
+/// Revoke persisted enablement consent after a package lifecycle change.
+/// Fail-closed (ADR-K1-03 §3): every way this can fail — no state directory
+/// at all, a store that will not open, a write that does not land — is an
+/// `Err` the caller turns into a visible, non-zero result. Never a silent
+/// skip.
+async fn invalidate_module_consents(name: &str) -> Result<(), String> {
+    invalidate_module_consents_in(state_file::state_dir().as_deref(), name).await
+}
+
+async fn invalidate_module_consents_in(
+    state_dir: Option<&std::path::Path>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(dir) = state_dir else {
+        return Err(format!(
+            "could not revoke {name} module consent: no state directory (set HOME)"
+        ));
+    };
+    let store = agent24_store::Store::open(&dir.join("agent24.db"))
+        .await
+        .map_err(|e| {
+            format!("could not open the consent store to revoke {name} module consent: {e}")
+        })?;
+    store
+        .invalidate_module_consents(name)
+        .await
+        .map_err(|e| format!("could not revoke {name} module consent: {e}"))
+}
+
+/// The error a package lifecycle command ends with when its consent
+/// revocation did not land: the file change already happened (and was
+/// printed), but the command must not report success.
+fn consent_revocation_failed_message(why: &str) -> String {
+    format!(
+        "{why}\n  the package change above was made, but an earlier consent for this module may \
+         still be recorded; fix the state store and re-run the command"
+    )
 }
 
 /// Render a daemon error envelope the way every call site here should
@@ -886,8 +961,9 @@ fn daemon_error_line(body: &serde_json::Value) -> String {
 /// happens to restart (which the daemon's own re-check then reports as
 /// `package_changed` — but only for a module that DOES eventually restart;
 /// for a long-healthy one that could be indefinite). Never starts a daemon
-/// (`attach_only`, not `connect`) and never turns into an `Err` — by the
-/// time this runs, `cmd_uninstall`'s `Ok(())` is already final.
+/// (`attach_only`, not `connect`) and never turns into an `Err` of its own —
+/// `cmd_uninstall`'s result is decided by the removal and the consent
+/// revocation, not by this.
 async fn hot_disable_best_effort(name: &str) {
     let Some(ep) = attach_only().await else {
         println!(
@@ -960,7 +1036,7 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     if let OsAction::Uninstall { name } = &action {
         return cmd_uninstall(name).await;
     }
-    if let Some(done) = os_local(&action) {
+    if let Some(done) = os_local(&action).await {
         return done;
     }
     let ep = match attach_only().await {
@@ -1039,6 +1115,17 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// have no need for an abstraction over "which store backs this", because
 /// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
 /// today and for the foreseeable future.
+fn cmd_hw(action: HwAction) -> Result<(), String> {
+    match action {
+        HwAction::Probe => {
+            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
+            let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+            println!("{json}");
+            Ok(())
+        }
+    }
+}
+
 async fn cmd_decide(action: DecideAction) -> Result<(), String> {
     match &action {
         DecideAction::Export { jsonl, .. } => require_jsonl(*jsonl)?,
@@ -2177,6 +2264,7 @@ async fn main() -> std::process::ExitCode {
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
+        Command::Hw { action } => cmd_hw(action),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -2189,10 +2277,37 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn consent_revocation_without_state_dir_is_an_error_not_a_silent_skip() {
+        let err = invalidate_module_consents_in(None, "consent-mod")
+            .await
+            .unwrap_err();
+        assert!(err.contains("no state directory"), "{err}");
+        assert!(consent_revocation_failed_message(&err).contains("may"));
+    }
+
+    #[tokio::test]
+    async fn consent_revocation_store_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the database file should be: opening it fails.
+        std::fs::create_dir(dir.path().join("agent24.db")).unwrap();
+        let err = invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap_err();
+        assert!(err.contains("consent-mod"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn consent_revocation_succeeds_with_a_writable_store() {
+        let dir = tempfile::tempdir().unwrap();
+        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap();
+    }
 
     // ── D0-2 `agent24 decide` guards (pre-pr-check T2) ──────────────────────
 

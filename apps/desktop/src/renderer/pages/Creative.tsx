@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { OpenDesignComponentStatusResult } from '../../shared/ipc-types'
+import { translate, useT } from '../i18n'
+import { creativeMessages } from './Creative.i18n'
 
 function rectOf(el: HTMLElement): { x: number; y: number; width: number; height: number } {
   const rect = el.getBoundingClientRect()
@@ -11,7 +13,35 @@ function formatMb(bytes: number | undefined): string {
   return Math.max(1, Math.round(bytes / (1024 * 1024))).toString()
 }
 
-const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'verifying', 'failed'])
+/** SD-01: user-visible transfer rate — waiting-for-network (not a bogus "0 KiB/s")
+ * whenever the rolling-window estimator has no recent progress to measure. */
+function formatSpeed(bytesPerSecond: number | undefined): string {
+  if (!bytesPerSecond || bytesPerSecond <= 0) {
+    return translate(creativeMessages, 'download.waitingNetwork')
+  }
+  if (bytesPerSecond >= 1024 * 1024) {
+    return translate(creativeMessages, 'download.speedMib', {
+      value: (bytesPerSecond / (1024 * 1024)).toFixed(1),
+    })
+  }
+  return translate(creativeMessages, 'download.speedKib', {
+    value: Math.max(1, Math.round(bytesPerSecond / 1024)),
+  })
+}
+
+/** SD-01: '' (not a misleading ETA) whenever the rate is unknown/zero — the
+ * speed text alone already says waiting-for-network in that case. */
+function formatEta(etaSeconds: number | null | undefined): string {
+  if (etaSeconds == null || !Number.isFinite(etaSeconds) || etaSeconds <= 0) return ''
+  const totalSeconds = Math.round(etaSeconds)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return minutes > 0
+    ? translate(creativeMessages, 'download.etaMinutesSeconds', { minutes, seconds })
+    : translate(creativeMessages, 'download.etaSecondsOnly', { seconds })
+}
+
+const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'paused', 'verifying', 'failed'])
 
 /** The on-demand iDoris Design component card — shown instead of the Creative
  * WebContentsView whenever the component isn't installed yet. User-facing
@@ -26,19 +56,41 @@ const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'verifying
 function ComponentCard({
   status,
   onInstall,
+  onPause,
 }: {
   status: OpenDesignComponentStatusResult
   onInstall: () => void
+  onPause: () => void
 }): JSX.Element {
+  const t = useT(creativeMessages)
   if (status.state === 'downloading') {
     const total = status.total ?? 0
     const received = status.received ?? 0
     const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0
+    const etaText = formatEta(status.etaSeconds)
     return (
       <div className="creative-download">
-        <div>正在下载 iDoris Design 组件…</div>
+        <div>{t('download.progress')}</div>
         <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%` }} /></div>
-        <div className="creative-download-hint">{formatMb(received)} / {formatMb(total)} MB（{pct}%）</div>
+        <div className="creative-download-hint">
+          {t('download.size', { received: formatMb(received), total: formatMb(total), percent: pct })}
+          {` · ${formatSpeed(status.bytesPerSecond)}`}
+          {etaText ? ` · ${etaText}` : ''}
+        </div>
+        <button className="btn" type="button" onClick={onPause}>{t('action.pause')}</button>
+      </div>
+    )
+  }
+
+  if (status.state === 'paused') {
+    const total = status.total ?? 0
+    const received = status.received ?? 0
+    return (
+      <div className="creative-download">
+        <div>
+          {t('download.paused', { received: formatMb(received), total: formatMb(total) })}
+        </div>
+        <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.resume')}</button>
       </div>
     )
   }
@@ -46,7 +98,7 @@ function ComponentCard({
   if (status.state === 'verifying') {
     return (
       <div className="creative-download">
-        <div>正在校验…</div>
+        <div>{t('download.verifying')}</div>
       </div>
     )
   }
@@ -54,8 +106,8 @@ function ComponentCard({
   if (status.state === 'failed') {
     return (
       <div className="creative-download">
-        <div>iDoris Design 组件下载失败：{status.error ?? '未知错误'}</div>
-        <button className="btn btn-primary" type="button" onClick={onInstall}>重试</button>
+        <div>{t('download.failed', { error: status.error ?? t('download.unknownError') })}</div>
+        <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.retry')}</button>
       </div>
     )
   }
@@ -63,13 +115,14 @@ function ComponentCard({
   // 'not-installed' (also the synthesized shape for a needs-download result)
   return (
     <div className="creative-download">
-      <div>Design 需要额外下载 iDoris Design 组件（约 {formatMb(status.size)} MB），下载完成后即可使用。</div>
-      <button className="btn btn-primary" type="button" onClick={onInstall}>下载</button>
+      <div>{t('download.prompt', { size: formatMb(status.size) })}</div>
+      <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.download')}</button>
     </div>
   )
 }
 
 export default function CreativePage(): JSX.Element {
+  const t = useT(creativeMessages)
   const hostRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
   const [restarting, setRestarting] = useState(false)
@@ -88,6 +141,10 @@ export default function CreativePage(): JSX.Element {
 
   const installComponent = (): void => {
     void window.agent24.openDesignComponentInstall().then(applyComponentStatus)
+  }
+
+  const pauseComponent = (): void => {
+    void window.agent24.openDesignComponentPause().then(applyComponentStatus)
   }
 
   useEffect(() => {
@@ -126,10 +183,10 @@ export default function CreativePage(): JSX.Element {
         if (cancelled) return
         if (result.ok) { setError(null); return }
         if (result.needsDownload) { setNeedsDownloadSize(result.size ?? 0); return }
-        setError(result.error ?? 'iDoris Design 启动失败')
+        setError(result.error ?? translate(creativeMessages, 'error.start'))
       },
       (reason) => {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : 'iDoris Design 启动失败')
+        if (!cancelled) setError(reason instanceof Error ? reason.message : translate(creativeMessages, 'error.start'))
       },
     )
 
@@ -148,9 +205,9 @@ export default function CreativePage(): JSX.Element {
     setRestarting(true)
     try {
       const result = await window.agent24.creativeRestart(rectOf(host))
-      setError(result.ok ? null : (result.error ?? 'iDoris Design 启动失败'))
+      setError(result.ok ? null : (result.error ?? translate(creativeMessages, 'error.start')))
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'iDoris Design 启动失败')
+      setError(reason instanceof Error ? reason.message : translate(creativeMessages, 'error.start'))
     } finally {
       setRestarting(false)
     }
@@ -165,12 +222,12 @@ export default function CreativePage(): JSX.Element {
 
   return (
     <div ref={hostRef} className="creative-host">
-      {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} />}
+      {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} onPause={pauseComponent} />}
       {tryCreative && error && (
         <div className="creative-error">
-          <div>iDoris Design 暂不可用：{error}</div>
+          <div>{t('error.unavailable', { error })}</div>
           <button className="btn btn-primary" type="button" disabled={restarting} onClick={() => void restart()}>
-            {restarting ? '正在启动 iDoris Design…' : '重试'}
+            {restarting ? t('action.starting') : t('action.retry')}
           </button>
         </div>
       )}

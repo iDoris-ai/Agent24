@@ -20,10 +20,12 @@ mod authz;
 )]
 mod capabilities;
 mod comm_routes;
+mod consent_routes;
 mod decide_routes;
 mod domain;
 mod events;
 mod events_emit;
+mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
 #[cfg(not(unix))]
@@ -65,6 +67,7 @@ mod memory_routes;
 mod model_callback;
 mod module_approval_broker;
 mod module_approvals;
+mod module_tool_runtime;
 mod os_config;
 mod os_memory;
 mod os_memory_page;

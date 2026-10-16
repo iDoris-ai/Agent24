@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 pub mod router;
+mod stream;
 
 /// A tool advertised to the model (OpenAI function-calling wire shape is
 /// produced by the adapter; this stays provider-neutral).
@@ -117,6 +118,27 @@ pub struct CompletionRequest {
     /// decides when to set this (`_a24/model/complete`'s handler, gated on
     /// `complexity: simple`) — this crate has no opinion on complexity.
     pub disable_thinking: bool,
+    /// ME4-S2b: the sampling temperature, sent only when set. `None` leaves
+    /// the body byte for byte as before (and Ollama's OpenAI layer then uses
+    /// 1.0, over the model's own default). f64 end to end, so 0.7 stays 0.7.
+    pub temperature: Option<f64>,
+    /// ME4-S2a: read the answer as it is written, under these timers, instead
+    /// of within one fixed `chat_timeout`. `None` = today's request, byte for
+    /// byte. To be set only by `_a24/model/complete`; the router hands the same
+    /// value to every provider it tries, so its deadline is the call's.
+    /// Not with `tools`: a streamed answer carries no tool calls, so a request
+    /// with both is refused rather than answered without them.
+    pub progress: Option<Progress>,
+}
+
+/// How long a call may take while it makes progress (ME4-S2a §2.2): its first
+/// chunk within `first_chunk`, then one within every `stall`, and all of it
+/// by `deadline`, which is absolute and set once for the whole call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub deadline: std::time::Instant,
+    pub first_chunk: Duration,
+    pub stall: Duration,
 }
 
 /// Structured-output request, mirroring the OpenAI `response_format` wire shape
@@ -297,6 +319,93 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// A whole (non-streamed) answer as a response.
+    fn answer(&self, parsed: OaChatResponse) -> Result<CompletionResponse, ModelError> {
+        let model_id = parsed.model.filter(|m| !m.is_empty());
+        let choice =
+            parsed.choices.into_iter().next().ok_or_else(|| {
+                ModelError::Provider(format!("{} returned no choices", self.name))
+            })?;
+        Ok(CompletionResponse {
+            message: choice.message.into(),
+            usage: usage_of(parsed.usage),
+            model_id,
+        })
+    }
+
+    /// ME4-S2a §2.3: the answer read as it is written, under `p`'s timers. No
+    /// total request timeout: the timers are all there is. A backend that
+    /// ignored `stream` sends its whole answer at once; it is read by the
+    /// deadline, but its headers come only when the answer is done, so they
+    /// fall under the first-chunk timer.
+    async fn complete_streamed(
+        &self,
+        mut body: Value,
+        p: &Progress,
+        cancel: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        let started = std::time::Instant::now();
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+        let send = self
+            .authed(
+                self.client
+                    .post(format!("{}/v1/chat/completions", self.base_url)),
+            )
+            .json(&body)
+            .send();
+        let (first, what) = if let Some(at) = started.checked_add(p.first_chunk)
+            && at < p.deadline
+        {
+            (at, format!("no output within {}s", p.first_chunk.as_secs()))
+        } else {
+            (p.deadline, "past the call's deadline".to_owned())
+        };
+        let Some(sent) = stream::until(send, first, cancel).await? else {
+            return Err(ModelError::Unavailable(format!("{}: {what}", self.name)));
+        };
+        let response = sent.map_err(|e| classify(&e))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            // Its error body too is read by the deadline: no request timeout bounds it here.
+            let body = stream::until(read_error_body(response, cancel), p.deadline, cancel)
+                .await?
+                .unwrap_or_default();
+            return Err(friendly_http_error(&self.name, status, &body));
+        }
+        let streamed = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        if !streamed {
+            let whole = read_json_capped::<OaChatResponse>(
+                response,
+                MAX_CHAT_RESPONSE_BYTES,
+                cancel,
+                &self.name,
+            );
+            let Some(parsed) = stream::until(whole, p.deadline, cancel).await? else {
+                return Err(ModelError::Unavailable(format!(
+                    "{}: past the call's deadline",
+                    self.name
+                )));
+            };
+            return self.answer(parsed?);
+        }
+        let s = stream::read(response, p, started, cancel, &self.name).await?;
+        Ok(CompletionResponse {
+            message: Msg {
+                role: "assistant".to_owned(),
+                content: Some(s.content),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            usage: usage_of(s.usage),
+            model_id: s.model,
+        })
+    }
+
     fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.api_key {
             Some(key) if !key.is_empty() => rb.bearer_auth(key),
@@ -385,7 +494,7 @@ struct OaChoice {
     message: OaMessage,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 struct OaUsage {
     #[serde(default)]
     prompt_tokens: u64,
@@ -558,6 +667,23 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
         .map_err(|e| ModelError::Provider(format!("{name} returned invalid JSON: {e}")))
 }
 
+fn usage_of(u: Option<OaUsage>) -> Usage {
+    u.map_or(
+        Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+        },
+        |u| Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cost_usd: 0.0,
+        },
+    )
+}
+
 fn classify(err: &reqwest::Error) -> ModelError {
     if err.is_connect() || err.is_timeout() {
         ModelError::Unavailable(err.to_string())
@@ -607,6 +733,10 @@ impl ModelProvider for OpenAiCompatProvider {
         if let Some(n) = req.max_tokens {
             body["max_tokens"] = Value::from(n.get());
         }
+        // ME4-S2b: the same "only when set" rule.
+        if let Some(t) = req.temperature {
+            body["temperature"] = Value::from(t);
+        }
         // ME4-S2-thinking / review H2: same "only when set" rule — an unset
         // flag, OR a provider that never opted into this oMLX-specific
         // extension, keeps the body byte-for-byte unchanged. Gating on
@@ -616,6 +746,15 @@ impl ModelProvider for OpenAiCompatProvider {
         // OpenAI contract it actually speaks.
         if req.disable_thinking && self.supports_chat_template_kwargs {
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+        }
+        if let Some(p) = &req.progress {
+            if !req.tools.is_empty() {
+                return Err(ModelError::Provider(format!(
+                    "{}: a streamed request cannot carry tools",
+                    self.name
+                )));
+            }
+            return self.complete_streamed(body, p, cancel).await;
         }
         let fut = self
             .authed(
@@ -636,30 +775,7 @@ impl ModelProvider for OpenAiCompatProvider {
         }
         let parsed: OaChatResponse =
             read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
-        let model_id = parsed.model.filter(|m| !m.is_empty());
-        let choice =
-            parsed.choices.into_iter().next().ok_or_else(|| {
-                ModelError::Provider(format!("{} returned no choices", self.name))
-            })?;
-        let usage = parsed.usage.map_or(
-            Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                cost_usd: 0.0,
-            },
-            |u| Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                cost_usd: 0.0,
-            },
-        );
-        Ok(CompletionResponse {
-            message: choice.message.into(),
-            usage,
-            model_id,
-        })
+        self.answer(parsed)
     }
 
     async fn models(&self, cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
@@ -918,6 +1034,8 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
+            progress: None,
         }
     }
 
@@ -997,6 +1115,59 @@ mod tests {
             second.get("max_tokens").is_none(),
             "absent → not sent (/chat unchanged)"
         );
+    }
+
+    // ── ME4-S2b J1, J5, J6: temperature sent only when set, by value ─────────
+
+    #[tokio::test]
+    async fn temperature_is_sent_only_when_set_and_no_penalty_ever_is() {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = vec![];
+            for _ in 0..3 {
+                let (mut s, _) = l.accept().await.unwrap();
+                bodies.push(read_request(&mut s).await);
+                let body = r#"{"model":"stub","choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen2.5:7b");
+        let c = CancellationToken::new();
+        let at = |t: Option<f64>| CompletionRequest {
+            temperature: t,
+            ..req()
+        };
+        for t in [Some(0.7), Some(0.0), None] {
+            let _ = p.complete(&at(t), &c).await.unwrap();
+        }
+        let bodies: Vec<Value> = server
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        // By value: 0.7 is not 0.699999988…, and 0 is written as 0.0.
+        assert_eq!(bodies[0]["temperature"].as_f64(), Some(0.7));
+        assert_eq!(bodies[1]["temperature"].as_f64(), Some(0.0));
+        assert!(
+            bodies[2].get("temperature").is_none(),
+            "absent → not sent: every other caller's body is unchanged"
+        );
+        for b in &bodies {
+            for k in ["frequency_penalty", "presence_penalty", "repeat_penalty"] {
+                assert!(b.get(k).is_none(), "{k} in {b}");
+            }
+        }
+        // J5: requests that differ only in temperature are not equal.
+        assert_ne!(at(Some(0.0)), at(None));
+        assert_eq!(at(Some(0.0)), at(Some(0.0)));
     }
 
     // ── ME4-S2-thinking: disable_thinking → chat_template_kwargs, gated ──────
@@ -1085,6 +1256,48 @@ mod tests {
         assert!(
             body.get("chat_template_kwargs").is_none(),
             "a provider that never opted in must never see this field, even when disable_thinking is true"
+        );
+    }
+
+    /// The answer of a whole response: what a streamed one's end and the
+    /// non-streaming fallback both go through.
+    #[test]
+    fn a_whole_answer_takes_its_first_choice_a_named_model_and_its_usage() {
+        let p = OpenAiCompatProvider::new("ollama", "http://127.0.0.1:1", None, "local", "m");
+        let parsed = |v: Value| serde_json::from_value::<OaChatResponse>(v).unwrap();
+        let msg = serde_json::json!({ "role": "assistant", "content": "x" });
+        // An empty model is no model.
+        let r = p
+            .answer(parsed(
+                serde_json::json!({ "model": "", "choices": [{ "message": msg }] }),
+            ))
+            .unwrap();
+        assert_eq!(r.model_id, None);
+        // No choices is an error, named for the provider.
+        match p.answer(parsed(serde_json::json!({ "model": "m", "choices": [] }))) {
+            Err(ModelError::Provider(m)) => assert_eq!(m, "ollama returned no choices"),
+            other => panic!("{other:?}"),
+        }
+        // No usage is zeros, and a cost is never claimed.
+        let zero = usage_of(None);
+        assert_eq!(
+            (
+                zero.prompt_tokens,
+                zero.completion_tokens,
+                zero.total_tokens,
+                zero.cost_usd
+            ),
+            (0, 0, 0, 0.0)
+        );
+        let r = p.answer(parsed(serde_json::json!({ "choices": [{ "message": msg }], "usage": { "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 } }))).unwrap();
+        assert_eq!(
+            (
+                r.usage.prompt_tokens,
+                r.usage.completion_tokens,
+                r.usage.total_tokens,
+                r.usage.cost_usd
+            ),
+            (3, 4, 7, 0.0)
         );
     }
 

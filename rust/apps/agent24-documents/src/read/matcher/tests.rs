@@ -53,9 +53,13 @@ fn the_worst_case_stays_linear() {
     for _ in 0..100 {
         assert_eq!(find(&text, &query), []);
     }
-    // 100 such blocks (a whole response's pages) well under a second.
+    // 100 such blocks (a whole response's pages): about 0.4 s in a debug
+    // build on a laptop. Retrying from every start does some 60 times the
+    // work (8 million comparisons a block, not 130 thousand word steps), so
+    // 5 s still tells the two apart and leaves room for a busy CI runner,
+    // where 1 s did not.
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(1),
+        start.elapsed() < std::time::Duration::from_secs(5),
         "{:?}",
         start.elapsed()
     );

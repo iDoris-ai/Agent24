@@ -1,0 +1,20 @@
+{"fields":[
+ {"key":"doc_number","description":"这份通告的发文字号","type":"identifier"},
+ {"key":"issuer","description":"这份通告是哪个单位发的","type":"text"},
+ {"key":"issue_date","description":"这份通告落款的日期","type":"date"},
+ {"key":"web_publish_time","description":"这份通告在网站上的发布时间","type":"datetime"},
+ {"key":"validity_status","description":"这份通告现在的效力状态","type":"text"},
+ {"key":"tax_year","description":"这次汇算清缴针对的是哪一个年度的个人所得税","type":"text"},
+ {"key":"filing_period","description":"汇算清缴的办理时间是从哪天到哪天","type":"date"},
+ {"key":"early_period_booking_open_date","description":"想在办理期开头那段时间办理的人，从哪天起可以预约","type":"date"},
+ {"key":"early_period_window","description":"在哪一段时间内办理可以提前预约","type":"date"},
+ {"key":"booking_channel","description":"通过什么渠道预约","type":"text"},
+ {"key":"late_period_no_booking","description":"在哪一段时间内办理不需要预约","type":"date"},
+ {"key":"site_sponsor_phone","description":"转载这份通告的网站主办单位的电话","type":"identifier"},
+ {"key":"who_must_file","description":"哪些纳税人需要办理汇算清缴","type":"text"},
+ {"key":"late_filing_consequence","description":"过了办理期限没有办理会怎样","type":"text"},
+ {"key":"late_filing_penalty_amount","description":"逾期办理的罚款或滞纳金是多少","type":"amount"},
+ {"key":"tax_amount","description":"需要补缴或者可以退还的税额是多少","type":"amount"},
+ {"key":"filing_method_details","description":"除了预约以外，汇算清缴本身要通过什么方式办理","type":"text"},
+ {"key":"notice_contact","description":"通告正文给了什么咨询方式","type":"text"}
+]}
