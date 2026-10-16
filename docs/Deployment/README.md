@@ -38,6 +38,32 @@
 第 6 批   C4 远程访问设计 → C5 PWA 设计 → C6 实现
 ```
 
+## 用 `AGENT24_DATA_DIR` 跑隔离数据目录的实例（MAINT-03）
+
+默认数据根是 `$HOME/.agent24`：`daemon.json`、`logs/`、`agent24.db`、`attach/`、tool workspace 都在它下面。
+设置环境变量 `AGENT24_DATA_DIR`（非空的**绝对路径**）后，数据根就是这个目录本身（**不再拼 `.agent24`**）；
+空值或相对路径会被忽略，回落到默认。不设置时行为与以前完全一致。daemon、CLI 和桌面端读的是同一口径
+（`agent24_protocol::state_file::state_dir()` 与桌面端 `daemonStatePath()`），所以只要它们在同一个环境里启动，就会彼此找到。
+
+典型场景：**预览包与开发环境共存**。开发构建（如 `ab/kernel` 线）可能已把 `~/.agent24/agent24.db` 迁移到更新的 schema，
+main 基线的预览包再打开它会报 `migration N was previously applied but is missing`。让预览包用自己的目录即可互不破坏：
+
+```bash
+# macOS 预览包：从终端直接启动可执行文件，环境变量才会传进去（Finder/Dock 启动不会带）
+AGENT24_DATA_DIR="$HOME/.agent24-preview" /Applications/Agent24.app/Contents/MacOS/Agent24
+
+# 或者只跑 daemon / CLI
+AGENT24_DATA_DIR=/tmp/a24-x agent24d serve
+AGENT24_DATA_DIR=/tmp/a24-x agent24 daemon status
+```
+
+影响与注意：
+
+- 隔离实例**看不到原数据**：会话、记忆、已装模块、`attach` 注册都在新目录里从零开始；原 `~/.agent24` 不会被读取、迁移、复制或删除。
+- 两个数据目录各有自己的 daemon 单例锁和 `daemon.json`，可以同时运行（端口由各自 daemon 决定）；
+  但 CLI / 桌面端只会连上与自己 `AGENT24_DATA_DIR` 相同的那个 daemon。
+- 想回到原数据，去掉这个变量重新启动即可；不需要也不应手动搬动 `agent24.db`。
+
 ## 需要 jason 决定或动手的事
 
 1. **Apple 开发者账号**：到位后导出 Developer ID Application 证书和 App Store Connect API key，填进仓库 Secrets（B1，只能由你来做）。
