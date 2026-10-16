@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": null,
+  "attempt_id": null,
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "4acdc3959c580b87485f137b32d65bfe477489e6",
+  "result_sha": null,
+  "summary": "Grok Bot 车道已开工：D1-2b（L2 答案校验），基线 origin/ab/decide 4acdc395",
+  "tests": [],
+  "blocker": null,
+  "next": "按 PLAN-DECIDE-D1-2B-L2-VALIDATION.md 实现并测试",
+  "updated_at": "2026-10-16T12:20:13+00:00"
+}
