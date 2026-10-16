@@ -68,13 +68,42 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 | DEP-C5 | 移动端设计：**MVP 是 PWA**（由 daemon 或桌面端提供，经 tailscale 访问）；原生外壳（Capacitor 或 RN）排在之后，renderer 需要把 `window.agent24.*` 抽象成可替换的传输层 | C4 | Opus 设计 | M | `BACKLOG` |
 | DEP-C6 | 移动端实现（先 PWA；上架应用商店另行立项） | C5 | Sonnet | L | `BACKLOG` |
 | DEP-C7 | 重新评估 cargo-dist、`curl \| sh` 安装脚本、Homebrew tap（tap 仓库和 PAT 需要用户动手） | 有需求时 | Opus | S | `BACKLOG` |
-| DEP-C8 | Hyphae lock 升级：把 `rust/crates/agent24-comm/hyphae.lock.json` 升到含 daemon 锁（`.hyphae/daemon.lock`）的 Hyphae 版本（#104 之后），通过 Hyphae lock verify（来源：`docs/design/COMM-HYPHAE.md` §9 G3） | — | Sonnet | S | `BACKLOG` |
-| DEP-C9 | 发布包加入 `hyphae` 二进制（macOS / Linux），打包后在干净机器上验证 `agent24 comm` 可用（来源：`COMM-HYPHAE.md` §9 R4） | C8 | Sonnet | S | `BACKLOG` |
+| DEP-C8 | Hyphae lock 兼容晋升（保留原 ID）：原 daemon.lock / #104 要求继续验收；按下方网络交付里程碑核对当前锁与候选，补四平台 client 锁、独立 relay 锁与精确组合验证（来源：`COMM-HYPHAE.md` §9 G3） | HN0、HN1；Hyphae M1 发布门 | Sonnet | M（扩展验收） | `BACKLOG` |
+| DEP-C9 | 标准包携带 `hyphae`（保留原 ID）：CLI/桌面 macOS / Linux 四平台内置精确 client，不含 relay；更新包布局断言并验收 `agent24 comm`（来源：`COMM-HYPHAE.md` §9 R4） | C8、HN2 | Sonnet | M（四平台） | `BACKLOG` |
 
 **验收标准**
 - **C2**：`windows-latest` 上 Rust 全量测试通过；在 Windows 上 Sin90 能挂载，并能收到调度回调。
 - **C3**：安装包带有效的 Authenticode 签名，`signtool verify /pa` 通过；在干净的 Windows 机器上安装后，模块显示 `mounted`。SmartScreen 信誉需要时间积累，不作为验收条件。
 - **C4/C5**：设计经 1 轮评审后冻结，jason 确认功能范围。
+
+<a id="hyphae-delivery"></a>
+### Hyphae 网络交付：DEP-HN（2026-10-10 新增，尚未实现）
+
+规范见 [HYPHAE-NETWORK-DELIVERY.md](HYPHAE-NETWORK-DELIVERY.md)。这是 M1 之后的有界交付里程碑，不是 Hyphae M2；现在只允许文档/契约冻结，所有实现必须等待 Hyphae 当前 M1 发布门关闭。范围仅标准 client、可选本机 relay、离线包、服务器发行与三入口引导；远程执行、移动端、Windows、自动公网配置不在本轮。
+
+**C8/C9 对账**：原编号、BACKLOG 与来源保留，原始 S 规模因四平台/双锁验收扩大为 M；不另建“升级 client lock”或“标准包内置 client”的重复任务。基线生产锁已是 `671c584f…`，不能沿用设计文档“仍为 a4aa606”的历史描述，也不能仅凭 SHA 变化认定 C8 完成；须证明候选包含 #104 能力并通过实际占用/导入反例。A3/A8 等 DONE 记录保持历史原样，C9 负责把未来包布局从两程序更新为三程序。
+
+下表 HN 编号均为本交付台账 ID；Hyphae 行由上游建立对应 issue/PR 并双向映射，不替代其原生里程碑编号。可按 ≤300 行 task PR 再细分，依赖和出口不变。当前仅 HN0 为 READY，其余均 BACKLOG 且受 M1 门阻塞。#881 与 Hyphae 配套契约 PR 合并只建立基线；HN0 仍保持 READY，直到互链 follow-up PR 冻结健康阈值和 schema/回滚矩阵，才可标 DONE 并解锁 HN1。
+
+| ID | 归属仓库 / 负责人 | 依赖 | 交付及可观察验收 | 估算人日 |
+|---|---|---|---|---|
+| DEP-HN0 | Agent24 + Hyphae / 双方维护者 | —（只写文档） | 两仓互链契约 PR 合并；冻结 SKU、pin/签名根策略、健康探测时限、schema/回滚矩阵与责任；没有根不能声称验签 | 0.5–1 |
+| DEP-HN1 | Hyphae / 上游发布负责人 | HN0、M1 发布门 | tag 发布及四平台 client/relay 分包、两类 manifest/lock；固定版本安全安装器；Linux 双架构容器/持久卷指南；实际下载验证来源、完整 hash 与真实 relay smoke，坏资产拒绝 | 4–6 |
+| DEP-C8 | Agent24 / comm 维护者 | HN1 | lock-promotion PR 固定双方 SHA；四平台按配方重建匹配下载资产；client/relay 组合、daemon.lock 占用、身份/联系人/收发/离线/重启/zero-run 通过；不兼容附 Hyphae issue/PR | 1–2 |
+| DEP-HN2 | Agent24 / 安装器维护者 | C8 | client 与 relay 共用安全安装语义；staging/fsync/不覆盖原子提交、现有副本重验；断电模拟、满盘、篡改/并发/归档逃逸均不执行半成品、不覆盖异常目标 | 2–3 |
+| DEP-C9 | Agent24 / 发布负责人 | C8、HN2 | CLI 与桌面包内 client 匹配锁，relay 不在标准包；四平台 Release 下载 smoke；无源码/Go/PATH 外部 hyphae 的干净环境能使用通信 | 1–2 |
+| DEP-HN3 | Agent24 / daemon 管理层维护者 | HN2 | 可选下载、离线导入、plan/apply/组件 API 与持久状态机；同意绑定精确资产；取消/重启恢复/幂等成立；无 token、缺同意、坏 pin、latest 均拒绝；不放松 comm 依赖门 | 3–4 |
+| DEP-HN4 | Agent24 / 生命周期维护者 | HN3 | relay 专用数据、loopback 与显式首启/autostart；组合更新/健康回滚/备份恢复；注入启动失败恢复获授权旧组合；旧 schema 不可读则阻断，PID 复用不误杀 | 3–4 |
+| DEP-HN5 | Agent24 / UI 与 CLI 维护者 | HN4、C9 | 三个非术语入口及状态/确认落地到既有 COMM-6/7 通信界面，不复制消息实现；拒绝下载不监听，加入网络不拉 relay，服务器入口仅指引；ACK/进程存活不冒充送达/健康 | 3–4 |
+| DEP-HN6 | Agent24 + Hyphae / 发布与验收负责人 | HN1、C9、HN4、HN5 | 组装离线包；真实 Release 的标准/可选/离线路径、服务器持久卷更新/回退、干净 macOS/Linux 验收与负例全部归档；最终外部评审与双方发布出口通过 | 2–4 |
+
+依赖 DAG：`HN0 → [M1 发布门] → HN1 → C8 → HN2 → {C9, HN3 → HN4} → HN5 → HN6`；HN6 还直接依赖 HN1/C9/HN4。COMM-6/7 如尚未具备接入界面，HN5 必须与其负责人补齐所需通信入口，不以本表替 COMM 记完成；平台签名/公证仍依赖既有 DEP-B 门，不把未签名包写成已签名。
+
+验收必须落实契约 §7 的负例矩阵与干净机器矩阵：四平台安装/CLI smoke，至少 macOS arm64 笔记本与 Linux x64 干净 VM 的 CLI/桌面全流程；用隔离身份，禁止在 Mac mini 执行。篡改、未晋升组合、取消、磁盘满、并发、健康失败、备份恢复、无同意扩展监听及 zero-run 正反对照均有证据。计划/文档通过不能代替这些实现门禁。
+
+**工期估算，不是承诺**：合计约 **20–30 人日**，另预留外部评审/发布等待约 2–3 工作日；假设两仓各一名可用实现者、必要 UI/平台支持和签名条件就绪，按依赖推进预计 **15–20 个工作日**（可并行部分不等于启动额外方向）。文档冻结现在进行；若 M1 在 **2026-10-16** 前正式关闭且 HN0 同时冻结，最早 **2026-10-19** 开工，条件目标 **2026-11-06 至 2026-11-13** 完成，按周一至周五、不计当地假日估算。M1、上游可信资产、COMM UI、平台签名或评审延后则顺延，不能为日期缩减验收。
+
+**关闭条件**：两仓所需 PR 已合并并互链、实际发布资产已构建、标准/可选/离线和服务器路径通过、升级及回滚演练完成、干净机器证据归档；本里程碑每一个 PR 都必须取得 PR-Daemon 对精确最终 head 的 APPROVE，required CI/本地门禁全绿。LAN/公网暴露、TLS、访问控制以及安全/权限/协议/存储变更还须完成适用的独立安全设计评审；release 由人发起审查并经 jason 验收，不因 PR 合并自动发布。HN0 单独完成只表示契约冻结，不能把 DEP-HN、M1 或 M2 标 DONE。
 
 ## 不在本计划内
 - Mac App Store 上架：沙盒机制与拉起模块冲突。

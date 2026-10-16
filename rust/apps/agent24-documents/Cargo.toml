@@ -1,0 +1,33 @@
+[package]
+name = "agent24-documents"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Documenting domain OS (ADR-DOC-01): first-party out-of-process module `documents`, served under /api/v1/documents"
+
+[[bin]]
+name = "agent24-documents"
+path = "src/main.rs"
+
+[dependencies]
+agent24-os-sdk = { path = "../../crates/agent24-os-sdk" }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+getrandom = { version = "0.3", features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The kernel's own manifest validator, so the test proves the daemon would accept domain-os.yml.
+agent24-domain = { path = "../../crates/agent24-domain" }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

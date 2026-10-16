@@ -1,0 +1,25 @@
+id: "s01-03-zh-holiday-2026"
+title: "国务院办公厅关于2026年部分节假日安排的通知（国办发明电〔2025〕7号）"
+lang: "zh"
+kind: "text_pdf"
+pages: 2
+source_url: "https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm"
+publisher: "国务院办公厅"
+retrieved_at: "2026-10-07"
+license: "CN-Copyright-Art5"
+sha256_original: "182376afd5d9f161b21ee0998d76fa94b338dcd9f64e9c9a879a6a0bd6198859"
+sha256_stored: "182376afd5d9f161b21ee0998d76fa94b338dcd9f64e9c9a879a6a0bd6198859"
+redactions: []
+public_officials: []
+covers:
+  C1: [spring_festival_holiday, new_year_makeup_workday]
+reader: "在中国大陆上班或上学、要安排 2026 年假期的人"
+questions: [Q1, Q2]
+extraction_notes:
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "标题两行和各节标题（如“、元旦：”）重复抽出，并插进正文行之间，如“1月 / 、元旦： / 4日（周日）上班。”"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 1, "finding": "“正月 / 初七”在行末断开（L2 命中）"}
+  - {"extractor": "PDFKit (macOS 26.6.2)", "page": 2, "finding": "页尾元数据标签（索引号、成文日期等）重复多达 7 次"}
+derived_from: null
+sha256_parent: null
+derivation: []
+notes: "gov.cn 网页经 Chrome 无头打印为 PDF（gov.cn 打印样式），正文未改。v1 记录的“部分节假日日安排”来自另一个抽取器（Claude Read），PDFKit 复现不了，已删除。"

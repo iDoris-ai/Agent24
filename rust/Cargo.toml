@@ -6,6 +6,7 @@ members = [
     "crates/agent24-core",
     "crates/agent24-decide",
     "crates/agent24-domain",
+    "crates/agent24-hw",
     "crates/agent24-os-fd",
     "crates/agent24-os-cwd",
     "crates/agent24-os-packages",
@@ -25,6 +26,7 @@ members = [
     "crates/agent24-worker",
     "apps/agent24d",
     "apps/agent24-cli",
+    "apps/agent24-documents",
 ]
 
 [workspace.package]

@@ -1,0 +1,17 @@
+{
+  "os_version": "0.1.0",
+  "storage": { "state": "unavailable" },
+  "engines": [],
+  "knowledge": { "setting": "on", "state": "unavailable" },
+  "operations": [
+    { "op": "upload", "available": false, "reason": "storage_unavailable" },
+    { "op": "import", "available": false, "reason": "storage_unavailable" },
+    { "op": "get", "available": false, "reason": "storage_unavailable" },
+    { "op": "list", "available": false, "reason": "storage_unavailable" },
+    { "op": "job", "available": false, "reason": "storage_unavailable" },
+    { "op": "render", "available": false, "reason": "engine_unavailable" },
+    { "op": "read_range", "available": false, "reason": "engine_unavailable" },
+    { "op": "find", "available": false, "reason": "engine_unavailable" },
+    { "op": "extract", "available": false, "reason": "engine_unavailable" }
+  ]
+}
