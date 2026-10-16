@@ -2,10 +2,14 @@
 //! fields, through the kernel's model router, which runs only local models
 //! for this module. What each call answers is grounded and merged per field.
 //!
-//! Calls go one at a time. An answer cut off at the token limit is asked
-//! again in two halves of its batch; one not in the schema's shape is asked
-//! once more. A window the model rejects (most likely too long for its
-//! context) is asked again in two halves. A busy or rate-limited kernel is
+//! Calls go one at a time, each in up to two passes (ME4-S2c §5.1): first
+//! the model answers as it will, thinking if it does; an answer cut off at
+//! the token limit or not in the answer's shape, or a request rejected, is
+//! asked again held to the schema with thinking off. There an answer cut off
+//! is asked again in two halves of its batch, and one not in the shape once
+//! more. A window both passes reject (most likely too long for the model's
+//! context) is asked again in two halves; a second pass rejected after its
+//! first was taken fails the extraction. A busy or rate-limited kernel is
 //! waited out, up to two minutes a call; a timeout is retried once; no local
 //! model to answer is asked again after the router's longest cooldown, up to
 //! three minutes of such waiting a call. Every
@@ -18,14 +22,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_os_sdk::{
-    ClientError, CompleteRequest, CompleteResult, MODEL_NO_PROVIDER_WAIT, ModelClient, ServedTier,
-    UnavailableCause,
+    ClientError, CompleteRequest, CompleteResult, Complexity, MODEL_NO_PROVIDER_WAIT, ModelClient,
+    ServedTier, UnavailableCause,
 };
 
 use super::Field;
 use super::ground::Source;
 use super::merge::{Merged, Said, merge, said};
-use super::prompt::{AnswerValue, Unanswered, answer_format, messages, parse};
+use super::prompt::{AnswerValue, Pass, Unanswered, answer_format, messages, parse, unwrapped};
 use super::window::{BATCH, BUDGET, Window, batches, windows};
 
 /// What the model may write in one answer, at most (the kernel's limit).
@@ -101,6 +105,14 @@ pub struct Extracted {
     pub values: Vec<Merged>,
 }
 
+/// Why a batch went on to its second pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fell {
+    Truncated,
+    Malformed,
+    Rejected,
+}
+
 /// What a call came to, short of an answer.
 enum Refused {
     /// The model rejected the request: most likely too long for it.
@@ -118,7 +130,12 @@ struct Run<'a> {
 
 impl Run<'_> {
     /// One call, waiting out a busy kernel and retrying a timeout once.
-    async fn call(&mut self, window: &Window, batch: &[Field]) -> Result<String, Refused> {
+    async fn call(
+        &mut self,
+        window: &Window,
+        batch: &[Field],
+        pass: Pass,
+    ) -> Result<(String, u64), Refused> {
         let mut waited = Duration::ZERO;
         let mut pause = self.pace.first;
         let mut timeouts = 0;
@@ -127,11 +144,13 @@ impl Run<'_> {
             if !self.job.go_on().await {
                 return Err(Refused::Failed(Failure::Cancelled));
             }
+            let held = pass == Pass::Held;
             let req = CompleteRequest {
-                messages: messages(batch, self.src.layer, window),
-                response_format: Some(answer_format(batch)),
+                messages: messages(batch, self.src.layer, window, pass),
+                response_format: held.then(|| answer_format(batch)),
                 max_tokens: Some(MAX_TOKENS),
-                complexity: None,
+                // An explicit `simple` is what turns thinking off (ME4-S2c §4).
+                complexity: held.then_some(Complexity::Simple),
                 // Copying text and naming blocks wants no chance: the same
                 // request, the same answer (ME4-S2b; Ollama uses 1.0 otherwise).
                 temperature: Some(0.0),
@@ -204,8 +223,9 @@ impl Run<'_> {
         true
     }
 
-    /// The answer's text, once its model is known to be the one, local.
-    fn answered(&mut self, done: CompleteResult) -> Result<String, Failure> {
+    /// The answer's text and the tokens it took, once its model is known to
+    /// be the one, local.
+    fn answered(&mut self, done: CompleteResult) -> Result<(String, u64), Failure> {
         let engine = |why: &str| Err(Failure::Engine(why.into()));
         if done.tier != ServedTier::Local {
             return engine("a model that is not local answered");
@@ -222,38 +242,70 @@ impl Run<'_> {
             Some(known) if *known != id => engine("the local model changed during the extraction"),
             _ => {
                 self.model_id = Some(id);
-                Ok(done.text)
+                Ok((done.text, done.usage.completion_tokens))
             }
         }
     }
 
     /// The answers for `batch` over `window`, as (window, answers) pieces in
-    /// window order: a window rejected as too long is asked in halves, a
-    /// batch cut off in halves, a malformed answer once more.
-    fn answer<'b>(&'b mut self, window: Window, batch: Vec<Field>) -> Pieces<'b> {
+    /// window order, from its first pass or, `fell` there before, its second.
+    fn answer<'b>(
+        &'b mut self,
+        window: Window,
+        batch: Vec<Field>,
+        fell: Option<Fell>,
+    ) -> Pieces<'b> {
         Box::pin(async move {
-            let mut malformed = None;
-            for _ in 0..2 {
-                let text = match self.call(&window, &batch).await {
-                    Ok(text) => text,
+            let fell = match fell {
+                Some(fell) => fell,
+                None => match self.call(&window, &batch, Pass::Free).await {
                     Err(Refused::Failed(f)) => return Err(f),
                     Err(Refused::TooLong) => {
+                        log(&window, &batch, Pass::Free, None, "rejected", None);
+                        Fell::Rejected
+                    }
+                    Ok(done) => match read(&window, &batch, Pass::Free, None, done) {
+                        Ok(values) => return Ok(vec![(window, values)]),
+                        Err(Unanswered::Truncated) => Fell::Truncated,
+                        Err(Unanswered::Malformed(_)) => Fell::Malformed,
+                    },
+                },
+            };
+            let mut malformed = None;
+            for _ in 0..2 {
+                let done = match self.call(&window, &batch, Pass::Held).await {
+                    Ok(done) => done,
+                    Err(Refused::Failed(f)) => return Err(f),
+                    Err(Refused::TooLong) => {
+                        log(&window, &batch, Pass::Held, None, "rejected", Some(fell));
+                        // Its first pass, longer, was taken: not a window
+                        // too long, and a smaller one would answer otherwise.
+                        if fell != Fell::Rejected {
+                            return Err(Failure::Engine(
+                                "the local model rejected the second pass".into(),
+                            ));
+                        }
                         let Some((a, b)) = window.halves() else {
                             return Err(Failure::Engine(
                                 "the local model rejects even one block".into(),
                             ));
                         };
-                        let mut out = self.answer(a, batch.clone()).await?;
-                        out.extend(self.answer(b, batch).await?);
+                        let mut out = self.answer(a, batch.clone(), None).await?;
+                        out.extend(self.answer(b, batch, None).await?);
                         return Ok(out);
                     }
                 };
-                match parse(&batch, &text) {
+                match read(&window, &batch, Pass::Held, Some(fell), done) {
                     Ok(values) => return Ok(vec![(window, values)]),
                     Err(Unanswered::Truncated) if batch.len() > 1 => {
+                        // Halves of a batch that thought too long, or was
+                        // rejected, would again: they start at the second
+                        // pass. One whose answer was malformed may answer
+                        // well with fewer fields.
+                        let next = (fell != Fell::Malformed).then_some(fell);
                         let (a, b) = batch.split_at(batch.len() / 2);
-                        let mut out = self.answer(window.clone(), a.to_vec()).await?;
-                        out.extend(self.answer(window, b.to_vec()).await?);
+                        let mut out = self.answer(window.clone(), a.to_vec(), next).await?;
+                        out.extend(self.answer(window, b.to_vec(), next).await?);
                         return Ok(out);
                     }
                     Err(Unanswered::Truncated) => {
@@ -265,6 +317,45 @@ impl Run<'_> {
             Err(Failure::Unanswered(malformed.unwrap_or_default()))
         })
     }
+}
+
+/// The answers in what a call of `pass` wrote and the tokens it took, logged
+/// with why its batch came to the second pass (`fell`). A call that used all
+/// it may write was cut off, even if what it wrote reads whole (thinking
+/// counts, and may have filled it).
+fn read(
+    window: &Window,
+    batch: &[Field],
+    pass: Pass,
+    fell: Option<Fell>,
+    (text, tokens): (String, u64),
+) -> Result<Vec<AnswerValue>, Unanswered> {
+    let read = if tokens >= u64::from(MAX_TOKENS) {
+        Err(Unanswered::Truncated)
+    } else {
+        unwrapped(&text).and_then(|t| parse(batch, t))
+    };
+    let outcome = match &read {
+        Ok(_) => "answered",
+        Err(Unanswered::Truncated) => "truncated",
+        Err(Unanswered::Malformed(_)) => "malformed",
+    };
+    log(window, batch, pass, Some(tokens), outcome, fell);
+    read
+}
+
+/// One call, as the info log has it (ME4-S2c §5.1 step 5).
+fn log(
+    window: &Window,
+    batch: &[Field],
+    pass: Pass,
+    tokens: Option<u64>,
+    outcome: &str,
+    fell: Option<Fell>,
+) {
+    tracing::info!(window = ?window.0.first(), blocks = window.0.len(), fields = batch.len(),
+        pass = ?pass, completion_tokens = tokens, max_tokens = MAX_TOKENS, fell = ?fell,
+        "extraction call: {outcome}");
 }
 
 /// Extracts `fields` from the layer in `src` for `job`: asked before every
@@ -309,7 +400,7 @@ async fn paced(
     let mut done = 0;
     for window in &windows {
         for batch in &batches {
-            for (piece, answers) in run.answer(window.clone(), batch.clone()).await? {
+            for (piece, answers) in run.answer(window.clone(), batch.clone(), None).await? {
                 for a in &answers {
                     if let Some(i) = fields.iter().position(|f| f.key == a.key) {
                         said_of[i].push(said(src, &piece, a));
