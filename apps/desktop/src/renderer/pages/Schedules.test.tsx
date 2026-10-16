@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import SchedulesPage from './Schedules'
+import { setLocale } from '../i18n'
 
 const SCHEDULE = {
   id: 'sch_1',
@@ -30,7 +31,19 @@ function mount(list: unknown[]) {
   return proxy
 }
 
+describe('SchedulesPage (English default)', () => {
+  it('renders English copy by default', async () => {
+    mount([])
+    render(<SchedulesPage />)
+    expect(screen.getByText('Schedules')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Create' })).toBeInTheDocument()
+    expect(await screen.findByText('No schedules yet')).toBeInTheDocument()
+  })
+})
+
 describe('SchedulesPage', () => {
+  beforeEach(() => { setLocale('zh') })
+
   it('renders a live cron next-fire preview that updates with the expression', async () => {
     mount([])
     render(<SchedulesPage />)

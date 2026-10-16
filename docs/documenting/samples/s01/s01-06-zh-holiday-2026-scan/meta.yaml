@@ -1,0 +1,28 @@
+id: "s01-06-zh-holiday-2026-scan"
+title: "国务院办公厅关于2026年部分节假日安排的通知（第 1 页模拟扫描）"
+lang: "zh"
+kind: "image"
+pages: 1
+source_url: "https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm"
+publisher: "国务院办公厅"
+retrieved_at: "2026-10-07"
+license: "CN-Copyright-Art5"
+sha256_original: "182376afd5d9f161b21ee0998d76fa94b338dcd9f64e9c9a879a6a0bd6198859"
+sha256_stored: "78e459d6c6c8d7305b1a4b44f80aa44e2f4670706099463ba0411f65ccd4c8de"
+redactions: []
+public_officials: []
+covers:
+  C2: [spring_festival_holiday, labour_day_makeup_workday]
+  C9: [issue_date]
+reader: "在中国大陆上班或上学、要安排 2026 年假期的人（手上只有通知第 1 页的照片）"
+questions: [Q2]
+extraction_notes:
+  - {"extractor": "none (image)", "page": 1, "finding": "图片没有文本层；锚点按显示文字书写，一律记为“待目视”，人工核对时逐条确认后才算 L3 命中。harness 以后可以另拿 OCR 输出比对，但那不算原件锚点命中"}
+derived_from: "s01-03-zh-holiday-2026"
+sha256_parent: "182376afd5d9f161b21ee0998d76fa94b338dcd9f64e9c9a879a6a0bd6198859"
+derivation:
+  - "sips -s format png parent.pdf --out a.png"
+  - "sips -r 2 a.png --out b.png"
+  - "sips --resampleWidth 900 b.png --out c.png"
+  - "sips -s format jpeg -s formatOptions 45 c.png --out source.jpg"
+notes: "由 s01-03 第 1 页生成的模拟扫描件（sips 默认只渲染第 1 页，72 dpi），正文未改，计入合成占比。2026-10-08 在 macOS 26.6.2 上按 derivation 重跑，输出与 sha256_stored 逐字节一致。只含第 1 页，成文日期在父件第 2 页（missing_reason outside_page_scope）。"

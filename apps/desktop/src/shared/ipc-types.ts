@@ -31,6 +31,7 @@ export const IpcChannels = {
   ModulesInstall: 'modules:install',
   ModulesUninstall: 'modules:uninstall',
   LlmStatus: 'llm:status',
+  IdorisStatus: 'idoris:status',
   // A3-4: push channel only (main -> renderer via webContents.send). Not an
   // ipcMain.handle() target — see main/agentear-events.ts.
   AgentEarEvent: 'agentear:event',
@@ -43,6 +44,15 @@ export const IpcChannels = {
   // AgentEarSnapshot's shape exactly — see main/model-call-log.ts.
   ModelCallEvent: 'model-call:event',
   ModelCallSnapshot: 'model-call:snapshot',
+  // ADR-DOC-01 D5: the Documenting OS's typed channel. The renderer names an
+  // operation; main maps it to a fixed route (main/documents.ts).
+  DocumentsRequest: 'documents:request',
+  // Picks a file in a native dialog and imports it (main/documents-import.ts);
+  // progress is pushed on DocumentsImportProgress.
+  DocumentsImportFile: 'documents:import-file',
+  DocumentsImportProgress: 'documents:import-progress',
+  // The OS's job and document events, pushed (ADR-DOC-02 §7; main/documents.ts).
+  DocumentsEvent: 'documents:event',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -176,6 +186,63 @@ export interface LlmStatusResult {
   model: string
 }
 
+export interface IdorisCapacityEntry {
+  id: string
+  capability: string
+  resident: boolean
+  estimated_memory_gb: number
+  ctx_limit: number
+  queue_depth: number
+  admission_status: 'ready' | 'requires_eviction' | 'blocked'
+}
+
+export type IdorisCapacity =
+  | { state: 'observed'; entries: IdorisCapacityEntry[] }
+  | { state: 'unavailable' }
+  | { state: 'error' }
+
+export interface IdorisStatusResponse {
+  status: 'ok'
+  service: 'idoris'
+  version: string
+  contract_version: string
+  instance_id: string
+  components: number
+  runtimes: number
+  subscriptions: number
+  budget_configured: boolean
+  audit_configured: boolean
+  capacity: IdorisCapacity
+}
+
+export interface IdorisBackend {
+  provider_id: string
+  locality: 'loopback' | 'lan' | 'remote'
+  form: 'http_service' | 'spawn_cli' | 'bundled_binary' | 'nostr_node' | 'mitm_proxy' | 'batch_job'
+  lifecycle_runtime_bound: boolean
+}
+
+export type IdorisModelSource =
+  | { provider_id: string; source: 'http_models_endpoint'; state: 'observed'; models: string[] }
+  | { provider_id: string; source: 'subscription_registration'; state: 'configured'; models: string[] }
+  | { provider_id: string; source: 'http_models_endpoint'; state: 'error'; models: []; error: 'unavailable' | 'authentication_failed' }
+
+export interface IdorisModelsResponse {
+  sources: IdorisModelSource[]
+}
+
+export type IdorisUnavailableReason =
+  | 'handoff-missing'
+  | 'handoff-invalid'
+  | 'invalid-config'
+  | 'unreachable'
+  | 'http-error'
+  | 'invalid-response'
+
+export type IdorisStatusResult =
+  | { state: 'available'; status: IdorisStatusResponse; backends?: IdorisBackend[]; models?: IdorisModelsResponse }
+  | { state: 'unavailable'; reason: IdorisUnavailableReason }
+
 export interface ModuleInstallResult {
   ok: boolean
   id?: string        // module id if successfully loaded
@@ -261,4 +328,55 @@ export interface AgentEarEventEnvelope {
   seq: number
   type: 'turn' | 'transcript' | 'proposal' | 'speech' | 'error' | 'confirm_reply'
   payload: Record<string, unknown>
+}
+
+// ---- Documenting OS (ADR-DOC-01 D5) ----
+// Parameters and bodies come from the generated api-client, so a contract
+// change shows up here as a type error.
+
+type DocSchemas = import('@agent24/api-client').components['schemas']
+type DocOps = import('@agent24/api-client').operations
+type ListQuery = NonNullable<DocOps['documentsListDocuments']['parameters']['query']>
+
+/** The operations the page may ask for (ADR-DOC-02 §4). */
+export type DocumentsRequest =
+  | { op: 'capabilities' }
+  | { op: 'list'; cursor?: ListQuery['cursor']; limit?: ListQuery['limit'] }
+  | { op: 'get'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'job'; jobId: DocSchemas['JobIdString'] }
+  | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
+  | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
+
+/** What each operation returns on success. */
+export interface DocumentsResults {
+  capabilities: DocSchemas['DocumentsCapabilities']
+  list: DocSchemas['DocumentList']
+  get: DocSchemas['DocumentDetail']
+  job: DocSchemas['DocumentsJob']
+  cancelJob: DocSchemas['DocumentsJob']
+  retryJob: DocSchemas['DocumentsJob']
+}
+
+/** The error envelope: the OS's or the kernel's, or one main makes for a
+ * transport failure (`backend_not_ready`, `backend_unreachable`,
+ * `backend_timeout` — outcome unknown, never retried here —
+ * `invalid_response`, `invalid_request`). */
+export type DocumentsError = DocSchemas['ErrorBody']
+
+export type DocumentsResponse<Op extends DocumentsRequest['op'] = DocumentsRequest['op']> =
+  | { ok: true; status: number; data: DocumentsResults[Op] }
+  | { ok: false; status: number; error: DocumentsError }
+
+/** An event from the Documenting OS (ADR-DOC-02 §7): a hint to read the job
+ * or the list again, never the truth itself. */
+export type DocumentsEvent =
+  | { kind: 'job.progress'; payload: DocSchemas['DocumentsJobProgressEvent'] }
+  | { kind: 'job.finished'; payload: DocSchemas['DocumentsJobFinishedEvent'] }
+  | { kind: 'document.imported'; payload: DocSchemas['DocumentsDocumentImportedEvent'] }
+  | { kind: 'revision.committed'; payload: DocSchemas['DocumentsRevisionCommittedEvent'] }
+
+/** Bytes of the picked file sent so far, pushed while it uploads. */
+export interface DocumentsImportProgress {
+  sent: number
+  total: number
 }

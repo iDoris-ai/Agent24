@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useT } from '../i18n'
+import { memoryMessages } from './Memory.i18n'
 import {
   listMemoryAssertions,
   forgetMemoryAssertion,
@@ -18,10 +20,11 @@ function formatRecordedAt(iso: string): string {
 }
 
 export default function MemoryPage() {
+  const t = useT(memoryMessages)
   const [assertions, setAssertions] = useState<MemoryAssertion[]>([])
   const [query, setQuery] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
+  const [notice, setNotice] = useState(false)
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [enabled, setEnabled] = useState<boolean | null>(null)
   const [settingsError, setSettingsError] = useState<string | null>(null)
@@ -91,7 +94,7 @@ export default function MemoryPage() {
       reqSeq.current += 1
       refresh(query)
       setConfirmingId(null)
-      setNotice('已撤回')
+      setNotice(true)
       setError(null)
     } catch (e: unknown) {
       // Failure: keep the item in the list (and the confirmation open) —
@@ -102,8 +105,8 @@ export default function MemoryPage() {
 
   return (
     <div className="content">
-      <div className="page-title">记忆</div>
-      <div className="page-sub">Agent24 记得的事 · 查看、搜索、撤回</div>
+      <div className="page-title">{t('title')}</div>
+      <div className="page-sub">{t('subtitle')}</div>
 
       {/* 暂停记忆 */}
       <div
@@ -118,9 +121,9 @@ export default function MemoryPage() {
         }}
       >
         <div>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>暂停记忆</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>{t('pause.title')}</div>
           <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
-            暂停后不再写入新的记忆，也不会在新会话中被想起；已有的记忆保留
+            {t('pause.hint')}
           </div>
         </div>
         <button
@@ -130,13 +133,13 @@ export default function MemoryPage() {
           // (the earlier version) had it backwards: a screen reader would
           // have announced "暂停记忆: checked" while memory was actually ON.
           aria-checked={enabled === false}
-          aria-label="暂停记忆"
+          aria-label={t('pause.title')}
           className={`btn${enabled === false ? ' btn-primary' : ''}`}
           style={{ fontSize: 12 }}
           disabled={enabled === null || togglePending}
           onClick={onTogglePause}
         >
-          {enabled === null ? '…' : enabled ? '未暂停' : '已暂停'}
+          {enabled === null ? '…' : enabled ? t('pause.notPaused') : t('pause.paused')}
         </button>
       </div>
       {settingsError && (
@@ -145,8 +148,8 @@ export default function MemoryPage() {
 
       {/* 搜索 */}
       <input
-        aria-label="搜索记忆"
-        placeholder="搜索记忆…"
+        aria-label={t('search.label')}
+        placeholder={t('search.placeholder')}
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         style={{
@@ -163,7 +166,7 @@ export default function MemoryPage() {
       />
 
       {error && <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{error}</div>}
-      {notice && <div style={{ color: '#4caf50', fontSize: 12, marginBottom: 8 }}>{notice}</div>}
+      {notice && <div style={{ color: '#4caf50', fontSize: 12, marginBottom: 8 }}>{t('notice.retracted')}</div>}
 
       {/* Review Low: never show an empty-state copy while `error` is set —
           an empty list because the load FAILED is not the same fact as an
@@ -172,11 +175,11 @@ export default function MemoryPage() {
       {!error &&
         assertions.length === 0 &&
         (enabled === false ? (
-          <div style={{ fontSize: 12, color: 'var(--muted)' }}>记忆已暂停</div>
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>{t('empty.paused')}</div>
         ) : query.trim() === '' ? (
-          <div style={{ fontSize: 12, color: 'var(--muted)' }}>说『记住……』让我记住</div>
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>{t('empty.prompt')}</div>
         ) : (
-          <div style={{ fontSize: 12, color: 'var(--muted)' }}>没有匹配的记忆</div>
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>{t('empty.noMatches')}</div>
         ))}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -187,8 +190,8 @@ export default function MemoryPage() {
           >
             <div style={{ fontSize: 13 }}>{a.text}</div>
             <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
-              {a.session ? `来自会话 ${a.session}` : '来源未知'} · 记录于{' '}
-              {formatRecordedAt(a.recorded_at)}
+              {a.session ? t('source.session', { session: a.session }) : t('source.unknown')} ·{' '}
+              {t('source.recordedAt', { date: formatRecordedAt(a.recorded_at) })}
             </div>
 
             {confirmingId === a.id ? (
@@ -201,7 +204,7 @@ export default function MemoryPage() {
                 }}
               >
                 <div style={{ fontSize: 12, marginBottom: 8 }}>
-                  撤回后不会再在新会话中被想起；原始对话仍保留在本机
+                  {t('retract.hint')}
                 </div>
                 <div style={{ display: 'flex', gap: 6 }}>
                   <button
@@ -209,14 +212,14 @@ export default function MemoryPage() {
                     style={{ fontSize: 11 }}
                     onClick={() => onConfirmForget(a.id)}
                   >
-                    确认撤回
+                    {t('retract.confirm')}
                   </button>
                   <button
                     className="btn"
                     style={{ fontSize: 11 }}
                     onClick={() => setConfirmingId(null)}
                   >
-                    取消
+                    {t('retract.cancel')}
                   </button>
                 </div>
               </div>
@@ -227,7 +230,7 @@ export default function MemoryPage() {
                   style={{ fontSize: 11 }}
                   onClick={() => setConfirmingId(a.id)}
                 >
-                  撤回
+                  {t('retract.action')}
                 </button>
               </div>
             )}

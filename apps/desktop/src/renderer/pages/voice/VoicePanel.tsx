@@ -33,6 +33,8 @@ import {
 import type { ModelCallEnvelope } from '../../../shared/ipc-types'
 import { formatMs } from '../../../shared/format-latency'
 import { MAX_EVENTS_IN_MEMORY, pushCapped } from '../../../shared/agentearSequencer'
+import { translate, useT } from '../../i18n'
+import { voicePanelMessages } from './VoicePanel.i18n'
 
 /** Mirrors main/model-call-log.ts's own cap — the main process never sends
  *  more than this many anyway, but a defensive local cap keeps this
@@ -49,26 +51,11 @@ const USAGE_POLL_MS = 5000
  *  visible reason. */
 const SPEAK_TEXT_MAX_LENGTH = 2000
 
-const SPEAK_LANGS: { value: 'zh-CN' | 'en-US' | 'th-TH'; label: string }[] = [
-  { value: 'zh-CN', label: '中文' },
-  { value: 'en-US', label: 'English' },
-  { value: 'th-TH', label: 'ไทย' },
+const SPEAK_LANGS: { value: 'zh-CN' | 'en-US' | 'th-TH'; label: 'speak.langChinese' | 'speak.langEnglish' | 'speak.langThai' }[] = [
+  { value: 'zh-CN', label: 'speak.langChinese' },
+  { value: 'en-US', label: 'speak.langEnglish' },
+  { value: 'th-TH', label: 'speak.langThai' },
 ]
-
-const TURN_PHASE_LABELS: Record<string, string> = {
-  listening: '聆听中',
-  thinking: '思考中',
-  speaking: '播报中',
-  idle: '空闲',
-  failed: '失败',
-}
-
-const SPEECH_STATE_LABELS: Record<string, string> = {
-  started: '开始播放',
-  completed: '播放完成',
-  stopped: '已停止',
-  failed: '播放失败',
-}
 
 function isAttached(attach: AttachedView | null): boolean {
   return attach?.attach_status === 'attached'
@@ -117,21 +104,24 @@ function labelFor(table: Record<string, string>, raw: unknown, unknownLabel: str
   return unknownLabel
 }
 
-const TIER_LABELS: Record<string, string> = { local: '本地', remote: '远端' }
-
 /** ME4-desktop-model-ui: the one line shown for EACH of AgentEar's recent
  * `_a24/model/complete` calls — which model, local/remote, how long it took
  * (shared `formatMs` rule: "1,234 ms" once >= 1000, never rounded to
  * seconds), and a failure marker when the call itself didn't succeed.
  * Exported for its unit test. */
 export function formatModelCall(call: ModelCallEnvelope): string {
-  const model = call.model_id ?? '未知模型'
-  const tier = call.tier ? (TIER_LABELS[call.tier] ?? call.tier) : '未知位置'
-  const status = call.ok ? '' : ' · 失败'
+  const model = call.model_id ?? translate(voicePanelMessages, 'model.unknown')
+  const tierLabels: Record<string, string> = {
+    local: translate(voicePanelMessages, 'model.local'),
+    remote: translate(voicePanelMessages, 'model.remote'),
+  }
+  const tier = call.tier ? (tierLabels[call.tier] ?? call.tier) : translate(voicePanelMessages, 'model.locationUnknown')
+  const status = call.ok ? '' : ` · ${translate(voicePanelMessages, 'model.failed')}`
   return `${model} · ${tier} · ${formatMs(call.latency_ms)}${status}`
 }
 
 function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Element {
+  const t = useT(voicePanelMessages)
   const { type } = envelope
   // Guard against `payload` itself not even being an object (null, an
   // array, a primitive) — a malformed envelope from off the wire, not just
@@ -146,12 +136,12 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
     const { shown, truncated, fullLength } = truncateForDisplay(text)
     return (
       <div className="voice-row voice-row-transcript">
-        <span className="voice-row-badge">转写 · {lang}</span>
+        <span className="voice-row-badge">{t('event.transcript', { lang })}</span>
         <span className="voice-row-text">
           {shown}
           {truncated && (
-            <span className="voice-row-truncated" title={`共 ${fullLength} 字，仅显示前 ${shown.length} 字`}>
-              {' '}（已截断，共 {fullLength} 字）
+            <span className="voice-row-truncated" title={t('event.truncatedTitle', { total: fullLength, shown: shown.length })}>
+              {' '}{t('event.truncated', { total: fullLength })}
             </span>
           )}
         </span>
@@ -160,7 +150,7 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   }
 
   if (type === 'turn') {
-    const phaseLabel = labelFor(TURN_PHASE_LABELS, payload.phase, '未知阶段')
+    const phaseLabel = labelFor({ listening: t('turn.listening'), thinking: t('turn.thinking'), speaking: t('turn.speaking'), idle: t('turn.idle'), failed: t('turn.failed') }, payload.phase, t('turn.unknown'))
     // AgentEar PR #102 / agent-speaker v0.26.0: an idle/failed turn may carry
     // a `timings` object — `to_first_audio_ms` ("说完到听到") is the one
     // number worth surfacing right here, next to the turn itself; the fuller
@@ -170,21 +160,21 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
     const toFirstAudioMs = isPlainRecord(timings) ? timings.to_first_audio_ms : undefined
     return (
       <div className="voice-row voice-row-turn">
-        <span className="voice-row-badge">轮次</span>
+        <span className="voice-row-badge">{t('event.turn')}</span>
         <span className="voice-row-text">
           {phaseLabel}
-          {typeof toFirstAudioMs === 'number' && ` · 说完到听到 ${formatMs(toFirstAudioMs)}`}
+          {typeof toFirstAudioMs === 'number' && ` · ${t('event.turnLatency', { duration: formatMs(toFirstAudioMs) })}`}
         </span>
       </div>
     )
   }
 
   if (type === 'speech') {
-    const stateLabel = labelFor(SPEECH_STATE_LABELS, payload.state, '未知状态')
+    const stateLabel = labelFor({ started: t('speech.started'), completed: t('speech.completed'), stopped: t('speech.stopped'), failed: t('speech.failed') }, payload.state, t('speech.unknown'))
     const reason = safeString(payload.reason)
     return (
       <div className="voice-row voice-row-speech">
-        <span className="voice-row-badge">播报</span>
+        <span className="voice-row-badge">{t('event.speech')}</span>
         <span className="voice-row-text">
           {stateLabel}
           {reason && ` · ${reason}`}
@@ -194,11 +184,11 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   }
 
   if (type === 'error') {
-    const code = safeString(payload.code) ?? '未知错误码'
+    const code = safeString(payload.code) ?? t('event.unknownErrorCode')
     const message = safeString(payload.message) ?? ''
     return (
       <div className="voice-row voice-row-error">
-        <span className="voice-row-badge">错误 · {code}</span>
+        <span className="voice-row-badge">{t('event.error', { code })}</span>
         <span className="voice-row-text">{message}</span>
       </div>
     )
@@ -209,10 +199,10 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
     const builtin = isBuiltinProposal(envelope)
     return (
       <div className="voice-row voice-row-proposal">
-        <span className="voice-row-badge">指令</span>
+        <span className="voice-row-badge">{t('event.proposal')}</span>
         <span className="voice-row-text">{text}</span>
         <span className="voice-row-note">
-          {builtin ? '已在 AgentEar 本地执行' : 'P3 前不执行'}
+          {builtin ? t('proposal.builtin') : t('proposal.pending')}
         </span>
       </div>
     )
@@ -222,7 +212,7 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
     const reply = safeString(payload.reply) ?? ''
     return (
       <div className="voice-row voice-row-confirm">
-        <span className="voice-row-badge">确认</span>
+        <span className="voice-row-badge">{t('event.confirm')}</span>
         <span className="voice-row-text">{reply}</span>
       </div>
     )
@@ -249,6 +239,18 @@ interface VoicePanelBoundaryState {
   error: Error | null
 }
 
+function VoicePanelFallback(): JSX.Element {
+  const t = useT(voicePanelMessages)
+  return (
+    <div className="content">
+      <div className="page-title">{t('title')}</div>
+      <div style={{ fontSize: 12, color: '#e05050', padding: '8px 0' }}>
+        {t('boundary.message')}
+      </div>
+    </div>
+  )
+}
+
 class VoicePanelErrorBoundary extends Component<{ children: ReactNode }, VoicePanelBoundaryState> {
   constructor(props: { children: ReactNode }) {
     super(props)
@@ -266,14 +268,7 @@ class VoicePanelErrorBoundary extends Component<{ children: ReactNode }, VoicePa
 
   render(): ReactNode {
     if (this.state.error) {
-      return (
-        <div className="content">
-          <div className="page-title">语音（AgentEar）</div>
-          <div style={{ fontSize: 12, color: '#e05050', padding: '8px 0' }}>
-            语音面板遇到异常数据，已停止渲染以避免影响其他页面。请重新打开本页或稍后重试。
-          </div>
-        </div>
-      )
+      return <VoicePanelFallback />
     }
     return this.props.children
   }
@@ -288,6 +283,7 @@ export default function VoicePanel(): JSX.Element {
 }
 
 function VoicePanelInner(): JSX.Element {
+  const t = useT(voicePanelMessages)
   const [attach, setAttach] = useState<AttachedView | null>(null)
   const [attachChecked, setAttachChecked] = useState(false)
   const [attachError, setAttachError] = useState<string | null>(null)
@@ -415,40 +411,40 @@ function VoicePanelInner(): JSX.Element {
   }
 
   const statusLabel = !attachChecked
-    ? '检测中…'
+    ? t('attachment.checking')
     : attach === null
-      ? '未附着（尚未配对）'
+      ? t('attachment.unpaired')
       : attach.attach_status === 'attached'
-        ? '已附着'
+        ? t('attachment.attached')
         : attach.attach_status === 'disabled'
-          ? '已停用'
-          : '未附着'
+          ? t('attachment.disabled')
+          : t('attachment.detached')
 
   return (
     <div className="content">
-      <div className="page-title">语音（AgentEar）</div>
+      <div className="page-title">{t('title')}</div>
       <div className="page-sub">
-        实时展示 · 最近 {MAX_EVENTS_IN_MEMORY} 条 · 关闭应用即丢，不落盘
+        {t('subtitle', { count: MAX_EVENTS_IN_MEMORY })}
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
         <span
           className={`status-dot ${attached ? 'online' : attach?.attach_status === 'disabled' ? '' : 'offline'}`}
         />
-        <span style={{ fontSize: 12 }}>附着状态：{statusLabel}</span>
+        <span style={{ fontSize: 12 }}>{t('attachment.label', { status: statusLabel })}</span>
         {attach?.generation !== undefined && (
-          <span style={{ fontSize: 11, color: 'var(--muted)' }}>generation {attach.generation}</span>
+          <span style={{ fontSize: 11, color: 'var(--muted)' }}>{t('attachment.generation', { value: attach.generation })}</span>
         )}
         {usage && (
           <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>
-            本地 {totalCalls(usage.local)} 次 · 远端 {totalCalls(usage.remote)} 次
+            {t('usage.summary', { local: totalCalls(usage.local), remote: totalCalls(usage.remote) })}
           </span>
         )}
       </div>
 
       {modelCalls.length > 0 && (
         <div style={{ marginBottom: 12 }}>
-          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>最近模型调用</div>
+          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>{t('model.recent')}</div>
           {[...modelCalls].reverse().map((c, i) => (
             <div key={i} style={{ fontSize: 11, color: 'var(--muted)' }}>
               {formatModelCall(c)}
@@ -459,7 +455,7 @@ function VoicePanelInner(): JSX.Element {
 
       {attachError && (
         <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 8 }}>
-          {attachError}（AgentEar 可能尚未配对）
+          {t('attachment.errorHint', { error: attachError })}
         </div>
       )}
       {commandError && (
@@ -468,19 +464,19 @@ function VoicePanelInner(): JSX.Element {
 
       <div style={{ display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center' }}>
         <select
-          aria-label="语言"
+          aria-label={t('speak.language')}
           value={speakLang}
           onChange={(e) => setSpeakLang(e.target.value as typeof speakLang)}
           style={{ fontSize: 12 }}
           disabled={!attached}
         >
           {SPEAK_LANGS.map((l) => (
-            <option key={l.value} value={l.value}>{l.label}</option>
+            <option key={l.value} value={l.value}>{t(l.label)}</option>
           ))}
         </select>
         <input
-          aria-label="让它说"
-          placeholder="让 AgentEar 说一句…"
+          aria-label={t('speak.label')}
+          placeholder={t('speak.placeholder')}
           value={speakText}
           maxLength={SPEAK_TEXT_MAX_LENGTH}
           onChange={(e) => setSpeakText(e.target.value)}
@@ -501,7 +497,7 @@ function VoicePanelInner(): JSX.Element {
           disabled={!attached || speakText.trim() === ''}
           onClick={() => void onSpeak()}
         >
-          让它说
+          {t('speak.action')}
         </button>
         <button
           className="btn"
@@ -509,20 +505,20 @@ function VoicePanelInner(): JSX.Element {
           disabled={!attached}
           onClick={() => void onStop()}
         >
-          停止播放
+          {t('speak.stop')}
         </button>
       </div>
 
       {lastCommandId && (
         <div style={{ fontSize: 10, color: 'var(--muted)', marginBottom: 8 }}>
-          最近命令：<code>{lastCommandId}</code>
+          {t('speak.lastCommand')}<code>{lastCommandId}</code>
         </div>
       )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
         {events.length === 0 && (
           <div style={{ fontSize: 12, color: 'var(--muted)', padding: '8px 0' }}>
-            暂无事件
+            {t('events.empty')}
           </div>
         )}
         {events.map((e) => (

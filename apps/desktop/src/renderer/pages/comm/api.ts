@@ -1,5 +1,7 @@
 // Typed wrappers for the COMM REST surface. The renderer is sandboxed: every
 // request goes through the existing Electron IPC backend proxy.
+import { translate } from '../../i18n'
+import { communicationMessages } from './Communication.i18n'
 
 export interface CommIdentity {
   nickname: string
@@ -96,7 +98,7 @@ function errorFields(value: unknown, status: number): { message: string; code?: 
       return { message, ...(typeof code === 'string' ? { code } : {}) }
     }
   }
-  return { message: `COMM request failed (HTTP ${status})` }
+  return { message: translate(communicationMessages, 'api.requestFailed', { status }) }
 }
 
 function isProxyResponse(value: unknown): value is ProxyResponse {
@@ -111,25 +113,25 @@ function isProxyResponse(value: unknown): value is ProxyResponse {
 
 function decodeEnvelope<T>(response: unknown, validate: (value: unknown) => value is T): T {
   if (!isProxyResponse(response)) {
-    throw new CommApiError('Invalid backend proxy response', 0)
+    throw new CommApiError(translate(communicationMessages, 'api.invalidProxy'), 0)
   }
   if (!response.ok || response.status >= 400) {
     const fields = errorFields(response.data, response.status)
     throw new CommApiError(fields.message, response.status, fields.code)
   }
   if (!isRecord(response.data)) {
-    throw new CommApiError('Invalid COMM response envelope', response.status)
+    throw new CommApiError(translate(communicationMessages, 'api.invalidEnvelope'), response.status)
   }
   if (response.data['ok'] === false) {
     const fields = errorFields(response.data, response.status)
     throw new CommApiError(fields.message, response.status, fields.code)
   }
   if (response.data['ok'] !== true || !('data' in response.data)) {
-    throw new CommApiError('Invalid COMM response envelope', response.status)
+    throw new CommApiError(translate(communicationMessages, 'api.invalidEnvelope'), response.status)
   }
   const data = response.data['data']
   if (!validate(data)) {
-    throw new CommApiError('Malformed COMM response data', response.status)
+    throw new CommApiError(translate(communicationMessages, 'api.malformedData'), response.status)
   }
   return data
 }
@@ -219,7 +221,7 @@ async function request<T>(
   try {
     response = await window.agent24.backendProxy({ method, path, ...(body === undefined ? {} : { body }) })
   } catch {
-    throw new CommApiError('COMM backend request failed', 0)
+    throw new CommApiError(translate(communicationMessages, 'api.backendFailed'), 0)
   }
   return decodeEnvelope(response, validate)
 }
@@ -287,14 +289,14 @@ export async function unlockComm(password: string, remember = false): Promise<Co
   } catch {
     // IPC/native errors can contain implementation details; keep this path
     // generic so a rejected call can never echo a password into UI text.
-    throw new CommApiError('Unlock request failed', 0)
+    throw new CommApiError(translate(communicationMessages, 'api.unlockFailed'), 0)
   }
 
   try {
     return decodeEnvelope(response, isUnlockResult)
   } catch (error) {
     if (error instanceof CommApiError && password && error.message.includes(password)) {
-      throw new CommApiError('Unlock request failed', error.status, error.code)
+      throw new CommApiError(translate(communicationMessages, 'api.unlockFailed'), error.status, error.code)
     }
     throw error
   }

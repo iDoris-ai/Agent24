@@ -13,6 +13,8 @@
 // `firstTokenMs` stays `null` today (no streaming yet), so only `总计` shows.
 
 import { formatMs } from '../../shared/format-latency'
+import { translate } from '../i18n'
+import { chatMessages } from './Chat.i18n'
 
 export interface ReplyLatency {
   /** `null` when neither the server nor the topbar has a model name to show. */
@@ -25,18 +27,16 @@ export interface ReplyLatency {
   totalMs: number
 }
 
-const TIER_LABELS: Record<'local' | 'remote', string> = { local: '本地', remote: '远端' }
-
 /** The one line shown under an assistant reply. Never throws on a `null`
  *  modelName/tier — it just omits that segment. */
 export function formatReplySuffix(latency: ReplyLatency): string {
   const parts: string[] = []
   if (latency.modelName) parts.push(latency.modelName)
-  if (latency.tier) parts.push(TIER_LABELS[latency.tier])
+  if (latency.tier) parts.push(translate(chatMessages, `latency.${latency.tier}`))
   if (latency.firstTokenMs !== null && latency.firstTokenMs !== latency.totalMs) {
-    parts.push(`首字 ${formatMs(latency.firstTokenMs)}`)
+    parts.push(translate(chatMessages, 'latency.firstToken', { time: formatMs(latency.firstTokenMs) }))
   }
-  parts.push(`总计 ${formatMs(latency.totalMs)}`)
+  parts.push(translate(chatMessages, 'latency.total', { time: formatMs(latency.totalMs) }))
   return parts.join(' · ')
 }
 

@@ -1,0 +1,109 @@
+=== page 1 ===
+Self Assessment
+tax returns
+Contents
+—
+—
+—
+—
+—
+—
+—
+—
+—
+—
+—
+Overview
+(/self-assessment-tax-returns)
+Who must send a tax return
+(/self-assessment-tax-returns/who-must-send-a-tax-return)
+Registering for Self Assessment
+(/self-assessment-tax-returns/registering)
+Sending a return
+(/self-assessment-tax-returns/sending-return)
+If you no longer need to send a tax return
+(/self-assessment-tax-returns/no-longer-need-to-send-a-tax-return)
+Deadlines
+Penalties
+(/self-assessment-tax-returns/penalties)
+If you need to change your return
+(/self-assessment-tax-returns/corrections)
+Claiming a tax refund
+(/self-assessment-tax-returns/claiming-a-tax-refund)
+How to get help
+(/self-assessment-tax-returns/get-help)
+Returns for someone who has died
+(/self-assessment-tax-returns/returns-for-someone-who-has-died)
+Deadlines
+=== page 2 ===
+HM Revenue and Customs (HMRC) must receive your tax return and any
+money you owe by the deadline.
+If you do not know your profit for the whole tax year, you still need to send a
+tax return. Check how to send a return if you do not know your profit for the
+whole year (/self-assessment-tax-returns/sending-return).
+The last tax year started on 6 April 2025 and ended on 5 April 2026. The
+deadline for earlier tax returns has passed and you may have to pay a
+penalty. Send your tax return or payment as soon as possible to avoid
+further penalties.
+Telling HMRC you need to complete a return
+You must tell HMRC by 5 October if you need to complete a tax return for the
+previous year and you have either:
+not sent a tax return before
+registered before but did not need to send a tax return for the tax year 2024
+to 2025
+You can tell HMRC by registering for Self Assessment. Check how to register
+for Self Assessment (/register-for-self-assessment).
+If you register after 5 October 2026
+HMRC will send you a letter or email with a different deadline to send your tax
+return by - this will be 3 months from the date on the letter or email.
+!
+You must still pay the tax you owe by 11:59pm on 31 January 2027
+or you’ll get a penalty (/self-assessment-tax-returns/penalties).
+Sending a paper tax return
+HMRC must receive your paper tax return (/self-assessment-tax-return-forms) by
+11:59pm on 31 October 2026 or you’ll get a late filing penalty (/self-assessment-
+tax-returns/penalties).
+You can send it any time on or after 6 April 2026 as long as HMRC receives it
+by the deadline.
+=== page 3 ===
+Submitting an online tax return
+You must submit your online tax return (/log-in-file-self-assessment-tax-return) by
+11:59pm on 31 January 2027 or you’ll get a late filing penalty (/self-assessment-
+tax-returns/penalties).
+If you want to pay your Self Assessment bill through your tax code (/pay-self-
+assessment-tax-bill/through-your-tax-code), you must submit it by 11:59pm on 30
+December 2026. If you miss this deadline, you’ll have to pay another way.
+You can submit your return any time on or after 6 April 2026 up to the
+deadline.
+Paying the tax you owe
+You need to pay your Self Assessment tax (/pay-self-assessment-tax-bill) by
+11:59pm on 31 January 2027 or you’ll get a penalty (/self-assessment-tax-
+returns/penalties).
+There is a second payment deadline of 31 July if you make payments towards
+your bill - these are known as ‘payments on account (/understand-self-
+assessment-bill/payments-on-account)’
+.
+You can estimate your Self Assessment tax bill (/self-assessment-tax-calculator)
+before sending your tax return to:
+give you an idea of what your bill is likely to be
+allow you to budget and pay on time
+Find help on understanding the tax you owe (/understand-self-assessment-bill).
+Trustees of a registered pension scheme or non-resident
+companies
+HMRC must receive a paper tax return (/self-assessment-tax-return-forms) by 31
+January 2027. You cannot send a return online.
+You can send it any time on or after 6 April 2026 as long as HMRC receives it
+by the deadline.
+Partnership returns if you have a company as a partner
+=== page 4 ===
+If your partnership’s accounting date is between 1 February and 5 April and
+one of your partners is a limited company, the deadline for:
+online returns is 12 months from the accounting date
+paper returns is 9 months from the accounting date
+Previous
+If you no longer need to send a tax return (/self-assessment-tax-
+returns/no-longer-need-to-send-a-tax-return)
+Next
+Penalties (/self-assessment-tax-returns/penalties)
+View a printable version of the whole guide (/self-assessment-tax-returns/print)
+All content is available under the Open Government Licence v3.0, except where otherwise stated © Crown copyright

@@ -2,17 +2,20 @@
 import { useState, useEffect, useRef } from 'react'
 import type { DiscoveredModule, ModuleInfo, TrustTier } from '../../shared/ipc-types'
 import { listOsModules, setOsModuleEnabled, type DomainOsView } from './agent/api'
+import { useT } from '../i18n'
+import { modulesManagerMessages } from './ModulesManager.i18n'
 
 // M4 marketplace: trust-tier chips (roadmap 官方 / 社区 / 第三方).
-const TIER_META: Record<TrustTier, { label: string; color: string }> = {
-  official: { label: '官方', color: '#4caf50' },
-  community: { label: '社区', color: '#2196f3' },
-  'third-party': { label: '第三方', color: '#ff9800' },
+const TIER_META: Record<TrustTier, { color: string }> = {
+  official: { color: '#4caf50' },
+  community: { color: '#2196f3' },
+  'third-party': { color: '#ff9800' },
 }
 type TierFilter = 'all' | TrustTier
 type InstalledFilter = 'all' | 'installed' | 'available'
 
 export default function ModulesManagerPage() {
+  const t = useT(modulesManagerMessages)
   const [modules, setModules] = useState<ModuleInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [toggling, setToggling] = useState<string | null>(null)
@@ -65,7 +68,7 @@ export default function ModulesManagerPage() {
     } catch {
       if (seq === loadSeq.current) {
         setModules([])
-        setError('加载模块列表失败，请重试')
+        setError(t('error.loadModules'))
       }
     } finally {
       if (seq === loadSeq.current) setLoading(false)
@@ -82,10 +85,10 @@ export default function ModulesManagerPage() {
       if (result.ok) {
         await load()
       } else {
-        setError(`${mod.enabled ? '停用' : '启用'} ${mod.name} 失败`)
+        setError(t('error.toggle', { action: t(mod.enabled ? 'action.disable' : 'action.enable'), name: mod.name }))
       }
     } catch {
-      setError(`切换 ${mod.name} 时网络错误`)
+      setError(t('error.toggleNetwork', { name: mod.name }))
     } finally {
       setToggling(null)
     }
@@ -104,7 +107,7 @@ export default function ModulesManagerPage() {
     } catch {
       if (seq === loadOsSeq.current) {
         setOsModules([])
-        setOsError('加载 OS 模块列表失败，请重试')
+        setOsError(t('error.loadOs'))
       }
     } finally {
       if (seq === loadOsSeq.current) setOsLoading(false)
@@ -119,7 +122,7 @@ export default function ModulesManagerPage() {
       setOsModules(list.modules)
       setOsRegistryError(list.registry_error ?? null)
     } catch (e) {
-      setOsError(`${mod.enabled ? '停用' : '启用'} ${mod.name} 失败：${e instanceof Error ? e.message : String(e)}`)
+      setOsError(t('error.toggleOs', { action: t(mod.enabled ? 'action.disable' : 'action.enable'), name: mod.name, msg: e instanceof Error ? e.message : String(e) }))
     } finally {
       setOsToggling(null)
     }
@@ -133,14 +136,14 @@ export default function ModulesManagerPage() {
     try {
       const result = await window.agent24.modulesInstall(pkg)
       if (result.ok) {
-        setInstallMsg({ ok: true, text: `✅ 安装成功：${result.id ?? pkg}，已注册到 daemon` })
+        setInstallMsg({ ok: true, text: t('install.ok', { id: result.id ?? pkg }) })
         setInstallPkg('')
         await load()
       } else {
-        setInstallMsg({ ok: false, text: `❌ 安装失败：${result.error ?? '未知错误'}` })
+        setInstallMsg({ ok: false, text: t('install.fail', { error: result.error ?? t('install.unknownError') }) })
       }
     } catch {
-      setInstallMsg({ ok: false, text: '❌ 安装时网络错误' })
+      setInstallMsg({ ok: false, text: t('install.network') })
     } finally {
       setInstalling(false)
     }
@@ -154,10 +157,10 @@ export default function ModulesManagerPage() {
       if (result.ok) {
         await load()
       } else {
-        setError(`卸载 ${mod.name} 失败：${result.error ?? ''}`)
+        setError(t('error.uninstall', { name: mod.name, error: result.error ?? '' }))
       }
     } catch {
-      setError(`卸载 ${mod.name} 时网络错误`)
+      setError(t('error.uninstallNetwork', { name: mod.name }))
     } finally {
       setUninstalling(null)
     }
@@ -177,7 +180,7 @@ export default function ModulesManagerPage() {
     } catch {
       if (seq === browseSeq.current) {
         setDiscovered([])
-        setBrowseError('加载模块市场失败，请重试')
+        setBrowseError(t('error.loadMarket'))
       }
     } finally {
       if (seq === browseSeq.current) setBrowseLoading(false)
@@ -190,23 +193,24 @@ export default function ModulesManagerPage() {
     try {
       const result = await window.agent24.modulesInstall(pkg.packageName)
       if (result.ok) {
-        setInstallMsg({ ok: true, text: `✅ 安装成功：${result.id ?? pkg.packageName}，已注册到 daemon（默认停用，待你确认权限后启用）` })
+        setInstallMsg({ ok: true, text: t('install.okMarket', { id: result.id ?? pkg.packageName }) })
         await Promise.all([load(), browse()]) // refresh installed list + market "installed" flags
       } else {
-        setInstallMsg({ ok: false, text: `❌ 安装失败：${result.error ?? '未知错误'}` })
+        setInstallMsg({ ok: false, text: t('install.fail', { error: result.error ?? t('install.unknownError') }) })
       }
     } catch {
-      setInstallMsg({ ok: false, text: '❌ 安装时网络错误' })
+      setInstallMsg({ ok: false, text: t('install.network') })
     } finally {
       setMarketInstalling(null)
     }
   }
 
   function renderTierChip(tier: TrustTier) {
-    const { label, color } = TIER_META[tier]
+    const { color } = TIER_META[tier]
+    const label = t(`tier.${tier}`)
     return (
       <span
-        title={`信任级：${label}`}
+        title={t('tier.title', { label })}
         style={{
           fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 12, whiteSpace: 'nowrap',
           background: `${color}22`, color, border: `1px solid ${color}44`,
@@ -215,7 +219,7 @@ export default function ModulesManagerPage() {
     )
   }
 
-  const TYPE_LABELS: Record<string, string> = { ui: 'UI', headless: '后台', hybrid: '混合' }
+  const TYPE_LABELS: Record<string, string> = { ui: t('type.ui'), headless: t('type.headless'), hybrid: t('type.hybrid') }
   const TYPE_COLORS: Record<string, string> = { ui: '#4caf50', headless: '#2196f3', hybrid: '#ff9800' }
 
   // Heuristic: bundled modules don't have a packageName convention — community ones do
@@ -243,7 +247,7 @@ export default function ModulesManagerPage() {
                   {mod.permissions.map((p) => (
                     <span
                       key={p}
-                      title="此模块声明需要的权限"
+                      title={t('perm.declared')}
                       style={{
                         fontSize: 9, padding: '1px 6px', borderRadius: 8,
                         background: 'rgba(224,160,32,0.12)', color: '#e0a020',
@@ -273,20 +277,20 @@ export default function ModulesManagerPage() {
                 transition: 'all 0.15s',
               }}
             >
-              {toggling === mod.id ? '…' : mod.enabled ? '启用中' : '已停用'}
+              {toggling === mod.id ? '…' : mod.enabled ? t('mod.enabled') : t('mod.disabled')}
             </button>
             {isCommunity && (
               <button
                 onClick={() => void uninstall(mod, mod.id)}
                 disabled={uninstalling === mod.id || toggling === mod.id}
-                title="卸载此模块"
+                title={t('mod.uninstallTitle')}
                 style={{
                   fontSize: 11, padding: '5px 10px', borderRadius: 20, cursor: 'pointer',
                   background: 'rgba(244,67,54,0.1)', color: '#f44336',
                   border: '1px solid rgba(244,67,54,0.3)', transition: 'all 0.15s',
                 }}
               >
-                {uninstalling === mod.id ? '…' : '卸载'}
+                {uninstalling === mod.id ? '…' : t('mod.uninstall')}
               </button>
             )}
           </div>
@@ -308,10 +312,10 @@ export default function ModulesManagerPage() {
   }
 
   const OS_STATE_META: Record<string, { label: string; color: string }> = {
-    mounted: { label: '已挂载', color: '#4caf50' },
-    disabled: { label: '已停用', color: '#888' },
-    degraded: { label: '降级', color: '#ff9800' },
-    refused: { label: '被拒绝', color: '#f44336' },
+    mounted: { label: t('os.state.mounted'), color: '#4caf50' },
+    disabled: { label: t('os.state.disabled'), color: '#888' },
+    degraded: { label: t('os.state.degraded'), color: '#ff9800' },
+    refused: { label: t('os.state.refused'), color: '#f44336' },
   }
 
   function renderOsModule(mod: DomainOsView) {
@@ -329,10 +333,10 @@ export default function ModulesManagerPage() {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             {mod.restart_required && (
-              <span title="配置已改变，需要重启 daemon 才能生效" style={{
+              <span title={t('os.restartTitle')} style={{
                 fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 12,
                 background: 'rgba(224,160,32,0.12)', color: '#e0a020', border: '1px solid rgba(224,160,32,0.25)',
-              }}>需重启</span>
+              }}>{t('os.restartRequired')}</span>
             )}
             <span style={{
               fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 12,
@@ -348,7 +352,7 @@ export default function ModulesManagerPage() {
                 border: mod.enabled ? '1px solid #4caf5066' : '1px solid var(--border)',
               }}
             >
-              {osToggling === mod.name ? '…' : mod.enabled ? '停用' : '启用'}
+              {osToggling === mod.name ? '…' : mod.enabled ? t('os.disable') : t('os.enable')}
             </button>
           </div>
         </div>
@@ -356,7 +360,7 @@ export default function ModulesManagerPage() {
         {mod.granted.length > 0 && (
           <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             {mod.granted.map((g) => (
-              <span key={g} title="内核授予此模块的能力" style={{
+              <span key={g} title={t('os.grantedTitle')} style={{
                 fontSize: 10, padding: '1px 7px', borderRadius: 8,
                 background: 'rgba(255,255,255,0.06)', color: 'var(--muted)', border: '1px solid var(--border)',
               }}>{g}</span>
@@ -365,7 +369,7 @@ export default function ModulesManagerPage() {
         )}
         {mod.missing_models.length > 0 && (
           <div style={{ fontSize: 11, color: '#f44336', marginTop: 6 }}>
-            缺少模型：{mod.missing_models.join(', ')}
+            {t('os.missingModels', { models: mod.missing_models.join(', ') })}
           </div>
         )}
       </div>
@@ -375,10 +379,10 @@ export default function ModulesManagerPage() {
   return (
     <div className="content">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-        <div className="page-title">模块管理</div>
-        <button className="btn btn-ghost" onClick={() => void load()} style={{ fontSize: 12 }}>↻ 刷新</button>
+        <div className="page-title">{t('title')}</div>
+        <button className="btn btn-ghost" onClick={() => void load()} style={{ fontSize: 12 }}>{t('refresh')}</button>
       </div>
-      <div className="page-sub">安装的能力模块 — 切换启停立即生效，无需重启</div>
+      <div className="page-sub">{t('sub')}</div>
 
       {error && (
         <div style={{ color: '#f44336', fontSize: 12, padding: '8px 12px', marginTop: 8, background: 'rgba(244,67,54,0.1)', borderRadius: 6, border: '1px solid rgba(244,67,54,0.3)' }}>
@@ -389,8 +393,8 @@ export default function ModulesManagerPage() {
       {/* ── FU-90: OS 模块（内核挂载的进程外 domain-OS 模块，如 Sin90）── */}
       <div style={{ marginTop: 16, padding: '14px 18px', background: 'var(--surface2)', borderRadius: 10, border: '1px solid var(--border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-          <div style={{ fontWeight: 600, fontSize: 13 }}>OS 模块（内核挂载）</div>
-          <button className="btn btn-ghost" onClick={() => void loadOs()} style={{ fontSize: 11 }}>↻ 刷新</button>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>{t('os.title')}</div>
+          <button className="btn btn-ghost" onClick={() => void loadOs()} style={{ fontSize: 11 }}>{t('refresh')}</button>
         </div>
         {osError && (
           <div style={{ color: '#f44336', fontSize: 12, padding: '8px 12px', marginBottom: 8, background: 'rgba(244,67,54,0.1)', borderRadius: 6, border: '1px solid rgba(244,67,54,0.3)' }}>
@@ -403,9 +407,9 @@ export default function ModulesManagerPage() {
           </div>
         )}
         {osLoading ? (
-          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0', textAlign: 'center' }}>加载中…</div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0', textAlign: 'center' }}>{t('loading')}</div>
         ) : osModules.length === 0 ? (
-          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0' }}>没有挂载的 OS 模块</div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0' }}>{t('os.empty')}</div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {osModules.map((m) => renderOsModule(m))}
@@ -415,7 +419,7 @@ export default function ModulesManagerPage() {
 
       {/* ── M3: npm install panel ── */}
       <div style={{ marginTop: 16, padding: '14px 18px', background: 'var(--surface2)', borderRadius: 10, border: '1px solid var(--border)' }}>
-        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>从 npm 安装社区模块</div>
+        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>{t('npm.title')}</div>
         <div style={{ display: 'flex', gap: 8 }}>
           <input
             type="text"
@@ -439,7 +443,7 @@ export default function ModulesManagerPage() {
               color: '#2196f3', border: '1px solid rgba(33,150,243,0.4)', cursor: 'pointer',
             }}
           >
-            {installing ? '安装中…' : '安装'}
+            {installing ? t('npm.installing') : t('npm.install')}
           </button>
         </div>
         {installMsg && (
@@ -457,8 +461,8 @@ export default function ModulesManagerPage() {
       {/* ── M4: 模块市场（浏览 + 搜索 + 过滤 + 一键装）── */}
       <div style={{ marginTop: 16, padding: '14px 18px', background: 'var(--surface2)', borderRadius: 10, border: '1px solid var(--border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-          <div style={{ fontWeight: 600, fontSize: 13 }}>模块市场</div>
-          <button className="btn btn-ghost" onClick={() => void browse()} style={{ fontSize: 11 }}>↻ 刷新</button>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>{t('market.title')}</div>
+          <button className="btn btn-ghost" onClick={() => void browse()} style={{ fontSize: 11 }}>{t('refresh')}</button>
         </div>
 
         {/* 搜索框 */}
@@ -466,8 +470,8 @@ export default function ModulesManagerPage() {
           type="text"
           value={browseQuery}
           onChange={(e) => setBrowseQuery(e.target.value)}
-          placeholder="搜索模块名 / 描述…"
-          aria-label="搜索模块市场"
+          placeholder={t('market.searchPlaceholder')}
+          aria-label={t('market.searchLabel')}
           style={{
             width: '100%', boxSizing: 'border-box', padding: '6px 12px', borderRadius: 8, fontSize: 13,
             background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text)', outline: 'none',
@@ -476,14 +480,14 @@ export default function ModulesManagerPage() {
 
         {/* 过滤：信任级 chip + 已装/未装 */}
         <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-          <FilterChip active={tierFilter === 'all'} onClick={() => setTierFilter('all')} label="全部" />
-          {(Object.keys(TIER_META) as TrustTier[]).map((t) => (
+          <FilterChip active={tierFilter === 'all'} onClick={() => setTierFilter('all')} label={t('market.all')} />
+          {(Object.keys(TIER_META) as TrustTier[]).map((tier) => (
             <FilterChip
-              key={t}
-              active={tierFilter === t}
-              onClick={() => setTierFilter(t)}
-              label={TIER_META[t].label}
-              color={TIER_META[t].color}
+              key={tier}
+              active={tierFilter === tier}
+              onClick={() => setTierFilter(tier)}
+              label={t(`tier.${tier}`)}
+              color={TIER_META[tier].color}
             />
           ))}
           <span style={{ width: 1, height: 16, background: 'var(--border)', margin: '0 4px' }} />
@@ -492,7 +496,7 @@ export default function ModulesManagerPage() {
               key={f}
               active={installedFilter === f}
               onClick={() => setInstalledFilter(f)}
-              label={f === 'all' ? '全部' : f === 'available' ? '未装' : '已装'}
+              label={f === 'all' ? t('market.all') : f === 'available' ? t('market.available') : t('market.installed')}
             />
           ))}
         </div>
@@ -504,9 +508,9 @@ export default function ModulesManagerPage() {
           </div>
         )}
         {browseLoading ? (
-          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '16px 0', textAlign: 'center' }}>搜索中…</div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '16px 0', textAlign: 'center' }}>{t('market.searching')}</div>
         ) : discovered.length === 0 ? (
-          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '16px 0', textAlign: 'center' }}>没有匹配的模块</div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, padding: '16px 0', textAlign: 'center' }}>{t('market.empty')}</div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
             {discovered.map((m) => (
@@ -525,18 +529,18 @@ export default function ModulesManagerPage() {
                     <span style={{
                       fontSize: 11, fontWeight: 600, padding: '5px 12px', borderRadius: 20, whiteSpace: 'nowrap',
                       background: 'rgba(76,175,80,0.12)', color: '#4caf50', border: '1px solid rgba(76,175,80,0.3)',
-                    }}>已安装</span>
+                    }}>{t('market.installedBadge')}</span>
                   ) : (
                     <button
                       onClick={() => void installFromMarket(m)}
                       disabled={marketInstalling === m.packageName}
-                      aria-label={`安装 ${m.name}`}
+                      aria-label={t('market.installAria', { name: m.name })}
                       style={{
                         fontSize: 12, fontWeight: 600, padding: '5px 16px', borderRadius: 20, cursor: 'pointer', whiteSpace: 'nowrap',
                         background: 'rgba(33,150,243,0.2)', color: '#2196f3', border: '1px solid rgba(33,150,243,0.4)',
                       }}
                     >
-                      {marketInstalling === m.packageName ? '安装中…' : '安装'}
+                      {marketInstalling === m.packageName ? t('npm.installing') : t('npm.install')}
                     </button>
                   )}
                 </div>
@@ -548,13 +552,13 @@ export default function ModulesManagerPage() {
       </div>
 
       {loading ? (
-        <div style={{ color: 'var(--muted)', fontSize: 13, padding: '24px 0', textAlign: 'center' }}>加载中…</div>
+        <div style={{ color: 'var(--muted)', fontSize: 13, padding: '24px 0', textAlign: 'center' }}>{t('loading')}</div>
       ) : (
         <>
           {/* Builtin modules */}
           {builtinMods.length > 0 && (
             <div style={{ marginTop: 16 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>内置模块</div>
+              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('list.builtin')}</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {builtinMods.map((m) => renderModule(m, false))}
               </div>
@@ -563,9 +567,9 @@ export default function ModulesManagerPage() {
 
           {/* Community modules */}
           <div style={{ marginTop: 16 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>社区模块</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('list.community')}</div>
             {communityMods.length === 0 ? (
-              <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0' }}>暂无已安装的社区模块</div>
+              <div style={{ color: 'var(--muted)', fontSize: 12, padding: '12px 0' }}>{t('list.communityEmpty')}</div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {communityMods.map((m) => renderModule(m, true))}

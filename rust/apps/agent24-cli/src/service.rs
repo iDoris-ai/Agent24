@@ -117,7 +117,13 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 17] = [
+pub const PASSTHROUGH_VARS: [&str; 19] = [
+    // MAINT-03: the data root (`daemon.json`, `agent24.db`, `logs/`, the tool
+    // workspace). Without it a LaunchAgent-started daemon keeps using
+    // `~/.agent24` while the CLI that ran `service install` and the desktop app
+    // look in the override directory, so neither ever finds the daemon. Caught
+    // by `passthrough_list_matches_what_the_daemon_actually_reads`.
+    "AGENT24_DATA_DIR",
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -130,6 +136,9 @@ pub const PASSTHROUGH_VARS: [&str; 17] = [
     // D0-3: decision-model download consent (`GET /api/v1/decide/profile`).
     // Without it a launchd-started daemon always reports effective tier T0.
     "A24_DECIDE_DOWNLOAD_CONSENT",
+    // HW-1: clamps the effective memory budget (GiB) for single-machine tier
+    // simulation; `hardware.json` is written by the daemon at startup.
+    "A24_HW_BUDGET_CAP_GB",
     "A24_APPROVAL_TIMEOUT_SECS",
     "A24_SCHEDULER_TICK_SECS",
     // ME-3a. Missing it meant `agent24 os install` wrote to the override
