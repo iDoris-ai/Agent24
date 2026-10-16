@@ -85,9 +85,6 @@ function ComponentCard({
       </div>
     )
   }
-      </div>
-    )
-  }
 
   if (status.state === 'verifying') {
     return (
