@@ -480,7 +480,7 @@ Rejected { status: u16, message: String },     // friendly_http_error 对 4xx（
   "response_format": { "type": "json_schema",
                        "json_schema": { "name": "…", "schema": { … }, "strict": true } },  // 可选
   "max_tokens": 512,               // 可选，1..=4096，缺省 1024
-  "complexity": "simple" | "complex",   // 可选，缺省 simple；local_only 模块下无效果
+  "complexity": "simple" | "complex",   // 可选，缺省 simple；local_only 模块下不影响选路。显式 "simple" 还会关思考（ME4-S2-thinking；Ollama 自 ME4-S2c 起）
   "request_id": "req_…",           // 可选，§3.4
   "_meta": { … }                   // 可选，宽容，永不被读
 }

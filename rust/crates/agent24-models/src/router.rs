@@ -190,6 +190,34 @@ fn env_local_tier(url: &str) -> Tier {
     }
 }
 
+/// How a `from_env` provider may be asked to skip a reasoning model's
+/// thinking (`CompletionRequest::disable_thinking`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingSwitch {
+    /// Never: the request body stays as it was before the switches existed.
+    None,
+    /// oMLX / mlx-lm-server's `chat_template_kwargs` extension.
+    ChatTemplateKwargs,
+    /// `reasoning_effort: "none"`, which Ollama's OpenAI layer maps to
+    /// thinking off.
+    ReasoningEffort,
+}
+
+/// Review H2: `chat_template_kwargs` is oMLX's own extension, so only oMLX
+/// gets it — being local does not make a backend oMLX. ME4-S2c §4: Ollama gets
+/// `reasoning_effort` by the same rule. Either only when judged local: behind
+/// a remote URL may be any OpenAI-compatible service, which may refuse it.
+/// A function of its own so a test can read it; `from_env` hands back
+/// `dyn ModelProvider`s, which do not say.
+fn thinking_switch(backend: &str, tier: Tier) -> ThinkingSwitch {
+    match backend {
+        _ if !tier.is_local() => ThinkingSwitch::None,
+        "omlx" => ThinkingSwitch::ChatTemplateKwargs,
+        "ollama" => ThinkingSwitch::ReasoningEffort,
+        _ => ThinkingSwitch::None,
+    }
+}
+
 /// The open-enum tier string reported on `/models` for a judged tier.
 fn tier_label(t: Tier) -> &'static str {
     match t {
@@ -300,50 +328,31 @@ impl ModelRouter {
         // v3 N1: a provider labeled Local talks ONLY to its loopback address —
         // no proxy, no redirect. v3 L-e: its reported tier string is the
         // judged tier, not a hard-coded "local".
-        // Review H2: `chat_template_kwargs` (the `enable_thinking: false`
-        // convention) is an oMLX/mlx-lm-server-specific extension — NOT part
-        // of the OpenAI-compatible contract every provider here claims to
-        // speak. Sending it to a hosted/managed OpenAI-compatible endpoint
-        // (a remote provider, or even a local one that isn't actually oMLX)
-        // risks a hard 400 from a strict server. So this is opt-in per
-        // PROVIDER INSTANCE (`allow_ctk`), not derived from `tier` — a
-        // future non-oMLX local provider must NOT inherit it just for being
-        // local.
-        let build = |name: &str,
-                     url: String,
-                     key: Option<String>,
-                     tier: Tier,
-                     allow_ctk: bool|
-         -> Arc<dyn ModelProvider> {
-            let p = crate::OpenAiCompatProvider::new(
-                name,
-                url,
-                key,
-                tier_label(tier),
-                default_model.clone(),
-            );
-            let p = if tier.is_local() {
-                p.loopback_only()
-            } else {
-                p
+        // Review H2, ME4-S2c §4: which thinking switch each one may be sent
+        // is decided per PROVIDER INSTANCE by `thinking_switch`, not by tier.
+        let build =
+            |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
+                let p = crate::OpenAiCompatProvider::new(
+                    name,
+                    url,
+                    key,
+                    tier_label(tier),
+                    default_model.clone(),
+                );
+                let p = if tier.is_local() {
+                    p.loopback_only()
+                } else {
+                    p
+                };
+                let p = match thinking_switch(name, tier) {
+                    ThinkingSwitch::ChatTemplateKwargs => p.supports_chat_template_kwargs(),
+                    ThinkingSwitch::ReasoningEffort => p.supports_reasoning_effort(),
+                    ThinkingSwitch::None => p,
+                };
+                Arc::new(p)
             };
-            let p = if allow_ctk {
-                p.supports_chat_template_kwargs()
-            } else {
-                p
-            };
-            Arc::new(p)
-        };
-        // oMLX only, and only when it actually judged as local (loopback) —
-        // a remote-pointed OMLX_URL never gets it either.
-        let omlx = build(
-            "omlx",
-            omlx_url,
-            Some(omlx_key),
-            omlx_tier,
-            omlx_tier.is_local(),
-        );
-        let ollama = build("ollama", ollama_url, None, ollama_tier, false);
+        let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
+        let ollama = build("ollama", ollama_url, None, ollama_tier);
         let mut router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
         router.default_model = Some(default_model);
         router
@@ -1144,6 +1153,79 @@ mod tests {
         assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// Child: `from_env`'s providers, each asked once with thinking off.
+    #[tokio::test]
+    #[ignore = "child process of from_env_sends_each_backend_its_own_thinking_switch"]
+    async fn switch_child_from_env() {
+        let r = ModelRouter::from_env();
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..Default::default()
+        };
+        let req = CompletionRequest {
+            disable_thinking: true,
+            ..secret_request()
+        };
+        let _ = r.complete(profile, &req, &CancellationToken::new()).await;
+    }
+
+    #[test]
+    fn from_env_sends_each_backend_its_own_thinking_switch() {
+        // J3's wiring: oMLX refuses for now (503), so the router goes on to
+        // Ollama; each body is read as it came.
+        use std::io::{Read, Write};
+        fn stub(reply: String) -> (u16, std::sync::mpsc::Receiver<String>) {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    let Ok(mut s) = s else { continue };
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 65536];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                    }
+                    let text = String::from_utf8_lossy(&got).to_string();
+                    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_owned());
+                    let _ = tx.send(body.unwrap_or_default());
+                    let _ = s.write_all(reply.as_bytes());
+                }
+            });
+            (port, rx)
+        }
+        let busy =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let (omlx_port, omlx) = stub(busy.to_owned());
+        let (ollama_port, ollama) = stub(http_ok());
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "router::tests::switch_child_from_env",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))
+            .env("OLLAMA_URL", format!("http://127.0.0.1:{ollama_port}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let wait = Duration::from_secs(5);
+        let omlx: serde_json::Value =
+            serde_json::from_str(&omlx.recv_timeout(wait).unwrap()).unwrap();
+        let ollama: serde_json::Value =
+            serde_json::from_str(&ollama.recv_timeout(wait).unwrap()).unwrap();
+        assert!(omlx.get("chat_template_kwargs").is_some(), "{omlx}");
+        assert!(omlx.get("reasoning_effort").is_none(), "{omlx}");
+        assert_eq!(ollama["reasoning_effort"], "none", "{ollama}");
+        assert!(ollama.get("chat_template_kwargs").is_none(), "{ollama}");
+    }
+
     #[tokio::test]
     async fn a_loopback_only_provider_does_not_follow_redirects() {
         let (rp, redirected) = thread_stub(http_ok());
@@ -1190,6 +1272,25 @@ mod tests {
     fn from_env_reports_the_judged_tier() {
         assert_eq!(tier_label(env_local_tier("http://0.0.0.0:1")), "remote");
         assert_eq!(tier_label(env_local_tier("http://127.0.0.1:1")), "local");
+    }
+
+    #[test]
+    fn only_a_local_ollama_is_sent_reasoning_effort() {
+        // J3 (ME4-S2c): a local Ollama gets `reasoning_effort`; Ollama
+        // judged remote and oMLX never do.
+        let local = env_local_tier("http://127.0.0.1:11434");
+        let remote = env_local_tier("http://10.0.0.5:11434");
+        assert_eq!(
+            thinking_switch("ollama", local),
+            ThinkingSwitch::ReasoningEffort
+        );
+        assert_eq!(thinking_switch("ollama", remote), ThinkingSwitch::None);
+        assert_eq!(
+            thinking_switch("omlx", local),
+            ThinkingSwitch::ChatTemplateKwargs
+        );
+        assert_eq!(thinking_switch("omlx", remote), ThinkingSwitch::None);
+        assert_eq!(thinking_switch("lmstudio", local), ThinkingSwitch::None);
     }
 
     /// `from_env()`'s own env-var manipulation is exercised only via the
