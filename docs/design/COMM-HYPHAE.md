@@ -355,6 +355,10 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
 | receipt | F4 `intent:"ack"` 加 `status:"working"`（T01 尚无回执候选） |
 | canary | nostr-bridge FU-32 的 canary 正文 |
 
+六类样本之外，T3 还发送一个 `hyphae.group/` 保留前缀消息：当前 COMM 只有 DM
+读取入口，没有 group handler；Hyphae 必须拒绝它进入 DM history，且 runs、模型及模块
+计数保持不变。该负向样本覆盖严格 group 协议与 COMM 的边界，不算作六类 DM 样本。
+
 **结构约束**（M8，COMM-5b）：
 - 测试 `comm_dependency_allowlist` 执行 `cargo metadata --format-version 1`，遍历 `agent24-comm` 的**完整依赖图**（normal 依赖，含传递依赖），断言：
   - 名字以 `agent24-` 开头的包只能是 `agent24-os-proto`、`agent24-domain`、`agent24-protocol`；
@@ -369,7 +373,7 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
 |---|---|---|
 | T1 runner/router 单测 | `agent24-comm`，`--features test-lock-override` | 假二进制（shell 脚本）配合 `HyphaeLock::override_for_test`；用 `tower::ServiceExt::oneshot` 在进程内调 router。覆盖：envelope 0–5、部分成功、超时、口令只经 stdin。**HOME 断言**：假二进制把 `$HOME` 和 `pwd` 回显出来，断言二者都等于 hyphae-home（r2 已验证可行） |
 | T2 zero-run（进程内） | `agent24-comm` | 假二进制在 `history inbox` / `storage outbox list` 中返回六类样本；假 daemon 每 100 ms 打一行日志。**计数后端**：照 `me4_model_blackbox.rs` 的做法，起一个计数 HTTP stub（Python `http.server`，找不到 python3 时测试直接失败，不跳过），并把 `OLLAMA_URL`、`OPENAI_BASE_URL`、`A24_BASE_URL` 都指向它。启动 daemon、各读接口轮询 20 次、stop 之后，断言 stub 请求数为 0 |
-| T3 正对照与真实二进制黑盒 | `apps/agent24d/tests/comm_blackbox.rs` | 运行真实 agent24d，模型后端用同一个计数 stub。(a) 对 F4b 实际使用的 HTTP 路径（`POST /api/v1/sessions` 加 `POST /api/v1/runs`）发一条 plain 消息，断言 stub 请求数 ≥1，且 `GET /api/v1/runs` 条数加 1；**正对照为 0 则整个测试判失败**。(b) `A24_HYPHAE_BIN` 指向 CI 按 lock 构建出的真实 linux-x64 二进制，再起一个 `hyphae-relay`、一个对端 Hyphae：对端向 A 发送六类样本，A 收齐后断言 runs 条数加 0、stub 请求数为 0 |
+| T3 正对照与真实二进制黑盒 | `apps/agent24d/tests/comm_blackbox.rs` | 运行真实 agent24d，模型后端用同一个计数 stub。(a) 对 F4b 实际使用的 HTTP 路径（`POST /api/v1/sessions` 加 `POST /api/v1/runs`）发一条 plain 消息，断言 stub 请求数 ≥1，且 `GET /api/v1/runs` 条数加 1；**正对照为 0 则整个测试判失败**。(b) `A24_HYPHAE_BIN` 指向 CI 按 lock 构建出的真实 linux-x64 二进制，再起一个 `hyphae-relay`、一个对端 Hyphae：对端向 A 发送六类 DM 样本并再发送一个 `hyphae.group/` 保留前缀负向样本；六类可读、保留组消息被拒绝且不进入 DM history，runs 条数加 0、模型与模块请求数为 0 |
 
 **F4b 冻结**（H5，COMM-5a）：
 - **只拦截分派这一步**：在 `InboundBridge.handle` 开头检查 `A24_NOSTR_F4B_INBOUND=1`，未设置就直接返回，不调用 `runToCompletion`。`pollOnce` 的轮询和 `liveness.observe` 照常运行，否则 FU-32 的 canary 永远无法被确认。
@@ -394,7 +398,7 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
 | COMM-3 | T20-B | send、history、outbox 的路由与 CLI；§5.1 分层与 §5.3 呈现字段 | COMM-2a | M | relay 不可达时 send 返回 ok，层级为 L1，`published_to==0`；retry 返回的 event_id 与原 event_id 相等；注入 data `{published_to:1,history_stored:false}` 得到 `partial`，接口中没有重发入口；clear 不带 confirm 被拒 |
 | COMM-4a | T20-B | daemon 监管：启动前置条件、按退出码分类、RestartPolicy、配置变更重启、pid 文件加启动时间的孤儿清理、接入 SHUT-1b、日志 0600 与启动时截断 | COMM-2a | M | kill -9 后按 500 ms、1000 ms 重启，第 5 次熔断；退出码 3 进入 `locked{password_rejected}` 且不重试；修改 relay 后 generation 加 1、失败计数不变；agent24d 被 SIGKILL 后重启，旧的 pgid 被清理；把 pid 文件里的 start_time 改成别的值后，不会误杀；关机后 `records[]` 中有 `comm.hyphae` |
 | COMM-4b | T20-B | 三项状态、手动 probe、catch_up 日志匹配 | COMM-4a | S | relay 停掉时 probe 结果为 `connected:false`；日志中出现 incomplete 行后，状态变为 `incomplete`；任何输入都不会产生 `complete` 状态 |
-| COMM-5b | T20-B | §7 结构约束、T2、T3 | COMM-3, COMM-4a | M | 依赖 allowlist 测试能挡住加了 `reqwest` 的分支（PR 中贴出该分支的失败截图），并对 agent24d 命中 `agent24-agent`；T2 中 stub=0；T3 正对照 runs Δ=1，真实二进制场景 runs Δ=0、stub=0 |
+| COMM-5b | T20-B | §7 结构约束、T2、T3 | COMM-3, COMM-4a | M | 依赖 allowlist 测试能挡住加了 `reqwest` 的分支（PR 中贴出该分支的失败截图），并对 agent24d 命中 `agent24-agent`；T2 中 stub=0；T3 正对照 runs Δ=1，六类 DM 消息被动读取，`hyphae.group/` 消息不进入 DM history，真实二进制场景 runs Δ=0、stub=0 |
 | COMM-6 | T21 | UI：身份、联系人、relay、daemon 状态、锁定状态、导入向导 | COMM-2b, COMM-4b | M | 在 `locked`、`gave_up` 状态或 relay 未配置时，界面不显示绿色；不会出现「补收完成」；UI 不 spawn 进程 |
 | COMM-7 | T22 | UI：收件历史、outbox、重试；§5.3 文案；**双仓联调**（§8.2） | COMM-3, COMM-6 | M | 界面中没有「已送达」；重试按钮只出现在 outbox 条目上；§8.2 全部步骤通过 |
 
