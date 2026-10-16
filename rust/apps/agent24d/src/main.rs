@@ -25,6 +25,7 @@ mod decide_routes;
 mod domain;
 mod events;
 mod events_emit;
+mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
 #[cfg(not(unix))]

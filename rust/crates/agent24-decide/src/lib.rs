@@ -46,7 +46,10 @@ pub mod types;
 
 pub use backend::{BackendOutcome, DecisionBackend, RuleBackend};
 pub use catalog::{CatalogEntry, CatalogError, ModelCatalog, Runtime as CatalogRuntime};
-pub use hw::{Accelerator, FakeHardwareProbe, HardwareProbe, HardwareProfile, SystemProbe};
+pub use hw::{
+    Accelerator, Budget, DiskInfo, FakeHardwareProbe, GpuInfo, HardwareProbe, HardwareProfile,
+    HwLevel, SystemProbe,
+};
 pub use log::{
     DECISION_LOG_SCHEMA_VERSION, DEFAULT_DECISION_LOG_RETENTION_DAYS, DecisionLog,
     DecisionLogError, DeleteSelector, ExportFilter, FinalAction, LogEntry, LoggedLayer,

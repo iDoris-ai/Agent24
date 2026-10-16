@@ -56,7 +56,10 @@ pnpm typecheck && pnpm lint && pnpm test
 改了 `protocol/` 时额外跑 `pnpm lint:openapi` 和 `pnpm gen:api` 并确认无 diff。
 
 ## 提交与 PR
-- commit author 必须是 `jhfnetboy <jhfnetboy@gmail.com>`（CLA 检查），不要把 Codex/AI 写成 author。
+- commit author：
+  - jason 派发给编码代理的任务，author 用 `jhfnetboy <jhfnetboy@gmail.com>`（CLA 检查）；
+  - 已自行签署 CLA 的协作者，用**本人身份**提交本人负责的工作（例如 David：`stoptheworld-java <183781976+stoptheworld-java@users.noreply.github.com>`，负责 Documenting），不改用 jason 的身份；
+  - 任何情况下都不要把 Codex/AI 写成 author，AI 协作只写在 `Co-Authored-By` 尾注里。
 - commit message、PR 标题与正文用中文；标题格式 `<type>(<scope>): <任务ID> —— <摘要>`。
 - 测试先行：验收判据先写成测试并确认它在修复前失败（反面对照），PR body 说明怎么证的。
 - 只修真 bug，不做范围外重构；原型阶段不要过度设计。

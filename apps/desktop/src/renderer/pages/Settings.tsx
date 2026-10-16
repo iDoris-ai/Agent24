@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
+import { LOCALES, isLocale, setLocale, useLocale, useT } from '../i18n'
+import { settingsMessages } from './Settings.i18n'
 
 type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
 type ModelCategory = 'resident' | 'ondemand'
 type TestResult = { ok: boolean; msg: string } | null
+// Our own errors are stored as keys so a later language switch relabels them
+// (and an init request finishing after the switch can't bake in the old
+// language); errors reported by the service are shown verbatim.
+type DetectError = { key: keyof typeof settingsMessages.en } | { raw: string } | null
 
 const CATEGORIES_KEY = 'agent24:model-categories'
 const AUTO_START_PORT = 8088
@@ -25,10 +31,12 @@ export default function SettingsPage() {
   const [omlxPort, setOmlxPort] = useState(String(AUTO_START_PORT))
   const [categories, setCategories] = useState<Record<string, ModelCategory>>(loadCategories)
   const [warmingUp, setWarmingUp] = useState<Record<string, boolean>>({})
-  const [detectError, setDetectError] = useState('')
+  const [detectError, setDetectError] = useState<DetectError>(null)
   const [testResult, setTestResult] = useState<TestResult>(null)
   const testTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const initDone = useRef(false)
+  const locale = useLocale()
+  const t = useT(settingsMessages)
 
   useEffect(() => {
     if (initDone.current) return
@@ -38,7 +46,7 @@ export default function SettingsPage() {
 
   async function initialize() {
     setOmlxStatus('detecting')
-    setDetectError('')
+    setDetectError(null)
     let detected = await window.agent24.omlxDetect()
     if (!detected) {
       // Auto-start oMLX
@@ -60,7 +68,7 @@ export default function SettingsPage() {
       applyDetected(detected.url, detected.apiKey, detected.models)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError('Could not start or connect to AI model service. Fill in the URL below.')
+      setDetectError({ key: 'error.startConnect' })
     }
   }
 
@@ -94,7 +102,7 @@ export default function SettingsPage() {
 
   async function autoDetect() {
     setOmlxStatus('detecting')
-    setDetectError('')
+    setDetectError(null)
     const result = await window.agent24.omlxDetect()
     if (result) {
       setOmlxUrl(result.url)
@@ -102,27 +110,27 @@ export default function SettingsPage() {
       applyDetected(result.url, result.apiKey, result.models)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError('No AI model service detected on ports 8088 / 8000 / 8001')
+      setDetectError({ key: 'error.noService' })
     }
   }
 
   async function testConnection() {
     setTestResult(null)
-    setDetectError('')
+    setDetectError(null)
     setOmlxStatus('detecting')
     const result = await window.agent24.omlxModels(omlxUrl, omlxApiKey)
     if (result.ok) {
       applyDetected(omlxUrl, omlxApiKey, result.models)
-      showTestResult({ ok: true, msg: `Connected — ${result.models.length} model(s)` })
+      showTestResult({ ok: true, msg: t('result.connected', { count: result.models.length }) })
     } else {
       setOmlxStatus('disconnected')
-      showTestResult({ ok: false, msg: result.error ?? 'Connection failed' })
+      showTestResult({ ok: false, msg: result.error ?? t('error.connectionFailed') })
     }
   }
 
   async function startServer() {
     setOmlxStatus('starting')
-    setDetectError('')
+    setDetectError(null)
     const port = parseInt(omlxPort, 10) || AUTO_START_PORT
     const result = await window.agent24.omlxStart(port, omlxApiKey)
     if (result.ok) {
@@ -132,12 +140,12 @@ export default function SettingsPage() {
         const r = await window.agent24.omlxModels(result.url, omlxApiKey)
         if (r.ok) { applyDetected(result.url, omlxApiKey, r.models) }
         else if (++attempts < 5) setTimeout(poll, 2000)
-        else { setOmlxStatus('disconnected'); setDetectError('Service started but not responding — try Auto-detect') }
+        else { setOmlxStatus('disconnected'); setDetectError({ key: 'error.startedUnresponsive' }) }
       }
       setTimeout(poll, 2000)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError(result.error ?? 'Failed to start service')
+      setDetectError(result.error ? { raw: result.error } : { key: 'error.startFailed' })
     }
   }
 
@@ -164,8 +172,8 @@ export default function SettingsPage() {
   const isBusy = omlxStatus === 'detecting' || omlxStatus === 'starting' || omlxStatus === 'stopping'
 
   const statusLabel: Record<OmlxStatus, string> = {
-    detecting: 'Detecting…', connected: 'Connected',
-    disconnected: 'Disconnected', starting: 'Starting…', stopping: 'Stopping…',
+    detecting: t('status.detecting'), connected: t('status.connected'),
+    disconnected: t('status.disconnected'), starting: t('status.starting'), stopping: t('status.stopping'),
   }
   const statusDotColor: Record<OmlxStatus, string> = {
     detecting: '#888', connected: '#4caf50',
@@ -174,12 +182,12 @@ export default function SettingsPage() {
 
   return (
     <div className="content">
-      <div className="page-title">Settings</div>
-      <div className="page-sub">Configure AI model service, backend daemon and app preferences</div>
+      <div className="page-title">{t('page.title')}</div>
+      <div className="page-sub">{t('page.subtitle')}</div>
 
       {/* ── AI Model Service ── */}
       <div className="settings-section">
-        <h3>AI Model Service</h3>
+        <h3>{t('service.title')}</h3>
 
         {/* Status bar */}
         <div className="setting-row" style={{ background: 'var(--surface2)', marginBottom: 2 }}>
@@ -192,22 +200,22 @@ export default function SettingsPage() {
             <span style={{ fontSize: 13 }}>{statusLabel[omlxStatus]}</span>
             {isConnected && (
               <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-                {omlxUrl} · {omlxModels.length} model(s)
+                {omlxUrl} · {t('status.modelCount', { count: omlxModels.length })}
               </span>
             )}
           </div>
           <div style={{ display: 'flex', gap: 6 }}>
             <button className="btn btn-ghost" onClick={autoDetect} disabled={isBusy}
-              style={{ fontSize: 12, padding: '4px 10px' }}>Auto-detect</button>
+              style={{ fontSize: 12, padding: '4px 10px' }}>{t('action.autoDetect')}</button>
             {isConnected ? (
               <button className="btn btn-ghost" onClick={stopServer} disabled={isBusy}
                 style={{ fontSize: 12, padding: '4px 10px', color: '#f44336', borderColor: '#f44336' }}>
-                Stop Service
+                {t('action.stop')}
               </button>
             ) : (
               <button className="btn btn-primary" onClick={startServer} disabled={isBusy}
                 style={{ fontSize: 12, padding: '4px 10px' }}>
-                Start oMLX
+                {t('action.start')}
               </button>
             )}
           </div>
@@ -215,19 +223,19 @@ export default function SettingsPage() {
 
         {detectError && (
           <div style={{ fontSize: 12, color: '#f44336', padding: '6px 18px', marginBottom: 2, background: 'rgba(244,67,54,0.08)', borderRadius: 6 }}>
-            {detectError}
+            {'key' in detectError ? t(detectError.key) : detectError.raw}
           </div>
         )}
 
         {/* URL + Test */}
         <div className="setting-row">
-          <div><label>Service URL</label><p>OpenAI-compatible API endpoint</p></div>
+          <div><label>{t('service.url')}</label><p>{t('service.urlHint')}</p></div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <input type="text" value={omlxUrl} onChange={(e) => setOmlxUrl(e.target.value)}
               style={{ width: 210 }} placeholder="http://127.0.0.1:8088" />
             <button className="btn btn-ghost" onClick={testConnection} disabled={isBusy}
               style={{ fontSize: 12, padding: '4px 10px', whiteSpace: 'nowrap' }}>
-              {isBusy ? 'Testing…' : 'Test'}
+              {isBusy ? t('action.testing') : t('action.test')}
             </button>
             {testResult && (
               <span style={{ fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap', color: testResult.ok ? '#4caf50' : '#f44336' }}>
@@ -239,13 +247,13 @@ export default function SettingsPage() {
 
         {/* API Key + eye */}
         <div className="setting-row">
-          <div><label>API Key</label><p>Leave empty if no auth required</p></div>
+          <div><label>{t('service.apiKey')}</label><p>{t('service.apiKeyHint')}</p></div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <input type={showApiKey ? 'text' : 'password'} value={omlxApiKey}
-              onChange={(e) => setOmlxApiKey(e.target.value)} style={{ width: 180 }} placeholder="optional" />
+              onChange={(e) => setOmlxApiKey(e.target.value)} style={{ width: 180 }} placeholder={t('service.optional')} />
             <button onClick={() => setShowApiKey((v) => !v)}
               style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--muted)', fontSize: 15, padding: '2px 4px', lineHeight: 1 }}
-              title={showApiKey ? 'Hide' : 'Show'}>
+              title={showApiKey ? t('action.hide') : t('action.show')}>
               {showApiKey ? '🙈' : '👁'}
             </button>
           </div>
@@ -254,7 +262,7 @@ export default function SettingsPage() {
         {/* Start port (disconnected only) */}
         {!isConnected && (
           <div className="setting-row">
-            <div><label>Start Port</label><p>Port when clicking "Start oMLX"</p></div>
+            <div><label>{t('service.port')}</label><p>{t('service.portHint')}</p></div>
             <input type="text" value={omlxPort} onChange={(e) => setOmlxPort(e.target.value)} style={{ width: 80 }} />
           </div>
         )}
@@ -263,7 +271,7 @@ export default function SettingsPage() {
         {omlxModels.length > 0 && (
           <div style={{ marginTop: 4 }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', padding: '8px 18px 4px', letterSpacing: '0.6px', textTransform: 'uppercase' }}>
-              Models — category persists across restarts
+              {t('models.heading')}
             </div>
             {omlxModels.map((model) => {
               const cat: ModelCategory = categories[model] ?? 'ondemand'
@@ -285,7 +293,7 @@ export default function SettingsPage() {
                       {model}
                     </span>
                     {isWarmingUp && (
-                      <span style={{ fontSize: 10, color: '#ff9800' }}>loading…</span>
+                      <span style={{ fontSize: 10, color: '#ff9800' }}>{t('models.loading')}</span>
                     )}
                   </div>
                   <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -298,7 +306,7 @@ export default function SettingsPage() {
                         border: cat === 'resident' ? '1px solid #4caf5066' : '1px solid var(--border)',
                       }}
                     >
-                      Resident
+                      {t('models.resident')}
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); setCategory(model, 'ondemand') }}
@@ -309,24 +317,36 @@ export default function SettingsPage() {
                         border: cat === 'ondemand' ? '1px solid #2196f366' : '1px solid var(--border)',
                       }}
                     >
-                      On-demand
+                      {t('models.onDemand')}
                     </button>
                   </div>
                 </div>
               )
             })}
             <div style={{ fontSize: 11, color: 'var(--muted)', padding: '4px 18px 0' }}>
-              <b>Resident</b> — auto-loaded when service starts, stays in memory.&nbsp;
-              <b>On-demand</b> — loaded on first use, evicted by oMLX when idle.
+              <b>{t('models.resident')}</b> — {t('models.residentHint')}&nbsp;
+              <b>{t('models.onDemand')}</b> — {t('models.onDemandHint')}
             </div>
           </div>
         )}
 
         {!isConnected && omlxModels.length === 0 && (
           <div className="setting-row">
-            <span style={{ fontSize: 12, color: 'var(--muted)' }}>Connect to list and configure models</span>
+            <span style={{ fontSize: 12, color: 'var(--muted)' }}>{t('models.connectHint')}</span>
           </div>
         )}
+      </div>
+
+      {/* ── Appearance ── the one global language setting every page follows. */}
+      <div className="settings-section">
+        <h3>{t('appearance.title')}</h3>
+        <div className="setting-row">
+          <div><label htmlFor="settings-language">{t('appearance.language')}</label><p>{t('appearance.languageHint')}</p></div>
+          <select id="settings-language" value={locale}
+            onChange={(e) => { if (isLocale(e.target.value)) setLocale(e.target.value) }}>
+            {LOCALES.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+          </select>
+        </div>
       </div>
 
       {/*

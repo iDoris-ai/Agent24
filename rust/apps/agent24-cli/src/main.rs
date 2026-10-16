@@ -85,6 +85,19 @@ enum Command {
         #[command(subcommand)]
         action: DecideAction,
     },
+    /// Local hardware inspection (HW-1). Does NOT go through the daemon.
+    Hw {
+        #[command(subcommand)]
+        action: HwAction,
+    },
+}
+
+/// `agent24 hw …` (HW-1).
+#[derive(Subcommand)]
+enum HwAction {
+    /// Probe this machine now and print JSON: profile, level, usable_bytes,
+    /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
+    Probe,
 }
 
 /// `agent24 decide …` (D0-2).
@@ -990,23 +1003,24 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     if let Some(done) = os_local(&action).await {
         return done;
     }
-    let ep = match connect().await {
-        Ok(ep) => ep,
-        // The bootstrapping case, and it is the one that matters most: if a domain
-        // OS is what keeps the daemon from starting, "ask the daemon to disable it"
-        // is exactly the advice that cannot work. `os.json` is plain JSON and
-        // nothing stops the user editing it — so say that, with the edit spelled
-        // out, rather than leaving them stuck behind a tool that requires the very
-        // thing that is broken.
-        Err(e) => {
+    let ep = match attach_only().await {
+        Some(ep) => ep,
+        // `connect` would start an ephemeral daemon with an isolated package
+        // root. Its empty catalogue would report false facts about the user's
+        // installed OS packages, so these commands only use a resident daemon.
+        None => {
             let path = agent24_protocol::state_file::state_dir()
                 .map(|d| d.join("os.json").display().to_string())
                 .unwrap_or_else(|| "~/.agent24/os.json".to_owned());
-            return Err(format!(
-                "{e}\n  this command goes through the daemon, which owns os.json. \
-                 If a domain OS is what stops the daemon starting, {}",
+            let hint = format!(
+                "daemon not running; start it with `agent24 daemon start`.\n  {}",
                 offline_hint(&path, &action)
-            ));
+            );
+            if matches!(action, OsAction::List) {
+                println!("{hint}");
+                return Ok(());
+            }
+            return Err(hint);
         }
     };
     let req = match &action {
@@ -1065,6 +1079,17 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// have no need for an abstraction over "which store backs this", because
 /// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
 /// today and for the foreseeable future.
+fn cmd_hw(action: HwAction) -> Result<(), String> {
+    match action {
+        HwAction::Probe => {
+            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
+            let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+            println!("{json}");
+            Ok(())
+        }
+    }
+}
+
 async fn cmd_decide(action: DecideAction) -> Result<(), String> {
     match &action {
         DecideAction::Export { jsonl, .. } => require_jsonl(*jsonl)?,
@@ -2203,6 +2228,7 @@ async fn main() -> std::process::ExitCode {
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
+        Command::Hw { action } => cmd_hw(action),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

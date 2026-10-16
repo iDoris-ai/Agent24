@@ -68,7 +68,8 @@
 
 | crate | 依赖 |
 |---|---|
-| protocol / sidecar-host-protocol / os-fd / os-cwd / worker / comm / **decide** 🟡 | （无内部依赖） |
+| protocol / sidecar-host-protocol / os-fd / os-cwd / worker / comm / **hw** 🟡 | （无内部依赖） |
+| **decide** 🟡 | hw |
 | core、domain、models | protocol |
 | store | core, protocol |
 | workspace | core, protocol, store, os-cwd |
@@ -85,7 +86,7 @@
 | agent24-cli | mcp, os-packages, protocol, store（D0-2：`decide export`/`delete` 直接读写 `agent24.db`，不经过 daemon，见 ADR-034） |
 | agent24-sidecar-host | sidecar-host-protocol（**没有任何 app 依赖它，Desktop 也不调用**） |
 
-依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`decide` 同样没有消费者（D0-1，见下）；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
+依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`decide` 只被 agent24d 的 `GET /api/v1/decide/profile` 消费（D0-1，见下）；`hw` 被 decide / agent24d / agent24-cli 依赖；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
 
 ---
 
@@ -138,6 +139,7 @@
 | `agent24-mcp` | 外部 MCP server 适配 | 外部工具包装成普通 `Tool`，与内建工具走同一条审批流水线 |
 | `agent24-comm` | Hyphae（Nostr）CLI 调用、keystore 串行化、密码存储、REST 路由与 daemon 状态 | 二进制哈希校验、密码只走 stdin（[COMM-HYPHAE](design/COMM-HYPHAE.md)） |
 | `agent24-worker` 🟡 | Python ML Worker（embedding / whisper）的 Rust 侧 wire 契约 + HTTP 客户端 | workspace 内没有任何 crate 依赖它 |
+| `agent24-hw` 🟡 | 硬件探测与内存账（HW-1，[ADR-036](decision.md)，设计 [HW-TIERS](design/HW-TIERS-capability-hardware-matrix.md)）：`HardwareProfile` v2（芯片、统一内存、GPU wired 上限、独显、**全部挂载卷**含外接盘、模型目录所在盘余量、电池）+ `HardwareProbe`/`SystemProbe`/`FakeHardwareProbe` + `HwLevel::L1..L6` + `usable_bytes` 预算（`A24_HW_BUDGET_CAP_GB` 可压低以模拟小内存机） | 只依赖 serde/serde_json/sysinfo，不依赖任何其它内部 crate；外部命令（sysctl/sw_vers/pmset/nvidia-smi）全带 2s 超时、失败为 `None`；agent24d 启动时写 `~/.agent24/hardware.json`，`agent24 hw probe` 打印；**runtimes 未探测、无 HTTP 路由（HW-3）、能力梯/解析器未做** |
 | `agent24-decide` 🟡 | 决策服务（D0-1，[ADR-033](decision.md)）：`DecisionRequest`/`Question`/`Decision` 等类型 + `DecisionBackend` trait + `RuleBackend` + 级联 `DecisionService`；接口形状照 Jev `/v1/systemone`（choice/noul/score + 校准概率）。D0-2（[ADR-034](decision.md)）追加 `log` 模块：决策日志的 `DecisionLog` trait + DTO（`LogEntry`/`OutcomeEntry`/`ExportFilter`/`DeleteSelector`） | 只依赖 serde/serde_json/async-trait/thiserror；不依赖任何其它内部 crate；**D0-1/D0-2 都不接入 agent24d，不改任何现有调用点**；无消费者，等 D1 接线（记住意图 + 召回门控）时才有人实现 `DecisionLog`（预期落在 `agent24d`，ADR-034） |
 
 ### L4 运行时内核 — `agent24-agent`
