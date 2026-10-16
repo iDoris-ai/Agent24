@@ -21,6 +21,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [lints]
 workspace = true

@@ -116,9 +116,9 @@ pub struct CompletionRequest {
     /// special-cases `enable_thinking`), or Ollama's `reasoning_effort:
     /// "none"` (ME4-S2c §4); one that opted into neither sends nothing. A
     /// backend that refuses the field with a 400 is asked again without it.
-    /// The CALLER
-    /// decides when to set this (`_a24/model/complete`'s handler, gated on
-    /// `complexity: simple`) — this crate has no opinion on complexity.
+    /// The CALLER decides when to set this (`_a24/model/complete`'s handler,
+    /// gated on `complexity: simple`) — this crate has no opinion on
+    /// complexity.
     pub disable_thinking: bool,
     /// ME4-S2b: the sampling temperature, sent only when set. `None` leaves
     /// the body byte for byte as before (and Ollama's OpenAI layer then uses
@@ -760,8 +760,11 @@ fn classify(err: &reqwest::Error) -> ModelError {
 /// whole. `is_canceled` is also a request that was never sent: hyper cancels
 /// one still queued when its connection fails or closes ("the message was
 /// never even started", hyper 1.11 `proto/h1/dispatch.rs`), so trying again
-/// later is as safe as after a refused connect. `is_closed` is the answer's
-/// body channel closing because the connection under it went away.
+/// later is as safe as after a refused connect. `is_closed` is the same kind:
+/// the request was handed to a connection whose task had already ended
+/// (hyper 1.11 `client/dispatch.rs` `Sender::poll_ready`; hyper-util 0.1
+/// `legacy/client.rs`, a fresh connection that died before it was ready or a
+/// pooled one that had closed), so it was never sent either.
 fn hung_up(err: &reqwest::Error) -> bool {
     let mut source = std::error::Error::source(err);
     while let Some(e) = source {
@@ -868,24 +871,23 @@ impl ModelProvider for OpenAiCompatProvider {
         // answers as it did before the switch existed, thinking and all,
         // rather than fail every `complexity: "simple"` call. A 400 for any
         // other reason costs one more refusal.
-        let switch = ["chat_template_kwargs", "reasoning_effort"]
-            .into_iter()
-            .find(|k| body.get(k).is_some());
-        match (
-            self.send(&body, req.progress.as_ref(), cancel).await,
-            switch,
-        ) {
-            (Err(ModelError::Rejected { status: 400, .. }), Some(k)) => {
-                tracing::warn!(
-                    "{} refused {k} (HTTP 400); asking again without it",
-                    self.name
-                );
+        const SWITCHES: [&str; 2] = ["chat_template_kwargs", "reasoning_effort"];
+        let switched = SWITCHES.iter().any(|k| body.get(k).is_some());
+        match self.send(&body, req.progress.as_ref(), cancel).await {
+            Err(e @ ModelError::Rejected { status: 400, .. }) if switched => {
+                // A refusal whose error body a cancel cut short is a cancel.
+                if cancel.is_cancelled() {
+                    return Err(ModelError::Cancelled);
+                }
+                tracing::warn!("{e}; asking again without the thinking switch");
                 if let Some(fields) = body.as_object_mut() {
-                    fields.remove(k);
+                    for k in SWITCHES {
+                        fields.remove(k);
+                    }
                 }
                 self.send(&body, req.progress.as_ref(), cancel).await
             }
-            (answer, _) => answer,
+            answer => answer,
         }
     }
 
@@ -1437,6 +1439,44 @@ mod tests {
         (url, asked)
     }
 
+    /// What this thread logs from here on, as text.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+            let logs = Logs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn retries(&self) -> usize {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .matches("asking again without the thinking switch")
+                .count()
+        }
+    }
+
     fn thinking_off(progress: Option<Progress>) -> CompletionRequest {
         CompletionRequest {
             disable_thinking: true,
@@ -1511,8 +1551,10 @@ mod tests {
             ] {
                 let (url, asked) =
                     answers_in_turn(vec![refused("400 Bad Request"), ok.clone()]).await;
+                let (logs, _guard) = Logs::capture();
                 let got = build(url).complete(&thinking_off(progress), &c).await;
                 assert_eq!(got.unwrap().message.content.as_deref(), Some("x"));
+                assert_eq!(logs.retries(), 1, "{key}: the retry is logged");
                 let asked = asked.lock().unwrap().clone();
                 assert_eq!(asked.len(), 2, "{key}: {asked:?}");
                 assert!(asked[0].get(key).is_some(), "{key}: {}", asked[0]);
@@ -1547,6 +1589,62 @@ mod tests {
             );
             assert_eq!(asked.lock().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_both_switches_drops_both_when_refused() {
+        let (url, asked) = answers_in_turn(vec![refused("400 Bad Request"), ok_whole()]).await;
+        let p = OpenAiCompatProvider::new("p", url, None, "local", "qwen3")
+            .supports_chat_template_kwargs()
+            .supports_reasoning_effort();
+        let c = CancellationToken::new();
+        p.complete(&thinking_off(None), &c).await.unwrap();
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2);
+        assert!(asked[0].get("reasoning_effort").is_some(), "{}", asked[0]);
+        assert!(
+            asked[0].get("chat_template_kwargs").is_some(),
+            "{}",
+            asked[0]
+        );
+        for k in ["reasoning_effort", "chat_template_kwargs"] {
+            assert!(asked[1].get(k).is_none(), "{k}: {}", asked[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_cut_short_by_a_cancel_is_not_asked_again() {
+        // The whole path reads a refusal's body until cancelled, then still
+        // reports the refusal: it must not be taken for one to retry.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":";
+                s.write_all(head.as_bytes()).await.unwrap();
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let c = CancellationToken::new();
+        let later = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            later.cancel();
+        });
+        let (logs, _guard) = Logs::capture();
+        let got = p.complete(&thinking_off(None), &c).await;
+        assert!(matches!(got, Err(ModelError::Cancelled)), "{got:?}");
+        assert_eq!(logs.retries(), 0, "a cancel is no refusal to retry");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// The answer of a whole response: what a streamed one's end and the
