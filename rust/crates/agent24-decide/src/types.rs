@@ -240,6 +240,25 @@ pub enum Outcome {
         failed_stage_index: usize,
         failed_backend_kind: BackendKind,
     },
+    /// A layer ran but returned an answer set that failed L2 validation
+    /// (`docs/agent/PLAN-DECIDE-D1-2B-L2-VALIDATION.md`). Terminal like
+    /// `Unavailable`: the malformed set is discarded whole and no later layer
+    /// is called. `failed_stage_index`/`failed_backend_kind` use the same
+    /// zero-based configured-entry identity as `Unavailable`.
+    InvalidResponse {
+        code: String,
+        failed_stage_index: usize,
+        failed_backend_kind: BackendKind,
+    },
+}
+
+/// A [`DecisionRequest`] rejected by L2 validation before any backend ran.
+/// `code` is a stable error code from
+/// `docs/agent/PLAN-DECIDE-D1-2B-L2-VALIDATION.md` (e.g. `empty_questions`).
+/// Serialize-only, like [`Decision`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InvalidRequest {
+    pub code: String,
 }
 
 /// The full result of running a [`DecisionRequest`] through a
