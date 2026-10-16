@@ -1,3 +1,12 @@
 ts	lane	decision	reason
 2026-10-16T13:04:17Z	grokbot	从 origin/ab/decide@4acdc395 新建 baton/grokbot-20261016-a24-d1-2c	按 next 指示；只新增一份契约 md，不动 ab/decide/main 与 mini 分支
 2026-10-16T13:04:17Z	grokbot	task_id/attempt_id 置 null	webhook body 未提供这两个字段，不自行编造
+2026-10-16T13:10:59Z	grokbot	只新增 docs/agent/PLAN-DECIDE-D1-2C-L3-LAYERS.md（9322a9ad），不改代码	predicate 限定只写一份契约文档；全文标为提案，结尾写明"实现须等外部精确 head APPROVE"
+2026-10-16T13:10:59Z	grokbot	ModelRef 上报：DecisionBackend 加带默认 None 的同步 fn model()；evaluate 返回后每阶段恰调一次	源码向后兼容（RuleBackend 与全部 fake 不改即编译）；不改 BackendOutcome/evaluate 签名
+2026-10-16T13:10:59Z	grokbot	逐层轨迹走新增 decide_traced -> Result<TracedDecision, InvalidRequest>，Decision 形状不变；Decision.model 与 Decision.backend 描述同一阶段	默认 model() 下四种 Decision JSON 与 L2 合入后基线逐字节相同；否决给 Decision 加 layers 字段
+2026-10-16T13:10:59Z	grokbot	StageRecord 字段顺序 stage_index/backend/model/outcome/answers/latency_ms；StageOutcome 四种（decided/no_conclusion/unavailable/invalid_response），与 L1 failed_* 及 L2 code 一一对应	每个实际尝试阶段恰一条；layers.len() 由终止阶段确定
+2026-10-16T13:10:59Z	grokbot	新增稳定 code：invalid_model_ref（InvalidResponse，先于答案/Unavailable 解释）与 multi_question_unsupported（LayerLogError）	身份无法如实记录的阶段不能如实入日志；L2 的 14 个 code 与顺序不变
+2026-10-16T13:10:59Z	grokbot	LoggedLayer v1 / schema_version=1 / 存储 / CLI export 不动；logged_layers() 一阶段一条，单题时取 label/p，多题整体报错	v1 一层只有一个 label/p 槽位；不截断不拼接；calibrated 不入日志列为已知局限
+2026-10-16T13:10:59Z	grokbot	耗时口径：仅包住 evaluate() future，as_millis 截断、饱和；总耗时口径不变；Σ层耗时 ≤ 总耗时	不引入可注入时钟；快照前置零
+2026-10-16T13:10:59Z	grokbot	证据：F1–F4 五段 JSON fixture 用临时探针测试（未提交）以真实 serde 输出逐字节比对一致；f32 Display 验证 -1/0.5	cargo test -p agent24-decide --test 临时探针 exit 0；探针文件已删除
+2026-10-16T13:10:59Z	grokbot	L2 实现 #1033 撰写时仍 OPEN 未合入；契约按 #909 形状书写并写明 L3 实现须等 L2 合入	gh pr view 实查：#908/#909 MERGED，#1033 OPEN head 66472b89

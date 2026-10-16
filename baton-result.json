@@ -2,13 +2,22 @@
   "schema": "baton-result/v1",
   "task_id": null,
   "attempt_id": null,
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "4acdc3959c580b87485f137b32d65bfe477489e6",
-  "result_sha": null,
-  "summary": "开始 D1-2c：只写 docs/agent/PLAN-DECIDE-D1-2C-L3-LAYERS.md 契约文档（提案，不改代码）。",
-  "tests": [],
+  "result_sha": "9322a9ad561f7d1348ae910714893e96b293bf2d",
+  "summary": "新增 docs/agent/PLAN-DECIDE-D1-2C-L3-LAYERS.md（D1-2c L3 契约提案，不改代码）：DecisionBackend::model() 默认 None 的向后兼容上报、Decision.model 取值表、decide_traced/TracedDecision/StageRecord/StageOutcome 精确字段与顺序、与 L1 failed_* 和 L2 InvalidResponse 的共存规则、逐层耗时口径、LoggedLayer v1 映射（单题限定）、两个新稳定 code、F1–F4 固定 fixtures 与验收矩阵、JSON 字节兼容承诺、不做的事；结尾写明实现须等外部精确 head APPROVE。",
+  "tests": [
+    {
+      "command": "python3 校验文档内 5 个 json 代码块均可解析",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-decide --test zz_l3_fixture_probe（临时 fixture 字节探针，未提交、已删除）",
+      "exit_code": 0
+    }
+  ],
   "blocker": null,
-  "next": null,
-  "updated_at": "2026-10-16T13:04:17+00:00"
+  "next": "等待外部 PR-Daemon 审查本契约精确 head；L3 实现（D1-2c-T/G）须在 APPROVE 且 L2 实现 #1033 合入后另开任务。本车道不开 PR、不合并。",
+  "updated_at": "2026-10-16T13:10:59+00:00"
 }
