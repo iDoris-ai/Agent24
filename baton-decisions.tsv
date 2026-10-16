@@ -1,0 +1,2 @@
+timestamp	decision	evidence
+2026-10-16T11:38:10Z	started F1 i18n fix on baton/grokbot-20261016-a24-showcase-i18n	base_sha=221cfd432e92bb45cc14a682d9f2465f0344f6db; PR #1023

@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": null,
+  "attempt_id": null,
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "221cfd432e92bb45cc14a682d9f2465f0344f6db",
+  "result_sha": null,
+  "summary": "Starting F1 i18n regression fix for PR #1023 on ab/showcase-download",
+  "tests": [],
+  "blocker": null,
+  "next": null,
+  "updated_at": "2026-10-16T11:38:10Z"
+}
