@@ -98,6 +98,14 @@ enum HwAction {
     /// Probe this machine now and print JSON: profile, level, usable_bytes,
     /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
     Probe,
+    /// Print a nonsecret environment assignment for an independently started
+    /// iDoris. Core reservations are explicit; no daemon is started or owned.
+    IdorisEnv {
+        /// Bytes reserved for voice, decision, embedding and other core models.
+        /// Use the actual allocation; zero must be chosen explicitly.
+        #[arg(long)]
+        core_reserved_bytes: u64,
+    },
 }
 
 /// `agent24 decide …` (D0-2).
@@ -1053,11 +1061,20 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
 /// today and for the foreseeable future.
 fn cmd_hw(action: HwAction) -> Result<(), String> {
+    let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
     match action {
         HwAction::Probe => {
-            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
             let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
             println!("{json}");
+            Ok(())
+        }
+        HwAction::IdorisEnv {
+            core_reserved_bytes,
+        } => {
+            // usable_bytes already accounts for OS and App overhead. Deduct
+            // only the explicit core allocation, and preserve a real zero.
+            let bytes = report.usable_bytes.saturating_sub(core_reserved_bytes);
+            println!("IDORIS_ALLOCATED_BUDGET_BYTES={bytes}");
             Ok(())
         }
     }
