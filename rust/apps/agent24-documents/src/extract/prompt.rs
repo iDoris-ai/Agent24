@@ -350,9 +350,10 @@ pub enum Unanswered {
     Malformed(String),
 }
 
-/// The answer in what the model wrote in `pass` (ME4-S2c §5.1): its thinking
-/// (left open: [`Unanswered::Truncated`]; else up to its last `</think>`) and
-/// a code fence, with what follows the answer in it, cut off.
+/// The answer in what the model wrote in `pass` (ME4-S2c §5.1): thinking at
+/// its start (left open: [`Unanswered::Truncated`]); in the free pass, when
+/// the rest is no answer as it stands, all up to its last `</think>`; and a
+/// code fence, with what follows the answer in it, cut off.
 pub fn unwrapped(text: &str, pass: Pass) -> Result<&str, Unanswered> {
     let mut t = text.trim();
     if let Some(rest) = t.strip_prefix("<think>") {

@@ -176,6 +176,10 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
             assert_eq!(unwrapped(&text, Pass::Free), Ok(after.as_str()), "{text}");
         }
     }
+    // The cost, taken: words after a fenced answer quoting `</think>` cut it,
+    // and the first pass falls to the second.
+    let after = format!("```json\n{a}\n```\nI did not use </think> tags.");
+    assert_eq!(unwrapped(&after, Pass::Free), Ok("tags."));
     // Two ends of thinking, none at its start: the last ends it (L3).
     let twice = format!("I close with </think> then</think>\n{a}");
     assert_eq!(unwrapped(&twice, Pass::Free), Ok(a));
