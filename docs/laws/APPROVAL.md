@@ -95,6 +95,8 @@ MUST 只提供 `approve` / 定向的 `approve_for_target`（当且仅当资格�
 （`agent24-store/src/repo.rs:639-670`）；external 资格三重收窄在 `agent24-policy/src/lib.rs:238-242`
 （`standing_grant_eligible().then_some(standing_target).flatten()`）。K1-6a.5 的 `ConsentGate` 会把具备第一方来源、有效匹配同意和宿主核验语义的 `WriteLocal` 草稿标记为免逐次审批；manifest 的 `reversible_draft` 只是声明。当前工具分发路径尚未接入该核验结构，实际操作路径与可逆语义的宿主核验仍须由调用方提供，缺失时按普通 `WriteLocal` 逐次审批。
 
+**本条 2026-10-08 的修订溯源**（`docs/laws/APPROVAL.md` blob `16db4489` → `244429b0`；jason 于该日授权，依据见 [`ADR-K1-03`](../adr/ADR-K1-03-enable-authorization-trust-revocation.md) 的「K1-6a.5 补遗」）**原先随实现提交 `62218c31` 合入，未走独立法律 PR**，与 [`README.md`](README.md)「改变可观察行为的 PR…**不得**在同一个 PR 里既改法律又改行为」相冲突。2026-10-16 按该条要求补做了**独立的追溯性法律评审**（PR #1031），仅复核上述这段边界变更本身，**未改动本条的 MUST 表述**；本段是该评审留下的记录。
+
 ---
 
 ### L-APPR-6 · 常驻授权挂在 schedule 上，不是会话上
