@@ -116,6 +116,7 @@ fn what_is_added_to_the_instruction_by_window_and_pass() {
 #[test]
 fn the_answer_is_read_inside_thinking_and_a_fence() {
     let a = r#"{"values": {"a": {"missing": {"reason": "not_in_document"}}}}"#;
+    let draft = r#"{"values": {"a": {"missing": {"reason": "blank_in_template"}}}}"#;
     for wrapped in [
         a.to_owned(),
         format!("```json\n{a}\n```"),
@@ -141,6 +142,9 @@ fn the_answer_is_read_inside_thinking_and_a_fence() {
         // Thinking that starts with a quote mark, or quotes `</think>`.
         format!("`status` is a property name</think>\n{a}"),
         format!("<think>I close with </think> then</think>\n{a}"),
+        // A draft in the thinking, fenced or not, is not the answer.
+        format!("```json\n{draft}\n```\nwait</think>\n{a}"),
+        format!("{draft} no</think>\n```json\n{a}\n```"),
     ] {
         assert_eq!(unwrapped(&wrapped), Ok(a), "{wrapped}");
         assert!(parse(&[field("a")], unwrapped(&wrapped).unwrap()).is_ok());

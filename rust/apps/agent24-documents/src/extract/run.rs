@@ -7,8 +7,8 @@
 //! thinking off. There an answer cut off at the token limit is asked again
 //! in two halves of its batch, one not in the shape once more. A window the
 //! model rejects (most likely too long for its context) in both passes is
-//! asked in two halves, unless it took a call before: then the rejection
-//! fails the extraction. A busy or rate-limited kernel is
+//! asked in two halves, unless it took a call for the batch (or the one it
+//! was split from): then the rejection fails. A busy or rate-limited kernel is
 //! waited out, up to two minutes a call; a timeout is retried once; no local
 //! model to answer is asked again after the router's longest cooldown, up to
 //! three minutes of such waiting a call. Every
@@ -264,7 +264,7 @@ impl Run<'_> {
 
     /// The answers for `batch` over `window`, as (window, answers) pieces in
     /// window order, from its first pass or, `fell` there, its second
-    /// (`taken`: a pass on this window was taken).
+    /// (`taken`: a pass for this batch, or the one it was split from, was taken).
     fn answer<'b>(
         &'b mut self,
         window: Window,
@@ -292,7 +292,7 @@ impl Run<'_> {
                     Ok(done) => done,
                     Err(Refused::Failed(f)) => return Err(f),
                     Err(Refused::TooLong) => {
-                        // A call on this window was taken: it is not too long.
+                        // A call for this batch here was taken: not too long.
                         if taken {
                             return Err(Failure::Engine(
                                 "the local model rejected the second pass".into(),

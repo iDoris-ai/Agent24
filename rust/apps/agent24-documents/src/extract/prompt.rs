@@ -352,8 +352,8 @@ pub enum Unanswered {
 }
 
 /// The answer in what the model wrote (ME4-S2c §5.1): its thinking (left
-/// open: [`Unanswered::Truncated`]; opened by the template: up to its last
-/// `</think>`) and a code fence, with what follows the answer in it, cut off.
+/// open: [`Unanswered::Truncated`]; else up to a last `</think>` an answer
+/// follows) and a code fence, with what follows the answer in it, cut off.
 pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
     let mut t = text.trim();
     if let Some(rest) = t.strip_prefix("<think>") {
@@ -362,9 +362,8 @@ pub fn unwrapped(text: &str) -> Result<&str, Unanswered> {
         };
         t = after.trim();
     }
-    if !t.starts_with('{')
-        && !t.starts_with("```")
-        && let Some((_, after)) = t.rsplit_once("</think>")
+    if let Some((_, after)) = t.rsplit_once("</think>")
+        && after.trim_start().starts_with(['{', '`'])
     {
         t = after.trim();
     }
