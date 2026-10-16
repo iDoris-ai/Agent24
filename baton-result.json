@@ -2,13 +2,30 @@
   "schema": "baton-result/v1",
   "task_id": null,
   "attempt_id": null,
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "571190cb52bbd8f4f13b668c1ff6b4f50a44851d",
-  "result_sha": null,
-  "summary": "开始 K1 release 合并树只读复核",
-  "tests": [],
+  "result_sha": "e24b2c84c408462a635f8a19f36950847962bf15",
+  "summary": "已推送独立只读复核报告 docs/agent/REVIEW-kernel-to-main-20261016.md：问1 生命周期 consent 撤销为 fail-open（潜伏，生产暂无 grant 路径）；问2 0015-0017 逐 blob 一致、migrations tree 与 ab/kernel 相同；问3 PASSTHROUGH_VARS=19/state_dir()/#1014/#1015 均保留，LocalOnly 默认化删除 main 远端回退。合前清单 3 项。本报告不是审批。",
+  "tests": [
+    {
+      "command": "cargo test -p agent24-store module_consents",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24-cli passthrough",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24d --bin agent24d consent",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p agent24d --bin agent24d k1review_scratch (临时测试，未提交)",
+      "exit_code": 0
+    }
+  ],
   "blocker": null,
-  "next": null,
-  "updated_at": "2026-10-16T07:26:53+00:00"
+  "next": "交 PR-Daemon / jason 处理报告末尾「必须在合 main 前修掉」3 项",
+  "updated_at": "2026-10-16T07:35:34+00:00"
 }
