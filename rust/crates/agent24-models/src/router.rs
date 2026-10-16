@@ -423,11 +423,25 @@ impl ModelRouter {
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<Served, ModelError> {
+        self.complete_served_with_request_id(profile, req, cancel, None)
+            .await
+    }
+
+    /// Carry an admitted lifecycle id on `X-iDoris-Trace-Id` when iDoris accepts it.
+    /// `X-iDoris-Request-Id` is a fresh idempotency key on every call, with or
+    /// without that id. A missing or rejected id omits the trace header.
+    pub async fn complete_served_with_request_id(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+        request_id: Option<&str>,
+    ) -> Result<Served, ModelError> {
         if let Some(gateway) = &self.idoris {
             return gateway
                 .as_ref()
                 .map_err(|e| ModelError::Provider(e.clone()))?
-                .complete(profile, req, cancel)
+                .complete(profile, req, cancel, request_id)
                 .await;
         }
         let route = self.route(profile, Instant::now());

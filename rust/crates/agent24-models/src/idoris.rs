@@ -31,6 +31,22 @@ fn invalid(message: &str) -> ModelError {
     ModelError::Provider(message.into())
 }
 
+/// iDoris `correlation.rs` rejects a trace id that is blank (`trim` empty),
+/// longer than 128 UTF-16 code units, or contains a control character
+/// (`INVALID_CORRELATION_TRACE_ID`). Omit the header instead of sending one.
+const IDORIS_TRACE_ID_MAX_UTF16_UNITS: usize = 128;
+
+fn correlation_trace_id(raw: &str) -> Option<&str> {
+    if raw.trim().is_empty()
+        || raw.encode_utf16().count() > IDORIS_TRACE_ID_MAX_UTF16_UNITS
+        || raw.chars().any(char::is_control)
+    {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
 fn response_error(error: ModelError) -> ModelError {
     match error {
         ModelError::Cancelled => ModelError::Cancelled,
@@ -81,7 +97,7 @@ impl IdorisClient {
         let response = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
-            response = request.header(AUTHORIZATION, self.key.clone()).send() =>
+            response = request.send() =>
                 response.map_err(|_| ModelError::Unavailable("iDoris unavailable".into()))?,
         };
         let status = response.status();
@@ -134,10 +150,11 @@ impl IdorisClient {
         profile: TaskProfile,
         req: &CompletionRequest,
         cancel: &CancellationToken,
+        request_id: Option<&str>,
     ) -> Result<Served, ModelError> {
         tokio::time::timeout(
             self.request_timeout,
-            self.complete_inner(profile, req, cancel),
+            self.complete_inner(profile, req, cancel, request_id),
         )
         .await
         .map_err(|_| ModelError::Unavailable("iDoris request timed out".into()))?
@@ -148,6 +165,7 @@ impl IdorisClient {
         profile: TaskProfile,
         req: &CompletionRequest,
         cancel: &CancellationToken,
+        request_id: Option<&str>,
     ) -> Result<Served, ModelError> {
         self.identity(cancel).await?;
         let (complexity, role) = match profile.complexity {
@@ -156,17 +174,20 @@ impl IdorisClient {
         };
         // This first consumer supports local-only execution; Any may tighten to local.
         let body = completion_body(req, role, true);
-        let response = self
-            .send(
-                self.client
-                    .post(self.endpoint("/v1/chat/completions"))
-                    .header("X-iDoris-Privacy", "local_only")
-                    .header("X-iDoris-Complexity", complexity)
-                    .header("X-iDoris-Request-Id", uuid::Uuid::new_v4().to_string())
-                    .json(&body),
-                cancel,
-            )
-            .await?;
+        // Request-Id is iDoris's idempotency key: the same id with a different
+        // payload is 409 `request_id_conflict`. One admitted kernel id may bind
+        // many calls, so it travels on Trace-Id and every call mints its own key.
+        let mut call = self
+            .client
+            .post(self.endpoint("/v1/chat/completions"))
+            .header(AUTHORIZATION, self.key.clone())
+            .header("X-iDoris-Privacy", "local_only")
+            .header("X-iDoris-Complexity", complexity)
+            .header("X-iDoris-Request-Id", uuid::Uuid::new_v4().to_string());
+        if let Some(trace_id) = request_id.and_then(correlation_trace_id) {
+            call = call.header("X-iDoris-Trace-Id", trace_id);
+        }
+        let response = self.send(call.json(&body), cancel).await?;
         let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
         if header("x-idoris-served-locality") != Some("loopback") {
             return Err(invalid("iDoris did not attest loopback inference"));
@@ -232,6 +253,7 @@ impl IdorisClient {
             .send(
                 self.client
                     .get(self.endpoint("/v1/models"))
+                    .header(AUTHORIZATION, self.key.clone())
                     .timeout(Duration::from_secs(2)),
                 cancel,
             )
@@ -342,8 +364,31 @@ mod tests {
                 },
                 &request,
                 &cancel,
+                None,
             )
             .await
+    }
+
+    #[test]
+    fn correlation_trace_id_keeps_sendable_ids_and_omits_rejected_ones() {
+        assert_eq!(correlation_trace_id("req_ok"), Some("req_ok"));
+        // iDoris preserves surrounding spaces; only a trim-empty value is blank.
+        assert_eq!(correlation_trace_id("  kept  "), Some("  kept  "));
+        let ascii_max = "a".repeat(128);
+        assert_eq!(correlation_trace_id(&ascii_max), Some(ascii_max.as_str()));
+        assert_eq!(correlation_trace_id(&"a".repeat(129)), None);
+        // U+1F600 is one scalar and two UTF-16 units. 64 of them is the limit.
+        let emoji_max = "😀".repeat(64);
+        assert_eq!(emoji_max.encode_utf16().count(), 128);
+        assert_eq!(correlation_trace_id(&emoji_max), Some(emoji_max.as_str()));
+        assert!(reqwest::header::HeaderValue::from_str(&emoji_max).is_ok());
+        assert_eq!(correlation_trace_id(&format!("{emoji_max}a")), None);
+        for blank in ["", " ", "\t", "\n", "\u{00A0}", "\u{2028}"] {
+            assert_eq!(correlation_trace_id(blank), None, "{blank:?}");
+        }
+        for control in ["bad\u{0000}id", "bad\u{007F}id", "bad\u{0085}id", "a\nb"] {
+            assert_eq!(correlation_trace_id(control), None, "{control:?}");
+        }
     }
 
     #[tokio::test]
