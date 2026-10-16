@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": null,
+  "attempt_id": null,
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "571190cb52bbd8f4f13b668c1ff6b4f50a44851d",
+  "result_sha": null,
+  "summary": "开始 K1 release 合并树只读复核",
+  "tests": [],
+  "blocker": null,
+  "next": null,
+  "updated_at": "2026-10-16T07:26:53+00:00"
+}

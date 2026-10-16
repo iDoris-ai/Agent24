@@ -1,0 +1,3 @@
+ts	lane	decision	reason
+2026-10-16T07:26:53Z	grokbot	从 origin/merge/kernel-to-main-20261016@571190cb 新建 baton/grokbot-20261016-a24-k1review	按 next 指示；只读复核，不改生产代码
+2026-10-16T07:26:53Z	grokbot	task_id/attempt_id 置 null	webhook body 未提供这两个字段，不自行编造
