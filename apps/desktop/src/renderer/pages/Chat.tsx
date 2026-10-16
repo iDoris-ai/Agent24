@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from 'react'
-import { formatReplySuffix, extractServerReported } from './chat-latency'
+import { formatReplySuffix, extractServerReported, type ReplyLatency } from './chat-latency'
 import logoWelcome from '../assets/logo-welcome.png'
+import { useT } from '../i18n'
+import { chatMessages } from './Chat.i18n'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -8,31 +10,18 @@ import logoWelcome from '../assets/logo-welcome.png'
  *  skipped because memory was paused). */
 type MemoryReceipt = 'saved' | 'paused_not_saved' | 'failed'
 
-const MEMORY_RECEIPT_TEXT: Record<MemoryReceipt, string> = {
-  saved: '✓ 已记住，可在「记忆」页查看或撤回',
-  paused_not_saved: '记忆已暂停，这条没有被记住',
-  failed: '记住失败，请稍后重试',
-}
-
 interface Message {
   role: 'user' | 'assistant'
   content: string
   /** ME4-desktop-model-ui: the "model · tier · 首字/总计 ms" line shown under
    *  an assistant reply. Never set on a user message or the error fallback
    *  message (§ below) — only a real, successful reply gets timed. */
-  suffix?: string
+  suffix?: ReplyLatency
   /** M1-T14: the system-provided receipt line shown under an assistant
    *  reply, distinct from (and below) the latency suffix. Never set on a
    *  user message or the error fallback message. */
   memoryReceipt?: MemoryReceipt
 }
-
-const SUGGESTIONS = [
-  '帮我分析一段文字',
-  '用中文总结这篇文章',
-  '写一段产品介绍',
-  '翻译成英文',
-]
 
 // M1-T12: one id per conversation, sent as `session_id` on every
 // `/api/v1/chat` call so the daemon can key D1 personal-memory recall/retain
@@ -46,6 +35,7 @@ export function genChatSessionId(): string {
 }
 
 export default function ChatPage() {
+  const t = useT(chatMessages)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -85,11 +75,19 @@ export default function ChatPage() {
       })
       if (!res.ok) {
         // v1 error envelope { error: { code, message } }
-        const err = (res.data as { error?: { message?: string } } | null)?.error
-        throw new Error(err?.message ?? `HTTP ${res.status}`)
+        const err = (res.data as { error?: { code?: string; message?: string } } | null)?.error
+        // The catch below picks its message by `code`. `proxyToBackend`
+        // answers `backend_not_ready` (503) whenever `getBackendEndpoint()`
+        // is null, i.e. the daemon's ready line never arrived
+        // (apps/desktop/src/main/ipc/index.ts). That is a daemon-startup
+        // failure, not an unreachable model service, so it must not read
+        // like one — 2026-10-16 install acceptance followed the wrong one.
+        const failure = new Error(err?.message ?? `HTTP ${res.status}`) as Error & { code?: string }
+        failure.code = err?.code
+        throw failure
       }
       const totalMs = performance.now() - sentAt
-      const reply = (res.data as { message?: { content?: string } })?.message?.content ?? '（模型未返回内容）'
+      const reply = (res.data as { message?: { content?: string } })?.message?.content ?? t('reply.empty')
       const server = extractServerReported(res.data)
       // M1-T14: a deterministic receipt — present only when this prompt was
       // an explicit "记住…" and session_id was set; absent otherwise.
@@ -103,18 +101,20 @@ export default function ChatPage() {
       // reports the model_id the provider that actually served this call
       // gave, or null when the provider didn't say; either way this suffix
       // reflects what actually happened, never a name that might not be it.
-      const suffix = formatReplySuffix({
+      const suffix: ReplyLatency = {
         modelName: server.modelId,
         tier: server.tier,
         firstTokenMs: server.firstTokenMs,
         totalMs: server.totalMs ?? totalMs,
-      })
+      }
       setMessages(prev => [...prev, { role: 'assistant', content: reply, suffix, memoryReceipt }])
     } catch (e) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: `⚠️ 无法连接到后端服务。\n请确认 oMLX 或 Ollama 已启动，端口 11434 可用。\n\n错误：${String(e)}`,
-      }])
+      // `failure.code` above is the only input: `backend_not_ready` gets the
+      // daemon-startup message, everything else the generic request failure.
+      const content = (e as { code?: string } | null)?.code === 'backend_not_ready'
+        ? t('reply.backendNotReady', { error: String(e) })
+        : t('reply.connectionError', { error: String(e) })
+      setMessages(prev => [...prev, { role: 'assistant', content }])
     } finally {
       setLoading(false)
     }
@@ -134,11 +134,11 @@ export default function ChatPage() {
           <div className="chat-empty">
             <img className="chat-empty-logo" src={logoWelcome} alt="" />
             <h2>Agent24</h2>
-            <p>你的本地 AI 助理，数据不离机</p>
+            <p>{t('welcome.subtitle')}</p>
             <div className="chat-suggestions">
-              {SUGGESTIONS.map(s => (
-                <button key={s} className="suggestion-chip" onClick={() => void send(s)}>
-                  {s}
+              {(['suggestion.analyze', 'suggestion.summarize', 'suggestion.introduce', 'suggestion.translate'] as const).map(key => (
+                <button key={key} className="suggestion-chip" onClick={() => void send(t(key))}>
+                  {t(key)}
                 </button>
               ))}
             </div>
@@ -152,13 +152,13 @@ export default function ChatPage() {
             <div className="message-bubble">
               {m.content}
               {m.suffix && (
-                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{m.suffix}</div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{formatReplySuffix(m.suffix)}</div>
               )}
               {/* M1-T14: a deterministic system line, visually distinct from
                   (and never mistaken for) the model's own reply text. */}
               {m.memoryReceipt && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
-                  {MEMORY_RECEIPT_TEXT[m.memoryReceipt]}
+                  {t(`memory.${m.memoryReceipt}`)}
                 </div>
               )}
             </div>
@@ -167,7 +167,7 @@ export default function ChatPage() {
         {loading && (
           <div className="message assistant">
             <div className="message-avatar">🤖</div>
-            <div className="message-bubble" style={{ color: 'var(--muted)' }}>思考中…</div>
+            <div className="message-bubble" style={{ color: 'var(--muted)' }}>{t('status.thinking')}</div>
           </div>
         )}
         <div ref={bottomRef} />
@@ -177,7 +177,7 @@ export default function ChatPage() {
         <textarea
           ref={textareaRef}
           className="chat-input"
-          placeholder="输入消息… (Enter 发送，Shift+Enter 换行)"
+          placeholder={t('input.placeholder')}
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={handleKeyDown}

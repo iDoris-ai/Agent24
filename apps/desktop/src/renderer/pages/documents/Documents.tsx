@@ -5,22 +5,26 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { components } from '@agent24/api-client'
 import { describeError, getImportState, nudge, startImport, subscribeImport } from './importStore'
+import { useT } from '../../i18n'
+import { documentsMessages } from './Documents.i18n'
 
 type Doc = components['schemas']['Document']
 
-const STATUS_LABELS: Record<string, string> = {
-  queued: '排队中',
-  running: '导入中',
-  cancelling: '取消中',
-  succeeded: '已导入',
-  failed: '导入失败',
-  cancelled: '已取消',
-  interrupted: '已中断',
+const STATUS_LABELS: Record<string, 'status.queued' | 'status.running' | 'status.cancelling' | 'status.succeeded' | 'status.failed' | 'status.cancelled' | 'status.interrupted'> = {
+  queued: 'status.queued',
+  running: 'status.running',
+  cancelling: 'status.cancelling',
+  succeeded: 'status.succeeded',
+  failed: 'status.failed',
+  cancelled: 'status.cancelled',
+  interrupted: 'status.interrupted',
 }
+const STORAGE_UNAVAILABLE = 'storage-unavailable'
 const ALERT = { color: '#e5534b', fontSize: 13, margin: '8px 0' } as const
 const CELL = { padding: '6px 12px 6px 0', borderBottom: '1px solid var(--border)', textAlign: 'left' } as const
 
 export default function DocumentsPage() {
+  const t = useT(documentsMessages)
   const api = window.agent24.documents
   const imp = useSyncExternalStore(subscribeImport, getImportState)
   const [docs, setDocs] = useState<Doc[]>([])
@@ -70,7 +74,7 @@ export default function DocumentsPage() {
     void api.request({ op: 'capabilities' }).then((res) => {
       if (!live) return
       if (!res.ok) setUnavailable(describeError(res))
-      else setUnavailable(res.data.storage.state === 'ready' ? null : '文档存储暂不可用')
+      else setUnavailable(res.data.storage.state === 'ready' ? null : STORAGE_UNAVAILABLE)
     })
     return () => {
       live = false
@@ -99,25 +103,26 @@ export default function DocumentsPage() {
   return (
     <div className="content">
       <div className="page-title" role="heading" aria-level={1}>
-        文档
+        {t('title')}
       </div>
-      <p style={{ color: 'var(--muted)', fontSize: 12 }}>本地单用户：文档只保存在这台电脑上。</p>
+      <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
       {unavailable && (
         <div role="alert" style={ALERT}>
-          {unavailable}
+          {unavailable === STORAGE_UNAVAILABLE ? t('storage.unavailable') : unavailable}
         </div>
       )}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
         <button className="btn btn-primary" onClick={() => void startImport(api)} disabled={importing}>
-          导入文件（PDF、JPEG、PNG）
+          {t('import.button')}
         </button>
         {importing && !job && progress && progress.total > 0 && (
-          <span role="status">上传 {Math.floor((progress.sent / progress.total) * 100)}%</span>
+          <span role="status">{t('import.uploading', { percent: Math.floor((progress.sent / progress.total) * 100) })}</span>
         )}
         {job && (
           <span role="status">
-            {STATUS_LABELS[job.status] ?? job.status}
-            {job.error ? `：${job.error.message}` : ''}
+            {job.error
+              ? t('status.error', { status: STATUS_LABELS[job.status] ? t(STATUS_LABELS[job.status]) : job.status, error: job.error.message })
+              : STATUS_LABELS[job.status] ? t(STATUS_LABELS[job.status]) : job.status}
           </span>
         )}
       </div>
@@ -127,14 +132,14 @@ export default function DocumentsPage() {
         </div>
       )}
       {docs.length === 0 ? (
-        <p style={{ color: 'var(--muted)' }}>还没有文档。</p>
+        <p style={{ color: 'var(--muted)' }}>{t('list.empty')}</p>
       ) : (
         <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
           <thead>
             <tr>
-              <th style={CELL}>标题</th>
-              <th style={CELL}>格式</th>
-              <th style={CELL}>导入时间</th>
+              <th style={CELL}>{t('list.title')}</th>
+              <th style={CELL}>{t('list.format')}</th>
+              <th style={CELL}>{t('list.importedAt')}</th>
             </tr>
           </thead>
           <tbody>
@@ -150,7 +155,7 @@ export default function DocumentsPage() {
       )}
       {more && (
         <button className="btn btn-ghost" onClick={() => void loadMore()} disabled={loadingMore}>
-          加载更多
+          {t('list.loadMore')}
         </button>
       )}
     </div>

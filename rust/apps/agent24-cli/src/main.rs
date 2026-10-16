@@ -85,6 +85,19 @@ enum Command {
         #[command(subcommand)]
         action: DecideAction,
     },
+    /// Local hardware inspection (HW-1). Does NOT go through the daemon.
+    Hw {
+        #[command(subcommand)]
+        action: HwAction,
+    },
+}
+
+/// `agent24 hw …` (HW-1).
+#[derive(Subcommand)]
+enum HwAction {
+    /// Probe this machine now and print JSON: profile, level, usable_bytes,
+    /// reasons. `A24_HW_BUDGET_CAP_GB=<n>` simulates a smaller machine.
+    Probe,
 }
 
 /// `agent24 decide …` (D0-2).
@@ -1039,6 +1052,17 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// have no need for an abstraction over "which store backs this", because
 /// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
 /// today and for the foreseeable future.
+fn cmd_hw(action: HwAction) -> Result<(), String> {
+    match action {
+        HwAction::Probe => {
+            let report = agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new());
+            let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+            println!("{json}");
+            Ok(())
+        }
+    }
+}
+
 async fn cmd_decide(action: DecideAction) -> Result<(), String> {
     match &action {
         DecideAction::Export { jsonl, .. } => require_jsonl(*jsonl)?,
@@ -2177,6 +2201,7 @@ async fn main() -> std::process::ExitCode {
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
+        Command::Hw { action } => cmd_hw(action),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
