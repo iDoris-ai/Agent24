@@ -1,6 +1,6 @@
 # Knowledge 只读接入契约 v1（CONTRACT-READONLY-v1）
 
-> **状态**：**草案（Draft）**，待 jason 或 fork 侧维护者评审（文档 PR，base `ab/weknora`）。评审通过前不授权任何实现。
+> **状态**：**草案（Draft）**，待 fork 侧维护者（David）评审（文档 PR，base `ab/weknora`）。评审通过前不授权任何实现。
 > **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r5 · **日期**：2026-10-17 · **作者**：David Xu
 > **Issue**：#1011（KB-CT-02a），阶段 #1000；探测依据 iDoris-ai/WeKnora#5。
 > **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）。每条规则后方括号里是来源：决策 `[D1]`–`[D8]`（方案 §1），或任务条目与方案章节（如 `[KB-C1-04]`、`[KB-C1-01b-b]`、`[方案 §4]`）。
@@ -53,10 +53,10 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 ## 1. 信任边界
 
 - **R1.1** [D2] 签发权威只在可信服务端一侧，凭据的签发、收窄、撤销都由它完成。**remote 下 Desktop 不持有任何签名密钥**，只持有并出示凭据；local-managed 见 R1.4。
-- **R1.2** [D2+新设] **remote 与共享租户下，租户 HMAC 绝不下发 Desktop**：持有它就能为任意 `sub` 签名（local-managed 的收窄解释见 R1.4，待 jason 确认，§12 #17）。[KB-C4-02a] 平台 API key 在任何 profile 下都不进 Desktop，也不用于知识读取。
+- **R1.2** [D2+新设] **remote 与共享租户下，租户 HMAC 绝不下发 Desktop**：持有它就能为任意 `sub` 签名（local-managed 的收窄解释见 R1.4，§12 #17）。[KB-C4-02a] 平台 API key 在任何 profile 下都不进 Desktop，也不用于知识读取。
   证据：signed_token 要求 `aud=weknora`、exp 必填、HS256（矩阵 #2，`internal/middleware/auth.go:623-626`），剩余有效期不超过 24h、nbf、token 的 tenant_id 与 key 所属租户一致（`:644-651`），之后只取出 `sub`（校验函数 `:613-659`）；租户 Owner 可经 `POST /tenants/:id/api-principal-test-token` 为任意外部主体签发（`internal/handler/tenant.go:1021-1095`）；平台 key 经 X-Tenant-ID 进入任意租户（矩阵 #10，`auth.go:388-408`），创建请求没有 KB 白名单字段，白名单为空（`internal/handler/system.go:101-105`）。
 - **R1.3** [D2] remote：凭据由可信签发服务在验证登录、成员资格、授权之后签发，绑定用户、可撤销、范围受限。签发服务部署在哪、由谁交付与运营**待决**（#992）；决定之前只允许单用户样本与 Mock。
-- **R1.4** [D2+新设] local-managed：实例是本机单用户实例，principal 就是本机唯一用户，签发由本实例完成。**v1 默认**：jason 确认之前（§12 #17），宿主不持有任何能签发凭据的秘密（HMAC、JWT_SECRET、Owner 级凭据），local-managed 只用于受控样本，凭据由实例按 KB-HOST-01 交付。确认之后才放宽为：宿主可以持有**本实例专属**的秘密（含该实例自己的 JWT_SECRET 或 HMAC），只用于本实例，不跨实例、不跨 profile 使用，也不与 remote 共用。Provider 如何取得凭据见 KB-HOST-01 与 #1013②；实例托管见 KB-LITE-01a。
+- **R1.4** [D2+新设] local-managed：实例是本机单用户实例，principal 就是本机唯一用户，签发由本实例完成。宿主可以持有**本实例专属**的秘密（含该实例自己的 JWT_SECRET 或 HMAC），只用于本实例，不跨实例、不跨 profile 使用，也不与 remote 共用（D2 原文"local-managed：宿主只管理本实例专属秘密"；已定，David，2026-10-17，§12 #17）。Provider 如何取得凭据见 KB-HOST-01 与 #1013②；实例托管见 KB-LITE-01a。
   **前提**：KB-LITE-01a（只监听本机、端口回报、握手）与 KB-C1-01（关闭自助注册入口）完成之前，"本机单用户实例"不成立：无头 Lite 默认监听 `0.0.0.0` 并开放自助注册（矩阵 #12、#15）。在此之前 local-managed 只用于受控样本。
 - **R1.5** [D2] 服务端只信凭据里绑定的 principal。`direct` 模式（直接读 `X-External-User-ID`，`auth.go:580-594`）在集成模式下必须拒绝；改 principal Mode 不算撤权手段（矩阵 #11）。
 - **R1.6** [D2] 防重放要求凭据标识配有撤销或消费机制；只有 jti 字段不算防重放。上游 signed_token 无 jti、无单主体撤销（矩阵 #2、#11）。
@@ -356,15 +356,15 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 | 6 | 服务端是否校验 generation。**比方案 §4"两端校验"弱，是临时取舍，交评审裁定**（R7.5） | 服务端只回显 | #1013①②、KB-C1-03 |
 | 7 | 是否在 #1011 列出的 8 类之外补 `invalid_request`、`internal` | 本文补上，评审时确认 | 本 PR 评审 |
 | 8 | `integration.agent24_knowledge` 的键名 | 按本文命名，#1012 可改名但不改语义 | #1012 |
-| 9 | **越界资源与不存在返回相同的 `not_found`**（R2.6）。上游现在区分 404 与 403，改动会改变对外行为 | 按本文：不可区分，防止探测资源是否存在 | 需 jason 确认（不能只凭 fork 维护者批准） |
-| 10 | **部分越界按交集执行并回报 `effective_scope`**（R2.5）。上游白名单是任一越界即整体 403 | 按本文：取交集；交集为空时按 R2.3 拒绝 | 需 jason 确认（不能只凭 fork 维护者批准） |
+| 9 | **越界资源与不存在返回相同的 `not_found`**（R2.6）。上游现在区分 404 与 403，改动会改变对外行为 | 按本文：不可区分，防止探测资源是否存在 | 已定（David，2026-10-17） |
+| 10 | **部分越界按交集执行并回报 `effective_scope`**（R2.5）。上游白名单是任一越界即整体 403 | 按本文：取交集；交集为空时按 R2.3 拒绝 | 已定（David，2026-10-17） |
 | 11 | **`partial` 是成功状态，不是错误码**（R3.4、R6.5）。#1011 原文把 partial 列为错误类别；#1012 的夹具清单要把 partial 从"拒绝例"挪到"成功例" | 按本文：`completeness: "partial"` | 本 PR 评审、#1012 |
 | 12 | **read 也必须带 `scope`**（R2.5、R4.1），目标资源须在 E 内 | 按本文 | 本 PR 评审 |
 | 13 | **服务端端点只接受单一 score_space，Provider 层按 R3.7 补齐与轮转合并** | 按本文 | 本 PR 评审 |
 | 14 | **文档级 read 只比较 `source_revision` 与 `index_build_id`**（R4.3、R4.5），翻页中单个分块被编辑不算 stale | 按本文 | 本 PR 评审 |
 | 15 | 所有标 `[新设]` 的规则 | 按本文 | 本 PR 评审 |
-| 16 | **v1 只收 `text` 分块**（R3.8）：FAQ、图片 OCR / 描述、表格摘要类内容在 v1 搜不到，是用户可见的范围取舍 | 按本文 | 需 jason 确认（不能只凭 fork 维护者批准） |
-| 17 | **local-managed 宿主可否持有本实例的 HMAC / JWT_SECRET**（R1.4），是对 D2"绝不下发"的收窄解释 | 确认前宿主不持有任何能签发凭据的秘密，local-managed 只用于受控样本，凭据由实例按 KB-HOST-01 交付 | 需 jason 确认（不能只凭 fork 维护者批准） |
+| 16 | **v1 只收 `text` 分块**（R3.8）：FAQ、图片 OCR / 描述、表格摘要类内容在 v1 搜不到，是用户可见的范围取舍 | 按本文 | 已定（David，2026-10-17） |
+| 17 | **local-managed 宿主可否持有本实例的 HMAC / JWT_SECRET**（R1.4），是对 D2"绝不下发"的收窄解释 | 可以持有，限本实例专属、只用于本实例（R1.4） | 已定（David，2026-10-17） |
 | 18 | **#1012 的取消夹具**由三部分组成：一条线上成功响应、一条 Provider 本地 `cancelled` 结果、一条"迟到响应被丢弃"的测试用例；不进 Go 端编码测试 | 按本文 | #1012 |
 
 ## 变更记录
@@ -375,3 +375,4 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 - r4（2026-10-17）：按第 4 轮双审互评裁定修订。`chunk_id` 跨构建不稳定（v1 约定），构建变了一律 `anchor_missing`；带 `chunk_id` 的 read 判定统一为 `anchor_missing`，`expected_revision` 可选但须三项齐全，`index_pending` / `index_failed` 只用于文档级 read；v1 不返回编辑后未入索引或索引失败的分块作为 hit，`index_state` 去掉 `failed`；补标 `[新设]`；`partial_failures` 增加 `reason`，E 内不可搜索的 KB 列入 partial，失败单位为 store group；locator 有效条件补齐并改为预留；证据修正（`:337`、knowledge_span `:92-96`、`knowledgebase_search.go:134-137`）；C 缺失与 C 为空集分开；示例措辞；审计中过期/撤销凭据的记录条件；R5.2 类型说明；跨组合并对 `empty_scope` 的处理；R7.6 同步过滤 `partial_failures`；KB 级就绪的聚合规则；#997 的挂靠。影响夹具：是（#1012 尚未建清单）。
 - r5（2026-10-17）：按第 5 轮评审（David 选定三项）修订。带 `chunk_id` 的 read 把文档判定与锚点判定分开：`not_found` 只看文档，分块问题一律 `stale/anchor_missing` 且彼此不可区分，锚点还要求 `index_build_id` 等于活动构建，`chunk_id` 不跨构建复用；空 KB 是成功分支，就绪为 `ready`；全部索引失败的 KB 记 `index_failed`；就绪聚合改为"活动构建里有 v1 范围内的分块"；无分支成功且原因混杂时取最不可重试的一项，`details` 可带 `partial_failures`；local-managed 在 jason 确认前宿主不持有签发秘密；§12 #9、#10、#16、#17 改为需 jason 确认。影响夹具：是（#1012 尚未建清单）。
 - r6（2026-10-17）：按第 6 轮双审互评（David 选定三项，不再审）修订。空 KB 的就绪与成功分支加上基础设施就绪的前提，补 `dependency` 原因并定出就绪原因的优先级；合并结果的 `score` 不可比较，交给 Tool 时去掉；R8.2、R8.4、R3.10、R9.2 补标 `[新设]`。不影响夹具清单，只需在 #1012 增加“基础设施不可用时空 KB 为 `not_ready/dependency`”一例。
+- r7（2026-10-17）：§12 #9、#10、#16、#17 由 David（fork 侧维护者、Knowledge 负责人）确认，不涉及内核接口，无须 jason 确认。#9、#10、#16 按原文；#17 采用确认后的放宽：local-managed 宿主可以持有本实例专属的秘密（R1.4、R1.2 同步）。不影响夹具清单。
