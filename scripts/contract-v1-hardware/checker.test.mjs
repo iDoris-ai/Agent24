@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -89,27 +89,37 @@ test('结构性递归 schema 触发深度保护而非栈溢出', () => {
   assert.throws(() => checkHardwareCompat(d, d), /嵌套过深/)
 })
 
-// ---- CLI 与真实历史（只读公开 Git 历史；子进程 env allowlist + fake HOME） ----
+// ---- CLI 与不可变 Git 对象（不读工作树 openapi；工作树比对只在 run-history.sh） ----
+// 6072fd37 = 6072fd373142eb3dbf1a6a4a3222e6eec82c74f6（仍含 free_disk_bytes）
+// cb11d7bc = cb11d7bc345ce8dfb5c438e4d6cf0d3663e76724（#966 起删除该字段）
 const OLD = 'git:6072fd373142eb3dbf1a6a4a3222e6eec82c74f6:protocol/openapi.yaml'
+const BROKEN_REV = 'cb11d7bc345ce8dfb5c438e4d6cf0d3663e76724'
+const BROKEN = `git:${BROKEN_REV}:protocol/openapi.yaml`
 const tmp = mkdtempSync(join(tmpdir(), 'v1hw-'))
+const gitEnv = { PATH: process.env.PATH, HOME: tmp, XDG_CONFIG_HOME: join(tmp, '.config'), TMPDIR: tmp }
 const cli = (...a) => spawnSync('node', [join(here, 'cli.mjs'), ...a], {
-  cwd: join(here, '..', '..'), encoding: 'utf8',
-  env: { PATH: process.env.PATH, HOME: tmp, XDG_CONFIG_HOME: join(tmp, '.config'), TMPDIR: tmp },
+  cwd: join(here, '..', '..'), encoding: 'utf8', env: gitEnv,
 })
 test.after(() => rmSync(tmp, { recursive: true, force: true }))
 
-test('CLI：真实 6072 → 当前 openapi 预期 RED（free_disk_bytes）', (t) => {
-  const r = cli('--old', OLD, '--new', 'protocol/openapi.yaml')
+test('CLI：6072 → cb11d7bc openapi 预期 RED（free_disk_bytes）', (t) => {
+  const r = cli('--old', OLD, '--new', BROKEN)
   if (r.status === 2) return t.skip(`历史对象不可用: ${r.stderr.trim()}`)
   assert.equal(r.status, 1, r.stdout + r.stderr)
   assert.match(r.stdout, /required-removed .*free_disk_bytes/)
 })
-test('CLI 变异反证：把 free_disk_bytes 加回当前 openapi 副本 → GREEN', (t) => {
-  let text = readFileSync(join(here, '..', '..', 'protocol', 'openapi.yaml'), 'utf8')
+test('CLI 变异反证：cb11 openapi 副本加回 free_disk_bytes → GREEN', (t) => {
+  const show = spawnSync('git', ['show', `${BROKEN_REV}:protocol/openapi.yaml`], {
+    cwd: join(here, '..', '..'), encoding: 'utf8', maxBuffer: 64 << 20, env: gitEnv,
+  })
+  if (show.status !== 0) return t.skip(`历史对象不可用: ${show.stderr.trim()}`)
+  let text = show.stdout
   const req = 'required: [total_mem_bytes, avail_mem_bytes, arch, cpu_cores, accelerator, os]'
-  assert.ok(text.includes(req), '预期的 required 行不存在，fixture 漂移')
+  const osAnchor = '        os:\n          type: string\n          examples: [macos'
+  assert.equal(text.split(req).length - 1, 1, 'cb11 required 锚点应恰好一处')
+  assert.equal(text.split(osAnchor).length - 1, 1, 'cb11 os 锚点应恰好一处')
   text = text.replace(req, 'required: [total_mem_bytes, avail_mem_bytes, arch, cpu_cores, accelerator, free_disk_bytes, os]')
-    .replace('        os:\n          type: string\n          examples: [macos', '        free_disk_bytes:\n          type: integer\n          deprecated: true\n        os:\n          type: string\n          examples: [macos')
+    .replace(osAnchor, `        free_disk_bytes:\n          type: integer\n          deprecated: true\n${osAnchor}`)
   const f = join(tmp, 'restored.yaml'); writeFileSync(f, text)
   const r = cli('--old', OLD, '--new', f)
   if (r.status === 2) return t.skip(`历史对象不可用: ${r.stderr.trim()}`)

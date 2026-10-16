@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 显式入口（不绑定默认 CI）：历史基准 6072fd37 → 当前 protocol/openapi.yaml。
-# 在 a9b 上预期 RED（exit 1，required free_disk_bytes 被删）；恢复候选应使其 exit 0。
+# 显式入口（不绑定默认 CI）：历史基准 6072fd37 → 工作树 protocol/openapi.yaml。
+# 工作树自 #966（cb11d7bc）起预期 RED（exit 1，free_disk_bytes 从 required 与 properties 删除）；恢复候选应使其 exit 0。
 # 用法: scripts/contract-v1-hardware/run-history.sh [新 openapi 路径，默认 protocol/openapi.yaml]
 set -u
 root="$(cd "$(dirname "$0")/../.." && pwd)"
