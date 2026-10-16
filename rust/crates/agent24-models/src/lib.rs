@@ -426,10 +426,12 @@ impl OpenAiCompatProvider {
 
     /// One request with `body` as it is. A streamed one shares the call's
     /// deadline with any request before it; its first-chunk timer is its own.
+    /// A whole one is read within `timeout`.
     async fn send(
         &self,
         body: &Value,
         progress: Option<&Progress>,
+        timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<CompletionResponse, ModelError> {
         if let Some(p) = progress {
@@ -440,7 +442,7 @@ impl OpenAiCompatProvider {
                 self.client
                     .post(format!("{}/v1/chat/completions", self.base_url)),
             )
-            .timeout(self.chat_timeout)
+            .timeout(timeout)
             .json(body)
             .send();
         let response = tokio::select! {
@@ -876,13 +878,17 @@ impl ModelProvider for OpenAiCompatProvider {
         const SWITCHES: [&str; 2] = ["chat_template_kwargs", "reasoning_effort"];
         let switched = SWITCHES.iter().any(|k| body.get(k).is_some());
         let started = std::time::Instant::now();
-        match self.send(&body, req.progress.as_ref(), cancel).await {
+        match self
+            .send(&body, req.progress.as_ref(), self.chat_timeout, cancel)
+            .await
+        {
             Err(e @ ModelError::Rejected { status: 400, .. }) if switched => {
                 // A refusal whose error body a cancel cut short is a cancel.
                 // Without the time for another answer, it stays the refusal
                 // it is: a streamed call by the router's rule for trying the
                 // next provider (less than a stall left), a whole one when
-                // its own timeout already ran out reading it.
+                // its own timeout already ran out reading it. A whole call
+                // asked again has what is left of that timeout, not another.
                 if cancel.is_cancelled() {
                     return Err(ModelError::Cancelled);
                 }
@@ -899,7 +905,8 @@ impl ModelProvider for OpenAiCompatProvider {
                         fields.remove(k);
                     }
                 }
-                self.send(&body, req.progress.as_ref(), cancel).await
+                let left = self.chat_timeout.saturating_sub(started.elapsed());
+                self.send(&body, req.progress.as_ref(), left, cancel).await
             }
             answer => answer,
         }
@@ -1732,13 +1739,15 @@ mod tests {
     async fn a_refusal_with_less_than_a_stall_left_is_not_asked_again() {
         // The router's rule for the next provider: less than a stall left is
         // no time for another answer.
-        let (url, count) = refuses_after(450, true).await;
+        // About 500ms are left when the refusal is read, under a 1s stall;
+        // 500ms more slack before the deadline would turn it into a timeout.
+        let (url, count) = refuses_after(1500, true).await;
         let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
             .supports_reasoning_effort();
         let progress = Some(Progress {
-            deadline: std::time::Instant::now() + Duration::from_millis(600),
-            first_chunk: Duration::from_millis(1000),
-            stall: Duration::from_millis(300),
+            deadline: std::time::Instant::now() + Duration::from_millis(2000),
+            first_chunk: Duration::from_millis(3000),
+            stall: Duration::from_millis(1000),
         });
         let (logs, _guard) = Logs::capture();
         let got = p
@@ -1769,6 +1778,39 @@ mod tests {
         assert_eq!(logs.retries(), 0);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_whole_call_asked_again_has_only_what_is_left_of_its_timeout() {
+        // Refused at 400ms of a 600ms timeout; asked again, the backend says
+        // nothing. The call ends near 600ms, not 400ms + another 600ms.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = vec![];
+            let mut first = true;
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                if std::mem::take(&mut first) {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    s.write_all(refused("400 Bad Request").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort()
+            .with_timeouts(Duration::from_millis(600), Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let got = p
+            .complete(&thinking_off(None), &CancellationToken::new())
+            .await;
+        assert!(matches!(got, Err(ModelError::Unavailable(_))), "{got:?}");
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(900), "{took:?}");
     }
 
     /// The answer of a whole response: what a streamed one's end and the

@@ -1153,6 +1153,79 @@ mod tests {
         assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// Child: `from_env`'s providers, each asked once with thinking off.
+    #[tokio::test]
+    #[ignore = "child process of from_env_sends_each_backend_its_own_thinking_switch"]
+    async fn switch_child_from_env() {
+        let r = ModelRouter::from_env();
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..Default::default()
+        };
+        let req = CompletionRequest {
+            disable_thinking: true,
+            ..secret_request()
+        };
+        let _ = r.complete(profile, &req, &CancellationToken::new()).await;
+    }
+
+    #[test]
+    fn from_env_sends_each_backend_its_own_thinking_switch() {
+        // J3's wiring: oMLX refuses for now (503), so the router goes on to
+        // Ollama; each body is read as it came.
+        use std::io::{Read, Write};
+        fn stub(reply: String) -> (u16, std::sync::mpsc::Receiver<String>) {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    let Ok(mut s) = s else { continue };
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 65536];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                    }
+                    let text = String::from_utf8_lossy(&got).to_string();
+                    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_owned());
+                    let _ = tx.send(body.unwrap_or_default());
+                    let _ = s.write_all(reply.as_bytes());
+                }
+            });
+            (port, rx)
+        }
+        let busy =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let (omlx_port, omlx) = stub(busy.to_owned());
+        let (ollama_port, ollama) = stub(http_ok());
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "router::tests::switch_child_from_env",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))
+            .env("OLLAMA_URL", format!("http://127.0.0.1:{ollama_port}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let wait = Duration::from_secs(5);
+        let omlx: serde_json::Value =
+            serde_json::from_str(&omlx.recv_timeout(wait).unwrap()).unwrap();
+        let ollama: serde_json::Value =
+            serde_json::from_str(&ollama.recv_timeout(wait).unwrap()).unwrap();
+        assert!(omlx.get("chat_template_kwargs").is_some(), "{omlx}");
+        assert!(omlx.get("reasoning_effort").is_none(), "{omlx}");
+        assert_eq!(ollama["reasoning_effort"], "none", "{ollama}");
+        assert!(ollama.get("chat_template_kwargs").is_none(), "{ollama}");
+    }
+
     #[tokio::test]
     async fn a_loopback_only_provider_does_not_follow_redirects() {
         let (rp, redirected) = thread_stub(http_ok());
