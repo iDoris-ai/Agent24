@@ -45,6 +45,7 @@ pub mod service;
 pub mod threshold;
 pub mod tier;
 pub mod types;
+mod validate;
 
 pub use backend::{BackendOutcome, DecisionBackend, RuleBackend};
 pub use catalog::{CatalogEntry, CatalogError, ModelCatalog, Runtime as CatalogRuntime};
@@ -61,6 +62,6 @@ pub use service::DecisionService;
 pub use threshold::{Action, ThresholdBands, ThresholdError};
 pub use tier::{DownloadConsent, Tier, TierDecision, TierPolicy};
 pub use types::{
-    Answer, AnswerValue, BackendKind, Decision, DecisionPoint, DecisionRequest, ModelRef, Outcome,
-    Question, SideEffectClass,
+    Answer, AnswerValue, BackendKind, Decision, DecisionPoint, DecisionRequest, InvalidRequest,
+    ModelRef, Outcome, Question, SideEffectClass,
 };
