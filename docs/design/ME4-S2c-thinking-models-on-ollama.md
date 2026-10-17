@@ -1,6 +1,6 @@
 # ME4-S2c —— Ollama 上的思考模型：抽取先自由作答，不合格再关思考、按 schema 重答
 
-> 状态：**v5.1**。§9 的 Q1–Q3 已定（David，2026-10-16）：采用 A + C，分段提示同片纳入，本轮不提高 `max_tokens` 上限。之后按评审补的规则（§4 的 400 后重发、§5.1 第 2–4 步）请 David 知悉。起草：Documenting 线（DOC-1-18，2026-10-16）。
+> 状态：**v5.2**。§9 的 Q1–Q3 已定（David，2026-10-16）：采用 A + C，分段提示同片纳入，本轮不提高 `max_tokens` 上限。Q4 已定（David，2026-10-17）：J9 第一次未达标，改写分段提示后重测，J9、J10 都达标（§5.3）。之后按评审补的规则（§4 的 400 后重发、§5.1 第 2–4 步）请 David 知悉。起草：Documenting 线（DOC-1-18，2026-10-16）。
 > 设计审查：第 1 轮 Grok REJECT，已在 v2 采纳。第 2 轮 Grok 额度用完、Codex 用量要到 2026-10-22 才恢复，由 Sonnet 5.5 与 Opus 5.5 代审并互评，REJECT，已在 v3 采纳；第 3 轮同样代审，REJECT，已在 v4 采纳；第 4 轮两方 APPROVE，互评后剩下的低严重度意见已在 v5 采纳。见文末「改动记录」。
 > 改到内核的地方有两处行为（§4）：Ollama provider 也要遵守已有的 `disable_thinking`；带关思考字段的请求回 400 时去掉该字段重发一次，这也影响 oMLX 上的调用。没有新的线上字段，协议版本不变。两处都会在 PR 里知会 jason。
 > 依据：2026-10-15、16 在 Modal L40S（Ollama 0.40.4，`qwen3.8:27b`）和本机 Mac mini M4（Ollama 0.40.4，`qwen2.5:7b`）上跑的 S01 全量验收，各组材料见 §2 的表注。
@@ -183,7 +183,7 @@ David 选择保留分段提示、改写措辞后重测（§9 Q4）。新措辞�
 
 > These blocks are only one part of a longer document; the other parts are read separately and the answers combined. Answer from these blocks only. Check every block for each field: when blocks here state it, answer `present` with the value as written and its quotes, or `conflict` if they state different values. Answer `missing` with reason `not_in_document` only when no block here states it; never guess what another part says. Never answer with a value about another item, row, fee or date because it looks similar.
 
-J9、J10 用这一版重跑，门槛不变；结果见第 3 片的证据。
+J9、J10 用这一版重跑，门槛不变，两项都达标：7B 52/115、严重错误 20，27B 83/115、严重错误 2（证据 `docs/documenting/evidence/2026-10-17-s01-s2c-two-pass/`）。
 
 ### 5.4 版本与记录
 
@@ -251,6 +251,8 @@ J9、J10 用这一版重跑，门槛不变；结果见第 3 片的证据。
 - **Q4**（2026-10-17）J9 第一次未达标（严重错误 25 > 21，原因是分段提示的措辞）：保留分段提示，改写一版措辞后重测，门槛不变（§5.3）。没有选的三项是：去掉分段提示、放宽门槛、退回只做 A。
 
 ## 改动记录
+
+**v5.1 → v5.2**（第 3 片，2026-10-17）：J9 第一次未达标（7B 严重错误 25 > 21）。David 选择保留分段提示、改写措辞后重测（§9 Q4）；§5.3 记下原因、新措辞和重测结果。§6 写明门槛卡在第 3 片和不达标时的处理；J9、J10 加「8 份都有抽取结果」，J10 的汇总写进证据 README；§0 的上游 issue 降为「可能相关」，R-d 改用重放判断（#1041）。
 
 **v5 → v5.1**（第 5 轮，Sonnet 5.5 与 Opus 5.5 代审并互评，两方都 APPROVE，互评后只剩低。已到 5 轮上限，只改下面这一处行为相关的措辞，**未再审**；其余低问题记在 issue，见 PR 正文）：
 - 「改到内核的只有一处行为」漏了 400 后重发对 oMLX 的影响：不认 `chat_template_kwargs` 的服务上，AgentEar 的调用从失败变成开着思考作答 → David 定保留重发；状态说明、§4、R-g 写明，§6 第 1 片改为「请求体和重发规则」。
