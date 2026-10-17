@@ -1,0 +1,8 @@
+{ "$comment": "R4.4: document-level read without expected_revision while the first build is still running.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3R4E5F6G7H8J9K0M1N2P3Q", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-8" },
+  "response": { "status": 503, "body": { "error": { "code": "unavailable", "message": "The document is not ready.",
+    "hint": "Check readiness again later.",
+    "details": { "retryable": true, "reason": "index_pending", "retry_after_ms": 2000,
+      "request_id": "01JB3R4E5F6G7H8J9K0M1N2P3Q", "generation": 15 } } } } }
