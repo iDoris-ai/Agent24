@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/v1/common.schema.json",
+  "title": "Agent24 Knowledge v1 — shared definitions",
+  "description": "Machine form of docs/knowledge/CONTRACT-READONLY-v1.md (r8). Every schema under protocol/knowledge/v1 describes what a conforming v1 producer emits, so objects are closed and enums are the v1 sets. Consumers must not use these schemas to reject live messages: they ignore unknown fields and fall back on unknown enum values (contract §0.3, R6.2).",
+  "$defs": {
+    "protocol_version": { "description": "Contract major version (R3.2).", "const": 1 },
+    "request_id": { "description": "Client-generated, unique per request; echoed back (R7.2).", "type": "string", "minLength": 1, "maxLength": 128 },
+    "generation": { "description": "Client generation for the profile x principal binding; echoed, not checked, by the server (R7.2, R7.5).", "type": "integer", "minimum": 0 },
+    "id": { "description": "Opaque server-assigned identifier (R5.2).", "type": "string", "minLength": 1, "maxLength": 256 },
+    "positive_int": { "type": "integer", "minimum": 1 },
+    "chunk_revision": { "description": "Edit count of a chunk, 0 = unedited (R5.2).", "type": "integer", "minimum": 0 },
+    "chunk_type": { "description": "v1 serves text chunks only (R3.8).", "const": "text" },
+    "request_scope": {
+      "description": "Request scope Q (R2.5): required, non-empty; may only narrow.",
+      "type": "object", "required": ["knowledge_base_ids"], "additionalProperties": false,
+      "properties": { "knowledge_base_ids": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/id" } } }
+    },
+    "effective_scope": {
+      "description": "Effective scope E = A ∩ C ∩ Q as executed (R2.1, R2.5); never empty.",
+      "type": "object", "required": ["knowledge_base_ids"], "additionalProperties": false,
+      "properties": { "knowledge_base_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } } }
+    },
+    "doc_revision": {
+      "description": "Document-level revision pair (R4.3, R5.3).",
+      "type": "object", "required": ["source_revision", "index_build_id"], "additionalProperties": false,
+      "properties": { "source_revision": { "$ref": "#/$defs/id" }, "index_build_id": { "$ref": "#/$defs/id" } }
+    },
+    "display": {
+      "description": "Display metadata only: not body text, never a citation (R3.8, R4.2).",
+      "type": "object", "additionalProperties": false,
+      "properties": { "title": { "type": "string", "maxLength": 1024 }, "file_name": { "type": "string", "maxLength": 1024 } }
+    },
+    "partial_failure": {
+      "description": "One failed branch of a search (R3.5, R3.7b). code is a subset of the closed error-code set; timeout pairs only with reason timeout.",
+      "type": "object", "required": ["knowledge_base_id", "code", "reason", "retryable"], "additionalProperties": false,
+      "properties": {
+        "knowledge_base_id": { "$ref": "#/$defs/id" },
+        "code": { "enum": ["timeout", "unavailable"] },
+        "reason": { "enum": ["timeout", "dependency", "not_ready", "overloaded", "index_building", "unsupported_kb_type", "index_failed"] },
+        "retryable": { "type": "boolean" }
+      },
+      "allOf": [
+        { "if": { "properties": { "code": { "const": "timeout" } } }, "then": { "properties": { "reason": { "const": "timeout" } } },
+          "else": { "properties": { "reason": { "not": { "const": "timeout" } } } } },
+        { "if": { "properties": { "reason": { "enum": ["unsupported_kb_type", "index_failed"] } } },
+          "then": { "properties": { "retryable": { "const": false } } }, "else": { "properties": { "retryable": { "const": true } } } }
+      ]
+    }
+  }
+}
