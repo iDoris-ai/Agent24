@@ -168,6 +168,118 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | IT-09 | W4.5 | 中间态期间同组织另一成员调用初始化 | `unavailable/request_in_progress`，带 `retry_after_ms`；不接续、不阻塞 |
 | IT-10 | W4.3 | 归属人用不含新库的旧凭据再次初始化；随后续签 | `existing`，回报 `knowledge_base_id`；续签后的凭据范围包含新库 |
 
+## 5. ingest 与 job
+
+### 5.1 提交
+- **W5.1** [KB-C4-04+新设] `ingest.submit` 的请求：`scope`（只含目标 KB）、`idempotency_key`、原件（文件字节或文本）、`content_sha256`、`file_name` 与规范化文件类型、`expected_policy_version`；更新已有文档时另带 `knowledge_id` 与 `expected_source_revision`（缺失为 `invalid_request`；不等于当前源修订为 `stale`，`reason: "base_revision_changed"`，附 `current_revision`；文档不存在或正在删除为 `not_found`）。**`origin: "sop"` 的文档只能经 `sop.commit` 修订**，对它的 `ingest.submit` 返回 `forbidden`（`operation_not_allowed`）。已撤回的文档（W8.9）按不存在处理：修订、重新处理都返回 `not_found`。v1 只收文件与文本，服务端不接受 URL、不代为抓取；需要导入网页时，由宿主在本机抓取后按文件提交（§11 #A2 已定），宿主抓取的出口规则归宿主侧（#994），不在本文。
+- **W5.2** [KB-C4-01/R3.8+新设] **保存前拒绝**：格式不在配置档白名单、或其输出不会产生 v1 范围内的 `text` 分块（R3.8）时，返回 `invalid_request`（`unsupported_format`），不保存原件、不建 job；超过大小上限返回 `invalid_request`（`too_large`）；配额不足返回 `forbidden`（`quota_exceeded`）。上游在算 hash 之前拒绝视频与非法扩展名，FAQ 类 KB 拒绝文件上传，配额检查在去重之后（§10 第 1 条）。
+- **W5.3** [新设] **断开不是取消**：J01 之后，提交请求的连接断开、客户端超时、generation 作废、Off、切换与注销都不影响 job（W1.10）；只有 `job.cancel`、W1.3 的复验、J09 与 J10 能停止它。这与只读请求不同（READONLY R7.1 的断开即取消只适用于 search 与 read）。
+- **W5.4** [R5.1–R5.3+新设] **源修订**：每次被接受的提交（非去重命中）分配一个新的 `source_revision`，在 J01 时成为该文档的**当前源修订**；它的活动构建在 J04 之前为 `null`。这与 READONLY R5.3"活动构建还没建好时 `index_build_id: null`"、R4.4 的 `index_pending` / `index_failed` 一致。于是新修订处理期间，旧修订构建上的 hit（若仍保留）按 R5.3 为 `stale`。**取消与失败都不回退当前源修订**（§11 #B8）：本修订仍是当前，只是没有活动构建；要恢复旧内容，需把旧原件重新提交为新源修订。取消不等于撤销这次替换（§11 #A10 已定）。同一修订的重新处理不在此列，见 W5.13。
+- **W5.5** [KB-SVC-POLICY-01/#994+新设] `ingest.submit` 与 `ingest.reprocess` 的 `expected_policy_version` 与服务端当前政策版本不同时返回 `stale`（`policy_changed`，附当前版本），不保存、不建 job：用户同意时看到的处理目的地与费用上限，必须就是 job 执行时依据的政策。它在幂等指纹里（W3.2）。
+
+### 5.2 状态
+- **W5.6** [KB-C4-04+新设] job 状态是闭集：
+
+| 状态 | 含义 | 原件 | 本 job 的构建可检索 | 终态 | `job.cancel` |
+|---|---|---|---|---|---|
+| `saved` | 原件已持久保存，源修订与 job 已记录，尚未开始处理 | 已保存 | 否 | 否 | 生效（J06） |
+| `processing` | 解析、切分、embedding、建索引进行中 | 已保存 | 否（未激活的部分产物不可检索，W5.8） | 否 | 生效，异步完成（J06、W5.9） |
+| `indexed` | 本 job 的索引构建已激活为活动构建（R5.1）；增强子任务可能仍在进行（`cost.final: false`） | 已保存 | 是，且仅当它仍是该修订的活动构建（被 J04 替换后不再可检索） | 是（状态不再变，增强可单独停止） | 增强进行中：停止剩余增强（J15）；否则无效果（J11） |
+| `failed` | 处理失败；带 `failure_reason` | 已保存 | 否（同一修订之前的活动构建不受影响，W5.13） | 是 | 无效果（J11） |
+| `cancelled` | 被取消；带 `cancel_reason` | 按 W5.9 报告 | 否（同上） | 是 | 无效果（J11） |
+
+  `failure_reason`：`parse_failed`、`embedding_failed`、`index_failed`、`policy_denied`、`budget_exhausted`、`storage_failed`（J01 之后的存储故障）、`enqueue_failed`、`interrupted`、`timeout`、`internal`。`cancel_reason`：`user`、`authorization_revoked`、`superseded`、`document_deleted`、`document_withdrawn`。`indexed` 的 `enrichment` 字段：`none`（没有增强）、`running`、`done`、`stopped`（带 `stop_reason`：`user`、`authorization_revoked`、`policy_denied`、`budget_exhausted`、`superseded`、`document_deleted`、`document_withdrawn`，以及增强自身出问题时的 `failed`（子任务重试用尽）、`timeout`（超过增强时限）、`interrupted`（中断后未能在恢复时限内继续））。`enrichment` 离开 `running` 之后，所有在途调用结束时 `cost.final` 必须变为 `true`。
+  **上游映射**：`pending` → `saved`；`processing` → `processing`；`completed` → `indexed`；`failed` → `failed`；`cancelled` → `cancelled`，但上游在 `finalizing` 时取消也记为 `cancelled`（§10 第 3 条），这时映射为 `indexed` 加 `enrichment: "stopped"`（`user`）；`deleting` 不是 job 状态（文档删除，J10）；手工知识的 `draft` 不是 job（§10 第 9 条）；`finalizing`（主解析完成、增强子任务仍在花费资源，已可检索）映射为 `indexed` 加 `enrichment: "running"`、`cost.final: false`，直到增强子任务结束（§11 #B7 已定）。
+
+### 5.3 转移
+- **W5.7** [新设] 转移表（同一 job 的转移串行；`saved`、`processing` 之外的状态不再变，`indexed` 只有 `enrichment` 还会变）：
+
+| ID | 前置 | 事件 | 后置 | 当前源修订与活动构建 | 依据 |
+|---|---|---|---|---|---|
+| J01 | — | 提交被接受（W3.4 同一事务） | `saved` | 新提交：本修订成为当前（W5.4）；重新处理：不变（W5.13） | [KB-C4-04] |
+| J02 | — | 内容去重（W3.5）、同键回放（W3.2）或该修订已有占用中的 job（W5.13） | 不新建 job | 不变 | [新设] |
+| J03 | `saved` | 阶段边界复验通过，开始处理 | `processing` | 不变 | [W1.3] |
+| J04 | `processing` | 索引构建完成并激活 | `indexed` | 本 job 的构建成为该修订的活动构建；同一修订之前的构建被替换（R5.1），其 job 若增强仍在进行，按 J17 停止 | [R5.1] |
+| J05 | `saved` / `processing` | 入队失败、解析或依赖失败且重试用尽、进程正常但超过处理时限（含停在 `saved` 的） | `failed`（`enqueue_failed` / `parse_failed` / … / `timeout`） | 不变 | [R4.4] |
+| J06 | `saved` / `processing` | `job.cancel` | `cancelled`（`user`）；`cancel_effect: "cancelled"` | 不变 | [KB-C4-04+新设] |
+| J07 | `saved` / `processing` | 阶段边界复验：授权被撤（W1.3 ①②） | `cancelled`（`authorization_revoked`） | 不变 | [W1.3] |
+| J08 | `saved` / `processing` | 阶段边界复验：政策不允许或预算耗尽（W1.3 ③） | `failed`（`policy_denied` / `budget_exhausted`） | 不变 | [KB-SVC-POLICY-01] |
+| J09 | `saved` / `processing` | 同一文档的新源修订被接受（J01） | `cancelled`（`superseded`） | 变为更新的修订 | [新设] |
+| J10 | `saved` / `processing` | 文档被删除，或被 `sop.withdraw` 撤回 | `cancelled`（`document_deleted` / `document_withdrawn`） | 文档不存在或已撤回 | [新设] |
+| J11 | `indexed`（增强不在进行）/ `failed` / `cancelled` | `job.cancel` | 不变；200，`cancel_effect: "none"` | 不变 | [新设] |
+| J12 | `indexed`（增强不在进行）/ `failed` / `cancelled` | `ingest.reprocess`（W5.13） | 原 job 不变；新 job `saved`（J01） | 不变 | [新设] |
+| J13 | `processing` | 服务端重启或工作进程中断 | 在恢复时限内恢复则仍 `processing`；否则 `failed`（`interrupted`） | 不变 | [新设] |
+| J14 | `saved` / `processing` / `indexed`（增强中） | 建立 job 所用凭据过期（未撤销） | 不变 | 不变 | [W1.3] |
+| J15 | `indexed`（`enrichment: "running"`） | `job.cancel` | `indexed`；`enrichment: "stopped"`（`user`）；`cancel_effect: "enrichment_stopped"` | 不变；活动构建保留 | [§10 第 3 条+新设] |
+| J16 | `indexed`（`enrichment: "running"`） | 增强子任务开始前复验不成立（W1.3） | `indexed`；`enrichment: "stopped"`（`authorization_revoked` / `policy_denied` / `budget_exhausted`）；记审计与费用 | 不变 | [W1.3] |
+| J17 | `indexed`（`enrichment: "running"`） | 同一文档的新源修订被接受（J01）、文档被删除或撤回；另有防御性触发：同一修订的新构建激活（J04；W5.13 的占用规则使它正常不会发生，只用故障注入测试） | `indexed`；`enrichment: "stopped"`（`superseded` / `document_deleted` / `document_withdrawn`） | 变为更新的修订 / 文档不存在或已撤回 / 不变 | [新设] |
+| J18 | `indexed`（`enrichment: "running"`） | 增强子任务重试用尽、超过增强时限，或中断后未能在恢复时限内继续（含服务端重启） | `indexed`；`enrichment: "stopped"`（`failed` / `timeout` / `interrupted`）；`cost.final` 随后为 `true` | 不变；活动构建保留 | [新设] |
+
+  新修订的构建激活（J04）之前，**旧修订**的构建是否保留不作要求：保留时只能按 R5.3 作为 `stale` 线索，不得作为当前构建返回 `fresh`（取消不撤销替换，§11 #A10，所以不要求保留）。上游 reparse 在重建前先清理旧分块（READONLY R4.4 引用的 `internal/application/service/knowledge_process.go:423`）。当前修订没有活动构建时，不带 `expected_revision` 的文档级 read：J05–J08 之后返回 `unavailable/index_failed`（R4.4；取消是否另设 `reason` 随 §11 #C2 的 READONLY 修订）；J09 之后当前修订是更新的那个，按它的进度返回 `index_pending` 或其结果；J10 之后返回 `not_found`。
+- **W5.8** [R5.3+新设] 部分产物按 `job_id` 标记：`processing`、`failed`、`cancelled` 的 job 已写下的分块与索引**不得**被检索或读取到，也不得成为活动构建；一个 job **不再有工作之后**（不处于 `saved`、`processing`，且 `enrichment` 不为 `running`）迟到写下的产物一律丢弃，`indexed` 之后增强阶段正常写下的产物照常保留；构建被替换后，属于旧构建的增强产物丢弃。新 job 只认自己 `job_id` 的产物。上游取消时保留已写入的分块与索引（§10 第 3 条），检索过滤只看分块的 `is_enabled`、`index_status` 与类型，不看文档的解析状态（§10 第 4 条）→ KB-C4-04。
+
+### 5.4 取消、费用与重新处理
+- **W5.9** [KB-C4-04+新设] **取消**：`job.cancel` 同步记录取消并返回 `cancel_effect`（`cancelled` / `enrichment_stopped` / `none`），随后在每个阶段边界停止；已经发出的外部调用可能仍会完成并计费。响应与之后的 `job.read` 如实报告：`original_retained`（原件是否仍保存）、`partial_artifacts`（`discarded` / `retained_invisible`）、`cost`（W5.10）。取消、失败与撤权都不删除原件与部分产物，只如实报告（§11 #A5 已定，之后的删除功能归 #997）。Lite 模式没有队列出队，只能靠检查点停止（§10 第 3 条），同样适用本条。
+- **W5.10** [KB-C4-04/KB-SVC-POLICY-01+新设] **费用报告**：每个 job 带 `cost: { final, items: [{ kind, destination, units, unit_type, measured }] }`。
+  - `kind`：`storage`、`parse`、`embedding`、`multimodal`、`llm_enrichment`（摘要、问题生成、图谱、wiki 等）；`destination` 取处理政策里的目的地标识；`unit_type`：`bytes`、`pages`、`tokens`、`calls`、`images`；`measured`：`exact`、`estimated`、`unknown`。
+  - **如实**：不知道就填 `units: null` 加 `unknown`，**不得填 0**；估算必须标 `estimated`。`final: true` 只在不再有任何工作可能产生费用之后（所有在途调用都已结束、增强子任务都已终止或停止）。界面只有在 `final: true` 且全部项为精确 0 时，才能说"没有产生费用"。
+  - 金额、币种与承担方不在本文（#994、#995）；服务端若给出金额，放在可选的 `amount` 里并标明依据的价格表版本。
+  - 上游没有按文档持久化的计量，embedding 用量只在 Langfuse 追踪里按 rune 数 / 4 估算（§10 第 5 条）→ KB-C4-04、KB-SVC-POLICY-01。
+- **W5.11** [新设] **查询**：`job.read` 可按 `job_id`，或按 `(操作类, idempotency_key)` 查询（作用域同 W3.2，只能查自己当前 principal 的键；principal 变化后旧键不可查，只能按 `job_id`）；返回操作类、状态、`enrichment`、`knowledge_id`、`source_revision`、`index_build_id`（`indexed` 时）、`attempt`、`failure_reason` / `cancel_reason`、`cost`、各状态时间戳。目标 KB 不在 E 内时 `not_found`（R2.6）。**谁能读取与取消 job**：v1 默认只有发起该 job 的 principal（按 W1.1 仍须持有相应操作类），同 KB 的其他成员按 R2.6 得 `not_found`；是否放宽为"KB 上持有该操作类的人都可以"属于 #996 的条件（§11 #A1）。文档删除（J10、J17）之后，job 与费用仍可在 W3.3 规定的 job 与费用记录保留期内查询。
+- **W5.12** [D4] job 状态与费用只是元数据，不是知识证据，不进入模型上下文作为引文；Tool 层展示时按普通状态处理。
+- **W5.13** [新设] **重新处理**：`ingest.reprocess` 带 `knowledge_id`、`source_revision`、`idempotency_key` 与 `expected_policy_version`，检查链为：政策版本（W5.5）→ 文档存在且未撤回（否则 `not_found`）→ `source_revision` 是当前源修订（否则 `stale/base_revision_changed`）→ 该修订没有**占用中**的 job。不做格式、配额、`origin` 与内容去重检查（没有新原件）。**占用**指 job 处于 `saved`、`processing`，或 `indexed` 且 `enrichment: "running"`；每个源修订至多一个占用中的 job，已有时不新建，返回 200，`details.outcome: "existing_job"`；该 job 由调用者发起时附该 job，否则只附文档级处理状态，不回 `job_id` 与 `cost`（W5.11，J02）；判定与创建在同一事务里。重新处理期间，该修订原有的活动构建**保持到新 job 的 J04 才被替换**；新 job `failed` 或 `cancelled` 时原活动构建不撤下，文档照常可检索。**新构建不继承旧构建上的人工分块编辑**（分块属于构建，R5.1）：该修订有 `chunk_revision > 0` 的分块时，宿主在发起重新处理之前必须提示用户"人工编辑将不会保留"。SOP 文档的重新处理不需要新批准：批准绑定的是字节与解读方式，不绑定分块边界（W8.4）。
+- **W5.14** [S-5+新设] **删除与分块编辑**：`document.delete` 与 `chunk.edit`（编辑、回滚、删除、启用 / 禁用分块，增删与重新生成问题）按矩阵授权；对 `origin: "sop"` 的文档一律 `forbidden`（`operation_not_allowed`），SOP 文档只能经 `sop.commit` 修订、经 `sop.withdraw` 撤回（通用规则见 W1.11）。删除或清空 KB 时，KB 内未撤回的 SOP 文档**一并撤回**（§11 #A14 已定）：每份先按 W8.9 撤回（取消在途 job、停止增强、记审计 `knowledge.sop.withdraw`，原因 `kb_deleted`），再执行删除或清空；这两条上游路由对 v1 凭据不开放（W1.11），本条是开放之后的语义。`document.delete` 触发 J10、J17；同一主体在保留期内重复删除返回 200 与 `already: true`（W3.1）。`chunk.edit` 会同步重新 embedding，增删与重新生成问题会调用模型（§10 第 1 条），所以它带 `expected_policy_version`（不符为 `stale/policy_changed`）、执行前按当前政策复验目的地与预算、响应带与 W5.10 同格式的 `cost`，并要求 ingest 就绪（W1.4；§11 #B21 已定）；它改变 `chunk_revision`（R5.1），引用该分块的 ContextPack 在下次发布或加载时失效（W7.9 ③）。
+
+## 6. 验收：ingest 与 job
+
+前提同 §4.1。KB-C4-04、KB-C1-04 按本表写测试。
+
+| ID | 规则 | 构造 | 期望 |
+|---|---|---|---|
+| JT-01 | J01、W3.4 | 正常提交 | `saved`；原件、源修订、job、幂等记录都已持久；新修订成为当前 |
+| JT-02 | J02、W3.2 | 同键同指纹重放三次（含首个响应丢失） | 同一 `job_id`，`replayed: true`；只计费一次 |
+| JT-03 | W3.2 | 同键、不同 `content_sha256` | `invalid_request/idempotency_key_reused` |
+| JT-04 | W3.4 | 不同键并发提交同一文件到同一 KB | 只有一个新源修订与 job；其余为 `existing` |
+| JT-05 | J02、W3.5 | 提交与当前修订相同的内容；修订文档 B 时内容等于文档 A 的当前内容 | 前者 `outcome: "existing"`、不新建 job、时间戳不变；后者为 B 新建修订 |
+| JT-06 | W3.6 | 声明的 `content_sha256` 与实际不符 | `invalid_request/content_hash_mismatch`；不保存 |
+| JT-07 | W5.2 | 不支持的格式；超过大小上限；配额不足 | 依次 `unsupported_format`、`too_large`、`forbidden/quota_exceeded`；都不保存 |
+| JT-08 | W5.5 | `expected_policy_version` 已过期 | `stale/policy_changed`，附当前版本；不保存 |
+| JT-09 | W5.1 | 更新已有文档：`expected_source_revision` 不是当前值；缺 `expected_source_revision`；文档正在删除 | 依次 `stale/base_revision_changed`、`invalid_request`、`not_found`；都不保存 |
+| JT-10 | J03、J04 | 正常处理 | `saved` → `processing` → `indexed`；`index_build_id` 成为活动构建；READONLY search 能命中 |
+| JT-11 | J05 | 解析失败且重试用尽；另测入队失败；另测停在 `saved` 超过时限 | 依次 `failed/parse_failed`、`failed/enqueue_failed`、`failed/timeout`；文档级 read 得 `index_failed` |
+| JT-12 | J06、W5.9 | `processing` 中取消，测试桩让一次 embedding 调用在取消后才返回 | 立即 `cancelled/user`，`cancel_effect: "cancelled"`；`cost.final` 先为 false，调用结束后为 true 且含该次调用；部分产物不可检索；原件保留并如实报告 |
+| JT-13 | J06、W5.4 | 文档已有 indexed 的修订 r1，提交 r2 后在 `processing` 中取消 | 当前源修订仍为 r2，没有活动构建；文档级 read 得 `unavailable/index_failed`；r1 的 hit 若出现只能是 `stale`；重新提交 r1 的原件得到新修订 r3 |
+| JT-14 | J07 | `processing` 中撤销提交人对目标 KB 的 ingest 授权；另测撤销提交所用凭据 | 下一个阶段边界都 → `cancelled/authorization_revoked`；不再产生新调用 |
+| JT-15 | J14 | 提交后凭据自然过期（未撤销） | job 照常完成 |
+| JT-16 | J08 | 处理中政策改为禁止 embedding 目的地；另测预算耗尽 | 下一个阶段边界 → `failed/policy_denied`、`failed/budget_exhausted`；未授权目的地零调用 |
+| JT-17 | J09 | r1 处理中提交 r2 | r1 的 job `cancelled/superseded`；当前为 r2 |
+| JT-18 | J11 | 对增强已结束的 `indexed`、`failed`、`cancelled` 的 job 取消 | 200，`cancel_effect: "none"`，状态不变 |
+| JT-19 | J12、W5.13 | 对 `failed` 的 job 显式重新处理；对非当前修订重新处理 | 前者新 `job_id`，旧 job 仍 `failed`，按当前政策计费；后者 `stale/base_revision_changed` |
+| JT-20 | J13、J05 | 处理中重启服务端并在恢复时限内恢复；中断后超过恢复时限；进程正常但超过处理时限 | 依次继续处理、`failed/interrupted`、`failed/timeout`；不会永远停在 `processing` |
+| JT-21 | W5.3、W1.5 | 提交后立即断开连接；另测 STATE 草案 S4.5 中止在途提交 | job 照常处理；后者 Provider 得本地 `cancelled`，带 `write_outcome: "unknown"` 与幂等键，回到可服务后按键查到真实 job |
+| JT-22 | W5.8 | 取消或失败后，用分块 ID 直接 read、用相关 query search；被取消的 job 在终态后又写下产物 | 部分产物都不出现；迟到产物被丢弃 |
+| JT-23 | W5.10 | 测试桩让某目的地无法计量 | 该项 `units: null`、`measured: "unknown"`，不为 0；界面不显示"没有费用" |
+| JT-24 | W5.7 | r2 的 job 失败后 search | r1 的 hit 不出现，或只以 `stale` 出现，不生成确定引用；从不以 `fresh` 出现 |
+| JT-25 | J10、W5.11 | 处理中删除文档；之后按 `job_id` 查询 | job `cancelled/document_deleted`；job 与费用仍可查 |
+| JT-26 | J15 | `indexed` 且增强进行中时取消 | `cancel_effect: "enrichment_stopped"`；状态仍 `indexed`，活动构建可检索；增强停止，`cost.final` 随后为 true |
+| JT-27 | J16 | 增强进行中撤销提交人授权；另测政策禁止增强目的地 | 下一个增强子任务开始前停止：`enrichment: "stopped"`，`stop_reason` 分别为 `authorization_revoked`、`policy_denied`；有审计与费用 |
+| JT-28 | J17 | r1 `indexed` 且增强进行中时提交 r2 | r1 的增强停止（`superseded`），不再为 r1 花费 |
+| JT-29 | W5.13 | 不同幂等键并发两个 `ingest.reprocess` 同一修订 | 只有一个新 job；另一个得 `existing_job` |
+| JT-30 | W5.13 | 已 `indexed` 的修订重新处理，新 job 失败；另测新 job 被取消 | 两种情况下原活动构建始终可检索，从未撤下 |
+| JT-31 | W5.13、W5.5 | `ingest.reprocess` 缺 `expected_policy_version`；版本已过期 | 依次 `invalid_request`、`stale/policy_changed` |
+| JT-32 | W3.4 | 两个提交都带 `expected_source_revision: r1` 并发到达 | 只有一个建立 r2；另一个 `stale/base_revision_changed` |
+| JT-33 | W1.3 | 用 `ingest.reprocess` 建立的 job；提交人只有 `ingest.reprocess`、没有 `ingest.submit` | J03 照常，不被误取消 |
+| JT-34 | W1.4 | `operations.ingest` 为 `not_ready` 时对 `processing` 的 job 取消 | 照常发出并生效 |
+| JT-35 | W5.13 | 修订已 `indexed` 且增强进行中时 `ingest.reprocess` | `outcome: "existing_job"`，不新建 job |
+| JT-36 | J04、J17、W5.8 | 故障注入：绕过占用规则，让同一修订的新 job 在旧 job 增强进行中激活构建 | 旧 job `enrichment: "stopped"`（`superseded`）；旧构建的增强产物丢弃；旧 job 的构建不再可检索 |
+| JT-37 | J18 | 增强子任务重试用尽；超过增强时限；增强中重启且超过恢复时限 | 依次 `stopped`（`failed` / `timeout` / `interrupted`）；`cost.final` 都随后变为 `true` |
+| JT-38 | W3.5 | 提交的内容等于一份已撤回文档、或删除中文档的当前内容 | 不命中去重，照常新建文档与 job |
+| JT-39 | W5.13、W5.1 | 对已撤回文档重新处理或修订 | 都 `not_found` |
+| JT-40 | W5.14 | v1 凭据：对普通文档 `document.delete`；对 `origin: "sop"` 的文档 `document.delete`、编辑分块、删除分块、禁用分块、增删生成问题。集成模式下的上游非 v1 凭据（Admin JWT）：删除、清空含未撤回 SOP 的 KB；删除只含已撤回 SOP 的 KB | 第一项成功并触发 J10 / J17；v1 的其余各项 `forbidden/operation_not_allowed`；含未撤回 SOP 的 KB 删除或清空时，其中的 SOP 先逐份撤回（审计原因 `kb_deleted`，在途 job `cancelled/document_withdrawn`），再删除或清空；只含已撤回 SOP 的直接放行 |
+| JT-41 | W5.8 | `indexed` 之后增强阶段正常写下产物；之后增强停止，再有迟到产物 | 前者保留；后者丢弃 |
+| JT-42 | W5.14 | `chunk.edit` 时政策版本已变；政策禁止 embedding 目的地 | 前者 `stale/policy_changed`；后者 `forbidden/policy_denied`，零调用；成功时响应带 `cost` |
+| JT-43 | W5.13 | 修订有人工编辑的分块时发起重新处理 | 宿主先提示"人工编辑将不会保留"；新构建激活后分块为上游重新切分的结果，`chunk_revision` 为 0 |
+
 ## 10. 现状证据（WeKnora `4b363d15`；Agent24 见 STATE 草案 §9、BRIDGE 草案 §9）
 
 1. **上传入口**：文件、URL、手工三条入口都要求 `OwnedKBOrAdmin` 与 KB 写访问（`internal/router/routes_knowledge.go:73-75`；"KB 创建人或 Admin+"，`internal/router/rbac.go:445-450`），API key 需 `ingest` 能力且受 KB 白名单约束（`internal/types/tenant_api_key.go:86-91`）；角色只有 owner / admin / contributor / viewer 四级（`internal/types/tenant_member.go:19-32`）。服务层先拒绝视频（`internal/application/service/knowledge_create.go:48-51`）、FAQ 类 KB 拒绝文件（`:62-64`）、校验扩展名（`:74-77`），再算 hash（`:81`）、去重（`:90-117`）、查配额（`:121`），新记录为 `pending` / `disabled`（`:174-175`），先存文件（`:192`）再建记录（`:201`）；入队失败时把记录标为 `failed`（`:242`、`:260`，`markKnowledgeEnqueueFailed` 定义在 `:1153`），但仍返回已保存的知识且不报错（`:249`、`:267`）；任务 `MaxRetry(3)`（`:255`）。会改变文档或 KB 的其他上游写路由（`internal/router/routes_knowledge.go`）：删除分块与删除文档的全部分块（`:40`、`:42`）、编辑与回滚分块（`:44-45`）、增删与重新生成问题（`:51-53`）、重命名文件夹（`:80`）、清空 KB（`:83`，Admin）、删除文档（`:108`）、更新文档标题、描述与元数据（`:109`）、重新生成摘要（`:110`）、更新手工知识（`:111`）、图片信息更新（`:122`）、批量标签（`:130`）、批量重新处理（`:131`）、批量删除（`:132`）、移动到文件夹与跨 KB 移动（`:133-134`）、更新 KB（`:217`）、删除 KB（`:221`）、复制 KB（`:239`）；单个对象的路由大多要求"KB 创建人或 Admin+"；清空 KB（`:83`）要求 Admin，批量、移动与复制 KB（`:239`）只要求 Contributor+。编辑分块会同步重新 embedding（`internal/application/service/chunk.go:669-718`）；文档标题会拼进每条索引文本（`internal/application/service/knowledge_index_content.go:12-21`），元数据变化会排队刷新摘要（`internal/application/service/knowledge.go:820-825`，模型调用）。
@@ -191,6 +303,8 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | A4 | **职责分离**：创建人能否批准自己的候选、发布人能否就是 ContextPack 的批准人；SOP 批准能否由批准人以外的人代为提交。SOP 侧"创建人不得自批"在服务端保存候选或创建人以自己凭据登记候选（#A12）之前**不能作为服务端保证**，只能由宿主执行；ContextPack 侧服务端可执行 | 写进矩阵条件（W2.4）；`sop.*` 用途的批准只能由批准人本人消费，`pack.publish` 用途的批准由发布人出示（W8.4、W7.15） | 待 #996；v1 随 #A1 拒绝（第一片） |
 | A5 | **取消、失败、撤权后原件与部分产物是否删除**；撤回的 SOP 原件是否删除 | 都不删，如实报告（W5.9、W8.9） | 已定（David）（第一片） |
 | A13 | **Off、切换、注销是否应取消在途 job** | 不取消；动作前提示并提供取消入口（W1.10） | 已定（David）（第一片） |
+| A14 | **删除或清空 KB 时其中的 SOP 文档怎么处理**（一并撤回、迁移，还是拒绝） | 一并撤回其中未撤回的 SOP 文档，再删除或清空（W5.14） | 已定（David）（第二片） |
+| A10 | **取消一次替换（新修订处理中取消）是否等于撤销这次替换**，即回到上一个源修订；若是，旧构建必须保留到新构建激活 | 不等于：当前源修订不回退（W5.4、W5.7） | 已定（David）（第二片） |
 | B0 | 所有标 `[新设]` 的规则 | 按本文 | 本 PR 评审 |
 | B1 | `authz_version` 的粒度 | 每个"主体 × 资源"一个值，资源含组织级授予；可以保守地多变（W1.2） | 已定（盲选一致），含补充（第一片） |
 | B2 | 后台阶段复验的内容 | 建立 job 的操作类 + 凭据未撤销 + 政策；撤销记录保留到相关 job 结束（W1.3） | 已定（盲选一致），含补充（第一片） |
@@ -199,6 +313,12 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | B5 | 去重命中的文档处于 `failed` / `cancelled` 时 | 返回 `existing`，不自动重新处理（W3.5） | 已定（David）（第一片） |
 | B6 | `config_version` 是否进默认库唯一键 | 不进（W4.2） | 已定（盲选一致）（第一片） |
 | B20 | job 与费用记录的保留期 | 至少 90 天，且不短于对应幂等记录（W3.3） | 已定（David）（第一片） |
+| B21 | `chunk.edit` 的费用与政策：带 `expected_policy_version`、复验政策与预算、报告费用，还是 v1 只开放不产生外部调用的子操作 | 前者（W5.14） | 已定（David）（第二片） |
+| B23 | 多个 binding 时 ContextPack 的加载顺序与预算 | 单一预算、全序：类别 → profile 稳定标识 → `pack_id`，宿主整包裁定（W7.10） | 已定（Grok/Opus 交叉确认）（第三片） |
+| B24 | 已注入包内容换成占位的触发条件 | 明示 `expired`/`invalidated` 或 `pack_id` 从结果消失；`scope_mismatch`、`policy_denied`、`over_budget`、`not_yet_valid`、被新版本取代不触发（W7.14） | 已定（Grok/Opus 交叉确认，讨论一轮后一致）（第三片） |
+| B7 | 上游 `finalizing` 的映射 | `indexed` 加 `enrichment: "running"`、`cost.final: false`；增强可单独停止（W5.6、J15–J18） | 已定（David）（第二片） |
+| B8 | 取消、失败后当前源修订是否回退 | 都不回退（W5.4、J05–J07）；同一修订的重新处理失败不撤下原活动构建（W5.13） | 已定（盲选一致）；r1 由"取消回退"改来（第二片） |
+| B9 | 对终态 job 取消的响应 | 200，`cancel_effect: "none"`（J11） | 已定（盲选一致）（第二片） |
 | C1 | 服务端为写操作新增的端点、计量、幂等与唯一约束（KB-C4-04、KB-C4-02b） | 按本文语义实现 | WeKnora 实现（第一片） |
 | C2 | **READONLY R2.7 需同步修订**：凭据的操作范围按操作类扩展到写操作；与 BRIDGE 草案 §10 #25 一并处理。另：取消后的文档级 read 暂按 `index_failed`，是否另设 `reason` 一并定；SOP 撤回后 search 不返回、read 返回 `not_found`（W8.9），是 READONLY 的新过滤条件，需要写进 R2.6 / R4.4。R2.6 原文只说文档，本文把"越界与不存在不可区分"扩到 job、批准记录与 ContextPack（W1.1、W1.9 ③）；新增的 `details.reason`（`version_not_draft`、`version_not_published`、`validity_invalid`、`approval_used`、`approval_expired`、`approval_void`、`approval_mismatch`、`kb_deleted`）按 READONLY §0.3 是兼容新增。 | 修订前写操作不实现 | READONLY 下一修订（第一片） |
 | C3 | **依赖 STATE 草案 r14**（PR #1070–#1072）：S1.1、S1.3、S1.5（需扩展到写操作，W1.4）、S1.6、S1.10、S3.1（凭据无效类 T42、旧凭据复验，W1.4）、S4.5、S4.6（W1.5、W7.12）、S4.7（run 绑定 binding 集合，W7.9、W8.1）、S4.9（多个 binding，W1.4、W1.10、W7.9、W7.10）、S5.3、S5.6 与 §10 #4（#A9、W7.14）、§6 本地结果、S5.8；S3.1 另需写明 `request_in_progress` 不触发就绪探测（W3.2）。另：STATE S5.10 提到"经 #1013③ 的接口"删除 KB，而本文 v1 没有删除或清空 KB 的操作类（W1.11），STATE 那一句在 v1 只对应宿主界面经允许列表之外的路由，需在 STATE 下一修订里对齐 | 按 STATE 草案 r14 | STATE 合入时逐条复核（第一片） |
@@ -210,6 +330,10 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 - r1（2026-10-17）：按 B 类盲选裁定修订。B8 改为取消与失败都不回退当前源修订；B15 改为只能原文摘录；B16 改为候选只在宿主本地；B17 改为批准有效期 1 小时；B1、B2 补充；B3–B5、B7、B11–B13、B19 标待 David（盲选分歧）；新增 #A10–#A12；SOP 转移编号改为 V01–V12。影响夹具：否。
 - r2（2026-10-17）：按第 1 轮双审互评裁定修订。新增写操作判定顺序（W1.9，含同键在途、回放先于其余检查）与 Off / 切换 / 注销对在途 job 的 v1 默认（W1.10，#A13）；只有新建工作的操作要求 ingest 就绪（W1.4）；后台复验建立 job 的操作类（W1.3）；新增 `pack.approve` 操作类，下载原件一行标 v1 不开放；W2.4 写明 SOP 职责分离在服务端的限度；基础修订 compare-and-set 进 J01 事务（W3.4）；`sop.commit` 幂等键即 `approval_id`；初始化 `existing` 不改授权、归属取自凭据与成员资格（W4.1、W4.3、W4.5）；本地 `write_outcome`；验收 MT-10–MT-19、IT-07–IT-08；§10 更正入队失败、来源身份去重、建 KB 的 `creator_id`、组织申请审批、batch-download 行号。ingest 与 job 部分：增强阶段可单独停止（J15–J17，`cancel_effect`、`enrichment`）；每个源修订至多一个非终态 job，重新处理期间原活动构建保持、失败或取消不撤下，`ingest.reprocess` 带 `expected_policy_version`（W5.13）；`origin: "sop"` 的文档只能经 `sop.commit` 修订（W5.1）；部分产物按 `job_id` 隔离（W5.8）；入队失败与停在 `saved` 的转移（J05）；验收 JT-25–JT-34；§10 第 3 条补 finalizing 可取消。影响夹具：否。 ContextPack 与 SOP 部分：W7.9 改为先按受众与组织身份筛候选集，逐来源比对修订三元组、`chunk_id` 仍在活动构建、来源未撤回或删除（新 `reason` `source_withdrawn`、`not_yet_valid`）；发布时同样校验来源；ContextPack 批准与发布分两步（W7.15），`approval_digest` 按 JCS 规范化，发布串行化（W7.16）；摘录以整句为单位；W8.6 并入 W1.9 顺序、①⑧ 与批准使用同一事务、批准只能由批准人本人消费，补全失败时批准与候选的状态（V13–V15）；作废通知与 hash 绑定（W8.3）；批准正文的访问与删除（W8.2）；验收 PT-18–PT-24、AT-16–AT-21。影响夹具：否。
 - r3 第一片（2026-10-17）：按第 2 轮双审互评裁定修订，改为三片。矩阵新增 `pack.read`、`sop.approval.read`、`document.delete`、`chunk.edit`；内容去重只比对可检索生命周期内的文档，`sop.commit` 的去重只命中可检索的 SOP 文档（W3.5）；使批准作废的拒绝也写幂等记录（W3.2）；`request_in_progress` 不触发就绪探测；job 与费用记录单独保留（W3.3，#B20）；待决写操作持久化、principal 变化时保持未知（W1.5）；W1.10 覆盖 `cost.final: false`；`degraded` 准入；初始化中间态返回 `request_in_progress`（W4.5）；reprocess 单列检查链（W1.9）；验收 MT-20–21、IT-09；§10 补删除与分块路由、更正行号。影响夹具：否。
+- r3 第二片（2026-10-17）：增强占用修订、J04 与 J17 停旧增强、`stop_reason` 增 `failed` / `timeout` / `interrupted` 与 J18、`cost.final` 必然结束（W5.6、W5.7、W5.13）；`indexed` 构建被替换后不可检索；W5.8 改为"不再有工作"；`finalizing` 取消映射为 `indexed` + `stopped(user)`；删除与分块编辑对 SOP 文档按机制拒绝（W5.14）；已撤回文档不可修订与重新处理；J05 / J13 超时语义分开；验收 JT-20 改写、JT-35–41。影响夹具：否。
 - r4 第一片（2026-10-17）：按第 3 轮双审互评裁定修订。新增 W1.11：矩阵之外的上游写路由对 v1 凭据一律不开放，改变 SOP 文档正文、所在 KB 或存在与否的路由按机制拒绝；矩阵新增 `sop.approval.void`，`chunk.edit` 并入删除分块并改为新建工作的操作，`sop.withdraw` 不要求已发布，`pack.read` 只对通过检查的 `published` 版本返回正文；幂等例外加入 `pack.publish`，指纹含文件类型；初始化 `existing` 按 A 判定、创建后续签；job 只有发起人可读可取消；审计事件补全；§10 补全上游写路由；验收 MT-22–23、IT-10。影响夹具：否。
+- r4 第二片（2026-10-17）：撤回与删除一样取消在途 job、停止增强（`document_withdrawn`）；J17 的同修订触发标为防御性，JT-36 改为故障注入；`chunk.edit` 带 `expected_policy_version` 并报告费用（#B21）；删除或清空含 SOP 的 KB 默认拒绝（#A14）；无活动构建时的文档级 read 按 J05–J10 分别说明；B7 备选说明补 J18 与 `cancelled` 保留构建的冲突；验收 JT-40 扩充、JT-42。影响夹具：否。
 - r5 第一片（2026-10-17）：按第 4 轮双审互评裁定修订。矩阵新增 `pack.discard`；`approval.read` / `approval.void`（由 `sop.approval.*` 改名）按 `approval_id` 覆盖 SOP 与 ContextPack 两种用途；天然幂等操作重复执行返回 `already: true`（W3.1），`sop.withdraw` 的检查链（W1.9）；W1.11 的保护面扩到检索可见的内容；宿主待决写操作超过服务端保留期改记未知（W1.5）；`/files` 不开放；`pack.read` 沿用加载顺序；§10 补 `:80`、`:109`、`:130`、`:131`、`:217` 与标题进索引、元数据刷新摘要；W8.6 编号改写为 W8.6-①；验收 MT-06、MT-08、MT-20 扩充，MT-24–25。影响夹具：否。
+- r5 第二片（2026-10-17）：重新处理不继承人工分块编辑，宿主须提示（W5.13）；批准绑定字节加解读方式、不绑定分块边界；重复删除返回 `already: true`；JT-40 改用上游非 v1 凭据验证 #A14 的默认；验收 JT-43。影响夹具：否。
 - r6 第一片（2026-10-18）：按第 5 轮裁定与 David 的决定修订。目标解析（存在、在 E 内、未撤回、不在删除中）统一放在 W1.9 ③、返回同一个 `not_found`，pack 操作补检查链与 `stale/version_not_draft`、`version_not_published`；`pack.discard` 只限起草人；去重与 existing_job 不泄露他人 job；`job.cancel` 以 J11 为准；W1.11 限定未撤回的 SOP；矩阵"模型发起"列按 #A3；幂等记录与 job 同寿命（#B3）；去重键与失败命中（#B4、#B5）；对齐 STATE r14（多个 binding、凭据类响应）；验收 MT-23–MT-26。影响夹具：否。
+- r6 第二片（2026-10-18）：URL 由宿主抓取后按文件提交（#A2）；取消不撤销替换（#A10）；`finalizing` 映射为 `indexed`（#B7）；原件与部分产物不删（#A5）；删除或清空 KB 时一并撤回 SOP（#A14）；JT-40 改写。影响夹具：否。
