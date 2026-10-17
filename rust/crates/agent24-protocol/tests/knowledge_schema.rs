@@ -1,9 +1,10 @@
 //! KB-CT-02b (#1012): every Knowledge v1 fixture is validated against the full
 //! `protocol/knowledge/v1` schemas, the same files and the same mapping as
 //! `packages/contract-tests/src/knowledge-v1.test.ts` (Ajv). So a fixture edit
-//! that breaks a cross-field rule turns Rust red too, not only TS, even after
-//! the manifest digests are re-pinned. `knowledge_fixtures.rs` keeps the strict
-//! serde decoding as a smoke check; wire types come with KB-C1-02a.
+//! that breaks a schema rule turns Rust red too, not only TS, even after the
+//! manifest digests are re-pinned. Rules the schemas cannot express (a response
+//! against its request) are `knowledge_rules.rs`; `knowledge_fixtures.rs` keeps
+//! the strict serde decoding as a smoke check; wire types come with KB-C1-02a.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
