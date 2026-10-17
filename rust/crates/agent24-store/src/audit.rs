@@ -284,6 +284,16 @@ pub(crate) fn entry_hash(
 }
 
 impl Store {
+    /// Strict pre-append check for typed audit writers: every row must link
+    /// and hash correctly from seq 1, and the newest row must equal the
+    /// AUTOINCREMENT high-water mark so a deleted valid tail is detected.
+    pub(crate) async fn verify_audit_chain_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
+        strict_audit_tail_tx(tx)
+            .await
+            .map(|_| ())
+            .map_err(|error| StoreError::Conflict(format!("audit chain rejected: {error}")))
+    }
+
     pub(crate) async fn append_audit_tx(
         tx: &mut Transaction<'_, Sqlite>,
         ts: &str,
@@ -319,6 +329,31 @@ impl Store {
             prev_hash,
             hash,
         })
+    }
+
+    /// Typed writers must verify the actual row and transaction-visible
+    /// high-water after triggers have run, before releasing the write lock.
+    pub(crate) async fn append_verified_audit_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        ts: &str,
+        actor: &str,
+        action: &str,
+        detail: &Value,
+    ) -> Result<AuditEntry> {
+        let entry = Self::append_audit_tx(tx, ts, actor, action, detail).await?;
+        let expected = ProspectiveAuditTuple {
+            seq: entry.seq,
+            ts: entry.ts.clone(),
+            actor: entry.actor.clone(),
+            action: entry.action.clone(),
+            detail: serde_json::to_string(detail)?,
+            prev_hash: entry.prev_hash.clone(),
+            hash: entry.hash.clone(),
+        };
+        verify_prospective_tail_tx(tx, &expected)
+            .await
+            .map_err(|error| StoreError::Conflict(format!("audit insert rejected: {error}")))?;
+        Ok(entry)
     }
 
     /// Append an audit entry, chaining onto the latest hash. Serialized via
@@ -358,36 +393,12 @@ impl Store {
             .collect()
     }
 
-    /// Walk the chain from genesis; any recomputed-hash mismatch or broken
-    /// prev-link means tampering.
+    /// Verify the chain and AUTOINCREMENT high-water in one read snapshot,
+    /// including detection of an internally valid but deleted tail.
     pub async fn verify_audit_chain(&self) -> Result<()> {
-        let rows = sqlx::query("SELECT * FROM audit_log ORDER BY seq ASC")
-            .fetch_all(self.pool())
-            .await?;
-        let mut prev = GENESIS.to_owned();
-        for r in &rows {
-            let seq: i64 = r.get("seq");
-            let prev_hash: String = r.get("prev_hash");
-            let hash: String = r.get("hash");
-            if prev_hash != prev {
-                return Err(StoreError::Conflict(format!(
-                    "audit chain broken at seq {seq}: prev link mismatch"
-                )));
-            }
-            let recomputed = entry_hash(
-                &prev_hash,
-                &r.get::<String, _>("ts"),
-                &r.get::<String, _>("actor"),
-                &r.get::<String, _>("action"),
-                &r.get::<String, _>("detail"),
-            );
-            if recomputed != hash {
-                return Err(StoreError::Conflict(format!(
-                    "audit chain broken at seq {seq}: hash mismatch"
-                )));
-            }
-            prev = hash;
-        }
+        let mut tx = self.pool().begin().await?;
+        Self::verify_audit_chain_tx(&mut tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
