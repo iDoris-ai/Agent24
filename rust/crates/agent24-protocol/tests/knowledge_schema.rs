@@ -114,42 +114,207 @@ fn every_knowledge_fixture_matches_the_schemas() {
     }
 }
 
-/// Cross-field rules the serde smoke check cannot see; each edit must fail.
+/// `file`'s response body (or request) after `edit`, checked against `name`.
+fn edited(file: &str, part: &str, edit: impl FnOnce(&mut Value)) -> Value {
+    let mut doc = fixture(file);
+    let target = if part == "request" {
+        &mut doc["request"]
+    } else {
+        &mut doc["response"]["body"]
+    };
+    edit(target);
+    target.clone()
+}
+
+fn drop_key(v: &mut Value, key: &str) {
+    v.as_object_mut().unwrap().remove(key);
+}
+
+/// The canonical negatives of knowledge-v1.test.ts, run through this
+/// validator too, so the two schema engines are held to the same verdicts.
 #[test]
-fn schema_rejects_what_serde_alone_accepts() {
+fn schema_negatives_match_the_ts_suite() {
     let v = validators();
-    let mut ready = fixture("ready.operation-disabled.json")["response"]["body"].clone();
-    ready["knowledge_bases"][0]["search"] =
-        json!({ "state": "not_ready", "reason": "index_building" });
-    check(
-        &v,
+    let bad = |name: &str, file: &str, part: &str, edit: &dyn Fn(&mut Value)| {
+        check(&v, name, &edited(file, part, |d| edit(d)), false, file);
+    };
+    let good = |name: &str, file: &str, part: &str, edit: &dyn Fn(&mut Value)| {
+        check(&v, name, &edited(file, part, |d| edit(d)), true, file);
+    };
+    let err = |file: &str, edit: &dyn Fn(&mut Value)| {
+        bad("error", file, "body", &|b| edit(&mut b["error"]["details"]));
+    };
+    // search: partial needs partial_failures, complete has none; null chunk_revision means unknown.
+    bad("search.response", "search.partial.json", "body", &|b| {
+        b["partial_failures"] = json!([])
+    });
+    bad("search.response", "search.partial.json", "body", &|b| {
+        b["completeness"] = json!("complete")
+    });
+    bad("search.response", "search.partial.json", "body", &|b| {
+        b["completeness"] = json!("complete");
+        b["partial_failures"] = json!([]);
+    });
+    bad("search.response", "search.ok.json", "body", &|b| {
+        b["hits"][2]["index_state"] = json!("fresh")
+    });
+    // read: three-part expected_revision with chunk_id, two without; page.limit optional.
+    bad("read.request", "read.chunk.json", "request", &|r| {
+        drop_key(&mut r["expected_revision"], "chunk_revision")
+    });
+    bad("read.request", "read.chunk.json", "request", &|r| {
+        r["expected_revision"]["chunk_revision"] = Value::Null
+    });
+    bad("read.request", "read.document.json", "request", &|r| {
+        r["expected_revision"]["chunk_revision"] = json!(0)
+    });
+    good("read.request", "read.chunk.json", "request", &|r| {
+        r["page"] = json!({ "cursor": "cur-71-1" })
+    });
+    bad("read.request", "read.chunk.json", "request", &|r| {
+        r["page"] = json!({ "limit": 5 })
+    });
+    // errors: retryable, reasons and details are fixed per code (§6, r8).
+    err("read.out-of-scope.json", &|d| {
+        d["reason"] = json!("out_of_scope")
+    });
+    err("read.stale-anchor-missing.json", &|d| {
+        d["current_chunk_revision"] = json!(3)
+    });
+    err("search.unavailable-mixed.json", &|d| {
+        d["retryable"] = json!(true)
+    });
+    err("search.unavailable-mixed.json", &|d| {
+        d["reason"] = json!("dependency");
+        d["retryable"] = json!(true);
+    });
+    err("search.unavailable-mixed.json", &|d| {
+        drop_key(d, "reason");
+        d["retryable"] = json!(true);
+    });
+    err("search.unavailable-mixed.json", &|d| drop_key(d, "reason"));
+    err("search.unavailable-mixed.json", &|d| {
+        drop_key(d, "partial_failures");
+        d["reason"] = json!("dependency");
+    });
+    err("read.out-of-scope.json", &|d| d["request_id"] = Value::Null);
+    good("error", "read.internal.json", "body", &|b| {
+        b["error"]["details"]["request_id"] = Value::Null;
+        b["error"]["details"]["generation"] = Value::Null;
+    });
+    err("search.mixed-score-space.json", &|d| {
+        d["request_id"] = Value::Null;
+        d["generation"] = Value::Null;
+    });
+    err("read.stale-chunk-edited.json", &|d| {
+        d["current_revision"]["index_build_id"] = Value::Null
+    });
+    bad("error", "search.empty-scope.json", "body", &|b| {
+        b["error"]["code"] = json!("cancelled")
+    });
+    err("search.mixed-score-space.json", &|d| drop_key(d, "groups"));
+    // R6.4: protocol_version is checked first, so unsupported_protocol_version may echo null.
+    good("error", "read.unsupported-version.json", "body", &|b| {
+        b["error"]["details"]["request_id"] = Value::Null;
+        b["error"]["details"]["generation"] = Value::Null;
+    });
+    err("search.unauthorized-revoked.json", &|d| {
+        drop_key(d, "reason")
+    });
+    err("search.empty-scope.json", &|d| drop_key(d, "reason"));
+    err("search.unavailable-mixed.json", &|d| {
+        d["partial_failures"][0]["reason"] = json!("overloaded")
+    });
+    err("search.unavailable-mixed.json", &|d| {
+        d["partial_failures"][1]["reason"] = json!("unsupported_kb_type")
+    });
+    err("search.unavailable-mixed.json", &|d| {
+        d["reason"] = json!("unsupported_kb_type")
+    });
+    err("search.unavailable-mixed.json", &|d| {
+        d["partial_failures"][1] = json!({ "knowledge_base_id": "kb-c", "code": "unavailable", "reason": "dependency", "retryable": true });
+    });
+    err("read.index-pending.json", &|d| {
+        d["partial_failures"] = json!([{ "knowledge_base_id": "kb-c", "code": "unavailable", "reason": "dependency", "retryable": true }]);
+    });
+    // ready: infrastructure not ready makes every KB not_ready/dependency (r6).
+    let dep = |kb: Value| move |b: &mut Value| b["knowledge_bases"][1]["search"] = kb.clone();
+    bad(
         "ready.response",
-        &ready,
-        false,
+        "ready.dependency.json",
+        "body",
+        &dep(json!({ "state": "ready" })),
+    );
+    bad(
+        "ready.response",
+        "ready.dependency.json",
+        "body",
+        &dep(json!({ "state": "not_ready", "reason": "index_building" })),
+    );
+    bad("ready.response", "ready.dependency.json", "body", &|b| {
+        b["knowledge_bases"] = json!([])
+    });
+    // The same rules for read (R8.2, R8.4).
+    let read_down = |kb: Option<Value>| {
+        move |b: &mut Value| {
+            b["operations"]["read"] =
+                json!({ "state": "not_ready", "reason": "vector_store_unavailable" });
+            for i in 0..2 {
+                if let Some(kb) = &kb {
+                    b["knowledge_bases"][i]["read"] = kb.clone();
+                }
+            }
+        }
+    };
+    let ready = "ready.response";
+    bad(ready, "ready.dependency.json", "body", &read_down(None));
+    let building = json!({ "state": "not_ready", "reason": "index_building" });
+    bad(
+        ready,
+        "ready.dependency.json",
+        "body",
+        &read_down(Some(building)),
+    );
+    let dependency = json!({ "state": "not_ready", "reason": "dependency" });
+    good(
+        ready,
+        "ready.dependency.json",
+        "body",
+        &read_down(Some(dependency)),
+    );
+    // ready: closed KB reasons; operation_disabled exactly when the operation is disabled (§12 #19).
+    for kb in [
+        json!({ "state": "banana" }),
+        json!({ "state": "not_ready", "reason": "whatever" }),
+        json!({ "state": "not_ready" }),
+        json!({ "state": "ready", "reason": "dependency" }),
+        json!({ "state": "not_ready", "reason": "operation_disabled" }),
+        // R8.4 (r8): dependency only when the infrastructure is not_ready.
+        json!({ "state": "not_ready", "reason": "dependency" }),
+    ] {
+        bad("ready.response", "ready.scoped.json", "body", &|b| {
+            b["knowledge_bases"][0]["search"] = kb.clone()
+        });
+    }
+    for kb in [
+        json!({ "state": "ready" }),
+        json!({ "state": "not_ready" }),
+        json!({ "state": "not_ready", "reason": "index_building" }),
+    ] {
+        bad(
+            "ready.response",
+            "ready.operation-disabled.json",
+            "body",
+            &|b| b["knowledge_bases"][0]["search"] = kb.clone(),
+        );
+    }
+    bad(
+        "ready.response",
         "ready.operation-disabled.json",
-    );
-    let mut scoped = fixture("ready.scoped.json")["response"]["body"].clone();
-    scoped["knowledge_bases"][1]["search"]["reason"] = json!("whatever");
-    check(&v, "ready.response", &scoped, false, "ready.scoped.json");
-    let mut partial = fixture("search.partial.json")["response"]["body"].clone();
-    partial["completeness"] = json!("complete");
-    check(
-        &v,
-        "search.response",
-        &partial,
-        false,
-        "search.partial.json",
-    );
-    let mut revoked = fixture("search.unauthorized-revoked.json")["response"]["body"].clone();
-    revoked["error"]["details"]
-        .as_object_mut()
-        .unwrap()
-        .remove("reason");
-    check(
-        &v,
-        "error",
-        &revoked,
-        false,
-        "search.unauthorized-revoked.json",
+        "body",
+        &|b| {
+            b["knowledge_bases"][0]["read"] =
+                json!({ "state": "not_ready", "reason": "operation_disabled" });
+        },
     );
 }
