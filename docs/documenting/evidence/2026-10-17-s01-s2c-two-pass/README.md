@@ -87,7 +87,7 @@ David 选择保留分段提示、改写一版措辞后重测，门槛不变。�
 
 - 第一遍请求都不带 `reasoning_effort`（J9 17 次，J10 17 次），第二遍都带 `"none"`（J9 5 次，J10 3 次），全部是流式。被取消的那次调用没有发出：日志记的是 `Cancelled`（发请求前查到 job 已取消），转发器收到的 POST 数正好等于上表各条路径实际发出的请求数：J9 22 = 第一遍 17（12 + 5）+ 第二遍 5，J10 20 = 第一遍 17（14 + 3）+ 第二遍 3。
 - 每个应答的 `usage.completion_tokens` 都大于 0（J9 22/22，J10 20/20）。模块日志里的 `completion_tokens` 也都大于 0（J9 22 次调用，103 到 1872；J10 20 次调用，其中截断的 3 次正好是 4096），说明内核把 `usage` 传到了模块。
-- 正文里没有出现 `<think>` 或 `</think>`：Ollama 把思考放在 `delta.reasoning` 里。所以 #1048 说的「思考写进正文」在 Ollama 上不会出现；oMLX 还没测。
+- 正文里没有出现 `<think>` 或 `</think>`：本次 J10 里 Ollama 0.40.4 把 `qwen3.8:27b` 的思考放在 `delta.reasoning` 里。所以 #1048 说的「思考写进正文」在 Ollama 0.40.4 的 `qwen3.8:27b` 上不会出现；换别的思考模型、Ollama 没把它的思考拆进 `delta.reasoning` 时仍可能出现；oMLX 还没测。
 - J10 的内核日志里没有 `no output`，也没有 WARN 或 ERROR 行：流式的思考推动了进展计时。
 
 ## 还没解决的
