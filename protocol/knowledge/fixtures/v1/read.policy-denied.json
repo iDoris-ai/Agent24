@@ -1,0 +1,6 @@
+{ "$comment": "§6: the credential is valid but a policy denies the read.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3V3D4E5F6G7H8J9K0M1N2P", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7" },
+  "response": { "status": 403, "body": { "error": { "code": "forbidden", "message": "Operation is not allowed.",
+    "details": { "retryable": false, "reason": "policy_denied", "request_id": "01JB3V3D4E5F6G7H8J9K0M1N2P", "generation": 15 } } } } }
