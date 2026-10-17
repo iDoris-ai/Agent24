@@ -457,6 +457,98 @@ async fn a_chunked_stream_that_breaks_off_is_unavailable_and_one_that_ends_is_wh
     assert_eq!(r.message.content.as_deref(), Some("whole"));
 }
 
+/// How a backend that takes a request answers it instead of with HTTP.
+#[derive(Clone, Copy, Debug)]
+enum Instead {
+    /// It closes without a word, as Ollama does when it is stopped while it
+    /// reads the prompt.
+    Closes,
+    /// It resets the connection.
+    Resets,
+    /// It writes something that is not HTTP: a wrong port, not one going away.
+    NotHttp,
+}
+
+async fn answers_with(instead: Instead) -> String {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let _ = request(&mut s).await;
+            match instead {
+                Instead::Closes => {}
+                // A zero linger sends RST on drop and never blocks, which is
+                // what the deprecation warns of.
+                #[allow(deprecated)]
+                Instead::Resets => s.set_linger(Some(Duration::ZERO)).unwrap(),
+                Instead::NotHttp => {
+                    let _ = s.write_all(b"not http\r\n\r\n").await;
+                }
+            }
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn a_backend_that_hangs_up_before_it_answers_is_unavailable() {
+    // r4 acceptance D2/D2b: this was `Provider`, so the job failed for good
+    // instead of waiting for the backend to come back.
+    let c = CancellationToken::new();
+    for instead in [Instead::Closes, Instead::Resets] {
+        let p = provider(answers_with(instead).await);
+        for r in [req(None), req(Some(progress(1000, 1000, 5000)))] {
+            let m = unavailable(p.complete(&r, &c).await).await;
+            assert!(m.contains("error sending request"), "{instead:?}: {m}");
+        }
+        let models = p.models(&c).await;
+        assert!(
+            matches!(models, Err(ModelError::Unavailable(_))),
+            "{instead:?}: {models:?}"
+        );
+    }
+    // Control: an answer that is not HTTP is the backend's fault, not it going away.
+    let p = provider(answers_with(Instead::NotHttp).await);
+    for r in [req(None), req(Some(progress(1000, 1000, 5000)))] {
+        let got = p.complete(&r, &c).await;
+        assert!(matches!(got, Err(ModelError::Provider(_))), "{got:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_answer_that_breaks_off_is_unavailable_and_a_malformed_one_is_not() {
+    /// A backend that answers 200 with `head` and `body`, then closes.
+    async fn answers(head: &'static str, body: &'static str) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let _ = request(&mut s).await;
+            let all =
+                format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{head}\r\n{body}");
+            s.write_all(all.as_bytes()).await.unwrap();
+        });
+        url
+    }
+    let c = CancellationToken::new();
+    for (head, body) in [
+        ("content-length: 100\r\n", r#"{"choices":"#),
+        ("transfer-encoding: chunked\r\n", "b\r\n{\"choices\":\r\n"),
+    ] {
+        let url = answers(head, body).await;
+        let m = unavailable(provider(url).complete(&req(None), &c).await).await;
+        assert!(m.contains("broke off"), "{head}: {m}");
+    }
+    // Controls: the backend's fault, not it going away. A chunk size that is
+    // no number, and an answer that ends whole but is no JSON.
+    let url = answers("transfer-encoding: chunked\r\n", "ZZ\r\n{}\r\n0\r\n\r\n").await;
+    let got = provider(url).complete(&req(None), &c).await;
+    assert!(matches!(got, Err(ModelError::Provider(_))), "{got:?}");
+    let (url, _) = backend("application/json", vec![(0, "not json".to_owned())]).await;
+    let got = provider(url).complete(&req(None), &c).await;
+    assert!(matches!(got, Err(ModelError::Provider(_))), "{got:?}");
+}
+
 #[tokio::test]
 async fn an_error_answer_that_never_ends_is_cut_at_the_deadline() {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -662,4 +754,33 @@ async fn a_streamed_request_carries_its_temperature() {
         (body["stream"].as_bool(), body["temperature"].as_f64()),
         (Some(true), Some(0.0))
     );
+}
+
+#[tokio::test]
+async fn a_backend_that_hangs_up_while_a_large_prompt_is_written_is_unavailable() {
+    // #1021 L1: the write meets the hang-up, as `BrokenPipe` or
+    // `ConnectionReset`, whichever comes first: on macOS, 400 calls met 385
+    // resets and 15 broken pipes, all through `hung_up`'s io branch and none
+    // through a hyper predicate. That both kinds count is pinned by
+    // `went_away`'s own test.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let _ = s.read(&mut [0u8; 4096]).await;
+        }
+    });
+    let big = CompletionRequest {
+        messages: vec![Msg::user("x".repeat(16 << 20))],
+        ..req(None)
+    };
+    let streamed = CompletionRequest {
+        progress: Some(progress(1000, 1000, 5000)),
+        ..big.clone()
+    };
+    let p = provider(url);
+    for r in [big, streamed] {
+        let m = unavailable(p.complete(&r, &CancellationToken::new()).await).await;
+        assert!(m.contains("error sending request"), "{m}");
+    }
 }
