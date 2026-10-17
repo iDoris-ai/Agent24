@@ -5,8 +5,9 @@
 //! hit, segment and partial failure decodes into strict types (unknown fields
 //! rejected, required fields present, `null` only where the contract allows it),
 //! and the fields a client branches on decode into their v1 values (R6.2).
-//! `packages/contract-tests/src/knowledge-v1.test.ts` validates the same files
-//! against the full `protocol/knowledge/v1` schemas.
+//! These types are a smoke check: `knowledge_schema.rs` (Rust) and
+//! `packages/contract-tests/src/knowledge-v1.test.ts` (Ajv) validate the same
+//! files against the full `protocol/knowledge/v1` schemas.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
