@@ -71,7 +71,7 @@ fn every_knowledge_fixture_keeps_the_cross_field_rules() {
         }
         if !accept {
             if request.is_object() {
-                reject_pairs_with_request(file, request, &body["error"]);
+                reject_pairs_with_request(file, op, request, &body["error"]);
             }
             continue;
         }
@@ -173,6 +173,10 @@ fn search(file: &str, request: &Value, body: &Value, e_scope: &[&str]) {
 }
 
 fn read(file: &str, request: &Value, body: &Value) {
+    assert_eq!(
+        body["knowledge_id"], request["knowledge_id"],
+        "{file}: knowledge_id"
+    );
     let segments = body["segments"].as_array().unwrap();
     if let Some(chunk) = request.get("chunk_id") {
         // R4.3: a chunk read returns that one chunk.
@@ -198,31 +202,67 @@ fn read(file: &str, request: &Value, body: &Value) {
     }
 }
 
-/// Rules that tie an error to the request it answers (§6, R3.6, R4.4).
-fn reject_pairs_with_request(file: &str, request: &Value, error: &Value) {
+/// Rules that tie an error to the request it answers (§6, R3.5, R3.6, R4.4).
+fn reject_pairs_with_request(file: &str, op: &str, request: &Value, error: &Value) {
     let d = &error["details"];
+    let asked = ids(&request["scope"]["knowledge_base_ids"]);
+    let failed: Vec<&str> = d["partial_failures"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|pf| pf["knowledge_base_id"].as_str().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    unique(file, "partial failure", &failed);
+    assert!(
+        failed.iter().all(|kb| asked.contains(kb)),
+        "{file}: failure outside Q"
+    );
+    // R4.4: index_pending, and index_failed on read, are document-level only.
+    if d["reason"] == "index_pending" || (op == "knowledge.read" && d["reason"] == "index_failed") {
+        assert_eq!(op, "knowledge.read", "{file}");
+        assert!(
+            request.get("chunk_id").is_none() && request.get("expected_revision").is_none(),
+            "{file}"
+        );
+    }
     if error["code"] == "stale" {
         let want = request.get("expected_revision");
         let same_build = want.is_some_and(|w| {
             d["current_revision"]["source_revision"] == w["source_revision"]
                 && d["current_revision"]["index_build_id"] == w["index_build_id"]
         });
+        // R4.5: with a cursor too, expected_revision is checked first and then the
+        // cursor, so a current expected_revision may still meet a stale cursor.
+        let cursor = request["page"]["cursor"].is_string();
         if request.get("chunk_id").is_none() {
-            // Document level: no reason, no chunk revision, and the pair really moved.
+            // Document level: no reason, no chunk revision, and something really moved.
             assert!(
                 d.get("reason").is_none() && d.get("current_chunk_revision").is_none(),
                 "{file}"
             );
-            assert!(want.is_none() || !same_build, "{file}: stale but unchanged");
+            assert!(
+                want.is_none() || cursor || !same_build,
+                "{file}: stale but unchanged"
+            );
         } else if let Some(reason) = d.get("reason") {
             assert_eq!(reason, "anchor_missing", "{file}");
         } else {
-            // Chunk edited in the same build: the new chunk revision is reported.
-            assert!(same_build, "{file}: chunk stale needs the same build");
+            // Chunk edited in the same build: the new chunk revision is reported. A
+            // cursor-only continuation (R4.1, R4.5) carries no expected_revision.
             let current = d
                 .get("current_chunk_revision")
                 .expect("current_chunk_revision");
-            assert_ne!(Some(current), want.unwrap().get("chunk_revision"), "{file}");
+            match want {
+                Some(w) => {
+                    assert!(same_build, "{file}: chunk stale needs the same build");
+                    if !cursor {
+                        assert_ne!(Some(current), w.get("chunk_revision"), "{file}");
+                    }
+                }
+                None => assert!(cursor, "{file}: chunk stale without a cursor"),
+            }
         }
     }
     if d["reason"] == "mixed_score_space" {
@@ -237,10 +277,25 @@ fn reject_pairs_with_request(file: &str, request: &Value, error: &Value) {
             .collect();
         unique(file, "score_space", &spaces);
         unique(file, "grouped KB", &kbs);
-        let asked = ids(&request["scope"]["knowledge_base_ids"]);
         assert!(
             kbs.iter().all(|kb| asked.contains(kb)),
             "{file}: group KB outside Q"
         );
     }
+}
+
+#[test]
+fn missing_and_out_of_scope_documents_are_indistinguishable() {
+    // R2.6, §11.2: same status and body once the echoed ids are removed.
+    let strip = |file: &str| {
+        let mut wire = fixture(file)["response"].clone();
+        let details = wire["body"]["error"]["details"].as_object_mut().unwrap();
+        details.remove("request_id");
+        details.remove("generation");
+        wire
+    };
+    assert_eq!(
+        strip("read.not-found.json"),
+        strip("read.out-of-scope.json")
+    );
 }

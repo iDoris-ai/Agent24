@@ -66,6 +66,8 @@
       "sha256": "62318f30c17fb533a2da3a90c60dbf22b877354ae92bae6c259e0243125b8b79" },
     { "file": "read.expected-revision-partial.json", "version": 1, "class": "reject", "request_valid": false, "server_handler": true,
       "sha256": "5a6c85a5945f465bb4d608051707e630679395e560e116a41be391aa371ab58a" },
+    { "file": "read.stale-chunk-cursor.json", "version": 1, "class": "reject", "request_valid": true, "server_handler": true,
+      "sha256": "0fdf7bf4fbff406f044f552206064b757ae69ca2a2d85ad8d6eee672c4683a05" },
     { "file": "read.stale-page.json", "version": 1, "class": "reject", "request_valid": true, "server_handler": true,
       "sha256": "9d5651105dbb2c3fe6c068a284b6df94c487633786c07bed3f1de45241d1218a" },
     { "file": "read.unsupported-version.json", "version": 1, "class": "reject", "request_valid": false, "server_handler": true,
