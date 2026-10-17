@@ -12,6 +12,7 @@ const creativeBounds = vi.fn()
 const creativeHide = vi.fn()
 const openDesignComponentStatus = vi.fn()
 const openDesignComponentInstall = vi.fn()
+const openDesignComponentPause = vi.fn()
 let resizeCallback: ResizeObserverCallback | null = null
 let progressListener: ((status: OpenDesignComponentStatusResult) => void) | null = null
 
@@ -30,7 +31,7 @@ beforeEach(() => {
   Object.defineProperty(window, 'agent24', {
     value: {
       creativeShow, creativeRestart, creativeBounds, creativeHide,
-      openDesignComponentStatus, openDesignComponentInstall,
+      openDesignComponentStatus, openDesignComponentInstall, openDesignComponentPause,
       onOpenDesignComponentProgress: (cb: (status: OpenDesignComponentStatusResult) => void) => {
         progressListener = cb
         return () => { progressListener = null }
@@ -95,7 +96,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 50 * 1024 * 1024 })
     render(<CreativePage />)
 
-    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 50 MB）/)).toBeTruthy()
+    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 50 MiB）/)).toBeTruthy()
     expect(screen.getByRole('button', { name: '下载' })).toBeTruthy()
     expect(creativeShow).not.toHaveBeenCalled()
   })
@@ -121,7 +122,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     creativeShow.mockResolvedValue({ ok: false, needsDownload: true, size: 20 * 1024 * 1024 })
     render(<CreativePage />)
 
-    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 20 MB）/)).toBeTruthy()
+    expect(await screen.findByText(/Design 需要额外下载 iDoris Design 组件（约 20 MiB）/)).toBeTruthy()
     expect(screen.getByRole('button', { name: '下载' })).toBeTruthy()
   })
 
@@ -151,7 +152,7 @@ describe('CreativePage — on-demand iDoris Design component', () => {
 
     act(() => progressListener?.({ state: 'downloading', received: 5 * 1024 * 1024, total: 10 * 1024 * 1024 }))
     expect(await screen.findByText(/正在下载 iDoris Design 组件/)).toBeTruthy()
-    expect(screen.getByText(/5 \/ 10 MB（50%）/)).toBeTruthy()
+    expect(screen.getByText(/5 \/ 10 MiB（50%）/)).toBeTruthy()
 
     act(() => progressListener?.({ state: 'verifying' }))
     expect(await screen.findByText('正在校验…')).toBeTruthy()
@@ -181,11 +182,99 @@ describe('CreativePage — on-demand iDoris Design component', () => {
     await waitFor(() => expect(creativeShow).toHaveBeenCalled())
     expect(screen.queryByText(/iDoris Design/)).toBeNull()
   })
+
+  // SD-01: pause/resume controls, speed/ETA display, and the unit label fix.
+  it('shows a pause button + speed/ETA while downloading, and calls the pause IPC without starting Creative', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
+    openDesignComponentInstall.mockReturnValue(new Promise(() => {}))
+    openDesignComponentPause.mockReturnValue(new Promise(() => {}))
+    render(<CreativePage />)
+
+    fireEvent.click(await screen.findByRole('button', { name: '下载' }))
+    act(() => progressListener?.({
+      state: 'downloading', received: 2 * 1024 * 1024, total: 10 * 1024 * 1024,
+      bytesPerSecond: 512 * 1024, etaSeconds: 16,
+    }))
+
+    expect(await screen.findByText(/512 KiB\/s/)).toBeTruthy()
+    expect(screen.getByText(/约剩 16 秒/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '暂停下载（保留进度）' }))
+    expect(openDesignComponentPause).toHaveBeenCalledTimes(1)
+    expect(creativeShow).not.toHaveBeenCalled()
+  })
+
+  it('shows "等待网络" instead of a bogus speed/ETA when the rate is unknown', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
+    openDesignComponentInstall.mockReturnValue(new Promise(() => {}))
+    render(<CreativePage />)
+
+    fireEvent.click(await screen.findByRole('button', { name: '下载' }))
+    act(() => progressListener?.({ state: 'downloading', received: 0, total: 10 * 1024 * 1024, bytesPerSecond: 0, etaSeconds: null }))
+
+    expect(await screen.findByText(/等待网络/)).toBeTruthy()
+  })
+
+  it('a paused download keeps its saved progress visible and resumes on "继续下载" click, with no network call before that click', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'paused', received: 4 * 1024 * 1024, total: 10 * 1024 * 1024 })
+    openDesignComponentInstall.mockResolvedValue({ state: 'installed', dir: '/tmp/open-design' })
+    render(<CreativePage />)
+
+    expect(await screen.findByText(/已暂停下载 iDoris Design 组件：已保存 4 \/ 10 MiB/)).toBeTruthy()
+    expect(openDesignComponentInstall).not.toHaveBeenCalled()
+    expect(creativeShow).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: '继续下载' }))
+    await waitFor(() => expect(openDesignComponentInstall).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(creativeShow).toHaveBeenCalled())
+  })
 })
 
-describe('CreativePage English default', () => {
-  it('shows the English download action', () => {
+describe('CreativePage — F1 i18n under English default', () => {
+  beforeEach(() => { setLocale('en') })
+
+  it('shows the English download action', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
     render(<CreativePage />)
-    expect(screen.getByRole('button', { name: 'Download' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Download' })).toBeInTheDocument()
+  })
+
+  // F1 acceptance (red on 221cfd43, green after i18n + MiB unification):
+  // en downloading/paused must contain no CJK, and both states share one size-unit token.
+  it('downloading and paused UI stay English with a unified size unit', async () => {
+    openDesignComponentStatus.mockResolvedValue({ state: 'not-installed', size: 10 * 1024 * 1024 })
+    openDesignComponentInstall.mockReturnValue(new Promise(() => {}))
+    const { container } = render(<CreativePage />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+    act(() => progressListener?.({
+      state: 'downloading',
+      received: 2 * 1024 * 1024,
+      total: 10 * 1024 * 1024,
+      bytesPerSecond: 3 * 1024 * 1024,
+      etaSeconds: 125,
+    }))
+
+    await screen.findByText(/3\.0 MiB\/s/)
+    const downloadingText = container.querySelector('.creative-download')?.textContent ?? ''
+    expect(downloadingText).not.toMatch(/[\u4e00-\u9fff]/)
+
+    act(() => progressListener?.({
+      state: 'paused',
+      received: 4 * 1024 * 1024,
+      total: 10 * 1024 * 1024,
+    }))
+    await screen.findByRole('button', { name: 'Resume download' })
+    const pausedText = container.querySelector('.creative-download')?.textContent ?? ''
+    expect(pausedText).not.toMatch(/[\u4e00-\u9fff]/)
+
+    const unitOf = (s: string): string | undefined => {
+      const m = s.match(/\d+\s*\/\s*\d+\s*(MiB|MB)\b/)
+      return m?.[1]
+    }
+    const downloadingUnit = unitOf(downloadingText)
+    const pausedUnit = unitOf(pausedText)
+    expect(downloadingUnit).toBeTruthy()
+    expect(pausedUnit).toBeTruthy()
+    expect(downloadingUnit).toBe(pausedUnit)
   })
 })
