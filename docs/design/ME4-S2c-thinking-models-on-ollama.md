@@ -179,7 +179,7 @@ Ollama 0.40.4 上这个组合会出错。s01-01 第 4 个窗口（第 27–33 �
 
 **改写（`extractor_version` 6，David 定，§9 Q4，2026-10-17）**：J9 第一次未达标，必答 50/115，严重错误 25（门槛 ≤21），两次运行结果相同。多出的严重错误集中在 33 页的 s01-01，都是漏答：7B 把窗口原文写着的值答成了 `missing`。原因在旧措辞的两句：一句是「本段没写就答 `missing`，即使别处可能写了」，另一句是「这里错答 `present` 比 `missing` 更糟」。去掉分段提示的实验构建是 7B 53/18、27B 83/2，两项门槛都达标。
 
-David 选择保留分段提示、改写措辞后重测（§9 Q4）。新措辞事先定好，只改这一版，不按结果反复调，以免对 8 份样本过拟合。冻结前请 Sonnet 5.5 和 Opus 5.5 各审一次措辞：两方都指出初稿的「写着就答 `present`」漏了 `conflict`，补上；`missing` 固定用 `not_in_document` 是旧版就有的写法，不改。冻结后的原文：
+David 选择保留分段提示、改写措辞后重测（§9 Q4）。新措辞事先定好，只改这一版，不按结果反复调，以免对 8 份样本过拟合。冻结前请 Sonnet 5.5 和 Opus 5.5 各审一次措辞：两方都指出初稿的「写着就答 `present`」漏了 `conflict`，补上；分段时 `missing` 写明用 `not_in_document` 是旧版就有的写法，不改（新措辞只限定何时用它，没有禁止别的原因，见 R-h）。冻结后的原文：
 
 > These blocks are only one part of a longer document; the other parts are read separately and the answers combined. Answer from these blocks only. Check every block for each field: when blocks here state it, answer `present` with the value as written and its quotes, or `conflict` if they state different values. Answer `missing` with reason `not_in_document` only when no block here states it; never guess what another part says. Never answer with a value about another item, row, fee or date because it looks similar.
 
@@ -241,6 +241,7 @@ J9、J10 用这一版重跑，门槛不变，两项都达标：7B 52/115、严�
 | R-e | 各组都只跑了一次，温度 0 也会因 prompt cache 不同而略有出入（ME4-S2b R-f） | 差距（75 → 82）远大于以往重跑的波动；J9 用全新的 `HOME` 再跑一次核对（第 3 片的证据 README） |
 | R-f | 某个版本的 Ollama 或某个模型对 `reasoning_effort: "none"` 回 400，或第二遍遇到别的拒绝 | 内核去掉该字段重发一次（§4，J2b），调用方退回今天的行为：Ollama 上仍会思考，但不失败。重发后仍被拒，说明拒的是别的（例如 `response_format`）；第二遍按 §5.1 第 3 步不拆窗，整个 job 以 `engine_unavailable` 失败（`run.rs:312`：任何一批失败都终止 job）。408、409 这类偶发拒绝落在第二遍时也一样，今天它们会被当成输入太长去拆窗；Ollama 不会主动回这两种，接受。只在 0.40.4 上用 `qwen2.5:7b`、`qwen3.8:27b` 核实过「`none` 被接受」（§4），实现 PR 在 README 写明已验证的 Ollama 版本和模型 |
 | R-g | oMLX 上的效果没测过（§4）。若 Qwen3 的思考在正文里而 §5.1 第 2 步没能去干净，每批都会落到第二遍：质量同 A，耗时约为 A 的两倍 | 今天的做法在 oMLX 上也没测过。第 3 片在 oMLX 上跑一次 S01（本机没有 oMLX 时请 jason 跑），只记录，结果写进证据。`OMLX_URL` 指向不认 `chat_template_kwargs` 的本地服务时，由 §4 的 400 后重发兜住：调用不再失败，但开着思考作答，AgentEar 可能把思考念出来（§4） |
+| R-h | 分窗抽取时，`missing` 的具体原因（`blank_in_template`、`referenced_but_absent`、`outside_page_scope`）可能丢失：分段提示点名了 `not_in_document`，模型可能照它答，合并后成了「文件里没有」（`merge.rs` 取第一个具体原因）。S01 测不到：要分窗的只有 s01-01，它的 `missing` 金标都是 `not_in_document`，评分也不把原因计入「missing 判对」 | 不是本片引入的：旧措辞写得更绝对。措辞已冻结、已实测，改它要再升 `extractor_version` 并重测；记在 #1041，下次改提示时改成「按适用的原因作答」 |
 
 ## 9. 决定（David，2026-10-16）
 
