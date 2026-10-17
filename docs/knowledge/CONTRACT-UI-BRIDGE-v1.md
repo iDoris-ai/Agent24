@@ -194,6 +194,158 @@ KnowledgeView（Electron main 为一个 binding 创建的隔离 WebContentsView�
 | UT-60 | U4.8、S4.9 | profile P、Q 的 binding 同时激活、各开一个 KnowledgeView；P 取消选用；随后 Off | 前者只销毁 P 的 view，Q 的 view 照常注入；后者两个都销毁，之后不新建 KnowledgeView，入口标明不可用及原因 |
 | UT-61 | U4.8 | 签发入口或页面请求触发 T42，续签也失败（`credential_rejected`）；随后同一 principal 重新登录（T38）；另测：遮罩期间收到撤权信号（T35a） | 暂停注入、关桥，view 不销毁，宿主遮罩显示"不可用，需要重新授权"，页面内容不可见、不接收输入；重新登录回到可服务后撤下遮罩，换发 JWT 并重新加载当前文档；撤权信号使 generation 递增，view 按 binding 级销毁 |
 
+## 6. 桥通道与宿主判定
+
+- **U6.1** [D5/KB-C2-04a+新设] **通道**：本文不规定机制，KB-C2-04a 先验证（页面里的 `window.postMessage` 到不了 main）。候选通道都必须满足：(a) main 从通道自身的元数据得知发出方的 WebContents、frame 与文档，不依赖消息内容；Electron 34 的 WebFrameMain 没有文档令牌（§9 第 7 条），**文档身份从哪里来是 PoC 项**；(b) 页面经通道只能到达桥的处理函数，通道不代发请求、不读文件、不开 URL；(c) main 能识别发出 frame 是否主 frame——这只用于违规检测，**不是安全边界**：同源子 frame 能操纵主 frame，与主 frame 同权，隔离靠 CSP 的 `frame-src 'none'`、`child-src 'none'` 与 origin 校验；(d) main 在解析之前就知道原始字节长度，并在传输层计数与拒绝；(e) 宿主到页面的消息只送达当前文档的主 frame，子 frame 与旧文档收不到。无 preload 时宿主→页面只能用 `executeJavaScript` 或 `executeJavaScriptInIsolatedWorld`：前者在页面主世界执行；后者在隔离世界执行，但交给页面代码时仍要经过主世界可见的事件。宿主调用两者时 `userGesture` 一律为 `false`。所以宿主→页面的消息对页面内任何脚本可见，也可能被页面脚本伪造给页面自己；它们不含秘密，页面不得据此做安全决策，宿主侧的判定不受影响。(f) main 用 `before-input-event` 加 `input-event` 观察该 view 内的用户输入，只认激活类事件（`InputEvent.type` 为 `mouseDown`、`pointerDown`、`rawKeyDown`、`keyDown`、`gestureTap`、`touchStart`），`mouseMove`、`mouseEnter`、滚轮与滚动手势不算；PoC 只验证这两个事件对 WebContentsView 是否生效（U7.2 用）。做不到 (a)、(b)、(d)、(e) 时桥不开放（§10 #14）。
+- **U6.2** [ADR-004:145/S5.9+新设] **方向与类型**：页面→宿主只有 `status`、`citation`、`cancel`、`return_to_chat_intent` 四种（任务原文的状态、引用、取消、回主对话意图）。宿主→页面另设闭集：`hello`（协议版本、generation、不透明的 view 实例 ID）、`state`（profile 状态及 code、主题、语言）、`reply`（对页面消息的应答）。没有交付票据或凭据的消息；宿主→页面同样不得出现 URL、路径与令牌（U7.4）。KnowledgeView 的 `closed` 状态由宿主自己的界面显示（ADR-004:141 的 typed status），不经桥发送。
+- **U6.3** [新设] **文档切换与 hello**：主 frame 每提交一个新文档（含重新加载），宿主清空该 view 实例按文档维护的去重表、在途表与待发队列，在 `dom-ready` 之后向新文档发 `hello`。页面还没拿到 generation 时，可以发一条 `generation` 为 0 的 `status` 作为 hello 请求，宿主回一条 `hello`，不计违规；每个文档至多 3 次，之后的按 `stale_generation` 处理。hello 请求在 U6.4 ⑫ 之后、⑬ 之前处理，所以桥未开放时也能拿到 `hello`；这是 S5.9 的例外，`hello` 只含非秘密信息（§10 #12）。旧文档的消息按通道给出的文档身份判为非当前文档（U6.4 ⑤）。
+- **U6.4** [S5.9/ADR-004:145+新设] **宿主对每条页面消息的判定**（按顺序，取第一个不成立的）：
+  ① 发出方 WebContents 按分区映射是一个存活 view 实例的 KnowledgeView，且该实例的桥未关闭；
+  ② 发出方 frame 是主 frame；
+  ③ 该 frame 已提交文档的 origin（main 看到的值）等于允许 origin；
+  ④ 该 WebContents 的 session 就是分区映射里该实例的分区，且 U4.2、U4.3 的条件成立；
+  ⑤ 发出文档是当前文档；
+  ⑥ 到达速率未超限（U6.7）：只看传输层元数据，按到达数计，不解析；
+  ⑦ 原始长度不超过上限（U6.7）；
+  ⑧ 是合法 UTF-8 JSON，没有重复键，嵌套、数组与字符串长度不超过上限（U6.7）；
+  ⑨ 任意深度都没有禁止键（U7.4）；
+  ⑩ 自由文本字段通过内容检查（U7.4；v1 没有自由文本字段，本步恒成立）；
+  ⑪ `v` 存在且受支持（`v` 缺失落到 ⑫）；
+  ⑫ 符合 schema（U7.1、U7.2），`direction` 为 `page_to_host`；通过后若是 hello 请求（U6.3），回 `hello` 并结束；
+  ⑬ 该 binding 准入开放、处于可服务状态（S5.9 中除 generation 以外的条件；待复验未解除视为准入未开放，S3.1），且 main 收到的最近一次心跳不超过 1 秒（U4.5 ⑥）；
+  ⑭ 消息的 `generation` 等于当前值（S5.9 的 generation 条件）；
+  ⑮ `id` 不在当前文档的去重表里（U6.7）；
+  ⑯ 未超过在途上限（U6.7）。
+  ①–⑤ 不成立时**静默丢弃**，不回 `reply`，按发出方计数，日志采样记录（每个发出方每分钟前 10 条，之后每 100 条记 1 条），宿主至多同时跟踪 256 个发出方、超出时淘汰最旧的；其中 ②、③ 的来源在 view 内部，同时记为硬违规（U6.6）。⑥ 超限时每个限速窗口只回一次 `overloaded`，其余静默丢弃并计数。⑦–⑯ 不成立时回 `reply`（`rejected`，`code` 与 `reason` 见 U7.5）。只有通过 ⑯ 的 `id` 才登记进去重表。任何一步不成立，消息都没有任何效果。
+- **U6.5** [D5+新设] sender、frame、origin 与文档身份**只取自传输层元数据**。报文自报任何绑定字段（如 `origin`、`sender`、`frame`、`webcontents`）即视为伪造，按禁止键处理（U7.4）。
+- **U6.6** [新设] **违规与关桥**：
+  - `overloaded` 是正常的背压信号，本身不算违规。**无视 `retry_after_ms`** 才算：宿主为某个限额（到达速率、在途总数或 intent 名额）发出 `overloaded` 后，只统计在发出时刻加 max(500 毫秒, 该通道的往返时延估计) 之后、`retry_after_ms` 结束之前到达、且受同一限额约束的消息（例如 intent 名额满时，并发的 `status` 不计）；这类消息达到 3 条，记一次软违规。窗口互不重叠：窗口未结束时再发出的 `overloaded` 不开新窗口。
+  - **软违规**：⑦、⑧、⑫、⑭、⑮ 不成立；无视 `retry_after_ms`；⑫ 中只因引用 ID 默认禁止规则（U7.1）不成立的不计；⑪ 不成立单独计数，同一 view 实例 10 秒内达到 5 次，记一次软违规并清零。⑬ 不成立只拒绝，不计入软违规，也不计入关桥上限。同一 view 实例 10 秒内 5 次软违规即关桥。
+  - **硬违规**：⑨ 不成立（先回 `reply` 的 `forbidden_key`，再关桥），或 ②、③ 的来源在 view 内部（静默后关桥）；一次即关桥，并记审计 `knowledge.bridge_violation`（`binding_tag`、H("kb-view-v1"; `view_nonce`)、判定步骤、`type`，不含消息内容）。
+  - 关桥是 view 级处理：按 U4.7 销毁 view 实例并撤销族，**不递增 generation**；KnowledgeView 进入 `closed`（`code: "bridge_closed"`），用户点重新加载才新建 view 实例。同一 binding 10 分钟内第 3 次因违规关桥后不再提供重新加载，直到用户从 Knowledge 设置里重新打开（§10 #17）。因端口变化（U4.8）、通道恢复或 binding 级销毁而关桥的，不计入。
+- **U6.7** [新设] **上限**（工程值，取较严，可按实测调整）：页面→宿主到达速率持续 10 条/秒、突发 20 条（⑥）；单条不超过 8 KiB（⑦，传输层拒绝）；嵌套不超过 4 层（根对象算第 1 层，每个对象或数组各算一层）；数组不超过 32 项；单个字符串不超过 2 KiB；处理中最多 4 条（`cancel` 不占名额），其中 `return_to_chat_intent` 最多 1 条（⑯）。宿主→页面单条不超过 32 KiB；按队列发送：`hello` 与 `state` 合计最多 5 条/秒，排队中的 `state` 只保留最新一条；`reply` 不合并、不丢弃，它的数量受 ⑥ 的到达限速约束：每条通过 ⑥ 的消息至多产生两条 `reply`（`accepted` 加 `done` 或 `rejected`），超限的到达每个窗口至多一条 `overloaded`。**去重表**：每个文档至多 4096 项，满了按 FIFO 淘汰；被淘汰的 `id` 再次出现时当新消息处理——内存有界比完美去重重要，页面重发自己的消息也得不到额外权限；作为替代手段，宿主可以拒收时间戳早于最老保留项的 ULID（回 `duplicate_id`）。hello 请求每个文档至多 3 次（U6.3）。
+- **U6.8** [R10.3+新设] 宿主日志与审计只记 `type`、`code`、`reason`、`id`、H("kb-view-v1"; `view_nonce`) 与判定步骤，不记消息体、票据、JWT 与 view 证明。
+
+## 7. 消息 schema
+
+- **U7.1** [KB-C2-04b+新设] **信封**：`{ v, direction, type, id, generation, in_reply_to?, payload }`。每一层都不允许多余字段（`additionalProperties: false`），除注明外都必填。
+
+| 字段 | 类型与约束 | 说明 |
+|---|---|---|
+| `v` | 整数，v1 恒为 `1` | 不受支持时回 `unsupported_protocol_version` |
+| `direction` | 枚举 `page_to_host` / `host_to_page` | 页面只能发 `page_to_host` |
+| `type` | 页面→宿主：`status` / `citation` / `cancel` / `return_to_chat_intent`；宿主→页面：`hello` / `state` / `reply` | 与 `direction` 不配即 `schema_violation` |
+| `id` | ULID，`^[0-9A-HJKMNP-TV-Z]{26}$` | 发出方生成，当前文档内唯一 |
+| `generation` | 整数，1 至 2^53−1；只有作为 hello 请求的 `status` 可以为 0（U6.3） | 页面取自最近一条 `hello` |
+| `in_reply_to` | ULID | `reply` 必填，其他类型不得出现（违反即 `schema_violation`） |
+| `payload` | 对象，按 `type` 取 U7.2、U7.3 之一 | |
+
+  **引用 ID**：`source_revision`、`index_build_id` 是 READONLY R5.2 的不透明标识；`knowledge_base_id`、`knowledge_id`、`chunk_id` 按本文约束。五者都校验 UTF-8 字节长度 1–128、不含控制字符（U+0000–U+001F、U+007F–U+009F），并作为纵深防御默认拒绝含 `/`、`\`、`:`、`..` 或空白的 ID；长度或控制字符不符合时回 `schema_violation`（软违规）；只命中默认禁止规则时同样回 `schema_violation`，但不计违规（服务端若使用含 `:` 等字符的 ID，不致因合法引用关桥，§10 #21）。它们不做 U7.4 的内容检查。宿主只把它们作为不透明值放进 READONLY 的 read 请求，从不当作 URL 或路径解释。这条默认禁止规则在与 READONLY R5.2 同步之前先行采用（§10 #21）。`chunk_revision` 为整数，0 至 2^31−1。引用的修订字段拍平在同一层，`return_to_chat_intent` 的嵌套为 4 层（信封、`payload`、`citations` 数组、引用对象）。**容量验算**：8 条引用、每个 ID 取满 128 字节且不含需要 JSON 转义的字符时，整条消息紧凑编码为 6283 字节，装得进 8 KiB；`\` 已被默认禁止；ID 若含 `"`，转义后最坏 11403 字节，按 `too_large` 拒绝。服务端生成的 ID 不含 `"`，所以 8 条的上限保持不变（§10 #21）。
+
+- **U7.2** [KB-C2-04b/R4.7+新设] **页面→宿主的 payload**：
+
+| `type` | payload | 宿主怎么处理 |
+|---|---|---|
+| `status` | `state`：`loading` / `ready` / `error`；`error_code`：只在 `error` 时出现，`unauthorized` / `forbidden` / `not_found` / `unavailable` / `internal` | 只用于宿主侧显示，不触发续期、登录、自查或任何 STATE 事件；`generation` 为 0 时是 hello 请求（U6.3） |
+| `citation` | `knowledge_base_id`、`knowledge_id`、`chunk_id`、`source_revision`、`index_build_id`、`chunk_revision`，全部必填 | 只用于展示：宿主经 Provider 以当前 generation 做带 `chunk_id` 与 `expected_revision` 的单分块 read（R4.1、R4.7），通过才在引用 UI 里显示（KB-C1-05）；不写入模型上下文，也不写入草稿；read 走桥预算并排队（见下） |
+| `cancel` | `target_id`：ULID | 撤回当前文档内一条还在处理或排队的 `citation` 或 `return_to_chat_intent`：被撤回的原消息最终回 `rejected`（`code: "cancelled"`），等待确认的弹窗随之关闭；`cancel` 本身回 `accepted`；目标不存在或已完成时回 `accepted`，不做任何事 |
+| `return_to_chat_intent` | `citations`：数组，0 至 8 项，每项同 `citation` 的 payload | 见下 |
+
+  `return_to_chat_intent` [新设]：只在该 KnowledgeView 最近 5 秒内有激活类用户输入（U6.1 (f)）时接受，否则回 `forbidden/user_activation_required`。草稿附件在一个对话里累计至多 16 项，超出回 `invalid_request/attachment_limit`。接受后宿主只高亮"回到对话"入口或弹出确认，**不自动切换**；确认界面列出将附加的引用条数与每条的标题，标题由宿主重新 read 后取得，不用页面给的任何文字；标题按纯文本渲染，去掉控制字符与 bidi 控制字符（U+202A–U+202E、U+2066–U+2069 等），截断到 120 个字符。等待确认最多 60 秒，超时释放名额并回 `rejected`（`forbidden/confirmation_timeout`，不可重试）；用户拒绝回 `rejected`（`forbidden/user_declined`），该 view 实例随后冷却 30 秒，冷却期内的 intent 回 `forbidden/cooldown`。用户确认后才切回主对话，引用逐项按 `citation` 的方式校验后作为草稿附件放进输入区；**只有这条路径产生草稿附件**。不自动发送、不创建 run、不做任何审批；v1 不带自由文本（§10 #15）。
+
+  **桥预算** [新设]：`citation` 与 intent 触发的 read（intent 的逐条校验 read 与标题 read 都算）走 Provider 为桥单设的低优先级预算，至多 2 个并发，其余按 FIFO 排队，不直接拒绝；不占用主对话知识调用的预算与并发，这是与 KB-C1-04 总预算的接口。U6.4 ⑯ 的"处理中"计数包含排队中的消息，上限 4 不变。排队超过 10 秒仍未开始的，回 `unavailable/overloaded` 并带 `retry_after_ms`。
+
+- **U7.3** [新设] **宿主→页面的 payload**：`hello`：`supported`（整数数组，v1 为 `[1]`）、`view_instance_id`（`^[A-Za-z0-9_-]{22}$`，随机生成，不同于 `view_nonce` 与 `view_secret`，不是秘密）。`state`：`profile_state`（STATE 草案 S1.1 的六个状态之一）、`code`（可选，`^[a-z_]{1,64}$`，取 STATE 草案 §6 的本地 `reason`）、`theme`（`light` / `dark`）、`locale`（BCP 47，`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$`）。`reply`：`result`（`accepted` / `rejected` / `done`）、`code`、`reason`、`retry_after_ms`、`supported`（后四项可选）；`done` 表示处理结束，宿主的 read 失败时 `code` 取 READONLY 的值（如 `stale`）。宿主→页面的消息没有自由文本，发出前同样过 U7.4 的禁止键检查，不通过就不发并记日志。
+- **U7.4** [ADR-004:145+新设] **禁止键与内容检查**：
+  - 禁止键在任意深度生效。比对方式：键名转小写、去掉 `_` 与 `-` 后，与清单项（同样规范化）**精确相等**才算命中，不做子串匹配。清单：`url`、`uri`、`href`、`path`、`file`、`dir`、`cwd`、`command`、`cmd`、`exec`、`executable`、`argv`、`args`、`shell`、`script`、`approval`、`approve`、`decision`、`token`、`jwt`、`ticket`、`secret`、`password`、`authorization`、`cookie`、`origin`、`sender`、`frame`、`webcontents`、`port`、`__proto__`、`constructor`、`prototype`。解析器不得给 `__proto__` 等键特殊语义。
+  - CI 检查桥 schema 本身不定义任何禁止键；检查用例里放 `profile_state`、`direction` 作为不应命中的反例。
+  - 内容检查只用于自由文本字段：字符串值含 `/`、`\`、`://`，或以 `~`、`.` 开头，视为携带 URL、路径或可执行内容，回 `forbidden_content` 并按硬违规处理。**v1 两个方向都没有自由文本字段，本条不适用**，留给以后的版本。
+- **U7.5** [R6.1+新设] **`reply` 的拒绝码**：`code` 沿用 READONLY 的取值，新增的 `reason` 只在桥上使用；不带自由文本，不回显内容。
+
+| 判定 | `code` / `reason` | 附加 | 违规 |
+|---|---|---|---|
+| U6.4 ⑥ 到达超速 | `unavailable` / `overloaded` | `retry_after_ms`；每窗口一次 | 不计（无视它另计，U6.6） |
+| U6.4 ⑦ 超长 | `invalid_request` / `too_large` | | 软 |
+| U6.4 ⑧、⑫ 格式或 schema 不符 | `invalid_request` / `schema_violation` | | 软 |
+| U6.4 ⑫ 只命中 U7.1 引用 ID 的默认禁止规则 | `invalid_request` / `schema_violation` | | 不计 |
+| U6.4 ⑨ 禁止键 | `invalid_request` / `forbidden_key` | | 硬：先回 `reply`，再关桥 |
+| U6.4 ⑪ 版本 | `invalid_request` / `unsupported_protocol_version` | `supported` | 单独计数（U6.6） |
+| U6.4 ⑬ 未准入、不可服务或心跳不新鲜 | `unavailable` / `not_ready` | | 不计 |
+| U6.4 ⑭ generation 不符 | `invalid_request` / `stale_generation` | | 软 |
+| U6.4 ⑮ `id` 重复 | `invalid_request` / `duplicate_id` | | 软 |
+| U6.4 ⑯ 在途已满 | `unavailable` / `overloaded` | `retry_after_ms` | 不计（无视它另计，U6.6） |
+| U7.2 缺少用户输入 | `forbidden` / `user_activation_required` | | 不计 |
+| U7.2 附件超限 | `invalid_request` / `attachment_limit` | | 不计 |
+| U7.2 确认超时；用户拒绝；冷却期内 | `forbidden` / `confirmation_timeout`；`forbidden` / `user_declined`；`forbidden` / `cooldown` | | 不计 |
+| U7.2 桥 read 排队超过 10 秒 | `unavailable` / `overloaded` | `retry_after_ms` | 不计 |
+| U7.2 被 `cancel` 撤回的原消息 | `cancelled`（READONLY 错误码闭集里的本地码，不上线到服务端） | | 不计 |
+
+- **U7.6** 示例。引用：
+```json
+{ "v": 1, "direction": "page_to_host", "type": "citation", "id": "01JB4A0B1C2D3E4F5G6H7J8K9M", "generation": 7,
+  "payload": { "knowledge_base_id": "kb-a", "knowledge_id": "doc-1", "chunk_id": "chk-11",
+               "source_revision": "src-3", "index_build_id": "ib-5", "chunk_revision": 0 } }
+```
+应答：
+```json
+{ "v": 1, "direction": "host_to_page", "type": "reply", "id": "01JB4A0C2D3E4F5G6H7J8K9M0N", "generation": 7,
+  "in_reply_to": "01JB4A0B1C2D3E4F5G6H7J8K9M", "payload": { "result": "accepted" } }
+```
+
+## 8. 验收：伪造与越权的拒绝用例
+
+KB-C2-04a、KB-C2-04b 按本表写测试。"静默"指不回 `reply`、没有任何效果、按 U6.4 计数并采样记日志。除注明外，消息本身合法，binding 处于 `ready`。会产生软违规的子用例各用一个新 view 实例，或间隔 10 秒以上执行，避免互相累积关桥。
+
+| ID | 规则 | 构造 | 期望 |
+|---|---|---|---|
+| UB-01 | U6.4 ① | Agent24 自身 renderer 或另一个非 KnowledgeView 的 WebContents 经同一通道发合法消息 | 静默 |
+| UB-02 | U6.4 ⑭ | 先打开 binding A 的 KnowledgeView（generation 5），再切换到 binding B（A 的 view 已销毁，B 的 generation 为 9）；B 的页面发 `generation: 5` | `stale_generation`；对 A 没有任何效果 |
+| UB-03 | U6.1 (c)、U6.4 ② | 测试桩绕过 CSP 插入同源子 frame（正常情况下 `frame-src 'none'` 已挡住），子 frame 发消息 | 静默；按违规检测记硬违规，关桥，记审计。隔离靠 CSP，不靠这一步 |
+| UB-04 | U6.4 ②、U6.6 | 同上，换成跨 origin 子 frame | 同 UB-03 |
+| UB-05 | U6.4 ③、U4.8 | 主 frame 落到其他 origin 后发消息 | 静默；硬违规；view 级处理 |
+| UB-06 | U6.4 ④ | 测试桩把一个使用其他分区的 WebContents 登记为 view 实例，并从它发消息 | 静默，记日志 |
+| UB-07 | U6.5、U6.6、U7.4 | 消息带 `origin`、`Sender`、`frame` 或 `web_contents` 键 | 先回 `forbidden_key`，再关桥；硬违规 |
+| UB-08 | U6.3、U6.4 ⑤ | 主 frame 导航到新文档后，旧文档在卸载前发消息 | 静默；不计违规 |
+| UB-09 | U6.4 ⑭ | `generation` 为当前值减一或加一 | `stale_generation`（软） |
+| UB-10 | U4.8、S5.9 | STATE 草案 S4.5 第 ① 步之后发消息 | 桥已在 ack 之前关闭：静默丢弃，即 S5.9 的"拒绝所有消息" |
+| UB-11 | U6.4 ⑬、U6.6 | binding 处于 `unavailable`（不递增 generation 的 T08）；`persist_pending` 为真（靠测试桩注入）；最近一次心跳超过 1 秒；以上各连发 10 次 | 都是 `unavailable/not_ready`；不计软违规，不关桥 |
+| UB-12 | U6.4 ⑮ | 同一 `id` 发两次；另把一条在 ⑫ 被拒的消息修正后用同一 `id` 重发 | 前者第二次 `duplicate_id`，效果只发生一次；后者正常处理（被拒的 `id` 未登记） |
+| UB-13 | U6.4 ⑦ | 8 KiB + 1 字节的消息 | `too_large`，不解析 |
+| UB-14 | U6.4 ⑧ | 子用例：非 UTF-8；非 JSON；重复键；嵌套 5 层（根对象算第 1 层，数组算一层）；数组 33 项；字符串超过 2 KiB | 每个子用例都是 `schema_violation` |
+| UB-15 | U6.4 ⑫ | `type` 为 `open_url` 或 `approve` | `schema_violation` |
+| UB-16 | U6.4 ⑪、U6.6 | `v` 为 2；10 秒内连发 5 次 | 每次 `unsupported_protocol_version`，`supported: [1]`；第 5 次记一次软违规 |
+| UB-17 | U6.4 ⑫ | 多一个未知字段 `note`；页面发 `direction: "host_to_page"`、`type: "reply"`；缺少 `v`；`reply` 缺 `in_reply_to`（测试桩构造宿主侧消息，CI schema 检查拒绝） | `schema_violation` |
+| UB-18 | U7.1 | `chunk_id` 为 `https://evil.example/x`；`knowledge_id` 为 `../../etc/passwd`；ID 含空白或 `\` | `schema_violation`，不计违规；不发 read |
+| UB-19 | U7.1 | 引用 ID 含控制字符；ID 为 43 个三字节字符（129 字节） | `schema_violation` |
+| UB-20 | U7.4 | 任意深度出现 `URL`、`file`、`Executable`、`argv`、`shell`、`approval`、`decision` 键 | 先回 `forbidden_key`，再关桥 |
+| UB-21 | U7.4 | 带 `token`、`jwt`、`ticket`、`authorization`、`cookie` 或 `password` 键 | 同 UB-20；值不进日志 |
+| UB-22 | U7.4 | 带 `__proto__` 或 `constructor` 键 | 同 UB-20；宿主对象原型不受影响 |
+| UB-23 | U7.2 | `status.state` 为 `approved`，或带自由文本字段 `message` | `schema_violation` |
+| UB-24 | U7.2 | `return_to_chat_intent` 带 9 条引用；`chunk_revision` 为 −1 或 2^31 | `schema_violation` |
+| UB-25 | U7.2 | 页面发 `status`（`error`，`error_code: "unauthorized"`） | 只更新显示；没有续期、自查、登录或 STATE 事件 |
+| UB-26 | U7.2、R4.4 | 形状合法的 `citation`，修订有效；另一条修订已过期 | 前者在引用 UI 显示，模型上下文与草稿都不变；后者 `done`，`code: "stale"`，不显示 |
+| UB-27 | U7.2 | `cancel` 指向另一个 view 实例或旧文档的 `id` | `accepted`，没有任何效果 |
+| UB-28 | U6.6、U6.7 | 1 秒内发 50 条，之后按 `retry_after_ms` 等待；收到 `overloaded` 后 500 毫秒内又到达的消息；intent 名额满时并发发 `status` | 超限部分每窗口一次 `overloaded`，其余静默；这三种都不计违规 |
+| UB-29 | U6.6 | 新 view：收到 `overloaded` 后，在宽限期之后、`retry_after_ms` 之内持续发受同一限额约束的消息 | 每个窗口记一次软违规，窗口不重叠；10 秒内 5 次关桥 |
+| UB-30 | U6.7、U7.2 | 测试桩让 Provider 的 read 延迟 30 秒；先发 4 条 `citation` 占满在途（2 条执行、2 条排队），再发 `cancel` 与第 5 条 `citation`；另测：一条 intent 等待确认时再发一条 intent | `cancel` 照常 `accepted`；第 5 条 `citation` `overloaded`；第二条 intent `overloaded` |
+| UB-31 | U6.6 | 10 秒内 5 次软违规 | 关桥；generation 不变；族被撤销；KnowledgeView `closed`（`bridge_closed`）；重新加载后新实例可用 |
+| UB-32 | U6.6 | 同一 binding 10 分钟内第 3 次关桥 | 不再提供重新加载；从 Knowledge 设置里重新打开后才恢复 |
+| UB-33 | U6.4 | 非 KnowledgeView 的 WebContents 1 分钟内发 10000 条；300 个不同来源各发 1 条 | 全部静默；日志按采样记录；跟踪的来源不超过 256 个，内存不随消息数增长 |
+| UB-34 | U6.1 (e) | 子 frame 与刚被替换的旧文档监听宿主消息 | 都收不到 `hello`、`state`、`reply` |
+| UB-35 | U6.7 | 1 秒内产生 20 次 `state` 更新与 10 条 `reply` | 页面收到的最后一条 `state` 是最新值；10 条 `reply` 全部送达 |
+| UB-36 | U7.3 | 故障注入：宿主要发的消息带 `url` 键 | 宿主不发送，记日志；CI 的 schema 检查同样拒绝 |
+| UB-37 | U7.2 | 页面在没有用户输入的情况下发合法 `return_to_chat_intent` | `forbidden/user_activation_required`；不切换、不加附件 |
+| UB-38 | U7.2 | 同一对话已有 16 项草稿附件后再发带引用的 intent | `invalid_request/attachment_limit` |
+| UB-39 | U7.2 | 合法 intent 被接受后用户 60 秒不确认；另一次用户点拒绝，并在 30 秒内再发 intent | 前者 `forbidden/confirmation_timeout` 并释放名额；后者先 `forbidden/user_declined`，冷却期内的 intent 得 `forbidden/cooldown`；都不加附件 |
+| UB-40 | U7.2 | 用户刚在 KnowledgeView 里按键或点击后发合法 intent（2 条有效引用） | 宿主只高亮入口或弹出确认，不自动切换；确认界面显示"2 条"与宿主 read 得到的标题；用户确认后两条引用以草稿附件出现；没有发送消息、没有创建 run、没有审批弹窗 |
+| UB-41 | U6.1 (f)、U7.2 | 只有 `mouseMove`、`mouseEnter`、滚轮或滚动手势之后发合法 intent | `forbidden/user_activation_required` |
+| UB-42 | U6.3 | 页面错过 `hello`，发 `generation: 0` 的 `status`；同一文档发第 4 次 | 前 3 次各得一条 `hello`，不计违规；第 4 次 `stale_generation` |
+| UB-43 | U6.7 | 同一文档发满 4096 个不同 `id` 后，重发最早的那个 `id` | 被淘汰的 `id` 当新消息处理（实现了时间戳替代手段时回 `duplicate_id`）；宿主内存不超过上限 |
+| UB-44 | U7.2 | 主对话正在进行知识调用时，页面在在途上限内连发 `citation`，测试桩让 read 变慢 | 主对话的知识调用不被延迟；桥的 read 至多 2 个并发，其余按 FIFO 排队；排队超过 10 秒的回 `overloaded` 并带 `retry_after_ms` |
+| UB-45 | U7.2 | `cancel` 一条正在排队的 `citation`；`cancel` 一条等待确认的 intent | 原消息都回 `rejected`（`cancelled`）；确认弹窗随之关闭；`cancel` 本身 `accepted` |
+| UB-46 | U7.2 | 宿主 read 得到的标题含控制字符、U+202E 等 bidi 控制字符、HTML 标记，或长于 120 字符 | 确认界面按纯文本显示：去掉控制与 bidi 字符，截断到 120 字符，不解释标记 |
+| UB-47 | U7.4 | 消息带 `port` 或 `Port` 键 | 先回 `forbidden_key`，再关桥 |
+
 ## 9. 现状证据（Agent24 `eb1a58b`）
 
 1. **现有隔离 view（Creative）**：`apps/desktop/src/main/main.ts:113-120` 创建 WebContentsView，`contextIsolation`、`sandbox` 为真，`nodeIntegration` 为假，没有 preload；但分区是持久的 `persist:agent24-creative`（`apps/desktop/src/main/creative-serve-web.ts:64`），与 ADR-004:117 的非持久要求不符。弹窗与导航策略在 `main.ts:122-141`。隐藏只把 bounds 设成 1×1（`main.ts:84-89`），全仓库没有 `clearStorageData` 调用。KnowledgeView 按 D5 新做，不照抄这些代码。
@@ -221,7 +373,15 @@ KnowledgeView（Electron main 为一个 binding 创建的隔离 WebContentsView�
 | 11 | remote 签发权威撤销刷新令牌的接口与时限；失败后的持久重试队列（先写墓碑 `revoke:<binding_id>:<序号>` 再删登录态，存系统凭据存储，指数退避 1 分钟到 1 小时，至多 20 次或 7 天）[新设] | 按本文，界面如实提示（U4.11） | #992（外部依赖）；队列数值本 PR 评审 |
 | 12 | **依赖 STATE 草案 r14（#1070–#1072）的规则**：可服务状态与术语表"连接阶段"（`degraded` 可服务，不暂停注入，U4.8）；S1.10 的不变式 I1–I8（I6 退役不复活、I7 Off 与注销不恢复成放开，对应 U4.9–U4.11）与 S1.14 的重启语义（全局收紧时登录态只作废，U4.9）；S1.13、T44（带 `unsaved_settings` 的 profile 重新登录，U4.9）；S2.4–S2.7；S3.1（撤权信号走 T18，处理时已不可服务走 T35a；凭据无效类走 T42；旧凭据撤权信号的待复验不准入，U6.4 ⑬；**STATE 仍需在 S3.1 写明"UI 兑换与会话探测的响应除外"**，r14 尚未写入；`credential_near_expiry` 不作为服务不可用交给 STATE，U2.1 ③、U3.8）；S3.2（ack 超时不得无限等待）；S4.2；S4.5（U4.7 的 ①② 发生在 S4.5 第 ① 步之内，main 回 ack 后 Provider 才进行第 ② 步，U4.8）、S4.6；S4.9（多个 binding 同时激活，view 按 binding 销毁，U4.8）；S5.9（拆成 U6.4 ⑬⑭ 两步；**STATE 仍需补一条例外**：hello 请求在桥未开放时也能拿到只含非秘密信息的 `hello`，U6.3，r14 尚未写入）；S5.3、T14、T19（取消选用）、T20（**STATE 仍需配合"先撤后丢"**：Off、停用、取消选用、注销时 Provider 先用 C 撤族再丢弃 C，U4.7 ③，r14 尚未写入）；S5.10（签发入口的 `forbidden/empty_scope`）；S1.6、S1.8；T08、T18、T21、T23–T25、T31、T32、T35a、T38、T42。**本文不新增 generation 递增事件**：页面引起的问题只做 view 级处理 | 按 STATE 草案 r14 | STATE 草案定稿时逐条复核 |
 | 13 | 所有标 `[新设]` 的规则 | 按本文 | 本 PR 评审 |
+| 14 | **无 preload 通道做不到 U6.1 时怎么办**：退到 ADR-004:119 的专用最小 preload，还是推迟桥。前者偏离 D5 与 KB-C2-03 的"无 preload" | 桥不开放，KnowledgeView 只显示、不收发消息 | 已定（David，先按此执行；KB-C2-04a 实测后再议） |
+| 15 | **`return_to_chat_intent` 是否允许带自由文本草稿**（产品范围） | v1 不带自由文本（U7.2） | 已定（David）；KB-C1-05 |
+| 16 | 四种类型只约束页面→宿主；宿主→页面另设 `hello`、`state`、`reply`；信封 `{ v, direction, type, id, generation, in_reply_to?, payload }` | 按本文（U6.2、U7.1、U7.3） | 已定（盲选一致） |
+| 17 | **关桥后需要用户重新加载，10 分钟内第 3 次后不再提供重新加载**（用户可见）。立场一（v1 默认）：交给用户决定何时恢复，防止恶意页面造成重建循环；立场二：冷却一段时间后自动重开，用户无感，但被注入的页面可以周期性地触发违规 | 立场一（U6.6）；端口变化、通道恢复与 binding 级销毁引起的关桥不计入；⑬ 不计入；到达限速、静默计数与日志采样、overloaded 宽限期、去重表等数值按 U6.4、U6.6、U6.7 | 已定（David）；数值本身为工程值，取较严 |
+| 18 | **盲选已定**：封闭 schema 加禁止键（任意深度、规范化比对、两边并集）、CI 检查 schema、静默丢弃与硬违规的范围、`reply` 的码。**r2–r5 双审增补，待评审**：清单加 `port`；规范化后精确匹配、CI 反例；硬违规先回 `reply` 再关桥；被拒的 `id` 不登记；`v` 缺失落到 ⑫；hello 请求；去重表 4096 项 FIFO；`direction` 改名（已确认） | 按本文（U6.4–U6.6、U7.4、U7.5） | 前半已定；后半本 PR 评审 |
+| 19 | 可选的宿主→页面 `reveal_citation`（让页面定位到某条引用） | v1 不加，以后按兼容新增 | 已定（David） |
 | 20 | **UI 路径上族或 `jti` 撤销用哪个 `reason`**：宿主要能把它与 C 撤销区分开（U3.8）。选项：复用 `credential_invalid`（与签名、证明错误同一处理，无须修订 READONLY）；或新增兼容值（如 `session_revoked`） | 复用 `credential_invalid`（U3.4） | 已定（David）：复用 `credential_invalid`，与 #5 一并 |
+| 21 | 引用 ID 的字符集要与 READONLY R5.2（不透明标识）同步；同步之前先采用默认禁止规则：拒绝含 `/`、`\`、`:`、`..` 或空白的 ID（`schema_violation`，软违规）。容量验算的前提（ID 不含 `"`，8 条上限不降）已获认可 | 默认禁止规则（U7.1） | READONLY 下一修订；#1012 |
+| 22 | `return_to_chat_intent` 的用户输入窗口 5 秒（只认激活类事件）、对话内附件上限 16 项、确认等待 60 秒、拒绝后冷却 30 秒、桥预算至多 2 个并发且 FIFO 排队（排队上限 10 秒）、标题纯文本 120 字符 [新设]；`before-input-event` 与 `input-event` 对 WebContentsView 是否生效待 PoC | 按本文（U7.2） | 本 PR 评审；KB-C2-04a |
 | 23 | Electron 34 下非持久 session 无法销毁：每进程至多 64 个 KnowledgeView 分区；只在同一 binding 内复用；清理四步任一失败即不复用、不新建；满额时拒绝并提示重启 [新设] | 按本文（U4.6） | 本 PR 评审；KB-C2-03 实测 |
 | 24 | CSP 的 `worker-src 'none'` 会挡掉合法的 Web Worker；WeKnora 嵌入页是否依赖 Worker 待实测 | 按本文禁用（U4.2） | KB-C2-03 实测 |
 | 25 | **READONLY 需同步修订**：R1 与 R2.7 写明 session JWT 的 `ops`（KB-C2-01 的 UI 操作清单）与 C 的数据操作范围之间的关系，以及"C 可用于 UI 票据的签发与撤销，不计入数据操作范围"（U1.3） | 在 #25 定之前，KB-C2-01 不得实现超出 search/read 的 UI 操作 | READONLY 下一修订；**阻塞 KB-C2-01 的实现** |
@@ -241,5 +401,5 @@ KnowledgeView（Electron main 为一个 binding 创建的隔离 WebContentsView�
 - r2（2026-10-17）：按第 1 轮双审互评修订。页面引起的问题只做 view 级处理，不递增 generation；UI 路径的 `unauthorized` 分三种处理；注入钩子先删头、只对 UI 白名单路径注入、origin 映射、逐跳判定；remote 只允许 https；Electron 34 session 累积的缓解；登录态临时键；`view_secret` 用 CSPRNG；撤销入口限同一 principal；关桥不递增 generation；`overloaded` 不算违规；`cancel` 不占名额；宿主→页面排队合并；`return_to_chat_intent` 要求用户输入、附件上限、不自动切换；引用 ID 只校验长度与控制字符；补 UT 与 UB。§10 #3、#17 改为待 David，新增 #20–#23。影响夹具：否。
 - r3（2026-10-17）：按第 2 轮双审互评修订。UI 路径的 401 由宿主自查；跨进程作废协议；分区映射与同 binding 复用；CSP 下限；生产构建禁用 DevTools；崩溃退避；私有路由须 `backendProxy` 到不了；到达限速前移、静默计数与日志采样；`overloaded` 宽限期；`status` 只用于显示，`citation` 只用于展示；ID 改为 128 字节并写出容量验算；补 UT-01–UT-42、UB-01–UB-40。§10 #2、#4、#18 拆分，新增 #24–#27。影响夹具：否。
 - r4（2026-10-17）：按第 3 轮双审互评修订。ack 超时撤族并断开私有通道；签发入口的响应按 S3.1 交 STATE，兑换与探测的响应不进入 STATE；持久重试队列；`degraded` 不暂停注入；兑换走 Node `https`；族撤销后同一 `vph` 一律拒绝；服务端记录持久化；文档身份列为 PoC 项；只认激活类输入；hello 请求；去重表上限；补 UT-43–UT-50、UB-41–UB-44，新增 #28、#29。影响夹具：否。
-- r5 第一片（2026-10-17）：按第 4 轮双审互评修订身份、票据、JWT 与分区部分。签发入口的撤权信号一律走 T18（`degraded` 也一样），删去 T05 例外；分区权限一律拒绝，WebRTC 设 `disable_non_proxied_udp`；Off、停用、注销、切换离开时先用 C 撤族再丢弃 C，C 不可用时跳过并靠断开通道兜底；族、`jti`、C 撤销时服务端关闭长连接（做不到则 60 秒重验）；注入与桥都要求心跳不超过 1 秒，写出 ack 超时路径的注入窗口上界（3 秒 + 通道时延）；休眠唤醒宽限；墓碑键 `revoke:<binding_id>:<序号>`，先写墓碑再删登录态，指数退避；U3.8 改为兑换与探测结果的处置表（`probe_failed`、`revocation_mismatch`、`empty_scope`）；兑换成功后才 `loadURL`，恢复注入时重载；键名索引；`vph` 按原始字节计算；路径按 WHATWG 规范化匹配、含 `%2f` / `%5c` 不注入；Node `https` 的信任库与代理；DevTools 与 fuses；补 UT-51–UT-56，改 UT-09、UT-12、UT-13、UT-28、UT-31、UT-40。新增 #30–#32。影响夹具：否。
-- r6 第一片（2026-10-18）：按第 5 轮裁定与 David 的决定修订，并对齐 STATE 草案 r14。注销标记写进键名索引，墓碑与标记都写失败时删除条目；设备选择事件（蓝牙、HID、串口、USB）一律 `preventDefault` 并取消，fuses 加 `RunAsNode`；签发入口的 `unauthorized` 按 S3.1 分流（撤权信号走 T18 或 T35a，凭据无效类走 T42），补 `credential_expired`、`forbidden/empty_scope` 的处置；C 变化时换发 JWT；JWT 固定算法；⑥ 不成立时取消请求，心跳恢复不重载；崩溃残留的 `pending:` 先撤销再删；多个 binding 同时激活时按 binding 销毁 view；全局收紧中的登录态只作废，T44 后销毁；"切换离开"改为"取消选用"；私有通道双向认证；补 UT-57–UT-60，改 UT-13、UT-28、UT-36、UT-40–UT-42、UT-51、UT-55。§10 #3、#5、#6、#7、#20、#26、#31 按 David 的决定改为已定（#14、#15、#17、#19 在第二片），#12 改按 STATE r14，新增 #33（David 定：T42 续签也失败时暂停注入并加遮罩，不销毁 view）、#34；补 UT-61。影响夹具：否。
+- r5（2026-10-17）：按第 4 轮双审互评修订。第一片：签发入口的撤权信号一律走 T18（`degraded` 也一样），删去 T05 例外；分区权限一律拒绝，WebRTC 设 `disable_non_proxied_udp`；先用 C 撤族再丢弃 C，C 不可用时跳过并靠断开通道兜底；撤销时服务端关闭长连接（做不到则 60 秒重验）；注入与桥都要求心跳不超过 1 秒，写出注入窗口上界（3 秒 + 通道时延）；休眠唤醒宽限；墓碑键 `revoke:<binding_id>:<序号>`，先写墓碑再删登录态，指数退避；U3.8 改为处置表；兑换成功后才 `loadURL`；键名索引；`vph` 按原始字节计算；路径按 WHATWG 规范化匹配；Node `https` 的信任库与代理；DevTools 与 fuses；补 UT-51–UT-56。第二片：⑬ 加心跳新鲜度，`not_ready` 不计违规；hello 请求是 S5.9 的例外；桥 read 在预算内 FIFO 排队，在途计数含排队，排队超过 10 秒才 `overloaded`；`cancel` 使原消息回 `rejected`（`cancelled`）并关闭确认弹窗；标题纯文本、去控制与 bidi 字符、截断 120 字符；引用 ID 默认禁止 `/`、`\`、`:`、`..` 与空白（软违规）；禁止键加 `port`；`userGesture` 为 false；补 UB-45–UB-47，改 UB-11、UB-18、UB-30、UB-44。新增 #30–#32，#9、#11、#12、#17、#21、#22 同步。影响夹具：否。
+- r6（2026-10-18）：按第 5 轮裁定与 David 的决定修订，并对齐 STATE 草案 r14。第一片：注销标记写进键名索引，墓碑与标记都写失败时删除条目；设备选择事件（蓝牙、HID、串口、USB）一律 `preventDefault` 并取消，fuses 加 `RunAsNode`；签发入口的 `unauthorized` 按 S3.1 分流（撤权信号走 T18 或 T35a，凭据无效类走 T42），补 `credential_expired`、`forbidden/empty_scope` 的处置；C 变化时换发 JWT；JWT 固定算法；⑥ 不成立时取消请求，心跳恢复不重载；崩溃残留的 `pending:` 先撤销再删；多个 binding 同时激活时按 binding 销毁 view；全局收紧中的登录态只作废，T44 后销毁；"切换离开"改为"取消选用"；私有通道双向认证；补 UT-57–UT-60，改 UT-13、UT-28、UT-36、UT-40–UT-42、UT-51、UT-55。第二片：⑬ 含待复验；引用 ID 默认禁止规则不计违规；`in_reply_to` 在 `reply` 中必填；改 UB-17、UB-18。§10 #3、#5、#6、#7、#14、#15、#17、#19、#20、#26、#31 按 David 的决定改为已定，#12 改按 STATE r14，新增 #33（David 定：T42 续签也失败时暂停注入并加遮罩，不销毁 view）、#34；补 UT-61。影响夹具：否。
