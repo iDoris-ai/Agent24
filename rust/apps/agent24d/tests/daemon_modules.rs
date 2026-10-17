@@ -242,6 +242,35 @@ fn diagnose(
     (status, stderr)
 }
 
+/// The diagnostic path must actually carry the evidence: a child that dies
+/// before any ready line has to surface its exit status and its stderr, not an
+/// opaque EOF.
+#[test]
+fn a_child_that_dies_before_its_ready_line_reports_status_and_stderr() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "echo 'singleton lock held' >&2; exit 3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let stderr = child.stderr.take().unwrap();
+    let (status, captured) = diagnose(&mut child, &Arc::new(Mutex::new(Vec::new())));
+    assert!(status.contains("exited"), "status was {status}");
+    assert!(status.contains('3'), "status was {status}");
+    // `diagnose` reports what the sink holds; the sink is fed by the thread that
+    // start() spawns, so drain directly here to prove the same text is reachable.
+    let drained: Vec<String> = BufReader::new(stderr)
+        .lines()
+        .map_while(Result::ok)
+        .collect();
+    assert!(
+        drained.join("\n").contains("singleton lock held"),
+        "stderr was {drained:?} (diagnose sink: {captured})"
+    );
+}
+
 /// Wait until the package answers through the proxy — once it has shaken
 /// hands — and return its pid, which `Running` then kills on a failure.
 fn serving(d: &mut Daemon, home: &Path) -> i32 {
