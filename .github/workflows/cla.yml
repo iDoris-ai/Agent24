@@ -37,7 +37,11 @@ jobs:
           path-to-signatures: 'signatures/cla.json'
           path-to-document: 'https://github.com/AAStarCommunity/Brood/blob/main/protocol/CLA.md'
           branch: 'cla-signatures'
-          allowlist: bot*,dependabot[bot],github-actions[bot]
+          # `baton*` / `baton@idoris.ai` covers the Baton GrokBot cloud worker
+          # (Baton GrokBot <baton@idoris.ai>), an authorised bot identity that
+          # commits receipts and merge commits on task branches. It is a bot,
+          # not a human contributor, so it does not sign the CLA itself.
+          allowlist: bot*,baton*,baton@idoris.ai,dependabot[bot],github-actions[bot]
           remote-organization-name: AAStarCommunity
           remote-repository-name: Brood
           # 合并后不锁 PR：集成分支上的 task PR 会在 CI 绿后先合并、再由 PR-Daemon 补评审（AGENTS.md 里程碑方向分支工作流），锁了评审就写不进去。
