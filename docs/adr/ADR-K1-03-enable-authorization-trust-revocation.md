@@ -32,7 +32,7 @@
 ### 2. 数据策略及更严格限制优先
 
 - 文档及其他敏感来源默认 `LocalOnly`。任何云处理必须由用户显式授权到**资料 × 用途 × 目的地**，并带有效期、可撤销；缺少任一维度即拒绝。
-- 组织、管理员、来源本身的更严格限制优先于用户授权和普通便利开关。便利开关不能放行受限来源，模块也不能自报更宽松的数据标记。具体标签传播与 LocalOnly 出口执行由 [ADR-K1-02](adr/ADR-K1-02-session-dataflow-security-modes.md)/K1-6 定义。
+- 组织、管理员、来源本身的更严格限制优先于用户授权和普通便利开关。便利开关不能放行受限来源，模块也不能自报更宽松的数据标记。具体标签传播与 LocalOnly 出口执行由 [ADR-K1-02](ADR-K1-02-session-dataflow-security-modes.md)/K1-6 定义。
 - 获准云处理是可选能力，首发默认关闭；是否在首发承诺提供获准云模式另行决定。未实现或无法证明某次出口满足政策时，明确报不可用并阻断。
 - **临时限制不随本 ADR 撤除**（jason 2026-10-07 裁决第 5 点）：现有「存在远端模型档位时不通告文档工具」的保守限制，只在 K1 隐私执行全部完成并验收后撤除，也就是 K1-6a（本 ADR 对应的启用时授权）**和** K1-6b（隐私标记传播与 LocalOnly 出口门）都落地并通过 #708 验收之后。K1-6a 单独落地不构成撤除条件；实现者不得以「启用授权已上线」为由放开该限制。
 - 即使用户给某项工具常驻许可，每次调用仍受当前风险等级、操作范围、来源政策、目的地、组织限制和宿主总开关约束。逐次确认可以更严格，不能扩大既有许可。
@@ -72,14 +72,14 @@ K1-6a 可消费宿主授权决定，按最小操作/资源/有效期签发或更
 
 ## 代码现状与差距
 
-以下行号对应本 ADR 编写时的 `ab/kernel` 工作树。
+以下行号对应本 ADR 编写时的 `ab/kernel` 工作树，代码链接固定到当时的提交 `9131bc7c`；「现状」一栏描述的是那时的代码，不随之后的改动更新。
 
 | 现状 | 证据 | 与本 ADR 的差距 |
 | --- | --- | --- |
-| `agent24-policy` 的 `ApprovalRequest` 由宿主调用路径携带有效 `RiskClass`，Broker 管理一次调用的待审批项；approve_for_session grant 是内存中的 `(scope, tool)`，target grant 另有约束。 | [`lib.rs`](../rust/crates/agent24-policy/src/lib.rs#L95)（请求字段）；[`lib.rs`](../rust/crates/agent24-policy/src/lib.rs#L163)（Broker/grants）；[`lib.rs`](../rust/crates/agent24-policy/src/lib.rs#L241)（单次 request）；[`lib.rs`](../rust/crates/agent24-policy/src/lib.rs#L393)（每次请求建立 approval/timeout） | 还没有模块启用授权记录，也没有权限面板数据模型、资料×用途×目的地范围、持久期限或启用授权撤销与在途调用联动。现有 grant 不可充当本 ADR 的授权。 |
-| `RiskClass` 有 `Read`、`WriteLocal`、`Exec`、`External`；`Read` 注释也指出网络读取的风险可能是外传而非副作用类别。策略使用有效等级。 | [`types.rs`](../rust/crates/agent24-protocol/src/types.rs#L1031)（分类说明）；[`types.rs`](../rust/crates/agent24-protocol/src/types.rs#L1036)（枚举） | 这是通用调用风险分类，不足以表示逐工具数据、用途、目的地、资源边界或来源 taint。不能把 `Read` 当作无外传风险，也不能采信模块自报风险。 |
-| `os_routes` 的启用开关写入 `os.json`；禁用时交给 supervisor 停止模块。当前注释明确启用需 daemon restart；启用前的 admission gate 只处理 refused/degraded mount 状态。 | [`os_routes.rs`](../rust/apps/agent24d/src/os_routes.rs#L29)（启停生效现状）；[`os_routes.rs`](../rust/apps/agent24d/src/os_routes.rs#L440)（配置写入/停止交接）；[`os_routes.rs`](../rust/apps/agent24d/src/os_routes.rs#L822)（启用 admission gate） | `enabled` 是生命周期配置，不是用户逐工具授权；没有首次权限确认、来源差异、权限变化重同意或撤销后中止 tool call 的语义。 |
-| `capabilities` 保存 scoped claims，含 audience/resource/generation/expiry/operations；validate 检查撤销、代次、到期和允许操作；revoke 会更新状态 epoch 并通知 watch。 | [`types.rs`](../rust/apps/agent24d/src/capabilities/types.rs#L13)（audience/resource）；[`mint.rs`](../rust/apps/agent24d/src/capabilities/mint.rs#L89)（Creative claims mint）；[`validate.rs`](../rust/apps/agent24d/src/capabilities/validate.rs#L7)（validate）；[`revoke.rs`](../rust/apps/agent24d/src/capabilities/revoke.rs#L12)（revoke/epoch） | 它隔离 API 操作和资源，不记录用户对模块工具数据范围的同意；当前代码也不等于撤销模块工具在途调用或其外发边界。须由 K1 把宿主授权与能力执行接起来。 |
+| `agent24-policy` 的 `ApprovalRequest` 由宿主调用路径携带有效 `RiskClass`，Broker 管理一次调用的待审批项；approve_for_session grant 是内存中的 `(scope, tool)`，target grant 另有约束。 | [`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L95)（请求字段）；[`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L163)（Broker/grants）；[`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L241)（单次 request）；[`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L393)（每次请求建立 approval/timeout） | 还没有模块启用授权记录，也没有权限面板数据模型、资料×用途×目的地范围、持久期限或启用授权撤销与在途调用联动。现有 grant 不可充当本 ADR 的授权。 |
+| `RiskClass` 有 `Read`、`WriteLocal`、`Exec`、`External`；`Read` 注释也指出网络读取的风险可能是外传而非副作用类别。策略使用有效等级。 | [`types.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-protocol/src/types.rs#L1031)（分类说明）；[`types.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-protocol/src/types.rs#L1036)（枚举） | 这是通用调用风险分类，不足以表示逐工具数据、用途、目的地、资源边界或来源 taint。不能把 `Read` 当作无外传风险，也不能采信模块自报风险。 |
+| `os_routes` 的启用开关写入 `os.json`；禁用时交给 supervisor 停止模块。当前注释明确启用需 daemon restart；启用前的 admission gate 只处理 refused/degraded mount 状态。 | [`os_routes.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/os_routes.rs#L29)（启停生效现状）；[`os_routes.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/os_routes.rs#L440)（配置写入/停止交接）；[`os_routes.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/os_routes.rs#L822)（启用 admission gate） | `enabled` 是生命周期配置，不是用户逐工具授权；没有首次权限确认、来源差异、权限变化重同意或撤销后中止 tool call 的语义。 |
+| `capabilities` 保存 scoped claims，含 audience/resource/generation/expiry/operations；validate 检查撤销、代次、到期和允许操作；revoke 会更新状态 epoch 并通知 watch。 | [`types.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/types.rs#L13)（audience/resource）；[`mint.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/mint.rs#L89)（Creative claims mint）；[`validate.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/validate.rs#L7)（validate）；[`revoke.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/revoke.rs#L12)（revoke/epoch） | 它隔离 API 操作和资源，不记录用户对模块工具数据范围的同意；当前代码也不等于撤销模块工具在途调用或其外发边界。须由 K1 把宿主授权与能力执行接起来。 |
 
 ## 状态、迁移与否决路径
 
@@ -102,9 +102,9 @@ K1-6a 可消费宿主授权决定，按最小操作/资源/有效期签发或更
 
 ## 法律映射与后续变更
 
-实现须遵守 [`APPROVAL.md`](laws/APPROVAL.md) L-APPR-1..7（用户权限不可由风险判断放宽；统一审批门；External 不给宽泛 session grant；常驻授权按确切目标收窄；读权限不进入存储）、[`MEMORY.md`](laws/MEMORY.md) L-MEM-1..7（身份/范围由内核注入，不让模块自报）及 [`CONTEXT.md`](laws/CONTEXT.md) L-CTX-1..4（来源可点名、可审计）。LocalOnly、授权撤销等长期隐私不变量如需成为新法律，必须另提 `docs/laws/PRIVACY.md`（或获批位置）的独立 PR；本 ADR 不代替法律流程。
+实现须遵守 [`APPROVAL.md`](../laws/APPROVAL.md) L-APPR-1..7（用户权限不可由风险判断放宽；统一审批门；External 不给宽泛 session grant；常驻授权按确切目标收窄；读权限不进入存储）、[`MEMORY.md`](../laws/MEMORY.md) L-MEM-1..7（身份/范围由内核注入，不让模块自报）及 [`CONTEXT.md`](../laws/CONTEXT.md) L-CTX-1..4（来源可点名、可审计）。LocalOnly、授权撤销等长期隐私不变量如需成为新法律，必须另提 `docs/laws/PRIVACY.md`（或获批位置）的独立 PR；本 ADR 不代替法律流程。
 
-本 ADR 不恢复 OD-M11 的 PAUSED 状态（`PLAN-OD-NEXT.md` F11.0/F11.1 与 [`ADR-005`](open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md) 仍按其原路线管理）。本 ADR 获批只为 K1-6a 提供契约，不能推断任何机制已实现或 Documenting 已验收。
+本 ADR 不恢复 OD-M11 的 PAUSED 状态（`PLAN-OD-NEXT.md` F11.0/F11.1 与 [`ADR-005`](../open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md) 仍按其原路线管理）。本 ADR 获批只为 K1-6a 提供契约，不能推断任何机制已实现或 Documenting 已验收。
 
 ## K1-6a 实现切片建议（每片 ≤300 行）
 
