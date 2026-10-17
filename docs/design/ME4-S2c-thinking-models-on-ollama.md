@@ -177,6 +177,14 @@ Ollama 0.40.4 上这个组合会出错。s01-01 第 4 个窗口（第 27–33 �
 
 两遍都带分段提示，与实验相同。系统指令后的追加顺序：先分段提示（窗口不是全文时），再答案形状（只有第一遍）。
 
+**改写（`extractor_version` 6，David 选 C，2026-10-17）**：J9 第一次未达标，必答 50/115，严重错误 25（门槛 ≤21），两次运行结果相同。多出的严重错误集中在 33 页的 s01-01，都是漏答：7B 把窗口原文写着的值答成了 `missing`。原因在旧措辞的两句：一句是「本段没写就答 `missing`，即使别处可能写了」，另一句是「这里错答 `present` 比 `missing` 更糟」。去掉分段提示的实验构建是 7B 53/18、27B 83/2，两项门槛都达标。
+
+David 选择保留分段提示、改写措辞后重测（§9 Q4）。新措辞事先定好，只改这一版，不按结果反复调，以免对 8 份样本过拟合。冻结前请 Sonnet 5.5 和 Opus 5.5 各审一次措辞：两方都指出初稿的「写着就答 `present`」漏了 `conflict`，补上；`missing` 固定用 `not_in_document` 是旧版就有的写法，不改。冻结后的原文：
+
+> These blocks are only one part of a longer document; the other parts are read separately and the answers combined. Answer from these blocks only. Check every block for each field: when blocks here state it, answer `present` with the value as written and its quotes, or `conflict` if they state different values. Answer `missing` with reason `not_in_document` only when no block here states it; never guess what another part says. Never answer with a value about another item, row, fee or date because it looks similar.
+
+J9、J10 用这一版重跑，门槛不变；结果见第 3 片的证据。
+
 ### 5.4 版本与记录
 
 - `extractor_version` 4 → 5：提示和调用方式都变了。
@@ -240,6 +248,7 @@ Ollama 0.40.4 上这个组合会出错。s01-01 第 4 个窗口（第 27–33 �
   - 只做 A：更简单、更快，思考模型 75/115（带分段提示）。7B 上 A 只多发一个被忽略的 `reasoning_effort`，推断与今天的 43/115 相同，没有单独测。
 - **Q2** 分段提示同片纳入（§5.3）。
 - **Q3** 本轮不提高 `max_tokens` 上限（R-a），等换模型时再议。
+- **Q4**（2026-10-17）J9 第一次未达标（严重错误 25 > 21，原因是分段提示的措辞）：保留分段提示，改写一版措辞后重测，门槛不变（§5.3）。没有选的三项是：去掉分段提示、放宽门槛、退回只做 A。
 
 ## 改动记录
 

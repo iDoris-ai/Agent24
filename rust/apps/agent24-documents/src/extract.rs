@@ -20,7 +20,8 @@ pub mod window;
 /// (2026-10-15). 4: the model is asked at temperature 0 (2026-10-15). 5: a
 /// call answers freely first, held to the schema only when that is not an
 /// answer, and a window of part of the document is told so (2026-10-17).
-pub const EXTRACTOR_VERSION: &str = "5";
+/// 6: that window is told to answer what its blocks state (2026-10-17).
+pub const EXTRACTOR_VERSION: &str = "6";
 
 /// A requested field (`DocumentsExtractField`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -54,13 +54,15 @@ no evidence.";
 
 /// Added for a window of part of the document: a value made up there
 /// contradicts the one found elsewhere (S01 on qwen3.8: s01-01 all conflicts).
+/// Even-handed: told a wrong `present` was worse, qwen2.5:7b answered
+/// `missing` for values its blocks state (S01 J9, 2026-10-17).
 const PART: &str = "
 
 These blocks are only one part of a longer document; the other parts are read separately and the answers \
-combined. Answer from these blocks only. When these blocks do not state a field, answer `missing` with reason \
-`not_in_document`, even if another part of the document probably states it. Never answer with a value about \
-another item, row, fee or date because it looks similar: here a wrong `present` is worse than `missing`, for \
-it contradicts the right value found in another part.";
+combined. Answer from these blocks only. Check every block for each field: when blocks here state it, answer \
+`present` with the value as written and its quotes, or `conflict` if they state different values. Answer \
+`missing` with reason `not_in_document` only when no block here states it; never guess what another part says. \
+Never answer with a value about another item, row, fee or date because it looks similar.";
 
 /// Which of a call's two passes (ME4-S2c §5.1): the model answering as it
 /// will, told the shape; or held to the answer's JSON Schema, thinking off.

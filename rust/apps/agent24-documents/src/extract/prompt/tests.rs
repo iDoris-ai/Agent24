@@ -70,6 +70,18 @@ fn the_document_and_the_fields_are_data_after_a_fixed_instruction() {
     );
 }
 
+/// ME4-S2c §5.3: a window of part of the document is told to answer what
+/// its blocks state, in the instruction's own statuses, and no status is
+/// weighed above another (told a wrong `present` was worse, qwen2.5:7b
+/// answered `missing` for values its blocks state: S01 J9, 2026-10-17).
+#[test]
+fn a_window_is_told_to_answer_what_its_blocks_state() {
+    for term in ["`present`", "`conflict`", "`missing`", "`not_in_document`"] {
+        assert!(PART.contains(term) && INSTRUCTION.contains(term), "{term}");
+    }
+    assert!(!PART.contains("worse"));
+}
+
 /// J4 (ME4-S2c): a window of part of the document is told so, in both
 /// passes; the first pass is told the answer's shape after that, the second
 /// is not. The whole document is told neither part.
