@@ -10,8 +10,8 @@ ME4-S2c 第 3 片的证据（设计 `docs/design/ME4-S2c-thinking-models-on-olla
 
 | 项 | 值 |
 |---|---|
-| 内核与文档模块 | DOC-1-22 分支上的提交（`ab/documenting` @ `56162f1b` 加上分段提示改写，`extractor_version` 6），`cargo build --release`；pdfkit 助手用 `engines/pdfkit/build.sh` 从同一提交构建 |
-| harness 与样本 | 在 `b8ce9caca10a` 的检出里运行，所以 `report.md` 里写的是这个提交。`packages/documents-accept` 和 `docs/documenting/samples` 在两个提交之间没有改动 |
+| 内核与文档模块 | `22e36598`（本 PR 的分段提示改写提交，基于 `ab/documenting` @ `56162f1b`，`extractor_version` 6），`cargo build --release`；pdfkit 助手用 `engines/pdfkit/build.sh` 从同一提交构建。J9、J10 用的是同一份模块包 |
+| harness 与样本 | 在 `b8ce9caca10a` 的检出里运行，所以 `report.md` 里写的是这个提交。`git diff b8ce9caca10a 22e36598 -- packages/documents-accept docs/documenting/samples` 为空 |
 | 数据目录 | 每组用全新的 `HOME`；模块包用 `agent24 os install` 安装 |
 | 运行 | `pnpm -s accept run --out <dir> --daemon <daemon.json> --job-minutes 120`，8 份样本 |
 | 抓包 | 内核和 Ollama 之间加一个透明转发器，原样转发请求和应答，同时把每个 POST 的请求体和应答存下来核对 |
@@ -50,7 +50,7 @@ oMLX 上还没有跑（R-g），只记录结果，不设门槛；本机没有 oM
 | **本次：改写后的分段提示（v6）** | **83/115** | **2** | 30/35 | 20/20 | 2/2 | 9 / 3 分 |
 
 - 7B 改写后的分数逐份样本都与第一次相同，只有 33 页的 s01-01 从 3/20 回到 5/20。27B 上三种分段提示几乎没有差别。
-- 第一次的 J9 用全新的 `HOME` 重跑过一次，结果逐项相同，所以 25 不是偶然波动。
+- J9 两个版本都用全新的 `HOME` 重跑过一次，结果都与第一轮逐项相同（上表各项和抽取耗时）：第一次的 25 不是偶然波动，本次的 20 也不是（离门槛只差 1，所以复跑核对，设计 R-e）。
 
 ## 第一次为什么没达标，怎么改的
 
@@ -70,7 +70,7 @@ David 选择保留分段提示、改写一版措辞后重测，门槛不变。�
 
 抓包核对：
 
-- 第一遍请求都不带 `reasoning_effort`（J9 17 次，J10 17 次），第二遍都带 `"none"`（J9 5 次，J10 3 次），全部是流式。
+- 第一遍请求都不带 `reasoning_effort`（J9 17 次，J10 17 次），第二遍都带 `"none"`（J9 5 次，J10 3 次），全部是流式。被取消的那次调用没有发出：日志记的是 `Cancelled`（发请求前查到 job 已取消），转发器收到的 POST 数（J9 22、J10 20）正好等于上表除取消外的调用数。
 - 每个应答的 `usage.completion_tokens` 都大于 0（J9 22/22，J10 20/20）。
 - 正文里没有出现 `<think>` 或 `</think>`：Ollama 把思考放在 `delta.reasoning` 里。所以 #1048 说的「思考写进正文」在 Ollama 上不会出现；oMLX 还没测。
 - J10 的内核日志里没有 `no output`，也没有 WARN 或 ERROR 行：流式的思考推动了进展计时。

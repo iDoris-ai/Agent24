@@ -74,12 +74,22 @@ fn the_document_and_the_fields_are_data_after_a_fixed_instruction() {
 /// its blocks state, in the instruction's own statuses, and no status is
 /// weighed above another (told a wrong `present` was worse, qwen2.5:7b
 /// answered `missing` for values its blocks state: S01 J9, 2026-10-17).
+/// The wording was frozen before it was measured: a change is measured
+/// again, so this holds it word for word, as §5.3 quotes it.
 #[test]
 fn a_window_is_told_to_answer_what_its_blocks_state() {
+    assert_eq!(
+        PART,
+        "\n\nThese blocks are only one part of a longer document; the other parts are read \
+separately and the answers combined. Answer from these blocks only. Check every block for each \
+field: when blocks here state it, answer `present` with the value as written and its quotes, or \
+`conflict` if they state different values. Answer `missing` with reason `not_in_document` only \
+when no block here states it; never guess what another part says. Never answer with a value \
+about another item, row, fee or date because it looks similar."
+    );
     for term in ["`present`", "`conflict`", "`missing`", "`not_in_document`"] {
-        assert!(PART.contains(term) && INSTRUCTION.contains(term), "{term}");
+        assert!(INSTRUCTION.contains(term), "{term}");
     }
-    assert!(!PART.contains("worse"));
 }
 
 /// J4 (ME4-S2c): a window of part of the document is told so, in both
