@@ -1,11 +1,11 @@
 # Knowledge 初始化 / ingest / job / ContextPack / SOP 语义契约 v1（CONTRACT-OPS-v1）
 
 > **状态**：**草案（Draft）**，待 fork 侧维护者（David）评审（文档 PR，base `ab/weknora`）。评审通过前不授权任何实现。
-> **版本**：契约 v1，文档修订 r0 · **日期**：2026-10-17 · **作者**：David Xu
+> **版本**：契约 v1，文档修订 r1 · **日期**：2026-10-17 · **作者**：David Xu
 > **Issue**：#1013 ③（KB-CT-03），阶段 #1000；消费方 KB-C4-02b、KB-C4-04、KB-CTX-01、KB-CTX-02、KB-SOP-01、KB-SOP-02，另供 KB-C4-03、KB-C4-05、KB-SVC-POLICY-01 引用。
 > **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）；`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r7）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE 草案，按 r5）与 `docs/knowledge/CONTRACT-UI-BRIDGE-v1.md`（下称 BRIDGE 草案，按 r5）。**两份草案都尚未合入**：本文只引用它们的条款，不假设其中待决的条目已定；依赖关系登记在 §11 #C3、#C4，草案定稿时逐条复核。
 > 来源标签沿用 READONLY：决策 `[D1]`–`[D8]`、任务条目（如 `[KB-C4-04]`）、READONLY 规则（如 `[R2.1]`）、STATE 草案规则（如 `[S4.5]`）、BRIDGE 草案规则（如 `[U1.3]`）、决策 issue（如 `[#996]`）。`[新设]` 表示本文新设计、在以上来源里都找不到依据的规则；与其他标签并列时，表示在该依据之上新增的部分。所有 `[新设]` 都待本 PR 评审（§11 #B0）。
-> **分片**：分两片提交，一起合入。第一片：§0–§6（授权绑定、授权矩阵、幂等、初始化、ingest 与 job 及其验收）、§10、§11 中标"第一片"的条目；第二片：§7–§9（ContextPack、SOP 候选与批准及其验收）与 §11 其余条目。单独阅读第一片时，正文引用的 W7.x、W8.x 都在第二片。
+> **分片**：分两片提交，一起合入。第一片：§0–§6（授权绑定、授权矩阵、幂等、初始化、ingest 与 job 及其验收）、§10、§11 中标"第一片"的条目；第二片：§7–§9（ContextPack、SOP 候选与批准及其验收）、§10 第 9–10 条与 §11 其余条目。单独阅读第一片时，正文引用的 W7.x、W8.x 都在第二片。
 > **现状证据**：WeKnora 的 `file:line` 都按 READONLY 固定的受测 SHA `4b363d15`（`a24/develop` 之后的提交只改文档，Go 源码不变），路径相对 WeKnora 仓库根目录；Agent24 的现状沿用 STATE 草案 §9、BRIDGE 草案 §9（`ab/weknora` 的 `eb1a58b`）。汇总在 §10。
 
 ## 0. 范围、边界与变更规则
@@ -47,13 +47,13 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 ## 1. 授权绑定与机制约束
 
 - **W1.1** [D2/R2.1+新设] **每个写操作都由服务端逐请求重新计算授权**：principal 只取自凭据（R1.5）；有效范围 E 按 R2.1 计算；另外要求该操作类同时在凭据的操作范围内、并且在 A 对目标资源授予的操作里。任一项不满足返回 `forbidden`（`operation_not_allowed`；目标 KB 不在 E 内按 R2.3 返回 `empty_scope`）；文档、job、候选等资源不在 E 内时返回与不存在相同的 `not_found`（R2.6）。READONLY R2.7 现在把 v1 凭据的操作范围限定为 search 与 read，写操作需要 READONLY 同步修订（§11 #C2）。
-- **W1.2** [D2+新设] 服务端在每个写操作的响应与审计里回报当次判定使用的 `authz_version`。客户端不得缓存它来跳过判定；它只用于追溯（ContextPack、SOP 批准记下它，W7.x、W8.x）。粒度见 §11 #B1。
-- **W1.3** [KB-C4-04/KB-SVC-POLICY-01+新设] **后台作业沿用授权**：job 在提交时记下 `{principal, credential_id, tenant_id, target_kb, authz_version, policy_version, config_version, generation}`（generation 只记录，R7.5）。每个阶段边界复验三项：① principal 当前仍在目标 KB 上持有 `ingest.submit`（按当前 A，不按记下的 `authz_version`）；② 提交所用凭据未被**撤销**（只是过期不算，job 寿命可以长于短期凭据）；③ 当前处理政策仍允许下一步的目的地与费用。① 或 ② 不成立 → `cancelled`（`authorization_revoked`，J07）；③ 不成立 → `failed`（`policy_denied` 或 `budget_exhausted`，J08）。复验内容的取舍见 §11 #B2。
+- **W1.2** [D2+新设] 服务端在每个写操作的响应与审计里回报当次判定使用的 `authz_version`。客户端不得缓存它来跳过判定；它只用于追溯（ContextPack、SOP 批准记下它，W7.4、W8.4）。**粒度**：每个"主体 × 资源"一个值，资源包括 KB，也包括组织级的发布权（如 `pack.publish` 的授予）；服务端可以保守地让它多变，用主体级或租户级的值也合规：多变只会让依赖它的记录更早失效或多复验一次，不会放宽授权（§11 #B1）。
+- **W1.3** [KB-C4-04/KB-SVC-POLICY-01+新设] **后台作业沿用授权**：job 在提交时记下 `{principal, credential_id, tenant_id, target_kb, authz_version, policy_version, config_version, generation}`（generation 只记录，R7.5）。每个阶段边界复验三项：① principal 当前仍在目标 KB 上持有 `ingest.submit`（按当前 A，不按记下的 `authz_version`）；② 提交所用凭据未被**撤销**（只是过期不算，job 寿命可以长于短期凭据）；③ 当前处理政策仍允许下一步的目的地与费用。① 或 ② 不成立 → `cancelled`（`authorization_revoked`，J07）；③ 不成立 → `failed`（`policy_denied` 或 `budget_exhausted`，J08）。为使 ② 可判定，服务端的凭据撤销记录至少保留到引用该凭据的所有 job 进入终态，凭据过期后也不得提前删除（§11 #B2）。
 - **W1.4** [S1.5/R8.2+新设] **客户端准入**：Provider 只在 binding 处于可服务状态（S1.1）、且最近一次就绪结果里对应操作（`operations.ingest`）为 `ready` 时发出写操作；否则按 STATE 草案 §6 本地拒绝（`not_ready` 等）。这不改变 STATE 的状态派生（S1.3 不看 ingest）。写请求同样带 `request_id` 与 `generation`（R7.2），按 S4.6 接受。STATE 草案 S1.5 目前只写了 search 与 read，需要它把准入扩展到写操作（§11 #C3）。
 - **W1.5** [S4.5/R7.1+新设] **作废与写操作**：S4.5 中止在途写请求时，服务端可能已经提交（J01）。Provider 给调用方的本地 `cancelled` 必须带 `details.outcome: "unknown"` 与该请求的 `idempotency_key`；界面不得据此声称"未保存"。binding 回到可服务状态后，客户端用同一幂等键查询（W5.11）得到真实结果。**不得**在新 generation 下用新幂等键自动重发同一写操作。
 - **W1.6** [#996/KB-SOP-02/KB-C4-03/U1.3+新设] **与业务决定无关的机制约束**（矩阵的"机制"列都由此而来）：
   - 授权只来自服务端的权威授权 A 与凭据，**不得**从 retrieve 能力、页面角色、上游 RBAC 角色、组织名输入、License 或激活状态推导（#996 正文、#1004 退出验收、KB-C4-03）。
-  - 服务端**不信任宿主转述的批准**：批准只能是批准人用自己的凭据发出的已认证请求，服务端据此生成批准记录（W8.x）；请求里的 `approved: true` 之类字段一律忽略并记审计（KB-SOP-02）。
+  - 服务端**不信任宿主转述的批准**：批准只能是批准人用自己的凭据发出的已认证请求，服务端据此生成批准记录（W8.4）；请求里的 `approved: true` 之类字段一律忽略并记审计（KB-SOP-02）。
   - KnowledgeView 不是写操作入口：session JWT 的 `ops` 不含写操作（U1.3）；桥消息类型是闭集，`approval`、`approve`、`decision` 是禁止键（U6.2、U7.4）。
   - 宿主自身没有 principal，不能以自己的名义写；引导身份只用于初始化（KB-C4-02a）。
   - 集成模式下 retrieve 级凭据不得取原件：上游 `/download`、batch-download 对本租户 retrieve key 开放（READONLY 矩阵 #5，`internal/router/routes_knowledge.go:120`）。
@@ -79,7 +79,7 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | `pack.publish` 批准并发布 ContextPack | 待 #996 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | ✗（机制） | ✗（机制，U7.4） | 待 #996 | 批准由批准人自己的已认证请求产生（W1.6）；与 SOP 批准分开（`purpose`） |
 | `pack.revoke` 撤销 ContextPack | 待 #996 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | ✗（机制） | ✗（机制） | 待 #996 | 撤销后不再加载，已注入的追不回（W1.8） |
 | `pack.load` 被加载进 run | 按受众（第二片） | 按受众 | 按受众 | 按受众 | 按受众 | ✗（机制） | ✗（机制） | 由宿主注入入口发起，不由模型选择 | 每次加载服务端复验（第二片）；受众的取值与谁可设定待 #996 |
-| `sop.candidate` 生成、编辑、撤回 SOP 候选 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | ✗（机制） | ✗（机制） | 待 #996 | 只能引用生成时有权读取的来源（第二片）；候选不进可检索正式库 |
+| `sop.candidate` 生成、编辑、撤回 SOP 候选 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | ✗（机制） | ✗（机制） | 待 #996 | 候选只在宿主本地；请求批准时连同正文上送，服务端校验引用与 hash（第二片） |
 | `sop.approve` 批准 SOP | 待 #996 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | ✗（机制） | ✗（机制，U7.4） | 待 #996 | 不信宿主 `approved` 布尔；批准记录单次有效、绑定 hash 与基础修订（第二片） |
 | `sop.commit` 按批准写入正式库 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | ✗（机制） | ✗（机制） | 待 #996 | 服务端提交时重验批准（第二片）；复用 ingest（§5） |
 | `sop.withdraw` 撤回已发布 SOP | 待 #996 | 待 #996 | 待 #996 | 待 #996 | 待 #996 | ✗（机制） | ✗（机制） | 待 #996 | 撤回可观察（审计 + 文档状态）；已交付的追不回 |
@@ -88,14 +88,14 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 
 ## 3. 幂等与去重
 
-- **W3.1** [KB-C4-04/KB-C4-02b+新设] 以下写操作**必须**带 `idempotency_key`：`init.default_kb`、`ingest.submit`、`ingest.reprocess`、`pack.publish`、`sop.candidate` 的创建、`sop.approve`、`sop.commit`。缺失返回 `invalid_request`（`idempotency_key_missing`）。`job.cancel`、`pack.revoke`、`sop.withdraw` 天然幂等，不要求。
+- **W3.1** [KB-C4-04/KB-C4-02b+新设] 以下写操作**必须**带 `idempotency_key`：`init.default_kb`、`ingest.submit`、`ingest.reprocess`、`pack.publish`、`sop.approve`、`sop.commit`。缺失返回 `invalid_request`（`idempotency_key_missing`）。`job.cancel`、`pack.revoke`、`sop.withdraw` 天然幂等，不要求。
 - **W3.2** [新设] **作用域**：幂等记录的键是 `(tenant_id, principal, 操作类, idempotency_key)`。记录同时保存请求指纹 = H(操作类、目标资源、`content_sha256`、影响结果的参数，含 `expected_policy_version`、`config_version` 与基础修订)。
   - 同键同指纹：返回首次的结果（同一 `job_id` 或资源 ID，附当前状态），`details.replayed: true`，不新建 job、不重复计费；这时仍按 W1.1 重新判定授权，授权已失去时返回 `forbidden` 而不是回放结果。
   - 同键不同指纹：`invalid_request`（`idempotency_key_reused`），不执行。
   - 不同主体用同一个键互不影响（作用域含 principal）。
-- **W3.3** [新设] **保留**：幂等记录至少保留到对应 job 进入终态之后 24 小时（数值见 §11 #B3）；过期后同键视为新请求。服务端重启不丢记录（持久化）。
+- **W3.3** [新设] **保留**：幂等记录至少保留到对应 job 进入终态之后 24 小时（数值待 David，盲选分歧，§11 #B3）；过期后同键视为新请求。服务端重启不丢记录（持久化）。
 - **W3.4** [新设] **原子性**：保存原件、建立源修订与 job、写幂等记录在同一个事务里完成（或以可恢复的两阶段完成），对外只有"全部完成"与"都未发生"两种结果；并发的同键请求只有一个执行，其余按同键回放；W3.5 的内容去重判定与创建同样原子。上游的去重是先查后插，`knowledges` 表没有唯一约束（§10 第 2 条），并发上传同一文件会产生两行。
-- **W3.5** [KB-C4-04+新设] **内容去重**（与幂等键无关、跨请求生效）：同一目标 KB 内，`content_sha256` 与规范化文件类型都相同、且该文档当前源修订就是这份内容时，`ingest.submit` 不新建源修订与 job，返回 200，`details.outcome: "existing"`，附已有文档、当前修订与最近一个 job 的状态；不改动已有记录的任何时间戳。不跨 KB 去重。去重键的组成、命中的已有文档处于 `failed` / `cancelled` 时怎么处理，见 §11 #B4、#B5。上游用 MD5、排除 `failed` 与 `deleting`、命中时返回 409 并改写 `created_at`（§10 第 2 条），都与本条不同。
+- **W3.5** [KB-C4-04+新设] **内容去重**（与幂等键无关、跨请求生效）：同一目标 KB 内，`content_sha256` 与规范化文件类型都相同、且该文档当前源修订就是这份内容时，`ingest.submit` 不新建源修订与 job，返回 200，`details.outcome: "existing"`，附已有文档、当前修订与最近一个 job 的状态；不改动已有记录的任何时间戳。不跨 KB 去重。去重键的组成（§11 #B4）、命中的已有文档处于 `failed` / `cancelled` 时怎么处理（本条默认返回 `existing`、不自动重新处理，§11 #B5）都待 David（盲选分歧），决定前按本条执行。上游用 MD5、排除 `failed` 与 `deleting`、命中时返回 409 并改写 `created_at`（§10 第 2 条），都与本条不同。
 - **W3.6** [新设] 客户端声明的 `content_sha256` 与服务端计算值不符时返回 `invalid_request`（`content_hash_mismatch`），不保存原件。
 - **W3.7** [D2+新设] 幂等记录、指纹与去重查询都不得泄露范围外资源：命中他人或范围外文档时不回报其存在，按无命中处理。
 
@@ -115,7 +115,7 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 - **W5.1** [KB-C4-04+新设] `ingest.submit` 的请求：`scope`（只含目标 KB）、`idempotency_key`、原件（文件字节或文本）、`content_sha256`、`file_name` 与规范化文件类型、`expected_policy_version`；更新已有文档时另带 `knowledge_id` 与 `expected_source_revision`（必须等于当前源修订，否则 `stale`，`reason: "base_revision_changed"`，附 `current_revision`）。v1 只收文件与文本；URL 导入会让服务端代为抓取，属出口，不在 v1（§11 #A2）。
 - **W5.2** [KB-C4-01/R3.8+新设] **保存前拒绝**：格式不在配置档白名单、或其输出不会产生 v1 范围内的 `text` 分块（R3.8）时，返回 `invalid_request`（`unsupported_format`），不保存原件、不建 job；超过大小上限返回 `invalid_request`（`too_large`）；配额不足返回 `forbidden`（`quota_exceeded`）。上游在算 hash 之前拒绝视频与非法扩展名，FAQ 类 KB 拒绝文件上传，配额检查在去重之后（§10 第 1 条）。
 - **W5.3** [新设] **断开不是取消**：J01 提交之后，提交请求的连接断开、客户端超时或 generation 作废都不影响 job；只有 `job.cancel`（或 W1.3 的复验）能取消。这与只读请求不同（READONLY R7.1 的断开即取消只适用于 search 与 read）。
-- **W5.4** [R5.1–R5.3+新设] **源修订**：每次被接受的提交（非去重命中）分配一个新的 `source_revision`，在 J01 时成为该文档的**当前源修订**；它的活动构建在 J04 之前为 `null`。这与 READONLY R5.3"活动构建还没建好时 `index_build_id: null`"、R4.4 的 `index_pending` / `index_failed` 一致。于是新修订处理期间，旧修订构建上的 hit 按 R5.3 为 `stale`。
+- **W5.4** [R5.1–R5.3+新设] **源修订**：每次被接受的提交（非去重命中）分配一个新的 `source_revision`，在 J01 时成为该文档的**当前源修订**；它的活动构建在 J04 之前为 `null`。这与 READONLY R5.3"活动构建还没建好时 `index_build_id: null`"、R4.4 的 `index_pending` / `index_failed` 一致。于是新修订处理期间，旧修订构建上的 hit（若仍保留）按 R5.3 为 `stale`。**取消与失败都不回退当前源修订**（§11 #B8）：本修订仍是当前，只是没有活动构建；要恢复旧内容，需把旧原件重新提交为新源修订。"取消是否等于撤销这次替换"另列为 §11 #A10。
 - **W5.5** [KB-SVC-POLICY-01/#994+新设] `expected_policy_version` 与服务端当前政策版本不同时返回 `stale`（`policy_changed`，附当前版本），不保存原件：用户同意上传时看到的处理目的地与费用上限，必须就是 job 执行时依据的政策。
 
 ### 5.2 状态
@@ -130,7 +130,7 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | `cancelled` | 被取消；带 `cancel_reason` | 按 W5.9 报告 | 否 | 是 | 无效果（J11） |
 
   `failure_reason`：`parse_failed`、`embedding_failed`、`index_failed`、`policy_denied`、`budget_exhausted`、`storage_failed`、`enqueue_failed`、`interrupted`、`timeout`、`internal`。`cancel_reason`：`user`、`authorization_revoked`、`superseded`、`document_deleted`。
-  **上游映射**：`pending` → `saved`；`processing` → `processing`；`completed` → `indexed`；`failed` → `failed`；`cancelled` → `cancelled`；`deleting` 不是 job 状态（文档删除，J10）；手工知识的 `draft` 不是 job（见第二片）；`finalizing`（主解析完成、增强子任务仍在花费资源，已可检索）的映射见 §11 #B7，v1 草稿按 `indexed` 加 `cost.final: false` 处理。
+  **上游映射**：`pending` → `saved`；`processing` → `processing`；`completed` → `indexed`；`failed` → `failed`；`cancelled` → `cancelled`；`deleting` 不是 job 状态（文档删除，J10）；手工知识的 `draft` 不是 job（见第二片）；`finalizing`（主解析完成、增强子任务仍在花费资源，已可检索）的映射待 David（盲选分歧，§11 #B7），决定前按 `indexed` 加 `cost.final: false` 处理。
 
 ### 5.3 转移
 - **W5.7** [新设] 转移表（同一 job 的转移串行；终态不再转移）：
@@ -142,17 +142,17 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | J03 | `saved` | 阶段边界复验通过，开始处理 | `processing` | 不变 | [W1.3] |
 | J04 | `processing` | 索引构建完成并激活 | `indexed` | 不变；本修订的构建成为活动构建，旧修订的构建不再对当前修订生效（R5.1） | [R5.1] |
 | J05 | `saved` / `processing` | 解析或依赖失败且重试用尽、超过处理时限 | `failed` | 不变（文档级 read 得 `index_failed`，R4.4） | [R4.4] |
-| J06 | `saved` / `processing` | `job.cancel` | `cancelled`（`user`） | 回退到上一个源修订（若有），它的活动构建恢复为当前（§11 #B8） | [KB-C4-04+新设] |
+| J06 | `saved` / `processing` | `job.cancel` | `cancelled`（`user`） | 不变（本修订仍为当前，没有活动构建，W5.4） | [KB-C4-04+新设] |
 | J07 | `saved` / `processing` | 阶段边界复验：授权被撤（W1.3 ①②） | `cancelled`（`authorization_revoked`） | 同 J06 | [W1.3] |
 | J08 | `saved` / `processing` | 阶段边界复验：政策不允许或预算耗尽（W1.3 ③） | `failed`（`policy_denied` / `budget_exhausted`） | 不变 | [KB-SVC-POLICY-01] |
 | J09 | `saved` / `processing` | 同一文档的新源修订被接受（J01） | `cancelled`（`superseded`） | 变为更新的修订 | [新设] |
 | J10 | `saved` / `processing` | 文档被删除 | `cancelled`（`document_deleted`） | 文档不存在 | [新设] |
 | J11 | `indexed` / `failed` / `cancelled` | `job.cancel` | 不变；返回 200，`details.cancel_effect: "none"` | 不变 | [新设] |
-| J12 | `indexed` / `failed` / `cancelled` | `ingest.reprocess`（显式） | 原 job 不变；为该源修订新建 job（`saved`） | 该修订成为当前（`cancelled` 的修订由此恢复） | [新设] |
+| J12 | `indexed` / `failed` / `cancelled` | `ingest.reprocess`（显式） | 原 job 不变；为该源修订新建 job（`saved`）；只允许对当前源修订，否则 `stale`（`base_revision_changed`） | 不变 | [新设] |
 | J13 | `processing` | 服务端重启或工作进程中断 | 恢复后仍 `processing`；超过处理时限 → `failed`（`interrupted`） | 不变 | [新设] |
 | J14 | `saved` / `processing` | 提交所用凭据过期（未撤销） | 不变 | 不变 | [W1.3] |
 
-  `indexed` 之前，旧修订的活动构建必须保留，直到新构建激活（J04）；J05–J10 之后它仍可按 R5.3 作为 `stale` 线索或（J06、J07 回退后）重新作为当前构建。上游 reparse 在重建前先清理旧分块（READONLY R4.4 引用的 `internal/application/service/knowledge_process.go:423`），与本条不符 → KB-C4-04。
+  新构建激活（J04）之前，旧修订的构建是否保留不作要求：保留时只能按 R5.3 作为 `stale` 线索，不得作为当前构建返回 `fresh`；若 §11 #A10 决定取消即撤销替换，则必须保留到新构建激活。上游 reparse 在重建前先清理旧分块（READONLY R4.4 引用的 `internal/application/service/knowledge_process.go:423`）。J06、J07、J05 之后没有活动构建，不带 `expected_revision` 的文档级 read 返回 `unavailable/index_failed`（R4.4；取消是否另设 `reason` 随 §11 #C2 的 READONLY 修订）。
 - **W5.8** [R5.3+新设] `processing`、`failed`、`cancelled` 的 job 已写下的部分分块与索引**不得**被检索或读取到，也不得成为活动构建。上游取消时保留已写入的分块与索引（§10 第 3 条），检索过滤只看分块的 `is_enabled`、`index_status` 与类型，不看文档的解析状态（§10 第 4 条）→ KB-C4-04。
 
 ### 5.4 取消与费用
@@ -198,7 +198,7 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | JT-10 | J03、J04 | 正常处理 | `saved` → `processing` → `indexed`；`index_build_id` 成为活动构建；READONLY search 能命中 |
 | JT-11 | J05 | 解析失败且重试用尽 | `failed/parse_failed`；文档级 read 得 `index_failed` |
 | JT-12 | J06、W5.9 | `processing` 中取消，测试桩让一次 embedding 调用在取消后才返回 | 立即 `cancelled/user`；`cost.final` 先为 false，调用结束后为 true 且含该次调用；部分产物不可检索；原件保留并如实报告 |
-| JT-13 | J06 | 文档已有 indexed 的修订 r1，提交 r2 后在 `processing` 中取消 | 当前源修订回到 r1，r1 的构建恢复为当前；search 命中 r1 为 `fresh` |
+| JT-13 | J06、W5.4 | 文档已有 indexed 的修订 r1，提交 r2 后在 `processing` 中取消 | 当前源修订仍为 r2，没有活动构建；文档级 read 得 `unavailable/index_failed`；r1 的 hit 若出现只能是 `stale`；重新提交 r1 的原件得到新修订 r3 |
 | JT-14 | J07 | `processing` 中撤销提交人对目标 KB 的 ingest 授权 | 下一个阶段边界 → `cancelled/authorization_revoked`；不再产生新调用 |
 | JT-15 | J14 | 提交后凭据自然过期（未撤销） | job 照常完成 |
 | JT-16 | J08 | 处理中政策改为禁止 embedding 目的地 | 下一个阶段边界 → `failed/policy_denied`；未授权目的地零调用 |
@@ -209,7 +209,7 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | JT-21 | W5.3 | 提交后立即断开连接；另测 STATE 草案 S4.5 中止在途提交 | job 照常处理；后者 Provider 得本地 `cancelled`，带 `outcome: "unknown"` 与幂等键，回到可服务后按键查到真实 job |
 | JT-22 | W5.8 | 取消或失败后，用分块 ID 直接 read、用相关 query search | 部分产物都不出现 |
 | JT-23 | W5.10 | 测试桩让某目的地无法计量 | 该项 `units: null`、`measured: "unknown"`，不为 0；界面不显示"没有费用" |
-| JT-24 | W5.7 | r2 的 job 失败后 search | r1 的构建仍保留；其 hit 为 `stale`，不生成确定引用 |
+| JT-24 | W5.7 | r2 的 job 失败后 search | r1 的 hit 不出现，或只以 `stale` 出现，不生成确定引用；从不以 `fresh` 出现 |
 
 ## 10. 现状证据（WeKnora `4b363d15`；Agent24 见 STATE 草案 §9、BRIDGE 草案 §9）
 
@@ -232,17 +232,18 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 | A2 | **v1 是否支持 URL 导入**（服务端代为抓取，是出口） | 不支持（W5.1） | 待 David；#994（第一片） |
 | A3 | **模型（Tool 调用）能否发起写操作；批准类操作是否必须由人在宿主界面确认** | 都不开放（§2 模型列"待 #996"，按 W2.2 拒绝） | 待 David / #996（第一片） |
 | A4 | **职责分离**：创建人能否批准自己的候选、发布人能否批准自己的 ContextPack | 写进矩阵条件（W2.4） | 待 #996（第一片） |
-| A5 | **取消、失败、撤权后原件与部分产物是否删除** | 都不删，如实报告（W5.9） | 待决；#997（第一片） |
+| A5 | **取消、失败、撤权后原件与部分产物是否删除**；撤回的 SOP 原件是否删除 | 都不删，如实报告（W5.9、W8.9） | 待决；#997（第一片） |
+| A10 | **取消一次替换（新修订处理中取消）是否等于撤销这次替换**，即回到上一个源修订；若是，旧构建必须保留到新构建激活 | 不等于：当前源修订不回退（W5.4、W5.7） | 待 David（第一片） |
 | B0 | 所有标 `[新设]` 的规则 | 按本文 | 本 PR 评审 |
-| B1 | `authz_version` 的粒度 | 每个"主体 × 资源"一个值（W1.2） | 本 PR 评审（第一片） |
-| B2 | 后台阶段复验的内容 | A + 凭据未撤销 + 政策（W1.3） | 本 PR 评审（第一片） |
-| B3 | 幂等记录的保留时长 | 终态后 24 小时（W3.3） | 本 PR 评审（第一片） |
-| B4 | 内容去重键 | KB + SHA-256 + 规范化文件类型（W3.5） | 本 PR 评审（第一片） |
-| B5 | 去重命中的文档处于 `failed` / `cancelled` 时 | 返回 `existing`，不自动重新处理（W3.5） | 本 PR 评审（第一片） |
-| B6 | `config_version` 是否进默认库唯一键 | 不进（W4.2） | 本 PR 评审（第一片） |
-| B7 | 上游 `finalizing` 的映射 | `indexed` 加 `cost.final: false`（W5.6） | 本 PR 评审（第一片） |
-| B8 | 取消、失败后当前源修订是否回退 | 取消回退，失败不回退（J05、J06） | 本 PR 评审（第一片） |
-| B9 | 对终态 job 取消的响应 | 200，`cancel_effect: "none"`（J11） | 本 PR 评审（第一片） |
+| B1 | `authz_version` 的粒度 | 每个"主体 × 资源"一个值，资源含组织级发布权；可以保守地多变（W1.2） | 已定（盲选一致），含补充（第一片） |
+| B2 | 后台阶段复验的内容 | A + 凭据未撤销 + 政策；撤销记录保留到相关 job 结束（W1.3） | 已定（盲选一致），含补充（第一片） |
+| B3 | 幂等记录的保留时长 | 终态后 24 小时（W3.3） | 待 David（盲选分歧）（第一片） |
+| B4 | 内容去重键 | KB + SHA-256 + 规范化文件类型（W3.5） | 待 David（盲选分歧）（第一片） |
+| B5 | 去重命中的文档处于 `failed` / `cancelled` 时 | 返回 `existing`，不自动重新处理（W3.5） | 待 David（盲选分歧）（第一片） |
+| B6 | `config_version` 是否进默认库唯一键 | 不进（W4.2） | 已定（盲选一致）（第一片） |
+| B7 | 上游 `finalizing` 的映射 | `indexed` 加 `cost.final: false`（W5.6） | 待 David（盲选分歧）（第一片） |
+| B8 | 取消、失败后当前源修订是否回退 | 都不回退（W5.4、J05–J07） | 已定（盲选一致）；r1 由"取消回退"改来（第一片） |
+| B9 | 对终态 job 取消的响应 | 200，`cancel_effect: "none"`（J11） | 已定（盲选一致）（第一片） |
 | C1 | 服务端为写操作新增的端点、计量与幂等存储（KB-C4-04、KB-C4-02b） | 按本文语义实现 | WeKnora 实现 |
 | C2 | **READONLY R2.7 需同步修订**：凭据的操作范围按操作类扩展到写操作；与 BRIDGE 草案 §10 #25 一并处理 | 修订前写操作不实现 | READONLY 下一修订（第一片） |
 | C3 | **依赖 STATE 草案**：S1.1、S1.3、S1.5（需扩展到写操作，W1.4）、S4.5、S4.6（W1.5）、S4.7（run 绑定，待决 #7）、§6 本地结果、S5.8 | 按 STATE 草案 r5 | STATE 定稿时逐条复核（第一片） |
@@ -251,3 +252,4 @@ Agent24（Provider 与宿主，下称"客户端"）与 WeKnora fork（下称"服
 
 ## 变更记录
 - r0 第一片（2026-10-17）：首稿。§0–§6：授权绑定与机制约束、授权矩阵结构（单元格待 #996）、幂等与去重、初始化、ingest 与 job（状态、转移 J01–J14、取消与费用报告）、验收 MT / IT / JT；§10 WeKnora 现状证据；§11 第一片条目。影响夹具：否（#1012 只覆盖只读）。
+- r1 第一片（2026-10-17）：按 B 类盲选裁定修订（Opus 与 Sonnet 各自作答、都没看草稿）。B8 改为取消与失败都不回退当前源修订，旧构建保留不作要求，J06、J12、JT-13、JT-24 同步；B1 补资源含组织级发布权、可保守地多变；B2 补撤销记录保留到相关 job 结束；B3、B4、B5、B7 标待 David（盲选分歧）；新增 #A10；W3.1 去掉候选创建。影响夹具：否。
