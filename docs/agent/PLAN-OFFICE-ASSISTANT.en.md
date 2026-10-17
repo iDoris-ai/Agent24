@@ -6,7 +6,7 @@
 > This document **is only a plan**: no item in it has been implemented, acceptance-tested, or registered as a project in [`tasks.md`](tasks.md).
 >
 > - Single source of truth (capabilities/interaction/permissions/acceptance): [`research/T007-office-assistant-report.md`](research/T007-office-assistant-report.md) (hereafter "the report", v0.2, 2026-10-16). The Chinese version `report.zh-CN.md` referenced on line 3 of the report is not in this worktree; this document cites sections of the English version.
-> - Technical design: [`OFFICE-ASSISTANT-TECH-DESIGN.en.md`](OFFICE-ASSISTANT-TECH-DESIGN.en.md); intern brief (English): [`OFFICE-ASSISTANT-INTERN-BRIEF.md`](OFFICE-ASSISTANT-INTERN-BRIEF.md); index: [`OFFICE-ASSISTANT-INDEX.md`](OFFICE-ASSISTANT-INDEX.md) (Chinese only; the Chinese version prevails).
+> - Technical design: [`OFFICE-ASSISTANT-TECH-DESIGN.en.md`](OFFICE-ASSISTANT-TECH-DESIGN.en.md); intern brief (English): [`OFFICE-ASSISTANT-INTERN-BRIEF.md`](OFFICE-ASSISTANT-INTERN-BRIEF.md); index: [`OFFICE-ASSISTANT-INDEX.md`](OFFICE-ASSISTANT-INDEX.md) (English by default; [Chinese index](OFFICE-ASSISTANT-INDEX.zh-CN.md)).
 > - **This plan does not change mainline priorities**: the main track still follows the rulings in [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) §3 and [`tasks.md`](tasks.md) (see §0.2). This plan requires jason's explicit approval before work begins; until approved it is only "a plan available for review".
 
 ---
