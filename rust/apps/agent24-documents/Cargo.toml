@@ -26,6 +26,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # The kernel's own manifest validator, so the test proves the daemon would accept domain-os.yml.
 agent24-domain = { path = "../../crates/agent24-domain" }
+# The kernel's own result-envelope parser, so the tool tests prove it accepts what we send.
+agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 

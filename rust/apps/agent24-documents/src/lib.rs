@@ -25,6 +25,7 @@ pub mod read;
 pub mod state;
 pub mod text_layer;
 pub mod timestamp;
+pub mod tools;
 pub mod uploads;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -195,6 +196,8 @@ pub fn router(state: AppState) -> Router {
             post(uploads::chunks::append_chunk)
                 .layer(DefaultBodyLimit::max(uploads::chunks::MAX_CHUNK)),
         )
+        // Kernel-only: the proxy answers 404 for `_a24` paths from clients.
+        .route("/_a24/tools/{op}", post(tools::call_tool))
         .with_state(state)
 }
 
