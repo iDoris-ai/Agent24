@@ -137,3 +137,4 @@ E 放最后：manifest 只要有一个工具不合法，整个模块就挂不上
 - 片 1 不按 `authorized_resources` 校验（§3.2）。生产里这个字段恒为空（`agent24-policy/src/consent_gate.rs:244`）。当白名单会在授予后每次拒绝，「非空才检查」会在检查失败时放行。授予时如何填资源范围，以及文档模块在工具可调用之前补上校验，归入 §4 第 5 条（ADR-K1-01 §2.3）。
 - 通告给模型的全名带点（`documents.list`）。`OpenAiCompatProvider` 原样写进 `function.name`（`agent24-models/src/lib.rs:829`）；OpenAI / Anthropic 的函数名只允许 `[a-zA-Z0-9_-]`。MCP 用 `mcp_{server}_{tool}` 避开（`agent24-mcp/src/lib.rs:184-186`）。模型可见的函数名形状由内核处理（§4 第 7 条）。片 1 不改。
 - 工具路径读不到超过预算的单个抽取值，REST 可读。游标按值切（`extractions.rs:110-112`，`next_cursor` 形如 `v{ord}`，`:226`），一条放不进 60 KiB 就返回 `payload_too_large`，不在值内分段。单值最大约 508 KiB（`MAX_VALUE_BYTES`，`:22-28`），REST 的 512 KiB 页放得下。以后可让 `extraction_get` 支持值内分段。
+- 工具路径的 `find` 遇到超过预算的单条匹配就停住，后面的匹配读不到，REST 可读。query 里的空白能匹配任意长的一段空白，例如 `"a b"` 匹配 `"a"+16000×U+000B+"b"`，U+000B 转义后占 6 字节，一条 anchor 就超过 60 KiB。这时返回 `payload_too_large`，游标不能跳过这一条。REST 的 512 KiB 页放得下。以后可让游标跳过超预算的条目，或在匹配里截断 `quote`。

@@ -123,25 +123,30 @@ pub async fn list_documents(
     let Query(params) = params.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let limit = match params.limit.as_deref() {
         None => DEFAULT_LIMIT,
-        Some(l) => l
-            .parse::<i64>()
-            .ok()
-            .filter(|l| (1..=MAX_LIMIT).contains(l))
-            .ok_or_else(|| ApiError::invalid_request("limit must be 1 to 200"))?,
+        // Its range is [`list`]'s to check.
+        Some(l) => l.parse::<i64>().map_err(|_| bad_limit())?,
     };
     list(&storage, params.cursor.as_deref(), limit, PAGE_BYTES)
         .await
         .map(Json)
 }
 
-/// The page after `cursor`: at most `limit` documents and `budget` bytes of
-/// JSON, newest first. `GET /documents` and `documents.list` both read here.
+fn bad_limit() -> ApiError {
+    ApiError::invalid_request("limit must be 1 to 200")
+}
+
+/// The page after `cursor`: at most `limit` (1 to 200) documents and
+/// `budget` bytes of JSON, newest first. `GET /documents` and
+/// `documents.list` both read here.
 pub(crate) async fn list(
     storage: &Storage,
     cursor: Option<&str>,
     limit: i64,
     budget: usize,
 ) -> Result<DocumentList, ApiError> {
+    if !(1..=MAX_LIMIT).contains(&limit) {
+        return Err(bad_limit());
+    }
     let after = match cursor {
         None => None,
         Some(c) => Some(decode_cursor(c).ok_or_else(|| ApiError::invalid_request("bad cursor"))?),
