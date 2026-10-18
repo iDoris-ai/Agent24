@@ -347,9 +347,22 @@ async fn a_blocked_reopen_does_not_stall_the_runtime() {
 }
 
 /// Keeps the blob lock a FIFO without a reader, so opening it for writing
-/// blocks; dropping it releases every blocked open, even after a failed
-/// assertion (the runtime waits for blocking threads when it shuts down).
-struct Stall(PathBuf);
+/// blocks.
+///
+/// Timing: a reopen's blocking thread may already have resolved the path to
+/// the FIFO but not yet started waiting in `open`. If the reader were closed
+/// right after the path is removed, that thread would then open a FIFO with
+/// no reader and no path and wait forever — and the runtime, which waits for
+/// blocking threads when it shuts down, would hang the test process. So the
+/// reader stays open until the reopen is known to have finished:
+/// [`Stall::release`] opens it and removes the path, and only
+/// [`Stall::finish`], called after `storage()` has come back (the stuck
+/// reopen returned), closes it. Any other path (a failed assertion) leaks the
+/// reader in `Drop`, so it outlives the runtime's shutdown.
+struct Stall {
+    fifo: PathBuf,
+    reader: Option<File>,
+}
 
 impl Stall {
     fn new(data_dir: &Path) -> Self {
@@ -360,18 +373,52 @@ impl Stall {
             .status()
             .unwrap();
         assert!(made.success());
-        Self(fifo)
+        Self { fifo, reader: None }
+    }
+
+    /// Lets every blocked open through, now and later, and keeps it so.
+    fn release(&mut self) {
+        if self.reader.is_some() {
+            return;
+        }
+        // Opening a FIFO read-write never blocks (Linux, macOS), and as a
+        // reader it lets the blocked writers through. With the path gone,
+        // later opens create a plain file instead of blocking again; an open
+        // that resolved the path before then still finds this reader.
+        self.reader = Some(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.fifo)
+                .unwrap(),
+        );
+        let _ = fs::remove_file(&self.fifo);
+    }
+
+    /// Closes the reader. Only call once the stuck reopen has returned, so no
+    /// thread can still be on its way into the FIFO.
+    fn finish(mut self) {
+        drop(self.reader.take());
     }
 }
 
 impl Drop for Stall {
     fn drop(&mut self) {
-        // Opening a FIFO read-write never blocks (Linux, macOS), and as a
-        // reader it lets the blocked writers through. Later opens then create
-        // a plain file instead of blocking again.
-        let reader = OpenOptions::new().read(true).write(true).open(&self.0);
-        let _ = fs::remove_file(&self.0);
-        drop(reader);
+        // After `finish` there is no reader and no FIFO: nothing to do.
+        if self.reader.is_none() && !self.fifo.exists() {
+            return;
+        }
+        // Otherwise `finish` was skipped (a failed assertion), and a reopen
+        // may be blocked or on its way into the FIFO: release it, and keep
+        // the reader open for the rest of the process (past the runtime's
+        // shutdown) instead of closing it under that open.
+        if self.reader.is_none() {
+            if let Ok(reader) = OpenOptions::new().read(true).write(true).open(&self.fifo) {
+                self.reader = Some(reader);
+            }
+            let _ = fs::remove_file(&self.fifo);
+        }
+        std::mem::forget(self.reader.take());
     }
 }
 
@@ -381,7 +428,7 @@ impl Drop for Stall {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_request_leaves_its_reopen_running_and_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let stall = Stall::new(dir.path());
+    let mut stall = Stall::new(dir.path());
     // No interval, so only the lock keeps a second reopen from starting.
     let state = AppState::failed(dir.path(), StorageCause::Locked, Duration::ZERO);
     for _ in 0..5 {
@@ -401,7 +448,9 @@ async fn a_cancelled_request_leaves_its_reopen_running_and_alone() {
         "the reopen lock was freed while the reopen is stuck"
     );
 
-    drop(stall);
+    // The reopen counted above may not be waiting in `open` yet; the reader
+    // stays open until storage is back, which means that reopen returned.
+    stall.release();
     let waiting = Instant::now();
     while state.storage().await.is_err() {
         assert!(
@@ -410,6 +459,7 @@ async fn a_cancelled_request_leaves_its_reopen_running_and_alone() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    stall.finish();
     assert_eq!(cause(&state), None);
 }
 
