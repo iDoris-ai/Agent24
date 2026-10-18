@@ -198,7 +198,7 @@
 ## 4. 操作清单（DOC-1）
 
 - **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。关联信息（`run_id`、`tool_call_id`）由内核放在请求正文的 `context` 里（正文 `{"context":…,"arguments":…}`），不是请求头（DOC-1-06b，2026-10-18）。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
-- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；REST 单页仍 ≤ 512 KiB，给 1 MiB 上限留余量。`documents.job_get` 返回单个 job，不分页（DOC-1-06b，2026-10-18）；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。工具响应信封 ≤ 64 KiB（内核上限，`agent24d/src/module_tool_runtime.rs:18`），按 60 KiB 预算（留 4 KiB 余量）提前截断并返回 `next_cursor`；`next_cursor` 放在信封的 `payload` 里（信封 `deny_unknown_fields`，`agent24-os-proto/src/kernel_call.rs:96-98`）。单个条目本身超过预算时返回 `error{code:"response_too_large"}`，不截断条目内容。`documents.extraction_get` 按同一预算分页读抽取值；单条值在 REST 最大 508 KiB（512 KiB 页减去 4 KiB 信封，`agent24-documents/src/extractions.rs:22-28`），超过工具预算则 `response_too_large`（DOC-1-06b，2026-10-18）。
+- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；REST 单页仍 ≤ 512 KiB，给 1 MiB 上限留余量。`documents.job_get` 返回单个 job，不分页（DOC-1-06b，2026-10-18）；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。工具响应信封 ≤ 64 KiB（内核上限，`agent24d/src/module_tool_runtime.rs:18`），按 60 KiB 预算（留 4 KiB 余量）提前截断并返回 `next_cursor`；`next_cursor` 放在信封的 `payload` 里（信封 `deny_unknown_fields`，`agent24-os-proto/src/kernel_call.rs:96-98`）。单个条目本身超过预算时返回 `error{code:"payload_too_large"}`，不截断条目内容。不用内核码 `response_too_large`：内核 `result_code` 把它归成 `ResultUnknown`（`agent24-tools/src/lib.rs:962-967`），`module_error_json` 给模型 `result_unknown:true`（`:1017-1044`），把确定的拒绝报成结果未知。`payload_too_large` 在 `DocumentsErrorCode` 闭集里（`protocol/openapi.yaml:3578-3600`；`agent24-documents/src/error.rs:113`），内核收成 `module_error`，原码进 `module_code`。`documents.extraction_get` 按同一预算分页读抽取值；单条值在 REST 最大 508 KiB（512 KiB 页减去 4 KiB 信封，`agent24-documents/src/extractions.rs:22-28`），超过工具预算则 `payload_too_large`（DOC-1-06b，2026-10-18）。
 - **风险映射**（用户确认后的内核 `RiskClass`，`types.rs:1036-1050`）：read → `Read`；create-record / mutate-draft / commit / create-artifact → `WriteLocal`；handoff → `External`。**DOC-1 没有第一方默认安装，所有工具实际按 `External` 处理、每次审批**，除非用户在启用时逐个确认（D4.2）。
 
 | 片 | 操作 | REST | 工具 | 知识类 | 业务风险 |
@@ -219,7 +219,7 @@
 | 2 | export | `POST /documents/{id}/revisions/{rev}/exports {format, options}` → 202 job；`GET /exports/{id}/content?offset=` | `documents.export` | free | create-artifact |
 
 - 「工具」列：内核要求操作名不含点（`agent24-domain/src/tool.rs:112-120`），全名按第一个点切出模块名（DOC-1-06b，2026-10-18）。
-- 工具不用 `pending` 信封（内核会收成 `result_unknown`）。`documents.extract` 只提交或重放，立即返回 `completed{payload:{status, job_id}}`，不等待抽取完成，不带抽取值，也不带 `extraction_id`。`extraction_id` 只在任务成功、提交事务时生成（`agent24-documents/src/extract/job.rs:216-231` 生成 id，`:247-267` 与 `succeeded` 同一事务）；`GET /jobs/{id}` 只有 `succeeded` 才带 `result.extraction_id`（`jobs.rs:113-117`）。agent 用 `documents.job_get` 查进度，成功后把 `result.extraction_id` 交给 `documents.extraction_get`（`GET /extractions/{id}`，`agent24-documents/src/lib.rs:184-187`）按工具字节预算分页读回。重放沿用 §5：业务键命中 `succeeded` 返回原 job；命中 `failed` 或 `interrupted` 把同一个 job 重新排队（`extract/handler.rs:203-218,253-255`），等于重跑；同一业务键但请求正文的规范化哈希不同，返回 422 `idempotency_key_reused`（`handler.rs:102-103,199-200`）。工具路径构造与 REST 相同的规范化请求正文（`revision`、`schema`），不含工具专有字段。`documents.extract` 不支持 `rerun`：`rerun:true` 需要 `Idempotency-Key`（`protocol/openapi.yaml:2214-2218`），内核工具请求不带额外请求头（`agent24d/src/module_tool_runtime.rs:101`）（DOC-1-06b，2026-10-18）。
+- 工具不用 `pending` 信封（内核会收成 `result_unknown`）。`documents.extract` 只提交或重放，立即返回 `completed{payload:{status, job_id}}`，不等待抽取完成，不带抽取值，也不带 `extraction_id`。`extraction_id` 只在任务成功、提交事务时生成（`agent24-documents/src/extract/job.rs:216-231` 生成 id，`:247-267` 与 `succeeded` 同一事务）；`GET /jobs/{id}` 只有 `succeeded` 才带 `result.extraction_id`（`jobs.rs:113-117`）。agent 用 `documents.job_get` 查进度，成功后把 `result.extraction_id` 交给 `documents.extraction_get`（`GET /extractions/{id}`，`agent24-documents/src/lib.rs:184-187`）按工具字节预算分页读回。重放沿用 §5：业务键命中 `succeeded` 返回原 job；命中 `failed` 或 `interrupted` 把同一个 job 重新排队（`extract/handler.rs:203-218,253-255`），等于重跑；同一业务键但请求正文的规范化哈希不同，返回 422 `idempotency_key_reused`（`handler.rs:102-103,199-200`）。工具路径的请求正文固定为 `{revision, schema, rerun:false}`，不含工具专有字段。REST 对整个请求体算 `request_sha256`（`extract/handler.rs:102-103`），字段是 `revision`、`schema`、`rerun`（默认 false，`:48-53`），哈希不同返回 422（`:199-200`）。页面带 `rerun:false`、工具省略该字段，会互相 422；固定带上 `"rerun": false`，与发 `rerun:false` 的页面一致，也与生成的 TS 类型把 `rerun` 标为必填一致（`packages/api-client/src/openapi.d.ts` 的 `DocumentsExtractRequest`）。`documents.extract` 不支持 `rerun:true`：它需要 `Idempotency-Key`（`protocol/openapi.yaml:2214-2218`），内核工具请求不带额外请求头（`agent24d/src/module_tool_runtime.rs:101`）（DOC-1-06b，2026-10-18）。
 - DOC-1 的 agent 只能读、查、抽取、提议修改、导出已提交的 revision。**导入只在页面经原生文件对话框完成（Q4）；review 和 commit 只在页面、在可见 diff 上由用户完成（Q5，README §11.6）**。以后若开放 agent 导入或对话内确认提交，按 `WriteLocal` 走审批，需修订本 ADR。
 - **之后的阶段**（只定方向）：DOC-2 `search`（required）、`ask / summarize / compare / translate`（按 §9.1 逐次分类）；DOC-3 `draft.create`、`revision.restore`（用目标 revision 的内容生成 change set 再走 commit）；DOC-4 `preflight`、`package.assemble`（绑定已批准的 revision）、`delivery.prepare`（`External`，由 Agent24 执行）。
 
@@ -270,30 +270,30 @@
 `documents` 命名空间的错误码是**闭集**，新增需修改本 ADR。唯一的例外是下文的“OS 的意外故障”。
 
 - **信封**：沿用现有信封；每个错误都带 `details.retryable`。**客户端按 `code` 分支，不按 HTTP 状态分支**。
-- **工具路径**：映射成 `ToolError`，`code` 作为消息前缀。**任何模块响应都不得映射成 `ToolError::Cancelled`**，因为那会取消整个 run（§1）。
+- **工具路径**（DOC-1-06b，2026-10-18）：返回信封 `error{code, retryable}`，不映射成 `ToolError`，也不把 `code` 当作消息前缀。`DocumentsErrorCode` 的原码直接作 `code`。这些码不在内核码表里时，内核收成 `module_error`，原码进 `module_code`（`agent24-domain/src/tool.rs:506-521`；交给模型的 JSON 见 `agent24-tools/src/lib.rs:1017-1044`）。模型和内核审计都看不到 `details`：交给模型的错误 JSON 没有这个字段；内核模块工具审计事件也没有 `details` 槽（`agent24-store/src/module_audit_event.rs:396-414`，`deny_unknown_fields`）。**任何模块响应都不得变成 `ToolError::Cancelled`**，因为那会取消整个 run（§1）。`engine_unavailable`，以及 `storage_unavailable` 且原因为 `locked` 或 `busy`，由**模块**返回 `module_unavailable`，`retryable:true`。`internal` 归 `module_error`，不算结果未知（见下）。
 - **取消的 job 不是错误**：`GET /jobs/{id}` 返回 200，`status: cancelled`。`cancelled` 只出现在 `job.error.code` 里。
 
-| code | HTTP | ToolError | 说明 |
+| code | HTTP | 工具信封 code / retryable | 说明 |
 |---|---|---|---|
-| `invalid_request` | 400 | `Invalid` | 参数错误、锚点不在字符边界 |
-| `not_found` | 404 | `Invalid` | 文档、revision、job、上传不存在或已过期 |
-| `payload_too_large` | 413 | `Invalid` | 与 `http.rs:121-122` 同码 |
-| `unsupported_format` | 422 | `Invalid` | 格式不在 §17 #3 已声明的范围内 |
-| `parse_failed` | 422 | `Failed` | 解析整体失败 |
-| `partial_parse` | 422 | `Failed` | 仅在请求 `require_complete` 时报错；默认是 200 + `parse_status: partial` + 未解析区域列表（§11.7） |
-| `idempotency_key_reused` | 422 | `Invalid` | 同一个键对应了不同的请求 |
-| `change_set_incomplete` | 422 | `Invalid` | 还有未决定的条目 |
-| `upload_checksum_mismatch` | 422 | `Invalid` | 整个文件的哈希不符 |
-| `knowledge_disabled` | 422 | `Failed` | 用户关闭了知识；required 类操作暂停（§9.1） |
-| `revision_conflict` | 409 | `Failed` | `details.current_revision` |
-| `change_set_stale` | 409 | `Failed` | change set 在客户端读取之后被重新 review 过 |
-| `change_set_committed` | 409 | `Failed` | change set 已冻结；`details.revision` |
-| `upload_offset_mismatch` | 409 | `Invalid` | `details.received_offset` |
-| `stale_index` | 409 | `Failed` | 仅在请求 `require_fresh` 时报错；默认在结果里标出索引的 revision（§7） |
-| `permission_denied` | 403 | `Denied` | OS 侧拒绝 |
-| `knowledge_unavailable` | 503 | `Failed` | `retryable: true` |
-| `engine_unavailable` | 503 | `Failed` | `details.engine`；`retryable: true` |
-| `storage_unavailable` | 503 | `Failed` | `data_dir` 或 DB 不可用；与知识关闭是不同状态。`details.cause` 说明原因；`retryable` **按原因定**（见表下说明） |
+| `invalid_request` | 400 | `invalid_request` / `false` | 参数错误、锚点不在字符边界 |
+| `not_found` | 404 | `not_found` / `false` | 文档、revision、job、上传不存在或已过期 |
+| `payload_too_large` | 413 | `payload_too_large` / `false` | 与 `http.rs:121-122` 同码。单条超过工具字节预算也用这一码，不用内核码 `response_too_large`（见 §4「分页」） |
+| `unsupported_format` | 422 | `unsupported_format` / `false` | 格式不在 §17 #3 已声明的范围内 |
+| `parse_failed` | 422 | `parse_failed` / `false` | 解析整体失败 |
+| `partial_parse` | 422 | `partial_parse` / `false` | 仅在请求 `require_complete` 时报错；默认是 200 + `parse_status: partial` + 未解析区域列表（§11.7） |
+| `idempotency_key_reused` | 422 | `idempotency_key_reused` / `false` | 同一个键对应了不同的请求 |
+| `change_set_incomplete` | 422 | `change_set_incomplete` / `false` | 还有未决定的条目 |
+| `upload_checksum_mismatch` | 422 | `upload_checksum_mismatch` / `false` | 整个文件的哈希不符 |
+| `knowledge_disabled` | 422 | `knowledge_disabled` / `false` | 用户关闭了知识；required 类操作暂停（§9.1） |
+| `revision_conflict` | 409 | `revision_conflict` / `false` | REST 的 `details.current_revision` |
+| `change_set_stale` | 409 | `change_set_stale` / `false` | change set 在客户端读取之后被重新 review 过 |
+| `change_set_committed` | 409 | `change_set_committed` / `false` | change set 已冻结；REST 的 `details.revision` |
+| `upload_offset_mismatch` | 409 | `upload_offset_mismatch` / `false` | REST 的 `details.received_offset` |
+| `stale_index` | 409 | `stale_index` / `false` | 仅在请求 `require_fresh` 时报错；默认在结果里标出索引的 revision（§7） |
+| `permission_denied` | 403 | `permission_denied` / `false` | OS 侧拒绝。此码在内核码表里（`agent24-domain/src/tool.rs:509`），内核保留它，`module_code` 为空 |
+| `knowledge_unavailable` | 503 | `knowledge_unavailable` / `true` | `retryable: true` |
+| `engine_unavailable` | 503 | `module_unavailable` / `true` | REST 仍是 `engine_unavailable`，`details.engine`，`retryable: true`。工具路径由**模块**返回 `module_unavailable`（调用时能力不可用，ADR-K1-01 第 55 行） |
+| `storage_unavailable` | 503 | 见下 | `data_dir` 或 DB 不可用；与知识关闭是不同状态。REST 的 `details.cause` 说明原因；`retryable` **按原因定**（见表下说明） |
 
 **`storage_unavailable` 的 `retryable`**（David，2026-10-08，回应 #803 评审）：不像 `engine_unavailable` / `knowledge_unavailable` 那样固定为 `true`，而是由 OS 按原因决定。这是有意的不对称，不要统一改成 `true`。
 
@@ -306,9 +306,11 @@
 
 界面对 `retryable: false` 的情况给出处理提示，不自动重试。
 
+工具路径（DOC-1-06b，2026-10-18）：`locked` / `busy` 由**模块**返回 `module_unavailable`，`retryable:true`；`corrupt` / `not_writable` / `disk_full` 仍用原码 `storage_unavailable`，`retryable:false`（内核收成 `module_error`，原码进 `module_code`）。
+
 **OS 的意外故障：共用内核码的唯一例外**：失败既不在上表、也不是存储不可用（例如数据库约束被触发，说明 OS 自身有 bug）时，OS 自己返回 500，用内核通用信封的 `internal` 码，`details.retryable: false`。这是唯一一个由 OS 产生、却不在本命名空间闭集里的码；OpenAPI 中 documents 路由的 500 响应和 `ModuleProxyError` 的说明里都注明了这一点。
-- 工具路径映射成 `ToolError::Failed`，`internal` 作为消息前缀；
-- 不自动重试；结果未知，用户重试时按下面的“默认规则”用同一个键重发。
+- 工具路径返回 `error{code:"internal", retryable:false}`。`internal` 不在内核码表里，内核收成 `module_error`，原码进 `module_code`。这不算结果未知，不按下面的“默认规则”当未知重发（DOC-1-06b，2026-10-18）。
+- 不自动重试。
 
 **会看到但不属于本命名空间的内核 / 代理码**：
 
@@ -319,7 +321,7 @@
   - `upstream_response_too_large`：模块可能已经执行；
   - `module_panicked`、`module_killed`、`stop_failed`。
 - **默认规则**：未列出的码一律按“结果未知”处理，用同一个键重发。
-- **内核工具代理产生**：`module_unavailable`（D4.4）。
+- **内核工具代理产生**：模块停用、退避、熔断时的 `module_unavailable`（D4.4）。这条路径的 `retryable` 是 `false`（`agent24d/src/module_tool_runtime.rs:54-60`；`agent24-tools/src/lib.rs:1033-1034`）。文档模块自己在 `engine_unavailable` 和存储 `locked` / `busy` 时另返回 `module_unavailable`，`retryable:true`（见上表；DOC-1-06b，2026-10-18）。
 
 ## 7. Job
 
