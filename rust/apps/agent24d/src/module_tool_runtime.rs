@@ -169,6 +169,10 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
         }
     }
 
+    async fn outbound_gate_ready(&self, module: &str, operation: &str) -> bool {
+        self.operation_available(module, operation).await
+    }
+
     async fn blocked_by_remote_tier_guard(&self, module: &str, _operation: &str) -> bool {
         self.remote_tier_present && is_document_class_module(module)
     }
@@ -189,6 +193,7 @@ mod tests {
         assert!(!is_document_class_module("sin90"));
     }
     use agent24_domain::tool::{ModuleToolCallError, ModuleToolResult};
+    use agent24_domain::{EgressGate, EgressResource};
     use agent24_policy::consent_gate::{
         ConsentGate, ConsentGateRequest, ModuleConsentAuthorization, StoreConsentGate,
     };
@@ -200,7 +205,7 @@ mod tests {
     };
     use agent24_tools::{
         ApprovalGate, GateDecision, ModuleTool, ModuleToolAuthorization, RiskOverrides, Tool,
-        ToolContext, ToolRegistry,
+        ToolContext, ToolError, ToolRegistry,
     };
     use async_trait::async_trait;
     use serde_json::{Map, Value};
@@ -269,6 +274,7 @@ mod tests {
     struct TestAdvertView {
         authorization: Arc<dyn ModuleToolAuthorization>,
         running: Arc<FakeModule>,
+        outbound_ready: AtomicBool,
     }
 
     #[async_trait]
@@ -283,6 +289,9 @@ mod tests {
             self.authorization
                 .has_current_consent(module, operation)
                 .await
+        }
+        async fn outbound_gate_ready(&self, _: &str, _: &str) -> bool {
+            self.outbound_ready.load(Ordering::SeqCst)
         }
         async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
             false
@@ -387,7 +396,18 @@ mod tests {
         running: bool,
     ) -> (ToolRegistry, Arc<FakeModule>, Arc<CountingApproval>, Store) {
         let (registry, runtime, approvals, store, _) =
-            fixture_using(risk, granted, running, None, None).await;
+            fixture_using(risk, granted, running, true, None, None).await;
+        (registry, runtime, approvals, store)
+    }
+
+    async fn fixture_with_outbound(
+        risk: RiskClass,
+        granted: bool,
+        running: bool,
+        outbound_ready: bool,
+    ) -> (ToolRegistry, Arc<FakeModule>, Arc<CountingApproval>, Store) {
+        let (registry, runtime, approvals, store, _) =
+            fixture_using(risk, granted, running, outbound_ready, None, None).await;
         (registry, runtime, approvals, store)
     }
 
@@ -395,6 +415,7 @@ mod tests {
         risk: RiskClass,
         granted: bool,
         running: bool,
+        outbound_ready: bool,
         supplied_store: Option<Store>,
         supplied_authorization: Option<Arc<dyn ModuleToolAuthorization>>,
     ) -> (
@@ -444,10 +465,12 @@ mod tests {
             unresponsive_check: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
         });
-        let view: Arc<dyn ModuleToolAdvertView> = Arc::new(TestAdvertView {
+        let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
             running: Arc::clone(&runtime),
+            outbound_ready: AtomicBool::new(outbound_ready),
         });
+        let view: Arc<dyn ModuleToolAdvertView> = test_view;
         let tool = Arc::new(
             ModuleTool::new(
                 "fake_module",
@@ -1184,6 +1207,7 @@ mod tests {
             RiskClass::Read,
             false,
             true,
+            true,
             Some(store),
             Some(authorization.clone()),
         )
@@ -1216,6 +1240,7 @@ mod tests {
         let (registry, runtime, _, store, _tool) = fixture_using(
             RiskClass::Read,
             false,
+            true,
             true,
             None,
             Some(authorization.clone()),
@@ -1264,6 +1289,7 @@ mod tests {
             RiskClass::Read,
             false,
             true,
+            true,
             None,
             Some(authorization.clone()),
         )
@@ -1311,6 +1337,7 @@ mod tests {
             RiskClass::Read,
             false,
             true,
+            true,
             None,
             Some(authorization.clone()),
         )
@@ -1351,6 +1378,7 @@ mod tests {
         let other: Arc<dyn agent24_domain::tool::ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: other_auth.clone(),
             running: other_runtime.clone(),
+            outbound_ready: AtomicBool::new(true),
         });
         let other_tool = ModuleTool::new(
             "other_module",
@@ -1412,7 +1440,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let (_registry, runtime, _, _store, tool) =
-            fixture_using(RiskClass::Read, false, true, None, Some(auth.clone())).await;
+            fixture_using(RiskClass::Read, false, true, true, None, Some(auth.clone())).await;
 
         let ctx = context();
         let capability = Arc::new(tool.prepare_invocation(&ctx).unwrap());
@@ -1466,7 +1494,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_reuse_of_capability_allows_only_one_call_to_enter() {
         let (_registry, runtime, _, store, tool) =
-            fixture_using(RiskClass::Read, true, true, None, None).await;
+            fixture_using(RiskClass::Read, true, true, true, None, None).await;
 
         let ctx = context();
         let capability = Arc::new(tool.prepare_invocation(&ctx).unwrap());
@@ -1519,7 +1547,7 @@ mod tests {
     #[tokio::test]
     async fn settlement_while_call_still_active_is_rejected() {
         let (_registry, runtime, _, _store, tool) =
-            fixture_using(RiskClass::Read, true, true, None, None).await;
+            fixture_using(RiskClass::Read, true, true, true, None, None).await;
         runtime.wait_for_cancel.store(true, Ordering::SeqCst);
 
         let ctx = context();
@@ -1563,9 +1591,9 @@ mod tests {
     async fn two_module_tools_with_identical_strings_do_not_accept_each_others_capability() {
         let store = Store::open_memory().await.unwrap();
         let (_reg1, _rt1, _, _, tool_a) =
-            fixture_using(RiskClass::Read, true, true, Some(store.clone()), None).await;
+            fixture_using(RiskClass::Read, true, true, true, Some(store.clone()), None).await;
         let (_reg2, _rt2, _, _, tool_b) =
-            fixture_using(RiskClass::Read, true, true, Some(store.clone()), None).await;
+            fixture_using(RiskClass::Read, true, true, true, Some(store.clone()), None).await;
 
         let ctx = context();
         let cap_a = tool_a.prepare_invocation(&ctx).unwrap();
@@ -1584,5 +1612,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_unknown_module_error(settle_res.unwrap_err(), "result_unknown");
+    }
+
+    #[tokio::test]
+    async fn unready_outbound_gate_is_not_advertised() {
+        let (registry, _, _, _) = fixture_with_outbound(RiskClass::Read, true, true, false).await;
+        assert!(registry.live_adverts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restricted_module_tool_is_denied_when_egress_gate_denies() {
+        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
+        let restricted = context().with_egress_policy(
+            <dyn EgressGate>::deny_all(),
+            vec![EgressResource::local_only(
+                "selected_material:private",
+                "rev-1",
+            )],
+            0,
+        );
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &restricted,
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::Denied(_)));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_module_tool_advert_view_outbound_gate_ready_only_for_registered_operations() {
+        let mut ops = HashSet::new();
+        ops.insert(("doc_mod".to_owned(), "read_op".to_owned()));
+        let runtime = AgentModuleToolRuntime::new(ops);
+        let view = AgentModuleToolAdvertView::new(runtime, HashMap::new(), false);
+        assert!(view.outbound_gate_ready("doc_mod", "read_op").await);
+        assert!(!view.outbound_gate_ready("doc_mod", "unknown_op").await);
     }
 }

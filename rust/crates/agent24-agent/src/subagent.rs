@@ -111,6 +111,10 @@ impl ExplorerSubagent {
 
 #[async_trait]
 impl Tool for ExplorerSubagent {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         // Read: spawning an explorer has only read side effects, because the
         // sub-run can only read. So it is not gated — advertised and runs like

@@ -112,6 +112,10 @@ fn is_iso8601_utc(s: &str) -> bool {
 
 #[async_trait]
 impl Tool for SelfWakeTool {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         ToolInfo::new(
             "self_wake",
@@ -243,6 +247,7 @@ mod tests {
 
     use super::*;
     use agent24_store::ModuleScheduleDesired;
+    use std::sync::Arc;
 
     fn ctx(session: Option<&str>) -> ToolContext {
         ToolContext::legacy("run_1", session.map(str::to_owned), None, "tc_1")
@@ -281,6 +286,31 @@ mod tests {
             }
             None => panic!("a self-wake is always a user row: action must be Some"),
         }
+    }
+
+    #[tokio::test]
+    async fn self_wake_is_dispatchable_without_an_egress_service() {
+        let (tool, store) = tool().await;
+        let registry = agent24_tools::ToolRegistry::new().with(Arc::new(tool));
+        assert!(
+            registry
+                .adverts()
+                .iter()
+                .any(|advert| advert.name == "self_wake")
+        );
+        let mut input = Map::new();
+        input.insert("prompt".to_owned(), json!("check later"));
+        input.insert("after_secs".to_owned(), json!(60));
+        registry
+            .dispatch(
+                "self_wake",
+                &ctx(Some("sess_1")),
+                &input,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.list_schedules_lenient().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
