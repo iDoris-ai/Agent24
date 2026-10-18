@@ -327,7 +327,7 @@
 
 - **`jobs` 表**：`job_id`（`job_` + ULID）、`kind`、`document_id`、`revision`、`status`（`queued / running / cancelling / succeeded / failed / cancelled / interrupted`）、`attempt`、`progress {stage, done, total, unit}`、`error {code, message}`、`result_ref`、`origin`、时间戳；经键表与幂等键关联（§5.4）。
 - **键命中时**：`queued` / `running` → 返回该 job；`succeeded` → 返回结果；`failed` / `interrupted` → **自动重新启用**（同一个 `job_id`，`attempt + 1`，回到 `queued`）。**`cancelled` 不会因键命中而重启**，返回原 job 及其 `cancelled` 状态，只能由用户显式调用 `POST /jobs/{id}/retry` 重启。这样，内容推导的键（例如 agent 调用 `extract` / `export`）不会悄悄撤销用户的取消。`POST /jobs/{id}/retry` 是同一动作的显式形式。
-- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具路径上，`inline_wait_ms` 是内核硬期限：内核用 `tokio::time::timeout(inline_wait, …)` 包住整次调用，超时记 `result_unknown`（`agent24-tools/src/lib.rs:868-884`；取值来自 manifest，`agent24d/src/server.rs:1635`）。`timeout_ms` 只是发给模块的 HTTP 期限（`module_tool_runtime.rs:108-110`）。模块自身处理预算严格小于 `inline_wait_ms` 并留余量（`inline_wait_ms=25000` 时预算 20000），超出返回 `error{code:"timeout", retryable:true}`。`documents.extract` 不等待抽取任务完成，只提交或重放后立即返回 `completed{payload:{status, job_id}}`（没有 `extraction_id`，见 §4 表格下方）（DOC-1-06b，2026-10-18）。
+- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具路径上，`inline_wait_ms` 是同步等待的期限：内核用 `tokio::time::timeout(inline_wait, …)` 包住对模块的调用，超时记 `result_unknown`（`agent24-tools/src/lib.rs:868-884`）。`timeout_ms` 是整次调用的外层硬上限，超时也是 `result_unknown`，同时也是发给模块的 HTTP 期限（`module_tool_runtime.rs:108-110`）。`ModuleTool::timeout()` 返回 `timeout_ms`（`:679-680`），`run_budgeted`（`:1486-1542`）从派发前的审计和同意检查算起包住整次调用；到点先取消，再等 5 s，仍未结束走 `unknown_module_outcome("timeout")`（`:1047-1050`），模型看到 `code:"timeout"`、`retryable:false`、`result_unknown:true`（ADR-K1-01:73）。取值来自 manifest（`agent24d/src/server.rs:1634-1635`）。正常情况下先到 `inline_wait`。模块自身处理预算严格小于 `inline_wait_ms` 并留余量（`inline_wait_ms=25000` 时预算 20000），超出返回 `error{code:"timeout", retryable:true}`。`documents.extract` 不等待抽取任务完成，只提交或重放后立即返回 `completed{payload:{status, job_id}}`（没有 `extraction_id`，见 §4 表格下方）（DOC-1-06b，2026-10-18）。
 - **完成**：结果行与 `status = succeeded` 在**同一个事务**里写入。
 - **取消**：`POST /jobs/{id}/cancel` 幂等。`running` 置 `cancelling`，工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出；没有工作线程在跑的 `queued` / `failed` / `interrupted` 直接置 `cancelled`，带 `cancelled` 标记（`failed` 原有的错误码被它替换），之后键命中也不会复活；其余状态不变。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
 - **崩溃恢复**：OS 启动时 `running` → `interrupted`，`queued` 也 → `interrupted`（进程重启后已没有处理它的工作线程；否则按键命中规则它会一直停在 `queued`），`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
@@ -354,7 +354,7 @@
 
 - `knowledge.state` 沿用 README §9.2 的六种状态。DOC-1 没有 required 类操作，所以只报告，不阻塞。
 - `reason` 取自 §6 的闭集。
-- **内核按这些数据过滤工具通告属于 Q7 的内核依赖**，目前不存在。在它落地前，工具照常通告，调用时返回类型化错误。
+- **内核按这些数据过滤工具通告属于 Q7 的内核依赖**，目前不存在。在它落地前，工具照常通告，调用时返回类型化错误。落地时 `/capabilities` 不改名，内核按 DOC-1-06b §3.1 的映射过滤：`list`、`get`、`read_range`、`find`、`extract` 同名，`job_get` 看 `job`，`extraction_get` 看 `extract`（`SLICE1_OPERATIONS` 是 `job`、`extract` 等，没有 `job_get`、`extraction_get`，`agent24-documents/src/lib.rs:96-106`）（DOC-1-06b，2026-10-18）。
 
 ## 9. 待决事项
 
@@ -366,7 +366,7 @@
 | Q4 | agent 能否导入文件 | **已定（David，2026-10-07）**：DOC-1 不能，只从页面经原生文件对话框导入；以后可在审批下开放 | David |
 | Q5 | agent 能否在用户确认后 commit | **已定（David，2026-10-07）**：DOC-1 没有 commit 工具，agent 只读和提议；review / commit 只在页面、diff 可见时进行；对话内确认提交以后可在审批下加入 | David |
 | Q6 | 偏移单位用 UTF-8 字节（§3） | 接受 | David |
-| Q7 | 内核工具 ADR 需要提供：结构化工具错误码、工具调用的取消信号、按 `/capabilities` 过滤工具通告、`inline_wait_ms` 声明 | 写入 C 的内核 ADR 需求 | jason / Agent24 kernel |
+| Q7 | 内核工具 ADR 需要提供：结构化工具错误码、工具调用的取消信号、按 `/capabilities` 过滤工具通告、`inline_wait_ms` 声明。过滤时 `/capabilities` 不改名，按 DOC-1-06b §3.1 的映射（`job_get`→`job`，`extraction_get`→`extract`）（DOC-1-06b，2026-10-18） | 写入 C 的内核 ADR 需求 | jason / Agent24 kernel |
 | Q8 | `partial_parse` / `stale_index` 何时作为结果状态、何时作为错误 | 默认作为结果状态，只在显式要求时报错 | David |
 | Q9 | 是否向 agent 通告 `job.cancel` / `job.retry` | DOC-1 不通告；如果通告，按 `WriteLocal` 处理，且只能操作同一个 run 启动的 job | David |
 | Q10 | commit 的内联预算（5 s）和 `inline_wait_ms` 的取值 | 先按 5 s，等第 2 片的 DOCX/PDF 实测后再调 | David |
