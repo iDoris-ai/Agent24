@@ -117,10 +117,9 @@ struct Inner {
     model: OnceLock<Arc<dyn Model>>,
     reopen_interval: Duration,
     current: Mutex<Opened>,
-    /// When the last reopen started. Held by the reopen task until the reopen
-    /// ends, so one reopen runs at a time while requests answer with the last
-    /// cause, even after the request that started it was cancelled.
-    last_attempt: Arc<tokio::sync::Mutex<Instant>>,
+    /// When the last reopen started. Held during a reopen, so one request
+    /// reopens while the others answer with the last cause.
+    last_attempt: tokio::sync::Mutex<Instant>,
     /// Reopens started, so tests can wait for one without touching the lock.
     #[cfg(test)]
     reopens: std::sync::atomic::AtomicUsize,
@@ -166,7 +165,7 @@ impl AppState {
             model: OnceLock::new(),
             reopen_interval,
             current: Mutex::new(current),
-            last_attempt: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            last_attempt: tokio::sync::Mutex::new(Instant::now()),
             #[cfg(test)]
             reopens: std::sync::atomic::AtomicUsize::new(0),
         }))
@@ -187,7 +186,7 @@ impl AppState {
             model: OnceLock::new(),
             reopen_interval,
             current: Mutex::new(Err(cause)),
-            last_attempt: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            last_attempt: tokio::sync::Mutex::new(Instant::now()),
             #[cfg(test)]
             reopens: std::sync::atomic::AtomicUsize::new(0),
         }))
@@ -224,40 +223,26 @@ impl AppState {
         if current.is_ok() {
             return current;
         }
-        let Ok(mut last) = Arc::clone(&self.0.last_attempt).try_lock_owned() else {
-            return self.current(); // a reopen is in progress
+        let Ok(mut last) = self.0.last_attempt.try_lock() else {
+            return self.current(); // another request is reopening
         };
         let current = self.current();
         if current.is_ok() || last.elapsed() < self.0.reopen_interval {
             return current;
         }
+        // Counted before the attempt: a request dropped mid-reopen still uses
+        // up this interval, so a client that keeps cancelling cannot make the
+        // service reopen on every request.
         *last = Instant::now();
         #[cfg(test)]
         self.0.reopens.fetch_add(1, Ordering::SeqCst);
-        // The reopen runs in its own task, which holds the lock until it ends:
-        // a request cancelled mid-reopen (a tool's deadline, a client that
-        // hangs up) neither interrupts it (migrations, job recovery) nor frees
-        // the lock while its filesystem work may still be stuck, so stalls do
-        // not pile up a blocking thread per request.
-        let state = self.clone();
-        let reopen = tokio::spawn(async move {
-            let _reopening = last;
-            let reopened = open_storage(&state.0.data_dir, &state.0.events).await;
-            *state
-                .0
-                .current
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = reopened.clone();
-            reopened
-        });
-        match reopen.await {
-            Ok(reopened) => reopened,
-            Err(e) => match e.try_into_panic() {
-                Ok(panic) => std::panic::resume_unwind(panic),
-                // Cancelled: the runtime is shutting down.
-                Err(_) => self.current(),
-            },
-        }
+        let reopened = open_storage(&self.0.data_dir, &self.0.events).await;
+        *self
+            .0
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = reopened.clone();
+        reopened
     }
 }
 
