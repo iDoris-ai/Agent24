@@ -346,6 +346,73 @@ async fn a_blocked_reopen_does_not_stall_the_runtime() {
     release.join().unwrap();
 }
 
+/// Keeps the blob lock a FIFO without a reader, so opening it for writing
+/// blocks; dropping it releases every blocked open, even after a failed
+/// assertion (the runtime waits for blocking threads when it shuts down).
+struct Stall(PathBuf);
+
+impl Stall {
+    fn new(data_dir: &Path) -> Self {
+        fs::create_dir_all(data_dir.join("blobs")).unwrap();
+        let fifo = data_dir.join("blobs/.lock");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        Self(fifo)
+    }
+}
+
+impl Drop for Stall {
+    fn drop(&mut self) {
+        // Opening a FIFO read-write never blocks (Linux, macOS), and as a
+        // reader it lets the blocked writers through. Later opens then create
+        // a plain file instead of blocking again.
+        let reader = OpenOptions::new().read(true).write(true).open(&self.0);
+        let _ = fs::remove_file(&self.0);
+        drop(reader);
+    }
+}
+
+/// A request cancelled while its reopen is stuck (a tool's deadline, a
+/// client that hangs up) must not free the reopen lock: the stuck work goes
+/// on, and the next request would start another, a blocking thread each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_request_leaves_its_reopen_running_and_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let stall = Stall::new(dir.path());
+    // No interval, so only the lock keeps a second reopen from starting.
+    let state = AppState::failed(dir.path(), StorageCause::Locked, Duration::ZERO);
+    for _ in 0..5 {
+        let got = tokio::time::timeout(Duration::from_millis(50), state.storage()).await;
+        assert!(
+            !matches!(got, Ok(Ok(_))),
+            "opened through a blocked lock file"
+        );
+    }
+    assert_eq!(
+        state.0.reopens.load(Ordering::SeqCst),
+        1,
+        "a cancelled request's reopen let another start"
+    );
+    assert!(
+        state.0.last_attempt.try_lock().is_err(),
+        "the reopen lock was freed while the reopen is stuck"
+    );
+
+    drop(stall);
+    let waiting = Instant::now();
+    while state.storage().await.is_err() {
+        assert!(
+            waiting.elapsed() < Duration::from_secs(5),
+            "storage never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(cause(&state), None);
+}
+
 #[tokio::test]
 async fn a_route_that_needs_storage_answers_503_with_the_cause() {
     use axum::body::Body;

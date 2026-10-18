@@ -189,9 +189,12 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         }
     };
     // Dropping `work` at the deadline is safe: all three operations only
-    // read (a pool wait, a query, a storage reopen that counts its attempt
-    // first). A tool that writes (slice D2's `extract`) must first be
-    // checked for what a cancel mid-way leaves behind.
+    // read (a pool wait, a query). Storage they find unavailable may be
+    // reopened first, which writes (migrations, `jobs::recover`, the header's
+    // `user_version`), but the reopen runs in its own task: a dropped call
+    // stops waiting for it without interrupting it (`AppState::storage`). A
+    // tool that writes (slice D2's `extract`) must first be checked for what
+    // a cancel mid-way leaves behind.
     match tokio::time::timeout(budget, work).await {
         Ok(outcome) => outcome.unwrap_or_else(|refused| refused),
         Err(_) => {
