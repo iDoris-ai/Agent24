@@ -148,8 +148,10 @@ fn anchor(
 /// bytes or [`last_page`]; the cursor resumes at the first match left out.
 /// `used` counts the regions of the whole window up front, so within budget
 /// every page after fits; the first match is taken even past it, and then
-/// nothing more is (no further match, no further page), and [`within`]
-/// judges whether that match with its page's regions fits.
+/// nothing more is (no further match, no further page). If it does not fit
+/// with the regions of the pages before its own, those pages go alone and
+/// the cursor resumes at it; [`within`] judges whether it fits with its
+/// own page's regions.
 fn page_of(
     r: &Revision,
     address: &str,
@@ -176,6 +178,7 @@ fn page_of(
         + full_cursor.len()
         + serde_json::to_vec(&all_regions).map_or(budget, |v| v.len());
     let mut at = start;
+    let mut first = at; // where the first match taken is
     'pages: while at.page <= last_page {
         let blocks: Vec<&Block> = layer.blocks.iter().filter(|b| b.page == at.page).collect();
         while at.block < blocks.len() {
@@ -185,6 +188,9 @@ fn page_of(
                 let size = serde_json::to_vec(&json).map_or(budget, |v| v.len()) + 1;
                 if out.matches.len() == limit || (used + size > budget && !out.matches.is_empty()) {
                     break 'pages;
+                }
+                if out.matches.is_empty() {
+                    first = at;
                 }
                 used += size;
                 out.matches.push(json);
@@ -215,6 +221,15 @@ fn page_of(
     (out.parse_status, out.unparsed_regions) = coverage(layer, start.page, end.min(last_page));
     if at.page <= layer.pages {
         out.next_cursor = Some(next(at));
+    }
+    // Past budget, the first match may not fit with the regions of the
+    // pages before its own: those go alone, and the next response starts
+    // at it (still at least a page further on).
+    let fits = || serde_json::to_vec(&out).is_ok_and(|v| v.len() <= budget);
+    if used > budget && first.page > start.page && !fits() {
+        out.matches.clear();
+        (out.parse_status, out.unparsed_regions) = coverage(layer, start.page, first.page - 1);
+        out.next_cursor = Some(next(first));
     }
     out
 }

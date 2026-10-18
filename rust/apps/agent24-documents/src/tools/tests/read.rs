@@ -383,7 +383,9 @@ async fn a_block_that_escaping_blows_over_the_budget_is_payload_too_large() {
     let body = call(&state, "read_range", at_block).await;
     assert_module_error(&body, "payload_too_large", false);
 
-    // A match never gets that wide; a tiny budget stands in.
+    // A match can get as wide (whitespace in the query matches a run of
+    // any length: "a"+16000×U+000B+"b" for "a b"); here a tiny budget
+    // stands in for one.
     let storage = state.storage().await.unwrap();
     let req = |limit| FindRequest {
         revision: 1,
@@ -483,6 +485,53 @@ async fn a_wide_first_match_ends_its_answer_at_its_page() {
     assert_eq!(got[0]["parse_status"], json!("complete"));
     assert_eq!(got[0]["unparsed_regions"], json!([]));
     assert!(got.len() >= 2, "{} pages", got.len());
+    assert_eq!(joined(&got, "matches"), want["matches"]);
+    assert_eq!(regions(&got), want["unparsed_regions"]);
+}
+
+/// Pages 1 to 20 unread (a 16-rect region each) and without a block, then
+/// `wide` on page 21 and `"a b tail"` on 22: the regions before the wide
+/// entry and the entry do not fit one answer, each alone does.
+fn before_a_wide_page(wide: String) -> Option<Fixed> {
+    let doc = (1..=20)
+        .map(|_| vec![])
+        .chain([vec![wide], vec!["a b tail".into()]]);
+    fixed(doc.collect(), (1..=20).collect(), 16)
+}
+
+#[tokio::test]
+async fn regions_before_a_wide_first_block_go_ahead_of_it() {
+    let wide = format!("a{}b", "\u{b}".repeat(6000));
+    let (_dir, state) = env(before_a_wide_page(wide)).await;
+    let (status, want) = rest(&state, &text_path("")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(want["next_cursor"].is_null());
+    let args = json!({ "document_id": DOC, "revision": 1 });
+    let got = pages(&state, "read_range", args).await;
+    // Pages 1 to 20's regions alone, the cursor at the wide block.
+    assert_eq!(got[0]["blocks"], json!([]));
+    assert_eq!(got[0]["unparsed_regions"], want["unparsed_regions"]);
+    assert!(got.len() >= 2, "{} pages", got.len());
+    assert_eq!(got[1]["blocks"][0], want["blocks"][0]);
+    assert_eq!(joined(&got, "blocks"), want["blocks"]);
+    assert_eq!(regions(&got), want["unparsed_regions"]);
+}
+
+#[tokio::test]
+async fn regions_before_a_wide_first_match_go_ahead_of_it() {
+    let wide = format!("a{}b", "\u{b}".repeat(6000));
+    let (_dir, state) = env(before_a_wide_page(wide)).await;
+    let body = json!({ "revision": 1, "query": "a b" });
+    let (status, want) = rest_find(&state, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(want["next_cursor"].is_null());
+    assert_eq!(want["matches"].as_array().unwrap().len(), 2);
+    let args = json!({ "document_id": DOC, "revision": 1, "query": "a b" });
+    let got = pages(&state, "find", args).await;
+    assert_eq!(got[0]["matches"], json!([]));
+    assert_eq!(got[0]["unparsed_regions"], want["unparsed_regions"]);
+    assert!(got.len() >= 2, "{} pages", got.len());
+    assert_eq!(got[1]["matches"][0], want["matches"][0]);
     assert_eq!(joined(&got, "matches"), want["matches"]);
     assert_eq!(regions(&got), want["unparsed_regions"]);
 }
