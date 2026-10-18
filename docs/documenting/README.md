@@ -426,6 +426,8 @@ These are acceptance requirements for the implementation. They are not precondit
 | `document.package.assemble` | create-artifact | free |
 | `document.delivery.prepare` | handoff (side effect executed by Agent24) | free |
 
+The dotted names in this list are operation concepts. Agent tool names are in [ADR-DOC-02](adr/ADR-DOC-02-operation-contract.md) §4 (`documents.change_propose`, `documents.revision_list`, `documents.revision_get`, and the other names in that table's tool column).
+
 **Single commit point.**
 
 - Accepting or rejecting suggestions only updates the working-draft state. `document.revision.commit` is the only operation that creates a revision. Restore also goes through it and produces a new revision; it never rewrites history.

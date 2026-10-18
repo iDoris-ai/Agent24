@@ -29,7 +29,7 @@
 | 幂等 | `FireId` 是带域分隔前缀、只由业务坐标决定的 SHA-256（`rust/crates/agent24-scheduler/src/fire.rs:25-44`），落库 `ON CONFLICT (fire_id) DO NOTHING`（`module_schedules.rs:443`）；`UNIQUE (module, request_id, kind)`（`rust/crates/agent24-store/migrations/0005_module_approvals.sql:39`） |
 | job | **没有** job 抽象（BASELINE §8） |
 | 错误信封 | `{error:{code,message,hint?,details?}}`，`code` 是开放枚举（`rust/crates/agent24-protocol/src/types.rs:247-264`）；413 用 `payload_too_large`（`rust/crates/agent24-domain/src/http.rs:121-122`） |
-| 工具错误 | `ToolError` = `Invalid(String) / Denied(String) / Failed(String) / Timeout(Duration) / Cancelled / AbortRun(String)`（`rust/crates/agent24-tools/src/lib.rs:153-170`）。agent loop 把 `Cancelled` 与 `AbortRun` 同等处理，**会取消整个 run**（`rust/crates/agent24-agent/src/lib.rs:1347`、`:1986`） |
+| 工具错误 | **当时**：工具错误 = `ToolError` 六变体 `Invalid(String) / Denied(String) / Failed(String) / Timeout(Duration) / Cancelled / AbortRun(String)`（`rust/crates/agent24-tools/src/lib.rs:153-170`）。agent loop 把 `Cancelled` 与 `AbortRun` 同等处理，**会取消整个 run**（`rust/crates/agent24-agent/src/lib.rs:1347`、`:1986`）。工具路径上模块错误的映射见 §6 的信封，不映射成这六个变体（DOC-1-06b，2026-10-18） |
 | 代理 | 首字节 10 s、总 30 s（`rust/crates/agent24-os-proto/src/proxy.rs:116`、`:124`）；响应体同样 1 MiB 上限（`:1709-1722`）；只自动重试无 body 的 GET/HEAD/OPTIONS（`:1546-1556`）；未派发即拒绝的 `module_stopping` / `module_overloaded` 等（`:1303-1436`），以及派发后结果未知的 503 `request_abandoned`（`:1286-1298`） |
 | 事件 | `module` 信封：`payload.module` = manifest id，`payload.kind` 为点分名（`protocol/events.schema.json:762-786`）。`_a24/events/emit` 每个 generation 令牌桶容量 20、每秒补 5（`rust/apps/agent24d/src/events_emit.rs:23-25`），payload ≤ 256 节点、字符串 ≤ 8 KiB（`:39-41`）。`EventsHub` 是广播给**所有** WS 客户端的通道（`rust/apps/agent24d/src/events.rs:22-30`，每个 WS 订阅在 `:134`） |
 
@@ -308,9 +308,9 @@
 
 工具路径（DOC-1-06b，2026-10-18）：`locked` / `busy` 返回原码 `storage_unavailable`，`retryable:true`；`corrupt` / `not_writable` / `disk_full` 仍用原码 `storage_unavailable`，`retryable:false`（内核收成 `module_error`，原码进 `module_code`）。文档模块的应答不用 `module_unavailable`。
 
-**OS 的意外故障：共用内核码的唯一例外**：失败既不在上表、也不是存储不可用（例如数据库约束被触发，说明 OS 自身有 bug）时，OS 自己返回 500，用内核通用信封的 `internal` 码，`details.retryable: false`。这是唯一一个由 OS 产生、却不在本命名空间闭集里的码；OpenAPI 中 documents 路由的 500 响应和 `ModuleProxyError` 的说明里都注明了这一点。
-- 工具路径返回 `error{code:"internal", retryable:false}`。`internal` 不在内核码表里，内核收成 `module_error`，原码进 `module_code`。这不算结果未知，不按下面的“默认规则”当未知重发（DOC-1-06b，2026-10-18）。
-- 不自动重试。
+**OS 的意外故障：`internal` 仍是不在本命名空间闭集里的唯一一个码**：失败既不在上表、也不是存储不可用（例如数据库约束被触发，说明 OS 自身有 bug）时，OS 自己返回 500，用内核通用信封的 `internal` 码，`details.retryable: false`。这个码仍是唯一一个由 OS 产生、却不在本命名空间闭集里的码，但有两种场景。OpenAPI 中 documents 路由的 500 响应和 `ModuleProxyError` 的说明里都注明了意外故障这一点（DOC-1-06b，2026-10-18）。
+- 工具路径上同一个码靠 `retryable` 区分：意外故障返回 `error{code:"internal", retryable:false}`；模块自身处理超出预算时返回 `error{code:"internal", retryable:true}`。两者都不是结果未知。`internal` 不在内核码表里，内核收成 `module_error`，`module_code` 都是 `internal`。不按下面的“默认规则”当未知重发（DOC-1-06b，2026-10-18）。
+- 意外故障不自动重试（超出处理预算的 internal 带 retryable:true，见上）。（DOC-1-06b，2026-10-18）
 
 **会看到但不属于本命名空间的内核 / 代理码**：
 
@@ -320,14 +320,14 @@
   - `upstream_unavailable`：它在 `proxy.rs:1587` 表示“未发出”，在 `:1731` 表示“响应中途断了”，无法区分，按未知处理；
   - `upstream_response_too_large`：模块可能已经执行；
   - `module_panicked`、`module_killed`、`stop_failed`。
-- **默认规则**：未列出的码一律按“结果未知”处理，用同一个键重发。
+- **默认规则**：未列出的码一律按“结果未知”处理，用同一个键重发。这只适用于页面和 REST 客户端。工具路径上模型看 `module_code` 和 `result_unknown`（本节工具路径；交给模型的 JSON 见 `agent24-tools/src/lib.rs:1017-1044`）（DOC-1-06b，2026-10-18）。
 - **内核工具代理产生**：模块停用、退避、熔断、未运行时的 `module_unavailable`（D4.4）。停用、draining、未运行走 `generation`（`agent24d/src/module_tool_runtime.rs:39-49`）的 `ModuleToolCallError::ModuleUnavailable`，`retryable` 为 `false`，来自 `agent24-tools/src/lib.rs:1033-1034`。`unavailable()`（`:54-60`）只被 `check_available`（`:71-76`）用于操作不在登记集合，同样是 `module_unavailable`、`retryable:false`。文档模块不返回这个码（DOC-1-06b，2026-10-18）。
 
 ## 7. Job
 
 - **`jobs` 表**：`job_id`（`job_` + ULID）、`kind`、`document_id`、`revision`、`status`（`queued / running / cancelling / succeeded / failed / cancelled / interrupted`）、`attempt`、`progress {stage, done, total, unit}`、`error {code, message}`、`result_ref`、`origin`、时间戳；经键表与幂等键关联（§5.4）。
 - **键命中时**：`queued` / `running` → 返回该 job；`succeeded` → 返回结果；`failed` / `interrupted` → **自动重新启用**（同一个 `job_id`，`attempt + 1`，回到 `queued`）。**`cancelled` 不会因键命中而重启**，返回原 job 及其 `cancelled` 状态，只能由用户显式调用 `POST /jobs/{id}/retry` 重启。这样，内容推导的键（例如 agent 调用 `extract` / `export`）不会悄悄撤销用户的取消。`POST /jobs/{id}/retry` 是同一动作的显式形式。
-- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具路径上，`inline_wait_ms` 是同步等待的期限：内核用 `tokio::time::timeout(inline_wait, …)` 包住对模块的调用，超时记 `result_unknown`（`agent24-tools/src/lib.rs:868-884`）。`timeout_ms` 是整次调用的外层硬上限，超时也是 `result_unknown`，同时也是发给模块的 HTTP 期限（`module_tool_runtime.rs:108-110`）。`ModuleTool::timeout()` 返回 `timeout_ms`（`:679-680`），`run_budgeted`（`:1486-1542`）从派发前的审计和同意检查算起包住整次调用；到点先取消，再等 5 s，仍未结束走 `unknown_module_outcome("timeout")`（`:1047-1050`），模型看到 `code:"timeout"`、`retryable:false`、`result_unknown:true`（ADR-K1-01:73）。取值来自 manifest（`agent24d/src/server.rs:1634-1635`）。正常情况下先到 `inline_wait`。模块自身处理预算严格小于 `inline_wait_ms` 并留余量（`inline_wait_ms=25000` 时预算 20000），超出返回 `error{code:"timeout", retryable:true}`。`documents.extract` 不等待抽取任务完成，只提交或重放后立即返回 `completed{payload:{status, job_id}}`（没有 `extraction_id`，见 §4 表格下方）（DOC-1-06b，2026-10-18）。
+- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具路径上，`inline_wait_ms` 是同步等待的期限：内核用 `tokio::time::timeout(inline_wait, …)` 包住对模块的调用，超时记 `result_unknown`（`agent24-tools/src/lib.rs:868-884`）。`timeout_ms` 是整次调用的外层硬上限，超时也是 `result_unknown`，同时也是发给模块的 HTTP 期限（`module_tool_runtime.rs:108-110`）。`ModuleTool::timeout()` 返回 `timeout_ms`（`:679-680`），`run_budgeted`（`:1486-1542`）从派发前的审计和同意检查算起包住整次调用；到点先取消，再等 5 s，仍未结束走 `unknown_module_outcome("timeout")`（`agent24-tools/src/lib.rs:1047-1050` 写出 `code:"timeout"`、`retryable:false`、`result_unknown:true`）。取值来自 manifest（`agent24d/src/server.rs:1634-1635`）。正常情况下先到 `inline_wait`。模块自身处理预算严格小于 `inline_wait_ms` 并留余量（`inline_wait_ms=25000` 时预算 20000）。模块自身处理超出预算时返回 `error{code:"internal", retryable:true}`（`module_code` 为 `internal`，与宿主的 `timeout` 区分）。`timeout` 是内核码（`agent24-domain/src/tool.rs:513`），放进应答时 `module_code` 为空，和宿主超时分不开。`documents.extract` 不等待抽取任务完成，只提交或重放后立即返回 `completed{payload:{status, job_id}}`（没有 `extraction_id`，见 §4 表格下方）（DOC-1-06b，2026-10-18）。
 - **完成**：结果行与 `status = succeeded` 在**同一个事务**里写入。
 - **取消**：`POST /jobs/{id}/cancel` 幂等。`running` 置 `cancelling`，工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出；没有工作线程在跑的 `queued` / `failed` / `interrupted` 直接置 `cancelled`，带 `cancelled` 标记（`failed` 原有的错误码被它替换），之后键命中也不会复活；其余状态不变。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
 - **崩溃恢复**：OS 启动时 `running` → `interrupted`，`queued` 也 → `interrupted`（进程重启后已没有处理它的工作线程；否则按键命中规则它会一直停在 `queued`），`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
@@ -354,7 +354,7 @@
 
 - `knowledge.state` 沿用 README §9.2 的六种状态。DOC-1 没有 required 类操作，所以只报告，不阻塞。
 - `reason` 取自 §6 的闭集。
-- **内核按这些数据过滤工具通告属于 Q7 的内核依赖**，目前不存在。在它落地前，工具照常通告，调用时返回类型化错误。落地时 `/capabilities` 不改名，内核按 DOC-1-06b §3.1 的映射过滤：`list`、`get`、`read_range`、`find`、`extract` 同名，`job_get` 看 `job`，`extraction_get` 看 `extract`（`SLICE1_OPERATIONS` 是 `job`、`extract` 等，没有 `job_get`、`extraction_get`，`agent24-documents/src/lib.rs:96-106`）（DOC-1-06b，2026-10-18）。
+- **内核按这些数据过滤工具通告属于 Q7 的内核依赖**，目前不存在。在它落地前，工具照常通告，调用时返回类型化错误。落地时 `/capabilities` 不改名，内核按 DOC-1-06b §3.1 的映射过滤：`list`、`get`、`read_range`、`find`、`extract` 同名，`job_get` 与 `extraction_get` 都看 `job`（`extraction_get` 只要求存储：`get_extraction` 的参数是 `Ready(storage)`，`extractions.rs:120-121`；`extract` 是 `Needs::Model`，`lib.rs:105,148`）。`SLICE1_OPERATIONS` 是 `job`、`extract` 等，没有 `job_get`、`extraction_get`（`agent24-documents/src/lib.rs:96-106`）（DOC-1-06b，2026-10-18）。
 
 ## 9. 待决事项
 
@@ -366,7 +366,7 @@
 | Q4 | agent 能否导入文件 | **已定（David，2026-10-07）**：DOC-1 不能，只从页面经原生文件对话框导入；以后可在审批下开放 | David |
 | Q5 | agent 能否在用户确认后 commit | **已定（David，2026-10-07）**：DOC-1 没有 commit 工具，agent 只读和提议；review / commit 只在页面、diff 可见时进行；对话内确认提交以后可在审批下加入 | David |
 | Q6 | 偏移单位用 UTF-8 字节（§3） | 接受 | David |
-| Q7 | 内核工具 ADR 需要提供：结构化工具错误码、工具调用的取消信号、按 `/capabilities` 过滤工具通告、`inline_wait_ms` 声明。过滤时 `/capabilities` 不改名，按 DOC-1-06b §3.1 的映射（`job_get`→`job`，`extraction_get`→`extract`）（DOC-1-06b，2026-10-18） | 写入 C 的内核 ADR 需求 | jason / Agent24 kernel |
+| Q7 | 内核工具 ADR 需要提供：结构化工具错误码、工具调用的取消信号、按 `/capabilities` 过滤工具通告、`inline_wait_ms` 声明。过滤时 `/capabilities` 不改名，按 DOC-1-06b §3.1 的映射（`job_get`→`job`，`extraction_get`→`job`，只要求存储）（DOC-1-06b，2026-10-18） | 写入 C 的内核 ADR 需求 | jason / Agent24 kernel |
 | Q8 | `partial_parse` / `stale_index` 何时作为结果状态、何时作为错误 | 默认作为结果状态，只在显式要求时报错 | David |
 | Q9 | 是否向 agent 通告 `job.cancel` / `job.retry` | DOC-1 不通告；如果通告，按 `WriteLocal` 处理，且只能操作同一个 run 启动的 job | David |
 | Q10 | commit 的内联预算（5 s）和 `inline_wait_ms` 的取值 | 先按 5 s，等第 2 片的 DOCX/PDF 实测后再调 | David |
