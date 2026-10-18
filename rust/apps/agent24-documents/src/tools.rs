@@ -9,8 +9,8 @@
 //! through the kernel proxy cannot reach it, as the proxy answers 404 when
 //! the first segment after the namespace canonicalises to `_a24`.
 //!
-//! Operations: `list`, `get`, `job_get`, each on the service layer of its
-//! REST route. Any other `op` is `operation_unavailable`.
+//! Operations: `list`, `get`, `job_get`, `read_range`, `find`, each on the
+//! service layer of its REST route. Any other `op` is `operation_unavailable`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,8 @@ use serde_json::{Map, Value};
 use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::error::ApiError;
 use crate::jobs;
+use crate::read::find::{self, FindRequest};
+use crate::read::text::{self, TextParams};
 use crate::state::{AppState, Storage};
 
 /// The input does not have the shape the kernel sends (kernel code table,
@@ -185,14 +187,17 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "list" => list(state, arguments).await,
             "get" => get(state, arguments).await,
             "job_get" => job_get(state, arguments).await,
+            "read_range" => read_range(state, arguments).await,
+            "find" => find(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
-    // Dropping `work` at the deadline is safe: all three operations only
-    // read (a pool wait, a query). Storage they find unavailable may be
+    // Dropping `work` at the deadline is safe: every operation only reads (a
+    // pool wait, a query, a blob). Storage they find unavailable may be
     // reopened first, which writes (migrations, `jobs::recover`, the header's
-    // `user_version`), but the reopen runs in its own task: a dropped call
-    // stops waiting for it without interrupting it (`AppState::storage`). A
+    // `user_version`), and `read_range` / `find` may build a text layer, but
+    // both run in their own task: a dropped call stops waiting for them
+    // without interrupting them (`AppState::storage`, `Layers::layer`). A
     // tool that writes (slice D2's `extract`) must first be checked for what
     // a cancel mid-way leaves behind.
     match tokio::time::timeout(budget, work).await {
@@ -245,17 +250,43 @@ struct JobGetArgs {
     job_id: String,
 }
 
+/// `GET …/revisions/{rev}/text`'s path and query, typed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRangeArgs {
+    document_id: String,
+    revision: i64,
+    #[serde(default, deserialize_with = "present")]
+    block: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    cursor: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    limit: Option<i64>,
+    #[serde(default, deserialize_with = "present")]
+    require_complete: Option<bool>,
+}
+
+/// `POST /documents/{id}/find`'s path and body, typed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindArgs {
+    document_id: String,
+    revision: i64,
+    query: String,
+    #[serde(default, deserialize_with = "present")]
+    cursor: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    limit: Option<i64>,
+    #[serde(default, deserialize_with = "present")]
+    require_complete: Option<bool>,
+}
+
 /// A completed envelope, or the error one that answers instead.
 type Outcome = Result<Envelope, Envelope>;
 
 async fn list(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: ListArgs = parse(arguments)?;
-    let limit = match args.limit {
-        None => DEFAULT_LIMIT,
-        Some(l) if (1..=MAX_LIMIT).contains(&l) => l,
-        // Outside the input schema's range: structural, not business.
-        Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
-    };
+    let limit = bounded(args.limit)?.unwrap_or(DEFAULT_LIMIT);
     let storage = ready(state).await?;
     let page = documents::list(&storage, args.cursor.as_deref(), limit, PAYLOAD_BYTES).await;
     completed(page)
@@ -271,6 +302,41 @@ async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: JobGetArgs = parse(arguments)?;
     let storage = ready(state).await?;
     completed(jobs::get(&storage, &args.job_id).await)
+}
+
+async fn read_range(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let args: ReadRangeArgs = parse(arguments)?;
+    let params = TextParams {
+        block: args.block,
+        cursor: args.cursor,
+        limit: bounded(args.limit)?.and_then(|l| usize::try_from(l).ok()),
+        require_complete: args.require_complete.unwrap_or(false),
+    };
+    let storage = ready(state).await?;
+    let (id, rev) = (&args.document_id, args.revision);
+    completed(text::read_range(state, &storage, id, rev, params, PAYLOAD_BYTES).await)
+}
+
+async fn find(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let args: FindArgs = parse(arguments)?;
+    let req = FindRequest {
+        revision: args.revision,
+        query: args.query,
+        cursor: args.cursor,
+        limit: bounded(args.limit)?.and_then(|l| usize::try_from(l).ok()),
+        require_complete: args.require_complete.unwrap_or(false),
+    };
+    let storage = ready(state).await?;
+    completed(find::search(state, &storage, &args.document_id, req, PAYLOAD_BYTES).await)
+}
+
+/// A `limit` outside the input schema's 1 to 200 is structural, not
+/// business: `invalid_input`. The service checks it again, for REST.
+fn bounded(limit: Option<i64>) -> Result<Option<i64>, Envelope> {
+    match limit {
+        Some(l) if !(1..=MAX_LIMIT).contains(&l) => Err(Envelope::error(INVALID_INPUT, false)),
+        l => Ok(l),
+    }
 }
 
 /// The arguments as `T`, or `invalid_input`: a missing, extra or mistyped
@@ -322,6 +388,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use serde_json::json;
     use tower::ServiceExt;
+
+    mod read;
 
     fn context() -> Value {
         json!({
@@ -412,6 +480,7 @@ mod tests {
     }
 
     const JOB: &str = "job_01K75A0B1C2D3E4F5G6H7J8K9M";
+    const DOC: &str = "doc_01K74Z3QJ8V5N2W9RTX6Y00001";
 
     /// A failed job whose error message is the SQL expression `message`.
     async fn add_failed_job(state: &AppState, message: &str) {
@@ -777,6 +846,11 @@ mod tests {
                     json!({ "document_id": "doc_01K74Z3QJ8V5N2W9RTX6Y00001" }),
                 ),
                 ("job_get", json!({ "job_id": JOB })),
+                ("read_range", json!({ "document_id": DOC, "revision": 1 })),
+                (
+                    "find",
+                    json!({ "document_id": DOC, "revision": 1, "query": "a" }),
+                ),
             ] {
                 let body = call(&state, op, args).await;
                 assert_module_error(&body, "storage_unavailable", retryable);
@@ -816,6 +890,11 @@ mod tests {
                 json!({ "document_id": "doc_01K74Z3QJ8V5N2W9RTX6Y00001" }),
             ),
             ("job_get", json!({ "job_id": JOB })),
+            ("read_range", json!({ "document_id": DOC, "revision": 1 })),
+            (
+                "find",
+                json!({ "document_id": DOC, "revision": 1, "query": "a" }),
+            ),
         ] {
             let body = json!({ "context": context_for(op), "arguments": args });
             let req = Request::post(format!("/_a24/tools/{op}"))

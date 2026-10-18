@@ -5,6 +5,8 @@
 //! whitespace, and a line break that may be skipped (Chinese wraps without
 //! a space).
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path as UrlPath, State};
@@ -13,11 +15,11 @@ use serde_json::{Value, json};
 
 use super::matcher::Query;
 use super::{
-    PAGE_BYTES, PAGES, Position, Revision, coverage, current_layer, cursor_layer, decode_cursor,
-    encode_cursor, geometry, revision,
+    PAGE_BYTES, Position, Revision, coverage, current_layer, cursor_layer, decode_cursor,
+    encode_cursor, geometry, last_page, revision, within,
 };
 use crate::error::ApiError;
-use crate::state::{AppState, Ready};
+use crate::state::{AppState, Ready, Storage};
 use crate::text_layer::{Block, ParseStatus, TextLayer, sha256_address};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -28,12 +30,12 @@ const MAX_QUERY_CHARS: usize = 500;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindRequest {
-    revision: i64,
-    query: String,
-    cursor: Option<String>,
-    limit: Option<usize>,
+    pub(crate) revision: i64,
+    pub(crate) query: String,
+    pub(crate) cursor: Option<String>,
+    pub(crate) limit: Option<usize>,
     #[serde(default)]
-    require_complete: bool,
+    pub(crate) require_complete: bool,
 }
 
 /// `DocumentsFindResult`.
@@ -53,6 +55,20 @@ pub async fn find(
 ) -> Result<Json<FindResult>, ApiError> {
     let UrlPath(id) = path.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let Json(req) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
+    search(&state, &storage, &id, req, PAGE_BYTES)
+        .await
+        .map(Json)
+}
+
+/// One page of `req`'s matches within `budget` bytes of JSON. `find` and
+/// `documents.find` both search here.
+pub(crate) async fn search(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    id: &str,
+    req: FindRequest,
+    budget: usize,
+) -> Result<FindResult, ApiError> {
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     let chars = req.query.chars().count();
     let bad = || {
@@ -68,12 +84,12 @@ pub async fn find(
     let find = |text: &str| query.find(&req.query, text);
     // The cursor holds the query's hash: bound to it, and short.
     let bound = sha256_address(req.query.as_bytes());
-    let r = revision(&storage, &id, req.revision).await?;
+    let r = revision(storage, id, req.revision).await?;
     let (address, layer, start) = match &req.cursor {
         Some(c) => {
             let bad = || ApiError::invalid_request("not a cursor for this find");
             let (address, at) = decode_cursor("f", &r, c, &bound).ok_or_else(bad)?;
-            let layer = cursor_layer(&storage, &r, &address).await?;
+            let layer = cursor_layer(storage, &r, &address).await?;
             let on_page: Vec<&Block> = layer.blocks.iter().filter(|b| b.page == at.page).collect();
             let hits = on_page.get(at.block).map_or(0, |b| find(&b.text).len());
             if at.page > layer.pages || at.block > on_page.len() || (at.hit > 0 && at.hit >= hits) {
@@ -82,7 +98,7 @@ pub async fn find(
             (address, layer, at)
         }
         None => {
-            let (address, layer) = current_layer(&state, &storage, &r).await?;
+            let (address, layer) = current_layer(state, storage, &r).await?;
             (
                 address,
                 layer,
@@ -101,9 +117,8 @@ pub async fn find(
         ));
     }
     let next = |at: Position| encode_cursor("f", &r, &address, at, &bound);
-    Ok(Json(page_of(
-        &r, &address, &layer, &find, start, limit, next,
-    )))
+    let page = page_of(&r, &address, &layer, &find, start, (limit, budget), next);
+    within(page, budget)
 }
 
 /// The anchor of `text[start..end]` in `b` (`DocumentsAnchor`).
@@ -129,15 +144,16 @@ fn anchor(
     })
 }
 
-/// One response from `start`: matches page by page until `limit`, 512 KiB
-/// or [`PAGES`] pages; the cursor resumes at the first match left out.
+/// One response from `start`: matches page by page until `limit`, `budget`
+/// bytes or [`last_page`]; the cursor resumes at the first match left out.
+/// The first match is always taken: [`within`] judges it.
 fn page_of(
     r: &Revision,
     address: &str,
     layer: &TextLayer,
     find: &dyn Fn(&str) -> Vec<(usize, usize)>,
     start: Position,
-    limit: usize,
+    (limit, budget): (usize, usize),
     next: impl Fn(Position) -> String,
 ) -> FindResult {
     let mut out = FindResult {
@@ -146,16 +162,16 @@ fn page_of(
         matches: Vec::new(),
         next_cursor: None,
     };
-    let last_page = layer.pages.min(start.page.saturating_add(PAGES - 1));
+    let last_page = last_page(layer, start.page, budget);
     let (_, all_regions) = coverage(layer, start.page, last_page);
     let full_cursor = next(Position {
         page: u32::MAX,
         block: usize::MAX,
         hit: usize::MAX,
     });
-    let mut used = serde_json::to_vec(&out).map_or(PAGE_BYTES, |v| v.len())
+    let mut used = serde_json::to_vec(&out).map_or(budget, |v| v.len())
         + full_cursor.len()
-        + serde_json::to_vec(&all_regions).map_or(PAGE_BYTES, |v| v.len());
+        + serde_json::to_vec(&all_regions).map_or(budget, |v| v.len());
     let mut at = start;
     'pages: while at.page <= last_page {
         let blocks: Vec<&Block> = layer.blocks.iter().filter(|b| b.page == at.page).collect();
@@ -163,10 +179,8 @@ fn page_of(
             let found = find(&blocks[at.block].text);
             while at.hit < found.len() {
                 let json = anchor(r, address, layer, blocks[at.block], found[at.hit]);
-                let size = serde_json::to_vec(&json).map_or(PAGE_BYTES, |v| v.len()) + 1;
-                if out.matches.len() == limit
-                    || (used + size > PAGE_BYTES && !out.matches.is_empty())
-                {
+                let size = serde_json::to_vec(&json).map_or(budget, |v| v.len()) + 1;
+                if out.matches.len() == limit || (used + size > budget && !out.matches.is_empty()) {
                     break 'pages;
                 }
                 used += size;

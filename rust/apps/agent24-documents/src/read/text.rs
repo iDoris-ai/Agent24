@@ -1,6 +1,8 @@
 //! `GET /documents/{id}/revisions/{rev}/text` (ADR-DOC-02 §3.1, §4;
 //! `documentsReadText`): the blocks of the pinned layer, page by page.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path as UrlPath, Query, State};
@@ -8,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    PAGE_BYTES, PAGES, Position, Revision, coverage, current_layer, cursor_layer, decode_cursor,
-    encode_cursor, geometry, revision,
+    PAGE_BYTES, Position, Revision, coverage, current_layer, cursor_layer, decode_cursor,
+    encode_cursor, geometry, last_page, revision, within,
 };
 use crate::error::ApiError;
-use crate::state::{AppState, Ready};
+use crate::state::{AppState, Ready, Storage};
 use crate::text_layer::{Block, EngineRef, ParseStatus, TextLayer, sha256_address};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -29,11 +31,11 @@ fn block_json(b: &Block) -> Value {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextParams {
-    block: Option<String>,
-    cursor: Option<String>,
-    limit: Option<usize>,
+    pub(crate) block: Option<String>,
+    pub(crate) cursor: Option<String>,
+    pub(crate) limit: Option<usize>,
     #[serde(default)]
-    require_complete: bool,
+    pub(crate) require_complete: bool,
 }
 
 /// `DocumentsTextPage`.
@@ -59,6 +61,21 @@ pub async fn read_text(
 ) -> Result<Json<TextPage>, ApiError> {
     let UrlPath((id, rev)) = path.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let Query(p) = params.map_err(|e| ApiError::invalid_request(e.body_text()))?;
+    read_range(&state, &storage, &id, rev, p, PAGE_BYTES)
+        .await
+        .map(Json)
+}
+
+/// One page of `rev`'s blocks within `budget` bytes of JSON. `GET text`
+/// and `documents.read_range` both read here.
+pub(crate) async fn read_range(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    id: &str,
+    rev: i64,
+    p: TextParams,
+    budget: usize,
+) -> Result<TextPage, ApiError> {
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT);
     let both = p.block.is_some() && p.cursor.is_some();
     if !(1..=MAX_LIMIT).contains(&limit) || both || p.block.as_deref() == Some("") {
@@ -66,12 +83,12 @@ pub async fn read_text(
             "limit is 1 to 200; a block id is not empty; give block or cursor, not both",
         ));
     }
-    let r = revision(&storage, &id, rev).await?;
+    let r = revision(storage, id, rev).await?;
     let (address, layer, start) = match &p.cursor {
         Some(c) => {
             let bad = || ApiError::invalid_request("not a cursor for this read");
             let (address, at) = decode_cursor("t", &r, c, "").ok_or_else(bad)?;
-            let layer = cursor_layer(&storage, &r, &address).await?;
+            let layer = cursor_layer(storage, &r, &address).await?;
             // A position this layer has: a page, and at most past its last block.
             let on_page = layer.blocks.iter().filter(|b| b.page == at.page).count();
             if at.page > layer.pages || at.block > on_page || at.hit != 0 {
@@ -80,7 +97,7 @@ pub async fn read_text(
             (address, layer, at)
         }
         None => {
-            let (address, layer) = current_layer(&state, &storage, &r).await?;
+            let (address, layer) = current_layer(state, storage, &r).await?;
             let at = match &p.block {
                 None => Position {
                     page: 1,
@@ -100,7 +117,7 @@ pub async fn read_text(
             "part of the document could not be read",
         ));
     }
-    Ok(Json(page_of(&r, &address, &layer, start, limit)))
+    within(page_of(&r, &address, &layer, start, limit, budget), budget)
 }
 
 /// The position of block `id`, if the layer has it.
@@ -118,14 +135,16 @@ fn start_of(layer: &TextLayer, id: &str) -> Option<Position> {
     })
 }
 
-/// One response from `start`: whole pages' blocks until `limit` blocks, 512
-/// KiB or [`PAGES`] pages; the cursor resumes at the first block left out.
+/// One response from `start`: whole pages' blocks until `limit` blocks,
+/// `budget` bytes or [`last_page`]; the cursor resumes at the first block
+/// left out. The first block is always taken: [`within`] judges it.
 fn page_of(
     r: &Revision,
     address: &str,
     layer: &TextLayer,
     start: Position,
     limit: usize,
+    budget: usize,
 ) -> TextPage {
     let mut out = TextPage {
         document_id: r.document_id.clone(),
@@ -150,19 +169,19 @@ fn page_of(
         },
         "",
     );
-    let last_page = layer.pages.min(start.page.saturating_add(PAGES - 1));
+    let last_page = last_page(layer, start.page, budget);
     // Room for the envelope, a cursor, and regions of every covered page.
     let (_, all_regions) = coverage(layer, start.page, last_page);
-    let mut used = serde_json::to_vec(&out).map_or(PAGE_BYTES, |v| v.len())
+    let mut used = serde_json::to_vec(&out).map_or(budget, |v| v.len())
         + full_cursor.len()
-        + serde_json::to_vec(&all_regions).map_or(PAGE_BYTES, |v| v.len());
+        + serde_json::to_vec(&all_regions).map_or(budget, |v| v.len());
     let mut at = start;
     'pages: while at.page <= last_page {
         let blocks: Vec<&Block> = layer.blocks.iter().filter(|b| b.page == at.page).collect();
         while at.block < blocks.len() {
             let json = block_json(blocks[at.block]);
-            let size = serde_json::to_vec(&json).map_or(PAGE_BYTES, |v| v.len()) + 1;
-            if out.blocks.len() == limit || (used + size > PAGE_BYTES && !out.blocks.is_empty()) {
+            let size = serde_json::to_vec(&json).map_or(budget, |v| v.len()) + 1;
+            if out.blocks.len() == limit || (used + size > budget && !out.blocks.is_empty()) {
                 break 'pages;
             }
             used += size;
