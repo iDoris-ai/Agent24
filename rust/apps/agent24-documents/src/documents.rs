@@ -8,14 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::id::{IdKind, is_id};
-use crate::state::Ready;
+use crate::state::{Ready, Storage};
 use crate::timestamp::is_timestamp;
 use crate::uploads::is_sha256_address;
 
-const DEFAULT_LIMIT: i64 = 50;
-const MAX_LIMIT: i64 = 200;
-/// A page's serialized JSON stays under this (ADR-DOC-02 §4).
-const PAGE_BYTES: usize = 512 * 1024;
+pub(crate) const DEFAULT_LIMIT: i64 = 50;
+pub(crate) const MAX_LIMIT: i64 = 200;
+/// A REST page's serialized JSON stays under this (ADR-DOC-02 §4); a tool
+/// page has its own, smaller budget (DOC-1-06b §2).
+pub(crate) const PAGE_BYTES: usize = 512 * 1024;
 /// A title the OS writes is 1 to 500 characters (import, §5.6).
 const MAX_TITLE_CHARS: usize = 500;
 /// Every cursor the OS issues: hex of a 24-byte timestamp, a space and a
@@ -128,7 +129,20 @@ pub async fn list_documents(
             .filter(|l| (1..=MAX_LIMIT).contains(l))
             .ok_or_else(|| ApiError::invalid_request("limit must be 1 to 200"))?,
     };
-    let after = match params.cursor.as_deref() {
+    list(&storage, params.cursor.as_deref(), limit, PAGE_BYTES)
+        .await
+        .map(Json)
+}
+
+/// The page after `cursor`: at most `limit` documents and `budget` bytes of
+/// JSON, newest first. `GET /documents` and `documents.list` both read here.
+pub(crate) async fn list(
+    storage: &Storage,
+    cursor: Option<&str>,
+    limit: i64,
+    budget: usize,
+) -> Result<DocumentList, ApiError> {
+    let after = match cursor {
         None => None,
         Some(c) => Some(decode_cursor(c).ok_or_else(|| ApiError::invalid_request("bad cursor"))?),
     };
@@ -151,31 +165,28 @@ pub async fn list_documents(
     if let Some(why) = rows.iter().find_map(|d| checked(d).err()) {
         return Err(storage.db_failure(sqlx::Error::Decode(why.into())).await);
     }
-    let page = fit_page(rows, usize::try_from(limit).unwrap_or(usize::MAX));
-    if let Some(page) = page {
-        return Ok(Json(page));
-    }
-    // A row the contract allows is a few KiB at most (the title check above).
-    let why = "a document too large for a page".into();
-    Err(storage.db_failure(sqlx::Error::Decode(why)).await)
+    // A row the contract allows is a few KiB at most (the title check above),
+    // so only a budget far under REST's can refuse the first row.
+    fit_page(rows, usize::try_from(limit).unwrap_or(usize::MAX), budget)
+        .ok_or_else(|| ApiError::over_budget(budget))
 }
 
-/// The page: at most `limit` rows and at most `PAGE_BYTES` of JSON, with a
+/// The page: at most `limit` rows and at most `budget` bytes of JSON, with a
 /// cursor after the last row it holds when more follow. `None` if not even
 /// one row fits.
-fn fit_page(rows: Vec<Document>, limit: usize) -> Option<DocumentList> {
+fn fit_page(rows: Vec<Document>, limit: usize, budget: usize) -> Option<DocumentList> {
     let envelope = |documents: Vec<Document>, next_cursor: Option<String>| DocumentList {
         documents,
         next_cursor,
     };
     // The envelope with a full-length cursor, and one comma per row.
     let mut used = serde_json::to_vec(&envelope(Vec::new(), Some("0".repeat(CURSOR_LEN))))
-        .map_or(PAGE_BYTES, |v| v.len());
+        .map_or(budget, |v| v.len());
     let total = rows.len();
     let mut documents = Vec::new();
     for d in rows.into_iter().take(limit) {
-        let size = serde_json::to_vec(&d).map_or(PAGE_BYTES, |v| v.len()) + 1;
-        if used + size > PAGE_BYTES {
+        let size = serde_json::to_vec(&d).map_or(budget, |v| v.len()) + 1;
+        if used + size > budget {
             break;
         }
         used += size;
@@ -236,7 +247,13 @@ pub async fn get_document(
     Ready(storage): Ready,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<DocumentDetail>, ApiError> {
-    if !is_id(IdKind::Document, &id) {
+    get(&storage, &id).await.map(Json)
+}
+
+/// One document with its head revision. `GET /documents/{document_id}` and
+/// `documents.get` both read here.
+pub(crate) async fn get(storage: &Storage, id: &str) -> Result<DocumentDetail, ApiError> {
+    if !is_id(IdKind::Document, id) {
         return Err(ApiError::invalid_request("not a document id"));
     }
     // One statement, so the document and its head are read together.
@@ -247,12 +264,12 @@ pub async fn get_document(
          LEFT JOIN revisions r ON r.document_id = d.id AND r.revision = d.head_revision
          WHERE d.id = ?",
     )
-    .bind(&id)
+    .bind(id)
     .fetch_optional(storage.db.pool())
     .await;
     let found = row.and_then(|row| row.map(HeadRow::checked).transpose());
     match found {
-        Ok(Some(detail)) => Ok(Json(detail)),
+        Ok(Some(detail)) => Ok(detail),
         Ok(None) => Err(ApiError::not_found("no such document")),
         Err(e) => Err(storage.db_failure(e).await),
     }

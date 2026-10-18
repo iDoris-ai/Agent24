@@ -262,9 +262,14 @@ pub async fn get_job(
     Ready(storage): Ready,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Job>, ApiError> {
-    job_id(&id)?;
-    match load(storage.db.pool(), &id).await {
-        Ok(Some(job)) => Ok(Json(job)),
+    get(&storage, &id).await.map(Json)
+}
+
+/// One job. `GET /jobs/{job_id}` and `documents.job_get` both read here.
+pub(crate) async fn get(storage: &Storage, id: &str) -> Result<Job, ApiError> {
+    job_id(id)?;
+    match load(storage.db.pool(), id).await {
+        Ok(Some(job)) => Ok(job),
         Ok(None) => Err(ApiError::not_found("no such job")),
         Err(e) => Err(storage.db_failure(e).await),
     }
