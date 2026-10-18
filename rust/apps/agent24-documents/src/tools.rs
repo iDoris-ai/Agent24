@@ -13,6 +13,7 @@
 //! REST route. Any other `op` is `operation_unavailable`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, PathRejection};
@@ -36,6 +37,15 @@ pub const OPERATION_UNAVAILABLE: &str = "operation_unavailable";
 /// A payload's serialized JSON stays under this, so the envelope stays under
 /// the kernel's 64 KiB with room to spare (DOC-1-06b §2).
 pub const PAYLOAD_BYTES: usize = 60 * 1024;
+/// The module's own time for one call (DOC-1-06b §3.2 期限): strictly under
+/// the manifest's `inline_wait_ms` (25 000), with room to spare. Past it the
+/// call answers `internal`, retryable, before the kernel's wait runs out.
+pub const TOOL_BUDGET: Duration = Duration::from_secs(20);
+/// The code for a call past [`TOOL_BUDGET`] (retryable) and for an
+/// unexpected failure (not): not in the kernel table, so it reaches the
+/// model as `module_code`. Never the kernel's `timeout`, which reads as a
+/// host-side timeout.
+pub const INTERNAL: &str = "internal";
 
 /// What the kernel injects (`agent24-tools` `ModuleToolContext`). Lenient on
 /// purpose: a newer kernel adding a field must not make every call fail.
@@ -105,9 +115,20 @@ impl Envelope {
 /// `POST /_a24/tools/{op}`. Extractor failures are taken as values so that
 /// they too come back as a 2xx envelope, not axum's 4xx.
 pub async fn call_tool(
+    state: State<AppState>,
+    op: Result<UrlPath<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    call_tool_within(state, op, body, TOOL_BUDGET).await
+}
+
+/// [`call_tool`] with the processing budget as a parameter, so a test can
+/// run past a short one without waiting 20 s.
+async fn call_tool_within(
     State(state): State<AppState>,
     op: Result<UrlPath<String>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
+    budget: Duration,
 ) -> Response {
     let Ok(UrlPath(op)) = op else {
         let (bytes, res) = reply(&Envelope::error(OPERATION_UNAVAILABLE, false));
@@ -127,7 +148,7 @@ pub async fn call_tool(
         call.context.run_id.clone(),
         call.context.tool_call_id.clone(),
     );
-    let envelope = dispatch(&state, &op, call).await;
+    let envelope = dispatch(&state, &op, call, budget).await;
     let (bytes, res) = reply(&envelope);
     // Never the arguments or the payload: they may carry document content.
     tracing::info!(
@@ -151,28 +172,62 @@ fn reply(envelope: &Envelope) -> (usize, Response) {
 }
 
 /// Each tool calls the same service layer as its REST route, never the
-/// route itself over HTTP.
-async fn dispatch(state: &AppState, op: &str, call: ToolCall) -> Envelope {
+/// route itself over HTTP. Each runs within `budget`.
+async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) -> Envelope {
     // The path names the operation; a context naming another is not what
     // the kernel sends.
     if op != call.context.operation {
         return Envelope::error(INVALID_INPUT, false);
     }
-    let outcome = match op {
-        "list" => list(state, call.arguments).await,
-        "get" => get(state, call.arguments).await,
-        "job_get" => job_get(state, call.arguments).await,
-        _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
+    let ToolCall { context, arguments } = call;
+    let work = async move {
+        match op {
+            "list" => list(state, arguments).await,
+            "get" => get(state, arguments).await,
+            "job_get" => job_get(state, arguments).await,
+            _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
+        }
     };
-    outcome.unwrap_or_else(|refused| refused)
+    // Dropping `work` at the deadline is safe: all three operations only
+    // read (a pool wait, a query, a storage reopen that counts its attempt
+    // first). A tool that writes (slice D2's `extract`) must first be
+    // checked for what a cancel mid-way leaves behind.
+    match tokio::time::timeout(budget, work).await {
+        Ok(outcome) => outcome.unwrap_or_else(|refused| refused),
+        Err(_) => {
+            // Never the arguments: they may carry document content.
+            tracing::warn!(
+                op = ?op,
+                run_id = ?context.run_id,
+                tool_call_id = ?context.tool_call_id,
+                budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                "documents: tool call over its processing budget"
+            );
+            Envelope::error(INTERNAL, true)
+        }
+    }
 }
 
-/// `GET /documents`'s query, typed: `cursor?`, `limit?` (1 to 200).
+/// `GET /documents`'s query, typed: `cursor?`, `limit?` (1 to 200). A field
+/// left out is `None`; one sent as `null` is not a string or an integer, so
+/// it fails the schema like any other wrong type.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListArgs {
+    #[serde(default, deserialize_with = "present")]
     cursor: Option<String>,
+    #[serde(default, deserialize_with = "present")]
     limit: Option<i64>,
+}
+
+/// An optional field that, when present, must be a `T`: unlike plain
+/// `Option<T>`, an explicit `null` is refused, not read as absent.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -667,7 +722,13 @@ mod tests {
             ("list", json!({ "limit": 0 })),
             ("list", json!({ "limit": 201 })),
             ("list", json!({ "cursor": 7 })),
+            // `null` is neither an integer nor a string: not "left out".
+            ("list", json!({ "limit": null })),
+            ("list", json!({ "cursor": null })),
+            ("list", json!({ "limit": 5, "cursor": null })),
             ("get", json!({})),
+            ("get", json!({ "document_id": null })),
+            ("job_get", json!({ "job_id": null })),
             ("get", json!({ "document_id": 1 })),
             ("get", json!({ "document_id": "doc_x", "revision": 1 })),
             ("job_get", json!({ "id": JOB })),
@@ -718,6 +779,66 @@ mod tests {
                 assert_module_error(&body, "storage_unavailable", retryable);
             }
         }
+    }
+
+    /// A call past its processing budget answers `internal`, retryable, by
+    /// the budget: here the pool is held, so each operation waits for a
+    /// connection (sqlx's own acquire timeout is 30 s, past the kernel's
+    /// 25 s `inline_wait`).
+    #[tokio::test]
+    async fn a_call_past_its_budget_is_200_internal_retryable() {
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(storage.db.pool().acquire().await.unwrap());
+        }
+        let budget = Duration::from_millis(100);
+        let app = axum::Router::new()
+            .route(
+                "/_a24/tools/{op}",
+                axum::routing::post(
+                    move |s: State<AppState>,
+                          o: Result<UrlPath<String>, PathRejection>,
+                          b: Result<Bytes, BytesRejection>| {
+                        call_tool_within(s, o, b, budget)
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        for (op, args) in [
+            ("list", json!({})),
+            (
+                "get",
+                json!({ "document_id": "doc_01K74Z3QJ8V5N2W9RTX6Y00001" }),
+            ),
+            ("job_get", json!({ "job_id": JOB })),
+        ] {
+            let body = json!({ "context": context_for(op), "arguments": args });
+            let req = Request::post(format!("/_a24/tools/{op}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            // Longer than the budget, far shorter than sqlx's 30 s: without
+            // the budget the call is still waiting when this runs out.
+            let res = tokio::time::timeout(Duration::from_secs(3), app.clone().oneshot(req))
+                .await
+                .unwrap_or_else(|_| panic!("{op}: no answer within its budget"))
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                json!({ "kind": "error", "code": "internal", "retryable": true }),
+                "{op}"
+            );
+            assert_module_error(&bytes, "internal", true);
+        }
+        drop(held);
+        // The pool is free again: the same call completes.
+        assert!(payload(&call(&state, "list", json!({})).await)["documents"].is_array());
     }
 
     #[tokio::test]
