@@ -21,8 +21,9 @@ use crate::engine::pdfkit;
 use crate::error::ApiError;
 use crate::extractions::is_field_key;
 use crate::id::{IdKind, is_id, new_id};
-use crate::idem::request_sha256;
+use crate::idem::{UnsupportedNumber, request_sha256};
 use crate::jobs::{Job, load};
+use crate::oplog::Origin;
 use crate::state::{AppState, Storage};
 use crate::uploads::idempotency_key;
 
@@ -50,6 +51,19 @@ pub struct ExtractRequest {
     schema: Schema,
     #[serde(default)]
     rerun: bool,
+}
+
+/// What a reused key is compared on (§5.4): the body as sent, less
+/// `"rerun": false`, which says what leaving it out says. Without `rerun`
+/// the hash is the one a body has always had, so stored jobs still replay.
+fn request_hash(body: &Value) -> Result<String, UnsupportedNumber> {
+    let mut body = body.clone();
+    if let Some(map) = body.as_object_mut()
+        && map.get("rerun") == Some(&Value::Bool(false))
+    {
+        map.remove("rerun");
+    }
+    request_sha256(&body)
 }
 
 /// What is wrong with `fields`, if anything (`DocumentsExtractField`).
@@ -99,8 +113,7 @@ pub async fn extract(
     } else {
         None
     };
-    // The whole body, as sent, is what a reused key is compared on (§5.4).
-    let request = request_sha256(&body).map_err(|e| ApiError::invalid_request(e.to_string()))?;
+    let request = request_hash(&body).map_err(|e| ApiError::invalid_request(e.to_string()))?;
     let schema = schema_sha256(&req.schema.fields).map_err(ApiError::invalid_request)?;
     if state.model().is_none() {
         return Err(ApiError::engine_unavailable(
@@ -156,9 +169,22 @@ pub async fn extract(
     };
     // In a task of its own: a client that goes away must not stop a commit
     // halfway from the worker start that belongs with it.
-    let task = tokio::spawn(claim(state, storage.clone(), key, request, input));
+    let task = tokio::spawn(claim(
+        state,
+        storage.clone(),
+        key,
+        request,
+        input,
+        Origin::Page,
+    ));
     match task.await {
-        Ok(Ok(answer)) => Ok(answer),
+        Ok(Ok((job, _))) => {
+            let status = match job.status.as_str() {
+                "succeeded" | "cancelled" => StatusCode::OK,
+                _ => StatusCode::ACCEPTED,
+            };
+            Ok((status, Json(job)))
+        }
         Ok(Err(Fail::Api(e))) => Err(e),
         Ok(Err(Fail::Db(e))) => Err(storage.db_failure(e).await),
         // A spawned task is only cancelled when the runtime shuts down.
@@ -166,7 +192,7 @@ pub async fn extract(
     }
 }
 
-enum Fail {
+pub(crate) enum Fail {
     Api(ApiError),
     Db(sqlx::Error),
 }
@@ -177,17 +203,19 @@ impl From<sqlx::Error> for Fail {
     }
 }
 
-/// Claims `key` and writes the job under the write lock, then starts its
-/// worker; a key already claimed replays its job instead (§7): the same
-/// request returns it, 202 while it works and 200 once it succeeded or was
-/// cancelled; a failed or interrupted one is queued again, attempt + 1.
-async fn claim(
+/// Claims `key` and writes the job, from `origin`, under the write lock,
+/// then starts its worker; a key already claimed replays its job instead
+/// (§7), whose origin stays the first request's: the same request returns
+/// it as it is; a failed or interrupted one is queued again, attempt + 1.
+/// Answers the job as this claim leaves it, and whether a worker started.
+pub(crate) async fn claim(
     state: AppState,
     storage: Arc<Storage>,
     key: String,
     request: String,
     input: Input,
-) -> Result<(StatusCode, Json<Job>), Fail> {
+    origin: Origin,
+) -> Result<(Job, bool), Fail> {
     let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
     let hit: Option<(String, String)> = sqlx::query_as(
         "SELECT request_sha256, target_ref FROM idempotency WHERE kind = 'extract' AND key = ?",
@@ -225,11 +253,12 @@ async fn claim(
             })?;
             sqlx::query(
                 "INSERT INTO jobs (id, kind, document_id, revision, status, origin, input)
-                 VALUES (?, 'extract', ?, ?, 'queued', '{\"kind\":\"page\"}', ?)",
+                 VALUES (?, 'extract', ?, ?, 'queued', ?, ?)",
             )
             .bind(&job_id)
             .bind(&input.document_id)
             .bind(input.revision)
+            .bind(origin.job_json())
             .bind(json!(input).to_string())
             .execute(&mut *tx)
             .await?;
@@ -253,11 +282,7 @@ async fn claim(
     if let Some(attempt) = attempt {
         spawn(state, storage, job_id, attempt);
     }
-    let status = match job.status.as_str() {
-        "succeeded" | "cancelled" => StatusCode::OK,
-        _ => StatusCode::ACCEPTED,
-    };
-    Ok((status, Json(job)))
+    Ok((job, attempt.is_some()))
 }
 
 #[cfg(test)]
