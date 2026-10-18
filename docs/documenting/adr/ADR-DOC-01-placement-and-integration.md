@@ -37,7 +37,7 @@
 | 进程外 ② | 已有 Sin90 / Cos72 在用。<br>• 调模型：manifest 需要在 `kernel_capabilities` 里申请 `models`，`model_access` 默认 `local_only`（`agent24-domain/src/lib.rs:235`、`:819-826`）。<br>• 传输：Unix 域套接字（SPEC-ME3 FU-60） |
 | 命名 | 命名空间和数据目录都**从 `name` 推导**：必须是 `/api/v1/{name}` 和 `~/.agent24/os/{name}/`（`lib.rs:546-553`、`:780-800`） |
 | 公开代理 | 对外入口 `/api/v1/<ns>/*`，限制如下：<br>• body 上限 1 MiB；<br>• 首字节 10 s，总时长 30 s；<br>• 不支持流式；<br>• 剥掉双向的 `X-A24-*` 头；<br>• 客户端请求 `_a24` 路径一律返回 404（`agent24-os-proto/src/proxy.rs`） |
-| 内核 → 模块 | `send_kernel_request` 调模块私有的 `/api/v1/<ns>/_a24/...`，每次调用可单独设 `KernelLimits`，不占客户端的并发配额（`os-proto/src/kernel_call.rs:235`）。调度器投递就走这条路（`scheduler_deliver.rs`，`x-a24-fire-id`）。<br>**它只返回状态码**：响应体在限额内读完即丢弃（`KernelResponse { status }`，`:88-95`）。调用语义按“可能重复投递”设计 |
+| 内核 → 模块 | `send_kernel_request` 调模块私有的 `/api/v1/<ns>/_a24/...`，每次调用可单独设 `KernelLimits`，不占客户端的并发配额（`os-proto/src/kernel_call.rs:235`）。调度器投递就走这条路（`scheduler_deliver.rs`，`x-a24-fire-id`）。<br>**当时它只返回状态码**：响应体在限额内读完即丢弃（`KernelResponse { status }`，`:88-95`）。模块工具调用已由 ADR-K1-01 的带响应体调用实现（见 D4.3 与 ADR-DOC-02 §4）（DOC-1-06b，2026-10-18）。调用语义按“可能重复投递”设计 |
 | 工具 | 领域 OS 不能向 agent loop 贡献工具。<br>• 工具表在 `mount_all` 之前构建并冻结（`server.rs:1523-1599`）。<br>• MCP 工具强制为 `External`（`agent24-mcp/src/lib.rs:269-273`）；第三方声明的风险等级“只是猜测”（`agent24-tools/src/lib.rs:400-434`）。<br>• `Read` 类直接跳过审批 |
 | 审批类别 | `BrokerGate::check` 按工具**名字**决定类别，未知名字一律落到 `module`（`agent24-policy/src/lib.rs:897-902`）。这只是兜底，不是为模块设计的接缝 |
 | 记忆 | agent loop 会自动把每轮的 prompt 和最终回答写进内核记忆（`remember_exchange`，`agent24-agent/src/lib.rs:641`、`:1730`） |
@@ -98,8 +98,8 @@
    - 用户覆盖时只能收紧。
    - DOC-1 期间还没有“第一方默认安装”（D6），Documenting 自己的工具也因此是 `External`，每次调用都要审批，除非用户在启用时逐个确认过。这一点如实写进 DOC-1 的验收说明。
 3. **调用通道**：
-   - 内核调用 `POST /api/v1/<ns>/_a24/tools/<op>`，带 `x-a24-run-id` 和 `x-a24-tool-call-id` 头。客户端碰不到 `_a24` 路由，也伪造不了 `X-A24-*` 头。
-   - 现有的 `send_kernel_request` 只返回状态码。内核 ADR 要新增一个**返回响应体**的变体，响应体以 `max_response_bytes` 为上限，这个上限也就是工具输出的上限。
+   - 内核调用 `POST /api/v1/<ns>/_a24/tools/<op>`，正文 `{"context":…,"arguments":…}`，`context` 由内核注入 `run_id`、`tool_call_id` 等（ADR-K1-01，`agent24-tools/src/lib.rs:858-866`；DOC-1-06b，2026-10-18）。客户端碰不到 `_a24` 路由，也伪造不了 `X-A24-*` 头。
+   - 内核已按 ADR-K1-01 实现带响应体的调用，结果信封与 64 KiB 上限见 ADR-DOC-02 §4（DOC-1-06b，2026-10-18）。
    - 工具调用**绝不自动重试**（调度器那条路径默认按“可能重复投递”设计）。
    - **调用关联与业务幂等分两层**（2026-10-07 统一，见 #740）：
      - `tool_call_id`（以及 `run_id`）只用于**可信的调用关联与审计**；
