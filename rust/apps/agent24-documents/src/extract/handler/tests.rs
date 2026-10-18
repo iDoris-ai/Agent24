@@ -317,3 +317,111 @@ async fn without_a_read_engine_there_is_no_extraction() {
             .unwrap();
     assert_eq!((jobs, keys), (0, 0));
 }
+
+/// `"rerun": false` says what leaving it out says: the same job, not 422
+/// (DOC-1-06b §2.3). Without `rerun` the hash is the one the whole body
+/// always had, so a stored key still replays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_rerun_false_is_the_request_without_it() {
+    let env = env(Some(script(vec![answer("present")]))).await;
+    let (status, job) = post(&env, DOC, &body(false), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+    let id = job["job_id"].as_str().unwrap().to_owned();
+    assert_eq!(ended(&env, &id).await.0, "succeeded");
+    let stored: String = sqlx::query_scalar("SELECT request_sha256 FROM idempotency")
+        .fetch_one(env.storage.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored, request_sha256(&body(false)).unwrap());
+    let mut explicit = body(false);
+    explicit["rerun"] = json!(false);
+    let (status, again) = post(&env, DOC, &explicit, None).await;
+    assert_eq!(
+        (status, &again["job_id"]),
+        (StatusCode::OK, &json!(id)),
+        "{again}"
+    );
+}
+
+#[test]
+fn only_rerun_false_is_left_out_of_the_hash() {
+    let plain = body(false);
+    let mut explicit = plain.clone();
+    explicit["rerun"] = json!(false);
+    assert_eq!(request_hash(&plain), request_sha256(&plain));
+    assert_eq!(request_hash(&explicit), request_sha256(&plain));
+    let rerun = body(true);
+    assert_eq!(request_hash(&rerun), request_sha256(&rerun));
+    assert_ne!(request_hash(&rerun), request_hash(&plain));
+}
+
+async fn origin_of(env: &Env, job: &str) -> Value {
+    let origin: String = sqlx::query_scalar("SELECT origin FROM jobs WHERE id = ?")
+        .bind(job)
+        .fetch_one(env.storage.db.pool())
+        .await
+        .unwrap();
+    serde_json::from_str(&origin).unwrap()
+}
+
+/// What a claim from a run looks like, with the key the page would use.
+async fn claim_as(env: &Env, origin: Origin) -> (Job, bool) {
+    let b = body(false);
+    let req: ExtractRequest = serde_json::from_value(b.clone()).unwrap();
+    let schema = schema_sha256(&req.schema.fields).unwrap();
+    let key = format!("{DOC}/1/{schema}/{EXTRACTOR_VERSION}");
+    let input = Input {
+        document_id: DOC.into(),
+        revision: 1,
+        schema_sha256: schema,
+        fields: req.schema.fields,
+    };
+    let request = request_hash(&b).unwrap();
+    match claim(
+        env.state.clone(),
+        env.storage.clone(),
+        key,
+        request,
+        input,
+        origin,
+    )
+    .await
+    {
+        Ok(claimed) => claimed,
+        Err(_) => panic!("the claim failed"),
+    }
+}
+
+fn a_run() -> Origin {
+    Origin::Run(crate::oplog::Run {
+        run_id: "run_1".into(),
+        tool_call_id: "call_1".into(),
+    })
+}
+
+/// The page's job says so; a run's job names the run; a replay keeps the
+/// first request's origin, whoever replays it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_keeps_the_origin_of_its_first_request() {
+    let env = env(Some(script(vec![answer("present")]))).await;
+    let (_, job) = post(&env, DOC, &body(false), None).await;
+    let id = job["job_id"].as_str().unwrap().to_owned();
+    assert_eq!(origin_of(&env, &id).await, json!({ "kind": "page" }));
+    assert_eq!(ended(&env, &id).await.0, "succeeded");
+    let (replayed, started) = claim_as(&env, a_run()).await;
+    assert_eq!((replayed.job_id.as_str(), started), (id.as_str(), false));
+    assert_eq!(origin_of(&env, &id).await, json!({ "kind": "page" }));
+
+    let env = crate::extract::job::tests::env(Some(script(vec![answer("present")]))).await;
+    let (job, started) = claim_as(&env, a_run()).await;
+    assert!(started);
+    let run = json!({ "kind": "run", "run_id": "run_1", "tool_call_id": "call_1" });
+    assert_eq!(origin_of(&env, &job.job_id).await, run);
+    assert_eq!(ended(&env, &job.job_id).await.0, "succeeded");
+    let (status, again) = post(&env, DOC, &body(false), None).await;
+    assert_eq!(
+        (status, &again["job_id"]),
+        (StatusCode::OK, &json!(job.job_id))
+    );
+    assert_eq!(origin_of(&env, &job.job_id).await, run);
+}
