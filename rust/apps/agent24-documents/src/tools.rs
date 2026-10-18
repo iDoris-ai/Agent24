@@ -5,8 +5,9 @@
 //! envelope (`agent24-os-proto/src/kernel_call.rs`, `ModuleToolEnvelope`):
 //! `completed{payload, replayed}` or `error{code, retryable, details}`. This
 //! entry always answers 2xx with an envelope, so a refusal is never mistaken
-//! for a broken module. Clients cannot reach it: the kernel proxy answers 404
-//! for any `_a24` path.
+//! for a broken module. Only the kernel calls it directly: clients going
+//! through the kernel proxy cannot reach it, as the proxy answers 404 when
+//! the first segment after the namespace canonicalises to `_a24`.
 //!
 //! Slice A has no operation yet; every `op` is `operation_unavailable`.
 
@@ -237,6 +238,21 @@ mod tests {
         )
         .await;
         // Parsed, so it reaches dispatch: no operation exists yet.
+        assert_kernel_error(&body, ModuleToolErrorCode::OperationUnavailable);
+    }
+
+    #[tokio::test]
+    async fn authorization_fields_are_accepted_and_not_used() {
+        let mut ctx = context();
+        ctx["authorized_resources"] = json!(["doc_01"]);
+        ctx["authorization_ref"] = json!("auth-2");
+        let body = post(
+            "no_such_op",
+            json!({ "context": ctx, "arguments": {} }).to_string(),
+        )
+        .await;
+        // Parsed (not `invalid_input`) and not an allow-list: it reaches
+        // dispatch like any other call.
         assert_kernel_error(&body, ModuleToolErrorCode::OperationUnavailable);
     }
 

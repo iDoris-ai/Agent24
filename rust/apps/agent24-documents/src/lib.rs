@@ -196,7 +196,8 @@ pub fn router(state: AppState) -> Router {
             post(uploads::chunks::append_chunk)
                 .layer(DefaultBodyLimit::max(uploads::chunks::MAX_CHUNK)),
         )
-        // Kernel-only: the proxy answers 404 for `_a24` paths from clients.
+        // Kernel-only: the kernel proxy answers 404 to clients when the first
+        // segment after the namespace canonicalises to `_a24`.
         .route("/_a24/tools/{op}", post(tools::call_tool))
         .with_state(state)
 }
