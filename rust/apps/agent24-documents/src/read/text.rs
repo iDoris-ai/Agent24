@@ -137,7 +137,10 @@ fn start_of(layer: &TextLayer, id: &str) -> Option<Position> {
 
 /// One response from `start`: whole pages' blocks until `limit` blocks,
 /// `budget` bytes or [`last_page`]; the cursor resumes at the first block
-/// left out. The first block is always taken: [`within`] judges it.
+/// left out. `used` counts the regions of the whole window up front, so
+/// within budget every page after fits; the first block is taken even past
+/// it, and then nothing more is (no further block, no further page), and
+/// [`within`] judges whether that block with its page's regions fits.
 fn page_of(
     r: &Revision,
     address: &str,
@@ -193,6 +196,10 @@ fn page_of(
             block: 0,
             hit: 0,
         };
+        // Past budget (only the first block can be): end at this page.
+        if used > budget && !out.blocks.is_empty() {
+            break;
+        }
     }
     // The pages it gave blocks of (or that have none): a page it stopped
     // at before its first block is the next response's.

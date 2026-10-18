@@ -433,6 +433,60 @@ async fn regions_over_half_the_budget_shorten_the_window_not_refuse_it() {
     assert_eq!(regions(&got), want["unparsed_regions"]);
 }
 
+/// Pages 2 to 40 unread (a 16-rect region each): with a first entry of
+/// about 36 KiB, more than the window's regions leave room for.
+fn after_a_wide_first_page(first: String, others: impl Fn(u32) -> Vec<String>) -> Option<Fixed> {
+    let doc = std::iter::once(vec![first]).chain((2..=40).map(others));
+    fixed(doc.collect(), (2..=40).collect(), 16)
+}
+
+#[tokio::test]
+async fn a_wide_first_block_ends_its_answer_at_its_page() {
+    // 6000 bytes of a control character: 36 KB once JSON-escaped.
+    let wide = "\u{1}".repeat(6000);
+    let (_dir, state) = env(after_a_wide_first_page(wide, |_| vec![])).await;
+    let (status, want) = rest(&state, &text_path("")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(want["next_cursor"].is_null());
+    let args = json!({ "document_id": DOC, "revision": 1 });
+    let got = pages(&state, "read_range", args).await;
+    // Page 1 alone, then the regions from page 2 on.
+    assert_eq!(got[0]["blocks"], json!([want["blocks"][0]]));
+    assert_eq!(got[0]["parse_status"], json!("complete"));
+    assert_eq!(got[0]["unparsed_regions"], json!([]));
+    assert!(got.len() >= 2, "{} pages", got.len());
+    assert_eq!(joined(&got, "blocks"), want["blocks"]);
+    assert_eq!(regions(&got), want["unparsed_regions"]);
+}
+
+#[tokio::test]
+async fn a_wide_first_match_ends_its_answer_at_its_page() {
+    // "a b" matches across 6000 vertical tabs: a quote of 36 KB escaped.
+    let wide = format!("a{}b", "\u{b}".repeat(6000));
+    // Even pages have a block that does not match; odd ones none.
+    let other = |p: u32| {
+        if p.is_multiple_of(2) {
+            vec![format!("no match on {p}")]
+        } else {
+            vec![]
+        }
+    };
+    let (_dir, state) = env(after_a_wide_first_page(wide, other)).await;
+    let body = json!({ "revision": 1, "query": "a b" });
+    let (status, want) = rest_find(&state, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(want["next_cursor"].is_null());
+    assert_eq!(want["matches"].as_array().unwrap().len(), 1);
+    let args = json!({ "document_id": DOC, "revision": 1, "query": "a b" });
+    let got = pages(&state, "find", args).await;
+    assert_eq!(got[0]["matches"], want["matches"]);
+    assert_eq!(got[0]["parse_status"], json!("complete"));
+    assert_eq!(got[0]["unparsed_regions"], json!([]));
+    assert!(got.len() >= 2, "{} pages", got.len());
+    assert_eq!(joined(&got, "matches"), want["matches"]);
+    assert_eq!(regions(&got), want["unparsed_regions"]);
+}
+
 #[tokio::test]
 async fn the_list_service_holds_its_own_limit_range() {
     let (_dir, state) = opened().await;

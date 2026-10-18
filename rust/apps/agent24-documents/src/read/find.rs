@@ -146,7 +146,10 @@ fn anchor(
 
 /// One response from `start`: matches page by page until `limit`, `budget`
 /// bytes or [`last_page`]; the cursor resumes at the first match left out.
-/// The first match is always taken: [`within`] judges it.
+/// `used` counts the regions of the whole window up front, so within budget
+/// every page after fits; the first match is taken even past it, and then
+/// nothing more is (no further match, no further page), and [`within`]
+/// judges whether that match with its page's regions fits.
 fn page_of(
     r: &Revision,
     address: &str,
@@ -198,6 +201,10 @@ fn page_of(
             block: 0,
             hit: 0,
         };
+        // Past budget (only the first match can be): end at this page.
+        if used > budget && !out.matches.is_empty() {
+            break;
+        }
     }
     // The pages it searched: one it stopped at before searching is the next's.
     let end = if at.block == 0 && at.hit == 0 {
