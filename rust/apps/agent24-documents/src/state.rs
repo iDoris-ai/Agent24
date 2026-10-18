@@ -124,21 +124,6 @@ struct Inner {
     /// Reopens started, so tests can wait for one without touching the lock.
     #[cfg(test)]
     reopens: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    hooks: Hooks,
-}
-
-#[cfg(test)]
-type Hook = Box<dyn FnOnce(&AppState) + Send>;
-
-/// Points where a test steps into [`AppState::storage`].
-#[cfg(test)]
-#[derive(Default)]
-struct Hooks {
-    /// Run once, right after a request takes the reopen lock.
-    after_lock: Mutex<Option<Hook>>,
-    /// The next reopen task panics before it opens anything.
-    panic_reopen: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -184,8 +169,6 @@ impl AppState {
             last_attempt: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             #[cfg(test)]
             reopens: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            hooks: Hooks::default(),
         }))
     }
 
@@ -207,8 +190,6 @@ impl AppState {
             last_attempt: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             #[cfg(test)]
             reopens: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            hooks: Hooks::default(),
         }))
     }
 
@@ -246,8 +227,6 @@ impl AppState {
         let Ok(mut last) = Arc::clone(&self.0.last_attempt).try_lock_owned() else {
             return self.current(); // a reopen is in progress
         };
-        #[cfg(test)]
-        self.after_lock_hook();
         let current = self.current();
         if current.is_ok() || last.elapsed() < self.0.reopen_interval {
             return current;
@@ -263,11 +242,6 @@ impl AppState {
         let state = self.clone();
         let reopen = tokio::spawn(async move {
             let _reopening = last;
-            #[cfg(test)]
-            assert!(
-                !state.0.hooks.panic_reopen.swap(false, Ordering::SeqCst),
-                "injected reopen panic"
-            );
             let reopened = open_storage(&state.0.data_dir, &state.0.events).await;
             *state
                 .0
@@ -283,20 +257,6 @@ impl AppState {
                 // Cancelled: the runtime is shutting down.
                 Err(_) => self.current(),
             },
-        }
-    }
-
-    #[cfg(test)]
-    fn after_lock_hook(&self) {
-        let hook = self
-            .0
-            .hooks
-            .after_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(hook) = hook {
-            hook(self);
         }
     }
 }
