@@ -198,7 +198,7 @@
 ## 4. 操作清单（DOC-1）
 
 - **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。关联信息（`run_id`、`tool_call_id`）由内核放在请求正文的 `context` 里（正文 `{"context":…,"arguments":…}`），不是请求头（DOC-1-06b，2026-10-18）。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
-- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；REST 单页仍 ≤ 512 KiB，给 1 MiB 上限留余量。`documents.job_get` 返回单个 job，不分页（DOC-1-06b，2026-10-18）；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。工具响应信封 ≤ 64 KiB（内核上限，`agent24d/src/module_tool_runtime.rs:18`），按 60 KiB 预算（留 4 KiB 余量）提前截断并返回 `next_cursor`；单个条目本身超过预算时返回 `error{code:"response_too_large"}`，不截断条目内容（DOC-1-06b，2026-10-18）。
+- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；REST 单页仍 ≤ 512 KiB，给 1 MiB 上限留余量。`documents.job_get` 返回单个 job，不分页（DOC-1-06b，2026-10-18）；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。工具响应信封 ≤ 64 KiB（内核上限，`agent24d/src/module_tool_runtime.rs:18`），按 60 KiB 预算（留 4 KiB 余量）提前截断并返回 `next_cursor`；`next_cursor` 放在信封的 `payload` 里（信封 `deny_unknown_fields`，`agent24-os-proto/src/kernel_call.rs:96-98`）。单个条目本身超过预算时返回 `error{code:"response_too_large"}`，不截断条目内容。`documents.extraction_get` 按同一预算分页读抽取值；单条值在 REST 最大 508 KiB（512 KiB 页减去 4 KiB 信封，`agent24-documents/src/extractions.rs:22-28`），超过工具预算则 `response_too_large`（DOC-1-06b，2026-10-18）。
 - **风险映射**（用户确认后的内核 `RiskClass`，`types.rs:1036-1050`）：read → `Read`；create-record / mutate-draft / commit / create-artifact → `WriteLocal`；handoff → `External`。**DOC-1 没有第一方默认安装，所有工具实际按 `External` 处理、每次审批**，除非用户在启用时逐个确认（D4.2）。
 
 | 片 | 操作 | REST | 工具 | 知识类 | 业务风险 |
@@ -209,7 +209,7 @@
 | 1 | render | `GET /documents/{id}/revisions/{rev}/pages/{n}?scale=`（≤ 1 MiB；超出时自动降低 scale，降到 0.25 仍超出则 413，由客户端用 `region` 分块请求） | 不通告 | free | read |
 | 1 | read_range | `GET /documents/{id}/revisions/{rev}/text?block=&cursor=` | `documents.read_range` | free | read |
 | 1 | find | `POST /documents/{id}/find {revision, query, cursor}` | `documents.find` | free | read |
-| 1 | extract | `POST /documents/{id}/extractions {revision, schema}` → 202 job；`GET /extractions/{id}` | `documents.extract` | free（显式给定文档） | read |
+| 1 | extract | `POST /documents/{id}/extractions {revision, schema}` → 202 job；`GET /extractions/{id}` | `documents.extract`、`documents.extraction_get` | free（显式给定文档） | read |
 | 1 | job | `GET /jobs/{id}`；`POST /jobs/{id}/cancel`；`POST /jobs/{id}/retry` | `documents.job_get`（cancel / retry 不通告，Q9） | free | read；cancel / retry 是 mutate-draft |
 | 1 | capabilities | `GET /capabilities`（§8） | 不单独通告 | free | read |
 | 2 | change.propose | `POST /documents/{id}/changes {base_revision, ops}` | `documents.change_propose` | optional | mutate-draft |
@@ -219,7 +219,7 @@
 | 2 | export | `POST /documents/{id}/revisions/{rev}/exports {format, options}` → 202 job；`GET /exports/{id}/content?offset=` | `documents.export` | free | create-artifact |
 
 - 「工具」列：内核要求操作名不含点（`agent24-domain/src/tool.rs:112-120`），全名按第一个点切出模块名（DOC-1-06b，2026-10-18）。
-- 工具不用 `pending` 信封（内核会收成 `result_unknown`）；`documents.extract` 未完成时在 `completed.payload` 返回 `status`、`job_id`、`extraction_id`，agent 用 `documents.job_get` 查进度，完成后用同样参数再调一次 `documents.extract` 取结果（结果按工具字节预算分页），依赖 §5 的业务键幂等（DOC-1-06b，2026-10-18）。
+- 工具不用 `pending` 信封（内核会收成 `result_unknown`）。`documents.extract` 只提交或重放，立即返回 `completed{payload:{status, job_id}}`，不等待抽取完成，不带抽取值，也不带 `extraction_id`。`extraction_id` 只在任务成功、提交事务时生成（`agent24-documents/src/extract/job.rs:216-231` 生成 id，`:247-267` 与 `succeeded` 同一事务）；`GET /jobs/{id}` 只有 `succeeded` 才带 `result.extraction_id`（`jobs.rs:113-117`）。agent 用 `documents.job_get` 查进度，成功后把 `result.extraction_id` 交给 `documents.extraction_get`（`GET /extractions/{id}`，`agent24-documents/src/lib.rs:184-187`）按工具字节预算分页读回。重放沿用 §5：业务键命中 `succeeded` 返回原 job；命中 `failed` 或 `interrupted` 把同一个 job 重新排队（`extract/handler.rs:203-218,253-255`），等于重跑；同一业务键但请求正文的规范化哈希不同，返回 422 `idempotency_key_reused`（`handler.rs:102-103,199-200`）。工具路径构造与 REST 相同的规范化请求正文（`revision`、`schema`），不含工具专有字段。`documents.extract` 不支持 `rerun`：`rerun:true` 需要 `Idempotency-Key`（`protocol/openapi.yaml:2214-2218`），内核工具请求不带额外请求头（`agent24d/src/module_tool_runtime.rs:101`）（DOC-1-06b，2026-10-18）。
 - DOC-1 的 agent 只能读、查、抽取、提议修改、导出已提交的 revision。**导入只在页面经原生文件对话框完成（Q4）；review 和 commit 只在页面、在可见 diff 上由用户完成（Q5，README §11.6）**。以后若开放 agent 导入或对话内确认提交，按 `WriteLocal` 走审批，需修订本 ADR。
 - **之后的阶段**（只定方向）：DOC-2 `search`（required）、`ask / summarize / compare / translate`（按 §9.1 逐次分类）；DOC-3 `draft.create`、`revision.restore`（用目标 revision 的内容生成 change set 再走 commit）；DOC-4 `preflight`、`package.assemble`（绑定已批准的 revision）、`delivery.prepare`（`External`，由 Agent24 执行）。
 
@@ -325,7 +325,7 @@
 
 - **`jobs` 表**：`job_id`（`job_` + ULID）、`kind`、`document_id`、`revision`、`status`（`queued / running / cancelling / succeeded / failed / cancelled / interrupted`）、`attempt`、`progress {stage, done, total, unit}`、`error {code, message}`、`result_ref`、`origin`、时间戳；经键表与幂等键关联（§5.4）。
 - **键命中时**：`queued` / `running` → 返回该 job；`succeeded` → 返回结果；`failed` / `interrupted` → **自动重新启用**（同一个 `job_id`，`attempt + 1`，回到 `queued`）。**`cancelled` 不会因键命中而重启**，返回原 job 及其 `cancelled` 状态，只能由用户显式调用 `POST /jobs/{id}/retry` 重启。这样，内容推导的键（例如 agent 调用 `extract` / `export`）不会悄悄撤销用户的取消。`POST /jobs/{id}/retry` 是同一动作的显式形式。
-- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具调用最多等 manifest 声明的 `inline_wait_ms`（**严格小于**注册的超时，至少留 5 s 余量），到期返回 `{job_id, status}`（工具路径上放在 `completed.payload` 里，`documents.extract` 另带 `extraction_id`，见 §4 表格下方的说明），agent 用 `documents.job_get` 查询（DOC-1-06b，2026-10-18）。
+- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具路径上，`inline_wait_ms` 是内核硬期限：内核用 `tokio::time::timeout(inline_wait, …)` 包住整次调用，超时记 `result_unknown`（`agent24-tools/src/lib.rs:868-884`；取值来自 manifest，`agent24d/src/server.rs:1635`）。`timeout_ms` 只是发给模块的 HTTP 期限（`module_tool_runtime.rs:108-110`）。模块自身处理预算严格小于 `inline_wait_ms` 并留余量（`inline_wait_ms=25000` 时预算 20000），超出返回 `error{code:"timeout", retryable:true}`。`documents.extract` 不等待抽取任务完成，只提交或重放后立即返回 `completed{payload:{status, job_id}}`（没有 `extraction_id`，见 §4 表格下方）（DOC-1-06b，2026-10-18）。
 - **完成**：结果行与 `status = succeeded` 在**同一个事务**里写入。
 - **取消**：`POST /jobs/{id}/cancel` 幂等。`running` 置 `cancelling`，工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出；没有工作线程在跑的 `queued` / `failed` / `interrupted` 直接置 `cancelled`，带 `cancelled` 标记（`failed` 原有的错误码被它替换），之后键命中也不会复活；其余状态不变。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
 - **崩溃恢复**：OS 启动时 `running` → `interrupted`，`queued` 也 → `interrupted`（进程重启后已没有处理它的工作线程；否则按键命中规则它会一直停在 `queued`），`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
