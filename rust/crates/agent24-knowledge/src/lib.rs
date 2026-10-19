@@ -12,9 +12,11 @@
 
 mod common;
 mod error;
+mod search;
 
 pub use common::*;
 pub use error::*;
+pub use search::*;
 
 use serde::{Deserialize, Deserializer};
 
