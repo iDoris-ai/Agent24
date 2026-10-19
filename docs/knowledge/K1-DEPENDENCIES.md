@@ -3,6 +3,7 @@
 > 任务：KB-SEC-01a（#1088）· 阶段 #1001（WS2）· 内核依赖跟踪 #735 · 下游验收 KB-SEC-01b（#1089）
 > 依据：本 worktree（基于 `ab/weknora` `eb1a58bb`）的代码；文中 `文件:行` 都按这个提交，Rust 路径相对 `rust/`。issue 正文按 2026-10-18 的快照。
 > 本文只定契约与安全前提，不写实现、错误码映射和函数签名。
+> 修订：r3（变更记录见 §5）
 
 ## 1. 目的与范围
 
@@ -23,16 +24,16 @@ Knowledge 检索到的证据（search 的 hit、read 的正文）进入任何模
 | K1-D6 | 审计能回答"哪条证据进入了哪次模型调用"（只记 id，不记正文） | **部分**。标签按 `(run_id, seq)` 关联到消息（`0016_run_source_tags.sql:18-26`），可以回答"哪条证据进入了哪个 run 的哪条消息"。模型调用耗时记录 `NewCallTiming` 有 `source`（计时通道名，`model_call_timings.rs:19`），但没有 run_id 和证据来源标识（`crates/agent24-store/src/model_call_timings.rs:17-32`），无法回答"进入了哪次模型调用"。K1-7.2 的审计只覆盖模块工具：事件定义在 `crates/agent24-store/src/module_audit_event.rs:400-415`（action 为 `k1.module_tool.pre_dispatch` / `k1.module_tool.terminal`，`:469-470`），由 `crates/agent24-tools/src/lib.rs` 的 `ModuleTool`（`:546`）写入（`:979-1014`）。Knowledge 的 Tool 走内置 Tool trait，不是模块工具，是否在覆盖范围内：待核实 | 待定（K1-7 / ADR-K1-04 还是 Knowledge 自己做，尚未分配） | 未开工；#735 第 4 项 | KB-C1-05、KB-SEC-01b（证据链）、#1001 退出验收 |
 | K1-D7 | 跨重启、恢复、续轮时，证据的标签不丢失，也不被放宽 | **已有（仅标签存储）**。标签已落盘，重启后可读回（测试见 `source_policy.rs:469-501`）。schema 未知或损坏的行读回时降为 LocalOnly（`:215-252`）。对话文本不能放宽已持久化的政策（`:31`） | — | 随 #1022 发布 | KB-SEC-01b（恢复、续轮路径） |
 | K1-D8 | K1 经 main 发布（#1089 的前置条件） | **部分**。main 上已有 release 提交 `56264ef9`（#1022，2026-10-16），提交标题为"迁移 0015–0017 + consent/工具调用/审计"，本 worktree 的历史已包含它。6b.3–6b.5 不在 main，`ab/kernel` 上也没有对应提交（K1-D4）。#735 截至 2026-10-18 仍为 OPEN | David（K1，#735） | 部分发布；#1022、#735 | KB-SEC-01b、§3 禁用门 |
-| K1-D9 | Knowledge 自己的传输（Agent24 → WeKnora）发出的 query 和 scope 也要经过出站判定 | **缺失**。`agent24-knowledge` crate 还不存在（KB-C1-02a，#1083）；出站判定 API 属于 6b.3，同样未交付（K1-D4）。WeKnora 部署在内网时算不算"本地"，待 #994 | David（Knowledge 传输侧）＋ David（K1 6b.3）；口径待 #994 | 未开工；#1083、#1084、#994 | KB-C1-02b、KB-C1-04、KB-SEC-01b、§3 禁用门（G1(a)） |
+| K1-D9 | Knowledge 自己的传输（Agent24 → WeKnora）发出的 search 的 query 和 scope、read 的目标（契约 R4.1 随请求发往服务端的 `scope`、`knowledge_id`、`chunk_id`、`expected_revision`、`page.cursor`，`CONTRACT-READONLY-v1.md:111`）也要在发送前经过出站判定 | **缺失**。`agent24-knowledge` crate 还不存在（KB-C1-02a，#1083）；出站判定 API 属于 6b.3，同样未交付（K1-D4）。WeKnora 部署在内网时算不算"本地"，待 #994 | David（Knowledge 传输侧）＋ David（K1 6b.3）；口径待 #994 | 未开工；#1083、#1084、#994 | KB-C1-02b、KB-C1-04、KB-SEC-01b、§3 禁用门（G1(a)） |
 
 ## 3. 私有数据禁用门（安全前提）
 
 本节是规范性条款，"必须""不得"都是强制要求。
 
 - **G1 门的状态。** 下列条件全部满足之前，门处于**关闭**状态：
-  - (a) K1-D2、K1-D4 所需的 K1 能力已经经 main 发布；K1-D9 已交付，并且 KB-SEC-01b 有一条覆盖 Agent24 → WeKnora 传输的用例；
-  - (b) KB-SEC-01b（#1089）的全路径出口验收通过，LocalOnly 下远端调用计数为零；
-  - (c) #994 已对 §4 第 1、2 项作出明确决定（LocalOnly 是否严格限于设备本地、内网 WeKnora 适用什么政策；测试资料和正式资料分别允许经过哪些服务），并且已经回写到 §4。无论 #994 怎么定，都不免除 (a) 对 K1-D9 的要求；
+  - (a) K1-D2、K1-D4 所需的 K1 能力已经经 main 发布；K1-D9 已交付，并且 KB-SEC-01b 有一条覆盖 Agent24 → WeKnora 传输的用例，该用例在发送前检查 search 的 query、scope 和 read 的目标（K1-D9 所列 R4.1 标识），按 #994 回写到 §4 第 1 项后的口径（内网远端算不算远端）执行并通过，且计入 (b) 的远端调用计数；
+  - (b) KB-SEC-01b（#1089）的全路径出口验收通过（含 (a) 的 Agent24 → WeKnora 传输用例），LocalOnly 下远端调用计数为零；
+  - (c) #994 已对 §4 第 1、2 项作出明确决定（LocalOnly 是否严格限于设备本地、内网远端适用什么政策；测试资料和正式资料分别允许经过哪些服务、费用上限由谁承担），并且已经回写到 §4。无论 #994 怎么定，都不免除 (a) 对 K1-D9 的要求；
   - (d) KB-SVC-POLICY-01 已实现并通过验收，WeKnora 服务端对未授权目的地零调用（契约 §12 第 3 项，`CONTRACT-READONLY-v1.md:353`）。
 
   开门要做一次本文修订，链接上述证据，由 David 复述确认；涉及内核接口时还需要 jason 确认。这道门不是运行时开关，不提供用户或配置层面的绕过手段。
@@ -62,3 +63,4 @@ Knowledge 检索到的证据（search 的 hit、read 的正文）进入任何模
 - r0（2026-10-18）：首稿。
 - r1（2026-10-18）：按第 1 轮 Grok/Codex 双审互评修订：新增发送前检查条款；开门条件加入服务端出口策略验收；收窄 K1-D3；更正 documents 过渡门的范围；若干出处更正。第 2 轮只剩 Low，按 Low 修订（G7 澄清、条款排序、K1-D4 需求列）。
 - r2（2026-10-20）：按 PR-Daemon #1091 评审（7240d40）修订：F1 G1(a) 加入 K1-D9 已交付及 KB-SEC-01b 覆盖 Agent24 → WeKnora 传输的用例，G1(c) 写明 #994 须对 §4 第 1、2 项作出明确决定且不免除 K1-D9，K1-D9 行与 §4 第 1、2 项补上对 G1 的引用；F2 K1-D6 的 K1-7.2 审计出处改为 `module_audit_event.rs` 的事件定义与 `agent24-tools` `ModuleTool` 的写入；F3 K1-D4、G8 改为"只过滤通告，不阻止按名调用"。
+- r3（2026-10-20）：按第 2 轮 Grok 复审修订：G1 G1(a) 的 Agent24 → WeKnora 传输用例须按 #994 回写后 §4 第 1 项的口径执行并通过，并计入 G1(b) 的远端调用计数；G2 K1-D9 的交付定义和 G1(a) 的用例加入 read 的目标（契约 R4.1 发往服务端的标识）；Low G1(c) 括号改回 §4 第 1 项原话"内网远端"，补上第 2 项的费用上限。文件头加修订号。
