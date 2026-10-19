@@ -1,0 +1,8 @@
+{ "$comment": "R3.4, R3.5: infrastructure ready and every KB in E is empty, so the search is complete with zero hits.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB3S9A0B1C2D3E4F5G6H7J8K", "generation": 4,
+    "query": "报销流程", "scope": { "knowledge_base_ids": ["kb-e"] },
+    "budget": { "deadline_ms": 5000, "max_results": 10, "max_concurrency": 1 } },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3S9A0B1C2D3E4F5G6H7J8K", "generation": 4,
+    "completeness": "complete", "effective_scope": { "knowledge_base_ids": ["kb-e"] },
+    "applied_budget": { "deadline_ms": 5000, "max_results": 10, "max_concurrency": 1 }, "hits": [] } } }

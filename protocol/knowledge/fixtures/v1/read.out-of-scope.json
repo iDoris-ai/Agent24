@@ -1,0 +1,8 @@
+{ "$comment": "§11.2, R2.6, R6.4: doc-x exists in kb-b, outside E = {kb-a}; identical to a missing document even with expected_revision.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB2Q8A0B1C2D3E4F5G6H7J8K", "generation": 7,
+    "scope": { "knowledge_base_ids": ["kb-a"] }, "knowledge_id": "doc-x",
+    "expected_revision": { "source_revision": "src-1", "index_build_id": "ib-1" },
+    "page": { "cursor": null, "limit": 20 }, "max_bytes": 65536 },
+  "response": { "status": 404, "body": { "error": { "code": "not_found", "message": "Resource not found.",
+    "details": { "retryable": false, "request_id": "01JB2Q8A0B1C2D3E4F5G6H7J8K", "generation": 7 } } } } }

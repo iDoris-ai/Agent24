@@ -1667,8 +1667,11 @@ mod tests {
     async fn grants_are_scoped_to_session_and_tool() {
         // An approve_for_session grant must NOT leak across sessions or tools:
         // a different session, or a different tool in the same session, still
-        // creates a fresh pending approval (review C4 grant-scoping).
-        let (broker, _events, store) = broker_with_timeout(Duration::from_millis(80)).await;
+        // creates a fresh pending approval that must be explicitly asked and
+        // explicitly denied, never silently auto-granted (review C4
+        // grant-scoping). Use a 30s arrangement for this non-timeout test;
+        // the grant-scope assertions must not rely on the timeout firing.
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
         seed_run(&store, "run_1").await;
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
@@ -1686,17 +1689,20 @@ mod tests {
             )
             .await
         });
-        let id = wait_for_pending(&store).await;
+        let id1 = wait_for_pending(&store).await;
         broker
-            .resolve(&id, decision("approve_for_session", None))
+            .resolve(&id1, decision("approve_for_session", None))
             .await
             .unwrap();
         assert_eq!(waiter.await.unwrap(), Verdict::Approved);
 
-        // Different SESSION, same tool → not granted → asks (times out closed)
+        // Different SESSION, same tool → the grant does not apply: a fresh
+        // pending row is created (never the already-resolved id1) and must be
+        // explicitly denied.
         seed_run(&store, "run_2").await;
-        let other_session = broker
-            .request(
+        let b2 = Arc::clone(&broker);
+        let waiter_2 = tokio::spawn(async move {
+            b2.request(
                 req(
                     "run_2",
                     Some("sess_2"),
@@ -1708,16 +1714,48 @@ mod tests {
                 ),
                 &CancellationToken::new(),
             )
-            .await;
-        assert!(
-            matches!(other_session, Verdict::Denied(_)),
+            .await
+        });
+        let id2 = wait_for_pending(&store).await;
+        assert_ne!(
+            id2, id1,
+            "a different session must get a fresh row, not the resolved one"
+        );
+        let row2 = store.get_approval(&id2).await.unwrap().unwrap();
+        assert_eq!(row2.run_id, "run_2");
+        assert_eq!(row2.tool_call_id, "tc_2");
+        assert_eq!(row2.status, ApprovalStatus::Pending);
+        broker
+            .resolve(
+                &id2,
+                decision("deny", Some("different session must re-ask")),
+            )
+            .await
+            .unwrap();
+        let other_session = waiter_2.await.unwrap();
+        assert_eq!(
+            other_session,
+            Verdict::Denied("denied by user: different session must re-ask".to_owned()),
             "a different session must still be asked: {other_session:?}"
         );
+        assert_eq!(
+            store.get_approval(&id2).await.unwrap().unwrap().status,
+            ApprovalStatus::Denied
+        );
+        assert!(
+            store.list_audit().await.unwrap().iter().all(|entry| {
+                !(entry.action == "approval.auto_granted"
+                    && entry.detail.get("run_id").and_then(Value::as_str) == Some("run_2"))
+            }),
+            "a different session must never be audited as auto-granted"
+        );
 
-        // Same session, different TOOL → not granted → asks (times out closed)
+        // Same session, different TOOL → the grant does not apply either: a
+        // fresh pending row is created and must be explicitly denied too.
         seed_run(&store, "run_3").await;
-        let other_tool = broker
-            .request(
+        let b3 = Arc::clone(&broker);
+        let waiter_3 = tokio::spawn(async move {
+            b3.request(
                 req(
                     "run_3",
                     Some("sess_1"),
@@ -1729,10 +1767,38 @@ mod tests {
                 ),
                 &CancellationToken::new(),
             )
-            .await;
-        assert!(
-            matches!(other_tool, Verdict::Denied(_)),
+            .await
+        });
+        let id3 = wait_for_pending(&store).await;
+        assert_ne!(
+            id3, id1,
+            "a different tool must get a fresh row, not the resolved one"
+        );
+        assert_ne!(id3, id2, "run_3's row must not be run_2's leftover row");
+        let row3 = store.get_approval(&id3).await.unwrap().unwrap();
+        assert_eq!(row3.run_id, "run_3");
+        assert_eq!(row3.tool_call_id, "tc_3");
+        assert_eq!(row3.status, ApprovalStatus::Pending);
+        broker
+            .resolve(&id3, decision("deny", Some("different tool must re-ask")))
+            .await
+            .unwrap();
+        let other_tool = waiter_3.await.unwrap();
+        assert_eq!(
+            other_tool,
+            Verdict::Denied("denied by user: different tool must re-ask".to_owned()),
             "a different tool must still be asked: {other_tool:?}"
+        );
+        assert_eq!(
+            store.get_approval(&id3).await.unwrap().unwrap().status,
+            ApprovalStatus::Denied
+        );
+        assert!(
+            store.list_audit().await.unwrap().iter().all(|entry| {
+                !(entry.action == "approval.auto_granted"
+                    && entry.detail.get("run_id").and_then(Value::as_str) == Some("run_3"))
+            }),
+            "a different tool must never be audited as auto-granted"
         );
     }
 

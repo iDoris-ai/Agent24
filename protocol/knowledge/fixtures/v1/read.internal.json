@@ -1,0 +1,6 @@
+{ "$comment": "§6, R6.3: unexpected server fault; generic message, no reason, not retryable.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3R8J9K0M1N2P3Q4R5S6T7V", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7" },
+  "response": { "status": 500, "body": { "error": { "code": "internal", "message": "Internal error.",
+    "details": { "retryable": false, "request_id": "01JB3R8J9K0M1N2P3Q4R5S6T7V", "generation": 15 } } } } }
