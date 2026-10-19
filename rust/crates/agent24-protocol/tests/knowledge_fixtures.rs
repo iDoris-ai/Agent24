@@ -1,15 +1,16 @@
 //! KB-CT-02b (#1012): Knowledge v1 fixture lockstep. `protocol/knowledge/fixtures/v1`
 //! is registered here explicitly (`fixtures_roundtrip.rs` only reads
 //! `protocol/fixtures/events`). The manifest, and through it every fixture's
-//! version and sha256, is pinned (CONTRACT-READONLY-v1 r8), and the cancel
-//! fixture must be internally consistent.
+//! version and sha256, is pinned (CONTRACT-READONLY-v1 r8). Every error envelope
+//! and partial failure decodes into strict types (unknown fields rejected,
+//! required fields present, `null` only where the contract allows it).
 //! `packages/contract-tests/src/knowledge-v1.test.ts` validates the same files
 //! against the full `protocol/knowledge/v1` schemas.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Deserializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -75,6 +76,18 @@ fn decode<T: DeserializeOwned>(file: &str, value: &Value) -> T {
     serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("{file}: {e}"))
 }
 
+/// A key that must be present but may be `null`. A bare `Option` field would
+/// also accept a missing key.
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    Option::deserialize(d)
+}
+
+/// An optional key that, when present, must not be `null`. Use with
+/// `#[serde(default)]`.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
 #[derive(Deserialize)]
 struct Manifest {
     contract_revision: String,
@@ -113,24 +126,141 @@ struct Echo {
     generation: u64,
 }
 
-// ---- local cancelled result (R7.3) ----
+// ---- error envelope (contract §6, R6.1, R7.3) ----
 
 #[derive(Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "snake_case")]
 enum Code {
+    InvalidRequest,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    Stale,
+    Timeout,
+    Unavailable,
+    Internal,
     Cancelled,
 }
 
-#[derive(Deserialize)]
-struct ErrorBody {
-    code: Code,
-    details: Details,
+impl Code {
+    /// §6 (r8): HTTP status, fixed `retryable`, `reason` required (true) or
+    /// forbidden (false); `None` = it depends. `cancelled` is never on the wire.
+    fn wire(&self) -> Option<(u16, Option<bool>, Option<bool>)> {
+        Some(match self {
+            Code::InvalidRequest => (400, Some(false), None),
+            Code::Unauthorized => (401, Some(false), Some(true)),
+            Code::Forbidden => (403, Some(false), Some(true)),
+            Code::NotFound => (404, Some(false), Some(false)),
+            Code::Stale => (409, Some(false), None),
+            Code::Timeout => (504, Some(true), None),
+            Code::Unavailable => (503, None, None),
+            Code::Internal => (500, Some(false), Some(false)),
+            Code::Cancelled => return None,
+        })
+    }
+
+    /// R6.1, R6.4: only these may echo `null` (body unreadable, ids invalid, or
+    /// failed before parsing); `mixed_score_space` comes after E, so it echoes.
+    fn may_echo_null(&self, reason: Option<&str>) -> bool {
+        match self {
+            Code::Unauthorized | Code::Internal => true,
+            Code::InvalidRequest => reason != Some("mixed_score_space"),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorBody {
+    code: Code,
+    message: String,
+    #[serde(default, deserialize_with = "present")]
+    hint: Option<String>,
+    details: Details,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Details {
     retryable: bool,
+    #[serde(deserialize_with = "nullable")]
+    request_id: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    generation: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    reason: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    current_revision: Option<CurrentRevision>,
+    #[serde(default, deserialize_with = "present")]
+    current_chunk_revision: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    groups: Option<Vec<Group>>,
+    #[serde(default, deserialize_with = "present")]
+    supported: Option<Vec<u32>>,
+    #[serde(default, deserialize_with = "present")]
+    partial_failures: Option<Vec<PartialFailure>>,
+    #[serde(default, deserialize_with = "present")]
+    retry_after_ms: Option<u64>,
+    /// Provider-local `cancelled` only (R7.3).
+    #[serde(default, deserialize_with = "present")]
     current_generation: Option<u64>,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentRevision {
+    source_revision: String,
+    #[serde(deserialize_with = "nullable")]
+    index_build_id: Option<String>,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Group {
+    score_space: String,
+    knowledge_base_ids: Vec<String>,
+}
+
+#[allow(dead_code)] // decoded to check the shape; not every field is read
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFailure {
+    knowledge_base_id: String,
+    code: FailCode,
+    reason: FailReason,
+    retryable: bool,
+}
+
+/// `partial_failures[].code` is the subset R3.5 allows.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailCode {
+    Timeout,
+    Unavailable,
+}
+
+/// R3.5 (r8).
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailReason {
+    Timeout,
+    Dependency,
+    NotReady,
+    Overloaded,
+    IndexBuilding,
+    UnsupportedKbType,
+    IndexFailed,
 }
 
 // ---- tests ----
@@ -186,6 +316,81 @@ fn manifest_pins_every_knowledge_fixture() {
 }
 
 #[test]
+fn every_knowledge_fixture_decodes_strictly() {
+    for e in load::<Manifest>("manifest.json").fixtures {
+        let file = e.file.as_str();
+        let fx: Fixture = load(file);
+        let body = &fx.response.body;
+        assert_eq!(fx.request.is_none(), e.request_valid.is_none(), "{file}");
+        assert_eq!(fx.local.is_some(), !e.server_handler, "{file}");
+        // Malformed requests still carry the ids the error must echo; a raw,
+        // unparseable body (a string) has nothing to echo (R6.1).
+        let echo = fx
+            .request
+            .as_ref()
+            .filter(|r| r.is_object())
+            .map(|r| decode::<Echo>(file, r));
+        if let Some(raw) = fx.request.as_ref().and_then(Value::as_str) {
+            // R6.1: a raw request stands for a body that does not parse.
+            assert!(
+                serde_json::from_str::<Value>(raw).is_err(),
+                "{file}: raw request parses"
+            );
+            let details = &body["error"]["details"];
+            assert!(
+                details["request_id"].is_null() && details["generation"].is_null(),
+                "{file}"
+            );
+        }
+        let echoed = match e.class.as_str() {
+            "accept" => {
+                assert_eq!(fx.response.status, 200, "{file}");
+                body
+            }
+            "reject" => {
+                let err = decode::<ErrorEnvelope>(file, body).error;
+                let (status, retryable, reason) = err.code.wire().expect("not on the wire");
+                assert_eq!(fx.response.status, status, "{file}");
+                if let Some(r) = retryable {
+                    assert_eq!(err.details.retryable, r, "{file}");
+                }
+                if let Some(must) = reason {
+                    assert_eq!(err.details.reason.is_some(), must, "{file}: reason");
+                }
+                // §6 (r8): a non-retryable unavailable names the non-retryable cause.
+                if err.code == Code::Unavailable && !err.details.retryable {
+                    let r = err.details.reason.as_deref();
+                    assert!(
+                        matches!(r, Some("unsupported_kb_type" | "index_failed")),
+                        "{file}"
+                    );
+                }
+                let null_echo =
+                    err.details.request_id.is_none() || err.details.generation.is_none();
+                let may = err.code.may_echo_null(err.details.reason.as_deref());
+                assert!(!null_echo || may, "{file}: null echo");
+                assert!(err.details.current_generation.is_none(), "{file}");
+                &body["error"]["details"]
+            }
+            other => panic!("{file}: unknown class {other}"),
+        };
+        if let Some(echo) = echo {
+            // R7.2: echoed as sent; a null allowed above (R6.1) is not compared.
+            if !echoed["request_id"].is_null() {
+                assert_eq!(echoed["request_id"], echo.request_id.as_str(), "{file}");
+            }
+            if !echoed["generation"].is_null() {
+                assert_eq!(
+                    echoed["generation"].as_u64(),
+                    Some(echo.generation),
+                    "{file}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn late_response_fixture_is_consistent() {
     // §11.4 / R7.3 / §12 #18: the fixture's late success, its stale generation
     // and its local cancelled result agree with each other. Nothing here drops
@@ -201,7 +406,7 @@ fn late_response_fixture_is_consistent() {
     let current_generation = local["current_generation"].as_u64().unwrap();
     let request: Echo = decode(file, &fx.request.unwrap());
     let late: Echo = decode(file, &fx.response.body);
-    let result: ErrorBody = decode(file, &local["result"]["error"]);
+    let result = decode::<ErrorEnvelope>(file, &local["result"]).error;
 
     assert_eq!(late, request, "the response answers the in-flight request");
     assert_ne!(late.generation, current_generation, "generation moved on");
