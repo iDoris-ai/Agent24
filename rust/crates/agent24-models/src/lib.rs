@@ -3,7 +3,8 @@
 //! Design rules (ADR-026 §6.5, openfang lessons):
 //! - The [`ModelProvider`] trait stays MINIMAL — retry, cooldown, routing and
 //!   health feedback live ABOVE the trait (M-D `ModelRouter`), never inside a
-//!   provider.
+//!   provider. One exception: [`OpenAiCompatProvider`] asks once more without
+//!   a thinking switch the backend refused (ME4-S2c §4).
 //! - Every async call takes a [`CancellationToken`] — cancellation is a
 //!   first-class citizen from the first line (never retrofit).
 //! - Providers are registered in an ordered registry (no if/else factory).
@@ -108,15 +109,17 @@ pub struct CompletionRequest {
     /// the value verbatim and never clamps it silently.
     pub max_tokens: Option<std::num::NonZeroU32>,
     /// ME4-S2-thinking: ask the backend to skip a reasoning model's internal
-    /// monologue (Qwen3-style `<think>…</think>`) for THIS request. Forwarded
-    /// verbatim by [`OpenAiCompatProvider`] as the OpenAI-compat
-    /// `chat_template_kwargs: {"enable_thinking": false}` convention
+    /// monologue (Qwen3-style `<think>…</think>`) for THIS request.
+    /// [`OpenAiCompatProvider`] sends it only in the form its instance opted
+    /// into: oMLX's `chat_template_kwargs: {"enable_thinking": false}`
     /// (confirmed against oMLX's own `mlx_lm.server`/`omlx.server`, which
     /// reads `chat_template_kwargs` off the request body top level and
-    /// special-cases `enable_thinking`); a provider that doesn't recognise
-    /// the field ignores it, same as any other unknown JSON key. The CALLER
-    /// decides when to set this (`_a24/model/complete`'s handler, gated on
-    /// `complexity: simple`) — this crate has no opinion on complexity.
+    /// special-cases `enable_thinking`), or Ollama's `reasoning_effort:
+    /// "none"` (ME4-S2c §4); one that opted into neither sends nothing. A
+    /// backend that refuses the field with a 400 is asked again without it.
+    /// The CALLER decides when to set this (`_a24/model/complete`'s handler,
+    /// gated on `complexity: simple`) — this crate has no opinion on
+    /// complexity.
     pub disable_thinking: bool,
     /// ME4-S2b: the sampling temperature, sent only when set. `None` leaves
     /// the body byte for byte as before (and Ollama's OpenAI layer then uses
@@ -204,8 +207,10 @@ pub enum ModelError {
     Cancelled,
 }
 
-/// Minimal provider contract: request in, response out. No routing, no retry,
-/// no health logic here.
+/// Minimal provider contract: request in, response out. No routing, no
+/// health logic here, and no retry but one: [`OpenAiCompatProvider`] asks
+/// again, once, without a thinking switch the backend refused (ME4-S2c §4),
+/// so one `complete` may send two requests.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &str;
@@ -242,6 +247,10 @@ pub struct OpenAiCompatProvider {
     /// called — `new` never turns it on itself, and it is NOT derived from
     /// `tier`: being local does not imply being oMLX.
     supports_chat_template_kwargs: bool,
+    /// ME4-S2c §4: whether `disable_thinking` may be sent to THIS instance as
+    /// `reasoning_effort: "none"`. Same rule as the field above: `false`
+    /// unless [`Self::supports_reasoning_effort`] was called.
+    supports_reasoning_effort: bool,
 }
 
 /// v3.1 L-3: the settings every provider client shares; `new` and
@@ -273,6 +282,7 @@ impl OpenAiCompatProvider {
             chat_timeout: Duration::from_secs(120),
             quick_timeout: Duration::from_secs(5),
             supports_chat_template_kwargs: false,
+            supports_reasoning_effort: false,
         }
     }
 
@@ -284,6 +294,17 @@ impl OpenAiCompatProvider {
     #[must_use]
     pub fn supports_chat_template_kwargs(mut self) -> Self {
         self.supports_chat_template_kwargs = true;
+        self
+    }
+
+    /// ME4-S2c §4: opt this SPECIFIC provider instance into sending
+    /// `disable_thinking` as `reasoning_effort: "none"`. Only `"none"` is ever
+    /// sent: Ollama refuses a value asking for thought from a model that
+    /// cannot think. `router.rs::from_env` calls it on the `ollama`-named
+    /// provider only, and only when it judged local (loopback).
+    #[must_use]
+    pub fn supports_reasoning_effort(mut self) -> Self {
+        self.supports_reasoning_effort = true;
         self
     }
 
@@ -340,19 +361,17 @@ impl OpenAiCompatProvider {
     /// fall under the first-chunk timer.
     async fn complete_streamed(
         &self,
-        mut body: Value,
+        body: &Value,
         p: &Progress,
         cancel: &CancellationToken,
     ) -> Result<CompletionResponse, ModelError> {
         let started = std::time::Instant::now();
-        body["stream"] = Value::Bool(true);
-        body["stream_options"] = serde_json::json!({ "include_usage": true });
         let send = self
             .authed(
                 self.client
                     .post(format!("{}/v1/chat/completions", self.base_url)),
             )
-            .json(&body)
+            .json(body)
             .send();
         let (first, what) = if let Some(at) = started.checked_add(p.first_chunk)
             && at < p.deadline
@@ -404,6 +423,41 @@ impl OpenAiCompatProvider {
             usage: usage_of(s.usage),
             model_id: s.model,
         })
+    }
+
+    /// One request with `body` as it is. A streamed one shares the call's
+    /// deadline with any request before it; its first-chunk timer is its own.
+    /// A whole one is read within `timeout`.
+    async fn send(
+        &self,
+        body: &Value,
+        progress: Option<&Progress>,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        if let Some(p) = progress {
+            return self.complete_streamed(body, p, cancel).await;
+        }
+        let fut = self
+            .authed(
+                self.client
+                    .post(format!("{}/v1/chat/completions", self.base_url)),
+            )
+            .timeout(timeout)
+            .json(body)
+            .send();
+        let response = tokio::select! {
+            r = fut => r.map_err(|e| classify(&e))?,
+            () = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = read_error_body(response, cancel).await;
+            return Err(friendly_http_error(&self.name, status, &body));
+        }
+        let parsed: OaChatResponse =
+            read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
+        self.answer(parsed)
     }
 
     fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -650,9 +704,19 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     name: &str,
 ) -> Result<T, ModelError> {
     let mut body = Vec::new();
+    // A body that breaks off is the backend going away, as in a stream
+    // (`stream.rs`); one framed wrongly is not. reqwest reports both as
+    // `is_decode`, so `classify` alone cannot tell them apart.
+    let read_error = |e: reqwest::Error| {
+        if hung_up(&e) {
+            ModelError::Unavailable(format!("{name}: the answer broke off: {e}"))
+        } else {
+            classify(&e)
+        }
+    };
     loop {
         let chunk = tokio::select! {
-            c = response.chunk() => c.map_err(|e| classify(&e))?,
+            c = response.chunk() => c.map_err(read_error)?,
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
         };
         let Some(chunk) = chunk else { break };
@@ -685,11 +749,56 @@ fn usage_of(u: Option<OaUsage>) -> Usage {
 }
 
 fn classify(err: &reqwest::Error) -> ModelError {
-    if err.is_connect() || err.is_timeout() {
+    if err.is_connect() || err.is_timeout() || (err.is_request() && hung_up(err)) {
         ModelError::Unavailable(err.to_string())
     } else {
         ModelError::Provider(err.to_string())
     }
+}
+
+/// A backend that hangs up after the request went out (Ollama stopped while
+/// it reads the prompt, or an idle pooled connection it had closed) is going
+/// away, like one that cannot be reached. An answer that is not HTTP is not
+/// that: it stays the backend's fault.
+///
+/// hyper's three: `is_incomplete_message` is a close before the answer was
+/// whole. `is_canceled` is also a request that was never sent: hyper cancels
+/// one still queued when its connection fails or closes ("the message was
+/// never even started", hyper 1.11 `proto/h1/dispatch.rs`), so trying again
+/// later is as safe as after a refused connect. `is_closed` is the same kind:
+/// the request was handed to a connection whose task had already ended
+/// (hyper 1.11 `client/dispatch.rs` `Sender::poll_ready`; hyper-util 0.1
+/// `legacy/client.rs`, a fresh connection that died before it was ready or a
+/// pooled one that had closed), so it was never sent either.
+fn hung_up(err: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(err);
+    while let Some(e) = source {
+        if let Some(h) = e.downcast_ref::<hyper::Error>()
+            && (h.is_incomplete_message() || h.is_canceled() || h.is_closed())
+        {
+            return true;
+        }
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && went_away(io.kind())
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// The ways a socket says the other end went away. A backend that closes
+/// while a large prompt is still being written shows up as `BrokenPipe` or
+/// `ConnectionReset`, whichever the write meets first; `ConnectionAborted` is
+/// what Windows reports where Unix says reset; `UnexpectedEof` is a close in
+/// the middle of the answer.
+fn went_away(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+    matches!(
+        kind,
+        ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
+    )
 }
 
 #[async_trait]
@@ -747,35 +856,69 @@ impl ModelProvider for OpenAiCompatProvider {
         if req.disable_thinking && self.supports_chat_template_kwargs {
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
         }
-        if let Some(p) = &req.progress {
+        // ME4-S2c §4: the same gate, for Ollama.
+        if req.disable_thinking && self.supports_reasoning_effort {
+            body["reasoning_effort"] = Value::from("none");
+        }
+        if req.progress.is_some() {
             if !req.tools.is_empty() {
                 return Err(ModelError::Provider(format!(
                     "{}: a streamed request cannot carry tools",
                     self.name
                 )));
             }
-            return self.complete_streamed(body, p, cancel).await;
+            body["stream"] = Value::Bool(true);
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
-        let fut = self
-            .authed(
-                self.client
-                    .post(format!("{}/v1/chat/completions", self.base_url)),
-            )
-            .timeout(self.chat_timeout)
-            .json(&body)
-            .send();
-        let response = tokio::select! {
-            r = fut => r.map_err(|e| classify(&e))?,
-            () = cancel.cancelled() => return Err(ModelError::Cancelled),
-        };
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = read_error_body(response, cancel).await;
-            return Err(friendly_http_error(&self.name, status, &body));
+        // ME4-S2c §4: a backend that does not know the thinking switch (an
+        // Ollama version or model that refuses `"none"`, an OMLX_URL that is
+        // not oMLX) refuses the whole request. Asked once more without it, it
+        // answers as it did before the switch existed, thinking and all,
+        // rather than fail every `complexity: "simple"` call. A 400 for any
+        // other reason costs one more refusal.
+        const SWITCHES: [&str; 2] = ["chat_template_kwargs", "reasoning_effort"];
+        let switched = SWITCHES.iter().any(|k| body.get(k).is_some());
+        let started = std::time::Instant::now();
+        match self
+            .send(&body, req.progress.as_ref(), self.chat_timeout, cancel)
+            .await
+        {
+            Err(e @ ModelError::Rejected { status: 400, .. }) if switched => {
+                // A refusal whose error body a cancel cut short is a cancel.
+                // Without the time for another answer, it stays the refusal
+                // it is: a streamed call by the router's rule for trying the
+                // next provider (less than a stall left), a whole one with
+                // less of its timeout left than the quick timeout. A whole
+                // call asked again has what is left of that timeout, not
+                // another.
+                if cancel.is_cancelled() {
+                    return Err(ModelError::Cancelled);
+                }
+                let no_time = match &req.progress {
+                    Some(p) => stream::left(p, std::time::Instant::now()) < p.stall,
+                    None => {
+                        self.chat_timeout.saturating_sub(started.elapsed()) < self.quick_timeout
+                    }
+                };
+                if no_time {
+                    return Err(e);
+                }
+                tracing::warn!("{e}; asking again without the thinking switch");
+                if let Some(fields) = body.as_object_mut() {
+                    for k in SWITCHES {
+                        fields.remove(k);
+                    }
+                }
+                let left = self.chat_timeout.saturating_sub(started.elapsed());
+                let again = self.send(&body, req.progress.as_ref(), left, cancel).await;
+                // The same for the second refusal (PR-Daemon #1045 L-b).
+                if matches!(again, Err(ModelError::Rejected { .. })) && cancel.is_cancelled() {
+                    return Err(ModelError::Cancelled);
+                }
+                again
+            }
+            answer => answer,
         }
-        let parsed: OaChatResponse =
-            read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
-        self.answer(parsed)
     }
 
     async fn models(&self, cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
@@ -1257,6 +1400,532 @@ mod tests {
             body.get("chat_template_kwargs").is_none(),
             "a provider that never opted in must never see this field, even when disable_thinking is true"
         );
+    }
+
+    #[test]
+    fn the_ways_a_socket_says_the_backend_went_away() {
+        use std::io::ErrorKind::*;
+        for k in [
+            BrokenPipe,
+            ConnectionReset,
+            ConnectionAborted,
+            UnexpectedEof,
+        ] {
+            assert!(went_away(k), "{k:?}");
+        }
+        // Controls: a framing or data error is the backend's fault.
+        for k in [InvalidData, InvalidInput, TimedOut, Other] {
+            assert!(!went_away(k), "{k:?}");
+        }
+    }
+
+    // ── ME4-S2c §4: disable_thinking → reasoning_effort, and the 400 retry ──
+
+    /// A whole HTTP answer: `status`, then `body` as JSON.
+    fn reply(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn ok_whole() -> String {
+        reply(
+            "200 OK",
+            r#"{"model":"stub","choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+    }
+
+    fn ok_streamed() -> String {
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n".to_owned()
+    }
+
+    fn refused(status: &str) -> String {
+        reply(status, r#"{"error":{"message":"bad field"}}"#)
+    }
+
+    /// A backend that answers its n-th request with `replies[n]` (the last one
+    /// once they run out). Every body it was sent, in order.
+    async fn answers_in_turn(
+        replies: Vec<String>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let asked = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = Arc::clone(&asked);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let body = read_request(&mut s).await;
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(serde_json::from_str(&body).unwrap());
+                    seen.len() - 1
+                };
+                let reply = &replies[n.min(replies.len() - 1)];
+                s.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (url, asked)
+    }
+
+    /// What this thread logs from here on, as text.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+            let logs = Logs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn retries(&self) -> usize {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .matches("asking again without the thinking switch")
+                .count()
+        }
+    }
+
+    fn thinking_off(progress: Option<Progress>) -> CompletionRequest {
+        CompletionRequest {
+            disable_thinking: true,
+            progress,
+            ..req()
+        }
+    }
+
+    fn streamed() -> Option<Progress> {
+        Some(Progress {
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            first_chunk: Duration::from_secs(2),
+            stall: Duration::from_secs(2),
+        })
+    }
+
+    #[tokio::test]
+    async fn disable_thinking_sets_reasoning_effort_only_on_a_provider_that_opted_in() {
+        // J1: opted in → "none" when asked, absent otherwise.
+        let (url, asked) = answers_in_turn(vec![ok_whole()]).await;
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let c = CancellationToken::new();
+        p.complete(&thinking_off(None), &c).await.unwrap();
+        p.complete(&req(), &c).await.unwrap();
+        // J2: oMLX's switch and none at all never carry it.
+        let (url, omlx) = answers_in_turn(vec![ok_whole()]).await;
+        OpenAiCompatProvider::new("omlx", url, None, "local", "qwen3")
+            .supports_chat_template_kwargs()
+            .complete(&thinking_off(None), &c)
+            .await
+            .unwrap();
+        let (url, plain) = answers_in_turn(vec![ok_whole()]).await;
+        OpenAiCompatProvider::new("remote", url, None, "remote", "gpt-x")
+            .complete(&thinking_off(None), &c)
+            .await
+            .unwrap();
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked[0]["reasoning_effort"], "none");
+        assert!(
+            asked[0].get("chat_template_kwargs").is_none(),
+            "{}",
+            asked[0]
+        );
+        assert!(asked[1].get("reasoning_effort").is_none(), "{}", asked[1]);
+        let omlx = &omlx.lock().unwrap()[0];
+        assert!(omlx.get("reasoning_effort").is_none(), "{omlx}");
+        assert!(omlx.get("chat_template_kwargs").is_some(), "{omlx}");
+        let plain = &plain.lock().unwrap()[0];
+        assert!(plain.get("reasoning_effort").is_none(), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_thinking_switch_is_dropped_and_the_request_asked_once_more() {
+        // J2b, on both paths: a 400 → the same request without the switch.
+        let c = CancellationToken::new();
+        let ollama = |url| {
+            OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+                .supports_reasoning_effort()
+        };
+        let omlx = |url| {
+            OpenAiCompatProvider::new("omlx", url, None, "local", "qwen3")
+                .supports_chat_template_kwargs()
+        };
+        for (progress, ok) in [(None, ok_whole()), (streamed(), ok_streamed())] {
+            for (key, build) in [
+                (
+                    "reasoning_effort",
+                    &ollama as &dyn Fn(String) -> OpenAiCompatProvider,
+                ),
+                ("chat_template_kwargs", &omlx),
+            ] {
+                let (url, asked) =
+                    answers_in_turn(vec![refused("400 Bad Request"), ok.clone()]).await;
+                let (logs, _guard) = Logs::capture();
+                let got = build(url).complete(&thinking_off(progress), &c).await;
+                assert_eq!(got.unwrap().message.content.as_deref(), Some("x"));
+                assert_eq!(logs.retries(), 1, "{key}: the retry is logged");
+                let asked = asked.lock().unwrap().clone();
+                assert_eq!(asked.len(), 2, "{key}: {asked:?}");
+                assert!(asked[0].get(key).is_some(), "{key}: {}", asked[0]);
+                let mut without = asked[0].clone();
+                without.as_object_mut().unwrap().remove(key);
+                assert_eq!(asked[1], without, "{key}: only the switch is dropped");
+                // Refused again: that refusal stands, after one retry only.
+                let (url, again) = answers_in_turn(vec![refused("400 Bad Request")]).await;
+                let got = build(url).complete(&thinking_off(progress), &c).await;
+                assert!(
+                    matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+                    "{key}: {got:?}"
+                );
+                assert_eq!(again.lock().unwrap().len(), 2, "{key}");
+            }
+            // Controls: no switch in the request, or a refusal that is not a
+            // 400 → no retry. No switch either from a provider that opted
+            // into none, thinking off or not (PR-Daemon #1045 L-a).
+            let remote = |url| OpenAiCompatProvider::new("remote", url, None, "remote", "gpt-x");
+            for (what, p, r) in [
+                (
+                    "ollama, thinking on",
+                    ollama as fn(String) -> OpenAiCompatProvider,
+                    CompletionRequest { progress, ..req() },
+                ),
+                ("remote, thinking off", remote, thinking_off(progress)),
+            ] {
+                let (url, asked) = answers_in_turn(vec![refused("400 Bad Request")]).await;
+                let got = p(url).complete(&r, &c).await;
+                let streamed = progress.is_some();
+                assert!(
+                    matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+                    "{what}, streamed {streamed}: {got:?}"
+                );
+                assert_eq!(
+                    asked.lock().unwrap().len(),
+                    1,
+                    "{what}, streamed {streamed}"
+                );
+            }
+            let (url, asked) = answers_in_turn(vec![refused("422 Unprocessable Entity")]).await;
+            let got = ollama(url).complete(&thinking_off(progress), &c).await;
+            assert!(
+                matches!(got, Err(ModelError::Rejected { status: 422, .. })),
+                "{got:?}"
+            );
+            assert_eq!(asked.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_refusal_cut_short_by_a_cancel_is_a_cancel() {
+        // PR-Daemon #1045 L-b: refused at once, then asked again and refused
+        // with a body that never ends; cancelled while it is read, once the
+        // backend has written that refusal's head.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        let c = CancellationToken::new();
+        let later = c.clone();
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                let reply = if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    refused("400 Bad Request")
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":".to_owned()
+                };
+                s.write_all(reply.as_bytes()).await.unwrap();
+                if held.len() == 1 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    later.cancel();
+                }
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let (logs, _guard) = Logs::capture();
+        let got = p.complete(&thinking_off(None), &c).await;
+        assert!(matches!(got, Err(ModelError::Cancelled)), "{got:?}");
+        assert_eq!(logs.retries(), 1, "it was asked again");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_both_switches_drops_both_when_refused() {
+        let (url, asked) = answers_in_turn(vec![refused("400 Bad Request"), ok_whole()]).await;
+        let p = OpenAiCompatProvider::new("p", url, None, "local", "qwen3")
+            .supports_chat_template_kwargs()
+            .supports_reasoning_effort();
+        let c = CancellationToken::new();
+        p.complete(&thinking_off(None), &c).await.unwrap();
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2);
+        assert!(asked[0].get("reasoning_effort").is_some(), "{}", asked[0]);
+        assert!(
+            asked[0].get("chat_template_kwargs").is_some(),
+            "{}",
+            asked[0]
+        );
+        for k in ["reasoning_effort", "chat_template_kwargs"] {
+            assert!(asked[1].get(k).is_none(), "{k}: {}", asked[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_cut_short_by_a_cancel_is_not_asked_again() {
+        // The whole path reads a refusal's body until cancelled, then still
+        // reports the refusal: it must not be taken for one to retry.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":";
+                s.write_all(head.as_bytes()).await.unwrap();
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let c = CancellationToken::new();
+        let later = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            later.cancel();
+        });
+        let (logs, _guard) = Logs::capture();
+        let got = p.complete(&thinking_off(None), &c).await;
+        assert!(matches!(got, Err(ModelError::Cancelled)), "{got:?}");
+        assert_eq!(logs.retries(), 0, "a cancel is no refusal to retry");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_cut_short_by_the_deadline_is_not_asked_again() {
+        // Its error body never ends; the call's deadline comes first. That is
+        // still the refusal, not a backend gone away.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":";
+                s.write_all(head.as_bytes()).await.unwrap();
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let progress = Some(Progress {
+            deadline: std::time::Instant::now() + Duration::from_millis(300),
+            first_chunk: Duration::from_millis(200),
+            stall: Duration::from_millis(200),
+        });
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(progress), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A backend that refuses with a 400 after `wait` ms; with `whole`, the
+    /// refusal's body comes in full, else it never ends. How many it was asked.
+    async fn refuses_after(
+        wait: u64,
+        whole: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                let reply = if whole {
+                    refused("400 Bad Request")
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":".to_owned()
+                };
+                s.write_all(reply.as_bytes()).await.unwrap();
+                held.push(s);
+            }
+        });
+        (url, count)
+    }
+
+    #[tokio::test]
+    async fn a_refusal_with_less_than_a_stall_left_is_not_asked_again() {
+        // The router's rule for the next provider: less than a stall left is
+        // no time for another answer.
+        // About 500ms are left when the refusal is read, under a 1s stall;
+        // 500ms more slack before the deadline would turn it into a timeout.
+        let (url, count) = refuses_after(1500, true).await;
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let progress = Some(Progress {
+            deadline: std::time::Instant::now() + Duration::from_millis(2000),
+            first_chunk: Duration::from_millis(3000),
+            stall: Duration::from_millis(1000),
+        });
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(progress), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_whole_refusal_its_timeout_cut_short_is_not_asked_again() {
+        let (url, count) = refuses_after(0, false).await;
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort()
+            .with_timeouts(Duration::from_millis(300), Duration::from_secs(1));
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(None), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_whole_call_asked_again_has_only_what_is_left_of_its_timeout() {
+        // Refused at 400ms of a 600ms timeout; asked again, the backend says
+        // nothing. The call ends near 600ms, not 400ms + another 600ms.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = vec![];
+            let mut first = true;
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                if std::mem::take(&mut first) {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    s.write_all(refused("400 Bad Request").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                held.push(s);
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort()
+            .with_timeouts(Duration::from_millis(600), Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let got = p
+            .complete(&thinking_off(None), &CancellationToken::new())
+            .await;
+        assert!(matches!(got, Err(ModelError::Unavailable(_))), "{got:?}");
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(900), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_whole_refusal_with_little_of_its_timeout_left_is_not_asked_again() {
+        // Refused at 400ms of a 600ms timeout, with a 300ms quick timeout:
+        // 200ms is too little for another answer.
+        let (url, count) = refuses_after(400, true).await;
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort()
+            .with_timeouts(Duration::from_millis(600), Duration::from_millis(300));
+        let (logs, _guard) = Logs::capture();
+        let got = p
+            .complete(&thinking_off(None), &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(got, Err(ModelError::Rejected { status: 400, .. })),
+            "{got:?}"
+        );
+        assert_eq!(logs.retries(), 0);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_call_asked_again_starts_its_first_chunk_timer_anew() {
+        // L2: each request answers its first chunk at 300ms, under a 400ms
+        // first-chunk timer. Together they take 600ms: the second answer is in
+        // time only by a timer of its own.
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = read_request(&mut s).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let reply = if std::mem::take(&mut first) {
+                    refused("400 Bad Request")
+                } else {
+                    ok_streamed()
+                };
+                s.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let p = OpenAiCompatProvider::new("ollama", url, None, "local", "qwen3")
+            .supports_reasoning_effort();
+        let progress = Some(Progress {
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            first_chunk: Duration::from_millis(400),
+            stall: Duration::from_secs(1),
+        });
+        let got = p
+            .complete(&thinking_off(progress), &CancellationToken::new())
+            .await;
+        assert_eq!(got.unwrap().message.content.as_deref(), Some("x"));
     }
 
     /// The answer of a whole response: what a streamed one's end and the
