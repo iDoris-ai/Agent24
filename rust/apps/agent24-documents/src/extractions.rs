@@ -14,9 +14,9 @@ use sqlx::SqliteConnection;
 
 use crate::error::ApiError;
 use crate::id::{IdKind, is_id};
-use crate::state::Ready;
+use crate::state::{Ready, Storage};
 
-const DEFAULT_LIMIT: usize = 50;
+pub(crate) const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 /// A page's serialized JSON stays under this (§4).
 const PAGE_BYTES: usize = 512 * 1024;
@@ -125,14 +125,29 @@ pub async fn get_extraction(
     let UrlPath(id) = path.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let Query(p) = params.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT);
-    let from = match p.cursor.as_deref() {
+    get(&storage, &id, p.cursor.as_deref(), limit, PAGE_BYTES)
+        .await
+        .map(Json)
+}
+
+/// The extraction and the page of its values after `cursor`: at most `limit`
+/// (1 to 200) values and `budget` bytes of JSON. `GET /extractions/{id}` and
+/// `documents.extraction_get` both read here.
+pub(crate) async fn get(
+    storage: &Storage,
+    id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    budget: usize,
+) -> Result<Extraction, ApiError> {
+    let from = match cursor {
         None => Some(0),
         Some(c) => decode_cursor(c),
     };
     let (Some(from), true, true) = (
         from,
         (1..=MAX_LIMIT).contains(&limit),
-        is_id(IdKind::Extraction, &id),
+        is_id(IdKind::Extraction, id),
     ) else {
         return Err(ApiError::invalid_request(
             "an extraction id; limit is 1 to 200; a cursor from the previous page",
@@ -149,14 +164,14 @@ pub async fn get_extraction(
              JOIN revisions r ON r.document_id = e.document_id AND r.revision = e.revision
              WHERE e.id = ?",
         )
-        .bind(&id)
+        .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT ord, value FROM extraction_values WHERE extraction_id = ? AND ord >= ?
              ORDER BY ord LIMIT ?",
         )
-        .bind(&id)
+        .bind(id)
         .bind(i64::try_from(from).unwrap_or(i64::MAX))
         .bind(i64::try_from(limit + 1).unwrap_or(i64::MAX))
         .fetch_all(&mut *tx)
@@ -181,7 +196,7 @@ pub async fn get_extraction(
         return Err(ApiError::not_found("no such extraction"));
     };
     let mut page = Extraction {
-        extraction_id: id,
+        extraction_id: id.to_owned(),
         document_id,
         revision,
         content_sha256,
@@ -197,7 +212,7 @@ pub async fn get_extraction(
         next_cursor: Some("v99".into()),
         ..page.clone_head()
     })
-    .map_or(PAGE_BYTES, |v| v.len());
+    .map_or(budget, |v| v.len());
     for (ord, raw) in rows {
         // A stored value that breaks the contract is the OS's failure, as
         // is one that cannot fit a page: never sent as if it were fine.
@@ -219,7 +234,14 @@ pub async fn get_extraction(
             .map_err(|e| broken(e.to_string()))?
             .len()
             + 1;
-        if page.values.len() == limit || used + size > PAGE_BYTES {
+        if page.values.len() == limit || used + size > budget {
+            // `insert` keeps every value within a REST page, so at REST's
+            // budget a first value that does not fit is a broken store. A
+            // smaller (tool) budget can refuse a sound value: it is too large
+            // to send there, never cut (DOC-1-06b §3.2, §6).
+            if page.values.is_empty() && budget < PAGE_BYTES {
+                return Err(ApiError::over_budget(budget));
+            }
             if page.values.is_empty() {
                 return Err(broken(format!("{} bytes do not fit a page", raw.len())));
             }
@@ -229,7 +251,7 @@ pub async fn get_extraction(
         used += size;
         page.values.push(value);
     }
-    Ok(Json(page))
+    Ok(page)
 }
 
 impl Extraction {
