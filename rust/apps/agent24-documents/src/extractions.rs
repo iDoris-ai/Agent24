@@ -213,7 +213,8 @@ pub(crate) async fn get(
         ..page.clone_head()
     })
     .map_or(budget, |v| v.len());
-    for (ord, raw) in rows {
+    let mut rows = rows.into_iter().peekable();
+    while let Some((ord, raw)) = rows.next() {
         // A stored value that breaks the contract is the OS's failure, as
         // is one that cannot fit a page: never sent as if it were fine.
         let broken = |why: String| {
@@ -239,8 +240,23 @@ pub(crate) async fn get(
             // budget a first value that does not fit is a broken store. A
             // smaller (tool) budget can refuse a sound value: it is too large
             // to send there, never cut (DOC-1-06b §3.2, §6).
+            //
+            // The estimate above only decides whether to take one more value;
+            // at a tool budget the first value is judged by the body it will
+            // actually be sent in, alone on its page with its real cursor, so
+            // the reserve alone never refuses it (§3.2).
             if page.values.is_empty() && budget < PAGE_BYTES {
-                return Err(ApiError::over_budget(budget));
+                let next_cursor = rows.peek().map(|(next, _)| format!("v{next}"));
+                let alone = Extraction {
+                    values: vec![value],
+                    next_cursor,
+                    ..page.clone_head()
+                };
+                let exact = serde_json::to_vec(&alone).map_or(usize::MAX, |v| v.len());
+                if exact > budget {
+                    return Err(ApiError::over_budget(budget));
+                }
+                return Ok(alone);
             }
             if page.values.is_empty() {
                 return Err(broken(format!("{} bytes do not fit a page", raw.len())));

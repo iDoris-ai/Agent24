@@ -57,26 +57,110 @@ async fn env() -> (tempfile::TempDir, AppState) {
     .await;
     // Over 60 KiB, well within what a REST page (and `insert`) allows.
     let big = || value("big", 70 * 1024);
-    let mut tx = storage.db.pool().begin().await.unwrap();
     for (id, values) in [
         (SMALL, (0..5).map(|n| missing(&format!("f{n}"))).collect()),
         (BIG_FIRST, vec![big()]),
         (BIG_SECOND, vec![value("small", 10), big()]),
     ] {
-        let e = NewExtraction {
-            id: id.into(),
-            document_id: DOC.into(),
-            revision: 1,
-            schema_sha256: SCHEMA.into(),
-            extractor_version: "1".into(),
-            model_id: "qwen3-8b".into(),
-            text_layer_sha256: LAYER.into(),
-            values,
-        };
-        insert(&mut tx, &e).await.unwrap();
+        put(&state, id, values).await;
     }
-    tx.commit().await.unwrap();
     (dir, state)
+}
+
+/// Stores an extraction of `values` on the document of `env`.
+async fn put(state: &AppState, id: &str, values: Vec<ExtractedValue>) {
+    let storage = state.storage().await.unwrap();
+    let mut tx = storage.db.pool().begin().await.unwrap();
+    let e = NewExtraction {
+        id: id.into(),
+        document_id: DOC.into(),
+        revision: 1,
+        schema_sha256: SCHEMA.into(),
+        extractor_version: "1".into(),
+        model_id: "qwen3-8b".into(),
+        text_layer_sha256: LAYER.into(),
+        values,
+    };
+    insert(&mut tx, &e).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// The `n`th extraction id beyond those of `env`.
+fn ext(n: u8) -> String {
+    format!("ext_01K75A0B1C2D3E4F5G6H7J8KA{n}")
+}
+
+/// The bytes of a REST page as a payload counts them: REST sends the same
+/// JSON for the same limit and cursor, and its budget does not bind here.
+async fn rest_size(state: &AppState, path: &str) -> usize {
+    let (status, page) = rest(state, path).await;
+    assert_eq!(status, StatusCode::OK, "{}", page["error"]);
+    serde_json::to_vec(&page).unwrap().len()
+}
+
+/// The length of the `big` value that makes the page at `query` exactly the
+/// tool budget: measured on a probe of the same shape, as the size grows
+/// one byte per byte of plain ASCII (the callers check the result exactly).
+async fn fill_to_budget(state: &AppState, probe: &str, query: &str) -> usize {
+    let size = rest_size(state, &format!("/extractions/{probe}{query}")).await;
+    10 + PAYLOAD_BYTES - size
+}
+
+#[tokio::test]
+async fn a_lone_value_of_exactly_the_tool_budget_is_sent() {
+    let (_dir, state) = env().await;
+    put(&state, &ext(0), vec![value("big", 10)]).await;
+    let n = fill_to_budget(&state, &ext(0), "").await;
+    put(&state, &ext(1), vec![value("big", n)]).await;
+    put(&state, &ext(2), vec![value("big", n + 1)]).await;
+
+    let (_, want) = rest(&state, &format!("/extractions/{}", ext(1))).await;
+    let got = payload(&call(&state, "extraction_get", json!({ "extraction_id": ext(1) })).await);
+    assert_eq!(got, want);
+    assert_eq!(serde_json::to_vec(&got).unwrap().len(), PAYLOAD_BYTES);
+    assert!(got["next_cursor"].is_null());
+
+    let over = format!("/extractions/{}", ext(2));
+    assert_eq!(rest_size(&state, &over).await, PAYLOAD_BYTES + 1);
+    let body = call(&state, "extraction_get", json!({ "extraction_id": ext(2) })).await;
+    assert_module_error(&body, "payload_too_large", false);
+}
+
+#[tokio::test]
+async fn a_first_value_of_exactly_the_tool_budget_goes_alone_with_its_cursor() {
+    let (_dir, state) = env().await;
+    put(&state, &ext(3), vec![value("big", 10), value("small", 10)]).await;
+    let n = fill_to_budget(&state, &ext(3), "?limit=1").await;
+    put(&state, &ext(4), vec![value("big", n), value("small", 10)]).await;
+    put(
+        &state,
+        &ext(5),
+        vec![value("big", n + 1), value("small", 10)],
+    )
+    .await;
+
+    let (_, want) = rest(&state, &format!("/extractions/{}?limit=1", ext(4))).await;
+    for limit in [None, Some(1)] {
+        let mut args = json!({ "extraction_id": ext(4) });
+        if let Some(l) = limit {
+            args["limit"] = json!(l);
+        }
+        let first = payload(&call(&state, "extraction_get", args.clone()).await);
+        assert_eq!(first, want, "{limit:?}");
+        assert_eq!(serde_json::to_vec(&first).unwrap().len(), PAYLOAD_BYTES);
+        assert_eq!(first["values"].as_array().unwrap().len(), 1);
+        assert_eq!(first["next_cursor"], "v1");
+        args["cursor"] = first["next_cursor"].clone();
+        let second = payload(&call(&state, "extraction_get", args).await);
+        assert_eq!(second["values"].as_array().unwrap().len(), 1);
+        assert_eq!(second["values"][0]["key"], "small");
+        assert!(second["next_cursor"].is_null());
+    }
+
+    let over = format!("/extractions/{}?limit=1", ext(5));
+    assert_eq!(rest_size(&state, &over).await, PAYLOAD_BYTES + 1);
+    let body = call(&state, "extraction_get", json!({ "extraction_id": ext(5) })).await;
+    assert_module_error(&body, "payload_too_large", false);
 }
 
 #[tokio::test]
