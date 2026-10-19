@@ -98,11 +98,15 @@ export interface ExternalDaemonState {
   pid: number
 }
 
-/** Mirrors `agent24_protocol::state_file::state_path()` (Rust):
- * `$HOME/.agent24/daemon.json`. Reads `HOME` directly (not `os.homedir()`) so
- * this stays in lockstep with where the daemon itself looks, and so tests can
- * point it at an isolated HOME without touching the real one. */
-function daemonStatePath(): string | null {
+/** Mirrors `agent24_protocol::state_file::state_path()` (Rust), i.e.
+ * `state_dir()/daemon.json`: `AGENT24_DATA_DIR` (non-empty, absolute) is the
+ * data root as-is; otherwise `$HOME/.agent24`; no `HOME` → null. Reads the
+ * env directly (not `os.homedir()`) so this stays in lockstep with where the
+ * daemon itself looks, and so tests can point it at an isolated dir without
+ * touching the real one. */
+export function daemonStatePath(): string | null {
+  const dataDir = process.env['AGENT24_DATA_DIR']
+  if (dataDir && path.isAbsolute(dataDir)) return path.join(dataDir, 'daemon.json')
   const home = process.env['HOME']
   if (!home) return null
   return path.join(home, '.agent24', 'daemon.json')
