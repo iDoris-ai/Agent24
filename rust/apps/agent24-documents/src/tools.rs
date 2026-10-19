@@ -10,7 +10,9 @@
 //! the first segment after the namespace canonicalises to `_a24`.
 //!
 //! Operations: `list`, `get`, `job_get`, `read_range`, `find`,
-//! `extraction_get`, each on the service layer of its REST route. Any other `op` is `operation_unavailable`.
+//! `extraction_get` (read only) and `extract` (submits or replays a job),
+//! each on the service layer of its REST route. Any other `op` is
+//! `operation_unavailable`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,12 +24,14 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::error::ApiError;
+use crate::extract::handler::{self, Fail, Prepared, Schema};
 use crate::extractions;
 use crate::jobs;
+use crate::oplog::{Origin, Run};
 use crate::read::find::{self, FindRequest};
 use crate::read::text::{self, TextParams};
 use crate::state::{AppState, Storage};
@@ -183,8 +187,13 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         return Envelope::error(INVALID_INPUT, false);
     }
     let ToolCall { context, arguments } = call;
+    let run = Run {
+        run_id: context.run_id.clone(),
+        tool_call_id: context.tool_call_id.clone(),
+    };
     let work = async move {
         match op {
+            "extract" => extract(state, run, arguments).await,
             "list" => list(state, arguments).await,
             "get" => get(state, arguments).await,
             "job_get" => job_get(state, arguments).await,
@@ -194,15 +203,19 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
-    // Dropping `work` at the deadline is safe: every operation only reads (a
-    // pool wait, a query, a blob; `extraction_get` one read-only
-    // transaction, rolled back when dropped). Storage they find unavailable may be
-    // reopened first, which writes (migrations, `jobs::recover`, the header's
-    // `user_version`), and `read_range` / `find` may build a text layer, but
-    // both run in their own task: a dropped call stops waiting for them
-    // without interrupting them (`AppState::storage`, `Layers::layer`). A
-    // tool that writes (slice D2's `extract`) must first be checked for what
-    // a cancel mid-way leaves behind.
+    // Dropping `work` at the deadline is safe: every operation but `extract`
+    // only reads (a pool wait, a query, a blob; `extraction_get` one
+    // read-only transaction, rolled back when dropped). Storage they find
+    // unavailable may be reopened first, which writes (migrations,
+    // `jobs::recover`, the header's `user_version`), and `read_range` /
+    // `find` may build a text layer, but both run in their own task: a
+    // dropped call stops waiting for them without interrupting them
+    // (`AppState::storage`, `Layers::layer`). `extract` writes only in
+    // `claim`'s one transaction (job, key, `oplog` row), and `claim` runs in
+    // its own task: past the deadline this call answers `internal`
+    // (retryable) while the claim still commits and starts its worker; the
+    // retry hits the same key and replays that job (`replayed: true` unless
+    // it has since failed and runs again; one more `oplog` row either way).
     match tokio::time::timeout(budget, work).await {
         Ok(outcome) => outcome.unwrap_or_else(|refused| refused),
         Err(_) => {
@@ -295,6 +308,16 @@ struct ExtractionGetArgs {
     limit: Option<i64>,
 }
 
+/// `POST /documents/{id}/extractions`'s path and body, without `rerun`: a
+/// rerun is keyed by an `Idempotency-Key` header a tool call cannot send.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractArgs {
+    document_id: String,
+    revision: i64,
+    schema: Value,
+}
+
 /// A completed envelope, or the error one that answers instead.
 type Outcome = Result<Envelope, Envelope>;
 
@@ -352,6 +375,57 @@ async fn extraction_get(state: &AppState, arguments: Map<String, Value>) -> Outc
     let storage = ready(state).await?;
     let (id, cursor) = (&args.extraction_id, args.cursor.as_deref());
     completed(extractions::get(&storage, id, cursor, limit, PAYLOAD_BYTES).await)
+}
+
+/// Submits or replays an extract job, as REST does (DOC-1-06b §2.3), from
+/// `run`; never waits for it. The hash is taken of `{revision, schema}`, the
+/// body the page sends, so a page's job and a run's share a key.
+async fn extract(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+    // The oplog's CHECK would refuse it inside the claim, read as a
+    // storage failure.
+    if run.run_id.is_empty() || run.tool_call_id.is_empty() {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
+    let args: ExtractArgs = parse(arguments)?;
+    let schema: Schema = serde_json::from_value(args.schema.clone())
+        .map_err(|_| Envelope::error(INVALID_INPUT, false))?;
+    let body = json!({ "revision": args.revision, "schema": args.schema });
+    let Prepared {
+        storage,
+        key,
+        request,
+        input,
+    } = handler::prepare(
+        state,
+        args.document_id,
+        args.revision,
+        schema.fields,
+        &body,
+        None,
+    )
+    .await
+    .map_err(|e| refused(&e))?;
+    // In a task of its own: dropped at the deadline, this call must not stop
+    // the claim halfway from the worker start that belongs with it.
+    let origin = Origin::Run(run);
+    let task = tokio::spawn(handler::claim(
+        state.clone(),
+        storage.clone(),
+        key,
+        request,
+        input,
+        origin,
+    ));
+    match task.await {
+        Ok(Ok((job, started))) => Ok(Envelope::Completed {
+            payload: json!({ "status": job.status, "job_id": job.job_id }),
+            replayed: !started,
+        }),
+        Ok(Err(Fail::Api(e))) => Err(refused(&e)),
+        Ok(Err(Fail::Db(e))) => Err(refused(&storage.db_failure(e).await)),
+        // A spawned task is only cancelled when the runtime shuts down.
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
 }
 
 /// A `limit` outside the input schema's 1 to 200 is structural, not
@@ -413,6 +487,7 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    mod extract;
     mod extraction;
     mod read;
 

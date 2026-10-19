@@ -3,7 +3,8 @@
 //! document, revision, schema hash and extractor version, or for a rerun
 //! the document and its `Idempotency-Key` — and writes the job under one write lock,
 //! starts its worker, and answers 202. A key already claimed replays its
-//! job, as an import does.
+//! job, as an import does. The `documents.extract` tool shares the checks
+//! and the claim ([`prepare`], [`claim`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use crate::extractions::is_field_key;
 use crate::id::{IdKind, is_id, new_id};
 use crate::idem::{UnsupportedNumber, request_sha256};
 use crate::jobs::{Job, load};
-use crate::oplog::Origin;
+use crate::oplog::{self, Origin};
 use crate::state::{AppState, Storage};
 use crate::uploads::idempotency_key;
 
@@ -37,11 +38,11 @@ const KINDS: [&str; 7] = [
     "boolean",
 ];
 
-/// `DocumentsExtractRequest`, as sent.
+/// `DocumentsExtractRequest`'s `schema`, as sent.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Schema {
-    fields: Vec<Field>,
+pub(crate) struct Schema {
+    pub(crate) fields: Vec<Field>,
 }
 
 #[derive(Deserialize)]
@@ -55,7 +56,9 @@ pub struct ExtractRequest {
 
 /// What a reused key is compared on (§5.4): the body as sent, less
 /// `"rerun": false`, which says what leaving it out says. Without `rerun`
-/// the hash is the one a body has always had, so stored jobs still replay.
+/// the hash is the one a body has always had, so stored jobs still replay;
+/// a key once stored from an explicit `"rerun": false` is 422 from now on
+/// (DOC-1-06b §2.3 accepts it: there are none).
 fn request_hash(body: &Value) -> Result<String, UnsupportedNumber> {
     let mut body = body.clone();
     if let Some(map) = body.as_object_mut()
@@ -101,72 +104,14 @@ pub async fn extract(
     let Json(body) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let req: ExtractRequest = serde_json::from_value(body.clone())
         .map_err(|e| ApiError::invalid_request(e.to_string()))?;
-    if !is_id(IdKind::Document, &document_id) || req.revision < 1 {
-        return Err(ApiError::invalid_request("not a document id or revision"));
-    }
-    if let Some(why) = bad_fields(&req.schema.fields) {
-        return Err(ApiError::invalid_request(why));
-    }
-    // A rerun names itself: it is keyed by its Idempotency-Key (§5.4).
-    let rerun = if req.rerun {
-        Some(idempotency_key(&headers)?)
-    } else {
-        None
-    };
-    let request = request_hash(&body).map_err(|e| ApiError::invalid_request(e.to_string()))?;
-    let schema = schema_sha256(&req.schema.fields).map_err(ApiError::invalid_request)?;
-    if state.model().is_none() {
-        return Err(ApiError::engine_unavailable(
-            "local-model",
-            "the kernel offers this module no model",
-        ));
-    }
-    // Nor without the read engine that builds the text layer (D10): checked
-    // before any key is claimed or job queued again.
-    if state.layers().engine().is_none() {
-        return Err(ApiError::engine_unavailable(
-            pdfkit::ENGINE_ID,
-            "no read engine on this platform",
-        ));
-    }
-    let storage = state
-        .storage()
-        .await
-        .map_err(ApiError::storage_unavailable)?;
-    let row: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT media_type FROM revisions WHERE document_id = ? AND revision = ?",
-    )
-    .bind(&document_id)
-    .bind(req.revision)
-    .fetch_optional(storage.db.pool())
-    .await;
-    let media = match row {
-        Ok(Some(media)) => media,
-        Ok(None) => return Err(ApiError::not_found("no such document revision")),
-        Err(e) => return Err(storage.db_failure(e).await),
-    };
-    if !pdfkit::FORMATS.contains(&media.as_str()) {
-        return Err(ApiError::unprocessable(
-            "unsupported_format",
-            "slice 1 reads PDF, JPEG and PNG",
-        ));
-    }
-    // A first extraction is keyed by what it is (§5.4). A rerun is keyed by
-    // its Idempotency-Key within the document: resending it replays it, and
-    // the same key with another body is 422 (David, 2026-10-10).
-    let key = match &rerun {
-        None => format!(
-            "{document_id}/{}/{schema}/{EXTRACTOR_VERSION}",
-            req.revision
-        ),
-        Some(rerun) => format!("{document_id}/rerun/{rerun}"),
-    };
-    let input = Input {
-        document_id,
-        revision: req.revision,
-        schema_sha256: schema,
-        fields: req.schema.fields,
-    };
+    let rerun = req.rerun.then_some(&headers);
+    let (revision, fields) = (req.revision, req.schema.fields);
+    let Prepared {
+        storage,
+        key,
+        request,
+        input,
+    } = prepare(&state, document_id, revision, fields, &body, rerun).await?;
     // In a task of its own: a client that goes away must not stop a commit
     // halfway from the worker start that belongs with it.
     let task = tokio::spawn(claim(
@@ -192,6 +137,93 @@ pub async fn extract(
     }
 }
 
+/// What a checked request claims, and the storage it claims it in.
+pub(crate) struct Prepared {
+    pub(crate) storage: Arc<Storage>,
+    pub(crate) key: String,
+    pub(crate) request: String,
+    pub(crate) input: Input,
+}
+
+/// Checks an extract request and works out its key, in REST's order, for
+/// REST and the tool alike. `body` is what the hash is taken of: REST's
+/// body as sent, the tool's `{revision, schema}`. `rerun` carries the
+/// headers of a rerun, which only REST sends.
+pub(crate) async fn prepare(
+    state: &AppState,
+    document_id: String,
+    revision: i64,
+    fields: Vec<Field>,
+    body: &Value,
+    rerun: Option<&HeaderMap>,
+) -> Result<Prepared, ApiError> {
+    if !is_id(IdKind::Document, &document_id) || revision < 1 {
+        return Err(ApiError::invalid_request("not a document id or revision"));
+    }
+    if let Some(why) = bad_fields(&fields) {
+        return Err(ApiError::invalid_request(why));
+    }
+    // A rerun names itself: it is keyed by its Idempotency-Key (§5.4).
+    let rerun = rerun.map(idempotency_key).transpose()?;
+    let request = request_hash(body).map_err(|e| ApiError::invalid_request(e.to_string()))?;
+    let schema = schema_sha256(&fields).map_err(ApiError::invalid_request)?;
+    if state.model().is_none() {
+        return Err(ApiError::engine_unavailable(
+            "local-model",
+            "the kernel offers this module no model",
+        ));
+    }
+    // Nor without the read engine that builds the text layer (D10): checked
+    // before any key is claimed or job queued again.
+    if state.layers().engine().is_none() {
+        return Err(ApiError::engine_unavailable(
+            pdfkit::ENGINE_ID,
+            "no read engine on this platform",
+        ));
+    }
+    let storage = state
+        .storage()
+        .await
+        .map_err(ApiError::storage_unavailable)?;
+    let row: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT media_type FROM revisions WHERE document_id = ? AND revision = ?",
+    )
+    .bind(&document_id)
+    .bind(revision)
+    .fetch_optional(storage.db.pool())
+    .await;
+    let media = match row {
+        Ok(Some(media)) => media,
+        Ok(None) => return Err(ApiError::not_found("no such document revision")),
+        Err(e) => return Err(storage.db_failure(e).await),
+    };
+    if !pdfkit::FORMATS.contains(&media.as_str()) {
+        return Err(ApiError::unprocessable(
+            "unsupported_format",
+            "slice 1 reads PDF, JPEG and PNG",
+        ));
+    }
+    // A first extraction is keyed by what it is (§5.4). A rerun is keyed by
+    // its Idempotency-Key within the document: resending it replays it, and
+    // the same key with another body is 422 (David, 2026-10-10).
+    let key = match &rerun {
+        None => format!("{document_id}/{revision}/{schema}/{EXTRACTOR_VERSION}"),
+        Some(rerun) => format!("{document_id}/rerun/{rerun}"),
+    };
+    let input = Input {
+        document_id,
+        revision,
+        schema_sha256: schema,
+        fields,
+    };
+    Ok(Prepared {
+        storage,
+        key,
+        request,
+        input,
+    })
+}
+
 pub(crate) enum Fail {
     Api(ApiError),
     Db(sqlx::Error),
@@ -207,6 +239,10 @@ impl From<sqlx::Error> for Fail {
 /// then starts its worker; a key already claimed replays its job instead
 /// (§7), whose origin stays the first request's: the same request returns
 /// it as it is; a failed or interrupted one is queued again, attempt + 1.
+/// A claim from a run, new or replayed, appends its `oplog` row in the same
+/// transaction, so the row and the job commit or roll back together; the
+/// page's writes none, its job records it (ADR-DOC-01 D9). A request whose
+/// hash differs is 422 before anything is written.
 /// Answers the job as this claim leaves it, and whether a worker started.
 pub(crate) async fn claim(
     state: AppState,
@@ -274,6 +310,9 @@ pub(crate) async fn claim(
             (job_id, Some(1))
         }
     };
+    if let Origin::Run(run) = &origin {
+        oplog::extract_submitted(&mut tx, run, &input.document_id, input.revision, &job_id).await?;
+    }
     // The answer is the job as this transaction leaves it.
     let job = load(&mut *tx, &job_id)
         .await?
