@@ -145,6 +145,76 @@ async fn a_new_extract_answers_its_job_logs_the_run_and_reads_back_as_rest() {
     assert_eq!(oplog(&env).await, vec![line(&id), line(&id)]);
 }
 
+/// An `extract` call from run-1 / call-1 within `budget`, its envelope as
+/// JSON.
+async fn submit_within(env: &Env, args: Value, budget: Duration) -> Value {
+    let app = axum::Router::new()
+        .route(
+            "/_a24/tools/{op}",
+            axum::routing::post(
+                move |s: State<AppState>,
+                      o: Result<UrlPath<String>, PathRejection>,
+                      b: Result<Bytes, BytesRejection>| {
+                    call_tool_within(s, o, b, budget)
+                },
+            ),
+        )
+        .with_state(env.state.clone());
+    let body = json!({ "context": context_for("extract"), "arguments": args });
+    let req = Request::post("/_a24/tools/extract")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(3), app.oneshot(req))
+        .await
+        .expect("no answer within the budget")
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Past the deadline the call answers `internal`, retryable, and the claim
+/// it was waiting on still commits and starts its worker: the retry
+/// replays that job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_past_the_deadline_still_commits_and_the_retry_replays_it() {
+    let env = env(Some(script(vec![answer("present")]))).await;
+    // The write lock, held: the claim's `BEGIN IMMEDIATE` waits for it (up
+    // to the 5 s busy timeout). `prepare` only reads, which WAL lets go on
+    // under a writer, so the call gets past it and waits in the claim.
+    let lock = env
+        .storage
+        .db
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    let late = submit_within(&env, args(), Duration::from_millis(500)).await;
+    assert_eq!(
+        late,
+        json!({ "kind": "error", "code": "internal", "retryable": true })
+    );
+    lock.rollback().await.unwrap();
+    // Only a claim already under way commits now: a call dropped in
+    // `prepare` would have left nothing behind.
+    let start = std::time::Instant::now();
+    while scalar::<i64>(&env, "SELECT count(*) FROM jobs").await == 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "never claimed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let id: String = scalar(&env, "SELECT id FROM jobs").await;
+    let key = "SELECT count(*) FROM idempotency WHERE kind = 'extract' AND target_ref = ";
+    assert_eq!(scalar::<i64>(&env, &format!("{key}'{id}'")).await, 1);
+    assert_eq!(oplog(&env).await, vec![line(&id)]);
+    assert_eq!(ended(&env, &id).await.0, "succeeded");
+
+    assert_eq!(submit(&env, args()).await, done("succeeded", &id, true));
+    assert_eq!(oplog(&env).await, vec![line(&id), line(&id)]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replay_is_marked_unless_its_job_runs_again() {
     let replies = vec![failing(), answer("present"), failing(), answer("present")];
@@ -154,8 +224,13 @@ async fn a_replay_is_marked_unless_its_job_runs_again() {
     for status in ["queued", "running", "cancelling", "cancelled"] {
         set(&env, &a, status).await;
         assert_eq!(submit(&env, args()).await, done(status, &a, true));
+        // `replayed: true` is the deterministic check: the claim reports a
+        // start exactly when it spawned a worker. The row below only backs it
+        // up, and no test hook marks a spawn, so it waits: a stray worker
+        // would claim the queued job and run it on the in-memory engine and
+        // scripted model within milliseconds, well inside 100 ms; under the
+        // other statuses its claim finds nothing queued and leaves the row.
         settle().await;
-        // No worker: one would take the next answer and move the job on.
         assert_eq!(row(&env, &a).await, (status.to_owned(), 1));
     }
     set(&env, &a, "failed").await;
