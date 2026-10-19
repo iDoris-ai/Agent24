@@ -91,8 +91,12 @@ describe('knowledge v1 fixtures — schemas and contract rules', () => {
   it.each(manifest.fixtures.map((e) => [e.file, e] as const))('%s', (file, e) => {
     const fx = load(file)
     const { status, body } = fx.response
-    if (e.request_valid === null) expect(fx.request).toBeUndefined()
-    else ok(`${SCHEMA[fx.op]}.request`, fx.request, e.request_valid)
+    // Manifest flags agree with the file (same checks as the Rust test).
+    expect(['accept', 'reject']).toContain(e.class)
+    expect(fx.request === undefined, file).toBe(e.request_valid === null)
+    if (e.request_valid === false) expect(e.class).toBe('reject')
+    expect('local' in fx, file).toBe(!e.server_handler)
+    if (e.request_valid !== null) ok(`${SCHEMA[fx.op]}.request`, fx.request, e.request_valid)
     if (e.class === 'accept') {
       expect(status).toBe(200)
       ok(responseSchema(fx.op), body)
@@ -112,6 +116,7 @@ describe('knowledge v1 fixtures — schemas and contract rules', () => {
         else expect(echo[k], k).toBe(fx.request[k])
       }
     }
+    if (e.class === 'reject' && typeof fx.request === 'object') rejectPairsWithRequest(fx.request, body.error)
     if (e.class !== 'accept' || !fx.request) return
     const asked: string[] = fx.request.scope?.knowledge_base_ids ?? []
     const inE = (kb: string) => body.effective_scope.knowledge_base_ids.includes(kb)
@@ -120,6 +125,9 @@ describe('knowledge v1 fixtures — schemas and contract rules', () => {
       // R3.6: authoritative order, rank 1..n, one score_space per response; R3.3: clamped budget.
       expect(body.hits.map((h: any) => h.rank)).toEqual(body.hits.map((_: unknown, i: number) => i + 1))
       expect(body.hits.length).toBeLessThanOrEqual(body.applied_budget.max_results)
+      for (const [k, applied] of Object.entries(body.applied_budget)) {
+        if (fx.request.budget?.[k] !== undefined) expect(applied, k).toBeLessThanOrEqual(fx.request.budget[k])
+      }
       expect(new Set(body.hits.map((h: any) => h.score_space)).size).toBeLessThanOrEqual(1)
       for (const h of body.hits) {
         expect(inE(h.knowledge_base_id)).toBe(true)
@@ -139,6 +147,12 @@ describe('knowledge v1 fixtures — schemas and contract rules', () => {
     if (fx.op === 'knowledge.read' && fx.request.chunk_id) {
       expect(body.segments.map((s: any) => s.chunk_id)).toEqual([fx.request.chunk_id])
     }
+    const want = fx.op === 'knowledge.read' ? fx.request.expected_revision : undefined
+    if (want) {
+      // R4.4: a successful read is at the expected revision.
+      expect([body.revision.source_revision, body.revision.index_build_id]).toEqual([want.source_revision, want.index_build_id])
+      if (fx.request.chunk_id) expect(body.segments[0].chunk_revision).toBe(want.chunk_revision)
+    }
     if (fx.op === 'knowledge.ready') {
       // R8.2/R8.4: per-KB entries only with scope, and only for KBs that were asked for.
       expect(body.knowledge_bases !== undefined).toBe(fx.request.scope !== undefined)
@@ -148,6 +162,36 @@ describe('knowledge v1 fixtures — schemas and contract rules', () => {
     }
   })
 })
+
+// Rules that tie an error to the request it answers (§6, R3.6, R4.4); the Rust
+// test (knowledge_schema.rs) checks the same.
+function rejectPairsWithRequest(request: any, error: any) {
+  const d = error.details
+  if (error.code === 'stale') {
+    const want = request.expected_revision
+    const sameBuild = want && d.current_revision.source_revision === want.source_revision &&
+      d.current_revision.index_build_id === want.index_build_id
+    if (!request.chunk_id) {
+      // Document level: no reason, no chunk revision, and the pair really moved.
+      expect([d.reason, d.current_chunk_revision]).toEqual([undefined, undefined])
+      if (want) expect(sameBuild).toBe(false)
+    } else if (d.reason !== undefined) {
+      expect(d.reason).toBe('anchor_missing')
+    } else {
+      // Chunk edited in the same build: the new chunk revision is reported.
+      expect(sameBuild).toBe(true)
+      expect(d.current_chunk_revision).toBeDefined()
+      expect(d.current_chunk_revision).not.toBe(want.chunk_revision)
+    }
+  }
+  if (d.reason === 'mixed_score_space') {
+    const spaces = d.groups.map((g: any) => g.score_space)
+    const kbs = d.groups.flatMap((g: any) => g.knowledge_base_ids)
+    expect(new Set(spaces).size).toBe(spaces.length)
+    expect(new Set(kbs).size).toBe(kbs.length)
+    for (const kb of kbs) expect(request.scope.knowledge_base_ids).toContain(kb)
+  }
+}
 
 // R6.1, R6.4: the errors that may echo null (unauthorized, internal, and an
 // invalid_request other than mixed_score_space, which comes after E).
@@ -231,6 +275,8 @@ describe('knowledge v1 schemas — canonical negatives', () => {
     // R6.1: null echoes only for invalid_request, unauthorized and internal.
     ok('error', mutate('read.out-of-scope.json', (e) => { e.details.request_id = null }), false)
     ok('error', mutate('read.internal.json', (e) => { e.details.request_id = null; e.details.generation = null }))
+    // An invalid_request with a reason was parsed, so it echoes (R6.4).
+    ok('error', mutate('search.mixed-score-space.json', (e) => { e.details.request_id = null; e.details.generation = null }), false)
     ok('error', mutate('read.stale-chunk-edited.json', (e) => { e.details.current_revision.index_build_id = null }), false)
     ok('error', mutate('search.empty-scope.json', (e) => { e.code = 'cancelled' }), false)
     ok('error', mutate('search.mixed-score-space.json', (e) => { delete e.details.groups }), false)
