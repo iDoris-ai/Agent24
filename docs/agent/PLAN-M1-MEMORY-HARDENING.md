@@ -1,5 +1,14 @@
 # M1 记忆发布后最小修复计划
 
+> **归档入库说明（2026-10-19，PR #1094）**：本文原为 2026-10-12 的工作草稿，此前只存在于一个已清理的工作区的未跟踪文件里，本次仅作**归档入库**保留历史。
+> **它不构成任何 exact-head 设计 APPROVE，也不授权实现。** 若要据此派活，须先按下列「截至 2026-10-19 的状态」重新核对，并另开契约/设计评审 PR。
+
+## 截至 2026-10-19 的状态（相对 main `db8be93f`）
+
+- **H01 已交付**：PR #1024 已合入 main（`dae043d`，`fix(memory): H01 —— 修复重复撤回审计标识碰撞`），`rust/crates/agent24-memory/tests/retract_cycle.rs` 也已在 main 上。**下表把 H01 列为待做的地方已过时**——不要再派一遍 H01。
+- 文中引用的 `/tmp/a24-memory-hardening/...` 报告是**本机临时文件，未入库**，他人读不到；关键结论以 `docs/agent/HANDOFF-MEMORY-HARDENING.md` 的记载为准。
+- 文中写的「每个未来 task PR base=`ab/m1-memory-hardening`」是当时的纪律；本 PR 只是文档归档，故 base 为 `main`。
+
 日期：2026-10-12。状态：bounded triage；R1 已有他方红测，尚无绿测或验收。此文是发布后 bugfix workset，不重新开启 M1/M2，也不是 Hindsight 全量增强或新全局里程碑。
 
 ## 基线、权限与证据等级

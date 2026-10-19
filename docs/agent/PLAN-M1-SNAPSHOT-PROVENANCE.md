@@ -1,5 +1,14 @@
 # P02：运行输入快照的私有来源契约
 
+> **归档入库说明（2026-10-19，PR #1094）**：本文原为 2026-10-12 的契约草稿，此前只存在于一个已清理的工作区的未跟踪文件里，本次仅作**归档入库**。
+> **本 PR 的合并不等于本契约通过 exact-head 设计评审，也不授权实现。** 派实现前必须先解决下列三处与 main 现状的冲突，并另开契约评审 PR。
+
+## 截至 2026-10-19 的状态（相对 main `db8be93f`）
+
+1. **迁移号已被占用**：§2 选定「在 `0014_decision_log.sql` 之后新增 `0015_run_input_provenance.sql`」已过时——main 上 `0015` 是 `0015_module_consents.sql`，其后还有 `0016_run_source_tags.sql`、`0017_module_consent_revocations.sql`。文档自带的保护（"0015 被占就停下重审"）仍然有效，但"选定"本身需要重新定号。
+2. **与 main 已有的 `0016_run_source_tags`（K1-6b.1）关系未定**：那张表是「给进入 run 上下文的内容附可信宿主标签」，按 `(run_id, seq)` 绑定、读取 fail-closed，与本文要的"宿主来源 / 实例绑定"属**同一类**。本文一字未提它。**这是派任何实现之前必须先回答的问题**（合并复用、还是划清边界各管一段），本 PR 不做判断。
+3. 文中引用的 `/tmp/a24-memory-hardening/...` 报告为**本机临时文件，未入库**；相关上下文见 `docs/agent/HANDOFF-MEMORY-HARDENING.md`。
+
 状态：**待外部 exact-head APPROVE；本文选定方案，但未授权实现或上线。**
 本轮核查基线：`86808d30f683262fcf7bc92d6d666fbede5850f6`，分支 `ab/m1-memory-hardening-06-provenance-contract`；原稿基线为 `ab125de262827bd0f1c6680b427d9c241ccff785`。
 本文仅处理 P02 完整 marker 用户输入被误删及其冷恢复来源边界；不扩大到 M3、全量 Hindsight、NoLoss、Workspace 权限或自动回放。
