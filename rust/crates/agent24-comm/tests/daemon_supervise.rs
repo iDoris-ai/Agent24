@@ -9,6 +9,7 @@ use std::ops::Deref;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent24_comm::binary::sha256_of;
@@ -25,13 +26,18 @@ use agent24_comm::{
 /// process with no child of its own, so a plain `kill -9 <pid>` (no process
 /// group needed) leaves nothing behind.
 const DAEMON_SCRIPT: &str = r#"#!/bin/sh
+printf '%s\n' "$$" > "$HOME/fixture-$1-started"
 case "$1" in
   identity)
+    printf '' > "$HOME/fixture-$1-emitting"
     echo '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    printf '' > "$HOME/fixture-$1-emitted"
     exit 0
     ;;
   relay)
+    printf '' > "$HOME/fixture-$1-emitting"
     echo '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    printf '' > "$HOME/fixture-$1-emitted"
     exit 0
     ;;
   daemon)
@@ -1064,12 +1070,14 @@ impl Drop for ReleaseOnDrop {
 struct BlockingPasswordStore {
     inner: MemoryPasswordStore,
     entered: Arc<tokio::sync::Notify>,
+    entered_durable: Arc<AtomicBool>,
     release: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
 impl PasswordStore for BlockingPasswordStore {
     async fn get(&self, account: &Account) -> Result<Password, agent24_comm::StoreError> {
+        self.entered_durable.store(true, Ordering::SeqCst);
         self.entered.notify_one();
         self.release.notified().await;
         self.inner.get(account).await
@@ -1088,6 +1096,46 @@ impl PasswordStore for BlockingPasswordStore {
     }
 }
 
+// Observation only: a pulse is not proof that the actor received Start.
+// Two sequential 5s preflights can exceed this bounded 6s horizon legally.
+async fn observe_failed_start(
+    sup: &FixtureSupervisor,
+    start: &mut tokio::task::JoinHandle<Result<(), DaemonStartError>>,
+    first_poll: &AtomicBool,
+    store_entered: &AtomicBool,
+) -> ([bool; 3], &'static str) {
+    let mut pulse = sup.runtime.as_ref().unwrap().spawn(async {});
+    let worker_polled = matches!(
+        tokio::time::timeout(Duration::from_millis(200), &mut pulse).await,
+        Ok(Ok(()))
+    );
+    pulse.abort();
+    let outcome = match tokio::time::timeout(Duration::from_secs(6), start).await {
+        Err(_) => "unknown_at_horizon",
+        Ok(Err(_)) => "join_error",
+        Ok(Ok(Ok(()))) => "completed",
+        Ok(Ok(Err(DaemonStartError::NotConfigured(_)))) => "not_configured",
+        Ok(Ok(Err(DaemonStartError::Locked(_)))) => "locked",
+        Ok(Ok(Err(DaemonStartError::Failed(message)))) => {
+            if message.starts_with("hyphae timed out after ") {
+                "runner_timeout"
+            } else if message.starts_with("failed to spawn hyphae: ") {
+                "spawn_error"
+            } else {
+                "failed_other"
+            }
+        }
+    };
+    (
+        [
+            first_poll.load(Ordering::SeqCst),
+            worker_polled,
+            store_entered.load(Ordering::SeqCst),
+        ],
+        outcome,
+    )
+}
+
 /// High #1: a shutdown that lands WHILE a start is still blocked inside one
 /// of `try_start`'s own precondition awaits (identity/relay/password — all
 /// before the real `spawn()`) must neither leave a process running nor ever
@@ -1098,8 +1146,11 @@ async fn shutdown_during_a_blocked_start_leaves_no_process_and_never_reports_run
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = make_ctx(tmp.path()).await;
     let pid_path = ctx.pid_path.clone();
+    let fixture_home = ctx.home.clone();
 
     let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_durable = Arc::new(AtomicBool::new(false));
+    let first_poll = Arc::new(AtomicBool::new(false));
     let release = Arc::new(tokio::sync::Notify::new());
     let inner = MemoryPasswordStore::new();
     inner
@@ -1112,18 +1163,53 @@ async fn shutdown_during_a_blocked_start_leaves_no_process_and_never_reports_run
     ctx.password_store = Arc::new(BlockingPasswordStore {
         inner,
         entered: Arc::clone(&entered),
+        entered_durable: Arc::clone(&entered_durable),
         release: Arc::clone(&release),
     });
     let sup = FixtureSupervisor::spawn(ctx);
     let _release_on_drop = ReleaseOnDrop(Arc::clone(&release));
 
     let sup_for_start = sup.clone();
-    let start = tokio::spawn(async move { sup_for_start.start().await });
+    let polled = Arc::clone(&first_poll);
+    let mut start = tokio::spawn(async move {
+        polled.store(true, Ordering::SeqCst);
+        sup_for_start.start().await
+    });
     // Wait until the start is genuinely blocked inside `try_start`'s own
     // `password_store.get`, not merely "a `Start` command was sent".
-    tokio::time::timeout(Duration::from_secs(2), entered.notified())
-        .await
-        .expect("the blocked start never reached the password store");
+    let stages = || {
+        [
+            "identity-started",
+            "identity-emitting",
+            "identity-emitted",
+            "relay-started",
+            "relay-emitting",
+            "relay-emitted",
+            "daemon-started",
+        ]
+        .map(|name| fixture_home.join(format!("fixture-{name}")).is_file())
+    };
+    tokio::select! {
+        reached = tokio::time::timeout(Duration::from_secs(2), entered.notified()) => {
+            if reached.is_err() {
+                let original_stages = stages();
+                let observation = observe_failed_start(&sup, &mut start, &first_poll, &entered_durable).await;
+                // A late store entry intentionally leaves Start pending until release.
+                // Diagnostics must never turn the already-failed 2s assertion green.
+                panic!("password-store barrier timed out; original stages: {original_stages:?}; late stages: {:?}; first-poll/worker-pulse/late-store and outcome: {observation:?}", stages());
+            }
+        }
+        result = &mut start => {
+            let outcome_flags = [
+                result.is_err(),
+                matches!(&result, Ok(Ok(_))),
+                matches!(&result, Ok(Err(DaemonStartError::NotConfigured(_)))),
+                matches!(&result, Ok(Err(DaemonStartError::Locked(_)))),
+                matches!(&result, Ok(Err(DaemonStartError::Failed(_)))),
+            ];
+            panic!("start finished before password-store barrier; join/ok/config/locked/failed: {outcome_flags:?}; fixture stages: {:?}", stages());
+        }
+    }
 
     // Shutdown lands WHILE the start is still blocked — exactly the window
     // the three call sites' own pre-checks (all evaluated before
@@ -1196,4 +1282,42 @@ async fn fixture_guard_reaps_the_leader_and_helper_after_a_test_panics() {
         "fixture teardown leaked its TERM-ignoring helper"
     );
     assert!(pid_removed, "fixture teardown left its pid file behind");
+}
+
+// A throwaway discriminator control, explicitly selected outside the default gate.
+#[tokio::test]
+#[ignore = "diagnostic negative control, not product acceptance"]
+async fn start_failure_observation_classifies_pre_marker_runner_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = DAEMON_SCRIPT.replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nif [ \"$1\" = identity ]; then sleep 10; fi\n",
+        1,
+    );
+    let mut ctx = make_ctx_with_script(tmp.path(), &script).await;
+    let home = ctx.home.clone();
+    let pid_path = ctx.pid_path.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(AtomicBool::new(false));
+    ctx.password_store = Arc::new(BlockingPasswordStore {
+        inner: MemoryPasswordStore::new(),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        entered_durable: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let sup = FixtureSupervisor::spawn(ctx);
+    let _release_on_drop = ReleaseOnDrop(release);
+    let first_poll = Arc::new(AtomicBool::new(false));
+    let polled = Arc::clone(&first_poll);
+    let start_sup = sup.clone();
+    let mut start = tokio::spawn(async move {
+        polled.store(true, Ordering::SeqCst);
+        start_sup.start().await
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let observation = observe_failed_start(&sup, &mut start, &first_poll, &entered).await;
+    assert_eq!(observation, ([true, true, false], "runner_timeout"));
+    assert!(!home.join("fixture-identity-started").exists());
+    assert!(!pid_path.exists());
+    eprintln!("negative control: first-poll/worker-pulse/store and outcome: {observation:?}");
 }
