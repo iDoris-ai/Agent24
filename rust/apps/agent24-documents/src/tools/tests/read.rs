@@ -412,6 +412,22 @@ async fn a_block_that_escaping_blows_over_the_budget_is_payload_too_large() {
     );
 }
 
+/// A match too wide for the budget on the first page searched is refused:
+/// put back for the next response, it would come back empty with the
+/// cursor where it was, every time (`first.page > start.page`, find.rs).
+#[tokio::test]
+async fn a_match_too_wide_on_the_first_page_is_payload_too_large() {
+    let wide = format!("a{}b", "\u{b}".repeat(16000));
+    let (_dir, state) = env(fixed(vec![vec![wide], vec!["a b".into()]], vec![], 1)).await;
+    let (status, want) = rest_find(&state, json!({ "revision": 1, "query": "a b" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(want["matches"].as_array().unwrap().len(), 2);
+    // One call, no cursor followed: a regression answers, it does not hang.
+    let args = json!({ "document_id": DOC, "revision": 1, "query": "a b" });
+    let body = call(&state, "find", args).await;
+    assert_module_error(&body, "payload_too_large", false);
+}
+
 #[tokio::test]
 async fn regions_over_half_the_budget_shorten_the_window_not_refuse_it() {
     // 100 pages, each with a block and a 16-rect unread region: about 120

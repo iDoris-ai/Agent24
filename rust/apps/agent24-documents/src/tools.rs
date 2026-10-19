@@ -9,8 +9,8 @@
 //! through the kernel proxy cannot reach it, as the proxy answers 404 when
 //! the first segment after the namespace canonicalises to `_a24`.
 //!
-//! Operations: `list`, `get`, `job_get`, `read_range`, `find`, each on the
-//! service layer of its REST route. Any other `op` is `operation_unavailable`.
+//! Operations: `list`, `get`, `job_get`, `read_range`, `find`,
+//! `extraction_get`, each on the service layer of its REST route. Any other `op` is `operation_unavailable`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,7 @@ use serde_json::{Map, Value};
 
 use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::error::ApiError;
+use crate::extractions;
 use crate::jobs;
 use crate::read::find::{self, FindRequest};
 use crate::read::text::{self, TextParams};
@@ -189,11 +190,13 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "job_get" => job_get(state, arguments).await,
             "read_range" => read_range(state, arguments).await,
             "find" => find(state, arguments).await,
+            "extraction_get" => extraction_get(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
     // Dropping `work` at the deadline is safe: every operation only reads (a
-    // pool wait, a query, a blob). Storage they find unavailable may be
+    // pool wait, a query, a blob; `extraction_get` one read-only
+    // transaction, rolled back when dropped). Storage they find unavailable may be
     // reopened first, which writes (migrations, `jobs::recover`, the header's
     // `user_version`), and `read_range` / `find` may build a text layer, but
     // both run in their own task: a dropped call stops waiting for them
@@ -281,6 +284,17 @@ struct FindArgs {
     require_complete: Option<bool>,
 }
 
+/// `GET /extractions/{id}`'s path and query, typed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractionGetArgs {
+    extraction_id: String,
+    #[serde(default, deserialize_with = "present")]
+    cursor: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    limit: Option<i64>,
+}
+
 /// A completed envelope, or the error one that answers instead.
 type Outcome = Result<Envelope, Envelope>;
 
@@ -328,6 +342,16 @@ async fn find(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     };
     let storage = ready(state).await?;
     completed(find::search(state, &storage, &args.document_id, req, PAYLOAD_BYTES).await)
+}
+
+async fn extraction_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let args: ExtractionGetArgs = parse(arguments)?;
+    let limit = bounded(args.limit)?
+        .and_then(|l| usize::try_from(l).ok())
+        .unwrap_or(extractions::DEFAULT_LIMIT);
+    let storage = ready(state).await?;
+    let (id, cursor) = (&args.extraction_id, args.cursor.as_deref());
+    completed(extractions::get(&storage, id, cursor, limit, PAYLOAD_BYTES).await)
 }
 
 /// A `limit` outside the input schema's 1 to 200 is structural, not
@@ -389,6 +413,7 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    mod extraction;
     mod read;
 
     fn context() -> Value {
@@ -850,6 +875,10 @@ mod tests {
                 (
                     "find",
                     json!({ "document_id": DOC, "revision": 1, "query": "a" }),
+                ),
+                (
+                    "extraction_get",
+                    json!({ "extraction_id": "ext_01K75A0B1C2D3E4F5G6H7J8K9M" }),
                 ),
             ] {
                 let body = call(&state, op, args).await;
