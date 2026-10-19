@@ -14,13 +14,19 @@
 //!   `kind()` via [`crate::types::Answer::normalized_for`] right after
 //!   `evaluate()` returns — the service does not trust a backend's
 //!   self-reported `BackendKind` on each `Answer` (see that function's docs
-//!   for why `Answer::new`'s own check is not sufficient on its own).
+//!   for why `Answer::new`'s own check is not sufficient on its own);
+//! - L2 (`docs/agent/PLAN-DECIDE-D1-2B-L2-VALIDATION.md`): the request is
+//!   validated before any backend's `kind()`/`evaluate()` runs (`Err` on
+//!   failure); a `Decided` or non-empty floor answer set that fails
+//!   validation is discarded whole and ends the cascade with
+//!   `Outcome::InvalidResponse`, keeping the last valid non-empty floor.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::backend::{BackendOutcome, DecisionBackend};
-use crate::types::{Answer, BackendKind, Decision, DecisionRequest, Outcome};
+use crate::types::{Answer, BackendKind, Decision, DecisionRequest, InvalidRequest, Outcome};
+use crate::validate::{validate_answers, validate_request};
 
 /// Runs a [`DecisionRequest`] through an ordered stack of backends.
 pub struct DecisionService {
@@ -32,35 +38,64 @@ impl DecisionService {
         Self { backends }
     }
 
-    pub async fn decide(&self, request: &DecisionRequest) -> Decision {
+    /// Validates `request` (L2) before any backend's `kind()`/`evaluate()`
+    /// is called — an invalid request is `Err` and no backend runs. Every
+    /// answer set a layer returns is validated as a whole before it is
+    /// trusted; a malformed one ends the cascade with
+    /// `Outcome::InvalidResponse` (see module docs).
+    pub async fn decide(&self, request: &DecisionRequest) -> Result<Decision, InvalidRequest> {
+        validate_request(request).map_err(|code| InvalidRequest {
+            code: code.to_owned(),
+        })?;
         let start = Instant::now();
         // The most recent non-empty floor a layer actually left behind,
-        // carried forward so an `Unavailable`/exhausted-cascade ending can
-        // report it instead of reporting nothing — see module docs.
+        // carried forward so an `Unavailable`/`InvalidResponse`/exhausted-
+        // cascade ending can report it instead of reporting nothing — see
+        // module docs.
         let mut floor_answers: Vec<Answer> = Vec::new();
         let mut floor_backend: Option<BackendKind> = None;
 
         for (index, backend) in self.backends.iter().enumerate() {
             let kind = backend.kind();
+            let invalid =
+                |code: &str, floor_answers: Vec<Answer>, floor_backend: Option<BackendKind>| {
+                    Decision {
+                        answers: floor_answers,
+                        backend: floor_backend.unwrap_or(kind),
+                        model: None,
+                        latency_ms: elapsed_ms(start),
+                        outcome: Outcome::InvalidResponse {
+                            code: code.to_owned(),
+                            failed_stage_index: index,
+                            failed_backend_kind: kind,
+                        },
+                    }
+                };
             match backend.evaluate(request).await {
                 BackendOutcome::Decided(answers) => {
+                    if let Err(code) = validate_answers(request, &answers, true) {
+                        return Ok(invalid(code, floor_answers, floor_backend));
+                    }
                     let answers = normalize(answers, kind);
-                    return Decision {
+                    return Ok(Decision {
                         answers,
                         backend: kind,
                         model: None,
                         latency_ms: elapsed_ms(start),
                         outcome: Outcome::Decided,
-                    };
+                    });
                 }
                 BackendOutcome::NoConclusion { floor } => {
                     if !floor.is_empty() {
+                        if let Err(code) = validate_answers(request, &floor, false) {
+                            return Ok(invalid(code, floor_answers, floor_backend));
+                        }
                         floor_answers = normalize(floor, kind);
                         floor_backend = Some(kind);
                     }
                 }
                 BackendOutcome::Unavailable { reason } => {
-                    return Decision {
+                    return Ok(Decision {
                         answers: floor_answers,
                         backend: floor_backend.unwrap_or(kind),
                         model: None,
@@ -70,12 +105,12 @@ impl DecisionService {
                             failed_stage_index: index,
                             failed_backend_kind: kind,
                         },
-                    };
+                    });
                 }
             }
         }
 
-        Decision {
+        Ok(Decision {
             answers: floor_answers,
             backend: floor_backend.unwrap_or(BackendKind::Rule),
             model: None,
@@ -83,7 +118,7 @@ impl DecisionService {
             outcome: Outcome::Abstain {
                 reason: "no backend reached a conclusion".to_owned(),
             },
-        }
+        })
     }
 }
 
@@ -167,7 +202,7 @@ mod tests {
         };
 
         let service = DecisionService::new(vec![Arc::new(rule), Arc::new(next)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(decision.outcome, Outcome::Decided);
         assert_eq!(decision.backend, BackendKind::Rule);
@@ -196,7 +231,7 @@ mod tests {
         };
 
         let service = DecisionService::new(vec![Arc::new(rule), Arc::new(next)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(decision.outcome, Outcome::Decided);
         assert_eq!(decision.backend, BackendKind::Encoder);
@@ -234,7 +269,7 @@ mod tests {
             Arc::new(unavailable),
             Arc::new(never_reached),
         ]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(
             decision.outcome,
@@ -292,7 +327,7 @@ mod tests {
         };
 
         let service = DecisionService::new(vec![Arc::new(floor), Arc::new(unavailable)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(
             decision.backend,
@@ -331,7 +366,7 @@ mod tests {
         };
 
         let service = DecisionService::new(vec![Arc::new(rule), Arc::new(unavailable)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert!(decision.answers.is_empty());
         assert_eq!(
@@ -371,7 +406,7 @@ mod tests {
         }
 
         let service = DecisionService::new(vec![Arc::new(SelfMislabelingBackend)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(
             decision.backend,
@@ -389,7 +424,7 @@ mod tests {
     async fn no_backend_reaching_a_conclusion_abstains_rather_than_guessing() {
         let rule = RuleBackend::new(|_req| None);
         let service = DecisionService::new(vec![Arc::new(rule)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert!(matches!(decision.outcome, Outcome::Abstain { .. }));
         assert!(decision.answers.is_empty());
@@ -412,7 +447,7 @@ mod tests {
             outcome: BackendOutcome::Decided(vec![]),
         };
         let service = DecisionService::new(vec![Arc::new(first), Arc::new(second)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert!(
             decision.answers.is_empty(),
@@ -468,7 +503,7 @@ mod tests {
             Arc::new(unavail_backend),
             Arc::new(later_backend),
         ]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(
             decision.backend,
@@ -525,7 +560,7 @@ mod tests {
             Arc::new(empty_backend),
             Arc::new(unavail_backend),
         ]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(
             decision.backend,
@@ -581,7 +616,7 @@ mod tests {
 
         let service =
             DecisionService::new(vec![Arc::new(floor1), Arc::new(floor2), Arc::new(unavail)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(
             decision.backend,
@@ -614,7 +649,7 @@ mod tests {
         };
 
         let service = DecisionService::new(vec![Arc::new(first_encoder), Arc::new(second_encoder)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         let outcome_val = serde_json::to_value(&decision.outcome).expect("serialize outcome");
         assert_eq!(outcome_val["kind"], "unavailable");
@@ -650,7 +685,7 @@ mod tests {
 
         let service =
             DecisionService::new(vec![Arc::new(before), Arc::new(failed), Arc::new(after)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
 
         assert_eq!(
             calls_before.load(Ordering::SeqCst),
@@ -701,7 +736,7 @@ mod tests {
             },
         };
         let service = DecisionService::new(vec![Arc::new(unavailable)]);
-        let decision = service.decide(&request()).await;
+        let decision = service.decide(&request()).await.expect("valid request");
         let unavail_val = serde_json::to_value(&decision.outcome).expect("serialize unavailable");
         assert_eq!(
             unavail_val,
