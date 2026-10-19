@@ -1,0 +1,9 @@
+{ "$comment": "R4.4, R5.1: the source was re-uploaded and the new build is not ready; chunk_id does not survive a build change.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3R3D4E5F6G7H8J9K0M1N2P", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "chunk_id": "chk-70",
+    "expected_revision": { "source_revision": "src-8", "index_build_id": "ib-20", "chunk_revision": 2 } },
+  "response": { "status": 409, "body": { "error": { "code": "stale", "message": "The requested revision is no longer available.",
+    "hint": "Search again to obtain the current revision.",
+    "details": { "retryable": false, "reason": "anchor_missing", "request_id": "01JB3R3D4E5F6G7H8J9K0M1N2P", "generation": 15,
+      "current_revision": { "source_revision": "src-9", "index_build_id": null } } } } } }

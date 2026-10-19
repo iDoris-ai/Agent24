@@ -1,0 +1,7 @@
+{ "$comment": "§9, R9.1-R9.4: data layer of /system/capabilities in integration mode. Limit values are illustrative.",
+  "op": "system.capabilities",
+  "response": { "status": 200, "body": { "edition": "lite", "capabilities": { "integrations.api": { "supported": true } },
+    "integration": { "agent24_knowledge": {
+      "protocol_versions": [1], "mode": "integration", "supported_operations": ["search", "read"], "server_version": "0.8.2-a24.1",
+      "limits": { "max_results": 50, "max_concurrency": 4, "max_deadline_ms": 30000,
+        "max_read_bytes": 262144, "max_page_limit": 100, "max_snippet_bytes": 2048 } } } } } }
