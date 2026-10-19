@@ -12,10 +12,12 @@
 
 mod common;
 mod error;
+mod read;
 mod search;
 
 pub use common::*;
 pub use error::*;
+pub use read::*;
 pub use search::*;
 
 use serde::{Deserialize, Deserializer};
