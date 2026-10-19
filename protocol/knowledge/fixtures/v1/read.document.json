@@ -1,0 +1,13 @@
+{ "$comment": "R4.3, R4.5: document-level page; only the document pair is compared; more pages follow.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3R2C3D4E5F6G7H8J9K0M1N", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c", "kb-d"] }, "knowledge_id": "doc-7",
+    "expected_revision": { "source_revision": "src-8", "index_build_id": "ib-20" },
+    "page": { "cursor": null, "limit": 2 }, "max_bytes": 65536 },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3R2C3D4E5F6G7H8J9K0M1N", "generation": 15,
+    "effective_scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7",
+    "revision": { "source_revision": "src-8", "index_build_id": "ib-20" },
+    "display": { "title": "<redacted>", "file_name": "<redacted>" },
+    "segments": [ { "chunk_id": "chk-70", "chunk_type": "text", "chunk_revision": 2, "text": "<redacted>" },
+      { "chunk_id": "chk-71", "chunk_type": "text", "chunk_revision": 0, "text": "<redacted>" } ],
+    "truncated": false, "next_cursor": "cur-doc-7-2" } } }
