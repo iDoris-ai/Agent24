@@ -97,6 +97,16 @@ MUST 只提供 `approve` / 定向的 `approve_for_target`（当且仅当资格�
 
 **本条 2026-10-08 的修订溯源**（`docs/laws/APPROVAL.md` blob `16db4489` → `244429b0`；jason 于该日授权，依据见 [`ADR-K1-03`](../adr/ADR-K1-03-enable-authorization-trust-revocation.md) 的「K1-6a.5 补遗」）**原先随实现提交 `62218c31` 合入，未走独立法律 PR**，与 [`README.md`](README.md)「改变可观察行为的 PR…**不得**在同一个 PR 里既改法律又改行为」相冲突。2026-10-16 按该条要求补做了**独立的追溯性法律评审**（PR #1031），仅复核上述这段边界变更本身，**未改动本条的 MUST 表述**；本段是该评审留下的记录。
 
+**该评审的两条意见的处置**（2026-10-19）：
+
+- **L1（MUST 表述需收窄到第一方 Documenting）** —— 已由 PR #1034 在 main 上处置：
+  本条 MUST 现为「**第一方 Documenting 模块**的可逆草稿写入」，不再泛指「第一方工具」。
+- **L2（草稿例外只信请求自报，未核验同意记录里的属性）** —— 由 PR #1108 处置：
+  新增迁移 `0018_module_consent_reversible_draft.sql` 让同意记录本身携带该位（存量行回填为
+  「非草稿同意」），`ConsentGate` 的豁免判定要求「请求声明 ∧ 同意记录属性 ∧ 第一方
+  ∧ 模块为 `documents` ∧ 宿主核验合格」同时成立，并补了两条回归测试
+  （非草稿同意、以及第一方但非 Documenting 模块，均仍逐次人审）。
+
 ---
 
 ### L-APPR-6 · 常驻授权挂在 schedule 上，不是会话上
