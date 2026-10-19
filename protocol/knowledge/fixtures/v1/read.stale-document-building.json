@@ -1,0 +1,8 @@
+{ "$comment": "R4.4, §11.5: as read.stale-document.json, but the new source revision has no active build yet.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3R7H8J9K0M1N2P3Q4R5S6T", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7",
+    "expected_revision": { "source_revision": "src-8", "index_build_id": "ib-20" } },
+  "response": { "status": 409, "body": { "error": { "code": "stale", "message": "The requested revision is no longer available.",
+    "details": { "retryable": false, "request_id": "01JB3R7H8J9K0M1N2P3Q4R5S6T", "generation": 15,
+      "current_revision": { "source_revision": "src-9", "index_build_id": null } } } } } }

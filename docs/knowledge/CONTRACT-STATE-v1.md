@@ -1,9 +1,9 @@
 # Knowledge profile / Off / 撤权状态机契约 v1（CONTRACT-STATE-v1）
 
 > **状态**：**草案（Draft）**，待 fork 侧维护者（David）评审（文档 PR，base `ab/weknora`）。评审通过前不授权任何实现。
-> **版本**：契约 v1，文档修订 r14 · **日期**：2026-10-17 · **作者**：David Xu
+> **版本**：契约 v1，文档修订 r16 · **日期**：2026-10-17 · **作者**：David Xu
 > **Issue**：#1013 ①（KB-CT-03），阶段 #1000；消费方 KB-C1-04、KB-LITE-04、KB-HOST-01。
-> **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）与 `docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r7）。来源标签沿用 READONLY：决策 `[D1]`–`[D8]`、任务条目（如 `[KB-C1-04]`）、READONLY 规则（如 `[R7.4]`）。
+> **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）与 `docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8）。来源标签沿用 READONLY：决策 `[D1]`–`[D8]`、任务条目（如 `[KB-C1-04]`）、READONLY 规则（如 `[R7.4]`）。
 > `[新设]` 表示本文新设计、在决策、方案与 READONLY 里都找不到依据的规则；与其他标签并列时，表示在该依据之上新增的部分。所有 `[新设]` 都待本 PR 评审（§10 #15）。
 > **分片**：本文分三片提交。第一片：§0–§3（状态、profile、binding 身份、事件与转移）、§9 现状证据、§10 待决；第二片：§4–§8（generation 作废流程、事件处理、本地结果、M1 独立、测试清单）；第三片：附录 A（非规范性参考设计）。第一片里指向 §4–§8 与附录 A 的引用在后两片落地。**三片作为一组合入，不单独关闭任务①。** 附录 A 不是规范，实现可以替换；规范只有正文。
 > **现状证据**：Agent24 的 `file:line` 都按 `ab/weknora` 的 `eb1a58b`，路径相对仓库根目录，汇总在 §9。
@@ -49,9 +49,9 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 
 | 状态 | 定义 | 进入（§3） | 离开（§3） | 新调用 |
 |---|---|---|---|---|
-| `registered` | profile 已登记，binding 未激活：profile 未被选用、principal 未绑定（未登录、已注销）、带待确认标志（S1.13），或只有未绑定占位 | T01、T13、T16、T19、T20、T22（占位）、T23、T24、T26、T43、T44（新 binding 待确认时） | T02、T12、T15、T36、T40、T41、T44、终结（T23–T25） | 本地拒绝 `profile_inactive`（占位记有失败 `reason` 时用它，§6） |
+| `registered` | profile 已登记，binding 未激活：profile 未被选用、principal 未绑定（未登录、已注销）、带待确认标志（S1.13），或只有未绑定占位 | T01、T13、T16、T19、T20、T22（占位）、T23、T24、T26、T36（profile 未选用时）、T43、T44（新 binding 待确认时） | T02、T12、T15、T36、T40、T41、T44、终结（T23–T25） | 本地拒绝 `profile_inactive`（占位记有失败 `reason` 时用它，§6） |
 | `loading` | 已激活，正在建立：local-managed 完成握手并取得实例标识（KB-LITE-01a）；remote 取得凭据（#1013②）；能力发现与兼容判定（R9.4）；不带 scope 的就绪探测（R8.2） | T02、T10、T13、T16、T18、T21、T34、T35b、T36、T38、T40、T41、T42、T44；启动时已激活（T26；带不自动重试 `reason` 的除外） | T03、T04、T05、T11、T14、T19–T25、T33、T35a、T35b、T42 | 本地拒绝 `not_ready` |
-| `ready` | 兼容；凭据有效；`operations.search` 与 `operations.read` 都是 `ready`；进入时清除 `revoked_since_ready`（S1.11） | T03、T07 | T06、T08、T11、T14、T18–T20、T23–T25、T33、T42 | 准入 |
+| `ready` | 兼容；凭据有效；`live: true`；`operations.search` 与 `operations.read` 都是 `ready`；进入时清除 `revoked_since_ready`（S1.11） | T03、T07 | T06、T08、T11、T14、T18–T20、T23–T25、T33、T42 | 准入 |
 | `degraded` | 兼容；凭据有效；`live: true`；search 与 read 恰好一个是 `ready` | T04、T06 | T07、T09、T11、T14、T18–T20、T23–T25、T33、T42 | 只准入为 `ready` 的操作，另一个本地拒绝 `not_ready` |
 | `unavailable` | 已激活但不能服务，带 `reason`（S1.4） | T05、T08、T09、T18、T35b 与 T42（窗口内第 3 次）、T22、T33、T35a；启动时保持不自动重试的 `reason`（T26）；`persist_pending` 时进入连接阶段（S1.7） | T10、T11、T14、T19、T20、T23–T25、T34、T35b、T38、T42（只从 `dependency`、`not_ready`） | 本地拒绝，按 §6 |
 | `disabled` | Off 标志为真（S5.1），或该 profile 的停用标志为真（S5.4），或重启时进入全局收紧、持久状态损坏（S1.8、S1.14） | T01、T11、T12、T14、T15、T17、T23、T24、T37、T43、T44；启动时标志已持久（T26） | 两个标志都清除：T13、T16；T44；终结（T23–T25） | Off：`knowledge_off`；仅 profile 停用：`profile_inactive` |
@@ -60,15 +60,15 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 - **S1.3** [R8.2/R8.4+新设] 连接阶段只看就绪响应的 `live` 与 `operations.search`、`operations.read`：`live: false`，或 search 与 read 都不是 `ready`，为 `unavailable`（S1.4）。`operations.ingest`（只读 v1 为 `disabled`）不参与判定。按 KB 的就绪（R8.4）不改变服务状态，由 Tool 结果按 KB 报告。未知的就绪 `state` 按 `not_ready`（R6.2）。
 - **S1.4** [R9.4+新设] `unavailable` 的 `reason`：
   - 按退避自动重试：`dependency`（不可达、探测超时、`live: false`、sidecar 不可用，或取凭据、续签时签发方不可达）；`not_ready`（存活，但 search 与 read 都不是 `ready`）。
-  - 不自动重试，只在手动重试、重新登录（T38）、profile 配置变更或 sidecar 重新握手后再试：`incompatible`（R9.4 不兼容）；`credential_rejected`（T05：属于 S3.1 例外的签发被拒，或本轮新签发的凭据被以撤权信号拒绝且属于该例外；凭据无效类响应的续签也失败，S3.1、T42，此时占位）；`access_revoked`（`loading` 或 `unavailable` 中出现撤权信号，包括不属于 S3.1 例外的重签被拒，T35a；或撤权类事件在窗口内达到上限，T18、T35b）；`instance_unidentified`（握手拿不到实例标识，S2.4）。
+  - 不自动重试，只在手动重试、profile 配置变更或 sidecar 重新握手后再试（T10），其中 `credential_rejected`、`access_revoked` 另可在重新登录后再试（T38）：`incompatible`（R9.4 不兼容）；`credential_rejected`（T05：属于 S3.1 例外的签发被拒，或本轮新签发的凭据被以撤权信号拒绝且属于该例外；凭据无效类响应的续签也失败，S3.1、T42，此时占位）；`access_revoked`（`loading` 或 `unavailable` 中出现撤权信号，包括不属于 S3.1 例外的重签被拒，T35a；或撤权类事件在窗口内达到上限，T18、T35b）；`instance_unidentified`（握手拿不到实例标识，S2.4）。
   - `local_storage`：由 T33 进入，或由 S1.7 规定的、要进入 `loading` 时遇到 `persist_pending` 的转移进入；`persist_pending` 清除后回到 `loading`（T34）。其他 `reason` 的 `unavailable` 在 `persist_pending` 期间保持原 `reason`，清除后也不变。
 - **S1.5** [D4+新设] 只有可服务状态发出 search 与 read。`loading`、`unavailable` 只发能力发现与就绪探测，例外：`unavailable` 的 `reason` 为 `local_storage`，或 `persist_pending` 为真时，不发任何请求；`incompatible`、`credential_rejected`、`access_revoked`、`instance_unidentified` 不自动重试。`registered`、`disabled`、`retired` 与未绑定占位不发任何 READONLY 请求，包括就绪探测。Provider 在 **dispatch 时每次**检查状态并按 §6 本地拒绝；这条是硬性要求，与 Tool 是否注册、是否向模型广告无关。**广告**（§10 #14、#18 已定）：Off 时 Knowledge Tool 仍在广告里，不隐藏；描述标明"当前不可用"及原因（Knowledge 已关闭），按当前状态每轮生成（`info()` 每轮读取，§9 第 3 条），不改注册表、不改内核接口；不主动提示用户打开。其他不可服务情形的描述由 KB-C1-05 定。
-- **S1.6** [新设] **终态 `retired`**：binding 的生命周期终点。进入：换实例后的旧 binding（T21）、principal 变化后的旧 binding（T23）、改端点或租户后的旧 binding（T24）、移除 profile（T25）、持久状态损坏，或重启时的全局收紧（S1.14，界面上以待确认呈现）。`retired` 的 binding 不可再激活，只能新建 binding；不准入任何请求；绑定它的 run 一律本地拒绝 `profile_inactive`（S4.7）。它的最终 generation 继续保存，供同一 profile 下新 binding 取初值（S4.4）。
-- **S1.7** [新设] **阻断条件 `persist_pending`**：该 binding 有尚未确认持久化的 generation 变化或放开类变化（S1.10）时为真（持久化失败、超时、结果未知，或在重试）；收紧类变化的持久化失败不置它，只影响单个 run 的持久化（run 绑定与补记，S4.7）失败也不置它。它不参与 S1.2 的派生，对外仍可显示 `disabled` 或 `registered`；但只要它为真，该 binding 不准入任何请求，本地结果与准入都以它为准（§6 `local_storage`）。所有进入 `loading` 的转移都先检查它：为真时改为进入 `unavailable`（`local_storage`）。Provider 在后台重试，确认后清除（T34）。
+- **S1.6** [新设] **终态 `retired`**：binding 的生命周期终点。进入：换实例后的旧 binding（T21）、principal 变化后的旧 binding（T23）、改端点或租户后的旧 binding（T24）、移除 profile（T25）、持久状态损坏，或重启时的全局收紧（S1.14，界面上以待确认呈现）。`retired` 的 binding 不可再激活，只能新建 binding；不准入任何请求；绑定它的 run 一律本地拒绝，`reason` 按 §6 的顺序（S4.7）。它的最终 generation 继续保存，供同一 profile 下新 binding 取初值（S4.4）。
+- **S1.7** [新设] **阻断条件 `persist_pending`**：该 binding 有尚未确认持久化的 generation 变化或放开类变化（S1.10）时为真（持久化失败、超时、结果未知，或在重试）；收紧类变化的持久化失败不置它，只影响单个 run 的持久化（run 绑定与补记，S4.7）失败也不置它。它不参与 S1.2 的派生，对外仍可显示 `disabled` 或 `registered`；但只要它为真，该 binding 不准入任何请求，不论派生状态是什么；本地结果按 §6 的顺序（Off 时 `knowledge_off`，否则 `local_storage`）。所有进入 `loading` 的转移都先检查它：为真时改为进入 `unavailable`（`local_storage`）。Provider 在后台重试，确认后清除（T34）。
 - **S1.8** [新设] **持久状态损坏时 fail closed**：持久状态无法读取、损坏或不完整到无法判定时，按 S1.14 的"持久状态损坏"处理，不再区分单个 binding 的损坏。该 profile 上次已确认的 principal 无法确定时按"不同"处理（T43）。M1 不同：写入门遇到损坏内容按开，召回路径报错、不召回（§9 第 1 条）。
 - **S1.9** [新设] **loading 轮次**：每次进入 `loading` 生成一个新的尝试令牌；本轮发出的凭据请求、握手与探测都带它。由这些结果派生的转移（T03–T05、T21、T22）只在令牌等于当前轮时应用；离开 `loading` 时，本轮在途的探测立即标记作废并中止。上一轮的结果因此不能推动新的一轮。占位上的登录与握手（S2.5、T40、T41）同样带尝试令牌，只有当前令牌的结果才能建立 binding。同一轮内的就绪探测带递增序号，只应用序号大于已应用者的结果。
 - **S1.10** [新设] **崩溃安全不变式**（规范；David 第 9 轮后定：正文只冻结对外行为与本条不变式，实现方式不冻结，非规范性参考设计见附录 A，以 §8 的故障注入用例 FI 验收）。变化分两类。**收紧类**：Off、停用 profile、取消选用、注销（解除登录、销毁短期凭据，长期登录态按 #1013② 清除）、移除 profile、`retired`（含换实例、principal 变化、改端点或租户中旧 binding 的退役）、撤权类事件与其他 S5.6 触发事件的占位规则与证据纪元、宿主删除 KB 的墓碑与占位（S5.10）、待复验登记（S3.1）、标记待确认（S1.13、S1.14）、进入不自动重试的 `unavailable` reason（`incompatible`、`credential_rejected`、`access_revoked`、`instance_unidentified`）、占位上记下的不自动重试的失败 `reason`（`credential_rejected`、`instance_unidentified`）、复验的超时计数。`dependency` 与撤权窗口、凭据无效窗口的计数尽力持久化：持久化失败不算收紧丢失，不触发全局收紧。**放开类**：On、启用 profile、选用 profile、用户确认（S1.13）、新建或重新绑定 binding（含 generation 初值与待确认标志）、首次可服务（S1.12）、解除待复验（S3.1）、撤回删除墓碑（S5.10）、run 的绑定与补记（S4.7）、宿主级确认（S1.14 的提示）、离开不自动重试的 reason（T10 手动重试、T38 重新登录、配置变更或重新握手），以及不自动重试的占位失败 `reason`（`credential_rejected`、`instance_unidentified`）的清除与复验超时计数清零。最近一次可见集合（S5.10）的增补同样要持久化。不变式：
-  - **I1 没有持久记录就不放开**：放开类变化在持久化确认之前不生效；持久化已经落盘、确认尚未返回时崩溃，重启后可以按已确认生效；持久化结果未知而放弃时，持久状态不得比内存更放开，重启后不得出现内存里从未生效、也未曾落盘的放开。**挂起期间的相反动作**：放开已提交、尚未确认时，用户做出相反的动作（如 On 挂起时点 Off），视为放弃这次放开，并持久化一条抵消它的收紧（收紧类；即使内存里是空操作也要持久化）；被放弃的放开，之后返回的确认一律忽略。**阻止范围**（第 10 轮盲选）：一个放开，只要它生效所依赖的对象上有尚未确认持久化的收紧，就被拒：宿主级收紧未确认时拒绝所有放开；binding 级收紧（含注销、退役）未确认时拒绝同一 profile 下的放开，包括给该 profile 新建 binding，按 profile 判定；宿主级放开（如 On）在任一 binding 有未确认收紧时被拒；涉及多个 binding 的放开，任一涉及的 binding 有未确认收紧即被拒。依赖一个尚未生效的放开（新 binding 尚未持久化、宿主级确认尚未给出或尚未持久化）的放开同样被拒：所依赖的放开正在持久化时本地结果为 `local_storage`，宿主级确认尚未给出时 Off 仍为真，本地结果为 `knowledge_off`。依赖宿主级确认的放开只有 On 与 T44。**被拒的放开直接丢弃**（第 10 轮盲选）：不排队、不自动重放，本地结果按上面两种原因给出（因未确认的收紧被拒为 `local_storage`）交给发起方；用户发起的，在所依赖的收紧或放开确认持久化之后界面可以提示重试，重试按当时的状态重新校验；系统发起的（run 绑定、解除待复验等）由发起方按自己的逻辑重试。
+  - **I1 没有持久记录就不放开**：放开类变化在持久化确认之前不生效；持久化已经落盘、确认尚未返回时崩溃，重启后可以按已确认生效；持久化结果未知而放弃时，持久状态不得比内存更放开，重启后不得出现内存里从未生效、也未曾落盘的放开。**挂起期间的相反动作**：放开已提交、尚未确认时，用户做出相反的动作（如 On 挂起时点 Off），视为放弃这次放开，并持久化一条抵消它的收紧（收紧类；即使内存里是空操作也要持久化）；被放弃的放开，之后返回的确认一律忽略。**阻止范围**（第 10 轮盲选）：一个放开，只要它生效所依赖的对象上有尚未确认持久化的收紧，就被拒：宿主级收紧未确认时拒绝所有放开；binding 级收紧（含注销、退役）未确认时拒绝同一 profile 下的放开，包括给该 profile 新建 binding，按 profile 判定（T21、T23 在同一步里退役旧 binding 又新建 binding 时，新 binding 等旧 binding 的退役确认持久化之后才持久化，也可以与退役同一次原子持久化；退役没有确认持久化时新 binding 丢弃，profile 回到未绑定占位并记下 `dependency`，按 T40 退避重试，每次重试按当时的状态重新校验）；宿主级放开（如 On）在任一 binding 有未确认收紧时被拒；涉及多个 binding 的放开，任一涉及的 binding 有未确认收紧即被拒。依赖一个尚未生效的放开（新 binding 尚未持久化、宿主级确认尚未给出或尚未持久化）的放开同样被拒：所依赖的放开正在持久化时本地结果为 `local_storage`，宿主级确认尚未给出时 Off 仍为真，本地结果为 `knowledge_off`。依赖宿主级确认的放开只有 On 与 T44。**被拒的放开直接丢弃**（第 10 轮盲选）：不排队、不自动重放，本地结果按上面两种原因给出（因未确认的收紧被拒为 `local_storage`）交给发起方；用户发起的，在所依赖的收紧或放开确认持久化之后界面可以提示重试，重试按当时的状态重新校验；系统发起的（run 绑定、解除待复验等）由发起方按自己的逻辑重试。
   - **I2 收紧立即生效、不回退**：收紧类变化在内存立即生效（作废事件即 S4.5 ①），持久化失败不阻断收紧、不置 `persist_pending`，界面提示"部分设置尚未保存"。之后任何时刻崩溃，重启后要么得到这项收紧，要么进入 S1.14 的全局收紧。保证的边界：持久化介质在收紧之后完全不可写、随后崩溃，重启时可能两者都得不到，这是残余风险，FI 不注入这种故障（FI 只注入单次持久化失败与崩溃）。崩溃之后，只要能确定所有已生效的收紧都已持久化，就按正常恢复，属于 §10 #4 所说的"单纯重启"。
   - **I3 不确定一律收紧**：重启时只要不能确定所有已生效的收紧都已持久化，或持久状态损坏，就按 S1.14 收紧，不得按较放开的状态恢复。
   - **I4 generation 不撞号**：任何崩溃序列之后，每个非 `retired` binding 的 generation 大于崩溃前用过和对外回报过（含 S4.5 的待写值）的任何值；新 binding 的初值大于同一 profile 下用过或回报过的任何值（含 `retired` binding 的值）。`retired` 的 binding 不再准入，它用过和回报过的值由同一 profile 下新 binding 的初值越过（S4.4），不再给它递增。
@@ -97,7 +97,7 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 | 激活前提 | R1.4 的前提成立前只用于受控样本 | R1.3 |
 
 - **S2.2** [R8.1+新设] local-managed 的 sidecar 状态（`SidecarState`，见 §9）是服务状态的输入，不是服务状态本身：sidecar 进入 `starting` 时，`unavailable` 的 binding 经 T10 回到 `loading`；`ready`、`healthy` 不单独改变服务状态（health ≠ ready，R8.1），由握手与 Knowledge 就绪探测决定；`degraded`、`failed`、`stopping`、`stopped` → `unavailable`（`dependency`）：`loading` 中经 T05，`ready`、`degraded` 中经 T08、T09。
-- **S2.3** [KB-LITE-04+新设] Off 不规定 sidecar 是否停止（§10 #3）。停用或移除 local-managed profile 时，先按 T14 进入 `disabled`、丢弃凭据、递增 generation（只在连接阶段），再按 KB-LITE-04② 的所有权语义停止 sidecar；hide ≠ disable。
+- **S2.3** [KB-LITE-04+新设] Off 不停止 sidecar（§10 #3、S5.3）。停用或移除 local-managed profile 时，先按 T14 进入 `disabled`、丢弃凭据、递增 generation（只在连接阶段），再按 KB-LITE-04② 的所有权语义停止 sidecar；hide ≠ disable。
 - **S2.4** [D2+新设] **binding 身份**：remote 为 profile × principal × 端点 × 租户（或 profile 配置修订号）；local-managed 为 profile × principal × 实例标识。任何一项变了就是新 binding，旧 binding 进入 `retired`（T21、T23、T24）。local-managed 的实例标识只取自 KB-LITE-01a 的受控握手，不取 HTTP 响应自报的值；同一实例重启（标识不变）不算换实例，generation 不变。握手拿不到标识时按 T22 处理：不新建 binding，不递增；`instance_unidentified` 按收紧类持久化（S1.10）。换实例只能靠 sidecar 状态变化或握手发现；新实例若仍接受旧凭据（例如复制了数据目录），归 KB-LITE-01a、KB-LITE-02 处理，不在本文。
 - **S2.5** [新设] **未绑定占位与 binding 建立**：profile 登记后、首个 binding 建立前，以及所有 binding 都已 `retired` 后（例如改端点或租户，T24），profile 只有一个未绑定占位：状态取 `registered`（Off 或停用时取 `disabled`），没有 generation，不准入任何请求。登录（remote）与握手（local-managed）在占位上进行；成功后新 binding 连同 generation 初值（S4.4）持久化，确认后按 T02 进入 `loading`（所属 profile 带 `unsaved_settings` 时不在此建立，按 S1.13、T44），才发 READONLY 请求（能力发现、就绪探测）。失败时占位保持 `registered`，并记下失败 `reason`（`credential_rejected`、`instance_unidentified`、`dependency`）供本地结果使用；被选中、且 Off 与停用标志都为假的占位，记有 `dependency` 时按退避自动重试，local-managed 在 sidecar 进入 `starting` 时也重试（T40，与 T10、S2.2 一致）；记有 `instance_unidentified` 或 `credential_rejected` 时，只在手动重试、sidecar 重新握手或重新登录后再试（T41）。Off 或停用期间暂停重试，不发任何请求。登录与握手本身不是 READONLY 请求，不带 generation。还有非 `retired` 的 binding 时，登录得到的 principal 与该 binding 的 principal 不同按 T23（该 binding 带 `principal_changed` 时按 T36 的规则处理）；只剩占位时，登录得到的 principal 与该 profile 上次已确认的 principal（S1.13）不同按 T43，新建的 binding 带待确认标志（S1.13），停在 `registered` 等用户确认（T36）。上次已确认的 principal 不可读按"不同"处理（S1.8）。
 - **S2.6** [新设] **持久键**：generation 等 binding 级持久状态以 `binding_id` 为键。身份元组（S2.4）随 binding 一起持久化，用来查找"该身份下非 `retired` 的 binding"。同一身份元组在旧 binding `retired` 之后再次出现（例如端点 X → Y → X），新建 binding，取新的 `binding_id`；generation 初值仍按 S4.4 取同一 profile 下的最大值 + 1。
@@ -108,7 +108,7 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 - **S3.1** [D2+新设] 事件定义：
   - **Off / On**：用户关闭或打开 Knowledge，改的是宿主级 Off 标志（S5.1、S5.2）。**停用 / 启用 profile**：改的是该 profile 的停用标志，持久保存（S1.10）。**移除 profile**：先停用再终结（T25）。
   - **撤权类事件**分两种。**撤权信号**：响应为 `unauthorized` 且 `reason` 是 `credential_revoked`；签发权威通知撤销，或拒绝续签（凭据无效类响应触发的那一次续签被拒按下面的凭据无效类处理，除非签发方明示已撤销）；不属于下面例外的重签被拒（S1.11、S1.12）；local-managed 轮换本实例秘密。**范围变窄**：同一 principal 续签后凭据有效，但范围更窄（新范围既有新增又有移除时，只要移除了任一 KB 或操作，就算变窄）；或凭据没变、服务端收窄了授权（S5.10，§10 #21 已定按撤权处理）。**任何连接阶段**出现撤权类事件，不论凭据是新签发的还是沿用的，都按 S4.5 作废在途请求、递增 generation、触发 S5.6 的占位，并置 `revoked_since_ready`。去向：`ready`、`degraded` 走 T18（回到 `loading` 重签）；`loading`、`unavailable` 中的撤权信号走 T35a（`access_revoked`），范围变窄走 T35b（回到 `loading`：续签变窄用新凭据，服务端收窄重新取凭据）。由已接受响应派生的撤权事件不受 S4.6 前置状态检查的约束。`credential_expired` 先续签：续签成功按 T27，被拒算撤权，签发方不可达按 T08、T09 进入 `unavailable`（`dependency`），不递增；`loading`、`unavailable` 中同样先续签：成功、且同一 principal、范围相同或更宽，则在 `loading` 中继续（`unavailable` 时按 T10 回到 `loading`），principal 变化按 T23，范围变窄按 T35b，被拒按撤权（T35a，例外条件下按 T05），签发方不可达按 T05 进入或保持 `unavailable`（`dependency`）。`forbidden`（任何 `reason`）只是请求级错误（T28），本身不算撤权；它带出的服务端收窄按 S5.10 判定。
-  - **凭据无效类响应**（§10 #9 已定）：响应为 `unauthorized` 且 `reason` 是 `credential_invalid`、`credential_missing` 或未知值。第一次不算撤权：不递增、不作废在途请求、不占位、不置 `revoked_since_ready`；Provider 立即停止准入新调用，丢弃当前短期凭据，进入 `loading` 的新一轮并续签一次（T42；`unavailable` 只在 `dependency`、`not_ready` 时这样做，其他 `reason` 保持不变）。续签成功按正常的 `loading` 判定。**续签也失败**（签发方拒绝这次续签，或续签得到的凭据仍收到凭据无效类响应）：按 T05 进入 `unavailable`（`credential_rejected`），并按 S5.6 记一条适用全部 KB 的占位规则；不递增，也不声称已撤权。"续签也失败"只在 T42 开启的那一轮 `loading` 内判定；该轮进入可服务状态后，再收到凭据无效类响应重新按 T42（计入下面的上限）。签发方明示已撤销（如以 `credential_revoked` 拒绝）时按撤权处理（T35a）；签发方不可达按 T05 进入 `unavailable`（`dependency`），不占位。**凭据归属** [新设]：请求记下所用短期凭据的代号；只有用当前凭据发出的请求，其凭据无效类响应才触发上述处理；用已丢弃的旧凭据发出的请求，只把结果换成本地 `not_ready` 交给 Tool 层（§6），不触发转移。**旧凭据的撤权信号** [新设]（David 第 7 轮后定；未完成时的收尾经 Grok、Opus 盲选）：用已丢弃的旧凭据发出的请求带回撤权信号时，不立即按撤权处理。Provider 记下待复验（收紧类：binding、被质疑请求的 Q 与版本号；同一 binding 的多条合并，Q 取并集，版本号 +1），在内存立即生效：该 binding 不准入新调用（本地 `not_ready`），历史中该 binding、Q 内 KB 的证据正文暂扣，包括登记之后追加的证据（S5.6）。然后用当前凭据发一次复验探测（带 scope 的就绪探测，范围覆盖 Q）：复验得到撤权信号，按撤权处理（T18、T35a），暂扣变为占位；复验通过、且这次复验覆盖的版本号仍是当前版本，解除待复验（放开类），持久化确认后恢复准入、解除暂扣，旧请求的结果换成本地 `not_ready`；版本号已变则按新的 Q 再复验；复验得到凭据无效类响应，按本段凭据无效类处理，待复验保留。复验没能完成（被 S4.5 中止、复验期间崩溃、不可达或超时、当前没有可用凭据）时待复验保留，不准入、暂扣继续；之后该 binding 每次取得当前凭据并处于连接阶段时重做复验，超时按退避重试，连续 3 次超时后停止自动重试，等手动重试或重新登录。binding 终结（`retired`）时待复验仍未解除，按撤权收尾：暂扣的证据换成占位。服务端收窄与所用凭据无关，不适用复验（S5.10）。**上限** [新设]：同一 binding 10 分钟内第 3 次凭据无效类事件不再续签，直接按"续签也失败"处理。本类响应不适用下面的例外。
+  - **凭据无效类响应**（§10 #9 已定）：响应为 `unauthorized` 且 `reason` 是 `credential_invalid`、`credential_missing` 或未知值。第一次不算撤权：不递增、不作废在途请求、不占位、不置 `revoked_since_ready`；Provider 立即停止准入新调用，丢弃当前短期凭据，进入 `loading` 的新一轮并续签一次（T42；`unavailable` 只在 `dependency`、`not_ready` 时这样做，其他 `reason` 保持不变）。续签成功按正常的 `loading` 判定。**续签也失败**（签发方拒绝这次续签，或续签得到的凭据仍收到凭据无效类响应）：按 T05 进入 `unavailable`（`credential_rejected`），并按 S5.6 记一条适用全部 KB 的占位规则；不递增，也不声称已撤权。"续签也失败"只在 T42 开启的那一轮 `loading` 内判定；该轮进入可服务状态后，再收到凭据无效类响应重新按 T42（计入下面的上限）。签发方明示已撤销（如以 `credential_revoked` 拒绝）时按撤权处理（T35a）；签发方不可达按 T05 进入 `unavailable`（`dependency`），不占位。**凭据归属** [新设]：请求记下所用短期凭据的代号；只有用当前凭据发出的请求，其凭据无效类响应才触发上述处理；用已丢弃的旧凭据发出的请求，只把结果换成本地 `not_ready` 交给 Tool 层（§6），不触发转移。**旧凭据的撤权信号** [新设]（David 第 7 轮后定；未完成时的收尾经 Grok、Opus 盲选）：用已丢弃的旧凭据发出的请求带回撤权信号时，不立即按撤权处理。Provider 记下待复验（收紧类：binding、被质疑请求的 Q 与版本号；同一 binding 的多条合并，Q 取并集，版本号 +1），在内存立即生效：该 binding 不准入新调用（本地 `not_ready`），历史中该 binding、Q 内 KB 的证据正文暂扣，包括登记之后追加的证据（S5.6）。然后用当前凭据发一次复验探测（带 scope 的就绪探测，范围覆盖 Q）：复验得到撤权信号，按撤权处理（T18、T35a），暂扣变为占位；复验通过、且这次复验覆盖的版本号仍是当前版本，解除待复验（放开类），持久化确认后恢复准入、解除暂扣，旧请求的结果换成本地 `not_ready`；版本号已变则按新的 Q 再复验；复验得到凭据无效类响应，按本段凭据无效类处理，待复验保留。复验没能完成（被 S4.5 中止、复验期间崩溃、不可达或超时、当前没有可用凭据）时待复验保留，不准入、暂扣继续；之后该 binding 每次取得当前凭据并处于连接阶段时重做复验，超时按退避重试，连续 3 次超时后停止自动重试，等手动重试或重新登录。binding 终结（`retired`）时待复验仍未解除，按撤权收尾：暂扣的证据换成占位。服务端收窄不适用复验；它只比较用当前凭据发出的请求（S5.10）。**上限** [新设]：同一 binding 10 分钟内第 3 次凭据无效类事件不再续签，直接按"续签也失败"处理。本类响应不适用下面的例外。
   - **唯一例外**：`revoked_since_ready` 为假、且该 binding 从未可服务（S1.12）时，`loading` 中签发方拒绝签发，或本轮新签发的凭据被服务端以撤权信号拒绝：走 T05，记为 `credential_rejected`，不递增、不占位。**窗口上限** [新设]：同一 binding 10 分钟内第 3 次撤权类事件（T18、T35a、T35b 都计入）仍按 S4.5 处理，但去向一律改为 `unavailable`（`access_revoked`），不再自动重签，避免活锁；这条优先于 T35b 在不自动重试 `reason` 下保持原 `reason` 的规则。
   - **principal 变化**：续签或登录得到的 principal 与 binding 不同（T23）。**改端点或租户**：remote profile 的这两项配置被修改（T24）。**换实例**：local-managed 握手得到不同的实例标识（T21）。
   - **取消选用**：用户把一个 profile 移出使用中，它的 binding 离开（T19）。选用另一个 profile 不影响已激活的 binding（S4.9）。重新选用原 profile 时，原 binding 未终结就按 T02 重新激活。
@@ -120,8 +120,8 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 |---|---|---|---|---|---|
 | T01 | — | 登记 profile | 未绑定占位（S2.5），按 S1.2 派生：Off 时 `disabled`（`knowledge_off`），否则 `registered` | 无 | [新设] |
 | T02 | `registered`（所属 profile 不带 `unsaved_settings`；binding 不带 `principal_changed`） | 激活：选用该 profile，或登录（登录得到的 principal 等于该 binding 的 principal；只有占位时与上次已确认的相同或首次）；占位在 binding 建立后进入 | `loading`（`persist_pending` 时 `unavailable`/`local_storage`） | 不变（新建时写初值） | [KB-HOST-01] |
-| T03 | `loading` | 兼容，search 与 read 都 `ready` | `ready`（首次先持久化"首次可服务"，S1.12） | 不变 | [R8.2/R9.4] |
-| T04 | `loading` | 兼容，恰好一个 `ready` | `degraded`（同 T03） | 不变 | [新设] |
+| T03 | `loading` | 兼容，`live: true`，search 与 read 都 `ready` | `ready`（首次先持久化"首次可服务"，S1.12） | 不变 | [R8.2/R9.4] |
+| T04 | `loading` | 兼容，`live: true`，恰好一个 `ready` | `degraded`（同 T03） | 不变 | [新设] |
 | T05 | `loading` | 不兼容、不可达、`live: false`、两者都不 `ready`、sidecar 故障、签发方不可达；S3.1 例外中的签发被拒或新凭据被以撤权信号拒绝；凭据无效类响应的续签也失败（S3.1，此时按 S5.6 占位） | `unavailable`（S1.4；凭据被拒为 `credential_rejected`） | 不变 | [R9.4+新设] |
 | T06 | `ready` | 降级 | `degraded` | 不变 | [新设] |
 | T07 | `degraded` | 恢复 | `ready` | 不变 | [新设] |
@@ -138,9 +138,9 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 | T18 | `ready` / `degraded` | 撤权类事件（S3.1） | `loading`（重签；重签被拒按 T35a）；窗口内第 3 次改为 `unavailable`（`access_revoked`） | +1 | [D2/R7.6+新设] |
 | T19 | 连接阶段 | 取消选用 | `registered` | +1 | [KB-LITE-04①] |
 | T20 | 连接阶段 | 注销（仅 remote） | `registered` | +1 | [KB-LITE-04①] |
-| T21 | `loading` | 换实例 | 旧 binding `retired`；新 binding 建立，按 S1.2 派生 | 旧 +1；新 binding 按 S4.4 | [新设] |
+| T21 | `loading` | 换实例 | 旧 binding `retired`；新 binding 建立（等退役确认持久化，S1.10 I1），按 S1.2 派生 | 旧 +1；新 binding 按 S4.4 | [新设] |
 | T22 | `loading`，或占位上的握手 | 握手拿不到实例标识 | 已有 binding：`unavailable`（`instance_unidentified`）；占位：保持 `registered` 并记下该 `reason` | 不变；`instance_unidentified` 按收紧类持久化，不写 generation | [新设] |
-| T23 | 任一非 `retired` | principal 变化 | 旧 binding `retired`；新 binding 建立，按 S1.2 派生（带待确认标志，未经用户确认不算激活，S1.13、T36） | 旧 binding 在连接阶段时 +1；新 binding 按 S4.4 | [D2+新设] |
+| T23 | 任一非 `retired` | principal 变化 | 旧 binding `retired`；新 binding 建立（等退役确认持久化，S1.10 I1），按 S1.2 派生（带待确认标志，未经用户确认不算激活，S1.13、T36） | 旧 binding 在连接阶段时 +1；新 binding 按 S4.4 | [D2+新设] |
 | T24 | 任一非 `retired` | 改端点或租户（remote） | 旧 binding `retired`；profile 回到未绑定占位（按 S1.2 派生），不复用旧登录态，重新登录后按 S2.5 建立新 binding | 同 T23 | [新设] |
 | T25 | 任一非 `retired` | 移除 profile | 连接阶段先按 T14 作废；之后 `retired` | 只在连接阶段 +1 | [新设] |
 | T26 | 进程启动 | Provider 启动 | 按 S1.14 的恢复语义派生（不自动重试的 `reason` 保持） | 每个非 `retired` 的 binding 递增；已退役的 binding 不递增，其值由新 binding 的初值越过（I4、S4.4） | [KB-C1-04+新设] |
@@ -149,14 +149,14 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 | T29 | 任一 | M1 记忆开关切换 | 不变 | 不变 | [KB-C1-04] |
 | T30 | `ready` / `degraded` | 用户取消一个 run | 不变 | 不变；该 run 的在途请求立即移出在途集合并中止 | [R7.1+新设] |
 | T31 | `disabled` | 撤权、取消选用、注销 | `disabled` | 不变（无在途请求） | [新设] |
-| T32 | `registered` | 撤权、注销 | `registered` | 不变 | [新设] |
+| T32 | `registered` | 撤权、取消选用、注销 | `registered` | 不变 | [新设] |
 | T33 | 连接阶段 | 目标为 `loading` 的递增事件（T18、T26，以及目标为 `loading` 的 T35b；不含窗口内第 3 次）持久化失败或未确认；或"首次可服务"未确认持久化（S1.12） | `unavailable`（`local_storage`），`persist_pending` 为真 | 新值不生效 | [新设] |
 | T34 | `persist_pending` 为真 | 后台重试，该 binding 未确认的 generation 与放开类变化全部确认持久化（S1.10） | 清除 `persist_pending`；只有 `unavailable`（`local_storage`）回到 `loading`，其他状态与 `reason` 不变 | 写入的值生效 | [新设] |
 | T35a | `loading` / `unavailable` | 撤权信号（S3.1；T05 的例外除外），包括 `unavailable` 期间已接受响应带回的撤权信号 | `unavailable`（`access_revoked`）；丢弃内存凭据 | +1（按 S4.5 作废在途请求） | [D2+新设] |
 | T35b | `loading` / `unavailable` | 范围变窄（S3.1，含服务端收窄 S5.10） | 进入 `loading` 的新一轮（续签变窄用新凭据，服务端收窄重新取凭据）；窗口内第 3 次改为 `unavailable`（`access_revoked`）；`unavailable` 的 `reason` 为 `credential_rejected`、`access_revoked`、`incompatible`、`instance_unidentified` 时只作废与占位，`reason` 不变，不重新取凭据 | +1（按 S4.5 作废在途请求） | [D2+新设] |
 | T36 | `registered` 或 `disabled`，带待确认标志，原因 `principal_changed`（S1.13）（所属 profile 不带 `unsaved_settings`；带标志时只能经 T44） | 用户确认 | 存在长期登录态而其 principal 与 binding 不同时，必须重新登录并得到与 binding 相同的 principal，确认才能落盘；得到别的 principal 按 T23 处理，这次确认丢弃；确认持久化后（S1.13）按 S1.2 派生（`disabled` 时仍为 `disabled`） | 不变 | [新设] |
 | T37 | `disabled` | 登录或选用该 profile | `disabled`，记下登录与选用；Off 与停用都清除后按 T13、T16 激活；所属 profile 带 `unsaved_settings` 时只记下选用，登录按 S1.13 引导进 T44，不建立 binding | 不变 | [新设] |
-| T38 | `unavailable`（`credential_rejected` / `access_revoked`） | 重新登录 | 同一 principal：`loading`（`revoked_since_ready` 不清除）；不同 principal：T23 | 不变 | [新设] |
+| T38 | `unavailable`（`credential_rejected` / `access_revoked`） | 重新登录 | 同一 principal：`loading`（`revoked_since_ready` 不清除）；不同 principal：T23 | 同一 principal：不变；不同 principal：同 T23（旧 binding +1，新 binding 按 S4.4） | [新设] |
 | T39 | `persist_pending` 为真 | 又一个需要递增的事件 | 按该事件派生 | 待写值在已有待写值上 +1，写成功后一次生效（S4.4） | [新设] |
 | T40 | 被选中的未绑定占位，记有 `dependency`，Off 与停用标志都为假，且所属 profile 不带 `unsaved_settings` | 退避到时，或 sidecar 进入 `starting` | 重新握手或取凭据；成功按 S2.5 建立 binding，按 S1.2 派生；失败保持并记下 `reason` | 无 | [新设] |
 | T41 | 被选中的未绑定占位，记有 `instance_unidentified` 或 `credential_rejected`，Off 与停用标志都为假，且所属 profile 不带 `unsaved_settings` | 手动重试、sidecar 重新握手，或重新登录 | 同 T40 | 无 | [新设] |
@@ -164,17 +164,17 @@ Agent24 宿主侧（KnowledgeProvider 及其 profile 管理，下称"Provider"�
 | T43 | 未绑定占位（所属 profile 不带 `unsaved_settings`；带标志时只能经 T44） | 登录得到与该 profile 上次已确认的不同的 principal（或上次已确认的不可读，S1.8） | 新 binding 建立，带待确认标志，`registered`（Off 或停用时 `disabled`） | 新 binding 按 S4.4 | [新设] |
 | T44 | 带 `unsaved_settings` 的 profile（S1.13），宿主级确认已持久化 | 用户确认该 profile，并重新登录或重新握手 | 解除 `unsaved_settings` 与建立新的 binding（新 `binding_id`、初值）是同一次原子持久化，按 S1.2 派生；principal 与上次已确认的不同时，新 binding 带 `principal_changed`（同 T43 的效果），`unsaved_settings` 照常解除 | 新 binding 按 S4.4 | [新设] |
 
-T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下的取消选用只改变哪些 profile 被选用。目标状态不是 `loading` 的递增事件（T11、T14、T19、T20、T23–T25、T35a，不自动重试 `reason` 下的 T35b，以及窗口内第 3 次撤权类事件）持久化失败时，状态照常派生，同时 `persist_pending` 为真（S1.7）；只有目标为 `loading` 的递增事件走 T33。
+T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled`、`registered` 下的取消选用只改变哪些 profile 被选用。目标状态不是 `loading` 的递增事件（T11、T14、T19、T20、T23–T25、T35a，不自动重试 `reason` 下的 T35b，以及窗口内第 3 次撤权类事件）持久化失败时，状态照常派生，同时 `persist_pending` 为真（S1.7）；只有目标为 `loading` 的递增事件走 T33。
 
 ## 4. generation
 
 - **S4.1** [R7.2+新设] 每个 binding 一个 generation：正整数，只增不减，不复用。唯一来源是 Provider（KB-C1-04）；Electron 主进程、桥与页面只读取（#1013②）。
-- **S4.2** [KB-C1-04+新设] **+1 的事件，且只有这些**：Off（T11）、停用 profile（T14）、撤权（T18）、取消选用（T19）、注销（T20）、换实例的旧 binding（T21）、principal 变化、改端点或租户、移除 profile 时处于连接阶段的旧 binding（T23–T25）、Provider 启动（T26）、`loading` 或 `unavailable` 中的撤权类事件（T35a、T35b）。
-- **S4.3** [新设] **不递增**：降级、不可用与恢复（T03–T10）；S3.1 例外中的签发被拒（T05）；凭据无效类响应与它触发的续签（T42）；拿不到实例标识（T22）；未绑定占位的重试（T40、T41）；同一实例重启（S2.4）；续签范围相同或更宽（T27）；单个请求的错误与 partial（T28）；M1 开关（T29）；`registered` 或 `disabled` 上的 Off、停用、叠加、移除、principal 变化、改端点与登录（T12、T15、T17、T23–T25、T31、T32、T37：没有在途请求）；On、启用 profile、用户确认与重新登录（T13、T16、T36、T38：不论派生到哪个状态都不递增，因为进入 `disabled` 或 `registered` 时已经递增或当时没有在途请求）。取消单个 run（T30）也不递增：它只中止这个 run 的请求，不是 binding 级的作废。理由：generation 作废的是授权与信任上下文；服务暂时不可用不改变已发请求的授权，结果仍然可用。
+- **S4.2** [KB-C1-04+新设] **+1 的事件，且只有这些**：Off（T11）、停用 profile（T14）、撤权（T18）、取消选用（T19）、注销（T20）、换实例的旧 binding（T21）、principal 变化、改端点或租户、移除 profile 时处于连接阶段的旧 binding（T23–T25；含 T38 换 principal 那一支）、Provider 启动（T26）、`loading` 或 `unavailable` 中的撤权类事件（T35a、T35b）。
+- **S4.3** [新设] **不递增**：降级、不可用与恢复（T03–T10）；S3.1 例外中的签发被拒（T05）；凭据无效类响应与它触发的续签（T42）；拿不到实例标识（T22）；未绑定占位的重试（T40、T41）；同一实例重启（S2.4）；续签范围相同或更宽（T27）；单个请求的错误与 partial（T28）；M1 开关（T29）；`registered` 或 `disabled` 上的 Off、停用、叠加、移除、principal 变化、改端点与登录（T12、T15、T17、T23–T25、T31、T32、T37：没有在途请求）；On、启用 profile、用户确认与同一 principal 重新登录（T13、T16、T36，T38 同一 principal 那一支：不论派生到哪个状态都不递增，因为进入 `disabled` 或 `registered` 时已经递增或当时没有在途请求；T38 换 principal 那一支按 T23，旧 binding +1，见 S4.2）。取消单个 run（T30）也不递增：它只中止这个 run 的请求，不是 binding 级的作废。理由：generation 作废的是授权与信任上下文；服务暂时不可用不改变已发请求的授权，结果仍然可用。
 - **S4.4** [新设] **持久**：generation 按 binding 持久保存（S2.6）。新 binding 的初值大于同一 profile 下用过或回报过的任何值（含 `retired` 的 binding 与内存中的待写值），首个为 1。**每次递增都先持久化、确认后才生效**；Provider 启动时把每个非 `retired` 的 binding 递增，持久化确认后才准入，新值满足 I4（参考做法见附录 A.4）。持久化有时限，超时按结果未知处理，确认前不生效。任何一次持久化失败（初值、递增、启动）都置 `persist_pending`（S1.7）：不准入任何请求，后台重试，确认后清除（T34）。`persist_pending` 期间又发生需要递增的事件时，待写值在已有待写值上再 +1（如 N+1 → N+2），确认后一次生效（T39）。持久状态损坏后新建的 binding，初值大于损坏前可能用过的任何值（S1.14）；验收时以测试构造的损坏前最大值判定（ST-26e）。理由：先持久化后生效，崩溃后才不会与崩溃前用过的值撞号；审计（R10.1）与将来的服务端校验（R7.5、READONLY §12 #6）需要跨重启单调。
 - **S4.5** [R7.4+新设] **作废流程**：① 在同一个临界区内关闭准入，并把全部在途请求标记为"已作废"；准入检查与读取 generation 在同一把锁下，因此不会有请求拿着旧值在关闭之后发出；② 持久化新值，确认后作为当前值，失败或超时按 S4.4；③ 中止全部在途请求（R7.1）；④ 按 §5 清缓存（含合并缓冲区）；⑤ ① 之后到达的响应都按 S4.6 丢弃（已标记作废，不论 ② 是否成功）。① 完成即视为事件生效；②–④ 出错不得重新开放准入。下一个事件在 ①–④ 完成后才处理（S3.2）。本地 `cancelled` 的 `current_generation` 取本次递增的新值；② 失败时取待写值（尚未生效）：在途请求已经相对它作废，回报旧值会让调用方以为旧值仍然有效。所有 S5.6 触发事件都在 ① 的同一临界区内记下占位规则（收紧类，S1.10），先于新 generation 持久化。
-- **S4.6** [R7.2/R7.3/R7.5+新设] **接受与消费**：每个请求携带准入时的 generation。Provider 只接受同时满足三条的响应：`request_id` 在途；未被标记作废；generation 等于当前值（R7.3）。判定、把请求标记为已完成（移出在途集合）、交给 Tool 层（或写缓存、派生状态事件）三件事在同一个临界区内完成。由响应派生的状态事件（如探测结果驱动 T03）与缓存写入都携带 generation；应用时 generation 已过期，或 binding 的状态已不是转移表要求的前置状态（例如 T35a 之后迟到的探测结果不能再驱动 T03），或探测不属于当前 loading 轮次（S1.9），就丢弃，不写入。例外：由已接受响应派生的撤权事件（S3.1）不受前置状态检查约束，必须处理。**追加前复查**：Tool 结果被接受之后、追加进模型上下文之前再检查一次，复查与追加在同一个临界区内完成（宿主组装上下文时持有该 binding 的准入锁，跨 binding 时按 `binding_id` 顺序取锁，KB-HOST-01）。丢弃的条件只有两类：generation 已过期；或该 binding 准入已关闭，即 S4.5 ① 已开始、`persist_pending` 为真，或状态为 `disabled`、`registered`、`retired`。`loading`、`degraded`、`unavailable` 不算准入关闭（与 ST-08a 一致：服务不可用不作废已接受的结果）。被丢弃时，Off 换成本地 `knowledge_off`，其他情况换成本地 `cancelled`。Off 之后因此不会再有新证据进入上下文。被中止的请求（S4.5、T30）立即移出在途集合，之后到达的响应因此被丢弃。服务端只回显（R7.5）。
-- **S4.7** [KB-C1-04+新设] **run 绑定 binding，不绑定 generation**（§10 #7 已定）。run 开始时持久化一条 run 绑定（放开类，KB-HOST-01 为 RunCreate 补字段）：当时激活的 binding 集合，以及当时每个已选用 profile 的配置所指向的候选身份元组（profile × principal × 端点/租户，local-managed 为实例标识；Off 时也记）。之后每次调用用这些 binding 各自当时的 generation。集合中的 binding 未激活或已 `retired` 时，对它按 §6 本地拒绝（Off 时 `knowledge_off`，其余 `profile_inactive`）；**不改用其他 binding**（不读全局活动 profile，不跟随改过的端点，也不把 run 开始后才激活的 binding 加进来）。因此重新选用原 profile、同一 principal 重新登录、Off 后再 On 时，旧 run 会继续调用。**空集合补记** [新设]（David 第 7 轮后定；身份键经 Grok、Opus 盲选收紧为完整元组）：集合为空时，在第一次 dispatch 时存在与某个候选元组完全一致的激活 binding 的调用时补记，只补记一次，补记（放开类）持久化确认后生效；本地拒绝的调用不占用补记；开始时没有候选元组，或当前配置与记下的候选元组不同，这个 run 不补记。run 绑定或补记持久化失败时，只有这个 run 的 Knowledge 调用得本地 `local_storage`，不置 binding 的 `persist_pending`（S1.7）。
+- **S4.6** [R7.2/R7.3/R7.5+新设] **接受与消费**：每个请求携带准入时的 generation。Provider 只接受同时满足三条的响应：`request_id` 在途；未被标记作废；generation 等于当前值（R7.3）。**`null` 回显**：READONLY R6.1 允许回显为 `null` 的错误信封（如解析请求体之前就失败的 `unauthorized`）不按回显配对，按发起它的那次 HTTP 交换配对（R7.3）：该交换仍在途、未被标记作废、准入时的 generation 等于当前值，就照常接受（撤权信号、凭据无效类响应照常驱动 T18、T35a、T42 等）；否则丢弃，给本地 `cancelled`（回显该交换的 `request_id` 与准入时的 generation，S6.1）。非 `null` 的回显值不符，照旧拒绝。判定、把请求标记为已完成（移出在途集合）、交给 Tool 层（或写缓存、派生状态事件）三件事在同一个临界区内完成。由响应派生的状态事件（如探测结果驱动 T03）与缓存写入都携带 generation；应用时 generation 已过期，或 binding 的状态已不是转移表要求的前置状态（例如 T35a 之后迟到的探测结果不能再驱动 T03），或探测不属于当前 loading 轮次（S1.9），就丢弃，不写入。例外：由已接受响应派生的撤权事件（S3.1）不受前置状态检查约束，必须处理。**追加前复查**：Tool 结果被接受之后、追加进模型上下文之前再检查一次，复查与追加在同一个临界区内完成（宿主组装上下文时持有该 binding 的准入锁，跨 binding 时按 `binding_id` 顺序取锁，KB-HOST-01）。丢弃的条件只有两类：generation 已过期；或该 binding 准入已关闭，即 S4.5 ① 已开始、`persist_pending` 为真，或状态为 `disabled`、`registered`、`retired`。`loading`、`degraded`、`unavailable` 不算准入关闭（与 ST-08a 一致：服务不可用不作废已接受的结果）。被丢弃时，Off 换成本地 `knowledge_off`，其他情况换成本地 `cancelled`。Off 之后因此不会再有新证据进入上下文。被中止的请求（S4.5、T30）立即移出在途集合，之后到达的响应因此被丢弃。服务端只回显（R7.5）。
+- **S4.7** [KB-C1-04+新设] **run 绑定 binding，不绑定 generation**（§10 #7 已定）。run 开始时持久化一条 run 绑定（放开类，KB-HOST-01 为 RunCreate 补字段）：当时激活的 binding 集合，以及当时每个已选用 profile 的配置所指向的候选身份元组（profile × principal × 端点/租户，local-managed 为实例标识；Off 时也记）。之后每次调用用这些 binding 各自当时的 generation。集合中的 binding 未激活或已 `retired` 时，对它本地拒绝，`reason` 按 §6 的顺序；**不改用其他 binding**（不读全局活动 profile，不跟随改过的端点，也不把 run 开始后才激活的 binding 加进来）。因此重新选用原 profile、同一 principal 重新登录、Off 后再 On 时，旧 run 会继续调用。**空集合补记** [新设]（David 第 7 轮后定；身份键经 Grok、Opus 盲选收紧为完整元组）：集合为空时，在第一次 dispatch 时存在与某个候选元组完全一致的激活 binding 的调用时补记，只补记一次，补记（放开类）持久化确认后生效；本地拒绝的调用不占用补记；开始时没有候选元组，或当前配置与记下的候选元组不同，这个 run 不补记。run 绑定或补记持久化失败时，只有这个 run 的 Knowledge 调用得本地 `local_storage`，不置 binding 的 `persist_pending`（S1.7）。
 - **S4.8** [R3.7+新设] **调用级作废**：一次 Tool 调用可能派生多个子请求（R3.7(b) 按组并行、R3.7(a) 重试补齐），它们都绑定这次调用准入时的 generation。任一子请求被作废（S4.5 ①）时，整次调用返回本地 `cancelled`，已接受的部分结果全部丢弃，不作为 partial 交出。重试补齐只在 generation 未变、调用未被作废、binding 处于可服务状态且使用当前凭据时发出。合并缓冲区算作缓存，在 ④ 清除。按 `next_cursor` 翻页是新的一次调用，不受此条约束，按自己准入时的 generation 判定。一次调用涉及多个 binding 时，按 binding 分成独立的部分（S4.9）：某个 binding 的子请求被作废，只让这一部分变为本地 `cancelled`（带该 binding 的值），其他 binding 的部分照常交付；Off 作废全部 binding，各部分按 §6 中已发出调用的规则：在途的得 `cancelled`，已接受未追加的得 `knowledge_off`。
 - **S4.9** [新设] **多个 binding 同时激活**（§10 #5 已定）：不同 profile 的 binding 可以同时激活，每个 profile 至多一个。每个 binding 独立维护状态、generation、loading 轮次、`revoked_since_ready`、撤权窗口计数、证据纪元与占位规则、`persist_pending`；一个 binding 的事件不改变其他 binding 的 generation，也不作废它们的在途请求。Off 是宿主级（S5.2），一次作用于全部 binding，每个处于连接阶段的 binding 各按 T11 递增；停用、移除 profile 只作用于该 profile 的 binding。**跨 binding 的结果**：不同 binding 来自不同服务端，KB、文档与分块标识可能重复，`score` 与 `rank` 也不可比较（R3.6、R3.7）。Provider 不跨 binding 合并排名：每个 binding 内按 R3.7 合并，按 binding 分别交给 Tool 层（各自的结果、partial 或本地结果），由 KB-C1-05 呈现；证据与引用都带 `binding_id`，去重、`score_space` 分组与缓存都以 binding 为界。
 
@@ -185,9 +185,11 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | Off | ① 标记作废，③ 中止（R7.1）；每个调用得本地 `cancelled`，带 `current_generation`（READONLY R6 表 `cancelled` 行、§11.4），派生多个子请求的调用整体 `cancelled`（S4.8） | 丢弃（S4.6） | 全部清除，含内存凭据与合并缓冲区 | 不再产生新 Tool 结果与自动注入；历史中的已有证据不处理（S5.6） | `knowledge_off`，模型仍调用工具时也如此（S1.5） |
 | 停用、移除 profile | 同 Off | 同 Off | 同 Off | 同取消选用 | `profile_inactive` |
 | 撤权类事件（S3.1） | 同 Off | 同 Off | 全部清除；取得新凭据后重建 | 回到可服务前不产生；之后只用新 generation 的结果；历史证据按 S5.6 | `loading` 期间 `not_ready`；`access_revoked` 时按 §6 |
+| 凭据无效类响应（T42，S3.1） | 不作废、不中止，各自完成；用已丢弃的旧凭据发出的请求收到凭据无效类响应，只得本地 `not_ready` | 不适用：未作废，到达的响应按 S4.6 接受 | 丢弃当前短期凭据，续签一次 | 第一次不占位；续签也失败（含窗口内第 3 次）时按 S5.6 占位 | 停止准入，`loading` 期间 `not_ready`；续签也失败后 `credential_rejected` |
 | 取消选用、注销 | 同 Off | 同 Off | 全部清除（含 `score_space` 分组）；注销另销毁短期凭据，长期登录态按 #1013② 清除（收紧类，S1.10） | 旧 binding 不再产生；绑定它的 run 不改道（S4.7）；历史证据按 S5.6 | `profile_inactive` |
 | 换实例、principal 变化、改端点或租户 | 同 Off | 同 Off | 旧 binding 全部清除；新 binding 重新做能力发现；旧登录态不复用（S2.7） | 旧 binding 终结，绑定它的 run 失去 Knowledge；历史证据按 S5.6 | 旧 binding `profile_inactive` |
 | 服务不可用、降级 | 不主动中止，各自按 deadline 结束（R3.3、R4.5），结果与错误照常交 Tool 层 | 不适用：未作废，到达的响应按 S4.6 接受 | 只清就绪结果；能力声明在回到 `loading` 时重新判定兼容（R9.4） | 不受影响 | 按 S1.4；`degraded` 只准入为 `ready` 的操作 |
+| 宿主发起的删除 KB（S5.10） | 不作废、不中止 | 不适用：未作废，按 S4.6 接受；墓碑存在期间响应里出现该 KB 不把它加回可见集合，省略它也不算收窄 | 记下墓碑时把该 KB 移出最近一次可见集合；删除失败撤回墓碑 | 删除成功后按 S5.6 只占位该 KB；重启时墓碑仍未决的，按 S1.14 暂扣该 KB 的证据并重查 | 不改变状态，照常准入；不递增 |
 | Provider 启动 | 随上个进程结束，不存在 | 不存在（连接已断） | 不跨进程保存；凭据按 #1013② 从系统凭据存储重新取得（不自动重试的 `reason` 与 S1.14 全局收紧后的 profile 除外） | 按派生状态；单纯重启不把历史证据换成占位（S5.6；S1.14 全局收紧除外） | 按派生状态 |
 
 - **S5.1** [KB-C1-04+新设] **Off 持久**：Off 与 On 持久保存，重启后不变（T26）。Off 是收紧类：先在内存生效（S4.5 第 ① 步），同时持久化；持久化失败时保持内存中的 Off、后台重试，并在界面提示；期间重启按 S1.14 以 Off 恢复并等用户确认（I2、I7，§10 #20 已定）。On 是放开类：持久化确认后才生效，存在未确认的收紧时也不生效（I1），否则保持 `disabled`。profile 停用标志同理。持久状态损坏时按 S1.8。
@@ -199,7 +201,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 - **S5.7** [R7.3/R10.3] 本地 `cancelled` 只交 Tool 层，不进上下文、不进缓存、不作为证据。宿主日志记 `request_id`、旧与新 generation、事件类型，不记 query、正文与凭据。
 - **S5.8** [KB-C1-04] 任何状态都不得引入证据缓存：同一查询再次调用必须重新发请求。
 - **S5.9** [#1013②+新设] 桥只接受同时满足以下条件的消息：generation 等于当前值；该 binding 准入开放（`persist_pending` 为假）；处于可服务状态。S4.5 第 ① 步到第 ② 步完成之间拒绝所有消息。细则与用例在 ②；KnowledgeView 页面会话的销毁按 KB-LITE-04①、KB-C2-03。
-- **S5.10** [R7.6+新设] **服务端收窄**（§10 #21 已定：按撤权处理）。凭据没变，但服务端收窄了授权 A。Provider 按 binding 维护"最近一次可见"的 KB 集合：被接受的 search、read 成功响应的 `effective_scope`，以及就绪探测列出的 KB，都加入集合；判定只看成功响应的 `effective_scope`、带 scope 的就绪探测，以及 `forbidden/empty_scope`，其他 `forbidden`（`policy_denied`、`operation_not_allowed`）不参与；某个 KB 在请求范围 Q 里，响应的 `effective_scope` 却不含它（`forbidden/empty_scope` 视为 Q 里的全部 KB 都不在），而它在集合里，就视为被移出；带 scope 的就绪探测（R8.4）同样按它省略或列出的 KB 更新并比较；不拿不同 Q 的结果互相比较。判定移出时，在同一临界区把这些 KB 移出集合，并按范围变窄处理（S3.1）：`ready`、`degraded` 走 T18，`loading`、`unavailable` 走 T35b（不自动重试的 `reason` 下不重新取凭据）；作废在途请求、递增 generation、按 S5.6 占位、计入窗口上限。它由已接受响应派生，不受 S4.6 前置状态检查约束。触发收窄的那个响应经追加前复查换成本地 `cancelled`（S4.6），之后的新调用照常把服务端的 `forbidden` 交给 Tool 层。**持久** [新设]（§10 #21）：集合按 binding 持久保存，增补也要持久化；判定时始终与该 binding 交付过、且尚未被占位规则覆盖的证据所属的 KB 取并集。**删除** [新设]（David 第 7 轮后定）：宿主自己发起删除 KB（经 #1013③ 的接口或宿主界面）之前，先记下该 KB 的删除墓碑（收紧类），立即把它移出集合；墓碑存在期间，响应里出现该 KB 不把它加回集合，省略它也不算收窄。删除成功后按 S5.6 把纪元 +1，记一条只适用该 KB 的占位规则；删除失败时撤回墓碑（放开类）。重启时墓碑没有成功或撤回结果的，按 S1.14 暂扣并重查。这一过程不递增 generation、不作废在途请求、不计入窗口上限。别处的删除与收窄不可区分（R2.5、R8.4），仍按收窄处理。局限：之后既不查询、也不探测的 KB 无法发现被收窄；别处删除可能被当成收窄并计入窗口（§10 #21）。
+- **S5.10** [R7.6+新设] **服务端收窄**（§10 #21 已定：按撤权处理）。凭据没变，但服务端收窄了授权 A。Provider 按 binding 维护"最近一次可见"的 KB 集合：被接受的 search、read 成功响应的 `effective_scope`，以及就绪探测列出的 KB，都加入集合；判定只看成功响应的 `effective_scope`、带 scope 的就绪探测，以及 `forbidden/empty_scope`，其他 `forbidden`（`policy_denied`、`operation_not_allowed`）不参与；某个 KB 在请求范围 Q 里，响应的 `effective_scope` 却不含它（`forbidden/empty_scope` 视为 Q 里的全部 KB 都不在），而它在集合里，就视为被移出；带 scope 的就绪探测（R8.4）同样按它省略或列出的 KB 更新并比较；不拿不同 Q 的结果互相比较；只拿用当前凭据发出的请求做比较（凭据归属同 S3.1），用已丢弃的旧凭据发出的请求，其响应不判定移出（结果仍按 S4.6 接受或丢弃）。判定移出时，在同一临界区把这些 KB 移出集合，并按范围变窄处理（S3.1）：`ready`、`degraded` 走 T18，`loading`、`unavailable` 走 T35b（不自动重试的 `reason` 下不重新取凭据）；作废在途请求、递增 generation、按 S5.6 占位、计入窗口上限。它由已接受响应派生，不受 S4.6 前置状态检查约束。触发收窄的那个响应经追加前复查换成本地 `cancelled`（S4.6），之后的新调用照常把服务端的 `forbidden` 交给 Tool 层。**持久** [新设]（§10 #21）：集合按 binding 持久保存，增补也要持久化；判定时始终与该 binding 交付过、且尚未被占位规则覆盖的证据所属的 KB 取并集。**删除** [新设]（David 第 7 轮后定）：宿主自己发起删除 KB（经 #1013③ 的接口或宿主界面）之前，先记下该 KB 的删除墓碑（收紧类），立即把它移出集合；墓碑存在期间，响应里出现该 KB 不把它加回集合，省略它也不算收窄。删除成功后按 S5.6 把纪元 +1，记一条只适用该 KB 的占位规则；删除失败时撤回墓碑（放开类）。重启时墓碑没有成功或撤回结果的，按 S1.14 暂扣并重查。这一过程不递增 generation、不作废在途请求、不计入窗口上限。别处的删除与收窄不可区分（R2.5、R8.4），仍按收窄处理。局限：之后既不查询、也不探测的 KB 无法发现被收窄；别处删除可能被当成收窄并计入窗口（§10 #21）。
 
 ## 6. Provider 本地结果
 
@@ -243,8 +245,8 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | ST-05c | T05 | `loading` | 首次激活时签发方拒绝签发 | `unavailable`（`credential_rejected`） | 不自动重试；本地结果不用 `unauthorized` |
 | ST-05d | T05 | `loading` | `live: true`，search、read 都 `not_ready`，ingest `ready` | `unavailable`（`not_ready`） | ingest 不参与判定 |
 | ST-05e | T05 | `loading`，凭据刚签发，`revoked_since_ready` 为假，从未可服务 | 探测得 `unauthorized`/`credential_revoked` | `unavailable`（`credential_rejected`） | generation 不变；不占位；不自动重试 |
-| ST-05h | T42 | `loading`，本轮新签发的凭据（非 T42 续签得来），曾可服务 | 探测得 `credential_invalid` | `loading` 的新一轮 | 不递增；续签一次；续签后仍得 `credential_invalid` 按 ST-18i |
 | ST-05g | S3.1、S1.12 | 重启后 `loading`，该 binding 曾可服务；`revoked_since_ready` 随重启丢失 | 新签发的凭据被以 `unauthorized`/`credential_revoked` 拒绝 | `unavailable`（`access_revoked`） | 走 T35a 而不是 T05：+1，写占位 |
+| ST-05h | T42 | `loading`，本轮新签发的凭据（非 T42 续签得来），曾可服务 | 探测得 `credential_invalid` | `loading` 的新一轮 | 不递增；续签一次；续签后仍得 `credential_invalid` 按 ST-18i |
 | ST-05f | T18→T35a | `ready` | 撤权后重签成功，探测仍得 `unauthorized` | `unavailable`（`access_revoked`） | T18、T35a 各 +1，各写一次占位 |
 | ST-06 | T06 | `ready` | 探测：read `not_ready` | `degraded` | generation 不变 |
 | ST-07 | T07 | `degraded` | 探测：都 `ready` | `ready` | generation 不变 |
@@ -255,7 +257,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | ST-10b | T10 | `unavailable`（`incompatible`） | 退避到时；再手动重试 | 先不变，手动后 `loading` | 手动前不发任何请求 |
 | ST-10c | T10、S2.4 | local-managed，`unavailable`（`dependency`） | sidecar 进入 `starting`，握手得到相同实例标识 | `loading` | 同一 binding；generation 不变 |
 | ST-11a | T11 | `ready`，在途 2 | Off | `disabled` | +1；两个在途被中止，各得本地 `cancelled`（`current_generation` 为新值）；凭据与缓存清空；Off 已持久 |
-| ST-11c | T11、S4.5 | `ready`，在途 1；持久值 N | Off，持久化失败 | `disabled`，`persist_pending` | 在途得 `cancelled`，`current_generation` 为待写值 N+1，N+1 尚未生效 |
+| ST-11c | T11、S4.5 | `ready`，在途 1；持久值 N | Off，持久化失败 | `disabled`，`persist_pending` | 在途得 `cancelled`，`current_generation` 为待写值 N+1，N+1 尚未生效；新调用得 `knowledge_off`（§6 中 Off 先于 `local_storage`） |
 | ST-11b | T11 | `loading`，探测在途 | Off | `disabled` | +1；探测的迟到结果不改状态、不写缓存 |
 | ST-12 | T12 | `registered` | Off | `disabled` | generation 不变 |
 | ST-13a | T13 | `disabled`（Off），已选中 | On | `loading` | On 先持久再生效 |
@@ -286,7 +288,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | ST-18h | T18 | `ready` | 续签：同一 principal，新增 kb-c、移除 kb-b | `loading` | 按变窄处理：+1；作废在途；写占位 |
 | ST-19a | T19 | A、B 都 `ready`；run R 开始时两者都激活，R 对 A 在途 1 | 取消选用 A | A `registered`，B 不变 | A +1，B 不变；R 对 A 的在途被中止，迟到响应被丢弃；A 的缓存（含 `score_space`）清空；R 之后对 A 得 `profile_inactive`，对 B 照常 |
 | ST-19b | T02 | 接 ST-19a | 重新选用 A | A `loading`→`ready` | R 继续调用 A，使用新 generation（随 #7） |
-| ST-19c | T19、S1.7 | A `ready` | 取消选用，generation 持久化失败 | A `registered`，`persist_pending` | 再激活 A 得 `unavailable`（`local_storage`），不准入 |
+| ST-19c | T19、S1.7 | A `ready` | 取消选用，generation 持久化失败 | A `registered`，`persist_pending` | 绑定 A 的 run 的新调用得 `local_storage`（§6 中 `persist_pending` 先于 `profile_inactive`）；再激活 A 得 `unavailable`（`local_storage`），不准入 |
 | ST-19d | T19 | A `unavailable`（`dependency`），B `ready` | 取消选用 A | A `registered` | A +1；B 不受影响 |
 | ST-20a | T20 | `ready`；run R，在途 1 | 注销 | `registered` | +1；迟到响应被丢弃；缓存清空；凭据销毁 |
 | ST-20b | T02 | 接 ST-20a | 同一 principal 重新登录 | 同一 binding `loading` | R 继续调用（随 #7） |
@@ -300,8 +302,8 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | ST-23c | T23 | `disabled`（Off） | principal 变化 | 旧 `retired`；新 binding `disabled` | 不递增 |
 | ST-24a | T24 | `degraded`；run R 绑定旧端点 | 修改 profile 端点 | 旧 `retired`；profile 回到未绑定占位 `registered` | 旧 +1；R 之后的调用得 `profile_inactive`，不发往新端点；不复用旧登录态，需要重新登录 |
 | ST-24d | T24、S2.5 | 接 ST-24a | 重新登录 | 新 binding `loading` | 新的 `binding_id`；初值大于旧值；写初值后才发探测 |
-| ST-24f | S1.13、T43 | 接 ST-24e，用户未确认 V | 再改端点（T24），然后以 V 登录 | 新 binding `registered`（待确认） | 上次已确认的 principal 仍是原来的，V 未确认过，不走 T02 |
 | ST-24e | T43、S1.13 | 接 ST-24a | 用另一个 principal 登录 | 新 binding `registered`（待确认） | 初值与待确认标志同一次持久化；用户确认后才 `loading` |
+| ST-24f | S1.13、T43 | 接 ST-24e，用户未确认 V | 再改端点（T24），然后以 V 登录 | 新 binding `registered`（待确认） | 上次已确认的 principal 仍是原来的，V 未确认过，不走 T02 |
 | ST-24b | T24 | `registered` | 修改租户 | 旧 `retired`；未绑定占位 `registered` | 不递增 |
 | ST-24c | T24、S2.6 | 端点 X 的 binding b1 | 改为 Y 并登录（b2），再改回 X 并登录 | 第三个 binding b3 | b3 是新的 `binding_id`，不复活 b1；初值大于 b1、b2 用过的所有值 |
 | ST-25a | T25 | local-managed，`loading` | 移除 profile | `retired` | 先按 T14 作废并停 sidecar（+1）；数据不删 |
@@ -311,6 +313,8 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | ST-26c | T26 | On，已激活 | Provider 启动，持久化失败 | `unavailable`（`local_storage`） | 不准入任何请求 |
 | ST-26d | T26 | `registered`；generation 5 | Provider 启动（正常恢复） | `registered` | generation 大于 5；不发请求 |
 | ST-26e | T26、S1.8 | 持久状态损坏；测试构造损坏前用过的最大 generation M（如 1000） | Provider 启动 | 全部 binding `retired`，profile 回到未绑定占位，`disabled` | 全部历史证据换成占位；提示用户；不发请求；用户确认并重新登录后，新 binding 的初值大于 M |
+| ST-26f | T26、S1.14 | On，已激活；三个 binding 分别为 `unavailable`（`access_revoked`）、`unavailable`（`credential_rejected`）、`unavailable`（`incompatible`），均已持久化 | Provider 启动（正常恢复） | 各自保持原 `reason` 的 `unavailable` | generation 递增；不从系统凭据存储自动取凭据，不发任何请求；新调用得同一 `reason`；只在 T10 的手动重试、配置变更（前两者另可经 T38 重新登录）后再试 |
+| ST-26g | T26、S1.14 | 占位 P 记有 `credential_rejected`；binding A 在 10 分钟窗口内已有 2 次撤权类事件；binding B 的待复验已连续 2 次超时；以上均已持久化 | Provider 启动（正常恢复），仍在 A 的 10 分钟窗口内；之后 A 回到 `ready` 后再遇撤权类事件，B 取得凭据后的复验再超时一次 | P 的新调用仍得 `credential_rejected`；A 进入 `unavailable`（`access_revoked`）；B 停止自动复验 | 计数与占位 `reason` 跨重启保持，不因重启清零；P 不自动重试 |
 | ST-27a | T27 | `ready`，在途 1 | 续签：同一 principal，范围不变 | `ready` | 不递增；在途不中止 |
 | ST-27b | T27 | `ready`，在途 1 | 续签：同一 principal，范围变宽 | `ready` | 不递增；在途不中止 |
 | ST-28a | T28 | `ready` | 单个请求得 `forbidden/policy_denied`；或 `forbidden/empty_scope`，但 Q 中的 KB 都不在最近一次可见集合 | `ready` | 不递增；不算撤权 |
@@ -340,7 +344,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | ST-37 | T37 | `disabled`（Off） | 登录并选用该 profile；再 On | 先 `disabled`，On 后 `loading` | 不递增 |
 | ST-38 | T38 | `unavailable`（`credential_rejected`） | 同一 principal 重新登录 | `loading` | 不递增 |
 | ST-38b | T38 | `unavailable`（`access_revoked`） | 同一 principal 重新登录 | `loading` | 不递增；`revoked_since_ready` 仍为真，新凭据再被拒走 T35a |
-| ST-38c | T38→T23 | `unavailable`（`credential_rejected`） | 用另一 principal 重新登录 | 旧 `retired`；新 binding `registered` | 不递增；新 binding 不带 `revoked_since_ready`，等用户确认 |
+| ST-38c | T38→T23 | `unavailable`（`credential_rejected`），generation N | 用另一 principal 重新登录 | 旧 `retired`；新 binding `registered` | 旧 binding +1（N+1，`unavailable` 属连接阶段，同 T23）；新 binding 初值按 S4.4 大于 N+1；新 binding 不带 `revoked_since_ready`，等用户确认 |
 | ST-39 | T39 | `persist_pending`，待写 N+1 | Off | `disabled` | 待写值变为 N+2；写成功后 N+2 一次生效，N+1 从未生效 |
 | ST-40 | T40 | local-managed 未绑定占位，被选中，sidecar 未启动 | 首次激活；之后 sidecar 进入 `starting` | 先占位 `registered`（`dependency`），重试成功后 `loading` | 建立 binding，写初值后才发探测 |
 | ST-40b | T40、S2.5 | 同上，但 Off | sidecar 进入 `starting`；退避到时 | 占位 `disabled` | 不重试，不发任何请求 |
@@ -354,10 +358,13 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | ST-48b | T44 | 同 ST-48a，但仍 Off | 用户确认 P 并重新登录 | 新 binding `disabled` | 解除 `unsaved_settings`；On 后进入 `loading` |
 | ST-48c | T44 | 同 ST-48a | 用另一个 principal 重新登录 | 新 binding `registered`（`principal_changed`） | `unsaved_settings` 已解除；等用户确认 |
 | ST-48d | S1.14、I1 | 全局收紧后，宿主级确认尚未给出 | 用户点 On | 仍 `disabled` | On 被拒，本地结果 `knowledge_off`，界面提示先确认 |
-| ST-48f | S1.14、I1 | 全局收紧后，宿主级确认已给出、持久化尚未确认 | 用户点 On | 仍 `disabled` | On 被拒，本地结果 `local_storage` |
 | ST-48e | S1.13、S2.5 | 全局收紧后 P 只有未绑定占位，带 `unsaved_settings` | 用户以上次已确认的 principal 登录；或 sidecar 自动重新握手 | 不经 T02 | 登录被引导进 T44 的确认，用户确认后才建立 binding；自动握手（T40、T41）暂停 |
+| ST-48f | S1.14、I1 | 全局收紧后，宿主级确认已给出、持久化尚未确认 | 用户点 On | 仍 `disabled` | On 被拒，本地结果 `local_storage` |
 | ST-48g | T13、T37、S1.13 | 全局收紧后 P 的占位为 `disabled`，带 `unsaved_settings`，宿主级确认已持久化 | 用户点 On；或选用 P；或登录（含另一 principal） | On 后 P 的占位为 `registered`（带 `unsaved_settings`） | On 照常生效；选用只记下；登录引导进 T44；不进入 `loading`、不建立 binding |
 | ST-49 | I1 | Off；On 已提交、尚未确认 | 用户点 Off，之后 On 的确认才返回 | `disabled` | 晚到的确认被忽略；准入保持关闭 |
+| ST-49b | I1 | Off 已生效、持久化尚未确认（宿主级收紧）；P 未选用，Q 的新 binding 待确认（`principal_changed`） | 用户选用 P；用户确认 Q 的新 binding（T36） | P 仍未选用；Q 的新 binding 仍待确认 | 两项放开都被拒并直接丢弃，不排队，发起方得 `local_storage`；Off 确认持久化后界面可提示重试 |
+| ST-49c | I1、S2.5 | P 的 binding b1 因改端点（T24）退役，退役尚未确认持久化；P 回到未绑定占位 | 用户以 P 登录；或 b1 注销（T20）未确认时同一 principal 重新登录 | 不建立新 binding（或不重新激活） | 放开被拒并丢弃，得 `local_storage`；b1 的收紧确认持久化后重试才按 S2.5、T02 建立或激活 |
+| ST-49d | I1、S4.7 | A、B 都激活；A 的撤权占位规则尚未确认持久化，B 没有未确认的收紧 | 新 run R 开始，激活集合为 {A, B} | A、B 状态不变 | R 的 run 绑定涉及 A，被拒；R 对 A、B 的 Knowledge 调用都得 `local_storage`；不只绑定 B |
 | ST-36b | T36 | 接 ST-23a，长期登录态的 principal 仍是 U | 用户确认 | 先要求重新登录 | 得到 V：确认落盘，按 S1.2 派生；得到 U：按 T23，这次确认丢弃；不用 U 的登录态为 V 取凭据 |
 
 | ID | 规则 | 场景与期望 |
@@ -390,6 +397,8 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | EV-26 | S4.4、S1.14 | generation 持久化失败期间回报过待写值 N+2，随后崩溃：重启后的初值大于 N+2 |
 | EV-27 | S4.8 | 补齐前 binding 经 T42 进入 `loading`：不发补齐请求 |
 | EV-28 | S4.7 | run 在 Off 期间开始（候选元组 P × U × 端点 X）：Off 期间的调用被本地拒绝，不占用补记；On 之后第一次调用补记 P × U × X 的 binding；若期间换成 P × V，或改为端点 Y，都不补记，得 `profile_inactive` |
+| EV-33 | S4.6、S5.6 | `ready`，HTTP 交换 X1、X2 在途；X1 得到 `request_id`、`generation` 都为 `null` 的 `unauthorized`/`credential_revoked`（R6.1）：按交换配对接受，驱动 T18（+1、作废在途、按 S5.6 写占位）；X2 随后也带回 `null` 回显的 `unauthorized`/`credential_revoked`：已作废，被丢弃，得本地 `cancelled`（回显 X2 的 `request_id` 与准入时的值），不再触发撤权、不再 +1；回显为非 `null` 的错值照旧被拒 |
+| EV-34 | S5.10、S3.1、T27 | `ready`；search X 用凭据 c1（范围 {kb-a}）准入，Q = {kb-a, kb-b}；续签得 c2（同一 principal，范围 {kb-a, kb-b}，T27 不递增），c2 发出的请求先把 kb-b 加进最近一次可见集合；X 随后带着 `effective_scope` = {kb-a} 到达：不判收窄，不递增、不占位、不计入窗口，X 的结果照常接受；之后用 c2 发出、同一 Q 的响应省略 kb-b 时才按收窄处理 |
 
 **故障注入验收**（S1.10 不变式；"崩溃点"之后立即重启；收紧类用例的"写入之前"指持久化还没开始，已落盘未确认的情形见 FI-2c；注入的故障只有单次持久化失败与崩溃，不含存储整体不可写。参考设计的附加用例见附录 A.6，不属于规范）
 
@@ -399,7 +408,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | FI-1e | I1 | Off，用户点 On | On 已落盘、确认尚未返回 | On 生效，或 `disabled`；两者都合格 |
 | FI-1b | I1 | On 持久化结果未知，Provider 放弃这次 On，界面显示 Off | 放弃之后 | `disabled`，与界面一致 |
 | FI-1c | I1、I7 | 停用 P 已生效、持久化未确认；用户启用 P，被拒并提示 | 被拒之后 | P 不是启用：保持停用，或全局收紧；那次启用不会在重启后自动生效 |
-| FI-1f | I1 | binding A 的撤权占位未确认；用户 On | 被拒之后 | 不是 On（宿主级放开被任一 binding 的未确认收紧阻止） |
+| FI-1f | I1 | Off；binding A 的撤权占位未确认；用户 On | 被拒之后 | 不是 On（宿主级放开被任一 binding 的未确认收紧阻止） |
 | FI-1g | I1 | 选用、解除待复验、撤回墓碑、首次可服务、run 绑定或补记，各自在写入之前 | 此时 | 对应放开都没有生效 |
 | FI-1h | I1、I7 | Off，用户点 On，On 已提交未确认；用户再点 Off | Off 的抵消写入之后 | `disabled`；不会按挂起的 On 打开 |
 | FI-1i | I1、I3、I7 | On 已落盘未确认；用户点 Off 之后 On 的确认才返回 | Off 的抵消写入之前 | 全局收紧 |
@@ -407,10 +416,12 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | FI-2a | I2、I7 | `ready`，在途 1，历史有证据 | Off 生效后、写入之前 | 全局收紧：全部 `disabled`，历史证据占位，binding `retired`、各 profile 带 `unsaved_settings`，提示 |
 | FI-2b | I2、I5 | `ready`，历史有证据 | 撤权（T18）生效后、占位规则写入之前 | 全局收紧；该 binding 的旧证据不带正文 |
 | FI-2c | I2 | FI-2a、2b、6a、6b、6d、6e、7a–7d 中任一收紧已落盘、确认尚未返回 | 此时 | 这项收紧被保持（正常恢复，Off 不改历史证据），或全局收紧；两者都合格 |
-| FI-3a | I3 | 持久状态中间损坏 | 启动时 | 持久状态损坏情形：全部 `retired`，证据占位，Off，提示 |
+| FI-3a | I3 | 持久状态中间损坏 | 启动时 | 持久状态损坏情形：全部 `retired`，profile 回到未绑定占位并带 `unsaved_settings`，所有 profile 按未选用、已停用处理，证据占位，Off，提示 |
 | FI-3b | I3 | 持久状态缺失，且不能确认是首次安装 | 启动时 | 同 FI-3a |
 | FI-3c | I3 | 首次安装 | 启动时 | 默认 Off，不提示，不收紧 |
 | FI-3d | I3 | 接 FI-2a，用户已确认提示 | 再次正常重启 | 正常恢复，不再全局收紧 |
+| FI-3e | I3 | 接 FI-3a，用户确认提示且确认已持久化 | 再次正常重启 | 正常恢复，不因同一损坏再次进入持久状态损坏情形，不再提示 |
+| FI-3f | I3 | 持久状态缺失，但会话历史里有 Knowledge 证据；或存在 Knowledge profile 配置 | 启动时 | 不视为首次安装，同 FI-3a |
 | FI-4a | I4 | generation 持久值 N；N+1 持久化失败，`cancelled` 回报过 N+1，T39 后回报过 N+2 | 此时 | generation 大于 N+2 |
 | FI-4b | I4 | 同 FI-4a | 用户正常退出后重启 | generation 大于 N+2 |
 | FI-4c | I4 | 同 FI-4a 的 `persist_pending` 期间 T23 新建 binding | 此时 | 新 binding 的初值大于回报过的 N+2 |
@@ -424,6 +435,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | FI-6e | I3、I6 | local-managed 换实例（T21），旧 binding 的 `retired` 写入之前 | 此时 | 全局收紧；旧 binding `retired`；用户确认该 profile 后，重新握手得到新实例标识，经 T44 建立新 binding |
 | FI-6f | I6 | profile 配置修订号已变，或 profile 已不存在；其余状态已持久化 | 正常重启 | 对应 binding `retired`；正常恢复，不提示 |
 | FI-6c | I6、I7 | 已注销（T20），正常退出 | 重启 | binding `registered`，不退役；若 run 跨重启存活（KB-HOST-01），同一 principal 重新登录后它继续（随 #7） |
+| FI-6g | I6 | binding 的 principal 为 U、不带 `principal_changed`，长期登录态的 principal 已是 V；其余状态已持久化。对照：已注销（没有长期登录态）的 binding | 正常重启 | 前者 `retired`，不用 V 的登录态为它取凭据；对照的 binding 不退役；正常恢复，不提示 |
 | FI-7c | I7 | 注销已生效（占位已持久化），长期登录态清除写入之前 | 此时 | 全局收紧；长期登录态作废，binding 不自动激活 |
 | FI-7d | I7 | local-managed P 只有未绑定占位；停用 P 生效后、写入之前 | 此时 | 全局收紧；确认 P 之前不自动握手（T40 暂停） |
 | FI-7a | I7 | 停用 P 生效后、写入之前 | 此时 | 全局收紧；P 带 `unsaved_settings`，确认前不激活 |
@@ -436,6 +448,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 | FI-8g | I2、I3 | 全局收紧自身的 Off 或 `unsaved_settings` 写入之前 | 此时 | 再次启动时再次全局收紧并提示 |
 | FI-8h | I6、I8 | ST-36b 中，T36 要求的重新登录完成之前 | 此时 | 仍待确认（`principal_changed`）；不用旧登录态取凭据 |
 | FI-8c | I8 | 用户确认（T36）写入之前 | 此时 | 仍待确认 |
+| FI-8i | I8、I3 | 接 ST-23a，P 的新 binding 带 `principal_changed`、用户未确认；随后 Off 生效后、写入之前 | 此时 | 全局收紧：该 binding `retired`，待确认转到 P 的 `unsaved_settings`；只能经 T44 确认并重新登录，不经 T36 |
 
 ## 9. 现状证据（Agent24 `eb1a58b`）
 
@@ -449,7 +462,7 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 
 ## 10. 待决与需要评审确认的点
 
-第一片不单独合入，也不单独关闭任务①；两片作为一组合入。
+第一片不单独合入，也不单独关闭任务①；三片作为一组合入。
 
 | # | 事项 | 结论（未定时为 v1 默认） | 链接 |
 |---|---|---|---|
@@ -521,3 +534,5 @@ T31、T32 里的注销仍按 #1013② 清除长期登录状态；`disabled` 下�
 - r13 第二片（2026-10-18）：§6 占位 `dependency` 在 `unsaved_settings` 下 retryable 为 false；ST-48c/d/e 改写，新增 ST-48f、ST-48g、ST-36b；EV-06、FI-2a、FI-7a 随 profile 级待确认改写；新增 FI-1i、FI-8g、FI-8h。影响夹具：否。
 - r14 第一片（2026-10-18）：按第 13 轮（定向）双审互评修订：T13、T16、T37 不再整行排除带 `unsaved_settings` 的 profile，只挡进入 `loading` 与建立 binding；T02 加"binding 不带 `principal_changed`、登录 principal 等于 binding 的 principal"；S2.5 改为与 binding 的 principal 比较，并写明带 `unsaved_settings` 时不在此建立；T44 要求宿主级确认已持久化、措辞改为"同 T43 的效果"；I1 写明依赖宿主级确认的放开与本地结果、重试时机；放开类只保留不自动重试占位 reason 的清除与复验超时计数清零；I8 补全局收紧情形；§1 表补 T44；§10 #27 同步。影响夹具：否。
 - r14 第二片（2026-10-18）：§6 `local_storage` 行同步；ST-48c、ST-48g 改写，新增 ST-49；FI-1i 只接受全局收紧。影响夹具：否。
+- r15 第一片（2026-10-20）：按 PR-Daemon 对 #1070、#1071 的评审修订：依据的 READONLY 改为 r8；#1070 B1：S2.3 改为 Off 不停止 sidecar（§10 #3、S5.3）；L1：S1.4 的重新登录（T38）只适用 `credential_rejected`、`access_revoked`，`incompatible`、`instance_unidentified` 只经 T10；L2：T32 补取消选用，表后说明同步；L3：I1 写明 T21、T23 的新 binding 等退役确认持久化（或同一次原子持久化），未确认时新 binding 丢弃、占位记 `dependency` 按 T40 重试，T21、T23 后置同步；L4：§1 `ready` 行与 T03 补 `live: true`，T04 同样补上；L5：§1 `registered` 进入列补 T36；N1：§10 开头改为三片；#1071 B1（本片部分）：T38 的 generation 列分支，同一 principal 不变，换 principal 同 T23（旧 binding +1）。影响夹具：否。
+- r16 第二片（2026-10-20）：按 PR-Daemon 对 #1071 的评审修订：B1：S4.3 的不递增只限 T38 同一 principal 那一支，换 principal 那一支按 T23（旧 binding +1），S4.2 同步；ST-38c 改为旧 binding +1。B2：S4.6 吸收 READONLY r8 R6.1、R7.3 的 `null` 回显配对（按 HTTP 交换配对，在途、未作废、准入 generation 等于当前值才接受，否则丢弃并给本地 `cancelled`；非 `null` 的错值照旧拒绝），新增 EV-33（EV-29–EV-32 已用于附录 A.6）。M1：S5.10 只拿用当前凭据发出的请求做比较（凭据归属同 S3.1），S3.1 末句同步，新增 EV-34。L1：S1.6、S1.7、S4.7 的本地结果改为按 §6 的顺序，ST-11c、ST-19c 写明新调用的 `reason`。L2：§5 表补凭据无效类响应（T42）与宿主发起的删除 KB 两行。L3：新增 ST-26f、ST-26g（正常恢复下不自动重试的 reason、占位 reason 与各计数跨重启保持）、ST-49b–d（I1 阻止范围）、FI-3e、FI-3f（损坏确认后不再进入、首次安装的否定判据）、FI-6g（正常恢复下 principal 不同即 `retired`）、FI-8i（I8 第二句）；FI-3a 补断言 profile 按未选用、已停用处理。Nit：FI-1f 前置写明 Off；ST-05g/05h、ST-24e/24f、ST-48e/48f 按 ID 排序。影响夹具：否。

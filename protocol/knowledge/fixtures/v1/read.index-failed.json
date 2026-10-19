@@ -1,0 +1,6 @@
+{ "$comment": "R4.4: document-level read without expected_revision; the only build failed, so it is not retryable.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3V5F6G7H8J9K0M1N2P3Q4R", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-9" },
+  "response": { "status": 503, "body": { "error": { "code": "unavailable", "message": "The document is not available.",
+    "details": { "retryable": false, "reason": "index_failed", "request_id": "01JB3V5F6G7H8J9K0M1N2P3Q4R", "generation": 15 } } } } }

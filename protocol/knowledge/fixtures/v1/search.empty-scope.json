@@ -1,0 +1,7 @@
+{ "$comment": "§11.1, R2.3: Q is well formed but E is empty; no retrieval, no query embedding.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB2Q7M3W5X8Y9Z0A1B2C3D4E", "generation": 7,
+    "query": "报销流程", "scope": { "knowledge_base_ids": ["kb-z"] },
+    "budget": { "deadline_ms": 8000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 403, "body": { "error": { "code": "forbidden", "message": "No knowledge base in the effective scope.",
+    "details": { "retryable": false, "reason": "empty_scope", "request_id": "01JB2Q7M3W5X8Y9Z0A1B2C3D4E", "generation": 7 } } } } }
