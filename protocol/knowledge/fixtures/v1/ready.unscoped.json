@@ -1,0 +1,6 @@
+{ "$comment": "R8.2: probe without scope; only live and the infrastructure operations, no per-KB entries.",
+  "op": "knowledge.ready",
+  "request": { "protocol_version": 1, "request_id": "01JB3T4E5F6G7H8J9K0M1N2P3Q", "generation": 3 },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3T4E5F6G7H8J9K0M1N2P3Q", "generation": 3, "live": true,
+    "operations": { "search": { "state": "ready" }, "read": { "state": "ready" },
+      "ingest": { "state": "disabled", "reason": "read_only_v1" } } } } }

@@ -1,0 +1,7 @@
+{ "$comment": "§6, R10.2: no credential at all.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB3V1B2C3D4E5F6G7H8J9K0M", "generation": 7,
+    "query": "报销流程", "scope": { "knowledge_base_ids": ["kb-a"] },
+    "budget": { "deadline_ms": 8000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 401, "body": { "error": { "code": "unauthorized", "message": "Credential is not valid.",
+    "details": { "retryable": false, "reason": "credential_missing", "request_id": "01JB3V1B2C3D4E5F6G7H8J9K0M", "generation": 7 } } } } }

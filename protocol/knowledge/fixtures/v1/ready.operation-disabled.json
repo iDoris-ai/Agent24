@@ -1,0 +1,11 @@
+{ "$comment": "R8.4 (§12 #19): operations.search is disabled, so every KB's search is not_ready/operation_disabled, ahead of index_building; read follows its own operation.",
+  "op": "knowledge.ready",
+  "request": { "protocol_version": 1, "request_id": "01JB3T5F6G7H8J9K0M1N2P3Q4R", "generation": 3,
+    "scope": { "knowledge_base_ids": ["kb-a", "kb-b"] } },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3T5F6G7H8J9K0M1N2P3Q4R", "generation": 3, "live": true,
+    "operations": { "search": { "state": "disabled", "reason": "admin_disabled" }, "read": { "state": "ready" },
+      "ingest": { "state": "disabled", "reason": "read_only_v1" } },
+    "knowledge_bases": [
+      { "knowledge_base_id": "kb-a", "score_space": "emb-g1", "search": { "state": "not_ready", "reason": "operation_disabled" }, "read": { "state": "ready" } },
+      { "knowledge_base_id": "kb-b", "score_space": "emb-g2",
+        "search": { "state": "not_ready", "reason": "operation_disabled" }, "read": { "state": "not_ready", "reason": "index_building" } } ] } } }

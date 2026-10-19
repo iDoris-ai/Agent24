@@ -1,0 +1,13 @@
+{ "$comment": "§11.7, R8.2, R8.4: per-KB readiness; kb-z is outside E and omitted; kb-e is an empty KB and ready.",
+  "op": "knowledge.ready",
+  "request": { "protocol_version": 1, "request_id": "01JB3T2C3D4E5F6G7H8J9K0M1N", "generation": 3,
+    "scope": { "knowledge_base_ids": ["kb-a", "kb-b", "kb-f", "kb-e", "kb-z"] } },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3T2C3D4E5F6G7H8J9K0M1N", "generation": 3, "live": true,
+    "operations": { "search": { "state": "ready" }, "read": { "state": "ready" }, "ingest": { "state": "disabled", "reason": "read_only_v1" } },
+    "knowledge_bases": [
+      { "knowledge_base_id": "kb-a", "score_space": "emb-g1", "search": { "state": "ready" }, "read": { "state": "ready" } },
+      { "knowledge_base_id": "kb-b", "score_space": "emb-g2",
+        "search": { "state": "not_ready", "reason": "index_building" }, "read": { "state": "not_ready", "reason": "index_building" } },
+      { "knowledge_base_id": "kb-f", "score_space": "emb-g1",
+        "search": { "state": "not_ready", "reason": "unsupported_kb_type" }, "read": { "state": "not_ready", "reason": "unsupported_kb_type" } },
+      { "knowledge_base_id": "kb-e", "score_space": "emb-g1", "search": { "state": "ready" }, "read": { "state": "ready" } } ] } } }

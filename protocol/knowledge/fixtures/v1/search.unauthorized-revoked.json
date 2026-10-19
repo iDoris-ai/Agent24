@@ -1,0 +1,8 @@
+{ "$comment": "§11.3, R7.6: the credential was revoked; the next request is rejected.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB2Q9C3D4E5F6G7H8J9K0M1N", "generation": 7,
+    "query": "报销流程", "scope": { "knowledge_base_ids": ["kb-a"] },
+    "budget": { "deadline_ms": 8000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 401, "body": { "error": { "code": "unauthorized", "message": "Credential is not valid.",
+    "hint": "Obtain a new credential from the issuing authority.",
+    "details": { "retryable": false, "reason": "credential_revoked", "request_id": "01JB2Q9C3D4E5F6G7H8J9K0M1N", "generation": 7 } } } } }
