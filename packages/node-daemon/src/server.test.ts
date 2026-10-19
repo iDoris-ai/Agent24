@@ -1,5 +1,20 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'node:http'
+
+// Mock boxlite-service and boxlite-host to isolate tests from native BoxLite VM
+vi.mock('./boxlite-service', () => ({
+  startService: vi.fn().mockResolvedValue({ ok: true, hostPort: 18000 }),
+  stopService: vi.fn().mockResolvedValue(undefined),
+  stopAll: vi.fn().mockResolvedValue(undefined),
+  getHostPort: vi.fn().mockReturnValue(null),
+  isServiceAvailable: vi.fn().mockReturnValue(false),
+  proxyToService: vi.fn().mockResolvedValue({ status: 200, body: {} }),
+}))
+vi.mock('./boxlite-host', () => ({
+  isBoxliteAvailable: vi.fn().mockReturnValue(false),
+  getBoxliteError: vi.fn().mockReturnValue(null),
+  runPython: vi.fn().mockResolvedValue({ ok: false, error: 'BoxLite unavailable in unit test' }),
+}))
 
 // Start the server in-process and query it via http
 // Use a random port to avoid conflicts

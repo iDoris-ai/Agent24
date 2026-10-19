@@ -1,0 +1,7 @@
+{ "$comment": "R4.5: the cursor is bound to the first page's revision pair; the document was rebuilt between pages. page.limit is optional.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3V7H8J9K0M1N2P3Q4R5S6T", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "page": { "cursor": "cur-doc-7-2" } },
+  "response": { "status": 409, "body": { "error": { "code": "stale", "message": "The requested revision is no longer available.",
+    "details": { "retryable": false, "request_id": "01JB3V7H8J9K0M1N2P3Q4R5S6T", "generation": 15,
+      "current_revision": { "source_revision": "src-9", "index_build_id": "ib-21" } } } } } }

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/v1/ready.schema.json",
+  "title": "Agent24 Knowledge v1 — knowledge.ready",
+  "description": "Readiness probe request ($defs/request) and response ($defs/response), CONTRACT-READONLY-v1 §8. Credential required; scope optional; health != ready.",
+  "$defs": {
+    "request": {
+      "type": "object", "required": ["protocol_version", "request_id", "generation"], "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocol_version" },
+        "request_id": { "$ref": "common.schema.json#/$defs/request_id" },
+        "generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "scope": { "$ref": "common.schema.json#/$defs/request_scope" }
+      }
+    },
+    "operation_state": {
+      "description": "R8.2: infrastructure only, independent of any KB.",
+      "type": "object", "required": ["state"], "additionalProperties": false,
+      "properties": { "state": { "enum": ["ready", "not_ready", "disabled"] }, "reason": { "type": "string", "minLength": 1, "maxLength": 128 } }
+    },
+    "kb_state": {
+      "description": "R8.4: ready never carries a reason; not_ready carries the first matching reason in the order operation_disabled, dependency, index_building, index_failed, unsupported_kb_type.",
+      "type": "object", "required": ["state"], "additionalProperties": false,
+      "properties": { "state": { "enum": ["ready", "not_ready"] }, "reason": { "enum": ["operation_disabled", "dependency", "index_building", "index_failed", "unsupported_kb_type"] } },
+      "if": { "properties": { "state": { "const": "ready" } } }, "then": { "not": { "required": ["reason"] } }, "else": { "required": ["reason"] }
+    },
+    "knowledge_base": {
+      "type": "object", "required": ["knowledge_base_id", "score_space", "search", "read"], "additionalProperties": false,
+      "properties": {
+        "knowledge_base_id": { "$ref": "common.schema.json#/$defs/id" },
+        "score_space": { "$ref": "common.schema.json#/$defs/id" },
+        "search": { "$ref": "#/$defs/kb_state" },
+        "read": { "$ref": "#/$defs/kb_state" }
+      }
+    },
+    "response": {
+      "type": "object", "required": ["protocol_version", "request_id", "generation", "live", "operations"], "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "$ref": "common.schema.json#/$defs/protocol_version" },
+        "request_id": { "$ref": "common.schema.json#/$defs/request_id" },
+        "generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "live": { "type": "boolean" },
+        "operations": {
+          "type": "object", "required": ["search", "read", "ingest"], "additionalProperties": false,
+          "properties": {
+            "search": { "$ref": "#/$defs/operation_state" },
+            "read": { "$ref": "#/$defs/operation_state" },
+            "ingest": { "description": "Read-only v1: always disabled.", "allOf": [{ "$ref": "#/$defs/operation_state" }, { "properties": { "state": { "const": "disabled" } } }] }
+          }
+        },
+        "knowledge_bases": { "description": "Present only when the request carried scope; lists only KBs in E, which is never empty.", "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/knowledge_base" } }
+      },
+      "allOf": [
+        { "description": "R8.4 (§12 #19): operation_disabled appears exactly when operations.search is disabled.",
+          "if": { "properties": { "operations": { "properties": { "search": { "properties": { "state": { "const": "disabled" } } } } } } },
+          "then": { "properties": { "knowledge_bases": { "items": { "properties": { "search": { "properties": { "reason": { "const": "operation_disabled" } } } } } } } },
+          "else": { "properties": { "knowledge_bases": { "items": { "properties": { "search": { "properties": { "reason": { "not": { "const": "operation_disabled" } } } } } } } } } },
+        { "description": "Same for read.",
+          "if": { "properties": { "operations": { "properties": { "read": { "properties": { "state": { "const": "disabled" } } } } } } },
+          "then": { "properties": { "knowledge_bases": { "items": { "properties": { "read": { "properties": { "reason": { "const": "operation_disabled" } } } } } } } },
+          "else": { "properties": { "knowledge_bases": { "items": { "properties": { "read": { "properties": { "reason": { "not": { "const": "operation_disabled" } } } } } } } } } },
+        { "description": "R8.2: if the infrastructure cannot serve search, no KB can.",
+          "if": { "properties": { "operations": { "properties": { "search": { "properties": { "state": { "not": { "const": "ready" } } } } } } } },
+          "then": { "properties": { "knowledge_bases": { "items": { "properties": { "search": { "properties": { "state": { "const": "not_ready" } } } } } } } } },
+        { "description": "R8.4 (r6, r8): dependency exactly when the infrastructure is not_ready, which makes every KB not_ready/dependency, empty KBs included.",
+          "if": { "properties": { "operations": { "properties": { "search": { "properties": { "state": { "const": "not_ready" } } } } } } },
+          "then": { "properties": { "knowledge_bases": { "items": { "properties": { "search": { "properties": { "reason": { "const": "dependency" } } } } } } } },
+          "else": { "properties": { "knowledge_bases": { "items": { "properties": { "search": { "properties": { "reason": { "not": { "const": "dependency" } } } } } } } } } },
+        { "description": "Same two rules for read.",
+          "if": { "properties": { "operations": { "properties": { "read": { "properties": { "state": { "not": { "const": "ready" } } } } } } } },
+          "then": { "properties": { "knowledge_bases": { "items": { "properties": { "read": { "properties": { "state": { "const": "not_ready" } } } } } } } } },
+        { "if": { "properties": { "operations": { "properties": { "read": { "properties": { "state": { "const": "not_ready" } } } } } } },
+          "then": { "properties": { "knowledge_bases": { "items": { "properties": { "read": { "properties": { "reason": { "const": "dependency" } } } } } } } },
+          "else": { "properties": { "knowledge_bases": { "items": { "properties": { "read": { "properties": { "reason": { "not": { "const": "dependency" } } } } } } } } } }
+      ]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{ "$comment": "R3.4: no branch succeeded and every failure hit the deadline, so the whole search is a retryable timeout.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB3U1B2C3D4E5F6G7H8J9K0M", "generation": 12,
+    "query": "差旅标准", "scope": { "knowledge_base_ids": ["kb-a", "kb-b"] },
+    "budget": { "deadline_ms": 2000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 504, "body": { "error": { "code": "timeout", "message": "Knowledge search timed out.",
+    "details": { "retryable": true, "reason": "timeout", "request_id": "01JB3U1B2C3D4E5F6G7H8J9K0M", "generation": 12,
+      "partial_failures": [ { "knowledge_base_id": "kb-a", "code": "timeout", "reason": "timeout", "retryable": true },
+        { "knowledge_base_id": "kb-b", "code": "timeout", "reason": "timeout", "retryable": true } ] } } } } }
