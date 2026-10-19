@@ -1,0 +1,7 @@
+{ "$comment": "R2.4, R2.5: an empty request scope is a malformed request, never 'all'.",
+  "op": "knowledge.search",
+  "request": { "protocol_version": 1, "request_id": "01JB2Q7N4X6Y9Z0A1B2C3D4E5F", "generation": 7,
+    "query": "报销流程", "scope": { "knowledge_base_ids": [] },
+    "budget": { "deadline_ms": 8000, "max_results": 10, "max_concurrency": 2 } },
+  "response": { "status": 400, "body": { "error": { "code": "invalid_request", "message": "The request is not valid.",
+    "details": { "retryable": false, "request_id": "01JB2Q7N4X6Y9Z0A1B2C3D4E5F", "generation": 7 } } } } }
