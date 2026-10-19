@@ -1,8 +1,9 @@
 //! What one model call is told, and the shape of its answer (§3.2). The
-//! instruction is fixed; the fields and the document's blocks follow it as
-//! JSON data, which the instruction says never to obey. The answer is held
-//! to a JSON Schema: per field one status, and with it the value as written
-//! and evidence as quotes of named blocks, a reason, or the conflicting
+//! instruction is fixed, with parts for a window of part of the document and
+//! a first pass; the fields and blocks follow as JSON data, which it says
+//! never to obey. The answer, told to the first pass and held to a JSON
+//! Schema in the second (ME4-S2c §5): per field one status, with the value
+//! as written and quotes of named blocks, a reason, or the conflicting
 //! candidates. The OS, not the model, locates each quote.
 
 use std::fmt;
@@ -51,9 +52,54 @@ exactly from one block, names that block's `block_id`, is at most 500 characters
 another block. The value must appear in one of its quotes. Never make up a quote: a value you cannot quote has \
 no evidence.";
 
-/// The messages for `fields` over `window` of `layer`.
+/// Added for a window of part of the document: a value made up there
+/// contradicts the one found elsewhere (S01 on qwen3.8: s01-01 all conflicts).
+/// Even-handed: told a wrong `present` was worse, qwen2.5:7b answered
+/// `missing` for values its blocks state (S01 J9, 2026-10-17).
+const PART: &str = "
+
+These blocks are only one part of a longer document; the other parts are read separately and the answers \
+combined. Answer from these blocks only. Check every block for each field: when blocks here state it, answer \
+`present` with the value as written and its quotes, or `conflict` if they state different values. Answer \
+`missing` with reason `not_in_document` only when no block here states it; never guess what another part says. \
+Never answer with a value about another item, row, fee or date because it looks similar.";
+
+/// Which of a call's two passes (ME4-S2c §5.1): the model answering as it
+/// will, told the shape; or held to the answer's JSON Schema, thinking off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    Free,
+    Held,
+}
+
+/// Added for the first pass, after [`PART`]: the shape no schema holds it to
+/// (without it, values of "missing": S01, 2026-10-15).
+fn shape() -> String {
+    format!(
+        "\n\nWrite your final answer as JSON of the form {{\"values\": {{<field key>: <answer>, ...}}}} with every \
+field key, where each <answer> is an object with exactly one property, its status, valid under this JSON \
+Schema:\n{}\nFor example {{\"missing\": {{\"reason\": \"not_in_document\"}}}} or {{\"present\": {{\"evidence\": \
+[{{\"block_id\": \"p1/b2\", \"quote\": \"...\"}}], \"normalized\": \"\", \"value\": \"...\"}}}}. The status is the \
+property name; never write a status such as \"missing\" as a value.",
+        one_answer()
+    )
+}
+
+/// The messages for `fields` over `window` of `layer`, in `pass`.
 #[must_use]
-pub fn messages(fields: &[Field], layer: &TextLayer, window: &Window) -> Vec<ModelMessage> {
+pub fn messages(
+    fields: &[Field],
+    layer: &TextLayer,
+    window: &Window,
+    pass: Pass,
+) -> Vec<ModelMessage> {
+    let mut instruction = INSTRUCTION.to_owned();
+    if window.0.len() < layer.blocks.len() {
+        instruction.push_str(PART);
+    }
+    if pass == Pass::Free {
+        instruction.push_str(&shape());
+    }
     let blocks: Vec<Value> = window
         .0
         .iter()
@@ -62,7 +108,7 @@ pub fn messages(fields: &[Field], layer: &TextLayer, window: &Window) -> Vec<Mod
     vec![
         ModelMessage {
             role: ModelRole::System,
-            content: INSTRUCTION.into(),
+            content: instruction,
         },
         ModelMessage {
             role: ModelRole::User,
@@ -83,6 +129,24 @@ pub fn messages(fields: &[Field], layer: &TextLayer, window: &Window) -> Vec<Mod
 #[must_use]
 pub fn answer_format(fields: &[Field]) -> JsonSchemaFormat {
     let keys: Vec<&str> = fields.iter().map(|f| f.key.as_str()).collect();
+    let answer = one_answer();
+    let each: Map<String, Value> = keys
+        .iter()
+        .map(|k| ((*k).to_owned(), answer.clone()))
+        .collect();
+    JsonSchemaFormat {
+        name: "extraction".into(),
+        schema: json!({
+            "type": "object", "additionalProperties": false, "required": ["values"],
+            "properties": { "values": { "type": "object", "additionalProperties": false,
+                                        "required": keys, "properties": each } }
+        }),
+        strict: true,
+    }
+}
+
+/// One field's answer, as its JSON Schema.
+fn one_answer() -> Value {
     let text = json!({ "type": "string", "maxLength": MAX_VALUE_CHARS });
     let said = json!({ "type": "string", "minLength": 1, "maxLength": MAX_VALUE_CHARS });
     let evidence = json!({
@@ -99,27 +163,14 @@ pub fn answer_format(fields: &[Field]) -> JsonSchemaFormat {
         json!({ "type": "object", "additionalProperties": false, "required": [status],
                 "properties": Map::from_iter([(status.to_owned(), body)]) })
     };
-    let answer = json!({ "anyOf": [
+    json!({ "anyOf": [
         one("present", claim.clone()),
         one("missing", json!({
             "type": "object", "additionalProperties": false, "required": ["reason"],
             "properties": { "reason": { "type": "string", "enum": MISSING_REASONS } }
         })),
         one("conflict", json!({ "type": "array", "minItems": 2, "maxItems": MAX_CANDIDATES, "items": claim })),
-    ] });
-    let each: Map<String, Value> = keys
-        .iter()
-        .map(|k| ((*k).to_owned(), answer.clone()))
-        .collect();
-    JsonSchemaFormat {
-        name: "extraction".into(),
-        schema: json!({
-            "type": "object", "additionalProperties": false, "required": ["values"],
-            "properties": { "values": { "type": "object", "additionalProperties": false,
-                                        "required": keys, "properties": each } }
-        }),
-        strict: true,
-    }
+    ] })
 }
 
 /// A `T` read only from a JSON object: serde's derived structs also take a
@@ -299,6 +350,39 @@ pub enum Unanswered {
     Truncated,
     /// Whole, but not the schema's shape, or not one answer per field.
     Malformed(String),
+}
+
+/// The answer in what the model wrote in `pass` (ME4-S2c §5.1): thinking at
+/// its start (left open: [`Unanswered::Truncated`]); in the free pass, when
+/// the rest is no answer as it stands, all up to its last `</think>`; and a
+/// code fence, with what follows the answer in it, cut off.
+pub fn unwrapped(text: &str, pass: Pass) -> Result<&str, Unanswered> {
+    let mut t = text.trim();
+    if let Some(rest) = t.strip_prefix("<think>") {
+        let Some((_, after)) = rest.split_once("</think>") else {
+            return Err(Unanswered::Truncated);
+        };
+        t = after.trim();
+    }
+    // Only in the pass that thinks, and only in what is no answer as it
+    // stands (a value may quote `</think>` too). Before its last end is
+    // thinking, a draft in it too: what follows, or nothing, is the answer.
+    if pass == Pass::Free
+        && serde_json::from_str::<serde::de::IgnoredAny>(t).is_err()
+        && let Some((_, after)) = t.rsplit_once("</think>")
+    {
+        t = after.trim();
+    }
+    if let Some(rest) = t.strip_prefix("```") {
+        // After its language, the answer ends where its JSON does.
+        let body = rest.trim_start_matches(char::is_alphanumeric).trim_start();
+        let mut one = serde_json::Deserializer::from_str(body).into_iter::<serde::de::IgnoredAny>();
+        t = one
+            .next()
+            .and_then(Result::ok)
+            .map_or(body, |_| &body[..one.byte_offset()]);
+    }
+    Ok(t)
 }
 
 /// The answers in `text`, one per field of `fields`, in their order.
