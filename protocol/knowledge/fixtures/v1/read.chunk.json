@@ -1,0 +1,11 @@
+{ "$comment": "R4.3, R4.5, R4.7: citation read of one chunk; revision check passes; cut by max_bytes, so the cursor continues the same chunk.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3R1B2C3D4E5F6G7H8J9K0M", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "chunk_id": "chk-71",
+    "expected_revision": { "source_revision": "src-8", "index_build_id": "ib-20", "chunk_revision": 0 },
+    "max_bytes": 4096, "deadline_ms": 5000 },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3R1B2C3D4E5F6G7H8J9K0M", "generation": 15,
+    "effective_scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7",
+    "revision": { "source_revision": "src-8", "index_build_id": "ib-20" },
+    "segments": [ { "chunk_id": "chk-71", "chunk_type": "text", "chunk_revision": 0, "text": "<redacted>" } ],
+    "truncated": true, "next_cursor": "cur-71-1" } } }
