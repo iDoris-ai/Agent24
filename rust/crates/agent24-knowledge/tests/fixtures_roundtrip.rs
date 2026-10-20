@@ -1,8 +1,7 @@
 //! KB-C1-02a / #1052: the wire types round-trip the pinned fixtures in
-//! `protocol/knowledge/fixtures/v1`. Covered here: every `search.*` fixture
-//! (request and response) and the response of every other `reject` fixture
-//! (error envelope only; read requests come with the read types). The manifest
-//! drives the list. Digests are pinned in `agent24-protocol/tests/knowledge_fixtures.rs`.
+//! `protocol/knowledge/fixtures/v1`. Covered here: every `search.*` and `read.*`
+//! fixture (request and response) and the response of every other `reject`
+//! fixture (error envelope only). The manifest drives the list. Digests are pinned in `agent24-protocol/tests/knowledge_fixtures.rs`.
 //!
 //! "Equal" means semantically equal JSON: object key order is ignored and numbers
 //! compare by value, so a fixture `1` and a re-encoded `f64` `1.0` match, but
@@ -10,7 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent24_knowledge::{ErrorEnvelope, SearchRequest, SearchResponse};
+use agent24_knowledge::{ErrorEnvelope, ReadRequest, ReadResponse, SearchRequest, SearchResponse};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -42,7 +41,7 @@ fn covered() -> Vec<Entry> {
     let m: Manifest = serde_json::from_value(load("manifest.json")).unwrap();
     m.fixtures
         .into_iter()
-        .filter(|e| e.file.starts_with("search.") || e.class == "reject")
+        .filter(|e| has_request(&e.file) || e.class == "reject")
         .collect()
 }
 
@@ -95,11 +94,52 @@ fn roundtrip<T: DeserializeOwned + Serialize>(v: &Value) -> Result<(), String> {
     }
 }
 
-fn decode_body(accept: bool, body: &Value) -> Result<(), String> {
-    if accept {
-        decode::<SearchResponse>(body).map(drop)
+/// Fixtures whose request this crate has types for.
+fn has_request(file: &str) -> bool {
+    file.starts_with("search.") || file.starts_with("read.")
+}
+
+fn is_read(file: &str) -> bool {
+    file.starts_with("read.")
+}
+
+fn decode_request(file: &str, v: &Value) -> Result<(), String> {
+    if is_read(file) {
+        decode::<ReadRequest>(v).map(drop)
     } else {
-        decode::<ErrorEnvelope>(body).map(drop)
+        decode::<SearchRequest>(v).map(drop)
+    }
+}
+
+fn decode_raw_request(file: &str, raw: &str) -> bool {
+    if is_read(file) {
+        serde_json::from_str::<ReadRequest>(raw).is_ok()
+    } else {
+        serde_json::from_str::<SearchRequest>(raw).is_ok()
+    }
+}
+
+fn roundtrip_request(file: &str, v: &Value) -> Result<(), String> {
+    if is_read(file) {
+        roundtrip::<ReadRequest>(v)
+    } else {
+        roundtrip::<SearchRequest>(v)
+    }
+}
+
+fn roundtrip_success(file: &str, v: &Value) -> Result<(), String> {
+    if is_read(file) {
+        roundtrip::<ReadResponse>(v)
+    } else {
+        roundtrip::<SearchResponse>(v)
+    }
+}
+
+fn decode_body(file: &str, accept: bool, body: &Value) -> Result<(), String> {
+    match (accept, is_read(file)) {
+        (true, true) => decode::<ReadResponse>(body).map(drop),
+        (true, false) => decode::<SearchResponse>(body).map(drop),
+        (false, _) => decode::<ErrorEnvelope>(body).map(drop),
     }
 }
 
@@ -114,17 +154,17 @@ fn covered_fixtures_roundtrip() {
                 failures.push(format!("{} [{side}]: {msg}", e.file));
             }
         };
-        if e.file.starts_with("search.") {
+        if has_request(&e.file) {
             let req = &fx["request"];
             match e.request_valid {
-                Some(true) => fail("request", roundtrip::<SearchRequest>(req)),
+                Some(true) => fail("request", roundtrip_request(&e.file, req)),
                 // A string request is a raw body that is not valid JSON.
                 Some(false) => match req {
-                    Value::String(raw) if serde_json::from_str::<SearchRequest>(raw).is_ok() => {
+                    Value::String(raw) if decode_raw_request(&e.file, raw) => {
                         fail("request", Err("raw body decoded".into()))
                     }
                     Value::String(_) => {}
-                    _ if decode::<SearchRequest>(req).is_ok() => {
+                    _ if decode_request(&e.file, req).is_ok() => {
                         fail("request", Err("invalid request decoded".into()))
                     }
                     _ => {}
@@ -140,8 +180,8 @@ fn covered_fixtures_roundtrip() {
         // Its request is still round-tripped (the client encodes requests); its
         // `local` part is the local-cancelled result, covered with those types.
         let r = match (e.server_handler, accept) {
-            (false, _) => decode_body(accept, body),
-            (true, true) => roundtrip::<SearchResponse>(body),
+            (false, _) => decode_body(&e.file, accept, body),
+            (true, true) => roundtrip_success(&e.file, body),
             (true, false) => roundtrip::<ErrorEnvelope>(body),
         };
         fail("response", r);
@@ -150,7 +190,7 @@ fn covered_fixtures_roundtrip() {
     println!("covered {} fixtures: {names:#?}", names.len());
     assert_eq!(
         names.len(),
-        32,
+        34,
         "manifest changed; review coverage: {names:#?}"
     );
     assert!(
@@ -193,7 +233,7 @@ fn unknown_fields_are_rejected_at_every_level() {
         let fx = load(&e.file);
         let accept = e.class == "accept";
         let mut targets = vec![("response", fx["response"]["body"].clone())];
-        if e.file.starts_with("search.") && e.request_valid == Some(true) {
+        if has_request(&e.file) && e.request_valid == Some(true) {
             targets.push(("request", fx["request"].clone()));
         }
         for (side, v) in targets {
@@ -203,8 +243,8 @@ fn unknown_fields_are_rejected_at_every_level() {
                 let mut m = v.clone();
                 obj(&mut m, &p).insert("x_unknown".into(), json!(1));
                 let ok = match side {
-                    "request" => decode::<SearchRequest>(&m).is_ok(),
-                    _ => decode_body(accept, &m).is_ok(),
+                    "request" => decode_request(&e.file, &m).is_ok(),
+                    _ => decode_body(&e.file, accept, &m).is_ok(),
                 };
                 if ok {
                     accepted.push(format!("{} [{side}] {p:?}", e.file));
@@ -219,54 +259,90 @@ fn unknown_fields_are_rejected_at_every_level() {
     );
 }
 
-/// Required-but-nullable keys (R6.1 echoes, `chunk_revision`, `index_build_id`)
-/// must be present; optional keys must not be `null`.
+/// `"/request"` or `"/response/body"` of a fixture.
+fn part(file: &str, side: &str) -> Value {
+    load(file).pointer_mut(side).unwrap().take()
+}
+
+fn decode_part(file: &str, side: &str, v: &Value) -> Result<(), String> {
+    if side == "/request" {
+        decode_request(file, v)
+    } else {
+        let accept = ["search.ok", "search.partial", "read.chunk", "read.document"]
+            .iter()
+            .any(|p| file.starts_with(p));
+        decode_body(file, accept, v)
+    }
+}
+
+/// Required-but-nullable keys (R6.1 echoes, `chunk_revision`, `index_build_id`,
+/// `page.cursor`, `next_cursor`) must be present; optional keys must not be `null`.
 #[test]
 fn nullable_and_optional_keys_are_distinct() {
+    const B: &str = "/response/body";
+    const Q: &str = "/request";
     let missing = [
-        ("search.invalid-body.json", "/error/details", "request_id"),
+        (
+            "search.invalid-body.json",
+            B,
+            "/error/details",
+            "request_id",
+        ),
         (
             "search.unauthorized-before-parse.json",
+            B,
             "/error/details",
             "generation",
         ),
         (
             "read.stale-anchor-missing.json",
+            B,
             "/error/details/current_revision",
             "index_build_id",
         ),
-        ("search.ok.json", "/hits/2/revision", "chunk_revision"),
+        ("search.ok.json", B, "/hits/2/revision", "chunk_revision"),
+        ("read.chunk.json", B, "", "next_cursor"),
+        ("read.document.json", Q, "/page", "cursor"),
     ];
-    for (file, ptr, key) in missing {
-        let mut body = load(file)["response"]["body"].take();
+    for (file, side, ptr, key) in missing {
+        let mut v = part(file, side);
         assert!(
-            obj(&mut body, ptr).remove(key).is_some(),
-            "{file}: no {ptr}/{key}"
+            obj(&mut v, ptr).remove(key).is_some(),
+            "{file}: no {side}{ptr}/{key}"
         );
-        let accept = file == "search.ok.json";
         assert!(
-            decode_body(accept, &body).is_err(),
-            "{file}: missing {ptr}/{key} was accepted"
+            decode_part(file, side, &v).is_err(),
+            "{file}: missing {side}{ptr}/{key} was accepted"
         );
     }
     let null = [
-        ("search.unauthorized-revoked.json", "/error", "hint"),
-        ("search.mixed-score-space.json", "/error/details", "reason"),
-        ("search.ok.json", "/hits/0", "display"),
-        ("search.partial.json", "", "partial_failures"),
+        ("search.unauthorized-revoked.json", B, "/error", "hint"),
+        (
+            "search.mixed-score-space.json",
+            B,
+            "/error/details",
+            "reason",
+        ),
+        ("search.ok.json", B, "/hits/0", "display"),
+        ("search.partial.json", B, "", "partial_failures"),
+        ("read.document.json", B, "", "display"),
+        ("read.document.json", Q, "/page", "limit"),
+        ("read.document.json", Q, "", "page"),
+        ("read.document.json", Q, "", "expected_revision"),
+        ("read.chunk.json", Q, "", "chunk_id"),
+        ("read.chunk.json", Q, "", "expected_revision"),
+        ("read.chunk.json", Q, "", "max_bytes"),
+        ("read.chunk.json", Q, "", "deadline_ms"),
     ];
-    for (file, ptr, key) in null {
-        let mut body = load(file)["response"]["body"].take();
+    for (file, side, ptr, key) in null {
+        let mut v = part(file, side);
         assert!(
-            obj(&mut body, ptr)
-                .insert(key.into(), Value::Null)
-                .is_some(),
-            "{file}: no {ptr}/{key}"
+            obj(&mut v, ptr).insert(key.into(), Value::Null).is_some(),
+            "{file}: no {side}{ptr}/{key}"
         );
-        let accept = file.starts_with("search.ok") || file.starts_with("search.partial");
         assert!(
-            decode_body(accept, &body).is_err(),
-            "{file}: null {ptr}/{key} was accepted"
+            decode_part(file, side, &v).is_err(),
+            "{file}: null {side}{ptr}/{key} was accepted"
         );
     }
 }
@@ -373,6 +449,68 @@ fn retryable_is_fixed_per_code() {
         assert_eq!(
             serde_json::to_value(decoded).unwrap()["error"]["details"]["retryable"],
             json!(v)
+        );
+    }
+}
+
+fn read_request(file: &str, ptr: &str, key: &str, v: Value) -> Value {
+    let mut req = part(file, "/request");
+    obj(&mut req, ptr).insert(key.into(), v);
+    req
+}
+
+/// `positive_int` (`max_bytes`, `deadline_ms`, `page.limit`) and the non-empty
+/// `scope` are in the read request types.
+#[test]
+fn read_request_bounds() {
+    let bad = [
+        ("read.chunk.json", "", "max_bytes", json!(0)),
+        ("read.chunk.json", "", "deadline_ms", json!(0)),
+        ("read.document.json", "/page", "limit", json!(0)),
+        (
+            "read.document.json",
+            "/scope",
+            "knowledge_base_ids",
+            json!([]),
+        ),
+    ];
+    for (file, ptr, key, v) in bad {
+        let req = read_request(file, ptr, key, v.clone());
+        assert!(
+            decode::<ReadRequest>(&req).is_err(),
+            "{file}: {ptr}/{key} = {v} was accepted"
+        );
+    }
+    for (file, ptr, key) in [
+        ("read.chunk.json", "", "max_bytes"),
+        ("read.chunk.json", "", "deadline_ms"),
+        ("read.document.json", "/page", "limit"),
+    ] {
+        assert!(decode::<ReadRequest>(&read_request(file, ptr, key, json!(1))).is_ok());
+    }
+}
+
+/// R4.3: with `chunk_id`, `expected_revision` has all three parts and a non-null
+/// `chunk_revision`; without it, only the document pair.
+#[test]
+fn read_expected_revision_matches_target() {
+    let full = json!({"source_revision": "s", "index_build_id": "b", "chunk_revision": 0});
+    let null_rev = json!({"source_revision": "s", "index_build_id": "b", "chunk_revision": null});
+    let pair = json!({"source_revision": "s", "index_build_id": "b"});
+    let cases = [
+        ("read.chunk.json", pair.clone(), false),
+        ("read.chunk.json", null_rev.clone(), false),
+        ("read.chunk.json", full.clone(), true),
+        ("read.document.json", full, false),
+        ("read.document.json", null_rev, false),
+        ("read.document.json", pair, true),
+    ];
+    for (file, rev, ok) in cases {
+        let req = read_request(file, "", "expected_revision", rev.clone());
+        assert_eq!(
+            decode::<ReadRequest>(&req).is_ok(),
+            ok,
+            "{file}: expected_revision {rev}"
         );
     }
 }
