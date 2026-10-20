@@ -324,12 +324,26 @@ mod tests {
     /// `--nocapture` is required. libtest's capture buffer absorbs
     /// `eprintln!`, so a captured child would exit 70 without ever hitting
     /// the panic this test exists to survive.
+    ///
+    /// The child is selected by **test name**, not by an environment variable:
+    /// `agent24-cli`'s passthrough guard scans for `std::env::var*("...")`
+    /// and fails when a variable the daemon reads is missing from
+    /// `PASSTHROUGH_VARS` (`service::tests::passthrough_list_matches_what_the_
+    /// daemon_actually_reads`). A marker variable here would trip that guard
+    /// for the whole workspace, so the child re-runs this binary with
+    /// `--ignored --exact module::tests::death_hook_child_entrypoint` instead.
     #[test]
     fn default_fatal_hook_exits_70_when_stderr_write_fails() {
-        if std::env::var_os("A24_DEATH_HOOK_CHILD").is_some() {
-            death_hook_child();
-        }
         death_hook_parent();
+    }
+
+    /// Child-process entry point for
+    /// [`default_fatal_hook_exits_70_when_stderr_write_fails`]. Ignored so a
+    /// plain `cargo test` does not kill the harness; never returns.
+    #[test]
+    #[ignore = "child process entry point; spawned by default_fatal_hook_exits_70_when_stderr_write_fails"]
+    fn death_hook_child_entrypoint() {
+        death_hook_child();
     }
 
     fn death_hook_child() -> ! {
@@ -388,11 +402,11 @@ mod tests {
         let mut child = std::process::Command::new(exe)
             .args([
                 "--exact",
-                "module::tests::default_fatal_hook_exits_70_when_stderr_write_fails",
+                "module::tests::death_hook_child_entrypoint",
+                "--ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env("A24_DEATH_HOOK_CHILD", "1")
             .env("RUST_TEST_NOCAPTURE", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
