@@ -19,6 +19,7 @@ tracing = "0.1"
 agent24-os-sdk = { path = ".", features = ["test-util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [features]
 # ME4-S3 §3.1/L8: forwards proto's in-memory fake kernel (`module::testing`)
