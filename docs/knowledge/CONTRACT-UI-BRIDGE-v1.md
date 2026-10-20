@@ -1,7 +1,7 @@
 # Knowledge UI 身份交换与消息桥契约 v1（CONTRACT-UI-BRIDGE-v1）
 
 > **状态**：规范核心 v1（草案）· **日期**：2026-10-20 · **桥报文** `v: 1`
-> **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，草案，PR #1070–#1072，尚未合入本分支；本文依赖它的规则汇总在 §8.2，STATE 定稿时逐条复核）。
+> **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
 > 由完整版 `ab/weknora-03b-ui-bridge`（#1077 的分支）压缩而来。本文只写对外行为与不变式；实现机制由各实现任务以代码和测试证明。
 > 编号：`R*` 为 READONLY 规则，`S*` 为 STATE 规范核心 v1（同批）的条款，`U*` 为本文规则（沿用完整版编号，空号即已移出规范），`决定 #n` 见 §9.1（已定）与 §9.5（待决）。
 
@@ -52,7 +52,7 @@
 - **U2.12** 签票后、兑换前：generation 变了 → 不兑换，票据与族都撤销，按 binding 级销毁；view 实例已失效（崩溃、销毁）→ 不兑换，只撤该实例的票据与族，不升级为 binding 级销毁，同一 binding 的其他实例不受影响；generation 未变但 binding 不再可服务 → 不兑换，只撤这一张票据，view 保留并暂停注入。
 - **U2.13** 签发、兑换、拒绝、撤销各记一条审计：H(`ticket_id`)、principal、`credential_id`、`binding_tag`、`outcome`、`internal_reason`；不记票据、JWT 与 view 证明。
 - **U2.14** **签发响应的凭据归属**：签发请求记下所用 C；签发入口的响应是 READONLY 类凭据响应，按所用 C 归属处理（STATE S3.1），R7.3 的 `null` 回显配对同样适用：
-  - 所用 C 仍是当前 C：`unauthorized` 按 S3.1 分流（撤权信号按撤权类事件处理（S3.1），处理时已不可服务则进入 `unavailable`（`access_revoked`，S3.1、S1.4）；凭据无效类按 S3.1 续签一次；`credential_expired` 先续签再重签）；`forbidden/empty_scope` 交 STATE 按 S5.10 判定，请求范围 Q 取所用 C 的范围，并按 U3.8 关闭 view；`credential_near_expiry` 先续 C 再重试，不交 STATE。
+  - 所用 C 仍是当前 C：`unauthorized` 按 S3.1 分流（撤权信号按撤权类事件处理（S3.1），处理时已不可服务则进入 `unavailable`（`access_revoked`，S3.1、S1.4）；凭据无效类按 S3.1 续签一次；`credential_expired` 先续签再重签）；`forbidden/empty_scope` 交 STATE 按 S5.10 判定，请求范围 Q 取所用 C 的范围，并按 U3.8 关闭 view；`credential_near_expiry` 先续 C 再重试，不交 STATE，也不触发 S1.3 的就绪探测（STATE §9 已登记这一例外）。
   - 所用 C 已被替换：本次签发作废，改用当前 C 重签（U3.6）。凭据无效类、`credential_expired` 与 `forbidden/empty_scope` 都**不触发任何转移、不占位、不判定收窄、不关闭 view**；撤权信号不按撤权类事件处理，按 S3.1「旧凭据的撤权信号」记待复验；签发请求不带 KB 范围，按 S3.1 待复验的 Q 取该旧 C 的授权范围，复验覆盖这一范围。
 
 ## 4. session JWT
@@ -69,7 +69,7 @@
   - 探测 `credential_expired` → 续期，不销毁 view。探测 `credential_revoked` → 不据此判定撤权，由 Provider 用当前 C 签一次票，签发响应按 U2.14；签票成功即续期；同一 binding 10 分钟内第 3 次"探测得 `credential_revoked` 而签票成功" → `closed/revocation_mismatch`。探测 `credential_invalid` → view 级处理。探测成功 → 无动作（若此时正因探测失败暂停，按下一条解除）。
   - 兑换 `credential_invalid` → 第一次改铸新票，连续第二次做 view 级处理；`credential_expired` → 先续 C 再重铸；`credential_revoked` → 由 Provider 用当前 C 签票，按 U2.14；`forbidden/empty_scope` → 见末条。
   - 探测或兑换超时、5xx 或未知 `reason` → 暂停注入并退避重试（兑换不重发同一票据）；连续 3 次 → `closed/probe_failed`；其间任一次得到其他结果，即解除暂停、计数清零，并按该结果处理。
-  - 同一 binding 10 分钟内由 `credential_invalid` 触发的第 2 次 view 级处理不再自动重建 → `closed/session_rejected`，等用户操作，profile 服务状态不变；崩溃、Off→On、端口变化与通道恢复引起的重建不计。
+  - 同一 binding 10 分钟内由 `credential_invalid` 触发的第 2 次 view 级处理不再自动重建 → `closed/session_rejected`，出口见 §9.2，profile 服务状态不变；崩溃、Off→On、端口变化与通道恢复引起的重建不计。
   - 当前 C 的签发或兑换得到 `forbidden/empty_scope`：不建 view；已有 view 销毁且不重建，显示"没有可见的知识库"（`closed/empty_scope`）。
 - **U3.9** 服务端不校验 `gen`（R7.5）；generation 由宿主执行：桥拒绝旧 generation 的消息（U6.4 ⑭），generation 递增时 binding 级销毁（U4.8）。
 
@@ -97,7 +97,7 @@
   - **同一 binding 重新登录**（注销后，S3.3；`credential_rejected`/`access_revoked` 后，S1.4）：旧登录态的撤销材料已持久保存之后，新登录态才能替换旧的并清除不可用标记；保存不了时本次登录按失败处理（新登录态撤销、不保存）。已在进行的旧撤销照常重试，不影响新登录态。
   - **全局收紧或持久状态损坏**（S1.14）：全部 Knowledge 登录态作废——不用、不续签、暂不销毁；该 profile 解除 `unsaved_settings` 并建立的新 binding（S1.13）持久化之后，或该 profile 被移除时，按 U4.11 销毁其作废条目。登录态属于哪个 profile 由宿主独立记录，不依赖 STATE 持久状态；所属 profile 已不存在的按"profile 被移除"处理（决定 #34）。
   - 宿主必须能完整列举自己保存的 Knowledge 登录态；无法确认完整性时，全部按失效处理并要求重新登录。
-- **U4.10** 销毁登录态：注销（S3.3）；binding 因换实例、principal 变化、改端点或租户（S3.5）、移除 profile（S3.3）进入 `retired`。**不销毁**：Off（S5.3）、取消选用（S3.3）、停用 profile（S3.3）（决定 #7）。
+- **U4.10** 销毁登录态：注销（S3.3）；binding 因任何原因进入 `retired`（含重启时判定身份不符，S1.6、S1.14）；全局收紧或持久状态损坏另按 U4.9。**不销毁**：Off（S5.3）、取消选用（S3.3）、停用 profile（S3.3）（决定 #7）。
 - **U4.11** **销毁步骤**：① 先标为不可用，内存立即生效并持久记录；② 按 U4.7 销毁该 binding 的全部 view 实例；③ remote：先持久保存撤销材料，再调签发权威撤销（有时限），失败则持久地有限次重试，到期丢弃并记审计；这一撤销只撤长期登录态（该 binding 的 UI 会话族另按 U4.7 ③ 撤销），不撤销已签出的 C，已签出的 C 至过期前仍有效；④ 撤销材料保存成功后才删除登录态；不可用标记与撤销材料都无法持久时，删除登录态、放弃远端撤销；⑤ 记录结果。远端撤销未确认成功时，界面写明"服务端登录在过期前可能仍有效"。local-managed 没有注销（S2.1），`retired` 时只删宿主为它保存的凭据材料，实例秘密由 KB-LITE-01a、KB-LITE-04② 管理。
 - **U4.12** 销毁 view 实例或登录态都追不回已显示或交给模型的内容（R7.7）；界面与审计不得声称可以。
 
@@ -134,7 +134,7 @@
 - 不修订 READONLY 的：票据失败与族撤销都复用 `credential_invalid`（决定 #5、#20）。
 - 需要 READONLY 下一修订的：新 `reason` `unavailable/credential_near_expiry`（可重试，决定 #29）；UI 操作清单与 C 的数据操作范围的关系，以及 C 可用于票据签发与撤销（决定 #25，阻塞 KB-C2-01 实现）；引用 ID 字符集（决定 #21）。
 
-### 8.2 与 STATE（草案）的交接
+### 8.2 与 STATE 的交接
 - **binding 状态**：可服务 = `ready`、`degraded`；`loading`、`unavailable` 只暂停注入（U4.8）；`retired` 与 generation 递增（S4.2）触发 binding 级销毁；多个 binding 各自处理（S4.9）；凭据无效类续签也失败（S3.1）按决定 #33。
 - **generation**：签票在同一次准入里读取（S4.6）；作废（S4.5）立即生效，不等待 main 或页面确认，生效后不再新发起注入，唯一例外是生效前已完成注入、已在通道中的请求（U4.8）；服务端只回显。
 - **桥准入 S5.9**：拆为 U6.4 ⑬（准入开放、可服务、存活信号新鲜，待复验未解除视为未开放）与 ⑭（generation）；从 S4.5 作废生效起桥消息一律拒绝（关桥前在 ⑬ 回 `not_ready`，关桥后按 ① 静默丢弃），不等关桥完成。hello 请求例外（U6.3）由本文定义，STATE §9 已委托。
@@ -164,7 +164,10 @@
 - #34 全局收紧作废的登录态，在该 profile 解除 `unsaved_settings` 重新绑定（S1.13）后或 profile 移除时销毁。
 
 ### 9.2 宿主侧 KnowledgeView `closed` 的 `code`（闭集）
-`session_rejected`、`revocation_mismatch`、`probe_failed`、`empty_scope`、`crash_loop`、`bridge_closed`。
+`session_rejected`、`revocation_mismatch`、`probe_failed`、`empty_scope`、`crash_loop`、`bridge_closed`。`closed` 不自动恢复；binding 级销毁也使它结束。各码的出口（用户操作后新建 view 实例，仍按 U2.1 取得会话）：
+- `session_rejected`、`revocation_mismatch`、`probe_failed`、`crash_loop`：用户点重新加载，或从 Knowledge 设置重新打开。
+- `empty_scope`：用户点重新加载、重新登录或修改配置，签发不再得到 `forbidden/empty_scope` 时离开，否则仍为 `empty_scope`。
+- `bridge_closed`：用户点重新加载；10 分钟内第 3 次后只能从 Knowledge 设置重新打开（U6.6）。
 
 ### 9.3 `reply` 的拒绝码（`code` 沿用 READONLY 闭集，新 `reason` 只在桥上使用）
 | 来源 | `code` / `reason` | 违规 |
