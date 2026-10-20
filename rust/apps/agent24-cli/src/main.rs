@@ -742,9 +742,17 @@ async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> 
         .await;
     let out = match result {
         Ok(res) if res.status().is_success() => {
+            let gateway_record_id = res
+                .headers()
+                .get("x-idoris-record-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
+            if let Some(record_id) = gateway_record_id {
+                println!("· iDoris record {record_id}");
+            }
             Ok(())
         }
         Ok(res) => {
