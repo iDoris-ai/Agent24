@@ -1472,6 +1472,16 @@ mod tests {
     use crate::binary::{VerifiedBinary, sha256_of};
     use crate::password_store::{MemoryPasswordStore, StoreError};
 
+    fn fixture_stage_flags(home: &std::path::Path) -> [bool; 4] {
+        [
+            "fixture-started",
+            "fixture-after-stdin",
+            "fixture-emitting",
+            "fixture-emitted",
+        ]
+        .map(|name| home.join(name).is_file())
+    }
+
     async fn install_fixture(dir: &Path, name: &str, script: &str) -> VerifiedBinary {
         let source_dir = dir.join("src");
         tokio::fs::create_dir_all(&source_dir).await.unwrap();
@@ -1681,12 +1691,20 @@ mod tests {
         let home = tmp.path().join("hyphae-home");
         tokio::fs::create_dir_all(&home).await.unwrap();
         write_unlock_keystore(&home, "salt-auth").await;
-        let script = "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"ok\":false,\"error\":\"auth_error\",\"message\":\"password verification failed\"}' >&2\nexit 3\n";
+        let script = r#"#!/bin/sh
+printf '' > "$HOME/fixture-started"
+cat >/dev/null
+printf '' > "$HOME/fixture-after-stdin"
+printf '' > "$HOME/fixture-emitting"
+printf '%s\n' '{"ok":false,"error":"auth_error","message":"password verification failed"}' >&2
+printf '' > "$HOME/fixture-emitted"
+exit 3
+"#;
         let bin = install_fixture(tmp.path(), "hyphae-fake.sh", script).await;
         let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
         let store = Arc::new(MemoryPasswordStore::new());
         let account = Account::from_salt("salt-auth");
-        let state = CommState::ready(runner, store.clone(), home);
+        let state = CommState::ready(runner, store.clone(), home.clone());
 
         let (status, body) = call(
             router(state),
@@ -1696,7 +1714,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::LOCKED, "{body:?}");
+        assert_eq!(
+            status,
+            StatusCode::LOCKED,
+            "fixture stages: {:?}",
+            fixture_stage_flags(&home)
+        );
+        assert_eq!(fixture_stage_flags(&home), [true; 4]);
         assert_eq!(body["error"], "locked");
         assert!(matches!(
             store.get(&account).await,
@@ -1711,7 +1735,15 @@ mod tests {
         tokio::fs::create_dir_all(&home).await.unwrap();
         write_unlock_keystore(&home, "salt-before").await;
         let script = format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{{\"salt\":\"salt-after\"}}' > '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"encrypted\":true,\"valid\":true}}}}'\n",
+            r#"#!/bin/sh
+printf '' > "$HOME/fixture-started"
+cat >/dev/null
+printf '' > "$HOME/fixture-after-stdin"
+printf '%s\n' '{{"salt":"salt-after"}}' > '{}'
+printf '' > "$HOME/fixture-emitting"
+printf '%s\n' '{{"ok":true,"data":{{"encrypted":true,"valid":true}}}}'
+printf '' > "$HOME/fixture-emitted"
+"#,
             home.join(".hyphae").join("keystore.json").display()
         );
         let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
@@ -1719,9 +1751,9 @@ mod tests {
         let store = Arc::new(MemoryPasswordStore::new());
         let previous = Account::from_salt("salt-before");
         let current = Account::from_salt("salt-after");
-        let state = CommState::ready(runner, store.clone(), home);
+        let state = CommState::ready(runner, store.clone(), home.clone());
 
-        let (status, body) = call(
+        let (status, _body) = call(
             router(state),
             "POST",
             "/unlock",
@@ -1729,7 +1761,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "fixture stages: {:?}",
+            fixture_stage_flags(&home)
+        );
+        assert_eq!(fixture_stage_flags(&home), [true; 4]);
         assert!(matches!(
             store.get(&previous).await,
             Err(StoreError::NotFound)
