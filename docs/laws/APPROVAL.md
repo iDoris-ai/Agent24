@@ -93,19 +93,23 @@ MUST 只提供 `approve` / 定向的 `approve_for_target`（当且仅当资格�
 
 **今天靠什么保证**：**部分靠机制**。external 匹配按 `(scope_kind, scope_id, tool, target)` 精确相等
 （`agent24-store/src/repo.rs:639-670`）；external 资格三重收窄在 `agent24-policy/src/lib.rs:238-242`
-（`standing_grant_eligible().then_some(standing_target).flatten()`）。K1-6a.5 的 `ConsentGate` 会把具备第一方来源、有效匹配同意和宿主核验语义的 `WriteLocal` 草稿标记为免逐次审批；manifest 的 `reversible_draft` 只是声明。当前工具分发路径尚未接入该核验结构，实际操作路径与可逆语义的宿主核验仍须由调用方提供，缺失时按普通 `WriteLocal` 逐次审批。**本次对范围的收窄尚未在代码中生效**：`ConsentGate` 目前只核「第一方来源」（`rust/crates/agent24-policy/src/consent_gate.rs:363-369`），没有限定到 Documenting 模块；同时它判定草稿属性时读的是请求自报的 `reversible_draft_declared`，而不是同意记录里的那一项（`ToolPermissionSummary::new` 默认 `reversible_draft: false`，见 `rust/crates/agent24-store/src/module_consents.rs:138`），因此“用户同意过草稿属性”这一条件今天没有被真正核验。两处分别由后续独立 PR 收口；在那之前，本条的例外在生产装配下不可达（生产路径传入 `risk: External` 与 `draft_verification: None`）。
+（`standing_grant_eligible().then_some(standing_target).flatten()`）。K1-6a.5 的 `ConsentGate` 会把具备第一方来源、有效匹配同意和宿主核验语义的 `WriteLocal` 草稿标记为免逐次审批；manifest 的 `reversible_draft` 只是声明。工具分发路径仍未接入该核验结构：生产装配传入 `risk: External`、`reversible_draft_declared: false` 与 `draft_verification: None`（`rust/apps/agent24d/src/server.rs:1603-1604`），缺失宿主核验时按普通 `WriteLocal` 逐次审批。**门本身已经按本条收窄**（#1034 改 MUST 表述；#1108 合入 `53032dac`）：`ConsentGate` 免逐次人审要求 `WriteLocal` ∧ 请求声明草稿 ∧ 同意记录 `reversible_draft` ∧ 来源 `FirstParty` ∧ `record.module == "documents"` ∧ 宿主核验合格（`rust/crates/agent24-policy/src/consent_gate.rs:391-398`，常量 `DRAFT_EXEMPTION_MODULE`）。同意记录的草稿位由迁移 `0018_module_consent_reversible_draft.sql` 携带，存量行默认 0（非草稿同意）。**例外在生产装配下仍不可达**：上述门条件已在代码里，但没有调用方把宿主核验交给它。把例外接进工具分发路径的 PR 必须先解决下文「未决 / 接线闸门」。
 
-**本条 2026-10-08 的修订溯源**（`docs/laws/APPROVAL.md` blob `16db4489` → `244429b0`；jason 于该日授权，依据见 [`ADR-K1-03`](../adr/ADR-K1-03-enable-authorization-trust-revocation.md) 的「K1-6a.5 补遗」）**原先随实现提交 `62218c31` 合入，未走独立法律 PR**，与 [`README.md`](README.md)「改变可观察行为的 PR…**不得**在同一个 PR 里既改法律又改行为」相冲突。2026-10-16 按该条要求补做了**独立的追溯性法律评审**（PR #1031），仅复核上述这段边界变更本身，**未改动本条的 MUST 表述**；本段是该评审留下的记录。
+**本条 2026-10-08 的修订溯源**（`docs/laws/APPROVAL.md` blob `16db4489` → `244429b0`；jason 于该日授权，依据见 [`ADR-K1-03`](../adr/ADR-K1-03-enable-authorization-trust-revocation.md) 的「K1-6a.5 补遗」）**随实现提交 `62218c31`（`ab/kernel`）一起提交，经 #1022（`56264ef9`）进入 main，未走独立法律 PR**。`62218c31` 本身不是 main 的祖先。这与 [`README.md`](README.md)「改变可观察行为的 PR…**不得**在同一个 PR 里既改法律又改行为」相冲突。2026-10-16 按该条要求补做了**独立的追溯性法律评审**（PR #1031），仅复核上述这段边界变更本身，**未改动本条的 MUST 表述**；本段是该评审留下的记录。
 
-**该评审的两条意见的处置**（2026-10-19）：
+**该评审意见的处置**（2026-10-20，#1108 已合入）。评审结论是**有条件成立**，不是「意见都已处置、可以接线」。
 
-- **L1（MUST 表述需收窄到第一方 Documenting）** —— 已由 PR #1034 在 main 上处置：
+- **L1（MUST 表述需收窄到第一方 Documenting）** —— 已由 PR #1034 在 main 上处置（`d40a34a0`）：
   本条 MUST 现为「**第一方 Documenting 模块**的可逆草稿写入」，不再泛指「第一方工具」。
-- **L2（草稿例外只信请求自报，未核验同意记录里的属性）** —— 由 PR #1108 处置：
-  新增迁移 `0018_module_consent_reversible_draft.sql` 让同意记录本身携带该位（存量行回填为
+- **L2（草稿例外只信请求自报，未核验同意记录里的属性）** —— 已由 PR #1108 合入 main（`53032dac`）：
+  迁移 `0018_module_consent_reversible_draft.sql` 让同意记录本身携带该位（存量行回填为
   「非草稿同意」），`ConsentGate` 的豁免判定要求「请求声明 ∧ 同意记录属性 ∧ 第一方
-  ∧ 模块为 `documents` ∧ 宿主核验合格」同时成立，并补了两条回归测试
+  ∧ 模块为 `documents` ∧ 宿主核验合格」同时成立，并有两条回归
   （非草稿同意、以及第一方但非 Documenting 模块，均仍逐次人审）。
+- **未决 / 接线闸门（L3–L5）**。把本条例外接进工具分发路径的 PR，必须先逐项解决下列三条，并在该 PR 内提供证据：
+  - **L3**：「第一方」今天由宿主填入 `ConsentSource`，来源/签名核验未实现（`rust/crates/agent24-store/src/module_consents.rs:34-42`）。
+  - **L4**：`!self.external` 没有负例，不能用「测试绿」证明 External 不会走草稿例外。
+  - **L5**：适配器按 `(module, op)` 固定请求，拿不到本次调用输入，条件 ③–⑥ 无法逐次核验。
 
 ---
 
