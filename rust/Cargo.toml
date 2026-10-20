@@ -7,6 +7,7 @@ members = [
     "crates/agent24-decide",
     "crates/agent24-domain",
     "crates/agent24-hw",
+    "crates/agent24-knowledge",
     "crates/agent24-os-fd",
     "crates/agent24-os-cwd",
     "crates/agent24-os-packages",
