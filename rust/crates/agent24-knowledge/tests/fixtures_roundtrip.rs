@@ -1,7 +1,7 @@
 //! KB-C1-02a / #1052: the wire types round-trip the pinned fixtures in
-//! `protocol/knowledge/fixtures/v1`. Covered here: the response of every `reject`
-//! fixture (error envelope only; requests and success bodies come with their
-//! types). The manifest
+//! `protocol/knowledge/fixtures/v1`. Covered here: every `search.*` fixture
+//! (request and response) and the response of every other `reject` fixture
+//! (error envelope only; read requests come with the read types). The manifest
 //! drives the list. Digests are pinned in `agent24-protocol/tests/knowledge_fixtures.rs`.
 //!
 //! "Equal" means semantically equal JSON: object key order is ignored and numbers
@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent24_knowledge::ErrorEnvelope;
+use agent24_knowledge::{ErrorEnvelope, SearchRequest, SearchResponse};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -34,13 +34,15 @@ struct Manifest {
 struct Entry {
     file: String,
     class: String,
+    request_valid: Option<bool>,
+    server_handler: bool,
 }
 
 fn covered() -> Vec<Entry> {
     let m: Manifest = serde_json::from_value(load("manifest.json")).unwrap();
     m.fixtures
         .into_iter()
-        .filter(|e| e.class == "reject")
+        .filter(|e| e.file.starts_with("search.") || e.class == "reject")
         .collect()
 }
 
@@ -93,6 +95,14 @@ fn roundtrip<T: DeserializeOwned + Serialize>(v: &Value) -> Result<(), String> {
     }
 }
 
+fn decode_body(accept: bool, body: &Value) -> Result<(), String> {
+    if accept {
+        decode::<SearchResponse>(body).map(drop)
+    } else {
+        decode::<ErrorEnvelope>(body).map(drop)
+    }
+}
+
 #[test]
 fn covered_fixtures_roundtrip() {
     let mut failures = Vec::new();
@@ -104,14 +114,43 @@ fn covered_fixtures_roundtrip() {
                 failures.push(format!("{} [{side}]: {msg}", e.file));
             }
         };
+        if e.file.starts_with("search.") {
+            let req = &fx["request"];
+            match e.request_valid {
+                Some(true) => fail("request", roundtrip::<SearchRequest>(req)),
+                // A string request is a raw body that is not valid JSON.
+                Some(false) => match req {
+                    Value::String(raw) if serde_json::from_str::<SearchRequest>(raw).is_ok() => {
+                        fail("request", Err("raw body decoded".into()))
+                    }
+                    Value::String(_) => {}
+                    _ if decode::<SearchRequest>(req).is_ok() => {
+                        fail("request", Err("invalid request decoded".into()))
+                    }
+                    _ => {}
+                },
+                None => {}
+            }
+        }
         let body = &fx["response"]["body"];
-        fail("response", roundtrip::<ErrorEnvelope>(body));
+        let accept = e.class == "accept";
+        // server_handler: false (§12 #18, search.cancelled) is a client-only fixture:
+        // its late success body is something a client decodes, never something a
+        // server encodes, so it is decoded only and kept out of the encode check.
+        // Its request is still round-tripped (the client encodes requests); its
+        // `local` part is the local-cancelled result, covered with those types.
+        let r = match (e.server_handler, accept) {
+            (false, _) => decode_body(accept, body),
+            (true, true) => roundtrip::<SearchResponse>(body),
+            (true, false) => roundtrip::<ErrorEnvelope>(body),
+        };
+        fail("response", r);
     }
     let names: Vec<_> = entries.iter().map(|e| e.file.as_str()).collect();
     println!("covered {} fixtures: {names:#?}", names.len());
     assert_eq!(
         names.len(),
-        27,
+        32,
         "manifest changed; review coverage: {names:#?}"
     );
     assert!(
@@ -152,14 +191,21 @@ fn unknown_fields_are_rejected_at_every_level() {
     let mut accepted = Vec::new();
     for e in covered() {
         let fx = load(&e.file);
-        let targets = [("response", fx["response"]["body"].clone())];
+        let accept = e.class == "accept";
+        let mut targets = vec![("response", fx["response"]["body"].clone())];
+        if e.file.starts_with("search.") && e.request_valid == Some(true) {
+            targets.push(("request", fx["request"].clone()));
+        }
         for (side, v) in targets {
             let mut paths = Vec::new();
             object_paths(&v, String::new(), &mut paths);
             for p in paths {
                 let mut m = v.clone();
                 obj(&mut m, &p).insert("x_unknown".into(), json!(1));
-                let ok = decode::<ErrorEnvelope>(&m).is_ok();
+                let ok = match side {
+                    "request" => decode::<SearchRequest>(&m).is_ok(),
+                    _ => decode_body(accept, &m).is_ok(),
+                };
                 if ok {
                     accepted.push(format!("{} [{side}] {p:?}", e.file));
                 }
@@ -189,6 +235,7 @@ fn nullable_and_optional_keys_are_distinct() {
             "/error/details/current_revision",
             "index_build_id",
         ),
+        ("search.ok.json", "/hits/2/revision", "chunk_revision"),
     ];
     for (file, ptr, key) in missing {
         let mut body = load(file)["response"]["body"].take();
@@ -196,14 +243,17 @@ fn nullable_and_optional_keys_are_distinct() {
             obj(&mut body, ptr).remove(key).is_some(),
             "{file}: no {ptr}/{key}"
         );
+        let accept = file == "search.ok.json";
         assert!(
-            decode::<ErrorEnvelope>(&body).is_err(),
+            decode_body(accept, &body).is_err(),
             "{file}: missing {ptr}/{key} was accepted"
         );
     }
     let null = [
         ("search.unauthorized-revoked.json", "/error", "hint"),
         ("search.mixed-score-space.json", "/error/details", "reason"),
+        ("search.ok.json", "/hits/0", "display"),
+        ("search.partial.json", "", "partial_failures"),
     ];
     for (file, ptr, key) in null {
         let mut body = load(file)["response"]["body"].take();
@@ -213,8 +263,9 @@ fn nullable_and_optional_keys_are_distinct() {
                 .is_some(),
             "{file}: no {ptr}/{key}"
         );
+        let accept = file.starts_with("search.ok") || file.starts_with("search.partial");
         assert!(
-            decode::<ErrorEnvelope>(&body).is_err(),
+            decode_body(accept, &body).is_err(),
             "{file}: null {ptr}/{key} was accepted"
         );
     }
@@ -263,6 +314,20 @@ fn groups_need_two_items() {
         );
     }
     assert!(decode::<ErrorEnvelope>(&mutated(file, "/error/details", "groups", groups)).is_ok());
+}
+
+/// `locator.end` has `minimum: 1`.
+#[test]
+fn locator_end_must_be_positive() {
+    let file = "search.ok.json";
+    let zero = json!({"valid": true, "start": 0, "end": 0});
+    let body = mutated(file, "/hits/0", "locator", zero);
+    assert!(
+        decode::<SearchResponse>(&body).is_err(),
+        "end 0 was accepted"
+    );
+    let one = json!({"valid": true, "start": 0, "end": 1});
+    assert!(decode::<SearchResponse>(&mutated(file, "/hits/0", "locator", one)).is_ok());
 }
 
 /// `retryable` is fixed per code (§6) except for `unavailable`.
