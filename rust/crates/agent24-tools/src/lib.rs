@@ -34,6 +34,30 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+/// Directory opened before the approval gate. Writes use this handle, not a
+/// later lookup of the same path name.
+#[derive(Clone)]
+pub struct PinnedOutsideDir {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) dir: std::sync::Arc<cap_std::fs::Dir>,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl PinnedOutsideDir {
+    pub(crate) fn dir(&self) -> &cap_std::fs::Dir {
+        &self.dir
+    }
+
+    pub(crate) fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
 /// Per-call execution context.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -49,7 +73,7 @@ pub struct ToolContext {
     tool_call_id: String,
     workspace: WorkspaceAuthority,
     confirmed_write_root: Option<std::path::PathBuf>,
-    approved_outside_directory: Option<std::path::PathBuf>,
+    approved_outside_directory: Option<std::sync::Arc<PinnedOutsideDir>>,
 }
 
 #[derive(Clone)]
@@ -109,14 +133,23 @@ impl ToolContext {
     }
 
     #[must_use]
-    pub fn with_approved_outside_directory(mut self, directory: std::path::PathBuf) -> Self {
+    pub fn with_approved_outside_directory(
+        mut self,
+        directory: std::sync::Arc<PinnedOutsideDir>,
+    ) -> Self {
         self.approved_outside_directory = Some(directory);
         self
     }
 
     #[must_use]
     pub fn approved_outside_directory(&self) -> Option<&std::path::Path> {
-        self.approved_outside_directory.as_deref()
+        self.approved_outside_directory
+            .as_ref()
+            .map(|pin| pin.path.as_path())
+    }
+
+    pub(crate) fn pinned_outside_directory(&self) -> Option<&std::sync::Arc<PinnedOutsideDir>> {
+        self.approved_outside_directory.as_ref()
     }
 
     #[must_use]

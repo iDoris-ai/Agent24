@@ -30,10 +30,22 @@ pub fn classify_builtin_write(workspace_root: Option<&Path>, raw_path: &str) -> 
     {
         return WriteLocation::InsideConfirmedRoot;
     }
-    match canonical.parent().and_then(path_utf8) {
-        Some(directory) => WriteLocation::Outside { directory },
+    match canonical.parent() {
+        Some(parent) if directory_grant_forbidden(parent) => {
+            WriteLocation::AskWithoutDirectoryGrant
+        }
+        Some(parent) => path_utf8(parent)
+            .map(|directory| WriteLocation::Outside { directory })
+            .unwrap_or(WriteLocation::AskWithoutDirectoryGrant),
         None => WriteLocation::AskWithoutDirectoryGrant,
     }
+}
+
+pub(crate) fn directory_grant_forbidden(directory: &Path) -> bool {
+    let directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.to_path_buf());
+    forbidden_workspace_root(&directory)
 }
 
 fn forbidden_workspace_root(root: &Path) -> bool {
@@ -136,6 +148,20 @@ mod tests {
             classify_builtin_write(Some(&root), outside.to_str().unwrap()),
             WriteLocation::Outside { .. }
         ));
+    }
+
+    #[test]
+    fn ssh_is_not_a_directory_grant_target() {
+        let home = std::env::var("HOME").unwrap();
+        let ssh = Path::new(&home).join(".ssh");
+        if !ssh.is_dir() {
+            return;
+        }
+        let file = ssh.join("authorized_keys");
+        assert_eq!(
+            classify_builtin_write(None, file.to_str().unwrap()),
+            WriteLocation::AskWithoutDirectoryGrant
+        );
     }
 
     #[test]

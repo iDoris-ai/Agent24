@@ -64,16 +64,31 @@ fn str_arg<'a>(input: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
 
-/// Canonical parent of an absolute `fs_write` path, captured before the gate.
-/// The gate and the later open both use this value. Relative paths and the
-/// filesystem root have none.
-pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<PathBuf> {
+/// Open the parent directory before the gate. The returned handle is what the
+/// later write uses. Relative paths and the filesystem root have none.
+pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<Arc<crate::PinnedOutsideDir>> {
     let raw = str_arg(input, "path")?;
     let path = Path::new(raw);
     if !path.is_absolute() {
         return None;
     }
-    path.parent()?.canonicalize().ok()
+    let parent = path.parent()?.canonicalize().ok()?;
+    pin_outside_dir(parent).ok()
+}
+
+pub(crate) fn pin_outside_dir(
+    parent: PathBuf,
+) -> Result<Arc<crate::PinnedOutsideDir>, std::io::Error> {
+    use std::os::unix::fs::MetadataExt as _;
+    let file = std::fs::File::open(&parent)?;
+    let meta = file.metadata()?;
+    let dir = cap_std::fs::Dir::from_std_file(file);
+    Ok(Arc::new(crate::PinnedOutsideDir {
+        path: parent,
+        dir: Arc::new(dir),
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }))
 }
 
 /// Lexically fold `.` / `..` (no filesystem access). `None` when `..` would
@@ -269,14 +284,13 @@ impl Tool for FsWriteTool {
             return Ok(format!("wrote {written} bytes to {raw}"));
         }
         if let Err(err) = resolve_in_roots(raw, &self.roots) {
-            let Some(directory) = ctx.approved_outside_directory() else {
+            let Some(pinned) = ctx.pinned_outside_directory().cloned() else {
                 return Err(err);
             };
             let bytes = content.as_bytes().to_vec();
             let raw_owned = raw.to_owned();
-            let directory = directory.to_path_buf();
             let written = tokio::task::spawn_blocking(move || {
-                write_approved_outside(&raw_owned, &directory, &bytes)
+                write_approved_outside(&raw_owned, &pinned, &bytes)
             })
             .await
             .map_err(|e| ToolError::Failed(format!("write task: {e}")))??;
@@ -305,7 +319,11 @@ impl Tool for FsWriteTool {
     }
 }
 
-fn write_approved_outside(raw: &str, approved: &Path, bytes: &[u8]) -> Result<usize, ToolError> {
+fn write_approved_outside(
+    raw: &str,
+    pinned: &crate::PinnedOutsideDir,
+    bytes: &[u8],
+) -> Result<usize, ToolError> {
     use std::io::Write as _;
     let path = Path::new(raw);
     let parent = path
@@ -314,35 +332,44 @@ fn write_approved_outside(raw: &str, approved: &Path, bytes: &[u8]) -> Result<us
     let name = path
         .file_name()
         .ok_or_else(|| ToolError::Invalid(format!("path {raw} has no file name")))?;
-    if name == "." || name == ".." {
-        return Err(ToolError::Denied(format!(
-            "path {raw} is not a file in the approved directory"
-        )));
-    }
-    let parent = parent
-        .canonicalize()
+    let parent_meta = parent
+        .metadata()
         .map_err(|err| ToolError::Denied(format!("path {raw} parent is not a directory: {err}")))?;
-    let approved = approved
-        .canonicalize()
-        .map_err(|err| ToolError::Denied(format!("approved directory is unavailable: {err}")))?;
-    if parent != approved {
+    if std::os::unix::fs::MetadataExt::dev(&parent_meta) != pinned.dev()
+        || std::os::unix::fs::MetadataExt::ino(&parent_meta) != pinned.ino()
+    {
         return Err(ToolError::Denied(format!(
             "path {raw} is outside the approved directory"
         )));
     }
-    let dir = cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())
-        .map_err(|err| ToolError::Failed(format!("open approved directory: {err}")))?;
-    if dir
-        .symlink_metadata(name)
-        .is_ok_and(|meta| meta.file_type().is_symlink())
+    let live = pinned
+        .dir()
+        .dir_metadata()
+        .map_err(|err| ToolError::Denied(format!("approved directory is unavailable: {err}")))?;
+    if cap_fs_ext::MetadataExt::dev(&live) != pinned.dev()
+        || cap_fs_ext::MetadataExt::ino(&live) != pinned.ino()
     {
-        return Err(ToolError::Denied(format!("path {raw} is a symlink")));
+        return Err(ToolError::Denied(format!(
+            "path {raw} is outside the approved directory"
+        )));
     }
     let mut opts = cap_std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    let mut file = dir
+    opts.write(true).create(true);
+    cap_fs_ext::OpenOptionsFollowExt::follow(&mut opts, cap_fs_ext::FollowSymlinks::No);
+    let mut file = pinned
+        .dir()
         .open_with(name, &opts)
         .map_err(|err| map_fs_err(raw, &err))?;
+    let meta = file
+        .metadata()
+        .map_err(|err| ToolError::Failed(format!("write {raw}: {err}")))?;
+    if cap_fs_ext::MetadataExt::nlink(&meta) > 1 {
+        return Err(ToolError::Denied(format!(
+            "path {raw} is a hard link and is not an approved target"
+        )));
+    }
+    file.set_len(0)
+        .map_err(|err| ToolError::Failed(format!("write {raw}: {err}")))?;
     file.write_all(bytes)
         .map_err(|err| ToolError::Failed(format!("write {raw}: {err}")))?;
     Ok(bytes.len())
@@ -557,7 +584,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(denied, ToolError::Denied(_)), "{denied:?}");
 
-        let approved = ctx().with_approved_outside_directory(outside.canonicalize().unwrap());
+        let approved = ctx().with_approved_outside_directory(
+            pin_outside_dir(outside.canonicalize().unwrap()).unwrap(),
+        );
         let out = tool
             .call(
                 &approved,
@@ -601,6 +630,32 @@ mod tests {
             std::os::unix::fs::symlink(&self.secret, &self.link).unwrap();
             crate::GateDecision::Allow
         }
+    }
+
+    #[tokio::test]
+    async fn replacing_the_approved_directory_name_does_not_redirect_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        let secret = dir.path().join("secret");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let pinned = pin_outside_dir(safe.canonicalize().unwrap()).unwrap();
+        let moved = dir.path().join("safe-moved");
+        std::fs::rename(&safe, &moved).unwrap();
+        std::os::unix::fs::symlink(&secret, &safe).unwrap();
+        let tool = FsWriteTool::new(vec![dir.path().join("ws")]);
+        let file = safe.join("a.txt");
+        let err = tool
+            .call(
+                &ctx().with_approved_outside_directory(pinned),
+                &sinput(&[("path", file.to_str().unwrap()), ("content", "ok")]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err:?}");
+        assert!(!secret.join("a.txt").exists());
+        assert!(!moved.join("a.txt").exists());
     }
 
     #[cfg(unix)]

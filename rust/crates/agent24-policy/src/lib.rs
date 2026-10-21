@@ -186,7 +186,13 @@ fn classify_write(
     if source != "builtin" || tool != "fs_write" || risk != RiskClass::WriteLocal {
         return None;
     }
-    if let Some(directory) = captured_write_directory.and_then(|path| path.to_str()) {
+    if let Some(path) = captured_write_directory {
+        let Some(directory) = path.to_str() else {
+            return Some(write_scope::WriteLocation::AskWithoutDirectoryGrant);
+        };
+        if write_scope::directory_grant_forbidden(path) {
+            return Some(write_scope::WriteLocation::AskWithoutDirectoryGrant);
+        }
         return Some(write_scope::WriteLocation::Outside {
             directory: directory.to_owned(),
         });
