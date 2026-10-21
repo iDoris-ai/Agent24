@@ -554,6 +554,34 @@ mod tests {
         }
     }
 
+    /// An entry added to a directory already read, with the directory's
+    /// modification time then set back: only its `ctime` still moves.
+    #[test]
+    fn an_entry_added_with_the_directory_mtime_set_back_is_caught() {
+        let t = sample();
+        let root = t.path().to_owned();
+        let result = collect_swapping(t.path(), move |dir| {
+            if dir.ends_with("dir") && !root.join("late").exists() {
+                let before = std::fs::metadata(&root).unwrap().modified().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::fs::write(root.join("late"), "late").unwrap();
+                std::fs::File::open(&root)
+                    .unwrap()
+                    .set_modified(before)
+                    .unwrap();
+                assert_eq!(
+                    std::fs::metadata(&root).unwrap().modified().unwrap(),
+                    before
+                );
+            }
+        });
+        assert!(
+            matches!(result, Err(ArtifactError::Changed(_))),
+            "{:?}",
+            result.err()
+        );
+    }
+
     /// A root that does not end in a name would follow a linked last
     /// component (`O_NOFOLLOW` does not apply to `link/`): refused.
     #[test]
@@ -577,6 +605,14 @@ mod tests {
             identity(s.path()).is_ok(),
             "the same root, ending in its name"
         );
+        // `link/..` names the clean package that holds the link's target.
+        std::fs::create_dir(s.path().join("dir/sub")).unwrap();
+        symlink(s.path().join("dir/sub"), link.path().join("sub")).unwrap();
+        let parent = PathBuf::from(format!("{}/sub/..", link.path().display()));
+        assert!(matches!(
+            identity(&parent),
+            Err(ArtifactError::Unsupported(_))
+        ));
     }
 
     /// A hashed file written again before the walk ends, even back to the
