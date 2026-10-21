@@ -107,10 +107,9 @@ pub fn identity(package_dir: &Path) -> Result<String, ArtifactError> {
 }
 
 /// Every file and symlink under `root`, within `(entries, bytes)` caps.
-/// Each directory is opened from its parent's descriptor, refusing a link,
-/// and must be the inode its parent listed; so must each file. A swap
-/// while the walk runs is never followed, and every hashed file is checked
-/// again at the end.
+/// Each directory and file is opened refusing a link and must be the inode
+/// its parent listed, so no swap is followed; one descriptor is open at a
+/// time, and every file and link is checked again at the end.
 fn collect(
     root: &Path,
     (max_entries, max_bytes): (usize, u64),
@@ -118,39 +117,29 @@ fn collect(
     let unreadable =
         |path: &Path, e: rustix::io::Errno| ArtifactError::Unreadable(path.to_owned(), e.into());
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let root_fd = rustix::fs::open(root, dir_flags, Mode::empty()).map_err(|e| match e {
-        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
-            ArtifactError::Unsupported(root.to_owned())
-        }
-        e => unreadable(root, e),
-    })?;
-    // Where links must land: the root as the filesystem resolves it.
+    let listed = rustix::fs::lstat(root).map_err(|e| unreadable(root, e))?;
+    if FileType::from_raw_mode(listed.st_mode) != FileType::Directory {
+        return Err(ArtifactError::Unsupported(root.to_owned()));
+    }
+    // Where links must land: the root as the filesystem resolves it, which
+    // must be the directory listed here.
     let real_root =
         std::fs::canonicalize(root).map_err(|e| ArtifactError::Unreadable(root.to_owned(), e))?;
-    // Directories still to read, each opened only when its turn comes.
-    let mut pending = vec![(
-        std::sync::Arc::new(root_fd),
-        None,
-        root.to_owned(),
-        PathBuf::new(),
-    )];
+    if !rustix::fs::stat(&real_root).is_ok_and(|real| same_inode(&real, &listed)) {
+        return Err(ArtifactError::Changed(root.to_owned()));
+    }
+    let mut pending = vec![(root.to_owned(), PathBuf::new(), listed)];
     let (mut found, mut bytes, mut entries, mut stamps) = (0usize, 0u64, Vec::new(), Vec::new());
-    while let Some((parent, listed, dir, rel_dir)) = pending.pop() {
-        let fd = match listed {
-            None => parent,
-            Some((name, walked)) => {
-                let fd = rustix::fs::openat(&*parent, &name, dir_flags, Mode::empty())
-                    .map_err(|_| ArtifactError::Changed(dir.clone()))?;
-                if !same_inode(
-                    &rustix::fs::fstat(&fd).map_err(|e| unreadable(&dir, e))?,
-                    &walked,
-                ) {
-                    return Err(ArtifactError::Changed(dir));
-                }
-                std::sync::Arc::new(fd)
-            }
-        };
-        for item in rustix::fs::Dir::read_from(&*fd).map_err(|e| unreadable(&dir, e))? {
+    while let Some((dir, rel_dir, listed)) = pending.pop() {
+        let fd =
+            rustix::fs::open(&dir, dir_flags, Mode::empty()).map_err(|e| open_failed(&dir, e))?;
+        if !same_inode(
+            &rustix::fs::fstat(&fd).map_err(|e| unreadable(&dir, e))?,
+            &listed,
+        ) {
+            return Err(ArtifactError::Changed(dir));
+        }
+        for item in rustix::fs::Dir::read_from(&fd).map_err(|e| unreadable(&dir, e))? {
             let item = item.map_err(|e| unreadable(&dir, e))?;
             let name = OsStr::from_bytes(item.file_name().to_bytes()).to_owned();
             if name == "." || name == ".." {
@@ -161,33 +150,36 @@ fn collect(
                 return Err(ArtifactError::TooLarge);
             }
             let (abs, rel) = (dir.join(&name), rel_dir.join(&name));
-            let walked = rustix::fs::statat(&*fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+            let walked = rustix::fs::statat(&fd, &name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|e| unreadable(&abs, e))?;
             match FileType::from_raw_mode(walked.st_mode) {
-                FileType::Directory => {
-                    pending.push((std::sync::Arc::clone(&fd), Some((name, walked)), abs, rel))
-                }
+                FileType::Directory => pending.push((abs, rel, walked)),
                 FileType::RegularFile => {
                     let (len, digest, hashed) =
-                        hash_file(&*fd, &name, &abs, &walked, max_bytes - bytes)?;
+                        hash_file(&fd, &name, &abs, &walked, max_bytes - bytes)?;
                     bytes += len;
                     entries.push(Entry::new(&rel, b'f', len, &digest));
                     stamps.push((abs, hashed));
                 }
                 FileType::Symlink => {
-                    let target = rustix::fs::readlinkat(&*fd, &name, Vec::new())
+                    let link = std::fs::symlink_metadata(&abs)
+                        .map_err(|e| ArtifactError::Unreadable(abs.clone(), e))?;
+                    let target = rustix::fs::readlinkat(&fd, &name, Vec::new())
                         .map_err(|e| unreadable(&abs, e))?;
                     let target = target.into_bytes();
+                    let written = Path::new(OsStr::from_bytes(&target));
                     // Lexically inside is not enough: through another link
                     // (`s -> .`, then `l -> s/s/../..`) it can still climb
-                    // out, so it must also resolve under the root; a
-                    // dangling link resolves nowhere.
-                    let lands_inside =
-                        std::fs::canonicalize(&abs).is_ok_and(|real| real.starts_with(&real_root));
-                    if !stays_inside(&rel, Path::new(OsStr::from_bytes(&target))) || !lands_inside {
+                    // out, so the target read here must also resolve under
+                    // the root; a dangling one resolves nowhere.
+                    if !stays_inside(&rel, written)
+                        || !std::fs::canonicalize(dir.join(written))
+                            .is_ok_and(|real| real.starts_with(&real_root))
+                    {
                         return Err(ArtifactError::EscapingLink(abs));
                     }
                     entries.push(Entry::new(&rel, b'l', target.len() as u64, &target));
+                    stamps.push((abs, stamp(&link)));
                 }
                 _ => return Err(ArtifactError::Unsupported(abs)),
             }
@@ -195,6 +187,16 @@ fn collect(
     }
     unchanged(&stamps)?;
     Ok(entries)
+}
+
+/// An entry that would not open: replaced (now a link, no longer a
+/// directory, or gone), else unreadable.
+fn open_failed(path: &Path, e: rustix::io::Errno) -> ArtifactError {
+    use rustix::io::Errno;
+    match e {
+        Errno::LOOP | Errno::NOTDIR | Errno::NOENT => ArtifactError::Changed(path.to_owned()),
+        e => ArtifactError::Unreadable(path.to_owned(), e.into()),
+    }
 }
 
 fn same_inode(a: &Stat, b: &Stat) -> bool {
@@ -219,10 +221,8 @@ fn hash_file(
     let changed = || ArtifactError::Changed(path.to_owned());
     let unreadable = |e: std::io::Error| ArtifactError::Unreadable(path.to_owned(), e);
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let fd = rustix::fs::openat(dir, name, flags, Mode::empty()).map_err(|e| match e {
-        rustix::io::Errno::LOOP => changed(),
-        e => unreadable(e.into()),
-    })?;
+    let fd =
+        rustix::fs::openat(dir, name, flags, Mode::empty()).map_err(|e| open_failed(path, e))?;
     let opened = rustix::fs::fstat(&fd).map_err(|e| unreadable(e.into()))?;
     if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
         || !same_inode(&opened, walked)
@@ -243,7 +243,7 @@ fn hash_file(
     Ok((before.2, hasher.finalize().into(), before))
 }
 
-/// Every hashed file is still at its path, as it was when it was read.
+/// Every hashed file and read link is still at its path, as it was.
 fn unchanged(stamps: &[(PathBuf, Stamp)]) -> Result<(), ArtifactError> {
     for (path, hashed) in stamps {
         let now = std::fs::symlink_metadata(path)
@@ -560,6 +560,41 @@ mod tests {
         assert!(matches!(unchanged(&stamps), Err(ArtifactError::Changed(_))));
         std::fs::remove_file(&path).unwrap();
         assert!(unchanged(&stamps).is_err(), "gone is not unchanged");
+    }
+
+    /// A link re-pointed before the walk ends, even inside the package, is
+    /// caught: links are checked again at the end like files.
+    #[test]
+    fn a_link_repointed_after_it_was_read_is_caught() {
+        let t = sample();
+        let link = t.path().join("l");
+        let stamps = vec![(
+            link.clone(),
+            stamp(&std::fs::symlink_metadata(&link).unwrap()),
+        )];
+        assert!(unchanged(&stamps).is_ok());
+        std::fs::remove_file(&link).unwrap();
+        symlink("dir/b", &link).unwrap();
+        assert!(matches!(unchanged(&stamps), Err(ArtifactError::Changed(_))));
+    }
+
+    /// A directory that will not open for want of permission is unreadable,
+    /// not "changed".
+    #[test]
+    fn an_unreadable_directory_is_not_reported_as_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root opens it anyway
+        }
+        let t = sample();
+        let dir = t.path().join("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = identity(t.path());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(result, Err(ArtifactError::Unreadable(..))),
+            "{result:?}"
+        );
     }
 
     #[test]
