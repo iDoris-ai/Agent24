@@ -127,22 +127,28 @@ fn is_document_class_module(module: &str) -> bool {
     module == DOCUMENTS_MODULE_ID
 }
 
+/// Whether a remote model tier exists right now (K1-6a-G §2.4): read on
+/// every advert and every call, never a startup snapshot. `None` means the
+/// tier configuration could not be read, which gate 5 treats as a remote
+/// tier being present.
+pub type RemoteTierProbe = Arc<dyn Fn() -> Option<bool> + Send + Sync>;
+
 pub struct AgentModuleToolAdvertView {
     runtime: Arc<AgentModuleToolRuntime>,
     authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
-    remote_tier_present: bool,
+    remote_tier: RemoteTierProbe,
 }
 
 impl AgentModuleToolAdvertView {
     pub fn new(
         runtime: Arc<AgentModuleToolRuntime>,
         authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
-        remote_tier_present: bool,
+        remote_tier: RemoteTierProbe,
     ) -> Arc<Self> {
         Arc::new(Self {
             runtime,
             authorizations,
-            remote_tier_present,
+            remote_tier,
         })
     }
 }
@@ -174,7 +180,7 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
     }
 
     async fn blocked_by_remote_tier_guard(&self, module: &str, _operation: &str) -> bool {
-        self.remote_tier_present && is_document_class_module(module)
+        is_document_class_module(module) && (self.remote_tier)().unwrap_or(true)
     }
 }
 
@@ -220,6 +226,8 @@ mod tests {
         slow_check: AtomicBool,
         unresponsive_check: AtomicBool,
         entered: tokio::sync::Notify,
+        /// What `TestAdvertView`'s gate 5 reads, per call.
+        remote_tier: AtomicBool,
     }
 
     #[async_trait]
@@ -294,7 +302,7 @@ mod tests {
             self.outbound_ready.load(Ordering::SeqCst)
         }
         async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
-            false
+            self.running.remote_tier.load(Ordering::SeqCst)
         }
     }
 
@@ -464,6 +472,7 @@ mod tests {
             slow_check: AtomicBool::new(false),
             unresponsive_check: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
+            remote_tier: AtomicBool::new(false),
         });
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
@@ -1374,6 +1383,7 @@ mod tests {
             slow_check: AtomicBool::new(false),
             unresponsive_check: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
+            remote_tier: AtomicBool::new(false),
         });
         let other: Arc<dyn agent24_domain::tool::ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: other_auth.clone(),
@@ -1644,12 +1654,119 @@ mod tests {
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
     }
 
+    /// K1-6a-G §4 case 1: a withheld tool called by name, on either
+    /// dispatch path, is refused before the module and audited as denied.
+    #[tokio::test]
+    async fn a_withheld_tool_called_by_name_is_refused_and_audited() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        runtime.remote_tier.store(true, Ordering::SeqCst);
+        assert!(registry.live_adverts().await.is_empty());
+        let by_dispatch = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let preapproved = registry
+            .execute_preapproved(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        for error in [by_dispatch, preapproved] {
+            assert!(error.to_string().contains("permission_denied"), "{error}");
+        }
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 4, "a pre-dispatch and a terminal per call");
+        for pair in rows.chunks(2) {
+            assert_eq!(pair[0].action, "k1.module_tool.pre_dispatch");
+            assert_eq!(
+                pair[0].detail["pre_dispatch"]["authorization_ref"],
+                "denied:remote_tier"
+            );
+            assert_eq!(pair[1].detail["terminal"]["result"], "denied");
+        }
+    }
+
+    /// K1-6a-G §2.4: the guard comes before the authorization lookup; an
+    /// authorization that never answers is never reached.
+    #[tokio::test]
+    async fn the_guard_refuses_before_authorization_is_looked_up() {
+        let authorization = Arc::new(PausingAuthorization {
+            entered: tokio::sync::Notify::new(),
+        });
+        let (registry, runtime, _, _, _tool) =
+            fixture_using(RiskClass::Read, true, true, true, None, Some(authorization)).await;
+        runtime.remote_tier.store(true, Ordering::SeqCst);
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("the guard answers without waiting on authorization")
+        .unwrap_err();
+        assert!(refused.to_string().contains("permission_denied"));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// K1-6a-G §4 case 2: a remote tier that appears while the daemon runs
+    /// refuses the next call; nothing is read once at startup.
+    #[tokio::test]
+    async fn a_remote_tier_added_while_running_refuses_the_next_call() {
+        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
+        let (ctx, input, cancel) = (context(), Map::new(), CancellationToken::new());
+        let call = || registry.dispatch("fake_module.write_local", &ctx, &input, &cancel);
+        call().await.unwrap();
+        runtime.remote_tier.store(true, Ordering::SeqCst);
+        let refused = call().await.unwrap_err();
+        assert!(refused.to_string().contains("permission_denied"));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The production view reads its probe on every check, and an unreadable
+    /// tier configuration counts as a remote tier; only the document-class
+    /// module is withheld.
+    #[tokio::test]
+    async fn the_production_view_reads_the_tier_on_every_check() {
+        let tier = Arc::new(std::sync::Mutex::new(Some(false)));
+        let probe = {
+            let tier = Arc::clone(&tier);
+            Arc::new(move || *tier.lock().unwrap())
+        };
+        let view = AgentModuleToolAdvertView::new(
+            AgentModuleToolRuntime::new(HashSet::new()),
+            HashMap::new(),
+            probe,
+        );
+        assert!(!view.blocked_by_remote_tier_guard("documents", "get").await);
+        *tier.lock().unwrap() = Some(true);
+        assert!(view.blocked_by_remote_tier_guard("documents", "get").await);
+        *tier.lock().unwrap() = None;
+        assert!(view.blocked_by_remote_tier_guard("documents", "get").await);
+        assert!(!view.blocked_by_remote_tier_guard("sin90", "get").await);
+        *tier.lock().unwrap() = Some(false);
+        assert!(!view.blocked_by_remote_tier_guard("documents", "get").await);
+    }
+
     #[tokio::test]
     async fn agent_module_tool_advert_view_outbound_gate_ready_only_for_registered_operations() {
         let mut ops = HashSet::new();
         ops.insert(("doc_mod".to_owned(), "read_op".to_owned()));
         let runtime = AgentModuleToolRuntime::new(ops);
-        let view = AgentModuleToolAdvertView::new(runtime, HashMap::new(), false);
+        let view =
+            AgentModuleToolAdvertView::new(runtime, HashMap::new(), Arc::new(|| Some(false)));
         assert!(view.outbound_gate_ready("doc_mod", "read_op").await);
         assert!(!view.outbound_gate_ready("doc_mod", "unknown_op").await);
     }
