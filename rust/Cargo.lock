@@ -300,6 +300,7 @@ dependencies = [
 name = "agent24-protocol"
 version = "0.5.1"
 dependencies = [
+ "agent24-knowledge",
  "chrono",
  "fs2",
  "hex",
