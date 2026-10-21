@@ -1,6 +1,6 @@
 // KB-CT-02b (#1012): the Knowledge v1 fixtures (protocol/knowledge/fixtures/v1)
 // must match the digests pinned in their manifest and the schemas in
-// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r8). The Rust
+// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r9). The Rust
 // side (agent24-protocol tests/knowledge_fixtures.rs) checks the same manifest,
 // so changing any fixture byte turns both red. Pure schema test, no daemon.
 
@@ -24,7 +24,7 @@ const manifest = JSON.parse(readFileSync(join(fixtureDir, 'manifest.json'), 'utf
 // Pins the whole fixture set (every file digest and version). Changing a fixture
 // means bumping its version, re-pinning its sha256 and updating this constant
 // together with MANIFEST_SHA256 in rust/crates/agent24-protocol/tests/knowledge_fixtures.rs.
-const MANIFEST_SHA256 = '408dbd91f933b2a6fe5cf1a973d1af1eced483a5e40939e75395ed0ac39eec04'
+const MANIFEST_SHA256 = 'bb90b8755a06333fbc5db18b49ac6f3854b15c92843e63bb5d26770c09ce192c'
 // Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); same list as the Rust test.
 const REQUIRED = [
   'search.empty-scope.json', 'search.scope-empty-array.json', 'search.partial.json', 'search.partial-overloaded.json',
@@ -63,7 +63,7 @@ const responseSchema = (op: string) => (op === 'system.capabilities' ? 'capabili
 
 describe('knowledge v1 fixtures — manifest', () => {
   it('pins exactly the files in the directory, by version and sha256', () => {
-    expect(manifest.contract_revision).toBe('r8')
+    expect(manifest.contract_revision).toBe('r9')
     // The manifest pins the revision named in the contract's own header.
     const contract = readFileSync(join(repoRoot, 'docs', 'knowledge', 'CONTRACT-READONLY-v1.md'), 'utf8')
     expect(contract.match(/文档修订 (r\d+)/)?.[1]).toBe(manifest.contract_revision)
@@ -150,9 +150,11 @@ describe('knowledge v1 fixtures — schemas and contract rules', () => {
     if (fx.op === 'knowledge.read') expect(body.knowledge_id).toBe(fx.request.knowledge_id)
     const want = fx.op === 'knowledge.read' ? fx.request.expected_revision : undefined
     if (want) {
-      // R4.4: a successful read is at the expected revision.
-      expect([body.revision.source_revision, body.revision.index_build_id]).toEqual([want.source_revision, want.index_build_id])
-      if (fx.request.chunk_id) expect(body.segments[0].chunk_revision).toBe(want.chunk_revision)
+      // R4.4 (r9): a successful document read is at the expected pair; a chunk
+      // read matches on content_tag only (the pair on a chunk request is
+      // informational, and other chunks may have changed the build).
+      if (fx.request.chunk_id) expect(body.segments[0].content_tag).toBe(want.content_tag)
+      else expect([body.revision.source_revision, body.revision.index_build_id]).toEqual([want.source_revision, want.index_build_id])
     }
     if (fx.op === 'knowledge.ready') {
       // R8.2/R8.4: per-KB entries only with scope, and only for KBs that were asked for.
@@ -185,18 +187,20 @@ function rejectPairsWithRequest(op: string, request: any, error: any) {
     // cursor, so a current expected_revision may still meet a stale cursor.
     const cursor = typeof request.page?.cursor === 'string'
     if (!request.chunk_id) {
-      // Document level: no reason, no chunk revision, and something really moved.
-      expect([d.reason, d.current_chunk_revision]).toEqual([undefined, undefined])
+      // Document level: no reason, no chunk fields, and something really moved.
+      expect([d.reason, d.current_chunk_revision, d.current_content_tag]).toEqual([undefined, undefined, undefined])
       if (want && !cursor) expect(sameBuild).toBe(false)
     } else if (d.reason !== undefined) {
       expect(d.reason).toBe('anchor_missing')
+      expect([d.current_chunk_revision, d.current_content_tag]).toEqual([undefined, undefined])
     } else {
-      // Chunk edited in the same build: the new chunk revision is reported. A
-      // cursor-only continuation (R4.1, R4.5) carries no expected_revision.
+      // Servable chunk whose content_tag differs (r9): both current fields are
+      // reported; the build may have changed (R4.4). A cursor-only continuation
+      // (R4.1, R4.5) carries no expected_revision.
       expect(d.current_chunk_revision).toBeDefined()
+      expect(d.current_content_tag).toBeDefined()
       if (want) {
-        expect(sameBuild).toBe(true)
-        if (!cursor) expect(d.current_chunk_revision).not.toBe(want.chunk_revision)
+        if (!cursor) expect(d.current_content_tag).not.toBe(want.content_tag)
       } else {
         expect(cursor).toBe(true)
       }
@@ -277,15 +281,19 @@ describe('knowledge v1 schemas — canonical negatives', () => {
     ok('search.response', { ...partial, completeness: 'complete' }, false)
     ok('search.response', { ...partial, completeness: 'complete', partial_failures: [] }, false)
     const res = clone(load('search.ok.json').response.body)
-    res.hits[2].index_state = 'fresh'
+    res.hits[2].revision.chunk_revision = null
     ok('search.response', res, false)
   })
 
-  it('read: expected_revision has three parts with chunk_id, two without', () => {
+  it('read: expected_revision needs content_tag with chunk_id, two parts without', () => {
     const chunk = load('read.chunk.json').request
-    ok('read.request', { ...chunk, expected_revision: { source_revision: 's', index_build_id: 'i' } }, false)
-    ok('read.request', { ...chunk, expected_revision: { ...chunk.expected_revision, chunk_revision: null } }, false)
+    ok('read.request', { ...chunk, expected_revision: { content_tag: 'ct-chk-71' } })
+    ok('read.request', { ...chunk, expected_revision: { content_tag: 'ct-chk-71', chunk_revision: 1 } })
+    ok('read.request', { ...chunk, expected_revision: { source_revision: 's', index_build_id: 'i', chunk_revision: 1 } }, false)
+    ok('read.request', { ...chunk, expected_revision: { ...chunk.expected_revision, chunk_revision: null } })
     const doc = load('read.document.json').request
+    ok('read.request', { ...doc, expected_revision: { source_revision: 's', index_build_id: 'i' } })
+    ok('read.request', { ...doc, expected_revision: { ...doc.expected_revision, content_tag: 'ct-doc' } }, false)
     ok('read.request', { ...doc, expected_revision: { ...doc.expected_revision, chunk_revision: 0 } }, false)
     // R4.1: page.limit is optional; continuing a single-chunk read needs only the cursor.
     ok('read.request', { ...chunk, page: { cursor: 'cur-71-1' } })
@@ -300,6 +308,8 @@ describe('knowledge v1 schemas — canonical negatives', () => {
     }
     ok('error', mutate('read.out-of-scope.json', (e) => { e.details.reason = 'out_of_scope' }), false)
     ok('error', mutate('read.stale-anchor-missing.json', (e) => { e.details.current_chunk_revision = 3 }), false)
+    ok('error', mutate('read.stale-anchor-missing.json', (e) => { e.details.current_chunk_revision = 3; e.details.current_content_tag = 'ct-chk-70' }), false)
+    ok('error', mutate('read.stale-chunk-edited.json', (e) => { delete e.details.current_content_tag }), false)
     ok('error', mutate('search.unavailable-mixed.json', (e) => { e.details.retryable = true }), false)
     // R3.4: a non-retryable partial failure makes the error non-retryable, with or without a reason.
     ok('error', mutate('search.unavailable-mixed.json', (e) => { e.details.reason = 'dependency'; e.details.retryable = true }), false)

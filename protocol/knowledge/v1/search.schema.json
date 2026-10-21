@@ -43,11 +43,12 @@
         "chunk_id": { "$ref": "common.schema.json#/$defs/id" },
         "chunk_type": { "$ref": "common.schema.json#/$defs/chunk_type" },
         "revision": {
-          "type": "object", "required": ["source_revision", "index_build_id", "chunk_revision"], "additionalProperties": false,
+          "type": "object", "required": ["source_revision", "index_build_id", "chunk_revision", "content_tag"], "additionalProperties": false,
           "properties": {
             "source_revision": { "$ref": "common.schema.json#/$defs/id" },
             "index_build_id": { "$ref": "common.schema.json#/$defs/id" },
-            "chunk_revision": { "oneOf": [{ "$ref": "common.schema.json#/$defs/chunk_revision" }, { "type": "null" }] }
+            "chunk_revision": { "oneOf": [{ "$ref": "common.schema.json#/$defs/chunk_revision" }, { "type": "null" }] },
+            "content_tag": { "$ref": "common.schema.json#/$defs/content_tag" }
           }
         },
         "locator": { "$ref": "#/$defs/locator" },

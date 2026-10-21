@@ -179,6 +179,8 @@ details!(StaleDetails: ConstBool<false> {
     pub current_revision: CurrentRevision,
     #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
     pub current_chunk_revision: Option<u64>,
+    #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
+    pub current_content_tag: Option<String>,
 });
 details!(TimeoutDetails: ConstBool<true> {
     #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]

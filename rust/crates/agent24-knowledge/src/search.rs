@@ -88,6 +88,7 @@ pub struct HitRevision {
     pub index_build_id: String,
     #[serde(deserialize_with = "crate::nullable")]
     pub chunk_revision: Option<ChunkRevision>,
+    pub content_tag: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

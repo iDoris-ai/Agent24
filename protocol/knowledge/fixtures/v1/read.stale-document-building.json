@@ -1,4 +1,4 @@
-{ "$comment": "R4.4, §11.5: as read.stale-document.json, but the new source revision has no active build yet.",
+{ "$comment": "R4.4, §11.5 (r9): as read.stale-document.json, but the new source revision has no build yet.",
   "op": "knowledge.read",
   "request": { "protocol_version": 1, "request_id": "01JB3R7H8J9K0M1N2P3Q4R5S6T", "generation": 15,
     "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7",

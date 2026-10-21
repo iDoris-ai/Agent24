@@ -1,7 +1,7 @@
 # Knowledge 只读接入契约 v1（CONTRACT-READONLY-v1）
 
 > **状态**：**草案（Draft）**，待 fork 侧维护者（David）评审（文档 PR，base `ab/weknora`）。评审通过前不授权任何实现。
-> **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r8 · **日期**：2026-10-18 · **作者**：David Xu
+> **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r9 · **日期**：2026-10-21 · **作者**：David Xu
 > **Issue**：#1011（KB-CT-02a），阶段 #1000；探测依据 iDoris-ai/WeKnora#5。
 > **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）。每条规则后方括号里是来源：决策 `[D1]`–`[D8]`（方案 §1），或任务条目与方案章节（如 `[KB-C1-04]`、`[KB-C1-01b-b]`、`[方案 §4]`）。
 > `[新设]` 表示本文新设计、在决策与方案里都找不到依据的规则；与其他标签并列（如 `[D1+新设]`）时，表示在该依据之上新增的部分。所有 `[新设]` 都待本 PR 评审（§12 #15）。
@@ -43,8 +43,8 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 | profile | Agent24 连接一个服务端的配置档：`local-managed`（宿主托管的本机单用户实例）或 `remote`（远端服务）。 |
 | 资源（resource） | 知识库（KB，`knowledge_base_id`）、文档（`knowledge_id`）、分块（`chunk_id`）。 |
 | scope（范围） | 一组 KB ID，表示可触及的资源边界。分权威授权 A、凭据范围 C、请求范围 Q 三种，交集为有效范围 E（§2）。 |
-| revision（修订） | 三个层次：**源修订** `source_revision`（原件某个不可变版本）、**索引构建** `index_build_id`（某个源修订按某套解析/切分/embedding 配置的一次建索引）、**分块修订** `chunk_revision`（分块正文的编辑计数，0 表示未编辑）。前两项是文档级修订，三项合称修订三元组（§5）。 |
-| 活动构建（active build） | 某个源修订当前对检索生效的那次索引构建；每个源修订至多一个（R5.1）。 |
+| revision（修订） | 修订标识（r9 起由内容派生，§5）：**源修订** `source_revision`（源指纹的带密钥摘要）、**构建标识** `index_build_id`（文档有构建时，其可服务分块集合的带密钥摘要）、**分块修订** `chunk_revision`（上游编辑计数，只作参考）、**内容标签** `content_tag`（分块完整正文的带密钥摘要，判断正文是否变化以它为准）。前两项是文档级修订。 |
+| 可服务分块（servable chunk） | r9 取代 r8 的"活动构建"：文档**有构建**（parse_status 为 completed 或 finalizing）时，属于该文档、未删除、`chunk_type` 为 `text` 且启用的分块。v1 只返回可服务分块（R5.1）。 |
 | score_space | 同一 embedding 模型与检索配置的分组标识；一次服务端请求只能落在一个 score_space（R3.6）。`score` 只能比较**同一个响应**里的 hit，跨响应（包括同一 score_space 的重试）不可比。 |
 | generation（代） | 客户端为每个"profile × principal"绑定维护的单调递增整数。任何使在途工作作废的事件都让它加一（规则见 #1013①）。 |
 | deadline / 预算 | 调用方给出的时限与资源上限（返回量、并发、字节）。 |
@@ -70,7 +70,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R2.3** [D2] **空交集拒绝**：Q 形状合法但 E 为空（包括 A 为空、C 为空集）时，整个请求返回 `forbidden`，`details.reason: "empty_scope"`，不执行检索、不计算 query embedding。示例见 §11.1。`operations.X` 为 `disabled` 时先按 R6.4 返回 `operation_disabled`，不进入本条。
 - **R2.4** [D2] **永不回写空数组**：任何一方在收窄后得到空集时，必须拒绝，不得把 `[]` 写进下游请求、凭据或配置。上游在多处把空列表当"全部"或"回退到默认"。
 - **R2.5** [D2+新设] **search 与 read 都必须带 `scope.knowledge_base_ids`**（就绪请求可选，见 R8.2）。Q 缺失、为 `[]` 或无法解析，一律返回 `invalid_request`；C 缺失或无法解析返回 `unauthorized`，`reason: "credential_invalid"`（C 为空集按 R2.2）。Q 与 A ∩ C 部分重叠时按交集执行，响应用 `effective_scope` 回报实际范围，不说明其余 ID 是不存在还是无权；`effective_scope` 比请求范围窄时，Tool 层必须标出"范围已被收窄"。
-- **R2.6** [新设] **越界资源与不存在不可区分**：这里的资源只指 `knowledge_id` 对应的文档。read 的目标文档必须落在 E 内；落在 E 之外时，返回与"不存在"完全相同的 `not_found`（同码、同 message、无 reason）。`chunk_id` 一律按锚点校验（R4.4），不走这条。search 结果永远不含 E 之外的资源。示例见 §11.2。
+- **R2.6** [新设] **越界资源与不存在不可区分**：这里的资源只指 `knowledge_id` 对应的文档。read 的目标文档必须落在 E 内；落在 E 之外时，返回与"不存在"完全相同的 `not_found`（同码、同 message、无 reason）。正在删除（deleting）的文档视同已删除（r9）。`chunk_id` 一律按锚点校验（R4.4），不走这条。search 结果永远不含 E 之外的资源。示例见 §11.2。
 - **R2.7** [D3/D4] v1 凭据的操作范围只含 search 与 read；下载原件、preview、`/files` 不在 v1 内（矩阵 #5、#6；谁可下载原件待决 #996）。集成模式不消费既存的组织共享与共享 Agent 授权（`internal/application/access/knowledgebase.go:120-154`）。
 - **证据与差距**：
   - 上游空白名单 = 全租户：`AllowsKnowledgeBase` / `AllowsKnowledgeBases` 遇空列表返回 true（矩阵 #1，`internal/types/tenant_api_key.go:328-330`、`:345-347`）；`apiKeyAny()`（定义在 `internal/router/rbac.go:226-228`）对任何有效 key 放行（`internal/middleware/api_key_gate.go:149-151`）。
@@ -85,18 +85,18 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R3.2** [D1] 请求包含：`query`（文本）、`scope`（§2）、`budget`，以及通用字段 `protocol_version`、`request_id`、`generation`（§7）。
 - **R3.3** [D1+新设] `budget`：`deadline_ms`（相对时限，避免时钟偏差）、`max_results`、`max_concurrency`（**单次请求内**服务端对各分支的并发上限）。Provider 层对多次请求的总预算另行控制（KB-C1-04）。超过服务端上限时**截到上限**，不报错，响应用 `applied_budget` 回报实际值；上限在能力声明里公开（§9）。
 - **R3.4** [D1+新设] **完整性**：服务端按 E 内的 KB 分支执行（E 内不可搜索的 KB 视为失败分支，R3.5；检索所需的基础设施就绪时，空 KB 是成功分支，否则与其他 KB 一样按 `dependency` 失败）。全部分支成功 → `completeness: "complete"`（E 内全是空 KB 时为 `complete` 加 0 命中）；至少一个分支成功完成（哪怕 0 命中）而其余失败或超时 → `"partial"`；一个都没成功 → 所有失败都因到达 deadline 时返回 `timeout`，否则返回 `unavailable`。原因混杂时，顶层错误取"最不可重试"的一项：只要任一失败不可重试，整体 `retryable: false`，`reason` 优先取不可重试的那一项；错误信封的 `details` 可以携带 `partial_failures`，让客户端分别处理。
-- **R3.5** [D1+新设] **partial**：`partial_failures[]` 每项为 `{ "knowledge_base_id", "code": "timeout" | "unavailable", "reason", "retryable" }`；`reason` 取 `timeout`、`dependency`、`not_ready`、`overloaded`、`index_building`、`unsupported_kb_type`、`index_failed`（全部文档都索引失败），前五项可重试，后两项不可重试；`code` 为 `timeout` 当且仅当 `reason` 为 `timeout`。`dependency` 表示该分支所需的基础设施（存储、向量库、需要时的 embedding 模型）不可用，与 R8.4 对齐；`not_ready` 表示服务端整体或该组尚未完成初始化，只出现在组级错误的合并（R3.7(b)）与顶层 `unavailable`；客户端对两者的重试处理相同，区分只用于诊断与审计。这与 R3.7(b)（合并时 `reason` 用该组错误的值）及 §6 中 search 的 `unavailable` reason 一致。E 内没有可搜索内容的 KB（首次构建中、全部索引失败，或全部内容不在 v1 范围，R8.4）也列入 `partial_failures`（`code: "unavailable"`），`completeness` 记为 `partial`；空 KB（还没有任何文档）是成功分支，0 命中，不列入。E 内没有任何分支成功时按 R3.4 返回错误。上游的失败单位是 store group：一组失败时，组内所有 KB 都要列入（`knowledgebase_search_fanout.go:89-104`）。客户端可以只针对可重试的失败 KB 发一个新请求重试（新 `request_id`、当前 generation），计入剩余总预算，结果按 R3.7(a) 合并。partial 结果可以使用，但 Tool 层必须标出不完整（KB-C1-05）。示例见 §11.6。
+- **R3.5** [D1+新设] **partial**：`partial_failures[]` 每项为 `{ "knowledge_base_id", "code": "timeout" | "unavailable", "reason", "retryable" }`；`reason` 取 `timeout`、`dependency`、`not_ready`、`overloaded`、`index_building`、`unsupported_kb_type`、`index_failed`（没有文档有构建、也没有在构建中的文档，即全部 failed 或 cancelled，r9），前五项可重试，后两项不可重试；`code` 为 `timeout` 当且仅当 `reason` 为 `timeout`。`dependency` 表示该分支所需的基础设施（存储、向量库、需要时的 embedding 模型）不可用，与 R8.4 对齐；`not_ready` 表示服务端整体或该组尚未完成初始化，只出现在组级错误的合并（R3.7(b)）与顶层 `unavailable`；客户端对两者的重试处理相同，区分只用于诊断与审计。这与 R3.7(b)（合并时 `reason` 用该组错误的值）及 §6 中 search 的 `unavailable` reason 一致。E 内没有可搜索内容的 KB（取值同 R8.4：构建中为 `index_building`，全部 failed 或 cancelled 为 `index_failed`，有构建但可服务集合都为空为 `unsupported_kb_type`；正在删除的文档不计入，r9）也列入 `partial_failures`（`code: "unavailable"`），`completeness` 记为 `partial`；空 KB（还没有任何文档）是成功分支，0 命中，不列入。E 内没有任何分支成功时按 R3.4 返回错误。上游的失败单位是 store group：一组失败时，组内所有 KB 都要列入（`knowledgebase_search_fanout.go:89-104`）。客户端可以只针对可重试的失败 KB 发一个新请求重试（新 `request_id`、当前 generation），计入剩余总预算，结果按 R3.7(a) 合并。partial 结果可以使用，但 Tool 层必须标出不完整（KB-C1-05）。示例见 §11.6。
 - **R3.6** [D1+新设] **排序与 score_space**：响应里 `hits` 的顺序就是权威顺序，`rank` 从 1 连续编号。`score` 只是参考，并带 `score_space`；**`score` 只能比较同一个响应里的 hit**：上游 hybrid 用 RRF，分数只取决于本次请求内的名次（`internal/application/service/knowledgebase_search_fusion.go:33-53`、`:125-126`），纯关键词模式按本次请求内的最高分缩放（`:40-47`、`:94` 起）。v1 服务端端点只接受 E 落在同一个 score_space 的请求；E 跨多个 score_space 时返回 `invalid_request`，`reason: "mixed_score_space"`，`details.groups` 为 `[{ "score_space", "knowledge_base_ids" }]`，只列 E 内的 KB，不泄露范围外的。
 - **R3.7** [新设] **Provider 层合并**：
   - (a) **重试补齐**（同一 score_space）：把重试结果当成新的一组，与原结果按 (b) 的秩轮转规则合并（原结果在前），按 `chunk_id` 去重（保留先出现者），截到原请求的 `max_results`，重新编号 `rank`。**不得按 `score` 合并**（R3.6）。重试成功的 KB 从 `partial_failures` 移除，`completeness` 按 R3.4 重新计算。
   - (b) **跨组合并**：按 `details.groups`（或已知分组）每组发一个请求。组内保持服务端顺序；组间按秩轮转交错（各组第 1 名、各组第 2 名……，组的先后按请求里 KB 的首次出现顺序）；按 `chunk_id` 去重（保留先出现者）；总命中截到调用方的 `max_results`，重新编号 `rank`。组级错误：`forbidden` 且 `reason` 为 `empty_scope` 时，把该组的 KB 从合并结果的 `effective_scope` 移除，不算整体失败，所有组都是 `empty_scope` 时返回 `forbidden`；其他 `forbidden`，以及 `unauthorized`、`invalid_request`、`internal`，合并结果整体返回这个错误，其他组已拿到的结果全部丢弃。`timeout` 与 `unavailable` 并入 partial：只要还有一组成功，该组的 KB 都并入 `partial_failures`（`code` 与 `reason` 用该组错误的值，`reason` 缺省时 `timeout` 对 `timeout`、`unavailable` 对 `dependency`），合并结果为 `partial`；所有组都失败时，按 R3.4 返回 `timeout` 或 `unavailable`。`effective_scope` 取各组并集；`applied_budget` 逐项取各组实际值中最严的；`completeness` 取各组中最差的，`partial_failures` 取并集。
   - **合并结果里的 `score`**：来自不同响应，彼此不可比较（R3.6）。Provider 交给 Tool 层的合并结果不带 `score`，只保留 `rank`；需要分数时只能在单个服务端响应内部使用。
   - (c) **分组从哪来**：按 KB 就绪响应（R8.4）里每个 KB 带的 `score_space`，或 `mixed_score_space` 错误的 `details.groups`。
-- **R3.8** [D1+新设] 每个 hit 带：`knowledge_base_id`、`knowledge_id`、`chunk_id`、`chunk_type`、修订三元组 `revision`、`locator`、`index_state`（§5）、`score`、`score_space`、受字节上限约束的 `snippet`，以及可选的 `display: { title, file_name }`。snippet 是检索证据，不是正文；`display` 只是展示元数据，**不是正文，不能作为引文**；引用正文用 read（R4.7）。
+- **R3.8** [D1+新设] 每个 hit 带：`knowledge_base_id`、`knowledge_id`、`chunk_id`、`chunk_type`、修订标识 `revision`（`source_revision`、`index_build_id`、`chunk_revision`、`content_tag`，§5）、`locator`、`index_state`（§5）、`score`、`score_space`、受字节上限约束的 `snippet`，以及可选的 `display: { title, file_name }`。snippet 是检索证据，不是正文；`display` 只是展示元数据，**不是正文，不能作为引文**；引用正文用 read（R4.7）。snippet 必须从与 `content_tag` **同一次回表取到的同一串数据库正文**中截取，不得使用索引侧的匹配文本、标题或上下文头（r9）。
   **hit 只能是检索命中**：v1 的 hit 不包含上下文扩展附带的父块、邻块与关系块。服务端在这个端点上要关闭扩展（上游 `SkipContextEnrichment` 默认 false，`internal/types/search.go:248-251`），或把附带结果过滤掉。
   **分块类型**：v1 的 hit 与 read 只包含 `text` 类型、且 `is_enabled` 为真的分块，`chunk_type` 恒为 `"text"`；`parent_text`、模型生成的类型（summary、entity、relationship、table_summary、table_column）、image_ocr / image_caption、faq、web_search、wiki_page 一律不出现（用户可见的取舍，§12 #16）。上游类型清单见 `internal/types/chunk.go:17-39`，`IsEnabled` 在 `:141`，`ChunkType` 字段在 `:156`；上游检索路径的 `isSearchableChunk` 放行 text、summary、table_column、table_summary、faq、image_ocr、image_caption，并丢弃 processing 与 failed 状态的分块（`internal/application/service/knowledgebase_search_results.go:361-378`）；read 侧的 chunk 列表默认只返回 text（`internal/handler/chunk.go:128`）。
-- **R3.9** [D1] hit 的 `revision.chunk_revision` 指 snippet 所出自、**已经进入检索存储**的那个版本；由于 R5.3 不返回编辑后尚未入索引的分块，它也就是分块的当前修订。服务端无法确定时，`chunk_revision` 填 `null`，`index_state` 给 `unknown`；这样的 hit 不能用于精确引用（R4.7）。
-- **R3.10** [D1+新设] **locator**：坐标按该索引构建的解析输出文本中的 rune 偏移理解，区间 `[start, end)`，待 PR② 实测。`locator.valid` 为 `true` 须同时满足：`chunk_revision == 0`、分块正文未被改写（父块或邻块扩展）、区间合法（`end > start`）、正文 rune 长度等于 `end − start`；否则为 `false`，不给偏移。**v1 的 locator 只为将来精确定位预留**：v1 没有能取到原文区间的接口，客户端不得依赖它取文本。read 的 `segment.text` 是分块正文，不等于解析输出文本的 `[start, end)` 区间。依据：上游 `chunkTrusted`（`internal/application/service/chat_pipeline/merge_overlap.go:94-99`）；`StartAt` / `EndAt`（`internal/types/chunk.go:147-150`）。
+- **R3.9** [D1+新设] hit 的正文、`chunk_revision` 与 `content_tag` 都取自数据库当前行，并且在同一个数据库快照里核对该分块属于可服务集合（R5.1）；不可服务的分块不进 hit。召回来自检索索引，**索引里的版本可能比数据库旧**（§13），这影响召回质量，不影响标识与正文的一致性。精确引用只来自单分块 read（R4.7）。
+- **R3.10** [D1+新设] **locator**：坐标按该索引构建的解析输出文本中的 rune 偏移理解，区间 `[start, end)`，待 PR② 实测。`locator.valid` 为 `true` 须同时满足：`chunk_revision == 0`、分块正文未被改写（父块或邻块扩展）、区间合法（`end > start`）、正文 rune 长度等于 `end − start`；否则为 `false`，不给偏移。**v1 的 locator 只为将来精确定位预留；r9 起 v1 服务端恒给 `valid: false`、不给偏移**（`chunk_revision == 0` 不能证明正文未被改写，§13）：v1 没有能取到原文区间的接口，客户端不得依赖它取文本。read 的 `segment.text` 是分块正文，不等于解析输出文本的 `[start, end)` 区间。依据：上游 `chunkTrusted`（`internal/application/service/chat_pipeline/merge_overlap.go:94-99`）；`StartAt` / `EndAt`（`internal/types/chunk.go:147-150`）。
 - **R3.11** [KB-SVC-POLICY-01/#994] 只读检索也可能产生处理出口：开向量检索且调用方没给 query_embedding 时，服务端会算一次 query embedding（矩阵 #3，`internal/application/service/knowledgebase_search.go:206-213`）。允许的处理目的地待决（#994），由 KB-SVC-POLICY-01 执行；客户端不得假定 search 只在本地发生。
 - **差距**（矩阵 #3）：
   - 无调用方 deadline，内部只有 12s 解析上限与多组 30s 超时（`knowledgebase_search_storegroup.go:21`、`knowledgebase_search_fanout.go:23`）。
@@ -108,32 +108,32 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 
 ## 4. read
 
-- **R4.1** [D1] 请求包含：`scope`（§2，规则与 search 相同）、`knowledge_id`；可选 `chunk_id`、`expected_revision`、`page`（`cursor`、`limit`；`limit` 可选，单分块续读只需 `cursor`）、`max_bytes`、`deadline_ms`；以及通用字段。从引用发起的 read **必须**带 `expected_revision`（取自 search hit）；非引用发起的 read 可以不带。
-- **R4.2** [D1] **只返回分块正文**：响应 `segments[]` 每项含 `chunk_id`、`chunk_type`（v1 恒为 `"text"`，R3.8）、`chunk_revision`、`text`；响应可带可选 `display: { title, file_name }`（不是正文，不能作为引文）。元数据、标题、描述、spans、stages 都不是正文，不得当作引文出示。上游 `/knowledge/:id/spans`、`/stages` 是处理阶段时间线（`internal/handler/knowledge.go:649` 起），但会序列化 `input`、`output`、`metadata`（`internal/types/knowledge_span.go:92-94`）以及 `error_code`、`error_message`（`:95-96`），后者也可能带出原文；是否带出解析正文待探测（iDoris-ai/WeKnora#8）；无论是否带出，都不得作为正文或引文来源。
+- **R4.1** [D1] 请求包含：`scope`（§2，规则与 search 相同）、`knowledge_id`；可选 `chunk_id`、`expected_revision`、`page`（`cursor`、`limit`；`limit` 可选，单分块续读只需 `cursor`）、`max_bytes`、`deadline_ms`；以及通用字段。从引用发起的 read **必须**带 `chunk_id` 与 `expected_revision.content_tag`（取自 search hit，r9）；非引用发起的 read 可以不带。
+- **R4.2** [D1] **只返回分块正文**：响应 `segments[]` 每项含 `chunk_id`、`chunk_type`（v1 恒为 `"text"`，R3.8）、`chunk_revision`、`content_tag`、`text`；响应可带可选 `display: { title, file_name }`（不是正文，不能作为引文）。元数据、标题、描述、spans、stages 都不是正文，不得当作引文出示。上游 `/knowledge/:id/spans`、`/stages` 是处理阶段时间线（`internal/handler/knowledge.go:649` 起），但会序列化 `input`、`output`、`metadata`（`internal/types/knowledge_span.go:92-94`）以及 `error_code`、`error_message`（`:95-96`），后者也可能带出原文；是否带出解析正文待探测（iDoris-ai/WeKnora#8）；无论是否带出，都不得作为正文或引文来源。
 - **R4.3** [新设] **粒度**：
-  - 带 `chunk_id`：只返回这一个分块（单个 segment）。`expected_revision` 可选；带了就必须含全部三项，缺项或 `chunk_revision` 为 `null` 返回 `invalid_request`。被 `max_bytes` 截断时，用 `next_cursor` 继续读同一个分块，游标绑定三项；
+  - 带 `chunk_id`：只返回这一个分块（单个 segment）。`expected_revision` 可选；带了就**必须**含 `content_tag`，缺了返回 `invalid_request`；`source_revision`、`index_build_id`、`chunk_revision` 可以一并带上，只作参考，不参与判定（r9）。被 `max_bytes` 截断时，用 `next_cursor` 继续读同一个分块，游标绑定 `content_tag`，`content_tag` 覆盖整段分块正文；
   - 不带 `chunk_id`：按文档顺序分页，`expected_revision` 只能含、也只比较 `source_revision` 与 `index_build_id`（多带 `chunk_revision` 为 `invalid_request`）。
-  - 响应顶层 `revision` 只放文档级两项；`chunk_revision` 放在各 segment 里。
-- **R4.4** [D1+新设] **校验检索时修订**：当前修订 = 当前源修订 + 其活动构建（R5.3）。**v1 不提供旧版本**，不返回旧正文。
-  - **带 `chunk_id`**（文档已按 R2.6 判定在 E 内）：`chunk_id` 一律按锚点校验。分块不存在、已删除、属于其他文档（包括 E 外文档）、不在活动构建里（含没有活动构建）、已禁用、或类型不在 v1 范围（非 `text`）时，不论是否带 `expected_revision`，都返回 `stale`，`reason: "anchor_missing"`，`current_revision` 照常给出；**这几种情况彼此不可区分**。带了 `expected_revision` 时，锚点成立还要求其中的 `index_build_id` 等于当前活动构建，否则同样返回 `anchor_missing`。所以"构建变了"必然落在这一类（R5.1）；只有构建一致、分块被编辑时，才返回 `stale` 并附 `details.current_chunk_revision`。示例见 §11.5。上游 reparse 前清理、索引失败、删除中止时都会物理删除旧分块（`internal/application/service/knowledge_process.go:423`、`:723`、`:708`、`:760`）。
-  - **不带 `chunk_id`**：带 `expected_revision` 且两项任一不同，返回 `stale`，`current_revision` 给出当前两项（没有活动构建时 `index_build_id` 为 `null`）。没带 `expected_revision` 又没有活动构建时：构建中返回 `unavailable`，`reason: "index_pending"`，`retryable: true`，可带 `retry_after_ms`；构建失败返回 `unavailable`，`reason: "index_failed"`，`retryable: false`。`index_pending` / `index_failed` 只用于这种文档级 read。
+  - 响应顶层 `revision` 只放文档级两项；`chunk_revision` 与 `content_tag` 放在各 segment 里。
+- **R4.4** [D1+新设] **校验检索时修订**：当前修订 = 当前 `source_revision` + 当前 `index_build_id`（后者由当前可服务分块集合派生，R5.1、R5.3）。标识与正文在同一个数据库快照里取得（r9）。**v1 不提供旧版本**，不返回旧正文。
+  - **带 `chunk_id`**（文档已按 R2.6 判定在 E 内）：按顺序判定（r9）。(1) 分块不在该文档当前的可服务集合里（不存在、已删除、属于其他文档包括 E 外文档、文档没有构建、已禁用、非 `text`）：返回 `stale`，`reason: "anchor_missing"`，`current_revision` 照常给出，**这几种情况彼此不可区分**。(2) 在可服务集合里，带了 `expected_revision` 且 `content_tag` 与当前不同：返回 `stale`，不带 `reason`，附 `current_revision`、`current_chunk_revision` 与 `current_content_tag`，**不附正文**。(3) 其余：200。文档里其他分块的增删（`index_build_id` 变化）不影响单分块 read：分块原样还在就可以读。上游重新解析时会删除旧分块并以新 ID 重建，旧 `chunk_id` 随之落入 (1)；删除失败留下残留时见 §13。示例见 §11.5。
+  - **不带 `chunk_id`**：带 `expected_revision` 且两项任一不同，返回 `stale`，`current_revision` 给出当前两项（没有构建时 `index_build_id` 为 `null`）。没带 `expected_revision` 又没有构建时：构建中（pending / processing）返回 `unavailable`，`reason: "index_pending"`，`retryable: true`，可带 `retry_after_ms`；构建失败或已取消（failed / cancelled，r9）返回 `unavailable`，`reason: "index_failed"`，`retryable: false`。有构建但可服务集合为空时返回 200，`segments: []`。`index_pending` / `index_failed` 只用于这种文档级 read。
   - 上游 `/revisions` 能取历史正文（`internal/handler/chunk.go:257-268`），但编辑可能是删改敏感内容。可否取回旧版本与 #997 的保留要求相关，本身另需决策（§12 #5）。
-- **R4.5** [D1+新设] **上限与时限**：`max_bytes` 与 `page.limit` 超过服务端上限时截到上限；正文在字符边界截断，`truncated: true` 并给 `next_cursor`。`next_cursor` 也用于按 `page.limit` 翻页，与 `truncated` 无关。`deadline_ms` 内没完成返回 `timeout`；不传时以服务端上限为准。游标绑定首页的修订：文档级分页绑定两项，单分块读绑定三项（R4.3）；任一项变了，后续页返回 `stale`。同时带 `expected_revision` 与游标时，先按 `expected_revision` 判定（R4.4），再按游标判定；任一不是当前修订都返回 `stale`，`current_revision` 照常给出。只有文档级分页时，翻页期间单个分块被编辑不算 stale，segment 照常返回读取时的 `chunk_revision`。
+- **R4.5** [D1+新设] **上限与时限**：`max_bytes` 与 `page.limit` 超过服务端上限时截到上限；正文在字符边界截断，`truncated: true` 并给 `next_cursor`。`next_cursor` 也用于按 `page.limit` 翻页，与 `truncated` 无关。`deadline_ms` 内没完成返回 `timeout`；不传时以服务端上限为准。游标绑定首页的修订：文档级分页绑定两项，并且每一页都在与本页正文相同的快照里重算 `index_build_id` 后比对；单分块读绑定 `content_tag`（R4.3，r9）；任一项变了，后续页返回 `stale`。同时带 `expected_revision` 与游标时，先按 `expected_revision` 判定（R4.4），再按游标判定；任一不是当前修订都返回 `stale`，`current_revision` 照常给出。只有文档级分页时，翻页期间单个分块被编辑不算 stale，segment 照常返回读取时的 `chunk_revision`。
 - **R4.6** [D2] read 每次都按 §2 重新计算 E，目标资源必须在 E 内；"之前 search 返回过"不构成授权。
-- **R4.7** [D1] **引用义务**：精确引用必须来自带 `chunk_id` 的单分块 read，且修订校验通过；`chunk_revision` 为 `null` 的 hit 不能用于精确引用。单分块读跨页时，各页修订三项必须一致（R4.5）。文档级 read 的 segment 只能作为"当前正文"出示；引用时记下 `segment.chunk_revision`，它与 hit 的 `chunk_revision` 不一致时，只能作为线索。
+- **R4.7** [D1+新设] **引用义务**：精确引用必须来自带 `chunk_id` 与 `expected_revision.content_tag` 的单分块 read，且判定为 200（R4.4）。单分块读跨页时各页 `content_tag` 必须一致（R4.5）；`content_tag` 覆盖整段正文，客户端要先拿齐整段才能拼接引用。文档级 read 的 segment 与 search 的 snippet 只能作为"当前正文"或线索出示，不生成确定引用（r9）。
 - **差距**（矩阵 #4）：能读分块（分页默认 10、最大 100，`internal/handler/chunk.go:117-125`），但不能按指定修订读并校验，没有 stale；服务层错误一律 500 并带回内部错误原文（`chunk.go:74-75`）→ KB-C1-01c ②。
 
 ## 5. 索引状态与 stale
 
-- **R5.1** [D1+新设] **三者关系**：一个 `knowledge_id` 有一串源修订；每个源修订可以有多次索引构建，但**至多一个活动构建**；每个分块属于一次索引构建，`chunk_revision` 在该构建内随人工编辑或回滚递增。**`chunk_id` 不跨构建复用**（v1 约定）：构建变了，旧 `chunk_id` 不再可读（R4.4 `anchor_missing`）。
-- **R5.2** [D1] `source_revision`、`index_build_id` 是服务端分配的**不透明标识**；`chunk_revision` 是单调递增的整数，0 表示未编辑。`updated_at`、`file_hash` 不充当索引修订：相同文件在不同解析或 embedding 配置下会产生不同索引。
-- **R5.3** [D1+新设] **当前修订**（`current_revision`）= 当前源修订 + 它的活动构建；活动构建还没建好时 `index_build_id: null`。hit 的 `index_state` 取值：
-  - `fresh`：hit 所在的构建就是当前源修订的活动构建；
-  - `stale`：源修订已比 hit 所在的构建新（构建不再活动，或新构建还没建好）；
-  - `unknown`：服务端**主动给出**的值，表示无法判定，按 `stale` 对待。客户端遇到**无法识别**的取值是另一回事，按 R6.2 兜底。
-  **v1 不返回编辑后尚未入索引、或索引失败的分块作为 hit**，沿用上游的丢弃行为（`knowledgebase_search_results.go:366-371`，注释 "Do not hydrate stale vector hits..."）。理由：避免把编辑前的旧文本当 snippet 交给模型，与 R4.4 拒绝取回旧正文的立场一致。
+- **R5.1** [D1+新设] **标识由内容派生**（r9 取代 r8 的"源修订—索引构建—活动构建"三者映射）：文档**有构建**指 parse_status 为 completed 或 finalizing；有构建时，其**可服务分块集合**是属于该文档、未删除、`text` 且启用的分块。`index_build_id` 是 knowledge_id 与可服务集合（分块 ID 排序后）的带密钥摘要，有构建但集合为空时照算，没有构建时为 `null`；`content_tag` 是 `chunk_id` 与该分块完整正文的带密钥摘要；`source_revision` 是 knowledge_id 与源指纹的带密钥摘要，**源指纹**由上游知识行的 `file_hash`、`file_path`、`source` 与手工知识的 version 组成。所有派生标识都是服务端密钥的 HMAC-SHA256，输入按"域前缀（`source` / `build` / `chunk`）、各组成项"依次以 NUL 字节分隔、文本按 UTF-8 编码，输出为小写十六进制，对外不透明；缺少密钥时服务端拒绝进入集成模式；换密钥后全部标识都变，旧引用一律按 stale 处理。上游重建时以新 ID 生成分块，旧 `chunk_id` 不再可服务（R4.4）。
+- **R5.2** [D1+新设] `source_revision`、`index_build_id`、`content_tag` 是**不透明标识**（R5.1）。`chunk_revision` 沿用上游的编辑计数，0 表示未编辑，**只作参考**：上游某些写路径改了正文却不递增它，判断正文是否变化以 `content_tag` 为准（r9）。`updated_at`、`file_hash` 不直接对外。
+- **R5.3** [D1+新设] **当前修订**（`current_revision`）= 当前 `source_revision` + 当前 `index_build_id`（没有构建时为 `null`）。hit 的 `index_state` 取值：
+  - `fresh`：r9 的 v1 服务端对每个 hit 都给 `fresh`：hit 必须在同一快照里属于可服务集合（R3.9），不可服务的直接丢弃；
+  - `stale`：保留给客户端兼容，r9 的 v1 服务端不再给出；
+  - `unknown`：保留给客户端兼容，r9 的 v1 服务端不再给出（`chunk_revision` 恒为整数）；客户端收到时按 `stale` 对待。客户端遇到**无法识别**的取值是另一回事，按 R6.2 兜底。
+  **v1 沿用上游的丢弃行为**：上游标记为处理中或索引失败（`index_status` 为 processing / failed）的分块不作为 hit（`knowledgebase_search_results.go:366-371`）。这只是一层额外过滤：`index_status` 为 ready 时，索引里的版本仍可能比数据库旧（§13）；无论哪种情况，hit 的正文与标识都取自数据库当前行（R3.9，r9）。
 - **R5.4** [D1] **展示**：`stale` / `unknown` 的 hit 展示方式相同：可以作为线索出示，但必须标"可能已过期"，不生成确定引用；确定引用只来自 R4.7。
-- **证据与差距**：Chunk 有 `content_revision` 与 `index_status`（ready/processing/failed，`internal/types/chunk.go:132-135`），可映射为分块修订与 R5.3 的一部分；Knowledge 有 `parse_status` 与 `file_hash`（`internal/types/knowledge.go:189`、`:218`）；**没有源修订、索引构建与活动构建标识，也没有三者映射**（矩阵 #4）→ KB-C1-01c ③。
+- **证据与差距**：Chunk 有 `content_revision` 与 `index_status`（ready/processing/failed，`internal/types/chunk.go:132-135`），可映射为分块修订与 R5.3 的一部分；Knowledge 有 `parse_status` 与 `file_hash`（`internal/types/knowledge.go:189`、`:218`）；**没有源修订、索引构建与活动构建标识，也没有三者映射**（矩阵 #4）→ KB-C1-01c ③；r9 改为由内容派生的标识（R5.1），不需要三者映射，代价见 §13。
 
 ## 6. 错误分类
 
@@ -143,18 +143,18 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R6.4** [新设] **服务端判定顺序**：凭据（`unauthorized`）→ 请求形状（`invalid_request`）→ 操作是否关闭（`forbidden`，`reason: "operation_disabled"`，§12 #20）→ 计算 E（`forbidden`；search 的 `mixed_score_space` 在 E 之后判定）→ 文档（`knowledge_id`）存在且在 E 内（否则 `not_found`）→ 锚点与修订（`stale`）→ 执行（`timeout` / `unavailable` / partial）。由此：
   - 越界资源即使带 `expected_revision`，也返回 `not_found`；
   - search 之后文档被删，read 返回 `not_found`；
-  - 带 `chunk_id` 时锚点不成立（不存在、已删除、属于其他文档含 E 外文档、不在活动构建里、已禁用、非 `text`，或 `index_build_id` 与活动构建不同），返回 `stale`（`anchor_missing`），彼此不可区分；
-  - 不带 `chunk_id`、没有活动构建且未带 `expected_revision`，返回 `unavailable`（`index_pending` / `index_failed`）；
+  - 带 `chunk_id` 时锚点不成立（不在当前可服务集合里：不存在、已删除、属于其他文档含 E 外文档、文档没有构建、已禁用、非 `text`），返回 `stale`（`anchor_missing`），彼此不可区分；锚点成立但 `content_tag` 不同，返回不带 `reason` 的 `stale`（R4.4，r9）；
+  - 不带 `chunk_id`、没有构建且未带 `expected_revision`，返回 `unavailable`（`index_pending` / `index_failed`，R4.4）；
   - 服务端不支持请求的 `protocol_version`：`invalid_request`，`reason: "unsupported_protocol_version"`，`details.supported` 列出支持的版本。`protocol_version` 是请求形状一步的第一项，先于其余形状检查；`request_id`、`generation` 能回显就回显，不能则为 `null`（R6.1）；
   - 请求形状通过后、计算 E 之前，先判对应操作是否被关闭：`operations.search` / `operations.read` 为 `disabled` 时返回 `forbidden`，`reason: "operation_disabled"`（不可重试），优先于 `empty_scope`，也先于 `operation_not_allowed`（凭据不允许此操作，R2.7）（§12 #20）。
 
 | code | 建议 HTTP | retryable | 含义与 `details` |
 |---|---|---|---|
-| `invalid_request` | 400 | false | `reason` 条件必填：带 `groups` 时必须为 `mixed_score_space`，带 `supported` 时必须为 `unsupported_protocol_version`，其余情况不带。请求形状不合法：Q 缺失、为 `[]` 或无法解析，字段越界，`expected_revision` 缺项，带 `chunk_id` 时 `chunk_revision` 为 `null`；`reason`：`mixed_score_space`（带 `groups`）/ `unsupported_protocol_version`（带 `supported`）。**补充项**，见 §12 |
+| `invalid_request` | 400 | false | `reason` 条件必填：带 `groups` 时必须为 `mixed_score_space`，带 `supported` 时必须为 `unsupported_protocol_version`，其余情况不带。请求形状不合法：Q 缺失、为 `[]` 或无法解析，字段越界，带 `chunk_id` 时 `expected_revision` 缺 `content_tag`，文档级 `expected_revision` 缺项（r9）；`reason`：`mixed_score_space`（带 `groups`）/ `unsupported_protocol_version`（带 `supported`）。**补充项**，见 §12 |
 | `unauthorized` | 401 | false | `reason` 必填。凭据缺失、无法解析、无效、过期或已撤销；`reason`：`credential_missing` / `credential_invalid` / `credential_expired` / `credential_revoked` |
 | `forbidden` | 403 | false | `reason` 必填。凭据有效但不允许：`reason`：`empty_scope`（E 为空，含 A 为空、C 为空集）/ `operation_not_allowed`（凭据不允许此操作，R2.7）/ `operation_disabled`（服务端关闭了该操作，换凭据也没用，R6.4、§12 #20）/ `policy_denied` |
-| `not_found` | 404 | false | 文档（`knowledge_id`）不存在、已删除，**或在 E 之外**（R2.6）。`reason` 禁止。分块问题一律走 `stale/anchor_missing` |
-| `stale` | 409 | false | 修订不是当前修订且不可取（`current_revision`；`current_chunk_revision` 只在构建不变、分块被编辑时出现），或 `reason: "anchor_missing"`（带 `chunk_id` 时锚点不成立，R4.4）。`reason` 条件必填：锚点不成立时必须为 `anchor_missing`；分块被编辑、文档级修订不一致时不带。重新 search |
+| `not_found` | 404 | false | 文档（`knowledge_id`）不存在、已删除（含正在删除，r9），**或在 E 之外**（R2.6）。`reason` 禁止。分块问题一律走 `stale/anchor_missing` |
+| `stale` | 409 | false | 修订不是当前修订且不可取（`current_revision`；`current_chunk_revision` 与 `current_content_tag` 只在带 `chunk_id`、锚点成立但 `content_tag` 不同时出现，与 `anchor_missing` 互斥（r9）），或 `reason: "anchor_missing"`（带 `chunk_id` 时锚点不成立，R4.4）。`reason` 条件必填：锚点不成立时必须为 `anchor_missing`；`content_tag` 不同、文档级修订不一致时不带。重新 search |
 | `timeout` | 504 | true | `reason` 可选，只能为 `timeout`；缺省时按 `timeout` 理解（同 R3.7(b)）。没有分支成功，且所有失败都因到达 deadline；read 在 `deadline_ms` 内没完成 |
 | `unavailable` | 503 | true（`index_failed`、`unsupported_kb_type` 为 false；原因混杂时按 R3.4 取最不可重试的一项） | `reason` 可选；但 `retryable` 为 `false` 时必填，取不可重试的那一项（`unsupported_kb_type` 或 `index_failed`，R3.4）；缺省时按 `dependency`（可重试）理解（同 R3.7(b)）。没有分支成功且至少一个失败不是 deadline，或依赖不可用、未就绪；`reason`：`not_ready` / `dependency` / `overloaded` / `index_building` / `unsupported_kb_type` / `index_failed`（search，R3.5；`details` 可带 `partial_failures`）/ `index_pending`（文档级 read，稍后再查就绪）/ `index_failed`；可带 `retry_after_ms` |
 | `internal` | 500 | false | `reason` 禁止。服务端意外故障；客户端遇到未知 `code` 也按此处理。**补充项**，见 §12 |
@@ -180,7 +180,7 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 - **R8.2** [KB-C1-01b-b/D8+新设] 就绪探针要求凭据，`scope` 可选。不带 scope：只返回 `live`（进程存活，布尔）与 `operations`：`search`、`read`、`ingest` 各有 `state`（`ready` / `not_ready` / `disabled`）与可选 `reason`；`operations` 只反映基础设施（存储、向量库、需要时的 embedding 模型），不依赖任何 KB。只读 v1 下 `ingest` 为 `disabled`。带 scope：另返回 `knowledge_bases`（R8.4）。
   **两层关系**：`operations.X` 为 `ready` 只说明基础设施能服务 X；某个 KB 能否服务 X 看它自己的状态。`operations.X` 不是 `ready` 时，所有 KB 的 X 也都不是 `ready`；反之不成立（如 §11.7 里 `operations.search` 为 `ready` 而 `kb-b` 为 `not_ready`）。
 - **R8.3** [KB-C1-01b-b] search 就绪只取决于检索所需的存储、向量库与（需要时）query embedding 模型，不依赖 chat、docreader 或默认 KB，避免与初始化互相等待。
-- **R8.4** [KB-C1-01b-b+新设] **按 KB 就绪**：带 `scope.knowledge_base_ids` 时按 §2 计算 E（规则相同，E 为空返回 `forbidden`）；响应 `knowledge_bases[]` 每项为 `{ "knowledge_base_id", "score_space", "search": { "state", "reason"? }, "read": { "state", "reason"? } }`，只列 E 内的 KB，范围外的 ID 直接省略，不区分不存在与无权。**聚合**：某 KB 的 search 为 `ready`，当且仅当 `operations.search` 为 `ready`（R8.2），并且满足以下之一：(i) KB 为空（还没有任何文档）；(ii) KB 内至少一个文档的当前源修订有活动构建，且其中有 v1 范围内（`text` 且启用）的分块。read 同理，看 `operations.read`。不为 `ready` 时，按下面的顺序取第一个满足的 `reason`：`operations.X` 为 `disabled`（被关闭，不是故障）→ `operation_disabled`（不可重试，§12 #19）；基础设施不可用 → `dependency`（可重试）；首次构建中、还没有任何活动构建 → `index_building`（可重试）；全部文档都索引失败 → `index_failed`（不可重试）；有活动构建但没有 v1 范围内的分块（如 FAQ 类 KB，R3.8）→ `unsupported_kb_type`（不可重试）。示例见 §11.7。`operations.X` 为 `disabled` 时，KB 级 X 的 `state` 为 `not_ready`、`reason` 为 `operation_disabled`，`operation_disabled` 也只在这时出现；`dependency` 当且仅当 `operations.X` 为 `not_ready` 时出现。
+- **R8.4** [KB-C1-01b-b+新设] **按 KB 就绪**：带 `scope.knowledge_base_ids` 时按 §2 计算 E（规则相同，E 为空返回 `forbidden`）；响应 `knowledge_bases[]` 每项为 `{ "knowledge_base_id", "score_space", "search": { "state", "reason"? }, "read": { "state", "reason"? } }`，只列 E 内的 KB，范围外的 ID 直接省略，不区分不存在与无权。**聚合**：正在删除（deleting）的文档在下列判定中一律不计入（r9）。某 KB 的 search 为 `ready`，当且仅当 `operations.search` 为 `ready`（R8.2），并且满足以下之一：(i) KB 为空（还没有任何文档；正在删除的文档不计入，r9）；(ii) KB 内至少一个文档有构建且可服务分块集合非空（R5.1，r9）。read 同理，看 `operations.read`。不为 `ready` 时，按下面的顺序取第一个满足的 `reason`：`operations.X` 为 `disabled`（被关闭，不是故障）→ `operation_disabled`（不可重试，§12 #19）；基础设施不可用 → `dependency`（可重试）；没有文档有构建、且至少一个文档在构建中（pending / processing）→ `index_building`（可重试）；没有文档有构建、也没有在构建中的文档（全部 failed 或 cancelled，r9）→ `index_failed`（不可重试）；有构建但可服务集合都为空（如 FAQ 类 KB、text 分块全部禁用，R3.8）→ `unsupported_kb_type`（不可重试）。示例见 §11.7。`operations.X` 为 `disabled` 时，KB 级 X 的 `state` 为 `not_ready`、`reason` 为 `operation_disabled`，`operation_disabled` 也只在这时出现；`dependency` 当且仅当 `operations.X` 为 `not_ready` 时出现。
 - **R8.5** [KB-C1-01b-b] 服务端就绪与 Agent24 宿主的 profile 状态（registered / loading / ready / degraded / unavailable / disabled）是两回事；后者由前者映射而来，映射规则见 #1013①。
 - **差距**：没有 /ready，也没有按操作的探针（矩阵 #9）→ KB-C1-01b-b。
 
@@ -207,10 +207,10 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
 
 - **R10.1** [#1011 内容10 / KB-C1-03 / KB-OBS-01] 每次 search、read 与就绪请求都产生一条审计事件（`knowledge.search` / `knowledge.read` / `knowledge.ready`），至少包含：
   `occurred_at`、`request_id`、`generation`、`principal`（凭据绑定的主体）、`credential_id`、`tenant_id`、`effective_scope`（KB ID 列表）、
-  `resource`（read：`knowledge_id` 与 `chunk_id` 列表；search：命中的 `chunk_id` 列表与数量）、`revision`（read 时的文档级两项与各 segment 的分块修订；search 时各 hit 的三元组）、
+  `resource`（read：`knowledge_id` 与 `chunk_id` 列表；search：命中的 `chunk_id` 列表与数量）、`revision`（read 时的文档级两项与各 segment 的分块修订；search 时各 hit 的 `source_revision`、`index_build_id`、`chunk_revision`；**不记 `content_tag`**，r9）、
   `outcome`（`ok` / `partial` / 错误码 / `cancelled`）、`metering`（具体字段 `latency_ms`、`result_count`、`bytes_returned`、`embedding_calls` 为 [新设]）。
 - **R10.2** [#1011 内容10 / KB-C1-03 / KB-OBS-01+新设] **未认证请求也记一条最小审计**，`outcome` 为 `unauthorized`：`credential_missing` / `credential_invalid` 时 `principal`、`credential_id`、`tenant_id` 都为 null；`credential_expired` / `credential_revoked` 只在签名校验通过后才记 `credential_id` 与 `principal`；签名不通过的按 `credential_invalid` 记 null。
-- **R10.3** [#1011 内容10 / KB-C1-03 / KB-OBS-01] 审计与日志**不含正文、snippet、query 原文和凭据**。是否记录带密钥的 query 摘要由 KB-OBS-01 决定；未决定前不记任何形式的 query。
+- **R10.3** [#1011 内容10 / KB-C1-03 / KB-OBS-01] 审计与日志**不含正文、snippet、query 原文和凭据**。是否记录带密钥的 query 摘要由 KB-OBS-01 决定；未决定前不记任何形式的 query。`content_tag` 也不进审计与日志（r9）。
 - **R10.4** [#1011 内容10 / KB-C1-03 / KB-OBS-01] principal 必须是凭据绑定的主体，不得用"租户里最早的真人"或合成用户代替。
 - **差距**：`audit_logs` 只有 `actor_user_id`，租户 key 的操作记到 `created_at` 最早的用户名下，principal 不进审计（矩阵 #2，`internal/types/audit_log.go:220`、`internal/middleware/auth.go:513`）→ KB-C1-03；访问日志记请求与响应正文各 10KB，handler 与服务层记 query 全文，配置 Langfuse 时 query 与命中预览进追踪（矩阵 #13，`internal/middleware/logger.go:96-124`、`:221-258`）→ KB-OBS-01。
 
@@ -273,8 +273,8 @@ Agent24 的 KnowledgeProvider（下称"客户端"）与 WeKnora fork（下称"�
   "applied_budget": { "deadline_ms": 8000, "max_results": 10, "max_concurrency": 2 },
   "hits": [ { "rank": 1, "knowledge_base_id": "kb-a", "knowledge_id": "doc-1", "chunk_id": "chk-11",
     "chunk_type": "text",
-    "revision": { "source_revision": "src-3", "index_build_id": "ib-5", "chunk_revision": 0 },
-    "locator": { "valid": true, "start": 120, "end": 410 }, "index_state": "fresh",
+    "revision": { "source_revision": "src-3", "index_build_id": "ib-5", "chunk_revision": 0, "content_tag": "ct-11a" },
+    "locator": { "valid": false }, "index_state": "fresh",
     "score": 0.82, "score_space": "emb-g1", "snippet": { "text": "<redacted>", "truncated": false } } ] } }
 ```
 Provider 的本地结果（同时写宿主侧日志；服务端只有观察到连接中止时才在审计记 `cancelled`）：
@@ -285,22 +285,22 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 ```
 
 ### 11.5 stale（R4.4、R5.3）
-与 11.4 无关。引用来自源修订 `src-8` 的活动构建 `ib-20`，当时 `chk-70` 的分块修订是 1；之后它被人工编辑为 2，文档级两项不变。
+与 11.4 无关。引用来自 hit：`chk-70` 当时的内容标签是 `ct-70a`、分块修订是 1；之后它被人工编辑为 2，内容标签变为 `ct-70b`，文档级两项不变。
 ```json
 { "request": { "op": "knowledge.read", "body": {
     "protocol_version": 1, "request_id": "01JB3R0A1B2C3D4E5F6G7H8J9K", "generation": 15,
     "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "chunk_id": "chk-70",
-    "expected_revision": { "source_revision": "src-8", "index_build_id": "ib-20", "chunk_revision": 1 },
+    "expected_revision": { "content_tag": "ct-70a", "chunk_revision": 1 },
     "max_bytes": 65536, "deadline_ms": 5000 } },
   "response": { "status": 409, "body": { "error": {
     "code": "stale", "message": "The requested revision is no longer available.",
     "hint": "Search again to obtain the current revision.",
     "details": { "retryable": false, "request_id": "01JB3R0A1B2C3D4E5F6G7H8J9K", "generation": 15,
       "current_revision": { "source_revision": "src-8", "index_build_id": "ib-20" },
-      "current_chunk_revision": 2 } } } } }
+      "current_chunk_revision": 2, "current_content_tag": "ct-70b" } } } } }
 ```
-其他情形（R4.4）：原件被重新上传或构建变了时，带 `chunk_id` 的 read 一律返回 `stale`，`reason: "anchor_missing"`（R5.1：`chunk_id` 跨构建不稳定）；不带 `chunk_id` 的文档级 read 带着旧的 `expected_revision`，返回 `stale`，`current_revision` 给出新的两项（新构建还没建好时 `index_build_id` 为 `null`）；不带 `expected_revision` 的文档级 read 遇到没有活动构建，返回 `unavailable`（`index_pending`，`hint` 为"稍后再查就绪"）。
-修订一致时的成功响应形状：`{ "protocol_version", "request_id", "generation", "effective_scope", "knowledge_id", "revision": { "source_revision", "index_build_id" }, "display"?, "segments": [{ "chunk_id", "chunk_type", "chunk_revision", "text" }], "truncated", "next_cursor" }`。
+其他情形（R4.4，r9）：原件被重新上传、旧分块已被删除时，带 `chunk_id` 的 read 返回 `stale`，`reason: "anchor_missing"`（旧 `chunk_id` 不在可服务集合里）；文档里只是增删了**别的**分块时，原分块照常可读。不带 `chunk_id` 的文档级 read 带着旧的 `expected_revision`，返回 `stale`，`current_revision` 给出新的两项（没有构建时 `index_build_id` 为 `null`）；不带 `expected_revision` 的文档级 read 遇到构建中，返回 `unavailable`（`index_pending`，`hint` 为"稍后再查就绪"）。
+修订一致时的成功响应形状：`{ "protocol_version", "request_id", "generation", "effective_scope", "knowledge_id", "revision": { "source_revision", "index_build_id" }, "display"?, "segments": [{ "chunk_id", "chunk_type", "chunk_revision", "content_tag", "text" }], "truncated", "next_cursor" }`。
 
 ### 11.6 partial（R3.4、R3.5）
 `kb-a`、`kb-b` 同属 `emb-g1`；`kb-b` 的分支超时，`kb-a` 成功。
@@ -315,8 +315,8 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
     "applied_budget": { "deadline_ms": 5000, "max_results": 10, "max_concurrency": 2 },
     "hits": [ { "rank": 1, "knowledge_base_id": "kb-a", "knowledge_id": "doc-2", "chunk_id": "chk-21",
       "chunk_type": "text",
-      "revision": { "source_revision": "src-4", "index_build_id": "ib-9", "chunk_revision": 0 },
-      "locator": { "valid": true, "start": 0, "end": 512 }, "index_state": "fresh",
+      "revision": { "source_revision": "src-4", "index_build_id": "ib-9", "chunk_revision": 0, "content_tag": "ct-40a" },
+      "locator": { "valid": false }, "index_state": "fresh",
       "score": 0.77, "score_space": "emb-g1", "snippet": { "text": "<redacted>", "truncated": true },
       "display": { "title": "<redacted>", "file_name": "<redacted>" } } ],
     "partial_failures": [ { "knowledge_base_id": "kb-b", "code": "timeout", "reason": "timeout", "retryable": true } ] } } }
@@ -370,6 +370,17 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 | 19 | **`operations.X` 为 `disabled` 时，KB 级 X 的 `reason` 取什么**（R8.2、R8.4）：盲选结论分歧 | KB 级 X 为 `not_ready`，`reason` 为新增的 `operation_disabled`（不可重试），排在 R8.4 原因顺序第一位（兼容新增） | 已定（David，2026-10-17） |
 | 20 | **`operations.search` / `operations.read` 为 `disabled` 时，search / read 请求本身返回什么错误码**：契约未定义 | 对应请求返回 `forbidden`，`reason: "operation_disabled"`（不可重试，兼容新增）；判定位置在请求形状之后、计算 E 之前，优先于 `empty_scope`（R6.4） | 已定（David 确认，见 [#1012 评论](https://github.com/iDoris-ai/Agent24/issues/1012#issuecomment-6239062330)；Grok、Opus 盲选一致，2026-10-18） |
 
+## 13. 已知差距（r9）
+
+r9 用由内容派生的标识换掉了"可证明的构建归属"（KB-C1-01c ③ 的设计取舍，WeKnora#38）。下面几项不在 v1 的保证范围内，客户端与 Tool 层据此设计：
+- **残留分块**：上游删除旧分块失败时只打警告、继续处理，残留分块会进入可服务集合，文档级正文可能混入旧内容；单分块引用以 `content_tag` 核对，不受影响。
+- **索引滞后**：召回来自检索索引，索引里的版本可能比数据库旧；hit 展示的正文与标识取自数据库当前行，一致但不保证就是被检索打分的那个版本。
+- **并发覆盖**：上游部分写路径按整行保存，可能覆盖并发编辑，表现为正文变了而 `chunk_revision` 不变；`content_tag` 能发现。
+- **对 WeKnora 实现的要求**（契约夹具与规则测试只能检查形状，下面两项由 WeKnora 侧测试守住）：
+  - 就绪探针必须改按 R5.1 的可服务集合计数，并去掉 cancelled：WeKnora#65 现在仍把 cancelled 文档已写入的 text 分块算作有分块，会出现"就绪 ready、读取 index_failed"的分歧。这一项在本修订合入后、随 ③ 的就绪探针片修正；
+  - R3.8、R3.9、R4.4、R4.5 的"同一快照、同一次回表"要求，WeKnora ③ 必须用并发改写下"标识与正文一致"的测试守住。
+- **URL 类知识**：上游对 URL 类知识的 `file_hash` 只按 URL 计算，页面正文变化不一定改变 `source_revision`；重新抓取会重建分块，单分块引用仍以 `content_tag` 核对。
+
 ## 变更记录
 - r0（2026-10-16）：首稿。
 - r1（2026-10-16）：按第 1 轮双审互评裁定修订。read 必须带 scope；Q、C、A 的错误码分开；新增判定顺序（R6.4）；新增活动构建，重写 `fresh` 与 `current_revision`；read 分单分块与文档级两种粒度；服务端只接受单一 score_space，Provider 层按秩轮转合并；`partial_failures` 带 `retryable`，并写明重试规则；信封与上游的差异，未知 `code` 按 `internal` 处理；写明 generation 只回显的理由；新增草案期规则；新增按 KB 就绪；新增示例 11.6、11.7；11.5 改为独立场景；来源标签可以是任务条目。影响夹具：是（#1012 尚未建清单）。
@@ -380,3 +391,4 @@ Provider 的本地结果（同时写宿主侧日志；服务端只有观察到�
 - r6（2026-10-17）：按第 6 轮双审互评（David 选定三项，不再审）修订。空 KB 的就绪与成功分支加上基础设施就绪的前提，补 `dependency` 原因并定出就绪原因的优先级；合并结果的 `score` 不可比较，交给 Tool 时去掉；R8.2、R8.4、R3.10、R9.2 补标 `[新设]`。不影响夹具清单，只需在 #1012 增加“基础设施不可用时空 KB 为 `not_ready/dependency`”一例。
 - r7（2026-10-17）：§12 #9、#10、#16、#17 由 David（fork 侧维护者、Knowledge 负责人）确认，不涉及内核接口，无须 jason 确认。#9、#10、#16 按原文；#17 采用确认后的放宽：local-managed 宿主可以持有本实例专属的秘密（R1.4、R1.2 同步）。不影响夹具清单。
 - r8（2026-10-17）：按 #1012 待决问题的裁定修订（按 David 2026-10-17 授权的夜间规则，由 Opus 和 Sonnet 代替 Grok 和 Codex 盲选，两票一致才执行；PR 合入前请 David 确认。裁定见 [#1012 评论](https://github.com/iDoris-ai/Agent24/issues/1012#issuecomment-6224023854)）。R3.5 的 `partial_failures[].reason` 增加 `not_ready`、`overloaded`，与 R3.7(b) 及 §6 一致（兼容新增），并写明 `code` 为 `timeout` 当且仅当 `reason` 为 `timeout`；§6 表逐码写明 `reason` 必填、条件必填、可选或禁止，R6.1 注明以 §6 为准；文件头修订号改为当前值；§6 的 `unavailable` 在 `retryable` 为 false 时必须带不可重试的 reason；R4.5 写明 `next_cursor` 也用于翻页；R4.1 的 `page.limit` 可选；R6.1 写明回显为 `null` 的情形（含请求体能解析但 `request_id` / `generation` 本身缺失或不合法）；R8.4 新增 KB 级 `reason` `operation_disabled`（`operations.X` 为 `disabled` 时使用，不可重试，排在原因顺序第一位；§12 #19，David 2026-10-17 定），并写明 `dependency` 当且仅当 `operations.X` 为 `not_ready`；§12 新增 #19、#20（#20 待决，给出 v1 默认值，覆盖 search 与 read）。§6 中 `unavailable` 在 `retryable` 为 false 时 reason 必填一项不在 Q3 裁定原文里，是 #1012 第 2 轮评审补充的（与 R3.4 一致）。PR-Daemon 评审后再补（按 Grok、Opus 盲选一致执行，David 已确认，见 [#1012 评论](https://github.com/iDoris-ai/Agent24/issues/1012#issuecomment-6239062330)，2026-10-18）：R7.2、R7.3 写明回显为 `null` 的错误信封按发起它的 HTTP 交换配对；R6.4 写明 `protocol_version` 先判，R6.1 相应允许 `unsupported_protocol_version` 回显 `null`；R4.5 写明 `expected_revision` 与游标同时出现时的判定顺序；R3.5 区分 `dependency` 与 `not_ready`；R8.4 写明 disabled 时 KB 级 `state` 为 `not_ready`；#20 的 v1 默认改为新增的 `forbidden/operation_disabled`，并写明判定位置（#20 已定）。影响夹具：是，#1012 清单改为 r8，新增一个带 `overloaded` 的 partial 夹具、一个 `operation_disabled` 的就绪夹具、#20 默认值的 search 与 read 两个 `operation_disabled` 夹具，以及一个解析前就失败、回显为 `null` 的 `unauthorized` 夹具。
+- r9（2026-10-21）：KB-C1-01c ③ 改用内容寻址（WeKnora#38，设计经 Grok 与 Codex 两轮双审，David 选定并确认）。新增 `content_tag`（分块完整正文的带密钥摘要），出现在 hit.revision、segment、单分块 `expected_revision` 与 stale 详情（`current_content_tag`）；"活动构建"改为"有构建时的可服务分块集合"，`index_build_id`、`source_revision` 改为由内容派生的带密钥摘要（R5.1）；单分块 read 先判可服务、再比 `content_tag`，其他分块增删不影响（R4.3、R4.4、R6.4）；`chunk_revision` 只作参考（R5.2）；snippet 与 `content_tag` 同源（R3.8、R3.9）；文档级翻页每页同快照重算（R4.5）；引用只来自单分块 read（R4.7）；cancelled 不可服务、文档级 read 为 `index_failed`，deleting 视同已删除（R2.6、R4.4、R8.4）；就绪按"有构建"重写判定（R8.4）；审计不记 `content_tag`（R10.1、R10.3）；locator 恒为 `valid: false`（R3.10）；新增 §13 已知差距。PR 双审第 1、2 轮补充：R5.1 写明各标识的输入组成与 HMAC 编码；R3.5、R8.4 不计入 deleting；单分块 `expected_revision` 的 `chunk_revision` 允许 null；夹具新增 read.stale-chunk-overwritten、read.document-empty。依 §0.3 草案期条款，评审通过前不升主版本（`protocol_version` 仍为 1）。影响夹具：是（同一 PR 更新清单与 schema）。
