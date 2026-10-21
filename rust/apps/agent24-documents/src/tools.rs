@@ -30,6 +30,7 @@ use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::error::ApiError;
 use crate::extract::handler::{self, Fail, Prepared, Schema};
 use crate::extractions;
+use crate::id::{IdKind, is_id};
 use crate::jobs;
 use crate::oplog::{Origin, Run};
 use crate::read::find::{self, FindRequest};
@@ -198,7 +199,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         run_id: context.run_id.clone(),
         tool_call_id: context.tool_call_id.clone(),
     };
-    // Every operation takes the scope: one added without it does not build.
+    // Every operation takes the scope, read once here for the whole call.
     let scope = &scope;
     let work = async move {
         match op {
@@ -479,31 +480,38 @@ async fn ready(state: &AppState) -> Result<Arc<Storage>, Envelope> {
 /// §2.4). A malformed id passes: the service refuses it as
 /// `invalid_request` before reading, and it names no document.
 fn in_scope(scope: &Scope, id: &str) -> Result<(), Envelope> {
-    if !crate::id::is_id(crate::id::IdKind::Document, id) || scope.allows_document(id) {
+    if !is_id(IdKind::Document, id) || scope.allows_document(id) {
         Ok(())
     } else {
         Err(refused(&ApiError::not_found("no such document")))
     }
 }
 
-/// Refuses a job whose document is outside `scope`, or that has none,
-/// exactly as an unknown job (`jobs.rs` `get`'s not-found). No such job
-/// passes: the service answers it as it does today.
+/// Refuses a well-formed job id unless its job exists and its document is
+/// in `scope`, exactly as an unknown job (`jobs.rs` `get`'s not-found). A
+/// missing job is refused here too, not by the service: the service checks
+/// other arguments first, and a refusal of those for a missing job alone
+/// would tell it apart from one outside the scope (K1-06a §2.4). A
+/// malformed id passes: no job has one, and the service refuses it.
 async fn job_in_scope(storage: &Storage, scope: &Scope, id: &str) -> Result<(), Envelope> {
+    if !is_id(IdKind::Job, id) {
+        return Ok(());
+    }
     match scope::job_document(storage, id).await {
         Err(e) => Err(refused(&e)),
-        Ok(None) => Ok(()),
         Ok(Some(Some(doc))) if scope.allows_document(&doc) => Ok(()),
         _ => Err(refused(&ApiError::not_found("no such job"))),
     }
 }
 
 /// As [`job_in_scope`], for an extraction (`extractions.rs` `get`'s
-/// not-found).
+/// not-found), whose service checks the cursor before the id.
 async fn extraction_in_scope(storage: &Storage, scope: &Scope, id: &str) -> Result<(), Envelope> {
+    if !is_id(IdKind::Extraction, id) {
+        return Ok(());
+    }
     match scope::extraction_document(storage, id).await {
         Err(e) => Err(refused(&e)),
-        Ok(None) => Ok(()),
         Ok(Some(doc)) if scope.allows_document(&doc) => Ok(()),
         _ => Err(refused(&ApiError::not_found("no such extraction"))),
     }

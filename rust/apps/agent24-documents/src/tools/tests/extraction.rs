@@ -283,4 +283,17 @@ async fn an_extraction_outside_the_scope_reads_as_none() {
         absent
     );
     assert_eq!(call_in(&state, "extraction_get", &[], small).await, absent);
+    // An argument the service refuses before it reads the id (a cursor it
+    // cannot decode) must not tell a missing extraction from one outside
+    // the scope either.
+    for cursor in ["nope", "", "v100"] {
+        let outside = json!({ "extraction_id": SMALL, "cursor": cursor });
+        let missing = json!({ "extraction_id": ext(9), "cursor": cursor });
+        let outside = call_in(&state, "extraction_get", &[other], outside).await;
+        assert_module_error(&outside, "not_found", false);
+        assert_eq!(
+            outside,
+            call_in(&state, "extraction_get", &[other], missing).await
+        );
+    }
 }
