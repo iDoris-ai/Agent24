@@ -4893,7 +4893,7 @@ mod approval_tests {
     }
 
     #[tokio::test]
-    async fn restored_session_approval_replays_its_grant() {
+    async fn restored_exec_session_approval_does_not_mint_a_grant() {
         let dir = tempfile::tempdir().unwrap();
         let h = resume_harness(dir.path().to_path_buf()).await;
         let now = now_iso8601();
@@ -4999,6 +4999,9 @@ mod approval_tests {
         assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
         assert!(!h.store.list_audit().await.unwrap().iter().any(|entry| {
             entry.action == "approval.auto_granted" && entry.detail["run_id"] == "probe"
+        }));
+        assert!(!h.store.list_audit().await.unwrap().iter().any(|entry| {
+            entry.action == "approval.session_grant" && entry.detail["tool"] == "shell_exec"
         }));
     }
 

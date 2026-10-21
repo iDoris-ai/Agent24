@@ -144,10 +144,11 @@ struct GrantCtx {
 
 /// A `(session, tool)` grant is only still offered for `Read`.
 ///
-/// `Exec` is asked on every call (L-APPR-5). `WriteLocal` may later hold a
-/// path-scoped grant; a grant of the tool itself is not that. A Guardian, when
-/// enabled, can still auto-approve WriteLocal. That is existing behavior, not
-/// a session grant.
+/// `Exec` is asked on every call when the default always-review list includes
+/// exec. `WriteLocal` may later hold a path-scoped grant; a grant of the tool
+/// itself is not that. A Guardian can still auto-approve WriteLocal, and can
+/// auto-approve Exec if always-review is explicitly emptied. That is existing
+/// behavior, not a session grant.
 fn session_wide_grant_allowed(risk: RiskClass) -> bool {
     matches!(risk, RiskClass::Read)
 }
