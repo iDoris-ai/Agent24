@@ -370,7 +370,7 @@ async fn arguments_or_a_context_outside_the_schema_are_invalid_input() {
         assert_kernel_error(&body, ModuleToolErrorCode::InvalidInput);
     }
     for id in ["run_id", "tool_call_id"] {
-        let mut ctx = context_for("extract");
+        let mut ctx = context_with("extract", &[DOC]);
         ctx[id] = json!("");
         let body = json!({ "context": ctx, "arguments": args() }).to_string();
         let body = post_to(&env.state, "extract", body).await;

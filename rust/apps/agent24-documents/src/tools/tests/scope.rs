@@ -20,7 +20,8 @@ async fn two_documents() -> (tempfile::TempDir, AppState) {
 
 /// The arguments of each operation that names a document, on `doc`.
 fn on(doc: &str) -> [(&'static str, Value); 4] {
-    let schema = json!({ "fields": [{ "key": "k", "type": "string", "description": "d" }] });
+    let schema =
+        json!({ "fields": [{ "key": "date", "description": "停水日期", "type": "date" }] });
     [
         ("get", json!({ "document_id": doc })),
         ("read_range", json!({ "document_id": doc, "revision": 1 })),
@@ -91,6 +92,10 @@ async fn a_malformed_scope_refuses_every_operation_before_storage() {
             "extraction_get",
             json!({ "extraction_id": "ext_01K75A0B1C2D3E4F5G6H7J8K9M" }),
         ),
+        (
+            "extract",
+            json!({ "document_id": A, "revision": 1, "schema": { "fields": [] } }),
+        ),
     ];
     for scope in [
         json!(null),
@@ -125,17 +130,45 @@ async fn an_absent_scope_is_empty() {
     assert_eq!(body, absent);
 }
 
-/// §5.6: a scope in the arguments is not a scope; the schema refuses it.
+/// §5.6: a scope in the arguments is not a scope. Outside the call's own
+/// scope it reads as absent; inside it the schema refuses the extra field.
 #[tokio::test]
-async fn a_scope_in_the_arguments_is_invalid_input() {
+async fn a_scope_in_the_arguments_does_not_widen_the_call() {
     let (_dir, state) = two_documents().await;
+    let absent = call_in(&state, "get", &[A], json!({ "document_id": C })).await;
     for smuggled in [
         json!({ "document_id": B, "authorized_resources": [format!("doc:{B}")] }),
         json!({ "document_id": B, "context": context_with("get", &[B]) }),
     ] {
-        let body = call_in(&state, "get", &[A], smuggled).await;
+        assert_eq!(call_in(&state, "get", &[A], smuggled.clone()).await, absent);
+        let body = call_in(&state, "get", &[B], smuggled).await;
         assert_kernel_error(&body, ModuleToolErrorCode::InvalidInput);
     }
+}
+
+/// §4.1: the entry checks every operation against one table, and an
+/// operation with no row in it is refused before it runs, whatever the
+/// scope: routing one is not enough to reach storage.
+#[tokio::test]
+async fn an_operation_without_a_resource_row_never_runs() {
+    let (_dir, state) = two_documents().await;
+    for op in [
+        "get",
+        "read_range",
+        "find",
+        "extract",
+        "job_get",
+        "extraction_get",
+        "list",
+    ] {
+        assert!(super::super::resource(op).is_some(), "{op}");
+    }
+    let args = json!({ "document_id": A }).as_object().unwrap().clone();
+    let scope = Scope::parse(Some(&json!([format!("doc:{A}")]))).unwrap();
+    assert_eq!(
+        super::super::admit(&state, &scope, "peek", &args).await,
+        Err(Envelope::error(OPERATION_UNAVAILABLE, false))
+    );
 }
 
 /// §5.7: each call reads its own scope; a wider one before does not carry.

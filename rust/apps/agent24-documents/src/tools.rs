@@ -199,17 +199,19 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         run_id: context.run_id.clone(),
         tool_call_id: context.tool_call_id.clone(),
     };
-    // Every operation takes the scope, read once here for the whole call.
     let scope = &scope;
     let work = async move {
+        // The scope is checked here, for every operation, before it runs
+        // (K1-06a §4.1): an operation `admit` has no row for never runs.
+        admit(state, scope, op, &arguments).await?;
         match op {
-            "extract" => extract(state, scope, run, arguments).await,
+            "extract" => extract(state, run, arguments).await,
             "list" => list(state, scope, arguments).await,
-            "get" => get(state, scope, arguments).await,
-            "job_get" => job_get(state, scope, arguments).await,
-            "read_range" => read_range(state, scope, arguments).await,
-            "find" => find(state, scope, arguments).await,
-            "extraction_get" => extraction_get(state, scope, arguments).await,
+            "get" => get(state, arguments).await,
+            "job_get" => job_get(state, arguments).await,
+            "read_range" => read_range(state, arguments).await,
+            "find" => find(state, arguments).await,
+            "extraction_get" => extraction_get(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
@@ -342,23 +344,20 @@ async fn list(state: &AppState, scope: &Scope, arguments: Map<String, Value>) ->
     completed(page)
 }
 
-async fn get(state: &AppState, scope: &Scope, arguments: Map<String, Value>) -> Outcome {
+async fn get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: GetArgs = parse(arguments)?;
-    in_scope(scope, &args.document_id)?;
     let storage = ready(state).await?;
     completed(documents::get(&storage, &args.document_id).await)
 }
 
-async fn job_get(state: &AppState, scope: &Scope, arguments: Map<String, Value>) -> Outcome {
+async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: JobGetArgs = parse(arguments)?;
     let storage = ready(state).await?;
-    job_in_scope(&storage, scope, &args.job_id).await?;
     completed(jobs::get(&storage, &args.job_id).await)
 }
 
-async fn read_range(state: &AppState, scope: &Scope, arguments: Map<String, Value>) -> Outcome {
+async fn read_range(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: ReadRangeArgs = parse(arguments)?;
-    in_scope(scope, &args.document_id)?;
     let params = TextParams {
         block: args.block,
         cursor: args.cursor,
@@ -370,9 +369,8 @@ async fn read_range(state: &AppState, scope: &Scope, arguments: Map<String, Valu
     completed(text::read_range(state, &storage, id, rev, params, PAYLOAD_BYTES).await)
 }
 
-async fn find(state: &AppState, scope: &Scope, arguments: Map<String, Value>) -> Outcome {
+async fn find(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: FindArgs = parse(arguments)?;
-    in_scope(scope, &args.document_id)?;
     let req = FindRequest {
         revision: args.revision,
         query: args.query,
@@ -384,13 +382,12 @@ async fn find(state: &AppState, scope: &Scope, arguments: Map<String, Value>) ->
     completed(find::search(state, &storage, &args.document_id, req, PAYLOAD_BYTES).await)
 }
 
-async fn extraction_get(state: &AppState, scope: &Scope, arguments: Map<String, Value>) -> Outcome {
+async fn extraction_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: ExtractionGetArgs = parse(arguments)?;
     let limit = bounded(args.limit)?
         .and_then(|l| usize::try_from(l).ok())
         .unwrap_or(extractions::DEFAULT_LIMIT);
     let storage = ready(state).await?;
-    extraction_in_scope(&storage, scope, &args.extraction_id).await?;
     let (id, cursor) = (&args.extraction_id, args.cursor.as_deref());
     completed(extractions::get(&storage, id, cursor, limit, PAYLOAD_BYTES).await)
 }
@@ -398,19 +395,13 @@ async fn extraction_get(state: &AppState, scope: &Scope, arguments: Map<String, 
 /// Submits or replays an extract job, as REST does (DOC-1-06b §2.3), from
 /// `run`; never waits for it. The hash is taken of `{revision, schema}`, the
 /// body the page sends, so a page's job and a run's share a key.
-async fn extract(
-    state: &AppState,
-    scope: &Scope,
-    run: Run,
-    arguments: Map<String, Value>,
-) -> Outcome {
+async fn extract(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
     // The oplog's CHECK would refuse it inside the claim, read as a
     // storage failure.
     if run.run_id.is_empty() || run.tool_call_id.is_empty() {
         return Err(Envelope::error(INVALID_INPUT, false));
     }
     let args: ExtractArgs = parse(arguments)?;
-    in_scope(scope, &args.document_id)?;
     let schema: Schema = serde_json::from_value(args.schema.clone())
         .map_err(|_| Envelope::error(INVALID_INPUT, false))?;
     let body = json!({ "revision": args.revision, "schema": args.schema });
@@ -473,6 +464,68 @@ async fn ready(state: &AppState) -> Result<Arc<Storage>, Envelope> {
         .storage()
         .await
         .map_err(|cause| refused(&ApiError::storage_unavailable(cause)))
+}
+
+/// What an operation touches: the table the entry checks the scope against
+/// (K1-06a §4.1, §4.3). `None`: not an operation of this module, refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resource {
+    /// `document_id` names it.
+    Document,
+    /// `job_id` names it; it belongs to the job's document.
+    Job,
+    /// `extraction_id` names it; it belongs to the extraction's document.
+    Extraction,
+    /// None named: the operation filters by the scope itself (`list`).
+    Listing,
+}
+
+fn resource(op: &str) -> Option<Resource> {
+    match op {
+        "get" | "read_range" | "find" | "extract" => Some(Resource::Document),
+        "job_get" => Some(Resource::Job),
+        "extraction_get" => Some(Resource::Extraction),
+        "list" => Some(Resource::Listing),
+        _ => None,
+    }
+}
+
+/// Lets `op` run only if what it names is in `scope`, by [`resource`]'s
+/// row for it. An id that is missing or not a string is `invalid_input`, as
+/// the operation's own parse would answer. Outside the scope reads as
+/// absent (K1-06a §2.4), and nothing but a job's or an extraction's owner
+/// is read to tell.
+async fn admit(
+    state: &AppState,
+    scope: &Scope,
+    op: &str,
+    arguments: &Map<String, Value>,
+) -> Result<(), Envelope> {
+    let named = |key: &str| match arguments.get(key) {
+        Some(Value::String(id)) => Ok(id.as_str()),
+        _ => Err(Envelope::error(INVALID_INPUT, false)),
+    };
+    match resource(op) {
+        None => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
+        Some(Resource::Listing) => Ok(()),
+        Some(Resource::Document) => in_scope(scope, named("document_id")?),
+        Some(Resource::Job) => {
+            let id = named("job_id")?;
+            if !is_id(IdKind::Job, id) {
+                return Ok(());
+            }
+            let storage = ready(state).await?;
+            job_in_scope(&storage, scope, id).await
+        }
+        Some(Resource::Extraction) => {
+            let id = named("extraction_id")?;
+            if !is_id(IdKind::Extraction, id) {
+                return Ok(());
+            }
+            let storage = ready(state).await?;
+            extraction_in_scope(&storage, scope, id).await
+        }
+    }
 }
 
 /// Refuses a well-formed document id outside `scope` exactly as an unknown
@@ -997,6 +1050,9 @@ mod tests {
     #[tokio::test]
     async fn arguments_outside_the_schema_are_invalid_input() {
         let (_dir, state) = opened().await;
+        // In the scope (`call` authorizes every stored document): outside
+        // it, the scope answers first, as absent (K1-06a §4.1).
+        add_failed_job(&state, "'it broke'").await;
         for (op, args) in [
             ("list", json!({ "limit": 5, "extra": true })),
             ("list", json!({ "limit": "5" })),
