@@ -4952,32 +4952,54 @@ mod approval_tests {
             RunStatus::Completed
         );
 
-        let approvals_before = h.store.list_approvals(None).await.unwrap().len();
-        let verdict = h
-            .broker
-            .request(
-                ApprovalRequest {
-                    run_id: "probe",
-                    session_id: Some("sess_1"),
-                    schedule_id: None,
-                    tool_call_id: "tc_probe",
-                    tool: "shell_exec",
-                    source: "builtin",
-                    kind: "exec",
-                    risk: RiskClass::Exec,
-                    per_call_approval: false,
-                    standing_target: None,
-                    summary: "probe".to_owned(),
-                    payload: serde_json::Map::new(),
-                },
-                &CancellationToken::new(),
-            )
-            .await;
-        assert_eq!(verdict, Verdict::Approved);
-        assert_eq!(
-            h.store.list_approvals(None).await.unwrap().len(),
-            approvals_before
+        let mut probe = run_in("probe", RunStatus::Running);
+        probe.session_id = Some("sess_1".to_owned());
+        h.store.insert_run(&probe).await.unwrap();
+        let broker = h.broker.clone();
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            broker
+                .request(
+                    ApprovalRequest {
+                        run_id: "probe",
+                        session_id: Some("sess_1"),
+                        schedule_id: None,
+                        tool_call_id: "tc_probe",
+                        tool: "shell_exec",
+                        source: "builtin",
+                        kind: "exec",
+                        risk: RiskClass::Exec,
+                        per_call_approval: false,
+                        standing_target: None,
+                        summary: "probe".to_owned(),
+                        payload: serde_json::Map::new(),
+                    },
+                    &request_cancel,
+                )
+                .await
+        });
+        let mut saw_pending = false;
+        for _ in 0..50 {
+            let rows = h.store.list_approvals(None).await.unwrap();
+            if rows
+                .iter()
+                .any(|row| row.run_id == "probe" && row.status == ApprovalStatus::Pending)
+            {
+                saw_pending = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_pending,
+            "restored exec session decision must not skip the next ask"
         );
+        cancel.cancel();
+        assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
+        assert!(!h.store.list_audit().await.unwrap().iter().any(|entry| {
+            entry.action == "approval.auto_granted" && entry.detail["run_id"] == "probe"
+        }));
     }
 
     /// A denied restored approval does not execute the tool: the reason goes

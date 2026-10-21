@@ -142,19 +142,19 @@ struct GrantCtx {
     target: Option<String>,
 }
 
-/// Where a standing grant would live: the schedule if one fired this run, else
-/// the session. Schedule wins because that is what the user was consenting to —
-/// "this automation may post there", not "this conversation may".
 /// A `(session, tool)` grant is only still offered for `Read`.
 ///
-/// `Exec` must be asked every time (L-APPR-5). `WriteLocal` may later hold a
-/// path-scoped grant for one confirmed workspace root or one outside directory
-/// (L-APPR-8); a grant of the tool itself is not that. Until the path-scoped
-/// grant exists, write calls ask every time too.
+/// `Exec` is asked on every call (L-APPR-5). `WriteLocal` may later hold a
+/// path-scoped grant; a grant of the tool itself is not that. A Guardian, when
+/// enabled, can still auto-approve WriteLocal. That is existing behavior, not
+/// a session grant.
 fn session_wide_grant_allowed(risk: RiskClass) -> bool {
     matches!(risk, RiskClass::Read)
 }
 
+/// Where a standing grant would live: the schedule if one fired this run, else
+/// the session. Schedule wins because that is what the user was consenting to —
+/// "this automation may post there", not "this conversation may".
 fn grant_scope<'a>(
     session_id: Option<&'a str>,
     schedule_id: Option<&'a str>,
@@ -1565,6 +1565,44 @@ mod tests {
         let pending = store.get_approval(&id).await.unwrap().unwrap();
         assert!(
             !pending
+                .available_decisions
+                .iter()
+                .any(|d| d == "approve_for_session")
+        );
+        cancel.cancel();
+        assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
+    }
+
+    #[tokio::test]
+    async fn write_local_session_grant_does_not_skip_the_next_ask() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        broker.grant("sess_1", "fs_write");
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            b.request(
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "fs_write",
+                    "fs_write",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
+                &request_cancel,
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        assert!(
+            !store
+                .get_approval(&id)
+                .await
+                .unwrap()
+                .unwrap()
                 .available_decisions
                 .iter()
                 .any(|d| d == "approve_for_session")
