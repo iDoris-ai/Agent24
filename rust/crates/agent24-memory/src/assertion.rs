@@ -132,6 +132,10 @@ pub struct Assertion {
     pub recorded_from: String,
     pub recorded_to: Option<String>,
     pub evidence: Vec<EventId>,
+    /// Trusted host source reference, stored in the same row/transaction as
+    /// the assertion content. Missing legacy metadata is not ordinary data.
+    #[serde(default)]
+    pub source_ref: Option<Value>,
     pub confidence: f32,
     pub modality: Modality,
     pub speaker: Option<String>,
@@ -165,6 +169,7 @@ impl Assertion {
             recorded_from: now,
             recorded_to: None,
             evidence,
+            source_ref: None,
             confidence: 1.0,
             modality: Modality::Said,
             speaker: None,
@@ -260,9 +265,9 @@ impl AssertionLedger {
             "INSERT INTO mem_assertions
                  (id, scope_owner, scope, subject, predicate, object,
                   valid_from, valid_to, recorded_from, recorded_to,
-                  evidence, confidence, modality, speaker, writer_version,
+                  evidence, source_ref, confidence, modality, speaker, writer_version,
                   supersedes, qualified)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&a.id)
         .bind(&a.scope.owner)
@@ -275,6 +280,12 @@ impl AssertionLedger {
         .bind(&a.recorded_from)
         .bind(&a.recorded_to)
         .bind(&evidence)
+        .bind(
+            a.source_ref
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .bind(a.confidence as f64)
         .bind(a.modality.as_str())
         .bind(&a.speaker)
@@ -310,6 +321,10 @@ impl AssertionLedger {
             recorded_from: row.get("recorded_from"),
             recorded_to: row.get("recorded_to"),
             evidence: serde_json::from_str(&row.get::<String, _>("evidence"))?,
+            source_ref: row
+                .get::<Option<String>, _>("source_ref")
+                .map(|source| serde_json::from_str(&source))
+                .transpose()?,
             confidence: row.get::<f64, _>("confidence") as f32,
             modality: Modality::parse(&row.get::<String, _>("modality")),
             speaker: row.get("speaker"),
@@ -371,7 +386,7 @@ impl AssertionStore for AssertionLedger {
         // AND (to IS NULL OR t < to). A NULL upper bound is an open interval.
         let mut sql = String::from(
             "SELECT id, scope, subject, predicate, object, valid_from, valid_to,
-                    recorded_from, recorded_to, evidence, confidence, modality,
+                    recorded_from, recorded_to, evidence, source_ref, confidence, modality,
                     speaker, writer_version, supersedes, qualified
              FROM mem_assertions
              WHERE scope_owner = ?
@@ -432,6 +447,19 @@ mod tests {
         assert_eq!(beliefs.len(), 1);
         assert_eq!(beliefs[0].object, serde_json::json!("blue"));
         assert_eq!(beliefs[0].evidence, vec!["e1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn assertion_schema_persists_source_reference_with_content() {
+        let ledger = ledger().await;
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(mem_assertions)")
+            .fetch_all(&ledger.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get("name"))
+            .collect();
+        assert!(columns.iter().any(|column| column == "source_ref"));
     }
 
     #[tokio::test]

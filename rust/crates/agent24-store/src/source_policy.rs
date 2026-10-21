@@ -45,7 +45,7 @@ use crate::{Result, Store};
 /// Current on-disk shape version for a [`SourceRef`] row. A reader that
 /// finds a different value treats the row as unreadable and degrades it to
 /// `LocalOnly` WITHOUT attempting to parse `tag_json` — see module docs.
-pub const SOURCE_TAG_SCHEMA_VERSION: i64 = 1;
+pub const SOURCE_TAG_SCHEMA_VERSION: i64 = 2;
 
 /// What kind of content entering the run this tag describes. Informational
 /// only in this slice (nothing branches on it yet); an unrecognized value on
@@ -61,6 +61,20 @@ pub enum SourceKind {
     /// yet (ID-2 is unimplemented) — modeled ahead of that wiring so the
     /// contract does not need to change shape when it lands.
     SelectedMaterial,
+    /// A recalled assertion. This identifies the retrieval path; it is not
+    /// itself a sensitivity classification.
+    MemoryRecall,
+}
+
+/// Sensitivity classification is independent from processing mode and source
+/// kind. Missing/invalid persisted classifications are never assumed ordinary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceClassification {
+    Ordinary,
+    Restricted,
+    #[default]
+    Unknown,
 }
 
 /// Processing mode. `LocalOnly` is the only mode [`SourceRef::user_input`]
@@ -90,6 +104,9 @@ pub struct SourceRef {
     /// same underlying source.
     pub source_id: String,
     pub kind: SourceKind,
+    /// `Unknown` is the safe default for old or incomplete persisted tags.
+    #[serde(default)]
+    pub classification: SourceClassification,
     /// Revision/content digest, when the source has one. `None` for a
     /// source with no meaningful revision concept (e.g. a one-shot prompt).
     pub revision_digest: Option<String>,
@@ -108,14 +125,30 @@ pub struct SourceRef {
 }
 
 impl SourceRef {
+    /// A persisted-memory hit with no usable provenance. Its stable marker is
+    /// a category, not an assertion identifier, and folds to LocalOnly.
+    pub fn unknown_memory(created_at: impl Into<String>) -> Self {
+        Self {
+            source_id: "unknown:memory".to_owned(),
+            kind: SourceKind::MemoryRecall,
+            classification: SourceClassification::Unknown,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
     /// A fresh, unclassified tag for user input at run entry. Always
-    /// `LocalOnly`: nothing upstream of this call classifies or authorizes
-    /// user input for cloud processing, so the only safe default is the
-    /// fail-closed one (ADR-K1-02 §0).
+    /// `LocalOnly` for the model routing default, and `Ordinary` as the separate
+    /// sensitivity classification (ADR-K1-02 §2.1.1). Local routing does not
+    /// label ordinary user input as restricted.
     pub fn user_input(run_id: &str, created_at: impl Into<String>) -> Self {
         SourceRef {
             source_id: format!("user_input:{run_id}"),
             kind: SourceKind::UserInput,
+            classification: SourceClassification::Ordinary,
             revision_digest: None,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -136,6 +169,7 @@ impl SourceRef {
         SourceRef {
             source_id: format!("selected_material:{material_id}"),
             kind: SourceKind::SelectedMaterial,
+            classification: SourceClassification::Unknown,
             revision_digest,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -153,7 +187,8 @@ impl SourceRef {
     fn fail_closed_unknown(source_id: String, created_at: String) -> Self {
         SourceRef {
             source_id,
-            kind: SourceKind::SelectedMaterial,
+            kind: SourceKind::MemoryRecall,
+            classification: SourceClassification::Unknown,
             revision_digest: None,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -164,8 +199,8 @@ impl SourceRef {
 }
 
 /// A run's effective source policy, folded from every tag persisted against
-/// it (ADR-K1-02 §2.1: "会话由宿主汇总消息和被引用资料的标签，生成 run 的
-/// 有效政策"). Model consumers use `effective_mode` to constrain routing.
+/// it. `effective_mode` is the upper bound for model context routing; it is
+/// not the payload/source set for an arbitrary action (ADR-K1-02 §2.1/§2.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySnapshot {
     pub schema_version: i64,
@@ -197,7 +232,12 @@ impl PolicySnapshot {
     /// 所有输入...中最严格者". An empty set is [`Self::fail_closed`], not an
     /// unrestricted snapshot.
     pub fn from_tags(sources: Vec<SourceRef>) -> Self {
-        if sources.is_empty() || sources.iter().any(|s| s.mode == SourceMode::LocalOnly) {
+        if sources.is_empty()
+            || sources.iter().any(|s| {
+                s.mode == SourceMode::LocalOnly
+                    || s.classification != SourceClassification::Ordinary
+            })
+        {
             return PolicySnapshot {
                 schema_version: SOURCE_TAG_SCHEMA_VERSION,
                 effective_mode: SourceMode::LocalOnly,
@@ -348,12 +388,27 @@ mod tests {
         let json = serde_json::to_string(&material).unwrap();
         let back: SourceRef = serde_json::from_str(&json).unwrap();
         assert_eq!(material, back);
+        assert_eq!(tag.classification, SourceClassification::Ordinary);
+        assert_eq!(material.classification, SourceClassification::Unknown);
+    }
+
+    #[test]
+    fn user_input_is_ordinary_while_legacy_classification_is_unknown() {
+        let current = serde_json::to_value(SourceRef::user_input("run_1", "t")).unwrap();
+        assert_eq!(current["classification"], "ordinary");
+
+        let mut legacy = current;
+        legacy.as_object_mut().unwrap().remove("classification");
+        let decoded: SourceRef = serde_json::from_value(legacy).unwrap();
+        let decoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(decoded["classification"], "unknown");
     }
 
     #[test]
     fn policy_snapshot_fold_is_strictest_wins() {
         let local = SourceRef::user_input("run_1", "t");
         let mut cloud = SourceRef::selected_material("doc_1", None, "t");
+        cloud.classification = SourceClassification::Ordinary;
         cloud.mode = SourceMode::CloudAuthorized;
 
         // All-cloud folds to cloud.
@@ -364,6 +419,14 @@ mod tests {
         // with a cloud-authorized one.
         let snap = PolicySnapshot::from_tags(vec![cloud, local]);
         assert_eq!(snap.effective_mode, SourceMode::LocalOnly);
+
+        let mut unknown = SourceRef::selected_material("legacy", None, "t");
+        unknown.mode = SourceMode::CloudAuthorized;
+        assert_eq!(
+            PolicySnapshot::from_tags(vec![unknown]).effective_mode,
+            SourceMode::LocalOnly,
+            "unknown classification must keep model context local"
+        );
     }
 
     #[tokio::test]
