@@ -64,8 +64,9 @@ fn str_arg<'a>(input: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
 
-/// Canonical parent of an absolute `fs_write` path. Used only after the gate
-/// has allowed this call. Relative paths and the filesystem root have none.
+/// Canonical parent of an absolute `fs_write` path, captured before the gate.
+/// The gate and the later open both use this value. Relative paths and the
+/// filesystem root have none.
 pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<PathBuf> {
     let raw = str_arg(input, "path")?;
     let path = Path::new(raw);
@@ -604,7 +605,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_symlink_swap_after_capture_still_writes_the_captured_directory() {
+    async fn a_symlink_swap_during_the_gate_does_not_write_the_new_target() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
         let safe = dir.path().join("safe");

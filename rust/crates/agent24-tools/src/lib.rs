@@ -1425,10 +1425,17 @@ impl ToolRegistry {
         } else {
             None
         };
+        let owned;
+        let exec_ctx = if let Some(directory) = approved_before_gate {
+            owned = ctx.clone().with_approved_outside_directory(directory);
+            &owned
+        } else {
+            ctx
+        };
         if effective.requires_approval() {
             match self
                 .gate
-                .check(&info, ctx, input, standing_target.as_deref(), cancel)
+                .check(&info, exec_ctx, input, standing_target.as_deref(), cancel)
                 .await
             {
                 GateDecision::Allow => {}
@@ -1442,14 +1449,6 @@ impl ToolRegistry {
                 }
             }
         }
-
-        let owned;
-        let exec_ctx = if let Some(directory) = approved_before_gate {
-            owned = ctx.clone().with_approved_outside_directory(directory);
-            &owned
-        } else {
-            ctx
-        };
         Self::run_budgeted(tool, exec_ctx, input, cancel).await
     }
 

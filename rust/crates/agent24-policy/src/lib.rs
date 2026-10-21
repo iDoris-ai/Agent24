@@ -131,6 +131,9 @@ pub struct ApprovalRequest<'a> {
     pub payload: Map<String, Value>,
     /// Builtin workspace root for L-APPR-8. Absent means no confirmed root.
     pub workspace_root: Option<&'a Path>,
+    /// Parent directory captured before the gate. When set, this is the only
+    /// directory the grant may name. The raw path is not resolved again.
+    pub captured_write_directory: Option<&'a Path>,
 }
 
 /// What an approved decision needs in order to mint the right kind of grant.
@@ -178,9 +181,15 @@ fn classify_write(
     risk: RiskClass,
     workspace_root: Option<&Path>,
     payload: &Map<String, Value>,
+    captured_write_directory: Option<&Path>,
 ) -> Option<write_scope::WriteLocation> {
     if source != "builtin" || tool != "fs_write" || risk != RiskClass::WriteLocal {
         return None;
+    }
+    if let Some(directory) = captured_write_directory.and_then(|path| path.to_str()) {
+        return Some(write_scope::WriteLocation::Outside {
+            directory: directory.to_owned(),
+        });
     }
     let raw = payload.get("path").and_then(Value::as_str)?;
     Some(write_scope::classify_builtin_write(workspace_root, raw))
@@ -318,6 +327,7 @@ impl ApprovalBroker {
             summary,
             payload,
             workspace_root,
+            captured_write_directory,
         } = req;
         let module_per_call = source == "module" && per_call_approval;
         // A target-scoped grant is only offerable when there is something
@@ -338,7 +348,14 @@ impl ApprovalBroker {
         );
         let scope = grant_ctx.scope.clone();
         let grant_scope = grant_scope(session_id, schedule_id);
-        let write_location = classify_write(source, tool, risk, workspace_root, &payload);
+        let write_location = classify_write(
+            source,
+            tool,
+            risk,
+            workspace_root,
+            &payload,
+            captured_write_directory,
+        );
         if matches!(
             write_location,
             Some(write_scope::WriteLocation::InsideConfirmedRoot)
@@ -1049,6 +1066,7 @@ impl ApprovalGate for BrokerGate {
                     summary,
                     payload: input.clone(),
                     workspace_root: ctx.confirmed_write_root(),
+                    captured_write_directory: ctx.approved_outside_directory(),
                 },
                 cancel,
             )
@@ -1100,6 +1118,7 @@ mod tests {
             summary,
             payload,
             workspace_root: None,
+            captured_write_directory: None,
         }
     }
 
@@ -1659,6 +1678,47 @@ mod tests {
         );
         request.workspace_root = root;
         request
+    }
+
+    #[tokio::test]
+    async fn a_standing_grant_matches_the_captured_directory_not_a_second_parse() {
+        let dir = std::env::temp_dir().join(format!("a24-cap-{}", std::process::id()));
+        let safe = dir.join("safe");
+        let secret = dir.join("secret");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let safe_owned = safe.clone();
+        let waiter = tokio::spawn(async move {
+            let mut request = write_req("run_1", Some("sess_1"), "tc_1", "/tmp/ignored", None);
+            request.captured_write_directory = Some(&safe_owned);
+            b.request(request, &CancellationToken::new()).await
+        });
+        let id = wait_for_pending(&store).await;
+        broker
+            .resolve(&id, decision("approve_for_target", None))
+            .await
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+
+        seed_run(&store, "run_2").await;
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let secret_owned = secret.clone();
+        let second = tokio::spawn(async move {
+            let mut request = write_req("run_2", Some("sess_1"), "tc_2", "/tmp/ignored", None);
+            request.captured_write_directory = Some(&secret_owned);
+            b.request(request, &request_cancel).await
+        });
+        let id2 = wait_for_pending(&store).await;
+        let pending = store.get_approval(&id2).await.unwrap().unwrap();
+        assert_eq!(pending.standing_target.as_deref(), secret.to_str());
+        cancel.cancel();
+        assert!(matches!(second.await.unwrap(), Verdict::Aborted(_)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -2243,6 +2303,7 @@ mod tests {
             summary: "post a message".to_owned(),
             payload: Map::new(),
             workspace_root: None,
+            captured_write_directory: None,
         }
     }
 
