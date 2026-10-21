@@ -13,8 +13,10 @@
 pub mod consent_gate;
 pub mod guardian;
 pub mod overrides;
+pub mod write_scope;
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,8 +57,8 @@ pub const AVAILABLE_DECISIONS: [&str; 4] = ["approve", "approve_for_session", "d
 ///    approval.
 /// 4. Builtin `exec` and `write_local` also get no `approve_for_session`.
 ///    A session-wide tool grant is not an exact target (L-APPR-5 / L-APPR-8).
-///    Path-scoped workspace write grants are a later slice; until they exist,
-///    every such call asks.
+///    An outside `fs_write` may still offer `approve_for_target` for one
+///    canonical directory. A confirmed workspace root is not wired yet.
 pub fn decisions_for(
     risk: RiskClass,
     standing_target: Option<&str>,
@@ -127,6 +129,8 @@ pub struct ApprovalRequest<'a> {
     pub standing_target: Option<&'a str>,
     pub summary: String,
     pub payload: Map<String, Value>,
+    /// Builtin workspace root for L-APPR-8. Absent means no confirmed root.
+    pub workspace_root: Option<&'a Path>,
 }
 
 /// What an approved decision needs in order to mint the right kind of grant.
@@ -151,6 +155,35 @@ struct GrantCtx {
 /// behavior, not a session grant.
 fn session_wide_grant_allowed(risk: RiskClass) -> bool {
     matches!(risk, RiskClass::Read)
+}
+
+fn write_decisions(
+    mut offered: Vec<String>,
+    risk: RiskClass,
+    tool: &str,
+    directory: Option<&str>,
+) -> Vec<String> {
+    if risk == RiskClass::WriteLocal && tool == "fs_write" && directory.is_some() {
+        let target = "approve_for_target".to_owned();
+        if !offered.contains(&target) {
+            offered.insert(1, target);
+        }
+    }
+    offered
+}
+
+fn classify_write(
+    source: &str,
+    tool: &str,
+    risk: RiskClass,
+    workspace_root: Option<&Path>,
+    payload: &Map<String, Value>,
+) -> Option<write_scope::WriteLocation> {
+    if source != "builtin" || tool != "fs_write" || risk != RiskClass::WriteLocal {
+        return None;
+    }
+    let raw = payload.get("path").and_then(Value::as_str)?;
+    Some(write_scope::classify_builtin_write(workspace_root, raw))
 }
 
 /// Where a standing grant would live: the schedule if one fired this run, else
@@ -284,13 +317,14 @@ impl ApprovalBroker {
             standing_target,
             summary,
             payload,
+            workspace_root,
         } = req;
         let module_per_call = source == "module" && per_call_approval;
         // A target-scoped grant is only offerable when there is something
         // durable to hang it on. A transient run's id never recurs, so a grant
         // scoped to it could never match again — offering it would be a button
         // that silently does nothing.
-        let grant_ctx = grant_ctx(
+        let mut grant_ctx = grant_ctx(
             run_id,
             session_id,
             schedule_id,
@@ -304,6 +338,28 @@ impl ApprovalBroker {
         );
         let scope = grant_ctx.scope.clone();
         let grant_scope = grant_scope(session_id, schedule_id);
+        let write_location = classify_write(source, tool, risk, workspace_root, &payload);
+        if matches!(
+            write_location,
+            Some(write_scope::WriteLocation::InsideConfirmedRoot)
+        ) {
+            let detail = serde_json::json!({
+                "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
+                "kind": kind, "reason": "confirmed_workspace_root"
+            });
+            if self
+                .try_audit("approval.workspace_write_allowed", &detail)
+                .await
+                .is_ok()
+            {
+                return Verdict::Approved;
+            }
+        }
+        if let Some(write_scope::WriteLocation::Outside { directory }) = &write_location
+            && grant_ctx.scope_kind.is_some()
+        {
+            grant_ctx.target = Some(directory.clone());
+        }
         let offer_target = grant_ctx.target.as_deref();
 
         // Standing grant (H4): persistent, and matched on the EXACT target.
@@ -362,7 +418,9 @@ impl ApprovalBroker {
         // fast path above. A prior `approve_for_session` is an EXPLICIT human
         // pre-authorisation and outranks the model's per-call opinion, so a
         // granted (session, tool) never re-consults the guardian — by design.
-        if let Some(guardian) = &self.guardian {
+        if write_location.is_none()
+            && let Some(guardian) = &self.guardian
+        {
             let assess = AssessInput {
                 tool,
                 kind,
@@ -459,7 +517,12 @@ impl ApprovalBroker {
             kind: kind.to_owned(),
             summary,
             payload,
-            available_decisions: decisions_for(risk, offer_target, source, per_call_approval),
+            available_decisions: write_decisions(
+                decisions_for(risk, offer_target, source, per_call_approval),
+                risk,
+                tool,
+                offer_target,
+            ),
             standing_target: offer_target.map(str::to_owned),
             status: ApprovalStatus::Pending,
             decision: None,
@@ -985,6 +1048,7 @@ impl ApprovalGate for BrokerGate {
                     standing_target,
                     summary,
                     payload: input.clone(),
+                    workspace_root: ctx.confirmed_write_root(),
                 },
                 cancel,
             )
@@ -1035,6 +1099,7 @@ mod tests {
             standing_target: None,
             summary,
             payload,
+            workspace_root: None,
         }
     }
 
@@ -1574,6 +1639,125 @@ mod tests {
         assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
     }
 
+    fn write_req<'a>(
+        run_id: &'a str,
+        session_id: Option<&'a str>,
+        tool_call_id: &'a str,
+        path: &'a str,
+        root: Option<&'a Path>,
+    ) -> ApprovalRequest<'a> {
+        let mut payload = Map::new();
+        payload.insert("path".to_owned(), Value::String(path.to_owned()));
+        let mut request = req(
+            run_id,
+            session_id,
+            tool_call_id,
+            "fs_write",
+            "fs_write",
+            "write".to_owned(),
+            payload,
+        );
+        request.workspace_root = root;
+        request
+    }
+
+    #[tokio::test]
+    async fn a_write_inside_the_confirmed_root_does_not_ask() {
+        let dir = std::env::temp_dir().join(format!("a24-ws-in-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let verdict = broker
+            .request(
+                write_req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    file.to_str().unwrap(),
+                    Some(&dir),
+                ),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+        assert!(store.list_approvals(None).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_outside_directory_grant_does_not_cover_a_sibling() {
+        let dir = std::env::temp_dir().join(format!("a24-ws-out-{}", std::process::id()));
+        let root = dir.join("proj");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let outside = other.join("a.txt");
+        let sibling = dir.join("third").join("b.txt");
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let path = outside.to_str().unwrap().to_owned();
+        let root_owned = root.clone();
+        let waiter = tokio::spawn(async move {
+            b.request(
+                write_req("run_1", Some("sess_1"), "tc_1", &path, Some(&root_owned)),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        let pending = store.get_approval(&id).await.unwrap().unwrap();
+        assert!(
+            pending
+                .available_decisions
+                .iter()
+                .any(|d| d == "approve_for_target")
+        );
+        broker
+            .resolve(&id, decision("approve_for_target", None))
+            .await
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+
+        seed_run(&store, "run_2").await;
+        let again = outside.to_str().unwrap().to_owned();
+        let root_owned = root.clone();
+        let verdict = broker
+            .request(
+                write_req("run_2", Some("sess_1"), "tc_2", &again, Some(&root_owned)),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+
+        seed_run(&store, "run_3").await;
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let sibling_path = sibling.to_str().unwrap().to_owned();
+        let root_owned = root.clone();
+        let third = tokio::spawn(async move {
+            b.request(
+                write_req(
+                    "run_3",
+                    Some("sess_1"),
+                    "tc_3",
+                    &sibling_path,
+                    Some(&root_owned),
+                ),
+                &request_cancel,
+            )
+            .await
+        });
+        let id3 = wait_for_pending(&store).await;
+        assert_ne!(id3, id);
+        cancel.cancel();
+        assert!(matches!(third.await.unwrap(), Verdict::Aborted(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn write_local_session_grant_does_not_skip_the_next_ask() {
         let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
@@ -1880,7 +2064,7 @@ mod tests {
                     "run_1",
                     Some("sess_1"),
                     "tc_1",
-                    "fs_write",
+                    "notes_write",
                     "fs_write",
                     "fs_write: /tmp/x".to_owned(),
                     payload,
@@ -2058,6 +2242,7 @@ mod tests {
             standing_target: target,
             summary: "post a message".to_owned(),
             payload: Map::new(),
+            workspace_root: None,
         }
     }
 
