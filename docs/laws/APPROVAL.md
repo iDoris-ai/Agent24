@@ -86,12 +86,12 @@ MUST 只提供 `approve` / 定向的 `approve_for_target`（当且仅当资格�
 
 ### L-APPR-5 · 常驻授权必须窄到确切目标
 
-**由一次批准铸出的常驻授权 MUST 形如 `tool → 确切目标`；其资格 MUST 同时满足：① 有效风险为 `external`；② 工具声明了 target 参数；③ 该次调用真的填了 target。`exec` MUST 永远逐次询问，MUST NOT 提供或承认会话级或常驻授权。`write_local` MUST 逐次询问，但有且仅有两例外：① **第一方 Documenting 模块**的可逆草稿写入，仅在启用时用户已明确同意该工具且当前权限指纹匹配、宿主确认操作只写模块私有存储并有修订历史且可撤回、不覆盖权威内容、不提交正式修订、不删除且不外发时，MAY 免逐次询问；② 内置写入的规范化目标落在用户已确认的工作区根内时，MAY 依 L-APPR-8 免逐文件询问。**
+**由一次批准铸出的常驻授权 MUST 形如 `tool → 确切目标`；其资格 MUST 同时满足：① 有效风险为 `external`；② 工具声明了 target 参数；③ 该次调用真的填了 target。`exec` MUST 永远逐次询问，MUST NOT 提供或承认会话级或常驻授权。`write_local` MUST 逐次询问，但除下列情形外不得免问：① **第一方 Documenting 模块**的可逆草稿写入，仅在启用时用户已明确同意该工具且当前权限指纹匹配、宿主确认操作只写模块私有存储并有修订历史且可撤回、不覆盖权威内容、不提交正式修订、不删除且不外发时，MAY 免逐次询问；② L-APPR-8 列出的工作区根内写入，以及根外「一直允许这个规范化目录」。根外目录授权不是 `external` 常驻授权，不适用本条开头的三项 external 资格，只适用 L-APPR-8。**
 
 **挡的是什么**：常驻授权是「以后都不问」的承诺。把承诺从「这个工具」收窄到「这个工具对这个目标」，
 是唯一能让 external 授权可撤销、可解释的形态；否则一次点击等于授出一个开放代理。草稿例外只覆盖可审阅、可撤回且不改变权威内容的私有提议，**且仅限第一方 Documenting 模块**。工作区写入例外只覆盖用户已确认的那一个工作区根，不覆盖执行，也不覆盖根外路径。正式 commit、覆盖权威内容、删除、Exec、External，以及来源、同意、指纹、修订历史、撤回性或数据路径无法核验的 WriteLocal 操作仍 MUST 逐次审批。「本会话都批准这个工具」不是确切目标：它会让一次点击覆盖该工具以后的每一次写和每一次执行。
 
-**今天靠什么保证**：**部分靠机制**。external 匹配按 `(scope_kind, scope_id, tool, target)` 精确相等
+**今天靠什么保证**：**部分靠机制**。`exec` 不得提供或承认会话级授权这一句，今天仍被 `approve_for_session` 对 `shell_exec` 的快路径违反；缺口与 L-APPR-8 相同，不是符合。external 匹配按 `(scope_kind, scope_id, tool, target)` 精确相等
 （`agent24-store/src/repo.rs:639-670`）；external 资格三重收窄在 `agent24-policy/src/lib.rs:238-242`
 （`standing_grant_eligible().then_some(standing_target).flatten()`）。K1-6a.5 的 `ConsentGate` 会把具备第一方来源、有效匹配同意和宿主核验语义的 `WriteLocal` 草稿标记为免逐次审批；manifest 的 `reversible_draft` 只是声明。工具分发路径仍未接入该核验结构：生产装配传入 `risk: External`、`reversible_draft_declared: false` 与 `draft_verification: None`（`rust/apps/agent24d/src/server.rs:1603-1604`），缺失宿主核验时按普通 `WriteLocal` 逐次审批。**门本身已经按本条收窄**（#1034 改 MUST 表述；#1108 合入 `53032dac`）：`ConsentGate` 免逐次人审要求 `WriteLocal` ∧ 请求声明草稿 ∧ 同意记录 `reversible_draft` ∧ 来源 `FirstParty` ∧ `record.module == "documents"` ∧ 宿主核验合格（`rust/crates/agent24-policy/src/consent_gate.rs:391-398`，常量 `DRAFT_EXEMPTION_MODULE`）。同意记录的草稿位由迁移 `0018_module_consent_reversible_draft.sql` 携带，存量行默认 0（非草稿同意）。**例外在生产装配下仍不可达**：上述门条件已在代码里，但没有调用方把宿主核验交给它。把例外接进工具分发路径的 PR 必须先解决下文「未决 / 接线闸门」。
 
@@ -145,9 +145,9 @@ MUST 在该 schedule 删除时一并失效。**
 
 ### L-APPR-8 · 工作区写入可常驻，根外写入必须指向确切目录
 
-**内置写入 MAY 在用户已明确确认的工作区根内免逐文件询问；该确认只授权 `fs_write → 这个工作区根`，MUST NOT 授权执行，也 MUST NOT 授权根外路径。工作区根外的内置写入 MUST 单独询问，且只能提供「仅本次」与「一直允许写入这个规范化目录」；后者 MUST 可撤销，撤销或目录授权删除后 MUST 立即失效。判定 MUST 使用写入当下解析出的规范化路径，按路径分量比较，MUST NOT 信模型声明的字符串。家目录、`~/.ssh` 与系统目录 MUST NOT 作为工作区根。**
+**内置写入 MAY 在用户已明确确认的工作区根内免逐文件询问；该确认只授权 `fs_write → 这个工作区根`，MUST NOT 授权执行，也 MUST NOT 授权根外路径。确认 MUST 是用户的显式动作，MUST 可撤销，撤销后立即失效。守护进程自动创建的状态目录不是确认。工作区根外的内置写入 MUST 单独询问，且只能提供「仅本次」与「一直允许写入这个规范化目录」；后者 MUST 可撤销，撤销或目录授权删除后 MUST 立即失效。判定 MUST 使用写入方真正打开的那个规范化路径，按路径分量比较，MUST NOT 信模型声明的字符串，也 MUST NOT 把含 `..` 或悬空符号链接的路径当成根内。家目录、`~/.ssh`、系统目录，以及包含它们的祖先目录，MUST NOT 作为工作区根，也 MUST NOT 作为根外目录授权的目标。**
 
-**挡的是什么**：每次写都问会让用户放弃审查；「本会话都批准写」又会让一次点击覆盖以后的每一个路径，包括工作区外。字符串前缀比较会把 `/proj` 误当 `/proj-evil`，符号链接和 `..` 会把写入送出工作区。把家目录当工作区根，等于一次确认就授出整机写权限。
+**挡的是什么**：每次写都问会让用户放弃审查；「本会话都批准写」又会让一次点击覆盖以后的每一个路径，包括工作区外。字符串前缀比较会把 `/proj` 误当 `/proj-evil`，符号链接和 `..` 会把写入送出工作区。把家目录、它的祖先（例如 `/Users`）或系统目录当成工作区根或「一直允许」的目录，等于一次确认就授出整机写权限。
 
 **今天靠什么保证**：**今天没有这条机制。** `fs_write` 仍被工作区白名单直接拒绝根外写入，不会弹出「仅本次 / 一直允许这个目录」。`approve_for_session` 仍会放行同一会话内后续的 `fs_write` 与 `shell_exec`（`agent24-policy/src/lib.rs` 的会话授权快路径）。这与本条以及 L-APPR-5 的执行逐次询问不一致，是已知缺口，不是符合。行为修复必须另开 PR，不得与本法律变更同交。
 

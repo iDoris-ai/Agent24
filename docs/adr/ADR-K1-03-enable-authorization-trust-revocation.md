@@ -102,7 +102,7 @@ K1-6a 可消费宿主授权决定，按最小操作/资源/有效期签发或更
 
 ## 法律映射与后续变更
 
-实现须遵守 [`APPROVAL.md`](laws/APPROVAL.md) L-APPR-1..7（用户权限不可由风险判断放宽；统一审批门；External 不给宽泛 session grant；常驻授权按确切目标收窄；读权限不进入存储）、[`MEMORY.md`](laws/MEMORY.md) L-MEM-1..7（身份/范围由内核注入，不让模块自报）及 [`CONTEXT.md`](laws/CONTEXT.md) L-CTX-1..4（来源可点名、可审计）。LocalOnly、授权撤销等长期隐私不变量如需成为新法律，必须另提 `docs/laws/PRIVACY.md`（或获批位置）的独立 PR；本 ADR 不代替法律流程。
+实现须遵守 [`APPROVAL.md`](laws/APPROVAL.md) L-APPR-1..8（用户权限不可由风险判断放宽；统一审批门；External 不给宽泛 session grant；常驻授权按确切目标收窄；读权限不进入存储）、[`MEMORY.md`](laws/MEMORY.md) L-MEM-1..7（身份/范围由内核注入，不让模块自报）及 [`CONTEXT.md`](laws/CONTEXT.md) L-CTX-1..4（来源可点名、可审计）。LocalOnly、授权撤销等长期隐私不变量如需成为新法律，必须另提 `docs/laws/PRIVACY.md`（或获批位置）的独立 PR；本 ADR 不代替法律流程。
 
 本 ADR 不恢复 OD-M11 的 PAUSED 状态（`PLAN-OD-NEXT.md` F11.0/F11.1 与 [`ADR-005`](open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md) 仍按其原路线管理）。本 ADR 获批只为 K1-6a 提供契约，不能推断任何机制已实现或 Documenting 已验收。
 
