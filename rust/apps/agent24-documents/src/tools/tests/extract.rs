@@ -160,7 +160,7 @@ async fn submit_within(env: &Env, args: Value, budget: Duration) -> Value {
             ),
         )
         .with_state(env.state.clone());
-    let body = json!({ "context": context_for("extract"), "arguments": args });
+    let body = json!({ "context": context_with("extract", &[DOC]), "arguments": args });
     let req = Request::post("/_a24/tools/extract")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
