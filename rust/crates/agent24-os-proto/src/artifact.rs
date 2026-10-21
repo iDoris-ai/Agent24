@@ -13,9 +13,7 @@
 //! file or directory, an entry that changes or is replaced while it is
 //! read, or more than [`MAX_PACKAGE_ENTRIES`](crate::launch::MAX_PACKAGE_ENTRIES)
 //! entries, [`MAX_PACKAGE_BYTES`] bytes or [`MAX_PACKAGE_DEPTH`] levels.
-//! The caller fails closed. It vouches for the files as read; a change
-//! after it returns is caught by comparing it again at dispatch, and one
-//! inside a single timestamp tick of a coarse-grained filesystem is not.
+//! The caller fails closed.
 //!
 //! The digest is SHA-256 over the files sorted by relative path bytes
 //! (components joined by `/`), each `u64be(len(path)) ‖ path ‖ b'f' ‖
@@ -26,7 +24,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// What every identity starts with.
@@ -57,9 +55,9 @@ pub enum ArtifactError {
 impl std::fmt::Display for ArtifactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreadable(path, e) => write!(f, "{} could not be read: {e}", path.display()),
-            Self::Unsupported(path) => write!(f, "{} is no file or directory", path.display()),
-            Self::Changed(path) => write!(f, "{} changed while it was read", path.display()),
+            Self::Unreadable(p, e) => write!(f, "{} could not be read: {e}", p.display()),
+            Self::Unsupported(p) => write!(f, "{} is no file or directory", p.display()),
+            Self::Changed(p) => write!(f, "{} changed while it was read", p.display()),
             Self::TooLarge => write!(f, "the package has too many entries, bytes or levels"),
         }
     }
@@ -129,12 +127,8 @@ fn collect(
         |path: &Path, e: rustix::io::Errno| ArtifactError::Unreadable(path.to_owned(), e.into());
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     // The root must end in a name: `link/` or `link/.` would follow `link`.
-    let raw = root.as_os_str().as_bytes();
-    let named = matches!(
-        root.components().next_back(),
-        Some(std::path::Component::Normal(_))
-    );
-    if !named || raw.ends_with(b"/") || raw.ends_with(b"/.") {
+    let (raw, last) = (root.as_os_str().as_bytes(), root.components().next_back());
+    if !matches!(last, Some(Component::Normal(_))) || raw.ends_with(b"/") || raw.ends_with(b"/.") {
         return Err(ArtifactError::Unsupported(root.to_owned()));
     }
     let mut pending: Vec<Pending> = vec![(None, root.to_owned(), PathBuf::new())];
@@ -217,6 +211,12 @@ fn same_inode(a: &Stat, b: &Stat) -> bool {
     a.st_dev == b.st_dev && a.st_ino == b.st_ino
 }
 
+/// The same directory, with nothing added, removed or renamed in it since.
+fn same_dir(a: &Stat, b: &Stat) -> bool {
+    let times = |s: &Stat| (s.st_mtime, s.st_mtime_nsec, s.st_ctime, s.st_ctime_nsec);
+    same_inode(a, b) && times(a) == times(b)
+}
+
 /// Length, SHA-256 and [`Stamp`] of the regular file `name` in `dir`, which
 /// the walk listed as `walked`, reading at most `budget` bytes. Opened
 /// without following a link or waiting on a FIFO; [`ArtifactError::Changed`]
@@ -263,19 +263,7 @@ fn hash_file(
 fn unchanged(stamps: &[(PathBuf, Stamp)], dirs: &[(PathBuf, Stat)]) -> Result<(), ArtifactError> {
     for (path, read) in dirs {
         if !rustix::fs::lstat(path).is_ok_and(|now| {
-            FileType::from_raw_mode(now.st_mode) == FileType::Directory
-                && same_inode(&now, read)
-                && (
-                    now.st_mtime,
-                    now.st_mtime_nsec,
-                    now.st_ctime,
-                    now.st_ctime_nsec,
-                ) == (
-                    read.st_mtime,
-                    read.st_mtime_nsec,
-                    read.st_ctime,
-                    read.st_ctime_nsec,
-                )
+            FileType::from_raw_mode(now.st_mode) == FileType::Directory && same_dir(&now, read)
         }) {
             return Err(ArtifactError::Changed(path.clone()));
         }
