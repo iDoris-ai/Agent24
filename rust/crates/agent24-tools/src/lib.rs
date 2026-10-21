@@ -403,8 +403,8 @@ pub enum ToolError {
     #[error("run aborted: {0}")]
     AbortRun(String),
     /// The approval was given under a grant that is no longer current, or
-    /// names none (K1-6a-G §2.3). The registry asks again; it reaches a
-    /// caller only from a direct `Tool::call`, which no approval covers.
+    /// names none (K1-6a-G §2.3). `dispatch` asks again; from
+    /// `execute_preapproved` the caller must ask again through `dispatch`.
     #[error(
         "the approval no longer matches the current grant; call the tool again to be asked anew"
     )]
@@ -576,7 +576,11 @@ pub trait Tool: Send + Sync {
     /// Before an approval card is shown: refuse (and audit) a call that could
     /// never run, rather than ask a human for nothing, and name the grant the
     /// approval will be bound to. Ordinary tools have none: `Ok(None)`.
-    async fn approval_binding(&self, _ctx: &ToolContext) -> Result<Option<String>, ToolError> {
+    async fn approval_binding(
+        &self,
+        _ctx: &ToolContext,
+        _cancel: &CancellationToken,
+    ) -> Result<Option<String>, ToolError> {
         Ok(None)
     }
 
@@ -1017,23 +1021,41 @@ impl Tool for ModuleTool {
         self.audit_refusal(ctx).await
     }
 
-    async fn approval_binding(&self, ctx: &ToolContext) -> Result<Option<String>, ToolError> {
+    async fn approval_binding(
+        &self,
+        ctx: &ToolContext,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, ToolError> {
         // #1130 L3: the gate-5 guard and the grant are settled before any
         // card, so a call that `call_with_invocation` would refuse is refused
-        // here, with the same audit and the same error.
-        if self
-            .advert_view
-            .blocked_by_remote_tier_guard(&self.module, &self.operation)
-            .await
-        {
+        // here, with the same audit and the same error. Only the lookup is
+        // cancellable and bounded; a refusal's audit is always written whole.
+        let lookup = async {
+            if self
+                .advert_view
+                .blocked_by_remote_tier_guard(&self.module, &self.operation)
+                .await
+            {
+                return None;
+            }
+            Some(
+                self.authorization
+                    .authorize(&self.module, &self.operation, ctx)
+                    .await,
+            )
+        };
+        let looked_up = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(ToolError::Cancelled),
+            looked_up = tokio::time::timeout(self.timeout, lookup) => {
+                looked_up.map_err(|_| ToolError::Timeout(self.timeout))?
+            }
+        };
+        let Some(authorized) = looked_up else {
             self.audit_refusal_as(ctx, REMOTE_TIER_REF).await?;
             return Err(ToolError::Failed(module_error_json(permission_denied())));
-        }
-        match self
-            .authorization
-            .authorize(&self.module, &self.operation, ctx)
-            .await
-        {
+        };
+        match authorized {
             Ok(grant) => Ok(Some(grant.authorization_ref)),
             Err(error) => {
                 self.audit_refusal_as(ctx, &denied_authorization_ref(&error))
@@ -1868,16 +1890,7 @@ impl ToolRegistry {
         for _ in 0..MAX_APPROVAL_ROUNDS {
             let mut approval = ApprovalBinding::NotAsked;
             if effective.requires_approval() {
-                // Outside `run_budgeted`, so bounded here: cancellable, and
-                // within the tool's own budget.
-                let budget = tool.timeout();
-                let bound = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => return Err(ToolError::Cancelled),
-                    bound = tokio::time::timeout(budget, tool.approval_binding(ctx)) => {
-                        bound.map_err(|_| ToolError::Timeout(budget))??
-                    }
-                };
+                let bound = tool.approval_binding(ctx, cancel).await?;
                 match self
                     .gate
                     .check(&info, ctx, input, standing_target.as_deref(), cancel)
@@ -1921,10 +1934,10 @@ impl ToolRegistry {
     /// deliberately SKIPS the gate. It is the one execution path that does not
     /// ask, and must only be reached with an approval already in hand.
     ///
-    /// The one exception: a call whose approval must name the grant it was
-    /// given under (K1-6a-G §2.3) cannot be held to one here, since which
-    /// grant the human saw is not recorded. It goes back through `dispatch`
-    /// and is asked again.
+    /// A call whose approval must name the grant it was given under (K1-6a-G
+    /// §2.3) cannot be held to one here, since which grant the human saw is
+    /// not recorded: it stops before the module with `ApprovalStale`, and
+    /// the caller asks again through `dispatch`.
     pub async fn execute_preapproved(
         &self,
         name: &str,
@@ -1951,10 +1964,7 @@ impl ToolRegistry {
             || ctx.clone(),
             |gate| ctx.clone().with_egress_gate(Arc::clone(gate)),
         );
-        match Self::run_budgeted(tool, &call_ctx, input, cancel, ApprovalBinding::Unbound).await {
-            Err(ToolError::ApprovalStale) => self.dispatch(name, ctx, input, cancel).await,
-            result => result,
-        }
+        Self::run_budgeted(tool, &call_ctx, input, cancel, ApprovalBinding::Unbound).await
     }
 
     /// Restore grant side-effects for a durable approval without asking again.

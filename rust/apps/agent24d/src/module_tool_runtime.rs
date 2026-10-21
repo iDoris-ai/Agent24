@@ -2755,41 +2755,61 @@ mod tests {
 
     /// An approval given out of band (durable resume) does not record which
     /// grant the human saw, so it is not taken as covering this one: the
-    /// call is asked about once more and runs on that answer.
+    /// call stops before the module, for the caller to ask again.
     #[tokio::test]
-    async fn an_approval_from_a_resume_is_asked_again_and_runs() {
+    async fn an_approval_from_a_resume_stops_before_the_module() {
         let (registry, runtime, approvals, store) =
             fixture(RiskClass::WriteLocal, true, true).await;
-        preapprove_write_local(&registry).await.unwrap();
-        assert_eq!(approvals.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let error = preapprove_write_local(&registry).await.unwrap_err();
+        assert!(matches!(error, ToolError::ApprovalStale), "{error}");
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
         let rows = store.list_audit().await.unwrap();
-        let results: Vec<_> = rows
-            .iter()
-            .filter_map(|row| row.detail["terminal"]["result"].as_str())
-            .collect();
-        assert_eq!(results, ["cancelled", "success"]);
-        approvals.deny.store(true, Ordering::SeqCst);
-        assert!(preapprove_write_local(&registry).await.is_err());
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1, "a refusal holds");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].detail["terminal"]["result"], "cancelled");
     }
 
-    /// No approval travels on a `ToolContext`: one kept from an approved
-    /// call does not let a direct call reach the module.
+    /// Grants every lookup and keeps the last context it was handed.
+    struct KeepingAuthorization {
+        kept: std::sync::Mutex<Option<ToolContext>>,
+    }
+
+    #[async_trait]
+    impl ModuleToolAuthorization for KeepingAuthorization {
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            ctx: &ToolContext,
+        ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            *self.kept.lock().unwrap() = Some(ctx.clone());
+            Ok(agent24_tools::ModuleToolGrantContext {
+                authorized_resources: vec![],
+                authorization_ref: "grant:kept".to_owned(),
+                per_call_approval: false,
+                valid_for: None,
+            })
+        }
+    }
+
+    /// No approval travels on a `ToolContext`: the one an adapter kept from
+    /// inside an approved call does not let a direct call reach the module.
     #[tokio::test]
     async fn a_context_kept_from_an_approved_call_carries_no_approval() {
-        let (registry, runtime, approvals, _, tool) =
-            fixture_using(RiskClass::WriteLocal, true, true, true, None, None).await;
-        let kept = context();
-        registry
-            .dispatch(
-                "fake_module.write_local",
-                &kept,
-                &Map::new(),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+        let authorization = Arc::new(KeepingAuthorization {
+            kept: std::sync::Mutex::new(None),
+        });
+        let (registry, runtime, approvals, _, tool) = fixture_using(
+            RiskClass::WriteLocal,
+            true,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        dispatch_write_local(&registry).await.unwrap();
+        let kept = authorization.kept.lock().unwrap().take().unwrap();
         let direct = tool
             .call(&kept, &Map::new(), &CancellationToken::new())
             .await
@@ -2808,16 +2828,19 @@ mod tests {
     }
 
     /// A tool declared `read` that the user tightened to ask every call:
-    /// an approval from a resume is asked again for it too.
+    /// an approval from a resume names no grant for it either.
     #[tokio::test]
-    async fn a_tightened_tool_approved_out_of_band_is_asked_again() {
+    async fn a_tightened_tool_approved_out_of_band_stops_before_the_module() {
         let (_, runtime, approvals, _, tool) =
             fixture_using(RiskClass::Read, true, true, true, None, None).await;
         let mut registry = ToolRegistry::new()
             .with_risk_overrides(Arc::new(TightenModuleRisk))
             .with_gate(approvals.clone());
         registry.register_module_tool(tool).unwrap();
-        preapprove_write_local(&registry).await.unwrap();
+        let error = preapprove_write_local(&registry).await.unwrap_err();
+        assert!(matches!(error, ToolError::ApprovalStale), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        dispatch_write_local(&registry).await.unwrap();
         assert_eq!(approvals.calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
     }
