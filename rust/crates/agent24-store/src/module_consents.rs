@@ -221,6 +221,15 @@ pub struct ModuleConsentRecord {
     pub expires_at: String,
 }
 
+/// A grant, refusal or revocation for `(module, op)` was committed; `op:
+/// None` is every tool of the module (K1-6a-G §2.5). It carries no decision:
+/// a listener re-reads the store, which stays authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleConsentChange {
+    pub module: String,
+    pub op: Option<String>,
+}
+
 /// A persisted module authorization revocation. `op: None` revokes every
 /// tool for the module; `Some(op)` revokes only that tool. This host consent
 /// event is intentionally independent of capability claims and epochs.
@@ -362,6 +371,14 @@ fn parse_instant(s: &str) -> Result<(i64, String)> {
     ))
 }
 
+/// UTC epoch milliseconds of an RFC 3339 instant, by the same parser
+/// [`Store::lookup_module_consent`] judges expiry with; `None` if it does
+/// not parse.
+#[must_use]
+pub fn consent_instant_millis(s: &str) -> Option<i64> {
+    parse_instant(s).ok().map(|(millis, _)| millis)
+}
+
 fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
     Ok(ModuleConsentRecord {
         module: row.get("module"),
@@ -388,6 +405,22 @@ impl Store {
             .fetch_all(self.pool())
             .await?;
         rows.iter().map(row_to_record).collect()
+    }
+
+    /// Subscribe to every committed grant, refusal and revocation. A
+    /// receiver that falls behind gets `Lagged` and must re-read the store
+    /// for everything it watches.
+    pub fn subscribe_module_consent_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ModuleConsentChange> {
+        self.module_consent_changes.subscribe()
+    }
+
+    fn announce_module_consent_change(&self, module: &str, op: Option<&str>) {
+        let _ = self.module_consent_changes.send(ModuleConsentChange {
+            module: module.to_owned(),
+            op: op.map(str::to_owned),
+        });
     }
 
     /// Subscribe to post-commit consent revocations. A broadcast channel is
@@ -427,6 +460,7 @@ impl Store {
                 op: op.map(str::to_owned),
                 revoked_at,
             });
+        self.announce_module_consent_change(module, op);
         Ok(())
     }
 
@@ -492,7 +526,9 @@ impl Store {
         .bind(expires_at)
         .fetch_one(self.pool())
         .await?;
-        row_to_record(&row)
+        let record = row_to_record(&row)?;
+        self.announce_module_consent_change(&summary.module, Some(&summary.op));
+        Ok(record)
     }
 
     /// Records the host's confirmation that the user explicitly accepted
@@ -1328,6 +1364,49 @@ mod tests {
             .unwrap();
         assert!(matches!(lookup, ConsentLookup::Revoked(None)));
         assert!(!lookup.is_authorized());
+    }
+
+    /// K1-6a-G §2.5: a grant and a refusal are announced like a
+    /// revocation, so an in-flight call can see its grant replaced.
+    #[tokio::test]
+    async fn grants_refusals_and_revocations_are_all_announced() {
+        let store = store().await;
+        let mut changes = store.subscribe_module_consent_changes();
+        let s = summary("reads one file");
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .deny_module_consent(&s, "2026-10-08T00:00:01Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .revoke_module_consent(&s.module, None, "2026-10-08T00:00:02Z")
+            .await
+            .unwrap();
+        let tool = ModuleConsentChange {
+            module: s.module.clone(),
+            op: Some(s.op.clone()),
+        };
+        assert_eq!(changes.try_recv().unwrap(), tool);
+        assert_eq!(changes.try_recv().unwrap(), tool);
+        assert_eq!(
+            changes.try_recv().unwrap(),
+            ModuleConsentChange {
+                module: s.module.clone(),
+                op: None
+            }
+        );
+        assert!(changes.try_recv().is_err(), "one announcement per write");
+        // A write that fails announces nothing.
+        assert!(
+            store
+                .grant_module_consent(&s, "not a time", "2026-11-08T00:00:00Z")
+                .await
+                .is_err()
+        );
+        assert!(changes.try_recv().is_err());
     }
 
     #[tokio::test]

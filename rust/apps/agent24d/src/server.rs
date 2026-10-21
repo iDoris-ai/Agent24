@@ -1604,8 +1604,12 @@ pub async fn serve(
             agent24_policy::consent_gate::ModuleConsentAuthorization::new(
                 consent_gate.clone(),
                 request,
-                StdArc::new(agent24_core::util::now_iso8601),
-            ),
+                // Milliseconds: a grant's remaining time is measured from
+                // this (K1-6a-G §2.5). No clock reads as no time, expiring
+                // the grant.
+                StdArc::new(|| agent24_core::util::now_iso8601_millis().unwrap_or_default()),
+            )
+            .with_consent_changes(store.clone()),
         );
         module_authorizations.insert((module, operation), authorization);
     }
@@ -1613,8 +1617,9 @@ pub async fn serve(
         StdArc::clone(&module_tool_runtime),
         module_authorizations.clone(),
         {
-            // Read per call (K1-6a-G §2.4); the router is fixed today, but
-            // the guard must not depend on that.
+            // Read per call (K1-6a-G §2.4), from this one router instance,
+            // which is never replaced today; a replaceable router must make
+            // the probe read the current instance (#1130 L2).
             let router = Arc::clone(&router);
             StdArc::new(move || Some(router.has_remote_tier()))
         },
