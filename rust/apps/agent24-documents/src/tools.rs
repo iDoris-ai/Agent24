@@ -466,17 +466,17 @@ async fn ready(state: &AppState) -> Result<Arc<Storage>, Envelope> {
         .map_err(|cause| refused(&ApiError::storage_unavailable(cause)))
 }
 
-/// What an operation touches: the table the entry checks the scope against
-/// (K1-06a §4.1, §4.3). `None`: not an operation of this module, refused.
+/// What an operation touches: the one table the entry checks the scope
+/// against (K1-06a §4.1, §4.3). `None`: no such operation, refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resource {
-    /// `document_id` names it.
+    /// By `document_id`.
     Document,
-    /// `job_id` names it; it belongs to the job's document.
+    /// By `job_id`, through the job's document.
     Job,
-    /// `extraction_id` names it; it belongs to the extraction's document.
+    /// By `extraction_id`, through the extraction's document.
     Extraction,
-    /// None named: the operation filters by the scope itself (`list`).
+    /// None: the operation filters by the scope itself (`list`).
     Listing,
 }
 
@@ -490,11 +490,12 @@ fn resource(op: &str) -> Option<Resource> {
     }
 }
 
-/// Lets `op` run only if what it names is in `scope`, by [`resource`]'s
-/// row for it. An id that is missing or not a string is `invalid_input`, as
-/// the operation's own parse would answer. Outside the scope reads as
-/// absent (K1-06a §2.4), and nothing but a job's or an extraction's owner
-/// is read to tell.
+/// Lets `op` run only if what it names is in `scope`, by its row in
+/// [`resource`]; before any other argument is checked, so outside the
+/// scope always reads as absent: the service's own not-found (K1-06a
+/// §2.4), whatever else is wrong. A missing or non-string id is
+/// `invalid_input`; a malformed one passes, as nothing has it and the
+/// service refuses it. Only a job's or an extraction's owner is read.
 async fn admit(
     state: &AppState,
     scope: &Scope,
@@ -505,68 +506,28 @@ async fn admit(
         Some(Value::String(id)) => Ok(id.as_str()),
         _ => Err(Envelope::error(INVALID_INPUT, false)),
     };
-    match resource(op) {
-        None => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
-        Some(Resource::Listing) => Ok(()),
-        Some(Resource::Document) => in_scope(scope, named("document_id")?),
-        Some(Resource::Job) => {
-            let id = named("job_id")?;
-            if !is_id(IdKind::Job, id) {
-                return Ok(());
-            }
-            let storage = ready(state).await?;
-            job_in_scope(&storage, scope, id).await
-        }
-        Some(Resource::Extraction) => {
-            let id = named("extraction_id")?;
-            if !is_id(IdKind::Extraction, id) {
-                return Ok(());
-            }
-            let storage = ready(state).await?;
-            extraction_in_scope(&storage, scope, id).await
-        }
-    }
-}
-
-/// Refuses a well-formed document id outside `scope` exactly as an unknown
-/// document (`documents.rs` `get`'s not-found), before any read (K1-06a
-/// §2.4). A malformed id passes: the service refuses it as
-/// `invalid_request` before reading, and it names no document.
-fn in_scope(scope: &Scope, id: &str) -> Result<(), Envelope> {
-    if !is_id(IdKind::Document, id) || scope.allows_document(id) {
-        Ok(())
-    } else {
-        Err(refused(&ApiError::not_found("no such document")))
-    }
-}
-
-/// Refuses a well-formed job id unless its job exists and its document is
-/// in `scope`, exactly as an unknown job (`jobs.rs` `get`'s not-found). A
-/// missing job is refused here too, not by the service: the service checks
-/// other arguments first, and a refusal of those for a missing job alone
-/// would tell it apart from one outside the scope (K1-06a §2.4). A
-/// malformed id passes: no job has one, and the service refuses it.
-async fn job_in_scope(storage: &Storage, scope: &Scope, id: &str) -> Result<(), Envelope> {
-    if !is_id(IdKind::Job, id) {
+    let (kind, id, absent) = match resource(op) {
+        None => return Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
+        Some(Resource::Listing) => return Ok(()),
+        Some(Resource::Document) => (IdKind::Document, named("document_id")?, "no such document"),
+        Some(Resource::Job) => (IdKind::Job, named("job_id")?, "no such job"),
+        Some(Resource::Extraction) => (
+            IdKind::Extraction,
+            named("extraction_id")?,
+            "no such extraction",
+        ),
+    };
+    if !is_id(kind, id) {
         return Ok(());
     }
-    match scope::job_document(storage, id).await {
-        Err(e) => Err(refused(&e)),
-        Ok(Some(Some(doc))) if scope.allows_document(&doc) => Ok(()),
-        _ => Err(refused(&ApiError::not_found("no such job"))),
-    }
-}
-
-/// As [`job_in_scope`], for an extraction (`extractions.rs` `get`'s
-/// not-found), whose service checks the cursor before the id.
-async fn extraction_in_scope(storage: &Storage, scope: &Scope, id: &str) -> Result<(), Envelope> {
-    if !is_id(IdKind::Extraction, id) {
-        return Ok(());
-    }
-    match scope::extraction_document(storage, id).await {
-        Err(e) => Err(refused(&e)),
-        Ok(Some(doc)) if scope.allows_document(&doc) => Ok(()),
-        _ => Err(refused(&ApiError::not_found("no such extraction"))),
+    let owner = match kind {
+        IdKind::Job => scope::job_document(&*ready(state).await?, id).await,
+        IdKind::Extraction => scope::extraction_document(&*ready(state).await?, id).await,
+        _ => Ok(Some(id.to_owned())),
+    };
+    match owner.map_err(|e| refused(&e))? {
+        Some(doc) if scope.allows_document(&doc) => Ok(()),
+        _ => Err(refused(&ApiError::not_found(absent))),
     }
 }
 

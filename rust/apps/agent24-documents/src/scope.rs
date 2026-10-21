@@ -90,8 +90,8 @@ impl Scope {
     }
 }
 
-/// The document a job belongs to: `None` when there is no such job,
-/// `Some(None)` when the job has no document.
+/// The document a job belongs to: `None` when there is no such job, or
+/// it has none.
 ///
 /// # Errors
 ///
@@ -99,14 +99,14 @@ impl Scope {
 pub(crate) async fn job_document(
     storage: &Storage,
     job_id: &str,
-) -> Result<Option<Option<String>>, ApiError> {
+) -> Result<Option<String>, ApiError> {
     let row: Result<Option<Option<String>>, sqlx::Error> =
         sqlx::query_scalar("SELECT document_id FROM jobs WHERE id = ?1")
             .bind(job_id)
             .fetch_optional(storage.db.pool())
             .await;
     match row {
-        Ok(found) => Ok(found),
+        Ok(found) => Ok(found.flatten()),
         Err(e) => Err(storage.db_failure(e).await),
     }
 }
