@@ -538,6 +538,9 @@ pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
 
 /// The package's artifact identity for the run about to start (K1-6a-G
 /// §2.1). Without one the run still starts; grants fail closed on `None`.
+/// It vouches for the files as read here: a later change is caught only by
+/// comparing identities at dispatch, and a same-length rewrite within one
+/// timestamp tick of a coarse-grained filesystem is not caught at all.
 fn package_artifact(name: &str, package: &Path) -> Option<String> {
     crate::artifact::identity(package)
         .map_err(|e| tracing::warn!(module = %name, "no artifact identity for this run: {e}"))
