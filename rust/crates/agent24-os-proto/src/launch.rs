@@ -522,13 +522,26 @@ pub struct LaunchSpec<'a> {
 ///
 /// [`LaunchError`] — resolution, ownership, entropy, or the OS refusing.
 pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
-    let program = {
+    let (program, artifact) = {
         let (command, package) = (spec.command.clone(), spec.package_dir.to_owned());
-        tokio::task::spawn_blocking(move || resolve(&command, &package))
-            .await
-            .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))??
+        let name = spec.name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            // Identity first: `resolve`'s checks stay next to the exec.
+            let artifact = package_artifact(&name, &package);
+            Ok::<_, LaunchError>((resolve(&command, &package)?, artifact))
+        })
+        .await
+        .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))??
     };
-    start(spec, &program)
+    start(spec, &program, artifact)
+}
+
+/// The package's artifact identity for the run about to start (K1-6a-G
+/// §2.1). Without one the run still starts; grants fail closed on `None`.
+fn package_artifact(name: &str, package: &Path) -> Option<String> {
+    crate::artifact::identity(package)
+        .map_err(|e| tracing::warn!(module = %name, "no artifact identity for this run: {e}"))
+        .ok()
 }
 
 /// The half of [`spawn`] that creates the child and hands it back — a plain
@@ -540,7 +553,11 @@ pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
 /// leave a child nobody holds — and the supervisor, holding no process,
 /// would free a slot with a run still in it. The compiler now refuses that
 /// await, where before only a comment asked for it (FU-58).
-fn start(spec: LaunchSpec<'_>, program: &Path) -> Result<ModuleProcess, LaunchError> {
+fn start(
+    spec: LaunchSpec<'_>,
+    program: &Path,
+    artifact: Option<String>,
+) -> Result<ModuleProcess, LaunchError> {
     use command_fds::{CommandFdExt, FdMapping};
 
     let token = mint_token()?;
@@ -597,7 +614,7 @@ fn start(spec: LaunchSpec<'_>, program: &Path) -> Result<ModuleProcess, LaunchEr
     }
     ModuleProcess::new(
         child,
-        Generation::serving_at(upstream),
+        Generation::serving_package(upstream, artifact),
         token,
         drains,
         spec.http_path,
@@ -1025,6 +1042,37 @@ mod tests {
         // Control: it is NOT this process's group — otherwise "its own group"
         // would be satisfied by inheriting ours whenever we happen to lead one.
         assert_ne!(child_pgid, i32::try_from(std::process::id()).unwrap());
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// K1-6a-G §2.1: a run carries the identity of the package it was
+    /// started from, computed before the process could touch it.
+    #[tokio::test]
+    async fn a_run_carries_its_package_identity() {
+        let t = pkg();
+        exe(&t.path().join("bin/mod"), "#!/bin/sh\necho changed > out\n");
+        let before = crate::artifact::identity(t.path()).unwrap();
+        let mut p = start(t.path(), &cmd("bin/mod", &[])).await;
+        exited(&mut p).await;
+        assert_eq!(p.generation().artifact(), Some(before.as_str()));
+        assert_ne!(
+            crate::artifact::identity(t.path()).unwrap(),
+            before,
+            "the run wrote into its package after the identity was taken"
+        );
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// A package whose identity cannot be computed still starts; its run
+    /// has none, so no grant can match it.
+    #[tokio::test]
+    async fn a_package_without_an_identity_starts_without_one() {
+        let t = pkg();
+        exe(&t.path().join("bin/mod"), "#!/bin/sh\nexit 0\n");
+        std::os::unix::fs::symlink("/etc/hosts", t.path().join("escape")).unwrap();
+        let mut p = start(t.path(), &cmd("bin/mod", &[])).await;
+        exited(&mut p).await;
+        assert_eq!(p.generation().artifact(), None);
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 
