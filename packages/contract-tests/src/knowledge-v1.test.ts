@@ -24,7 +24,7 @@ const manifest = JSON.parse(readFileSync(join(fixtureDir, 'manifest.json'), 'utf
 // Pins the whole fixture set (every file digest and version). Changing a fixture
 // means bumping its version, re-pinning its sha256 and updating this constant
 // together with MANIFEST_SHA256 in rust/crates/agent24-protocol/tests/knowledge_fixtures.rs.
-const MANIFEST_SHA256 = 'cabf69d4a7d8c31a6ca6ca3ed21fb9a1ad96a6d398f2a3e7d26e015d7361f039'
+const MANIFEST_SHA256 = 'bb90b8755a06333fbc5db18b49ac6f3854b15c92843e63bb5d26770c09ce192c'
 // Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); same list as the Rust test.
 const REQUIRED = [
   'search.empty-scope.json', 'search.scope-empty-array.json', 'search.partial.json', 'search.partial-overloaded.json',

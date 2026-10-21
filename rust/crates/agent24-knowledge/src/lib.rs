@@ -1,14 +1,18 @@
 //! Knowledge v1 wire types (KB-C1-02a), one-to-one with `protocol/knowledge/v1`
-//! (CONTRACT-READONLY-v1 r8). Types are strict, producer-side: unknown fields and
+//! (CONTRACT-READONLY-v1 r9). Types are strict, producer-side: unknown fields and
 //! values outside the v1 enums are rejected. Shape rules a type cannot carry
 //! (cross-field `allOf`, string lengths, `uniqueItems`) stay with the schema and
 //! `agent24-protocol/tests/knowledge_rules.rs`.
 //!
-//! Two kinds of `Option` appear, never mixed:
+//! Three kinds of `Option` appear, never mixed:
 //! - required but nullable (`"k": null` allowed, missing key rejected, `None`
 //!   always encodes as `null`): `#[serde(deserialize_with = "crate::nullable")]`;
 //! - optional, never null (missing key = `None`, `null` rejected, `None` encodes
-//!   as no key): `#[serde(default, with = "crate::opt", skip_serializing_if = ..)]`.
+//!   as no key): `#[serde(default, with = "crate::opt", skip_serializing_if = ..)]`;
+//! - optional, informational, `null` accepted (missing key or `null` = `None`,
+//!   `None` encodes as no key): plain `#[serde(default, skip_serializing_if = ..)]`.
+//!   Only `ChunkExpectedRevision::chunk_revision` (r9: a hit's `null` may be sent
+//!   back, the server ignores the value).
 
 mod capabilities;
 mod common;

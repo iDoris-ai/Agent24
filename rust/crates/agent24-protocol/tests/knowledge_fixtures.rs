@@ -28,7 +28,7 @@ const KNOWLEDGE_FIXTURES: &str = "protocol/knowledge/fixtures/v1";
 /// sha256 of `manifest.json`, which pins every fixture's version and digest.
 /// Changing a fixture means bumping its version, re-pinning its sha256 and
 /// updating this constant together with `MANIFEST_SHA256` in knowledge-v1.test.ts.
-const MANIFEST_SHA256: &str = "cabf69d4a7d8c31a6ca6ca3ed21fb9a1ad96a6d398f2a3e7d26e015d7361f039";
+const MANIFEST_SHA256: &str = "bb90b8755a06333fbc5db18b49ac6f3854b15c92843e63bb5d26770c09ce192c";
 
 /// Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); never
 /// fewer. The TS test carries the same list.

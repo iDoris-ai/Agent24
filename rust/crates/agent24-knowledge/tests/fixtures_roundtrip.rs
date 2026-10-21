@@ -528,7 +528,7 @@ fn read_request_bounds() {
 }
 
 /// R4.3 (r9): with `chunk_id`, `expected_revision` needs `content_tag`
-/// (`chunk_revision` may come along and must not be null); without `chunk_id`,
+/// (`chunk_revision` may come along, `null` included, and is informational); without `chunk_id`,
 /// only the document pair.
 #[test]
 fn read_expected_revision_matches_target() {

@@ -1,10 +1,10 @@
 { "$comment": "R4.4, §13 (r9): chk-72's text was overwritten without its chunk_revision moving (an upstream whole-row save); content_tag differs, so stale with current_chunk_revision and current_content_tag.",
   "op": "knowledge.read",
-  "request": { "protocol_version": 1, "request_id": "01JB3R6G7H8J9K0M1N2P3Q4R5S", "generation": 15,
+  "request": { "protocol_version": 1, "request_id": "01JB3R9K0M1N2P3Q4R5S6T7V8W", "generation": 15,
     "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "chunk_id": "chk-72",
     "expected_revision": { "content_tag": "ct-chk-72", "chunk_revision": 0 },
     "max_bytes": 65536, "deadline_ms": 5000 },
   "response": { "status": 409, "body": { "error": { "code": "stale", "message": "The requested revision is no longer available.",
     "hint": "Search again to obtain the current revision.",
-    "details": { "retryable": false, "request_id": "01JB3R6G7H8J9K0M1N2P3Q4R5S", "generation": 15,
+    "details": { "retryable": false, "request_id": "01JB3R9K0M1N2P3Q4R5S6T7V8W", "generation": 15,
       "current_revision": { "source_revision": "src-8", "index_build_id": "ib-20" }, "current_chunk_revision": 0, "current_content_tag": "ct-chk-72-b" } } } } }

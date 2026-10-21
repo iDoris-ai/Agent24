@@ -83,8 +83,8 @@
     { "file": "capabilities.integration.json", "version": 1, "class": "accept", "request_valid": null, "server_handler": true,
       "sha256": "ca9bc04409868b53906d603c2c060d0cfe1f65bf96cd1ae2722c5556ae3f344f" },
     { "file": "read.stale-chunk-overwritten.json", "version": 1, "class": "reject", "request_valid": true, "server_handler": true,
-      "sha256": "524425ad731abdb52ad56c84d6469f531f8e3a7a6ad3c52a472243b5ac24a9fc" },
+      "sha256": "f9ec3f264138dd8cc1fe9aecf00eb23b6ac1a22f56fe54f99e7aa4e193701120" },
     { "file": "read.document-empty.json", "version": 1, "class": "accept", "request_valid": true, "server_handler": true,
-      "sha256": "035f809b900cb4acb03f2bef2571c1cf7f4605d99c845d847796e38f0ea24a95" }
+      "sha256": "1175709c060873f849ac880fbf68e237671caccd662c8c06fb19b142c4fa0e08" }
   ]
 }
