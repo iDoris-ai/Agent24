@@ -22,4 +22,5 @@ thiserror = "2"
 workspace = true
 
 [dev-dependencies]
+agent24-knowledge = { path = "../agent24-knowledge" }
 jsonschema = { version = "0.59", default-features = false }
