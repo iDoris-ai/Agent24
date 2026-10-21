@@ -3,23 +3,29 @@
 //! version with a changed file is a different artifact. It proves which
 //! files these are, not where they came from (ADR-K1-03 §4).
 //!
-//! The walk follows no symlink. A regular file contributes its relative
-//! path, length and SHA-256; a symlink its relative path and its target as
-//! written. Anything else, a link that is absolute, climbs out of the
-//! package (as written or as resolved) or resolves to nothing, an entry that
-//! changes or is replaced while the package is read, or more than
-//! [`MAX_PACKAGE_ENTRIES`](crate::launch::MAX_PACKAGE_ENTRIES) entries or
-//! [`MAX_PACKAGE_BYTES`] bytes: no identity, and the caller fails closed.
+//! The walk follows nothing: each directory and file is opened from its
+//! parent's descriptor, refusing a link, and must be the inode the parent
+//! listed. A regular file contributes its relative path, length and
+//! SHA-256. A package with a symlink anywhere has no identity (installing
+//! never copies one; K1-6a-G §2.1 as revised in A2b): what a link means
+//! depends on what it resolves to while the package runs, which no digest
+//! of the tree can pin. Nor does a package with anything else that is not a
+//! file or directory, an entry that changes or is replaced while it is
+//! read, or more than [`MAX_PACKAGE_ENTRIES`](crate::launch::MAX_PACKAGE_ENTRIES)
+//! entries, [`MAX_PACKAGE_BYTES`] bytes or [`MAX_PACKAGE_DEPTH`] levels.
+//! The caller fails closed.
 //!
-//! The digest is SHA-256 over the entries sorted by relative path bytes
-//! (components joined by `/`), each `u64be(len(path)) ‖ path` followed by
-//! `b'f' ‖ u64be(length) ‖ sha256(file)` or `b'l' ‖ u64be(len(target)) ‖
-//! target`, written `sha256:` and 64 lowercase hex digits.
+//! The digest is SHA-256 over the files sorted by relative path bytes
+//! (components joined by `/`), each `u64be(len(path)) ‖ path ‖ b'f' ‖
+//! u64be(length) ‖ sha256(file)`, written `sha256:` and 64 lowercase hex
+//! digits.
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use std::ffi::OsStr;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// What every identity starts with.
 pub const PREFIX: &str = "sha256:";
@@ -28,19 +34,21 @@ pub const PREFIX: &str = "sha256:";
 /// every start reads them all, before the start timeout runs. ⚖️
 pub const MAX_PACKAGE_BYTES: u64 = 1 << 30;
 
+/// Deepest directory nesting walked. The walk holds one descriptor per
+/// level with directories still to read, so this bounds them too. ⚖️
+pub const MAX_PACKAGE_DEPTH: usize = 64;
+
 /// Why a package has no identity.
 #[derive(Debug)]
 pub enum ArtifactError {
     /// An entry could not be read or inspected.
     Unreadable(PathBuf, std::io::Error),
-    /// Neither a regular file, a directory nor a symlink (a FIFO, socket or
-    /// device), or the package root is not a directory.
+    /// A symlink, or anything else that is neither a regular file nor a
+    /// directory; or the package root is not a directory.
     Unsupported(PathBuf),
-    /// A symlink whose target is absolute or leads out of the package.
-    EscapingLink(PathBuf),
     /// An entry changed, or was replaced, while the package was read.
     Changed(PathBuf),
-    /// More entries or bytes than a start may read.
+    /// More entries, bytes or levels than a start may read.
     TooLarge,
 }
 
@@ -48,30 +56,27 @@ impl std::fmt::Display for ArtifactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreadable(path, e) => write!(f, "{} could not be read: {e}", path.display()),
-            Self::Unsupported(path) => write!(f, "{} is no file, dir or link", path.display()),
-            Self::EscapingLink(path) => write!(f, "{} links outside the package", path.display()),
+            Self::Unsupported(path) => write!(f, "{} is no file or directory", path.display()),
             Self::Changed(path) => write!(f, "{} changed while it was read", path.display()),
-            Self::TooLarge => write!(f, "the package has too many entries or bytes"),
+            Self::TooLarge => write!(f, "the package has too many entries, bytes or levels"),
         }
     }
 }
 
 impl std::error::Error for ArtifactError {}
 
-/// One entry: its relative path, and the rest of its encoding (`b'f' ‖ …`
-/// or `b'l' ‖ …`, see the module docs).
+/// One file: its relative path, and the rest of its encoding (`b'f' ‖ …`,
+/// see the module docs).
 struct Entry {
     path: Vec<u8>,
     tail: Vec<u8>,
 }
 
 impl Entry {
-    fn new(rel: &Path, tag: u8, len: u64, rest: &[u8]) -> Self {
+    fn file(rel: &Path, len: u64, digest: &[u8]) -> Self {
         let path = rel.as_os_str().as_bytes().to_vec();
-        Self {
-            path,
-            tail: [&[tag][..], &len.to_be_bytes(), rest].concat(),
-        }
+        let tail = [&b"f"[..], &len.to_be_bytes(), digest].concat();
+        Self { path, tail }
     }
 }
 
@@ -106,10 +111,14 @@ pub fn identity(package_dir: &Path) -> Result<String, ArtifactError> {
     Ok(digest(collect(package_dir, caps)?))
 }
 
-/// Every file and symlink under `root`, within `(entries, bytes)` caps.
-/// Each directory and file is opened refusing a link and must be the inode
-/// its parent listed, so no swap is followed; one descriptor is open at a
-/// time, and every file and link is checked again at the end.
+/// A directory still to read: its parent's descriptor and what the parent
+/// listed it as (`None` for the root), its path and its relative path.
+type Pending = (Option<(Arc<OwnedFd>, Stat)>, PathBuf, PathBuf);
+
+/// Every file under `root`, within `(entries, bytes)` caps and
+/// [`MAX_PACKAGE_DEPTH`]. Directories and files are opened from their
+/// parent's descriptor, refusing a link, and must be the inode the parent
+/// listed; every hashed file is checked again at the end.
 fn collect(
     root: &Path,
     (max_entries, max_bytes): (usize, u64),
@@ -117,29 +126,33 @@ fn collect(
     let unreadable =
         |path: &Path, e: rustix::io::Errno| ArtifactError::Unreadable(path.to_owned(), e.into());
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let listed = rustix::fs::lstat(root).map_err(|e| unreadable(root, e))?;
-    if FileType::from_raw_mode(listed.st_mode) != FileType::Directory {
-        return Err(ArtifactError::Unsupported(root.to_owned()));
-    }
-    // Where links must land: the root as the filesystem resolves it, which
-    // must be the directory listed here.
-    let real_root =
-        std::fs::canonicalize(root).map_err(|e| ArtifactError::Unreadable(root.to_owned(), e))?;
-    if !rustix::fs::stat(&real_root).is_ok_and(|real| same_inode(&real, &listed)) {
-        return Err(ArtifactError::Changed(root.to_owned()));
-    }
-    let mut pending = vec![(root.to_owned(), PathBuf::new(), listed)];
+    let mut pending: Vec<Pending> = vec![(None, root.to_owned(), PathBuf::new())];
     let (mut found, mut bytes, mut entries, mut stamps) = (0usize, 0u64, Vec::new(), Vec::new());
-    while let Some((dir, rel_dir, listed)) = pending.pop() {
-        let fd =
-            rustix::fs::open(&dir, dir_flags, Mode::empty()).map_err(|e| open_failed(&dir, e))?;
-        if !same_inode(
-            &rustix::fs::fstat(&fd).map_err(|e| unreadable(&dir, e))?,
-            &listed,
-        ) {
-            return Err(ArtifactError::Changed(dir));
-        }
-        for item in rustix::fs::Dir::read_from(&fd).map_err(|e| unreadable(&dir, e))? {
+    while let Some((listed, dir, rel_dir)) = pending.pop() {
+        let fd = match listed {
+            // The parent's descriptor is dropped here unless a sibling
+            // still holds it: one descriptor per level, at most.
+            Some((parent, walked)) => {
+                let name = dir.file_name().unwrap_or_default();
+                let fd = rustix::fs::openat(&*parent, name, dir_flags, Mode::empty())
+                    .map_err(|e| open_failed(&dir, e))?;
+                if !same_inode(
+                    &rustix::fs::fstat(&fd).map_err(|e| unreadable(&dir, e))?,
+                    &walked,
+                ) {
+                    return Err(ArtifactError::Changed(dir));
+                }
+                fd
+            }
+            None => rustix::fs::open(&dir, dir_flags, Mode::empty()).map_err(|e| match e {
+                rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                    ArtifactError::Unsupported(dir.clone())
+                }
+                e => unreadable(&dir, e),
+            })?,
+        };
+        let fd = Arc::new(fd);
+        for item in rustix::fs::Dir::read_from(&*fd).map_err(|e| unreadable(&dir, e))? {
             let item = item.map_err(|e| unreadable(&dir, e))?;
             let name = OsStr::from_bytes(item.file_name().to_bytes()).to_owned();
             if name == "." || name == ".." {
@@ -150,36 +163,19 @@ fn collect(
                 return Err(ArtifactError::TooLarge);
             }
             let (abs, rel) = (dir.join(&name), rel_dir.join(&name));
-            let walked = rustix::fs::statat(&fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+            let walked = rustix::fs::statat(&*fd, &name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|e| unreadable(&abs, e))?;
             match FileType::from_raw_mode(walked.st_mode) {
-                FileType::Directory => pending.push((abs, rel, walked)),
+                FileType::Directory if rel.components().count() > MAX_PACKAGE_DEPTH => {
+                    return Err(ArtifactError::TooLarge);
+                }
+                FileType::Directory => pending.push((Some((Arc::clone(&fd), walked)), abs, rel)),
                 FileType::RegularFile => {
                     let (len, digest, hashed) =
-                        hash_file(&fd, &name, &abs, &walked, max_bytes - bytes)?;
+                        hash_file(&*fd, &name, &abs, &walked, max_bytes - bytes)?;
                     bytes += len;
-                    entries.push(Entry::new(&rel, b'f', len, &digest));
+                    entries.push(Entry::file(&rel, len, &digest));
                     stamps.push((abs, hashed));
-                }
-                FileType::Symlink => {
-                    let link = std::fs::symlink_metadata(&abs)
-                        .map_err(|e| ArtifactError::Unreadable(abs.clone(), e))?;
-                    let target = rustix::fs::readlinkat(&fd, &name, Vec::new())
-                        .map_err(|e| unreadable(&abs, e))?;
-                    let target = target.into_bytes();
-                    let written = Path::new(OsStr::from_bytes(&target));
-                    // Lexically inside is not enough: through another link
-                    // (`s -> .`, then `l -> s/s/../..`) it can still climb
-                    // out, so the target read here must also resolve under
-                    // the root; a dangling one resolves nowhere.
-                    if !stays_inside(&rel, written)
-                        || !std::fs::canonicalize(dir.join(written))
-                            .is_ok_and(|real| real.starts_with(&real_root))
-                    {
-                        return Err(ArtifactError::EscapingLink(abs));
-                    }
-                    entries.push(Entry::new(&rel, b'l', target.len() as u64, &target));
-                    stamps.push((abs, stamp(&link)));
                 }
                 _ => return Err(ArtifactError::Unsupported(abs)),
             }
@@ -243,7 +239,7 @@ fn hash_file(
     Ok((before.2, hasher.finalize().into(), before))
 }
 
-/// Every hashed file and read link is still at its path, as it was.
+/// Every hashed file is still at its path, as it was when it was read.
 fn unchanged(stamps: &[(PathBuf, Stamp)]) -> Result<(), ArtifactError> {
     for (path, hashed) in stamps {
         let now = std::fs::symlink_metadata(path)
@@ -253,28 +249,6 @@ fn unchanged(stamps: &[(PathBuf, Stamp)]) -> Result<(), ArtifactError> {
         }
     }
     Ok(())
-}
-
-/// Whether a symlink at `link` (relative to the root) with `target` stays
-/// inside the package: `target` is relative, and resolving it lexically from
-/// the link's directory never climbs above the root.
-fn stays_inside(link: &Path, target: &Path) -> bool {
-    use std::path::Component;
-    let mut depth = link
-        .parent()
-        .map_or(0, |parent| parent.components().count());
-    for component in target.components() {
-        depth = match component {
-            Component::CurDir => depth,
-            Component::Normal(_) => depth + 1,
-            Component::ParentDir => match depth.checked_sub(1) {
-                Some(depth) => depth,
-                None => return false,
-            },
-            Component::RootDir | Component::Prefix(_) => return false,
-        };
-    }
-    true
 }
 
 /// The encoding of the module docs over `entries` sorted by path.
@@ -302,14 +276,21 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    /// `a.txt` = "hello", `dir/b` = "x", `l` → `a.txt`.
+    /// `a.txt` = "hello", `dir/b` = "x".
     fn sample() -> tempfile::TempDir {
         let t = tempfile::tempdir().unwrap();
         std::fs::write(t.path().join("a.txt"), "hello").unwrap();
         std::fs::create_dir(t.path().join("dir")).unwrap();
         std::fs::write(t.path().join("dir/b"), "x").unwrap();
-        symlink("a.txt", t.path().join("l")).unwrap();
         t
+    }
+
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     /// The encoding, pinned by a value computed outside this code (Python,
@@ -319,7 +300,7 @@ mod tests {
         let t = sample();
         assert_eq!(
             identity(t.path()).unwrap(),
-            "sha256:73e3e7d5a1622f120e4007f0d0e993485adcdd8c5f4e13794d5cbc1c272fcfd6"
+            "sha256:83748820712137b3768fc766c5f94ca68daaaf2d381695a716d32f3d1adab084"
         );
     }
 
@@ -340,15 +321,11 @@ mod tests {
         let t = sample();
         let base = identity(t.path()).unwrap();
         assert_eq!(identity(t.path()).unwrap(), base);
-        let changes: [&dyn Fn(&Path); 5] = [
+        let changes: [&dyn Fn(&Path); 4] = [
             &|p| std::fs::write(p.join("a.txt"), "jello").unwrap(),
             &|p| std::fs::write(p.join("dir/b"), "xx").unwrap(),
             &|p| std::fs::rename(p.join("dir/b"), p.join("dir/c")).unwrap(),
             &|p| std::fs::write(p.join("new"), "").unwrap(),
-            &|p| {
-                std::fs::remove_file(p.join("l")).unwrap();
-                symlink("dir/b", p.join("l")).unwrap();
-            },
         ];
         let mut seen = std::collections::BTreeSet::from([base]);
         for change in changes {
@@ -358,173 +335,97 @@ mod tests {
         }
     }
 
-    /// A link is recorded, not followed: a link into a directory does not
-    /// walk it, and a link inside the package may point at a sibling.
+    /// A symlink anywhere, wherever it points (inside or out, to a file, a
+    /// directory or nothing) means no identity; so does a linked root.
     #[test]
-    fn links_are_recorded_not_followed() {
-        let t = sample();
-        symlink("dir", t.path().join("to_dir")).unwrap();
-        symlink("../a.txt", t.path().join("dir/up")).unwrap();
-        let mut found: Vec<(String, char)> = collect(t.path(), CAPS)
-            .unwrap()
-            .into_iter()
-            .map(|Entry { path, tail }| match tail[0] {
-                b'f' => (String::from_utf8(path).unwrap(), 'f'),
-                _ => {
-                    let target = &tail[9..];
-                    let path = String::from_utf8(path).unwrap();
-                    let expected = if path == "to_dir" {
-                        "dir"
-                    } else if path == "l" {
-                        "a.txt"
-                    } else {
-                        "../a.txt"
-                    };
-                    assert_eq!(target, expected.as_bytes(), "{path}");
-                    (path, 'l')
-                }
-            })
-            .collect();
-        found.sort();
-        assert_eq!(
-            found,
-            [
-                ("a.txt".to_owned(), 'f'),
-                ("dir/b".to_owned(), 'f'),
-                ("dir/up".to_owned(), 'l'),
-                ("l".to_owned(), 'l'),
-                ("to_dir".to_owned(), 'l'),
-            ]
-        );
-    }
-
-    /// A link out of the package, however it is spelled, is no identity.
-    #[test]
-    fn a_link_out_of_the_package_has_no_identity() {
+    fn a_symlink_anywhere_has_no_identity() {
         for (at, target) in [
+            ("l", "a.txt"),
+            ("to_dir", "dir"),
+            ("dir/up", "../a.txt"),
             ("out", "/etc/hosts"),
-            ("out", ".."),
-            ("out", "../x"),
-            ("dir/out", "../../x"),
-            ("dir/out", "../dir/../../x"),
+            ("dangling", "missing"),
         ] {
             let t = sample();
             symlink(target, t.path().join(at)).unwrap();
             assert!(
-                matches!(identity(t.path()), Err(ArtifactError::EscapingLink(_))),
+                matches!(identity(t.path()), Err(ArtifactError::Unsupported(_))),
                 "{at} -> {target}"
             );
         }
-        // Lexically inside, but through a link to the root it climbs out.
-        let t = sample();
-        symlink(".", t.path().join("s")).unwrap();
-        symlink("s/s/../..", t.path().join("through")).unwrap();
-        assert!(stays_inside(Path::new("through"), Path::new("s/s/../..")));
-        assert!(
-            matches!(identity(t.path()), Err(ArtifactError::EscapingLink(_))),
-            "a link through a link out of the package"
-        );
-        // A link to nothing is refused too.
-        let t = sample();
-        symlink("missing", t.path().join("dangling")).unwrap();
+        let s = sample();
+        let link = tempfile::tempdir().unwrap();
+        symlink(s.path(), link.path().join("pkg")).unwrap();
         assert!(matches!(
-            identity(t.path()),
-            Err(ArtifactError::EscapingLink(_))
+            identity(&link.path().join("pkg")),
+            Err(ArtifactError::Unsupported(_))
         ));
-        let t = sample();
-        symlink("../a.txt", t.path().join("dir/inside")).unwrap();
-        assert!(identity(t.path()).is_ok(), "dir/../a.txt stays inside");
-        assert!(stays_inside(Path::new("dir/x"), Path::new("./../a.txt")));
-        assert!(!stays_inside(Path::new("x"), Path::new("./..")));
     }
 
     #[test]
-    fn a_fifo_or_a_missing_or_linked_root_has_no_identity() {
+    fn a_fifo_or_a_missing_or_file_root_has_no_identity() {
         let t = sample();
-        let status = std::process::Command::new("mkfifo")
-            .arg(t.path().join("pipe"))
-            .status()
-            .unwrap();
-        assert!(status.success());
+        mkfifo(&t.path().join("pipe"));
         assert!(matches!(
             identity(t.path()),
             Err(ArtifactError::Unsupported(_))
         ));
         assert!(identity(&t.path().join("missing")).is_err());
-        let s = sample();
-        let link = tempfile::tempdir().unwrap();
-        symlink(s.path(), link.path().join("pkg")).unwrap();
         assert!(
-            identity(&link.path().join("pkg")).is_err(),
-            "the root is not followed"
-        );
-        assert!(
-            identity(&s.path().join("a.txt")).is_err(),
+            identity(&sample().path().join("a.txt")).is_err(),
             "the root is a directory"
         );
     }
 
-    const CAPS: (usize, u64) = (crate::launch::MAX_PACKAGE_ENTRIES, MAX_PACKAGE_BYTES);
-
-    /// A link that is out of the package as written is refused even when it
-    /// resolves back inside: both checks run.
+    /// The entry, byte and depth caps each end the walk with no identity;
+    /// the depth cap is what bounds the descriptors held open at once.
     #[test]
-    fn a_link_out_as_written_is_refused_even_if_it_resolves_inside() {
-        let t = sample();
-        symlink(t.path().join("a.txt"), t.path().join("absolute")).unwrap();
+    fn a_package_over_any_cap_has_no_identity() {
+        let t = sample(); // 2 entries at the root and 1 in `dir`; 6 bytes
+        assert!(collect(t.path(), (3, 6)).is_ok());
         assert!(matches!(
-            identity(t.path()),
-            Err(ArtifactError::EscapingLink(_))
-        ));
-        let t = sample();
-        let name = t.path().file_name().unwrap().to_str().unwrap().to_owned();
-        symlink(format!("../{name}/a.txt"), t.path().join("round_trip")).unwrap();
-        assert!(matches!(
-            identity(t.path()),
-            Err(ArtifactError::EscapingLink(_))
-        ));
-    }
-
-    /// Both caps, entries and bytes, end the walk with no identity.
-    #[test]
-    fn a_package_over_either_cap_has_no_identity() {
-        let t = sample(); // 3 entries at the root and 1 in `dir`; 6 bytes
-        assert!(collect(t.path(), (4, 6)).is_ok());
-        assert!(matches!(
-            collect(t.path(), (3, 6)),
+            collect(t.path(), (2, 6)),
             Err(ArtifactError::TooLarge)
         ));
         assert!(matches!(
-            collect(t.path(), (4, 5)),
+            collect(t.path(), (3, 5)),
+            Err(ArtifactError::TooLarge)
+        ));
+        let deep = tempfile::tempdir().unwrap();
+        let mut at = deep.path().to_owned();
+        for _ in 0..MAX_PACKAGE_DEPTH {
+            at.push("d");
+        }
+        std::fs::create_dir_all(&at).unwrap();
+        assert!(identity(deep.path()).is_ok(), "exactly the cap");
+        std::fs::create_dir(at.join("d")).unwrap();
+        assert!(matches!(
+            identity(deep.path()),
             Err(ArtifactError::TooLarge)
         ));
     }
 
     /// A file is hashed only if it is the one the walk listed; a FIFO in its
-    /// place is refused at once, never waited on.
+    /// place is refused at once, never waited on, and a link is not opened.
     #[test]
     fn a_file_swapped_after_it_was_listed_is_refused() {
-        use rustix::fs::{AtFlags, Mode, OFlags};
         let t = sample();
-        let status = std::process::Command::new("mkfifo")
-            .arg(t.path().join("pipe"))
-            .status()
-            .unwrap();
-        assert!(status.success());
+        mkfifo(&t.path().join("pipe"));
+        symlink("a.txt", t.path().join("l")).unwrap();
         let dir =
             rustix::fs::open(t.path(), OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
         let stat = |name: &str| rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
-        let hash = |name: &str, walked: &rustix::fs::Stat| {
+        let hash = |name: &str, walked: &Stat| {
             hash_file(
                 &dir,
-                std::ffi::OsStr::new(name),
+                OsStr::new(name),
                 &t.path().join(name),
                 walked,
                 u64::MAX,
             )
         };
         assert!(hash("a.txt", &stat("a.txt")).is_ok());
-        // Listed as `l` (a link), opened as `a.txt`: not the same inode.
+        // Listed as `dir`, opened as `a.txt`: not the same inode.
         assert!(matches!(
             hash("a.txt", &stat("dir")),
             Err(ArtifactError::Changed(_))
@@ -536,6 +437,27 @@ mod tests {
         assert!(matches!(
             hash("l", &stat("l")),
             Err(ArtifactError::Changed(_))
+        ));
+    }
+
+    /// A directory replaced after its parent listed it is not the inode
+    /// listed, and one replaced by a link does not open: both are changes.
+    #[test]
+    fn a_directory_swapped_after_it_was_listed_is_refused() {
+        let t = sample();
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+        let parent = rustix::fs::open(t.path(), flags, Mode::empty()).unwrap();
+        let listed = rustix::fs::statat(&parent, "dir", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        std::fs::rename(t.path().join("dir"), t.path().join("old")).unwrap();
+        std::fs::create_dir(t.path().join("dir")).unwrap();
+        let fd = rustix::fs::openat(&parent, "dir", flags, Mode::empty()).unwrap();
+        assert!(!same_inode(&rustix::fs::fstat(&fd).unwrap(), &listed));
+        std::fs::remove_dir(t.path().join("dir")).unwrap();
+        symlink("old", t.path().join("dir")).unwrap();
+        let e = rustix::fs::openat(&parent, "dir", flags, Mode::empty()).unwrap_err();
+        assert!(matches!(
+            open_failed(Path::new("dir"), e),
+            ArtifactError::Changed(_)
         ));
     }
 
@@ -562,60 +484,31 @@ mod tests {
         assert!(unchanged(&stamps).is_err(), "gone is not unchanged");
     }
 
-    /// A link re-pointed before the walk ends, even inside the package, is
-    /// caught: links are checked again at the end like files.
-    #[test]
-    fn a_link_repointed_after_it_was_read_is_caught() {
-        let t = sample();
-        let link = t.path().join("l");
-        let stamps = vec![(
-            link.clone(),
-            stamp(&std::fs::symlink_metadata(&link).unwrap()),
-        )];
-        assert!(unchanged(&stamps).is_ok());
-        std::fs::remove_file(&link).unwrap();
-        symlink("dir/b", &link).unwrap();
-        assert!(matches!(unchanged(&stamps), Err(ArtifactError::Changed(_))));
-    }
-
     /// A directory that will not open for want of permission is unreadable,
-    /// not "changed".
+    /// not "changed"; so is such a file.
     #[test]
-    fn an_unreadable_directory_is_not_reported_as_changed() {
+    fn unreadable_entries_are_not_reported_as_changed() {
         use std::os::unix::fs::PermissionsExt;
         if rustix::process::geteuid().is_root() {
-            return; // root opens it anyway
+            return; // root opens them anyway
         }
-        let t = sample();
-        let dir = t.path().join("dir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = identity(t.path());
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            matches!(result, Err(ArtifactError::Unreadable(..))),
-            "{result:?}"
-        );
-    }
-
-    #[test]
-    fn an_unreadable_file_has_no_identity() {
-        use std::os::unix::fs::PermissionsExt;
-        if rustix::process::geteuid().is_root() {
-            return; // root reads it anyway
+        for entry in ["dir", "dir/b"] {
+            let t = sample();
+            let path = t.path().join(entry);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = identity(t.path());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                matches!(result, Err(ArtifactError::Unreadable(..))),
+                "{entry}: {result:?}"
+            );
         }
-        let t = sample();
-        let file = t.path().join("dir/b");
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(matches!(
-            identity(t.path()),
-            Err(ArtifactError::Unreadable(..))
-        ));
     }
 
     /// The digest sorts by path bytes, not by walk order or `Path` order.
     #[test]
     fn the_digest_sorts_by_path_bytes() {
-        let file = |path: &str| Entry::new(Path::new(path), b'f', 0, &[0; 32]);
+        let file = |path: &str| Entry::file(Path::new(path), 0, &[0; 32]);
         let forward = digest(vec![file("a-b"), file("a/b"), file("a0")]);
         let backward = digest(vec![file("a0"), file("a/b"), file("a-b")]);
         assert_eq!(forward, backward);
