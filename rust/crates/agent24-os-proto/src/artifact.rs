@@ -13,7 +13,9 @@
 //! file or directory, an entry that changes or is replaced while it is
 //! read, or more than [`MAX_PACKAGE_ENTRIES`](crate::launch::MAX_PACKAGE_ENTRIES)
 //! entries, [`MAX_PACKAGE_BYTES`] bytes or [`MAX_PACKAGE_DEPTH`] levels.
-//! The caller fails closed.
+//! The caller fails closed. It vouches for the files as read; a change
+//! after it returns is caught by comparing it again at dispatch, and one
+//! inside a single timestamp tick of a coarse-grained filesystem is not.
 //!
 //! The digest is SHA-256 over the files sorted by relative path bytes
 //! (components joined by `/`), each `u64be(len(path)) ‖ path ‖ b'f' ‖
@@ -126,6 +128,15 @@ fn collect(
     let unreadable =
         |path: &Path, e: rustix::io::Errno| ArtifactError::Unreadable(path.to_owned(), e.into());
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    // The root must end in a name: `link/` or `link/.` would follow `link`.
+    let raw = root.as_os_str().as_bytes();
+    let named = matches!(
+        root.components().next_back(),
+        Some(std::path::Component::Normal(_))
+    );
+    if !named || raw.ends_with(b"/") || raw.ends_with(b"/.") {
+        return Err(ArtifactError::Unsupported(root.to_owned()));
+    }
     let mut pending: Vec<Pending> = vec![(None, root.to_owned(), PathBuf::new())];
     let (mut found, mut bytes, mut entries, mut stamps) = (0usize, 0u64, Vec::new(), Vec::new());
     let mut dirs = Vec::new();
@@ -247,11 +258,24 @@ fn hash_file(
 }
 
 /// Every hashed file is still at its path, as it was when it was read, and
-/// every directory read is still that directory at its path, not a link.
+/// every directory read is still that directory at its path, not a link,
+/// with nothing added, removed or renamed in it since (its times).
 fn unchanged(stamps: &[(PathBuf, Stamp)], dirs: &[(PathBuf, Stat)]) -> Result<(), ArtifactError> {
     for (path, read) in dirs {
         if !rustix::fs::lstat(path).is_ok_and(|now| {
-            FileType::from_raw_mode(now.st_mode) == FileType::Directory && same_inode(&now, read)
+            FileType::from_raw_mode(now.st_mode) == FileType::Directory
+                && same_inode(&now, read)
+                && (
+                    now.st_mtime,
+                    now.st_mtime_nsec,
+                    now.st_ctime,
+                    now.st_ctime_nsec,
+                ) == (
+                    read.st_mtime,
+                    read.st_mtime_nsec,
+                    read.st_ctime,
+                    read.st_ctime_nsec,
+                )
         }) {
             return Err(ArtifactError::Changed(path.clone()));
         }
@@ -517,6 +541,55 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    /// An entry added to a directory already read (a file, or a link that
+    /// would otherwise escape "a symlink anywhere") is caught at the end.
+    #[test]
+    fn an_entry_added_to_a_directory_already_read_is_caught() {
+        for add in [
+            (|root: &Path| std::fs::write(root.join("late"), "late").unwrap()) as fn(&Path),
+            |root: &Path| symlink("a.txt", root.join("late")).unwrap(),
+        ] {
+            let t = sample();
+            let root = t.path().to_owned();
+            let result = collect_swapping(t.path(), move |dir| {
+                if dir.ends_with("dir") && !root.join("late").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    add(&root);
+                }
+            });
+            assert!(
+                matches!(result, Err(ArtifactError::Changed(_))),
+                "{:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// A root that does not end in a name would follow a linked last
+    /// component (`O_NOFOLLOW` does not apply to `link/`): refused.
+    #[test]
+    fn a_root_not_ending_in_a_name_is_refused() {
+        let s = sample();
+        let link = tempfile::tempdir().unwrap();
+        symlink(s.path(), link.path().join("pkg")).unwrap();
+        for root in ["pkg/", "pkg/.", "pkg//"] {
+            let path = PathBuf::from(format!("{}/{root}", link.path().display()));
+            assert!(
+                matches!(identity(&path), Err(ArtifactError::Unsupported(_))),
+                "{root}"
+            );
+        }
+        let trailing = PathBuf::from(format!("{}/", s.path().display()));
+        assert!(matches!(
+            identity(&trailing),
+            Err(ArtifactError::Unsupported(_))
+        ));
+        assert!(
+            identity(s.path()).is_ok(),
+            "the same root, ending in its name"
+        );
     }
 
     /// A hashed file written again before the walk ends, even back to the
