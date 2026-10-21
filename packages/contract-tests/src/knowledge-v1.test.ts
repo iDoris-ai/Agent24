@@ -1,6 +1,6 @@
 // KB-CT-02b (#1012): the Knowledge v1 fixtures (protocol/knowledge/fixtures/v1)
 // must match the digests pinned in their manifest and the schemas in
-// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r9). The Rust
+// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r10). The Rust
 // side (agent24-protocol tests/knowledge_fixtures.rs) checks the same manifest,
 // so changing any fixture byte turns both red. Pure schema test, no daemon.
 
@@ -24,7 +24,7 @@ const manifest = JSON.parse(readFileSync(join(fixtureDir, 'manifest.json'), 'utf
 // Pins the whole fixture set (every file digest and version). Changing a fixture
 // means bumping its version, re-pinning its sha256 and updating this constant
 // together with MANIFEST_SHA256 in rust/crates/agent24-protocol/tests/knowledge_fixtures.rs.
-const MANIFEST_SHA256 = 'bb90b8755a06333fbc5db18b49ac6f3854b15c92843e63bb5d26770c09ce192c'
+const MANIFEST_SHA256 = '5ed4cfa16fe2c286a2cfa4243c26b49145db3346a40394338c7bc948e7d94694'
 // Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); same list as the Rust test.
 const REQUIRED = [
   'search.empty-scope.json', 'search.scope-empty-array.json', 'search.partial.json', 'search.partial-overloaded.json',
@@ -63,7 +63,7 @@ const responseSchema = (op: string) => (op === 'system.capabilities' ? 'capabili
 
 describe('knowledge v1 fixtures — manifest', () => {
   it('pins exactly the files in the directory, by version and sha256', () => {
-    expect(manifest.contract_revision).toBe('r9')
+    expect(manifest.contract_revision).toBe('r10')
     // The manifest pins the revision named in the contract's own header.
     const contract = readFileSync(join(repoRoot, 'docs', 'knowledge', 'CONTRACT-READONLY-v1.md'), 'utf8')
     expect(contract.match(/文档修订 (r\d+)/)?.[1]).toBe(manifest.contract_revision)
