@@ -630,6 +630,31 @@ pub struct ModuleToolGrantContext {
     pub valid_for: Option<Duration>,
 }
 
+/// What can end a grant while a call runs (K1-6a-G §2.5): its expiry, and
+/// any change to this tool's consent that makes its reference no longer
+/// current.
+struct GrantWatch {
+    changes: Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>>,
+    deadline: Option<tokio::time::Instant>,
+    /// A change was taken from `changes` and the grant not yet re-read: set
+    /// before the re-read, cleared only once it says current, so a wait
+    /// dropped midway leaves it for the next.
+    recheck: bool,
+}
+
+impl GrantWatch {
+    fn new(
+        changes: Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>>,
+        valid_for: Option<Duration>,
+        looked_up: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            changes,
+            deadline: valid_for.map(|valid_for| looked_up + valid_for),
+            recheck: false,
+        }
+    }
+}
 pub struct DenyModuleToolAuthorization;
 
 fn permission_denied() -> ModuleToolCallError {
@@ -737,6 +762,101 @@ impl ModuleTool {
             std::time::Instant::now(),
         )
         .await
+    }
+
+    /// Resolves once the grant behind `authorization_ref` has ended: its
+    /// deadline passed, or a change to this tool's consent (this operation,
+    /// or the whole module) after which
+    /// [`ModuleToolAuthorization::still_current`] says no. A receiver that
+    /// lagged re-checks as if a change had arrived; a closed one is
+    /// dropped and only the deadline remains. With neither, it never
+    /// resolves. A re-check left unfinished by an earlier wait comes first.
+    async fn grant_ended(
+        &self,
+        watch: &mut GrantWatch,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            if watch.recheck {
+                if !self.recheck(watch, ctx, authorization_ref).await {
+                    return;
+                }
+                continue;
+            }
+            let deadline = watch.deadline;
+            let received = tokio::select! {
+                () = until(deadline) => return,
+                received = async {
+                    match watch.changes.as_mut() {
+                        Some(changes) => changes.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => received,
+            };
+            match received {
+                Ok(change) if !self.concerns(&change) => {}
+                Ok(_) | Err(RecvError::Lagged(_)) => watch.recheck = true,
+                Err(RecvError::Closed) => watch.changes = None,
+            }
+        }
+    }
+
+    /// Right before dispatch: whether the grant still holds, settling every
+    /// change already delivered (K1-6a-G §2.5) without waiting for more.
+    async fn grant_holds(
+        &self,
+        watch: &mut GrantWatch,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> bool {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            if watch
+                .deadline
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+            {
+                return false;
+            }
+            while let Some(changes) = watch.changes.as_mut() {
+                match changes.try_recv() {
+                    Ok(change) if !self.concerns(&change) => {}
+                    Ok(_) | Err(TryRecvError::Lagged(_)) => watch.recheck = true,
+                    Err(TryRecvError::Closed) => watch.changes = None,
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+            // A re-check that says current may have let more arrive meanwhile.
+            if !watch.recheck {
+                return true;
+            }
+            if !self.recheck(watch, ctx, authorization_ref).await {
+                return false;
+            }
+        }
+    }
+
+    /// Re-reads the grant, but no later than its deadline; clears
+    /// `watch.recheck` only when the grant is still current.
+    async fn recheck(
+        &self,
+        watch: &mut GrantWatch,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> bool {
+        let current = tokio::select! {
+            biased;
+            () = until(watch.deadline) => false,
+            current = self.authorization.still_current(&self.module, &self.operation, ctx, authorization_ref) => current,
+        };
+        watch.recheck &= !current;
+        current
+    }
+
+    /// Whether `change` is to this tool: this operation, or the whole module.
+    fn concerns(&self, change: &agent24_store::ModuleConsentChange) -> bool {
+        change.module == self.module && change.op.as_deref().is_none_or(|op| op == self.operation)
     }
 
     async fn audit_refusal(&self, ctx: &ToolContext) -> Result<(), ToolError> {
@@ -974,6 +1094,8 @@ impl Tool for ModuleTool {
             return Err(ToolError::Failed(module_error_json(permission_denied())));
         }
 
+        let changes = self.authorization.consent_changes();
+        let looked_up = tokio::time::Instant::now();
         let authorized = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
@@ -1018,11 +1140,36 @@ impl Tool for ModuleTool {
             execution_guard.mark_completed();
             return Err(ToolError::Failed(module_error_json(permission_denied())));
         }
-        if let Err(error) = self
-            .runtime
-            .check_available(&self.module, &self.operation)
-            .await
-        {
+        let mut watch = GrantWatch::new(changes, grant.valid_for, looked_up);
+        // Before anything is sent to the module, a grant that ends stops the
+        // call as `cancelled`, and the model sees `permission_denied`.
+        let available = tokio::select! {
+            biased;
+            () = self.grant_ended(&mut watch, ctx, &authorization_ref) => {
+                self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                    .await?;
+                execution_guard.mark_completed();
+                return Err(ToolError::Failed(module_error_json(permission_denied())));
+            }
+            available = self.runtime.check_available(&self.module, &self.operation) => available,
+        };
+        // The wait above may have taken a change and been dropped before it
+        // re-read the grant: settle it here, still before anything is sent
+        // and before the module's own unavailability is reported.
+        // A cancellation still wins while this waits on a re-check.
+        let holds = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            holds = self.grant_holds(&mut watch, ctx, &authorization_ref) => Some(holds),
+        };
+        if holds != Some(true) {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            let error = holds.map_or(ModuleToolCallError::Cancelled, |_| permission_denied());
+            return Err(ToolError::Failed(module_error_json(error)));
+        }
+        if let Err(error) = available {
             self.finish_audit(&relation, result_code(&error), started)
                 .await?;
             execution_guard.mark_completed();
@@ -1046,13 +1193,26 @@ impl Tool for ModuleTool {
             authorization_ref: grant.authorization_ref,
         };
         let call_cancel = cancel.child_token();
-        let result = match tokio::time::timeout(
-            self.inline_wait,
-            self.runtime
-                .invoke(context, input.clone(), self.timeout, call_cancel.clone()),
-        )
-        .await
-        {
+        let invoked = tokio::select! {
+            // A result in hand is never traded for an unknown one.
+            biased;
+            invoked = tokio::time::timeout(
+                self.inline_wait,
+                self.runtime
+                    .invoke(context, input.clone(), self.timeout, call_cancel.clone()),
+            ) => invoked,
+            // Possibly sent: a grant that ends now leaves the outcome unknown.
+            () = self.grant_ended(&mut watch, ctx, &authorization_ref) => {
+                call_cancel.cancel();
+                self.finish_audit(&relation, ModuleToolResultCode::ResultUnknown, started)
+                    .await?;
+                execution_guard.mark_completed();
+                return Err(ToolError::Failed(module_error_json(
+                    ModuleToolCallError::ResultUnknown,
+                )));
+            }
+        };
+        let result = match invoked {
             Ok(result) => result,
             Err(_) => {
                 call_cancel.cancel();
@@ -1071,6 +1231,21 @@ impl Tool for ModuleTool {
         };
         self.finish_audit(&relation, code, started).await?;
         execution_guard.mark_completed();
+        // What the module said reaches the model only under a grant still
+        // current once the call and its audit are done (K1-6a-G §2.5); the
+        // audit keeps what the module did. A pending job carries nothing of
+        // the module's and is reported as unknown either way.
+        if !matches!(result, Ok(ModuleToolResult::Pending { .. }))
+            && !tokio::select! {
+                // A grant past its deadline is not current, whatever the
+                // lookup would say once it answers.
+                biased;
+                () = until(watch.deadline) => false,
+                current = self.authorization.still_current(&self.module, &self.operation, ctx, &authorization_ref) => current,
+            }
+        {
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         match result {
             Ok(ModuleToolResult::Completed { payload, replayed }) => Ok(serde_json::json!({
                 "kind":"completed", "payload":payload, "replayed":replayed
@@ -1081,6 +1256,14 @@ impl Tool for ModuleTool {
             ))),
             Err(failure) => Err(ToolError::Failed(module_error_json(failure))),
         }
+    }
+}
+
+/// Resolves at `deadline`; never without one.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
