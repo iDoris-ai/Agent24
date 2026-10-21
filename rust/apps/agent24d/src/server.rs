@@ -1615,7 +1615,12 @@ pub async fn serve(
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
         StdArc::clone(&module_tool_runtime),
         module_authorizations.clone(),
-        router.has_remote_tier(),
+        {
+            // Read per call (K1-6a-G §2.4); the router is fixed today, but
+            // the guard must not depend on that.
+            let router = Arc::clone(&router);
+            StdArc::new(move || Some(router.has_remote_tier()))
+        },
     );
     let advert_view_dyn: StdArc<dyn agent24_domain::tool::ModuleToolAdvertView> = advert_view;
     for (_, registered) in module_registry.iter() {

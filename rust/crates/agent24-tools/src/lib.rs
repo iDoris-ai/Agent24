@@ -686,6 +686,29 @@ impl ModuleTool {
         })
     }
 
+    /// Writes the pre-dispatch record and its `Denied` terminal for a call
+    /// gate 5 refused, under [`REMOTE_TIER_REF`], and leaves the relation on
+    /// the invocation as the authorized path does.
+    async fn audit_remote_tier_refusal(
+        &self,
+        ctx: &ToolContext,
+        capability: &ModuleInvocationCapability,
+    ) -> Result<(), ToolError> {
+        let relation = self.audit_relation(ctx, REMOTE_TIER_REF, &capability.attempt_id)?;
+        {
+            let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
+            state.relation = Some(relation.clone());
+        }
+        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
+            .await?;
+        self.finish_audit(
+            &relation,
+            ModuleToolResultCode::Denied,
+            std::time::Instant::now(),
+        )
+        .await
+    }
+
     async fn audit_refusal(&self, ctx: &ToolContext) -> Result<(), ToolError> {
         let invocation = ToolInvocation::module(self.owner_token.clone())?;
         let capability = invocation.module.as_ref().ok_or_else(audit_unavailable)?;
@@ -908,6 +931,19 @@ impl Tool for ModuleTool {
         }
         let mut execution_guard = capability.claim_for_execution()?;
 
+        // Gate 5 at dispatch (K1-6a-G §2.4): before the authorization lookup,
+        // so `dispatch` and `execute_preapproved` both pass it, and a call
+        // by name to a withheld tool is refused and audited.
+        if self
+            .advert_view
+            .blocked_by_remote_tier_guard(&self.module, &self.operation)
+            .await
+        {
+            self.audit_remote_tier_refusal(ctx, capability).await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
+
         let authorized = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
@@ -1040,6 +1076,10 @@ fn persisted_terminal_error(result: agent24_store::ModuleToolResultCode) -> Tool
     };
     ToolError::Failed(module_error_json(failure))
 }
+
+/// The audit `authorization_ref` of a call refused by gate 5: no grant was
+/// looked up for it.
+const REMOTE_TIER_REF: &str = "denied:remote_tier";
 
 fn audit_unavailable() -> ToolError {
     ToolError::Failed("module_tool_audit_unavailable".to_owned())
