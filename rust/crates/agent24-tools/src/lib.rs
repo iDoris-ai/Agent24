@@ -1416,6 +1416,15 @@ impl ToolRegistry {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_owned);
+        // Capture the outside directory before the gate. A later symlink swap
+        // must not make the write follow a different parent than this one.
+        // Exec-tightened fs_write does not get the exception: Guardian can
+        // Allow that class without a human, and the whitelist must still hold.
+        let approved_before_gate = if name == "fs_write" && effective == RiskClass::WriteLocal {
+            crate::local::approved_parent(input)
+        } else {
+            None
+        };
         if effective.requires_approval() {
             match self
                 .gate
@@ -1434,15 +1443,8 @@ impl ToolRegistry {
             }
         }
 
-        // An Allow for fs_write authorises this call's path. The tool still
-        // refuses to open a parent that does not match this directory.
-        let approved = if name == "fs_write" {
-            crate::local::approved_parent(input)
-        } else {
-            None
-        };
         let owned;
-        let exec_ctx = if let Some(directory) = approved {
+        let exec_ctx = if let Some(directory) = approved_before_gate {
             owned = ctx.clone().with_approved_outside_directory(directory);
             &owned
         } else {

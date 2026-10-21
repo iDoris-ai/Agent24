@@ -581,6 +581,58 @@ mod tests {
         assert!(!other.exists());
     }
 
+    struct SwapGate {
+        link: PathBuf,
+        secret: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ApprovalGate for SwapGate {
+        async fn check(
+            &self,
+            _: &agent24_protocol::ToolInfo,
+            _: &ToolContext,
+            _: &Map<String, Value>,
+            _: Option<&str>,
+            _: &CancellationToken,
+        ) -> crate::GateDecision {
+            let _ = std::fs::remove_file(&self.link);
+            std::os::unix::fs::symlink(&self.secret, &self.link).unwrap();
+            crate::GateDecision::Allow
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_swap_after_capture_still_writes_the_captured_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let safe = dir.path().join("safe");
+        let secret = dir.path().join("secret");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&safe, &link).unwrap();
+        let file = link.join("a.txt");
+        let reg = ToolRegistry::builtin(ws).with_gate(Arc::new(SwapGate {
+            link: link.clone(),
+            secret: secret.clone(),
+        }));
+        let err = reg
+            .dispatch(
+                "fs_write",
+                &ctx(),
+                &sinput(&[("path", file.to_str().unwrap()), ("content", "ok")]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err:?}");
+        assert!(!secret.join("a.txt").exists());
+        assert!(!safe.join("a.txt").exists());
+    }
+
     #[tokio::test]
     async fn fs_read_and_write_inside_root() {
         let dir = tempfile::tempdir().unwrap();
