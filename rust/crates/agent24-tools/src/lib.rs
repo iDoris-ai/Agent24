@@ -1764,6 +1764,17 @@ mod tests {
         }
     }
 
+    /// Gate 5 open, so a call reaches its authorization (K1-6a-G §2.4 puts
+    /// the guard first).
+    struct UnguardedAdvertView;
+
+    #[async_trait]
+    impl agent24_domain::tool::ModuleToolAdvertView for UnguardedAdvertView {
+        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
     struct SlowTool;
 
     #[async_trait]
@@ -2373,7 +2384,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
                 RiskClass::External,
-                Arc::new(DenyAdvertView),
+                Arc::new(UnguardedAdvertView),
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(Runtime),
                 agent24_store::Store::open_memory().await.unwrap(),
