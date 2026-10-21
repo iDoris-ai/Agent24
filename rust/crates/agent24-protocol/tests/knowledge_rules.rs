@@ -184,18 +184,18 @@ fn read(file: &str, request: &Value, body: &Value) {
         assert_eq!(&segments[0]["chunk_id"], chunk, "{file}: chunk_id");
     }
     if let Some(want) = request.get("expected_revision") {
-        // R4.4: a successful read is at the expected revision.
-        assert_eq!(
-            body["revision"]["source_revision"], want["source_revision"],
-            "{file}"
-        );
-        assert_eq!(
-            body["revision"]["index_build_id"], want["index_build_id"],
-            "{file}"
-        );
+        // R4.4 (r9): a successful document read is at the expected pair; a chunk
+        // read matches on content_tag only (the pair on a chunk request is
+        // informational, and other chunks may have changed the build).
         if request.get("chunk_id").is_some() {
+            assert_eq!(segments[0]["content_tag"], want["content_tag"], "{file}");
+        } else {
             assert_eq!(
-                segments[0]["chunk_revision"], want["chunk_revision"],
+                body["revision"]["source_revision"], want["source_revision"],
+                "{file}"
+            );
+            assert_eq!(
+                body["revision"]["index_build_id"], want["index_build_id"],
                 "{file}"
             );
         }
@@ -237,9 +237,11 @@ fn reject_pairs_with_request(file: &str, op: &str, request: &Value, error: &Valu
         // cursor, so a current expected_revision may still meet a stale cursor.
         let cursor = request["page"]["cursor"].is_string();
         if request.get("chunk_id").is_none() {
-            // Document level: no reason, no chunk revision, and something really moved.
+            // Document level: no reason, no chunk fields, and something really moved.
             assert!(
-                d.get("reason").is_none() && d.get("current_chunk_revision").is_none(),
+                d.get("reason").is_none()
+                    && d.get("current_chunk_revision").is_none()
+                    && d.get("current_content_tag").is_none(),
                 "{file}"
             );
             assert!(
@@ -248,17 +250,22 @@ fn reject_pairs_with_request(file: &str, op: &str, request: &Value, error: &Valu
             );
         } else if let Some(reason) = d.get("reason") {
             assert_eq!(reason, "anchor_missing", "{file}");
+            assert!(
+                d.get("current_chunk_revision").is_none() && d.get("current_content_tag").is_none(),
+                "{file}"
+            );
         } else {
-            // Chunk edited in the same build: the new chunk revision is reported. A
-            // cursor-only continuation (R4.1, R4.5) carries no expected_revision.
-            let current = d
-                .get("current_chunk_revision")
-                .expect("current_chunk_revision");
+            // Servable chunk whose content_tag differs (r9): both current fields
+            // are reported; the build may have changed (R4.4). A cursor-only
+            // continuation (R4.1, R4.5) carries no expected_revision.
+            assert!(
+                d.get("current_chunk_revision").is_some() && d.get("current_content_tag").is_some(),
+                "{file}"
+            );
             match want {
                 Some(w) => {
-                    assert!(same_build, "{file}: chunk stale needs the same build");
                     if !cursor {
-                        assert_ne!(Some(current), w.get("chunk_revision"), "{file}");
+                        assert_ne!(d.get("current_content_tag"), w.get("content_tag"), "{file}");
                     }
                 }
                 None => assert!(cursor, "{file}: chunk stale without a cursor"),

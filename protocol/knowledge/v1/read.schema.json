@@ -5,9 +5,10 @@
   "description": "Read request ($defs/request) and success response ($defs/response), CONTRACT-READONLY-v1 §4. Errors use error.schema.json.",
   "$defs": {
     "chunk_expected_revision": {
-      "description": "R4.3: with chunk_id, expected_revision carries all three parts and chunk_revision is not null.",
-      "type": "object", "required": ["source_revision", "index_build_id", "chunk_revision"], "additionalProperties": false,
+      "description": "R4.3 (r9): with chunk_id, expected_revision must carry content_tag; the other parts are informational and not compared.",
+      "type": "object", "required": ["content_tag"], "additionalProperties": false,
       "properties": {
+        "content_tag": { "$ref": "common.schema.json#/$defs/content_tag" },
         "source_revision": { "$ref": "common.schema.json#/$defs/id" },
         "index_build_id": { "$ref": "common.schema.json#/$defs/id" },
         "chunk_revision": { "$ref": "common.schema.json#/$defs/chunk_revision" }
@@ -39,11 +40,12 @@
       "else": { "properties": { "expected_revision": { "$ref": "common.schema.json#/$defs/doc_revision" } } }
     },
     "segment": {
-      "type": "object", "required": ["chunk_id", "chunk_type", "chunk_revision", "text"], "additionalProperties": false,
+      "type": "object", "required": ["chunk_id", "chunk_type", "chunk_revision", "content_tag", "text"], "additionalProperties": false,
       "properties": {
         "chunk_id": { "$ref": "common.schema.json#/$defs/id" },
         "chunk_type": { "$ref": "common.schema.json#/$defs/chunk_type" },
         "chunk_revision": { "$ref": "common.schema.json#/$defs/chunk_revision" },
+        "content_tag": { "$ref": "common.schema.json#/$defs/content_tag" },
         "text": { "type": "string" }
       }
     },

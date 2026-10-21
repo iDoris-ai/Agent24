@@ -158,12 +158,25 @@ fn schema_negatives_match_the_ts_suite() {
     bad("search.response", "search.ok.json", "body", &|b| {
         b["hits"][2]["index_state"] = json!("fresh")
     });
-    // read: three-part expected_revision with chunk_id, two without; page.limit optional.
-    bad("read.request", "read.chunk.json", "request", &|r| {
+    // read: chunk expected_revision needs content_tag; document pair is two parts; page.limit optional.
+    good("read.request", "read.chunk.json", "request", &|r| {
         drop_key(&mut r["expected_revision"], "chunk_revision")
+    });
+    good("read.request", "read.chunk.json", "request", &|r| {
+        r["expected_revision"] = json!({ "content_tag": "ct-chk-71", "chunk_revision": 1 });
+    });
+    bad("read.request", "read.chunk.json", "request", &|r| {
+        r["expected_revision"] =
+            json!({ "source_revision": "s", "index_build_id": "i", "chunk_revision": 1 });
     });
     bad("read.request", "read.chunk.json", "request", &|r| {
         r["expected_revision"]["chunk_revision"] = Value::Null
+    });
+    good("read.request", "read.document.json", "request", &|r| {
+        r["expected_revision"] = json!({ "source_revision": "s", "index_build_id": "i" });
+    });
+    bad("read.request", "read.document.json", "request", &|r| {
+        r["expected_revision"]["content_tag"] = json!("ct-doc");
     });
     bad("read.request", "read.document.json", "request", &|r| {
         r["expected_revision"]["chunk_revision"] = json!(0)
@@ -180,6 +193,13 @@ fn schema_negatives_match_the_ts_suite() {
     });
     err("read.stale-anchor-missing.json", &|d| {
         d["current_chunk_revision"] = json!(3)
+    });
+    err("read.stale-anchor-missing.json", &|d| {
+        d["current_chunk_revision"] = json!(3);
+        d["current_content_tag"] = json!("ct-chk-70");
+    });
+    err("read.stale-chunk-edited.json", &|d| {
+        drop_key(d, "current_content_tag");
     });
     err("search.unavailable-mixed.json", &|d| {
         d["retryable"] = json!(true)

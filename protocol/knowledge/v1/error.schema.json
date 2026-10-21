@@ -70,7 +70,7 @@
       "properties": { "retryable": { "const": false } }
     },
     "stale": {
-      "description": "R4.4: current_chunk_revision only when the build is unchanged and the chunk was edited; never with anchor_missing.",
+      "description": "R4.4 (r9): current_chunk_revision and current_content_tag together, only when the chunk is servable but its content_tag differs; never with anchor_missing.",
       "$ref": "#/$defs/base", "unevaluatedProperties": false, "required": ["current_revision"],
       "properties": {
         "retryable": { "const": false },
@@ -82,11 +82,13 @@
             "index_build_id": { "oneOf": [{ "$ref": "common.schema.json#/$defs/id" }, { "type": "null" }] }
           }
         },
-        "current_chunk_revision": { "$ref": "common.schema.json#/$defs/chunk_revision" }
+        "current_chunk_revision": { "$ref": "common.schema.json#/$defs/chunk_revision" },
+        "current_content_tag": { "$ref": "common.schema.json#/$defs/content_tag" }
       },
+      "dependentRequired": { "current_chunk_revision": ["current_content_tag"], "current_content_tag": ["current_chunk_revision"] },
       "allOf": [
-        { "if": { "required": ["reason"] }, "then": { "not": { "required": ["current_chunk_revision"] } } },
-        { "description": "current_chunk_revision means the build is unchanged, so an active build exists.",
+        { "if": { "required": ["reason"] }, "then": { "not": { "anyOf": [{ "required": ["current_chunk_revision"] }, { "required": ["current_content_tag"] }] } } },
+        { "description": "current_chunk_revision means the chunk is servable, so the document has a build.",
           "if": { "required": ["current_chunk_revision"] }, "then": { "properties": { "current_revision": { "properties": { "index_build_id": { "type": "string" } } } } } }
       ]
     },

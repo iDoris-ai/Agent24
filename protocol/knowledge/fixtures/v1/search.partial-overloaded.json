@@ -7,8 +7,8 @@
     "completeness": "partial", "effective_scope": { "knowledge_base_ids": ["kb-a", "kb-b", "kb-c"] },
     "applied_budget": { "deadline_ms": 5000, "max_results": 10, "max_concurrency": 3 },
     "hits": [ { "rank": 1, "knowledge_base_id": "kb-a", "knowledge_id": "doc-2", "chunk_id": "chk-21", "chunk_type": "text",
-      "revision": { "source_revision": "src-4", "index_build_id": "ib-9", "chunk_revision": 0 },
-      "locator": { "valid": true, "start": 0, "end": 512 }, "index_state": "fresh",
+      "revision": { "source_revision": "src-4", "index_build_id": "ib-9", "chunk_revision": 0, "content_tag": "ct-chk-21" },
+      "locator": { "valid": false }, "index_state": "fresh",
       "score": 0.77, "score_space": "emb-g1", "snippet": { "text": "<redacted>", "truncated": false } } ],
     "partial_failures": [ { "knowledge_base_id": "kb-b", "code": "unavailable", "reason": "overloaded", "retryable": true },
       { "knowledge_base_id": "kb-c", "code": "unavailable", "reason": "not_ready", "retryable": true } ] } } }

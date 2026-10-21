@@ -336,6 +336,7 @@ fn nullable_and_optional_keys_are_distinct() {
             "/error/details/current_revision",
             "index_build_id",
         ),
+        ("search.ok.json", B, "/hits/0/revision", "content_tag"),
         ("search.ok.json", B, "/hits/2/revision", "chunk_revision"),
         ("read.chunk.json", B, "", "next_cursor"),
         ("read.document.json", Q, "/page", "cursor"),
@@ -526,20 +527,25 @@ fn read_request_bounds() {
     }
 }
 
-/// R4.3: with `chunk_id`, `expected_revision` has all three parts and a non-null
-/// `chunk_revision`; without it, only the document pair.
+/// R4.3 (r9): with `chunk_id`, `expected_revision` needs `content_tag`
+/// (`chunk_revision` may come along and must not be null); without `chunk_id`,
+/// only the document pair.
 #[test]
 fn read_expected_revision_matches_target() {
-    let full = json!({"source_revision": "s", "index_build_id": "b", "chunk_revision": 0});
-    let null_rev = json!({"source_revision": "s", "index_build_id": "b", "chunk_revision": null});
+    let tag = json!({"content_tag": "ct-chk-71"});
+    let tag_rev = json!({"content_tag": "ct-chk-71", "chunk_revision": 0});
+    let triple = json!({"source_revision": "s", "index_build_id": "b", "chunk_revision": 0});
+    let null_rev = json!({"content_tag": "ct-chk-71", "chunk_revision": null});
     let pair = json!({"source_revision": "s", "index_build_id": "b"});
+    let pair_tag =
+        json!({"source_revision": "s", "index_build_id": "b", "content_tag": "ct-chk-71"});
     let cases = [
-        ("read.chunk.json", pair.clone(), false),
-        ("read.chunk.json", null_rev.clone(), false),
-        ("read.chunk.json", full.clone(), true),
-        ("read.document.json", full, false),
-        ("read.document.json", null_rev, false),
+        ("read.chunk.json", tag, true),
+        ("read.chunk.json", tag_rev, true),
+        ("read.chunk.json", triple, false),
+        ("read.chunk.json", null_rev, false),
         ("read.document.json", pair, true),
+        ("read.document.json", pair_tag, false),
     ];
     for (file, rev, ok) in cases {
         let req = read_request(file, "", "expected_revision", rev.clone());

@@ -9,7 +9,8 @@
     "generation": { "description": "Client generation for the profile x principal binding; echoed, not checked, by the server (R7.2, R7.5).", "type": "integer", "minimum": 0 },
     "id": { "description": "Opaque server-assigned identifier (R5.2).", "type": "string", "minLength": 1, "maxLength": 256 },
     "positive_int": { "type": "integer", "minimum": 1 },
-    "chunk_revision": { "description": "Edit count of a chunk, 0 = unedited (R5.2).", "type": "integer", "minimum": 0 },
+    "chunk_revision": { "description": "Upstream edit count of a chunk, 0 = unedited; informational only, content_tag decides whether the text changed (R5.2, r9).", "type": "integer", "minimum": 0 },
+    "content_tag": { "description": "Keyed digest of a chunk's full text, opaque (R5.1, r9).", "type": "string", "minLength": 1, "maxLength": 256 },
     "chunk_type": { "description": "v1 serves text chunks only (R3.8).", "const": "text" },
     "request_scope": {
       "description": "Request scope Q (R2.5): required, non-empty; may only narrow.",

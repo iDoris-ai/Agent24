@@ -8,6 +8,6 @@
     "effective_scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7",
     "revision": { "source_revision": "src-8", "index_build_id": "ib-20" },
     "display": { "title": "<redacted>", "file_name": "<redacted>" },
-    "segments": [ { "chunk_id": "chk-70", "chunk_type": "text", "chunk_revision": 2, "text": "<redacted>" },
-      { "chunk_id": "chk-71", "chunk_type": "text", "chunk_revision": 0, "text": "<redacted>" } ],
+    "segments": [ { "chunk_id": "chk-70", "chunk_type": "text", "chunk_revision": 2, "content_tag": "ct-chk-70-v2", "text": "<redacted>" },
+      { "chunk_id": "chk-71", "chunk_type": "text", "chunk_revision": 0, "content_tag": "ct-chk-71", "text": "<redacted>" } ],
     "truncated": false, "next_cursor": "cur-doc-7-2" } } }

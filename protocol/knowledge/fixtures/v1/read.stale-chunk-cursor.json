@@ -1,4 +1,4 @@
-{ "$comment": "R4.1, R4.5, §6: a single-chunk continuation carries only the cursor; chk-71 was edited between pages in the same build, so the next page is stale with current_chunk_revision.",
+{ "$comment": "R4.1, R4.5, §6 (r9): a single-chunk continuation carries only the cursor; chk-71 was edited between pages in the same build, so the next page is stale with current_chunk_revision and current_content_tag.",
   "op": "knowledge.read",
   "request": { "protocol_version": 1, "request_id": "01JB3VB1N2P3Q4R5S6T7V8W9X0", "generation": 15,
     "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "chunk_id": "chk-71",
@@ -6,4 +6,4 @@
   "response": { "status": 409, "body": { "error": { "code": "stale", "message": "The requested revision is no longer available.",
     "hint": "Search again to obtain the current revision.",
     "details": { "retryable": false, "request_id": "01JB3VB1N2P3Q4R5S6T7V8W9X0", "generation": 15,
-      "current_revision": { "source_revision": "src-8", "index_build_id": "ib-20" }, "current_chunk_revision": 1 } } } } }
+      "current_revision": { "source_revision": "src-8", "index_build_id": "ib-20" }, "current_chunk_revision": 1, "current_content_tag": "ct-chk-71-v1" } } } } }

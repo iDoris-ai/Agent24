@@ -1,7 +1,7 @@
 //! KB-CT-02b (#1012): Knowledge v1 fixture lockstep. `protocol/knowledge/fixtures/v1`
 //! is registered here explicitly (`fixtures_roundtrip.rs` only reads
 //! `protocol/fixtures/events`). The manifest, and through it every fixture's
-//! version and sha256, is pinned (CONTRACT-READONLY-v1 r8). Every body decodes
+//! version and sha256, is pinned (CONTRACT-READONLY-v1 r9). Every body decodes
 //! into the formal `agent24-knowledge` wire types (#1052; their round trips are in
 //! that crate), and the rules a type cannot carry are checked here: HTTP status
 //! and `retryable` per code, which errors may echo `null`, and the late-response
@@ -28,7 +28,7 @@ const KNOWLEDGE_FIXTURES: &str = "protocol/knowledge/fixtures/v1";
 /// sha256 of `manifest.json`, which pins every fixture's version and digest.
 /// Changing a fixture means bumping its version, re-pinning its sha256 and
 /// updating this constant together with `MANIFEST_SHA256` in knowledge-v1.test.ts.
-const MANIFEST_SHA256: &str = "408dbd91f933b2a6fe5cf1a973d1af1eced483a5e40939e75395ed0ac39eec04";
+const MANIFEST_SHA256: &str = "46b9b804c28a4febf9e4a08ad27523eda12b4ffdc1cfa117167b5c69566b644e";
 
 /// Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); never
 /// fewer. The TS test carries the same list.
@@ -194,7 +194,7 @@ fn manifest_pins_every_knowledge_fixture() {
         "改夹具要升 version，并更新清单摘要常量 (MANIFEST_SHA256, Rust and TS)"
     );
     let m: Manifest = load("manifest.json");
-    assert_eq!(m.contract_revision, "r8");
+    assert_eq!(m.contract_revision, "r9");
     assert_eq!(m.protocol_version, 1);
     let listed: BTreeSet<&str> = m.fixtures.iter().map(|e| e.file.as_str()).collect();
     assert_eq!(listed.len(), m.fixtures.len(), "duplicate manifest entry");

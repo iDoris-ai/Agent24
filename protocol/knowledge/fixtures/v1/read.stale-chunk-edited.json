@@ -1,10 +1,10 @@
-{ "$comment": "§11.5, R4.4: same build, chk-70 edited from 1 to 2; current_chunk_revision is reported.",
+{ "$comment": "§11.5, R4.4 (r9): same build, chk-70 edited from 1 to 2; current_chunk_revision and current_content_tag are reported.",
   "op": "knowledge.read",
   "request": { "protocol_version": 1, "request_id": "01JB3R0A1B2C3D4E5F6G7H8J9K", "generation": 15,
     "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-7", "chunk_id": "chk-70",
-    "expected_revision": { "source_revision": "src-8", "index_build_id": "ib-20", "chunk_revision": 1 },
+    "expected_revision": { "content_tag": "ct-chk-70", "chunk_revision": 1 },
     "max_bytes": 65536, "deadline_ms": 5000 },
   "response": { "status": 409, "body": { "error": { "code": "stale", "message": "The requested revision is no longer available.",
     "hint": "Search again to obtain the current revision.",
     "details": { "retryable": false, "request_id": "01JB3R0A1B2C3D4E5F6G7H8J9K", "generation": 15,
-      "current_revision": { "source_revision": "src-8", "index_build_id": "ib-20" }, "current_chunk_revision": 2 } } } } }
+      "current_revision": { "source_revision": "src-8", "index_build_id": "ib-20" }, "current_chunk_revision": 2, "current_content_tag": "ct-chk-70-v2" } } } } }

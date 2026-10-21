@@ -15,14 +15,18 @@ pub struct DocRevision {
     pub index_build_id: String,
 }
 
-/// `$defs/chunk_expected_revision` (R4.3): all three parts, `chunk_revision`
-/// never `null`.
+/// `$defs/chunk_expected_revision` (R4.3, r9): `content_tag` is required and
+/// decides the match; the other parts are informational, never `null` when present.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkExpectedRevision {
-    pub source_revision: String,
-    pub index_build_id: String,
-    pub chunk_revision: ChunkRevision,
+    pub content_tag: String,
+    #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
+    pub index_build_id: Option<String>,
+    #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
+    pub chunk_revision: Option<ChunkRevision>,
 }
 
 /// What is read (R4.3). The schema's `if chunk_id` / `then` / `else` picks the
@@ -184,5 +188,6 @@ pub struct Segment {
     pub chunk_id: String,
     pub chunk_type: ChunkType,
     pub chunk_revision: ChunkRevision,
+    pub content_tag: String,
     pub text: String,
 }
