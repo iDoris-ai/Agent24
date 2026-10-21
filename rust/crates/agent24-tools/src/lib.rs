@@ -48,6 +48,7 @@ pub struct ToolContext {
     /// The persisted tool-call row this execution belongs to
     tool_call_id: String,
     workspace: WorkspaceAuthority,
+    confirmed_write_root: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -70,6 +71,7 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Legacy,
+            confirmed_write_root: None,
         }
     }
 
@@ -88,7 +90,19 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Bound(authority),
+            confirmed_write_root: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_confirmed_write_root(mut self, root: std::path::PathBuf) -> Self {
+        self.confirmed_write_root = Some(root);
+        self
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
     }
 
     #[must_use]
@@ -134,6 +148,7 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: self.workspace.clone(),
+            confirmed_write_root: self.confirmed_write_root.clone(),
         }
     }
 }
@@ -1071,6 +1086,7 @@ pub struct ToolRegistry {
     interactive_gate: bool,
     /// User-local risk adjustments (H2). None → declared classes stand.
     overrides: Option<Arc<dyn RiskOverrides>>,
+    confirmed_write_root: Option<std::path::PathBuf>,
 }
 
 impl ToolRegistry {
@@ -1081,7 +1097,13 @@ impl ToolRegistry {
             gate: Arc::new(DenyAllGate),
             interactive_gate: false,
             overrides: None,
+            confirmed_write_root: None,
         }
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
     }
 
     /// Install the user's local risk overrides (H2).
