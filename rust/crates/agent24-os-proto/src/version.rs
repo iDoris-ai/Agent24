@@ -188,19 +188,24 @@ pub fn negotiate(
     Ok(module.max.min(kernel.max))
 }
 
-/// What this kernel build speaks.
-///
-/// A single version today, expressed as a range so that the day a second one
-/// exists is an edit to one line rather than a change of shape at every call
-/// site. `agent24_domain::DAEMON_PROTOCOL_VERSION` remains the definition of
+/// The oldest protocol version this kernel still speaks. Version 2 only added
+/// a manifest field (K1-6a-G §2.6, `tools[].resource_kinds`), so a v2 kernel
+/// serves a v1 module exactly as before and need not tell the two apart on a
+/// connection: the gate is the manifest's `min_daemon_protocol`. (`main`
+/// made the same move for its own version 2, ME4-S2b.)
+pub const KERNEL_PROTOCOL_MIN: u32 = 1;
+
+/// What this kernel build speaks: [`KERNEL_PROTOCOL_MIN`] up to
+/// `agent24_domain::DAEMON_PROTOCOL_VERSION`, which remains the definition of
 /// "current"; this is the same number said in the form the handshake needs.
 #[must_use]
 pub fn kernel_range() -> VersionRange {
     let v = agent24_domain::DAEMON_PROTOCOL_VERSION;
-    // Cannot fail: `min == max`. Written without `expect` so a daemon can never
-    // panic here.
-    VersionRange::new(v, v).unwrap_or(VersionRange { min: v, max: v })
+    // Cannot fail: the assertion below holds `min <= max`. Written without
+    // `expect` so a daemon can never panic here.
+    VersionRange::new(KERNEL_PROTOCOL_MIN, v).unwrap_or(VersionRange { min: v, max: v })
 }
+const _: () = assert!(KERNEL_PROTOCOL_MIN <= agent24_domain::DAEMON_PROTOCOL_VERSION);
 
 #[cfg(test)]
 mod tests {
@@ -399,13 +404,24 @@ mod tests {
         // The two must not be able to drift: `DAEMON_PROTOCOL_VERSION` is the
         // definition, and this is meant to be the same number in another shape.
         let k = kernel_range();
-        assert_eq!(k.min(), agent24_domain::DAEMON_PROTOCOL_VERSION);
         assert_eq!(k.max(), agent24_domain::DAEMON_PROTOCOL_VERSION);
         // And a module that speaks exactly it can connect today.
         assert_eq!(
             negotiate(Some(k), k),
             Ok(agent24_domain::DAEMON_PROTOCOL_VERSION)
         );
+    }
+
+    /// K1-6a-G §2.6: a v2 kernel still speaks 1 to a module that only knows
+    /// 1, and 2 to one that knows 2.
+    #[test]
+    fn a_v1_module_still_connects_and_a_v2_one_gets_2() {
+        let k = kernel_range();
+        assert_eq!((k.min(), k.max()), (1, 2));
+        assert_eq!(negotiate(Some(r(1, 1)), k), Ok(1));
+        assert_eq!(negotiate(Some(r(1, 2)), k), Ok(2));
+        assert_eq!(negotiate(Some(r(2, 9)), k), Ok(2));
+        assert!(negotiate(Some(r(3, 9)), k).is_err());
     }
 }
 

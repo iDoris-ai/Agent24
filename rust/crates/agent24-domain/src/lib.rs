@@ -402,7 +402,17 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// The kernel↔module PROTOCOL version this build speaks. Separate from the schema
 /// version: a manifest can be v1 while the protocol moves, and vice versa.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 (K1-6a-G §2.6): tools may declare `resource_kinds`. `ab/kernel` moved
+/// from 1; `main` is already at 2 for another change, so merging `main` into
+/// `ab/kernel` must move this AND [`RESOURCE_KINDS_PROTOCOL`] to 3.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+
+/// The first protocol whose kernels read `tools[].resource_kinds`. A manifest
+/// that declares the field must require at least this, so an older kernel
+/// refuses it at the version check rather than at `deny_unknown_fields`.
+pub const RESOURCE_KINDS_PROTOCOL: u32 = 2;
+const _: () = assert!(RESOURCE_KINDS_PROTOCOL <= DAEMON_PROTOCOL_VERSION);
 
 /// The wire shape of `domain-os.yml`. PRIVATE, and the only MANIFEST type that
 /// derives `Deserialize`, so a caller cannot skip validation by deserializing
@@ -713,7 +723,8 @@ impl DomainOsManifest {
         //    reason §3 gives for why `<= current` cannot survive a field being
         //    renamed or retyped — except it was not in the `<= current`, it was
         //    three lines above it.
-        if let Some(min) = field_u32("min_daemon_protocol")?
+        let min_protocol = field_u32("min_daemon_protocol")?;
+        if let Some(min) = min_protocol
             && min > u64::from(DAEMON_PROTOCOL_VERSION)
         {
             return Err(DomainError::ManifestUnsupported {
@@ -907,6 +918,18 @@ impl DomainOsManifest {
         // K1-5.1: all-or-nothing, like every other gate above — one invalid or
         // duplicate tool fails the WHOLE manifest rather than silently dropping
         // just that entry (ADR-K1-01 §5(2)).
+        // K1-6a-G §2.6: `resource_kinds` only on a manifest an older kernel
+        // refuses by version, never by an unknown field.
+        if raw
+            .tools
+            .iter()
+            .any(tool::RawToolDeclaration::declares_resource_kinds)
+            && min_protocol.unwrap_or(0) < u64::from(RESOURCE_KINDS_PROTOCOL)
+        {
+            return Err(DomainError::Manifest(format!(
+                "tools: resource_kinds requires min_daemon_protocol >= {RESOURCE_KINDS_PROTOCOL}"
+            )));
+        }
         let tools = tool::validate_tools(raw.tools)?;
 
         Ok(Self {
@@ -2585,6 +2608,99 @@ mod tool_manifest_tests {
         );
         let err = manifest(&two).expect_err("duplicate operation");
         assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    /// `ONE_TOOL` with `kinds` as its `resource_kinds` line, on a manifest
+    /// requiring `protocol`.
+    fn with_kinds(kinds: &str, protocol: Option<u32>) -> Result<DomainOsManifest> {
+        let tool = ONE_TOOL.replace(
+            "output_privacy: local_only",
+            &format!("output_privacy: local_only\n    resource_kinds: {kinds}"),
+        );
+        let min = protocol.map_or_else(String::new, |p| format!("min_daemon_protocol: {p}\n"));
+        manifest(&format!("{min}{tool}"))
+    }
+
+    /// K1-06a-resource-scope §2.3: declared kinds are kept in order; an
+    /// absent or empty list is no kinds.
+    #[test]
+    fn resource_kinds_are_read_in_order() {
+        let m = with_kinds("[doc, page_2]", Some(RESOURCE_KINDS_PROTOCOL)).unwrap();
+        assert_eq!(m.tools()[0].resource_kinds(), ["doc", "page_2"]);
+        let empty = with_kinds("[]", Some(RESOURCE_KINDS_PROTOCOL)).unwrap();
+        assert!(empty.tools()[0].resource_kinds().is_empty());
+        assert!(
+            manifest(ONE_TOOL).unwrap().tools()[0]
+                .resource_kinds()
+                .is_empty()
+        );
+        let longest = format!("[a{}]", "b".repeat(31));
+        assert!(with_kinds(&longest, Some(RESOURCE_KINDS_PROTOCOL)).is_ok());
+    }
+
+    /// A kind outside `[a-z][a-z0-9_]{0,31}`, or one repeated, refuses the
+    /// whole manifest.
+    #[test]
+    fn a_bad_or_repeated_kind_refuses_the_manifest() {
+        let too_long = format!("[a{}]", "b".repeat(32));
+        for kinds in [
+            "[Doc]",
+            "[1doc]",
+            "[_doc]",
+            "[do-c]",
+            "[\"do c\"]",
+            "[\"é\"]",
+            "[\"\"]",
+            "[doc, doc]",
+            "[\"doc:x\"]",
+            too_long.as_str(),
+            "doc",
+            "[1]",
+        ] {
+            assert!(
+                with_kinds(kinds, Some(RESOURCE_KINDS_PROTOCOL)).is_err(),
+                "{kinds}"
+            );
+        }
+        assert!(tool::is_resource_kind("doc"));
+        assert!(!tool::is_resource_kind("Doc"));
+    }
+
+    /// K1-6a-G §2.6: `resource_kinds`, even empty, only on a manifest that
+    /// requires the protocol that reads it.
+    #[test]
+    fn resource_kinds_require_the_protocol_that_reads_them() {
+        for protocol in [None, Some(RESOURCE_KINDS_PROTOCOL - 1)] {
+            for kinds in ["[doc]", "[]"] {
+                let err = with_kinds(kinds, protocol).expect_err("protocol too low");
+                assert!(err.to_string().contains("min_daemon_protocol"), "{err}");
+            }
+        }
+        assert!(with_kinds("[doc]", Some(RESOURCE_KINDS_PROTOCOL)).is_ok());
+    }
+
+    /// The acceptance of §2.6: a kernel one protocol behind refuses such a
+    /// manifest at the version check, naming both numbers, before it could
+    /// trip over a tool field it does not know.
+    #[test]
+    fn a_kernel_one_behind_refuses_by_version_not_by_field() {
+        let next = DAEMON_PROTOCOL_VERSION + 1;
+        let tool = ONE_TOOL.replace(
+            "output_privacy: local_only",
+            "output_privacy: local_only\n    resource_scopes_from_the_future: [doc]",
+        );
+        let err = manifest(&format!("min_daemon_protocol: {next}\n{tool}")).unwrap_err();
+        match &err {
+            DomainError::ManifestUnsupported {
+                requirement,
+                supported,
+                ..
+            } => {
+                assert!(requirement.contains(&next.to_string()), "{requirement}");
+                assert!(supported.contains(&DAEMON_PROTOCOL_VERSION.to_string()));
+            }
+            other => panic!("expected a version refusal, got {other:?}"),
+        }
     }
 }
 mod egress;
