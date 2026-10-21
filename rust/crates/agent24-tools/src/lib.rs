@@ -53,11 +53,11 @@ pub struct ToolContext {
     egress_resources: Vec<EgressResource>,
     egress_policy_unavailable: bool,
     authorization_generation: u64,
-    approval: ApprovalBinding,
 }
 
-/// What the approval gate bound this call to (K1-6a-G §2.3). Only the
-/// registry sets it, so an adapter holding a `ToolContext` cannot claim one.
+/// What the approval gate bound this call to (K1-6a-G §2.3). It travels on
+/// the [`ToolInvocation`] the registry mints, never on the `ToolContext`, so
+/// a context an adapter kept carries no approval into a later call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ApprovalBinding {
     /// The gate was not consulted for this call.
@@ -93,7 +93,6 @@ impl ToolContext {
             egress_resources: Vec::new(),
             egress_policy_unavailable: false,
             authorization_generation: 0,
-            approval: ApprovalBinding::NotAsked,
         }
     }
 
@@ -191,7 +190,6 @@ impl ToolContext {
             egress_resources: Vec::new(),
             egress_policy_unavailable: false,
             authorization_generation: 0,
-            approval: ApprovalBinding::NotAsked,
         }
     }
 
@@ -242,7 +240,6 @@ impl ToolContext {
             egress_resources: self.egress_resources.clone(),
             egress_policy_unavailable: self.egress_policy_unavailable,
             authorization_generation: self.authorization_generation,
-            approval: ApprovalBinding::NotAsked,
         }
     }
 }
@@ -342,15 +339,20 @@ impl ModuleInvocationCapability {
 /// only `ToolContext`, so cloning it cannot copy this capability.
 pub struct ToolInvocation {
     module: Option<Arc<ModuleInvocationCapability>>,
+    approval: ApprovalBinding,
 }
 
 impl ToolInvocation {
     fn unbound() -> Self {
-        Self { module: None }
+        Self {
+            module: None,
+            approval: ApprovalBinding::NotAsked,
+        }
     }
 
     fn module(owner_token: ModuleToolOwnerToken) -> Result<Self, ToolError> {
         Ok(Self {
+            approval: ApprovalBinding::NotAsked,
             module: Some(Arc::new(ModuleInvocationCapability {
                 owner_token,
                 attempt_id: fresh_attempt_id()?,
@@ -400,9 +402,9 @@ pub enum ToolError {
     /// The approval gate decided the whole run must stop (user chose abort)
     #[error("run aborted: {0}")]
     AbortRun(String),
-    /// The approval was given under a grant that is no longer current
-    /// (K1-6a-G §2.3). `dispatch` asks again; only `execute_preapproved`
-    /// lets it reach the caller.
+    /// The approval was given under a grant that is no longer current, or
+    /// names none (K1-6a-G §2.3). The registry asks again; it reaches a
+    /// caller only from a direct `Tool::call`, which no approval covers.
     #[error(
         "the approval no longer matches the current grant; call the tool again to be asked anew"
     )]
@@ -1214,7 +1216,7 @@ impl Tool for ModuleTool {
         // K1-6a-G §2.3: an approval holds only for the grant it was given
         // under; a call that needs one and has none was never approved.
         // Nothing has reached the module, so this is `cancelled`.
-        let approved = match &ctx.approval {
+        let approved = match &invocation.approval {
             ApprovalBinding::Bound(bound) => *bound == grant.authorization_ref,
             ApprovalBinding::Unbound => false,
             ApprovalBinding::NotAsked => !self.risk.requires_approval(),
@@ -1227,14 +1229,21 @@ impl Tool for ModuleTool {
         }
         let mut watch = GrantWatch::new(changes, grant.valid_for, looked_up);
         // Before anything is sent to the module, a grant that ends stops the
-        // call as `cancelled`, and the model sees `permission_denied`.
+        // call as `cancelled`, and the model sees `permission_denied` — or,
+        // when a human approved this call under that grant, the approval is
+        // void and the registry asks again (§2.3); a grant that is simply
+        // gone is then refused before any card.
+        let ended = || match invocation.approval {
+            ApprovalBinding::Bound(_) => ToolError::ApprovalStale,
+            _ => ToolError::Failed(module_error_json(permission_denied())),
+        };
         let available = tokio::select! {
             biased;
             () = self.grant_ended(&mut watch, ctx, &authorization_ref) => {
                 self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
                     .await?;
                 execution_guard.mark_completed();
-                return Err(ToolError::Failed(module_error_json(permission_denied())));
+                return Err(ended());
             }
             available = self.runtime.check_available(&self.module, &self.operation) => available,
         };
@@ -1251,8 +1260,10 @@ impl Tool for ModuleTool {
             self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
                 .await?;
             execution_guard.mark_completed();
-            let error = holds.map_or(ModuleToolCallError::Cancelled, |_| permission_denied());
-            return Err(ToolError::Failed(module_error_json(error)));
+            return Err(holds.map_or_else(
+                || ToolError::Failed(module_error_json(ModuleToolCallError::Cancelled)),
+                |_| ended(),
+            ));
         }
         if let Err(error) = available {
             self.finish_audit(&relation, result_code(&error), started)
@@ -1855,9 +1866,18 @@ impl ToolRegistry {
         // §2.3): when that grant changes before the call reaches the module,
         // the call stops and the human is asked again.
         for _ in 0..MAX_APPROVAL_ROUNDS {
-            let mut approved_ctx = call_ctx.clone();
+            let mut approval = ApprovalBinding::NotAsked;
             if effective.requires_approval() {
-                let bound = tool.approval_binding(ctx).await?;
+                // Outside `run_budgeted`, so bounded here: cancellable, and
+                // within the tool's own budget.
+                let budget = tool.timeout();
+                let bound = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(ToolError::Cancelled),
+                    bound = tokio::time::timeout(budget, tool.approval_binding(ctx)) => {
+                        bound.map_err(|_| ToolError::Timeout(budget))??
+                    }
+                };
                 match self
                     .gate
                     .check(&info, ctx, input, standing_target.as_deref(), cancel)
@@ -1873,12 +1893,11 @@ impl ToolRegistry {
                         return Err(ToolError::AbortRun(reason));
                     }
                 }
-                approved_ctx.approval =
-                    bound.map_or(ApprovalBinding::NotAsked, ApprovalBinding::Bound);
+                approval = bound.map_or(ApprovalBinding::NotAsked, ApprovalBinding::Bound);
             }
 
             // 4. execute under the tool's budget, cancellable at any point
-            match Self::run_budgeted(tool, &approved_ctx, input, cancel).await {
+            match Self::run_budgeted(tool, &call_ctx, input, cancel, approval).await {
                 Err(ToolError::ApprovalStale) if effective.requires_approval() => {}
                 Err(ToolError::ApprovalStale) => {
                     return Err(ToolError::Denied(format!("tool {name} was never approved")));
@@ -1901,6 +1920,11 @@ impl ToolRegistry {
     /// So this runs the same normalize + whitelist + budgeted-execute path but
     /// deliberately SKIPS the gate. It is the one execution path that does not
     /// ask, and must only be reached with an approval already in hand.
+    ///
+    /// The one exception: a call whose approval must name the grant it was
+    /// given under (K1-6a-G §2.3) cannot be held to one here, since which
+    /// grant the human saw is not recorded. It goes back through `dispatch`
+    /// and is asked again.
     pub async fn execute_preapproved(
         &self,
         name: &str,
@@ -1923,12 +1947,14 @@ impl ToolRegistry {
         if tool.requires_outbound_policy() && self.outbound_gate.is_none() {
             return Err(ToolError::Denied("outbound policy unavailable".into()));
         }
-        let mut call_ctx = self.outbound_gate.as_ref().map_or_else(
+        let call_ctx = self.outbound_gate.as_ref().map_or_else(
             || ctx.clone(),
             |gate| ctx.clone().with_egress_gate(Arc::clone(gate)),
         );
-        call_ctx.approval = ApprovalBinding::Unbound;
-        Self::run_budgeted(tool, &call_ctx, input, cancel).await
+        match Self::run_budgeted(tool, &call_ctx, input, cancel, ApprovalBinding::Unbound).await {
+            Err(ToolError::ApprovalStale) => self.dispatch(name, ctx, input, cancel).await,
+            result => result,
+        }
     }
 
     /// Restore grant side-effects for a durable approval without asking again.
@@ -1986,10 +2012,12 @@ impl ToolRegistry {
         ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
+        approval: ApprovalBinding,
     ) -> Result<String, ToolError> {
         // Mint opaque settlement authority before constructing the call future.
         // Authorization receives only the reusable ToolContext.
-        let invocation = tool.prepare_invocation(ctx)?;
+        let mut invocation = tool.prepare_invocation(ctx)?;
+        invocation.approval = approval;
         let budget = tool.timeout();
         const CANCELLATION_SETTLE_GRACE: Duration = Duration::from_secs(5);
         const INTERRUPTED_AUDIT_BUDGET: Duration = Duration::from_secs(5);
