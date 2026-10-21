@@ -1,5 +1,5 @@
 //! KB-C1-02a / #1052: the wire types round-trip the pinned fixtures in
-//! `protocol/knowledge/fixtures/v1`. Covered here: every `search.*` and `read.*`
+//! `protocol/knowledge/fixtures/v1`. Covered here: every `search.*`, `read.*` and `ready.*`
 //! fixture (request and response) and the response of every other `reject`
 //! fixture (error envelope only). The manifest drives the list. Digests are pinned in `agent24-protocol/tests/knowledge_fixtures.rs`.
 //!
@@ -9,7 +9,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent24_knowledge::{ErrorEnvelope, ReadRequest, ReadResponse, SearchRequest, SearchResponse};
+use agent24_knowledge::{
+    ErrorEnvelope, ReadRequest, ReadResponse, ReadyRequest, ReadyResponse, SearchRequest,
+    SearchResponse,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -94,52 +97,76 @@ fn roundtrip<T: DeserializeOwned + Serialize>(v: &Value) -> Result<(), String> {
     }
 }
 
-/// Fixtures whose request this crate has types for.
-fn has_request(file: &str) -> bool {
-    file.starts_with("search.") || file.starts_with("read.")
+#[derive(Clone, Copy, PartialEq)]
+enum Op {
+    Search,
+    Read,
+    Ready,
 }
 
-fn is_read(file: &str) -> bool {
-    file.starts_with("read.")
+/// The op of a fixture this crate has request types for.
+fn op(file: &str) -> Option<Op> {
+    if file.starts_with("search.") {
+        Some(Op::Search)
+    } else if file.starts_with("read.") {
+        Some(Op::Read)
+    } else if file.starts_with("ready.") {
+        Some(Op::Ready)
+    } else {
+        None
+    }
+}
+
+fn has_request(file: &str) -> bool {
+    op(file).is_some()
 }
 
 fn decode_request(file: &str, v: &Value) -> Result<(), String> {
-    if is_read(file) {
-        decode::<ReadRequest>(v).map(drop)
-    } else {
-        decode::<SearchRequest>(v).map(drop)
+    match op(file) {
+        Some(Op::Search) => decode::<SearchRequest>(v).map(drop),
+        Some(Op::Read) => decode::<ReadRequest>(v).map(drop),
+        Some(Op::Ready) => decode::<ReadyRequest>(v).map(drop),
+        None => unreachable!("{file}: no request types"),
     }
 }
 
 fn decode_raw_request(file: &str, raw: &str) -> bool {
-    if is_read(file) {
-        serde_json::from_str::<ReadRequest>(raw).is_ok()
-    } else {
-        serde_json::from_str::<SearchRequest>(raw).is_ok()
+    match op(file) {
+        Some(Op::Search) => serde_json::from_str::<SearchRequest>(raw).is_ok(),
+        Some(Op::Read) => serde_json::from_str::<ReadRequest>(raw).is_ok(),
+        Some(Op::Ready) => serde_json::from_str::<ReadyRequest>(raw).is_ok(),
+        None => unreachable!("{file}: no request types"),
     }
 }
 
 fn roundtrip_request(file: &str, v: &Value) -> Result<(), String> {
-    if is_read(file) {
-        roundtrip::<ReadRequest>(v)
-    } else {
-        roundtrip::<SearchRequest>(v)
+    match op(file) {
+        Some(Op::Search) => roundtrip::<SearchRequest>(v),
+        Some(Op::Read) => roundtrip::<ReadRequest>(v),
+        Some(Op::Ready) => roundtrip::<ReadyRequest>(v),
+        None => unreachable!("{file}: no request types"),
     }
 }
 
 fn roundtrip_success(file: &str, v: &Value) -> Result<(), String> {
-    if is_read(file) {
-        roundtrip::<ReadResponse>(v)
-    } else {
-        roundtrip::<SearchResponse>(v)
+    match op(file) {
+        Some(Op::Search) => roundtrip::<SearchResponse>(v),
+        Some(Op::Read) => roundtrip::<ReadResponse>(v),
+        Some(Op::Ready) => roundtrip::<ReadyResponse>(v),
+        None => unreachable!("{file}: no request types"),
     }
 }
 
 fn decode_body(file: &str, accept: bool, body: &Value) -> Result<(), String> {
-    match (accept, is_read(file)) {
-        (true, true) => decode::<ReadResponse>(body).map(drop),
-        (true, false) => decode::<SearchResponse>(body).map(drop),
-        (false, _) => decode::<ErrorEnvelope>(body).map(drop),
+    if accept {
+        match op(file) {
+            Some(Op::Search) => decode::<SearchResponse>(body).map(drop),
+            Some(Op::Read) => decode::<ReadResponse>(body).map(drop),
+            Some(Op::Ready) => decode::<ReadyResponse>(body).map(drop),
+            None => unreachable!("{file}: no request types"),
+        }
+    } else {
+        decode::<ErrorEnvelope>(body).map(drop)
     }
 }
 
@@ -190,7 +217,7 @@ fn covered_fixtures_roundtrip() {
     println!("covered {} fixtures: {names:#?}", names.len());
     assert_eq!(
         names.len(),
-        34,
+        38,
         "manifest changed; review coverage: {names:#?}"
     );
     assert!(
@@ -268,9 +295,15 @@ fn decode_part(file: &str, side: &str, v: &Value) -> Result<(), String> {
     if side == "/request" {
         decode_request(file, v)
     } else {
-        let accept = ["search.ok", "search.partial", "read.chunk", "read.document"]
-            .iter()
-            .any(|p| file.starts_with(p));
+        let accept = [
+            "search.ok",
+            "search.partial",
+            "read.chunk",
+            "read.document",
+            "ready.",
+        ]
+        .iter()
+        .any(|p| file.starts_with(p));
         decode_body(file, accept, v)
     }
 }
@@ -513,4 +546,61 @@ fn read_expected_revision_matches_target() {
             "{file}: expected_revision {rev}"
         );
     }
+}
+
+/// `kb_state`: `reason` appears exactly when `state` is `not_ready`, and only
+/// from the kb reason enum.
+#[test]
+fn ready_kb_state_reason_pairs() {
+    let file = "ready.scoped.json";
+    for v in [
+        json!({"state": "ready", "reason": "dependency"}),
+        json!({"state": "not_ready"}),
+        json!({"state": "not_ready", "reason": "read_only_v1"}),
+        json!({"state": "disabled", "reason": "operation_disabled"}),
+    ] {
+        let body = mutated(file, "/knowledge_bases/0", "search", v.clone());
+        assert!(decode::<ReadyResponse>(&body).is_err(), "{v} was accepted");
+    }
+    let ok = json!({"state": "not_ready", "reason": "index_failed"});
+    let body = mutated(file, "/knowledge_bases/0", "search", ok.clone());
+    let back = serde_json::to_value(decode::<ReadyResponse>(&body).unwrap()).unwrap();
+    assert!(same(&back["knowledge_bases"][0]["search"], &ok));
+}
+
+/// `operations.ingest` stays `disabled`; operation `reason` is a non-null string;
+/// `knowledge_bases` is non-empty; request `scope` is never null.
+#[test]
+fn ready_operations_shape() {
+    let file = "ready.unscoped.json";
+    let cases = [
+        ("/operations", "ingest", json!({"state": "ready"}), false),
+        (
+            "/operations",
+            "search",
+            json!({"state": "not_ready", "reason": null}),
+            false,
+        ),
+        ("", "knowledge_bases", json!([]), false),
+        (
+            "/operations",
+            "search",
+            json!({"state": "not_ready", "reason": "vector_store_unavailable"}),
+            true,
+        ),
+    ];
+    for (ptr, key, v, ok) in cases {
+        let body = mutated(file, ptr, key, v.clone());
+        assert_eq!(
+            decode::<ReadyResponse>(&body).is_ok(),
+            ok,
+            "{ptr}/{key} = {v}"
+        );
+    }
+    let mut req = part(file, "/request");
+    obj(&mut req, "").insert("scope".into(), Value::Null);
+    assert!(
+        decode::<ReadyRequest>(&req).is_err(),
+        "null scope was accepted"
+    );
 }
