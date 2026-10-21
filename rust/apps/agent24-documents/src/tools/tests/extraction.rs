@@ -266,3 +266,34 @@ async fn extraction_get_refuses_as_the_other_tools_do() {
         payload(&call(&state, "extraction_get", args).await);
     }
 }
+
+/// K1-06a §2.3, §5.3: an extraction is reached through its document; on a
+/// document outside the scope it reads as no extraction at all.
+#[tokio::test]
+async fn an_extraction_outside_the_scope_reads_as_none() {
+    let (_dir, state) = env().await;
+    let other = "doc_01K74Z3QJ8V5N2W9RTX6YB4M99";
+    let none = json!({ "extraction_id": ext(9) });
+    let absent = call_in(&state, "extraction_get", &[DOC], none).await;
+    assert_module_error(&absent, "not_found", false);
+    let small = json!({ "extraction_id": SMALL });
+    payload(&call_in(&state, "extraction_get", &[DOC], small.clone()).await);
+    assert_eq!(
+        call_in(&state, "extraction_get", &[other], small.clone()).await,
+        absent
+    );
+    assert_eq!(call_in(&state, "extraction_get", &[], small).await, absent);
+    // An argument the service refuses before it reads the id (a cursor it
+    // cannot decode) must not tell a missing extraction from one outside
+    // the scope either.
+    for cursor in ["nope", "", "v100"] {
+        let outside = json!({ "extraction_id": SMALL, "cursor": cursor });
+        let missing = json!({ "extraction_id": ext(9), "cursor": cursor });
+        let outside = call_in(&state, "extraction_get", &[other], outside).await;
+        assert_module_error(&outside, "not_found", false);
+        assert_eq!(
+            outside,
+            call_in(&state, "extraction_get", &[other], missing).await
+        );
+    }
+}

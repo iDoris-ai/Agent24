@@ -23,6 +23,7 @@ pub mod imports;
 pub mod jobs;
 pub mod oplog;
 pub mod read;
+pub mod scope;
 pub mod state;
 pub mod text_layer;
 pub mod timestamp;

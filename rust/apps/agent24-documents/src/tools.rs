@@ -30,10 +30,12 @@ use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::error::ApiError;
 use crate::extract::handler::{self, Fail, Prepared, Schema};
 use crate::extractions;
+use crate::id::{IdKind, is_id};
 use crate::jobs;
 use crate::oplog::{Origin, Run};
 use crate::read::find::{self, FindRequest};
 use crate::read::text::{self, TextParams};
+use crate::scope::{self, PERMISSION_DENIED, Scope};
 use crate::state::{AppState, Storage};
 
 /// The input does not have the shape the kernel sends (kernel code table,
@@ -64,10 +66,12 @@ pub struct ToolContext {
     pub tool_call_id: String,
     pub module_id: String,
     pub operation: String,
-    /// Accepted and not used in slice 1 (DOC-1-06b §3.2): in production it
-    /// is always empty, so it is neither an allow-list nor a check.
-    #[serde(default)]
-    pub authorized_resources: Vec<String>,
+    /// Read by [`Scope::parse`] (K1-06a §2.2): kept as sent, so that a
+    /// malformed list refuses the call as `permission_denied` instead of
+    /// failing the body as `invalid_input`. `None` when absent; an explicit
+    /// `null` is `Some(Value::Null)`, which is malformed.
+    #[serde(default, deserialize_with = "present")]
+    pub authorized_resources: Option<Value>,
     #[serde(default)]
     pub authorization_ref: Option<String>,
 }
@@ -186,15 +190,23 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
     if op != call.context.operation {
         return Envelope::error(INVALID_INPUT, false);
     }
+    // Once per call, before any operation reads storage (K1-06a §2.2).
+    let Ok(scope) = Scope::parse(call.context.authorized_resources.as_ref()) else {
+        return Envelope::error(PERMISSION_DENIED, false);
+    };
     let ToolCall { context, arguments } = call;
     let run = Run {
         run_id: context.run_id.clone(),
         tool_call_id: context.tool_call_id.clone(),
     };
+    let scope = &scope;
     let work = async move {
+        // The scope is checked here, for every operation, before it runs
+        // (K1-06a §4.1): an operation `admit` has no row for never runs.
+        admit(state, scope, op, &arguments).await?;
         match op {
             "extract" => extract(state, run, arguments).await,
-            "list" => list(state, arguments).await,
+            "list" => list(state, scope, arguments).await,
             "get" => get(state, arguments).await,
             "job_get" => job_get(state, arguments).await,
             "read_range" => read_range(state, arguments).await,
@@ -321,11 +333,14 @@ struct ExtractArgs {
 /// A completed envelope, or the error one that answers instead.
 type Outcome = Result<Envelope, Envelope>;
 
-async fn list(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+/// Only the documents in `scope`: counts and cursors as well (K1-06a §2.4).
+async fn list(state: &AppState, scope: &Scope, arguments: Map<String, Value>) -> Outcome {
     let args: ListArgs = parse(arguments)?;
     let limit = bounded(args.limit)?.unwrap_or(DEFAULT_LIMIT);
     let storage = ready(state).await?;
-    let page = documents::list(&storage, args.cursor.as_deref(), limit, PAYLOAD_BYTES).await;
+    let only = Some(scope.documents());
+    let cursor = args.cursor.as_deref();
+    let page = documents::list(&storage, only, cursor, limit, PAYLOAD_BYTES).await;
     completed(page)
 }
 
@@ -451,6 +466,71 @@ async fn ready(state: &AppState) -> Result<Arc<Storage>, Envelope> {
         .map_err(|cause| refused(&ApiError::storage_unavailable(cause)))
 }
 
+/// What an operation touches: the one table the entry checks the scope
+/// against (K1-06a §4.1, §4.3). `None`: no such operation, refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resource {
+    /// By `document_id`.
+    Document,
+    /// By `job_id`, through the job's document.
+    Job,
+    /// By `extraction_id`, through the extraction's document.
+    Extraction,
+    /// None: the operation filters by the scope itself (`list`).
+    Listing,
+}
+
+fn resource(op: &str) -> Option<Resource> {
+    match op {
+        "get" | "read_range" | "find" | "extract" => Some(Resource::Document),
+        "job_get" => Some(Resource::Job),
+        "extraction_get" => Some(Resource::Extraction),
+        "list" => Some(Resource::Listing),
+        _ => None,
+    }
+}
+
+/// Lets `op` run only if what it names is in `scope`, by its row in
+/// [`resource`]; before any other argument is checked, so outside the
+/// scope always reads as absent: the service's own not-found (K1-06a
+/// §2.4), whatever else is wrong. A missing or non-string id is
+/// `invalid_input`; a malformed one passes, as nothing has it and the
+/// service refuses it. Only a job's or an extraction's owner is read.
+async fn admit(
+    state: &AppState,
+    scope: &Scope,
+    op: &str,
+    arguments: &Map<String, Value>,
+) -> Result<(), Envelope> {
+    let named = |key: &str| match arguments.get(key) {
+        Some(Value::String(id)) => Ok(id.as_str()),
+        _ => Err(Envelope::error(INVALID_INPUT, false)),
+    };
+    let (kind, id, absent) = match resource(op) {
+        None => return Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
+        Some(Resource::Listing) => return Ok(()),
+        Some(Resource::Document) => (IdKind::Document, named("document_id")?, "no such document"),
+        Some(Resource::Job) => (IdKind::Job, named("job_id")?, "no such job"),
+        Some(Resource::Extraction) => (
+            IdKind::Extraction,
+            named("extraction_id")?,
+            "no such extraction",
+        ),
+    };
+    if !is_id(kind, id) {
+        return Ok(());
+    }
+    let owner = match kind {
+        IdKind::Job => scope::job_document(&*ready(state).await?, id).await,
+        IdKind::Extraction => scope::extraction_document(&*ready(state).await?, id).await,
+        _ => Ok(Some(id.to_owned())),
+    };
+    match owner.map_err(|e| refused(&e))? {
+        Some(doc) if scope.allows_document(&doc) => Ok(()),
+        _ => Err(refused(&ApiError::not_found(absent))),
+    }
+}
+
 /// A service error under its own code (ADR-DOC-02 §6): the kernel keeps an
 /// unknown code as `module_code`, and keeps `retryable` as given.
 fn refused(e: &ApiError) -> Envelope {
@@ -490,6 +570,7 @@ mod tests {
     mod extract;
     mod extraction;
     mod read;
+    mod scope;
 
     fn context() -> Value {
         json!({
@@ -509,9 +590,38 @@ mod tests {
         ctx
     }
 
-    /// Calls `op` as the kernel does, with a matching context.
+    /// [`context_for`] with a scope of these documents (K1-06a §2.1).
+    fn context_with(op: &str, docs: &[&str]) -> Value {
+        let mut ctx = context_for(op);
+        ctx["authorized_resources"] = docs.iter().map(|d| format!("doc:{d}")).collect();
+        ctx
+    }
+
+    /// Calls `op` as the kernel does, authorized: its scope holds every
+    /// stored document and the one `arguments` names (when that one can be
+    /// a scope entry), so it tests the operation, not the scope. The scope
+    /// itself is tested through [`call_in`] (`tests/scope.rs`).
     async fn call(state: &AppState, op: &str, arguments: Value) -> Vec<u8> {
-        let body = json!({ "context": context_for(op), "arguments": arguments });
+        let mut docs: Vec<String> = match state.storage().await {
+            Ok(storage) => sqlx::query_scalar("SELECT id FROM documents")
+                .fetch_all(storage.db.pool())
+                .await
+                .unwrap(),
+            Err(_) => Vec::new(),
+        };
+        if let Some(id) = arguments.get("document_id").and_then(Value::as_str) {
+            let entry = json!([format!("doc:{id}")]);
+            if Scope::parse(Some(&entry)).is_ok() {
+                docs.push(id.to_owned());
+            }
+        }
+        let docs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        call_in(state, op, &docs, arguments).await
+    }
+
+    /// Calls `op` as the kernel does, with a scope of exactly `docs`.
+    async fn call_in(state: &AppState, op: &str, docs: &[&str], arguments: Value) -> Vec<u8> {
+        let body = json!({ "context": context_with(op, docs), "arguments": arguments });
         post_to(state, op, body.to_string()).await
     }
 
@@ -582,14 +692,26 @@ mod tests {
     const JOB: &str = "job_01K75A0B1C2D3E4F5G6H7J8K9M";
     const DOC: &str = "doc_01K74Z3QJ8V5N2W9RTX6Y00001";
 
-    /// A failed job whose error message is the SQL expression `message`.
+    /// A failed job on [`DOC`] r1 (added here unless already there) whose
+    /// error message is the SQL expression `message`. A job reaches a tool
+    /// call only through its document (K1-06a §2.3).
     async fn add_failed_job(state: &AppState, message: &str) {
+        let storage = state.storage().await.unwrap();
+        let found: Option<String> = sqlx::query_scalar("SELECT id FROM documents WHERE id = ?1")
+            .bind(DOC)
+            .fetch_optional(storage.db.pool())
+            .await
+            .unwrap();
+        if found.is_none() {
+            add_document(state, 1, "'the job''s document'").await;
+        }
         exec(
             state,
             &format!(
-                "INSERT INTO jobs (id, kind, status, origin, error)
+                "INSERT INTO jobs (id, kind, status, origin, error, document_id, revision)
                  VALUES ('{JOB}', 'probe', 'failed', '{{\"kind\":\"page\"}}',
-                         json_object('code', 'parse_failed', 'message', {message}))"
+                         json_object('code', 'parse_failed', 'message', {message}),
+                         '{DOC}', 1)"
             ),
         )
         .await;
@@ -692,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorization_fields_are_accepted_and_not_used() {
+    async fn a_malformed_scope_is_permission_denied_not_invalid_input() {
         let mut ctx = context();
         ctx["operation"] = json!("no_such_op");
         ctx["authorized_resources"] = json!(["doc_01"]);
@@ -702,9 +824,8 @@ mod tests {
             json!({ "context": ctx, "arguments": {} }).to_string(),
         )
         .await;
-        // Parsed (not `invalid_input`) and not an allow-list: it reaches
-        // dispatch like any other call.
-        assert_kernel_error(&body, ModuleToolErrorCode::OperationUnavailable);
+        // The body parses; the scope does not (K1-06a §2.2).
+        assert_kernel_error(&body, ModuleToolErrorCode::PermissionDenied);
     }
 
     #[tokio::test]
@@ -839,7 +960,9 @@ mod tests {
         add_document(&state, 1, "'a title'").await;
         let storage = state.storage().await.unwrap();
         // No row the contract allows reaches 60 KiB; a tiny budget stands in.
-        let e = documents::list(&storage, None, 50, 64).await.unwrap_err();
+        let e = documents::list(&storage, None, None, 50, 64)
+            .await
+            .unwrap_err();
         assert_eq!(e.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = serde_json::to_vec(&refused(&e)).unwrap();
         assert_module_error(&body, "payload_too_large", false);
@@ -888,6 +1011,9 @@ mod tests {
     #[tokio::test]
     async fn arguments_outside_the_schema_are_invalid_input() {
         let (_dir, state) = opened().await;
+        // In the scope (`call` authorizes every stored document): outside
+        // it, the scope answers first, as absent (K1-06a §4.1).
+        add_failed_job(&state, "'it broke'").await;
         for (op, args) in [
             ("list", json!({ "limit": 5, "extra": true })),
             ("list", json!({ "limit": "5" })),
@@ -1000,7 +1126,7 @@ mod tests {
                 json!({ "document_id": DOC, "revision": 1, "query": "a" }),
             ),
         ] {
-            let body = json!({ "context": context_for(op), "arguments": args });
+            let body = json!({ "context": context_with(op, &[DOC]), "arguments": args });
             let req = Request::post(format!("/_a24/tools/{op}"))
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))

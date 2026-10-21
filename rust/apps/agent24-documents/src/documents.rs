@@ -1,6 +1,8 @@
 //! Documents (ADR-DOC-02 §3, §4): `GET /documents`, newest first, and
 //! `GET /documents/{document_id}` with its head revision.
 
+use std::collections::BTreeSet;
+
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path as UrlPath, Query};
@@ -126,7 +128,7 @@ pub async fn list_documents(
         // Its range is [`list`]'s to check.
         Some(l) => l.parse::<i64>().map_err(|_| bad_limit())?,
     };
-    list(&storage, params.cursor.as_deref(), limit, PAGE_BYTES)
+    list(&storage, None, params.cursor.as_deref(), limit, PAGE_BYTES)
         .await
         .map(Json)
 }
@@ -138,8 +140,14 @@ fn bad_limit() -> ApiError {
 /// The page after `cursor`: at most `limit` (1 to 200) documents and
 /// `budget` bytes of JSON, newest first. `GET /documents` and
 /// `documents.list` both read here.
+///
+/// `only`: when `Some`, just the documents whose id it holds, in the same
+/// order, with `next_cursor` set only when another of them follows (a tool
+/// call's scope, K1-06a §2.4); an empty set reads as an empty page without
+/// a query. REST passes `None`: every document.
 pub(crate) async fn list(
     storage: &Storage,
+    only: Option<&BTreeSet<String>>,
     cursor: Option<&str>,
     limit: i64,
     budget: usize,
@@ -152,15 +160,31 @@ pub(crate) async fn list(
         Some(c) => Some(decode_cursor(c).ok_or_else(|| ApiError::invalid_request("bad cursor"))?),
     };
     let (after_at, after_id) = after.unzip();
+    let only_json = match only {
+        Some(set) if set.is_empty() => {
+            return Ok(DocumentList {
+                documents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        None => None,
+        Some(set) => Some(
+            serde_json::to_string(set)
+                .map_err(|_| ApiError::internal("cannot serialize the scope"))?,
+        ),
+    };
     // One more row than the page, to know whether another page follows.
+    // `?4` is NULL for REST (`only` absent); a tool scope binds its ids.
     let rows: Vec<Document> = match sqlx::query_as(
         "SELECT id, title, media_type, head_revision, created_at, updated_at FROM documents
-         WHERE ?1 IS NULL OR (created_at, id) < (?1, ?2)
+         WHERE (?1 IS NULL OR (created_at, id) < (?1, ?2))
+           AND (?4 IS NULL OR id IN (SELECT value FROM json_each(?4)))
          ORDER BY created_at DESC, id DESC LIMIT ?3",
     )
     .bind(after_at)
     .bind(after_id)
     .bind(limit + 1)
+    .bind(only_json)
     .fetch_all(storage.db.pool())
     .await
     {

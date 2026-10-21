@@ -557,7 +557,7 @@ async fn the_list_service_holds_its_own_limit_range() {
     let (_dir, state) = opened().await;
     let storage = state.storage().await.unwrap();
     for limit in [0, -1, 201] {
-        let e = documents::list(&storage, None, limit, PAYLOAD_BYTES)
+        let e = documents::list(&storage, None, None, limit, PAYLOAD_BYTES)
             .await
             .err()
             .unwrap();
@@ -568,7 +568,7 @@ async fn the_list_service_holds_its_own_limit_range() {
     }
     for limit in [1, 200] {
         assert!(
-            documents::list(&storage, None, limit, PAYLOAD_BYTES)
+            documents::list(&storage, None, None, limit, PAYLOAD_BYTES)
                 .await
                 .is_ok()
         );
