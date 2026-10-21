@@ -128,11 +128,14 @@ fn collect(
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut pending: Vec<Pending> = vec![(None, root.to_owned(), PathBuf::new())];
     let (mut found, mut bytes, mut entries, mut stamps) = (0usize, 0u64, Vec::new(), Vec::new());
+    let mut dirs = Vec::new();
     while let Some((listed, dir, rel_dir)) = pending.pop() {
         let fd = match listed {
             // The parent's descriptor is dropped here unless a sibling
             // still holds it: one descriptor per level, at most.
             Some((parent, walked)) => {
+                #[cfg(test)]
+                tests::between_listing_and_opening(&dir);
                 let name = dir.file_name().unwrap_or_default();
                 let fd = rustix::fs::openat(&*parent, name, dir_flags, Mode::empty())
                     .map_err(|e| open_failed(&dir, e))?;
@@ -151,6 +154,10 @@ fn collect(
                 e => unreadable(&dir, e),
             })?,
         };
+        dirs.push((
+            dir.clone(),
+            rustix::fs::fstat(&fd).map_err(|e| unreadable(&dir, e))?,
+        ));
         let fd = Arc::new(fd);
         for item in rustix::fs::Dir::read_from(&*fd).map_err(|e| unreadable(&dir, e))? {
             let item = item.map_err(|e| unreadable(&dir, e))?;
@@ -181,7 +188,7 @@ fn collect(
             }
         }
     }
-    unchanged(&stamps)?;
+    unchanged(&stamps, &dirs)?;
     Ok(entries)
 }
 
@@ -239,8 +246,16 @@ fn hash_file(
     Ok((before.2, hasher.finalize().into(), before))
 }
 
-/// Every hashed file is still at its path, as it was when it was read.
-fn unchanged(stamps: &[(PathBuf, Stamp)]) -> Result<(), ArtifactError> {
+/// Every hashed file is still at its path, as it was when it was read, and
+/// every directory read is still that directory at its path, not a link.
+fn unchanged(stamps: &[(PathBuf, Stamp)], dirs: &[(PathBuf, Stat)]) -> Result<(), ArtifactError> {
+    for (path, read) in dirs {
+        if !rustix::fs::lstat(path).is_ok_and(|now| {
+            FileType::from_raw_mode(now.st_mode) == FileType::Directory && same_inode(&now, read)
+        }) {
+            return Err(ArtifactError::Changed(path.clone()));
+        }
+    }
     for (path, hashed) in stamps {
         let now = std::fs::symlink_metadata(path)
             .map_err(|e| ArtifactError::Unreadable(path.clone(), e))?;
@@ -274,7 +289,39 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use std::cell::RefCell;
     use std::os::unix::fs::symlink;
+
+    type Swap = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        /// What a test does to a directory after its parent listed it and
+        /// before `collect` opens it.
+        static BETWEEN: RefCell<Option<Swap>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn between_listing_and_opening(dir: &Path) {
+        BETWEEN.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(dir);
+            }
+        });
+    }
+
+    /// `collect` over `root`, with `swap` run on each directory between its
+    /// listing and its opening.
+    fn collect_swapping(
+        root: &Path,
+        swap: impl Fn(&Path) + 'static,
+    ) -> Result<Vec<Entry>, ArtifactError> {
+        BETWEEN.with(|hook| *hook.borrow_mut() = Some(Box::new(swap)));
+        let result = collect(
+            root,
+            (crate::launch::MAX_PACKAGE_ENTRIES, MAX_PACKAGE_BYTES),
+        );
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        result
+    }
 
     /// `a.txt` = "hello", `dir/b` = "x".
     fn sample() -> tempfile::TempDir {
@@ -440,25 +487,36 @@ mod tests {
         ));
     }
 
-    /// A directory replaced after its parent listed it is not the inode
-    /// listed, and one replaced by a link does not open: both are changes.
+    /// A directory replaced after its parent listed it, by another
+    /// directory or by a link to the original, is not read: `collect` opens
+    /// it from the parent's descriptor and checks the inode listed.
     #[test]
     fn a_directory_swapped_after_it_was_listed_is_refused() {
-        let t = sample();
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
-        let parent = rustix::fs::open(t.path(), flags, Mode::empty()).unwrap();
-        let listed = rustix::fs::statat(&parent, "dir", AtFlags::SYMLINK_NOFOLLOW).unwrap();
-        std::fs::rename(t.path().join("dir"), t.path().join("old")).unwrap();
-        std::fs::create_dir(t.path().join("dir")).unwrap();
-        let fd = rustix::fs::openat(&parent, "dir", flags, Mode::empty()).unwrap();
-        assert!(!same_inode(&rustix::fs::fstat(&fd).unwrap(), &listed));
-        std::fs::remove_dir(t.path().join("dir")).unwrap();
-        symlink("old", t.path().join("dir")).unwrap();
-        let e = rustix::fs::openat(&parent, "dir", flags, Mode::empty()).unwrap_err();
-        assert!(matches!(
-            open_failed(Path::new("dir"), e),
-            ArtifactError::Changed(_)
-        ));
+        let swaps: [fn(&Path, &Path); 2] = [
+            |dir, away| {
+                std::fs::rename(dir, away).unwrap();
+                std::fs::create_dir(dir).unwrap();
+                std::fs::write(dir.join("b"), "x").unwrap();
+            },
+            |dir, away| {
+                std::fs::rename(dir, away).unwrap();
+                symlink(away, dir).unwrap();
+            },
+        ];
+        for swap in swaps {
+            let t = sample();
+            let away = tempfile::tempdir().unwrap().keep().join("dir");
+            let result = collect_swapping(t.path(), move |dir| {
+                if dir.ends_with("dir") && !away.exists() {
+                    swap(dir, &away);
+                }
+            });
+            assert!(
+                matches!(result, Err(ArtifactError::Changed(_))),
+                "{:?}",
+                result.err()
+            );
+        }
     }
 
     /// A hashed file written again before the walk ends, even back to the
@@ -469,7 +527,7 @@ mod tests {
         let path = t.path().join("a.txt");
         let meta = std::fs::symlink_metadata(&path).unwrap();
         let stamps = vec![(path.clone(), stamp(&meta))];
-        assert!(unchanged(&stamps).is_ok());
+        assert!(unchanged(&stamps, &[]).is_ok());
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, "jello").unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -479,9 +537,34 @@ mod tests {
             (again.len(), again.modified().unwrap()),
             (meta.len(), meta.modified().unwrap())
         );
-        assert!(matches!(unchanged(&stamps), Err(ArtifactError::Changed(_))));
+        assert!(matches!(
+            unchanged(&stamps, &[]),
+            Err(ArtifactError::Changed(_))
+        ));
         std::fs::remove_file(&path).unwrap();
-        assert!(unchanged(&stamps).is_err(), "gone is not unchanged");
+        assert!(unchanged(&stamps, &[]).is_err(), "gone is not unchanged");
+    }
+
+    /// A directory read, then moved away and replaced by a link to where it
+    /// went (so paths through it still reach the same files), is caught by
+    /// the closing check (review: directories are checked like files).
+    #[test]
+    fn a_directory_replaced_by_a_link_after_it_was_read_is_caught() {
+        let t = sample();
+        let dir = t.path().join("dir");
+        let dirs = vec![(dir.clone(), rustix::fs::lstat(&dir).unwrap())];
+        assert!(unchanged(&[], &dirs).is_ok());
+        let away = tempfile::tempdir().unwrap();
+        std::fs::rename(&dir, away.path().join("dir")).unwrap();
+        symlink(away.path().join("dir"), &dir).unwrap();
+        assert!(
+            std::fs::metadata(dir.join("b")).is_ok(),
+            "the file is still reachable"
+        );
+        assert!(matches!(
+            unchanged(&[], &dirs),
+            Err(ArtifactError::Changed(_))
+        ));
     }
 
     /// A directory that will not open for want of permission is unreadable,
