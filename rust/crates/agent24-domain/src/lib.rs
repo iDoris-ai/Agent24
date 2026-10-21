@@ -2671,12 +2671,21 @@ mod tool_manifest_tests {
     #[test]
     fn resource_kinds_require_the_protocol_that_reads_them() {
         for protocol in [None, Some(RESOURCE_KINDS_PROTOCOL - 1)] {
-            for kinds in ["[doc]", "[]"] {
+            // A written `null`, `~` or empty value is the key all the same.
+            for kinds in ["[doc]", "[]", "null", "~", ""] {
                 let err = with_kinds(kinds, protocol).expect_err("protocol too low");
                 assert!(err.to_string().contains("min_daemon_protocol"), "{err}");
             }
         }
         assert!(with_kinds("[doc]", Some(RESOURCE_KINDS_PROTOCOL)).is_ok());
+        // At a protocol that reads it, `null` is still not a list.
+        for kinds in ["null", "~", ""] {
+            let err = with_kinds(kinds, Some(RESOURCE_KINDS_PROTOCOL)).expect_err("null kinds");
+            assert!(
+                err.to_string().contains("must be a list"),
+                "{kinds:?}: {err}"
+            );
+        }
     }
 
     /// The acceptance of §2.6: a kernel one protocol behind refuses such a

@@ -160,14 +160,25 @@ pub struct RawToolDeclaration {
     #[serde(default)]
     reversible_draft: bool,
     /// K1-06a-resource-scope §2.3: the root kinds a grant for this tool may
-    /// carry. Absent or empty: grants carry no resources.
-    #[serde(default)]
-    resource_kinds: Option<Vec<String>>,
+    /// carry. Absent or empty: grants carry no resources. The outer `Option`
+    /// is whether the key is there at all, so an explicit `null` counts as
+    /// written (and is then refused): an older kernel refuses the key
+    /// whatever its value.
+    #[serde(default, deserialize_with = "present")]
+    resource_kinds: Option<Option<Vec<String>>>,
+}
+
+/// A key that is present, whatever its value, including `null`.
+fn present<'de, D>(deserializer: D) -> Result<Option<Option<Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer).map(Some)
 }
 
 impl RawToolDeclaration {
-    /// Whether the entry carries `resource_kinds` at all, even empty: an
-    /// older kernel refuses the field whatever its value.
+    /// Whether the entry carries `resource_kinds` at all, even empty or
+    /// `null`: an older kernel refuses the key whatever its value.
     pub(crate) fn declares_resource_kinds(&self) -> bool {
         self.resource_kinds.is_some()
     }
@@ -257,13 +268,19 @@ pub fn is_resource_kind(kind: &str) -> bool {
 }
 
 /// Each kind valid ([`is_resource_kind`]) and none repeated, else the whole
-/// manifest is refused; absent is empty.
+/// manifest is refused; absent is empty, and an explicit `null` is refused.
 fn validate_resource_kinds(
     operation: &str,
-    kinds: Option<Vec<String>>,
+    kinds: Option<Option<Vec<String>>>,
 ) -> Result<Vec<String>, DomainError> {
-    let Some(list) = kinds else {
-        return Ok(Vec::new());
+    let list = match kinds {
+        None => return Ok(Vec::new()),
+        Some(None) => {
+            return Err(DomainError::Manifest(format!(
+                "tools.{operation:?}: resource_kinds must be a list, not null"
+            )));
+        }
+        Some(Some(list)) => list,
     };
     let mut seen = BTreeSet::new();
     for k in &list {
