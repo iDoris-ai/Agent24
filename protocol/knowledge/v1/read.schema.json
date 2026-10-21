@@ -11,7 +11,7 @@
         "content_tag": { "$ref": "common.schema.json#/$defs/content_tag" },
         "source_revision": { "$ref": "common.schema.json#/$defs/id" },
         "index_build_id": { "$ref": "common.schema.json#/$defs/id" },
-        "chunk_revision": { "$ref": "common.schema.json#/$defs/chunk_revision" }
+        "chunk_revision": { "oneOf": [{ "$ref": "common.schema.json#/$defs/chunk_revision" }, { "type": "null" }] }
       }
     },
     "request": {

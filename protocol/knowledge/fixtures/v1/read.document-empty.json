@@ -1,0 +1,9 @@
+{ "$comment": "R4.4, R5.1 (r9): the document has a build but no servable chunk (e.g. only FAQ chunks), so a document read is 200 with no segments.",
+  "op": "knowledge.read",
+  "request": { "protocol_version": 1, "request_id": "01JB3R7H8J9K0M1N2P3Q4R5S6T", "generation": 15,
+    "scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-9",
+    "page": { "cursor": null } },
+  "response": { "status": 200, "body": { "protocol_version": 1, "request_id": "01JB3R7H8J9K0M1N2P3Q4R5S6T", "generation": 15,
+    "effective_scope": { "knowledge_base_ids": ["kb-c"] }, "knowledge_id": "doc-9",
+    "revision": { "source_revision": "src-9", "index_build_id": "ib-empty" },
+    "segments": [], "truncated": false, "next_cursor": null } } }

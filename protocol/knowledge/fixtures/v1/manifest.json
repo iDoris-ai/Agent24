@@ -4,8 +4,8 @@
   "contract_revision": "r9",
   "protocol_version": 1,
   "fixtures": [
-    { "file": "search.ok.json", "version": 3, "class": "accept", "request_valid": true, "server_handler": true,
-      "sha256": "d6c95123ea1455911a29aa60ef8211b3921828fcbd1afadbc023f673378cb014" },
+    { "file": "search.ok.json", "version": 4, "class": "accept", "request_valid": true, "server_handler": true,
+      "sha256": "85c399ac56a9886a32f615c0bc2a95942a6bdd6ec6704bf16b0f8dcf4a3f5ced" },
     { "file": "search.partial.json", "version": 2, "class": "accept", "request_valid": true, "server_handler": true,
       "sha256": "4db3080cddba3b2f7e9749ff08fd7b9f07602d76e10c2c4905bf44315560a164" },
     { "file": "search.partial-overloaded.json", "version": 2, "class": "accept", "request_valid": true, "server_handler": true,
@@ -26,8 +26,8 @@
       "sha256": "f34e6f3e5c4480f486f2335115a5daf2c77177b54deb5d368a17a6c70dddeddb" },
     { "file": "search.timeout.json", "version": 1, "class": "reject", "request_valid": true, "server_handler": true,
       "sha256": "82931ef2d609299ba764ebb1e9bdd1986f3757cd651b694664e2e54526463a59" },
-    { "file": "read.chunk.json", "version": 2, "class": "accept", "request_valid": true, "server_handler": true,
-      "sha256": "38f785e215573550be74471102e16044243cca60bde72fb7ec80dccee19defe5" },
+    { "file": "read.chunk.json", "version": 3, "class": "accept", "request_valid": true, "server_handler": true,
+      "sha256": "18d0a879e242f026fcdf8e2d7964f678ef6b590438b5425f779eb8bfb79c5752" },
     { "file": "read.document.json", "version": 2, "class": "accept", "request_valid": true, "server_handler": true,
       "sha256": "0e27ee4c363584a802591398ab34e19510ce9dbfe6851863975a682fbc1b8686" },
     { "file": "read.out-of-scope.json", "version": 1, "class": "reject", "request_valid": true, "server_handler": true,
@@ -81,6 +81,10 @@
     { "file": "ready.operation-disabled.json", "version": 1, "class": "accept", "request_valid": true, "server_handler": true,
       "sha256": "1a9b159ab550026c8f2edbe107fbe0c01a722d094feb7e460b44b0876916f3ea" },
     { "file": "capabilities.integration.json", "version": 1, "class": "accept", "request_valid": null, "server_handler": true,
-      "sha256": "ca9bc04409868b53906d603c2c060d0cfe1f65bf96cd1ae2722c5556ae3f344f" }
+      "sha256": "ca9bc04409868b53906d603c2c060d0cfe1f65bf96cd1ae2722c5556ae3f344f" },
+    { "file": "read.stale-chunk-overwritten.json", "version": 1, "class": "reject", "request_valid": true, "server_handler": true,
+      "sha256": "524425ad731abdb52ad56c84d6469f531f8e3a7a6ad3c52a472243b5ac24a9fc" },
+    { "file": "read.document-empty.json", "version": 1, "class": "accept", "request_valid": true, "server_handler": true,
+      "sha256": "035f809b900cb4acb03f2bef2571c1cf7f4605d99c845d847796e38f0ea24a95" }
   ]
 }

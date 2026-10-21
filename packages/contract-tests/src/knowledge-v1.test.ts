@@ -24,7 +24,7 @@ const manifest = JSON.parse(readFileSync(join(fixtureDir, 'manifest.json'), 'utf
 // Pins the whole fixture set (every file digest and version). Changing a fixture
 // means bumping its version, re-pinning its sha256 and updating this constant
 // together with MANIFEST_SHA256 in rust/crates/agent24-protocol/tests/knowledge_fixtures.rs.
-const MANIFEST_SHA256 = '46b9b804c28a4febf9e4a08ad27523eda12b4ffdc1cfa117167b5c69566b644e'
+const MANIFEST_SHA256 = 'cabf69d4a7d8c31a6ca6ca3ed21fb9a1ad96a6d398f2a3e7d26e015d7361f039'
 // Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); same list as the Rust test.
 const REQUIRED = [
   'search.empty-scope.json', 'search.scope-empty-array.json', 'search.partial.json', 'search.partial-overloaded.json',
@@ -281,7 +281,7 @@ describe('knowledge v1 schemas — canonical negatives', () => {
     ok('search.response', { ...partial, completeness: 'complete' }, false)
     ok('search.response', { ...partial, completeness: 'complete', partial_failures: [] }, false)
     const res = clone(load('search.ok.json').response.body)
-    res.hits[2].index_state = 'fresh'
+    res.hits[2].revision.chunk_revision = null
     ok('search.response', res, false)
   })
 
@@ -290,7 +290,7 @@ describe('knowledge v1 schemas — canonical negatives', () => {
     ok('read.request', { ...chunk, expected_revision: { content_tag: 'ct-chk-71' } })
     ok('read.request', { ...chunk, expected_revision: { content_tag: 'ct-chk-71', chunk_revision: 1 } })
     ok('read.request', { ...chunk, expected_revision: { source_revision: 's', index_build_id: 'i', chunk_revision: 1 } }, false)
-    ok('read.request', { ...chunk, expected_revision: { ...chunk.expected_revision, chunk_revision: null } }, false)
+    ok('read.request', { ...chunk, expected_revision: { ...chunk.expected_revision, chunk_revision: null } })
     const doc = load('read.document.json').request
     ok('read.request', { ...doc, expected_revision: { source_revision: 's', index_build_id: 'i' } })
     ok('read.request', { ...doc, expected_revision: { ...doc.expected_revision, content_tag: 'ct-doc' } }, false)

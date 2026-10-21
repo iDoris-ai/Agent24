@@ -16,7 +16,8 @@ pub struct DocRevision {
 }
 
 /// `$defs/chunk_expected_revision` (R4.3, r9): `content_tag` is required and
-/// decides the match; the other parts are informational, never `null` when present.
+/// decides the match; the other parts are informational. `chunk_revision` may be
+/// `null` (a hit's value sent back as is) and then encodes as no key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkExpectedRevision {
@@ -25,7 +26,7 @@ pub struct ChunkExpectedRevision {
     pub source_revision: Option<String>,
     #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
     pub index_build_id: Option<String>,
-    #[serde(default, with = "crate::opt", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_revision: Option<ChunkRevision>,
 }
 
@@ -115,10 +116,10 @@ impl TryFrom<RawReadRequest> for ReadRequest {
                 expected_revision: Some(e),
             },
             (Some(_), Some(RawExpected::Doc(_))) => {
-                return Err("expected_revision: a chunk read needs all three parts");
+                return Err("expected_revision: a chunk read needs content_tag");
             }
             (None, Some(RawExpected::Chunk(_))) => {
-                return Err("expected_revision: a document read carries no chunk_revision");
+                return Err("expected_revision: a document read carries only the document pair");
             }
         };
         Ok(Self {

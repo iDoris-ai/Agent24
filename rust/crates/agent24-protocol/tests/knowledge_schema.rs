@@ -156,7 +156,7 @@ fn schema_negatives_match_the_ts_suite() {
         b["partial_failures"] = json!([]);
     });
     bad("search.response", "search.ok.json", "body", &|b| {
-        b["hits"][2]["index_state"] = json!("fresh")
+        b["hits"][2]["revision"]["chunk_revision"] = Value::Null
     });
     // read: chunk expected_revision needs content_tag; document pair is two parts; page.limit optional.
     good("read.request", "read.chunk.json", "request", &|r| {
@@ -169,7 +169,8 @@ fn schema_negatives_match_the_ts_suite() {
         r["expected_revision"] =
             json!({ "source_revision": "s", "index_build_id": "i", "chunk_revision": 1 });
     });
-    bad("read.request", "read.chunk.json", "request", &|r| {
+    // r9: chunk_revision is informational; a hit's null may be sent back as is.
+    good("read.request", "read.chunk.json", "request", &|r| {
         r["expected_revision"]["chunk_revision"] = Value::Null
     });
     good("read.request", "read.document.json", "request", &|r| {

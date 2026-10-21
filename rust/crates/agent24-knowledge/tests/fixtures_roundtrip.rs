@@ -220,7 +220,7 @@ fn covered_fixtures_roundtrip() {
     println!("covered {} fixtures: {names:#?}", names.len());
     assert_eq!(
         names.len(),
-        38,
+        40,
         "manifest changed; review coverage: {names:#?}"
     );
     assert!(
@@ -543,7 +543,7 @@ fn read_expected_revision_matches_target() {
         ("read.chunk.json", tag, true),
         ("read.chunk.json", tag_rev, true),
         ("read.chunk.json", triple, false),
-        ("read.chunk.json", null_rev, false),
+        ("read.chunk.json", null_rev, true),
         ("read.document.json", pair, true),
         ("read.document.json", pair_tag, false),
     ];
