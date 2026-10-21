@@ -2040,6 +2040,32 @@ mod tests {
         call.abort();
     }
 
+    /// A grant valid for longer than an `Instant` can represent runs the
+    /// call instead of panicking on the deadline.
+    #[tokio::test]
+    async fn a_grant_too_long_for_a_deadline_still_runs_the_call() {
+        let authorization = FeedAuthorization::new(1, false, Some(Duration::MAX));
+        let (registry, runtime, _, _, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
     /// K1-6a-G §4 case 3b: a watcher that fell behind re-reads the grant;
     /// the call stops if it is no longer current, and only then.
     #[tokio::test]

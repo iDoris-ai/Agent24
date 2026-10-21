@@ -650,7 +650,9 @@ impl GrantWatch {
     ) -> Self {
         Self {
             changes,
-            deadline: valid_for.map(|valid_for| looked_up + valid_for),
+            // Too far off to represent: no deadline, the grant is still
+            // re-checked on every change and after the call returns.
+            deadline: valid_for.and_then(|valid_for| looked_up.checked_add(valid_for)),
             recheck: false,
         }
     }
