@@ -14,7 +14,10 @@ pub enum WriteLocation {
 
 pub fn classify_builtin_write(workspace_root: Option<&Path>, raw_path: &str) -> WriteLocation {
     let raw = Path::new(raw_path);
-    if raw.components().any(|part| matches!(part, Component::ParentDir)) {
+    if raw
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
         return WriteLocation::AskWithoutDirectoryGrant;
     }
     let Some(canonical) = canonical_claim(raw) else {
@@ -38,11 +41,7 @@ fn forbidden_workspace_root(root: &Path) -> bool {
         && let Some(home) = canonical_claim(&home)
     {
         let ssh = home.join(".ssh");
-        if root == home
-            || root == ssh
-            || is_within(root, &home)
-            || is_within(root, &ssh)
-        {
+        if root == home || root == ssh || is_within(root, &home) || is_within(root, &ssh) {
             return true;
         }
     }
@@ -60,7 +59,9 @@ fn forbidden_workspace_root(root: &Path) -> bool {
     ];
     SYSTEM.iter().any(|item| {
         let literal = Path::new(item);
-        let canonical = literal.canonicalize().unwrap_or_else(|_| literal.to_path_buf());
+        let canonical = literal
+            .canonicalize()
+            .unwrap_or_else(|_| literal.to_path_buf());
         root == literal || root == canonical
     })
 }
@@ -80,7 +81,10 @@ fn canonical_claim(raw: &Path) -> Option<PathBuf> {
         return None;
     }
     let mut missing = Vec::new();
-    let mut cursor = raw.to_path_buf();
+    // Drop a trailing slash or `.` before lstat. Otherwise `lnk/` follows the
+    // link, ENOENT looks like a missing component, and the link name is glued
+    // back on as if it were a real directory.
+    let mut cursor: PathBuf = raw.components().collect();
     loop {
         if let Ok(found) = cursor.canonicalize() {
             let mut out = found;
@@ -162,6 +166,29 @@ mod tests {
             classify_builtin_write(Some(&root), via_link.to_str().unwrap()),
             WriteLocation::Outside { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_trailing_slash_does_not_hide_a_symlink() {
+        let dir = temp();
+        let allowed = dir.join("allowed");
+        let secret = dir.join("secret");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&secret).unwrap();
+        std::os::unix::fs::symlink("../secret/new", allowed.join("lnk")).unwrap();
+        for raw in [
+            allowed.join("lnk").to_str().unwrap().to_owned() + "/",
+            allowed.join("lnk").to_str().unwrap().to_owned() + "/.",
+        ] {
+            assert!(
+                !matches!(
+                    classify_builtin_write(None, &raw),
+                    WriteLocation::Outside { directory } if directory.ends_with("/allowed")
+                ),
+                "{raw}"
+            );
+        }
     }
 
     #[cfg(unix)]

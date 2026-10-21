@@ -57,8 +57,8 @@ pub const AVAILABLE_DECISIONS: [&str; 4] = ["approve", "approve_for_session", "d
 ///    approval.
 /// 4. Builtin `exec` and `write_local` also get no `approve_for_session`.
 ///    A session-wide tool grant is not an exact target (L-APPR-5 / L-APPR-8).
-///    Path-scoped workspace write grants are a later slice; until they exist,
-///    every such call asks.
+///    An outside `fs_write` may still offer `approve_for_target` for one
+///    canonical directory. A confirmed workspace root is not wired yet.
 pub fn decisions_for(
     risk: RiskClass,
     standing_target: Option<&str>,
