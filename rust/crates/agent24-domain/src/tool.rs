@@ -159,6 +159,29 @@ pub struct RawToolDeclaration {
     /// Untrusted semantic claim only; the host must verify storage and effects.
     #[serde(default)]
     reversible_draft: bool,
+    /// K1-06a-resource-scope §2.3: the root kinds a grant for this tool may
+    /// carry. Absent or empty: grants carry no resources. The outer `Option`
+    /// is whether the key is there at all, so an explicit `null` counts as
+    /// written (and is then refused): an older kernel refuses the key
+    /// whatever its value.
+    #[serde(default, deserialize_with = "present")]
+    resource_kinds: Option<Option<Vec<String>>>,
+}
+
+/// A key that is present, whatever its value, including `null`.
+fn present<'de, D>(deserializer: D) -> Result<Option<Option<Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer).map(Some)
+}
+
+impl RawToolDeclaration {
+    /// Whether the entry carries `resource_kinds` at all, even empty or
+    /// `null`: an older kernel refuses the key whatever its value.
+    pub(crate) fn declares_resource_kinds(&self) -> bool {
+        self.resource_kinds.is_some()
+    }
 }
 
 /// One module-declared tool operation, VALIDATED.
@@ -178,6 +201,7 @@ pub struct ToolDeclaration {
     timeout_ms: u64,
     inline_wait_ms: u64,
     reversible_draft: bool,
+    resource_kinds: Vec<String>,
 }
 
 impl ToolDeclaration {
@@ -222,6 +246,56 @@ impl ToolDeclaration {
     pub fn reversible_draft(&self) -> bool {
         self.reversible_draft
     }
+
+    /// The grantable root kinds, in declaration order; empty when none
+    /// (K1-06a-resource-scope §2.3). Declared, not granted: the host decides
+    /// which ids a grant carries.
+    pub fn resource_kinds(&self) -> &[String] {
+        &self.resource_kinds
+    }
+}
+
+/// `kind` of K1-06a-resource-scope §2.1: `[a-z][a-z0-9_]{0,31}`, ASCII.
+pub fn is_resource_kind(kind: &str) -> bool {
+    let bytes = kind.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// Each kind valid ([`is_resource_kind`]) and none repeated, else the whole
+/// manifest is refused; absent is empty, and an explicit `null` is refused.
+fn validate_resource_kinds(
+    operation: &str,
+    kinds: Option<Option<Vec<String>>>,
+) -> Result<Vec<String>, DomainError> {
+    let list = match kinds {
+        None => return Ok(Vec::new()),
+        Some(None) => {
+            return Err(DomainError::Manifest(format!(
+                "tools.{operation:?}: resource_kinds must be a list, not null"
+            )));
+        }
+        Some(Some(list)) => list,
+    };
+    let mut seen = BTreeSet::new();
+    for k in &list {
+        if !is_resource_kind(k) {
+            return Err(DomainError::Manifest(format!(
+                "tools.{operation:?}: invalid resource kind {k:?} (expected [a-z][a-z0-9_]{{0,31}})"
+            )));
+        }
+        if !seen.insert(k.clone()) {
+            return Err(DomainError::Manifest(format!(
+                "tools.{operation:?}: resource kind {k:?} is declared more than once"
+            )));
+        }
+    }
+    Ok(list)
 }
 
 /// Validate a manifest's declared tools (ADR-K1-01 §2.1, §2.2, §5(2)).
@@ -286,6 +360,7 @@ pub(crate) fn validate_tools(
                 r.operation, r.inline_wait_ms, r.timeout_ms
             )));
         }
+        let resource_kinds = validate_resource_kinds(&r.operation, r.resource_kinds)?;
         out.push(ToolDeclaration {
             operation: r.operation,
             description: r.description,
@@ -295,6 +370,7 @@ pub(crate) fn validate_tools(
             timeout_ms: r.timeout_ms,
             inline_wait_ms: r.inline_wait_ms,
             reversible_draft: r.reversible_draft,
+            resource_kinds,
         });
     }
     Ok(out)
@@ -639,6 +715,7 @@ mod tests {
             timeout_ms: 5_000,
             inline_wait_ms: 1_000,
             reversible_draft: false,
+            resource_kinds: None,
         }
     }
 

@@ -13,6 +13,7 @@
 pub mod consent_gate;
 pub mod guardian;
 pub mod overrides;
+pub mod tool_summary;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

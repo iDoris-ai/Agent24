@@ -1577,18 +1577,15 @@ pub async fn serve(
         let module = registered.module().to_owned();
         let declaration = registered.declaration();
         let operation = declaration.operation().to_owned();
-        let summary = agent24_store::ToolPermissionSummary::new(
-            module.clone(),
-            operation.clone(),
-            catalogue
+        // K1-6a-G §2.1: the same function the grant route uses, so a grant's
+        // fingerprint and this one agree byte for byte.
+        let summary = agent24_policy::tool_summary::module_tool_summary(
+            &module,
+            &catalogue
                 .iter()
                 .find(|entry| entry.name == module)
                 .map_or_else(String::new, |entry| entry.version.clone()),
-            agent24_store::ConsentSource::ManualInstall,
-            Some("invoke one host-registered module tool".to_owned()),
-            None,
-            Some("module operation".to_owned()),
-            agent24_store::HostRiskLevel::High,
+            declaration,
         );
         let request = agent24_policy::consent_gate::ConsentGateRequest {
             module: module.clone(),
