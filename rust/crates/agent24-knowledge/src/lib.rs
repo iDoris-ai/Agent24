@@ -10,14 +10,18 @@
 //! - optional, never null (missing key = `None`, `null` rejected, `None` encodes
 //!   as no key): `#[serde(default, with = "crate::opt", skip_serializing_if = ..)]`.
 
+mod capabilities;
 mod common;
 mod error;
+mod local_cancelled;
 mod read;
 mod ready;
 mod search;
 
+pub use capabilities::*;
 pub use common::*;
 pub use error::*;
+pub use local_cancelled::*;
 pub use read::*;
 pub use ready::*;
 pub use search::*;

@@ -1,7 +1,10 @@
 //! KB-C1-02a / #1052: the wire types round-trip the pinned fixtures in
 //! `protocol/knowledge/fixtures/v1`. Covered here: every `search.*`, `read.*` and `ready.*`
 //! fixture (request and response) and the response of every other `reject`
-//! fixture (error envelope only). The manifest drives the list. Digests are pinned in `agent24-protocol/tests/knowledge_fixtures.rs`.
+//! fixture (error envelope only). The manifest drives the list. The
+//! `integration.agent24_knowledge` object of `capabilities.integration.json` and
+//! the `local` result of `search.cancelled.json` have their own tests below.
+//! Digests are pinned in `agent24-protocol/tests/knowledge_fixtures.rs`.
 //!
 //! "Equal" means semantically equal JSON: object key order is ignored and numbers
 //! compare by value, so a fixture `1` and a re-encoded `f64` `1.0` match, but
@@ -10,8 +13,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent24_knowledge::{
-    ErrorEnvelope, ReadRequest, ReadResponse, ReadyRequest, ReadyResponse, SearchRequest,
-    SearchResponse,
+    CapabilitiesData, ErrorEnvelope, KnowledgeCapabilities, LocalCancelled, ReadRequest,
+    ReadResponse, ReadyRequest, ReadyResponse, SearchRequest, SearchResponse,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -602,5 +605,126 @@ fn ready_operations_shape() {
     assert!(
         decode::<ReadyRequest>(&req).is_err(),
         "null scope was accepted"
+    );
+}
+
+/// Every object path inside `v` must reject an extra key when decoded as `T`
+/// (`deny_unknown_fields` on every closed type). Returns the paths that were
+/// accepted.
+fn unknown_accepted<T: DeserializeOwned>(v: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    object_paths(v, String::new(), &mut paths);
+    let mut accepted = Vec::new();
+    for p in paths {
+        let mut m = v.clone();
+        obj(&mut m, &p).insert("x_unknown".into(), json!(1));
+        if decode::<T>(&m).is_ok() {
+            accepted.push(p);
+        }
+    }
+    accepted
+}
+
+/// §9: `capabilities.integration.json`. The full body decodes as
+/// `CapabilitiesData` (upstream keys pass through); the closed
+/// `integration.agent24_knowledge` object round-trips and rejects unknown keys
+/// at every level.
+#[test]
+fn capabilities_fixture_roundtrip() {
+    let body = load("capabilities.integration.json")["response"]["body"].clone();
+    assert!(decode::<CapabilitiesData>(&body).is_ok());
+    let kc = body["integration"]["agent24_knowledge"].clone();
+    let rt = roundtrip::<KnowledgeCapabilities>(&kc);
+    assert!(rt.is_ok(), "{}", rt.unwrap_err());
+    let accepted = unknown_accepted::<KnowledgeCapabilities>(&kc);
+    assert!(accepted.is_empty(), "{accepted:?}");
+    let mut up = body.clone();
+    obj(&mut up, "").insert("x_upstream".into(), json!(1));
+    assert!(decode::<CapabilitiesData>(&up).is_ok());
+    let mut other = body.clone();
+    obj(&mut other, "/integration").insert("other".into(), json!({}));
+    assert!(decode::<CapabilitiesData>(&other).is_ok());
+    let mut missing = body.clone();
+    obj(&mut missing, "").remove("integration");
+    assert!(decode::<CapabilitiesData>(&missing).is_err());
+}
+
+/// §9 shape: values outside the v1 sets are rejected.
+#[test]
+fn capabilities_bounds() {
+    let kc = load("capabilities.integration.json")["response"]["body"]["integration"]
+        ["agent24_knowledge"]
+        .clone();
+    let cases = [
+        ("", "protocol_versions", json!([]), false),
+        ("", "protocol_versions", json!([0]), false),
+        ("", "mode", json!("direct"), false),
+        ("", "mode", json!("standalone"), true),
+        ("", "supported_operations", json!(["ingest"]), false),
+        ("", "supported_operations", json!([]), true),
+        ("", "server_version", Value::Null, false),
+        ("/limits", "max_results", json!(0), false),
+        ("/limits", "max_snippet_bytes", Value::Null, false),
+    ];
+    for (ptr, key, v, ok) in cases {
+        let mut m = kc.clone();
+        obj(&mut m, ptr).insert(key.into(), v.clone());
+        assert_eq!(
+            decode::<KnowledgeCapabilities>(&m).is_ok(),
+            ok,
+            "{ptr} {key} {v}"
+        );
+    }
+    let mut m = kc;
+    obj(&mut m, "/limits").remove("max_page_limit");
+    assert!(
+        decode::<KnowledgeCapabilities>(&m).is_err(),
+        "/limits max_page_limit removed"
+    );
+}
+
+/// R7.3 / §11.4: the `local.result` of `search.cancelled.json` round-trips as
+/// `LocalCancelled` and rejects unknown keys at every level.
+#[test]
+fn local_cancelled_roundtrip() {
+    let fx = load("search.cancelled.json");
+    let r = fx["local"]["result"].clone();
+    let rt = roundtrip::<LocalCancelled>(&r);
+    assert!(rt.is_ok(), "{}", rt.unwrap_err());
+    let accepted = unknown_accepted::<LocalCancelled>(&r);
+    assert!(accepted.is_empty(), "{accepted:?}");
+    let decoded = decode::<LocalCancelled>(&r).unwrap();
+    assert_eq!(
+        decoded.error.details.current_generation,
+        fx["local"]["current_generation"].as_u64().unwrap()
+    );
+    assert_eq!(
+        decoded.error.details.generation,
+        fx["request"]["generation"].as_u64().unwrap()
+    );
+}
+
+/// `local-cancelled.schema.json`: fixed code and `retryable`, required ids.
+#[test]
+fn local_cancelled_bounds() {
+    let r = load("search.cancelled.json")["local"]["result"].clone();
+    let cases = [
+        ("/error", "code", json!("timeout"), false),
+        ("/error/details", "retryable", json!(true), false),
+        ("/error/details", "request_id", Value::Null, false),
+        ("/error/details", "generation", Value::Null, false),
+        ("/error", "hint", Value::Null, false),
+        ("/error", "hint", json!("retry later"), true),
+    ];
+    for (ptr, key, v, ok) in cases {
+        let mut m = r.clone();
+        obj(&mut m, ptr).insert(key.into(), v.clone());
+        assert_eq!(decode::<LocalCancelled>(&m).is_ok(), ok, "{ptr} {key} {v}");
+    }
+    let mut m = r;
+    obj(&mut m, "/error/details").remove("current_generation");
+    assert!(
+        decode::<LocalCancelled>(&m).is_err(),
+        "/error/details current_generation removed"
     );
 }
