@@ -136,8 +136,7 @@ fn collect(
     let mut dirs = Vec::new();
     while let Some((listed, dir, rel_dir)) = pending.pop() {
         let fd = match listed {
-            // The parent's descriptor is dropped here unless a sibling
-            // still holds it: one descriptor per level, at most.
+            // Frees the parent's descriptor unless a sibling holds it.
             Some((parent, walked)) => {
                 #[cfg(test)]
                 tests::between_listing_and_opening(&dir);
