@@ -50,7 +50,7 @@ Agent24 管理的组件必须由可信 Agent24 发行内嵌独立 client/relay p
 
 tuple 精确绑定 Agent24 build、平台、client binary/lock、relay binary/lock（client-only 明确 null）与配置约束；client/relay 各自升级不意味着任意笛卡尔积可运行。当前 Agent24 build 必须同时授权 candidate/current/previous 的**完整 tuple 和有向转换边**，旧 Agent24 发行曾接受过不够。每次 spawn 均重验 hash，不能绕开 VerifiedBinary 或开生产 override；单一 embedded lock 在 HN4 完成此能力前禁止自动旧 hash 回滚。
 
-下面为可机器解析的**目标兼容 manifest 阻断示例**，不是现有文件格式/有效授权。null、空证据或 unknown 一律拒绝晋升与迁移；`manifest_schema` 只版本化本清单，不给数据杜撰版本。实际 pins 必须为完整 64 位 SHA-256，source/Agent24 commit 为完整 Git SHA；填入真值也须经过评审，不自动变成 trusted。
+下面为可机器解析的**目标兼容 manifest 阻断示例**，不是现有文件格式/有效授权。null、空证据或 unknown 一律拒绝晋升与迁移；`manifest_schema` 只版本化本清单，不给数据杜撰版本。实际 pins 必须为完整 SHA-256：256 位，编码为恰好 64 个十六进制字符。source/Agent24 commit 为完整 Git SHA。填入真值也须经过评审，不自动变成 trusted。
 
 ```json
 {
