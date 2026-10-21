@@ -1,7 +1,7 @@
 {
   "$comment": "Pinned fixture set for docs/knowledge/CONTRACT-READONLY-v1.md. Every file in this directory except this manifest must be listed. sha256 is over the exact file bytes (LF line endings, see .gitattributes); bump version whenever a fixture changes. class: accept = success response, reject = error envelope (partial is accept, §12 #11). request_valid: whether the request matches the v1 request schema (false = the malformed request the error answers; null = no request body; a string request holds a raw body that is not valid JSON). server_handler: false = client-only fixture, kept out of server request-parse / response-encode tests (§12 #18).",
   "contract": "docs/knowledge/CONTRACT-READONLY-v1.md",
-  "contract_revision": "r9",
+  "contract_revision": "r10",
   "protocol_version": 1,
   "fixtures": [
     { "file": "search.ok.json", "version": 4, "class": "accept", "request_valid": true, "server_handler": true,
