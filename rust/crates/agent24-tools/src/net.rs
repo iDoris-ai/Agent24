@@ -13,6 +13,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
+use std::{future::Future, io};
 
 use agent24_protocol::{RiskClass, ToolInfo};
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use crate::{Tool, ToolContext, ToolError, truncate};
+use agent24_domain::{EgressDestination, EgressPurpose};
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
@@ -109,8 +111,35 @@ fn str_arg<'a>(input: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
 
+async fn resolve_domain_with_egress<F, Fut>(
+    ctx: &ToolContext,
+    destination: EgressDestination,
+    resolve: F,
+) -> Result<Vec<SocketAddr>, ToolError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
+{
+    ctx.authorize_egress_if_restricted(EgressPurpose::HttpFetch, destination)
+        .await?;
+    // Kept in the same helper as the resolver so tests can verify that a
+    // denied request never invokes DNS at all.
+    let addrs = resolve()
+        .await
+        .map_err(|e| ToolError::Failed(format!("dns lookup failed: {e}")))?;
+    if addrs.is_empty() {
+        return Err(ToolError::Failed("domain resolved to nothing".into()));
+    }
+    Ok(addrs)
+}
+
 #[async_trait]
 impl Tool for HttpFetchTool {
+    fn requires_outbound_policy(&self) -> bool {
+        // Egress authorization is conditional on this run's source resources.
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         // RiskClass::Read, deliberately — a GET/HEAD changes nothing off the
         // machine, so it is not `External`. What makes it dangerous is
@@ -146,7 +175,7 @@ impl Tool for HttpFetchTool {
 
     async fn call(
         &self,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
@@ -199,16 +228,24 @@ impl Tool for HttpFetchTool {
                 }
             }
             Host::Domain(domain) => {
-                let lookup = tokio::select! {
-                    r = tokio::net::lookup_host((domain.as_str(), port)) => r,
-                    () = cancel.cancelled() => return Err(ToolError::Cancelled),
-                };
-                let addrs: Vec<SocketAddr> = lookup
-                    .map_err(|e| ToolError::Failed(format!("dns lookup failed: {e}")))?
-                    .collect();
-                if addrs.is_empty() {
-                    return Err(ToolError::Failed(format!("{domain} resolved to nothing")));
-                }
+                let destination =
+                    EgressDestination::exact(format!("{}://{}:{}", url.scheme(), host, port));
+                let addrs = resolve_domain_with_egress(ctx, destination, || async {
+                    tokio::select! {
+                        r = tokio::net::lookup_host((domain.as_str(), port)) => {
+                            r.map(Iterator::collect)
+                        },
+                        () = cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+                    }
+                })
+                .await
+                .map_err(|err| {
+                    if cancel.is_cancelled() {
+                        ToolError::Cancelled
+                    } else {
+                        err
+                    }
+                })?;
                 if !self.allow_local
                     && let Some(bad) = addrs.iter().find(|a| !ip_is_public(a.ip()))
                 {
@@ -224,6 +261,13 @@ impl Tool for HttpFetchTool {
         let client = builder
             .build()
             .map_err(|e| ToolError::Failed(format!("http client init: {e}")))?;
+        if !matches!(host, Host::Domain(_)) {
+            ctx.authorize_egress_if_restricted(
+                EgressPurpose::HttpFetch,
+                EgressDestination::exact(format!("{}://{}:{}", url.scheme(), host, port)),
+            )
+            .await?;
+        }
         let response = tokio::select! {
             r = client.request(method, url.clone()).send() => {
                 r.map_err(|e| ToolError::Failed(format!("request failed: {e}")))?
@@ -280,6 +324,25 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use agent24_domain::{EgressDecision, EgressGate, EgressRequest, EgressResource};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct FixtureGrant;
+    #[async_trait]
+    impl EgressGate for FixtureGrant {
+        async fn check(&self, _request: &EgressRequest) -> Result<(), EgressDecision> {
+            Ok(())
+        }
+    }
+
+    struct FixtureDeny;
+    #[async_trait]
+    impl EgressGate for FixtureDeny {
+        async fn check(&self, _request: &EgressRequest) -> Result<(), EgressDecision> {
+            Err(EgressDecision)
+        }
+    }
 
     fn input(url: &str) -> Map<String, Value> {
         let mut m = Map::new();
@@ -288,7 +351,61 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        ToolContext::legacy("run_test", None, None, "tc_test")
+        ToolContext::legacy("run_test", None, None, "tc_test").with_egress_policy(
+            Arc::new(FixtureGrant),
+            vec![
+                EgressResource::cloud_authorized("fixture", "fixture-rev", 1)
+                    .with_authorization_ref("fixture-grant"),
+            ],
+            1,
+        )
+    }
+
+    fn denied_ctx() -> ToolContext {
+        ToolContext::legacy("run_test", None, None, "tc_test").with_egress_policy(
+            Arc::new(FixtureDeny),
+            vec![
+                EgressResource::cloud_authorized("fixture", "fixture-rev", 1)
+                    .with_authorization_ref("fixture-grant"),
+            ],
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn denied_fetch_does_not_invoke_dns_resolver() {
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&lookups);
+        let result = resolve_domain_with_egress(
+            &denied_ctx(),
+            EgressDestination::exact("https://encoded.attacker.invalid:443"),
+            move || async move {
+                resolver_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec!["203.0.113.10:443".parse().unwrap()])
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_fetch_does_not_require_egress_policy_before_dns() {
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&lookups);
+        let result = resolve_domain_with_egress(
+            &ToolContext::legacy("run_test", None, None, "tc_test"),
+            EgressDestination::exact("https://example.invalid:443"),
+            || async move {
+                resolver_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![SocketAddr::from(([93, 184, 216, 34], 443))])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -1708,7 +1708,7 @@ mod handler_tests {
     // ---- J3: LocalOnly negative control / positive control ----
 
     #[tokio::test]
-    async fn local_only_never_reaches_a_remote_provider_and_remote_allowed_does() {
+    async fn remote_provider_stays_closed_without_a_host_egress_policy() {
         let remote = stub("stub-SECRET", Behave::Ok);
         let (d, sink) = deps(router(vec![(remote.clone(), Tier::Remote)]));
         let h = handler(ModelGrant::new(
@@ -1729,8 +1729,8 @@ mod handler_tests {
             0,
             "remote stub must see ZERO requests"
         );
-        // Fields that could change privacy do not exist — proven again here
-        // against the SAME router, so a positive control is on record too.
+        // Caller-controlled fields cannot change privacy, and the host has
+        // not installed an egress policy for this fixture.
         let mut p = ok_params();
         p["_meta"] = json!({"privacy": "any", "tier": "remote"});
         let e = h.call(p).await.unwrap_err();
@@ -1742,20 +1742,17 @@ mod handler_tests {
             ModelAccess::RemoteAllowed,
             d,
         ));
-        let v = h.call(ok_params()).await.unwrap();
-        assert_eq!(
-            (v["tier"].clone(), v["model_id"].clone()),
-            (json!("remote"), json!("stub-actual-7b"))
-        );
-        assert_eq!(remote.calls.load(Ordering::SeqCst), 1);
-        // Three records: the router itself is what refuses LocalOnly (empty
-        // `tier_order`, §2.2) — a call still reaches it and is ticketed, it
-        // just never reaches `remote`. So: Failed, Failed, then Ok.
+        let e = h.call(ok_params()).await.unwrap_err();
+        assert_eq!(e.kind, Some(ErrorKind::Unavailable));
+        assert_eq!(remote.calls.load(Ordering::SeqCst), 0);
+        // The remote grant affects routing eligibility but cannot replace the
+        // live host egress decision at the provider boundary.
         let recs = sink.take();
         assert_eq!(recs.len(), 3);
-        assert!(matches!(recs[0].1, UsageOutcome::Failed));
-        assert!(matches!(recs[1].1, UsageOutcome::Failed));
-        assert!(matches!(recs[2].1, UsageOutcome::Ok { .. }));
+        assert!(
+            recs.iter()
+                .all(|record| matches!(record.1, UsageOutcome::Failed))
+        );
     }
 
     // ---- ME4-desktop-model-ui: one `model.call` WS event per completed call ----

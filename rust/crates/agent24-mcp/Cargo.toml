@@ -8,6 +8,7 @@ description = "Agent24 MCP adapter (M-E/E1 client + E4 server): rmcp-backed, iso
 
 [dependencies]
 agent24-tools = { path = "../agent24-tools" }
+agent24-domain = { path = "../agent24-domain" }
 agent24-protocol = { path = "../agent24-protocol" }
 async-trait = "0.1"
 # E1 = client, E4 = server (stdio via transport-io). rmcp stays confined to this

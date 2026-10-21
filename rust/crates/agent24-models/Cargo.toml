@@ -8,6 +8,7 @@ description = "Agent24 model gateway — minimal ModelProvider trait, OpenAI-com
 
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
+agent24-domain = { path = "../agent24-domain" }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
