@@ -429,6 +429,37 @@ mod tests {
         Store::open_memory().await.unwrap()
     }
 
+    /// K1-6a-G §2.5: in-flight calls hear the store's consent writes only
+    /// once the authorization is given that store.
+    #[tokio::test]
+    async fn consent_changes_come_from_the_store_it_was_given() {
+        use agent24_tools::ModuleToolAuthorization;
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let gate = std::sync::Arc::new(StoreConsentGate::new(store.clone()));
+        let clock = std::sync::Arc::new(|| "2026-10-08T00:00:01Z".to_owned());
+        let unwired = ModuleConsentAuthorization::new(
+            gate.clone(),
+            request_for(&s, RiskClass::Read),
+            clock.clone(),
+        );
+        assert!(unwired.consent_changes().is_none());
+        let wired = ModuleConsentAuthorization::new(gate, request_for(&s, RiskClass::Read), clock)
+            .with_consent_changes(store.clone());
+        let mut changes = wired.consent_changes().expect("wired to the store");
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.try_recv().unwrap(),
+            agent24_store::ModuleConsentChange {
+                module: s.module.clone(),
+                op: Some(s.op.clone()),
+            }
+        );
+    }
+
     /// K1-6a-G §2.5: what remains of a grant, by the authorization's clock;
     /// past or unreadable is nothing.
     #[test]

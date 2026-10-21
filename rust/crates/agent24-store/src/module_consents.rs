@@ -1409,6 +1409,31 @@ mod tests {
         assert!(changes.try_recv().is_err());
     }
 
+    /// The announcement follows the commit: a write the database refuses
+    /// announces nothing, so no listener re-reads a grant that never changed.
+    #[tokio::test]
+    async fn a_write_the_database_refuses_announces_nothing() {
+        let store = store().await;
+        let mut changes = store.subscribe_module_consent_changes();
+        let s = summary("reads one file");
+        for table in ["module_consents", "module_consent_revocations"] {
+            sqlx::query(&format!("DROP TABLE {table}"))
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        let (at, until) = ("2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z");
+        assert!(store.grant_module_consent(&s, at, until).await.is_err());
+        assert!(store.deny_module_consent(&s, at, until).await.is_err());
+        assert!(
+            store
+                .revoke_module_consent(&s.module, None, at)
+                .await
+                .is_err()
+        );
+        assert!(changes.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn module_revocation_covers_each_tool_and_broadcasts_scope() {
         let store = store().await;
