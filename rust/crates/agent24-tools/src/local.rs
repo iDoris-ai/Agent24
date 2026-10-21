@@ -64,6 +64,17 @@ fn str_arg<'a>(input: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
 
+/// Canonical parent of an absolute `fs_write` path. Used only after the gate
+/// has allowed this call. Relative paths and the filesystem root have none.
+pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<PathBuf> {
+    let raw = str_arg(input, "path")?;
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+    path.parent()?.canonicalize().ok()
+}
+
 /// Lexically fold `.` / `..` (no filesystem access). `None` when `..` would
 /// climb above the root — those can never be workspace paths.
 fn lexical_normalize(path: &Path) -> Option<PathBuf> {
@@ -256,6 +267,20 @@ impl Tool for FsWriteTool {
                 .map_err(|e| ToolError::Denied(format!("workspace authority unavailable: {e}")))?;
             return Ok(format!("wrote {written} bytes to {raw}"));
         }
+        if let Err(err) = resolve_in_roots(raw, &self.roots) {
+            let Some(directory) = ctx.approved_outside_directory() else {
+                return Err(err);
+            };
+            let bytes = content.as_bytes().to_vec();
+            let raw_owned = raw.to_owned();
+            let directory = directory.to_path_buf();
+            let written = tokio::task::spawn_blocking(move || {
+                write_approved_outside(&raw_owned, &directory, &bytes)
+            })
+            .await
+            .map_err(|e| ToolError::Failed(format!("write task: {e}")))??;
+            return Ok(format!("wrote {written} bytes to {raw}"));
+        }
         let (root, rel) = resolve_in_roots(raw, &self.roots)?;
         // Beneath-only traversal from the pinned dirfd — parent swaps and
         // symlinks escaping the workspace fail at open, atomically with it.
@@ -277,6 +302,49 @@ impl Tool for FsWriteTool {
         .map_err(|e| ToolError::Failed(format!("write task: {e}")))??;
         Ok(format!("wrote {written} bytes to {raw}"))
     }
+}
+
+fn write_approved_outside(raw: &str, approved: &Path, bytes: &[u8]) -> Result<usize, ToolError> {
+    use std::io::Write as _;
+    let path = Path::new(raw);
+    let parent = path
+        .parent()
+        .ok_or_else(|| ToolError::Denied(format!("path {raw} has no parent directory")))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| ToolError::Invalid(format!("path {raw} has no file name")))?;
+    if name == "." || name == ".." {
+        return Err(ToolError::Denied(format!(
+            "path {raw} is not a file in the approved directory"
+        )));
+    }
+    let parent = parent
+        .canonicalize()
+        .map_err(|err| ToolError::Denied(format!("path {raw} parent is not a directory: {err}")))?;
+    let approved = approved
+        .canonicalize()
+        .map_err(|err| ToolError::Denied(format!("approved directory is unavailable: {err}")))?;
+    if parent != approved {
+        return Err(ToolError::Denied(format!(
+            "path {raw} is outside the approved directory"
+        )));
+    }
+    let dir = cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())
+        .map_err(|err| ToolError::Failed(format!("open approved directory: {err}")))?;
+    if dir
+        .symlink_metadata(name)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(ToolError::Denied(format!("path {raw} is a symlink")));
+    }
+    let mut opts = cap_std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    let mut file = dir
+        .open_with(name, &opts)
+        .map_err(|err| map_fs_err(raw, &err))?;
+    file.write_all(bytes)
+        .map_err(|err| ToolError::Failed(format!("write {raw}: {err}")))?;
+    Ok(bytes.len())
 }
 
 // ── shell_exec ───────────────────────────────────────────────────────────────
@@ -465,6 +533,52 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), Value::String((*v).to_owned())))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn an_approved_outside_directory_can_be_written_and_a_sibling_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let tool = FsWriteTool::new(vec![workspace]);
+        let file = outside.join("a.txt");
+        let denied = tool
+            .call(
+                &ctx(),
+                &sinput(&[("path", file.to_str().unwrap()), ("content", "x")]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, ToolError::Denied(_)), "{denied:?}");
+
+        let approved = ctx().with_approved_outside_directory(outside.canonicalize().unwrap());
+        let out = tool
+            .call(
+                &approved,
+                &sinput(&[("path", file.to_str().unwrap()), ("content", "ok")]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("wrote"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ok");
+
+        let other = sibling.join("b.txt");
+        let wrong = tool
+            .call(
+                &approved,
+                &sinput(&[("path", other.to_str().unwrap()), ("content", "no")]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(wrong, ToolError::Denied(_)), "{wrong:?}");
+        assert!(!other.exists());
     }
 
     #[tokio::test]

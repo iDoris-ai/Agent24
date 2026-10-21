@@ -49,6 +49,7 @@ pub struct ToolContext {
     tool_call_id: String,
     workspace: WorkspaceAuthority,
     confirmed_write_root: Option<std::path::PathBuf>,
+    approved_outside_directory: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -72,6 +73,7 @@ impl ToolContext {
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Legacy,
             confirmed_write_root: None,
+            approved_outside_directory: None,
         }
     }
 
@@ -91,6 +93,7 @@ impl ToolContext {
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Bound(authority),
             confirmed_write_root: None,
+            approved_outside_directory: None,
         }
     }
 
@@ -103,6 +106,17 @@ impl ToolContext {
     #[must_use]
     pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
         self.confirmed_write_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_approved_outside_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.approved_outside_directory = Some(directory);
+        self
+    }
+
+    #[must_use]
+    pub fn approved_outside_directory(&self) -> Option<&std::path::Path> {
+        self.approved_outside_directory.as_deref()
     }
 
     #[must_use]
@@ -149,6 +163,7 @@ impl ToolContext {
             tool_call_id: tool_call_id.into(),
             workspace: self.workspace.clone(),
             confirmed_write_root: self.confirmed_write_root.clone(),
+            approved_outside_directory: self.approved_outside_directory.clone(),
         }
     }
 }
@@ -1419,8 +1434,21 @@ impl ToolRegistry {
             }
         }
 
-        // 4. execute under the tool's budget, cancellable at any point
-        Self::run_budgeted(tool, ctx, input, cancel).await
+        // An Allow for fs_write authorises this call's path. The tool still
+        // refuses to open a parent that does not match this directory.
+        let approved = if name == "fs_write" {
+            crate::local::approved_parent(input)
+        } else {
+            None
+        };
+        let owned;
+        let exec_ctx = if let Some(directory) = approved {
+            owned = ctx.clone().with_approved_outside_directory(directory);
+            &owned
+        } else {
+            ctx
+        };
+        Self::run_budgeted(tool, exec_ctx, input, cancel).await
     }
 
     /// Execute a tool whose approval was ALREADY granted out of band — the
