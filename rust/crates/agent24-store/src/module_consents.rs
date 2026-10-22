@@ -295,14 +295,16 @@ fn canonical_resources(resources: &[String]) -> Result<Vec<String>> {
             "a grant's resource is not a resource".to_owned(),
         ));
     }
-    let mut canonical = resources.to_vec();
-    canonical.sort();
-    canonical.dedup();
-    if canonical.len() > MAX_GRANT_RESOURCES {
+    // The cap counts what was submitted, not the set it reduces to (§2.1,
+    // counterexample 6): 257 elements are refused even if two are equal.
+    if resources.len() > MAX_GRANT_RESOURCES {
         return Err(StoreError::Conflict(format!(
             "a grant carries at most {MAX_GRANT_RESOURCES} resources"
         )));
     }
+    let mut canonical = resources.to_vec();
+    canonical.sort();
+    canonical.dedup();
     Ok(canonical)
 }
 
@@ -729,10 +731,14 @@ impl Store {
         current_scope_fingerprint: &str,
         now: &str,
     ) -> Result<ConsentLookup> {
+        // One read transaction, so the grant and the revocations come from
+        // the same snapshot: a revoke-then-regrant committed between two
+        // separate reads would pair the old grant with the new revocation.
+        let mut tx = self.pool().begin().await?;
         let row = sqlx::query("SELECT * FROM module_consents WHERE module = ? AND op = ?")
             .bind(module)
             .bind(op)
-            .fetch_optional(self.pool())
+            .fetch_optional(&mut *tx)
             .await?;
         let revocations = sqlx::query(
             "SELECT generation FROM module_consent_revocations
@@ -740,10 +746,16 @@ impl Store {
         )
         .bind(module)
         .bind(op)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         let record = row.as_ref().map(row_to_record).transpose()?;
         if let Some(record) = &record {
+            // A row whose `decided_at` does not parse was not written by
+            // `upsert_module_consent`; it fails closed, as `expires_at` does.
+            if parse_instant(&record.decided_at).is_err() {
+                return Ok(ConsentLookup::Revoked(Some(record.clone())));
+            }
             let revoked = revocations
                 .iter()
                 .any(|row| row.get::<i64, _>("generation") >= record.generation);
@@ -1790,26 +1802,97 @@ mod tests {
     /// The cap counts distinct resources: 256 of them pass, and so do 257
     /// entries that repeat one.
     #[tokio::test]
-    async fn the_resource_cap_counts_distinct_resources() {
+    async fn the_resource_cap_counts_submitted_resources() {
         let store = store().await;
         let s = summary("doc body");
-        let mut resources: Vec<String> = (0..MAX_GRANT_RESOURCES)
+        let scope = |resources: Vec<String>| GrantScope {
+            resources,
+            artifact: None,
+        };
+        let full: Vec<String> = (0..MAX_GRANT_RESOURCES)
             .map(|i| format!("doc:{i}"))
             .collect();
-        resources.push("doc:0".to_owned());
         let written = store
             .grant_module_consent_scoped(
                 &s,
-                &GrantScope {
-                    resources,
-                    artifact: None,
-                },
+                &scope(full.clone()),
                 "2026-10-08T00:00:00Z",
                 "2026-11-08T00:00:00Z",
             )
             .await
             .unwrap();
         assert_eq!(written.resources.len(), MAX_GRANT_RESOURCES);
+
+        // Counterexample 6: 257 submitted elements are refused even when one
+        // repeats, and the earlier grant is left as it was.
+        let mut over = full;
+        over.push("doc:0".to_owned());
+        let refused = store
+            .grant_module_consent_scoped(
+                &s,
+                &scope(over),
+                "2026-10-09T00:00:00Z",
+                "2026-11-09T00:00:00Z",
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Conflict(_))),
+            "{refused:?}"
+        );
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-10T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let ConsentLookup::Granted(record) = lookup else {
+            panic!("the earlier grant must stand: {lookup:?}");
+        };
+        assert_eq!(record.generation, written.generation);
+    }
+
+    /// A row whose `decided_at` does not parse was not written by this
+    /// module; with no revocation at all it still fails closed.
+    #[tokio::test]
+    async fn a_garbage_decided_at_never_makes_a_lookup_granted() {
+        let store = store().await;
+        let s = summary("doc body");
+        let fp = s.scope_fingerprint();
+        sqlx::query(
+            "INSERT INTO module_consents
+                (module, op, module_version, scope_fingerprint, source, risk,
+                 readable, writable, external, decision, decided_at, expires_at)
+             VALUES (?, ?, ?, ?, 'first_party', 'low', ?, NULL, NULL, 'granted',
+                     'garbage', '2026-11-08T00:00:00.000Z')",
+        )
+        .bind(&s.module)
+        .bind(&s.op)
+        .bind(&s.module_version)
+        .bind(&fp)
+        .bind(&s.readable)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &fp,
+                "2026-10-08T00:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(lookup, ConsentLookup::Revoked(Some(_))),
+            "{lookup:?}"
+        );
+        assert!(!lookup.is_authorized());
     }
 
     /// A stored set is read back as written (a dispatch validates it), but
