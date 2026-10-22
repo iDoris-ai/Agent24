@@ -90,7 +90,7 @@ export interface GroupReceiveReport {
   plaintext: string
 }
 
-/** Three members. `members[0]` calls `groupchat send`. `receiveNew` records `identity + logical id` after every history read has returned. */
+/** Three members. `members[0]` calls `groupchat send`. `receiveNew` records identity, group id, and logical id after every history read has returned. */
 export class GroupJoint {
   private readonly delivered = new Set<string>()
 
@@ -117,7 +117,7 @@ export class GroupJoint {
     for (const member of read) {
       for (const row of member.rows) {
         if (!row.id) continue
-        const key = `${member.identity}\0${row.id}`
+        const key = `${member.identity}\0${groupId}\0${row.id}`
         if (this.delivered.has(key)) continue
         this.delivered.add(key)
         fresh.push({

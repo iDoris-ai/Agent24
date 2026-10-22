@@ -283,5 +283,91 @@ describe('three-identity group joint', () => {
 
   it('rejects a joint without three identities', () => {
     expect(() => new GroupJoint([])).toThrow(/three identities/)
+    const one = groupMember('alice', async () => '{}')
+    const two = groupMember('bob', async () => '{}')
+    const three = groupMember('carol', async () => '{}')
+    const four = groupMember('dave', async () => '{}')
+    expect(() => new GroupJoint([one, two])).toThrow(/three identities/)
+    expect(() => new GroupJoint([one, two, three, four])).toThrow(/three identities/)
+  })
+
+  it('reports a later message when the sender event id is empty on both', async () => {
+    const firstLogical = '11'.repeat(16)
+    const secondLogical = '22'.repeat(16)
+    const sent: string[] = []
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        if (args[1] === 'send') {
+          const bodyAt = args.indexOf('--body')
+          sent.push(args[bodyAt + 1] ?? '')
+          const logical = sent.length === 1 ? firstLogical : secondLogical
+          return JSON.stringify({
+            ok: true,
+            data: {
+              logical_id: logical,
+              recipients: [
+                { recipient_npub: 'npub1bob', event_id: `${sent.length}b`.padEnd(64, 'b') },
+                { recipient_npub: 'npub1carol', event_id: `${sent.length}c`.padEnd(64, 'c') },
+              ],
+            },
+          })
+        }
+        if (args[1] === 'history') {
+          const messages = sent.map((plaintext, index) => ({
+            id: index === 0 ? firstLogical : secondLogical,
+            event_id: identity === 'alice' ? '' : `${index + 1}${identity === 'bob' ? 'b' : 'c'}`.padEnd(64, identity === 'bob' ? 'b' : 'c'),
+            sender: 'npub1alice',
+            plaintext,
+            created_at: 1_700_000_000 + index,
+          }))
+          return JSON.stringify({ ok: true, data: { messages } })
+        }
+        throw new Error(`unexpected argv ${args.join(' ')}`)
+      }),
+    )
+    const joint = new GroupJoint(members)
+    await joint.send(groupId, 'one')
+    expect(await joint.receiveNew(groupId)).toEqual([
+      { identity: 'alice', logical_id: firstLogical, event_id: undefined, plaintext: 'one' },
+      { identity: 'bob', logical_id: firstLogical, event_id: '1b'.padEnd(64, 'b'), plaintext: 'one' },
+      { identity: 'carol', logical_id: firstLogical, event_id: '1c'.padEnd(64, 'c'), plaintext: 'one' },
+    ])
+    await joint.send(groupId, 'two')
+    expect(await joint.receiveNew(groupId)).toEqual([
+      { identity: 'alice', logical_id: secondLogical, event_id: undefined, plaintext: 'two' },
+      { identity: 'bob', logical_id: secondLogical, event_id: '2b'.padEnd(64, 'b'), plaintext: 'two' },
+      { identity: 'carol', logical_id: secondLogical, event_id: '2c'.padEnd(64, 'c'), plaintext: 'two' },
+    ])
+  })
+
+  it('reports the same logical id from a second group', async () => {
+    const otherGroup = 'aabbccddeeff00112233445566778899'
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        if (args[1] !== 'history') throw new Error(`unexpected argv ${args.join(' ')}`)
+        const asked = args[args.indexOf('--group-id') + 1]
+        return JSON.stringify({
+          ok: true,
+          data: {
+            messages: [
+              {
+                id: logicalId,
+                event_id: identity === 'alice' ? '' : identity === 'bob' ? bobEvent : carolEvent,
+                sender: 'npub1alice',
+                plaintext: asked,
+                created_at: 1_700_000_000,
+              },
+            ],
+          },
+        })
+      }),
+    )
+    const joint = new GroupJoint(members)
+    const first = await joint.receiveNew(groupId)
+    const second = await joint.receiveNew(otherGroup)
+    expect(first.map((row) => row.logical_id)).toEqual([logicalId, logicalId, logicalId])
+    expect(second.map((row) => row.identity)).toEqual(['alice', 'bob', 'carol'])
+    expect(second.map((row) => row.logical_id)).toEqual([logicalId, logicalId, logicalId])
+    expect(second.map((row) => row.plaintext)).toEqual([otherGroup, otherGroup, otherGroup])
   })
 })
