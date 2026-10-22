@@ -291,8 +291,17 @@ pub fn resource_set_digest(resources: &[String]) -> String {
 /// resources and `digest` their [`resource_set_digest`]. Never an ID.
 #[must_use]
 pub fn resource_set_ref(resources: &[String]) -> String {
-    let _ = resources;
-    String::new()
+    let mut distinct: Vec<&String> = resources.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    let n = distinct.len();
+    let digest = resource_set_digest(resources);
+    format!("rs:{n}:{digest}")
+}
+
+fn append_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
 impl ModuleConsentRecord {
@@ -305,7 +314,29 @@ impl ModuleConsentRecord {
     /// replacement a new reference, even one that changes nothing else.
     #[must_use]
     pub fn authorization_ref(&self) -> String {
-        String::new()
+        use sha2::{Digest, Sha256};
+        let mut encoded = Vec::new();
+        append_len_prefixed(&mut encoded, b"ga1");
+        append_len_prefixed(&mut encoded, &self.generation.to_be_bytes());
+        append_len_prefixed(&mut encoded, self.scope_fingerprint.as_bytes());
+        append_len_prefixed(
+            &mut encoded,
+            resource_set_digest(&self.resources).as_bytes(),
+        );
+        let artifact = match &self.artifact {
+            None => vec![0u8],
+            Some(a) => {
+                let mut bytes = Vec::with_capacity(1 + a.len());
+                bytes.push(1u8);
+                bytes.extend_from_slice(a.as_bytes());
+                bytes
+            }
+        };
+        append_len_prefixed(&mut encoded, &artifact);
+        append_len_prefixed(&mut encoded, self.decided_at.as_bytes());
+        append_len_prefixed(&mut encoded, self.expires_at.as_bytes());
+        let hex = hex_encode(&Sha256::digest(&encoded));
+        format!("ga1:{hex}")
     }
 }
 

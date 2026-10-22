@@ -704,8 +704,10 @@ pub struct DenyModuleToolAuthorization;
 /// contract §2.1): at most [`agent24_store::MAX_GRANT_RESOURCES`] elements,
 /// each one [`agent24_store::is_resource_element`].
 fn dispatchable_resources(resources: &[String]) -> bool {
-    let _ = resources;
-    true
+    resources.len() <= agent24_store::MAX_GRANT_RESOURCES
+        && resources
+            .iter()
+            .all(|element| agent24_store::is_resource_element(element))
 }
 
 fn permission_denied() -> ModuleToolCallError {
