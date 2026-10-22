@@ -1566,9 +1566,6 @@ pub async fn serve(
     let module_tool_runtime_dyn: StdArc<dyn agent24_tools::ModuleToolRuntime> =
         module_tool_runtime.clone();
     let module_tool_supervisors = module_tool_runtime.supervisors_slot();
-    let consent_gate = StdArc::new(agent24_policy::consent_gate::StoreConsentGate::new(
-        store.clone(),
-    ));
     let mut module_authorizations: std::collections::HashMap<
         (String, String),
         StdArc<dyn agent24_tools::ModuleToolAuthorization>,
@@ -1600,17 +1597,13 @@ pub async fn serve(
             reversible_draft_declared: false,
             draft_verification: None,
         };
-        let authorization = StdArc::new(
-            agent24_policy::consent_gate::ModuleConsentAuthorization::new(
-                consent_gate.clone(),
-                request,
-                // Milliseconds: a grant's remaining time is measured from
-                // this (K1-6a-G §2.5). No clock reads as no time, expiring
-                // the grant.
-                StdArc::new(|| agent24_core::util::now_iso8601_millis().unwrap_or_default()),
-            )
-            .with_consent_changes(store.clone()),
-        );
+        let authorization = StdArc::new(crate::module_tool_runtime::store_authorization(
+            &store,
+            request,
+            // Milliseconds: a grant's remaining time is measured from this
+            // (K1-6a-G §2.5). No clock reads as no time, expiring the grant.
+            StdArc::new(|| agent24_core::util::now_iso8601_millis().unwrap_or_default()),
+        ));
         module_authorizations.insert((module, operation), authorization);
     }
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(

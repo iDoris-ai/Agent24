@@ -184,6 +184,25 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
     }
 }
 
+/// A module tool's authorization against the consent store (K1-6a-G §2.5):
+/// it checks grants in `store` and hears of every change committed to that
+/// same store, so a revocation reaches a call in flight. The daemon and the
+/// tests both build it here.
+pub(crate) fn store_authorization(
+    store: &agent24_store::Store,
+    request: agent24_policy::consent_gate::ConsentGateRequest,
+    now: Arc<dyn Fn() -> String + Send + Sync>,
+) -> agent24_policy::consent_gate::ModuleConsentAuthorization {
+    agent24_policy::consent_gate::ModuleConsentAuthorization::new(
+        Arc::new(agent24_policy::consent_gate::StoreConsentGate::new(
+            store.clone(),
+        )),
+        request,
+        now,
+    )
+    .with_consent_changes(store.clone())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -465,15 +484,12 @@ mod tests {
             reversible_draft_declared: false,
             draft_verification: None,
         };
-        let gate: Arc<dyn ConsentGate> = Arc::new(StoreConsentGate::new(store.clone()));
-        let default_authorization: Arc<dyn ModuleToolAuthorization> = Arc::new(
-            ModuleConsentAuthorization::new(
-                gate,
+        let default_authorization: Arc<dyn ModuleToolAuthorization> =
+            Arc::new(super::store_authorization(
+                &store,
                 request,
                 Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
-            )
-            .with_consent_changes(store.clone()),
-        );
+            ));
         let authorization = supplied_authorization.unwrap_or(default_authorization);
         let runtime = Arc::new(FakeModule {
             running: AtomicBool::new(running),
