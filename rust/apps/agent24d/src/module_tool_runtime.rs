@@ -184,6 +184,32 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
     }
 }
 
+/// The daemon's clock for consent checks. Milliseconds: a grant's remaining
+/// time is measured from it (K1-6a-G §2.5), and whole seconds would end a
+/// call up to a second late. No clock reads as no time, expiring the grant.
+pub(crate) fn consent_clock() -> String {
+    agent24_core::util::now_iso8601_millis().unwrap_or_default()
+}
+
+/// A module tool's authorization against the consent store (K1-6a-G §2.5):
+/// it checks grants in `store` and hears of every change committed to that
+/// same store, so a revocation reaches a call in flight. The daemon and the
+/// tests both build it here.
+pub(crate) fn store_authorization(
+    store: &agent24_store::Store,
+    request: agent24_policy::consent_gate::ConsentGateRequest,
+    now: Arc<dyn Fn() -> String + Send + Sync>,
+) -> agent24_policy::consent_gate::ModuleConsentAuthorization {
+    agent24_policy::consent_gate::ModuleConsentAuthorization::new(
+        Arc::new(agent24_policy::consent_gate::StoreConsentGate::new(
+            store.clone(),
+        )),
+        request,
+        now,
+    )
+    .with_consent_changes(store.clone())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -228,11 +254,33 @@ mod tests {
         entered: tokio::sync::Notify,
         /// What `TestAdvertView`'s gate 5 reads, per call.
         remote_tier: AtomicBool,
+        /// Notified as `check_available` starts.
+        check_entered: tokio::sync::Notify,
+        /// Run once, synchronously, as `check_available` / `invoke` is
+        /// first polled: whatever they do lands inside that one poll, so
+        /// the wait racing it is not polled again first.
+        on_check: Hook,
+        on_invoke: Hook,
+    }
+
+    type Hook = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
+
+    fn hook(hook: &Hook, run: impl FnOnce() + Send + 'static) {
+        *hook.lock().unwrap() = Some(Box::new(run));
+    }
+
+    fn run_hook(hook: &Hook) {
+        let run = hook.lock().unwrap().take();
+        if let Some(run) = run {
+            run();
+        }
     }
 
     #[async_trait]
     impl ModuleToolRuntime for FakeModule {
         async fn check_available(&self, _: &str, _: &str) -> Result<(), ModuleToolCallError> {
+            self.check_entered.notify_one();
+            run_hook(&self.on_check);
             if self.unresponsive_check.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
@@ -255,6 +303,7 @@ mod tests {
         ) -> Result<ModuleToolResult, ModuleToolCallError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
+            run_hook(&self.on_invoke);
             if self.wait_for_cancel.load(Ordering::SeqCst) {
                 cancel.cancelled().await;
                 return Err(self
@@ -359,6 +408,12 @@ mod tests {
                 Err(ModuleToolCallError::Cancelled)
             }
         }
+
+        // Its second lookup never answers; these tests are about which
+        // lookup a call makes, not the check after a call returns.
+        async fn still_current(&self, _: &str, _: &str, _: &ToolContext, _: &str) -> bool {
+            true
+        }
     }
 
     impl RiskOverrides for RelaxModuleRisk {
@@ -456,10 +511,9 @@ mod tests {
             reversible_draft_declared: false,
             draft_verification: None,
         };
-        let gate: Arc<dyn ConsentGate> = Arc::new(StoreConsentGate::new(store.clone()));
         let default_authorization: Arc<dyn ModuleToolAuthorization> =
-            Arc::new(ModuleConsentAuthorization::new(
-                gate,
+            Arc::new(super::store_authorization(
+                &store,
                 request,
                 Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
             ));
@@ -474,6 +528,9 @@ mod tests {
             unresponsive_check: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
             remote_tier: AtomicBool::new(false),
+            check_entered: tokio::sync::Notify::new(),
+            on_check: Hook::default(),
+            on_invoke: Hook::default(),
         });
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
@@ -1385,6 +1442,9 @@ mod tests {
             unresponsive_check: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
             remote_tier: AtomicBool::new(false),
+            check_entered: tokio::sync::Notify::new(),
+            on_check: Hook::default(),
+            on_invoke: Hook::default(),
         });
         let other: Arc<dyn agent24_domain::tool::ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: other_auth.clone(),
@@ -1443,6 +1503,11 @@ mod tests {
                 }
             }
             async fn has_current_consent(&self, _module: &str, _op: &str) -> bool {
+                true
+            }
+            // Its second lookup never answers; this test counts lookups
+            // made by a call, not the check after a call returns.
+            async fn still_current(&self, _: &str, _: &str, _: &ToolContext, _: &str) -> bool {
                 true
             }
         }
@@ -1762,6 +1827,689 @@ mod tests {
         assert!(!view.blocked_by_remote_tier_guard("documents", "get").await);
     }
 
+    /// A grant whose feed, currency and validity a test drives directly
+    /// (K1-6a-G §2.5): `current` decides every lookup; `one_shot` makes
+    /// every lookup after the first fail, as a revocation the feed never
+    /// announced would.
+    struct FeedAuthorization {
+        feed: tokio::sync::broadcast::Sender<agent24_store::ModuleConsentChange>,
+        current: AtomicBool,
+        one_shot: bool,
+        valid_for: Option<Duration>,
+        lookups: AtomicUsize,
+        /// The first lookup answers, then its grant is revoked and
+        /// announced at once: a change already waiting before dispatch.
+        revoke_on_first: AtomicBool,
+        /// Every later lookup (a re-check) is slow, or never answers.
+        slow_rechecks: AtomicBool,
+        hang_rechecks: AtomicBool,
+        /// The first lookup answers, then a change to this tool is
+        /// announced; the grant stays current.
+        announce_on_first: AtomicBool,
+    }
+
+    impl FeedAuthorization {
+        fn new(capacity: usize, one_shot: bool, valid_for: Option<Duration>) -> Arc<Self> {
+            Arc::new(Self {
+                feed: tokio::sync::broadcast::channel(capacity).0,
+                current: AtomicBool::new(true),
+                one_shot,
+                valid_for,
+                lookups: AtomicUsize::new(0),
+                revoke_on_first: AtomicBool::new(false),
+                slow_rechecks: AtomicBool::new(false),
+                hang_rechecks: AtomicBool::new(false),
+                announce_on_first: AtomicBool::new(false),
+            })
+        }
+
+        fn announce(&self, op: &str) {
+            let _ = self.feed.send(agent24_store::ModuleConsentChange {
+                module: "fake_module".to_owned(),
+                op: Some(op.to_owned()),
+            });
+        }
+    }
+
+    #[async_trait]
+    impl ModuleToolAuthorization for FeedAuthorization {
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ToolContext,
+        ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            let first = self.lookups.fetch_add(1, Ordering::SeqCst) == 0;
+            if !first && self.hang_rechecks.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if !first && self.slow_rechecks.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if !first && self.one_shot {
+                self.current.store(false, Ordering::SeqCst);
+            }
+            if first && self.announce_on_first.load(Ordering::SeqCst) {
+                let granted = self.grant();
+                self.announce("write_local");
+                return granted;
+            }
+            if first && self.revoke_on_first.load(Ordering::SeqCst) {
+                let granted = self.grant();
+                self.current.store(false, Ordering::SeqCst);
+                self.announce("write_local");
+                return granted;
+            }
+            self.grant()
+        }
+
+        fn consent_changes(
+            &self,
+        ) -> Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>> {
+            Some(self.feed.subscribe())
+        }
+    }
+
+    impl FeedAuthorization {
+        fn grant(&self) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            if self.current.load(Ordering::SeqCst) {
+                Ok(agent24_tools::ModuleToolGrantContext {
+                    authorized_resources: vec![],
+                    authorization_ref: "grant:feed".to_owned(),
+                    per_call_approval: false,
+                    valid_for: self.valid_for,
+                })
+            } else {
+                Err(ModuleToolCallError::Module {
+                    code: agent24_domain::tool::ModuleToolErrorCode::PermissionDenied,
+                    retryable: false,
+                    details: None,
+                    unknown_code: None,
+                })
+            }
+        }
+    }
+
+    /// Starts one call that waits inside the module until it is cancelled,
+    /// and returns once the module has it.
+    async fn call_in_module(
+        registry: ToolRegistry,
+        runtime: &Arc<FakeModule>,
+    ) -> tokio::task::JoinHandle<Result<String, ToolError>> {
+        runtime.wait_for_cancel.store(true, Ordering::SeqCst);
+        let entered = runtime.entered.notified();
+        let call = tokio::spawn(async move {
+            registry
+                .dispatch(
+                    "fake_module.write_local",
+                    &context(),
+                    &Map::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+        });
+        entered.await;
+        call
+    }
+
+    async fn stopped_within(call: tokio::task::JoinHandle<Result<String, ToolError>>) -> ToolError {
+        tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("the call stops when its grant ends")
+            .unwrap()
+            .unwrap_err()
+    }
+
+    /// The daemon's consent clock keeps milliseconds (#1134 PR-Daemon M10).
+    #[test]
+    fn the_consent_clock_reads_milliseconds() {
+        let now = super::consent_clock();
+        assert_eq!((now.len(), &now[19..20]), (24, "."), "{now}");
+    }
+
+    /// K1-6a-G §4 case 3: a revocation while the module runs stops the call
+    /// as `result_unknown` (it may have been sent), and the next is refused.
+    #[tokio::test]
+    async fn a_revocation_while_the_module_runs_stops_the_call() {
+        let (registry, runtime, _, store, tool) =
+            fixture_using(RiskClass::Read, true, true, true, None, None).await;
+        let call = call_in_module(registry, &runtime).await;
+        store
+            .revoke_module_consent(
+                "fake_module",
+                Some("write_local"),
+                "2026-10-08T00:00:00.500Z",
+            )
+            .await
+            .unwrap();
+        assert_unknown_module_error(stopped_within(call).await, "result_unknown");
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "result_unknown"
+        );
+        runtime.wait_for_cancel.store(false, Ordering::SeqCst);
+        let refused = tool
+            .call(&context(), &Map::new(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("permission_denied"));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// K1-6a-G §4 case 3: stopped before anything was sent, the call is
+    /// `cancelled` and the model sees `permission_denied`.
+    #[tokio::test]
+    async fn a_revocation_before_dispatch_cancels_without_reaching_the_module() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        runtime.slow_check.store(true, Ordering::SeqCst);
+        let checking = runtime.check_entered.notified();
+        let started = std::time::Instant::now();
+        let call = tokio::spawn(async move {
+            registry
+                .dispatch(
+                    "fake_module.write_local",
+                    &context(),
+                    &Map::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+        });
+        checking.await;
+        store
+            .revoke_module_consent("fake_module", None, "2026-10-08T00:00:00.500Z")
+            .await
+            .unwrap();
+        let error = stopped_within(call).await;
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it did not wait out the check"
+        );
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// K1-6a-G §4 case 3a: a replacing grant, a refusal and a revocation of
+    /// the whole module each end the reference the call started under.
+    #[tokio::test]
+    async fn every_change_that_ends_the_grant_stops_the_call() {
+        for change in ["regrant", "deny", "revoke_module"] {
+            let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+            let call = call_in_module(registry, &runtime).await;
+            match change {
+                "regrant" => {
+                    store
+                        .grant_module_consent(
+                            &summary(),
+                            "2026-10-08T00:00:00.700Z",
+                            "2026-11-08T00:00:00Z",
+                        )
+                        .await
+                        .unwrap();
+                }
+                "deny" => {
+                    store
+                        .deny_module_consent(
+                            &summary(),
+                            "2026-10-08T00:00:00.700Z",
+                            "2026-11-08T00:00:00Z",
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => store
+                    .revoke_module_consent("fake_module", None, "2026-10-08T00:00:00.700Z")
+                    .await
+                    .unwrap(),
+            }
+            assert_unknown_module_error(stopped_within(call).await, "result_unknown");
+        }
+    }
+
+    /// The control: a change to another tool, or one that leaves this
+    /// call's reference current, does not stop it.
+    #[tokio::test]
+    async fn a_change_that_leaves_the_grant_current_does_not_stop_the_call() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        let mut call = call_in_module(registry, &runtime).await;
+        store
+            .revoke_module_consent("fake_module", Some("other_op"), "2026-10-08T00:00:00.500Z")
+            .await
+            .unwrap();
+        store
+            .revoke_module_consent("other_module", None, "2026-10-08T00:00:00.500Z")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut call)
+                .await
+                .is_err(),
+            "a change to another tool stopped the call"
+        );
+        call.abort();
+    }
+
+    /// A grant valid for longer than an `Instant` can represent runs the
+    /// call instead of panicking on the deadline.
+    #[tokio::test]
+    async fn a_grant_too_long_for_a_deadline_still_runs_the_call() {
+        let authorization = FeedAuthorization::new(1, false, Some(Duration::MAX));
+        let (registry, runtime, _, _, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// K1-6a-G §4 case 3b: a watcher that fell behind re-reads the grant;
+    /// the call stops if it is no longer current, and only then.
+    #[tokio::test]
+    async fn a_lagged_watcher_rechecks_and_stops_only_an_ended_grant() {
+        for still_current in [true, false] {
+            let authorization = FeedAuthorization::new(1, false, None);
+            let (registry, runtime, _, _, _tool) = fixture_using(
+                RiskClass::Read,
+                false,
+                true,
+                true,
+                None,
+                Some(authorization.clone()),
+            )
+            .await;
+            let mut call = call_in_module(registry, &runtime).await;
+            // `false` makes the re-check's lookup fail (`Err`): a failed
+            // re-check stops the call like an ended grant (§4 case 3b).
+            authorization.current.store(still_current, Ordering::SeqCst);
+            // Unrelated to this tool, and more than the channel holds.
+            for _ in 0..3 {
+                authorization.announce("other_op");
+            }
+            let stopped = tokio::time::timeout(Duration::from_millis(500), &mut call).await;
+            if still_current {
+                assert!(
+                    stopped.is_err(),
+                    "a lag with a current grant stopped the call"
+                );
+                call.abort();
+            } else {
+                let error = stopped
+                    .expect("the lag re-check stops it")
+                    .unwrap()
+                    .unwrap_err();
+                assert_unknown_module_error(error, "result_unknown");
+            }
+        }
+    }
+
+    /// K1-6a-G §4 case 3 (review C1/G2): a change taken while the module was
+    /// still being checked, its re-check not yet answered, stops the call
+    /// before dispatch; the instant check must not swallow it.
+    #[tokio::test]
+    async fn a_change_taken_before_dispatch_still_stops_the_call() {
+        let authorization = FeedAuthorization::new(8, false, None);
+        authorization.revoke_on_first.store(true, Ordering::SeqCst);
+        authorization.slow_rechecks.store(true, Ordering::SeqCst);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            0,
+            "dispatched after the revocation"
+        );
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// K1-6a-G §4 case 3 (review round 2, G1): a change taken before
+    /// dispatch is settled even when the module turns out unavailable: the
+    /// call ends as a revocation, not as the module's own error.
+    #[tokio::test]
+    async fn a_change_taken_before_dispatch_wins_over_an_unavailable_module() {
+        let authorization = FeedAuthorization::new(8, false, None);
+        authorization.revoke_on_first.store(true, Ordering::SeqCst);
+        authorization.slow_rechecks.store(true, Ordering::SeqCst);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            false,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// K1-6a-G §2.5 (review round 3, C2): a cancellation while dispatch
+    /// waits on a re-check ends the call at once as `cancelled`, nothing
+    /// sent, instead of waiting out the re-check.
+    #[tokio::test]
+    async fn a_cancellation_during_a_recheck_before_dispatch_is_prompt() {
+        let authorization = FeedAuthorization::new(8, false, None);
+        authorization
+            .announce_on_first
+            .store(true, Ordering::SeqCst);
+        authorization.hang_rechecks.store(true, Ordering::SeqCst);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let call = tokio::spawn(async move {
+            registry
+                .dispatch("fake_module.write_local", &context(), &Map::new(), &cancel)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        stop.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("the cancellation is prompt")
+            .unwrap()
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let agent24_tools::ToolError::Failed(message) = error else {
+            panic!("expected a structured module error, got {error}");
+        };
+        let json: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(json["error"]["code"], "cancelled", "{message}");
+        assert_eq!(
+            json["error"]["result_unknown"], false,
+            "nothing was sent: {message}"
+        );
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// K1-6a-G §2.5 (review C3): a re-check that never answers does not hold
+    /// the call past its grant's deadline.
+    #[tokio::test]
+    async fn a_hung_recheck_still_ends_at_the_deadline() {
+        let authorization = FeedAuthorization::new(8, false, Some(Duration::from_millis(300)));
+        authorization.hang_rechecks.store(true, Ordering::SeqCst);
+        let (registry, runtime, _, _, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let call = call_in_module(registry, &runtime).await;
+        authorization.announce("write_local");
+        assert_unknown_module_error(stopped_within(call).await, "result_unknown");
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "held past the deadline until the inline wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// K1-6a-G §2.5 (review C6/G5): nothing the module said, an error
+    /// included, reaches the model under a grant that has ended.
+    #[tokio::test]
+    async fn an_error_under_an_ended_grant_is_not_passed_on() {
+        let authorization = FeedAuthorization::new(8, true, None);
+        let (registry, runtime, _, _, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        *runtime.failure.lock().unwrap() = Some(ModuleToolCallError::Module {
+            code: agent24_domain::tool::ModuleToolErrorCode::ModuleError,
+            retryable: true,
+            details: None,
+            unknown_code: Some("module_says_this".to_owned()),
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("permission_denied"), "{error}");
+        assert!(!error.contains("module_says_this"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// K1-6a-G §4 case 4: expiry in the middle of a call stops it, with no
+    /// event at all.
+    #[tokio::test]
+    async fn a_grant_that_expires_mid_call_stops_it() {
+        let authorization = FeedAuthorization::new(8, false, Some(Duration::from_millis(300)));
+        let (registry, runtime, _, _, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let call = call_in_module(registry, &runtime).await;
+        assert_unknown_module_error(stopped_within(call).await, "result_unknown");
+        assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    /// #1139 PR-Daemon B1: a watcher that fell behind between the wait for
+    /// the module and dispatch re-reads the grant there, and a grant ended
+    /// meanwhile is not dispatched. The lag lands inside the availability
+    /// check's one poll, so only the check right before dispatch sees it.
+    #[tokio::test]
+    async fn a_lag_just_before_dispatch_rechecks_and_stops_an_ended_grant() {
+        let authorization = FeedAuthorization::new(1, false, None);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        hook(&runtime.on_check, move || {
+            // Ended, with its notice among those lost to the lag.
+            authorization.current.store(false, Ordering::SeqCst);
+            for _ in 0..3 {
+                authorization.announce("other_op");
+            }
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0, "dispatched");
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// #1139 PR-Daemon B1: a grant whose deadline passed while the module
+    /// was being checked is not dispatched, with no change announced.
+    #[tokio::test]
+    async fn a_grant_past_its_deadline_at_dispatch_is_not_dispatched() {
+        let authorization = FeedAuthorization::new(8, false, Some(Duration::from_millis(30)));
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        hook(&runtime.on_check, || {
+            std::thread::sleep(Duration::from_millis(80));
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0, "dispatched");
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// #1139 PR-Daemon B1: an answer that comes back after the grant's
+    /// deadline is discarded even though the lookup still says current.
+    #[tokio::test]
+    async fn a_result_after_the_deadline_is_discarded_whatever_the_lookup_says() {
+        let authorization = FeedAuthorization::new(8, false, Some(Duration::from_millis(60)));
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        hook(&runtime.on_invoke, || {
+            std::thread::sleep(Duration::from_millis(120));
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert!(
+            !error.to_string().contains("\"ok\""),
+            "the payload leaked: {error}"
+        );
+        assert!(authorization.current.load(Ordering::SeqCst));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.last().unwrap().detail["terminal"]["result"], "success");
+    }
+
+    /// #1139 PR-Daemon (Low): a pending job carries nothing of the
+    /// module's, so under an ended grant it is still reported as unknown,
+    /// not as refused.
+    #[tokio::test]
+    async fn a_pending_job_under_an_ended_grant_is_still_unknown() {
+        let authorization = FeedAuthorization::new(8, true, None);
+        let (registry, runtime, _, _, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        runtime.pending.store(true, Ordering::SeqCst);
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_unknown_module_error(error, "result_unknown");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
     /// The deadline is the stored grant's own expiry, measured by the
     /// authorization's clock (here 00:00:01 against an expiry at 00:00:03),
     /// not the wall clock.
@@ -1794,6 +2542,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grant.valid_for, Some(Duration::from_secs(2)));
+    }
+
+    /// K1-6a-G §4 case 5: a grant that ended while the module answered —
+    /// with no announcement — keeps the answer from the model; the audit
+    /// keeps what the module did.
+    #[tokio::test]
+    async fn a_result_under_an_ended_grant_is_discarded() {
+        let authorization = FeedAuthorization::new(8, true, None);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert!(
+            !error.to_string().contains("\"ok\""),
+            "the payload leaked: {error}"
+        );
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.last().unwrap().detail["terminal"]["result"], "success");
     }
 
     #[tokio::test]
