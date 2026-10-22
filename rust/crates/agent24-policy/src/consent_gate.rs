@@ -1039,6 +1039,9 @@ mod tests {
             decision: agent24_store::ConsentDecision::Granted,
             decided_at: "2026-10-08T00:00:00.000Z".to_owned(),
             expires_at: "2026-11-08T00:00:00.000Z".to_owned(),
+            resources: Vec::new(),
+            artifact: None,
+            generation: 1,
         };
         assert_eq!(ConsentDenyReason::NotGranted.reason_code(), "not_granted");
         assert_eq!(
