@@ -85,7 +85,7 @@ pub use module_audit_event::{
 pub use module_consents::{
     ConsentDecision, ConsentLookup, ConsentSource, GrantScope, HostRiskLevel, MAX_GRANT_RESOURCES,
     ModuleConsentChange, ModuleConsentRecord, ModuleConsentRevocation, ToolPermissionSummary,
-    consent_instant_millis, is_resource_element, resource_set_digest,
+    consent_instant_millis, is_resource_element, resource_set_digest, resource_set_ref,
 };
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;

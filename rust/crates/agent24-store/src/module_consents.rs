@@ -286,6 +286,60 @@ pub fn resource_set_digest(resources: &[String]) -> String {
     hex_encode(&Sha256::digest(&encoded))
 }
 
+/// What the audit records for a dispatched resource set (K1-6a-G §2.2,
+/// resource contract §2.4): `rs:<n>:<digest>`, `n` the number of distinct
+/// resources and `digest` their [`resource_set_digest`]. Never an ID.
+#[must_use]
+pub fn resource_set_ref(resources: &[String]) -> String {
+    let mut distinct: Vec<&String> = resources.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    let n = distinct.len();
+    let digest = resource_set_digest(resources);
+    format!("rs:{n}:{digest}")
+}
+
+fn append_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+impl ModuleConsentRecord {
+    /// The grant reference (K1-6a-G §2.2): `ga1:` and 64 lowercase hex
+    /// digits, the SHA-256 of, in order, `ga1`, the generation (8 bytes,
+    /// big-endian), the permission fingerprint, the resource set digest,
+    /// the artifact identity (`0` when there is none, else `1` and the
+    /// identity), `decided_at` and `expires_at` — each written as its length
+    /// (u64, big-endian) then its bytes. The generation makes every
+    /// replacement a new reference, even one that changes nothing else.
+    #[must_use]
+    pub fn authorization_ref(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut encoded = Vec::new();
+        append_len_prefixed(&mut encoded, b"ga1");
+        append_len_prefixed(&mut encoded, &self.generation.to_be_bytes());
+        append_len_prefixed(&mut encoded, self.scope_fingerprint.as_bytes());
+        append_len_prefixed(
+            &mut encoded,
+            resource_set_digest(&self.resources).as_bytes(),
+        );
+        let artifact = match &self.artifact {
+            None => vec![0u8],
+            Some(a) => {
+                let mut bytes = Vec::with_capacity(1 + a.len());
+                bytes.push(1u8);
+                bytes.extend_from_slice(a.as_bytes());
+                bytes
+            }
+        };
+        append_len_prefixed(&mut encoded, &artifact);
+        append_len_prefixed(&mut encoded, self.decided_at.as_bytes());
+        append_len_prefixed(&mut encoded, self.expires_at.as_bytes());
+        let hex = hex_encode(&Sha256::digest(&encoded));
+        format!("ga1:{hex}")
+    }
+}
+
 fn canonical_resources(resources: &[String]) -> Result<Vec<String>> {
     if resources
         .iter()
@@ -2132,6 +2186,142 @@ mod tests {
             assert!(record.resources.is_empty(), "{record:?}");
             assert_eq!(record.artifact, None);
         }
+    }
+
+    fn ref_record() -> ModuleConsentRecord {
+        ModuleConsentRecord {
+            module: "documenting".to_owned(),
+            op: "read_doc".to_owned(),
+            module_version: "1.0.0".to_owned(),
+            scope_fingerprint: "fp".to_owned(),
+            source: ConsentSource::FirstParty,
+            risk: HostRiskLevel::Low,
+            readable: None,
+            writable: None,
+            external: None,
+            decision: ConsentDecision::Granted,
+            decided_at: "2026-10-08T00:00:00.000Z".to_owned(),
+            expires_at: "2026-11-08T00:00:00.000Z".to_owned(),
+            resources: vec!["doc:b".to_owned(), "doc:a".to_owned()],
+            artifact: Some("sha256:abc".to_owned()),
+            generation: 7,
+        }
+    }
+
+    /// K1-6a-G §2.2: the reference is `ga1:` and a digest, 68 bytes, an
+    /// audit ref; the golden values were computed independently of this
+    /// code.
+    #[test]
+    fn the_authorization_ref_is_ga1_and_the_digest_of_the_decision() {
+        let record = ref_record();
+        let reference = record.authorization_ref();
+        assert_eq!(
+            reference,
+            "ga1:a2b5a7a344a01c6064abc85d6431fdd54e5992d235a81cb086fdec0904bc53c2"
+        );
+        assert_eq!(reference.len(), 68);
+        assert!(crate::AuthorizationRef::new(reference).is_ok());
+
+        let bare = ModuleConsentRecord {
+            resources: Vec::new(),
+            artifact: None,
+            ..ref_record()
+        };
+        assert_eq!(
+            bare.authorization_ref(),
+            "ga1:194ba100fb90e92a4885d2a0f68497ebf4736fb2867f3374efc9a38e1d6d1633"
+        );
+        // No artifact is not the empty artifact.
+        let empty_artifact = ModuleConsentRecord {
+            artifact: Some(String::new()),
+            ..bare
+        };
+        assert_eq!(
+            empty_artifact.authorization_ref(),
+            "ga1:1c34c3b6fa3b5e5470449828e57c95c1f6ddbd8d43479cd8c0d149ffbe9a8326"
+        );
+    }
+
+    /// Every field the reference covers changes it; the resources count as
+    /// a set; what it does not cover (the summary text) does not.
+    #[test]
+    fn every_part_of_the_decision_changes_the_ref() {
+        let base = ref_record();
+        let changed = [
+            ModuleConsentRecord {
+                generation: 8,
+                ..ref_record()
+            },
+            ModuleConsentRecord {
+                scope_fingerprint: "fq".to_owned(),
+                ..ref_record()
+            },
+            ModuleConsentRecord {
+                resources: vec!["doc:a".to_owned()],
+                ..ref_record()
+            },
+            ModuleConsentRecord {
+                artifact: None,
+                ..ref_record()
+            },
+            ModuleConsentRecord {
+                artifact: Some("sha256:abd".to_owned()),
+                ..ref_record()
+            },
+            ModuleConsentRecord {
+                decided_at: "2026-10-08T00:00:00.001Z".to_owned(),
+                ..ref_record()
+            },
+            ModuleConsentRecord {
+                expires_at: "2026-11-08T00:00:00.001Z".to_owned(),
+                ..ref_record()
+            },
+        ];
+        for record in &changed {
+            assert_ne!(
+                record.authorization_ref(),
+                base.authorization_ref(),
+                "{record:?}"
+            );
+        }
+        let same = ModuleConsentRecord {
+            resources: vec!["doc:a".to_owned(), "doc:b".to_owned(), "doc:a".to_owned()],
+            readable: Some("other text".to_owned()),
+            ..ref_record()
+        };
+        assert_eq!(same.authorization_ref(), base.authorization_ref());
+    }
+
+    /// K1-6a-G §4 case 3a: refusing and granting the same scope again within
+    /// one millisecond still gives a new reference.
+    #[tokio::test]
+    async fn a_replaced_grant_has_a_new_ref_within_the_same_instant() {
+        let store = store().await;
+        let s = summary("doc body");
+        let at = "2026-10-08T00:00:00Z";
+        let until = "2026-11-08T00:00:00Z";
+        let first = store.grant_module_consent(&s, at, until).await.unwrap();
+        store.deny_module_consent(&s, at, until).await.unwrap();
+        let again = store.grant_module_consent(&s, at, until).await.unwrap();
+        assert_eq!(first.decided_at, again.decided_at);
+        assert_ne!(first.authorization_ref(), again.authorization_ref());
+    }
+
+    /// The audit's resource reference is a count and the set's digest.
+    #[test]
+    fn the_resource_ref_is_a_count_and_the_set_digest() {
+        assert_eq!(
+            resource_set_ref(&[]),
+            "rs:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let set = ["doc:b", "doc:a", "doc:b"].map(str::to_owned);
+        let reference = resource_set_ref(&set);
+        assert_eq!(
+            reference,
+            "rs:2:d871e5572f0cf6cfbcc2b5cf608ff1a53d1ab7e3f7813888ecad989874894f65"
+        );
+        assert!(!reference.contains("doc"));
+        assert!(crate::ResourceRef::new(reference).is_ok());
     }
 
     /// PR-Daemon B2: revoking the same tool again takes a new generation, so

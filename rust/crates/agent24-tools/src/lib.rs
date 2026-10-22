@@ -27,8 +27,8 @@ use agent24_domain::{EgressDestination, EgressGate, EgressPurpose, EgressRequest
 use agent24_protocol::{Decision, RiskClass, ToolInfo};
 use agent24_store::{
     ActorRef, AttemptId, AuditTimestamp, AuthorizationRef, DurationMs, ModuleId,
-    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, RunId,
-    SessionRef, Store, ToolCallId,
+    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef,
+    RunId, SessionRef, Store, ToolCallId,
 };
 use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
@@ -700,6 +700,16 @@ impl GrantWatch {
 }
 pub struct DenyModuleToolAuthorization;
 
+/// Whether a grant's resource set may go to the module as it is (resource
+/// contract §2.1): at most [`agent24_store::MAX_GRANT_RESOURCES`] elements,
+/// each one [`agent24_store::is_resource_element`].
+fn dispatchable_resources(resources: &[String]) -> bool {
+    resources.len() <= agent24_store::MAX_GRANT_RESOURCES
+        && resources
+            .iter()
+            .all(|element| agent24_store::is_resource_element(element))
+}
+
 fn permission_denied() -> ModuleToolCallError {
     ModuleToolCallError::Module {
         code: ModuleToolErrorCode::PermissionDenied,
@@ -763,6 +773,7 @@ impl ModuleTool {
         &self,
         ctx: &ToolContext,
         authorization_ref: &str,
+        resource_ref: Option<&str>,
         attempt_id: &AttemptId,
     ) -> Result<ModuleToolAuditRelation, ToolError> {
         Ok(ModuleToolAuditRelation {
@@ -780,7 +791,10 @@ impl ModuleTool {
                 .map_err(|_| audit_unavailable())?,
             authorization_ref: AuthorizationRef::new(authorization_ref)
                 .map_err(|_| audit_unavailable())?,
-            resource_ref: None,
+            resource_ref: resource_ref
+                .map(ResourceRef::new)
+                .transpose()
+                .map_err(|_| audit_unavailable())?,
         })
     }
 
@@ -792,7 +806,7 @@ impl ModuleTool {
         ctx: &ToolContext,
         capability: &ModuleInvocationCapability,
     ) -> Result<(), ToolError> {
-        let relation = self.audit_relation(ctx, REMOTE_TIER_REF, &capability.attempt_id)?;
+        let relation = self.audit_relation(ctx, REMOTE_TIER_REF, None, &capability.attempt_id)?;
         {
             let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
             state.relation = Some(relation.clone());
@@ -921,7 +935,7 @@ impl ModuleTool {
     ) -> Result<(), ToolError> {
         let invocation = ToolInvocation::module(self.owner_token.clone())?;
         let capability = invocation.module.as_ref().ok_or_else(audit_unavailable)?;
-        let relation = self.audit_relation(ctx, authorization_ref, &capability.attempt_id)?;
+        let relation = self.audit_relation(ctx, authorization_ref, None, &capability.attempt_id)?;
         self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
             .await?;
         self.finish_audit(
@@ -1056,6 +1070,12 @@ impl Tool for ModuleTool {
             return Err(ToolError::Failed(module_error_json(permission_denied())));
         };
         match authorized {
+            // A resource set the dispatch would refuse (§4 case 10) shows no
+            // card either.
+            Ok(grant) if !dispatchable_resources(&grant.authorized_resources) => {
+                self.audit_refusal_as(ctx, &grant.authorization_ref).await?;
+                Err(ToolError::Failed(module_error_json(permission_denied())))
+            }
             Ok(grant) => Ok(Some(grant.authorization_ref)),
             Err(error) => {
                 self.audit_refusal_as(ctx, &denied_authorization_ref(&error))
@@ -1200,7 +1220,19 @@ impl Tool for ModuleTool {
             .map_or_else(denied_authorization_ref, |grant| {
                 grant.authorization_ref.clone()
             });
-        let relation = self.audit_relation(ctx, &authorization_ref, &capability.attempt_id)?;
+        // K1-6a-G §2.2: the audit names the dispatched set by count and
+        // digest, never by ID; a set that will not be dispatched has none.
+        let resource_ref = authorized
+            .as_ref()
+            .ok()
+            .filter(|grant| dispatchable_resources(&grant.authorized_resources))
+            .map(|grant| agent24_store::resource_set_ref(&grant.authorized_resources));
+        let relation = self.audit_relation(
+            ctx,
+            &authorization_ref,
+            resource_ref.as_deref(),
+            &capability.attempt_id,
+        )?;
         {
             let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
             state.relation = Some(relation.clone());
@@ -1229,6 +1261,15 @@ impl Tool for ModuleTool {
                 return Err(ToolError::Failed(module_error_json(error)));
             }
         };
+        // K1-6a-G §2.2, §4 case 10: the module gets the recorded set as it is
+        // or the call is refused; a malformed or oversized set is never
+        // trimmed into one that would pass.
+        if !dispatchable_resources(&grant.authorized_resources) {
+            self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         if grant.per_call_approval && !self.risk.requires_approval() {
             self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
                 .await?;
