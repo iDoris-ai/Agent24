@@ -1799,8 +1799,8 @@ mod tests {
         assert_eq!(read, kept);
     }
 
-    /// The cap counts distinct resources: 256 of them pass, and so do 257
-    /// entries that repeat one.
+    /// The cap counts submitted resources: 256 distinct ones pass, but 257
+    /// entries are refused even when one repeats.
     #[tokio::test]
     async fn the_resource_cap_counts_submitted_resources() {
         let store = store().await;
@@ -1893,6 +1893,109 @@ mod tests {
             "{lookup:?}"
         );
         assert!(!lookup.is_authorized());
+    }
+
+    /// The grant row and the revocations are read from one snapshot. The
+    /// reader's only connection runs `after_release` the first time it goes
+    /// back to the pool; there another connection revokes and grants anew.
+    /// Read in two statements, the lookup would pair the old grant with the
+    /// new revocation and answer `Revoked`; in one transaction the
+    /// connection is held until both reads are done, and the answer is the
+    /// grant as it stood.
+    #[tokio::test]
+    async fn a_lookup_reads_the_grant_and_its_revocations_together() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("consents.db"))
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(&writer_pool)
+            .await
+            .unwrap();
+        let writer = crate::test_hooks::from_pool(writer_pool);
+        let s = summary("doc body");
+        let first = store_grant(&writer, &s).await;
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+        let reader_pool = {
+            let (writer, s, fired, done_tx) = (
+                writer.clone(),
+                s.clone(),
+                Arc::clone(&fired),
+                Arc::clone(&done_tx),
+            );
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .min_connections(0)
+                .idle_timeout(None)
+                .max_lifetime(None)
+                .after_release(move |_, _| {
+                    let (writer, s, fired, done_tx) = (
+                        writer.clone(),
+                        s.clone(),
+                        Arc::clone(&fired),
+                        Arc::clone(&done_tx),
+                    );
+                    Box::pin(async move {
+                        if !fired.swap(true, Ordering::SeqCst) {
+                            writer
+                                .revoke_module_consent(
+                                    &s.module,
+                                    Some(&s.op),
+                                    "2026-10-08T01:00:00Z",
+                                )
+                                .await
+                                .unwrap();
+                            store_grant(&writer, &s).await;
+                            if let Some(tx) = done_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        Ok(true)
+                    })
+                })
+                .connect_lazy_with(options)
+        };
+        let reader = crate::test_hooks::from_pool(reader_pool);
+
+        let lookup = reader
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T02:00:00Z",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), done_rx)
+            .await
+            .expect("the writes between the reads ran")
+            .unwrap();
+        let ConsentLookup::Granted(record) = lookup else {
+            panic!("one snapshot must give the grant as it stood: {lookup:?}");
+        };
+        assert_eq!(record.generation, first.generation);
+    }
+
+    async fn store_grant(store: &Store, s: &ToolPermissionSummary) -> ModuleConsentRecord {
+        store
+            .grant_module_consent(s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap()
     }
 
     /// A stored set is read back as written (a dispatch validates it), but
