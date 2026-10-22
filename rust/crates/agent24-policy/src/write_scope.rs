@@ -41,6 +41,12 @@ pub fn classify_builtin_write(workspace_root: Option<&Path>, raw_path: &str) -> 
     }
 }
 
+fn forbidden_against_home(root: &Path, home: &Path) -> bool {
+    let ssh = home.join(".ssh");
+    let ssh = ssh.canonicalize().unwrap_or(ssh);
+    root == home || root == ssh || is_within(root, home) || is_within(root, &ssh)
+}
+
 pub(crate) fn directory_grant_forbidden(directory: &Path) -> bool {
     let directory = directory
         .canonicalize()
@@ -52,8 +58,7 @@ fn forbidden_workspace_root(root: &Path) -> bool {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         && let Some(home) = canonical_claim(&home)
     {
-        let ssh = home.join(".ssh");
-        if root == home || root == ssh || is_within(root, &home) || is_within(root, &ssh) {
+        if forbidden_against_home(root, &home) {
             return true;
         }
     }
@@ -150,6 +155,20 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ssh_directory_is_still_forbidden() {
+        let dir = temp();
+        let home = dir.join("home");
+        let target = dir.join("ssh-target");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(target.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".ssh")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let target = target.canonicalize().unwrap();
+        assert!(forbidden_against_home(&target, &home));
+    }
+
     #[test]
     fn ssh_is_not_a_directory_grant_target() {
         let home = std::env::var("HOME").unwrap();
@@ -168,10 +187,10 @@ mod tests {
     fn home_and_system_roots_are_not_confirmed() {
         let home = std::env::var("HOME").unwrap();
         let file = Path::new(&home).join("notes.txt");
-        assert!(matches!(
+        assert_eq!(
             classify_builtin_write(Some(Path::new(&home)), file.to_str().unwrap()),
-            WriteLocation::Outside { .. }
-        ));
+            WriteLocation::AskWithoutDirectoryGrant
+        );
         assert!(matches!(
             classify_builtin_write(Some(Path::new("/")), "/tmp/a.txt"),
             WriteLocation::Outside { .. }

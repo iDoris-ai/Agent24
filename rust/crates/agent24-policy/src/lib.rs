@@ -1727,6 +1727,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    struct SwapAroundBroker {
+        inner: BrokerGate,
+        link: std::path::PathBuf,
+        safe: std::path::PathBuf,
+        secret: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl ApprovalGate for SwapAroundBroker {
+        async fn check(
+            &self,
+            info: &agent24_protocol::ToolInfo,
+            ctx: &ToolContext,
+            input: &Map<String, Value>,
+            standing_target: Option<&str>,
+            cancel: &CancellationToken,
+        ) -> GateDecision {
+            let _ = std::fs::remove_file(&self.link);
+            std::os::unix::fs::symlink(&self.safe, &self.link).unwrap();
+            let decision = self
+                .inner
+                .check(info, ctx, input, standing_target, cancel)
+                .await;
+            let _ = std::fs::remove_file(&self.link);
+            std::os::unix::fs::symlink(&self.secret, &self.link).unwrap();
+            decision
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_directory_not_the_grant_is_denied_through_the_real_gate() {
+        let dir = std::env::temp_dir().join(format!("a24-wire-{}", std::process::id()));
+        let ws = dir.join("ws");
+        let safe = dir.join("safe");
+        let secret = dir.join("secret");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let (broker, _events, store) = broker_with_timeout(Duration::from_millis(200)).await;
+        seed_run(&store, "run_1").await;
+        store
+            .insert_standing_grant(&agent24_store::StandingGrant {
+                id: "sg_safe".to_owned(),
+                scope_kind: "session".to_owned(),
+                scope_id: "sess_1".to_owned(),
+                tool: "fs_write".to_owned(),
+                target: safe.canonicalize().unwrap().to_str().unwrap().to_owned(),
+                created_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        let gate = SwapAroundBroker {
+            inner: BrokerGate::new(Arc::clone(&broker)),
+            link: link.clone(),
+            safe: safe.clone(),
+            secret: secret.clone(),
+        };
+        let reg = agent24_tools::ToolRegistry::builtin(ws).with_gate(Arc::new(gate));
+        let file = link.join("a.txt");
+        let mut input = Map::new();
+        input.insert(
+            "path".to_owned(),
+            Value::String(file.to_str().unwrap().to_owned()),
+        );
+        input.insert("content".to_owned(), Value::String("no".to_owned()));
+        let err = reg
+            .dispatch(
+                "fs_write",
+                &ToolContext::legacy("run_1", Some("sess_1".to_owned()), None, "tc_1"),
+                &input,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, agent24_tools::ToolError::Denied(_)),
+            "{err:?}"
+        );
+        assert!(!secret.join("a.txt").exists());
+        assert!(!safe.join("a.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_write_inside_the_confirmed_root_does_not_ask() {
         let dir = std::env::temp_dir().join(format!("a24-ws-in-{}", std::process::id()));

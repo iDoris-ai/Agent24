@@ -79,15 +79,15 @@ pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<Arc<crate::P
 pub(crate) fn pin_outside_dir(
     parent: PathBuf,
 ) -> Result<Arc<crate::PinnedOutsideDir>, std::io::Error> {
-    use std::os::unix::fs::MetadataExt as _;
-    let file = std::fs::File::open(&parent)?;
-    let meta = file.metadata()?;
-    let dir = cap_std::fs::Dir::from_std_file(file);
+    // Directory open fails immediately on a FIFO or regular file. `File::open`
+    // would block on a FIFO and stall the caller before any approval exists.
+    let dir = cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())?;
+    let meta = dir.dir_metadata()?;
     Ok(Arc::new(crate::PinnedOutsideDir {
         path: parent,
         dir: Arc::new(dir),
-        dev: meta.dev(),
-        ino: meta.ino(),
+        dev: cap_fs_ext::MetadataExt::dev(&meta),
+        ino: cap_fs_ext::MetadataExt::ino(&meta),
     }))
 }
 

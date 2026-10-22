@@ -1454,7 +1454,10 @@ impl ToolRegistry {
         // Exec-tightened fs_write does not get the exception: Guardian can
         // Allow that class without a human, and the whitelist must still hold.
         let approved_before_gate = if name == "fs_write" && effective == RiskClass::WriteLocal {
-            crate::local::approved_parent(input)
+            let input = input.clone();
+            tokio::task::spawn_blocking(move || crate::local::approved_parent(&input))
+                .await
+                .unwrap_or_default()
         } else {
             None
         };
