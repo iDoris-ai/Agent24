@@ -1600,9 +1600,7 @@ pub async fn serve(
         let authorization = StdArc::new(crate::module_tool_runtime::store_authorization(
             &store,
             request,
-            // Milliseconds: a grant's remaining time is measured from this
-            // (K1-6a-G §2.5). No clock reads as no time, expiring the grant.
-            StdArc::new(|| agent24_core::util::now_iso8601_millis().unwrap_or_default()),
+            StdArc::new(crate::module_tool_runtime::consent_clock),
         ));
         module_authorizations.insert((module, operation), authorization);
     }

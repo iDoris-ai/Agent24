@@ -184,6 +184,13 @@ impl ModuleToolAdvertView for AgentModuleToolAdvertView {
     }
 }
 
+/// The daemon's clock for consent checks. Milliseconds: a grant's remaining
+/// time is measured from it (K1-6a-G §2.5), and whole seconds would end a
+/// call up to a second late. No clock reads as no time, expiring the grant.
+pub(crate) fn consent_clock() -> String {
+    agent24_core::util::now_iso8601_millis().unwrap_or_default()
+}
+
 /// A module tool's authorization against the consent store (K1-6a-G §2.5):
 /// it checks grants in `store` and hears of every change committed to that
 /// same store, so a revocation reaches a call in flight. The daemon and the
@@ -1927,6 +1934,13 @@ mod tests {
             .expect("the call stops when its grant ends")
             .unwrap()
             .unwrap_err()
+    }
+
+    /// The daemon's consent clock keeps milliseconds (#1134 PR-Daemon M10).
+    #[test]
+    fn the_consent_clock_reads_milliseconds() {
+        let now = super::consent_clock();
+        assert_eq!((now.len(), &now[19..20]), (24, "."), "{now}");
     }
 
     /// K1-6a-G §4 case 3: a revocation while the module runs stops the call
