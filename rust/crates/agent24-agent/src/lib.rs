@@ -1432,11 +1432,21 @@ impl RunManager {
                 // off (assess_restore already proved it equals the thread's
                 // rebuilt input), so using it directly makes "run A, not B"
                 // structural rather than a re-parse we must trust.
-                match self
+                let outcome = match self
                     .tools
                     .execute_preapproved(&call.name, &ctx, &approval.payload, cancel)
                     .await
                 {
+                    // The approval names no grant (K1-6a-G §2.3): ask again,
+                    // with the run shown as awaiting that answer, as a fresh
+                    // call would be.
+                    Err(ToolError::ApprovalStale) => {
+                        self.reask_parked_call(&run.id, call, &ctx, &approval.payload, cancel)
+                            .await
+                    }
+                    outcome => outcome,
+                };
+                match outcome {
                     Ok(out) => Ok(out),
                     // The whole-run abort choice is honoured even on resume.
                     Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled) => {
@@ -1452,6 +1462,35 @@ impl RunManager {
             // "abort" or anything unexpected → cancel the run (fail-closed).
             _ => Err(ParkedCallStop::CancelRun),
         }
+    }
+
+    async fn reask_parked_call(
+        &self,
+        run_id: &str,
+        call: &ToolCallRequest,
+        ctx: &ToolContext,
+        input: &serde_json::Map<String, serde_json::Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        if let Err(err) = self
+            .store
+            .transition_run(run_id, RunStatus::AwaitingApproval, RunPatch::default())
+            .await
+        {
+            tracing::error!("run {run_id}: awaiting_approval transition failed: {err}");
+        }
+        let outcome = self.tools.dispatch(&call.name, ctx, input, cancel).await;
+        if !matches!(
+            outcome,
+            Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled)
+        ) && let Err(err) = self
+            .store
+            .transition_run(run_id, RunStatus::Running, RunPatch::default())
+            .await
+        {
+            tracing::error!("run {run_id}: back-to-running transition failed: {err}");
+        }
+        outcome
     }
 
     async fn execute(&self, run_id: String, cancel: CancellationToken) {
@@ -4774,6 +4813,13 @@ mod approval_tests {
     /// resume answers from the last tool result, so the run finishes as soon as
     /// the parked call has been settled and executed.
     async fn resume_harness(workdir: std::path::PathBuf) -> Harness {
+        resume_harness_with(workdir, None).await
+    }
+
+    async fn resume_harness_with(
+        workdir: std::path::PathBuf,
+        extra: Option<Arc<dyn agent24_tools::Tool>>,
+    ) -> Harness {
         let store = Store::open_memory().await.unwrap();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = Arc::clone(&events);
@@ -4784,9 +4830,12 @@ mod approval_tests {
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
         let (egress_gate, _resources, generation) = fixture_egress_policy();
-        let tools = ToolRegistry::builtin(workdir)
+        let mut tools = ToolRegistry::builtin(workdir)
             .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
             .with_egress_gate(Arc::clone(&egress_gate));
+        if let Some(tool) = extra {
+            tools.register_module_tool(tool).unwrap();
+        }
         struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
         impl EventSink for FnSink {
             fn emit(&self, body: EventBody) {
@@ -4916,6 +4965,141 @@ mod approval_tests {
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
             "no tool result was recorded for the resumed call"
         );
+    }
+
+    /// Says its approval names no grant the first time, as a module tool
+    /// resumed after a restart does (K1-6a-G §2.3), then runs.
+    struct StaleOnceTool {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl agent24_tools::Tool for StaleOnceTool {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new(
+                "doc.write",
+                "module",
+                "writes a document",
+                RiskClass::WriteLocal,
+            )
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(ToolError::ApprovalStale)
+            } else {
+                Ok("rewritten".to_owned())
+            }
+        }
+    }
+
+    /// A resumed approval that names no grant is asked again, with the run
+    /// shown (and restorable) as awaiting that answer; then the call runs.
+    #[tokio::test]
+    async fn a_resumed_approval_naming_no_grant_is_asked_again_while_awaiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = Arc::new(StaleOnceTool {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let h = resume_harness_with(dir.path().to_path_buf(), Some(tool.clone())).await;
+        let run = Run {
+            id: "run_1".to_owned(),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::AwaitingApproval,
+            input: RunInput {
+                prompt: "write it".to_owned(),
+                workspace_id: None,
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now_iso8601(),
+            started_at: Some(now_iso8601()),
+            ended_at: None,
+        };
+        h.store.insert_run(&run).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("write it"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+        h.store
+            .tag_run_source("run_1", 0, &source, &now_iso8601())
+            .await
+            .unwrap();
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "doc.write", "arguments": "{}" }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = Approval {
+            id: "apr_1".to_owned(),
+            run_id: "run_1".to_owned(),
+            tool_call_id: "tc_internal_1".to_owned(),
+            kind: "module".to_owned(),
+            summary: "doc.write".to_owned(),
+            payload: serde_json::Map::new(),
+            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
+            standing_target: None,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
+            created_at: now_iso8601(),
+            decided_at: None,
+        };
+        h.store.insert_approval(&approval).await.unwrap();
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+
+        let asked_again = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pending = h
+                    .store
+                    .list_approvals(Some(ApprovalStatus::Pending))
+                    .await
+                    .unwrap();
+                if let Some(again) = pending.into_iter().find(|a| a.id != "apr_1") {
+                    return again;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the resumed call is asked about again");
+        let waiting = h.store.get_run("run_1").await.unwrap().unwrap();
+        assert_eq!(waiting.status, RunStatus::AwaitingApproval);
+        h.broker
+            .resolve(&asked_again.id, decision("approve", None))
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(tool.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(done.output.unwrap().text.contains("rewritten"));
     }
 
     #[tokio::test]
