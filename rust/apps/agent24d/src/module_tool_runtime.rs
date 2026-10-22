@@ -256,12 +256,31 @@ mod tests {
         remote_tier: AtomicBool,
         /// Notified as `check_available` starts.
         check_entered: tokio::sync::Notify,
+        /// Run once, synchronously, as `check_available` / `invoke` is
+        /// first polled: whatever they do lands inside that one poll, so
+        /// the wait racing it is not polled again first.
+        on_check: Hook,
+        on_invoke: Hook,
+    }
+
+    type Hook = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
+
+    fn hook(hook: &Hook, run: impl FnOnce() + Send + 'static) {
+        *hook.lock().unwrap() = Some(Box::new(run));
+    }
+
+    fn run_hook(hook: &Hook) {
+        let run = hook.lock().unwrap().take();
+        if let Some(run) = run {
+            run();
+        }
     }
 
     #[async_trait]
     impl ModuleToolRuntime for FakeModule {
         async fn check_available(&self, _: &str, _: &str) -> Result<(), ModuleToolCallError> {
             self.check_entered.notify_one();
+            run_hook(&self.on_check);
             if self.unresponsive_check.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
@@ -284,6 +303,7 @@ mod tests {
         ) -> Result<ModuleToolResult, ModuleToolCallError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
+            run_hook(&self.on_invoke);
             if self.wait_for_cancel.load(Ordering::SeqCst) {
                 cancel.cancelled().await;
                 return Err(self
@@ -509,6 +529,8 @@ mod tests {
             entered: tokio::sync::Notify::new(),
             remote_tier: AtomicBool::new(false),
             check_entered: tokio::sync::Notify::new(),
+            on_check: Hook::default(),
+            on_invoke: Hook::default(),
         });
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
@@ -1421,6 +1443,8 @@ mod tests {
             entered: tokio::sync::Notify::new(),
             remote_tier: AtomicBool::new(false),
             check_entered: tokio::sync::Notify::new(),
+            on_check: Hook::default(),
+            on_invoke: Hook::default(),
         });
         let other: Arc<dyn agent24_domain::tool::ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: other_auth.clone(),
@@ -2342,6 +2366,148 @@ mod tests {
         let call = call_in_module(registry, &runtime).await;
         assert_unknown_module_error(stopped_within(call).await, "result_unknown");
         assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    /// #1139 PR-Daemon B1: a watcher that fell behind between the wait for
+    /// the module and dispatch re-reads the grant there, and a grant ended
+    /// meanwhile is not dispatched. The lag lands inside the availability
+    /// check's one poll, so only the check right before dispatch sees it.
+    #[tokio::test]
+    async fn a_lag_just_before_dispatch_rechecks_and_stops_an_ended_grant() {
+        let authorization = FeedAuthorization::new(1, false, None);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        hook(&runtime.on_check, move || {
+            // Ended, with its notice among those lost to the lag.
+            authorization.current.store(false, Ordering::SeqCst);
+            for _ in 0..3 {
+                authorization.announce("other_op");
+            }
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0, "dispatched");
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// #1139 PR-Daemon B1: a grant whose deadline passed while the module
+    /// was being checked is not dispatched, with no change announced.
+    #[tokio::test]
+    async fn a_grant_past_its_deadline_at_dispatch_is_not_dispatched() {
+        let authorization = FeedAuthorization::new(8, false, Some(Duration::from_millis(30)));
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        hook(&runtime.on_check, || {
+            std::thread::sleep(Duration::from_millis(80));
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0, "dispatched");
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// #1139 PR-Daemon B1: an answer that comes back after the grant's
+    /// deadline is discarded even though the lookup still says current.
+    #[tokio::test]
+    async fn a_result_after_the_deadline_is_discarded_whatever_the_lookup_says() {
+        let authorization = FeedAuthorization::new(8, false, Some(Duration::from_millis(60)));
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        hook(&runtime.on_invoke, || {
+            std::thread::sleep(Duration::from_millis(120));
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert!(
+            !error.to_string().contains("\"ok\""),
+            "the payload leaked: {error}"
+        );
+        assert!(authorization.current.load(Ordering::SeqCst));
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.last().unwrap().detail["terminal"]["result"], "success");
+    }
+
+    /// #1139 PR-Daemon (Low): a pending job carries nothing of the
+    /// module's, so under an ended grant it is still reported as unknown,
+    /// not as refused.
+    #[tokio::test]
+    async fn a_pending_job_under_an_ended_grant_is_still_unknown() {
+        let authorization = FeedAuthorization::new(8, true, None);
+        let (registry, runtime, _, _, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        runtime.pending.store(true, Ordering::SeqCst);
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_unknown_module_error(error, "result_unknown");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
     }
 
     /// The deadline is the stored grant's own expiry, measured by the
