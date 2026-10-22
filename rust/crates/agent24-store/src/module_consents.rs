@@ -245,8 +245,27 @@ pub struct GrantScope {
 /// `[a-z][a-z0-9_]{0,31}` and `id` matching `[A-Za-z0-9_-]{1,128}`.
 #[must_use]
 pub fn is_resource_element(element: &str) -> bool {
-    let _ = element;
-    true
+    let Some((kind, id)) = element.split_once(':') else {
+        return false;
+    };
+    let kind = kind.as_bytes();
+    let Some((first, rest)) = kind.split_first() else {
+        return false;
+    };
+    if kind.len() > 32
+        || !first.is_ascii_lowercase()
+        || !rest
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return false;
+    }
+    let id = id.as_bytes();
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
 }
 
 /// The digest of a resource set (K1-6a-G §2.2), as 64 lowercase hex
@@ -255,8 +274,36 @@ pub fn is_resource_element(element: &str) -> bool {
 /// not change it; no two sets share an encoding.
 #[must_use]
 pub fn resource_set_digest(resources: &[String]) -> String {
-    let _ = resources;
-    String::new()
+    use sha2::{Digest, Sha256};
+    let mut distinct: Vec<&String> = resources.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    let mut encoded = Vec::new();
+    for element in distinct {
+        encoded.extend_from_slice(&(element.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(element.as_bytes());
+    }
+    hex_encode(&Sha256::digest(&encoded))
+}
+
+fn canonical_resources(resources: &[String]) -> Result<Vec<String>> {
+    if resources
+        .iter()
+        .any(|element| !is_resource_element(element))
+    {
+        return Err(StoreError::Conflict(
+            "a grant's resource is not a resource".to_owned(),
+        ));
+    }
+    let mut canonical = resources.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    if canonical.len() > MAX_GRANT_RESOURCES {
+        return Err(StoreError::Conflict(format!(
+            "a grant carries at most {MAX_GRANT_RESOURCES} resources"
+        )));
+    }
+    Ok(canonical)
 }
 
 /// A grant, refusal or revocation for `(module, op)` was committed; `op:
@@ -418,6 +465,11 @@ pub fn consent_instant_millis(s: &str) -> Option<i64> {
 }
 
 fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
+    let resources = match row.get::<Option<String>, _>("resources") {
+        None => Vec::new(),
+        Some(text) => serde_json::from_str::<Vec<String>>(&text)
+            .map_err(|_| StoreError::Conflict("a stored resource set is malformed".to_owned()))?,
+    };
     Ok(ModuleConsentRecord {
         module: row.get("module"),
         op: row.get("op"),
@@ -431,9 +483,9 @@ fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
         decision: parse_decision(&row.get::<String, _>("decision"))?,
         decided_at: row.get("decided_at"),
         expires_at: row.get("expires_at"),
-        resources: Vec::new(),
-        artifact: None,
-        generation: 0,
+        resources,
+        artifact: row.get("artifact"),
+        generation: row.get("generation"),
     })
 }
 
@@ -484,16 +536,26 @@ impl Store {
     ) -> Result<()> {
         let (_, revoked_at) = parse_instant(now)?;
         let key = op.unwrap_or("*");
+        let mut tx = self.pool().begin().await?;
+        let generation: i64 = sqlx::query_scalar(
+            "INSERT INTO module_consent_generations DEFAULT VALUES RETURNING generation",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
-            "INSERT INTO module_consent_revocations (module, op, revoked_at)
-             VALUES (?, ?, ?)
-             ON CONFLICT (module, op) DO UPDATE SET revoked_at = excluded.revoked_at",
+            "INSERT INTO module_consent_revocations (module, op, revoked_at, generation)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (module, op) DO UPDATE SET
+                revoked_at = excluded.revoked_at,
+                generation = excluded.generation",
         )
         .bind(module)
         .bind(key)
         .bind(&revoked_at)
-        .execute(self.pool())
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         let _ = self
             .module_consent_revocations
             .send(ModuleConsentRevocation {
@@ -535,13 +597,26 @@ impl Store {
         // in the one form `lookup_module_consent` can trust.
         let (_, decided_at) = parse_instant(decided_at)?;
         let (_, expires_at) = parse_instant(expires_at)?;
-        let _ = scope;
+        let canonical = canonical_resources(&scope.resources)?;
         let scope_fingerprint = summary.scope_fingerprint();
+        #[allow(
+            clippy::expect_used,
+            reason = "a Vec<String> always serializes to a JSON array of strings"
+        )]
+        let resources =
+            serde_json::to_string(&canonical).expect("a resource set always serializes");
+        let mut tx = self.pool().begin().await?;
+        let generation: i64 = sqlx::query_scalar(
+            "INSERT INTO module_consent_generations DEFAULT VALUES RETURNING generation",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         let row = sqlx::query(
             "INSERT INTO module_consents
                 (module, op, module_version, scope_fingerprint, source, risk,
-                 readable, writable, external, decision, decided_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 readable, writable, external, decision, decided_at, expires_at,
+                 resources, artifact, generation)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (module, op) DO UPDATE SET
                 module_version = excluded.module_version,
                 scope_fingerprint = excluded.scope_fingerprint,
@@ -552,7 +627,10 @@ impl Store {
                 external = excluded.external,
                 decision = excluded.decision,
                 decided_at = excluded.decided_at,
-                expires_at = excluded.expires_at
+                expires_at = excluded.expires_at,
+                resources = excluded.resources,
+                artifact = excluded.artifact,
+                generation = excluded.generation
              RETURNING *",
         )
         .bind(&summary.module)
@@ -567,8 +645,12 @@ impl Store {
         .bind(decision_str(decision))
         .bind(decided_at)
         .bind(expires_at)
-        .fetch_one(self.pool())
+        .bind(&resources)
+        .bind(&scope.artifact)
+        .bind(generation)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         let record = row_to_record(&row)?;
         self.announce_module_consent_change(&summary.module, Some(&summary.op));
         Ok(record)
@@ -653,7 +735,7 @@ impl Store {
             .fetch_optional(self.pool())
             .await?;
         let revocations = sqlx::query(
-            "SELECT revoked_at FROM module_consent_revocations
+            "SELECT generation FROM module_consent_revocations
              WHERE module = ? AND op IN (?, '*')",
         )
         .bind(module)
@@ -662,20 +744,15 @@ impl Store {
         .await?;
         let record = row.as_ref().map(row_to_record).transpose()?;
         if let Some(record) = &record {
-            let consented_at = match parse_instant(&record.decided_at) {
-                Ok((at, _)) => at,
-                Err(_) => return Ok(ConsentLookup::Revoked(Some(record.clone()))),
-            };
-            let revoked = revocations.iter().any(|row| {
-                parse_instant(&row.get::<String, _>("revoked_at"))
-                    .map_or(true, |(at, _)| at >= consented_at)
-            });
+            let revoked = revocations
+                .iter()
+                .any(|row| row.get::<i64, _>("generation") >= record.generation);
             if revoked {
                 return Ok(ConsentLookup::Revoked(Some(record.clone())));
             }
         } else if !revocations.is_empty() {
             // Revoking before a consent exists remains observable and
-            // fail-closed; a later consent row supersedes it by timestamp.
+            // fail-closed; a later consent row supersedes it by generation.
             return Ok(ConsentLookup::Revoked(None));
         }
         let Some(record) = record else {
