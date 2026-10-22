@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { NostrBridge } from './bridge.js'
+import { GroupJoint, groupMember, NostrBridge } from './bridge.js'
 import { SpeakerClient } from './speaker.js'
 import { FakeSpeaker } from './testing/fake-speaker.js'
 import { loadAgent24Profile, toAgentSpeakerProfile } from './profile.js'
@@ -138,5 +138,111 @@ describe('NostrBridge outbound (real bridge + SpeakerClient vs fake agent-speake
     expect(call.args).toEqual(expect.arrayContaining(['--capability', '触达纺织业客户群', '--json']))
     expect(hits).toHaveLength(1)
     expect(hits[0]!.npub).toBe('npub1bob')
+  })
+})
+
+describe('three-identity group joint', () => {
+  const groupId = '00112233445566778899aabbccddeeff'
+  const eventId = 'ab'.repeat(32)
+  const logicalId = 'ff'.repeat(16)
+  const body = 'fixture group hello'
+
+  function localFixture() {
+    const calls: { identity: string; args: string[] }[] = []
+    let stored: string | undefined
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        calls.push({ identity, args })
+        if (args[0] === 'groupchat' && args[1] === 'send') {
+          const bodyAt = args.indexOf('--body')
+          stored = args[bodyAt + 1]
+          return JSON.stringify({
+            ok: true,
+            data: {
+              logical_id: logicalId,
+              recipients: [
+                { recipient_npub: 'npub1bob', event_id: eventId },
+                { recipient_npub: 'npub1carol', event_id: eventId },
+              ],
+            },
+          })
+        }
+        if (args[0] === 'groupchat' && args[1] === 'history') {
+          if (!stored) return JSON.stringify({ ok: true, data: { messages: [] } })
+          return JSON.stringify({
+            ok: true,
+            data: {
+              messages: [
+                {
+                  id: logicalId,
+                  event_id: eventId,
+                  sender: 'npub1alice',
+                  plaintext: stored,
+                  created_at: 1_700_000_000,
+                },
+              ],
+            },
+          })
+        }
+        throw new Error(`unexpected argv ${args.join(' ')}`)
+      }),
+    )
+    return { calls, members }
+  }
+
+  it('sends through groupchat send and each identity reports that event id on the first read', async () => {
+    const { calls, members } = localFixture()
+    const joint = new GroupJoint(members)
+    const sent = await joint.send(groupId, body)
+    const first = await joint.receiveNew(groupId)
+    const second = await joint.receiveNew(groupId)
+
+    expect(sent.logical_id).toBe(logicalId)
+    expect(sent.event_id).toBe(eventId)
+    expect(first.map((row) => row.identity)).toEqual(['alice', 'bob', 'carol'])
+    expect(first.map((row) => row.event_id)).toEqual([eventId, eventId, eventId])
+    expect(first.map((row) => row.plaintext)).toEqual([body, body, body])
+    expect(second).toEqual([])
+
+    const sends = calls.filter((call) => call.args[1] === 'send')
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.identity).toBe('alice')
+    expect(sends[0]?.args).toEqual([
+      'groupchat',
+      'send',
+      '--group-id',
+      groupId,
+      '--body',
+      body,
+      '--identity',
+      'alice',
+      '--json',
+    ])
+    const history = calls.filter((call) => call.args[1] === 'history')
+    expect(history.map((call) => call.identity)).toEqual([
+      'alice',
+      'bob',
+      'carol',
+      'alice',
+      'bob',
+      'carol',
+    ])
+    for (const call of calls) {
+      expect(call.args.join(' ')).not.toContain('wss://')
+      expect(call.args.join(' ')).not.toContain('ws://')
+      expect(call.args.join(' ')).not.toContain('relay.aastar')
+    }
+  })
+
+  it('fails the send when hyphae returns a non-zero envelope', async () => {
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async () => JSON.stringify({ ok: false, message: 'group is not active' })),
+    )
+    const joint = new GroupJoint(members)
+    await expect(joint.send(groupId, body)).rejects.toThrow(/group is not active/)
+  })
+
+  it('rejects a joint without three identities', () => {
+    expect(() => new GroupJoint([])).toThrow(/three identities/)
   })
 })

@@ -137,3 +137,28 @@ describe('group history', () => {
     )
   })
 })
+
+describe('group send', () => {
+  it('rejects a call with no identity', async () => {
+    const client = new SpeakerClient(async () => envelope({}))
+    await expect(client.groupSend(groupId, 'hi')).rejects.toThrow(/requires an identity/)
+  })
+
+  it('rejects an empty group id', async () => {
+    const client = new SpeakerClient(async () => envelope({}), { identity: 'alice' })
+    await expect(client.groupSend('', 'hi')).rejects.toThrow(/requires a group id/)
+  })
+
+  it('rejects an empty body', async () => {
+    const client = new SpeakerClient(async () => envelope({}), { identity: 'alice' })
+    await expect(client.groupSend(groupId, '')).rejects.toThrow(/requires a body/)
+  })
+
+  it('fails the call when hyphae returns a non-zero envelope', async () => {
+    const client = new SpeakerClient(
+      async () => JSON.stringify({ ok: false, message: 'group is not active' }),
+      { identity: 'alice' },
+    )
+    await expect(client.groupSend(groupId, 'hi')).rejects.toThrow(/group is not active/)
+  })
+})

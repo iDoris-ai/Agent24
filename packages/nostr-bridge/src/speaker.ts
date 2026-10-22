@@ -314,6 +314,57 @@ export class SpeakerClient {
       }
     })
   }
+
+  /** Enqueue one group body with `hyphae groupchat send --json`. */
+  async groupSend(groupId: string, body: string): Promise<GroupSendResult> {
+    if (!this.identity) {
+      throw new Error('groupchat send requires an identity')
+    }
+    if (!groupId) {
+      throw new Error('groupchat send requires a group id')
+    }
+    if (!body) {
+      throw new Error('groupchat send requires a body')
+    }
+    const data = unwrap<unknown>(
+      await this.run([
+        'groupchat',
+        'send',
+        '--group-id',
+        groupId,
+        '--body',
+        body,
+        '--identity',
+        this.identity,
+        '--json',
+      ]),
+      'groupchat send',
+    )
+    const row = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>
+    const recipients = Array.isArray(row.recipients) ? row.recipients : []
+    let eventId =
+      typeof row.event_id === 'string' && row.event_id !== '' ? row.event_id : undefined
+    if (!eventId) {
+      for (const item of recipients) {
+        if (!item || typeof item !== 'object') continue
+        const id = (item as Record<string, unknown>).event_id
+        if (typeof id === 'string' && id !== '') {
+          eventId = id
+          break
+        }
+      }
+    }
+    return {
+      logical_id: String(row.logical_id ?? ''),
+      event_id: eventId,
+    }
+  }
+}
+
+/** `groupchat send --json` data. `event_id` is the first recipient event id when the report has no top-level one. */
+export interface GroupSendResult {
+  logical_id: string
+  event_id?: string
 }
 
 interface Envelope {
