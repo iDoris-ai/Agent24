@@ -72,6 +72,14 @@ export function cliRunner(bin = 'agent-speaker', timeoutMs = CONFIG.SPEAKER_TIME
     })
 }
 
+/** Runner for `hyphae groupchat history`. A non-absolute path throws before execFile. */
+export function groupCliRunner(bin: string, timeoutMs = CONFIG.SPEAKER_TIMEOUT_MS): SpeakerRunner {
+  if (!bin.startsWith('/')) {
+    throw new Error(`hyphae binary path is not pinned: ${bin}`)
+  }
+  return cliRunner(bin, timeoutMs)
+}
+
 /** `agent msg` result (envelope `data`). */
 export interface SendResult {
   event_id?: string
@@ -102,6 +110,15 @@ export interface InboundMessage {
   /** Sender npub — the allowlist / session key. */
   from: string
   content: string
+  event_id?: string
+  created_at?: number
+}
+
+/** One row from `hyphae groupchat history --json` (`data.messages[]`). */
+export interface GroupHistoryEntry {
+  id: string
+  sender: string
+  plaintext: string
   event_id?: string
   created_at?: number
 }
@@ -260,6 +277,42 @@ export class SpeakerClient {
           created_at: typeof r.created_at === 'number' ? r.created_at : undefined,
         }
       })
+  }
+
+  /** Read `hyphae groupchat history --json` for this identity. */
+  async groupHistory(groupId: string, limit = 20): Promise<GroupHistoryEntry[]> {
+    if (!this.identity) {
+      throw new Error('groupchat history requires an identity')
+    }
+    if (!groupId) {
+      throw new Error('groupchat history requires a group id')
+    }
+    const data = unwrap<unknown>(
+      await this.run([
+        'groupchat',
+        'history',
+        '--group-id',
+        groupId,
+        '--identity',
+        this.identity,
+        '--limit',
+        String(limit),
+        '--json',
+      ]),
+      'groupchat history',
+    )
+    const rows = Array.isArray(data) ? data : ((data as { messages?: unknown[] })?.messages ?? [])
+    return (rows as Record<string, unknown>[]).map((row) => {
+      const eventId =
+        typeof row.event_id === 'string' && row.event_id !== '' ? row.event_id : undefined
+      return {
+        id: String(row.id ?? ''),
+        sender: String(row.sender ?? row.sender_npub ?? ''),
+        plaintext: String(row.plaintext ?? ''),
+        event_id: eventId,
+        created_at: typeof row.created_at === 'number' ? row.created_at : undefined,
+      }
+    })
   }
 }
 
