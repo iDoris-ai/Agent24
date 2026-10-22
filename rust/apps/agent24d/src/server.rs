@@ -4575,6 +4575,7 @@ pub(crate) mod tests {
             summary,
             payload,
             workspace_root: None,
+            captured_write_directory: None,
         }
     }
 

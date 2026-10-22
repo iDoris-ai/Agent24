@@ -30,20 +30,36 @@ pub fn classify_builtin_write(workspace_root: Option<&Path>, raw_path: &str) -> 
     {
         return WriteLocation::InsideConfirmedRoot;
     }
-    match canonical.parent().and_then(path_utf8) {
-        Some(directory) => WriteLocation::Outside { directory },
+    match canonical.parent() {
+        Some(parent) if directory_grant_forbidden(parent) => {
+            WriteLocation::AskWithoutDirectoryGrant
+        }
+        Some(parent) => path_utf8(parent)
+            .map(|directory| WriteLocation::Outside { directory })
+            .unwrap_or(WriteLocation::AskWithoutDirectoryGrant),
         None => WriteLocation::AskWithoutDirectoryGrant,
     }
+}
+
+fn forbidden_against_home(root: &Path, home: &Path) -> bool {
+    let ssh = home.join(".ssh");
+    let ssh = ssh.canonicalize().unwrap_or(ssh);
+    root == home || root == ssh || is_within(root, home) || is_within(root, &ssh)
+}
+
+pub(crate) fn directory_grant_forbidden(directory: &Path) -> bool {
+    let directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.to_path_buf());
+    forbidden_workspace_root(&directory)
 }
 
 fn forbidden_workspace_root(root: &Path) -> bool {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         && let Some(home) = canonical_claim(&home)
+        && forbidden_against_home(root, &home)
     {
-        let ssh = home.join(".ssh");
-        if root == home || root == ssh || is_within(root, &home) || is_within(root, &ssh) {
-            return true;
-        }
+        return true;
     }
     const SYSTEM: &[&str] = &[
         "/",
@@ -138,14 +154,42 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ssh_directory_is_still_forbidden() {
+        let dir = temp();
+        let home = dir.join("home");
+        let target = dir.join("ssh-target");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(target.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".ssh")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let target = target.canonicalize().unwrap();
+        assert!(forbidden_against_home(&target, &home));
+    }
+
+    #[test]
+    fn ssh_is_not_a_directory_grant_target() {
+        let home = std::env::var("HOME").unwrap();
+        let ssh = Path::new(&home).join(".ssh");
+        if !ssh.is_dir() {
+            return;
+        }
+        let file = ssh.join("authorized_keys");
+        assert_eq!(
+            classify_builtin_write(None, file.to_str().unwrap()),
+            WriteLocation::AskWithoutDirectoryGrant
+        );
+    }
+
     #[test]
     fn home_and_system_roots_are_not_confirmed() {
         let home = std::env::var("HOME").unwrap();
         let file = Path::new(&home).join("notes.txt");
-        assert!(matches!(
+        assert_eq!(
             classify_builtin_write(Some(Path::new(&home)), file.to_str().unwrap()),
-            WriteLocation::Outside { .. }
-        ));
+            WriteLocation::AskWithoutDirectoryGrant
+        );
         assert!(matches!(
             classify_builtin_write(Some(Path::new("/")), "/tmp/a.txt"),
             WriteLocation::Outside { .. }

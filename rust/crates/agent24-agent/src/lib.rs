@@ -4975,6 +4975,7 @@ mod approval_tests {
                         summary: "probe".to_owned(),
                         payload: serde_json::Map::new(),
                         workspace_root: None,
+                        captured_write_directory: None,
                     },
                     &request_cancel,
                 )
