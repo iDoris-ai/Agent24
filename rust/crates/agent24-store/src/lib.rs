@@ -83,8 +83,9 @@ pub use module_audit_event::{
     SizeBytes, ToolCallId,
 };
 pub use module_consents::{
-    ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentChange,
-    ModuleConsentRecord, ModuleConsentRevocation, ToolPermissionSummary, consent_instant_millis,
+    ConsentDecision, ConsentLookup, ConsentSource, GrantScope, HostRiskLevel, MAX_GRANT_RESOURCES,
+    ModuleConsentChange, ModuleConsentRecord, ModuleConsentRevocation, ToolPermissionSummary,
+    consent_instant_millis, is_resource_element, resource_set_digest,
 };
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;

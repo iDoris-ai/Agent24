@@ -219,6 +219,93 @@ pub struct ModuleConsentRecord {
     pub decision: ConsentDecision,
     pub decided_at: String,
     pub expires_at: String,
+    /// The resource set as stored (K1-6a-G §2.2): empty when the row has
+    /// none. Read back as written, not re-validated: a dispatch checks it.
+    pub resources: Vec<String>,
+    /// The artifact identity the user confirmed; `None` if none was.
+    pub artifact: Option<String>,
+    /// The write generation (see the migration): increasing, never reused.
+    pub generation: i64,
+}
+
+/// Most resources one grant may carry (resource contract §2.1).
+pub const MAX_GRANT_RESOURCES: usize = 256;
+
+/// What a grant covers beyond its tool's permission summary (K1-6a-G
+/// §2.2): the resources the user picked and the artifact identity the card
+/// showed. The default is no resources and no artifact.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrantScope {
+    pub resources: Vec<String>,
+    pub artifact: Option<String>,
+}
+
+/// Whether `element` is a resource as the resource contract §2.1 defines
+/// it: `<kind>:<id>`, split at the first `:`, `kind` matching
+/// `[a-z][a-z0-9_]{0,31}` and `id` matching `[A-Za-z0-9_-]{1,128}`.
+#[must_use]
+pub fn is_resource_element(element: &str) -> bool {
+    let Some((kind, id)) = element.split_once(':') else {
+        return false;
+    };
+    let kind = kind.as_bytes();
+    let Some((first, rest)) = kind.split_first() else {
+        return false;
+    };
+    if kind.len() > 32
+        || !first.is_ascii_lowercase()
+        || !rest
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return false;
+    }
+    let id = id.as_bytes();
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+}
+
+/// The digest of a resource set (K1-6a-G §2.2), as 64 lowercase hex
+/// digits: SHA-256 over each distinct element in byte order, each written
+/// as its length (u64, big-endian) then its bytes. Order and repeats do
+/// not change it; no two sets share an encoding.
+#[must_use]
+pub fn resource_set_digest(resources: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut distinct: Vec<&String> = resources.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    let mut encoded = Vec::new();
+    for element in distinct {
+        encoded.extend_from_slice(&(element.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(element.as_bytes());
+    }
+    hex_encode(&Sha256::digest(&encoded))
+}
+
+fn canonical_resources(resources: &[String]) -> Result<Vec<String>> {
+    if resources
+        .iter()
+        .any(|element| !is_resource_element(element))
+    {
+        return Err(StoreError::Conflict(
+            "a grant's resource is not a resource".to_owned(),
+        ));
+    }
+    // The cap counts what was submitted, not the set it reduces to (§2.1,
+    // counterexample 6): 257 elements are refused even if two are equal.
+    if resources.len() > MAX_GRANT_RESOURCES {
+        return Err(StoreError::Conflict(format!(
+            "a grant carries at most {MAX_GRANT_RESOURCES} resources"
+        )));
+    }
+    let mut canonical = resources.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
 }
 
 /// A grant, refusal or revocation for `(module, op)` was committed; `op:
@@ -380,6 +467,11 @@ pub fn consent_instant_millis(s: &str) -> Option<i64> {
 }
 
 fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
+    let resources = match row.get::<Option<String>, _>("resources") {
+        None => Vec::new(),
+        Some(text) => serde_json::from_str::<Vec<String>>(&text)
+            .map_err(|_| StoreError::Conflict("a stored resource set is malformed".to_owned()))?,
+    };
     Ok(ModuleConsentRecord {
         module: row.get("module"),
         op: row.get("op"),
@@ -393,6 +485,9 @@ fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
         decision: parse_decision(&row.get::<String, _>("decision"))?,
         decided_at: row.get("decided_at"),
         expires_at: row.get("expires_at"),
+        resources,
+        artifact: row.get("artifact"),
+        generation: row.get("generation"),
     })
 }
 
@@ -443,16 +538,26 @@ impl Store {
     ) -> Result<()> {
         let (_, revoked_at) = parse_instant(now)?;
         let key = op.unwrap_or("*");
+        let mut tx = self.pool().begin().await?;
+        let generation: i64 = sqlx::query_scalar(
+            "INSERT INTO module_consent_generations DEFAULT VALUES RETURNING generation",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
-            "INSERT INTO module_consent_revocations (module, op, revoked_at)
-             VALUES (?, ?, ?)
-             ON CONFLICT (module, op) DO UPDATE SET revoked_at = excluded.revoked_at",
+            "INSERT INTO module_consent_revocations (module, op, revoked_at, generation)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (module, op) DO UPDATE SET
+                revoked_at = excluded.revoked_at,
+                generation = excluded.generation",
         )
         .bind(module)
         .bind(key)
         .bind(&revoked_at)
-        .execute(self.pool())
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         let _ = self
             .module_consent_revocations
             .send(ModuleConsentRevocation {
@@ -480,6 +585,7 @@ impl Store {
     async fn upsert_module_consent(
         &self,
         summary: &ToolPermissionSummary,
+        scope: &GrantScope,
         decision: ConsentDecision,
         decided_at: &str,
         expires_at: &str,
@@ -493,12 +599,26 @@ impl Store {
         // in the one form `lookup_module_consent` can trust.
         let (_, decided_at) = parse_instant(decided_at)?;
         let (_, expires_at) = parse_instant(expires_at)?;
+        let canonical = canonical_resources(&scope.resources)?;
         let scope_fingerprint = summary.scope_fingerprint();
+        #[allow(
+            clippy::expect_used,
+            reason = "a Vec<String> always serializes to a JSON array of strings"
+        )]
+        let resources =
+            serde_json::to_string(&canonical).expect("a resource set always serializes");
+        let mut tx = self.pool().begin().await?;
+        let generation: i64 = sqlx::query_scalar(
+            "INSERT INTO module_consent_generations DEFAULT VALUES RETURNING generation",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         let row = sqlx::query(
             "INSERT INTO module_consents
                 (module, op, module_version, scope_fingerprint, source, risk,
-                 readable, writable, external, decision, decided_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 readable, writable, external, decision, decided_at, expires_at,
+                 resources, artifact, generation)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (module, op) DO UPDATE SET
                 module_version = excluded.module_version,
                 scope_fingerprint = excluded.scope_fingerprint,
@@ -509,7 +629,10 @@ impl Store {
                 external = excluded.external,
                 decision = excluded.decision,
                 decided_at = excluded.decided_at,
-                expires_at = excluded.expires_at
+                expires_at = excluded.expires_at,
+                resources = excluded.resources,
+                artifact = excluded.artifact,
+                generation = excluded.generation
              RETURNING *",
         )
         .bind(&summary.module)
@@ -524,8 +647,12 @@ impl Store {
         .bind(decision_str(decision))
         .bind(decided_at)
         .bind(expires_at)
-        .fetch_one(self.pool())
+        .bind(&resources)
+        .bind(&scope.artifact)
+        .bind(generation)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         let record = row_to_record(&row)?;
         self.announce_module_consent_change(&summary.module, Some(&summary.op));
         Ok(record)
@@ -544,8 +671,30 @@ impl Store {
         decided_at: &str,
         expires_at: &str,
     ) -> Result<ModuleConsentRecord> {
-        self.upsert_module_consent(summary, ConsentDecision::Granted, decided_at, expires_at)
+        self.grant_module_consent_scoped(summary, &GrantScope::default(), decided_at, expires_at)
             .await
+    }
+
+    /// [`Self::grant_module_consent`] for `scope`'s resources and artifact
+    /// (K1-6a-G §2.2). The resources are stored as a set; an element that
+    /// is not a resource (contract §2.1), or more than
+    /// [`MAX_GRANT_RESOURCES`] submitted (repeats counted), fails before
+    /// anything is written or announced.
+    pub async fn grant_module_consent_scoped(
+        &self,
+        summary: &ToolPermissionSummary,
+        scope: &GrantScope,
+        decided_at: &str,
+        expires_at: &str,
+    ) -> Result<ModuleConsentRecord> {
+        self.upsert_module_consent(
+            summary,
+            scope,
+            ConsentDecision::Granted,
+            decided_at,
+            expires_at,
+        )
+        .await
     }
 
     /// Records an explicit refusal, distinct from "never asked"
@@ -557,8 +706,14 @@ impl Store {
         decided_at: &str,
         expires_at: &str,
     ) -> Result<ModuleConsentRecord> {
-        self.upsert_module_consent(summary, ConsentDecision::Denied, decided_at, expires_at)
-            .await
+        self.upsert_module_consent(
+            summary,
+            &GrantScope::default(),
+            ConsentDecision::Denied,
+            decided_at,
+            expires_at,
+        )
+        .await
     }
 
     /// No record for `(module, op)` → [`ConsentLookup::NotGranted`] — fail
@@ -576,35 +731,40 @@ impl Store {
         current_scope_fingerprint: &str,
         now: &str,
     ) -> Result<ConsentLookup> {
+        // One read transaction, so the grant and the revocations come from
+        // the same snapshot: a revoke-then-regrant committed between two
+        // separate reads would pair the old grant with the new revocation.
+        let mut tx = self.pool().begin().await?;
         let row = sqlx::query("SELECT * FROM module_consents WHERE module = ? AND op = ?")
             .bind(module)
             .bind(op)
-            .fetch_optional(self.pool())
+            .fetch_optional(&mut *tx)
             .await?;
         let revocations = sqlx::query(
-            "SELECT revoked_at FROM module_consent_revocations
+            "SELECT generation FROM module_consent_revocations
              WHERE module = ? AND op IN (?, '*')",
         )
         .bind(module)
         .bind(op)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         let record = row.as_ref().map(row_to_record).transpose()?;
         if let Some(record) = &record {
-            let consented_at = match parse_instant(&record.decided_at) {
-                Ok((at, _)) => at,
-                Err(_) => return Ok(ConsentLookup::Revoked(Some(record.clone()))),
-            };
-            let revoked = revocations.iter().any(|row| {
-                parse_instant(&row.get::<String, _>("revoked_at"))
-                    .map_or(true, |(at, _)| at >= consented_at)
-            });
+            // A row whose `decided_at` does not parse was not written by
+            // `upsert_module_consent`; it fails closed, as `expires_at` does.
+            if parse_instant(&record.decided_at).is_err() {
+                return Ok(ConsentLookup::Revoked(Some(record.clone())));
+            }
+            let revoked = revocations
+                .iter()
+                .any(|row| row.get::<i64, _>("generation") >= record.generation);
             if revoked {
                 return Ok(ConsentLookup::Revoked(Some(record.clone())));
             }
         } else if !revocations.is_empty() {
             // Revoking before a consent exists remains observable and
-            // fail-closed; a later consent row supersedes it by timestamp.
+            // fail-closed; a later consent row supersedes it by generation.
             return Ok(ConsentLookup::Revoked(None));
         }
         let Some(record) = record else {
@@ -1470,5 +1630,633 @@ mod tests {
                 .unwrap();
             assert!(matches!(lookup, ConsentLookup::Revoked(_)));
         }
+    }
+
+    // ── K1-6a-G §2.2: resource sets, artifact identity, write generations ──
+
+    async fn lookup_at(store: &Store, s: &ToolPermissionSummary, now: &str) -> ConsentLookup {
+        store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                now,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn scope(resources: &[&str], artifact: Option<&str>) -> GrantScope {
+        GrantScope {
+            resources: resources.iter().map(|r| (*r).to_owned()).collect(),
+            artifact: artifact.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_resource_is_a_kind_and_an_id() {
+        let kind_32 = format!("a{}", "b".repeat(31));
+        let id_128 = "x".repeat(128);
+        for good in [
+            "doc:a".to_owned(),
+            "doc_2:A-b_9".to_owned(),
+            format!("{kind_32}:{id_128}"),
+            "doc:a-b".to_owned(),
+        ] {
+            assert!(is_resource_element(&good), "{good}");
+        }
+        for bad in [
+            String::new(),
+            "doc".to_owned(),
+            "doc:".to_owned(),
+            ":a".to_owned(),
+            "*".to_owned(),
+            "doc:*".to_owned(),
+            "Doc:a".to_owned(),
+            "2doc:a".to_owned(),
+            "doc-x:a".to_owned(),
+            "doc:a b".to_owned(),
+            "doc:a:b".to_owned(),
+            "doc:é".to_owned(),
+            format!("a{}:x", "b".repeat(32)),
+            format!("doc:{}", "x".repeat(129)),
+        ] {
+            assert!(!is_resource_element(&bad), "{bad}");
+        }
+    }
+
+    /// Golden values computed independently (Python: sha256 over
+    /// `struct.pack(">Q", len) + bytes` of each sorted distinct element).
+    #[test]
+    fn the_resource_digest_is_of_the_set() {
+        let set = |xs: &[&str]| xs.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            resource_set_digest(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            resource_set_digest(&set(&["doc:b", "doc:a", "doc:b"])),
+            "d871e5572f0cf6cfbcc2b5cf608ff1a53d1ab7e3f7813888ecad989874894f65"
+        );
+        assert_eq!(
+            resource_set_digest(&set(&["doc:a", "doc:b"])),
+            resource_set_digest(&set(&["doc:b", "doc:a"]))
+        );
+        assert_eq!(
+            resource_set_digest(&set(&["ab", "c"])),
+            "601d5476e2ccfe2c87a2bba7a322659734a05749d5b5aa781f513e4912db0d5f"
+        );
+        assert_eq!(
+            resource_set_digest(&set(&["a", "bc"])),
+            "3fafa1cf2f19a7c1129beb20cf0983f73a489a221fc0dd2f16d1be292d089205"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_keeps_its_resources_as_a_set_and_its_artifact() {
+        let store = store().await;
+        let s = summary("doc body");
+        let written = store
+            .grant_module_consent_scoped(
+                &s,
+                &scope(&["doc:b", "doc:a", "doc:b"], Some("sha256:abc")),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.resources, ["doc:a", "doc:b"]);
+        assert_eq!(written.artifact.as_deref(), Some("sha256:abc"));
+        let ConsentLookup::Granted(read) = lookup_at(&store, &s, "2026-10-08T00:00:01Z").await
+        else {
+            panic!("the grant is current");
+        };
+        assert_eq!(read, written);
+        assert_eq!(store.list_module_consents().await.unwrap(), [written]);
+    }
+
+    #[tokio::test]
+    async fn a_plain_grant_or_refusal_has_no_resources_and_no_artifact() {
+        let store = store().await;
+        let s = summary("doc body");
+        let granted = store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(granted.resources.is_empty());
+        assert_eq!(granted.artifact, None);
+        let denied = store
+            .deny_module_consent(&s, "2026-10-08T00:00:01Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(denied.resources.is_empty());
+        assert_eq!(denied.artifact, None);
+    }
+
+    /// A set that is not one the contract allows is refused whole: nothing
+    /// is written, nothing announced, and an earlier grant stays as it was.
+    #[tokio::test]
+    async fn a_bad_resource_set_is_refused_before_anything_is_written() {
+        let store = store().await;
+        let s = summary("doc body");
+        let kept = store
+            .grant_module_consent_scoped(
+                &s,
+                &scope(&["doc:kept"], None),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut changes = store.subscribe_module_consent_changes();
+        let too_many: Vec<String> = (0..=MAX_GRANT_RESOURCES)
+            .map(|i| format!("doc:{i}"))
+            .collect();
+        for resources in [
+            vec!["doc:a".to_owned(), "*".to_owned()],
+            vec!["doc:".to_owned()],
+            too_many,
+        ] {
+            let refused = store
+                .grant_module_consent_scoped(
+                    &s,
+                    &GrantScope {
+                        resources,
+                        artifact: None,
+                    },
+                    "2026-10-08T00:00:01Z",
+                    "2026-11-08T00:00:00Z",
+                )
+                .await;
+            assert!(refused.is_err());
+        }
+        assert!(changes.try_recv().is_err(), "nothing was announced");
+        let ConsentLookup::Granted(read) = lookup_at(&store, &s, "2026-10-08T00:00:02Z").await
+        else {
+            panic!("the earlier grant stands");
+        };
+        assert_eq!(read, kept);
+    }
+
+    /// The cap counts submitted resources: 256 distinct ones pass, but 257
+    /// entries are refused even when one repeats.
+    #[tokio::test]
+    async fn the_resource_cap_counts_submitted_resources() {
+        let store = store().await;
+        let s = summary("doc body");
+        let scope = |resources: Vec<String>| GrantScope {
+            resources,
+            artifact: None,
+        };
+        let full: Vec<String> = (0..MAX_GRANT_RESOURCES)
+            .map(|i| format!("doc:{i}"))
+            .collect();
+        let written = store
+            .grant_module_consent_scoped(
+                &s,
+                &scope(full.clone()),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.resources.len(), MAX_GRANT_RESOURCES);
+
+        // Counterexample 6: 257 submitted elements are refused even when one
+        // repeats, and the earlier grant is left as it was.
+        let mut over = full;
+        over.push("doc:0".to_owned());
+        let refused = store
+            .grant_module_consent_scoped(
+                &s,
+                &scope(over),
+                "2026-10-09T00:00:00Z",
+                "2026-11-09T00:00:00Z",
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Conflict(_))),
+            "{refused:?}"
+        );
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-10T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let ConsentLookup::Granted(record) = lookup else {
+            panic!("the earlier grant must stand: {lookup:?}");
+        };
+        assert_eq!(record.generation, written.generation);
+    }
+
+    /// A row whose `decided_at` does not parse was not written by this
+    /// module; with no revocation at all it still fails closed.
+    #[tokio::test]
+    async fn a_garbage_decided_at_never_makes_a_lookup_granted() {
+        let store = store().await;
+        let s = summary("doc body");
+        let fp = s.scope_fingerprint();
+        sqlx::query(
+            "INSERT INTO module_consents
+                (module, op, module_version, scope_fingerprint, source, risk,
+                 readable, writable, external, decision, decided_at, expires_at)
+             VALUES (?, ?, ?, ?, 'first_party', 'low', ?, NULL, NULL, 'granted',
+                     'garbage', '2026-11-08T00:00:00.000Z')",
+        )
+        .bind(&s.module)
+        .bind(&s.op)
+        .bind(&s.module_version)
+        .bind(&fp)
+        .bind(&s.readable)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let lookup = store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &fp,
+                "2026-10-08T00:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(lookup, ConsentLookup::Revoked(Some(_))),
+            "{lookup:?}"
+        );
+        assert!(!lookup.is_authorized());
+    }
+
+    /// The grant row and the revocations are read from one snapshot. The
+    /// reader's only connection runs `after_release` the first time it goes
+    /// back to the pool; there another connection revokes and grants anew.
+    /// Read in two statements, the lookup would pair the old grant with the
+    /// new revocation and answer `Revoked`; in one transaction the
+    /// connection is held until both reads are done, and the answer is the
+    /// grant as it stood.
+    #[tokio::test]
+    async fn a_lookup_reads_the_grant_and_its_revocations_together() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("consents.db"))
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(&writer_pool)
+            .await
+            .unwrap();
+        let writer = crate::test_hooks::from_pool(writer_pool);
+        let s = summary("doc body");
+        let first = store_grant(&writer, &s).await;
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+        let reader_pool = {
+            let (writer, s, fired, done_tx) = (
+                writer.clone(),
+                s.clone(),
+                Arc::clone(&fired),
+                Arc::clone(&done_tx),
+            );
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .min_connections(0)
+                .idle_timeout(None)
+                .max_lifetime(None)
+                .after_release(move |_, _| {
+                    let (writer, s, fired, done_tx) = (
+                        writer.clone(),
+                        s.clone(),
+                        Arc::clone(&fired),
+                        Arc::clone(&done_tx),
+                    );
+                    Box::pin(async move {
+                        if !fired.swap(true, Ordering::SeqCst) {
+                            writer
+                                .revoke_module_consent(
+                                    &s.module,
+                                    Some(&s.op),
+                                    "2026-10-08T01:00:00Z",
+                                )
+                                .await
+                                .unwrap();
+                            store_grant(&writer, &s).await;
+                            if let Some(tx) = done_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        Ok(true)
+                    })
+                })
+                .connect_lazy_with(options)
+        };
+        let reader = crate::test_hooks::from_pool(reader_pool);
+
+        let lookup = reader
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-08T02:00:00Z",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), done_rx)
+            .await
+            .expect("the writes between the reads ran")
+            .unwrap();
+        let ConsentLookup::Granted(record) = lookup else {
+            panic!("one snapshot must give the grant as it stood: {lookup:?}");
+        };
+        assert_eq!(record.generation, first.generation);
+    }
+
+    async fn store_grant(store: &Store, s: &ToolPermissionSummary) -> ModuleConsentRecord {
+        store
+            .grant_module_consent(s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap()
+    }
+
+    /// A stored set is read back as written (a dispatch validates it), but
+    /// one that is not a list of strings fails the read rather than being
+    /// taken as some other set.
+    #[tokio::test]
+    async fn a_stored_resource_set_is_read_as_written_or_not_at_all() {
+        let store = store().await;
+        let s = summary("doc body");
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let set_resources = |value: &'static str| {
+            let store = store.clone();
+            async move {
+                sqlx::query("UPDATE module_consents SET resources = ?")
+                    .bind(value)
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            }
+        };
+        set_resources(r#"["*","doc:a"]"#).await;
+        let ConsentLookup::Granted(read) = lookup_at(&store, &s, "2026-10-08T00:00:01Z").await
+        else {
+            panic!("the grant is current");
+        };
+        assert_eq!(read.resources, ["*", "doc:a"]);
+        for malformed in [r#"{"doc":"a"}"#, r#"["doc:a",3]"#, "doc:a", ""] {
+            set_resources(malformed).await;
+            let read = store
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-08T00:00:01Z",
+                )
+                .await;
+            assert!(read.is_err(), "{malformed}");
+            assert!(store.list_module_consents().await.is_err(), "{malformed}");
+        }
+    }
+
+    /// Every write takes a new generation, even one identical to the last
+    /// in scope and time (the same-millisecond refusal-then-grant of §4 3a).
+    #[tokio::test]
+    async fn every_write_takes_a_new_generation() {
+        let store = store().await;
+        let s = summary("doc body");
+        let at = "2026-10-08T00:00:00Z";
+        let first = store
+            .grant_module_consent(&s, at, "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let denied = store
+            .deny_module_consent(&s, at, "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .revoke_module_consent(&s.module, None, at)
+            .await
+            .unwrap();
+        let again = store
+            .grant_module_consent(&s, at, "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(0 < first.generation, "{}", first.generation);
+        assert!(first.generation < denied.generation);
+        // The revocation took one in between.
+        assert!(denied.generation + 1 < again.generation);
+        assert_eq!(
+            (&first.decided_at, &first.scope_fingerprint),
+            (&again.decided_at, &again.scope_fingerprint)
+        );
+    }
+
+    /// PR-Daemon B1: granting again replaces the resources and the artifact;
+    /// a narrower grant does not keep the wider set, and a refusal keeps
+    /// neither.
+    #[tokio::test]
+    async fn a_new_decision_replaces_the_resources_and_the_artifact() {
+        let store = store().await;
+        let s = summary("doc body");
+        let grant = |resources: &[&str], artifact: &str| GrantScope {
+            resources: resources.iter().map(|r| (*r).to_owned()).collect(),
+            artifact: Some(artifact.to_owned()),
+        };
+        let read_back = || async {
+            match store
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-10T00:00:00Z",
+                )
+                .await
+                .unwrap()
+            {
+                ConsentLookup::Granted(record) | ConsentLookup::Denied(record) => record,
+                other => panic!("{other:?}"),
+            }
+        };
+        store
+            .grant_module_consent_scoped(
+                &s,
+                &grant(&["doc:a", "doc:b"], "sha256:old"),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let narrowed = store
+            .grant_module_consent_scoped(
+                &s,
+                &grant(&["doc:c"], "sha256:new"),
+                "2026-10-09T00:00:00Z",
+                "2026-11-09T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        for record in [narrowed, read_back().await] {
+            assert_eq!(record.resources, ["doc:c"]);
+            assert_eq!(record.artifact.as_deref(), Some("sha256:new"));
+        }
+
+        let refused = store
+            .deny_module_consent(&s, "2026-10-09T01:00:00Z", "2026-11-09T01:00:00Z")
+            .await
+            .unwrap();
+        for record in [refused, read_back().await] {
+            assert!(record.resources.is_empty(), "{record:?}");
+            assert_eq!(record.artifact, None);
+        }
+    }
+
+    /// PR-Daemon B2: revoking the same tool again takes a new generation, so
+    /// it covers the grant made since the first revocation.
+    #[tokio::test]
+    async fn a_second_revocation_of_a_tool_covers_the_grant_since_the_first() {
+        let store = store().await;
+        let s = summary("doc body");
+        let lookup = || async {
+            store
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-10T00:00:00Z",
+                )
+                .await
+                .unwrap()
+        };
+        store_grant(&store, &s).await;
+        store
+            .revoke_module_consent(&s.module, Some(&s.op), "2026-10-08T01:00:00Z")
+            .await
+            .unwrap();
+        store_grant(&store, &s).await;
+        assert!(matches!(lookup().await, ConsentLookup::Granted(_)));
+        store
+            .revoke_module_consent(&s.module, Some(&s.op), "2026-10-08T02:00:00Z")
+            .await
+            .unwrap();
+        let after = lookup().await;
+        assert!(
+            matches!(after, ConsentLookup::Revoked(Some(_))),
+            "{after:?}"
+        );
+    }
+
+    /// K1-6a-G §4 case 16: a revocation covers the grants written before it
+    /// and none written after, whatever the clock said at each write.
+    #[tokio::test]
+    async fn a_revocation_covers_earlier_grants_whatever_the_clock_says() {
+        let store = store().await;
+        let s = summary("doc body");
+        store
+            .grant_module_consent(&s, "2026-10-08T10:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        // The clock went back an hour before the revocation.
+        store
+            .revoke_module_consent(&s.module, Some(&s.op), "2026-10-08T09:00:00Z")
+            .await
+            .unwrap();
+        assert!(matches!(
+            lookup_at(&store, &s, "2026-10-08T10:00:01Z").await,
+            ConsentLookup::Revoked(Some(_))
+        ));
+        // And further back before a new grant, which still stands.
+        store
+            .grant_module_consent(&s, "2026-10-08T08:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(matches!(
+            lookup_at(&store, &s, "2026-10-08T10:00:01Z").await,
+            ConsentLookup::Granted(_)
+        ));
+        // A whole-module revocation, with the clock still behind, covers it.
+        store
+            .revoke_module_consent(&s.module, None, "2026-10-08T07:00:00Z")
+            .await
+            .unwrap();
+        assert!(matches!(
+            lookup_at(&store, &s, "2026-10-08T10:00:01Z").await,
+            ConsentLookup::Revoked(Some(_))
+        ));
+    }
+
+    /// Rows from before generations existed carry 0 on both sides; the old
+    /// revocation still covers the old grant.
+    #[tokio::test]
+    async fn a_revocation_from_before_generations_covers_a_grant_from_then() {
+        let store = store().await;
+        let s = summary("doc body");
+        store
+            .grant_module_consent(&s, "2026-10-08T10:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE module_consents SET generation = 0")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO module_consent_revocations (module, op, revoked_at)
+             VALUES (?, '*', '2026-10-08T09:00:00.000Z')",
+        )
+        .bind(&s.module)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert!(matches!(
+            lookup_at(&store, &s, "2026-10-08T10:00:01Z").await,
+            ConsentLookup::Revoked(Some(_))
+        ));
+    }
+
+    /// A generation is never handed out twice, across reopening the store.
+    #[tokio::test]
+    async fn generations_keep_increasing_across_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("consents.db");
+        let s = summary("doc body");
+        let before = {
+            let store = Store::open(&db).await.unwrap();
+            store
+                .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+                .await
+                .unwrap()
+                .generation
+        };
+        let store = Store::open(&db).await.unwrap();
+        let after = store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap()
+            .generation;
+        assert!(before < after, "{before} then {after}");
     }
 }
