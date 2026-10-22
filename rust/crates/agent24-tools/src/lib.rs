@@ -619,6 +619,10 @@ pub struct ModuleToolContext {
     pub operation: String,
     pub authorized_resources: Vec<String>,
     pub authorization_ref: String,
+    /// The package the grant was given for (K1-6a-G §2.2), for the runtime
+    /// to hold the run it sends to against. Never sent to the module.
+    #[serde(skip)]
+    pub expected_artifact: Option<String>,
 }
 
 #[async_trait]
@@ -669,6 +673,9 @@ pub struct ModuleToolGrantContext {
     /// the authorization's own clock (K1-6a-G §2.5: a call ends at
     /// `min(timeout, expires_at)`). `None`: no expiry known.
     pub valid_for: Option<Duration>,
+    /// The artifact identity the grant was given for (K1-6a-G §2.2): the
+    /// runtime sends the call only to a run of that same package.
+    pub artifact: Option<String>,
 }
 
 /// What can end a grant while a call runs (K1-6a-G §2.5): its expiry, and
@@ -1350,6 +1357,7 @@ impl Tool for ModuleTool {
             operation: self.operation.clone(),
             authorized_resources: grant.authorized_resources,
             authorization_ref: grant.authorization_ref,
+            expected_artifact: grant.artifact,
         };
         let call_cancel = cancel.child_token();
         let invoked = tokio::select! {
