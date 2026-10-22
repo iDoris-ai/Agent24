@@ -678,8 +678,8 @@ impl Store {
     /// [`Self::grant_module_consent`] for `scope`'s resources and artifact
     /// (K1-6a-G §2.2). The resources are stored as a set; an element that
     /// is not a resource (contract §2.1), or more than
-    /// [`MAX_GRANT_RESOURCES`] distinct ones, fails before anything is
-    /// written or announced.
+    /// [`MAX_GRANT_RESOURCES`] submitted (repeats counted), fails before
+    /// anything is written or announced.
     pub async fn grant_module_consent_scoped(
         &self,
         summary: &ToolPermissionSummary,
@@ -2071,6 +2071,102 @@ mod tests {
         assert_eq!(
             (&first.decided_at, &first.scope_fingerprint),
             (&again.decided_at, &again.scope_fingerprint)
+        );
+    }
+
+    /// PR-Daemon B1: granting again replaces the resources and the artifact;
+    /// a narrower grant does not keep the wider set, and a refusal keeps
+    /// neither.
+    #[tokio::test]
+    async fn a_new_decision_replaces_the_resources_and_the_artifact() {
+        let store = store().await;
+        let s = summary("doc body");
+        let grant = |resources: &[&str], artifact: &str| GrantScope {
+            resources: resources.iter().map(|r| (*r).to_owned()).collect(),
+            artifact: Some(artifact.to_owned()),
+        };
+        let read_back = || async {
+            match store
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-10T00:00:00Z",
+                )
+                .await
+                .unwrap()
+            {
+                ConsentLookup::Granted(record) | ConsentLookup::Denied(record) => record,
+                other => panic!("{other:?}"),
+            }
+        };
+        store
+            .grant_module_consent_scoped(
+                &s,
+                &grant(&["doc:a", "doc:b"], "sha256:old"),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let narrowed = store
+            .grant_module_consent_scoped(
+                &s,
+                &grant(&["doc:c"], "sha256:new"),
+                "2026-10-09T00:00:00Z",
+                "2026-11-09T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        for record in [narrowed, read_back().await] {
+            assert_eq!(record.resources, ["doc:c"]);
+            assert_eq!(record.artifact.as_deref(), Some("sha256:new"));
+        }
+
+        let refused = store
+            .deny_module_consent(&s, "2026-10-09T01:00:00Z", "2026-11-09T01:00:00Z")
+            .await
+            .unwrap();
+        for record in [refused, read_back().await] {
+            assert!(record.resources.is_empty(), "{record:?}");
+            assert_eq!(record.artifact, None);
+        }
+    }
+
+    /// PR-Daemon B2: revoking the same tool again takes a new generation, so
+    /// it covers the grant made since the first revocation.
+    #[tokio::test]
+    async fn a_second_revocation_of_a_tool_covers_the_grant_since_the_first() {
+        let store = store().await;
+        let s = summary("doc body");
+        let lookup = || async {
+            store
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-10T00:00:00Z",
+                )
+                .await
+                .unwrap()
+        };
+        store_grant(&store, &s).await;
+        store
+            .revoke_module_consent(&s.module, Some(&s.op), "2026-10-08T01:00:00Z")
+            .await
+            .unwrap();
+        store_grant(&store, &s).await;
+        assert!(matches!(lookup().await, ConsentLookup::Granted(_)));
+        store
+            .revoke_module_consent(&s.module, Some(&s.op), "2026-10-08T02:00:00Z")
+            .await
+            .unwrap();
+        let after = lookup().await;
+        assert!(
+            matches!(after, ConsentLookup::Revoked(Some(_))),
+            "{after:?}"
         );
     }
 
