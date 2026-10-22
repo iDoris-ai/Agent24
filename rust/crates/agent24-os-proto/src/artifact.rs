@@ -1,7 +1,8 @@
 //! A module package's artifact identity (K1-6a-G §2.1): a digest of exactly
-//! the files in a package, for a run to carry from its start, so the same
-//! version with a changed file is a different artifact. It proves which
-//! files these are, not where they came from (ADR-K1-03 §4).
+//! the files a run was started from, kept on that run's
+//! [`Generation`](crate::drain::Generation), so the same version with a
+//! changed file is a different artifact. It proves which files these are,
+//! not where they came from (ADR-K1-03 §4).
 //!
 //! The walk follows nothing: each directory and file is opened from its
 //! parent's descriptor, refusing a link, and must be the inode the parent
