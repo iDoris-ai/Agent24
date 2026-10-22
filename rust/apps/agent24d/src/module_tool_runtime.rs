@@ -261,6 +261,8 @@ mod tests {
         /// the wait racing it is not polled again first.
         on_check: Hook,
         on_invoke: Hook,
+        /// `(authorized_resources, authorization_ref)` of each dispatch.
+        dispatched: std::sync::Mutex<Vec<(Vec<String>, String)>>,
     }
 
     type Hook = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
@@ -296,12 +298,16 @@ mod tests {
 
         async fn invoke(
             &self,
-            _: ModuleToolContext,
+            context: ModuleToolContext,
             _: Map<String, Value>,
             _: Duration,
             cancel: CancellationToken,
         ) -> Result<ModuleToolResult, ModuleToolCallError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.dispatched
+                .lock()
+                .unwrap()
+                .push((context.authorized_resources, context.authorization_ref));
             self.entered.notify_one();
             run_hook(&self.on_invoke);
             if self.wait_for_cancel.load(Ordering::SeqCst) {
@@ -531,6 +537,7 @@ mod tests {
             check_entered: tokio::sync::Notify::new(),
             on_check: Hook::default(),
             on_invoke: Hook::default(),
+            dispatched: std::sync::Mutex::default(),
         });
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
@@ -604,6 +611,119 @@ mod tests {
             serde_json::to_string(&audit.iter().map(|entry| &entry.detail).collect::<Vec<_>>())
                 .unwrap();
         assert!(!audit_text.contains("do-not-audit-this-secret"));
+    }
+
+    /// K1-6a-G §2.2, §4 case 9: the module gets the grant's resource set as
+    /// recorded and its `ga1:` reference; the audit names the set only by
+    /// count and digest. A grant without resources dispatches an empty list.
+    #[tokio::test]
+    async fn a_grant_dispatches_its_resources_and_audits_only_their_digest() {
+        let store = Store::open_memory().await.unwrap();
+        let (registry, runtime, _, store, _) =
+            fixture_using(RiskClass::Read, true, true, true, Some(store), None).await;
+        let call = || async {
+            registry
+                .dispatch(
+                    "fake_module.write_local",
+                    &context(),
+                    &Map::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        };
+        call().await;
+        let scoped = store
+            .grant_module_consent_scoped(
+                &summary(),
+                &agent24_store::GrantScope {
+                    resources: vec!["doc:doc_02".to_owned(), "doc:doc_01".to_owned()],
+                    artifact: None,
+                },
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        call().await;
+
+        let dispatched = runtime.dispatched.lock().unwrap().clone();
+        assert_eq!(dispatched.len(), 2);
+        assert!(dispatched[0].0.is_empty());
+        assert!(dispatched[0].1.starts_with("ga1:"));
+        assert_eq!(dispatched[1].0, ["doc:doc_01", "doc:doc_02"]);
+        assert_eq!(dispatched[1].1, scoped.authorization_ref());
+        assert_ne!(dispatched[0].1, dispatched[1].1);
+
+        let rows = store.list_audit().await.unwrap();
+        let pre: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.detail.get("pre_dispatch"))
+            .collect();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["resource_ref"], agent24_store::resource_set_ref(&[]));
+        assert_eq!(
+            pre[1]["resource_ref"],
+            agent24_store::resource_set_ref(&scoped.resources)
+        );
+        assert_eq!(pre[1]["authorization_ref"], scoped.authorization_ref());
+        let audit_text =
+            serde_json::to_string(&rows.iter().map(|row| &row.detail).collect::<Vec<_>>()).unwrap();
+        assert!(!audit_text.contains("doc_01"), "{audit_text}");
+    }
+
+    /// K1-6a-G §4 case 10: a stored set that is malformed or over the cap is
+    /// refused at dispatch, audited as denied, and never trimmed into one
+    /// that would pass; a set at the cap goes through whole.
+    #[tokio::test]
+    async fn a_stored_resource_set_that_is_malformed_or_too_large_is_not_dispatched() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        let set_resources = |resources: Vec<String>| {
+            let store = store.clone();
+            async move {
+                sqlx::query("UPDATE module_consents SET resources = ?")
+                    .bind(serde_json::to_string(&resources).unwrap())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            }
+        };
+        let call = || async {
+            registry
+                .dispatch(
+                    "fake_module.write_local",
+                    &context(),
+                    &Map::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+        };
+        let many = |n: usize| (0..n).map(|i| format!("doc:d{i}")).collect::<Vec<_>>();
+
+        for bad in [
+            vec!["doc:a".to_owned(), "not a resource".to_owned()],
+            vec!["doc:a:b".to_owned()],
+            many(agent24_store::MAX_GRANT_RESOURCES + 1),
+        ] {
+            set_resources(bad.clone()).await;
+            let error = call().await.unwrap_err();
+            assert!(
+                error.to_string().contains("permission_denied"),
+                "{bad:?}: {error}"
+            );
+            assert_eq!(runtime.calls.load(Ordering::SeqCst), 0, "{bad:?}");
+            let rows = store.list_audit().await.unwrap();
+            let last = &rows[rows.len() - 1];
+            assert_eq!(last.detail["terminal"]["result"], "denied", "{bad:?}");
+            let pre = &rows[rows.len() - 2].detail["pre_dispatch"];
+            assert!(pre.get("resource_ref").is_none_or(Value::is_null), "{pre}");
+        }
+
+        set_resources(many(agent24_store::MAX_GRANT_RESOURCES)).await;
+        call().await.unwrap();
+        let dispatched = runtime.dispatched.lock().unwrap().clone();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].0.len(), agent24_store::MAX_GRANT_RESOURCES);
     }
 
     #[tokio::test]
@@ -1445,6 +1565,7 @@ mod tests {
             check_entered: tokio::sync::Notify::new(),
             on_check: Hook::default(),
             on_invoke: Hook::default(),
+            dispatched: std::sync::Mutex::default(),
         });
         let other: Arc<dyn agent24_domain::tool::ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: other_auth.clone(),

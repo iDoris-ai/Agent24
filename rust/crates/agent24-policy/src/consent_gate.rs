@@ -161,6 +161,12 @@ pub struct GrantRef {
     pub scope_fingerprint: String,
     pub decided_at: String,
     pub expires_at: String,
+    /// The record's resource set as stored (K1-6a-G §2.2); a dispatch
+    /// checks it before the module sees it.
+    pub resources: Vec<String>,
+    /// [`ModuleConsentRecord::authorization_ref`]: `ga1:` and a digest that
+    /// changes with every replacement of the grant.
+    pub authorization_ref: String,
 }
 
 impl From<&ModuleConsentRecord> for GrantRef {
@@ -171,6 +177,8 @@ impl From<&ModuleConsentRecord> for GrantRef {
             scope_fingerprint: record.scope_fingerprint.clone(),
             decided_at: record.decided_at.clone(),
             expires_at: record.expires_at.clone(),
+            resources: record.resources.clone(),
+            authorization_ref: record.authorization_ref(),
         }
     }
 }
@@ -259,11 +267,9 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
                 grant_ref,
                 per_call_approval,
             } => Ok(agent24_tools::ModuleToolGrantContext {
-                authorized_resources: Vec::new(),
-                authorization_ref: format!(
-                    "{}:{}",
-                    grant_ref.scope_fingerprint, grant_ref.decided_at
-                ),
+                // As recorded: the dispatch validates the set, never trims it.
+                authorized_resources: grant_ref.resources,
+                authorization_ref: grant_ref.authorization_ref,
                 per_call_approval,
                 valid_for: Some(valid_for(&now, &grant_ref.expires_at)),
             }),
@@ -458,6 +464,53 @@ mod tests {
                 op: Some(s.op.clone()),
             }
         );
+    }
+
+    /// K1-6a-G §2.2, §4 case 9: an allowed call carries the grant's resource
+    /// set as recorded and its `ga1:` reference; a grant without resources
+    /// gives an empty list, and a new grant a new reference.
+    #[tokio::test]
+    async fn an_allowed_call_carries_the_recorded_resources_and_ref() {
+        use agent24_tools::ModuleToolAuthorization;
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let authorization = ModuleConsentAuthorization::new(
+            std::sync::Arc::new(StoreConsentGate::new(store.clone())),
+            request_for(&s, RiskClass::Read),
+            std::sync::Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
+        );
+        let ctx = agent24_tools::ToolContext::legacy("run", None, None, "call");
+        let plain = store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let grant = authorization
+            .authorize(&s.module, &s.op, &ctx)
+            .await
+            .unwrap();
+        assert!(grant.authorized_resources.is_empty());
+        assert_eq!(grant.authorization_ref, plain.authorization_ref());
+
+        let scoped = store
+            .grant_module_consent_scoped(
+                &s,
+                &agent24_store::GrantScope {
+                    resources: vec!["doc:b".to_owned(), "doc:a".to_owned()],
+                    artifact: Some("sha256:abc".to_owned()),
+                },
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let grant = authorization
+            .authorize(&s.module, &s.op, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(grant.authorized_resources, ["doc:a", "doc:b"]);
+        assert_eq!(grant.authorization_ref, scoped.authorization_ref());
+        assert_ne!(scoped.authorization_ref(), plain.authorization_ref());
+        assert!(grant.authorization_ref.starts_with("ga1:"));
     }
 
     /// K1-6a-G §2.5: what remains of a grant, by the authorization's clock;
