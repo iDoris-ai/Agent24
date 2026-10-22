@@ -1070,6 +1070,12 @@ impl Tool for ModuleTool {
             return Err(ToolError::Failed(module_error_json(permission_denied())));
         };
         match authorized {
+            // A resource set the dispatch would refuse (§4 case 10) shows no
+            // card either.
+            Ok(grant) if !dispatchable_resources(&grant.authorized_resources) => {
+                self.audit_refusal_as(ctx, &grant.authorization_ref).await?;
+                Err(ToolError::Failed(module_error_json(permission_denied())))
+            }
             Ok(grant) => Ok(Some(grant.authorization_ref)),
             Err(error) => {
                 self.audit_refusal_as(ctx, &denied_authorization_ref(&error))

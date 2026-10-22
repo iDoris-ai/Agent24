@@ -726,6 +726,41 @@ mod tests {
         assert_eq!(dispatched[0].0.len(), agent24_store::MAX_GRANT_RESOURCES);
     }
 
+    /// A call that asks for approval is refused before any card when its
+    /// stored resource set could not be dispatched, as #1130 L3 has it for
+    /// every refusal the dispatch would make.
+    #[tokio::test]
+    async fn a_resource_set_that_cannot_be_dispatched_shows_no_card() {
+        let (registry, runtime, approvals, store) =
+            fixture(RiskClass::WriteLocal, true, true).await;
+        sqlx::query("UPDATE module_consents SET resources = ?")
+            .bind(r#"["doc:a:b"]"#)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[0].detail["pre_dispatch"]["authorization_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("ga1:")
+        );
+        assert_eq!(rows[1].detail["terminal"]["result"], "denied");
+    }
+
     #[tokio::test]
     async fn missing_consent_is_not_advertised_and_never_reaches_fake_module() {
         let (registry, runtime, _, store) = fixture(RiskClass::Read, false, true).await;
