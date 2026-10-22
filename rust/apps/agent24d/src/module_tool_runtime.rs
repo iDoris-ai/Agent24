@@ -21,6 +21,9 @@ pub struct AgentModuleToolRuntime {
     supervisors: Arc<OnceLock<Arc<Supervisors>>>,
     operations: Arc<HashSet<(String, String)>>,
     request_ids: KernelRequestIds,
+    /// Runs a test puts in place of the supervisors' slots.
+    #[cfg(test)]
+    test_slots: std::sync::Mutex<HashMap<String, Arc<agent24_os_proto::drain::Current>>>,
 }
 
 impl AgentModuleToolRuntime {
@@ -29,6 +32,8 @@ impl AgentModuleToolRuntime {
             supervisors: Arc::new(OnceLock::new()),
             operations: Arc::new(operations),
             request_ids: KernelRequestIds::new_random(),
+            #[cfg(test)]
+            test_slots: std::sync::Mutex::default(),
         })
     }
 
@@ -37,18 +42,22 @@ impl AgentModuleToolRuntime {
     }
 
     fn generation(&self, module: &str) -> Result<Arc<Generation>, ModuleToolCallError> {
-        let supervisors = self
-            .supervisors
-            .get()
-            .ok_or(ModuleToolCallError::ModuleUnavailable)?;
-        let current = supervisors
-            .running_slot(module)
+        let current = self
+            .slot(module)
             .ok_or(ModuleToolCallError::ModuleUnavailable)?;
         let generation = current.get();
         if generation.state() != DrainState::Running {
             return Err(ModuleToolCallError::ModuleUnavailable);
         }
         Ok(generation)
+    }
+
+    fn slot(&self, module: &str) -> Option<Arc<agent24_os_proto::drain::Current>> {
+        #[cfg(test)]
+        if let Some(current) = self.test_slots.lock().ok()?.get(module) {
+            return Some(Arc::clone(current));
+        }
+        self.supervisors.get()?.running_slot(module)
     }
 
     /// The current identity of `module`'s running package (K1-6a-G §2.2),
@@ -140,14 +149,11 @@ fn serves_granted_package(generation: &Generation, expected: Option<&str>) -> bo
     expected.is_some() && generation.artifact() == expected
 }
 
-/// What a call gets when the running package is not the one granted.
+/// What a call gets when the running package is not the one granted: the
+/// host's own cancellation, before anything is sent (K1-6a-G §2.5), which
+/// the caller reports as `permission_denied`.
 fn stale_package() -> ModuleToolCallError {
-    ModuleToolCallError::Module {
-        code: ModuleToolErrorCode::PermissionDenied,
-        retryable: false,
-        details: Some(serde_json::json!({"reason": "stale"})),
-        unknown_code: None,
-    }
+    ModuleToolCallError::Cancelled
 }
 
 /// Module id of the Documenting OS, as adopted in ADR-DOC-01
@@ -884,6 +890,76 @@ mod tests {
         assert!(!super::serves_granted_package(&run(None), Some("sha256:a")));
         assert!(!super::serves_granted_package(&run(Some("sha256:a")), None));
         assert!(!super::serves_granted_package(&run(None), None));
+    }
+
+    /// The runtime itself turns away a call for a package other than the one
+    /// running, before anything is sent: a grant for A never reaches B.
+    #[tokio::test]
+    async fn invoke_refuses_a_run_of_another_package_before_sending() {
+        let runtime = AgentModuleToolRuntime::new(HashSet::from([(
+            "fake_module".to_owned(),
+            "write_local".to_owned(),
+        )]));
+        let generation = agent24_os_proto::drain::Generation::serving_package(
+            std::path::PathBuf::from("/nonexistent/upstream.sock"),
+            Some("sha256:b".to_owned()),
+        );
+        assert!(generation.ready());
+        runtime.test_slots.lock().unwrap().insert(
+            "fake_module".to_owned(),
+            agent24_os_proto::drain::Current::new(generation),
+        );
+        let invoke = |expected: Option<&str>| {
+            runtime.invoke(
+                ModuleToolContext {
+                    run_id: "run".to_owned(),
+                    session_id: None,
+                    tool_call_id: "call".to_owned(),
+                    module_id: "fake_module".to_owned(),
+                    operation: "write_local".to_owned(),
+                    authorized_resources: Vec::new(),
+                    authorization_ref: "ga1:x".to_owned(),
+                    expected_artifact: expected.map(str::to_owned),
+                },
+                Map::new(),
+                Duration::from_secs(1),
+                CancellationToken::new(),
+            )
+        };
+        for expected in [Some("sha256:a"), None] {
+            assert!(
+                matches!(invoke(expected).await, Err(ModuleToolCallError::Cancelled)),
+                "{expected:?}"
+            );
+        }
+        // The package granted is the one running: the call goes out, and
+        // fails only on the socket that is not there.
+        assert!(!matches!(
+            invoke(Some("sha256:b")).await,
+            Err(ModuleToolCallError::Cancelled)
+        ));
+    }
+
+    /// A runtime's own refusal, with the caller not cancelling, is the grant
+    /// no longer holding: audited `cancelled`, `permission_denied` to the
+    /// model, whatever the check after the call says.
+    #[tokio::test]
+    async fn a_runtime_refusal_reaches_the_model_as_permission_denied() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        *runtime.failure.lock().unwrap() = Some(ModuleToolCallError::Cancelled);
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].detail["terminal"]["result"], "cancelled");
     }
 
     /// A dispatch carries the granted package to the runtime, off the wire:

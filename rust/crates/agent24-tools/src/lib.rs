@@ -1391,6 +1391,16 @@ impl Tool for ModuleTool {
                 )));
             }
         };
+        // The runtime refused before sending, on its own and not for the
+        // caller (K1-6a-G §2.2: the run is not of the package granted): the
+        // grant as looked up no longer holds, so `cancelled` and
+        // `permission_denied` (§2.5), whatever a later lookup says.
+        if matches!(result, Err(ModuleToolCallError::Cancelled)) && !cancel.is_cancelled() {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         let code = match &result {
             Ok(ModuleToolResult::Completed { .. }) => ModuleToolResultCode::Success,
             Ok(ModuleToolResult::Pending { .. }) => ModuleToolResultCode::ResultUnknown,
