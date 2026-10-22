@@ -137,3 +137,61 @@ describe('group history', () => {
     )
   })
 })
+
+describe('group send', () => {
+  it('rejects a call with no identity', async () => {
+    const client = new SpeakerClient(async () => envelope({}))
+    await expect(client.groupSend(groupId, 'hi')).rejects.toThrow(/requires an identity/)
+  })
+
+  it('rejects an empty group id', async () => {
+    const client = new SpeakerClient(async () => envelope({}), { identity: 'alice' })
+    await expect(client.groupSend('', 'hi')).rejects.toThrow(/requires a group id/)
+  })
+
+  it('rejects an empty body', async () => {
+    const client = new SpeakerClient(async () => envelope({}), { identity: 'alice' })
+    await expect(client.groupSend(groupId, '')).rejects.toThrow(/requires a body/)
+  })
+
+  it('fails the call when hyphae returns a non-zero envelope', async () => {
+    const client = new SpeakerClient(
+      async () => JSON.stringify({ ok: false, message: 'group is not active' }),
+      { identity: 'alice' },
+    )
+    await expect(client.groupSend(groupId, 'hi')).rejects.toThrow(/group is not active/)
+  })
+
+  it('uses a top-level event id ahead of recipient ids', async () => {
+    const top = 'aa'.repeat(32)
+    const client = new SpeakerClient(
+      async () =>
+        envelope({
+          logical_id: logicalId,
+          event_id: top,
+          recipients: [{ event_id: 'bb'.repeat(32) }],
+        }),
+      { identity: 'alice' },
+    )
+    await expect(client.groupSend(groupId, 'hi')).resolves.toEqual({
+      logical_id: logicalId,
+      event_id: top,
+    })
+  })
+
+  it('skips an empty recipient event id', async () => {
+    const kept = 'cc'.repeat(32)
+    const client = new SpeakerClient(
+      async () =>
+        envelope({
+          logical_id: logicalId,
+          recipients: [{ event_id: '' }, { event_id: kept }],
+        }),
+      { identity: 'alice' },
+    )
+    await expect(client.groupSend(groupId, 'hi')).resolves.toEqual({
+      logical_id: logicalId,
+      event_id: kept,
+    })
+  })
+})
