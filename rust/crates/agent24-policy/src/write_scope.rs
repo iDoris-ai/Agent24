@@ -57,10 +57,9 @@ pub(crate) fn directory_grant_forbidden(directory: &Path) -> bool {
 fn forbidden_workspace_root(root: &Path) -> bool {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         && let Some(home) = canonical_claim(&home)
+        && forbidden_against_home(root, &home)
     {
-        if forbidden_against_home(root, &home) {
-            return true;
-        }
+        return true;
     }
     const SYSTEM: &[&str] = &[
         "/",
