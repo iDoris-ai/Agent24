@@ -2588,4 +2588,358 @@ mod tests {
         assert!(view.outbound_gate_ready("doc_mod", "read_op").await);
         assert!(!view.outbound_gate_ready("doc_mod", "unknown_op").await);
     }
+
+    /// A grant whose `authorization_ref` is `grant:<epoch>`.
+    struct RebindingAuthorization {
+        epoch: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModuleToolAuthorization for RebindingAuthorization {
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ToolContext,
+        ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            Ok(agent24_tools::ModuleToolGrantContext {
+                authorized_resources: vec![],
+                authorization_ref: format!("grant:{}", self.epoch.load(Ordering::SeqCst)),
+                per_call_approval: false,
+                valid_for: None,
+            })
+        }
+    }
+
+    /// Approves every card; the first `rebinds` approvals each replace the
+    /// grant just after the human said yes.
+    struct RebindingApproval {
+        calls: AtomicUsize,
+        epoch: Arc<AtomicUsize>,
+        rebinds: usize,
+    }
+
+    #[async_trait]
+    impl ApprovalGate for RebindingApproval {
+        async fn check(
+            &self,
+            _: &ToolInfo,
+            _: &ToolContext,
+            _: &Map<String, Value>,
+            _: Option<&str>,
+            _: &CancellationToken,
+        ) -> GateDecision {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.rebinds {
+                self.epoch.fetch_add(1, Ordering::SeqCst);
+            }
+            GateDecision::Allow
+        }
+    }
+
+    async fn rebinding_fixture(
+        rebinds: usize,
+    ) -> (ToolRegistry, Arc<FakeModule>, Arc<RebindingApproval>, Store) {
+        let epoch = Arc::new(AtomicUsize::new(0));
+        let authorization = Arc::new(RebindingAuthorization {
+            epoch: Arc::clone(&epoch),
+        });
+        let (_, runtime, _, store, tool) = fixture_using(
+            RiskClass::WriteLocal,
+            true,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        let approvals = Arc::new(RebindingApproval {
+            calls: AtomicUsize::new(0),
+            epoch,
+            rebinds,
+        });
+        let mut registry = ToolRegistry::new()
+            .with_risk_overrides(Arc::new(RelaxModuleRisk))
+            .with_gate(approvals.clone());
+        registry.register_module_tool(tool).unwrap();
+        (registry, runtime, approvals, store)
+    }
+
+    async fn dispatch_write_local(registry: &ToolRegistry) -> Result<String, ToolError> {
+        registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+    }
+
+    /// K1-6a-G §4 case 17: the grant changed between approval and dispatch,
+    /// so that approval is void and the human is asked again; the module
+    /// runs once, under the grant the second card was shown for.
+    #[tokio::test]
+    async fn a_grant_replaced_after_approval_asks_again() {
+        let (registry, runtime, approvals, store) = rebinding_fixture(1).await;
+        dispatch_write_local(&registry).await.unwrap();
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let rows = store.list_audit().await.unwrap();
+        let results: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.detail["terminal"]["result"].as_str())
+            .collect();
+        assert_eq!(results, ["cancelled", "success"]);
+        assert_eq!(
+            rows[2].detail["pre_dispatch"]["authorization_ref"],
+            "grant:1"
+        );
+    }
+
+    /// A grant that keeps changing is not asked about forever.
+    #[tokio::test]
+    async fn a_grant_that_keeps_changing_is_refused_after_three_cards() {
+        let (registry, runtime, approvals, _) = rebinding_fixture(usize::MAX).await;
+        let error = dispatch_write_local(&registry).await.unwrap_err();
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// #1130 L3: a call that could never run shows no card. Withheld by the
+    /// gate-5 guard, or with no grant, it is refused and audited before the
+    /// approval gate is asked.
+    #[tokio::test]
+    async fn a_call_bound_to_be_refused_shows_no_card() {
+        let (registry, runtime, approvals, store) =
+            fixture(RiskClass::WriteLocal, true, true).await;
+        runtime.remote_tier.store(true, Ordering::SeqCst);
+        let withheld = dispatch_write_local(&registry).await.unwrap_err();
+        let (registry, ungranted_runtime, ungranted_approvals, ungranted_store) =
+            fixture(RiskClass::WriteLocal, false, true).await;
+        let ungranted = dispatch_write_local(&registry).await.unwrap_err();
+        for error in [withheld, ungranted] {
+            assert!(error.to_string().contains("permission_denied"), "{error}");
+        }
+        for (approvals, runtime, store, authorization_ref) in [
+            (approvals, runtime, store, "denied:remote_tier"),
+            (
+                ungranted_approvals,
+                ungranted_runtime,
+                ungranted_store,
+                "denied:no_grant",
+            ),
+        ] {
+            assert_eq!(approvals.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+            let rows = store.list_audit().await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].detail["pre_dispatch"]["authorization_ref"],
+                authorization_ref
+            );
+            assert_eq!(rows[1].detail["terminal"]["result"], "denied");
+        }
+    }
+
+    async fn preapprove_write_local(registry: &ToolRegistry) -> Result<String, ToolError> {
+        registry
+            .execute_preapproved(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+    }
+
+    /// An approval given out of band (durable resume) does not record which
+    /// grant the human saw, so it is not taken as covering this one: the
+    /// call stops before the module, for the caller to ask again.
+    #[tokio::test]
+    async fn an_approval_from_a_resume_stops_before_the_module() {
+        let (registry, runtime, approvals, store) =
+            fixture(RiskClass::WriteLocal, true, true).await;
+        let error = preapprove_write_local(&registry).await.unwrap_err();
+        assert!(matches!(error, ToolError::ApprovalStale), "{error}");
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].detail["terminal"]["result"], "cancelled");
+    }
+
+    /// Grants every lookup and keeps the last context it was handed.
+    struct KeepingAuthorization {
+        kept: std::sync::Mutex<Option<ToolContext>>,
+    }
+
+    #[async_trait]
+    impl ModuleToolAuthorization for KeepingAuthorization {
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            ctx: &ToolContext,
+        ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            *self.kept.lock().unwrap() = Some(ctx.clone());
+            Ok(agent24_tools::ModuleToolGrantContext {
+                authorized_resources: vec![],
+                authorization_ref: "grant:kept".to_owned(),
+                per_call_approval: false,
+                valid_for: None,
+            })
+        }
+    }
+
+    /// No approval travels on a `ToolContext`: the one an adapter kept from
+    /// inside an approved call does not let a direct call reach the module.
+    #[tokio::test]
+    async fn a_context_kept_from_an_approved_call_carries_no_approval() {
+        let authorization = Arc::new(KeepingAuthorization {
+            kept: std::sync::Mutex::new(None),
+        });
+        let (registry, runtime, approvals, _, tool) = fixture_using(
+            RiskClass::WriteLocal,
+            true,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        dispatch_write_local(&registry).await.unwrap();
+        let kept = authorization.kept.lock().unwrap().take().unwrap();
+        let direct = tool
+            .call(&kept, &Map::new(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(direct, ToolError::ApprovalStale), "{direct}");
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct TightenModuleRisk;
+
+    impl RiskOverrides for TightenModuleRisk {
+        fn resolve(&self, _: &str) -> Option<RiskClass> {
+            Some(RiskClass::WriteLocal)
+        }
+    }
+
+    /// A tool declared `read` that the user tightened to ask every call:
+    /// an approval from a resume names no grant for it either.
+    #[tokio::test]
+    async fn a_tightened_tool_approved_out_of_band_stops_before_the_module() {
+        let (_, runtime, approvals, _, tool) =
+            fixture_using(RiskClass::Read, true, true, true, None, None).await;
+        let mut registry = ToolRegistry::new()
+            .with_risk_overrides(Arc::new(TightenModuleRisk))
+            .with_gate(approvals.clone());
+        registry.register_module_tool(tool).unwrap();
+        let error = preapprove_write_local(&registry).await.unwrap_err();
+        assert!(matches!(error, ToolError::ApprovalStale), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        dispatch_write_local(&registry).await.unwrap();
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Hands out `grant:a` until the call's own lookup, which replaces it
+    /// with `grant:b` and announces the change.
+    struct ReplacingAuthorization {
+        lookups: AtomicUsize,
+        feed: tokio::sync::broadcast::Sender<agent24_store::ModuleConsentChange>,
+    }
+
+    #[async_trait]
+    impl ModuleToolAuthorization for ReplacingAuthorization {
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ToolContext,
+        ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            let lookup = self.lookups.fetch_add(1, Ordering::SeqCst) + 1;
+            if lookup == 2 {
+                let _ = self.feed.send(agent24_store::ModuleConsentChange {
+                    module: "fake_module".to_owned(),
+                    op: Some("write_local".to_owned()),
+                });
+            }
+            Ok(agent24_tools::ModuleToolGrantContext {
+                authorized_resources: vec![],
+                authorization_ref: if lookup <= 2 { "grant:a" } else { "grant:b" }.to_owned(),
+                per_call_approval: false,
+                valid_for: None,
+            })
+        }
+
+        fn consent_changes(
+            &self,
+        ) -> Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>> {
+            Some(self.feed.subscribe())
+        }
+    }
+
+    /// The grant is replaced after the call matched its approval but before
+    /// the module has it: still the window §2.3 covers, so the approval is
+    /// void and the human is asked again, not told `permission_denied`.
+    #[tokio::test]
+    async fn a_grant_replaced_just_before_dispatch_asks_again() {
+        let authorization = Arc::new(ReplacingAuthorization {
+            lookups: AtomicUsize::new(0),
+            feed: tokio::sync::broadcast::channel(4).0,
+        });
+        let (registry, runtime, approvals, _, _) = fixture_using(
+            RiskClass::WriteLocal,
+            true,
+            true,
+            true,
+            None,
+            Some(authorization),
+        )
+        .await;
+        dispatch_write_local(&registry).await.unwrap();
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The lookup before the card is cancellable: a run cancelled while it
+    /// hangs stops promptly, and no card is shown.
+    #[tokio::test]
+    async fn a_lookup_before_the_card_that_hangs_is_cancellable() {
+        let authorization = Arc::new(PausingAuthorization {
+            entered: tokio::sync::Notify::new(),
+        });
+        let (registry, runtime, approvals, _, _) = fixture_using(
+            RiskClass::WriteLocal,
+            true,
+            true,
+            true,
+            None,
+            Some(authorization.clone()),
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        let entered = authorization.entered.notified();
+        let call = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                registry
+                    .dispatch("fake_module.write_local", &context(), &Map::new(), &cancel)
+                    .await
+            }
+        });
+        entered.await;
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(500), call)
+            .await
+            .expect("cancellation reaches the lookup")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, ToolError::Cancelled), "{error}");
+        assert_eq!(approvals.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    }
 }
