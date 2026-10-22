@@ -351,6 +351,7 @@ mod tests {
                     authorized_resources: vec![],
                     authorization_ref: "grant:retained".to_owned(),
                     per_call_approval: false,
+                    valid_for: None,
                 })
             } else {
                 self.entered_second.notify_one();
@@ -1434,6 +1435,7 @@ mod tests {
                         authorized_resources: vec![],
                         authorization_ref: "grant:first".into(),
                         per_call_approval: false,
+                        valid_for: None,
                     })
                 } else {
                     self.entered_second.notify_one();
@@ -1758,6 +1760,40 @@ mod tests {
         assert!(!view.blocked_by_remote_tier_guard("sin90", "get").await);
         *tier.lock().unwrap() = Some(false);
         assert!(!view.blocked_by_remote_tier_guard("documents", "get").await);
+    }
+
+    /// The deadline is the stored grant's own expiry, measured by the
+    /// authorization's clock (here 00:00:01 against an expiry at 00:00:03),
+    /// not the wall clock.
+    #[tokio::test]
+    async fn a_stored_grant_carries_its_remaining_validity() {
+        let summary = summary();
+        let store = Store::open_memory().await.unwrap();
+        store
+            .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2026-10-08T00:00:03Z")
+            .await
+            .unwrap();
+        let gate: Arc<dyn ConsentGate> = Arc::new(StoreConsentGate::new(store.clone()));
+        let authorization = ModuleConsentAuthorization::new(
+            gate,
+            ConsentGateRequest {
+                module: summary.module.clone(),
+                op: summary.op.clone(),
+                module_version: summary.module_version.clone(),
+                current_scope_fingerprint: summary.scope_fingerprint(),
+                risk: RiskClass::Read,
+                org_restricted: false,
+                source_restricted: false,
+                reversible_draft_declared: false,
+                draft_verification: None,
+            },
+            Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
+        );
+        let grant = authorization
+            .authorize("fake_module", "write_local", &context())
+            .await
+            .unwrap();
+        assert_eq!(grant.valid_for, Some(Duration::from_secs(2)));
     }
 
     #[tokio::test]

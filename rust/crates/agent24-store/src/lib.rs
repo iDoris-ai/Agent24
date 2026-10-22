@@ -83,8 +83,8 @@ pub use module_audit_event::{
     SizeBytes, ToolCallId,
 };
 pub use module_consents::{
-    ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentRecord,
-    ModuleConsentRevocation, ToolPermissionSummary,
+    ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentChange,
+    ModuleConsentRecord, ModuleConsentRevocation, ToolPermissionSummary, consent_instant_millis,
 };
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
@@ -145,6 +145,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     pool: SqlitePool,
     module_consent_revocations: tokio::sync::broadcast::Sender<ModuleConsentRevocation>,
+    module_consent_changes: tokio::sync::broadcast::Sender<ModuleConsentChange>,
     terminal_commit_ack_gate:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>>,
 }
@@ -166,9 +167,11 @@ impl Store {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
         Ok(Self {
             pool,
             module_consent_revocations,
+            module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
         })
     }
@@ -185,9 +188,11 @@ impl Store {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
         Ok(Self {
             pool,
             module_consent_revocations,
+            module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
         })
     }
@@ -243,9 +248,11 @@ pub mod test_hooks {
     #[must_use]
     pub fn from_pool(pool: sqlx::SqlitePool) -> super::Store {
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
         super::Store {
             pool,
             module_consent_revocations,
+            module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
         }
     }

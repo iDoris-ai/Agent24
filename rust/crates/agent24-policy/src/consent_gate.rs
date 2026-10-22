@@ -204,6 +204,8 @@ pub struct ModuleConsentAuthorization {
     gate: std::sync::Arc<dyn ConsentGate>,
     request: ConsentGateRequest,
     now: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
+    /// Where committed consent changes are announced (K1-6a-G §2.5).
+    changes: Option<Store>,
 }
 
 impl ModuleConsentAuthorization {
@@ -213,16 +215,29 @@ impl ModuleConsentAuthorization {
         request: ConsentGateRequest,
         now: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
     ) -> Self {
-        Self { gate, request, now }
+        Self {
+            gate,
+            request,
+            now,
+            changes: None,
+        }
     }
 
-    async fn decision(&self, module: &str, operation: &str) -> ConsentGateDecision {
+    /// In-flight calls watch `store`'s consent changes and stop when their
+    /// grant is no longer current (K1-6a-G §2.5).
+    #[must_use]
+    pub fn with_consent_changes(mut self, store: Store) -> Self {
+        self.changes = Some(store);
+        self
+    }
+
+    async fn decision(&self, module: &str, operation: &str, now: &str) -> ConsentGateDecision {
         if self.request.module != module || self.request.op != operation {
             return ConsentGateDecision::Deny {
                 reason: ConsentDenyReason::NotGranted,
             };
         }
-        self.gate.authorize(&self.request, &(self.now)()).await
+        self.gate.authorize(&self.request, now).await
     }
 }
 
@@ -236,7 +251,10 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
     ) -> Result<agent24_tools::ModuleToolGrantContext, agent24_domain::tool::ModuleToolCallError>
     {
         use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode};
-        match self.decision(module, operation).await {
+        // One instant for the lookup and the remaining validity, so the two
+        // agree.
+        let now = (self.now)();
+        match self.decision(module, operation, &now).await {
             ConsentGateDecision::Allow {
                 grant_ref,
                 per_call_approval,
@@ -247,6 +265,7 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
                     grant_ref.scope_fingerprint, grant_ref.decided_at
                 ),
                 per_call_approval,
+                valid_for: Some(valid_for(&now, &grant_ref.expires_at)),
             }),
             ConsentGateDecision::Deny { reason } => {
                 let details = matches!(reason, ConsentDenyReason::Revoked(_))
@@ -263,9 +282,32 @@ impl agent24_tools::ModuleToolAuthorization for ModuleConsentAuthorization {
 
     async fn has_current_consent(&self, module: &str, operation: &str) -> bool {
         matches!(
-            self.decision(module, operation).await,
+            self.decision(module, operation, &(self.now)()).await,
             ConsentGateDecision::Allow { .. }
         )
+    }
+
+    fn consent_changes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>> {
+        self.changes
+            .as_ref()
+            .map(Store::subscribe_module_consent_changes)
+    }
+}
+
+/// How long a grant expiring at `expires_at` stays valid after `now` (both
+/// RFC 3339). Zero when it has passed, or when either does not parse: a
+/// grant whose end cannot be read ends at once (K1-6a-G §2.5).
+fn valid_for(now: &str, expires_at: &str) -> std::time::Duration {
+    match (
+        agent24_store::consent_instant_millis(now),
+        agent24_store::consent_instant_millis(expires_at),
+    ) {
+        (Some(now), Some(end)) if end > now => {
+            std::time::Duration::from_millis(u64::try_from(end - now).unwrap_or(0))
+        }
+        _ => std::time::Duration::ZERO,
     }
 }
 
@@ -385,6 +427,54 @@ mod tests {
 
     async fn store() -> Store {
         Store::open_memory().await.unwrap()
+    }
+
+    /// K1-6a-G §2.5: in-flight calls hear the store's consent writes only
+    /// once the authorization is given that store.
+    #[tokio::test]
+    async fn consent_changes_come_from_the_store_it_was_given() {
+        use agent24_tools::ModuleToolAuthorization;
+        let store = store().await;
+        let s = summary(ConsentSource::FirstParty, HostRiskLevel::Low);
+        let gate = std::sync::Arc::new(StoreConsentGate::new(store.clone()));
+        let clock = std::sync::Arc::new(|| "2026-10-08T00:00:01Z".to_owned());
+        let unwired = ModuleConsentAuthorization::new(
+            gate.clone(),
+            request_for(&s, RiskClass::Read),
+            clock.clone(),
+        );
+        assert!(unwired.consent_changes().is_none());
+        let wired = ModuleConsentAuthorization::new(gate, request_for(&s, RiskClass::Read), clock)
+            .with_consent_changes(store.clone());
+        let mut changes = wired.consent_changes().expect("wired to the store");
+        store
+            .grant_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.try_recv().unwrap(),
+            agent24_store::ModuleConsentChange {
+                module: s.module.clone(),
+                op: Some(s.op.clone()),
+            }
+        );
+    }
+
+    /// K1-6a-G §2.5: what remains of a grant, by the authorization's clock;
+    /// past or unreadable is nothing.
+    #[test]
+    fn valid_for_is_what_remains_and_nothing_once_unreadable() {
+        use std::time::Duration;
+        let now = "2026-10-08T00:00:01Z";
+        assert_eq!(
+            valid_for(now, "2026-10-08T00:00:03.500Z"),
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(valid_for(now, "2026-10-08T02:00:01+02:00"), Duration::ZERO);
+        assert_eq!(valid_for(now, now), Duration::ZERO);
+        assert_eq!(valid_for(now, "2026-10-08T00:00:00Z"), Duration::ZERO);
+        assert_eq!(valid_for(now, "never"), Duration::ZERO);
+        assert_eq!(valid_for("now", "2026-10-08T00:00:03Z"), Duration::ZERO);
     }
 
     fn summary(source: ConsentSource, risk: HostRiskLevel) -> ToolPermissionSummary {

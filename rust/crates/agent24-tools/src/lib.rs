@@ -592,6 +592,31 @@ pub trait ModuleToolAuthorization: Send + Sync {
     async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
         false
     }
+
+    /// Every committed grant, refusal and revocation (K1-6a-G §2.5), taken
+    /// BEFORE [`Self::authorize`] so nothing between the two is missed.
+    /// `None`: no feed, and an in-flight call is bounded only by
+    /// [`ModuleToolGrantContext::valid_for`] and the check after it returns.
+    fn consent_changes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>> {
+        None
+    }
+
+    /// Whether `authorization_ref` is still the current grant for this tool:
+    /// a full lookup, not only revocation. Any failure is `false`.
+    async fn still_current(
+        &self,
+        module: &str,
+        operation: &str,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> bool {
+        matches!(
+            self.authorize(module, operation, ctx).await,
+            Ok(grant) if grant.authorization_ref == authorization_ref
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -599,7 +624,12 @@ pub struct ModuleToolGrantContext {
     pub authorized_resources: Vec<String>,
     pub authorization_ref: String,
     pub per_call_approval: bool,
+    /// How long the grant stays valid from the moment it was looked up, by
+    /// the authorization's own clock (K1-6a-G §2.5: a call ends at
+    /// `min(timeout, expires_at)`). `None`: no expiry known.
+    pub valid_for: Option<Duration>,
 }
+
 pub struct DenyModuleToolAuthorization;
 
 fn permission_denied() -> ModuleToolCallError {
