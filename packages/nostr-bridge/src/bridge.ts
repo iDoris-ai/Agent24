@@ -85,11 +85,12 @@ export function groupMember(identity: string, run: SpeakerRunner): GroupMember {
 
 export interface GroupReceiveReport {
   identity: string
-  event_id: string
+  logical_id: string
+  event_id?: string
   plaintext: string
 }
 
-/** Three members. `members[0]` calls `groupchat send`. `receiveNew` keeps an event id after the first read for that identity. */
+/** Three members. `members[0]` calls `groupchat send`. `receiveNew` records `identity + logical id` after every history read has returned. */
 export class GroupJoint {
   private readonly delivered = new Set<string>()
 
@@ -108,16 +109,20 @@ export class GroupJoint {
   }
 
   async receiveNew(groupId: string): Promise<GroupReceiveReport[]> {
-    const fresh: GroupReceiveReport[] = []
+    const read: { identity: string; rows: Awaited<ReturnType<SpeakerClient['groupHistory']>> }[] = []
     for (const member of this.members) {
-      const rows = await member.client.groupHistory(groupId)
-      for (const row of rows) {
-        if (!row.event_id) continue
-        const key = `${member.identity}\0${row.event_id}`
+      read.push({ identity: member.identity, rows: await member.client.groupHistory(groupId) })
+    }
+    const fresh: GroupReceiveReport[] = []
+    for (const member of read) {
+      for (const row of member.rows) {
+        if (!row.id) continue
+        const key = `${member.identity}\0${row.id}`
         if (this.delivered.has(key)) continue
         this.delivered.add(key)
         fresh.push({
           identity: member.identity,
+          logical_id: row.id,
           event_id: row.event_id,
           plaintext: row.plaintext,
         })

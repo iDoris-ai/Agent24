@@ -161,4 +161,37 @@ describe('group send', () => {
     )
     await expect(client.groupSend(groupId, 'hi')).rejects.toThrow(/group is not active/)
   })
+
+  it('uses a top-level event id ahead of recipient ids', async () => {
+    const top = 'aa'.repeat(32)
+    const client = new SpeakerClient(
+      async () =>
+        envelope({
+          logical_id: logicalId,
+          event_id: top,
+          recipients: [{ event_id: 'bb'.repeat(32) }],
+        }),
+      { identity: 'alice' },
+    )
+    await expect(client.groupSend(groupId, 'hi')).resolves.toEqual({
+      logical_id: logicalId,
+      event_id: top,
+    })
+  })
+
+  it('skips an empty recipient event id', async () => {
+    const kept = 'cc'.repeat(32)
+    const client = new SpeakerClient(
+      async () =>
+        envelope({
+          logical_id: logicalId,
+          recipients: [{ event_id: '' }, { event_id: kept }],
+        }),
+      { identity: 'alice' },
+    )
+    await expect(client.groupSend(groupId, 'hi')).resolves.toEqual({
+      logical_id: logicalId,
+      event_id: kept,
+    })
+  })
 })

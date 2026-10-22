@@ -143,9 +143,29 @@ describe('NostrBridge outbound (real bridge + SpeakerClient vs fake agent-speake
 
 describe('three-identity group joint', () => {
   const groupId = '00112233445566778899aabbccddeeff'
-  const eventId = 'ab'.repeat(32)
   const logicalId = 'ff'.repeat(16)
+  const bobEvent = 'bb'.repeat(32)
+  const carolEvent = 'cc'.repeat(32)
   const body = 'fixture group hello'
+
+  function historyRow(identity: string, plaintext: string): Record<string, unknown> {
+    if (identity === 'alice') {
+      return {
+        id: logicalId,
+        event_id: '',
+        sender: 'npub1alice',
+        plaintext,
+        created_at: 1_700_000_000,
+      }
+    }
+    return {
+      id: logicalId,
+      event_id: identity === 'bob' ? bobEvent : carolEvent,
+      sender: 'npub1alice',
+      plaintext,
+      created_at: 1_700_000_000,
+    }
+  }
 
   function localFixture() {
     const calls: { identity: string; args: string[] }[] = []
@@ -161,28 +181,19 @@ describe('three-identity group joint', () => {
             data: {
               logical_id: logicalId,
               recipients: [
-                { recipient_npub: 'npub1bob', event_id: eventId },
-                { recipient_npub: 'npub1carol', event_id: eventId },
+                { recipient_npub: 'npub1bob', event_id: bobEvent },
+                { recipient_npub: 'npub1carol', event_id: carolEvent },
               ],
             },
           })
         }
         if (args[0] === 'groupchat' && args[1] === 'history') {
           if (!stored) return JSON.stringify({ ok: true, data: { messages: [] } })
-          return JSON.stringify({
-            ok: true,
-            data: {
-              messages: [
-                {
-                  id: logicalId,
-                  event_id: eventId,
-                  sender: 'npub1alice',
-                  plaintext: stored,
-                  created_at: 1_700_000_000,
-                },
-              ],
-            },
-          })
+          const messages = [historyRow(identity, stored)]
+          if (identity === 'alice') {
+            messages.push({ id: '', event_id: 'ee'.repeat(32), sender: 'npub1alice', plaintext: 'skip', created_at: 1 })
+          }
+          return JSON.stringify({ ok: true, data: { messages } })
         }
         throw new Error(`unexpected argv ${args.join(' ')}`)
       }),
@@ -190,7 +201,7 @@ describe('three-identity group joint', () => {
     return { calls, members }
   }
 
-  it('sends through groupchat send and each identity reports that event id on the first read', async () => {
+  it('reports the sender row with an empty event id and distinct recipient event ids', async () => {
     const { calls, members } = localFixture()
     const joint = new GroupJoint(members)
     const sent = await joint.send(groupId, body)
@@ -198,10 +209,12 @@ describe('three-identity group joint', () => {
     const second = await joint.receiveNew(groupId)
 
     expect(sent.logical_id).toBe(logicalId)
-    expect(sent.event_id).toBe(eventId)
-    expect(first.map((row) => row.identity)).toEqual(['alice', 'bob', 'carol'])
-    expect(first.map((row) => row.event_id)).toEqual([eventId, eventId, eventId])
-    expect(first.map((row) => row.plaintext)).toEqual([body, body, body])
+    expect(sent.event_id).toBe(bobEvent)
+    expect(first).toEqual([
+      { identity: 'alice', logical_id: logicalId, event_id: undefined, plaintext: body },
+      { identity: 'bob', logical_id: logicalId, event_id: bobEvent, plaintext: body },
+      { identity: 'carol', logical_id: logicalId, event_id: carolEvent, plaintext: body },
+    ])
     expect(second).toEqual([])
 
     const sends = calls.filter((call) => call.args[1] === 'send')
@@ -232,6 +245,32 @@ describe('three-identity group joint', () => {
       expect(call.args.join(' ')).not.toContain('ws://')
       expect(call.args.join(' ')).not.toContain('relay.aastar')
     }
+  })
+
+  it('does not keep a partial read when a later history call throws', async () => {
+    let bobFailed = false
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        if (args[1] === 'history' && identity === 'bob' && !bobFailed) {
+          bobFailed = true
+          throw new Error('bob history down')
+        }
+        if (args[1] === 'history') {
+          return JSON.stringify({
+            ok: true,
+            data: { messages: [historyRow(identity, body)] },
+          })
+        }
+        throw new Error(`unexpected argv ${args.join(' ')}`)
+      }),
+    )
+    const joint = new GroupJoint(members)
+    await expect(joint.receiveNew(groupId)).rejects.toThrow(/bob history down/)
+    await expect(joint.receiveNew(groupId)).resolves.toEqual([
+      { identity: 'alice', logical_id: logicalId, event_id: undefined, plaintext: body },
+      { identity: 'bob', logical_id: logicalId, event_id: bobEvent, plaintext: body },
+      { identity: 'carol', logical_id: logicalId, event_id: carolEvent, plaintext: body },
+    ])
   })
 
   it('fails the send when hyphae returns a non-zero envelope', async () => {
