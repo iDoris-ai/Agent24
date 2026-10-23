@@ -545,6 +545,62 @@ fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
     })
 }
 
+/// `module`'s current enable epoch; 0 before any (K1-6a-G §2.1 F3).
+async fn current_enable_epoch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    module: &str,
+) -> Result<i64> {
+    let epoch: Option<i64> =
+        sqlx::query_scalar("SELECT epoch FROM module_enable_epochs WHERE module = ?")
+            .bind(module)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(epoch.unwrap_or(0))
+}
+
+/// Set what was last seen of `module`'s enablement; its epoch is left.
+async fn record_enablement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    module: &str,
+    enabled: bool,
+    entry: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO module_enable_epochs (module, observed_enabled, observed_entry)
+         VALUES (?, ?, ?)
+         ON CONFLICT (module) DO UPDATE SET
+            observed_enabled = excluded.observed_enabled,
+            observed_entry = excluded.observed_entry",
+    )
+    .bind(module)
+    .bind(enabled)
+    .bind(entry)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Set `module`'s enable epoch to a fresh write generation.
+async fn advance_enable_epoch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    module: &str,
+) -> Result<i64> {
+    let epoch: i64 = sqlx::query_scalar(
+        "INSERT INTO module_consent_generations DEFAULT VALUES RETURNING generation",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO module_enable_epochs (module, epoch) VALUES (?, ?)
+         ON CONFLICT (module) DO UPDATE SET epoch = excluded.epoch",
+    )
+    .bind(module)
+    .bind(epoch)
+    .execute(&mut **tx)
+    .await?;
+    Ok(epoch)
+}
+
 impl Store {
     /// Returns persisted per-tool authorization decisions for the host's
     /// management surface. The route derives current status with
@@ -631,6 +687,68 @@ impl Store {
             .await
     }
 
+    /// Advance `module`'s enable epoch (K1-6a-G §2.1 F3): every decision
+    /// written before is `Stale` from now on. Returns the new epoch, a fresh
+    /// write generation, so epochs only grow and are never reused. Callers
+    /// advance BEFORE the change it stands for takes effect, so a failed
+    /// write leaves the module as it was rather than an old grant live.
+    pub async fn advance_module_enable_epoch(&self, module: &str) -> Result<i64> {
+        let mut tx = self.pool().begin().await?;
+        let epoch = advance_enable_epoch(&mut tx, module).await?;
+        tx.commit().await?;
+        self.announce_module_consent_change(module, None);
+        Ok(epoch)
+    }
+
+    /// Record what is seen of `module`'s enablement now: `enabled`, and
+    /// `entry`, the digest of its os.json entry and enable mark (K1-6a-G
+    /// §2.1 F3). Enabled now, after last seeing it disabled, never, or with
+    /// another entry, advances the epoch in the same transaction. Returns
+    /// whether it did.
+    pub async fn observe_module_enablement(
+        &self,
+        module: &str,
+        enabled: bool,
+        entry: &str,
+    ) -> Result<bool> {
+        // BEGIN IMMEDIATE: what was seen is read under the write lock, so a
+        // commit elsewhere in between cannot fail the upgrade to a write.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let seen: Option<(bool, Option<String>)> = sqlx::query_as(
+            "SELECT observed_enabled, observed_entry FROM module_enable_epochs WHERE module = ?",
+        )
+        .bind(module)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let unchanged = matches!(&seen, Some((true, Some(last))) if last == entry);
+        let advance = enabled && !unchanged;
+        if advance {
+            advance_enable_epoch(&mut tx, module).await?;
+        }
+        record_enablement(&mut tx, module, enabled, entry).await?;
+        tx.commit().await?;
+        if advance {
+            self.announce_module_consent_change(module, None);
+        }
+        Ok(advance)
+    }
+
+    /// Record what is seen of `module`'s enablement, as
+    /// [`Self::observe_module_enablement`] does, but never advance: for a
+    /// caller that advanced before the change it now records (an enable
+    /// through a route), so a grant made in between still holds.
+    pub async fn record_module_enablement(
+        &self,
+        module: &str,
+        enabled: bool,
+        entry: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        record_enablement(&mut tx, module, enabled, entry).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// The sole write path: a fresh grant/deny for `(module, op)` always
     /// REPLACES whatever row was there (migration doc comment) — there is no
     /// in-place field mutation of an existing consent row anywhere in this
@@ -667,12 +785,13 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
+        let enable_epoch = current_enable_epoch(&mut tx, &summary.module).await?;
         let row = sqlx::query(
             "INSERT INTO module_consents
                 (module, op, module_version, scope_fingerprint, source, risk,
                  readable, writable, external, decision, decided_at, expires_at,
-                 resources, artifact, generation)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 resources, artifact, generation, enable_epoch)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (module, op) DO UPDATE SET
                 module_version = excluded.module_version,
                 scope_fingerprint = excluded.scope_fingerprint,
@@ -686,7 +805,8 @@ impl Store {
                 expires_at = excluded.expires_at,
                 resources = excluded.resources,
                 artifact = excluded.artifact,
-                generation = excluded.generation
+                generation = excluded.generation,
+                enable_epoch = excluded.enable_epoch
              RETURNING *",
         )
         .bind(&summary.module)
@@ -704,6 +824,7 @@ impl Store {
         .bind(&resources)
         .bind(&scope.artifact)
         .bind(generation)
+        .bind(enable_epoch)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -802,6 +923,7 @@ impl Store {
         .bind(op)
         .fetch_all(&mut *tx)
         .await?;
+        let enable_epoch = current_enable_epoch(&mut tx, module).await?;
         tx.commit().await?;
         let record = row.as_ref().map(row_to_record).transpose()?;
         if let Some(record) = &record {
@@ -821,11 +943,14 @@ impl Store {
             // fail-closed; a later consent row supersedes it by generation.
             return Ok(ConsentLookup::Revoked(None));
         }
-        let Some(record) = record else {
+        let (Some(record), Some(row)) = (record, row) else {
             return Ok(ConsentLookup::NotGranted);
         };
+        // K1-6a-G §2.1 F3: a decision holds only in the enable epoch it was
+        // written in; the module has been (re-)enabled since.
         if record.module_version != current_module_version
             || record.scope_fingerprint != current_scope_fingerprint
+            || row.get::<i64, _>("enable_epoch") != enable_epoch
         {
             return Ok(ConsentLookup::Stale(record));
         }
@@ -2014,6 +2139,7 @@ mod tests {
                                 .await
                                 .unwrap();
                             store_grant(&writer, &s).await;
+                            writer.advance_module_enable_epoch(&s.module).await.unwrap();
                             if let Some(tx) = done_tx.lock().unwrap().take() {
                                 let _ = tx.send(());
                             }
@@ -2043,6 +2169,21 @@ mod tests {
             panic!("one snapshot must give the grant as it stood: {lookup:?}");
         };
         assert_eq!(record.generation, first.generation);
+        // The epoch advanced between the reads is not paired with the
+        // grant from before it (K1-6a-G §2.1 F3), and is there after.
+        assert!(matches!(
+            writer
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-08T02:00:00Z",
+                )
+                .await
+                .unwrap(),
+            ConsentLookup::Stale(_)
+        ));
     }
 
     async fn store_grant(store: &Store, s: &ToolPermissionSummary) -> ModuleConsentRecord {
@@ -2322,6 +2463,366 @@ mod tests {
         );
         assert!(!reference.contains("doc"));
         assert!(crate::ResourceRef::new(reference).is_ok());
+    }
+
+    async fn lookup_now(store: &Store, s: &ToolPermissionSummary) -> ConsentLookup {
+        store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-09T00:00:00Z",
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn grant_now(store: &Store, s: &ToolPermissionSummary) {
+        store
+            .grant_module_consent(s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+    }
+
+    /// K1-6a-G §2.1 F3: a grant holds only in the enable epoch it was
+    /// written in; one written after the module is re-enabled holds.
+    #[tokio::test]
+    async fn a_grant_from_before_a_re_enable_is_stale() {
+        let store = store().await;
+        let s = summary("doc body");
+        grant_now(&store, &s).await;
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        let first = store.advance_module_enable_epoch(&s.module).await.unwrap();
+        assert!(matches!(
+            lookup_now(&store, &s).await,
+            ConsentLookup::Stale(_)
+        ));
+        grant_now(&store, &s).await;
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        // A refusal is stale the same way, not still a refusal.
+        store
+            .deny_module_consent(&s, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        let second = store.advance_module_enable_epoch(&s.module).await.unwrap();
+        assert!(second > first);
+        assert!(matches!(
+            lookup_now(&store, &s).await,
+            ConsentLookup::Stale(_)
+        ));
+        // Another module's epoch is its own.
+        let other = ToolPermissionSummary {
+            module: "other".to_owned(),
+            ..summary("doc body")
+        };
+        grant_now(&store, &other).await;
+        store.advance_module_enable_epoch(&s.module).await.unwrap();
+        assert!(lookup_now(&store, &other).await.is_authorized());
+    }
+
+    /// What a start sees advances the epoch only when the module is enabled
+    /// now and was last seen disabled, never, or with another entry.
+    #[tokio::test]
+    async fn an_observation_advances_the_epoch_only_on_a_change_to_enabled() {
+        let store = store().await;
+        let s = summary("doc body");
+        let observe = |enabled: bool, entry: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .observe_module_enablement("documenting", enabled, entry)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(observe(true, "e1").await, "never seen");
+        grant_now(&store, &s).await;
+        assert!(!observe(true, "e1").await, "the same");
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        assert!(observe(true, "e2").await, "another entry");
+        assert!(matches!(
+            lookup_now(&store, &s).await,
+            ConsentLookup::Stale(_)
+        ));
+        grant_now(&store, &s).await;
+        assert!(!observe(false, "e2").await, "disabled does not advance");
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        assert!(
+            observe(true, "e2").await,
+            "enabled after disabled, same entry"
+        );
+        assert!(matches!(
+            lookup_now(&store, &s).await,
+            ConsentLookup::Stale(_)
+        ));
+        assert!(!observe(false, "e3").await);
+        assert_eq!(last_observed(&store).await, (false, Some("e3".into())));
+        assert!(!observe(false, "e3").await);
+    }
+
+    /// What was last seen of `documenting`: `(observed_enabled,
+    /// observed_entry)`.
+    async fn last_observed(store: &Store) -> (bool, Option<String>) {
+        sqlx::query_as(
+            "SELECT observed_enabled, observed_entry FROM module_enable_epochs
+             WHERE module = 'documenting'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+    }
+
+    /// An observation's advance and record land together or not at all.
+    #[tokio::test]
+    async fn an_observation_that_cannot_be_recorded_does_not_advance() {
+        let store = store().await;
+        let s = summary("doc body");
+        assert!(
+            store
+                .observe_module_enablement(&s.module, false, "e1")
+                .await
+                .is_ok_and(|advanced| !advanced)
+        );
+        grant_now(&store, &s).await;
+        sqlx::query(
+            "CREATE TRIGGER no_record BEFORE UPDATE OF observed_entry
+             ON module_enable_epochs WHEN NEW.observed_entry = 'e2'
+             BEGIN SELECT RAISE(ABORT, 'no record'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            store
+                .observe_module_enablement(&s.module, true, "e2")
+                .await
+                .is_err()
+        );
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        assert_eq!(last_observed(&store).await, (false, Some("e1".into())));
+    }
+
+    /// Observations racing on one module, the daemon's other writes beside
+    /// them, neither fail nor advance more than once (review: a deferred
+    /// transaction read first and failed its upgrade to a write).
+    #[tokio::test]
+    async fn racing_observations_advance_once_and_none_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("race.db")).await.unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    if i % 2 == 0 {
+                        store
+                            .observe_module_enablement("documenting", true, "e1")
+                            .await
+                            .map(Some)
+                    } else {
+                        store
+                            .advance_module_enable_epoch(&format!("other{i}"))
+                            .await
+                            .map(|_| None)
+                    }
+                })
+            })
+            .collect();
+        let mut advanced = 0;
+        for handle in handles {
+            if handle.await.unwrap().unwrap() == Some(true) {
+                advanced += 1;
+            }
+        }
+        assert_eq!(advanced, 1);
+    }
+
+    /// An advance tells in-flight calls to look again (K1-6a-G §2.5); an
+    /// observation that changes nothing says nothing.
+    #[tokio::test]
+    async fn an_advance_is_announced_to_the_module() {
+        let store = store().await;
+        let mut changes = store.subscribe_module_consent_changes();
+        store
+            .advance_module_enable_epoch("documenting")
+            .await
+            .unwrap();
+        let change = changes.try_recv().unwrap();
+        assert_eq!((change.module.as_str(), change.op), ("documenting", None));
+        assert!(
+            store
+                .observe_module_enablement("documenting", false, "e1")
+                .await
+                .unwrap()
+                .eq(&false)
+        );
+        assert!(changes.try_recv().is_err());
+        assert!(
+            store
+                .observe_module_enablement("documenting", true, "e1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(changes.try_recv().unwrap().module, "documenting");
+    }
+
+    /// Rows from before migration 0020 keep their meaning across it: a
+    /// grant holds and a revoked one stays revoked until the first
+    /// observation reaches the module, which makes the grant stale and
+    /// leaves the revocation in force (review C2).
+    #[tokio::test]
+    async fn rows_from_before_migration_0020_keep_their_meaning() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = std::borrow::Cow::Owned(
+            before
+                .migrations
+                .iter()
+                .filter(|m| m.version < 20)
+                .cloned()
+                .collect(),
+        );
+        before.run(&pool).await.unwrap();
+        let read = summary("doc body");
+        let write = ToolPermissionSummary::new(
+            "documenting",
+            "write_doc",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("doc body".to_owned()),
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        for (generation, s) in [(1_i64, &read), (2, &write)] {
+            sqlx::query("INSERT INTO module_consent_generations DEFAULT VALUES")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO module_consents
+                    (module, op, module_version, scope_fingerprint, source, risk,
+                     readable, decision, decided_at, expires_at, generation)
+                 VALUES (?, ?, '1.0.0', ?, 'first_party', 'low', 'doc body', 'granted',
+                         '2026-10-08T00:00:00.000Z', '2026-11-08T00:00:00.000Z', ?)",
+            )
+            .bind(&s.module)
+            .bind(&s.op)
+            .bind(s.scope_fingerprint())
+            .bind(generation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO module_consent_generations DEFAULT VALUES")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO module_consent_revocations (module, op, revoked_at, generation)
+             VALUES ('documenting', 'write_doc', '2026-10-08T01:00:00.000Z', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        assert!(lookup_now(&store, &read).await.is_authorized());
+        assert!(matches!(
+            lookup_now(&store, &write).await,
+            ConsentLookup::Revoked(_)
+        ));
+        assert!(
+            store
+                .observe_module_enablement("documenting", true, "e1")
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            lookup_now(&store, &read).await,
+            ConsentLookup::Stale(_)
+        ));
+        assert!(matches!(
+            lookup_now(&store, &write).await,
+            ConsentLookup::Revoked(_)
+        ));
+    }
+
+    /// An advance leaves what was last observed: a grant made after it
+    /// holds across a start that sees the same entry (review G1).
+    #[tokio::test]
+    async fn an_advance_leaves_the_last_observation() {
+        let store = store().await;
+        let s = summary("doc body");
+        assert!(
+            store
+                .observe_module_enablement(&s.module, true, "e1")
+                .await
+                .unwrap()
+        );
+        store.advance_module_enable_epoch(&s.module).await.unwrap();
+        grant_now(&store, &s).await;
+        assert!(
+            !store
+                .observe_module_enablement(&s.module, true, "e1")
+                .await
+                .unwrap()
+        );
+        assert!(lookup_now(&store, &s).await.is_authorized());
+    }
+
+    /// An enable advances before it is written and records its new entry
+    /// after, without advancing again: a grant made in between holds, and
+    /// so across a start that sees that entry (review: observing the new
+    /// entry advanced a second time).
+    #[tokio::test]
+    async fn an_enable_recorded_after_its_advance_is_not_advanced_again() {
+        let store = store().await;
+        let s = summary("doc body");
+        assert!(
+            store
+                .observe_module_enablement(&s.module, true, "e1")
+                .await
+                .unwrap()
+        );
+        store.advance_module_enable_epoch(&s.module).await.unwrap();
+        grant_now(&store, &s).await;
+        store
+            .record_module_enablement(&s.module, true, "e2")
+            .await
+            .unwrap();
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        assert!(
+            !store
+                .observe_module_enablement(&s.module, true, "e2")
+                .await
+                .unwrap()
+        );
+        assert!(lookup_now(&store, &s).await.is_authorized());
+    }
+
+    /// A grant from before any observation (epoch 0, as every row from
+    /// before migration 0020) holds until the first one reaches its module.
+    #[tokio::test]
+    async fn a_grant_from_before_any_observation_holds_until_one() {
+        let store = store().await;
+        let s = summary("doc body");
+        grant_now(&store, &s).await;
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        store
+            .observe_module_enablement(&s.module, true, "e1")
+            .await
+            .unwrap();
+        assert!(matches!(
+            lookup_now(&store, &s).await,
+            ConsentLookup::Stale(_)
+        ));
     }
 
     /// PR-Daemon B2: revoking the same tool again takes a new generation, so
