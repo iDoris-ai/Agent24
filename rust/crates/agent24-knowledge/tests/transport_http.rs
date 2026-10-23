@@ -505,6 +505,31 @@ async fn closed_port_is_unreachable() {
     assert_eq!(err, TransportError::Unreachable);
 }
 
+/// reqwest's `connect_timeout` covers the TLS handshake, so a server that
+/// accepts TCP and never answers the ClientHello runs it out well before the
+/// deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_timeout_is_unreachable_not_timeout() {
+    let stub = Stub::start(Script::Stall).await;
+    let t = HttpTransport::new(HttpTransportConfig {
+        base_url: stub.base.replace("http://", "https://"),
+        credential: api_key(),
+        max_response_bytes: LIMIT,
+        connect_timeout: Duration::from_millis(200),
+    })
+    .unwrap();
+    let start = Instant::now();
+    let err = bounded(t.send(KnowledgeOperation::Search, b"{}".to_vec(), LONG))
+        .await
+        .unwrap_err();
+    assert_eq!(err, TransportError::Unreachable);
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_send_while_waiting_closes_the_connection() {
     let mut stub = Stub::start(Script::Stall).await;
