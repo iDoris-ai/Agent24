@@ -37,6 +37,7 @@ fn install(home: &Path) {
         "name: noted\nversion: \"0.1.0\"\nroute_namespace: /api/v1/noted\n\
          event_module: noted\ndata_dir: ~/.agent24/os/noted/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         min_daemon_protocol: 2\n\
          spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
@@ -44,6 +45,20 @@ fn install(home: &Path) {
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE).unwrap();
+    // A tool module on an older protocol (§2.6): never a card.
+    let dir = home.join(".agent24/packages/plain");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("domain-os.yml"),
+        "name: plain\nversion: \"0.1.0\"\nroute_namespace: /api/v1/plain\n\
+         event_module: plain\ndata_dir: ~/.agent24/os/plain/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: \"false\"\n  args: []\n\
+         tools:\n  - operation: list-notes\n    description: lists notes\n    \
+         input_schema: {type: object, properties: {}}\n    risk: read\n    \
+         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
+    )
+    .unwrap();
 }
 
 struct Daemon {
@@ -124,10 +139,10 @@ fn a_card_carries_the_running_package_identity() {
         assert!(Instant::now() < by, "the module never ran: {body}");
         std::thread::sleep(Duration::from_millis(100));
     };
-    let artifact = card["artifact"].as_str().unwrap();
-    assert!(
-        artifact.len() == 71 && artifact.starts_with("sha256:"),
-        "{artifact}"
+    let package = home.path().join(".agent24/packages/noted");
+    assert_eq!(
+        card["artifact"],
+        agent24_os_proto::artifact::identity(&package).unwrap()
     );
     assert_eq!(card["module_version"], "0.1.0");
     assert_eq!(card["resource_kinds"], serde_json::json!([]));
@@ -135,4 +150,12 @@ fn a_card_carries_the_running_package_identity() {
     assert!(card["fingerprint"].as_str().is_some_and(|f| !f.is_empty()));
     let (status, _) = get(&d, "/api/v1/module-consents/modules/noted/tools/other/card");
     assert_eq!(status, 404);
+    let (status, body) = get(
+        &d,
+        "/api/v1/module-consents/modules/plain/tools/list-notes/card",
+    );
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (409, &serde_json::json!("protocol_too_old"))
+    );
 }

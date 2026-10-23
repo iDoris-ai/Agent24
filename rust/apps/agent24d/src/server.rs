@@ -1583,44 +1583,28 @@ pub async fn serve(
         let module = registered.module().to_owned();
         let declaration = registered.declaration();
         let operation = declaration.operation().to_owned();
-        // K1-6a-G §2.1: the same function the grant route uses, so a grant's
-        // fingerprint and this one agree byte for byte.
-        let summary = agent24_policy::tool_summary::module_tool_summary(
-            &module,
-            &catalogue
-                .iter()
-                .find(|entry| entry.name == module)
-                .map_or_else(String::new, |entry| entry.version.clone()),
-            declaration,
-        );
-        let request = agent24_policy::consent_gate::ConsentGateRequest {
-            module: module.clone(),
-            op: operation.clone(),
-            module_version: summary.module_version.clone(),
-            current_scope_fingerprint: summary.scope_fingerprint(),
-            risk: agent24_protocol::RiskClass::External,
-            org_restricted: false,
-            source_restricted: false,
-            // The host has no verified reversible-draft semantics for this
-            // path yet, so the L-APPR-5 draft exception never applies here.
-            reversible_draft_declared: false,
-            draft_verification: None,
-            // Read per lookup from the running generation (K1-6a-G §2.2).
-            current_artifact: None,
+        let entry = catalogue.iter().find(|entry| entry.name == module);
+        // K1-6a-G §2.1: the card and the gate are made from one summary, so
+        // a grant's fingerprint and the gate's agree byte for byte.
+        let source = crate::consent_routes::ToolCardSource {
+            summary: agent24_policy::tool_summary::module_tool_summary(
+                &module,
+                &entry.map_or_else(String::new, |entry| entry.version.clone()),
+                declaration,
+            ),
+            resource_kinds: declaration.resource_kinds().to_vec(),
+            takes_grants: entry.is_some_and(|entry| {
+                matches!(&entry.build, crate::domain::Build::Package(p) if p.manifest.takes_grants())
+            }),
         };
+        let request = source.gate_request();
         let authorization = StdArc::new(crate::module_tool_runtime::store_authorization(
             &store,
             request,
             StdArc::new(crate::module_tool_runtime::consent_clock),
             module_tool_runtime.artifact_source(),
         ));
-        card_sources.insert(
-            (module.clone(), operation.clone()),
-            crate::consent_routes::ToolCardSource {
-                summary,
-                resource_kinds: declaration.resource_kinds().to_vec(),
-            },
-        );
+        card_sources.insert((module.clone(), operation.clone()), source);
         module_authorizations.insert((module, operation), authorization);
     }
     let module_tool_cards = crate::consent_routes::ModuleToolCards {
@@ -3678,6 +3662,17 @@ pub(crate) mod tests {
     /// running package.
     #[tokio::test]
     async fn a_module_tool_card_shows_what_a_grant_would_be_checked_against() {
+        let none_assembled = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents/modules/doc-module/tools/read_document/card")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(none_assembled.status(), StatusCode::NOT_FOUND);
         let mut state = state().await;
         let summary = agent24_store::ToolPermissionSummary::new(
             "doc-module",
@@ -3690,18 +3685,33 @@ pub(crate) mod tests {
             agent24_store::HostRiskLevel::High,
         );
         let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let source = |takes_grants| crate::consent_routes::ToolCardSource {
+            summary: summary.clone(),
+            resource_kinds: vec!["doc".to_owned()],
+            takes_grants,
+        };
+        let gate = source(true).gate_request();
+        let mut old = summary.clone();
+        old.module = "old-module".to_owned();
         state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
-            tools: StdArc::new(std::collections::HashMap::from([(
-                ("doc-module".to_owned(), "read_document".to_owned()),
-                crate::consent_routes::ToolCardSource {
-                    summary: summary.clone(),
-                    resource_kinds: vec!["doc".to_owned()],
-                },
-            )])),
+            tools: StdArc::new(std::collections::HashMap::from([
+                (
+                    ("doc-module".to_owned(), "read_document".to_owned()),
+                    source(true),
+                ),
+                (
+                    ("old-module".to_owned(), "read_document".to_owned()),
+                    crate::consent_routes::ToolCardSource {
+                        summary: old,
+                        ..source(false)
+                    },
+                ),
+            ])),
             artifact: {
                 let running = StdArc::clone(&running);
-                StdArc::new(move |module: &str| {
-                    (module == "doc-module" && running.load(std::sync::atomic::Ordering::SeqCst))
+                StdArc::new(move |_: &str| {
+                    running
+                        .load(std::sync::atomic::Ordering::SeqCst)
                         .then(|| "sha256:abc".to_owned())
                 })
             },
@@ -3726,7 +3736,8 @@ pub(crate) mod tests {
         let response = get(card).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["fingerprint"], summary.scope_fingerprint());
+        assert_eq!(body["fingerprint"], gate.current_scope_fingerprint);
+        assert_eq!(body["module_version"], gate.module_version);
         assert_eq!(body["module_version"], "1.2.3");
         assert_eq!(body["artifact"], "sha256:abc");
         assert_eq!(body["resource_kinds"], serde_json::json!(["doc"]));
@@ -3736,8 +3747,20 @@ pub(crate) mod tests {
         let response =
             get("/api/v1/module-consents/modules/doc-module/tools/write_document/card").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response =
+            get("/api/v1/module-consents/modules/old-module/tools/read_document/card").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "protocol_too_old"
+        );
         running.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(get(card).await.status(), StatusCode::CONFLICT);
+        let response = get(card).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "no_package_identity"
+        );
     }
 
     #[tokio::test]

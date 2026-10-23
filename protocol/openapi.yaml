@@ -223,10 +223,11 @@ paths:
       tags: [tools]
       summary: What a grant of one module tool would cover
       description: >-
-        Built by the host from the tool's manifest declaration; nothing the
-        module says about itself is shown. `fingerprint`, `module_version`
-        and `artifact` are what a grant must repeat, and what dispatch
-        compares it with (K1-6a-G §2.1).
+        Built by the host from the tool's manifest declaration (risk, output
+        privacy, resource kinds, reversible draft); the module's own
+        description text is not shown. `fingerprint`, `module_version` and
+        `artifact` are what a grant must repeat, and what dispatch compares
+        it with (K1-6a-G §2.1).
       responses:
         "200":
           description: The tool's card
@@ -240,10 +241,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Host authority required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "409":
           description: >-
-            The module has no running package with an identity (not running,
-            not yet observed by this daemon start, or an ephemeral daemon)
+            `protocol_too_old`: the module does not require the grants
+            protocol, so it cannot be told its grants were revoked (§2.6).
+            `no_package_identity`: no running package identity to grant
+            against (not running, not yet observed by this daemon start, or
+            an ephemeral daemon).
           content:
             application/json:
               schema:

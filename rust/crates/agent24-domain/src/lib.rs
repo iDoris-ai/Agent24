@@ -509,6 +509,8 @@ pub struct DomainOsManifest {
     spawn: Option<SpawnCommand>,
     host_commands: Vec<String>,
     tools: Vec<tool::ToolDeclaration>,
+    /// The kernel protocol the manifest requires; 0 when it names none.
+    min_daemon_protocol: u64,
 }
 
 /// Names that are not usable as a directory on Windows regardless of extension.
@@ -945,6 +947,7 @@ impl DomainOsManifest {
             impl_kind: raw.impl_kind,
             spawn: raw.spawn,
             tools,
+            min_daemon_protocol: min_protocol.unwrap_or(0),
         })
     }
 
@@ -1050,6 +1053,13 @@ impl DomainOsManifest {
     /// for why declaring a tool here grants nothing by itself.
     pub fn tools(&self) -> &[tool::ToolDeclaration] {
         &self.tools
+    }
+
+    /// Whether the module speaks the protocol that grants need (K1-6a-G
+    /// §2.6): an older one cannot be told its grants were revoked, so none
+    /// is offered to it.
+    pub fn takes_grants(&self) -> bool {
+        self.min_daemon_protocol >= u64::from(RESOURCE_KINDS_PROTOCOL)
     }
 }
 
@@ -2619,6 +2629,21 @@ mod tool_manifest_tests {
         );
         let min = protocol.map_or_else(String::new, |p| format!("min_daemon_protocol: {p}\n"));
         manifest(&format!("{min}{tool}"))
+    }
+
+    /// K1-6a-G §2.6: only a manifest that requires the grants protocol
+    /// takes grants; one that names an older protocol, or none, does not.
+    #[test]
+    fn only_a_manifest_on_the_grants_protocol_takes_grants() {
+        let on = |p: Option<u32>| {
+            let min = p.map_or_else(String::new, |p| format!("min_daemon_protocol: {p}\n"));
+            manifest(&format!("{min}{ONE_TOOL}"))
+                .unwrap()
+                .takes_grants()
+        };
+        assert!(on(Some(RESOURCE_KINDS_PROTOCOL)));
+        assert!(!on(Some(RESOURCE_KINDS_PROTOCOL - 1)));
+        assert!(!on(None));
     }
 
     /// K1-06a-resource-scope §2.3: declared kinds are kept in order; an

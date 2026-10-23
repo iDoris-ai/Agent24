@@ -101,7 +101,7 @@ export interface paths {
         };
         /**
          * What a grant of one module tool would cover
-         * @description Built by the host from the tool's manifest declaration; nothing the module says about itself is shown. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
+         * @description Built by the host from the tool's manifest declaration (risk, output privacy, resource kinds, reversible draft); the module's own description text is not shown. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
          */
         get: operations["getModuleToolCard"];
         put?: never;
@@ -2837,6 +2837,24 @@ export interface operations {
                     "application/json": components["schemas"]["ModuleToolCard"];
                 };
             };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description No such module tool */
             404: {
                 headers: {
@@ -2846,7 +2864,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description The module has no running package with an identity (not running, not yet observed by this daemon start, or an ephemeral daemon) */
+            /** @description `protocol_too_old`: the module does not require the grants protocol, so it cannot be told its grants were revoked (§2.6). `no_package_identity`: no running package identity to grant against (not running, not yet observed by this daemon start, or an ephemeral daemon). */
             409: {
                 headers: {
                     [name: string]: unknown;
