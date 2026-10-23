@@ -262,6 +262,20 @@ impl WriteGate {
         qualified: bool,
         verdict: &str,
     ) -> Result<CommitStatus> {
+        self.commit_with_audit_using_clock(c, qualified, verdict, now_iso8601)
+            .await
+    }
+
+    async fn commit_with_audit_using_clock<F>(
+        &self,
+        c: &Candidate,
+        qualified: bool,
+        verdict: &str,
+        clock: F,
+    ) -> Result<CommitStatus>
+    where
+        F: Fn() -> String,
+    {
         let assertion = Self::to_assertion(c, qualified);
         let audit = Self::audit_event(c, verdict, None);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -305,7 +319,7 @@ impl WriteGate {
 
             if let Some(row) = existing {
                 use sqlx::Row;
-                let now = now_iso8601();
+                let now = clock();
                 let expected_scope = serde_json::to_string(&c.scope)?;
                 let expected_object = serde_json::to_string(&c.object)?;
                 // Same (owner, scope, subject, predicate, object) the id is
@@ -397,11 +411,25 @@ impl WriteGate {
                     .bind(&c.id)
                     .execute(&mut *tx)
                     .await?;
-                    let reassert_id = format!(
+                    let base_id = format!(
                         "reassert-{}-{}",
                         c.id,
                         &checksum(&format!("{now}|{:?}", c.evidence))[..16]
                     );
+                    // Distinct transitions can share time and evidence. Allocate
+                    // under the existing write lock; never reuse an old audit.
+                    let mut reassert_id = base_id.clone();
+                    let mut suffix = 0_u64;
+                    while sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM mem_events WHERE id = ?)",
+                    )
+                    .bind(&reassert_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    {
+                        suffix += 1;
+                        reassert_id = format!("{base_id}-{suffix}");
+                    }
                     let mut reassert = MemEvent::new(
                         reassert_id,
                         c.scope.clone(),
@@ -722,6 +750,209 @@ mod tests {
             .filter(|e| e.event.kind == "assertion.reasserted")
             .count();
         assert_eq!(reasserted, 1, "the reactivation is audited exactly once");
+    }
+
+    const H02_T: &str = "2999-01-01T00:00:00Z";
+    const H02_T_PLUS_ONE: &str = "2999-01-01T00:00:01Z";
+
+    fn h02_candidate(evidence: &str) -> Candidate {
+        cand("h02-clock", "h02-owner", "same statement", Trust::UserSaid)
+            .with_evidence(vec![evidence.to_owned()])
+            .remember()
+    }
+
+    async fn reassert_at(g: &WriteGate, evidence: &str, at: &'static str) -> Result<CommitStatus> {
+        g.commit_with_audit_using_clock(&h02_candidate(evidence), true, "commit", move || {
+            at.to_owned()
+        })
+        .await
+    }
+
+    async fn start_h02_cycle(kv: &KvStore, g: &WriteGate) {
+        g.propose(vec![h02_candidate("ev1")]).await.unwrap();
+        assert_eq!(
+            kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap(),
+            crate::assertion::Forget::Forgotten
+        );
+    }
+
+    #[tokio::test]
+    async fn h02_same_second_same_evidence_two_transitions_must_succeed() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        let second = reassert_at(&g, "ev2", H02_T).await;
+        assert!(second.is_ok(), "second same-time reassert: {second:?}");
+        let rows = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let reasserts: Vec<_> = rows
+            .iter()
+            .filter(|e| e.event.kind == "assertion.reasserted")
+            .collect();
+        assert_eq!(reasserts.len(), 2);
+        assert_ne!(reasserts[0].event.id, reasserts[1].event.id);
+    }
+
+    #[tokio::test]
+    async fn h02_reassert_skips_occupied_suffix_without_reusing_events() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        let events = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let base = events
+            .iter()
+            .find(|e| e.event.kind == "assertion.reasserted")
+            .unwrap()
+            .event
+            .clone();
+        for suffix in [1, 3] {
+            let mut occupied = base.clone();
+            occupied.id = format!("{}-{suffix}", base.id);
+            occupied.kind = "test.occupied".into();
+            kv.events().append(&occupied).await.unwrap();
+        }
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        let after = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| e.event.kind == "test.occupied")
+                .count(),
+            2
+        );
+        assert!(
+            after.iter().any(|e| e.event.id == format!("{}-2", base.id)
+                && e.event.kind == "assertion.reasserted")
+        );
+    }
+
+    #[tokio::test]
+    async fn h02_failed_reassert_append_is_atomic() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        let before_events = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let before_count = before_events.len();
+        let before_usage: (i64, i64) =
+            sqlx::query_as("SELECT row_count, byte_count FROM mem_owner_usage WHERE owner = ?")
+                .bind("h02-owner")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "CREATE TEMP TRIGGER h02_abort_reassert BEFORE INSERT ON mem_events
+             WHEN NEW.kind = 'assertion.reasserted'
+             BEGIN SELECT RAISE(ABORT, 'h02 injected append failure'); END",
+        )
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+        // A distinct timestamp avoids relying on the known ID collision.
+        let result = reassert_at(&g, "ev2", H02_T_PLUS_ONE).await;
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("h02 injected append failure"),
+            "the dedicated append fault must be reached: {result:?}"
+        );
+        let after_events = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        assert_eq!(
+            after_events.len(),
+            before_count,
+            "failed transaction appends no event"
+        );
+        let after_usage: (i64, i64) =
+            sqlx::query_as("SELECT row_count, byte_count FROM mem_owner_usage WHERE owner = ?")
+                .bind("h02-owner")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_usage, before_usage,
+            "failed transaction leaves usage unchanged"
+        );
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(
+                &BeliefQuery::owner("h02-owner")
+                    .valid_at(H02_T)
+                    .recorded_at(H02_T),
+            )
+            .await
+            .unwrap();
+        assert!(
+            beliefs.is_empty(),
+            "failed retry leaves the assertion withdrawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn h02_distinct_second_timestamp_and_evidence_controls_succeed() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        reassert_at(&g, "ev2", H02_T_PLUS_ONE).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T_PLUS_ONE)
+            .await
+            .unwrap();
+        reassert_at(&g, "ev3", H02_T_PLUS_ONE).await.unwrap();
+        let rows = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .filter(|e| e.event.kind == "assertion.reasserted")
+            .map(|e| e.event.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[tokio::test]
+    async fn h02_active_repeat_does_not_append_a_transition() {
+        let (kv, g) = gate().await;
+        g.propose(vec![h02_candidate("ev1")]).await.unwrap();
+        let before = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap()
+            .len();
+        reassert_at(&g, "ev1", H02_T_PLUS_ONE).await.unwrap();
+        let after = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before);
     }
 
     #[tokio::test]
