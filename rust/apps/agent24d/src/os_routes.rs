@@ -324,8 +324,7 @@ enum HotStop {
 }
 
 impl HotStop {
-    /// The word this stop's own answer uses: `stopped`, or the error code
-    /// it would have answered with.
+    /// What this stop's own answer says: `stopped`, or its error code.
     fn word(self) -> &'static str {
         match self {
             HotStop::Stopping | HotStop::Already | HotStop::NotRunning => "stopped",
