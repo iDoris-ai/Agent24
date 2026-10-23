@@ -2,12 +2,17 @@
 //! CONTRACT-READONLY-v1: the credential goes only to the configured base URL
 //! (R1.7), so the client takes no proxy from the environment and follows no
 //! redirect; the whole exchange is bounded by the deadline and the body by a
-//! byte limit, read as a stream and dropped as soon as it goes over.
+//! byte limit, read as a stream and dropped as soon as it goes over. Response
+//! headers are bounded only by hyper's read buffer (about 400 KiB) and the
+//! deadline. The deadline has the timer's resolution (about 1 ms); a zero
+//! deadline fails before anything is sent.
 //!
 //! Cancelling is dropping the future returned by [`KnowledgeTransport::send`]:
-//! the request runs inside that future (nothing is spawned), so dropping it
-//! closes the connection and stops reading. Matching `request_id` and
-//! `generation` and discarding late responses (R7.3) belong to the Provider.
+//! the call is awaited inside that future, not handed to a task of its own
+//! (the client's connection driver and DNS lookup do run in the background), so
+//! dropping it ends the exchange, closes the connection and stops reading.
+//! Matching `request_id` and `generation` and discarding late responses (R7.3)
+//! belong to the Provider.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -51,8 +56,9 @@ pub struct HttpTransportConfig {
     pub credential: Credential,
     /// Largest response body accepted, in bytes.
     pub max_response_bytes: usize,
-    /// Bound on making the TCP and TLS connection; the deadline passed to
-    /// `send` still bounds the whole exchange.
+    /// Bound on making the TCP and TLS connection, positive; running out of it
+    /// is [`TransportError::Unreachable`]. The deadline passed to `send` still
+    /// bounds the whole exchange.
     pub connect_timeout: Duration,
 }
 
@@ -67,9 +73,9 @@ pub enum HttpConfigError {
     UrlHasUserInfo,
     /// The URL has a query or fragment.
     UrlHasQueryOrFragment,
-    /// The credential is empty or not a valid header value.
+    /// The credential is empty, not ASCII or not a valid header value.
     InvalidCredential,
-    /// `max_response_bytes` is 0.
+    /// `max_response_bytes` or `connect_timeout` is 0.
     InvalidLimit,
     /// The HTTP client could not be built.
     Client,
@@ -82,8 +88,8 @@ impl fmt::Display for HttpConfigError {
             Self::InsecureScheme => "base URL must be https, or http to a loopback IP",
             Self::UrlHasUserInfo => "base URL must not carry user info",
             Self::UrlHasQueryOrFragment => "base URL must not carry a query or fragment",
-            Self::InvalidCredential => "credential is empty or not a valid header value",
-            Self::InvalidLimit => "max_response_bytes must be positive",
+            Self::InvalidCredential => "credential is empty, not ASCII or not a valid header value",
+            Self::InvalidLimit => "max_response_bytes and connect_timeout must be positive",
             Self::Client => "HTTP client could not be built",
         };
         write!(f, "knowledge transport config: {what}")
@@ -115,7 +121,7 @@ impl fmt::Debug for HttpTransport {
 impl HttpTransport {
     pub fn new(config: HttpTransportConfig) -> Result<Self, HttpConfigError> {
         let base = validate_base_url(&config.base_url)?;
-        if config.max_response_bytes == 0 {
+        if config.max_response_bytes == 0 || config.connect_timeout.is_zero() {
             return Err(HttpConfigError::InvalidLimit);
         }
         let (auth_name, auth_value) = credential_header(&config.credential)?;
@@ -164,7 +170,13 @@ impl HttpTransport {
             return Err(TransportError::ResponseTooLarge);
         }
         let mut out = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| body_error(&e))? {
+        // A read error means the connection ended early or the framing broke:
+        // the body is incomplete and must not pass as a response.
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| TransportError::Other("response body interrupted"))?
+        {
             if chunk.len() > self.max_response_bytes - out.len() {
                 return Err(TransportError::ResponseTooLarge);
             }
@@ -184,6 +196,11 @@ impl KnowledgeTransport for HttpTransport {
     ) -> Result<TransportResponse, TransportError> {
         if !op.has_body() && !body.is_empty() {
             return Err(TransportError::Other("body on a request without one"));
+        }
+        // `timeout` polls the call once before looking at the clock, so an
+        // exhausted budget would still start a request.
+        if deadline.is_zero() {
+            return Err(TransportError::Timeout);
         }
         tokio::time::timeout(deadline, self.exchange(op, body))
             .await
@@ -225,13 +242,13 @@ fn credential_header(
     credential: &Credential,
 ) -> Result<(HeaderName, HeaderValue), HttpConfigError> {
     let (name, value) = match credential {
-        Credential::Bearer(token) if !token.is_empty() => {
-            (AUTHORIZATION, format!("Bearer {token}"))
+        Credential::Bearer(token) | Credential::ApiKey(token)
+            if token.is_empty() || !token.is_ascii() =>
+        {
+            return Err(HttpConfigError::InvalidCredential);
         }
-        Credential::ApiKey(key) if !key.is_empty() => {
-            (HeaderName::from_static("x-api-key"), key.clone())
-        }
-        _ => return Err(HttpConfigError::InvalidCredential),
+        Credential::Bearer(token) => (AUTHORIZATION, format!("Bearer {token}")),
+        Credential::ApiKey(key) => (HeaderName::from_static("x-api-key"), key.clone()),
     };
     let mut value =
         HeaderValue::from_str(&value).map_err(|_| HttpConfigError::InvalidCredential)?;
@@ -240,22 +257,13 @@ fn credential_header(
 }
 
 /// Maps a failure before the response head arrived. reqwest's error text holds
-/// the URL, so only a category goes out.
+/// the URL, so only a category goes out. The client has no request timeout of
+/// its own (the deadline is the `timeout` around the call), so a reqwest
+/// timeout here is `connect_timeout`: the server could not be reached.
 fn send_error(e: &reqwest::Error) -> TransportError {
-    if e.is_timeout() {
-        TransportError::Timeout
-    } else if e.is_connect() || e.is_request() {
+    if e.is_connect() || e.is_request() || e.is_timeout() {
         TransportError::Unreachable
     } else {
         TransportError::Other("request failed")
-    }
-}
-
-/// Maps a failure while reading the body.
-fn body_error(e: &reqwest::Error) -> TransportError {
-    if e.is_timeout() {
-        TransportError::Timeout
-    } else {
-        TransportError::Other("response body interrupted")
     }
 }

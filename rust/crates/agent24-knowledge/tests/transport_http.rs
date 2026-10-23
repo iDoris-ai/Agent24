@@ -227,8 +227,44 @@ async fn post_carries_path_json_body_and_api_key() {
         "{}",
         seen.head
     );
+    assert!(
+        seen.head.contains("\r\naccept: application/json\r\n"),
+        "{}",
+        seen.head
+    );
     assert!(!seen.head.contains("authorization:"), "{}", seen.head);
     assert_eq!(seen.body, b"{\"q\":1}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trailing_slash_in_the_base_adds_no_empty_segment() {
+    let mut stub = Stub::start(Script::Respond(response("200 OK", "", b"{}"))).await;
+    let t = transport_for(&format!("{}/", stub.base), api_key(), LIMIT);
+    t.send(KnowledgeOperation::Ready, b"{}".to_vec(), LONG)
+        .await
+        .unwrap();
+    let seen = stub.requests.recv().await.unwrap();
+    assert!(
+        seen.head
+            .starts_with("post /api/v1/agent24/knowledge/ready http/1.1\r\n"),
+        "{}",
+        seen.head
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_deadline_sends_nothing() {
+    let stub = Stub::start(Script::Respond(response("200 OK", "", b"{}"))).await;
+    let t = stub.transport(api_key());
+    for _ in 0..20 {
+        let err = t
+            .send(KnowledgeOperation::Search, b"{}".to_vec(), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(err, TransportError::Timeout);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(stub.conns.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -297,6 +333,44 @@ async fn body_at_the_limit_is_accepted() {
         .await
         .unwrap();
     assert_eq!(got.body, body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_length_at_the_limit_is_accepted() {
+    let body = vec![b'a'; LIMIT];
+    let stub = Stub::start(Script::Respond(response("200 OK", "", &body))).await;
+    let got = stub
+        .transport(api_key())
+        .send(KnowledgeOperation::Read, b"{}".to_vec(), LONG)
+        .await
+        .unwrap();
+    assert_eq!(got.body, body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_shorter_than_its_declared_length_is_an_error() {
+    let mut bytes = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n".to_vec();
+    bytes.extend_from_slice(b"short");
+    let stub = Stub::start(Script::Respond(bytes)).await;
+    let err = stub
+        .transport(api_key())
+        .send(KnowledgeOperation::Read, b"{}".to_vec(), LONG)
+        .await
+        .unwrap_err();
+    assert_eq!(err, TransportError::Other("response body interrupted"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunked_body_cut_off_midway_is_an_error() {
+    let mut bytes = chunked(b"0123456789");
+    bytes.truncate(bytes.len() - b"0\r\n\r\n".len());
+    let stub = Stub::start(Script::Respond(bytes)).await;
+    let err = stub
+        .transport(api_key())
+        .send(KnowledgeOperation::Read, b"{}".to_vec(), LONG)
+        .await
+        .unwrap_err();
+    assert_eq!(err, TransportError::Other("response body interrupted"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -462,7 +536,9 @@ async fn dropping_send_while_reading_stops_the_body() {
 async fn https_never_falls_back_to_plain_http() {
     let stub = Stub::start(Script::Respond(response("200 OK", "", b"{}"))).await;
     let base = stub.base.replace("http://", "https://");
-    let err = transport_for(&base, api_key(), LIMIT)
+    // The stub waits for a request head that a TLS ClientHello never forms;
+    // what matters is that no plain request arrives and nothing succeeds.
+    transport_for(&base, api_key(), LIMIT)
         .send(
             KnowledgeOperation::Search,
             b"{}".to_vec(),
@@ -470,7 +546,6 @@ async fn https_never_falls_back_to_plain_http() {
         )
         .await
         .unwrap_err();
-    assert_ne!(err, TransportError::ResponseTooLarge);
     let mut requests = stub.requests;
     assert!(
         requests.try_recv().is_err(),
@@ -558,6 +633,8 @@ fn credential_and_limit_rules() {
         Credential::Bearer(String::new()),
         Credential::ApiKey("a\nb".into()),
         Credential::Bearer("a\rb".into()),
+        Credential::ApiKey("tk-é".into()),
+        Credential::Bearer("jwt-é".into()),
     ] {
         assert_eq!(
             HttpTransport::new(config(base, bad)).unwrap_err(),
@@ -566,6 +643,12 @@ fn credential_and_limit_rules() {
     }
     let mut zero = config(base, api_key());
     zero.max_response_bytes = 0;
+    assert_eq!(
+        HttpTransport::new(zero).unwrap_err(),
+        HttpConfigError::InvalidLimit
+    );
+    let mut zero = config(base, api_key());
+    zero.connect_timeout = Duration::ZERO;
     assert_eq!(
         HttpTransport::new(zero).unwrap_err(),
         HttpConfigError::InvalidLimit
