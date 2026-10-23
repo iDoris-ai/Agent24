@@ -99,6 +99,9 @@ pub struct AppState {
     /// the daemon runs (SUP-5). `None` when out-of-process modules cannot be
     /// started at all.
     pub supervisors: Option<Arc<crate::domain::Supervisors>>,
+    /// What a module tool's card is made from (K1-6a-G §2.1); `None`
+    /// until `serve` assembles the module tools.
+    pub module_tool_cards: Option<crate::consent_routes::ModuleToolCards>,
     /// Held across the config write and the hand-off of a hot disable's stop
     /// in `PATCH /api/v1/os/{name}` — not across the wait that follows — so
     /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
@@ -680,6 +683,7 @@ impl AppState {
             package_dirs: Arc::new(std::collections::HashMap::new()),
             module_status: Arc::new(std::collections::HashMap::new()),
             supervisors: None,
+            module_tool_cards: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_report: Arc::new(crate::lifecycle::report(
                 &crate::lifecycle::Params::default(),
@@ -1090,6 +1094,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/module-consents/modules/{module}/tools/{tool}",
             axum::routing::delete(crate::consent_routes::revoke_tool),
+        )
+        .route(
+            "/api/v1/module-consents/modules/{module}/tools/{tool}/card",
+            get(crate::consent_routes::card),
         )
         .route(
             "/api/v1/tool-overrides",
@@ -1570,6 +1578,7 @@ pub async fn serve(
         (String, String),
         StdArc<dyn agent24_tools::ModuleToolAuthorization>,
     > = std::collections::HashMap::new();
+    let mut card_sources = std::collections::HashMap::new();
     for (_, registered) in module_registry.iter() {
         let module = registered.module().to_owned();
         let declaration = registered.declaration();
@@ -1605,8 +1614,19 @@ pub async fn serve(
             StdArc::new(crate::module_tool_runtime::consent_clock),
             module_tool_runtime.artifact_source(),
         ));
+        card_sources.insert(
+            (module.clone(), operation.clone()),
+            crate::consent_routes::ToolCardSource {
+                summary,
+                resource_kinds: declaration.resource_kinds().to_vec(),
+            },
+        );
         module_authorizations.insert((module, operation), authorization);
     }
+    let module_tool_cards = crate::consent_routes::ModuleToolCards {
+        tools: StdArc::new(card_sources),
+        artifact: module_tool_runtime.artifact_source(),
+    };
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
         StdArc::clone(&module_tool_runtime),
         module_authorizations.clone(),
@@ -2373,6 +2393,7 @@ pub async fn serve(
             .unwrap_or_default(),
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
+    state.module_tool_cards = Some(module_tool_cards);
     state.shutdown_report = Arc::new(report);
     // A3-2b (design §4/§5): the real attach registry — same "start empty,
     // replace once real data is ready" pattern as `os_reports` above, and for
@@ -3651,14 +3672,94 @@ pub(crate) mod tests {
         assert_eq!(notice.op, None);
     }
 
+    /// K1-6a-G §2.1: a card shows the summary the gate compares a grant
+    /// with — its fingerprint, version and the running package's identity —
+    /// and there is none for a tool that does not exist or a module with no
+    /// running package.
+    #[tokio::test]
+    async fn a_module_tool_card_shows_what_a_grant_would_be_checked_against() {
+        let mut state = state().await;
+        let summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "read_document",
+            "1.2.3",
+            agent24_store::ConsentSource::ManualInstall,
+            Some("local documents".to_owned()),
+            None,
+            None,
+            agent24_store::HostRiskLevel::High,
+        );
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
+            tools: StdArc::new(std::collections::HashMap::from([(
+                ("doc-module".to_owned(), "read_document".to_owned()),
+                crate::consent_routes::ToolCardSource {
+                    summary: summary.clone(),
+                    resource_kinds: vec!["doc".to_owned()],
+                },
+            )])),
+            artifact: {
+                let running = StdArc::clone(&running);
+                StdArc::new(move |module: &str| {
+                    (module == "doc-module" && running.load(std::sync::atomic::Ordering::SeqCst))
+                        .then(|| "sha256:abc".to_owned())
+                })
+            },
+        });
+        let router = build_router(state);
+        let get = |uri: &'static str| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("Authorization", "Bearer testtoken")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let card = "/api/v1/module-consents/modules/doc-module/tools/read_document/card";
+        let response = get(card).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["fingerprint"], summary.scope_fingerprint());
+        assert_eq!(body["module_version"], "1.2.3");
+        assert_eq!(body["artifact"], "sha256:abc");
+        assert_eq!(body["resource_kinds"], serde_json::json!(["doc"]));
+        assert_eq!(body["host_risk"], "high");
+        assert_eq!(body["source"], "manual_install");
+        assert_eq!(body["scope_summary"]["readable"], "local documents");
+        let response =
+            get("/api/v1/module-consents/modules/doc-module/tools/write_document/card").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get(card).await.status(), StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn module_consent_routes_reject_creative_identity() {
         let (state, _host, creative) = capability_state().await;
+        let state_again = state.clone();
         let router = build_router(state);
         let response = router
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/module-consents")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = build_router(state_again)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents/modules/doc-module/tools/read_document/card")
                     .header("Authorization", format!("Bearer {creative}"))
                     .body(Body::empty())
                     .unwrap(),
