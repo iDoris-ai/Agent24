@@ -10,6 +10,10 @@ import {
   type DisabledBy,
 } from './agent/api'
 import { previewNextFire, formatPreview, type ScheduleSpecInput } from './schedule/cronPreview'
+import { useT, useLocale, type T } from '../i18n'
+import { schedulesMessages } from './Schedules.i18n'
+
+type SchedKey = keyof typeof schedulesMessages.en
 
 type SpecType = 'cron' | 'every' | 'at'
 
@@ -20,6 +24,8 @@ function buildSpec(type: SpecType, expr: string, tz: string, secs: string, ts: s
 }
 
 export default function SchedulesPage() {
+  const t = useT(schedulesMessages)
+  const locale = useLocale()
   const [schedules, setSchedules] = useState<Schedule[]>([])
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -74,15 +80,16 @@ export default function SchedulesPage() {
       ts,
     }
     return previewNextFire(specInput, new Date(nowTick))
-  }, [specType, expr, tz, secs, ts, nowTick])
+    // locale is a dep because previewNextFire translates its messages
+  }, [specType, expr, tz, secs, ts, nowTick, locale])
 
   const onCreate = async () => {
     if (name.trim() === '' || prompt.trim() === '') {
-      setError('名称和 prompt 必填')
+      setError(t('error.required'))
       return
     }
     if (preview.isError) {
-      setError(`调度规格无效：${preview.message}`)
+      setError(t('error.invalidSpec', { msg: preview.message ?? '' }))
       return
     }
     try {
@@ -94,7 +101,7 @@ export default function SchedulesPage() {
       setName('')
       setPrompt('')
       setError(null)
-      setNotice('已创建调度')
+      setNotice(t('notice.created'))
       refresh()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -130,7 +137,7 @@ export default function SchedulesPage() {
       // (design §8.2) so the notice never reads "已触发运行 undefined".
       const outcome = await runScheduleNow(id)
       setNotice(
-        outcome.startsWith('fire_') ? `已投递给模块（fire_id ${outcome}）` : `已触发运行 ${outcome}`,
+        outcome.startsWith('fire_') ? t('notice.firedToModule', { id: outcome }) : t('notice.runTriggered', { id: outcome }),
       )
       refresh()
     } catch (e: unknown) {
@@ -140,39 +147,39 @@ export default function SchedulesPage() {
 
   return (
     <div className="content">
-      <div className="page-title">定时调度</div>
-      <div className="page-sub">挂钟定时工作流 · cron / 每隔 / 一次性</div>
+      <div className="page-title">{t('title')}</div>
+      <div className="page-sub">{t('sub')}</div>
 
       {error && <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{error}</div>}
       {notice && <div style={{ color: '#4caf50', fontSize: 12, marginBottom: 8 }}>{notice}</div>}
 
       {/* Create form */}
       <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 12, marginBottom: 16 }}>
-        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>新建调度</div>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>{t('form.title')}</div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <input
-            aria-label="名称"
-            placeholder="名称，如「每日晨报」"
+            aria-label={t('form.nameLabel')}
+            placeholder={t('form.namePlaceholder')}
             value={name}
             onChange={(e) => setName(e.target.value)}
             style={inputStyle}
           />
           <input
-            aria-label="prompt"
-            placeholder="prompt，如「抓取 RSS 并生成摘要」"
+            aria-label={t('form.promptLabel')}
+            placeholder={t('form.promptPlaceholder')}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             style={inputStyle}
           />
           <div style={{ display: 'flex', gap: 6 }}>
-            {(['cron', 'every', 'at'] as SpecType[]).map((t) => (
+            {(['cron', 'every', 'at'] as SpecType[]).map((st) => (
               <button
-                key={t}
-                className={`btn${specType === t ? ' btn-primary' : ''}`}
+                key={st}
+                className={`btn${specType === st ? ' btn-primary' : ''}`}
                 style={{ fontSize: 11 }}
-                onClick={() => setSpecType(t)}
+                onClick={() => setSpecType(st)}
               >
-                {t === 'cron' ? 'cron' : t === 'every' ? '每隔' : '一次性'}
+                {t(`form.type.${st}`)}
               </button>
             ))}
           </div>
@@ -180,14 +187,14 @@ export default function SchedulesPage() {
           {specType === 'cron' && (
             <div style={{ display: 'flex', gap: 6 }}>
               <input
-                aria-label="cron 表达式"
+                aria-label={t('form.cronLabel')}
                 placeholder="0 8 * * *"
                 value={expr}
                 onChange={(e) => setExpr(e.target.value)}
                 style={{ ...inputStyle, flex: 2, fontFamily: 'monospace' }}
               />
               <input
-                aria-label="时区"
+                aria-label={t('form.tzLabel')}
                 placeholder="UTC"
                 value={tz}
                 onChange={(e) => setTz(e.target.value)}
@@ -197,9 +204,9 @@ export default function SchedulesPage() {
           )}
           {specType === 'every' && (
             <input
-              aria-label="每隔秒数"
+              aria-label={t('form.secsLabel')}
               type="number"
-              placeholder="秒（60–86400）"
+              placeholder={t('form.secsPlaceholder')}
               value={secs}
               onChange={(e) => setSecs(e.target.value)}
               style={inputStyle}
@@ -207,7 +214,7 @@ export default function SchedulesPage() {
           )}
           {specType === 'at' && (
             <input
-              aria-label="触发时间"
+              aria-label={t('form.tsLabel')}
               placeholder="2026-08-01T09:00:00Z"
               value={ts}
               onChange={(e) => setTs(e.target.value)}
@@ -218,19 +225,19 @@ export default function SchedulesPage() {
           {/* Live preview */}
           <div style={{ fontSize: 12 }} data-testid="preview">
             {preview.isError ? (
-              <span style={{ color: '#e05050' }}>下次触发：{preview.message}</span>
+              <span style={{ color: '#e05050' }}>{t('preview.next', { value: preview.message ?? '' })}</span>
             ) : preview.next ? (
               <span style={{ color: 'var(--muted)' }}>
-                下次触发：{formatPreview(preview.next)}
-                {preview.approximate && '（近似 · 服务端按所选时区精确计算）'}
+                {t('preview.next', { value: formatPreview(preview.next) })}
+                {preview.approximate && t('preview.approx')}
               </span>
             ) : (
-              <span style={{ color: 'var(--muted)' }}>下次触发：{preview.message}</span>
+              <span style={{ color: 'var(--muted)' }}>{t('preview.next', { value: preview.message ?? '' })}</span>
             )}
           </div>
 
           <button className="btn btn-primary" style={{ fontSize: 12, alignSelf: 'flex-start' }} onClick={onCreate}>
-            创建
+            {t('form.create')}
           </button>
         </div>
       </div>
@@ -238,14 +245,14 @@ export default function SchedulesPage() {
       {/* List */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {schedules.length === 0 && (
-          <div style={{ fontSize: 12, color: 'var(--muted)' }}>暂无调度</div>
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>{t('list.empty')}</div>
         )}
         {schedules.map((s) => {
           // `?? enabled` is the load-bearing forward-compat fallback (design
           // §8.2): an older daemon never sends `effective_enabled`, so this
           // desktop build must keep reading plain `enabled` for it.
           const eff = s.effective_enabled ?? s.enabled
-          const reason = s.owner ? disabledReasonText(s.disabled_by) : null
+          const reason = s.owner ? disabledReasonText(s.disabled_by, t) : null
           return (
             <div
               key={s.id}
@@ -258,10 +265,10 @@ export default function SchedulesPage() {
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <strong style={{ fontSize: 13 }}>{s.name}</strong>
-                <span style={{ fontSize: 10, color: 'var(--muted)' }}>{specSummary(s.spec)}</span>
+                <span style={{ fontSize: 10, color: 'var(--muted)' }}>{specSummary(s.spec, t)}</span>
                 {s.owner && (
                   <span style={{ fontSize: 10, color: 'var(--muted)' }}>
-                    来自模块 {s.owner.module}
+                    {t('item.fromModule', { module: s.owner.module })}
                   </span>
                 )}
                 {reason && (
@@ -269,30 +276,30 @@ export default function SchedulesPage() {
                 )}
                 {s.consecutive_failures > 0 && (
                   <span style={{ fontSize: 10, color: '#e0a020' }}>
-                    连续失败 {s.consecutive_failures}
+                    {t('item.failures', { n: s.consecutive_failures })}
                   </span>
                 )}
                 <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
                   <button className="btn" style={{ fontSize: 11 }} onClick={() => onRunNow(s.id)}>
-                    立即运行
+                    {t('item.runNow')}
                   </button>
                   <button className="btn" style={{ fontSize: 11 }} onClick={() => onToggle(s)}>
-                    {eff ? '禁用' : '启用'}
+                    {eff ? t('item.disable') : t('item.enable')}
                   </button>
                   <button className="btn" style={{ fontSize: 11 }} onClick={() => onDelete(s.id)}>
-                    删除
+                    {t('item.delete')}
                   </button>
                 </div>
               </div>
               <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
-                {s.next_run_at ? `下次 ${s.next_run_at}` : '（无后续触发）'}
-                {s.last_run_at && ` · 上次 ${s.last_run_at}`}
+                {s.next_run_at ? t('item.next', { at: s.next_run_at }) : t('item.noNext')}
+                {s.last_run_at && t('item.last', { at: s.last_run_at })}
               </div>
               {/* `action` is null exactly when `owner` is set (design §8.1) —
                   a module row has no AgentRun prompt to show, ever. */}
               {s.action === null && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
-                  由模块 {s.owner?.module ?? '未知模块'} 处理
+                  {t('item.handledBy', { module: s.owner?.module ?? t('item.unknownModule') })}
                 </div>
               )}
             </div>
@@ -303,23 +310,23 @@ export default function SchedulesPage() {
   )
 }
 
-function disabledReasonText(by: DisabledBy | undefined): string | null {
+function disabledReasonText(by: DisabledBy | undefined, t: T<SchedKey>): string | null {
   switch (by) {
     case 'user':
-      return '已被你暂停'
+      return t('disabled.user')
     case 'system':
-      return '系统因连续失败禁用'
+      return t('disabled.system')
     case 'module':
-      return '模块自己停用'
+      return t('disabled.module')
     default:
       return null
   }
 }
 
-function specSummary(spec: ScheduleSpec): string {
+function specSummary(spec: ScheduleSpec, t: T<SchedKey>): string {
   if (spec.type === 'cron') return `cron ${spec.expr}${spec.tz ? ` @${spec.tz}` : ''}`
-  if (spec.type === 'every') return `每 ${spec.secs}s`
-  return `一次性 ${spec.ts}`
+  if (spec.type === 'every') return t('spec.every', { secs: spec.secs })
+  return t('spec.at', { ts: spec.ts })
 }
 
 const inputStyle: React.CSSProperties = {

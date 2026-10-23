@@ -6,6 +6,7 @@ import path from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import {
   deriveStatus,
+  daemonStatePath,
   readExternalDaemonState,
   BackendManager,
   getBackendEndpoint,
@@ -35,16 +36,21 @@ describe('deriveStatus (F1b tray daemon status)', () => {
 describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   let tmpHome: string
   let originalHome: string | undefined
+  let originalDataDir: string | undefined
 
   beforeEach(() => {
     originalHome = process.env['HOME']
+    originalDataDir = process.env['AGENT24_DATA_DIR']
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-daemon-state-'))
     process.env['HOME'] = tmpHome
+    delete process.env['AGENT24_DATA_DIR']
   })
 
   afterEach(() => {
     if (originalHome === undefined) delete process.env['HOME']
     else process.env['HOME'] = originalHome
+    if (originalDataDir === undefined) delete process.env['AGENT24_DATA_DIR']
+    else process.env['AGENT24_DATA_DIR'] = originalDataDir
     fs.rmSync(tmpHome, { recursive: true, force: true })
   })
 
@@ -83,6 +89,34 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   it('returns null when HOME is unset — mirrors the Rust state_dir() contract', () => {
     delete process.env['HOME']
     expect(readExternalDaemonState()).toBeNull()
+  })
+
+  it('daemonStatePath() defaults to $HOME/.agent24/daemon.json when AGENT24_DATA_DIR is unset', () => {
+    expect(daemonStatePath()).toBe(path.join(tmpHome, '.agent24', 'daemon.json'))
+  })
+
+  it('daemonStatePath() uses AGENT24_DATA_DIR as-is (no .agent24 suffix) — MAINT-03', () => {
+    const dataDir = path.join(tmpHome, 'isolated')
+    process.env['AGENT24_DATA_DIR'] = dataDir
+    expect(daemonStatePath()).toBe(path.join(dataDir, 'daemon.json'))
+    delete process.env['HOME'] // HOME is not needed once the override is set
+    expect(daemonStatePath()).toBe(path.join(dataDir, 'daemon.json'))
+  })
+
+  it('daemonStatePath() ignores an empty or relative AGENT24_DATA_DIR, like the Rust side', () => {
+    process.env['AGENT24_DATA_DIR'] = ''
+    expect(daemonStatePath()).toBe(path.join(tmpHome, '.agent24', 'daemon.json'))
+    process.env['AGENT24_DATA_DIR'] = 'relative/dir'
+    expect(daemonStatePath()).toBe(path.join(tmpHome, '.agent24', 'daemon.json'))
+  })
+
+  it('reads daemon.json from AGENT24_DATA_DIR, not $HOME/.agent24, when set', () => {
+    writeState({ port: 1111, token: 'home', pid: 1 })
+    const dataDir = path.join(tmpHome, 'isolated')
+    fs.mkdirSync(dataDir, { recursive: true })
+    fs.writeFileSync(path.join(dataDir, 'daemon.json'), JSON.stringify({ port: 2222, token: 'iso', pid: 2 }))
+    process.env['AGENT24_DATA_DIR'] = dataDir
+    expect(readExternalDaemonState()).toEqual({ port: 2222, token: 'iso', pid: 2 })
   })
 })
 

@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "storage_unavailable",
+    "message": "documents.db is locked by another writer",
+    "details": {
+      "retryable": true,
+      "cause": "locked"
+    }
+  }
+}

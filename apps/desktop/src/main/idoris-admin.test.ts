@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createIdorisStatusProvider, fetchIdorisStatus, parseAdminPort, parseAdminTokenFd, parseStatusResponse, parseTokenFrame, readAdminTokenFromFd } from './idoris-admin'
+import { createIdorisStatusProvider, fetchIdorisOverview, fetchIdorisStatus, parseAdminPort, parseAdminTokenFd, parseBackendsResponse, parseModelsResponse, parseStatusResponse, parseTokenFrame, readAdminTokenFromFd } from './idoris-admin'
 
 const TOKEN = 'a'.repeat(64)
 const VALID_STATUS = {
@@ -11,6 +11,8 @@ const VALID_STATUS = {
   components: 1, runtimes: 2, subscriptions: 0, budget_configured: true, audit_configured: false,
   capacity: { state: 'observed', entries: [{ id: 'm1', capability: 'chat', resident: true, estimated_memory_gb: 3.5, ctx_limit: 4096, queue_depth: 0, admission_status: 'ready' }] },
 } as const
+const VALID_BACKENDS = [{ provider_id: 'omlx-local', locality: 'loopback', form: 'http_service', lifecycle_runtime_bound: true }] as const
+const VALID_MODELS = { sources: [{ provider_id: 'omlx-local', source: 'http_models_endpoint', state: 'observed', models: ['qwen3-8b'] }] } as const
 
 const servers: http.Server[] = []
 afterEach(async () => {
@@ -85,6 +87,31 @@ describe('iDoris Admin status transport', () => {
     expect(parseStatusResponse(VALID_STATUS)).toEqual(VALID_STATUS)
     expect(parseStatusResponse({ ...VALID_STATUS, token: TOKEN })).toBeNull()
     expect(parseStatusResponse({ ...VALID_STATUS, capacity: { state: 'observed', entries: [{ ...VALID_STATUS.capacity.entries[0], estimated_memory_gb: -1 }] } })).toBeNull()
+  })
+
+  it('projects only the frozen backends/models contracts', () => {
+    expect(parseBackendsResponse(VALID_BACKENDS)).toEqual(VALID_BACKENDS)
+    expect(parseBackendsResponse([{ ...VALID_BACKENDS[0], endpoint: 'http://127.0.0.1:8088/v1' }])).toBeNull()
+    expect(parseModelsResponse(VALID_MODELS)).toEqual(VALID_MODELS)
+    expect(parseModelsResponse({ sources: [{ ...VALID_MODELS.sources[0], token: TOKEN }] })).toBeNull()
+    expect(parseModelsResponse({ sources: [{ provider_id: 'sub', source: 'subscription_registration', state: 'configured', models: [] }] })).toBeNull()
+  })
+
+  it('reads exactly the three fixed Admin status-card resources', async () => {
+    const seen = new Set<string>()
+    const { port } = await listen((req, res) => {
+      seen.add(req.url ?? '')
+      expect(req.headers.authorization).toBe(`Bearer ${TOKEN}`)
+      res.setHeader('content-type', 'application/json')
+      if (req.url === '/admin/api/v1/status') res.end(JSON.stringify(VALID_STATUS))
+      else if (req.url === '/admin/api/v1/backends') res.end(JSON.stringify(VALID_BACKENDS))
+      else if (req.url === '/admin/api/v1/models') res.end(JSON.stringify(VALID_MODELS))
+      else { res.statusCode = 404; res.end() }
+    })
+    const result = await fetchIdorisOverview(TOKEN, port)
+    expect(result).toEqual({ state: 'available', status: VALID_STATUS, backends: VALID_BACKENDS, models: VALID_MODELS })
+    expect([...seen].sort()).toEqual(['/admin/api/v1/backends', '/admin/api/v1/models', '/admin/api/v1/status'])
+    expect(JSON.stringify(result)).not.toContain(TOKEN)
   })
 
   it('uses fixed loopback/status path and the main-only bearer header', async () => {

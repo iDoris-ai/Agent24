@@ -633,18 +633,19 @@ Independent platform work; not on Documenting's critical path. Reproducible OD b
 
 Upstream-tracking WeKnora fork, adapter/service contract, search/source integration, citation preservation, identity/scope mapping, explicit health/capability states, and document ↔ KB revision mapping (§7).
 
-## 15. First Vertical Slices (proposed)
+## 15. First Vertical Slices
+
+Mapping confirmed by David on 2026-10-08 ([#693](https://github.com/iDoris-ai/Agent24/issues/693#issuecomment-6064089994)).
 
 The first end-to-end acceptance is two vertical slices, not the whole capability map.
 
-| Slice | Intent | Candidate scenarios | Key constraints (§11) |
+| Slice | Intent | Scenarios | Key constraints (§11) |
 |---|---|---|---|
 | **V1 收件看懂 — Receive & understand** | Receive material, understand it with evidence, keep a recoverable result | S01, S06 (reading part) | 1, 4, 7, 8 |
 | **V2 日常成稿 — Everyday drafting** | Produce a usable document from material/template, review it, export it | S03, S08 | 1, 3, 7 |
 
 - **Form filling (S02)** is not in the first slices. Before it is promised, the supported form types and the manual-completion path for unsupported ones must be declared.
 - If only one slice ships first, it is called “first slice”. It must not be described as covering the T005 first-release recommendation.
-- The scenario mapping above is **TBD — to confirm with reviewer**.
 
 ## 16. Dependencies and Team Inputs
 
@@ -673,16 +674,16 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 | # | Decision | Blocks |
 |---|---|---|
 | 1 | **Editable source of truth** — Documenting-managed, KB-managed immutable source, or external document system? Also covers persistence/recovery and the promotion of temporary artifacts (§22.1). **Decided for DOC-1 (David, 2026-10-07): Documenting-managed, see [ADR-DOC-02 §2](adr/ADR-DOC-02-operation-contract.md#2-存储与唯一可编辑权威690).** | DOC-1 — must be resolved before any persistent data is written |
-| 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? | DOC-1 slice 2 (a minimal model for editing a template region; slice 1 only needs the provenance anchor format, page/block/range, which the ADR defines), then DOC-3 |
-| 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). | DOC-1 (read side for slice 1; edit/export side for slice 2), DOC-3–DOC-4 |
+| 2 | **Primary content model** — Markdown-first, DOCX-first, internal structured model, or adapters? **Decided (David, 2026-10-08, [#691](https://github.com/iDoris-ai/Agent24/issues/691#issuecomment-6064088774)): format adapters over native authority.** Each revision's native file is the authority (ADR-DOC-02 §2); one read projection with provenance anchors is never written back; edits are typed ops from the ADR-DOC-03 §3 whitelist bound to `base_revision`; Markdown/HTML are derived views only. | DOC-1 slice 2 (a minimal model for editing a template region; slice 1 only needs the provenance anchor format, page/block/range, which the ADR defines), then DOC-3 |
+| 3 | **First formats and fidelity scope** — which formats ship first, and for DOCX: basic import/export vs comments/track-changes/headers/fields/complex tables/round-trip. Frozen before the engine choice (#6). **Slice 1 read side decided (David, 2026-10-08):** PDF with a text layer, JPG and PNG — the formats of the S01 samples. Engine for slice 1: macOS PDFKit (text layer, page render) and Vision (OCR) in a small out-of-process Swift helper, shipped in the OS package and built from this repo. Rust code depends only on an engine interface, so other engines can replace it later. This is a recorded exception to ADR-DOC-01 D6 (system frameworks need no on-demand download) and D10 (on Linux these operations report `engine_unavailable` until a cross-platform engine lands); see the 2026-10-08 amendments there. **Slice 2 edit/export side decided (David and jason, frozen 2026-10-10, [#692](https://github.com/iDoris-ai/Agent24/issues/692#issuecomment-6062986460)):** DOCX is the only editable format in slice 2; `.docm` and password-protected or IRM-encrypted DOCX are refused at import; DOC, ODT and RTF are DOC-3 candidates, imported as converted copies; the feature table, export rules and fidelity bar are as in the frozen draft. | DOC-1 (read side for slice 1; edit/export side for slice 2), DOC-3–DOC-4 |
 | 4 | **PDF scope** — reading, OCR, form filling (interactive vs flat overlay), page operations and true content editing are separate capabilities. | DOC-2, form slice |
 | 5 | **Collaboration depth** — single-user, async review, multi-user revision or real-time co-editing. Constrained by H2: anything beyond single-user waits for the Agent24 permission infrastructure (§16). | DOC-3 |
-| 6 | **Document engine/editor choice** — follows representative tasks and the frozen format scope (#3), not the other way round. | DOC-1 slice 2 (library for the first editable format), DOC-3 (editor UI and further formats) |
-| 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). | DOC-1 fixtures |
+| 6 | **Document engine/editor choice** — follows representative tasks and the frozen format scope (#3), not the other way round. **Direction decided 2026-10-08 (jason, #696): SuperDoc headless SDK for DOCX, LibreOffice headless for PDF/convert; see [ADR-DOC-03](adr/ADR-DOC-03-docx-engine-and-conversion.md) (**Accepted** 2026-10-08), conditional on #3.** | DOC-1 slice 2 (library for the first editable format), DOC-3 (editor UI and further formats) |
+| 7 | **First slices** — confirm V1/V2 and their scenario mapping (§15). **Confirmed (David, 2026-10-08, [#693](https://github.com/iDoris-ai/Agent24/issues/693#issuecomment-6064089994)).** | DOC-1 fixtures |
 | 8 | **Knowledge setting overrides** — who may override the setting, the override rules across org / personal / task, and the concrete interfaces. The default itself is settled: ON, with a persistent Off (§9). | DOC-2 knowledge-optional/required operations |
 | 9 | **Line W assignment** — which parts, if any, are temporarily David's, the handover owner and the exit date (§12). | Line W start (not Line D) |
 | 10 | **Roadmap conflicts** — how conflicts between this plan and existing Agent24/T006 roadmaps are resolved and recorded. | planning |
-| 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). | DOC-3 engine choice |
+| 11 | **External editing application** — whether to adopt a full standalone editor hosted as a product Workspace. Decided by reuse benefit. Base tools stay callable without it (§2.3). **Not adopted (2026-10-08, [ADR-DOC-03](adr/ADR-DOC-03-docx-engine-and-conversion.md) D5); full editing happens in Office via export and hand-back.** | DOC-3 engine choice |
 | 12 | **Placement and exposure (H1)** — in-process DomainModule vs out-of-process OS; agent exposure (kernel proxy tools / MCP / new `Capability`); default installation of a first-party OS; noun ownership of “document” (PLAN-OOP-OS-AND-BACKLOG §七). Decided in the DOC-1-02 ADR (#701). **Decided by [ADR-DOC-01](adr/ADR-DOC-01-placement-and-integration.md) (Accepted 2026-10-07)**: out-of-process domain OS; agent exposure through kernel-side module-declared tools; typed preload transport; bundled first-party package. The ADR must also weigh these facts: (a) in-process ① has no Models or Scheduler handle (`KERNEL_GRANTS` = Events, Memory, Approval); (b) no `Capability` provides kernel audit, which §10 expects for commits; (c) out-of-process ② runs on Unix sockets, and the Windows port (DEP-C2) is `BLOCKED`, which matters for both options' Windows story (§2.3). | **DOC-1 start** |
 
 ## 18. Release Hard Gates & Test Samples
@@ -703,6 +704,8 @@ These are intentionally **TBD** and must not be silently frozen by implementatio
 - Knowledge Off/unavailable behaves as in §9.1, and the T006 §7 inheritance, Off and LocalOnly requirements listed in §9.3 are demonstrated.
 
 ### 18.2 Sample set
+
+The spec for sources, coverage, gold labels and verification is [`samples/README.md`](samples/README.md). It starts with S01; jason confirmed on 2026-10-07 that no existing samples exist, so samples come from public sources that can legally be committed.
 
 - Sanitized, representative documents per slice, including bad cases: scans, mixed language, complex tables, same-name different versions, and duplicates.
 - Gold labels for critical fields (§11.8).
@@ -757,6 +760,7 @@ This working baseline is derived from the current project direction and the foll
 
 - iDoris product / OfficeSuite positioning;
 - T005 Documenting report, user scenarios & atomic capabilities, David Xu handoff, Agent24 kernel integration study;
+- T005 document editing engines study (2026-10-07): bounded editing with product-grade Office interoperability, per-format support contract, candidate providers and gates G0–G9 — research input for §17 #2, #3, #6, #11;
 - T006 Document ↔ KnowledgeBase/MediaBase service boundaries and WeKnora Workspace development plan;
 - T007 Assistant and T008 Media roadmap (for boundaries);
 - Agent24 current architecture/ADR/code observations;
@@ -777,6 +781,7 @@ Pinned references:
 | Agent24 source baseline | `c18d805` (main, 2026-10-07, after `docs/ARCHITECTURE-LAYERS.md` and BASELINE.md landed); earlier `54cec44` predates the architecture overview |
 | Research baseline (T001–T008) | `jhfnetboy/researcher` `9e374e1d8cd5b3415a1c5ee81029eb5aef187fde` |
 | T006 WeKnora Workspace plan (normative for §9) | `jhfnetboy/researcher` `c7ab2129dbf1ae3af2150adfded9aa1a449889dd` — `topics/T006-knowledge-media-base/subtopics/weknora-workspace-development-plan.md` §1, §3.1, §4, §7 |
+| T005 document editing engines (research input, not normative) | `jhfnetboy/researcher` `33f30f18a4c3e5566e286579684ebdff54911cb4` — `topics/T005-documenting/subtopics/document-editing-engines.md`; written before #701 closed, so its §6.4 integration gaps are superseded by ADR-DOC-01/02 except the renderer-side editor exception to D6 and Office hand-back re-import |
 
 Where these sources contain research proposals rather than approved engineering decisions, this document keeps the corresponding item marked **proposed** or **TBD**. Historical implementation observations in research documents are not treated as current run results.
 

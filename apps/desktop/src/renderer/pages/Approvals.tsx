@@ -1,12 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { listPendingApprovals, decideApproval, type Approval } from './agent/api'
-
-const DECISION_LABELS: Record<string, string> = {
-  approve: '批准',
-  approve_for_session: '本会话免问',
-  deny: '拒绝',
-  abort: '中止运行',
-}
+import { translate, useT } from '../i18n'
+import { approvalsMessages } from './Approvals.i18n'
 
 /** Fire a desktop notification for a newly-seen approval (best-effort — never
  *  throws or leaves an unhandled rejection). */
@@ -14,7 +9,7 @@ function notify(approval: Approval): void {
   if (typeof Notification === 'undefined') return
   const show = () => {
     try {
-      new Notification('需要审批', {
+      new Notification(translate(approvalsMessages, 'notification.title'), {
         body: approval.summary,
         tag: approval.id, // dedup repeat notifications for the same approval
       })
@@ -36,6 +31,7 @@ function notify(approval: Approval): void {
 }
 
 export default function ApprovalsPage() {
+  const t = useT(approvalsMessages)
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [error, setError] = useState<string | null>(null)
   // Which approval is in deny-reason entry
@@ -86,14 +82,14 @@ export default function ApprovalsPage() {
 
   return (
     <div className="content">
-      <div className="page-title">待审批 ({approvals.length})</div>
-      <div className="page-sub">工具执行审批 · 每 2 秒刷新 · 新审批弹系统通知</div>
+      <div className="page-title">{t('page.title', { count: approvals.length })}</div>
+      <div className="page-sub">{t('page.subtitle')}</div>
 
       {error && <div style={{ color: '#e05050', fontSize: 12, marginBottom: 8 }}>{error}</div>}
 
       {approvals.length === 0 && (
         <div style={{ fontSize: 12, color: 'var(--muted)', padding: '8px 0' }}>
-          没有待处理的审批
+          {t('empty')}
         </div>
       )}
 
@@ -122,8 +118,8 @@ export default function ApprovalsPage() {
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 <input
                   autoFocus
-                  aria-label="拒绝原因"
-                  placeholder="拒绝原因（必填）"
+                  aria-label={t('deny.reason')}
+                  placeholder={t('deny.placeholder')}
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
                   style={{
@@ -142,7 +138,7 @@ export default function ApprovalsPage() {
                   disabled={reason.trim() === ''}
                   onClick={() => decide(a.id, 'deny', reason.trim())}
                 >
-                  确认拒绝
+                  {t('deny.confirm')}
                 </button>
                 <button
                   className="btn"
@@ -152,7 +148,7 @@ export default function ApprovalsPage() {
                     setReason('')
                   }}
                 >
-                  返回
+                  {t('deny.back')}
                 </button>
               </div>
             ) : (
@@ -171,7 +167,7 @@ export default function ApprovalsPage() {
                       }
                     }}
                   >
-                    {DECISION_LABELS[d] ?? d}
+                    {d === 'approve' ? t('decision.approve') : d === 'approve_for_session' ? t('decision.approveForSession') : d === 'deny' ? t('decision.deny') : d === 'abort' ? t('decision.abort') : d}
                   </button>
                 ))}
               </div>

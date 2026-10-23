@@ -2,8 +2,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import ModelsPage from './Models'
+import { setLocale } from '../i18n'
 
 describe('ModelsPage', () => {
+  beforeEach(() => { setLocale('zh') })
   beforeEach(() => {
     window.agent24 = {
       backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
@@ -82,9 +84,29 @@ describe('ModelsPage', () => {
           components: 4, runtimes: 2, subscriptions: 0, budget_configured: true, audit_configured: true,
           capacity: { state: 'observed', entries: [] },
         },
+        backends: [
+          { provider_id: 'omlx-local', locality: 'loopback', form: 'http_service', lifecycle_runtime_bound: true },
+          { provider_id: 'llama-local', locality: 'loopback', form: 'spawn_cli', lifecycle_runtime_bound: true },
+        ],
+        models: { sources: [
+          { provider_id: 'omlx-local', source: 'http_models_endpoint', state: 'observed', models: ['qwen3-8b', 'bge-m3'] },
+          { provider_id: 'subscription', source: 'subscription_registration', state: 'configured', models: ['remote-coding'] },
+        ] },
       }),
     } as never
     render(<ModelsPage />)
-    expect(await screen.findByTestId('idoris-status-available')).toHaveTextContent('v1.2.3 · 4 components · 2 runtimes · capacity observed')
+    expect(await screen.findByTestId('idoris-status-available')).toHaveTextContent('v1.2.3 · 4 个组件 · 2 个运行时 · 容量 已观测')
+    expect(screen.getByTestId('idoris-status-resources')).toHaveTextContent('2 个后端 · 3 个模型')
+  })
+})
+
+describe('ModelsPage English default', () => {
+  it('shows the English page title', () => {
+    window.agent24 = {
+      backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
+      idorisStatus: vi.fn().mockResolvedValue({ state: 'unavailable', reason: 'handoff-missing' }),
+    } as never
+    render(<ModelsPage />)
+    expect(screen.getByText('Model management')).toBeInTheDocument()
   })
 })

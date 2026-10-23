@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import ModulesManagerPage from './ModulesManager'
 import type { DiscoveredModule, DiscoverFilter } from '../../shared/ipc-types'
+import { setLocale } from '../i18n'
 import type { DomainOsList, DomainOsView } from './agent/api'
 
 const CATALOG: DiscoveredModule[] = [
@@ -56,8 +57,19 @@ const SIN90: DomainOsView = {
   resources: 'ok', restart_required: false,
 }
 
-describe('ModulesManagerPage — 模块市场 (marketplace browse)', () => {
+describe('ModulesManagerPage — English default', () => {
   beforeEach(() => vi.restoreAllMocks())
+
+  it('renders the English title and sections', async () => {
+    mount()
+    expect(screen.getByText('Module management')).toBeInTheDocument()
+    expect(screen.getByText('Module marketplace')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('No OS modules mounted')).toBeInTheDocument())
+  })
+})
+
+describe('ModulesManagerPage — 模块市场 (marketplace browse)', () => {
+  beforeEach(() => { vi.restoreAllMocks(); setLocale('zh') })
 
   it('renders discovered modules with trust-tier chips', async () => {
     mount()
@@ -105,7 +117,7 @@ describe('ModulesManagerPage — 模块市场 (marketplace browse)', () => {
 })
 
 describe('ModulesManagerPage — OS 模块 (FU-90)', () => {
-  beforeEach(() => vi.restoreAllMocks())
+  beforeEach(() => { vi.restoreAllMocks(); setLocale('zh') })
 
   it('shows nothing mounted when the daemon has no domain-OS modules', async () => {
     mount({ osList: EMPTY_OS_LIST })

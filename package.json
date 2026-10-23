@@ -11,8 +11,8 @@
   "scripts": {
     "dev": "pnpm --filter @agent24/node-daemon build && pnpm --filter @agent24/desktop dev",
     "build": "pnpm --filter @agent24/node-daemon build && pnpm --filter @agent24/desktop build",
-    "typecheck": "pnpm --filter @agent24/desktop typecheck && pnpm --filter @agent24/node-daemon typecheck && pnpm --filter @agent24/wechat-bridge typecheck && pnpm --filter @agent24/nostr-bridge typecheck",
-    "test": "pnpm --filter @agent24/desktop test && pnpm --filter @agent24/node-daemon test && pnpm --filter @agent24/wechat-bridge test && pnpm --filter @agent24/nostr-bridge test",
+    "typecheck": "pnpm --filter @agent24/desktop typecheck && pnpm --filter @agent24/node-daemon typecheck && pnpm --filter @agent24/wechat-bridge typecheck && pnpm --filter @agent24/nostr-bridge typecheck && pnpm --filter @agent24/documents-accept typecheck",
+    "test": "pnpm --filter @agent24/desktop test && pnpm --filter @agent24/node-daemon test && pnpm --filter @agent24/wechat-bridge test && pnpm --filter @agent24/nostr-bridge test && pnpm --filter @agent24/documents-accept test",
     "test:contract": "pnpm --filter @agent24/contract-tests test",
     "lint": "eslint apps/desktop/src packages/node-daemon/src --ext .ts,.tsx",
     "lint:openapi": "pnpm --package=@redocly/cli@2.46.1 dlx redocly lint protocol/openapi.yaml",

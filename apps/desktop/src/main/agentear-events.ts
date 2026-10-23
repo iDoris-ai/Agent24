@@ -66,6 +66,32 @@ export function parseAgentEarFrame(raw: string): unknown | null {
   return outer['payload'] ?? null
 }
 
+/** A `type: "module"` WS event from any module (events.schema.json
+ *  `ModuleEventPayload`). The kernel stamps `module` from the sender's
+ *  manifest, so a module cannot speak for another. */
+export interface ModuleEvent {
+  module: string
+  kind: string
+  payload: Record<string, unknown>
+}
+
+/** Unwraps one WS text frame to its module event, whichever module sent it,
+ *  or null if it is not one. Pure, like parseAgentEarFrame. */
+export function parseModuleFrame(raw: string): ModuleEvent | null {
+  let msg: unknown
+  try {
+    msg = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isPlainObject(msg) || msg['type'] !== 'module') return null
+  const outer = msg['payload']
+  if (!isPlainObject(outer)) return null
+  const { module, kind, payload } = outer
+  if (typeof module !== 'string' || typeof kind !== 'string' || !isPlainObject(payload)) return null
+  return { module, kind, payload }
+}
+
 /** ME4-desktop-model-ui: unwraps one WS text frame to a `ModelCallEnvelope`,
  * or null if this frame isn't a `model.call` event for AgentEar specifically.
  * Unlike `parseAgentEarFrame`, this is a FIRST-PARTY kernel event (dotted
@@ -104,6 +130,9 @@ export class AgentEarEventBridge {
     // ME4-desktop-model-ui: optional so every existing call site (tests
     // included) keeps compiling unchanged.
     private readonly onModelCall?: (call: ModelCallEnvelope) => void,
+    // Every module's events, for bridges other than AgentEar's (ADR-DOC-01
+    // D5: the Documenting OS); optional for the same reason.
+    private readonly onModuleEvent?: (event: ModuleEvent) => void,
   ) {}
 
   start(): void {
@@ -153,6 +182,8 @@ export class AgentEarEventBridge {
       if (envelope !== null) this.onEnvelope(envelope)
       const modelCall = parseModelCallFrame(raw)
       if (modelCall !== null) this.onModelCall?.(modelCall)
+      const moduleEvent = this.onModuleEvent ? parseModuleFrame(raw) : null
+      if (moduleEvent !== null) this.onModuleEvent?.(moduleEvent)
     })
     socket.on('close', () => {
       if (this.socket === socket) this.socket = null
