@@ -150,8 +150,10 @@ dependencies = [
 name = "agent24-knowledge"
 version = "0.5.1"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

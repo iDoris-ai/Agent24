@@ -13,22 +13,28 @@
 //!   `None` encodes as no key): plain `#[serde(default, skip_serializing_if = ..)]`.
 //!   Only `ChunkExpectedRevision::chunk_revision` (r9: a hit's `null` may be sent
 //!   back, the server ignores the value).
+//!
+//! For the transport and the Mock, see `transport.rs` and `mock.rs`.
 
 mod capabilities;
 mod common;
 mod error;
 mod local_cancelled;
+mod mock;
 mod read;
 mod ready;
 mod search;
+mod transport;
 
 pub use capabilities::*;
 pub use common::*;
 pub use error::*;
 pub use local_cancelled::*;
+pub use mock::*;
 pub use read::*;
 pub use ready::*;
 pub use search::*;
+pub use transport::*;
 
 use serde::{Deserialize, Deserializer};
 
