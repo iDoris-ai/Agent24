@@ -41,10 +41,26 @@ fn install(home: &Path) {
          spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
-         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
+         output_privacy: local_only\n    resource_kinds: [note]\n    \
+         timeout_ms: 5000\n    inline_wait_ms: 1000\n",
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE).unwrap();
+    // On the grants protocol but never running: no identity, so no card.
+    let dir = home.join(".agent24/packages/idle");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("domain-os.yml"),
+        "name: idle\nversion: \"0.1.0\"\nroute_namespace: /api/v1/idle\n\
+         event_module: idle\ndata_dir: ~/.agent24/os/idle/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         min_daemon_protocol: 2\n\
+         spawn:\n  command: \"false\"\n  args: []\n\
+         tools:\n  - operation: list-notes\n    description: lists notes\n    \
+         input_schema: {type: object, properties: {}}\n    risk: read\n    \
+         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
+    )
+    .unwrap();
     // A tool module on an older protocol (§2.6): never a card.
     let dir = home.join(".agent24/packages/plain");
     std::fs::create_dir_all(&dir).unwrap();
@@ -145,7 +161,7 @@ fn a_card_carries_the_running_package_identity() {
         agent24_os_proto::artifact::identity(&package).unwrap()
     );
     assert_eq!(card["module_version"], "0.1.0");
-    assert_eq!(card["resource_kinds"], serde_json::json!([]));
+    assert_eq!(card["resource_kinds"], serde_json::json!(["note"]));
     assert_eq!(card["host_risk"], "high");
     assert!(card["fingerprint"].as_str().is_some_and(|f| !f.is_empty()));
     let (status, _) = get(&d, "/api/v1/module-consents/modules/noted/tools/other/card");
@@ -157,5 +173,13 @@ fn a_card_carries_the_running_package_identity() {
     assert_eq!(
         (status, &body["error"]["code"]),
         (409, &serde_json::json!("protocol_too_old"))
+    );
+    let (status, body) = get(
+        &d,
+        "/api/v1/module-consents/modules/idle/tools/list-notes/card",
+    );
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (409, &serde_json::json!("no_package_identity"))
     );
 }
