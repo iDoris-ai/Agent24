@@ -109,9 +109,9 @@ fn an_install_whose_grants_cannot_be_revoked_is_undone() {
     assert_ok(&agent24(home.path(), &["os", "install", &src]));
 }
 
-/// No HOME, no store: the uninstall stands, and says no grants were
-/// revoked rather than nothing (review G3; failing it would break the
-/// `A24_OS_PACKAGES` install the CLI documents for containers).
+/// No HOME, no store to reach: the uninstall stands, and says any grants
+/// were not revoked rather than nothing (review G3; failing it would break
+/// the `A24_OS_PACKAGES` install the CLI documents for containers).
 #[test]
 fn an_uninstall_without_home_says_there_was_no_store() {
     let home = tmp_home();
@@ -127,5 +127,5 @@ fn an_uninstall_without_home_says_there_was_no_store() {
         .unwrap();
     assert_ok(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no grants"), "{stderr}");
+    assert!(stderr.contains("were not revoked"), "{stderr}");
 }

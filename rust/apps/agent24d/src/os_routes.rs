@@ -323,6 +323,18 @@ enum HotStop {
     NotRunning,
 }
 
+impl HotStop {
+    /// The word this stop's own answer uses: `stopped`, or the error code
+    /// it would have answered with.
+    fn word(self) -> &'static str {
+        match self {
+            HotStop::Stopping | HotStop::Already | HotStop::NotRunning => "stopped",
+            HotStop::Pending => "disable_pending",
+            HotStop::Failed => "stop_failed",
+        }
+    }
+}
+
 /// Hand a running out-of-process module's stop to its supervisor (SUP-5):
 /// it drains and stops in the background, and the shutdown — if it begins
 /// meanwhile — waits for that stop, cutting it off at `cut_off`. Synchronous:
@@ -1009,7 +1021,10 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("{name:?}'s grants could not be ended (the stop: {hot:?}); stop it again"),
+            &format!(
+                "{name:?}'s grants could not be ended (the stop: {}); stop it again",
+                hot.word()
+            ),
         );
     }
     match hot {
@@ -2196,9 +2211,20 @@ mod tests {
         assert!(
             body["error"]["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("stop it again")),
+                .is_some_and(|m| m.contains("stop it again") && m.contains("(the stop: stopped)")),
             "{body}"
         );
+    }
+
+    /// The answer a stop whose grants could not be ended gives names what
+    /// the stop did, in the words its own answer would have used.
+    #[test]
+    fn a_stop_is_named_as_its_own_answer_names_it() {
+        assert_eq!(HotStop::Stopping.word(), "stopped");
+        assert_eq!(HotStop::Already.word(), "stopped");
+        assert_eq!(HotStop::NotRunning.word(), "stopped");
+        assert_eq!(HotStop::Pending.word(), "disable_pending");
+        assert_eq!(HotStop::Failed.word(), "stop_failed");
     }
 
     /// A stop whose grants cannot be revoked does not advance either, and

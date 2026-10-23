@@ -910,11 +910,14 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
 /// store that cannot record it fails the command (K1-6a-G §2.1 F1): whether
 /// a grant still holds is what the store says, not what this printed. An
 /// install is undone and an uninstall finds nothing left to remove, so
-/// running either again retries this. Without HOME there is no store (a
-/// daemon does not start without one either), and it says so.
+/// running either again retries this. Without HOME no store can be
+/// reached (a daemon does not start without one either): the command
+/// stands, and says the grants, if any, were not revoked.
 async fn revoke_module_consents(name: &str) -> Result<(), String> {
     let Some(dir) = state_file::state_dir() else {
-        eprintln!("  HOME is not set: no consent store, so no grants of {name} to revoke");
+        eprintln!(
+            "  HOME is not set: cannot reach a consent store, so any grants of {name} were not revoked"
+        );
         return Ok(());
     };
     let store = agent24_store::Store::open(&dir.join("agent24.db"))
