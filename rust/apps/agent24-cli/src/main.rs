@@ -844,8 +844,20 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
                     println!(
                         "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
                     );
+                    // Grants from an earlier install of this name end now,
+                    // or this install does not stand (K1-6a-G §2.1 F1):
+                    // undone, so running it again retries the revocation.
                     match dest.file_name().and_then(|n| n.to_str()) {
-                        Some(module) => revoke_module_consents(module).await,
+                        Some(module) => match revoke_module_consents(module).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                let undone = agent24_os_packages::install::uninstall(module, &root);
+                                Err(match undone {
+                                    Ok(_) => format!("{e}; the install was undone"),
+                                    Err(u) => format!("{e}; the install could not be undone: {u}"),
+                                })
+                            }
+                        },
                         None => Ok(()),
                     }
                 }
@@ -892,12 +904,15 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
 }
 
 /// End `name`'s module tool grants after a package lifecycle change. A
-/// store that cannot record it fails the command (K1-6a-G §2.1 F1): whether
-/// a grant still holds is what the store says, not what this printed. The
-/// files are already changed; running the command again retries this.
+/// store that cannot record it, or cannot be found, fails the command
+/// (K1-6a-G §2.1 F1): whether a grant still holds is what the store says,
+/// not what this printed. An install is undone and an uninstall finds
+/// nothing left to remove, so running either again retries this.
 async fn revoke_module_consents(name: &str) -> Result<(), String> {
     let Some(dir) = state_file::state_dir() else {
-        return Ok(());
+        return Err(format!(
+            "HOME is not set, so {name}'s module grants could not be revoked"
+        ));
     };
     let store = agent24_store::Store::open(&dir.join("agent24.db"))
         .await

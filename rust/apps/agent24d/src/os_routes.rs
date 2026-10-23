@@ -452,8 +452,9 @@ async fn apply(
     // K1-6a-G §2.1 F3: grants from before an enable end before it is
     // written; if they cannot, the enable is not.
     if enabled && let Err(e) = state.store.advance_module_enable_epoch(name).await {
+        tracing::error!(module = name, error = %e, "an enable could not end the module's grants");
         return Err(format!(
-            "could not end the grants for {name:?} before enabling it: {e}"
+            "could not end the grants for {name:?} before enabling it"
         ));
     }
     // Off the async workers: the file lock waits for any other writer, for
@@ -463,10 +464,10 @@ async fn apply(
         move || crate::os_config::OsConfig::set_enabled(&path, &name, enabled)
     })
     .await;
-    let failed = match written {
-        Ok(Ok(_)) => None,
-        Ok(Err(why)) => Some(why),
-        Err(e) => Some(format!("the config write failed: {e}")),
+    let (seen, failed) = match written {
+        Ok(Ok(seen)) => (Some(seen), None),
+        Ok(Err(why)) => (None, Some(why)),
+        Err(e) => (None, Some(format!("the config write failed: {e}"))),
     };
     if let Some(why) = &failed {
         let published = tokio::task::spawn_blocking({
@@ -490,21 +491,18 @@ async fn apply(
     }
     // What a later start compares with (K1-6a-G §2.1 F3): a disable, so
     // one that finds the module enabled again advances its epoch whatever
-    // the entry then reads; an enable's new entry, so a restart alone does
-    // not end the grants made since. Recorded without advancing: an enable
-    // advanced above. Unrecorded costs one more epoch at that start, never
-    // a missed one.
-    let entry =
-        crate::os_config::OsConfig::load(&path).map(|config| config.observed_entry(&path, name));
-    let observed = match entry {
-        Ok(entry) => state
+    // the entry then reads; an enable's new entry, as written under the
+    // config lock, so a restart alone does not end the grants made since.
+    // Recorded without advancing: an enable advanced above. An enable left
+    // unrecorded costs one more epoch at the next start; a disable left
+    // unrecorded is missed only if os.json is then restored byte for byte,
+    // the case §2.1 F3 leaves, and only after its grants were revoked above.
+    if let Some(seen) = seen
+        && let Err(e) = state
             .store
-            .record_module_enablement(name, enabled, &entry)
+            .record_module_enablement(name, enabled, &seen)
             .await
-            .map_err(|e| e.to_string()),
-        Err(e) => Err(e),
-    };
-    if let Err(e) = observed {
+    {
         tracing::error!(module = name, error = %e, "enablement not recorded for the enable epoch");
     }
     let handed = if enabled {
@@ -987,33 +985,42 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
             &format!("no domain OS named {name:?}; this daemon provides {known:?}"),
         );
     }
-    if let Err(e) = state.store.invalidate_module_consents(&name).await {
-        tracing::error!(module = name, error = %e, "failed to invalidate module consents before package stop");
-    }
-    // K1-6a-G §2.1 F3: a stop ends the epoch, so a grant from before it
-    // does not hold once the module runs again. The stop goes ahead either
-    // way; a failure is the answer.
-    let epoch_failed = state.store.advance_module_enable_epoch(&name).await.err();
+    let revoked = state.store.invalidate_module_consents(&name).await;
     let handed = hand_off(
         state.supervisors.as_deref(),
         state.shutdown.modules_cut_off(),
         &name,
     );
     let hot = settled_and_reconciled(handed, ADMISSION_CLOSED_WITHIN).await;
+    // K1-6a-G §2.1 F3: a stop ends the epoch, so no grant from before it,
+    // or from while it was stopping, holds once the module runs again. A
+    // store that cannot record that is the answer, whatever the stop did:
+    // nothing else remembers it, so the caller must, and stop again.
+    let ended = match revoked {
+        Ok(()) => state
+            .store
+            .advance_module_enable_epoch(&name)
+            .await
+            .map(|_| ()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = ended {
+        tracing::error!(module = name, error = %e, ?hot, "a stop could not end the module's grants");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!("{name:?}'s grants could not be ended; stop it again"),
+        );
+    }
     match hot {
         HotStop::Failed => stop_now_os_stop_failed_response(&name),
         HotStop::Pending => stop_now_os_disable_pending_response(&name),
         // Covers `Stopping`/`Already`/`NotRunning` alike — the body does not
         // (and must not) claim "it was running and I stopped it"; that
         // distinction belongs to `agent24 os list`, not to this ack.
-        HotStop::Stopping | HotStop::Already | HotStop::NotRunning => match epoch_failed {
-            Some(e) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("{name:?} was stopped, but its grants could not be ended: {e}"),
-            ),
-            None => Json(serde_json::json!({ "name": name, "stopped": true })).into_response(),
-        },
+        HotStop::Stopping | HotStop::Already | HotStop::NotRunning => {
+            Json(serde_json::json!({ "name": name, "stopped": true })).into_response()
+        }
     }
 }
 
@@ -2189,7 +2196,7 @@ mod tests {
         assert!(
             body["error"]["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("was stopped")),
+                .is_some_and(|m| m.contains("stop it again")),
             "{body}"
         );
     }
