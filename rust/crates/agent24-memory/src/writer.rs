@@ -275,6 +275,35 @@ impl WriteGate {
             && body_matches
     }
 
+    async fn commit_shaped_audits(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        owner: &str,
+        prefix: &str,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        let hex = "[0-9a-f]".repeat(16);
+        let hi = format!("{}.", &prefix[..prefix.len() - 1]);
+        Ok(sqlx::query(
+            "SELECT seq, id, scope_owner, scope, kind, payload, origin_source, origin_trust, at
+             FROM mem_events
+             WHERE scope_owner = ? AND kind = 'mem.write_decision'
+               AND id >= ? AND id < ?
+               AND length(id) = length(?) + 16
+               AND substr(id, 1, length(?)) = ?
+               AND lower(substr(id, length(?) + 1, 16)) GLOB ?
+             ORDER BY seq LIMIT 65",
+        )
+        .bind(owner)
+        .bind(prefix)
+        .bind(hi)
+        .bind(prefix)
+        .bind(prefix)
+        .bind(prefix)
+        .bind(prefix)
+        .bind(hex)
+        .fetch_all(&mut **tx)
+        .await?)
+    }
+
     async fn id_range(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         owner: &str,
@@ -312,6 +341,8 @@ impl WriteGate {
 
     /// Existing pre-#1153 reassert may omit the current commit audit. Accept only a
     /// complete commit→(retract,reassert)* chain; a forged expected ID never reaches here.
+    /// The anchor is the earliest commit-shaped audit whose reconstructed ID matches,
+    /// not merely the earliest audit in the ID range.
     async fn legacy_reassert_chain(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         c: &Candidate,
@@ -320,13 +351,8 @@ impl WriteGate {
     ) -> Result<bool> {
         use sqlx::Row;
         let owner = c.scope.owner.as_str();
-        let audits = Self::id_range(
-            tx,
-            owner,
-            &format!("audit-{}-", c.id),
-            &format!("audit-{}.", c.id),
-        )
-        .await?;
+        let audit_prefix = format!("audit-{}-", c.id);
+        let audits = Self::commit_shaped_audits(tx, owner, &audit_prefix).await?;
         let reasserts = Self::id_range(
             tx,
             owner,
@@ -358,11 +384,6 @@ impl WriteGate {
         if audits.len() > 64 || reasserts.len() > 64 || retracts.len() > 64 {
             return Ok(false);
         }
-        let audit_prefix = format!("audit-{}-", c.id);
-        let audits: Vec<_> = audits
-            .into_iter()
-            .filter(|row| Self::hex16(row.get::<String, _>("id").trim_start_matches(&audit_prefix)))
-            .collect();
         let re_prefix = format!("reassert-{}-", c.id);
         let reasserts: Vec<_> = reasserts
             .into_iter()
@@ -384,29 +405,33 @@ impl WriteGate {
                         .is_some_and(Self::positive_suffix)
             })
             .collect();
-        let Some(anchor) = audits.first() else {
+        let mut anchor_at = None;
+        for (index, row) in audits.iter().enumerate() {
+            let payload = serde_json::from_str::<Value>(&row.get::<String, _>("payload"))
+                .unwrap_or(Value::Null);
+            let Some(evidence) = payload.get("evidence").and_then(|v| v.as_array()) else {
+                return Ok(false);
+            };
+            let values: Vec<String> = evidence
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            if values.len() != evidence.len() || values.is_empty() {
+                return Ok(false);
+            }
+            let mut seeded = c.clone();
+            seeded.evidence = values;
+            let expected = Self::audit_event(&seeded, "commit", None);
+            if row.get::<String, _>("id") == expected.id
+                && Self::matches_commit_audit(row, expected_scope, &expected)
+            {
+                anchor_at = Some(index);
+                break;
+            }
+        }
+        let Some(anchor) = anchor_at.map(|index| &audits[index]) else {
             return Ok(false);
         };
-        let mut seeded = c.clone();
-        let Ok(anchor_evidence) = serde_json::from_str::<Vec<String>>(
-            &serde_json::from_str::<Value>(&anchor.get::<String, _>("payload"))
-                .ok()
-                .and_then(|body| body.get("evidence").cloned())
-                .unwrap_or(Value::Null)
-                .to_string(),
-        ) else {
-            return Ok(false);
-        };
-        if anchor_evidence.is_empty() {
-            return Ok(false);
-        }
-        seeded.evidence = anchor_evidence;
-        let expected = Self::audit_event(&seeded, "commit", None);
-        if anchor.get::<String, _>("id") != expected.id
-            || !Self::matches_commit_audit(anchor, expected_scope, &expected)
-        {
-            return Ok(false);
-        }
         let owner_scope = serde_json::to_string(&Scope::owner(owner))?;
         let mut links: Vec<_> = retracts.into_iter().chain(reasserts).collect();
         links.sort_by_key(|row| row.get::<i64, _>("seq"));

@@ -280,3 +280,32 @@ async fn legacy_chain_missing_original_commit_or_reassert_is_rejected() {
         pool.close().await;
     }
 }
+
+#[tokio::test]
+async fn earlier_reject_audit_does_not_hide_a_later_commit_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.sqlite");
+    let kv = KvStore::open(&path).await.unwrap();
+    let rejected = Candidate::new(
+        "reassert-audit",
+        Scope::owner("owner"),
+        "user",
+        "prefers",
+        json!("espresso"),
+        Origin {
+            source: "web".into(),
+            trust: Trust::WebFetch,
+        },
+    )
+    .with_evidence(vec!["web-evidence".into()]);
+    kv.write_gate().propose(vec![rejected]).await.unwrap();
+    let pool = legacy_shape(&kv, &path).await;
+    let before = kv.events().scan(&EventQuery::owner("owner")).await.unwrap();
+    let retry = kv.write_gate().propose(vec![candidate("ev3")]).await;
+    assert!(retry.is_ok(), "{retry:?}");
+    assert_eq!(
+        kv.events().scan(&EventQuery::owner("owner")).await.unwrap(),
+        before
+    );
+    pool.close().await;
+}
