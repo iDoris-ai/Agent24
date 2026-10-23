@@ -250,6 +250,31 @@ impl WriteGate {
         )
     }
 
+    fn matches_commit_audit(
+        row: &sqlx::sqlite::SqliteRow,
+        expected_scope: &str,
+        expected: &MemEvent,
+    ) -> bool {
+        use sqlx::Row;
+        let Ok(body) = serde_json::from_str::<Value>(&row.get::<String, _>("payload")) else {
+            return false;
+        };
+        let mut authorized = expected.body.clone();
+        let body_matches = [("UserSaid", true), ("System", false), ("System", true)]
+            .into_iter()
+            .any(|(trust, remember)| {
+                authorized["trust"] = serde_json::json!(trust);
+                authorized["explicit_remember"] = serde_json::json!(remember);
+                body == authorized
+            });
+        row.get::<String, _>("scope_owner") == expected.scope.owner
+            && row.get::<String, _>("scope") == expected_scope
+            && row.get::<String, _>("kind") == "mem.write_decision"
+            && row.get::<String, _>("origin_source") == "write_gate"
+            && row.get::<String, _>("origin_trust") == "system"
+            && body_matches
+    }
+
     /// Persist a Commit/Hold assertion AND its audit event in ONE transaction, so
     /// a belief can never land without its governance record (and vice versa).
     /// fix683: returns [`CommitStatus`] instead of bare `()` so a pause
@@ -358,33 +383,15 @@ impl WriteGate {
                         .fetch_optional(&mut *tx)
                         .await?;
 
-                        if let Some(audit_row) = audit_row {
-                            let body = serde_json::from_str::<Value>(
-                                &audit_row.get::<String, _>("payload"),
+                        if let Some(audit_row) = audit_row
+                            && Self::matches_commit_audit(
+                                &audit_row,
+                                &expected_scope,
+                                &expected_audit,
                             )
-                            .ok();
-                            let body_matches = body.is_some_and(|body| {
-                                if body == expected_audit.body {
-                                    return true;
-                                }
-                                let mut system_body = expected_audit.body.clone();
-                                system_body["trust"] = serde_json::json!("System");
-                                [false, true].into_iter().any(|remember| {
-                                    system_body["explicit_remember"] = serde_json::json!(remember);
-                                    body == system_body
-                                })
-                            });
-                            let audit_matches = audit_row.get::<String, _>("scope_owner")
-                                == c.scope.owner
-                                && audit_row.get::<String, _>("scope") == expected_scope
-                                && audit_row.get::<String, _>("kind") == "mem.write_decision"
-                                && audit_row.get::<String, _>("origin_source") == "write_gate"
-                                && audit_row.get::<String, _>("origin_trust") == "system"
-                                && body_matches;
-                            if audit_matches {
-                                tx.commit().await?;
-                                return Ok(CommitStatus::Committed);
-                            }
+                        {
+                            tx.commit().await?;
+                            return Ok(CommitStatus::Committed);
                         }
                     }
                 }
@@ -403,6 +410,22 @@ impl WriteGate {
                 // fresh write-gate verdict.
                 let recorded_to: Option<String> = row.get("recorded_to");
                 if content_matches && recorded_to.is_some() {
+                    let existing_audit = sqlx::query(
+                        "SELECT scope_owner, scope, kind, payload, origin_source, origin_trust
+                         FROM mem_events WHERE id = ?",
+                    )
+                    .bind(&audit.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some(existing) = existing_audit {
+                        if !Self::matches_commit_audit(&existing, &expected_scope, &audit) {
+                            return Err(MemoryError::Conflict(
+                                "invalid reassert commit audit".into(),
+                            ));
+                        }
+                    } else {
+                        EventLog::append_tx(&mut tx, &audit).await?;
+                    }
                     sqlx::query(
                         "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, qualified = 1
                          WHERE id = ?",

@@ -1,4 +1,4 @@
-//! Explicit readiness probes; known-red contract tests are opt-in, never CI failures.
+//! Readiness regression controls; historical compatibility is tracked separately.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use agent24_core::util::now_iso8601;
 use agent24_memory::assertion::{AssertionStore, BeliefQuery, Forget};
@@ -24,7 +24,6 @@ fn candidate(owner: &str, evidence: &str) -> Candidate {
 }
 
 #[tokio::test]
-#[ignore = "H02 contract probe: known-red baseline; run explicitly with --ignored"]
 async fn h02_new_evidence_reassert_then_retry_must_succeed() {
     let kv = KvStore::open_memory().await.unwrap();
     let gate = kv.write_gate();
