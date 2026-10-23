@@ -831,9 +831,6 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
         OsAction::Install { path } => {
             Some(match agent24_os_packages::install::install(path, &root) {
                 Ok(dest) => {
-                    if let Some(module) = dest.file_name().and_then(|n| n.to_str()) {
-                        invalidate_module_consents_best_effort(module).await;
-                    }
                     println!("installed {}", dest.display());
                     println!(
                         "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
@@ -847,7 +844,10 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
                     println!(
                         "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
                     );
-                    Ok(())
+                    match dest.file_name().and_then(|n| n.to_str()) {
+                        Some(module) => revoke_module_consents(module).await,
+                        None => Ok(()),
+                    }
                 }
                 Err(e) => Err(e.to_string()),
             })
@@ -875,35 +875,37 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
             // Not an error: the end state the operator asked for is the one
             // they have. Saying so beats a failure they must decide to
             // ignore. Idempotent: nothing NEW was removed, so there is
-            // nothing for a hot-stop to respond to.
+            // nothing for a hot-stop to respond to. Its grants are ended
+            // again all the same: an earlier run may have removed the files
+            // and failed to (K1-6a-G §2.1 F1).
             println!("{name} was not installed; nothing to remove");
-            Ok(())
+            revoke_module_consents(name).await
         }
         Ok(true) => {
             println!("removed {name}");
             println!("  it takes effect at the next daemon start");
-            invalidate_module_consents_best_effort(name).await;
+            let revoked = revoke_module_consents(name).await;
             hot_disable_best_effort(name).await;
-            Ok(())
+            revoked
         }
     }
 }
 
-/// Revoke persisted enablement consent after a successful package lifecycle
-/// change. Store failures are reported but do not change the established
-/// install/uninstall result or prevent the daemon stop attempt.
-async fn invalidate_module_consents_best_effort(name: &str) {
+/// End `name`'s module tool grants after a package lifecycle change. A
+/// store that cannot record it fails the command (K1-6a-G §2.1 F1): whether
+/// a grant still holds is what the store says, not what this printed. The
+/// files are already changed; running the command again retries this.
+async fn revoke_module_consents(name: &str) -> Result<(), String> {
     let Some(dir) = state_file::state_dir() else {
-        return;
+        return Ok(());
     };
-    match agent24_store::Store::open(&dir.join("agent24.db")).await {
-        Ok(store) => {
-            if let Err(e) = store.invalidate_module_consents(name).await {
-                eprintln!("  could not revoke {name} module consent: {e}");
-            }
-        }
-        Err(e) => eprintln!("  could not open consent store for {name}: {e}"),
-    }
+    let store = agent24_store::Store::open(&dir.join("agent24.db"))
+        .await
+        .map_err(|e| format!("could not open the consent store to revoke {name}'s grants: {e}"))?;
+    store
+        .invalidate_module_consents(name)
+        .await
+        .map_err(|e| format!("could not revoke {name}'s module grants: {e}"))
 }
 
 /// Render a daemon error envelope the way every call site here should

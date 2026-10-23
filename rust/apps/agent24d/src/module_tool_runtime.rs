@@ -21,6 +21,9 @@ pub struct AgentModuleToolRuntime {
     supervisors: Arc<OnceLock<Arc<Supervisors>>>,
     operations: Arc<HashSet<(String, String)>>,
     request_ids: KernelRequestIds,
+    /// Modules whose enable epoch this daemon has brought up to date
+    /// (K1-6a-G §2.1 F3); a grant holds for no other.
+    epoch_observed: std::sync::RwLock<HashSet<String>>,
     /// Runs a test puts in place of the supervisors' slots.
     #[cfg(test)]
     test_slots: std::sync::Mutex<HashMap<String, Arc<agent24_os_proto::drain::Current>>>,
@@ -32,6 +35,7 @@ impl AgentModuleToolRuntime {
             supervisors: Arc::new(OnceLock::new()),
             operations: Arc::new(operations),
             request_ids: KernelRequestIds::new_random(),
+            epoch_observed: std::sync::RwLock::default(),
             #[cfg(test)]
             test_slots: std::sync::Mutex::default(),
         })
@@ -60,11 +64,28 @@ impl AgentModuleToolRuntime {
         self.supervisors.get()?.running_slot(module)
     }
 
+    /// This start has seen `module`'s enablement and brought its enable
+    /// epoch up to date (K1-6a-G §2.1 F3): its grants may hold from now on.
+    pub fn epoch_observed(&self, module: &str) {
+        if let Ok(mut observed) = self.epoch_observed.write() {
+            observed.insert(module.to_owned());
+        }
+    }
+
     /// The current identity of `module`'s running package (K1-6a-G §2.2),
-    /// read per lookup; not running, or no identity, is `None`.
+    /// read per lookup; not running, or no identity, is `None`. So is a
+    /// module whose enable epoch this start has not brought up to date
+    /// (§2.1 F3): an ephemeral daemon never does (F6).
     pub fn artifact_source(self: &Arc<Self>) -> agent24_policy::consent_gate::ArtifactSource {
         let runtime = Arc::clone(self);
         Arc::new(move |module: &str| {
+            if !runtime
+                .epoch_observed
+                .read()
+                .is_ok_and(|observed| observed.contains(module))
+            {
+                return None;
+            }
             runtime
                 .generation(module)
                 .ok()
@@ -250,6 +271,31 @@ pub(crate) fn store_authorization(
     )
     .with_consent_changes(store.clone())
     .with_artifact_source(artifact)
+}
+
+/// What this start sees of each of `modules` (K1-6a-G §2.1 F3): recorded,
+/// advancing an enable epoch where it changed, and only then are the
+/// module's grants let hold. A module this fails for keeps none.
+pub(crate) async fn observe_enable_epochs<'a>(
+    store: &agent24_store::Store,
+    runtime: &AgentModuleToolRuntime,
+    config: &crate::os_config::OsConfig,
+    path: &std::path::Path,
+    modules: impl IntoIterator<Item = &'a str>,
+) {
+    let modules: std::collections::BTreeSet<&str> = modules.into_iter().collect();
+    for module in modules {
+        let entry = config.observed_entry(path, module);
+        match store
+            .observe_module_enablement(module, config.is_enabled(module), &entry)
+            .await
+        {
+            Ok(_) => runtime.epoch_observed(module),
+            Err(error) => {
+                tracing::error!(module, %error, "enable epoch not observed; its grants stay stale");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -890,6 +936,40 @@ mod tests {
         assert!(!super::serves_granted_package(&run(None), Some("sha256:a")));
         assert!(!super::serves_granted_package(&run(Some("sha256:a")), None));
         assert!(!super::serves_granted_package(&run(None), None));
+    }
+
+    /// K1-6a-G §2.1 F3/F6: no grant holds for a module whose enable epoch
+    /// this start has not brought up to date; a store that cannot record
+    /// what the start sees leaves it so. Once one has, the running package
+    /// is read as before.
+    #[tokio::test]
+    async fn grants_hold_only_once_this_start_observed_the_module() {
+        let runtime = AgentModuleToolRuntime::new(HashSet::new());
+        let generation = agent24_os_proto::drain::Generation::serving_package(
+            std::path::PathBuf::from("/nonexistent/upstream.sock"),
+            Some("sha256:a".to_owned()),
+        );
+        assert!(generation.ready());
+        runtime.test_slots.lock().unwrap().insert(
+            "fake_module".to_owned(),
+            agent24_os_proto::drain::Current::new(generation),
+        );
+        let source = runtime.artifact_source();
+        assert_eq!(source("fake_module"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("os.json");
+        let config = crate::os_config::OsConfig::load(&path).unwrap();
+        let broken = Store::open_memory().await.unwrap();
+        sqlx::query("DROP TABLE module_enable_epochs")
+            .execute(agent24_store::test_hooks::pool(&broken))
+            .await
+            .unwrap();
+        observe_enable_epochs(&broken, &runtime, &config, &path, ["fake_module"]).await;
+        assert_eq!(source("fake_module"), None);
+        let store = Store::open_memory().await.unwrap();
+        observe_enable_epochs(&store, &runtime, &config, &path, ["fake_module"]).await;
+        assert_eq!(source("fake_module").as_deref(), Some("sha256:a"));
+        assert_eq!(source("another_module"), None);
     }
 
     /// The runtime itself turns away a call for a package other than the one

@@ -1839,6 +1839,19 @@ pub async fn serve(
     if let Err(why) = &os_config {
         tracing::error!("os.json could not be read ({why}); every admissible domain OS will 503");
     }
+    // K1-6a-G §2.1 F3: what this start sees of each module with tools,
+    // before a grant of it can hold. A module this fails for keeps none;
+    // an ephemeral daemon sees none, so honours no grant (F6).
+    if !ephemeral && let Ok(config) = &os_config {
+        crate::module_tool_runtime::observe_enable_epochs(
+            &state.store,
+            &module_tool_runtime,
+            config,
+            &os_config_path,
+            module_registry.iter().map(|(_, r)| r.module()),
+        )
+        .await;
+    }
 
     // An ephemeral daemon gets a throwaway root, NOT `~/.agent24/os`. The mounter
     // creates a directory for every module it mounts, and an in-memory module will
