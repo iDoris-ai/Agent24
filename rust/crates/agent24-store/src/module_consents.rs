@@ -558,6 +558,28 @@ async fn current_enable_epoch(
     Ok(epoch.unwrap_or(0))
 }
 
+/// Set what was last seen of `module`'s enablement; its epoch is left.
+async fn record_enablement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    module: &str,
+    enabled: bool,
+    entry: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO module_enable_epochs (module, observed_enabled, observed_entry)
+         VALUES (?, ?, ?)
+         ON CONFLICT (module) DO UPDATE SET
+            observed_enabled = excluded.observed_enabled,
+            observed_entry = excluded.observed_entry",
+    )
+    .bind(module)
+    .bind(enabled)
+    .bind(entry)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Set `module`'s enable epoch to a fresh write generation.
 async fn advance_enable_epoch(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -689,7 +711,9 @@ impl Store {
         enabled: bool,
         entry: &str,
     ) -> Result<bool> {
-        let mut tx = self.pool().begin().await?;
+        // BEGIN IMMEDIATE: what was seen is read under the write lock, so a
+        // commit elsewhere in between cannot fail the upgrade to a write.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let seen: Option<(bool, Option<String>)> = sqlx::query_as(
             "SELECT observed_enabled, observed_entry FROM module_enable_epochs WHERE module = ?",
         )
@@ -701,23 +725,28 @@ impl Store {
         if advance {
             advance_enable_epoch(&mut tx, module).await?;
         }
-        sqlx::query(
-            "INSERT INTO module_enable_epochs (module, observed_enabled, observed_entry)
-             VALUES (?, ?, ?)
-             ON CONFLICT (module) DO UPDATE SET
-                observed_enabled = excluded.observed_enabled,
-                observed_entry = excluded.observed_entry",
-        )
-        .bind(module)
-        .bind(enabled)
-        .bind(entry)
-        .execute(&mut *tx)
-        .await?;
+        record_enablement(&mut tx, module, enabled, entry).await?;
         tx.commit().await?;
         if advance {
             self.announce_module_consent_change(module, None);
         }
         Ok(advance)
+    }
+
+    /// Record what is seen of `module`'s enablement, as
+    /// [`Self::observe_module_enablement`] does, but never advance: for a
+    /// caller that advanced before the change it now records (an enable
+    /// through a route), so a grant made in between still holds.
+    pub async fn record_module_enablement(
+        &self,
+        module: &str,
+        enabled: bool,
+        entry: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        record_enablement(&mut tx, module, enabled, entry).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// The sole write path: a fresh grant/deny for `(module, op)` always
@@ -2528,7 +2557,86 @@ mod tests {
             ConsentLookup::Stale(_)
         ));
         assert!(!observe(false, "e3").await);
+        assert_eq!(last_observed(&store).await, (false, Some("e3".into())));
         assert!(!observe(false, "e3").await);
+    }
+
+    /// What was last seen of `documenting`: `(observed_enabled,
+    /// observed_entry)`.
+    async fn last_observed(store: &Store) -> (bool, Option<String>) {
+        sqlx::query_as(
+            "SELECT observed_enabled, observed_entry FROM module_enable_epochs
+             WHERE module = 'documenting'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+    }
+
+    /// An observation's advance and record land together or not at all.
+    #[tokio::test]
+    async fn an_observation_that_cannot_be_recorded_does_not_advance() {
+        let store = store().await;
+        let s = summary("doc body");
+        assert!(
+            store
+                .observe_module_enablement(&s.module, false, "e1")
+                .await
+                .is_ok_and(|advanced| !advanced)
+        );
+        grant_now(&store, &s).await;
+        sqlx::query(
+            "CREATE TRIGGER no_record BEFORE UPDATE OF observed_entry
+             ON module_enable_epochs WHEN NEW.observed_entry = 'e2'
+             BEGIN SELECT RAISE(ABORT, 'no record'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            store
+                .observe_module_enablement(&s.module, true, "e2")
+                .await
+                .is_err()
+        );
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        assert_eq!(last_observed(&store).await, (false, Some("e1".into())));
+    }
+
+    /// Observations racing on one module, the daemon's other writes beside
+    /// them, neither fail nor advance more than once (review: a deferred
+    /// transaction read first and failed its upgrade to a write).
+    #[tokio::test]
+    async fn racing_observations_advance_once_and_none_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("race.db")).await.unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    if i % 2 == 0 {
+                        store
+                            .observe_module_enablement("documenting", true, "e1")
+                            .await
+                            .map(Some)
+                    } else {
+                        store
+                            .advance_module_enable_epoch(&format!("other{i}"))
+                            .await
+                            .map(|_| None)
+                    }
+                })
+            })
+            .collect();
+        let mut advanced = 0;
+        for handle in handles {
+            if handle.await.unwrap().unwrap() == Some(true) {
+                advanced += 1;
+            }
+        }
+        assert_eq!(advanced, 1);
     }
 
     /// An advance tells in-flight calls to look again (K1-6a-G §2.5); an
@@ -2647,8 +2755,7 @@ mod tests {
     }
 
     /// An advance leaves what was last observed: a grant made after it
-    /// holds across a start that sees the same entry (review G1; the
-    /// daemon records an enable's new entry after writing it).
+    /// holds across a start that sees the same entry (review G1).
     #[tokio::test]
     async fn an_advance_leaves_the_last_observation() {
         let store = store().await;
@@ -2664,6 +2771,36 @@ mod tests {
         assert!(
             !store
                 .observe_module_enablement(&s.module, true, "e1")
+                .await
+                .unwrap()
+        );
+        assert!(lookup_now(&store, &s).await.is_authorized());
+    }
+
+    /// An enable advances before it is written and records its new entry
+    /// after, without advancing again: a grant made in between holds, and
+    /// so across a start that sees that entry (review: observing the new
+    /// entry advanced a second time).
+    #[tokio::test]
+    async fn an_enable_recorded_after_its_advance_is_not_advanced_again() {
+        let store = store().await;
+        let s = summary("doc body");
+        assert!(
+            store
+                .observe_module_enablement(&s.module, true, "e1")
+                .await
+                .unwrap()
+        );
+        store.advance_module_enable_epoch(&s.module).await.unwrap();
+        grant_now(&store, &s).await;
+        store
+            .record_module_enablement(&s.module, true, "e2")
+            .await
+            .unwrap();
+        assert!(lookup_now(&store, &s).await.is_authorized());
+        assert!(
+            !store
+                .observe_module_enablement(&s.module, true, "e2")
                 .await
                 .unwrap()
         );
