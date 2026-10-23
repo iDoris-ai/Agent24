@@ -619,6 +619,10 @@ pub struct ModuleToolContext {
     pub operation: String,
     pub authorized_resources: Vec<String>,
     pub authorization_ref: String,
+    /// The package the grant was given for (K1-6a-G §2.2), for the runtime
+    /// to hold the run it sends to against. Never sent to the module.
+    #[serde(skip)]
+    pub expected_artifact: Option<String>,
 }
 
 #[async_trait]
@@ -669,6 +673,9 @@ pub struct ModuleToolGrantContext {
     /// the authorization's own clock (K1-6a-G §2.5: a call ends at
     /// `min(timeout, expires_at)`). `None`: no expiry known.
     pub valid_for: Option<Duration>,
+    /// The artifact identity the grant was given for (K1-6a-G §2.2): the
+    /// runtime sends the call only to a run of that same package.
+    pub artifact: Option<String>,
 }
 
 /// What can end a grant while a call runs (K1-6a-G §2.5): its expiry, and
@@ -1350,6 +1357,7 @@ impl Tool for ModuleTool {
             operation: self.operation.clone(),
             authorized_resources: grant.authorized_resources,
             authorization_ref: grant.authorization_ref,
+            expected_artifact: grant.artifact,
         };
         let call_cancel = cancel.child_token();
         let invoked = tokio::select! {
@@ -1383,6 +1391,16 @@ impl Tool for ModuleTool {
                 )));
             }
         };
+        // The runtime refused before sending, on its own and not for the
+        // caller (K1-6a-G §2.2: the run is not of the package granted): the
+        // grant as looked up no longer holds, so `cancelled` and
+        // `permission_denied` (§2.5), whatever a later lookup says.
+        if matches!(result, Err(ModuleToolCallError::Cancelled)) && !cancel.is_cancelled() {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         let code = match &result {
             Ok(ModuleToolResult::Completed { .. }) => ModuleToolResultCode::Success,
             Ok(ModuleToolResult::Pending { .. }) => ModuleToolResultCode::ResultUnknown,

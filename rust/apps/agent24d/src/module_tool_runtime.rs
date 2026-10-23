@@ -21,6 +21,9 @@ pub struct AgentModuleToolRuntime {
     supervisors: Arc<OnceLock<Arc<Supervisors>>>,
     operations: Arc<HashSet<(String, String)>>,
     request_ids: KernelRequestIds,
+    /// Runs a test puts in place of the supervisors' slots.
+    #[cfg(test)]
+    test_slots: std::sync::Mutex<HashMap<String, Arc<agent24_os_proto::drain::Current>>>,
 }
 
 impl AgentModuleToolRuntime {
@@ -29,6 +32,8 @@ impl AgentModuleToolRuntime {
             supervisors: Arc::new(OnceLock::new()),
             operations: Arc::new(operations),
             request_ids: KernelRequestIds::new_random(),
+            #[cfg(test)]
+            test_slots: std::sync::Mutex::default(),
         })
     }
 
@@ -37,18 +42,34 @@ impl AgentModuleToolRuntime {
     }
 
     fn generation(&self, module: &str) -> Result<Arc<Generation>, ModuleToolCallError> {
-        let supervisors = self
-            .supervisors
-            .get()
-            .ok_or(ModuleToolCallError::ModuleUnavailable)?;
-        let current = supervisors
-            .running_slot(module)
+        let current = self
+            .slot(module)
             .ok_or(ModuleToolCallError::ModuleUnavailable)?;
         let generation = current.get();
         if generation.state() != DrainState::Running {
             return Err(ModuleToolCallError::ModuleUnavailable);
         }
         Ok(generation)
+    }
+
+    fn slot(&self, module: &str) -> Option<Arc<agent24_os_proto::drain::Current>> {
+        #[cfg(test)]
+        if let Some(current) = self.test_slots.lock().ok()?.get(module) {
+            return Some(Arc::clone(current));
+        }
+        self.supervisors.get()?.running_slot(module)
+    }
+
+    /// The current identity of `module`'s running package (K1-6a-G §2.2),
+    /// read per lookup; not running, or no identity, is `None`.
+    pub fn artifact_source(self: &Arc<Self>) -> agent24_policy::consent_gate::ArtifactSource {
+        let runtime = Arc::clone(self);
+        Arc::new(move |module: &str| {
+            runtime
+                .generation(module)
+                .ok()
+                .and_then(|generation| generation.artifact().map(str::to_owned))
+        })
     }
 
     fn unavailable() -> ModuleToolCallError {
@@ -87,6 +108,12 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
         self.check_available(&context.module_id, &context.operation)
             .await?;
         let generation = self.generation(&context.module_id)?;
+        // K1-6a-G §2.2: the call goes only to a run of the package the grant
+        // was given for; the module may have restarted on another since the
+        // lookup, which no consent change announces.
+        if !serves_granted_package(&generation, context.expected_artifact.as_deref()) {
+            return Err(stale_package());
+        }
         let path = format!(
             "/api/v1/{}/_a24/tools/{}",
             context.module_id, context.operation
@@ -114,6 +141,19 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
         .await?;
         Ok(result)
     }
+}
+
+/// Whether `generation` runs the package a grant was given for: both
+/// identities known and equal.
+fn serves_granted_package(generation: &Generation, expected: Option<&str>) -> bool {
+    expected.is_some() && generation.artifact() == expected
+}
+
+/// What a call gets when the running package is not the one granted: the
+/// host's own cancellation, before anything is sent (K1-6a-G §2.5), which
+/// the caller reports as `permission_denied`.
+fn stale_package() -> ModuleToolCallError {
+    ModuleToolCallError::Cancelled
 }
 
 /// Module id of the Documenting OS, as adopted in ADR-DOC-01
@@ -199,6 +239,7 @@ pub(crate) fn store_authorization(
     store: &agent24_store::Store,
     request: agent24_policy::consent_gate::ConsentGateRequest,
     now: Arc<dyn Fn() -> String + Send + Sync>,
+    artifact: agent24_policy::consent_gate::ArtifactSource,
 ) -> agent24_policy::consent_gate::ModuleConsentAuthorization {
     agent24_policy::consent_gate::ModuleConsentAuthorization::new(
         Arc::new(agent24_policy::consent_gate::StoreConsentGate::new(
@@ -208,6 +249,7 @@ pub(crate) fn store_authorization(
         now,
     )
     .with_consent_changes(store.clone())
+    .with_artifact_source(artifact)
 }
 
 #[cfg(test)]
@@ -263,6 +305,8 @@ mod tests {
         on_invoke: Hook,
         /// `(authorized_resources, authorization_ref)` of each dispatch.
         dispatched: std::sync::Mutex<Vec<(Vec<String>, String)>>,
+        /// `(expected_artifact, the context as sent on the wire)`.
+        contexts: std::sync::Mutex<Vec<(Option<String>, String)>>,
     }
 
     type Hook = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
@@ -304,6 +348,10 @@ mod tests {
             cancel: CancellationToken,
         ) -> Result<ModuleToolResult, ModuleToolCallError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.contexts.lock().unwrap().push((
+                context.expected_artifact.clone(),
+                serde_json::to_string(&context).unwrap(),
+            ));
             self.dispatched
                 .lock()
                 .unwrap()
@@ -407,6 +455,7 @@ mod tests {
                     authorization_ref: "grant:retained".to_owned(),
                     per_call_approval: false,
                     valid_for: None,
+                    artifact: None,
                 })
             } else {
                 self.entered_second.notify_one();
@@ -445,6 +494,20 @@ mod tests {
                 GateDecision::Allow
             }
         }
+    }
+
+    /// The package the fixture's grants name, and the one "running".
+    const FIXTURE_PACKAGE: &str = "sha256:fixture-package";
+
+    fn fixture_scope() -> agent24_store::GrantScope {
+        agent24_store::GrantScope {
+            resources: Vec::new(),
+            artifact: Some(FIXTURE_PACKAGE.to_owned()),
+        }
+    }
+
+    fn fixture_package() -> agent24_policy::consent_gate::ArtifactSource {
+        Arc::new(|_: &str| Some(FIXTURE_PACKAGE.to_owned()))
     }
 
     fn summary() -> ToolPermissionSummary {
@@ -502,7 +565,12 @@ mod tests {
         let summary = summary();
         if granted {
             store
-                .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+                .grant_module_consent_scoped(
+                    &summary,
+                    &fixture_scope(),
+                    "2026-10-08T00:00:00Z",
+                    "2026-11-08T00:00:00Z",
+                )
                 .await
                 .unwrap();
         }
@@ -516,12 +584,14 @@ mod tests {
             source_restricted: false,
             reversible_draft_declared: false,
             draft_verification: None,
+            current_artifact: None,
         };
         let default_authorization: Arc<dyn ModuleToolAuthorization> =
             Arc::new(super::store_authorization(
                 &store,
                 request,
                 Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
+                fixture_package(),
             ));
         let authorization = supplied_authorization.unwrap_or(default_authorization);
         let runtime = Arc::new(FakeModule {
@@ -538,6 +608,7 @@ mod tests {
             on_check: Hook::default(),
             on_invoke: Hook::default(),
             dispatched: std::sync::Mutex::default(),
+            contexts: std::sync::Mutex::default(),
         });
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
@@ -638,7 +709,7 @@ mod tests {
                 &summary(),
                 &agent24_store::GrantScope {
                     resources: vec!["doc:doc_02".to_owned(), "doc:doc_01".to_owned()],
-                    artifact: None,
+                    artifact: Some(FIXTURE_PACKAGE.to_owned()),
                 },
                 "2026-10-08T00:00:00Z",
                 "2026-11-08T00:00:00Z",
@@ -759,6 +830,157 @@ mod tests {
                 .starts_with("ga1:")
         );
         assert_eq!(rows[1].detail["terminal"]["result"], "denied");
+    }
+
+    /// K1-6a-G §2.2, §4 case 6: the module gets the package the grant was
+    /// given for; a grant for another package (same version) is stale —
+    /// refused and audited before the module, and not advertised.
+    #[tokio::test]
+    async fn a_grant_for_another_package_is_stale_and_never_dispatched() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .grant_module_consent_scoped(
+                &summary(),
+                &agent24_store::GrantScope {
+                    resources: Vec::new(),
+                    artifact: Some("sha256:the-package-the-user-saw".to_owned()),
+                },
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let (registry, runtime, _, store, _) =
+            fixture_using(RiskClass::Read, false, true, true, Some(store), None).await;
+        assert!(registry.live_adverts().await.is_empty());
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].detail["terminal"]["result"], "denied");
+    }
+
+    /// The runtime holds the run it sends to against the granted package:
+    /// both known and equal, never `None` on either side.
+    #[test]
+    fn only_a_run_of_the_granted_package_is_served() {
+        let run = |artifact: Option<&str>| {
+            agent24_os_proto::drain::Generation::serving_package(
+                std::path::PathBuf::from("/nonexistent/upstream.sock"),
+                artifact.map(str::to_owned),
+            )
+        };
+        assert!(super::serves_granted_package(
+            &run(Some("sha256:a")),
+            Some("sha256:a")
+        ));
+        assert!(!super::serves_granted_package(
+            &run(Some("sha256:b")),
+            Some("sha256:a")
+        ));
+        assert!(!super::serves_granted_package(&run(None), Some("sha256:a")));
+        assert!(!super::serves_granted_package(&run(Some("sha256:a")), None));
+        assert!(!super::serves_granted_package(&run(None), None));
+    }
+
+    /// The runtime itself turns away a call for a package other than the one
+    /// running, before anything is sent: a grant for A never reaches B.
+    #[tokio::test]
+    async fn invoke_refuses_a_run_of_another_package_before_sending() {
+        let runtime = AgentModuleToolRuntime::new(HashSet::from([(
+            "fake_module".to_owned(),
+            "write_local".to_owned(),
+        )]));
+        let generation = agent24_os_proto::drain::Generation::serving_package(
+            std::path::PathBuf::from("/nonexistent/upstream.sock"),
+            Some("sha256:b".to_owned()),
+        );
+        assert!(generation.ready());
+        runtime.test_slots.lock().unwrap().insert(
+            "fake_module".to_owned(),
+            agent24_os_proto::drain::Current::new(generation),
+        );
+        let invoke = |expected: Option<&str>| {
+            runtime.invoke(
+                ModuleToolContext {
+                    run_id: "run".to_owned(),
+                    session_id: None,
+                    tool_call_id: "call".to_owned(),
+                    module_id: "fake_module".to_owned(),
+                    operation: "write_local".to_owned(),
+                    authorized_resources: Vec::new(),
+                    authorization_ref: "ga1:x".to_owned(),
+                    expected_artifact: expected.map(str::to_owned),
+                },
+                Map::new(),
+                Duration::from_secs(1),
+                CancellationToken::new(),
+            )
+        };
+        for expected in [Some("sha256:a"), None] {
+            assert!(
+                matches!(invoke(expected).await, Err(ModuleToolCallError::Cancelled)),
+                "{expected:?}"
+            );
+        }
+        // The package granted is the one running: the call goes out, and
+        // fails only on the socket that is not there.
+        assert!(!matches!(
+            invoke(Some("sha256:b")).await,
+            Err(ModuleToolCallError::Cancelled)
+        ));
+    }
+
+    /// A runtime's own refusal, with the caller not cancelling, is the grant
+    /// no longer holding: audited `cancelled`, `permission_denied` to the
+    /// model, whatever the check after the call says.
+    #[tokio::test]
+    async fn a_runtime_refusal_reaches_the_model_as_permission_denied() {
+        let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
+        *runtime.failure.lock().unwrap() = Some(ModuleToolCallError::Cancelled);
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].detail["terminal"]["result"], "cancelled");
+    }
+
+    /// A dispatch carries the granted package to the runtime, off the wire:
+    /// the module never sees it.
+    #[tokio::test]
+    async fn the_granted_package_reaches_the_runtime_but_not_the_module() {
+        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
+        registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let seen = runtime.contexts.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0.as_deref(), Some(FIXTURE_PACKAGE));
+        assert!(!seen[0].1.contains("expected_artifact"), "{}", seen[0].1);
+        assert!(!seen[0].1.contains(FIXTURE_PACKAGE), "{}", seen[0].1);
     }
 
     #[tokio::test]
@@ -1601,6 +1823,7 @@ mod tests {
             on_check: Hook::default(),
             on_invoke: Hook::default(),
             dispatched: std::sync::Mutex::default(),
+            contexts: std::sync::Mutex::default(),
         });
         let other: Arc<dyn agent24_domain::tool::ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: other_auth.clone(),
@@ -1652,6 +1875,7 @@ mod tests {
                         authorization_ref: "grant:first".into(),
                         per_call_approval: false,
                         valid_for: None,
+                        artifact: None,
                     })
                 } else {
                     self.entered_second.notify_one();
@@ -2074,6 +2298,7 @@ mod tests {
                     authorization_ref: "grant:feed".to_owned(),
                     per_call_approval: false,
                     valid_for: self.valid_for,
+                    artifact: None,
                 })
             } else {
                 Err(ModuleToolCallError::Module {
@@ -2200,8 +2425,9 @@ mod tests {
             match change {
                 "regrant" => {
                     store
-                        .grant_module_consent(
+                        .grant_module_consent_scoped(
                             &summary(),
+                            &fixture_scope(),
                             "2026-10-08T00:00:00.700Z",
                             "2026-11-08T00:00:00Z",
                         )
@@ -2674,7 +2900,12 @@ mod tests {
         let summary = summary();
         let store = Store::open_memory().await.unwrap();
         store
-            .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2026-10-08T00:00:03Z")
+            .grant_module_consent_scoped(
+                &summary,
+                &fixture_scope(),
+                "2026-10-08T00:00:00Z",
+                "2026-10-08T00:00:03Z",
+            )
             .await
             .unwrap();
         let gate: Arc<dyn ConsentGate> = Arc::new(StoreConsentGate::new(store.clone()));
@@ -2690,9 +2921,11 @@ mod tests {
                 source_restricted: false,
                 reversible_draft_declared: false,
                 draft_verification: None,
+                current_artifact: None,
             },
             Arc::new(|| "2026-10-08T00:00:01Z".to_owned()),
-        );
+        )
+        .with_artifact_source(fixture_package());
         let grant = authorization
             .authorize("fake_module", "write_local", &context())
             .await
@@ -2763,6 +2996,7 @@ mod tests {
                 authorization_ref: format!("grant:{}", self.epoch.load(Ordering::SeqCst)),
                 per_call_approval: false,
                 valid_for: None,
+                artifact: None,
             })
         }
     }
@@ -2944,6 +3178,7 @@ mod tests {
                 authorization_ref: "grant:kept".to_owned(),
                 per_call_approval: false,
                 valid_for: None,
+                artifact: None,
             })
         }
     }
@@ -3028,6 +3263,7 @@ mod tests {
                 authorization_ref: if lookup <= 2 { "grant:a" } else { "grant:b" }.to_owned(),
                 per_call_approval: false,
                 valid_for: None,
+                artifact: None,
             })
         }
 

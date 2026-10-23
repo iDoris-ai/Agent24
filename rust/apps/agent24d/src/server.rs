@@ -1596,11 +1596,14 @@ pub async fn serve(
             // path yet, so the L-APPR-5 draft exception never applies here.
             reversible_draft_declared: false,
             draft_verification: None,
+            // Read per lookup from the running generation (K1-6a-G §2.2).
+            current_artifact: None,
         };
         let authorization = StdArc::new(crate::module_tool_runtime::store_authorization(
             &store,
             request,
             StdArc::new(crate::module_tool_runtime::consent_clock),
+            module_tool_runtime.artifact_source(),
         ));
         module_authorizations.insert((module, operation), authorization);
     }
