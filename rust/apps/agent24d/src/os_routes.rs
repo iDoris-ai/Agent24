@@ -1009,7 +1009,7 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("{name:?}'s grants could not be ended; stop it again"),
+            &format!("{name:?}'s grants could not be ended (the stop: {hot:?}); stop it again"),
         );
     }
     match hot {
@@ -2199,6 +2199,27 @@ mod tests {
                 .is_some_and(|m| m.contains("stop it again")),
             "{body}"
         );
+    }
+
+    /// A stop whose grants cannot be revoked does not advance either, and
+    /// says so: the retry it asks for does both.
+    #[tokio::test]
+    async fn a_stop_that_cannot_revoke_does_not_advance() {
+        let (mut st, _dir, _path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        sqlx::query("DROP TABLE module_consent_revocations")
+            .execute(agent24_store::test_hooks::pool(&st.store))
+            .await
+            .unwrap();
+        let response = stop_now_os(State(st.clone()), Path("consent-mod".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let epoch: Option<i64> = sqlx::query_scalar(
+            "SELECT epoch FROM module_enable_epochs WHERE module = 'consent-mod'",
+        )
+        .fetch_optional(agent24_store::test_hooks::pool(&st.store))
+        .await
+        .unwrap();
+        assert_eq!(epoch, None);
     }
 
     /// Judgement criterion 4 — the blocked `message` is exactly what `os

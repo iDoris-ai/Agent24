@@ -83,7 +83,9 @@ fn an_uninstall_that_removed_the_files_retries_the_revocation() {
     let installed = home.path().join(".agent24/packages/noted");
     assert!(installed.exists());
     let db = home.path().join(".agent24/agent24.db");
-    std::fs::remove_file(&db).unwrap();
+    for file in ["agent24.db", "agent24.db-wal", "agent24.db-shm"] {
+        let _ = std::fs::remove_file(home.path().join(".agent24").join(file));
+    }
     break_store(home.path());
     assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "noted"]));
     assert!(!installed.exists());
@@ -98,15 +100,20 @@ fn an_install_whose_grants_cannot_be_revoked_is_undone() {
     let home = tmp_home();
     let src = write_package(home.path());
     let db = break_store(home.path());
-    assert_fails_on_grants(&agent24(home.path(), &["os", "install", &src]));
+    let out = agent24(home.path(), &["os", "install", &src]);
+    assert_fails_on_grants(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("installed"), "{stdout}");
     assert!(!home.path().join(".agent24/packages/noted").exists());
     std::fs::remove_dir(&db).unwrap();
     assert_ok(&agent24(home.path(), &["os", "install", &src]));
 }
 
-/// No HOME, no store to revoke in: not a success (review G3).
+/// No HOME, no store: the uninstall stands, and says no grants were
+/// revoked rather than nothing (review G3; failing it would break the
+/// `A24_OS_PACKAGES` install the CLI documents for containers).
 #[test]
-fn an_uninstall_without_home_does_not_claim_the_grants_ended() {
+fn an_uninstall_without_home_says_there_was_no_store() {
     let home = tmp_home();
     let packages = home.path().join("packages");
     std::fs::create_dir(&packages).unwrap();
@@ -118,5 +125,7 @@ fn an_uninstall_without_home_does_not_claim_the_grants_ended() {
         .args(["os", "uninstall", "ghost"])
         .output()
         .unwrap();
-    assert_fails_on_grants(&out);
+    assert_ok(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no grants"), "{stderr}");
 }
