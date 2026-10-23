@@ -275,6 +275,207 @@ impl WriteGate {
             && body_matches
     }
 
+    async fn id_range(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        owner: &str,
+        lo: &str,
+        hi: &str,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        Ok(sqlx::query(
+            "SELECT seq, id, scope_owner, scope, kind, payload, origin_source, origin_trust, at
+             FROM mem_events WHERE scope_owner = ? AND id >= ? AND id < ?
+             ORDER BY seq LIMIT 65",
+        )
+        .bind(owner)
+        .bind(lo)
+        .bind(hi)
+        .fetch_all(&mut **tx)
+        .await?)
+    }
+
+    fn hex16(s: &str) -> bool {
+        s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn positive_suffix(rest: &str) -> bool {
+        let Some(n) = rest.strip_prefix('-') else {
+            return false;
+        };
+        let mut chars = n.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_digit() && c != '0')
+            && chars.all(|c| c.is_ascii_digit())
+    }
+
+    fn exact_json(body: &Value, expected: Value) -> bool {
+        body == &expected
+    }
+
+    /// Existing pre-#1153 reassert may omit the current commit audit. Accept only a
+    /// complete commit→(retract,reassert)* chain; a forged expected ID never reaches here.
+    async fn legacy_reassert_chain(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        c: &Candidate,
+        expected_scope: &str,
+        current_evidence: &[String],
+    ) -> Result<bool> {
+        use sqlx::Row;
+        let owner = c.scope.owner.as_str();
+        let audits = Self::id_range(
+            tx,
+            owner,
+            &format!("audit-{}-", c.id),
+            &format!("audit-{}.", c.id),
+        )
+        .await?;
+        let reasserts = Self::id_range(
+            tx,
+            owner,
+            &format!("reassert-{}-", c.id),
+            &format!("reassert-{}.", c.id),
+        )
+        .await?;
+        let retract_base = checksum(&serde_json::to_string(&serde_json::json!([
+            "retract", owner, c.id
+        ]))?);
+        let mut retracts = Self::id_range(
+            tx,
+            owner,
+            &format!("{retract_base}-"),
+            &format!("{retract_base}."),
+        )
+        .await?;
+        if let Some(base) = sqlx::query(
+            "SELECT seq, id, scope_owner, scope, kind, payload, origin_source, origin_trust, at
+             FROM mem_events WHERE id = ?",
+        )
+        .bind(&retract_base)
+        .fetch_optional(&mut **tx)
+        .await?
+            && base.get::<String, _>("scope_owner") == owner
+        {
+            retracts.push(base);
+        }
+        if audits.len() > 64 || reasserts.len() > 64 || retracts.len() > 64 {
+            return Ok(false);
+        }
+        let audit_prefix = format!("audit-{}-", c.id);
+        let audits: Vec<_> = audits
+            .into_iter()
+            .filter(|row| Self::hex16(row.get::<String, _>("id").trim_start_matches(&audit_prefix)))
+            .collect();
+        let re_prefix = format!("reassert-{}-", c.id);
+        let reasserts: Vec<_> = reasserts
+            .into_iter()
+            .filter(|row| {
+                let id = row.get::<String, _>("id");
+                let rest = id.trim_start_matches(&re_prefix);
+                let (hex, suffix) = rest.split_once('-').map_or((rest, ""), |(h, s)| (h, s));
+                Self::hex16(hex)
+                    && (suffix.is_empty() || Self::positive_suffix(&format!("-{suffix}")))
+            })
+            .collect();
+        let retracts: Vec<_> = retracts
+            .into_iter()
+            .filter(|row| {
+                let id = row.get::<String, _>("id");
+                id == retract_base
+                    || id
+                        .strip_prefix(&retract_base)
+                        .is_some_and(Self::positive_suffix)
+            })
+            .collect();
+        let Some(anchor) = audits.first() else {
+            return Ok(false);
+        };
+        let mut seeded = c.clone();
+        let Ok(anchor_evidence) = serde_json::from_str::<Vec<String>>(
+            &serde_json::from_str::<Value>(&anchor.get::<String, _>("payload"))
+                .ok()
+                .and_then(|body| body.get("evidence").cloned())
+                .unwrap_or(Value::Null)
+                .to_string(),
+        ) else {
+            return Ok(false);
+        };
+        if anchor_evidence.is_empty() {
+            return Ok(false);
+        }
+        seeded.evidence = anchor_evidence;
+        let expected = Self::audit_event(&seeded, "commit", None);
+        if anchor.get::<String, _>("id") != expected.id
+            || !Self::matches_commit_audit(anchor, expected_scope, &expected)
+        {
+            return Ok(false);
+        }
+        let owner_scope = serde_json::to_string(&Scope::owner(owner))?;
+        let mut links: Vec<_> = retracts.into_iter().chain(reasserts).collect();
+        links.sort_by_key(|row| row.get::<i64, _>("seq"));
+        let anchor_seq = anchor.get::<i64, _>("seq");
+        if links.len() < 2
+            || links.len() % 2 != 0
+            || links
+                .iter()
+                .any(|row| row.get::<i64, _>("seq") <= anchor_seq)
+        {
+            return Ok(false);
+        }
+        for (index, row) in links.iter().enumerate() {
+            let kind = row.get::<String, _>("kind");
+            let payload = serde_json::from_str::<Value>(&row.get::<String, _>("payload"))
+                .unwrap_or(Value::Null);
+            let retract = index % 2 == 0;
+            if retract {
+                if kind != "assertion.retracted"
+                    || row.get::<String, _>("origin_source") != "memory.forget"
+                    || row.get::<String, _>("origin_trust") != "user_said"
+                    || row.get::<String, _>("scope") != owner_scope
+                    || !Self::exact_json(&payload, serde_json::json!({"assertion_id": c.id}))
+                {
+                    return Ok(false);
+                }
+            } else {
+                let evidence = payload.get("evidence").and_then(|v| v.as_array());
+                let Some(evidence) = evidence else {
+                    return Ok(false);
+                };
+                if evidence.is_empty()
+                    || kind != "assertion.reasserted"
+                    || row.get::<String, _>("origin_source") != "write_gate"
+                    || row.get::<String, _>("origin_trust") != "system"
+                    || row.get::<String, _>("scope") != expected_scope
+                    || !Self::exact_json(
+                        &payload,
+                        serde_json::json!({"assertion_id": c.id, "evidence": evidence}),
+                    )
+                {
+                    return Ok(false);
+                }
+                let values: Vec<String> = evidence
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                if values.len() != evidence.len() {
+                    return Ok(false);
+                }
+                let base = format!(
+                    "reassert-{}-{}",
+                    c.id,
+                    &checksum(&format!("{}|{:?}", row.get::<String, _>("at"), values))[..16]
+                );
+                let id = row.get::<String, _>("id");
+                if id != base && !id.strip_prefix(&base).is_some_and(Self::positive_suffix) {
+                    return Ok(false);
+                }
+            }
+        }
+        let Some(last) = links.last() else {
+            return Ok(false);
+        };
+        let last_body =
+            serde_json::from_str::<Value>(&last.get::<String, _>("payload")).unwrap_or(Value::Null);
+        Ok(last_body.get("evidence") == Some(&serde_json::json!(current_evidence)))
+    }
+
     /// Persist a Commit/Hold assertion AND its audit event in ONE transaction, so
     /// a belief can never land without its governance record (and vice versa).
     /// fix683: returns [`CommitStatus`] instead of bare `()` so a pause
@@ -373,7 +574,7 @@ impl WriteGate {
                         // content, including its original evidence. Validate the
                         // immutable event instead of appending a retry's evidence.
                         let mut original = c.clone();
-                        original.evidence = evidence;
+                        original.evidence = evidence.clone();
                         let expected_audit = Self::audit_event(&original, "commit", None);
                         let audit_row = sqlx::query(
                             "SELECT scope_owner, scope, kind, payload, origin_source, origin_trust
@@ -383,15 +584,30 @@ impl WriteGate {
                         .fetch_optional(&mut *tx)
                         .await?;
 
-                        if let Some(audit_row) = audit_row
-                            && Self::matches_commit_audit(
-                                &audit_row,
+                        match audit_row {
+                            Some(audit_row)
+                                if Self::matches_commit_audit(
+                                    &audit_row,
+                                    &expected_scope,
+                                    &expected_audit,
+                                ) =>
+                            {
+                                tx.commit().await?;
+                                return Ok(CommitStatus::Committed);
+                            }
+                            Some(_) => {}
+                            None if Self::legacy_reassert_chain(
+                                &mut tx,
+                                c,
                                 &expected_scope,
-                                &expected_audit,
+                                &evidence,
                             )
-                        {
-                            tx.commit().await?;
-                            return Ok(CommitStatus::Committed);
+                            .await? =>
+                            {
+                                tx.commit().await?;
+                                return Ok(CommitStatus::Committed);
+                            }
+                            None => {}
                         }
                     }
                 }

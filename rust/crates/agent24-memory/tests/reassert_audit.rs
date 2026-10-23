@@ -163,8 +163,7 @@ async fn rejected_reassert_proof_rolls_back_the_entire_transition() {
 }
 
 #[tokio::test]
-#[ignore = "Legacy compatibility remains known RED after the fresh-transition slice; run explicitly"]
-async fn historical_reassert_without_current_commit_still_needs_compatibility() {
+async fn historical_reassert_without_current_commit_retries_without_new_events() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("memory.sqlite");
     let kv = KvStore::open(&path).await.unwrap();
@@ -198,4 +197,86 @@ async fn historical_reassert_without_current_commit_still_needs_compatibility() 
         "historical legitimate reassert needs compatibility: {retry:?}"
     );
     pool.close().await;
+}
+
+async fn legacy_shape(kv: &KvStore, path: &std::path::Path) -> sqlx::SqlitePool {
+    closed(kv).await;
+    kv.write_gate()
+        .propose(vec![candidate("ev2")])
+        .await
+        .unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    let events = kv.events().scan(&EventQuery::owner("owner")).await.unwrap();
+    for event in events.iter().filter(|e| {
+        e.event.kind == "mem.write_decision" && e.event.body["evidence"] == json!(["ev2"])
+    }) {
+        sqlx::query("DELETE FROM mem_events WHERE id = ?")
+            .bind(&event.event.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    pool
+}
+
+#[tokio::test]
+async fn forged_expected_audit_does_not_fall_back_to_an_older_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.sqlite");
+    let kv = KvStore::open(&path).await.unwrap();
+    let pool = legacy_shape(&kv, &path).await;
+    let proof = KvStore::open_memory().await.unwrap();
+    proof
+        .write_gate()
+        .propose(vec![candidate("ev2")])
+        .await
+        .unwrap();
+    let mut forged = proof
+        .events()
+        .scan(&EventQuery::owner("owner"))
+        .await
+        .unwrap()[0]
+        .event
+        .clone();
+    forged.body["reason"] = json!("forged");
+    kv.events().append(&forged).await.unwrap();
+    let before = kv.events().scan(&EventQuery::owner("owner")).await.unwrap();
+    let result = kv.write_gate().propose(vec![candidate("ev3")]).await;
+    assert!(
+        matches!(result, Err(MemoryError::Conflict(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        kv.events().scan(&EventQuery::owner("owner")).await.unwrap(),
+        before
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn legacy_chain_missing_original_commit_or_reassert_is_rejected() {
+    for drop_kind in ["mem.write_decision", "assertion.reasserted"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite");
+        let kv = KvStore::open(&path).await.unwrap();
+        let pool = legacy_shape(&kv, &path).await;
+        sqlx::query("DELETE FROM mem_events WHERE kind = ? AND scope_owner = 'owner'")
+            .bind(drop_kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = kv.events().scan(&EventQuery::owner("owner")).await.unwrap();
+        let result = kv.write_gate().propose(vec![candidate("ev3")]).await;
+        assert!(
+            matches!(result, Err(MemoryError::Conflict(_))),
+            "{drop_kind}: {result:?}"
+        );
+        assert_eq!(
+            kv.events().scan(&EventQuery::owner("owner")).await.unwrap(),
+            before
+        );
+        pool.close().await;
+    }
 }
