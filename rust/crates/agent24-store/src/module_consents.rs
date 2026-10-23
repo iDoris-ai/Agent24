@@ -2110,6 +2110,7 @@ mod tests {
                                 .await
                                 .unwrap();
                             store_grant(&writer, &s).await;
+                            writer.advance_module_enable_epoch(&s.module).await.unwrap();
                             if let Some(tx) = done_tx.lock().unwrap().take() {
                                 let _ = tx.send(());
                             }
@@ -2139,6 +2140,21 @@ mod tests {
             panic!("one snapshot must give the grant as it stood: {lookup:?}");
         };
         assert_eq!(record.generation, first.generation);
+        // The epoch advanced between the reads is not paired with the
+        // grant from before it (K1-6a-G §2.1 F3), and is there after.
+        assert!(matches!(
+            writer
+                .lookup_module_consent(
+                    &s.module,
+                    &s.op,
+                    &s.module_version,
+                    &s.scope_fingerprint(),
+                    "2026-10-08T02:00:00Z",
+                )
+                .await
+                .unwrap(),
+            ConsentLookup::Stale(_)
+        ));
     }
 
     async fn store_grant(store: &Store, s: &ToolPermissionSummary) -> ModuleConsentRecord {
@@ -2542,6 +2558,116 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(changes.try_recv().unwrap().module, "documenting");
+    }
+
+    /// Rows from before migration 0020 keep their meaning across it: a
+    /// grant holds and a revoked one stays revoked until the first
+    /// observation reaches the module, which makes the grant stale and
+    /// leaves the revocation in force (review C2).
+    #[tokio::test]
+    async fn rows_from_before_migration_0020_keep_their_meaning() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = std::borrow::Cow::Owned(
+            before
+                .migrations
+                .iter()
+                .filter(|m| m.version < 20)
+                .cloned()
+                .collect(),
+        );
+        before.run(&pool).await.unwrap();
+        let read = summary("doc body");
+        let write = ToolPermissionSummary::new(
+            "documenting",
+            "write_doc",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("doc body".to_owned()),
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        for (generation, s) in [(1_i64, &read), (2, &write)] {
+            sqlx::query("INSERT INTO module_consent_generations DEFAULT VALUES")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO module_consents
+                    (module, op, module_version, scope_fingerprint, source, risk,
+                     readable, decision, decided_at, expires_at, generation)
+                 VALUES (?, ?, '1.0.0', ?, 'first_party', 'low', 'doc body', 'granted',
+                         '2026-10-08T00:00:00.000Z', '2026-11-08T00:00:00.000Z', ?)",
+            )
+            .bind(&s.module)
+            .bind(&s.op)
+            .bind(s.scope_fingerprint())
+            .bind(generation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO module_consent_generations DEFAULT VALUES")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO module_consent_revocations (module, op, revoked_at, generation)
+             VALUES ('documenting', 'write_doc', '2026-10-08T01:00:00.000Z', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        assert!(lookup_now(&store, &read).await.is_authorized());
+        assert!(matches!(
+            lookup_now(&store, &write).await,
+            ConsentLookup::Revoked(_)
+        ));
+        assert!(
+            store
+                .observe_module_enablement("documenting", true, "e1")
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            lookup_now(&store, &read).await,
+            ConsentLookup::Stale(_)
+        ));
+        assert!(matches!(
+            lookup_now(&store, &write).await,
+            ConsentLookup::Revoked(_)
+        ));
+    }
+
+    /// An advance leaves what was last observed: a grant made after it
+    /// holds across a start that sees the same entry (review G1; the
+    /// daemon records an enable's new entry after writing it).
+    #[tokio::test]
+    async fn an_advance_leaves_the_last_observation() {
+        let store = store().await;
+        let s = summary("doc body");
+        assert!(
+            store
+                .observe_module_enablement(&s.module, true, "e1")
+                .await
+                .unwrap()
+        );
+        store.advance_module_enable_epoch(&s.module).await.unwrap();
+        grant_now(&store, &s).await;
+        assert!(
+            !store
+                .observe_module_enablement(&s.module, true, "e1")
+                .await
+                .unwrap()
+        );
+        assert!(lookup_now(&store, &s).await.is_authorized());
     }
 
     /// A grant from before any observation (epoch 0, as every row from
