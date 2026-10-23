@@ -831,23 +831,38 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
         OsAction::Install { path } => {
             Some(match agent24_os_packages::install::install(path, &root) {
                 Ok(dest) => {
-                    if let Some(module) = dest.file_name().and_then(|n| n.to_str()) {
-                        invalidate_module_consents_best_effort(module).await;
+                    // Grants from an earlier install of this name end now,
+                    // or this install does not stand (K1-6a-G §2.1 F1):
+                    // undone, so running it again retries the revocation.
+                    let revoked = match dest.file_name().and_then(|n| n.to_str()) {
+                        Some(module) => match revoke_module_consents(module).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                let undone = agent24_os_packages::install::uninstall(module, &root);
+                                Err(match undone {
+                                    Ok(_) => format!("{e}; the install was undone"),
+                                    Err(u) => format!("{e}; the install could not be undone: {u}"),
+                                })
+                            }
+                        },
+                        None => Ok(()),
+                    };
+                    if revoked.is_ok() {
+                        println!("installed {}", dest.display());
+                        println!(
+                            "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+                        );
+                        // Said out loud because the isolation is deliberate and
+                        // therefore permanent: an ephemeral daemon (`agent24 chat`
+                        // with nothing running) resolves a different packages root
+                        // and will never see this package. Without this line the two
+                        // lines above are, for that user, a promise that never comes
+                        // true.
+                        println!(
+                            "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
+                        );
                     }
-                    println!("installed {}", dest.display());
-                    println!(
-                        "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
-                    );
-                    // Said out loud because the isolation is deliberate and
-                    // therefore permanent: an ephemeral daemon (`agent24 chat`
-                    // with nothing running) resolves a different packages root
-                    // and will never see this package. Without this line the two
-                    // lines above are, for that user, a promise that never comes
-                    // true.
-                    println!(
-                        "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
-                    );
-                    Ok(())
+                    revoked
                 }
                 Err(e) => Err(e.to_string()),
             })
@@ -875,35 +890,43 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
             // Not an error: the end state the operator asked for is the one
             // they have. Saying so beats a failure they must decide to
             // ignore. Idempotent: nothing NEW was removed, so there is
-            // nothing for a hot-stop to respond to.
+            // nothing for a hot-stop to respond to. Its grants are ended
+            // again all the same: an earlier run may have removed the files
+            // and failed to (K1-6a-G §2.1 F1).
             println!("{name} was not installed; nothing to remove");
-            Ok(())
+            revoke_module_consents(name).await
         }
         Ok(true) => {
             println!("removed {name}");
             println!("  it takes effect at the next daemon start");
-            invalidate_module_consents_best_effort(name).await;
+            let revoked = revoke_module_consents(name).await;
             hot_disable_best_effort(name).await;
-            Ok(())
+            revoked
         }
     }
 }
 
-/// Revoke persisted enablement consent after a successful package lifecycle
-/// change. Store failures are reported but do not change the established
-/// install/uninstall result or prevent the daemon stop attempt.
-async fn invalidate_module_consents_best_effort(name: &str) {
+/// End `name`'s module tool grants after a package lifecycle change. A
+/// store that cannot record it fails the command (K1-6a-G §2.1 F1): whether
+/// a grant still holds is what the store says, not what this printed. An
+/// install is undone and an uninstall finds nothing left to remove, so
+/// running either again retries this. Without HOME no store can be
+/// reached (a daemon does not start without one either): the command
+/// stands, and says the grants, if any, were not revoked.
+async fn revoke_module_consents(name: &str) -> Result<(), String> {
     let Some(dir) = state_file::state_dir() else {
-        return;
+        eprintln!(
+            "  HOME is not set: cannot reach a consent store, so any grants of {name} were not revoked"
+        );
+        return Ok(());
     };
-    match agent24_store::Store::open(&dir.join("agent24.db")).await {
-        Ok(store) => {
-            if let Err(e) = store.invalidate_module_consents(name).await {
-                eprintln!("  could not revoke {name} module consent: {e}");
-            }
-        }
-        Err(e) => eprintln!("  could not open consent store for {name}: {e}"),
-    }
+    let store = agent24_store::Store::open(&dir.join("agent24.db"))
+        .await
+        .map_err(|e| format!("could not open the consent store to revoke {name}'s grants: {e}"))?;
+    store
+        .invalidate_module_consents(name)
+        .await
+        .map_err(|e| format!("could not revoke {name}'s module grants: {e}"))
 }
 
 /// Render a daemon error envelope the way every call site here should
