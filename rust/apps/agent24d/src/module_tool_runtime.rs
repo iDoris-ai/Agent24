@@ -1008,7 +1008,8 @@ mod tests {
 
     /// K1-6a-G §2.5: a revocation is told to the running module, at the
     /// module's reserved path; only its 2xx within the bound confirms the
-    /// stop. A module with no run has nothing running.
+    /// stop. A run still starting, or out of the list but still stopping,
+    /// is unconfirmed; only a module with no run has nothing running.
     #[tokio::test]
     async fn a_revocation_is_told_to_the_running_module() {
         let sock = std::path::PathBuf::from(format!(
@@ -1057,11 +1058,14 @@ mod tests {
         stop.send_replace(agent24_os_proto::supervisor::Status::Stopped);
         assert_eq!(notify(within).await, RevocationStop::NotRunning);
         let generation = agent24_os_proto::drain::Generation::serving_package(sock.clone(), None);
-        assert!(generation.ready());
         runtime.test_slots.lock().unwrap().insert(
             "fake_module".to_owned(),
-            agent24_os_proto::drain::Current::new(generation),
+            agent24_os_proto::drain::Current::new(Arc::clone(&generation)),
         );
+        // A run still starting is a run: not told, and not gone.
+        assert_eq!(notify(within).await, RevocationStop::Unconfirmed);
+        assert!(told.lock().unwrap().is_empty());
+        assert!(generation.ready());
         assert_eq!(notify(within).await, RevocationStop::Confirmed);
         assert_eq!(
             told.lock().unwrap()[0],
