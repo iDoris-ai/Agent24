@@ -4,7 +4,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { components } from '@agent24/api-client'
-import { describeError, getImportState, nudge, startImport, subscribeImport } from './importStore'
+import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
 import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 
@@ -124,6 +124,16 @@ export default function DocumentsPage() {
               ? t('status.error', { status: STATUS_LABELS[job.status] ? t(STATUS_LABELS[job.status]) : job.status, error: job.error.message })
               : STATUS_LABELS[job.status] ? t(STATUS_LABELS[job.status]) : job.status}
           </span>
+        )}
+        {canCancel(imp) && (
+          <button className="btn btn-ghost" onClick={() => void cancelImport(api)} disabled={imp.acting}>
+            {t('import.cancel')}
+          </button>
+        )}
+        {canRetry(imp) && (
+          <button className="btn btn-ghost" onClick={() => void retryImport(api)} disabled={imp.acting}>
+            {t('import.retry')}
+          </button>
         )}
       </div>
       {(error || listError) && (
