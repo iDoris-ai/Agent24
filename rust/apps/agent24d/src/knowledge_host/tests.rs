@@ -48,6 +48,35 @@ fn a_change_older_than_one_already_applied_is_refused_and_changes_nothing() {
 }
 
 #[test]
+fn concurrent_changes_end_on_the_highest_sequence_number() {
+    // Check and store happen under one lock: whatever order the threads run
+    // in, the record ends on seq 64 and its change, and every lower number
+    // that arrived after a higher one was refused.
+    let registry = std::sync::Arc::new(KnowledgeHostRegistry::default());
+    let threads: Vec<_> = (1..=64u64)
+        .rev()
+        .map(|seq| {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                let change = if seq % 2 == 0 {
+                    Change::Activate
+                } else {
+                    Change::Deactivate
+                };
+                registry.apply("host", "b1", seq, change).is_ok()
+            })
+        })
+        .collect();
+    let applied = threads
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .filter(|ok| *ok)
+        .count();
+    assert!(applied >= 1);
+    assert_eq!(registry.record("host", "b1"), Some((true, 64)));
+}
+
+#[test]
 fn deactivation_keeps_the_high_water_mark() {
     let registry = KnowledgeHostRegistry::default();
     registry.apply("host", "b1", 1, Change::Activate).unwrap();
