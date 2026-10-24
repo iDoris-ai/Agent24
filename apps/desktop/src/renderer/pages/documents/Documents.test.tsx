@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import DocumentsPage from './Documents'
-import { getImportState, resetImportStore } from './importStore'
+import { cancelImport, getImportState, resetImportStore } from './importStore'
 import { setLocale } from '../../i18n'
 
 const doc = (n: number) => ({
@@ -262,6 +262,95 @@ describe('DocumentsPage: importing', () => {
     fireEvent.click(screen.getByRole('button', IMPORT))
     await tick(1100)
     await waitFor(() => expect(screen.getByText('导入失败：不支持这种格式')).toBeInTheDocument())
+  })
+})
+
+describe('DocumentsPage: cancel and retry', () => {
+  beforeEach(() => { setLocale('zh') })
+  const CANCEL = { name: '取消' }
+  const RETRY = { name: '重试' }
+  const ops = (m: Mock, op: string) => m.request.mock.calls.filter(([r]) => r.op === op)
+  /** `job` reads answer from `reads` in turn; `cancelJob` / `retryJob` from `acts`. */
+  const bases = new WeakMap<Mock, (req: { op: string }) => Promise<Res>>()
+  function answer(m: Mock, reads: Array<() => Promise<Res>>, acts: Record<string, () => Promise<Res>> = {}) {
+    if (!bases.has(m)) bases.set(m, m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>)
+    const base = bases.get(m)!
+    m.request.mockImplementation((req: { op: string }) => {
+      if (req.op === 'job') return reads.shift()!()
+      if (acts[req.op]) return acts[req.op]!()
+      return base(req)
+    })
+  }
+  const attempt = (status: string, n: number, error: unknown = null) => ({ ...job(status, error), attempt: n })
+
+  it('cancels the job being followed, which ends cancelled and can then be restarted', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    let ended: () => void = () => {}
+    const cancelled = () => new Promise<Res>((r) => (ended = () => r({ ok: true, status: 200, data: job('cancelled', { code: 'cancelled', message: 'cancelled' }) })))
+    answer(m, [() => ok(job('running')), cancelled], { cancelJob: () => ok(job('cancelling')) })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('导入中')).toBeInTheDocument())
+    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', CANCEL))
+    void cancelImport(window.agent24.documents) // while the first is on its way
+    await waitFor(() => expect(screen.getByText('取消中')).toBeInTheDocument())
+    expect(ops(m, 'cancelJob')).toEqual([[{ op: 'cancelJob', jobId: job('x').job_id }]])
+    expect(screen.queryByRole('button', CANCEL)).not.toBeInTheDocument()
+    await act(async () => ended())
+    await waitFor(() => expect(screen.getByRole('button', RETRY)).toBeInTheDocument())
+    expect(screen.getByRole('button', IMPORT)).not.toBeDisabled()
+  })
+
+  it('restarts a job that failed for a passing cause and follows it again; not one the file itself fails', async () => {
+    const m = mount({ lists: [page([]), page([9])] })
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    answer(m, [() => ok(job('failed', { code: 'engine_unavailable', message: '引擎不可用' })), () => ok(attempt('succeeded', 2))], {
+      retryJob: () => ok(attempt('queued', 2)),
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('导入失败：引擎不可用')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', RETRY))
+    await waitFor(() => expect(screen.getByText('排队中')).toBeInTheDocument())
+    expect(screen.getByRole('button', IMPORT)).toBeDisabled()
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('通告 9')).toBeInTheDocument())
+    expect(ops(m, 'retryJob')).toHaveLength(1)
+    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+
+    answer(m, [() => ok(job('failed', { code: 'unsupported_format', message: '不支持这种格式' }))])
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('导入失败：不支持这种格式')).toBeInTheDocument())
+    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+  })
+
+  it('a retry whose answer is lost is read, never sent again: a higher attempt is followed, else it says why', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    answer(m, [() => ok(job('interrupted')), () => ok(attempt('running', 2)), () => ok(attempt('succeeded', 2))], {
+      retryJob: () => err(504, 'backend_timeout', 'slow'),
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', RETRY))
+    await waitFor(() => expect(screen.getByText('导入中')).toBeInTheDocument())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
+
+    answer(m, [() => ok(job('interrupted')), () => ok(job('interrupted'))], { retryJob: () => err(504, 'backend_timeout', 'slow') })
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', RETRY))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('slow（backend_timeout）'))
+    expect(ops(m, 'retryJob')).toHaveLength(2)
+    expect(screen.getByText('已中断')).toBeInTheDocument()
   })
 })
 
