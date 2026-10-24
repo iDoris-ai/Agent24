@@ -404,6 +404,122 @@ describe('DocumentsPage: cancel and retry', () => {
     await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
     expect(screen.getByRole('button', RETRY)).toBeInTheDocument()
   })
+  it('a cancel answering after the job was read failed shows it cancelled, which can be restarted', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    let answered: () => void = () => {}
+    answer(m, [() => ok(job('running')), () => ok(job('failed', { code: 'unsupported_format', message: '不支持这种格式' }))], {
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: job('cancelled', { code: 'cancelled', message: 'cancelled' }) }))),
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', CANCEL))
+    await tick(1100) // the job is read failed before the cancel answers
+    await waitFor(() => expect(screen.getByText('导入失败：不支持这种格式')).toBeInTheDocument())
+    await act(async () => answered())
+    expect(screen.getByText(/^已取消/)).toBeInTheDocument()
+    expect(screen.getByRole('button', RETRY)).toBeInTheDocument()
+    expect(ops(m, 'job')).toHaveLength(2)
+  })
+
+  it('a read older than the cancel answer does not take the job back', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    let read: () => void = () => {}
+    answer(m, [
+      () => ok(job('running')),
+      () => new Promise<Res>((r) => (read = () => r({ ok: true, status: 200, data: job('failed', { code: 'engine_unavailable', message: '引擎不可用' }) }))),
+    ], { cancelJob: () => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' })) })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    await screen.findByRole('button', CANCEL)
+    await tick(1100) // a read is on its way
+    fireEvent.click(screen.getByRole('button', CANCEL))
+    await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
+    await act(async () => read())
+    await tick(1100)
+    expect(screen.getByText(/^已取消/)).toBeInTheDocument()
+    expect(screen.getByRole('button', RETRY)).toBeInTheDocument()
+    expect(ops(m, 'job')).toHaveLength(2)
+  })
+
+  it('a read sent before the cancel answered does not take the job back to running', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    let read: () => void = () => {}
+    answer(m, [
+      () => ok(job('running')),
+      () => new Promise<Res>((r) => (read = () => r({ ok: true, status: 200, data: job('running') }))),
+      () => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' })),
+    ], { cancelJob: () => ok(job('cancelling')) })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    await screen.findByRole('button', CANCEL)
+    await tick(1100) // a read is on its way
+    fireEvent.click(screen.getByRole('button', CANCEL))
+    await waitFor(() => expect(screen.getByText('取消中')).toBeInTheDocument())
+    await act(async () => read())
+    expect(screen.getByText('取消中')).toBeInTheDocument()
+    expect(screen.queryByRole('button', CANCEL)).not.toBeInTheDocument()
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
+  })
+
+  it('a read of an earlier attempt does not take a restarted job back', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    answer(m, [() => ok(job('interrupted')), () => ok(job('interrupted')), () => ok(attempt('succeeded', 2))], {
+      retryJob: () => ok(attempt('running', 2)),
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', RETRY))
+    await tick(1100) // the read still shows attempt 1
+    expect(screen.getByText('导入中')).toBeInTheDocument()
+    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
+  })
+
+  it('an import is counted once, whether its success is first heard from a read or from a cancel', async () => {
+    const lists = () => m.request.mock.calls.filter(([r]) => r.op === 'list')
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    let answered: () => void = () => {}
+    answer(m, [() => ok(job('running')), () => ok(job('succeeded'))], {
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: job('succeeded') }))),
+    })
+    render(<DocumentsPage />)
+    await waitFor(() => expect(lists()).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', CANCEL))
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
+    await waitFor(() => expect(lists()).toHaveLength(2))
+    await act(async () => answered())
+    await tick(1100)
+    expect(lists()).toHaveLength(2)
+
+    // Following stopped on a read error; the cancel is the first to hear of the success.
+    const other = (status: string) => ({ ...job(status), job_id: 'job_01K75A0B1C2D3E4F5G6H7J8K00' })
+    m.importFile.mockImplementation(() => ok(other('queued')))
+    answer(m, [() => ok(other('running')), () => err(503, 'storage_unavailable', 'storage is not available', { retryable: false, cause: 'corrupt' })], {
+      cancelJob: () => ok(other('succeeded')),
+    })
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(2200)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('storage_unavailable：corrupt'))
+    fireEvent.click(screen.getByRole('button', CANCEL))
+    await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
+    await waitFor(() => expect(lists()).toHaveLength(3))
+    await tick(1100)
+    expect(lists()).toHaveLength(3)
+  })
 })
 
 describe('DocumentsPage: OS events (hints only)', () => {

@@ -29,6 +29,8 @@ const MAX_FAILURES = 30
 
 const initial: ImportState = { importing: false, progress: null, job: null, error: null, imported: 0, acting: false }
 let state = initial
+/** The attempt last counted in `imported`, so a success is counted once. */
+let counted: string | null = null
 const listeners = new Set<() => void>()
 
 function set(patch: Partial<ImportState>): void {
@@ -45,6 +47,7 @@ export function subscribeImport(listener: () => void): () => void {
 /** For tests: forget everything. */
 export function resetImportStore(): void {
   state = initial
+  counted = null
   wake = null
   listeners.clear()
 }
@@ -97,6 +100,31 @@ const RESTART_READS = 10
 /** An answer that says the request was refused, so it did not happen. */
 const refused = (res: DocumentsResponse & { ok: false }): boolean => res.status >= 400 && res.status < 500
 
+/** How far a job is along within one attempt; a status never goes back. */
+const STAGE: Record<string, number> = { queued: 0, running: 1, cancelling: 2 }
+const stage = (j: Job): number => STAGE[j.status] ?? 3
+
+/** Takes `next` as the job shown unless it is older news than what was
+ * read: answers and reads can land out of order. An ended attempt changes
+ * only by a cancel turning it into `cancelled` (ADR-DOC-02 §7). */
+function adopt(next: Job): void {
+  const shown = state.job
+  if (shown && shown.job_id === next.job_id) {
+    if (next.attempt < shown.attempt) return
+    if (next.attempt === shown.attempt) {
+      if (stage(next) < stage(shown)) return
+      if (stage(shown) === 3 && next.status !== shown.status && next.status !== 'cancelled') return
+    }
+  }
+  const key = `${next.job_id}#${next.attempt}`
+  if (next.status === 'succeeded' && counted !== key) {
+    counted = key
+    set({ job: next, imported: state.imported + 1 })
+  } else {
+    set({ job: next })
+  }
+}
+
 /** The job is still to start or still running: it can be cancelled. */
 export const canCancel = (s: ImportState): boolean =>
   s.job !== null && (s.job.status === 'queued' || s.job.status === 'running')
@@ -121,8 +149,7 @@ export async function cancelImport(api: Api): Promise<void> {
       set({ error: describeError(res) })
       return
     }
-    // An answer read after the job moved on is older news.
-    if (state.job?.job_id === job.job_id && canCancel(state)) set({ job: res.data })
+    adopt(res.data)
     if (state.importing) {
       nudge(job.job_id)
       return
@@ -196,9 +223,9 @@ export async function startImport(api: Api): Promise<void> {
 
 /** Reads the job until it stops working, backing off on transient errors. */
 async function follow(api: Api, first: Job): Promise<void> {
-  let job = first
+  adopt(first)
+  let job = state.job ?? first
   let failures = 0
-  set({ job })
   while (WORKING.has(job.status)) {
     await sleep(Math.min(POLL_MS * 2 ** failures, MAX_BACKOFF_MS), job.job_id)
     const res = await api.request({ op: 'job', jobId: job.job_id })
@@ -215,8 +242,7 @@ async function follow(api: Api, first: Job): Promise<void> {
       continue
     }
     failures = 0
-    job = res.data
-    set({ job })
+    adopt(res.data)
+    job = state.job ?? res.data
   }
-  if (job.status === 'succeeded') set({ imported: state.imported + 1 })
 }
