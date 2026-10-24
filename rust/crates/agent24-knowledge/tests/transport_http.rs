@@ -505,6 +505,23 @@ async fn closed_port_is_unreachable() {
     assert_eq!(err, TransportError::Unreachable);
 }
 
+/// The server took the request and closed before any response head: it broke
+/// before a response, so `Unreachable`, and the request is not sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_before_the_head_is_unreachable() {
+    let mut stub = Stub::start(Script::Respond(Vec::new())).await;
+    let err = bounded(stub.transport(api_key()).send(
+        KnowledgeOperation::Search,
+        b"{}".to_vec(),
+        LONG,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(err, TransportError::Unreachable);
+    assert!(stub.requests.try_recv().is_ok());
+    assert_eq!(stub.conns.load(Ordering::SeqCst), 1);
+}
+
 /// reqwest's `connect_timeout` covers the TLS handshake, so a server that
 /// accepts TCP and never answers the ClientHello runs it out well before the
 /// deadline.
