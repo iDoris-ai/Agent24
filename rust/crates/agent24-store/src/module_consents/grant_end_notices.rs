@@ -1,0 +1,201 @@
+//! K1-6a-G §2.5.1 (A5c): the ends of grants a module must be told of. Each
+//! is a row written in the transaction of the write that ended the grants —
+//! a revocation, a decision replacing a granted row, an enable epoch advance
+//! — with their references, so the module can stop exactly their work and
+//! refuse late calls carrying them. A crash before the notice, or a later
+//! decision replacing the row, loses none: the notifier sends every row not
+//! answered yet.
+
+use sqlx::Row;
+use sqlx::sqlite::SqliteRow;
+
+use super::{ConsentDecision, ModuleConsentRecord, decision_str, parse_instant, row_to_record};
+use crate::{Result, Store, StoreError};
+
+type Tx<'c> = sqlx::Transaction<'c, sqlx::Sqlite>;
+
+/// How long a revocation's notice is left to the route that wrote it, which
+/// waits for the module 10 s at most: the notifier sends it only past this.
+const ROUTE_GRACE_MILLIS: i64 = 30_000;
+
+/// What ended the grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantEndReason {
+    Revoked,
+    /// A grant or refusal replaced the granted row.
+    Replaced,
+    /// The module's enable epoch advanced: its grants are `Stale`.
+    Epoch,
+}
+
+impl GrantEndReason {
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Revoked => "revoked",
+            Self::Replaced => "replaced",
+            Self::Epoch => "epoch",
+        }
+    }
+
+    fn parse(word: &str) -> Result<Self> {
+        match word {
+            "revoked" => Ok(Self::Revoked),
+            "replaced" => Ok(Self::Replaced),
+            "epoch" => Ok(Self::Epoch),
+            other => Err(StoreError::Conflict(format!(
+                "unknown grant end reason: {other}"
+            ))),
+        }
+    }
+}
+
+/// One end of grants to tell a module of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantEndNotice {
+    pub id: i64,
+    pub module: String,
+    /// The tool, or `*` for every tool of the module.
+    pub op: String,
+    /// The ended grants' references (`ga1:…`), sorted; empty when a
+    /// revocation found none in force.
+    pub authorization_refs: Vec<String>,
+    pub reason: GrantEndReason,
+    pub ended_at: String,
+    /// The write that ended them: a revocation's is its own generation.
+    pub generation: i64,
+}
+
+/// The granted rows of `module` (`op`: that tool's only; `epoch`: of that
+/// enable epoch only) whose end it was not told yet: no revocation covers
+/// them and no expiry of them was told.
+pub(super) async fn untold(
+    tx: &mut Tx<'_>,
+    module: &str,
+    op: Option<&str>,
+    epoch: Option<i64>,
+) -> Result<Vec<ModuleConsentRecord>> {
+    let rows = sqlx::query(
+        "SELECT c.* FROM module_consents c
+         WHERE c.module = ?1 AND (?2 IS NULL OR c.op = ?2)
+           AND (?3 IS NULL OR c.enable_epoch = ?3)
+           AND c.decision = ?4 AND c.expiry_stop_state IS NULL
+           AND NOT EXISTS (SELECT 1 FROM module_consent_revocations r
+               WHERE r.module = c.module AND r.op IN (c.op, '*')
+                 AND r.generation >= c.generation)",
+    )
+    .bind(module)
+    .bind(op)
+    .bind(epoch)
+    .bind(decision_str(ConsentDecision::Granted))
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.iter().map(row_to_record).collect()
+}
+
+/// Writes, in `tx`, that the write `generation` ended `ended` for
+/// `module`'s `op` (`*`: every tool) at `ended_at`.
+pub(super) async fn write(
+    tx: &mut Tx<'_>,
+    module: &str,
+    op: &str,
+    ended: &[ModuleConsentRecord],
+    reason: GrantEndReason,
+    ended_at: &str,
+    generation: i64,
+) -> Result<()> {
+    let mut refs: Vec<String> = ended
+        .iter()
+        .map(ModuleConsentRecord::authorization_ref)
+        .collect();
+    refs.sort();
+    refs.dedup();
+    #[allow(
+        clippy::expect_used,
+        reason = "a Vec<String> always serializes to a JSON array of strings"
+    )]
+    let refs = serde_json::to_string(&refs).expect("references always serialize");
+    sqlx::query(
+        "INSERT INTO module_grant_end_notices
+            (module, op, authorization_refs, reason, ended_at, generation)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(module)
+    .bind(op)
+    .bind(refs)
+    .bind(reason.word())
+    .bind(ended_at)
+    .bind(generation)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn row_to_notice(row: &SqliteRow) -> Result<GrantEndNotice> {
+    let refs = serde_json::from_str(&row.get::<String, _>("authorization_refs")).map_err(|_| {
+        StoreError::Conflict("a stored grant end's references are malformed".to_owned())
+    })?;
+    Ok(GrantEndNotice {
+        id: row.get("id"),
+        module: row.get("module"),
+        op: row.get("op"),
+        authorization_refs: refs,
+        reason: GrantEndReason::parse(&row.get::<String, _>("reason"))?,
+        ended_at: row.get("ended_at"),
+        generation: row.get("generation"),
+    })
+}
+
+impl Store {
+    /// The ends not answered yet as of `now`, oldest first: a replacement's
+    /// or an epoch's at once, a revocation's once its route had its chance
+    /// ([`ROUTE_GRACE_MILLIS`] after it ended).
+    pub async fn pending_grant_end_notices(&self, now: &str) -> Result<Vec<GrantEndNotice>> {
+        let (now, _) = parse_instant(now)?;
+        let rows = sqlx::query(
+            "SELECT * FROM module_grant_end_notices WHERE stop_state IS NULL ORDER BY id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        let mut pending = Vec::new();
+        for row in &rows {
+            let notice = row_to_notice(row)?;
+            let routes = notice.reason == GrantEndReason::Revoked
+                && parse_instant(&notice.ended_at)
+                    .is_ok_and(|(ended, _)| now < ended + ROUTE_GRACE_MILLIS);
+            if !routes {
+                pending.push(notice);
+            }
+        }
+        Ok(pending)
+    }
+
+    /// The end the write `generation` wrote, if it wrote one: a
+    /// revocation's always.
+    pub async fn grant_end_notice(&self, generation: i64) -> Result<Option<GrantEndNotice>> {
+        sqlx::query("SELECT * FROM module_grant_end_notices WHERE generation = ?")
+            .bind(generation)
+            .fetch_optional(self.pool())
+            .await?
+            .as_ref()
+            .map(row_to_notice)
+            .transpose()
+    }
+
+    /// Records what the module answered to end `id`; the first answer
+    /// stands, so `false` when one was already recorded.
+    pub async fn record_grant_end_stop(&self, id: i64, stop_state: &str) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE module_grant_end_notices SET stop_state = ?
+             WHERE id = ? AND stop_state IS NULL",
+        )
+        .bind(stop_state)
+        .bind(id)
+        .execute(self.pool())
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests;
