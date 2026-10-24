@@ -78,7 +78,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post?: never;
+        /**
+         * Write the user's decision on a module tool's card
+         * @description The card's `fingerprint`, `module_version` and `artifact` must still be what the tool is checked against when the decision is written, and the module enabled and running (K1-6a-G §2.1). Replaces any earlier decision for the tool.
+         */
+        post: operations["decideModuleToolConsent"];
         /**
          * Revoke one module tool authorization
          * @description Persists revocation and broadcasts the 6a.3 revocation notice.
@@ -101,7 +105,7 @@ export interface paths {
         };
         /**
          * What a grant of one module tool would cover
-         * @description Built by the host from the tool's manifest declaration (risk, output privacy, resource kinds, reversible draft); the module's own description text is not shown. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
+         * @description Built by the host from the tool's manifest declaration (risk, output privacy, resource kinds, reversible draft); the module's own description text is not shown. `reversible_draft` is what the manifest declares, and the declaration relaxes nothing: a module tool's dispatch is gated with no draft exception. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
          */
         get: operations["getModuleToolCard"];
         put?: never;
@@ -2457,6 +2461,16 @@ export interface components {
             fingerprint: string;
             artifact: string;
         };
+        ModuleToolDecision: {
+            /** @enum {string} */
+            decision: "granted" | "denied";
+            fingerprint: string;
+            module_version: string;
+            artifact: string;
+            resources?: string[];
+            /** Format: date-time */
+            expires_at: string;
+        };
         ModuleAuthorizationRevocation: {
             module: string;
             tool: string | null;
@@ -2771,6 +2785,123 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ModuleAuthorizationRevocation"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    decideModuleToolConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModuleToolDecision"];
+            };
+        };
+        responses: {
+            /** @description The decision as written */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorization"];
+                };
+            };
+            /** @description `invalid_request`: the body is not JSON */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required; or `grants_closed`: the host has not opened decisions (`A24_MODULE_TOOL_GRANTS=1`), or the daemon is ephemeral */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No such module tool */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `protocol_too_old` or `no_package_identity`, as for the card; `card_changed`: the fingerprint, version or package identity is no longer the current one; `module_disabled` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is larger than the daemon accepts */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not sent as `application/json` */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not a decision (`decision`, `fingerprint`, `module_version` or `artifact` missing, a field of another type, or one not defined). `invalid_decision`: `expires_at` missing, null or not an RFC 3339 instant, an expiry already past or past the host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at most 90), more than 256 resources, a resource that is not `<kind>:<id>` of a kind the tool declares, or a denial naming resources */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Whether the module is enabled could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Authorization storage is temporarily unavailable */

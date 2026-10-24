@@ -204,6 +204,104 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+    post:
+      operationId: decideModuleToolConsent
+      x-milestone: K1-6a
+      tags: [tools]
+      summary: Write the user's decision on a module tool's card
+      description: >-
+        The card's `fingerprint`, `module_version` and `artifact` must still
+        be what the tool is checked against when the decision is written,
+        and the module enabled and running (K1-6a-G §2.1). Replaces any
+        earlier decision for the tool.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModuleToolDecision"
+      responses:
+        "200":
+          description: The decision as written
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorization"
+        "400":
+          description: "`invalid_request`: the body is not JSON"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: >-
+            Host authority required; or `grants_closed`: the host has not
+            opened decisions (`A24_MODULE_TOOL_GRANTS=1`), or the daemon is
+            ephemeral
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No such module tool
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `protocol_too_old` or `no_package_identity`, as for the card;
+            `card_changed`: the fingerprint, version or package identity is
+            no longer the current one; `module_disabled`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: >-
+            `invalid_request`: the body is not a decision (`decision`,
+            `fingerprint`, `module_version` or `artifact` missing, a field of
+            another type, or one not defined). `invalid_decision`:
+            `expires_at` missing, null or not an RFC 3339 instant, an expiry
+            already past or past the
+            host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at
+            most 90), more than 256 resources, a resource that is not
+            `<kind>:<id>` of a kind the tool declares, or a denial naming
+            resources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "`invalid_request`: the body is larger than the daemon accepts"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: "`invalid_request`: the body is not sent as `application/json`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Whether the module is enabled could not be read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /module-consents/modules/{module}/tools/{tool}/card:
     parameters:
@@ -225,9 +323,11 @@ paths:
       description: >-
         Built by the host from the tool's manifest declaration (risk, output
         privacy, resource kinds, reversible draft); the module's own
-        description text is not shown. `fingerprint`, `module_version` and
-        `artifact` are what a grant must repeat, and what dispatch compares
-        it with (K1-6a-G §2.1).
+        description text is not shown. `reversible_draft` is what the
+        manifest declares, and the declaration relaxes nothing: a module
+        tool's dispatch is gated with no draft exception.
+        `fingerprint`, `module_version` and `artifact` are what a grant must
+        repeat, and what dispatch compares it with (K1-6a-G §2.1).
       responses:
         "200":
           description: The tool's card
@@ -4682,6 +4782,21 @@ components:
           items: { type: string }
         fingerprint: { type: string }
         artifact: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+
+    ModuleToolDecision:
+      type: object
+      required: [decision, fingerprint, module_version, artifact, expires_at]
+      additionalProperties: false
+      properties:
+        decision: { type: string, enum: [granted, denied] }
+        fingerprint: { type: string }
+        module_version: { type: string }
+        artifact: { type: string }
+        resources:
+          type: array
+          maxItems: 256
+          items: { type: string }
+        expires_at: { type: string, format: date-time }
 
     ModuleAuthorizationRevocation:
       type: object

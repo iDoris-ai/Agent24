@@ -90,12 +90,24 @@ impl Drop for Daemon {
     }
 }
 
-fn start(home: &Path) -> Daemon {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
+fn daemon(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
+        .envs(env.iter().copied())
         .args(["serve", "--port", "0"])
+        .args(args);
+    command
+}
+
+fn start(home: &Path) -> Daemon {
+    start_with(home, &[], &[])
+}
+
+fn start_with(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Daemon {
+    let mut child = daemon(home, env, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -123,12 +135,18 @@ fn start(home: &Path) -> Daemon {
 }
 
 fn get(d: &Daemon, path: &str) -> (u16, serde_json::Value) {
+    send(d, "GET", path, "")
+}
+
+fn send(d: &Daemon, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     let mut s = TcpStream::connect(("127.0.0.1", d.port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     write!(
         s,
-        "GET {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\nconnection: close\r\n\r\n",
-        d.token
+        "{method} {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        d.token,
+        body.len()
     )
     .unwrap();
     let mut raw = String::new();
@@ -139,22 +157,28 @@ fn get(d: &Daemon, path: &str) -> (u16, serde_json::Value) {
 }
 
 const CARD: &str = "/api/v1/module-consents/modules/noted/tools/list-notes/card";
+const DECIDE: &str = "/api/v1/module-consents/modules/noted/tools/list-notes";
+
+/// The card, once the module runs: before then there is none (409).
+fn running_card(d: &Daemon) -> serde_json::Value {
+    let by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, body) = get(d, CARD);
+        if status == 200 {
+            return body;
+        }
+        assert_eq!(status, 409, "{body}");
+        assert!(Instant::now() < by, "the module never ran: {body}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 #[test]
 fn a_card_carries_the_running_package_identity() {
     let home = tempfile::tempdir().unwrap();
     install(home.path());
     let d = start(home.path());
-    let by = Instant::now() + Duration::from_secs(30);
-    let card = loop {
-        let (status, body) = get(&d, CARD);
-        if status == 200 {
-            break body;
-        }
-        assert_eq!(status, 409, "{body}");
-        assert!(Instant::now() < by, "the module never ran: {body}");
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let card = running_card(&d);
     let package = home.path().join(".agent24/packages/noted");
     assert_eq!(
         card["artifact"],
@@ -182,4 +206,104 @@ fn a_card_carries_the_running_package_identity() {
         (status, &body["error"]["code"]),
         (409, &serde_json::json!("no_package_identity"))
     );
+}
+
+/// K1-6a-G §2.1 through the real binary: with the host switch on, a
+/// decision made on the card is written, and one on a card that is no
+/// longer current is not.
+#[test]
+fn a_decision_on_the_running_card_is_written() {
+    let home = tempfile::tempdir().unwrap();
+    install(home.path());
+    let d = start_with(home.path(), &[("A24_MODULE_TOOL_GRANTS", "1")], &[]);
+    let card = running_card(&d);
+    let decision = |fingerprint: &serde_json::Value| {
+        serde_json::json!({
+            "decision": "granted",
+            "fingerprint": fingerprint,
+            "module_version": card["module_version"],
+            "artifact": card["artifact"],
+            "resources": ["note:n1"],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339(),
+        })
+        .to_string()
+    };
+    // A field the request does not define is refused, not ignored.
+    let mut extra: serde_json::Value =
+        serde_json::from_str(&decision(&card["fingerprint"])).unwrap();
+    extra["scope"] = "everything".into();
+    let (status, body) = send(&d, "POST", DECIDE, &extra.to_string());
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (422, &"invalid_request".into())
+    );
+    let (status, body) = send(&d, "POST", DECIDE, &decision(&"sha256:other".into()));
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (409, &"card_changed".into())
+    );
+    let (_, list) = get(&d, "/api/v1/module-consents");
+    assert_eq!(list["authorizations"], serde_json::json!([]));
+    let (status, body) = send(&d, "POST", DECIDE, &decision(&card["fingerprint"]));
+    assert_eq!(
+        (status, &body["status"]),
+        (200, &"granted".into()),
+        "{body}"
+    );
+    let (_, list) = get(&d, "/api/v1/module-consents");
+    let written = &list["authorizations"][0];
+    assert_eq!(written["status"], "granted", "{list}");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(written["expires_at"].as_str().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let from_now = expires_at - chrono::Utc::now();
+    assert!(
+        from_now > chrono::Duration::days(6) && from_now <= chrono::Duration::days(7),
+        "{written}"
+    );
+}
+
+/// F6: an ephemeral daemon, whose store does not outlive it, takes no
+/// decision even with the switch on.
+#[test]
+fn an_ephemeral_daemon_takes_no_decision() {
+    let home = tempfile::tempdir().unwrap();
+    let d = start_with(
+        home.path(),
+        &[("A24_MODULE_TOOL_GRANTS", "1")],
+        &["--ephemeral"],
+    );
+    let (status, body) = send(&d, "POST", DECIDE, "{}");
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (403, &"grants_closed".into())
+    );
+}
+
+/// Criterion 14: a host bound past 90 days stops the start.
+#[test]
+fn a_bound_past_ninety_days_stops_the_start() {
+    let home = tempfile::tempdir().unwrap();
+    let mut child = daemon(home.path(), &[("A24_MODULE_GRANT_MAX_DAYS", "91")], &[])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A daemon that took the bound would serve until killed: wait for its
+    // exit only so long, not for ever.
+    let by = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > by {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the daemon started with a 91-day bound");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty(), "no ready line");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("A24_MODULE_GRANT_MAX_DAYS"), "{stderr}");
 }
