@@ -377,6 +377,26 @@ impl WriteGate {
                                 && audit_row.get::<String, _>("origin_trust") == "system"
                                 && body_matches;
                             if audit_matches {
+                                // K1-6b.4b: an identical re-assert still records
+                                // the provenance it was proposed with. The caller
+                                // passes one at least as strict as the stored one.
+                                let stored_source_ref = row
+                                    .get::<Option<String>, _>("source_ref")
+                                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+                                if c.source_ref.is_some() && c.source_ref != stored_source_ref {
+                                    sqlx::query(
+                                        "UPDATE mem_assertions SET source_ref = ? WHERE id = ?",
+                                    )
+                                    .bind(
+                                        c.source_ref
+                                            .as_ref()
+                                            .map(serde_json::to_string)
+                                            .transpose()?,
+                                    )
+                                    .bind(&c.id)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                }
                                 tx.commit().await?;
                                 return Ok(CommitStatus::Committed);
                             }
@@ -550,6 +570,27 @@ mod tests {
             .unwrap();
         assert_eq!(d, vec![WriteDecision::Committed("c1".into())]);
         assert_eq!(recall(&kv, "u1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_identical_reassert_records_its_new_source_reference() {
+        let (kv, gate) = gate().await;
+        let first = json!({"classification": "ordinary"});
+        let second = json!({"classification": "restricted"});
+        for source in [&first, &second] {
+            gate.propose(vec![
+                cand("c_again", "u1", "fact", Trust::UserSaid)
+                    .with_source_ref(source.clone())
+                    .remember(),
+            ])
+            .await
+            .unwrap();
+        }
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&second));
+        // Still one commit audit: the re-assert is the idempotent path.
+        assert_eq!(audits(&kv, "u1").await.len(), 1);
     }
 
     #[tokio::test]
