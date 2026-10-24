@@ -56,7 +56,7 @@ export const appMessages = defineMessages({
     'nav.voice': 'เสียง', 'nav.creative': 'Design', 'nav.models': 'โมเดล',
     'nav.modules-manager': 'โมดูล', 'nav.memory': 'ความจำ', 'nav.settings': 'ตั้งค่า',
     'title.chat': 'แชท', 'title.workbench': 'โต๊ะทำงาน', 'title.documents': 'เอกสาร',
-    'title.runs': 'งานที่รัน', 'title.schedules': 'ตารางเวลา', 'title.communication': 'ภาพรวมการสื่อสาร',
+    'title.runs': 'งานที่รัน', 'title.schedules': 'ตารางเวลา', 'title.communication': 'การสื่อสาร',
     'title.approvals': 'รอการอนุมัติ', 'title.voice': 'เสียง', 'title.creative': 'Design',
     'title.models': 'จัดการโมเดล', 'title.modules-manager': 'จัดการโมดูล',
     'title.memory': 'ความจำ', 'title.settings': 'ตั้งค่า',
