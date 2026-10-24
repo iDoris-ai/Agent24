@@ -33,6 +33,8 @@ enum Script {
     Respond(Vec<u8>),
     /// Write nothing; wait until the client closes.
     Stall,
+    /// Write nothing; reset the connection (RST, not FIN).
+    Reset,
     /// Write `head`, then `chunk` every `every` until a write fails.
     Drip {
         head: Vec<u8>,
@@ -109,6 +111,12 @@ async fn serve(
             let mut buf = [0u8; 256];
             while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
             let _ = closed_tx.send(());
+        }
+        Script::Reset => {
+            // A zero linger makes the close send RST.
+            #[allow(deprecated)]
+            stream.set_linger(Some(Duration::ZERO)).unwrap();
+            drop(stream);
         }
         Script::Drip { head, chunk, every } => {
             if stream.write_all(&head).await.is_err() {
@@ -503,6 +511,39 @@ async fn closed_port_is_unreachable() {
         .await
         .unwrap_err();
     assert_eq!(err, TransportError::Unreachable);
+}
+
+/// The server took the request and closed before any response head: it broke
+/// before a response, so `Unreachable`, and the request is not sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_before_the_head_is_unreachable() {
+    let mut stub = Stub::start(Script::Respond(Vec::new())).await;
+    let err = bounded(stub.transport(api_key()).send(
+        KnowledgeOperation::Search,
+        b"{}".to_vec(),
+        LONG,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(err, TransportError::Unreachable);
+    assert!(stub.requests.try_recv().is_ok());
+    assert_eq!(stub.conns.load(Ordering::SeqCst), 1);
+}
+
+/// A reset is an I/O error rather than an early EOF, and is `Unreachable` too.
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_before_the_head_is_unreachable() {
+    let mut stub = Stub::start(Script::Reset).await;
+    let err = bounded(stub.transport(api_key()).send(
+        KnowledgeOperation::Search,
+        b"{}".to_vec(),
+        LONG,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(err, TransportError::Unreachable);
+    assert!(stub.requests.try_recv().is_ok());
+    assert_eq!(stub.conns.load(Ordering::SeqCst), 1);
 }
 
 /// reqwest's `connect_timeout` covers the TLS handshake, so a server that
