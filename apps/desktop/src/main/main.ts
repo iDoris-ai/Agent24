@@ -219,7 +219,12 @@ process.on('unhandledRejection', (reason) => {
 // daemon's singleton lock; a second launch brings the first window forward.
 const isPrimaryInstance = app.requestSingleInstanceLock()
 if (!isPrimaryInstance) app.quit()
-app.on('second-instance', () => showOrCreateWindow())
+// Until whenReady below has created the first window (after the CSP hook and
+// IPC handlers are in place), a second launch has nothing to bring forward and
+// must not create a window of its own.
+app.on('second-instance', () => {
+  if (mainWin) showOrCreateWindow()
+})
 
 app.whenReady().then(async () => {
   if (!isPrimaryInstance) return

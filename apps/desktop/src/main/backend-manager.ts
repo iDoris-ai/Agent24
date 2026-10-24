@@ -538,7 +538,9 @@ export class BackendManager {
         // this re-check, that self-spawned child would just get killed and
         // re-spawned forever every MAX_HEALTH_FAILURES ticks, even once the
         // real (CLI-owned) daemon is up and healthy. Only fall back to
-        // spawning our own when the external daemon is still not reachable.
+        // spawning our own when no daemon answers at all: a capability-mode
+        // daemon of another host (`foreign`) parks this manager in `blocked`
+        // instead, so the same loop cannot start there either.
         if ((await this.tryReuseExternal()) === 'none') {
           this.spawnChild()
         }
