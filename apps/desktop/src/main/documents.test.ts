@@ -136,7 +136,8 @@ describe('httpSender', () => {
     const send = httpSender(() => ({ port, authHeaders: { Authorization: 'Bearer t0k' } }))
     const reply = await send(
       { method: 'POST', path: `/api/v1/documents/jobs/${JOB}/cancel` },
-      { headers: { 'Content-Type': 'application/octet-stream' }, body: Buffer.from([1, 2, 3]) },
+      // A caller's own Authorization never displaces main's credential.
+      { headers: { 'Content-Type': 'application/octet-stream', Authorization: 'Bearer forged' }, body: Buffer.from([1, 2, 3]) },
     )
     expect(toResponse(reply)).toEqual({ ok: false, status: 404, error: { code: 'not_found', message: 'no such job' } })
     expect(seen).toEqual([

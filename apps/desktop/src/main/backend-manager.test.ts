@@ -367,6 +367,49 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     manager.stop()
   })
 
+  it('the health tick probes the current port', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const checkHealth = vi.fn().mockResolvedValue(true)
+    const external: ExternalDaemonSource = { read: () => null, checkHealth }
+    const manager = new BackendManager({ external, spawnProcess: () => childAnnouncing({ port: 4102, token: 't' }) })
+    await manager.start()
+    await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
+    await (manager as unknown as { tick(): Promise<void> }).tick()
+    expect(checkHealth).toHaveBeenLastCalledWith({ port: 4102 })
+    manager.stop()
+  })
+
+  it('no credential outlives its daemon: exit, error, restart and stop all clear it', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const children: ChildProcess[] = []
+    const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
+    const manager = new BackendManager({
+      external,
+      spawnProcess: () => {
+        const child = childAnnouncing({ port: 4200 + children.length, token: `t${children.length}` })
+        children.push(child)
+        return child
+      },
+    })
+    await manager.start()
+    await vi.waitFor(() => expect(daemonConnection()).not.toBeNull())
+
+    children[0].emit('exit', 1)
+    expect(daemonConnection()).toBeNull()
+
+    manager.restart()
+    await vi.waitFor(() => expect(daemonConnection()?.port).toBe(4201))
+    children[1].emit('error', new Error('spawn failed'))
+    expect(daemonConnection()).toBeNull()
+
+    manager.restart()
+    expect(daemonConnection()).toBeNull()
+    await vi.waitFor(() => expect(daemonConnection()?.port).toBe(4202))
+
+    manager.stop()
+    expect(daemonConnection()).toBeNull()
+  })
+
   it('the node mock takes no credential and is still reachable', async () => {
     process.env['AGENT24_BACKEND'] = 'node'
     const manager = await startWith({ port: 8765 })

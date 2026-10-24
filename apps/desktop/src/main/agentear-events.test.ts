@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
+import { daemonConnection } from './backend-manager'
 import {
   parseAgentEarFrame,
   parseModelCallFrame,
@@ -174,7 +175,7 @@ const FakeWebSocket = vi.hoisted(() => {
 
 vi.mock('ws', () => ({ default: FakeWebSocket }))
 vi.mock('./backend-manager', () => ({
-  daemonConnection: () => ({ port: 12345, authHeaders: { Authorization: 'Bearer test-token' } }),
+  daemonConnection: vi.fn(() => ({ port: 12345, authHeaders: { Authorization: 'Bearer test-token' } })),
 }))
 
 describe('AgentEarEventBridge connects with main\'s daemon credential (KB-HOST-01 PR-A1)', () => {
@@ -184,6 +185,14 @@ describe('AgentEarEventBridge connects with main\'s daemon credential (KB-HOST-0
     const socket = (bridge as unknown as { socket: FakeWebSocket }).socket
     expect(socket.url).toBe('ws://127.0.0.1:12345/api/v1/events')
     expect(socket.opts).toEqual({ headers: { Authorization: 'Bearer test-token' } })
+    bridge.stop()
+  })
+
+  it('opens no socket while there is no connection', () => {
+    vi.mocked(daemonConnection).mockReturnValueOnce(null)
+    const bridge = new AgentEarEventBridge(() => {})
+    bridge.start()
+    expect((bridge as unknown as { socket: FakeWebSocket | null }).socket).toBeNull()
     bridge.stop()
   })
 })
