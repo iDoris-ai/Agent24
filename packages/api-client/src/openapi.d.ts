@@ -2443,7 +2443,7 @@ export interface components {
             /** @enum {string} */
             status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";
             /**
-             * @description Only for a revoked one: whether the module said it stopped the work the grant started (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded, as for a revocation made outside this daemon.
+             * @description Only for a revoked one, or an expired grant: whether the module said it stopped the work the grant started when told it ended (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded, as for a revocation made outside this daemon or an expiry not yet told.
              * @enum {string}
              */
             stop?: "confirmed" | "unconfirmed" | "not_running";

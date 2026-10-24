@@ -105,7 +105,16 @@ async fn authorization_views(state: &AppState) -> Result<Vec<AuthorizationView>,
             agent24_store::ConsentLookup::Stale(_) => "stale",
             agent24_store::ConsentLookup::NotGranted => "not_granted",
         };
+        let granted = record.decision == agent24_store::ConsentDecision::Granted;
         let mut view = view(record, status);
+        if status == "expired" && granted {
+            let stop = state
+                .store
+                .expiry_stop_state(&view.module, &view.tool)
+                .await
+                .map_err(|err| Box::new(storage_error("resolve_stop", err)))?;
+            view.stop = Some(stop.unwrap_or_else(|| "unconfirmed".to_owned()));
+        }
         if status == "revoked" {
             let stop = state
                 .store

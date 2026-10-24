@@ -735,6 +735,77 @@ impl Store {
         Ok(state.flatten())
     }
 
+    /// The grants that expired at or before `now` whose module was not yet
+    /// told (K1-6a-G §2.5), and the earliest expiry still ahead. Expiry is
+    /// judged as [`Self::lookup_module_consent`] judges it; a grant a
+    /// revocation already covers was told by that revocation.
+    pub async fn due_expiry_notices(
+        &self,
+        now: &str,
+    ) -> Result<(Vec<ModuleConsentRecord>, Option<String>)> {
+        let (now_millis, _) = parse_instant(now)?;
+        let rows = sqlx::query(
+            "SELECT c.* FROM module_consents c
+             WHERE c.decision = ? AND c.expiry_stop_state IS NULL
+               AND NOT EXISTS (SELECT 1 FROM module_consent_revocations r
+                   WHERE r.module = c.module AND r.op IN (c.op, '*')
+                     AND r.generation >= c.generation)",
+        )
+        .bind(decision_str(ConsentDecision::Granted))
+        .fetch_all(self.pool())
+        .await?;
+        let mut due = Vec::new();
+        let mut next: Option<(i64, String)> = None;
+        for row in &rows {
+            let record = row_to_record(row)?;
+            match parse_instant(&record.expires_at) {
+                Ok((expiry, _)) if expiry >= now_millis => {
+                    if next.as_ref().is_none_or(|(at, _)| expiry < *at) {
+                        next = Some((expiry, record.expires_at.clone()));
+                    }
+                }
+                _ => due.push(record),
+            }
+        }
+        Ok((due, next.map(|(_, at)| at)))
+    }
+
+    /// Records what the module answered when told grant `generation` of
+    /// `(module, op)` expired. A later decision of the same key has replaced
+    /// the row, so nothing is written and `false` returned.
+    pub async fn record_expiry_stop(
+        &self,
+        module: &str,
+        op: &str,
+        generation: i64,
+        stop_state: &str,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE module_consents SET expiry_stop_state = ?
+             WHERE module = ? AND op = ? AND generation = ?",
+        )
+        .bind(stop_state)
+        .bind(module)
+        .bind(op)
+        .bind(generation)
+        .execute(self.pool())
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// What the module answered when told `(module, op)`'s grant expired;
+    /// `None` when it was not told yet (read as unconfirmed).
+    pub async fn expiry_stop_state(&self, module: &str, op: &str) -> Result<Option<String>> {
+        let state: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT expiry_stop_state FROM module_consents WHERE module = ? AND op = ?",
+        )
+        .bind(module)
+        .bind(op)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(state.flatten())
+    }
+
     /// Lifecycle invalidation for disable/uninstall/package replacement. The
     /// operation is deliberately best-effort at call sites that already have
     /// an established lifecycle result; failures are returned for logging.
@@ -862,7 +933,8 @@ impl Store {
                 resources = excluded.resources,
                 artifact = excluded.artifact,
                 generation = excluded.generation,
-                enable_epoch = excluded.enable_epoch
+                enable_epoch = excluded.enable_epoch,
+                expiry_stop_state = NULL
              RETURNING *",
         )
         .bind(&summary.module)
@@ -1080,6 +1152,118 @@ mod tests {
     }
 
     // ── reverse case: ADR反例 1 — 未确认不可调用 ────────────────────────────
+
+    /// K1-6a-G §2.5: an expired grant is due for a notice until its answer
+    /// is recorded, against that grant only; a refusal, or a grant a
+    /// revocation covers, never is. The next expiry ahead is given.
+    #[tokio::test]
+    async fn an_expired_grant_is_due_for_one_notice() {
+        let store = Store::open_memory().await.unwrap();
+        let millis = |at: &str| consent_instant_millis(at).unwrap();
+        let granted = store
+            .grant_module_consent(
+                &summary("docs"),
+                "2026-10-24T00:00:00Z",
+                "2026-10-24T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut later = summary("docs");
+        later.op = "later".to_owned();
+        store
+            .grant_module_consent(&later, "2026-10-24T00:00:00Z", "2026-10-24T05:00:00Z")
+            .await
+            .unwrap();
+        let mut refused = summary("docs");
+        refused.op = "other".to_owned();
+        store
+            .deny_module_consent(&refused, "2026-10-24T00:00:00Z", "2026-10-24T00:30:00Z")
+            .await
+            .unwrap();
+        let (due, next) = store
+            .due_expiry_notices("2026-10-24T01:00:00Z")
+            .await
+            .unwrap();
+        assert!(due.is_empty(), "valid until the instant itself");
+        assert_eq!(millis(&next.unwrap()), millis("2026-10-24T01:00:00Z"));
+        let (due, next) = store
+            .due_expiry_notices("2026-10-24T02:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(millis(&next.unwrap()), millis("2026-10-24T05:00:00Z"));
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            (due[0].op.as_str(), due[0].generation),
+            ("read_doc", granted.generation)
+        );
+        assert_eq!(
+            store
+                .expiry_stop_state("documenting", "read_doc")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            store
+                .record_expiry_stop("documenting", "read_doc", granted.generation, "unconfirmed")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .due_expiry_notices("2026-10-24T02:00:00Z")
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .expiry_stop_state("documenting", "read_doc")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("unconfirmed")
+        );
+        let regranted = store
+            .grant_module_consent(
+                &summary("docs"),
+                "2026-10-24T02:00:00Z",
+                "2026-10-24T03:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .expiry_stop_state("documenting", "read_doc")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            !store
+                .record_expiry_stop("documenting", "read_doc", granted.generation, "confirmed")
+                .await
+                .unwrap()
+        );
+        let (due, _) = store
+            .due_expiry_notices("2026-10-24T04:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(due[0].generation, regranted.generation);
+        store
+            .revoke_module_consent("documenting", None, "2026-10-24T03:30:00Z")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .due_expiry_notices("2026-10-24T04:00:00Z")
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
 
     /// K1-6a-G §2.5: a stop answer is recorded against the revocation it
     /// answers, never a later one of the same key, which starts with none.
