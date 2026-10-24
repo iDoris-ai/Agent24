@@ -237,6 +237,19 @@ describe('KnowledgeLoginStore (KB-HOST-01 PR-B2a)', () => {
     expect(store.list().get('b1')).toEqual(login('RELOGIN'))
   })
 
+  it('keeps what the put was called with, even when the caller changes it afterwards', async () => {
+    const store = new KnowledgeLoginStore(dir, fakeBox(), 'darwin')
+    store.load()
+    const value = login('CALLED')
+    const putting = store.put('b1', value)
+    value.material = 'CHANGED'
+    await putting
+    expect(store.list().get('b1')).toEqual(login('CALLED'))
+    const again = new KnowledgeLoginStore(dir, fakeBox(), 'darwin')
+    again.load()
+    expect(again.list().get('b1')).toEqual(login('CALLED'))
+  })
+
   it('never logs the material', async () => {
     const spies = (['log', 'warn', 'error', 'info', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}))
     fs.writeFileSync(file(), 'garbage')

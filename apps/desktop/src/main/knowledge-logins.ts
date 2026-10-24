@@ -109,16 +109,19 @@ export class KnowledgeLoginStore {
   }
 
   /** Adds or replaces the login of `bindingId` once it is on disk. Rejected,
-   * and without effect, when the binding is marked unusable or removed after
-   * this call (the write queued by that tightening then fixes the disk). */
+   * and kept out of memory, when the binding is marked unusable or removed
+   * after this call. If the put was already written by then, the write queued
+   * by that tightening fixes the disk; should that write fail, the disk lags
+   * memory until the next write, as after any failed tightening. */
   put(bindingId: string, login: KnowledgeLogin): Promise<void> {
     const since = this.clock
     const superseded = () => (this.tightened.get(bindingId) ?? 0) > since
+    const value = { ...login }
     return this.enqueue(async () => {
       if (superseded()) throw new Error('Knowledge login superseded by a later change')
-      await this.write(new Map(this.logins).set(bindingId, { ...login }))
+      await this.write(new Map(this.logins).set(bindingId, value))
       if (superseded()) throw new Error('Knowledge login superseded by a later change')
-      this.logins.set(bindingId, { ...login })
+      this.logins.set(bindingId, value)
     })
   }
 
