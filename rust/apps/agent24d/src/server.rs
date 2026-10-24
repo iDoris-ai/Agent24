@@ -3918,6 +3918,9 @@ pub(crate) mod tests {
         );
         let (status, _) = post(&router, DECIDE, "{".to_owned()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        let not_text = decision(&summary, serde_json::json!({ "resources": ["doc:a1", 5] }));
+        let (status, _) = post(&router, DECIDE, not_text).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let in_days = |days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339();
         let many: Vec<String> = (0..257).map(|i| format!("doc:d{i}")).collect();
         for patch in [
@@ -4068,7 +4071,14 @@ pub(crate) mod tests {
     async fn module_consent_routes_reject_creative_identity() {
         let (state, _host, creative) = capability_state().await;
         let state_again = state.clone();
-        let state_post = state.clone();
+        // Decisions open, so only the host-authority check can answer 403.
+        let state_post = AppState {
+            module_grants: Some(crate::consent_routes::GrantSettings {
+                max_days: 30,
+                os_config: "/nonexistent/os.json".into(),
+            }),
+            ..state.clone()
+        };
         let router = build_router(state);
         let response = router
             .oneshot(

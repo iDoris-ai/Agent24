@@ -426,7 +426,7 @@ pub async fn decide(
     let request = match body {
         Ok(Json(request)) => request,
         Err(why) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_request", &why.body_text());
+            return error_response(why.status(), "invalid_request", &why.body_text());
         }
     };
     let now = Utc::now();
