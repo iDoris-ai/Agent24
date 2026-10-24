@@ -398,9 +398,16 @@ describe('DocumentsPage: cancel and retry', () => {
     fireEvent.click(screen.getByRole('button', IMPORT))
     await tick(2200)
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('storage_unavailable：corrupt'))
-    answer(m, [() => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' }))], { cancelJob: () => ok(job('cancelling')) })
+    let answered: () => void = () => {}
+    answer(m, [() => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' }))], {
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: job('cancelling') }))),
+    })
     fireEvent.click(screen.getByRole('button', CANCEL))
+    fireEvent.click(screen.getByRole('button', IMPORT)) // not while the cancel is on its way
+    expect(m.importFile).toHaveBeenCalledTimes(1)
+    await act(async () => answered())
     await waitFor(() => expect(screen.getByText('取消中')).toBeInTheDocument())
+    expect(screen.getByRole('button', IMPORT)).toBeDisabled() // following again
     await tick(1100)
     await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
     expect(screen.getByRole('button', RETRY)).toBeInTheDocument()
@@ -486,13 +493,16 @@ describe('DocumentsPage: cancel and retry', () => {
     await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
   })
 
-  it('a cancel answering after another import started leaves that import shown', async () => {
+  it.each([
+    ['answers', (): Promise<Res> => ok(attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }))],
+    ['fails', (): Promise<Res> => err(503, 'storage_unavailable', 'storage is not available')],
+  ])('a cancel that %s after another import started leaves that import shown', async (_, late) => {
     const m = mount({})
     m.importFile.mockImplementation(() => ok(job('queued')))
     let answered: () => void = () => {}
     answer(m, [() => ok(job('interrupted')), () => ok(attempt('running', 2)), () => ok(attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }))], {
       retryJob: () => ok(attempt('queued', 2)),
-      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }) }))),
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r(late()))),
     })
     render(<DocumentsPage />)
     fireEvent.click(screen.getByRole('button', IMPORT))
@@ -512,6 +522,7 @@ describe('DocumentsPage: cancel and retry', () => {
     await tick(1100)
     expect(screen.getByText('已导入')).toBeInTheDocument()
     expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('an import is counted once, whether its success is first heard from a read or from a cancel', async () => {
