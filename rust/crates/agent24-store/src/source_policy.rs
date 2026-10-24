@@ -896,8 +896,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_floor_merges_never_lose_the_strictest() {
-        let store = Store::open_memory().await.unwrap();
-        let merges = (0..16).map(|i| {
+        // A file database: `open_memory` has one connection, which would
+        // serialize the merges and hide a missing write lock.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("floor.db")).await.unwrap();
+        let merges = (0..64).map(|i| {
             let store = store.clone();
             tokio::spawn(async move {
                 let own = if i == 7 {
