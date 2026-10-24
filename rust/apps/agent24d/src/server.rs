@@ -2409,6 +2409,13 @@ pub async fn serve(
             .unwrap_or_default(),
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
+    // K1-6a-G §2.5 (A5b): told once the modules run, so a grant that
+    // expired while the daemon was down reaches the run that is up now.
+    tokio::spawn(crate::grant_expiry::run(
+        state.store.clone(),
+        module_tool_cards.notice.clone(),
+        cancel.child_token(),
+    ));
     state.module_tool_cards = Some(module_tool_cards);
     state.module_grants = module_grants;
     state.shutdown_report = Arc::new(report);
@@ -3895,6 +3902,73 @@ pub(crate) mod tests {
         grant().await.unwrap();
         let views = authorization_list(store.clone()).await;
         assert!(views["authorizations"][0].get("stop").is_none(), "{views}");
+    }
+
+    /// K1-6a-G §2.5 (A5b): an expired grant lists what its module answered
+    /// when told it ended; one not told yet reads unconfirmed. An expired
+    /// refusal started nothing to stop.
+    #[tokio::test]
+    async fn an_expired_grant_lists_whether_the_module_stopped() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let summary = |op: &str| {
+            agent24_store::ToolPermissionSummary::new(
+                "doc-module",
+                op,
+                "1.2.3",
+                agent24_store::ConsentSource::FirstParty,
+                Some("local documents".to_owned()),
+                None,
+                None,
+                agent24_store::HostRiskLevel::Low,
+            )
+        };
+        let (decided, expired) = ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+        let granted = store
+            .grant_module_consent(&summary("read_document"), decided, expired)
+            .await
+            .unwrap();
+        store
+            .deny_module_consent(&summary("write_document"), decided, expired)
+            .await
+            .unwrap();
+        let stops = |list: serde_json::Value| {
+            list["authorizations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| (a["tool"].clone(), a["status"].clone(), a["stop"].clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stops(authorization_list(store.clone()).await),
+            [
+                (
+                    "read_document".into(),
+                    "expired".into(),
+                    "unconfirmed".into()
+                ),
+                (
+                    "write_document".into(),
+                    "expired".into(),
+                    serde_json::Value::Null
+                ),
+            ]
+        );
+        assert!(
+            store
+                .record_expiry_stop(
+                    "doc-module",
+                    "read_document",
+                    granted.generation,
+                    "confirmed"
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            stops(authorization_list(store).await)[0].2,
+            serde_json::json!("confirmed")
+        );
     }
 
     async fn authorization_list(store: agent24_store::Store) -> serde_json::Value {
