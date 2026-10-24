@@ -1,7 +1,6 @@
 use super::*;
-use agent24_memory::event::{Origin, Scope, Trust};
-use agent24_memory::writer::{Candidate, MemoryWriter, WriteDecision};
-use agent24_store::{MessageOrigin, MessageOriginLookup};
+use agent24_memory::event::{Origin, Trust};
+use agent24_store::{MessageOrigin, MessageOriginLookup, OriginatedRunMessage};
 use sqlx::Row;
 
 const UNPROVEN_MESSAGE: &str = "无法证明本线程已落盘消息的来源，已停止发送。请新建会话。不要自动复制旧 recall 或待执行工具。";
@@ -24,29 +23,6 @@ async fn wait_settled(manager: &RunManager, store: &Store, run_id: &str) -> Run 
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("execute still holds the cancel token for {run_id}");
-}
-
-async fn remember(kv: &agent24_memory::KvStore, id: &str, object: &str) {
-    let decision = kv
-        .write_gate()
-        .propose(vec![
-            Candidate::new(
-                id,
-                Scope::owner("test-owner"),
-                "user",
-                "said_to_remember",
-                serde_json::json!(object),
-                Origin {
-                    source: "test".into(),
-                    trust: Trust::UserSaid,
-                },
-            )
-            .with_evidence(vec![format!("evidence-{id}")])
-            .remember(),
-        ])
-        .await
-        .unwrap();
-    assert!(matches!(decision[0], WriteDecision::Committed(_)));
 }
 
 async fn insert_grant(store: &Store, run_id: &str) {
@@ -135,58 +111,67 @@ async fn null_host_recall_does_not_call_the_provider() {
     let provider = Arc::new(RecordingProvider {
         seen: StdMutex::new(vec![]),
     });
-    let (manager, store, kv) =
-        manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
-    remember(&kv, "peanut", "我对花生过敏").await;
-    remember(&kv, "duck", "我喜欢北京烤鸭").await;
-    let run = manager
-        .start_run(RunCreate {
-            session_id: None,
-            workspace_id: None,
-            prompt: "花生 烤鸭".into(),
-            model_override: None,
-            mode: RunMode::Normal,
-        })
+    let (manager, _, store) = manager_with(provider.clone()).await;
+    let run = manager.start_run(create()).await.unwrap();
+    assert_eq!(
+        wait_terminal(&store, &run.id).await.status,
+        RunStatus::Completed
+    );
+    store
+        .append_originated_run_messages(
+            &run.id,
+            &[OriginatedRunMessage {
+                message: agent24_store::PendingRunMessage {
+                    role: "system".into(),
+                    content: Some("planted null recall".into()),
+                    tool_calls: serde_json::json!([]),
+                    tool_call_id: None,
+                },
+                origin: MessageOrigin::HostRecall { recall_ref: None },
+            }],
+            &now_iso8601(),
+        )
         .await
         .unwrap();
-    insert_grant(&store, &run.id).await;
-    let done = wait_settled(&manager, &store, &run.id).await;
-    assert_eq!(done.status, RunStatus::Failed);
-    assert_eq!(done.error, Some(unproven_body()));
-    assert!(provider.seen.lock().unwrap().is_empty());
-    let thread = store.list_run_messages(&run.id).await.unwrap();
-    assert_eq!(thread.len(), 2);
-    let recall = thread[0].content.as_deref().unwrap();
-    assert!(recall.contains("id=peanut") && recall.contains("id=duck"), "{recall}");
-    assert_eq!(thread[1].content.as_deref(), Some("花生 烤鸭"));
-    assert!(!thread.iter().any(|row| row.content.as_deref() == Some("pong")));
+    let before = store.list_run_messages(&run.id).await.unwrap();
+    let planted = before
+        .iter()
+        .find(|row| row.content.as_deref() == Some("planted null recall"))
+        .unwrap();
     assert_eq!(
         store
-            .read_run_message_origin(&run.id, thread[0].seq)
+            .read_run_message_origin(&run.id, planted.seq)
             .await
             .unwrap(),
         MessageOriginLookup::Present(agent24_store::StoredMessageOrigin {
-            seq: thread[0].seq,
+            seq: planted.seq,
             schema_version: agent24_store::MESSAGE_ORIGIN_SCHEMA_VERSION,
             origin: MessageOrigin::HostRecall { recall_ref: None },
             instance_digest: agent24_store::message_instance_digest(
-                &thread[0].role,
-                thread[0].content.as_deref(),
-                &thread[0].tool_calls,
-                thread[0].tool_call_id.as_deref(),
+                &planted.role,
+                planted.content.as_deref(),
+                &planted.tool_calls,
+                planted.tool_call_id.as_deref(),
             )
             .unwrap(),
         })
     );
-    let recall_ref: Option<String> = sqlx::query_scalar(
-        "SELECT recall_ref FROM run_message_origins WHERE run_id = ? AND seq = ?",
-    )
-    .bind(&run.id)
-    .bind(thread[0].seq)
-    .fetch_one(agent24_store::test_hooks::pool(&store))
-    .await
-    .unwrap();
-    assert_eq!(recall_ref, None);
+    insert_grant(&store, &run.id).await;
+    provider.seen.lock().unwrap().clear();
+    let running = reopen(&store, &run.id).await;
+    manager
+        .run_loop(
+            running,
+            thread_to_messages(&before),
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+    let done = store.get_run(&run.id).await.unwrap().unwrap();
+    assert_eq!(done.status, RunStatus::Failed);
+    assert_eq!(done.error, Some(unproven_body()));
+    assert!(provider.seen.lock().unwrap().is_empty());
+    assert_eq!(store.list_run_messages(&run.id).await.unwrap(), before);
     assert_eq!(grant_state(&store).await, ("pending".to_owned(), None, None));
 }
 

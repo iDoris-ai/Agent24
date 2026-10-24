@@ -76,6 +76,14 @@ fn origin_allows_send(lookup: &MessageOriginLookup) -> bool {
     }
 }
 
+/// Compact JSON array of every assertion id, sorted lexicographically.
+/// One id is `["id"]`. `serde_json::to_string` emits no spaces.
+fn canonical_recall_ref(ids: &[String]) -> Result<String, serde_json::Error> {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    serde_json::to_string(&sorted)
+}
+
 fn unproven_source_failure(run: &Run) -> bool {
     run.error
         .as_ref()
@@ -812,8 +820,8 @@ impl RunManager {
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
-    /// Most callers treat this as best-effort bookkeeping; callers that require
-    /// a complete replay prefix must check the result and fail closed.
+    /// A caller that then pushes the message into the next provider request
+    /// must use [`Self::persist_for_next_send`] instead of ignoring this error.
     async fn persist_message(&self, run_id: &str, msg: &Msg) -> Result<(), StoreError> {
         let tool_calls =
             serde_json::to_value(&msg.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
@@ -866,6 +874,21 @@ impl RunManager {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Persist a message the next provider request would include.
+    /// A failed write ends the run so the caller must not push it.
+    async fn persist_for_next_send(&self, run_id: &str, msg: &Msg) -> bool {
+        if let Err(err) = self.persist_message(run_id, msg).await {
+            self.finish_failed(
+                run_id,
+                "internal",
+                &format!("failed to persist run message: {err}"),
+            )
+            .await;
+            return false;
+        }
+        true
     }
 
     pub async fn start_run(self: &Arc<Self>, create: RunCreate) -> Result<Run, AgentError> {
@@ -1354,7 +1377,9 @@ impl RunManager {
                 }
             };
             let result = Msg::tool_result(call.id.clone(), content);
-            let _ = self.persist_message(&run_id, &result).await;
+            if !self.persist_for_next_send(&run_id, &result).await {
+                return;
+            }
             messages.push(result);
         }
 
@@ -1561,12 +1586,26 @@ impl RunManager {
         let mut rows = Vec::with_capacity(prior_context_len + 3);
         let mut recalled_ids = None;
         if let Some((recalled, ids)) = recall {
-            recalled_ids = Some(ids);
+            let encoded = match canonical_recall_ref(&ids) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "internal",
+                        &format!("failed to encode recall ref: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
             rows.push(originated(
                 &recalled,
-                MessageOrigin::HostRecall { recall_ref: None },
+                MessageOrigin::HostRecall {
+                    recall_ref: Some(encoded),
+                },
             ));
             snapshot.push(recalled);
+            recalled_ids = Some(ids);
         }
         if write_skipped {
             // M1-T10 review H1/M2: part of the SAME atomic snapshot as the
@@ -1950,7 +1989,9 @@ impl RunManager {
             // call. This is the row H3 keys resume off: an assistant turn on disk
             // whose trailing tool_call has no answering `tool` row is exactly a
             // run that died awaiting approval.
-            let _ = self.persist_message(&run_id, &res.message).await;
+            if !self.persist_for_next_send(&run_id, &res.message).await {
+                return;
+            }
             messages.push(res.message);
             for (idx, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -1964,7 +2005,9 @@ impl RunManager {
                             "skipped: per-turn tool call limit ({MAX_TOOL_CALLS_PER_TURN}) exceeded"
                         ),
                     );
-                    let _ = self.persist_message(&run_id, &skipped).await;
+                    if !self.persist_for_next_send(&run_id, &skipped).await {
+                        return;
+                    }
                     messages.push(skipped);
                     continue;
                 }
@@ -1979,7 +2022,9 @@ impl RunManager {
                         PlanOutcome::Approved(content) => {
                             plan_mode = false; // full tool set from the next turn
                             let result = Msg::tool_result(call.id.clone(), content);
-                            let _ = self.persist_message(&run_id, &result).await;
+                            if !self.persist_for_next_send(&run_id, &result).await {
+                                return;
+                            }
                             messages.push(result);
                         }
                         PlanOutcome::Rejected(content) => {
@@ -2014,14 +2059,18 @@ impl RunManager {
                          approved before using this tool"
                             .to_owned(),
                     );
-                    let _ = self.persist_message(&run_id, &denied).await;
+                    if !self.persist_for_next_send(&run_id, &denied).await {
+                        return;
+                    }
                     messages.push(denied);
                     continue;
                 }
                 match self.run_tool_call(&run, call, &cancel, false).await {
                     Ok(content) => {
                         let result = Msg::tool_result(call.id.clone(), content);
-                        let _ = self.persist_message(&run_id, &result).await;
+                        if !self.persist_for_next_send(&run_id, &result).await {
+                            return;
+                        }
                         messages.push(result);
                     }
                     Err(ParkedCallStop::CancelRun) => {

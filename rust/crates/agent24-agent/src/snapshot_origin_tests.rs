@@ -118,10 +118,24 @@ async fn paused_snapshot_notice_is_missing_and_neighbors_are_present() {
     manager.cancel_run(&run.id).await.unwrap();
 }
 
+#[test]
+fn one_assertion_id_encodes_as_a_json_array() {
+    let encoded = canonical_recall_ref(&["id".to_owned()]).unwrap();
+    assert_eq!(encoded, r#"["id"]"#);
+    assert_ne!(encoded, "id");
+    assert_eq!(
+        canonical_recall_ref(&["peanut".to_owned(), "duck".to_owned()]).unwrap(),
+        r#"["duck","peanut"]"#
+    );
+}
+
 #[tokio::test]
-async fn recall_snapshot_stores_null_recall_ref() {
+async fn recall_snapshot_stores_sorted_assertion_id_array() {
+    let provider = Arc::new(RecordingProvider {
+        seen: StdMutex::new(vec![]),
+    });
     let (manager, store, kv) =
-        manager_with_memory(Arc::new(HangingProvider), Arc::new(UnusedSummarizer)).await;
+        manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
     for (id, object) in [("peanut", "我对花生过敏"), ("duck", "我喜欢北京烤鸭")] {
         let decision = kv
             .write_gate()
@@ -154,24 +168,23 @@ async fn recall_snapshot_stores_null_recall_ref() {
         })
         .await
         .unwrap();
-    let thread = wait_snapshot(&store, &run.id).await;
+    let done = wait_terminal(&store, &run.id).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    assert!(!provider.seen.lock().unwrap().is_empty());
+    let thread = store.list_run_messages(&run.id).await.unwrap();
     let text = thread[0].content.as_deref().unwrap();
     assert!(text.contains("id=peanut") && text.contains("id=duck"), "{text}");
+    let stored = r#"["duck","peanut"]"#.to_owned();
     assert_eq!(
         present(&store, &run.id, thread[0].seq).await,
-        MessageOrigin::HostRecall { recall_ref: None }
+        MessageOrigin::HostRecall {
+            recall_ref: Some(stored.clone())
+        }
     );
-    let recall_ref: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT recall_ref FROM run_message_origins WHERE run_id = ? AND seq = ?",
-    )
-    .bind(&run.id)
-    .bind(thread[0].seq)
-    .fetch_optional(agent24_store::test_hooks::pool(&store))
-    .await
-    .unwrap();
-    assert_eq!(recall_ref, Some(None));
+    let recall_ref = stored_recall_ref(&store, &run.id, thread[0].seq).await;
+    assert_eq!(recall_ref, Some(Some(stored)));
     assert_ne!(recall_ref, Some(Some("peanut".into())));
-    manager.cancel_run(&run.id).await.unwrap();
+    assert_ne!(recall_ref, Some(Some("duck".into())));
 }
 
 async fn stored_recall_ref(store: &Store, run_id: &str, seq: i64) -> Option<Option<String>> {
