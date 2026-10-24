@@ -71,8 +71,32 @@ function fetchOmlxModels(url: string, apiKey: string): Promise<string[]> {
 // file:// or other dangerous schemes.
 const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 
+// The daemon's private host interface (`/api/v1/host/…`, KB-HOST-01) belongs
+// to main alone: the renderer's generic proxy never reaches it, or the page
+// would act with the product host's authority (UI-BRIDGE U1.5). Judged on the
+// path the daemon will route — query dropped, escapes decoded, dot segments
+// resolved, repeated slashes collapsed — and a path that does not decode is
+// refused as well.
+export function reachesHostInterface(requestPath: string): boolean {
+  let path: string
+  try {
+    path = new URL(decodeURIComponent(requestPath.split(/[?#]/, 1)[0] ?? ''), 'http://daemon').pathname
+  } catch {
+    return true
+  }
+  return /^\/api\/v1\/host(\/|$)/i.test(path.replace(/\/{2,}/g, '/'))
+}
+
 function proxyToBackend(req: BackendProxyRequest): Promise<BackendProxyResponse> {
   return new Promise((resolve) => {
+    if (reachesHostInterface(req.path)) {
+      resolve({
+        ok: false,
+        status: 403,
+        data: { error: { code: 'host_interface_private', message: 'The host interface is not reachable from the renderer' } },
+      })
+      return
+    }
     const body = req.body !== undefined ? JSON.stringify(req.body) : undefined
     // Port and credential come from the backend's ready line (dynamic port +
     // token for agent24d; fixed 8765 and no credential for the node mock).
