@@ -485,6 +485,34 @@ describe('DocumentsPage: cancel and retry', () => {
     await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
   })
 
+  it('a cancel answering after another import started leaves that import shown', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    let answered: () => void = () => {}
+    answer(m, [() => ok(job('interrupted')), () => ok(attempt('running', 2)), () => ok(attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }))], {
+      retryJob: () => ok(attempt('queued', 2)),
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }) }))),
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', RETRY))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', CANCEL))
+    await tick(1100) // the retry's following ends before the cancel answers
+    await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
+    const other = (status: string) => ({ ...job(status), job_id: 'job_01K75A0B1C2D3E4F5G6H7J8K00' })
+    m.importFile.mockImplementation(() => ok(other('queued')))
+    answer(m, [() => ok(other('succeeded'))])
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
+    await act(async () => answered())
+    await tick(1100)
+    expect(screen.getByText('已导入')).toBeInTheDocument()
+    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+  })
+
   it('an import is counted once, whether its success is first heard from a read or from a cancel', async () => {
     const lists = () => m.request.mock.calls.filter(([r]) => r.op === 'list')
     const m = mount({})
