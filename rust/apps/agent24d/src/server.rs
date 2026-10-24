@@ -3927,7 +3927,7 @@ pub(crate) mod tests {
         // The grant was told already: the module's revocation ends none.
         assert_eq!(pop(), told_end("*", Vec::new()));
         assert_eq!(stop_listed(store.clone()).await, "unconfirmed");
-        let pending = store
+        let (pending, _) = store
             .pending_grant_end_notices("2099-01-01T00:00:00Z")
             .await
             .unwrap();
@@ -3982,7 +3982,7 @@ pub(crate) mod tests {
             StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
                 let store = store.clone();
                 Box::pin(async move {
-                    let pending = store
+                    let (pending, _) = store
                         .pending_grant_end_notices("2099-01-01T00:00:00Z")
                         .await
                         .unwrap();
@@ -4049,7 +4049,7 @@ pub(crate) mod tests {
         use crate::module_tool_runtime::RevocationStop::{Confirmed, Unconfirmed};
         let pool = |store: &agent24_store::Store| agent24_store::test_hooks::pool(store).clone();
         let left = |store: agent24_store::Store| async move {
-            let pending = store
+            let (pending, _) = store
                 .pending_grant_end_notices("2099-01-01T00:00:00Z")
                 .await
                 .unwrap();

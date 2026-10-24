@@ -216,8 +216,13 @@ impl Store {
     /// The ends not answered nor settled yet as of `now`, oldest first: a
     /// replacement's, an epoch's or a revocation no route tells at once, a
     /// routed revocation's once its route had its chance
-    /// ([`ROUTE_GRACE_MILLIS`] after it ended).
-    pub async fn pending_grant_end_notices(&self, now: &str) -> Result<Vec<GrantEndNotice>> {
+    /// ([`ROUTE_GRACE_MILLIS`] after it ended). Also gives the earliest
+    /// instant, in Unix milliseconds, a routed revocation's held back now is
+    /// due.
+    pub async fn pending_grant_end_notices(
+        &self,
+        now: &str,
+    ) -> Result<(Vec<GrantEndNotice>, Option<i64>)> {
         let (now, _) = parse_instant(now)?;
         let rows = sqlx::query(
             "SELECT * FROM module_grant_end_notices
@@ -226,16 +231,18 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
         let mut pending = Vec::new();
+        let mut next: Option<i64> = None;
         for row in &rows {
             let notice = row_to_notice(row)?;
-            let routes = row.get::<bool, _>("routed")
-                && parse_instant(&notice.ended_at)
-                    .is_ok_and(|(ended, _)| now < ended + ROUTE_GRACE_MILLIS);
-            if !routes {
+            let due = parse_instant(&notice.ended_at)
+                .map_or(now, |(ended, _)| ended + ROUTE_GRACE_MILLIS);
+            if row.get::<bool, _>("routed") && now < due {
+                next = Some(next.map_or(due, |next| next.min(due)));
+            } else {
                 pending.push(notice);
             }
         }
-        Ok(pending)
+        Ok((pending, next))
     }
 
     /// The end the write `generation` wrote, if it wrote one: a
