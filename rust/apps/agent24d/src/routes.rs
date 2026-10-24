@@ -529,13 +529,18 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 )
                 .await;
             // K1-6b.4c: the session floor could not be recorded, so this
-            // turn's sources are unknown; fail before the model call.
-            let Ok((prelude, remember_state, source_ref)) = prelude else {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "source_policy_unavailable",
-                    "failed to persist session source policy",
-                );
+            // turn's sources are unknown; fail before the model call. The
+            // store error stays in the daemon log, not the response.
+            let (prelude, remember_state, source_ref) = match prelude {
+                Ok(prelude) => prelude,
+                Err(err) => {
+                    tracing::error!(run_id = %run_id, error = %err, "chat session source floor not recorded");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "source_policy_unavailable",
+                        "failed to persist session source policy",
+                    );
+                }
             };
             explicit_remember_state = remember_state;
             memory_source_ref = source_ref;
