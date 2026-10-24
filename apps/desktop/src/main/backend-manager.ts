@@ -23,16 +23,37 @@ export type BackendKind = 'node' | 'rust'
 
 export interface BackendEndpoint {
   port: number
-  token: string
+}
+
+/** How main authenticates to the daemon. Held apart from `BackendEndpoint` so
+ * the credential never travels with the port toward the renderer. `none` is
+ * only the node mock, which takes no credential. */
+type DaemonAuth = { kind: 'bearer'; token: string } | { kind: 'none' }
+
+/** The daemon's port and the headers that authenticate main to it. */
+export interface DaemonConnection {
+  port: number
+  authHeaders: Record<string, string>
 }
 
 // Module-level so the IPC proxy can read it without holding the manager.
 // Null until the CURRENT child's ready line arrives — never a guessed default:
 // a stale fallback port could silently route to the wrong backend (review B5).
-let currentEndpoint: BackendEndpoint | null = null
+let current: { port: number; auth: DaemonAuth } | null = null
 
 export function getBackendEndpoint(): BackendEndpoint | null {
-  return currentEndpoint
+  return current ? { port: current.port } : null
+}
+
+/** Null until the daemon is ready, and also when the rust daemon left no
+ * usable credential: callers then refuse to send instead of sending without
+ * one. */
+export function daemonConnection(): DaemonConnection | null {
+  if (!current) return null
+  const { port, auth } = current
+  if (auth.kind === 'none') return { port, authHeaders: {} }
+  if (!auth.token) return null
+  return { port, authHeaders: { Authorization: `Bearer ${auth.token}` } }
 }
 
 export function selectedBackend(): BackendKind {
@@ -146,17 +167,15 @@ export interface BackendManagerDeps {
   spawnProcess?: (kind: BackendKind) => ChildProcess
 }
 
+// `/api/v1/health` takes no credential, so none is sent.
 function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
   if (!endpoint) return Promise.resolve(false)
   return new Promise((resolve) => {
-    const headers: Record<string, string> = {}
-    if (endpoint.token) headers['Authorization'] = `Bearer ${endpoint.token}`
     const req = http.get(
       {
         host: '127.0.0.1',
         port: endpoint.port,
         path: '/api/v1/health',
-        headers,
         timeout: HEALTH_TIMEOUT_MS,
       },
       (res) => {
@@ -202,7 +221,7 @@ export class BackendManager {
   // auto-respawn it (that would defeat a manual stop).
   private lastHealthy = false
   private userStopped = false
-  // DEP-A5: true while `currentEndpoint` points at a daemon this manager
+  // DEP-A5: true while `current` points at a daemon this manager
   // discovered (via daemon.json) rather than spawned itself. Gates every
   // lifecycle action that would otherwise kill a process we don't own.
   private isExternal = false
@@ -233,12 +252,11 @@ export class BackendManager {
   private async tryReuseExternal(): Promise<boolean> {
     const state = this.external.read()
     if (!state) return false
-    const endpoint: BackendEndpoint = { port: state.port, token: state.token }
-    const healthy = await this.external.checkHealth(endpoint)
+    const healthy = await this.external.checkHealth({ port: state.port })
     if (!healthy) return false
     this.isExternal = true
     this.externalPid = state.pid
-    currentEndpoint = endpoint
+    current = { port: state.port, auth: { kind: 'bearer', token: state.token } }
     this.lastHealthy = true
     console.log(
       `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
@@ -261,7 +279,7 @@ export class BackendManager {
   status(): BackendStatus {
     return deriveStatus({
       userStopped: this.userStopped,
-      hasEndpoint: currentEndpoint !== null,
+      hasEndpoint: current !== null,
       healthy: this.lastHealthy,
     })
   }
@@ -315,11 +333,11 @@ export class BackendManager {
   private disconnectExternal(): void {
     this.isExternal = false
     this.externalPid = null
-    currentEndpoint = null
+    current = null
   }
 
   private spawnChild(): void {
-    currentEndpoint = null
+    current = null
     // Any spawn (initial, respawn-after-failure, or an explicit restart)
     // always produces a desktop-owned child — never external past this point.
     this.isExternal = false
@@ -344,7 +362,9 @@ export class BackendManager {
           const parsed = JSON.parse(line) as { type?: string; port?: number; token?: string }
           if (parsed.type === 'ready' && typeof parsed.port === 'number') {
             if (this.child === child) {
-              currentEndpoint = { port: parsed.port, token: parsed.token ?? '' }
+              const auth: DaemonAuth =
+                this.kind === 'node' ? { kind: 'none' } : { kind: 'bearer', token: parsed.token ?? '' }
+              current = { port: parsed.port, auth }
               console.log(`[backend:${this.kind}] ready on port ${parsed.port}`)
             }
             return
@@ -365,7 +385,7 @@ export class BackendManager {
       console.warn(`[backend:${this.kind}] exited with code ${String(code)}`)
       if (this.child === child) {
         this.child = null
-        currentEndpoint = null
+        current = null
       }
     })
     child.on('error', (err) => {
@@ -375,7 +395,7 @@ export class BackendManager {
       console.error(`[backend:${this.kind}] process error`, err)
       if (this.child === child) {
         this.child = null
-        currentEndpoint = null
+        current = null
       }
     })
   }
@@ -394,7 +414,7 @@ export class BackendManager {
         return
       }
 
-      const alive = await this.external.checkHealth(currentEndpoint)
+      const alive = await this.external.checkHealth(getBackendEndpoint())
       this.lastHealthy = alive
       if (alive) {
         this.failureCount = 0
@@ -457,7 +477,7 @@ export class BackendManager {
     // Clear immediately: with child already nulled, the exit handler's
     // identity guard will (correctly) skip its own cleanup — without this,
     // stop() would leave a stale dead endpoint exposed forever (review B5)
-    currentEndpoint = null
+    current = null
   }
 
   stop(): void {

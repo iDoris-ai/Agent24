@@ -133,7 +133,7 @@ describe('httpSender', () => {
         res.end('{"error":{"code":"not_found","message":"no such job"}}')
       })
     })
-    const send = httpSender(() => ({ port, token: 't0k' }))
+    const send = httpSender(() => ({ port, authHeaders: { Authorization: 'Bearer t0k' } }))
     const reply = await send(
       { method: 'POST', path: `/api/v1/documents/jobs/${JOB}/cancel` },
       { headers: { 'Content-Type': 'application/octet-stream' }, body: Buffer.from([1, 2, 3]) },
@@ -156,7 +156,7 @@ describe('httpSender', () => {
       res.write('{"documents":[')
       setTimeout(() => res.socket?.destroy(), 20)
     })
-    const reply = await httpSender(() => ({ port, token: '' }))({ method: 'GET', path: '/x' })
+    const reply = await httpSender(() => ({ port, authHeaders: {} }))({ method: 'GET', path: '/x' })
     expect(reply).toMatchObject({ status: 502, error: { code: 'backend_unreachable' } })
   })
 
@@ -164,13 +164,13 @@ describe('httpSender', () => {
     const port = await serve(() => {
       /* never answers */
     })
-    const reply = await httpSender(() => ({ port, token: '' }), '127.0.0.1', 50)({ method: 'POST', path: '/x' })
+    const reply = await httpSender(() => ({ port, authHeaders: {} }), '127.0.0.1', 50)({ method: 'POST', path: '/x' })
     expect(reply).toMatchObject({ status: 504, error: { code: 'backend_timeout' } })
   })
 
   it('a reply past the byte cap is refused', async () => {
     const port = await serve((_req, res) => res.end('x'.repeat(4096)))
-    const reply = await httpSender(() => ({ port, token: '' }), '127.0.0.1', 5000, 1024)({ method: 'GET', path: '/x' })
+    const reply = await httpSender(() => ({ port, authHeaders: {} }), '127.0.0.1', 5000, 1024)({ method: 'GET', path: '/x' })
     expect(reply).toMatchObject({ status: 502, error: { code: 'invalid_response' } })
   })
 
@@ -180,7 +180,7 @@ describe('httpSender', () => {
     const port = await serve((_req, res) => res.end())
     await new Promise<void>((r) => server!.close(() => r()))
     server = null
-    const unreachable = await httpSender(() => ({ port, token: '' }))({ method: 'GET', path: '/x' })
+    const unreachable = await httpSender(() => ({ port, authHeaders: {} }))({ method: 'GET', path: '/x' })
     expect(unreachable).toMatchObject({ status: 503, error: { code: 'backend_unreachable' } })
   })
 })
