@@ -13,6 +13,7 @@ export const documentsMessages = defineMessages({
     'list.importedAt': 'Imported', 'list.loadMore': 'Load more',
     'error.details': '{message} ({code}{cause})', 'error.cause': ': {cause}',
     'error.readStatus': 'Could not read import status: {error}',
+    'error.retryUnknown': 'Could not tell whether the retry went through; check again later: {error}',
   },
   zh: {
     'title': '文档', 'subtitle': '本地单用户：文档只保存在这台电脑上。',
@@ -26,6 +27,7 @@ export const documentsMessages = defineMessages({
     'list.importedAt': '导入时间', 'list.loadMore': '加载更多',
     'error.details': '{message}（{code}{cause}）', 'error.cause': '：{cause}',
     'error.readStatus': '无法读取导入状态：{error}',
+    'error.retryUnknown': '无法确定重试是否生效，请稍后再看：{error}',
   },
   th: {
     'title': 'เอกสาร', 'subtitle': 'จัดเก็บสำหรับผู้ใช้คนเดียว: เอกสารอยู่บนคอมพิวเตอร์เครื่องนี้เท่านั้น',
@@ -39,5 +41,6 @@ export const documentsMessages = defineMessages({
     'list.importedAt': 'นำเข้าเมื่อ', 'list.loadMore': 'โหลดเพิ่ม',
     'error.details': '{message} ({code}{cause})', 'error.cause': ': {cause}',
     'error.readStatus': 'อ่านสถานะการนำเข้าไม่ได้: {error}',
+    'error.retryUnknown': 'ไม่แน่ใจว่าการลองอีกครั้งสำเร็จหรือไม่ โปรดตรวจสอบภายหลัง: {error}',
   },
 })

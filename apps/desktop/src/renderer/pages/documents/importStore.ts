@@ -87,9 +87,15 @@ const sleep = (ms: number, jobId: string) =>
 /** A job that failed for what the file itself is fails the same way again
  * (ADR-DOC-02 §6): no retry is offered for it. */
 const SAME_AGAIN = new Set([
-  'invalid_request', 'payload_too_large', 'unsupported_format', 'parse_failed',
+  'invalid_request', 'not_found', 'payload_too_large', 'unsupported_format', 'parse_failed',
   'upload_checksum_mismatch', 'idempotency_key_reused',
 ])
+
+/** Reads, after a retry whose answer was lost, while it may still land. */
+const RESTART_READS = 10
+
+/** An answer that says the request was refused, so it did not happen. */
+const refused = (res: DocumentsResponse & { ok: false }): boolean => res.status >= 400 && res.status < 500
 
 /** The job is still to start or still running: it can be cancelled. */
 export const canCancel = (s: ImportState): boolean =>
@@ -115,11 +121,34 @@ export async function cancelImport(api: Api): Promise<void> {
       set({ error: describeError(res) })
       return
     }
-    if (state.job?.job_id === job.job_id) set({ job: res.data })
-    nudge(job.job_id)
+    // An answer read after the job moved on is older news.
+    if (state.job?.job_id === job.job_id && canCancel(state)) set({ job: res.data })
+    if (state.importing) {
+      nudge(job.job_id)
+      return
+    }
+    // Following had stopped (a read error): follow the job to its end.
+    set({ importing: true, acting: false })
+    try {
+      await follow(api, state.job ?? res.data)
+    } finally {
+      set({ importing: false })
+    }
   } finally {
     set({ acting: false })
   }
+}
+
+/** The retry's answer was lost and it may still land (openapi
+ * documentsRetryJob): the job is read again, a while, for a higher
+ * `attempt`; `null` if none came. */
+async function awaitRestart(api: Api, before: Job): Promise<Job | null> {
+  for (let i = 0; i < RESTART_READS; i++) {
+    const read = await api.request({ op: 'job', jobId: before.job_id })
+    if (read.ok && read.data.attempt > before.attempt) return read.data
+    await sleep(POLL_MS, before.job_id)
+  }
+  return null
 }
 
 /** Restarts the job shown and follows it again. The retry has no
@@ -131,16 +160,13 @@ export async function retryImport(api: Api): Promise<void> {
   set({ importing: true, acting: true, error: null })
   try {
     const res = await api.request({ op: 'retryJob', jobId: job.job_id })
-    let restarted: Job
-    if (res.ok) {
-      restarted = res.data
-    } else {
-      const read = await api.request({ op: 'job', jobId: job.job_id })
-      if (!read.ok || read.data.attempt <= job.attempt) {
-        set({ error: describeError(res) })
-        return
+    const restarted = res.ok ? res.data : refused(res) ? null : await awaitRestart(api, job)
+    if (!restarted) {
+      if (!res.ok) {
+        const error = describeError(res)
+        set({ error: refused(res) ? error : translate(documentsMessages, 'error.retryUnknown', { error }) })
       }
-      restarted = read.data
+      return
     }
     set({ acting: false })
     await follow(api, restarted)

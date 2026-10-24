@@ -270,13 +270,13 @@ describe('DocumentsPage: cancel and retry', () => {
   const CANCEL = { name: '取消' }
   const RETRY = { name: '重试' }
   const ops = (m: Mock, op: string) => m.request.mock.calls.filter(([r]) => r.op === op)
-  /** `job` reads answer from `reads` in turn; `cancelJob` / `retryJob` from `acts`. */
+  /** `job` reads answer from `reads` in turn (the last one repeats); `cancelJob` / `retryJob` from `acts`. */
   const bases = new WeakMap<Mock, (req: { op: string }) => Promise<Res>>()
   function answer(m: Mock, reads: Array<() => Promise<Res>>, acts: Record<string, () => Promise<Res>> = {}) {
     if (!bases.has(m)) bases.set(m, m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>)
     const base = bases.get(m)!
     m.request.mockImplementation((req: { op: string }) => {
-      if (req.op === 'job') return reads.shift()!()
+      if (req.op === 'job') return (reads.length > 1 ? reads.shift()! : reads[0]!)()
       if (acts[req.op]) return acts[req.op]!()
       return base(req)
     })
@@ -322,35 +322,87 @@ describe('DocumentsPage: cancel and retry', () => {
     expect(ops(m, 'retryJob')).toHaveLength(1)
     expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
 
-    answer(m, [() => ok(job('failed', { code: 'unsupported_format', message: '不支持这种格式' }))])
-    fireEvent.click(screen.getByRole('button', IMPORT))
-    await tick(1100)
-    await waitFor(() => expect(screen.getByText('导入失败：不支持这种格式')).toBeInTheDocument())
-    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+    for (const [code, message] of [['unsupported_format', '不支持这种格式'], ['not_found', '上传已过期']]) {
+      answer(m, [() => ok(job('failed', { code, message }))])
+      fireEvent.click(screen.getByRole('button', IMPORT))
+      await tick(1100)
+      await waitFor(() => expect(screen.getByText(`导入失败：${message}`)).toBeInTheDocument())
+      expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+    }
   })
 
-  it('a retry whose answer is lost is read, never sent again: a higher attempt is followed, else it says why', async () => {
+  it('a retry whose answer is lost is read again a while, never sent again: a later restart is followed', async () => {
     const m = mount({})
     m.importFile.mockImplementation(() => ok(job('queued')))
-    answer(m, [() => ok(job('interrupted')), () => ok(attempt('running', 2)), () => ok(attempt('succeeded', 2))], {
+    answer(m, [() => ok(job('interrupted')), () => ok(job('interrupted')), () => ok(attempt('running', 2)), () => ok(attempt('succeeded', 2))], {
       retryJob: () => err(504, 'backend_timeout', 'slow'),
     })
     render(<DocumentsPage />)
     fireEvent.click(screen.getByRole('button', IMPORT))
     await tick(1100)
     fireEvent.click(await screen.findByRole('button', RETRY))
+    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+    await tick(1100) // the restart lands only now
     await waitFor(() => expect(screen.getByText('导入中')).toBeInTheDocument())
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     await tick(1100)
     await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(ops(m, 'retryJob')).toHaveLength(1)
+  })
 
-    answer(m, [() => ok(job('interrupted')), () => ok(job('interrupted'))], { retryJob: () => err(504, 'backend_timeout', 'slow') })
+  it('a lost retry answer with no restart in the window says so; a refused retry says why at once', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    answer(m, [() => ok(job('interrupted'))], { retryJob: () => err(504, 'backend_timeout', 'slow') })
+    render(<DocumentsPage />)
     fireEvent.click(screen.getByRole('button', IMPORT))
     await tick(1100)
     fireEvent.click(await screen.findByRole('button', RETRY))
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('slow（backend_timeout）'))
-    expect(ops(m, 'retryJob')).toHaveLength(2)
-    expect(screen.getByText('已中断')).toBeInTheDocument()
+    await tick(5000)
+    expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument() // still reading
+    await tick(6000)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('无法确定重试是否生效，请稍后再看：slow（backend_timeout）'))
+    expect(ops(m, 'retryJob')).toHaveLength(1)
+    expect(ops(m, 'job')).toHaveLength(11)
+
+    answer(m, [() => ok(job('interrupted'))], { retryJob: () => err(400, 'invalid_request', '不能重试', { retryable: false }) })
+    fireEvent.click(screen.getByRole('button', RETRY))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('不能重试（invalid_request）'))
+    expect(ops(m, 'job')).toHaveLength(11)
+  })
+
+  it('a cancel answer older than what was read does not take the job back', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    let answered: () => void = () => {}
+    answer(m, [() => ok(job('running')), () => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' }))], {
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: job('cancelling') }))),
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(1100)
+    fireEvent.click(await screen.findByRole('button', CANCEL))
+    await tick(1100) // the job is read cancelled before the cancel answers
+    await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
+    await act(async () => answered())
+    expect(screen.getByText(/^已取消/)).toBeInTheDocument()
+    expect(screen.getByRole('button', RETRY)).toBeInTheDocument()
+  })
+
+  it('a cancel after following stopped follows the job to its end', async () => {
+    const m = mount({})
+    m.importFile.mockImplementation(() => ok(job('queued')))
+    answer(m, [() => ok(job('running')), () => err(503, 'storage_unavailable', 'storage is not available', { retryable: false, cause: 'corrupt' })])
+    render(<DocumentsPage />)
+    fireEvent.click(screen.getByRole('button', IMPORT))
+    await tick(2200)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('storage_unavailable：corrupt'))
+    answer(m, [() => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' }))], { cancelJob: () => ok(job('cancelling')) })
+    fireEvent.click(screen.getByRole('button', CANCEL))
+    await waitFor(() => expect(screen.getByText('取消中')).toBeInTheDocument())
+    await tick(1100)
+    await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
+    expect(screen.getByRole('button', RETRY)).toBeInTheDocument()
   })
 })
 
