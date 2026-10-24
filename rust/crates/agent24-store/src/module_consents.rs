@@ -1139,6 +1139,19 @@ mod tests {
             store.revocation_stop_state("other", "t").await.unwrap(),
             None
         );
+        // The newest revocation answers, whichever scope: a later one of the
+        // tool alone, not answered yet, is not hidden by the module's.
+        assert!(
+            store
+                .record_revocation_stop("m", None, whole, "confirmed")
+                .await
+                .unwrap()
+        );
+        store
+            .revoke_module_consent_tracked("m", Some("t"), "2026-10-24T00:00:03Z")
+            .await
+            .unwrap();
+        assert_eq!(store.revocation_stop_state("m", "t").await.unwrap(), None);
     }
 
     #[tokio::test]
