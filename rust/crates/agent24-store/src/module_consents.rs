@@ -646,6 +646,20 @@ impl Store {
         op: Option<&str>,
         now: &str,
     ) -> Result<()> {
+        self.revoke_module_consent_tracked(module, op, now)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::revoke_module_consent`], returning the revocation's write
+    /// generation: the key [`Self::record_revocation_stop`] records the
+    /// module's answer under (K1-6a-G §2.5).
+    pub async fn revoke_module_consent_tracked(
+        &self,
+        module: &str,
+        op: Option<&str>,
+        now: &str,
+    ) -> Result<i64> {
         let (_, revoked_at) = parse_instant(now)?;
         let key = op.unwrap_or("*");
         let mut tx = self.pool().begin().await?;
@@ -659,7 +673,8 @@ impl Store {
              VALUES (?, ?, ?, ?)
              ON CONFLICT (module, op) DO UPDATE SET
                 revoked_at = excluded.revoked_at,
-                generation = excluded.generation",
+                generation = excluded.generation,
+                stop_state = NULL",
         )
         .bind(module)
         .bind(key)
@@ -676,7 +691,45 @@ impl Store {
                 revoked_at,
             });
         self.announce_module_consent_change(module, op);
-        Ok(())
+        Ok(generation)
+    }
+
+    /// Records what the module answered to revocation `generation` of
+    /// `(module, op)` (K1-6a-G §2.5). A later revocation of the same key
+    /// has replaced the row, so nothing is written and `false` returned.
+    pub async fn record_revocation_stop(
+        &self,
+        module: &str,
+        op: Option<&str>,
+        generation: i64,
+        stop_state: &str,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE module_consent_revocations SET stop_state = ?
+             WHERE module = ? AND op = ? AND generation = ?",
+        )
+        .bind(stop_state)
+        .bind(module)
+        .bind(op.unwrap_or("*"))
+        .bind(generation)
+        .execute(self.pool())
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// What the module answered to the newest revocation covering
+    /// `(module, op)`, the tool's own or the whole module's; `None` when
+    /// none covers it or no answer was recorded (read as unconfirmed).
+    pub async fn revocation_stop_state(&self, module: &str, op: &str) -> Result<Option<String>> {
+        let state: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT stop_state FROM module_consent_revocations
+             WHERE module = ? AND op IN (?, '*') ORDER BY generation DESC LIMIT 1",
+        )
+        .bind(module)
+        .bind(op)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(state.flatten())
     }
 
     /// Lifecycle invalidation for disable/uninstall/package replacement. The
@@ -1024,6 +1077,66 @@ mod tests {
     }
 
     // ── reverse case: ADR反例 1 — 未确认不可调用 ────────────────────────────
+
+    /// K1-6a-G §2.5: a stop answer is recorded against the revocation it
+    /// answers, never a later one of the same key, which starts with none.
+    #[tokio::test]
+    async fn a_stop_answer_belongs_to_its_own_revocation() {
+        let store = Store::open_memory().await.unwrap();
+        let first = store
+            .revoke_module_consent_tracked("m", Some("t"), "2026-10-24T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(store.revocation_stop_state("m", "t").await.unwrap(), None);
+        assert!(
+            store
+                .record_revocation_stop("m", Some("t"), first, "confirmed")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .revocation_stop_state("m", "t")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("confirmed")
+        );
+        let second = store
+            .revoke_module_consent_tracked("m", Some("t"), "2026-10-24T00:00:01Z")
+            .await
+            .unwrap();
+        assert_eq!(store.revocation_stop_state("m", "t").await.unwrap(), None);
+        assert!(
+            !store
+                .record_revocation_stop("m", Some("t"), first, "confirmed")
+                .await
+                .unwrap()
+        );
+        let whole = store
+            .revoke_module_consent_tracked("m", None, "2026-10-24T00:00:02Z")
+            .await
+            .unwrap();
+        assert!(whole > second);
+        assert!(
+            store
+                .record_revocation_stop("m", None, whole, "not_running")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .revocation_stop_state("m", "t")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("not_running")
+        );
+        assert_eq!(
+            store.revocation_stop_state("other", "t").await.unwrap(),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn no_record_is_not_granted_fail_closed() {

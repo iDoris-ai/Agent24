@@ -4757,6 +4757,14 @@ components:
         decided_at: { type: string, format: date-time }
         expires_at: { type: string, format: date-time }
         status: { type: string, enum: [granted, denied, revoked, expired, stale, not_granted] }
+        stop:
+          description: >-
+            Only for a revoked one: whether the module said it stopped the
+            work the grant started (K1-6a-G §2.5). `unconfirmed` also when
+            no answer was recorded, as for a revocation made outside this
+            daemon.
+          type: string
+          enum: [confirmed, unconfirmed, not_running]
 
     ModuleToolCard:
       type: object
@@ -4800,12 +4808,20 @@ components:
 
     ModuleAuthorizationRevocation:
       type: object
-      required: [module, tool, status]
+      required: [module, tool, status, stop]
       additionalProperties: false
       properties:
         module: { type: string }
         tool: { type: [string, "null"] }
         status: { type: string, const: revoked }
+        stop:
+          description: >-
+            What the module answered when told (K1-6a-G §2.5): `confirmed`,
+            it stopped the work the grants started; `unconfirmed`, no 2xx
+            within the bound, so that work may still run; `not_running`, it
+            had no run. The revocation stands in every case.
+          type: string
+          enum: [confirmed, unconfirmed, not_running]
 
     Sin90Proposal:
       type: object

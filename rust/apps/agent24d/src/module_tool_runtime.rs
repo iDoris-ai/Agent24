@@ -8,7 +8,7 @@ use agent24_domain::tool::{
 };
 use agent24_os_proto::drain::{DrainState, Generation};
 use agent24_os_proto::kernel_call::{
-    KernelLimits, KernelRequest, KernelRequestIds, send_module_tool_request,
+    KernelLimits, KernelRequest, KernelRequestIds, send_kernel_request, send_module_tool_request,
 };
 use agent24_tools::{ModuleToolAuthorization, ModuleToolContext, ModuleToolRuntime};
 use async_trait::async_trait;
@@ -16,6 +16,32 @@ use axum::body::Bytes;
 use tokio_util::sync::CancellationToken;
 
 const MAX_TOOL_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// How long a revocation waits for the module to say it stopped the work
+/// the revoked grants started (K1-6a-G §2.5).
+pub const REVOCATION_NOTICE_WITHIN: Duration = Duration::from_secs(10);
+
+/// What a module answered when told a revocation ended its grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationStop {
+    /// It answered 2xx: it reached a safe point and stopped.
+    Confirmed,
+    /// No 2xx within the bound, or it was running but could not be asked.
+    Unconfirmed,
+    /// No run of it: nothing of it was running to stop.
+    NotRunning,
+}
+
+impl RevocationStop {
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unconfirmed => "unconfirmed",
+            Self::NotRunning => "not_running",
+        }
+    }
+}
 
 pub struct AgentModuleToolRuntime {
     supervisors: Arc<OnceLock<Arc<Supervisors>>>,
@@ -62,6 +88,41 @@ impl AgentModuleToolRuntime {
             return Some(Arc::clone(current));
         }
         self.supervisors.get()?.running_slot(module)
+    }
+
+    /// Tells `module` that its grants of `operation` (`"*"`: every tool)
+    /// were revoked at `revoked_at`, and waits, at most `within`, for it to
+    /// say it stopped what they started (K1-6a-G §2.5). A run that is
+    /// draining or stopping is still running, so it is unconfirmed.
+    pub async fn notify_revoked(
+        &self,
+        module: &str,
+        operation: &str,
+        revoked_at: &str,
+        within: Duration,
+    ) -> RevocationStop {
+        let Some(current) = self.slot(module) else {
+            return RevocationStop::NotRunning;
+        };
+        let generation = current.get();
+        if generation.state() != DrainState::Running {
+            return RevocationStop::Unconfirmed;
+        }
+        let namespace = agent24_domain::DomainOsManifest::declared_namespace(module);
+        let body = serde_json::json!({ "operation": operation, "revoked_at": revoked_at });
+        let request = KernelRequest {
+            path: format!("{namespace}/_a24/authorization/revoked"),
+            extra_headers: Vec::new(),
+            body: Bytes::from(body.to_string()),
+        };
+        let limits = KernelLimits {
+            total: within,
+            max_response_bytes: MAX_TOOL_RESPONSE_BYTES,
+        };
+        match send_kernel_request(&generation, &self.request_ids, request, limits, None).await {
+            Ok(response) if response.status.is_success() => RevocationStop::Confirmed,
+            _ => RevocationStop::Unconfirmed,
+        }
     }
 
     /// This start has seen `module`'s enablement and brought its enable
@@ -936,6 +997,66 @@ mod tests {
         assert!(!super::serves_granted_package(&run(None), Some("sha256:a")));
         assert!(!super::serves_granted_package(&run(Some("sha256:a")), None));
         assert!(!super::serves_granted_package(&run(None), None));
+    }
+
+    /// K1-6a-G §2.5: a revocation is told to the running module, at the
+    /// module's reserved path; only its 2xx within the bound confirms the
+    /// stop. A module with no run has nothing running.
+    #[tokio::test]
+    async fn a_revocation_is_told_to_the_running_module() {
+        let sock = std::path::PathBuf::from(format!(
+            "/tmp/a24-revoke-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let told = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let answer = Arc::new(std::sync::Mutex::new(axum::http::StatusCode::OK));
+        let app = axum::Router::new().route(
+            "/api/v1/fake_module/_a24/authorization/revoked",
+            axum::routing::post({
+                let (told, answer) = (Arc::clone(&told), Arc::clone(&answer));
+                move |axum::Json(body): axum::Json<Value>| async move {
+                    told.lock().unwrap().push(body);
+                    let status = *answer.lock().unwrap();
+                    if status == axum::http::StatusCode::ACCEPTED {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    status
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let runtime = AgentModuleToolRuntime::new(HashSet::new());
+        let notify =
+            |within| runtime.notify_revoked("fake_module", "*", "2026-10-24T00:00:00Z", within);
+        let within = Duration::from_secs(2);
+        assert_eq!(notify(within).await, RevocationStop::NotRunning);
+        let generation = agent24_os_proto::drain::Generation::serving_package(sock.clone(), None);
+        assert!(generation.ready());
+        runtime.test_slots.lock().unwrap().insert(
+            "fake_module".to_owned(),
+            agent24_os_proto::drain::Current::new(generation),
+        );
+        assert_eq!(notify(within).await, RevocationStop::Confirmed);
+        assert_eq!(
+            told.lock().unwrap()[0],
+            serde_json::json!({ "operation": "*", "revoked_at": "2026-10-24T00:00:00Z" })
+        );
+        *answer.lock().unwrap() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+        assert_eq!(notify(within).await, RevocationStop::Unconfirmed);
+        // Answered only after the bound: unconfirmed, and no later.
+        *answer.lock().unwrap() = axum::http::StatusCode::ACCEPTED;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            notify(Duration::from_millis(300)).await,
+            RevocationStop::Unconfirmed
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_file(&sock);
     }
 
     /// K1-6a-G §2.1 F3/F6: no grant holds for a module whose enable epoch
