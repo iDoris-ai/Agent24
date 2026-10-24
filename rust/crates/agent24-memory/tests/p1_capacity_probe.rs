@@ -3,8 +3,8 @@
 //! `cargo test -p agent24-memory --test p1_capacity_probe -- --nocapture` 查看数字。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent24_memory::event::{EventStore, MemEvent, Origin, Scope, Trust};
 use agent24_memory::KvStore;
+use agent24_memory::event::{EventStore, MemEvent, Origin, Scope, Trust};
 use serde_json::json;
 use std::os::unix::fs::MetadataExt;
 
