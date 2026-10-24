@@ -1168,6 +1168,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut later = summary("docs");
+        later.op = "later".to_owned();
+        store
+            .grant_module_consent(&later, "2026-10-24T00:00:00Z", "2026-10-24T05:00:00Z")
+            .await
+            .unwrap();
         let mut refused = summary("docs");
         refused.op = "other".to_owned();
         store
@@ -1184,7 +1190,7 @@ mod tests {
             .due_expiry_notices("2026-10-24T02:00:00Z")
             .await
             .unwrap();
-        assert_eq!(next, None);
+        assert_eq!(millis(&next.unwrap()), millis("2026-10-24T05:00:00Z"));
         assert_eq!(due.len(), 1);
         assert_eq!(
             (due[0].op.as_str(), due[0].generation),
