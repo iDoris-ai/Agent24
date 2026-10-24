@@ -493,10 +493,11 @@ async fn a_build_shared_with_a_page_stops_for_the_tool_that_also_asked() {
     f.hold.store(true, SeqCst);
     let l = layers(&f);
     let content = stored(&env, "shared");
-    // The page starts the build and waits on it.
+    // The page starts the build and waits on it, past `joined`'s limit.
     let page = {
         let (l, s, c) = (l.clone(), env.storage.clone(), content.clone());
-        tokio::spawn(async move { l.layer(&s, &c, PDF, WAIT, Requester::Page).await })
+        let wait = Duration::from_secs(30);
+        tokio::spawn(async move { l.layer(&s, &c, PDF, wait, Requester::Page).await })
     };
     wait_until(|| f.running.load(SeqCst) == 1).await;
     joined(&l, &env, &content, tool("read_range")).await;
