@@ -242,7 +242,16 @@ fn a_decision_on_the_running_card_is_written() {
         "{body}"
     );
     let (_, list) = get(&d, "/api/v1/module-consents");
-    assert_eq!(list["authorizations"][0]["status"], "granted", "{list}");
+    let written = &list["authorizations"][0];
+    assert_eq!(written["status"], "granted", "{list}");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(written["expires_at"].as_str().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let from_now = expires_at - chrono::Utc::now();
+    assert!(
+        from_now > chrono::Duration::days(6) && from_now <= chrono::Duration::days(7),
+        "{written}"
+    );
 }
 
 /// F6: an ephemeral daemon, whose store does not outlive it, takes no
@@ -266,10 +275,24 @@ fn an_ephemeral_daemon_takes_no_decision() {
 #[test]
 fn a_bound_past_ninety_days_stops_the_start() {
     let home = tempfile::tempdir().unwrap();
-    let out = daemon(home.path(), &[("A24_MODULE_GRANT_MAX_DAYS", "91")], &[])
+    let mut child = daemon(home.path(), &[("A24_MODULE_GRANT_MAX_DAYS", "91")], &[])
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    // A daemon that took the bound would serve until killed: wait for its
+    // exit only so long, not for ever.
+    let by = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > by {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the daemon started with a 91-day bound");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
     assert!(!out.status.success());
     assert!(out.stdout.is_empty(), "no ready line");
     let stderr = String::from_utf8_lossy(&out.stderr);

@@ -105,7 +105,7 @@ export interface paths {
         };
         /**
          * What a grant of one module tool would cover
-         * @description Built by the host from the tool's manifest declaration (risk, output privacy, resource kinds, reversible draft); the module's own description text is not shown. `reversible_draft` is what the manifest declares: no gate on this path relaxes for it. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
+         * @description Built by the host from the tool's manifest declaration (risk, output privacy, resource kinds, reversible draft); the module's own description text is not shown. `reversible_draft` is what the manifest declares, and the declaration relaxes nothing: a module tool's dispatch is gated with no draft exception. `fingerprint`, `module_version` and `artifact` are what a grant must repeat, and what dispatch compares it with (K1-6a-G §2.1).
          */
         get: operations["getModuleToolCard"];
         put?: never;
@@ -2823,7 +2823,7 @@ export interface operations {
                     "application/json": components["schemas"]["ModuleAuthorization"];
                 };
             };
-            /** @description The body is not JSON */
+            /** @description `invalid_request`: the body is not JSON */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -2868,7 +2868,25 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description `invalid_request`: the body is not a decision (a field missing or of another type, or one not defined). `invalid_decision`: no expiry, an expiry already past or past the host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at most 90), more than 256 resources, a resource that is not `<kind>:<id>` of a kind the tool declares, or a denial naming resources */
+            /** @description `invalid_request`: the body is larger than the daemon accepts */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not sent as `application/json` */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: the body is not a decision (`decision`, `fingerprint`, `module_version` or `artifact` missing, a field of another type, or one not defined). `invalid_decision`: `expires_at` missing, null or not an RFC 3339 instant, an expiry already past or past the host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at most 90), more than 256 resources, a resource that is not `<kind>:<id>` of a kind the tool declares, or a denial naming resources */
             422: {
                 headers: {
                     [name: string]: unknown;
