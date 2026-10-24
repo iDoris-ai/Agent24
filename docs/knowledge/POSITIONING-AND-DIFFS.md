@@ -1,7 +1,7 @@
 # Knowledge 定位与差异登记
 
 > **来源与适用范围**：KB-C0-01（[#1010](https://github.com/iDoris-ai/Agent24/issues/1010)）把两个 issue 的正文同步到 `ab/weknora`。验收清单没有带进来；原有的二级标题降为三级，并加了两个分节标题；正文句子未作改动，其中的“本 issue”指各自的来源 issue：
-> - 定位摘要：来自 [#987](https://github.com/iDoris-ai/Agent24/issues/987)。
+> - 定位摘要：来自 [#987](https://github.com/iDoris-ai/Agent24/issues/987)。同步时 #987 的验收项“jason 与 David 确认定位、边界与四条链路的权威划分”还没有完成，所以下面的定位和硬边界都是待确认的设计输入，确认结果以 #987 的评论为准。
 > - 差异登记：来自 [#989](https://github.com/iDoris-ai/Agent24/issues/989)，是 2026-10-15 的核实结果。
 >
 > 后续的更正和新发现的差异以 #989 的回写评论和 WeKnora [能力矩阵](https://github.com/iDoris-ai/WeKnora/blob/a24/develop/docs/agent24/CAPABILITY-MATRIX.md)为准，本文不再随之更新。任务方案全文见 [PLAN-KNOWLEDGE-TASKS.md](PLAN-KNOWLEDGE-TASKS.md)。

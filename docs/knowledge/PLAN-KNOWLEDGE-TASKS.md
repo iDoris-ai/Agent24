@@ -3,7 +3,7 @@
 > **来源与适用范围**：本文是 2026-10-15 定稿的任务方案 v2.1 原文，首发于 [#986 的评论](https://github.com/iDoris-ai/Agent24/issues/986#issuecomment-6195290128)。KB-C0-01（[#1010](https://github.com/iDoris-ai/Agent24/issues/1010)）把它作为已评审的设计输入同步到 `ab/weknora`，正文未作改动。
 > 正文是当时的状态，此后的变化以下列来源为准：
 > - **现状与差异（§0、§6）**：当时核实的结果。之后的更正见 WeKnora [能力矩阵](https://github.com/iDoris-ai/WeKnora/blob/a24/develop/docs/agent24/CAPABILITY-MATRIX.md)和 [#989](https://github.com/iDoris-ai/Agent24/issues/989) 的回写评论。
-> - **契约**：见本目录的 `CONTRACT-*.md`。
+> - **契约**：见本目录的 `CONTRACT-*.md`。§1、§2、§4 等处的措辞与契约不一致时，以契约为准。
 > - **任务状态**：见 [projects/2](https://github.com/orgs/iDoris-ai/projects/2) 和各 issue。
 > - **§5 的 9 项**：§5.1–§5.9 依次在 #990–#998 讨论和裁决（有的已关闭，有的仍待决），汇总见 [#986](https://github.com/iDoris-ai/Agent24/issues/986)。
 
