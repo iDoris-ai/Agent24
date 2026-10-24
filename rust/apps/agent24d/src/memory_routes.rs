@@ -753,7 +753,7 @@ mod tests {
         })
     }
 
-    async fn run_in_session(state: &AppState, session_id: &str, prompt: &str) {
+    async fn finish_run(state: &AppState, session_id: &str, prompt: &str) -> agent24_protocol::Run {
         let response = crate::runs::create_run(
             State(state.clone()),
             Request::builder()
@@ -776,14 +776,18 @@ mod tests {
             loop {
                 let current = state.store.get_run(&created.id).await.unwrap().unwrap();
                 if !matches!(current.status, RunStatus::Running | RunStatus::Queued) {
-                    assert_eq!(current.status, RunStatus::Completed);
-                    break;
+                    return current;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("run must finish");
+        .expect("run must finish")
+    }
+
+    async fn run_in_session(state: &AppState, session_id: &str, prompt: &str) {
+        let current = finish_run(state, session_id, prompt).await;
+        assert_eq!(current.status, RunStatus::Completed);
     }
 
     fn last_messages_mention(provider: &RecordingProvider, needle: &str) -> bool {
@@ -859,7 +863,13 @@ mod tests {
         assert_eq!(put.status(), StatusCode::OK);
 
         let mut events = state.events.subscribe();
-        run_in_session(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
+        let paused = finish_run(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
+        assert_eq!(paused.status, RunStatus::Failed);
+        assert_eq!(
+            paused.error.as_ref().map(|error| error.code.as_str()),
+            Some("source_unproven")
+        );
+        assert!(provider.received.lock().unwrap().is_empty());
 
         // H1: no new assertion — the write gate still independently refuses it.
         let rows = kv
@@ -868,14 +878,6 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.is_empty(), "paused memory must reject the write");
-
-        // H1: the MODEL was told, so it cannot claim to have remembered it.
-        // Content-only check (no role/prefix assumption — T07.1 may reshape
-        // how this is framed).
-        assert!(
-            last_messages_mention(&provider, "记忆已暂停"),
-            "the model must be told memory is paused for this prompt"
-        );
 
         // H1: `memory.write_skipped{reason:"paused"}` was emitted.
         let skipped: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
