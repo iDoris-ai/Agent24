@@ -59,3 +59,25 @@ async fn acceptances_are_append_only_and_bounded() {
         assert!(record(&mut conn, JOB, 1, &run, &accepted).await.is_err());
     }
 }
+
+/// A call knows whether its operation's authorization, or the whole
+/// module's, ended since it began; those still in flight are counted.
+#[test]
+fn a_call_knows_whether_its_authorization_ended_since_it_began() {
+    let calls = Arc::new(Calls::default());
+    let (find, list) = (calls.begin("find"), calls.begin("list"));
+    calls.end("find");
+    assert!(find.ended());
+    assert!(!list.ended());
+    assert!(!calls.begin("find").ended(), "begun after the end");
+    assert_eq!(calls.before_an_end("find"), 1);
+    assert_eq!(calls.before_an_end("list"), 0);
+    assert_eq!(calls.in_flight(), 2);
+    drop(find);
+    assert_eq!(calls.before_an_end("find"), 0);
+    calls.end(ALL);
+    assert!(list.ended());
+    assert_eq!(calls.before_an_end(ALL), 1);
+    drop(list);
+    assert_eq!(calls.in_flight(), 0);
+}

@@ -200,6 +200,19 @@ impl Layers {
         })
     }
 
+    /// The job attempts that asked for builds not yet finished.
+    pub fn job_requesters(&self) -> Vec<(String, i64)> {
+        let building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        building
+            .values()
+            .flat_map(|b| &b.by)
+            .filter_map(|by| match by {
+                Requester::Job { id, attempt } => Some((id.clone(), *attempt)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Stops the builds any of `which` asked for: one waiting for an engine
     /// at once, one parsing by dropping its parse (the PDFKit helper is
     /// killed); one already pinning goes on. Returns their outcomes, which
@@ -273,6 +286,9 @@ impl Layers {
                 // Its own task: a read that stops waiting does not stop it.
                 tokio::spawn(async move {
                     let result = tokio::select! {
+                        // A stop ready with a slot wins.
+                        biased;
+                        () = told_to_stop(&mut stopped) => Err(LayerFailure::Stopped),
                         slot = slots.acquire() => match slot {
                             // And the parse in one more, so an engine that
                             // panics is a failed build, not a stuck one.
@@ -281,7 +297,6 @@ impl Layers {
                                 .unwrap_or_else(|_| Err(failed("the engine stopped"))),
                             Err(_) => Err(LayerFailure::Busy),
                         },
-                        () = told_to_stop(&mut stopped) => Err(LayerFailure::Stopped),
                     };
                     // Pinned (or failed) before it stops counting as started,
                     // so a later read finds the layer or starts afresh.
@@ -361,22 +376,30 @@ async fn build(
     media_type: String,
     mut stop: watch::Receiver<bool>,
 ) -> Result<String, LayerFailure> {
-    // A build that finished between this one's lookup and its start.
-    if let Some(address) = key.pinned(&storage).await? {
+    // A build that finished between this one's lookup and its start: not
+    // given to a build told to stop meanwhile.
+    let pinned = key.pinned(&storage).await?;
+    if *stop.borrow() {
+        return Err(LayerFailure::Stopped);
+    }
+    if let Some(address) = pinned {
         return Ok(address);
     }
     let path = storage
         .blobs
         .path_of(&key.content)
         .map_err(|e| LayerFailure::Storage(Some(blob_cause(&e)), e.to_string()))?;
-    let layer = tokio::select! {
-        parsed = engine.parse(&key.content, &media_type, &path) => parsed.map_err(LayerFailure::Engine)?,
+    let parsed = tokio::select! {
+        biased;
         () = told_to_stop(&mut stop) => return Err(LayerFailure::Stopped),
+        parsed = engine.parse(&key.content, &media_type, &path) => parsed,
     };
-    // The last point it stops at: a pin, once begun, is finished.
+    // The last point it stops at, whatever the parse gave: a pin, once
+    // begun, is finished.
     if *stop.borrow() {
         return Err(LayerFailure::Stopped);
     }
+    let layer = parsed.map_err(LayerFailure::Engine)?;
     if layer.engine != key.engine || layer.config != engine.config() {
         return Err(failed("the layer names another engine or config"));
     }
