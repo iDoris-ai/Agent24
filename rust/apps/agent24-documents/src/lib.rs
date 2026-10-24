@@ -9,6 +9,7 @@
 //! is now, and every operation without a route yet as
 //! unavailable with a typed reason (ADR-DOC-02 §8).
 
+pub mod authorization;
 pub mod blob;
 pub mod db;
 pub mod documents;

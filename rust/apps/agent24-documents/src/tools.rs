@@ -26,6 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::authorization::Accepted;
 use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::engine::Requester;
 use crate::error::ApiError;
@@ -200,13 +201,17 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         run_id: context.run_id.clone(),
         tool_call_id: context.tool_call_id.clone(),
     };
+    let accepted = Accepted {
+        operation: op.to_owned(),
+        authorization_ref: context.authorization_ref.clone(),
+    };
     let scope = &scope;
     let work = async move {
         // The scope is checked here, for every operation, before it runs
         // (K1-06a §4.1): an operation `admit` has no row for never runs.
         admit(state, scope, op, &arguments).await?;
         match op {
-            "extract" => extract(state, run, arguments).await,
+            "extract" => extract(state, run, accepted, arguments).await,
             "list" => list(state, scope, arguments).await,
             "get" => get(state, arguments).await,
             "job_get" => job_get(state, arguments).await,
@@ -398,7 +403,12 @@ async fn extraction_get(state: &AppState, arguments: Map<String, Value>) -> Outc
 /// Submits or replays an extract job, as REST does (DOC-1-06b §2.3), from
 /// `run`; never waits for it. The hash is taken of `{revision, schema}`, the
 /// body the page sends, so a page's job and a run's share a key.
-async fn extract(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+async fn extract(
+    state: &AppState,
+    run: Run,
+    accepted: Accepted,
+    arguments: Map<String, Value>,
+) -> Outcome {
     // The oplog's CHECK would refuse it inside the claim, read as a
     // storage failure.
     if run.run_id.is_empty() || run.tool_call_id.is_empty() {
@@ -433,6 +443,7 @@ async fn extract(state: &AppState, run: Run, arguments: Map<String, Value>) -> O
         request,
         input,
         origin,
+        Some(accepted),
     ));
     match task.await {
         Ok(Ok((job, started))) => Ok(Envelope::Completed {

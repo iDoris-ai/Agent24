@@ -158,6 +158,11 @@ async fn wait_for(list: &Mutex<Vec<String>>, id: &str, n: usize) {
     }
 }
 
+/// Once `n` supervisors of the job have finished.
+pub(crate) async fn wait_for_done(id: &str, n: usize) {
+    wait_for(&DONE, id, n).await;
+}
+
 /// The row once every worker started for it has finished. It must also
 /// read back as a contract-valid job (`jobs::load` refuses one that is not).
 async fn finished(env: &Env, id: &str, workers: usize) -> Row {
