@@ -1802,7 +1802,7 @@ impl RunManager {
                     self.finish_failed(
                         &run_id,
                         "source_policy_unavailable",
-                        &format!("failed to persist session source floor: {err}"),
+                        &format!("failed to read or persist session source floor: {err}"),
                     )
                     .await;
                     return;
