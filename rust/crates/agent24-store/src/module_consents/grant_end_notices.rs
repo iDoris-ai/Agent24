@@ -1,10 +1,11 @@
-//! K1-6a-G §2.5.1 (A5c): the ends of grants a module must be told of. Each
-//! is a row written in the transaction of the write that ended the grants —
-//! a revocation, a decision replacing a granted row, an enable epoch advance
-//! — with their references, so the module can stop exactly their work and
-//! refuse late calls carrying them. A crash before the notice, or a later
-//! decision replacing the row, loses none: the notifier sends every row not
-//! answered yet.
+//! K1-6a-G §2.5.1 (A5c): the ends of grants a module must be told of, with
+//! their references, so the module can stop exactly their work and refuse
+//! late calls carrying them. A row is written in the transaction of the
+//! write that ended them: every revocation (its route always sends a
+//! notice), and a decision replacing a granted row or an enable epoch
+//! advance that ended grants not told yet. A crash before the notice, or a
+//! later decision replacing the row, so loses none: every row not answered
+//! yet stays pending for the notifier (A5c-2).
 
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
