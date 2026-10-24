@@ -47,6 +47,7 @@ KB-C ID 不取代 DOC/M1/K1/OD；首轮专用 REST/知识页不等待通用 Work
 - fork 侧：`iDoris-ai/WeKnora` 的 `a24/develop`。
 - 状态：跟踪 issue 是 [#986](https://github.com/iDoris-ai/Agent24/issues/986)，看板是 [projects/2](https://github.com/orgs/iDoris-ai/projects/2)。上表是 2026-10-11 的登记快照，各工作包的当前状态以看板为准。
 - 相关文档：任务方案见 [PLAN-KNOWLEDGE-TASKS](../knowledge/PLAN-KNOWLEDGE-TASKS.md)，定位与差异登记见 [POSITIONING-AND-DIFFS](../knowledge/POSITIONING-AND-DIFFS.md)，契约见 `docs/knowledge/CONTRACT-*.md`。
+- ADR-KB-01 与 PLAN-KNOWLEDGE-CONVERSATION 是从 [#906](https://github.com/iDoris-ai/Agent24/pull/906) 原样带入的，正文里的“本 PR”“合入前后”指的是 #906。
 
 ## Open Design / 第三方工具线台账（2026-10-03 立）
 

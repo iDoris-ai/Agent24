@@ -5,7 +5,7 @@
 > - **现状与差异（§0、§6）**：当时核实的结果。之后的更正见 WeKnora [能力矩阵](https://github.com/iDoris-ai/WeKnora/blob/a24/develop/docs/agent24/CAPABILITY-MATRIX.md)和 [#989](https://github.com/iDoris-ai/Agent24/issues/989) 的回写评论。
 > - **契约**：见本目录的 `CONTRACT-*.md`。
 > - **任务状态**：见 [projects/2](https://github.com/orgs/iDoris-ai/projects/2) 和各 issue。
-> - **§5 各项的裁决**：见 [#986](https://github.com/iDoris-ai/Agent24/issues/986) 和 #991–#997。
+> - **§5 的 9 项**：§5.1–§5.9 依次在 #990–#998 讨论和裁决（有的已关闭，有的仍待决），汇总见 [#986](https://github.com/iDoris-ai/Agent24/issues/986)。
 
 2026-10-15。v1 由 Claude 合并 Codex 独立方案（31 任务）与三份调研写成；Codex（gpt-6-astra，high）复核后 REQUEST_CHANGES，本稿逐条吸收其 D1–D8 和 37 个任务意见，Codex 引用的代码事实均已由 Claude 在源码复核。
 性质：任务方案，不是实施授权；KB-C1–C4 仍 BACKLOG；不恢复 OD-M11/TPI-W/Line W；README §12"DOC-1 期间 Line K 只起草契约"的限制未被解除，§22 允许的探测/PoC 不等于产品实施。

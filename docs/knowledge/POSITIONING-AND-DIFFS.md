@@ -1,6 +1,6 @@
 # Knowledge 定位与差异登记
 
-> **来源与适用范围**：KB-C0-01（[#1010](https://github.com/iDoris-ai/Agent24/issues/1010)）把两个 issue 的正文同步到 `ab/weknora`，验收清单没有带进来，其余内容未作改动：
+> **来源与适用范围**：KB-C0-01（[#1010](https://github.com/iDoris-ai/Agent24/issues/1010)）把两个 issue 的正文同步到 `ab/weknora`。验收清单没有带进来；原有的二级标题降为三级，并加了两个分节标题；正文句子未作改动，其中的“本 issue”指各自的来源 issue：
 > - 定位摘要：来自 [#987](https://github.com/iDoris-ai/Agent24/issues/987)。
 > - 差异登记：来自 [#989](https://github.com/iDoris-ai/Agent24/issues/989)，是 2026-10-15 的核实结果。
 >
