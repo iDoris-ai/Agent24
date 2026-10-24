@@ -27,7 +27,7 @@ export const approvalsMessages = defineMessages({
     'notification.title': 'ต้องอนุมัติ',
     'empty': 'ไม่มีรายการรออนุมัติ',
     'decision.approve': 'อนุมัติ', 'decision.approveForSession': 'อนุมัติตลอดเซสชัน',
-    'decision.deny': 'ปฏิเสธ', 'decision.abort': 'ยกเลิกการทำงาน',
+    'decision.deny': 'ปฏิเสธ', 'decision.abort': 'ยกเลิกงาน',
     'deny.reason': 'เหตุผลที่ปฏิเสธ', 'deny.placeholder': 'เหตุผลที่ปฏิเสธ (จำเป็น)',
     'deny.confirm': 'ยืนยันการปฏิเสธ', 'deny.back': 'กลับ',
   },

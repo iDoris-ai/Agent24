@@ -24,8 +24,8 @@ export const runsMessages = defineMessages({
   th: {
     'title': 'งานที่รัน', 'subtitle': 'ประวัติการทำงานของ Agent · อัปเดตทุก 3 วินาที',
     'status.queued': 'รอคิว', 'status.running': 'กำลังทำงาน', 'status.awaitingApproval': 'รออนุมัติ',
-    'status.completed': 'เสร็จแล้ว', 'status.failed': 'ล้มเหลว', 'status.cancelled': 'ยกเลิกแล้ว',
-    'list.empty': 'ยังไม่มีงานที่รัน', 'list.scheduled': 'เริ่มจากกำหนดเวลา',
+    'status.completed': 'เสร็จแล้ว', 'status.failed': 'ไม่สำเร็จ', 'status.cancelled': 'ยกเลิกแล้ว',
+    'list.empty': 'ยังไม่มีงานที่รัน', 'list.scheduled': 'เริ่มจากกำหนดการ',
     'detail.select': 'เลือกงานเพื่อดูรายละเอียด', 'detail.cancel': 'ยกเลิก',
     'detail.prompt': 'คำสั่ง:', 'detail.output': 'ผลลัพธ์:', 'detail.error': 'ข้อผิดพลาด [{code}]:',
     'detail.created': 'สร้างเมื่อ {date}', 'detail.ended': 'สิ้นสุดเมื่อ {date}',
