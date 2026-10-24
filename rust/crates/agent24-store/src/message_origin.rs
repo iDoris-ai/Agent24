@@ -32,6 +32,14 @@ pub struct OriginatedRunMessage {
     pub origin: MessageOrigin,
 }
 
+/// One row of the first model-call snapshot.
+/// `PauseNotice` is the only variant that writes no `run_message_origins` row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotRunMessage {
+    Originated(OriginatedRunMessage),
+    PauseNotice(PendingRunMessage),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMessageOrigin {
     pub seq: i64,
@@ -189,6 +197,58 @@ impl Store {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query(INSERT_ORIGIN)
+                .bind(run_id)
+                .bind(run_id)
+                .bind(MESSAGE_ORIGIN_SCHEMA_VERSION)
+                .bind(kind)
+                .bind(&digest)
+                .bind(recall_ref)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The whole snapshot commits in one `BEGIN IMMEDIATE`, or none of it does.
+    /// A pause notice writes no origin row. An empty slice does not start a transaction.
+    pub async fn append_snapshot_run_messages(
+        &self,
+        run_id: &str,
+        messages: &[SnapshotRunMessage],
+        now: &str,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        for row in messages {
+            let (message, origin) = match row {
+                SnapshotRunMessage::Originated(row) => (&row.message, Some(&row.origin)),
+                SnapshotRunMessage::PauseNotice(message) => (message, None),
+            };
+            let tool_calls_json = serde_json::to_string(&message.tool_calls)?;
+            sqlx::query(INSERT_MESSAGE)
+                .bind(run_id)
+                .bind(run_id)
+                .bind(&message.role)
+                .bind(message.content.as_deref())
+                .bind(&tool_calls_json)
+                .bind(message.tool_call_id.as_deref())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            let Some(origin) = origin else {
+                continue;
+            };
+            let (kind, recall_ref) = origin_columns(origin)?;
+            let digest = message_instance_digest(
+                &message.role,
+                message.content.as_deref(),
+                &message.tool_calls,
+                message.tool_call_id.as_deref(),
+            )?;
             sqlx::query(INSERT_ORIGIN)
                 .bind(run_id)
                 .bind(run_id)

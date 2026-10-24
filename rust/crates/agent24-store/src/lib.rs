@@ -78,7 +78,7 @@ pub use legacy_recovery::{
 };
 pub use message_origin::{
     MESSAGE_ORIGIN_SCHEMA_VERSION, MessageOrigin, MessageOriginLookup, OriginatedRunMessage,
-    StoredMessageOrigin, message_instance_digest,
+    SnapshotRunMessage, StoredMessageOrigin, message_instance_digest,
 };
 pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
 pub use module_audit_event::{
