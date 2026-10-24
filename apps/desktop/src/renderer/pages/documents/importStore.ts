@@ -145,13 +145,13 @@ export async function cancelImport(api: Api): Promise<void> {
   set({ acting: true, error: null })
   try {
     const res = await api.request({ op: 'cancelJob', jobId: job.job_id })
+    // A retry's following can end, and another import start, before the
+    // answer lands: an answer about a job no longer shown is dropped.
+    if (state.job?.job_id !== job.job_id) return
     if (!res.ok) {
       set({ error: describeError(res) })
       return
     }
-    // A retry's following can end, and another import start, before the
-    // answer lands: an answer about a job no longer shown is dropped.
-    if (state.job?.job_id !== job.job_id) return
     adopt(res.data)
     if (state.importing) {
       nudge(job.job_id)

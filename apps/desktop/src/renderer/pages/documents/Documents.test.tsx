@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import DocumentsPage from './Documents'
+import { readableSize } from './DocumentDetail'
 import { cancelImport, getImportState, resetImportStore } from './importStore'
 import { setLocale } from '../../i18n'
 
@@ -397,9 +398,16 @@ describe('DocumentsPage: cancel and retry', () => {
     fireEvent.click(screen.getByRole('button', IMPORT))
     await tick(2200)
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('storage_unavailable：corrupt'))
-    answer(m, [() => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' }))], { cancelJob: () => ok(job('cancelling')) })
+    let answered: () => void = () => {}
+    answer(m, [() => ok(job('cancelled', { code: 'cancelled', message: 'cancelled' }))], {
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: job('cancelling') }))),
+    })
     fireEvent.click(screen.getByRole('button', CANCEL))
+    fireEvent.click(screen.getByRole('button', IMPORT)) // not while the cancel is on its way
+    expect(m.importFile).toHaveBeenCalledTimes(1)
+    await act(async () => answered())
     await waitFor(() => expect(screen.getByText('取消中')).toBeInTheDocument())
+    expect(screen.getByRole('button', IMPORT)).toBeDisabled() // following again
     await tick(1100)
     await waitFor(() => expect(screen.getByText(/^已取消/)).toBeInTheDocument())
     expect(screen.getByRole('button', RETRY)).toBeInTheDocument()
@@ -485,13 +493,16 @@ describe('DocumentsPage: cancel and retry', () => {
     await waitFor(() => expect(screen.getByText('已导入')).toBeInTheDocument())
   })
 
-  it('a cancel answering after another import started leaves that import shown', async () => {
+  it.each([
+    ['answers', (): Promise<Res> => ok(attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }))],
+    ['fails', (): Promise<Res> => err(503, 'storage_unavailable', 'storage is not available')],
+  ])('a cancel that %s after another import started leaves that import shown', async (_, late) => {
     const m = mount({})
     m.importFile.mockImplementation(() => ok(job('queued')))
     let answered: () => void = () => {}
     answer(m, [() => ok(job('interrupted')), () => ok(attempt('running', 2)), () => ok(attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }))], {
       retryJob: () => ok(attempt('queued', 2)),
-      cancelJob: () => new Promise<Res>((r) => (answered = () => r({ ok: true, status: 200, data: attempt('cancelled', 2, { code: 'cancelled', message: 'cancelled' }) }))),
+      cancelJob: () => new Promise<Res>((r) => (answered = () => r(late()))),
     })
     render(<DocumentsPage />)
     fireEvent.click(screen.getByRole('button', IMPORT))
@@ -511,6 +522,7 @@ describe('DocumentsPage: cancel and retry', () => {
     await tick(1100)
     expect(screen.getByText('已导入')).toBeInTheDocument()
     expect(screen.queryByRole('button', RETRY)).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('an import is counted once, whether its success is first heard from a read or from a cancel', async () => {
@@ -547,6 +559,126 @@ describe('DocumentsPage: cancel and retry', () => {
     await waitFor(() => expect(lists()).toHaveLength(3))
     await tick(1100)
     expect(lists()).toHaveLength(3)
+  })
+})
+
+describe('DocumentsPage: a document and its text', () => {
+  beforeEach(() => { setLocale('zh') })
+  const detail = (n: number, size = 2048) => ({
+    ...doc(n),
+    head: { revision: 2, content_sha256: `sha256:${'a'.repeat(64)}`, size, media_type: 'application/pdf' },
+  })
+  const block = (id: string, text: string, page?: number) =>
+    ({ block_id: id, text, text_sha256: `sha256:${'b'.repeat(64)}`, ...(page ? { page, geometry: { x: 0, y: 0, width: 1, height: 1 } } : {}) })
+  const text = (blocks: unknown[], next: string | null = null, regions: unknown[] = []) => ({
+    document_id: doc(1).document_id, revision: 2, content_sha256: `sha256:${'a'.repeat(64)}`, media_type: 'application/pdf',
+    text_layer_sha256: `sha256:${'c'.repeat(64)}`, engine: { name: 'pdfkit', version: '1' },
+    parse_status: regions.length ? 'partial' : 'complete', unparsed_regions: regions, blocks, next_cursor: next,
+  })
+  /** Answers `get` and `readText` from the queues, the rest as `mount` does. */
+  function reading(m: Mock, gets: Array<() => Promise<Res>>, texts: Array<() => Promise<Res>>) {
+    const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+    m.request.mockImplementation((req: { op: string }) => {
+      if (req.op === 'get') return gets.shift()!()
+      if (req.op === 'readText') return texts.shift()!()
+      return base(req)
+    })
+  }
+  const reads = (m: Mock) => m.request.mock.calls.filter(([r]) => r.op === 'readText').map(([r]) => r)
+
+  it('opens a document: its details, its head revision\'s text by page, then the next page on demand', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [
+      () => ok(text([block('b1', '第一段', 1), block('b2', '第二段', 1), block('b3', '第三段', 2)], 'cc01', [{ reason: 'image', page: 2 }, { reason: 'image', page: 3 }])),
+      // Page 3 was cut short and is read on: its region comes again.
+      () => ok(text([block('b4', '第四段', 3)], null, [{ reason: 'image', page: 3 }, { reason: 'image', page: 4 }])),
+    ])
+    render(<DocumentsPage />)
+    const title = await screen.findByRole('button', { name: '通告 1' })
+    title.focus()
+    fireEvent.click(title)
+    const panel = await screen.findByRole('region', { name: '文档详情' })
+    expect(within(panel).getByRole('heading')).toHaveFocus()
+    await waitFor(() => expect(panel).toHaveTextContent('第三段'))
+    expect(panel).toHaveTextContent('application/pdf · 2.0 KB · 第 2 版')
+    expect(screen.getByRole('note')).toHaveTextContent('部分内容未能识别（涉及 2 页）')
+    expect(screen.getAllByText(/^第 \d 页$/).map((e) => e.textContent)).toEqual(['第 1 页', '第 2 页'])
+    expect(reads(m)).toEqual([{ op: 'readText', documentId: doc(1).document_id, revision: 2 }])
+    fireEvent.click(screen.getByRole('button', { name: '加载更多正文' }))
+    await waitFor(() => expect(panel).toHaveTextContent('第四段'))
+    expect(screen.getByRole('note')).toHaveTextContent('部分内容未能识别（涉及 3 页）')
+    expect(reads(m)[1]).toEqual({ op: 'readText', documentId: doc(1).document_id, revision: 2, cursor: 'cc01' })
+    expect(panel).toHaveTextContent('第一段')
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    expect(screen.queryByRole('region', { name: '文档详情' })).not.toBeInTheDocument()
+    expect(title).toHaveFocus()
+  })
+
+  it('a next page read after a failed one clears what the failure said', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [
+      () => ok(text([block('b1', '第一段', 1)], 'cc01')),
+      () => err(503, 'engine_unavailable', '引擎忙'),
+      () => ok(text([block('b2', '第二段', 2)])),
+    ])
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    fireEvent.click(await screen.findByRole('button', { name: '加载更多正文' }))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('引擎忙（engine_unavailable）'))
+    fireEvent.click(screen.getByRole('button', { name: '加载更多正文' }))
+    await waitFor(() => expect(screen.getByText('第二段')).toBeInTheDocument())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(reads(m)[2]).toMatchObject({ cursor: 'cc01' })
+  })
+
+  it('no text on a page read is not "no text": more may follow, or the pages were not parsed', async () => {
+    const m = mount({ lists: [page([1, 2])] })
+    reading(m, [() => ok(detail(1)), () => ok(detail(2))], [
+      () => ok(text([], 'cc01')),
+      () => ok(text([], null, [{ reason: 'image', page: 1 }])),
+    ])
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    await screen.findByRole('button', { name: '加载更多正文' })
+    expect(screen.queryByText('这份文档没有读出文字。')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '通告 2' }))
+    await waitFor(() => expect(screen.getByRole('note')).toHaveTextContent('涉及 1 页'))
+    expect(screen.queryByText('这份文档没有读出文字。')).not.toBeInTheDocument()
+  })
+
+  it('a reply for a document no longer open is dropped', async () => {
+    const m = mount({ lists: [page([1, 2])] })
+    let late: () => void = () => {}
+    reading(m, [() => ok(detail(1)), () => ok(detail(2))], [
+      () => new Promise((r) => (late = () => r({ ok: true, status: 200, data: text([block('x', '旧文档的字')]) }))),
+      () => ok(text([block('y', '新文档的字')])),
+    ])
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    await waitFor(() => expect(reads(m)).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', { name: '通告 2' }))
+    await waitFor(() => expect(screen.getByText('新文档的字')).toBeInTheDocument())
+    await act(async () => late())
+    expect(screen.queryByText('旧文档的字')).not.toBeInTheDocument()
+  })
+
+  it('says why the text could not be read, and when none was read', async () => {
+    const m = mount({ lists: [page([1, 2])] })
+    reading(m, [() => ok(detail(1)), () => ok(detail(2))], [
+      () => err(422, 'parse_failed', '解析失败'),
+      () => ok(text([])),
+    ])
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('解析失败（parse_failed）'))
+    expect(screen.queryByText('这份文档没有读出文字。')).not.toBeInTheDocument() // unread is not empty
+    fireEvent.click(screen.getByRole('button', { name: '通告 2' }))
+    await waitFor(() => expect(screen.getByText('这份文档没有读出文字。')).toBeInTheDocument())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('sizes read as bytes, KB or MB', () => {
+    expect([readableSize(512), readableSize(1536), readableSize(3 * 1024 * 1024)]).toEqual(['512 B', '1.5 KB', '3.0 MB'])
   })
 })
 

@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
+import DocumentDetail from './DocumentDetail'
 import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 
@@ -33,6 +34,9 @@ export default function DocumentsPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
+  const [open, setOpen] = useState<string | null>(null)
+  // The title that opened the details, given focus back when they close.
+  const opener = useRef<HTMLButtonElement | null>(null)
   // Each reload starts a new generation; a reply from an older one (or from
   // an unmounted page) is dropped, so pages never mix or repeat.
   const generation = useRef(0)
@@ -141,6 +145,7 @@ export default function DocumentsPage() {
           {error ?? listError}
         </div>
       )}
+      {open && <DocumentDetail documentId={open} onClose={() => { setOpen(null); opener.current?.focus() }} />}
       {docs.length === 0 ? (
         <p style={{ color: 'var(--muted)' }}>{t('list.empty')}</p>
       ) : (
@@ -155,7 +160,11 @@ export default function DocumentsPage() {
           <tbody>
             {docs.map((d) => (
               <tr key={d.document_id}>
-                <td style={CELL}>{d.title}</td>
+                <td style={CELL}>
+                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
+                    {d.title}
+                  </button>
+                </td>
                 <td style={CELL}>{d.media_type}</td>
                 <td style={CELL}>{new Date(d.created_at).toLocaleString()}</td>
               </tr>

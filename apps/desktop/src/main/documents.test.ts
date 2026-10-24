@@ -13,6 +13,8 @@ describe('documentsRoute', () => {
       [{ op: 'list' }, { method: 'GET', path: '/api/v1/documents/documents' }],
       [{ op: 'list', cursor: 'ab12', limit: 20 }, { method: 'GET', path: '/api/v1/documents/documents?cursor=ab12&limit=20' }],
       [{ op: 'get', documentId: DOC }, { method: 'GET', path: `/api/v1/documents/documents/${DOC}` }],
+      [{ op: 'readText', documentId: DOC, revision: 2 }, { method: 'GET', path: `/api/v1/documents/documents/${DOC}/revisions/2/text` }],
+      [{ op: 'readText', documentId: DOC, revision: 1, cursor: 'ab12' }, { method: 'GET', path: `/api/v1/documents/documents/${DOC}/revisions/1/text?cursor=ab12` }],
       [{ op: 'job', jobId: JOB }, { method: 'GET', path: `/api/v1/documents/jobs/${JOB}` }],
       [{ op: 'cancelJob', jobId: JOB }, { method: 'POST', path: `/api/v1/documents/jobs/${JOB}/cancel` }],
       [{ op: 'retryJob', jobId: JOB }, { method: 'POST', path: `/api/v1/documents/jobs/${JOB}/retry` }],
@@ -47,6 +49,14 @@ describe('documentsRoute', () => {
       { op: 'list', limit: 201 },
       { op: 'list', limit: 1.5 },
       { op: 'list', limit: '20' },
+      { op: 'readText', documentId: DOC },
+      { op: 'readText', documentId: DOC, revision: 0 },
+      { op: 'readText', documentId: DOC, revision: 1.5 },
+      { op: 'readText', documentId: DOC, revision: '1' },
+      { op: 'readText', documentId: DOC, revision: '1/../../runs' },
+      { op: 'readText', documentId: 'doc_x', revision: 1 },
+      { op: 'readText', documentId: DOC, revision: 1, cursor: 'ab&block=x' },
+      { op: 'readText', documentId: DOC, revision: 1, cursor: '' },
     ]) {
       expect(documentsRoute(req), JSON.stringify(req)).toBeNull()
     }
