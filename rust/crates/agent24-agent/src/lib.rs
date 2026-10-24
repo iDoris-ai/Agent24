@@ -1770,6 +1770,45 @@ impl RunManager {
                 return;
             }
         }
+        // K1-6b.4d (ADR-K1-02 §2.2): a run started by a kernel-created
+        // schedule (a self-wake) carries the classification recorded when it
+        // was created, re-read on every firing. A schedule the user created
+        // has none. A failed lookup is not safe to re-validate: fail before
+        // the model call.
+        if let Some(schedule_id) = run.schedule_id.as_deref() {
+            let origin = match self.store.schedule_origin_classification(schedule_id).await {
+                Ok(origin) => origin,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to read schedule source origin: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Some(classification) = origin {
+                let tag = agent24_store::SourceRef::schedule_origin(
+                    schedule_id,
+                    classification,
+                    now_iso8601(),
+                );
+                if let Err(err) = self
+                    .store
+                    .tag_run_source(&run_id, user_msg_seq, &tag, &now_iso8601())
+                    .await
+                {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to persist schedule source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
         // K1-6b.4c (ADR-K1-02 §2.2): earlier turns of the session are a
         // source of this run. Merge this run's own classification into the
         // session floor before the model call and tag the run with the
@@ -4274,6 +4313,129 @@ pub(crate) mod tests {
         .await
         .unwrap();
         let run = run_in_session(&manager, &store, "sess_nofloor", "hello").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    // ── K1-6b.4d: runs started by kernel-created schedules (ADR-K1-02 §2.2) ──
+
+    async fn run_scheduled(
+        manager: &Arc<RunManager>,
+        store: &Store,
+        session_id: Option<&str>,
+        schedule_id: &str,
+        prompt: &str,
+    ) -> Run {
+        let run = manager
+            .start_run_with_schedule(
+                RunCreate {
+                    session_id: session_id.map(str::to_owned),
+                    workspace_id: None,
+                    prompt: prompt.to_owned(),
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                },
+                Some(schedule_id.to_owned()),
+            )
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            let current = store.get_run(&run.id).await.unwrap().unwrap();
+            if current.status != RunStatus::Running && current.status != RunStatus::Queued {
+                return current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run did not finish");
+    }
+
+    #[tokio::test]
+    async fn a_self_wake_run_carries_the_classification_recorded_at_creation() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        // No session and no memory: nothing else could restrict this run.
+        for (origin, egress_allowed) in [(Ordinary, true), (Restricted, false), (Unknown, false)] {
+            let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+            store
+                .record_schedule_origin("wake_x", "run_creator", origin, &now_iso8601())
+                .await
+                .unwrap();
+            let run = run_scheduled(&manager, &store, None, "wake_x", "check the build").await;
+            let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+            let tag = snapshot
+                .sources
+                .iter()
+                .find(|source| source.source_id == "schedule_origin:wake_x")
+                .unwrap_or_else(|| panic!("no schedule origin tag in {:?}", snapshot.sources));
+            assert_eq!(tag.classification, origin);
+            assert_eq!(tag.kind, agent24_store::SourceKind::ScheduleOrigin);
+            assert_eq!(
+                process_egress_allowed_in(&manager, &run).await,
+                egress_allowed,
+                "{origin:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restricted_self_wake_raises_its_session_floor_for_later_turns() {
+        use agent24_store::SourceClassification::Restricted;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_wake").await;
+        store
+            .record_schedule_origin("wake_r", "run_creator", Restricted, &now_iso8601())
+            .await
+            .unwrap();
+        // A scheduled prompt cannot itself write a qualified memory, but the
+        // woken turn joins the session, so a later user turn inherits it.
+        run_scheduled(
+            &manager,
+            &store,
+            Some("sess_wake"),
+            "wake_r",
+            "check the build",
+        )
+        .await;
+        run_in_session(&manager, &store, "sess_wake", "记住 gamma is third").await;
+        assert_eq!(
+            stored_classification(&kv, "gamma is third").await,
+            Restricted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_schedule_run_has_no_schedule_origin() {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let run = run_scheduled(&manager, &store, None, "user_sched", "check the build").await;
+        let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+        assert!(
+            snapshot
+                .sources
+                .iter()
+                .all(|source| source.kind != agent24_store::SourceKind::ScheduleOrigin),
+            "{:?}",
+            snapshot.sources
+        );
+        assert!(process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        sqlx::raw_sql("DROP TABLE schedule_source_origin")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let run = run_scheduled(&manager, &store, None, "wake_gone", "check the build").await;
         assert_eq!(run.status, RunStatus::Failed);
         assert!(
             provider.seen.lock().unwrap().is_empty(),

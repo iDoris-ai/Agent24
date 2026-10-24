@@ -67,6 +67,9 @@ pub enum SourceKind {
     /// Earlier turns of the run's session (K1-6b.4c), classified by the
     /// session's source floor.
     SessionContext,
+    /// A prompt a kernel-created schedule (a self-wake) carries from the
+    /// run that created it (K1-6b.4d).
+    ScheduleOrigin,
 }
 
 /// Sensitivity classification is independent from processing mode and source
@@ -154,6 +157,26 @@ impl SourceRef {
         Self {
             source_id: format!("session_floor:{session_id}"),
             kind: SourceKind::SessionContext,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// The prompt of a run started by a kernel-created schedule. Its
+    /// classification is the one recorded when the schedule was created
+    /// ([`Store::record_schedule_origin`]).
+    pub fn schedule_origin(
+        schedule_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("schedule_origin:{schedule_id}"),
+            kind: SourceKind::ScheduleOrigin,
             classification,
             revision_digest: None,
             mode: SourceMode::LocalOnly,
@@ -523,6 +546,44 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(merged)
+    }
+
+    /// K1-6b.4d (ADR-K1-02 §2.2): record, before the schedule itself is
+    /// written, the classification a kernel-created schedule carries from the
+    /// run that created it.
+    pub async fn record_schedule_origin(
+        &self,
+        schedule_id: &str,
+        origin_run_id: &str,
+        classification: SourceClassification,
+        now: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schedule_source_origin (schedule_id, origin_run_id, classification, created_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(schedule_id)
+        .bind(origin_run_id)
+        .bind(classification_column(classification))
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The classification recorded for a kernel-created schedule; `None` for
+    /// a schedule the user created.
+    pub async fn schedule_origin_classification(
+        &self,
+        schedule_id: &str,
+    ) -> Result<Option<SourceClassification>> {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT classification FROM schedule_source_origin WHERE schedule_id = ?",
+        )
+        .bind(schedule_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(stored.as_deref().map(classification_from_column))
     }
 
     /// The run's fail-closed effective policy (ADR-K1-02 §2.1), folded from
@@ -954,6 +1015,37 @@ mod tests {
         let tags = store.list_run_source_tags("run_floor").await.unwrap();
         assert_eq!(tags[0].source, tag);
         assert_eq!(tags[0].source.kind, SourceKind::SessionContext);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_origin_round_trips_and_user_schedules_have_none() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .record_schedule_origin("wake_1", "run_1", SourceClassification::Restricted, "t")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .schedule_origin_classification("wake_1")
+                .await
+                .unwrap(),
+            Some(SourceClassification::Restricted)
+        );
+        assert_eq!(
+            store
+                .schedule_origin_classification("user_sched")
+                .await
+                .unwrap(),
+            None
+        );
+        // An origin is recorded once; a second write for the same schedule is
+        // an error rather than a silent overwrite.
+        assert!(
+            store
+                .record_schedule_origin("wake_1", "run_2", SourceClassification::Ordinary, "t")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
