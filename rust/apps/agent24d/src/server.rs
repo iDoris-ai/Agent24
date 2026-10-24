@@ -3867,6 +3867,20 @@ pub(crate) mod tests {
             || store.grant_module_consent(&summary, "2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z");
         grant().await.unwrap();
         assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        let unconfirmed = |store: agent24_store::Store| async move {
+            store
+                .list_audit()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.action == "module_consent.stop_unconfirmed")
+                .count()
+        };
+        assert_eq!(
+            unconfirmed(store.clone()).await,
+            0,
+            "a confirmed stop is not audited"
+        );
         assert_eq!(
             told.lock().unwrap().pop(),
             Some(("doc-module".to_owned(), "read_document".to_owned()))
@@ -3879,14 +3893,32 @@ pub(crate) mod tests {
             Some(("doc-module".to_owned(), "*".to_owned()))
         );
         assert_eq!(stop_listed(store.clone()).await, "unconfirmed");
-        let audited = store.list_audit().await.unwrap();
-        assert!(
-            audited
-                .iter()
-                .any(|e| e.action == "module_consent.stop_unconfirmed")
-        );
+        assert_eq!(unconfirmed(store.clone()).await, 1);
+        // A later revocation of the key while the module answers: the answer
+        // is not this revocation's, so it is not confirmed.
+        let mut racing = state.clone();
+        racing.module_tool_cards.as_mut().unwrap().notice = {
+            let store = store.clone();
+            StdArc::new(move |module: String, _: String, _: String| {
+                let store = store.clone();
+                Box::pin(async move {
+                    store
+                        .revoke_module_consent_tracked(&module, None, "2026-10-24T00:30:00Z")
+                        .await
+                        .unwrap();
+                    Confirmed
+                }) as futures::future::BoxFuture<'static, _>
+            })
+        };
+        assert_eq!(delete(build_router(racing), module).await, "unconfirmed");
+        assert_eq!(unconfirmed(store.clone()).await, 2);
         assert_eq!(delete(with(NotRunning), module).await, "not_running");
         assert_eq!(stop_listed(store.clone()).await, "not_running");
+        assert_eq!(
+            unconfirmed(store.clone()).await,
+            2,
+            "a module not running is not audited"
+        );
         // Revoked outside this route (the CLI's lifecycle revocation):
         // nothing recorded, so unconfirmed.
         store
@@ -3899,6 +3931,7 @@ pub(crate) mod tests {
             ..state.clone()
         });
         assert_eq!(delete(no_cards, module).await, "not_running");
+        assert_eq!(unconfirmed(store.clone()).await, 2);
         grant().await.unwrap();
         let views = authorization_list(store.clone()).await;
         assert!(views["authorizations"][0].get("stop").is_none(), "{views}");
