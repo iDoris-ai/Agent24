@@ -33,9 +33,9 @@
 
 ## 3. 批准前后
 
-clestons 在本文件的精确 head 上 APPROVE 之前，不切换 `append_originated_run_messages`，也不派 H03。
+clestons 在本文件的精确 head 上 APPROVE 之前，不切换写点，也不派 H03。
 
-APPROVE 之后的下一片才是写点切换。那一片仍不改发送路径。SQL NULL 的 HostRecall 拒发仍留给以后的 H03。写点切换不得把暂停通知标成已有三种 kind，也不得为它补迁移。
+APPROVE 之后的下一片不是把整批快照改交给 `append_originated_run_messages`。`OriginatedRunMessage.origin` 是必填的 `MessageOrigin`，暂停通知按上一表必须保持无来源行，所以它进不了这个函数。下一片要在同一次 `BEGIN IMMEDIATE` 里允许恰好这一类行不写 `run_message_origins`，其余行仍必须带 kind。读出来继续是 Missing。不得把暂停通知标成已有三种 kind，不得在这一片加 HostSystem 迁移，也不得把它拆出本次快照。那一片仍不改发送路径。SQL NULL 的 HostRecall 拒发仍留给以后的 H03。
 
 在该 APPROVE 之前，不得改 `request_messages_for`，不得改发送路径，不得写新建会话回执，不得移动审批 grant。
 
