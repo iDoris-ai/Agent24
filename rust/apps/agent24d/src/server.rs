@@ -3907,6 +3907,11 @@ pub(crate) mod tests {
         assert_eq!(unconfirmed(store.clone()).await, 2);
         assert_eq!(delete(with(NotRunning), module).await, "not_running");
         assert_eq!(stop_listed(store.clone()).await, "not_running");
+        assert_eq!(
+            unconfirmed(store.clone()).await,
+            2,
+            "a module not running is not audited"
+        );
         // Revoked outside this route (the CLI's lifecycle revocation):
         // nothing recorded, so unconfirmed.
         store
@@ -3919,6 +3924,7 @@ pub(crate) mod tests {
             ..state.clone()
         });
         assert_eq!(delete(no_cards, module).await, "not_running");
+        assert_eq!(unconfirmed(store.clone()).await, 2);
         grant().await.unwrap();
         let views = authorization_list(store.clone()).await;
         assert!(views["authorizations"][0].get("stop").is_none(), "{views}");
