@@ -521,7 +521,12 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         (Some(sid), Some(prompt)) => {
             let (prelude, remember_state, source_ref) = state
                 .runs
-                .chat_memory_prelude(&run_id, Some(sid), prompt)
+                .chat_memory_prelude(
+                    &run_id,
+                    Some(sid),
+                    prompt,
+                    chat.messages.iter().any(|m| m.role == "assistant"),
+                )
                 .await;
             explicit_remember_state = remember_state;
             memory_source_ref = source_ref;

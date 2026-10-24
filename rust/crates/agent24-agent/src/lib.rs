@@ -789,6 +789,7 @@ impl RunManager {
         run_id: &str,
         session_id: Option<&str>,
         prompt: &str,
+        has_assistant_history: bool,
     ) -> (
         Vec<Msg>,
         Option<ExplicitRememberState>,
@@ -801,6 +802,14 @@ impl RunManager {
             format!("user_input:{run_id}"),
             agent24_store::SourceClassification::Ordinary,
         )];
+        // Interim until 6b.4c: assistant turns the client sends back cannot be
+        // classified yet, so they are an Unknown source.
+        if has_assistant_history {
+            sources.push((
+                format!("chat_history:{run_id}"),
+                agent24_store::SourceClassification::Unknown,
+            ));
+        }
         let Some(memory) = self.memory.as_ref() else {
             return (
                 Vec::new(),
@@ -886,44 +895,6 @@ impl RunManager {
             source_ref,
         )
         .await
-    }
-
-    /// K1-6b.4b (ADR-K1-02 §2.1.1 item 4): a run parked by a build that did
-    /// not tag recalled facts has its recall block (thread position 0, the
-    /// only place `execute` puts one) in context but no recall tag. Those
-    /// facts' classification was never recorded, so tag them `Unknown`.
-    async fn tag_untagged_recall(
-        &self,
-        run_id: &str,
-        thread: &[RunMessage],
-    ) -> agent24_store::Result<()> {
-        let Some(first) = thread.first() else {
-            return Ok(());
-        };
-        let is_recall_block = first.role == "user"
-            && first.content.as_deref().is_some_and(|content| {
-                content.starts_with(RECALL_PREFIX) && content.ends_with(RECALL_END_MARKER)
-            });
-        if !is_recall_block {
-            return Ok(());
-        }
-        let snapshot = self.store.run_policy_snapshot(run_id).await?;
-        if snapshot
-            .sources
-            .iter()
-            .any(|source| source.kind == agent24_store::SourceKind::MemoryRecall)
-        {
-            return Ok(());
-        }
-        let now = now_iso8601();
-        self.store
-            .tag_run_source(
-                run_id,
-                first.seq,
-                &agent24_store::SourceRef::unknown_memory(now.clone()),
-                &now,
-            )
-            .await
     }
 
     /// K1-6b.4b (ADR-K1-02 §2.1.1 item 4): the classification a memory
@@ -1362,14 +1333,6 @@ impl RunManager {
                 return;
             }
         };
-
-        // K1-6b.4b: tag a recall block persisted without recall tags before
-        // anything (the approved tool included) runs again.
-        if let Err(err) = self.tag_untagged_recall(&run_id, &thread).await {
-            tracing::warn!("run {run_id}: resume source policy unavailable — {err}");
-            self.finish_cancelled(&run_id).await;
-            return;
-        }
 
         // A bound run must still have fresh workspace authority before restart
         // recovery may make it live again. The parked approval may have waited
@@ -4090,99 +4053,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_resumed_recall_block_without_recall_tags_is_tagged_unknown() {
-        let recall_block =
-            format!("{RECALL_PREFIX}\n- [id=a-old recorded_at=t] \"{TEAL}\"{RECALL_END_MARKER}");
-        // (first message, recall tag already present, expect an added tag)
-        for (first, pre_tagged, expect_added) in [
-            (recall_block.clone(), false, true),
-            (recall_block.clone(), true, false),
-            ("just a prompt".to_owned(), false, false),
-        ] {
-            let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
-            let now = now_iso8601();
-            let run = Run {
-                id: format!("run_{}", ulid()),
-                session_id: None,
-                workspace_id: None,
-                status: RunStatus::AwaitingApproval,
-                input: RunInput {
-                    prompt: "resume me".into(),
-                    workspace_id: None,
-                    model_override: None,
-                    mode: RunMode::Normal,
-                },
-                output: None,
-                error: None,
-                usage: zero_usage(),
-                schedule_id: None,
-                created_at: now.clone(),
-                started_at: Some(now.clone()),
-                ended_at: None,
-            };
-            store.insert_run(&run).await.unwrap();
-            for content in [first.as_str(), "resume me"] {
-                store
-                    .append_run_message(
-                        &run.id,
-                        "user",
-                        Some(content),
-                        &serde_json::json!([]),
-                        None,
-                        &now,
-                    )
-                    .await
-                    .unwrap();
-            }
-            store
-                .tag_run_source(
-                    &run.id,
-                    1,
-                    &agent24_store::SourceRef::user_input(&run.id, now.clone()),
-                    &now,
-                )
-                .await
-                .unwrap();
-            if pre_tagged {
-                let tag = agent24_store::SourceRef::recalled_memory(
-                    "a-old",
-                    agent24_store::SourceClassification::Ordinary,
-                    now.clone(),
-                );
-                store.tag_run_source(&run.id, 0, &tag, &now).await.unwrap();
-            }
-            let before = store
-                .run_policy_snapshot(&run.id)
-                .await
-                .unwrap()
-                .sources
-                .len();
-            let thread = store.list_run_messages(&run.id).await.unwrap();
-            manager.tag_untagged_recall(&run.id, &thread).await.unwrap();
-            let after = store.run_policy_snapshot(&run.id).await.unwrap().sources;
-            assert_eq!(after.len(), before + usize::from(expect_added), "{first:?}");
-            if expect_added {
-                assert!(
-                    after
-                        .iter()
-                        .any(|source| source.source_id == "unknown:memory"
-                            && source.classification
-                                == agent24_store::SourceClassification::Unknown)
-                );
-                let ctx = manager.tool_context_for(&run, "tc").await.unwrap();
-                assert!(
-                    ctx.authorize_egress_if_restricted(
-                        agent24_domain::EgressPurpose::ProcessExecution,
-                        agent24_domain::EgressDestination::unknown(),
-                    )
-                    .await
-                    .is_err()
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn a_recall_tag_that_cannot_be_written_stops_the_run_before_the_model() {
         let provider = Arc::new(RecordingProvider {
             seen: StdMutex::new(vec![]),
@@ -4227,7 +4097,7 @@ pub(crate) mod tests {
         let remembered = "my favourite colour is teal and blue";
         let prompt = format!("记住 {remembered}");
         let (_, _, source_ref) = manager
-            .chat_memory_prelude("run_chat", Some("sess_chat_write"), &prompt)
+            .chat_memory_prelude("run_chat", Some("sess_chat_write"), &prompt, false)
             .await;
         let outcome = manager
             .chat_remember_turn("sess_chat_write", &prompt, "ok", source_ref)
@@ -4237,6 +4107,47 @@ pub(crate) mod tests {
             stored_classification(&kv, remembered).await,
             agent24_store::SourceClassification::Restricted
         );
+    }
+
+    #[tokio::test]
+    async fn a_memory_written_after_earlier_turns_of_its_session_is_unknown() {
+        use agent24_store::SourceClassification::{Ordinary, Unknown};
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_turns").await;
+        run_in_session(&manager, &store, "sess_turns", "记住 alpha is first").await;
+        assert_eq!(stored_classification(&kv, "alpha is first").await, Ordinary);
+        // The second run carries the first turn as untagged prior context.
+        run_in_session(&manager, &store, "sess_turns", "记住 beta is second").await;
+        assert_eq!(stored_classification(&kv, "beta is second").await, Unknown);
+    }
+
+    #[tokio::test]
+    async fn the_chat_prelude_counts_client_assistant_history_as_unknown() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_hist").await;
+        for (has_assistant_history, expected) in [
+            (false, agent24_store::SourceClassification::Ordinary),
+            (true, agent24_store::SourceClassification::Unknown),
+        ] {
+            let (_, _, source_ref) = manager
+                .chat_memory_prelude(
+                    "run_hist",
+                    Some("sess_hist"),
+                    "hello",
+                    has_assistant_history,
+                )
+                .await;
+            assert_eq!(
+                source_ref.classification, expected,
+                "{has_assistant_history}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4282,7 +4193,7 @@ pub(crate) mod tests {
                 seed_memory(&kv, "a-teal", stored).await;
             }
             let (prelude, _, source_ref) = manager
-                .chat_memory_prelude("run_chat", Some("sess_chat"), "what colour is teal")
+                .chat_memory_prelude("run_chat", Some("sess_chat"), "what colour is teal", false)
                 .await;
             assert_eq!(prelude.is_empty(), seeded.is_none(), "{seeded:?}");
             assert_eq!(source_ref.classification, expected, "{seeded:?}");
@@ -5463,115 +5374,6 @@ mod approval_tests {
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
     /// thread.
-    #[tokio::test]
-    async fn a_resumed_run_parked_with_an_untagged_recall_block_gets_it_tagged() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = resume_harness(dir.path().to_path_buf()).await;
-
-        // Seed the crash state directly: an awaiting_approval run with NO live
-        // task, its thread persisted (user + assistant turn whose trailing
-        // tool_call is unanswered), and a matching pending approval. The
-        // assistant call's arguments MUST equal the approval payload, or
-        // staleness re-validation would (correctly) refuse to run B for A.
-        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
-        let run = Run {
-            id: "run_1".to_owned(),
-            session_id: None,
-            workspace_id: None,
-            status: RunStatus::AwaitingApproval,
-            input: RunInput {
-                prompt: "run echo".to_owned(),
-                workspace_id: None,
-                model_override: None,
-                mode: agent24_protocol::RunMode::Normal,
-            },
-            output: None,
-            error: None,
-            usage: zero_usage(),
-            schedule_id: None,
-            created_at: now_iso8601(),
-            started_at: Some(now_iso8601()),
-            ended_at: None,
-        };
-        h.store.insert_run(&run).await.unwrap();
-        // K1-6b.4b: parked by a build that persisted a recall block but no
-        // recall tag.
-        let recall_block =
-            format!("{RECALL_PREFIX}\n- [id=a-old recorded_at=t] \"old fact\"{RECALL_END_MARKER}");
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some(&recall_block),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
-        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
-        h.store
-            .tag_run_source("run_1", 1, &source, &now_iso8601())
-            .await
-            .unwrap();
-        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
-        let approval = Approval {
-            id: "apr_1".to_owned(),
-            run_id: "run_1".to_owned(),
-            tool_call_id: "tc_internal_1".to_owned(),
-            kind: "exec".to_owned(),
-            summary: "shell_exec".to_owned(),
-            payload: args.as_object().unwrap().clone(),
-            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
-            standing_target: None,
-            status: ApprovalStatus::Pending,
-            decision: None,
-            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
-            created_at: now_iso8601(),
-            decided_at: None,
-        };
-        h.store.insert_approval(&approval).await.unwrap();
-
-        // The human answers — no in-memory waiter is woken (the task is gone).
-        h.broker
-            .resolve("apr_1", decision("approve", None))
-            .await
-            .unwrap();
-        // The daemon resumes the run off the persisted thread.
-        h.manager
-            .resume_run("run_1".to_owned(), "apr_1".to_owned())
-            .await
-            .unwrap();
-
-        // This harness installs a granting test egress gate, so the tool
-        // itself may run; what must hold is that resume tagged the recall
-        // block before anything executed (restriction proper is covered by
-        // `a_resumed_recall_block_without_recall_tags_is_tagged_unknown`).
-        wait_terminal(&h.store, "run_1").await;
-        let sources = h.store.run_policy_snapshot("run_1").await.unwrap().sources;
-        assert!(
-            sources
-                .iter()
-                .any(|source| source.source_id == "unknown:memory"),
-            "{sources:?}"
-        );
-    }
-
     #[tokio::test]
     async fn a_parked_run_resumes_after_its_approval_is_answered() {
         let dir = tempfile::tempdir().unwrap();

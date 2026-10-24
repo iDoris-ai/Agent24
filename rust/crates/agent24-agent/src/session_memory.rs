@@ -347,6 +347,14 @@ impl SessionMemory {
                 ));
             }
         };
+        // K1-6b.4b interim (until 6b.4c records a per-session floor): earlier
+        // turns of this session reach the model context untagged, so a memory
+        // written after them is at least Unknown (ADR-K1-02 §2.1.1 item 4).
+        let source_ref = if turn_no > 0 {
+            source_ref.at_least(agent24_store::SourceClassification::Unknown)
+        } else {
+            source_ref
+        };
         // Once append starts, its transaction must outlive cancellation of the
         // caller. Keep both the append future and this session guard in a task;
         // the next writer cannot allocate a turn number until the transaction
