@@ -86,8 +86,12 @@ fn fixed(pages: Vec<Vec<String>>, unread: Vec<u32>, rects: usize) -> Option<Fixe
 
 /// A document with a PDF r1, read by `engine` (or by none).
 async fn env(engine: Option<Fixed>) -> (tempfile::TempDir, AppState) {
+    env_with(engine.map(|e| Arc::new(e) as Arc<dyn Engine>)).await
+}
+
+async fn env_with(engine: Option<Arc<dyn Engine>>) -> (tempfile::TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
-    let layers = Layers::new(engine.map(|e| Arc::new(e) as Arc<dyn Engine>));
+    let layers = Layers::new(engine);
     let state = AppState::open_serving(dir.path(), Events::default(), layers).await;
     let storage = state.storage().await.unwrap();
     let blob = storage.blobs.put_bytes(b"%PDF-1.7 bytes").unwrap();
@@ -394,7 +398,7 @@ async fn a_block_that_escaping_blows_over_the_budget_is_payload_too_large() {
         limit: Some(limit),
         require_complete: false,
     };
-    let e = find::search(&state, &storage, DOC, req(1), 256)
+    let e = find::search(&state, &storage, DOC, req(1), 256, Requester::Page)
         .await
         .err()
         .unwrap();
@@ -406,9 +410,16 @@ async fn a_block_that_escaping_blows_over_the_budget_is_payload_too_large() {
     );
     // The same search at the tool budget fits.
     assert!(
-        find::search(&state, &storage, DOC, req(1), PAYLOAD_BYTES)
-            .await
-            .is_ok()
+        find::search(
+            &state,
+            &storage,
+            DOC,
+            req(1),
+            PAYLOAD_BYTES,
+            Requester::Page
+        )
+        .await
+        .is_ok()
     );
 }
 
@@ -573,4 +584,65 @@ async fn the_list_service_holds_its_own_limit_range() {
                 .is_ok()
         );
     }
+}
+
+/// An engine whose parse never ends.
+struct Stuck;
+
+impl Engine for Stuck {
+    fn engine(&self) -> EngineRef {
+        EngineRef {
+            id: "apple-pdfkit".into(),
+            version: "26.6.2".into(),
+        }
+    }
+    fn config(&self) -> Value {
+        json!({ "blocks": "test" })
+    }
+    fn parse(&self, _content: &str, _media: &str, _path: &Path) -> Parse {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Stops the build `by` asked for, once there is one: it was asked for by
+/// `by` if this ends.
+async fn stop_once_asked(state: &AppState, by: &Requester) {
+    let start = std::time::Instant::now();
+    while state.layers().stop(|r| r == by).is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no build by {by:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// K1-06a-grant-path §2.5: a read's build is asked for by its tool's
+/// operation, or by the page; stopped, the read is retryable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_s_build_is_asked_for_by_its_tool_or_its_page() {
+    let (_dir, state) = env_with(Some(Arc::new(Stuck))).await;
+    for (op, args) in [
+        ("read_range", json!({ "document_id": DOC, "revision": 1 })),
+        (
+            "find",
+            json!({ "document_id": DOC, "revision": 1, "query": "a" }),
+        ),
+    ] {
+        let read = tokio::spawn({
+            let state = state.clone();
+            async move { call(&state, op, args).await }
+        });
+        stop_once_asked(&state, &Requester::Tool(op.to_owned())).await;
+        assert_module_error(&read.await.unwrap(), "engine_unavailable", true);
+    }
+    let page = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let req = Request::get(text_path("")).body(Body::empty()).unwrap();
+            crate::router(state).oneshot(req).await.unwrap().status()
+        }
+    });
+    stop_once_asked(&state, &Requester::Page).await;
+    assert_eq!(page.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
 }

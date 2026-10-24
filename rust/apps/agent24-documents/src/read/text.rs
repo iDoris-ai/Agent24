@@ -13,6 +13,7 @@ use super::{
     PAGE_BYTES, Position, Revision, coverage, current_layer, cursor_layer, decode_cursor,
     encode_cursor, geometry, last_page, revision, within,
 };
+use crate::engine::Requester;
 use crate::error::ApiError;
 use crate::state::{AppState, Ready, Storage};
 use crate::text_layer::{Block, EngineRef, ParseStatus, TextLayer, sha256_address};
@@ -61,7 +62,7 @@ pub async fn read_text(
 ) -> Result<Json<TextPage>, ApiError> {
     let UrlPath((id, rev)) = path.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let Query(p) = params.map_err(|e| ApiError::invalid_request(e.body_text()))?;
-    read_range(&state, &storage, &id, rev, p, PAGE_BYTES)
+    read_range(&state, &storage, &id, rev, p, PAGE_BYTES, Requester::Page)
         .await
         .map(Json)
 }
@@ -75,6 +76,7 @@ pub(crate) async fn read_range(
     rev: i64,
     p: TextParams,
     budget: usize,
+    by: Requester,
 ) -> Result<TextPage, ApiError> {
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT);
     let both = p.block.is_some() && p.cursor.is_some();
@@ -97,7 +99,7 @@ pub(crate) async fn read_range(
             (address, layer, at)
         }
         None => {
-            let (address, layer) = current_layer(state, storage, &r).await?;
+            let (address, layer) = current_layer(state, storage, &r, by).await?;
             let at = match &p.block {
                 None => Position {
                     page: 1,

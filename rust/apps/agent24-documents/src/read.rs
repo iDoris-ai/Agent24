@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::engine::{LayerFailure, WAIT, pdfkit};
+use crate::engine::{LayerFailure, Requester, WAIT, pdfkit};
 use crate::error::ApiError;
 use crate::id::{IdKind, is_id};
 use crate::state::{AppState, Storage, blob_cause};
@@ -57,11 +57,12 @@ pub async fn revision(storage: &Storage, id: &str, rev: i64) -> Result<Revision,
     })
 }
 
-/// The current engine's layer of `r`, built if need be.
+/// The current engine's layer of `r`, built if need be, asked for `by`.
 pub async fn current_layer(
     state: &AppState,
     storage: &Arc<Storage>,
     r: &Revision,
+    by: Requester,
 ) -> Result<(String, TextLayer), ApiError> {
     if !pdfkit::FORMATS.contains(&r.media_type.as_str()) {
         return Err(ApiError::unprocessable(
@@ -71,7 +72,7 @@ pub async fn current_layer(
     }
     let address = state
         .layers()
-        .layer(storage, &r.content_sha256, &r.media_type, WAIT)
+        .layer(storage, &r.content_sha256, &r.media_type, WAIT, by)
         .await;
     let address = address.map_err(layer_error)?;
     let layer = load(storage, &address).await?;
@@ -88,6 +89,9 @@ fn layer_error(f: LayerFailure) -> ApiError {
         LayerFailure::Busy => ApiError::engine_unavailable(engine, "the read engine is busy"),
         LayerFailure::Pending => {
             ApiError::engine_unavailable(engine, "the text layer is still being built")
+        }
+        LayerFailure::Stopped => {
+            ApiError::engine_unavailable(engine, "the text layer build was stopped")
         }
         LayerFailure::Engine(crate::engine::EngineError::Unsupported) => ApiError::unprocessable(
             "unsupported_format",
