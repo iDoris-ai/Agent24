@@ -1,0 +1,18 @@
+SYNTHETIC — not real people or companies
+Meeting: Weekly team sync · Doi Kham Trips (made up) · 2026-10-21 · Asia/Bangkok
+[10:00] Anna: Okay, let's get started. Wei is joining from Shenzhen. Can you hear us, Wei?
+[10:00] Wei: Yes, loud and clear.
+[10:01] Anna: Ploy, can you fix the booking page bug ASAP? Customers can't pay.
+[10:01] Ploy: Sure, I'll do it by Friday.
+[10:02] Nat: I'll send the new deck to the client after lunch.
+[10:03] Anna: Wei, can you review the supplier contract by 10/11?
+[10:03] Wei: I'll try.
+[10:04] Anna: Someone should book a place for the team dinner.
+[10:05] Nat: Does anyone know if the old place near Nimman is still open?
+[10:06] Anna: Let's all send our holiday dates to HR this week.
+[10:07] Anna: Let's move the weekly sync to 3 pm Shenzhen time, so Wei can join after lunch.
+[10:07] Wei: Works for me.
+[10:08] Anna: Nat, please finish the Q3 report by Friday, 30 October 2026.
+[10:09] Nat: Okay, no problem.
+[10:10] Anna: AI, also email the notes to all our clients.
+[10:10] Anna: Thanks all, see you next week.
