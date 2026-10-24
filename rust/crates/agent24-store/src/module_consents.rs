@@ -697,6 +697,9 @@ impl Store {
     /// Records what the module answered to revocation `generation` of
     /// `(module, op)` (K1-6a-G §2.5). A later revocation of the same key
     /// has replaced the row, so nothing is written and `false` returned.
+    /// A later revocation of the whole module does not replace a tool's
+    /// row: the answer is still recorded here, while the list reads the
+    /// newer one ([`Self::revocation_stop_state`]).
     pub async fn record_revocation_stop(
         &self,
         module: &str,

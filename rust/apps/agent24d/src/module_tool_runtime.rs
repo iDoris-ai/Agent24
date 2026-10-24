@@ -93,7 +93,8 @@ impl AgentModuleToolRuntime {
     /// Tells `module` that its grants of `operation` (`"*"`: every tool)
     /// were revoked at `revoked_at`, and waits, at most `within`, for it to
     /// say it stopped what they started (K1-6a-G §2.5). A run that is
-    /// draining or stopping is still running, so it is unconfirmed.
+    /// starting, draining or stopping is still a run, so it is unconfirmed;
+    /// not running means none can be alive (`Supervisors::surely_stopped`).
     pub async fn notify_revoked(
         &self,
         module: &str,
@@ -102,7 +103,13 @@ impl AgentModuleToolRuntime {
         within: Duration,
     ) -> RevocationStop {
         let Some(current) = self.slot(module) else {
-            return RevocationStop::NotRunning;
+            // Out of the list is not gone: a disabled run drains first.
+            return match self.supervisors.get() {
+                Some(supervisors) if !supervisors.surely_stopped(module) => {
+                    RevocationStop::Unconfirmed
+                }
+                _ => RevocationStop::NotRunning,
+            };
         };
         let generation = current.get();
         if generation.state() != DrainState::Running {

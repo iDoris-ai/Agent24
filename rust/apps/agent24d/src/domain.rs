@@ -935,6 +935,25 @@ impl Supervisors {
         self.lock().disabled.get(name).cloned()
     }
 
+    /// Whether no run of `name` can be alive under this daemon (K1-6a-G
+    /// §2.5): it is not in the list, and a stop a disable began has ended
+    /// with its process confirmed gone. Once the shutdown has closed the
+    /// list it owns every run, so then nothing is.
+    #[must_use]
+    pub fn surely_stopped(&self, name: &str) -> bool {
+        let registry = self.lock();
+        let Some(list) = registry.running.as_ref() else {
+            return false;
+        };
+        !list.iter().any(|s| s.name == name)
+            && registry.disabled.get(name).is_none_or(|d| {
+                matches!(
+                    *d.status.borrow(),
+                    agent24_os_proto::supervisor::Status::Stopped
+                )
+            })
+    }
+
     /// design §5.1: the proxy slot of the module `name` if — and only if — it
     /// is in the running list right now. `None` for: never started, disabled
     /// in os.json, hot-disabled (`disable` already `swap_remove`d it),
@@ -3067,6 +3086,35 @@ raise SystemExit(3)
     }
 
     /// `disable` takes one module out of the list and stops it — once — and
+    /// K1-6a-G §2.5: a disabled module is surely stopped only once its stop
+    /// says the process is gone; never once the shutdown owns every run.
+    #[test]
+    fn only_a_module_whose_stop_ended_is_surely_stopped() {
+        use agent24_os_proto::supervisor::Status;
+        let supervisors = Supervisors::default();
+        assert!(supervisors.surely_stopped("never-started"));
+        let (status, rx) = tokio::sync::watch::channel(Status::Stopping);
+        let current = agent24_os_proto::drain::Current::new(
+            agent24_os_proto::drain::Generation::serving_package("/nonexistent".into(), None),
+        );
+        supervisors.lock().disabled.insert(
+            "m".to_owned(),
+            Disabled {
+                current,
+                status: rx,
+            },
+        );
+        assert!(!supervisors.surely_stopped("m"), "still stopping");
+        status.send_replace(Status::StopFailed {
+            error: "x".to_owned(),
+        });
+        assert!(!supervisors.surely_stopped("m"), "not confirmed gone");
+        status.send_replace(Status::Stopped);
+        assert!(supervisors.surely_stopped("m"));
+        let _ = supervisors.close();
+        assert!(!supervisors.surely_stopped("never-started"));
+    }
+
     /// hands that stop to the shutdown rather than the module itself, so
     /// the shutdown waits for it and does not stop it twice (SUP-5).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3095,6 +3143,7 @@ raise SystemExit(3)
         let never = std::future::pending::<()>;
         assert!(host.supervisors.disable("nope", drain, never()).is_none());
         assert!(!host.supervisors.is_disabled("remote"));
+        assert!(!host.supervisors.surely_stopped("remote"), "in the list");
         let current = host
             .supervisors
             .disable("remote", drain, never())
