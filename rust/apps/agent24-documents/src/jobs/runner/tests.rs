@@ -715,3 +715,38 @@ async fn running_work_sees_a_cancel_and_records_its_progress() {
             .unwrap();
     assert_eq!(progress, "s", "not written once it stopped running");
 }
+
+/// A running attempt an authorization's end asked to stop settles saying
+/// so; any other cancel, that the user asked.
+#[tokio::test]
+async fn a_cancel_settles_saying_who_asked_for_it() {
+    let env = env().await;
+    let (user, ended) = (add_job(&env, 1).await, add_job(&env, 1).await);
+    exec(&env, "UPDATE jobs SET status = 'cancelling'").await;
+    exec(
+        &env,
+        &format!("INSERT INTO job_revocations (job_id, attempt) VALUES ('{ended}', 1)"),
+    )
+    .await;
+    for id in [&user, &ended] {
+        let me = Attempt {
+            job_id: id.clone(),
+            attempt: 1,
+            mine: Mine::Claimed,
+        };
+        settle(&env.storage, &me, None, "x").await.unwrap();
+    }
+    let message = |id: &str| {
+        let id = id.to_owned();
+        let pool = env.storage.db.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT error ->> '$.message' FROM jobs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(message(&user).await, "cancelled by the user");
+    assert_eq!(message(&ended).await, crate::authorization::ENDED);
+}

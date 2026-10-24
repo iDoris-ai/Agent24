@@ -648,7 +648,7 @@ async fn a_read_s_build_is_asked_for_by_its_tool_or_its_page() {
 }
 
 /// K1-06a-grant-path §2.5: a read whose authorization ends while it runs
-/// answers `permission_denied`, though its build ended otherwise.
+/// answers `permission_denied`, and the notice is answered once it has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_its_authorization_ends_under_gives_nothing() {
     let (_dir, state) = env_with(Some(Arc::new(Stuck))).await;
@@ -664,9 +664,8 @@ async fn a_read_its_authorization_ends_under_gives_nothing() {
         assert!(start.elapsed() < Duration::from_secs(5), "never began");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // What the notice does first: the end, then the call's build stops.
-    state.calls().end("find");
-    stop_once_asked(&state, &Requester::Tool("find".to_owned())).await;
+    let wait = Duration::from_secs(5);
+    assert!(crate::authorization::stop(&state, "find", wait).await);
     let answer = tokio::time::timeout(Duration::from_secs(2), read).await;
     let answer = answer.expect("the call goes on").unwrap();
     assert_kernel_error(&answer, ModuleToolErrorCode::PermissionDenied);
