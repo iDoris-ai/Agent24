@@ -457,6 +457,9 @@ export class BackendManager {
                 this.kind === 'node' ? { kind: 'none' } : { kind: 'bearer', token: readyToken(parsed, this.authMode) }
               current = { port: parsed.port, auth }
               console.log(`[backend:${this.kind}] ready on port ${parsed.port}`)
+              if (auth.kind === 'bearer' && !auth.token) {
+                console.error(`[backend:${this.kind}] ready line carries no credential for ${this.authMode} mode — requests are refused until restart`)
+              }
             }
             return
           }

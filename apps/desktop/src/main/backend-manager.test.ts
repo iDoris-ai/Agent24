@@ -531,6 +531,22 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
     await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
     expect(daemonConnection()).toBeNull()
     asksLegacy.stop()
+
+    // A host token under any other mode, or one that is not a string, is no
+    // credential either (PR-Daemon #1184 Low 1 / Low A).
+    for (const ready of [
+      { port: 4313, auth_mode: 'legacy_single_token', product_host_token: 'x' },
+      { port: 4314, auth_mode: 'capabilities', product_host_token: 42 },
+    ]) {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const manager = new BackendManager({ external, authMode: 'capabilities', spawnProcess: () => childAnnouncing(ready) })
+      await manager.start()
+      await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
+      expect(daemonConnection()).toBeNull()
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('carries no credential'))
+      manager.stop()
+      error.mockRestore()
+    }
   })
 
   it('another host\'s live capability daemon blocks: nothing reused, nothing spawned, until it is gone', async () => {

@@ -66,7 +66,10 @@ describe.skipIf(!bin || process.platform === 'win32')('real agent24d in capabili
     expect(await get(conn.port, '/api/v1/models', conn.authHeaders)).toBe(200)
     expect(await get(conn.port, '/api/v1/models', {})).toBe(401)
 
-    const record = JSON.parse(fs.readFileSync(path.join(dir, 'data', 'daemon.json'), 'utf8')) as Record<string, unknown>
+    const recordPath = path.join(dir, 'data', 'daemon.json')
+    // A stale agent24d that ignores AGENT24_DATA_DIR writes elsewhere: rebuild it.
+    expect(fs.existsSync(recordPath), `${recordPath} missing — is AGENT24D_BIN a fresh build?`).toBe(true)
+    const record = JSON.parse(fs.readFileSync(recordPath, 'utf8')) as Record<string, unknown>
     expect(record['auth_mode']).toBe('capabilities')
     daemonPid = record['pid'] as number
     expect(JSON.stringify(record)).not.toContain(conn.authHeaders['Authorization']!.slice('Bearer '.length))
