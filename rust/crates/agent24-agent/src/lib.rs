@@ -1925,6 +1925,12 @@ impl RunManager {
             };
             usage_total = add_usage(usage_total, &res.usage);
 
+            if res.message.role != "assistant" {
+                self.finish_failed(&run_id, "provider_error", PROVIDER_ROLE_MESSAGE)
+                    .await;
+                return;
+            }
+
             if res.message.tool_calls.is_empty() {
                 // Final answer
                 let text = res.message.content.clone().unwrap_or_default();
@@ -2004,11 +2010,6 @@ impl RunManager {
             // Every call gets a tool message (protocol requirement) but only
             // the first MAX_TOOL_CALLS_PER_TURN execute — a runaway fanout is
             // answered, not obeyed.
-            if res.message.role != "assistant" {
-                self.finish_failed(&run_id, "provider_error", PROVIDER_ROLE_MESSAGE)
-                    .await;
-                return;
-            }
             let calls = res.message.tool_calls.clone();
             // Persist the assistant turn (with its tool_calls) BEFORE running any
             // call. This is the row H3 keys resume off: an assistant turn on disk
@@ -5242,6 +5243,22 @@ mod approval_tests {
                 .unwrap()
                 .iter()
                 .any(|call| call.tool == "shell_exec" && call.status == ToolCallStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn user_role_final_answer_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _) = role_turn_harness(dir.path().to_path_buf(), Msg::user("not-an-answer")).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let done = finish_role_turn(&h, &run.id).await;
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(done.error.unwrap().code, "provider_error");
+        let thread = h.store.list_run_messages(&done.id).await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .all(|message| message.content.as_deref() != Some("not-an-answer"))
         );
     }
 
