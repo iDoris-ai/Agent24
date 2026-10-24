@@ -64,6 +64,7 @@ pub const MAX_ITERATIONS: usize = 10;
 const SOURCE_UNPROVEN_CODE: &str = "source_unproven";
 const SOURCE_UNPROVEN_MESSAGE: &str =
     "无法证明本线程已落盘消息的来源，已停止发送。请新建会话。不要自动复制旧 recall 或待执行工具。";
+const PROVIDER_ROLE_MESSAGE: &str = "模型返回的角色不是 assistant，已停止。不会执行这一轮的工具。";
 
 fn origin_allows_send(lookup: &MessageOriginLookup) -> bool {
     match lookup {
@@ -1923,6 +1924,12 @@ impl RunManager {
                 }
             };
             usage_total = add_usage(usage_total, &res.usage);
+
+            if res.message.role != "assistant" {
+                self.finish_failed(&run_id, "provider_error", PROVIDER_ROLE_MESSAGE)
+                    .await;
+                return;
+            }
 
             if res.message.tool_calls.is_empty() {
                 // Final answer
@@ -5029,6 +5036,229 @@ mod approval_tests {
                 .unwrap()
                 .iter()
                 .any(|event| event == "run.started")
+        );
+    }
+
+    const ROLE_TURN_TASK: &str = "SECRET-TASK-G3";
+
+    struct ScriptedRecordingProvider {
+        recorder: Arc<RecordingProvider>,
+        turn: StdMutex<Option<Msg>>,
+    }
+
+    #[async_trait::async_trait]
+    impl agent24_models::ModelProvider for ScriptedRecordingProvider {
+        fn name(&self) -> &str {
+            "scripted-recording"
+        }
+
+        async fn complete(
+            &self,
+            req: &agent24_models::CompletionRequest,
+            cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, agent24_models::ModelError> {
+            if let Some(turn) = self.turn.lock().unwrap().take() {
+                self.recorder
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .push(req.messages.clone());
+                return Ok(agent24_models::CompletionResponse {
+                    message: turn,
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                        cost_usd: 0.0,
+                    },
+                    model_id: None,
+                });
+            }
+            agent24_models::ModelProvider::complete(self.recorder.as_ref(), req, cancel).await
+        }
+
+        async fn models(
+            &self,
+            cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, agent24_models::ModelError> {
+            agent24_models::ModelProvider::models(self.recorder.as_ref(), cancel).await
+        }
+    }
+
+    fn role_tool_turn(role: &str, marker: &std::path::Path) -> Msg {
+        let mut turn = Msg::assistant(
+            None,
+            vec![
+                agent24_models::ToolCallRequest {
+                    id: "call_shell".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: serde_json::json!({
+                        "argv": ["/usr/bin/touch", marker]
+                    })
+                    .to_string(),
+                },
+                agent24_models::ToolCallRequest {
+                    id: "call_explore".to_owned(),
+                    name: "explore".to_owned(),
+                    arguments: serde_json::json!({ "task": ROLE_TURN_TASK }).to_string(),
+                },
+            ],
+        );
+        turn.role = role.to_owned();
+        turn
+    }
+
+    async fn role_turn_harness(
+        workdir: std::path::PathBuf,
+        turn: Msg,
+    ) -> (Harness, Arc<RecordingProvider>) {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let recorder = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let router = Arc::new(ModelRouter::with_defaults(vec![(
+            Arc::new(ScriptedRecordingProvider {
+                recorder: Arc::clone(&recorder),
+                turn: StdMutex::new(Some(turn)),
+            }) as Arc<dyn agent24_models::ModelProvider>,
+            Tier::Local,
+        )]));
+        let explorer = crate::subagent::ExplorerSubagent::new(
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::read_only(workdir.clone())),
+        );
+        let tools = ToolRegistry::builtin(workdir)
+            .with(Arc::new(explorer))
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let manager = RunManager::new(
+            store.clone(),
+            router,
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        (
+            Harness {
+                manager,
+                broker,
+                store,
+                events,
+            },
+            recorder,
+        )
+    }
+
+    fn saw_task(provider: &RecordingProvider) -> bool {
+        provider.seen.lock().unwrap().iter().any(|messages| {
+            messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some(ROLE_TURN_TASK))
+        })
+    }
+
+    async fn finish_role_turn(h: &Harness, run_id: &str) -> Run {
+        for _ in 0..200 {
+            let run = h.store.get_run(run_id).await.unwrap().unwrap();
+            if agent24_core::run_is_terminal(run.status) {
+                return run;
+            }
+            let pending = h
+                .store
+                .list_approvals(Some(ApprovalStatus::Pending))
+                .await
+                .unwrap();
+            if let Some(approval) = pending.first() {
+                h.broker
+                    .resolve(&approval.id, decision("approve", None))
+                    .await
+                    .unwrap();
+                return wait_terminal(&h.store, run_id).await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run {run_id} neither finished nor parked for approval");
+    }
+
+    async fn drive_role_turn(
+        role: &str,
+    ) -> (Harness, Arc<RecordingProvider>, tempfile::TempDir, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("g3-marker");
+        let (h, provider) =
+            role_turn_harness(dir.path().to_path_buf(), role_tool_turn(role, &marker)).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let done = finish_role_turn(&h, &run.id).await;
+        (h, provider, dir, done)
+    }
+
+    #[tokio::test]
+    async fn user_role_with_tools_stops_before_shell_and_explore() {
+        let (h, provider, dir, done) = drive_role_turn("user").await;
+        let marker = dir.path().join("g3-marker");
+        assert_eq!(done.status, RunStatus::Failed);
+        let error = done.error.unwrap();
+        assert_eq!(error.code, "provider_error");
+        assert_eq!(error.message, PROVIDER_ROLE_MESSAGE);
+        assert!(!marker.exists(), "shell_exec must not touch the marker");
+        assert!(!saw_task(&provider), "explore must not call the provider");
+        assert!(h.store.list_tool_calls(&done.id).await.unwrap().is_empty());
+        let thread = h.store.list_run_messages(&done.id).await.unwrap();
+        assert_eq!(
+            thread
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user"]
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_role_with_the_same_tools_runs_the_shell() {
+        let (h, provider, dir, done) = drive_role_turn("assistant").await;
+        let marker = dir.path().join("g3-marker");
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(
+            marker.exists(),
+            "approved shell_exec did not touch the marker"
+        );
+        assert!(saw_task(&provider), "explore should call the provider");
+        assert!(
+            h.store
+                .list_tool_calls(&done.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|call| call.tool == "shell_exec" && call.status == ToolCallStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn user_role_final_answer_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _) = role_turn_harness(dir.path().to_path_buf(), Msg::user("not-an-answer")).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let done = finish_role_turn(&h, &run.id).await;
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(done.error.unwrap().code, "provider_error");
+        let thread = h.store.list_run_messages(&done.id).await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .all(|message| message.content.as_deref() != Some("not-an-answer"))
         );
     }
 
