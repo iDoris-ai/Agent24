@@ -140,6 +140,26 @@ impl SourceRef {
         }
     }
 
+    /// A recalled assertion entering a run's context. Its classification is
+    /// the one stored with the assertion ([`AssertionSourceRef::classification_of`]);
+    /// the tag kind only names the retrieval path (ADR-K1-02 §6 item 4).
+    pub fn recalled_memory(
+        assertion_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("memory_assertion:{assertion_id}"),
+            kind: SourceKind::MemoryRecall,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
     /// A fresh, unclassified tag for user input at run entry. Always
     /// `LocalOnly` for the model routing default, and `Ordinary` as the separate
     /// sensitivity classification (ADR-K1-02 §2.1.1). Local routing does not
@@ -296,6 +316,87 @@ fn fail_closed_tag(seq: i64, source_id: String, created_at: String) -> StoredSou
         seq,
         source: SourceRef::fail_closed_unknown(source_id, created_at),
     }
+}
+
+/// Current shape of [`AssertionSourceRef`] in `mem_assertions.source_ref`.
+/// A stored value with any other version reads as `Unknown`.
+pub const ASSERTION_SOURCE_REF_SCHEMA_VERSION: i64 = 1;
+
+/// The provenance a memory assertion is written with (ADR-K1-02 §5 item 10),
+/// stored in the same row and transaction as its body. Only the host's
+/// retain path builds one; recall reads its classification back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssertionSourceRef {
+    pub schema_version: i64,
+    /// The strictest classification among the sources of the context the
+    /// assertion was written from.
+    pub classification: SourceClassification,
+    /// Those sources' ids, for audit only; nothing decides on them.
+    pub source_ids: Vec<String>,
+}
+
+impl AssertionSourceRef {
+    /// Fold the writing context's sources as `(source_id, classification)`.
+    /// No sources is no evidence, so the result is `Unknown` (ADR-K1-02
+    /// §2.1.1 item 4).
+    pub fn from_sources(sources: impl IntoIterator<Item = (String, SourceClassification)>) -> Self {
+        let (source_ids, classifications): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
+        AssertionSourceRef {
+            schema_version: ASSERTION_SOURCE_REF_SCHEMA_VERSION,
+            classification: strictest_classification(classifications),
+            source_ids,
+        }
+    }
+
+    /// This provenance, raised to at least `floor` (never lowered).
+    #[must_use]
+    pub fn at_least(&self, floor: SourceClassification) -> Self {
+        Self {
+            classification: strictest_classification([self.classification, floor]),
+            ..self.clone()
+        }
+    }
+
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": self.schema_version,
+            "classification": self.classification,
+            "source_ids": self.source_ids,
+        })
+    }
+
+    /// The classification of a stored `source_ref`. NULL, a value that does
+    /// not parse as the current shape, or another schema version reads as
+    /// `Unknown`, never `Ordinary`.
+    pub fn classification_of(stored: Option<&serde_json::Value>) -> SourceClassification {
+        stored
+            .and_then(|value| serde_json::from_value::<Self>(value.clone()).ok())
+            .filter(|parsed| parsed.schema_version == ASSERTION_SOURCE_REF_SCHEMA_VERSION)
+            .map_or(SourceClassification::Unknown, |parsed| {
+                parsed.classification
+            })
+    }
+}
+
+/// Strictest classification: `Restricted` over `Unknown` over `Ordinary`;
+/// an empty input is `Unknown`.
+pub fn strictest_classification(
+    classifications: impl IntoIterator<Item = SourceClassification>,
+) -> SourceClassification {
+    let mut strictest = None;
+    for classification in classifications {
+        strictest = Some(match (strictest, classification) {
+            (_, SourceClassification::Restricted) | (Some(SourceClassification::Restricted), _) => {
+                SourceClassification::Restricted
+            }
+            (_, SourceClassification::Unknown) | (Some(SourceClassification::Unknown), _) => {
+                SourceClassification::Unknown
+            }
+            _ => SourceClassification::Ordinary,
+        });
+    }
+    strictest.unwrap_or(SourceClassification::Unknown)
 }
 
 impl Store {
@@ -488,6 +589,7 @@ mod tests {
         let tags = store.list_run_source_tags("run_old_schema").await.unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
         assert_eq!(tags[0].source.source_id, "doc_legacy");
 
         let snap = store.run_policy_snapshot("run_old_schema").await.unwrap();
@@ -510,6 +612,7 @@ mod tests {
         let tags = store.list_run_source_tags("run_malformed").await.unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
     }
 
     #[tokio::test]
@@ -527,6 +630,29 @@ mod tests {
         let tags = store.list_run_source_tags("run_bad_columns").await.unwrap();
         assert_eq!(tags[0].seq, 7);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_tag_whose_payload_names_another_source_is_unknown() {
+        // Reverse: without the source_id cross-check, a row could carry an
+        // `Ordinary` payload copied from another source and be trusted.
+        let store = store_with_run("run_mismatch").await;
+        let ordinary = SourceRef::user_input("run_mismatch", "2026-10-08T00:00:00Z");
+        sqlx::query(
+            "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
+             VALUES (?, 0, 'memory_assertion:a1', ?, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind("run_mismatch")
+        .bind(SOURCE_TAG_SCHEMA_VERSION)
+        .bind(serde_json::to_string(&ordinary).unwrap())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let tags = store.list_run_source_tags("run_mismatch").await.unwrap();
+        assert_eq!(tags[0].source.source_id, "memory_assertion:a1");
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
     }
 
     #[tokio::test]
@@ -561,5 +687,114 @@ mod tests {
         assert_eq!(tags[0].source, tag);
         let snap = reopened.run_policy_snapshot("run_restart").await.unwrap();
         assert_eq!(snap.effective_mode, SourceMode::LocalOnly);
+    }
+
+    #[test]
+    fn strictest_classification_orders_restricted_over_unknown_over_ordinary() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        assert_eq!(strictest_classification([]), Unknown);
+        assert_eq!(strictest_classification([Ordinary]), Ordinary);
+        assert_eq!(strictest_classification([Ordinary, Ordinary]), Ordinary);
+        assert_eq!(strictest_classification([Ordinary, Unknown]), Unknown);
+        assert_eq!(
+            strictest_classification([Unknown, Restricted, Ordinary]),
+            Restricted
+        );
+        assert_eq!(strictest_classification([Restricted, Unknown]), Restricted);
+    }
+
+    #[test]
+    fn assertion_source_ref_folds_its_writing_context() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        let none = AssertionSourceRef::from_sources([]);
+        assert_eq!(none.classification, Unknown);
+        assert!(none.source_ids.is_empty());
+        let ordinary = AssertionSourceRef::from_sources([("user_input:r".to_owned(), Ordinary)]);
+        assert_eq!(ordinary.classification, Ordinary);
+        assert_eq!(ordinary.source_ids, vec!["user_input:r".to_owned()]);
+        assert_eq!(ordinary.schema_version, ASSERTION_SOURCE_REF_SCHEMA_VERSION);
+        let mixed = AssertionSourceRef::from_sources([
+            ("user_input:r".to_owned(), Ordinary),
+            ("memory_assertion:a".to_owned(), Restricted),
+        ]);
+        assert_eq!(mixed.classification, Restricted);
+    }
+
+    #[test]
+    fn assertion_source_ref_round_trips_through_its_stored_value() {
+        use SourceClassification::{Ordinary, Restricted};
+        for classification in [Ordinary, Restricted, SourceClassification::Unknown] {
+            let written = AssertionSourceRef::from_sources([("s".to_owned(), classification)]);
+            let stored = written.to_value();
+            assert_eq!(
+                serde_json::from_value::<AssertionSourceRef>(stored.clone()).unwrap(),
+                written
+            );
+            assert_eq!(
+                AssertionSourceRef::classification_of(Some(&stored)),
+                classification
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_assertion_source_refs_are_unknown_never_ordinary() {
+        let unknown = SourceClassification::Unknown;
+        let ordinary_v1 =
+            AssertionSourceRef::from_sources([("s".to_owned(), SourceClassification::Ordinary)])
+                .to_value();
+        let mut other_version = ordinary_v1.clone();
+        other_version["schema_version"] =
+            serde_json::json!(ASSERTION_SOURCE_REF_SCHEMA_VERSION + 1);
+        let mut extra_field = ordinary_v1.clone();
+        extra_field["trusted"] = serde_json::json!(true);
+        let mut bad_classification = ordinary_v1.clone();
+        bad_classification["classification"] = serde_json::json!("public");
+        for stored in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("ordinary")),
+            // The shape P1a's writer test used: no schema version.
+            Some(serde_json::json!({"classification": "ordinary"})),
+            Some(other_version),
+            Some(extra_field),
+            Some(bad_classification),
+        ] {
+            assert_eq!(
+                AssertionSourceRef::classification_of(stored.as_ref()),
+                unknown,
+                "{stored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recalled_memory_tag_carries_the_stored_classification() {
+        for classification in [
+            SourceClassification::Ordinary,
+            SourceClassification::Restricted,
+            SourceClassification::Unknown,
+        ] {
+            let tag = SourceRef::recalled_memory("a-1", classification, "t");
+            assert_eq!(tag.classification, classification);
+            assert_eq!(tag.kind, SourceKind::MemoryRecall);
+            assert_eq!(tag.mode, SourceMode::LocalOnly);
+            assert_eq!(tag.source_id, "memory_assertion:a-1");
+        }
+    }
+
+    #[test]
+    fn at_least_raises_but_never_lowers_a_classification() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        let ordinary = AssertionSourceRef::from_sources([("s".to_owned(), Ordinary)]);
+        assert_eq!(ordinary.at_least(Restricted).classification, Restricted);
+        assert_eq!(ordinary.at_least(Unknown).classification, Unknown);
+        assert_eq!(ordinary.at_least(Ordinary).classification, Ordinary);
+        let restricted = AssertionSourceRef::from_sources([("s".to_owned(), Restricted)]);
+        assert_eq!(restricted.at_least(Ordinary).classification, Restricted);
+        assert_eq!(
+            restricted.at_least(Ordinary).source_ids,
+            restricted.source_ids
+        );
     }
 }
