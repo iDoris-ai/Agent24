@@ -742,11 +742,15 @@ impl RunManager {
         prompt: &str,
         answer: &str,
         prompt_origin: Origin,
+        source_ref: agent24_store::AssertionSourceRef,
     ) -> MemoryWriteOutcome {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
             return MemoryWriteOutcome::NotApplicable;
         };
-        match memory.remember(sid, prompt, answer, prompt_origin).await {
+        match memory
+            .remember(sid, prompt, answer, prompt_origin, source_ref)
+            .await
+        {
             Ok(retain::RetainOutcome::Saved) => MemoryWriteOutcome::Saved,
             Ok(retain::RetainOutcome::SkippedPaused) => MemoryWriteOutcome::SkippedPaused,
             Ok(retain::RetainOutcome::NotApplicable) => MemoryWriteOutcome::NotApplicable,
@@ -785,17 +789,37 @@ impl RunManager {
         run_id: &str,
         session_id: Option<&str>,
         prompt: &str,
-    ) -> (Vec<Msg>, Option<ExplicitRememberState>) {
+    ) -> (
+        Vec<Msg>,
+        Option<ExplicitRememberState>,
+        agent24_store::AssertionSourceRef,
+    ) {
+        // K1-6b.4b: this stateless surface persists no run tags, so the
+        // sources of its model context are folded here: the caller's own
+        // messages (user input, Ordinary) plus every recalled fact.
+        let mut sources = vec![(
+            format!("user_input:{run_id}"),
+            agent24_store::SourceClassification::Ordinary,
+        )];
         let Some(memory) = self.memory.as_ref() else {
-            return (Vec::new(), None);
+            return (
+                Vec::new(),
+                None,
+                agent24_store::AssertionSourceRef::from_sources(sources),
+            );
         };
         let mut prelude = Vec::new();
         match memory.recall(prompt).await {
-            Ok(Some((msg, ids))) => {
+            Ok(Some((msg, recalled))) => {
+                sources.extend(
+                    recalled
+                        .iter()
+                        .map(|hit| (format!("memory_assertion:{}", hit.id), hit.classification)),
+                );
                 self.sink
                     .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
                         run_id: run_id.to_owned(),
-                        ids,
+                        ids: recalled.into_iter().map(|hit| hit.id).collect(),
                     }));
                 prelude.push(msg);
             }
@@ -827,7 +851,11 @@ impl RunManager {
         } else {
             None
         };
-        (prelude, explicit_state)
+        (
+            prelude,
+            explicit_state,
+            agent24_store::AssertionSourceRef::from_sources(sources),
+        )
     }
 
     /// M1-T12: the SAME post-answer commit `drive_new`'s run loop performs
@@ -845,6 +873,7 @@ impl RunManager {
         session_id: &str,
         prompt: &str,
         answer: &str,
+        source_ref: agent24_store::AssertionSourceRef,
     ) -> MemoryWriteOutcome {
         self.remember_exchange(
             Some(session_id),
@@ -854,8 +883,65 @@ impl RunManager {
                 source: "chat".into(),
                 trust: Trust::UserSaid,
             },
+            source_ref,
         )
         .await
+    }
+
+    /// K1-6b.4b (ADR-K1-02 §2.1.1 item 4): a run parked by a build that did
+    /// not tag recalled facts has its recall block (thread position 0, the
+    /// only place `execute` puts one) in context but no recall tag. Those
+    /// facts' classification was never recorded, so tag them `Unknown`.
+    async fn tag_untagged_recall(
+        &self,
+        run_id: &str,
+        thread: &[RunMessage],
+    ) -> agent24_store::Result<()> {
+        let Some(first) = thread.first() else {
+            return Ok(());
+        };
+        let is_recall_block = first.role == "user"
+            && first.content.as_deref().is_some_and(|content| {
+                content.starts_with(RECALL_PREFIX) && content.ends_with(RECALL_END_MARKER)
+            });
+        if !is_recall_block {
+            return Ok(());
+        }
+        let snapshot = self.store.run_policy_snapshot(run_id).await?;
+        if snapshot
+            .sources
+            .iter()
+            .any(|source| source.kind == agent24_store::SourceKind::MemoryRecall)
+        {
+            return Ok(());
+        }
+        let now = now_iso8601();
+        self.store
+            .tag_run_source(
+                run_id,
+                first.seq,
+                &agent24_store::SourceRef::unknown_memory(now.clone()),
+                &now,
+            )
+            .await
+    }
+
+    /// K1-6b.4b (ADR-K1-02 §2.1.1 item 4): the classification a memory
+    /// written from this run carries — the strictest of every source
+    /// persisted for the run. A failed read is no evidence, so `Unknown`.
+    async fn run_assertion_source_ref(&self, run_id: &str) -> agent24_store::AssertionSourceRef {
+        let sources = match self.store.run_policy_snapshot(run_id).await {
+            Ok(snapshot) => snapshot.sources,
+            Err(err) => {
+                tracing::warn!(run_id, error = %err, "run source policy lookup failed; memory written as unknown");
+                Vec::new()
+            }
+        };
+        agent24_store::AssertionSourceRef::from_sources(
+            sources
+                .into_iter()
+                .map(|source| (source.source_id, source.classification)),
+        )
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
@@ -1277,6 +1363,14 @@ impl RunManager {
             }
         };
 
+        // K1-6b.4b: tag a recall block persisted without recall tags before
+        // anything (the approved tool included) runs again.
+        if let Err(err) = self.tag_untagged_recall(&run_id, &thread).await {
+            tracing::warn!("run {run_id}: resume source policy unavailable — {err}");
+            self.finish_cancelled(&run_id).await;
+            return;
+        }
+
         // A bound run must still have fresh workspace authority before restart
         // recovery may make it live again. The parked approval may have waited
         // long enough for its workspace/lease authority to become unavailable.
@@ -1599,8 +1693,23 @@ impl RunManager {
         let prior_context_len = prior_context.len();
         let mut snapshot = Vec::with_capacity(prior_context_len + 3);
         let mut recalled_ids = None;
-        if let Some((recalled, ids)) = recall {
-            recalled_ids = Some(ids);
+        let mut recalled_tags = Vec::new();
+        if let Some((recalled, hits)) = recall {
+            let recall_seq = snapshot.len() as i64;
+            recalled_tags = hits
+                .iter()
+                .map(|hit| {
+                    (
+                        recall_seq,
+                        agent24_store::SourceRef::recalled_memory(
+                            &hit.id,
+                            hit.classification,
+                            now_iso8601(),
+                        ),
+                    )
+                })
+                .collect();
+            recalled_ids = Some(hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>());
             snapshot.push(recalled);
         }
         if write_skipped {
@@ -1666,6 +1775,24 @@ impl RunManager {
             )
             .await;
             return;
+        }
+        // K1-6b.4b (ADR-K1-02 §2.1.1 item 2): each recalled fact is a source
+        // of this run with the classification stored with it, so a
+        // non-Ordinary recall restricts the run and anything it remembers.
+        for (seq, tag) in &recalled_tags {
+            if let Err(err) = self
+                .store
+                .tag_run_source(&run_id, *seq, tag, &now_iso8601())
+                .await
+            {
+                self.finish_failed(
+                    &run_id,
+                    "source_policy_unavailable",
+                    &format!("failed to persist recalled memory source policy: {err}"),
+                )
+                .await;
+                return;
+            }
         }
         // The audit event names exactly the ids that made it into the
         // now-durable snapshot — emitted only once the snapshot is safely on
@@ -1890,12 +2017,17 @@ impl RunManager {
                 // after append starts, SessionMemory's detached transaction task
                 // keeps the session lock until SQLx confirms the append outcome.
                 tokio::select! {
-                    _ = self.remember_exchange(
-                        run.session_id.as_deref(),
-                        &run.input.prompt,
-                        &text,
-                        run_prompt_origin(&run),
-                    ) => {},
+                    _ = async {
+                        let source_ref = self.run_assertion_source_ref(&run_id).await;
+                        self.remember_exchange(
+                            run.session_id.as_deref(),
+                            &run.input.prompt,
+                            &text,
+                            run_prompt_origin(&run),
+                            source_ref,
+                        )
+                        .await
+                    } => {},
                     () = cancel.cancelled() => {
                         self.finish_cancelled(&run_id).await;
                         return;
@@ -3775,7 +3907,7 @@ pub(crate) mod tests {
         store: &Store,
         session_id: &str,
         prompt: &str,
-    ) {
+    ) -> Run {
         let run = manager
             .start_run(RunCreate {
                 session_id: Some(session_id.to_owned()),
@@ -3789,11 +3921,377 @@ pub(crate) mod tests {
         for _ in 0..200 {
             let current = store.get_run(&run.id).await.unwrap().unwrap();
             if current.status != RunStatus::Running && current.status != RunStatus::Queued {
-                return;
+                return current;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("run did not finish");
+    }
+
+    // ── K1-6b.4b: memory write/recall classification (ADR-K1-02 §2.1.1) ──
+
+    const TEAL: &str = "my favourite colour is teal";
+
+    /// Seed one explicit-remember assertion for the test owner, optionally
+    /// with a stored classification (`None` = a legacy NULL `source_ref`).
+    async fn seed_memory(
+        kv: &KvStore,
+        id: &str,
+        classification: Option<agent24_store::SourceClassification>,
+    ) {
+        use agent24_memory::event::Scope;
+        use agent24_memory::writer::{Candidate, MemoryWriter};
+        let mut candidate = Candidate::new(
+            id,
+            Scope::owner("test-owner"),
+            "user",
+            "said_to_remember",
+            serde_json::json!(TEAL),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+        .with_evidence(vec![format!("ev-{id}")]);
+        if let Some(classification) = classification {
+            candidate = candidate.with_source_ref(
+                agent24_store::AssertionSourceRef::from_sources([(
+                    "seed".to_owned(),
+                    classification,
+                )])
+                .to_value(),
+            );
+        }
+        kv.write_gate()
+            .propose(vec![candidate.remember()])
+            .await
+            .unwrap();
+    }
+
+    /// The stored classification of the owner's current assertion whose
+    /// object is `text`.
+    async fn stored_classification(
+        kv: &KvStore,
+        text: &str,
+    ) -> agent24_store::SourceClassification {
+        use agent24_memory::assertion::{AssertionStore, BeliefQuery};
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner("test-owner"))
+            .await
+            .unwrap();
+        let belief = beliefs
+            .iter()
+            .find(|belief| belief.object == serde_json::json!(text))
+            .unwrap_or_else(|| panic!("no assertion {text:?} in {beliefs:?}"));
+        agent24_store::AssertionSourceRef::classification_of(belief.source_ref.as_ref())
+    }
+
+    #[tokio::test]
+    async fn a_recalled_fact_tags_the_run_with_its_stored_classification() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        // (stored classification, tag classification, process egress allowed)
+        for (stored, expected, egress_allowed) in [
+            (Some(Ordinary), Ordinary, true),
+            (Some(Restricted), Restricted, false),
+            (None, Unknown, false),
+        ] {
+            let provider = Arc::new(RecordingProvider {
+                seen: StdMutex::new(vec![]),
+            });
+            let (manager, store, kv) =
+                manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+            seed_session(&store, "sess_recall").await;
+            seed_memory(&kv, "a-teal", stored).await;
+
+            let run = run_in_session(&manager, &store, "sess_recall", "what colour is teal").await;
+            let seen = provider.seen.lock().unwrap().clone();
+            assert!(
+                seen.iter()
+                    .flatten()
+                    .any(|msg| msg.content.as_deref().is_some_and(|c| c.contains(TEAL))),
+                "the fact must actually be recalled for this case to mean anything"
+            );
+            let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+            let tag = snapshot
+                .sources
+                .iter()
+                .find(|source| source.source_id == "memory_assertion:a-teal")
+                .unwrap_or_else(|| panic!("no recall tag in {:?}", snapshot.sources));
+            assert_eq!(tag.classification, expected, "{stored:?}");
+            assert_eq!(tag.kind, agent24_store::SourceKind::MemoryRecall);
+
+            let ctx = manager.tool_context_for(&run, "tc").await.unwrap();
+            let allowed = ctx
+                .authorize_egress_if_restricted(
+                    agent24_domain::EgressPurpose::ProcessExecution,
+                    agent24_domain::EgressDestination::unknown(),
+                )
+                .await
+                .is_ok();
+            assert_eq!(allowed, egress_allowed, "{stored:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remembered_fact_carries_the_strictest_source_of_its_run() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        let remembered = "my favourite colour is teal and blue";
+        let prompt = format!("记住 {remembered}");
+        // (seeded memory recalled by the same prompt, classification written)
+        for (seeded, expected) in [
+            (None, Ordinary),
+            (Some(Some(Restricted)), Restricted),
+            (Some(None), Unknown),
+            (Some(Some(Ordinary)), Ordinary),
+        ] {
+            let provider = Arc::new(RecordingProvider {
+                seen: StdMutex::new(vec![]),
+            });
+            let (manager, store, kv) =
+                manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+            seed_session(&store, "sess_write").await;
+            if let Some(stored) = seeded {
+                seed_memory(&kv, "a-teal", stored).await;
+            }
+            run_in_session(&manager, &store, "sess_write", &prompt).await;
+            assert_eq!(
+                stored_classification(&kv, remembered).await,
+                expected,
+                "{seeded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remembering_identical_text_again_never_loosens_its_classification() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted};
+        let remembered = "my favourite colour is teal and blue";
+        let prompt = format!("记住 {remembered}");
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_again").await;
+        run_in_session(&manager, &store, "sess_again", &prompt).await;
+        assert_eq!(stored_classification(&kv, remembered).await, Ordinary);
+        // The same text again, from a run that also recalls a restricted fact.
+        seed_memory(&kv, "a-teal", Some(Restricted)).await;
+        run_in_session(&manager, &store, "sess_again", &prompt).await;
+        assert_eq!(stored_classification(&kv, remembered).await, Restricted);
+        // And once restricted, a later ordinary-only run does not lower it.
+        use agent24_memory::assertion::AssertionStore;
+        kv.assertions()
+            .retract(&"a-teal".to_owned(), "test-owner", &now_iso8601())
+            .await
+            .unwrap();
+        run_in_session(&manager, &store, "sess_again", &prompt).await;
+        assert_eq!(stored_classification(&kv, remembered).await, Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_recall_block_without_recall_tags_is_tagged_unknown() {
+        let recall_block =
+            format!("{RECALL_PREFIX}\n- [id=a-old recorded_at=t] \"{TEAL}\"{RECALL_END_MARKER}");
+        // (first message, recall tag already present, expect an added tag)
+        for (first, pre_tagged, expect_added) in [
+            (recall_block.clone(), false, true),
+            (recall_block.clone(), true, false),
+            ("just a prompt".to_owned(), false, false),
+        ] {
+            let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+            let now = now_iso8601();
+            let run = Run {
+                id: format!("run_{}", ulid()),
+                session_id: None,
+                workspace_id: None,
+                status: RunStatus::AwaitingApproval,
+                input: RunInput {
+                    prompt: "resume me".into(),
+                    workspace_id: None,
+                    model_override: None,
+                    mode: RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: now.clone(),
+                started_at: Some(now.clone()),
+                ended_at: None,
+            };
+            store.insert_run(&run).await.unwrap();
+            for content in [first.as_str(), "resume me"] {
+                store
+                    .append_run_message(
+                        &run.id,
+                        "user",
+                        Some(content),
+                        &serde_json::json!([]),
+                        None,
+                        &now,
+                    )
+                    .await
+                    .unwrap();
+            }
+            store
+                .tag_run_source(
+                    &run.id,
+                    1,
+                    &agent24_store::SourceRef::user_input(&run.id, now.clone()),
+                    &now,
+                )
+                .await
+                .unwrap();
+            if pre_tagged {
+                let tag = agent24_store::SourceRef::recalled_memory(
+                    "a-old",
+                    agent24_store::SourceClassification::Ordinary,
+                    now.clone(),
+                );
+                store.tag_run_source(&run.id, 0, &tag, &now).await.unwrap();
+            }
+            let before = store
+                .run_policy_snapshot(&run.id)
+                .await
+                .unwrap()
+                .sources
+                .len();
+            let thread = store.list_run_messages(&run.id).await.unwrap();
+            manager.tag_untagged_recall(&run.id, &thread).await.unwrap();
+            let after = store.run_policy_snapshot(&run.id).await.unwrap().sources;
+            assert_eq!(after.len(), before + usize::from(expect_added), "{first:?}");
+            if expect_added {
+                assert!(
+                    after
+                        .iter()
+                        .any(|source| source.source_id == "unknown:memory"
+                            && source.classification
+                                == agent24_store::SourceClassification::Unknown)
+                );
+                let ctx = manager.tool_context_for(&run, "tc").await.unwrap();
+                assert!(
+                    ctx.authorize_egress_if_restricted(
+                        agent24_domain::EgressPurpose::ProcessExecution,
+                        agent24_domain::EgressDestination::unknown(),
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recall_tag_that_cannot_be_written_stops_the_run_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_fail").await;
+        seed_memory(
+            &kv,
+            "a-teal",
+            Some(agent24_store::SourceClassification::Ordinary),
+        )
+        .await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_recall_tags BEFORE INSERT ON run_source_tags \
+             WHEN NEW.source_id LIKE 'memory_assertion:%' BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = run_in_session(&manager, &store, "sess_fail", "what colour is teal").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chat_surface_writes_the_folded_classification() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_chat_write").await;
+        seed_memory(
+            &kv,
+            "a-teal",
+            Some(agent24_store::SourceClassification::Restricted),
+        )
+        .await;
+        let remembered = "my favourite colour is teal and blue";
+        let prompt = format!("记住 {remembered}");
+        let (_, _, source_ref) = manager
+            .chat_memory_prelude("run_chat", Some("sess_chat_write"), &prompt)
+            .await;
+        let outcome = manager
+            .chat_remember_turn("sess_chat_write", &prompt, "ok", source_ref)
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::Saved);
+        assert_eq!(
+            stored_classification(&kv, remembered).await,
+            agent24_store::SourceClassification::Restricted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_sources_cannot_be_read_writes_unknown_memory() {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        // No tags at all is no evidence either.
+        assert_eq!(
+            manager
+                .run_assertion_source_ref("run_untagged")
+                .await
+                .classification,
+            agent24_store::SourceClassification::Unknown
+        );
+        sqlx::query("DROP TABLE run_source_tags")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .run_assertion_source_ref("run_untagged")
+                .await
+                .classification,
+            agent24_store::SourceClassification::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chat_prelude_folds_the_caller_input_and_every_recalled_fact() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        for (seeded, expected) in [
+            (None, Ordinary),
+            (Some(Some(Ordinary)), Ordinary),
+            (Some(Some(Restricted)), Restricted),
+            (Some(None), Unknown),
+        ] {
+            let provider = Arc::new(RecordingProvider {
+                seen: StdMutex::new(vec![]),
+            });
+            let (manager, store, kv) =
+                manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+            seed_session(&store, "sess_chat").await;
+            if let Some(stored) = seeded {
+                seed_memory(&kv, "a-teal", stored).await;
+            }
+            let (prelude, _, source_ref) = manager
+                .chat_memory_prelude("run_chat", Some("sess_chat"), "what colour is teal")
+                .await;
+            assert_eq!(prelude.is_empty(), seeded.is_none(), "{seeded:?}");
+            assert_eq!(source_ref.classification, expected, "{seeded:?}");
+            assert!(
+                source_ref
+                    .source_ids
+                    .contains(&"user_input:run_chat".to_owned())
+            );
+        }
     }
 
     #[tokio::test]
@@ -3973,6 +4471,7 @@ pub(crate) mod tests {
                         source: "agent_loop".into(),
                         trust: Trust::UserSaid,
                     },
+                    agent24_store::AssertionSourceRef::from_sources([]),
                 )
                 .await;
             }));
@@ -4964,6 +5463,115 @@ mod approval_tests {
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
     /// thread.
+    #[tokio::test]
+    async fn a_resumed_run_parked_with_an_untagged_recall_block_gets_it_tagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+
+        // Seed the crash state directly: an awaiting_approval run with NO live
+        // task, its thread persisted (user + assistant turn whose trailing
+        // tool_call is unanswered), and a matching pending approval. The
+        // assistant call's arguments MUST equal the approval payload, or
+        // staleness re-validation would (correctly) refuse to run B for A.
+        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
+        let run = Run {
+            id: "run_1".to_owned(),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::AwaitingApproval,
+            input: RunInput {
+                prompt: "run echo".to_owned(),
+                workspace_id: None,
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now_iso8601(),
+            started_at: Some(now_iso8601()),
+            ended_at: None,
+        };
+        h.store.insert_run(&run).await.unwrap();
+        // K1-6b.4b: parked by a build that persisted a recall block but no
+        // recall tag.
+        let recall_block =
+            format!("{RECALL_PREFIX}\n- [id=a-old recorded_at=t] \"old fact\"{RECALL_END_MARKER}");
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some(&recall_block),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+        h.store
+            .tag_run_source("run_1", 1, &source, &now_iso8601())
+            .await
+            .unwrap();
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = Approval {
+            id: "apr_1".to_owned(),
+            run_id: "run_1".to_owned(),
+            tool_call_id: "tc_internal_1".to_owned(),
+            kind: "exec".to_owned(),
+            summary: "shell_exec".to_owned(),
+            payload: args.as_object().unwrap().clone(),
+            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
+            standing_target: None,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
+            created_at: now_iso8601(),
+            decided_at: None,
+        };
+        h.store.insert_approval(&approval).await.unwrap();
+
+        // The human answers — no in-memory waiter is woken (the task is gone).
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+        // The daemon resumes the run off the persisted thread.
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+
+        // This harness installs a granting test egress gate, so the tool
+        // itself may run; what must hold is that resume tagged the recall
+        // block before anything executed (restriction proper is covered by
+        // `a_resumed_recall_block_without_recall_tags_is_tagged_unknown`).
+        wait_terminal(&h.store, "run_1").await;
+        let sources = h.store.run_policy_snapshot("run_1").await.unwrap().sources;
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.source_id == "unknown:memory"),
+            "{sources:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_parked_run_resumes_after_its_approval_is_answered() {
         let dir = tempfile::tempdir().unwrap();

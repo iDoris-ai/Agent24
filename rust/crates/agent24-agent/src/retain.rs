@@ -14,6 +14,7 @@
 use agent24_memory::{
     KvStore,
     artifact::checksum,
+    assertion::{AssertionStore, BeliefQuery},
     event::{EventId, Origin, Scope, Trust},
     writer::{Candidate, MemoryWriter, WriteDecision},
 };
@@ -219,6 +220,7 @@ pub(super) async fn persist(
     object: &str,
     evidence: EventId,
     origin: Origin,
+    source_ref: &agent24_store::AssertionSourceRef,
 ) -> agent24_memory::Result<RetainOutcome> {
     // Only a direct user run can authorize a qualified personal assertion.
     // Validate the propagated origin here so future callers cannot
@@ -236,6 +238,30 @@ pub(super) async fn persist(
     // write path, so the gate is still "one early check at retain", just
     // one transaction deeper.
     let id = checksum(&format!("{owner}{object}"));
+    // K1-6b.4b: the id is content-addressed, so remembering identical text
+    // again lands on the same current assertion. Its classification never
+    // loosens, and a re-assert that does not tighten it leaves the stored
+    // provenance untouched (so the write stays idempotent).
+    let stored = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner(owner))
+        .await?
+        .into_iter()
+        .find(|assertion| assertion.id == id)
+        .map(|assertion| assertion.source_ref);
+    let source_ref = match stored {
+        None => Some(source_ref.to_value()),
+        Some(stored_ref) => {
+            let stored_class =
+                agent24_store::AssertionSourceRef::classification_of(stored_ref.as_ref());
+            let merged = source_ref.at_least(stored_class);
+            if merged.classification == stored_class {
+                stored_ref
+            } else {
+                Some(merged.to_value())
+            }
+        }
+    };
     let candidate = Candidate::new(
         id,
         Scope::owner(owner),
@@ -246,6 +272,12 @@ pub(super) async fn persist(
     )
     .with_evidence(vec![evidence])
     .remember();
+    // K1-6b.4b (ADR-K1-02 §5 item 10): the classification commits in the
+    // same row and transaction as the body.
+    let candidate = match source_ref {
+        Some(source_ref) => candidate.with_source_ref(source_ref),
+        None => candidate,
+    };
 
     let decisions = kv.write_gate().propose(vec![candidate]).await?;
     Ok(match decisions.into_iter().next() {
@@ -276,6 +308,13 @@ mod tests {
     use super::explicit_remember;
     use super::persist;
     use agent24_memory::event::{Origin, Trust};
+
+    fn ordinary_context() -> agent24_store::AssertionSourceRef {
+        agent24_store::AssertionSourceRef::from_sources([(
+            "user_input:run".to_owned(),
+            agent24_store::SourceClassification::Ordinary,
+        )])
+    }
     use agent24_memory::{
         KvStore,
         assertion::{AssertionStore, BeliefQuery},
@@ -329,6 +368,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisting_identical_text_never_lowers_its_stored_classification() {
+        use agent24_store::{AssertionSourceRef, SourceClassification};
+        let kv = KvStore::open_memory().await.unwrap();
+        let user = || Origin {
+            source: "test".into(),
+            trust: Trust::UserSaid,
+        };
+        let restricted =
+            AssertionSourceRef::from_sources([("s".to_owned(), SourceClassification::Restricted)]);
+        for (evidence, source_ref) in [("event-1", restricted), ("event-2", ordinary_context())] {
+            let outcome = persist(
+                &kv,
+                "owner",
+                "I like tea",
+                evidence.into(),
+                user(),
+                &source_ref,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, RetainOutcome::Saved);
+        }
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner("owner"))
+            .await
+            .unwrap();
+        assert_eq!(beliefs.len(), 1);
+        assert_eq!(
+            AssertionSourceRef::classification_of(beliefs[0].source_ref.as_ref()),
+            SourceClassification::Restricted
+        );
+    }
+
+    #[tokio::test]
     async fn model_origin_cannot_persist_a_qualified_remember_assertion() {
         let kv = KvStore::open_memory().await.unwrap();
         let outcome = persist(
@@ -340,6 +414,7 @@ mod tests {
                 source: "scheduler".into(),
                 trust: Trust::Model,
             },
+            &ordinary_context(),
         )
         .await
         .unwrap();
@@ -370,6 +445,7 @@ mod tests {
                 source: "test".into(),
                 trust: Trust::UserSaid,
             },
+            &ordinary_context(),
         )
         .await
         .unwrap();
@@ -398,6 +474,7 @@ mod tests {
                 source: "test".into(),
                 trust: Trust::UserSaid,
             },
+            &ordinary_context(),
         )
         .await
         .unwrap();
