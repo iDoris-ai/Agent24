@@ -42,6 +42,12 @@
 
 KB-C ID 不取代 DOC/M1/K1/OD；首轮专用 REST/知识页不等待通用 Workspace，组织/per-run 隐私门继续按能力阻塞对应场景。OD-M11/TPI-W/Line W 保持原暂停状态。
 
+登记（2026-10-24，[#1010](https://github.com/iDoris-ai/Agent24/issues/1010)）：
+- 分支与负责人：本线的集成分支是 `ab/weknora`，task PR 都以它为 base，负责人 David（GitHub `stoptheworld-java`）。
+- fork 侧：`iDoris-ai/WeKnora` 的 `a24/develop`。
+- 状态：跟踪 issue 是 [#986](https://github.com/iDoris-ai/Agent24/issues/986)，看板是 [projects/2](https://github.com/orgs/iDoris-ai/projects/2)。上表是 2026-10-11 的登记快照，各工作包的当前状态以看板为准。
+- 相关文档：任务方案见 [PLAN-KNOWLEDGE-TASKS](../knowledge/PLAN-KNOWLEDGE-TASKS.md)，定位与差异登记见 [POSITIONING-AND-DIFFS](../knowledge/POSITIONING-AND-DIFFS.md)，契约见 `docs/knowledge/CONTRACT-*.md`。
+
 ## Open Design / 第三方工具线台账（2026-10-03 立）
 
 定义见 [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md)。
