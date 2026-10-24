@@ -25,5 +25,5 @@ cd rust && cargo test -p agent24-memory --test p1_capacity_probe -- --nocapture
 衍生：约 276 B payload/行；约 494.6 B 文件/行；文件 ≈ 1.79× payload。
 
 ## 解读与限制
-- 仅一个合成形态（小 payload，单 owner，含默认索引/FTS 触发器影响），**不代表真实历史或附件**；线性外推到 200000 行约 99 MB 文件仅为粗估，**未测**。
+- 仅一个合成形态（小 payload，单 owner），**不代表真实历史或附件**；线性外推到 200000 行约 99 MB 文件仅为粗估，**未测**。
 - 按本合成形态，行数配额（200000）先于字节配额（256 MiB）触顶；payload 接近 64 KiB 的事件则相反。该结论需 P1-02b 用真实分布复核。
