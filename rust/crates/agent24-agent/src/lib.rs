@@ -1774,7 +1774,9 @@ impl RunManager {
         // source of this run. Merge this run's own classification into the
         // session floor before the model call and tag the run with the
         // result, so what the run remembers and which tools it may use both
-        // follow the strictest turn of its session.
+        // follow the strictest turn of its session. Without configured memory
+        // the floor is not kept: `session_context` loads nothing and nothing
+        // is recalled or remembered, so no earlier turn reaches the model.
         if let (Some(_), Some(sid)) = (self.memory.as_ref(), run.session_id.as_deref()) {
             // This run's own classification, read back from the tags just
             // written. A failed read must fail the run rather than fold to
@@ -4275,6 +4277,26 @@ pub(crate) mod tests {
         .unwrap();
         let run = run_in_session(&manager, &store, "sess_nofloor", "hello").await;
         assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_own_sources_cannot_be_read_stops_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_noread").await;
+        agent24_store::test_hooks::fail_source_tag_reads(&store);
+        let run = run_in_session(&manager, &store, "sess_noread", "hello").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let error = run.error.expect("a failed run carries its error");
+        assert_eq!(error.code, "source_policy_unavailable");
+        assert!(error.message.contains("session source floor"), "{error:?}");
         assert!(
             provider.seen.lock().unwrap().is_empty(),
             "the model must not be called"

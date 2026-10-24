@@ -475,6 +475,9 @@ impl Store {
     /// use [`Store::run_policy_snapshot`] instead of treating an empty
     /// result as "unrestricted".
     pub async fn list_run_source_tags(&self, run_id: &str) -> Result<Vec<StoredSourceTag>> {
+        if crate::test_hooks::source_tag_reads_fail(self) {
+            return Err(sqlx::Error::Protocol("injected source tag read failure".into()).into());
+        }
         let rows = sqlx::query(
             "SELECT seq, source_id, schema_version, tag_json, created_at \
              FROM run_source_tags WHERE run_id = ? ORDER BY seq ASC, source_id ASC",
