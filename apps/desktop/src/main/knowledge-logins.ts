@@ -8,6 +8,7 @@
 // memory at once and stay in effect when the write fails; adding or replacing
 // a login takes effect only once it is on disk (STATE I1/I2).
 
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -62,6 +63,10 @@ export class KnowledgeLoginStore {
   private logins = new Map<string, KnowledgeLogin>()
   private writable = false
   private queue: Promise<void> = Promise.resolve()
+  // When each binding was last tightened, on a counter bumped per tightening:
+  // a `put` called before that point must not undo it.
+  private clock = 0
+  private readonly tightened = new Map<string, number>()
 
   constructor(
     dir: string,
@@ -75,7 +80,9 @@ export class KnowledgeLoginStore {
   load(): LoadResult {
     this.logins = new Map()
     this.writable = false
-    fs.rmSync(`${this.file}.tmp`, { force: true })
+    for (const name of fs.existsSync(path.dirname(this.file)) ? fs.readdirSync(path.dirname(this.file)) : []) {
+      if (name.startsWith(`${FILE}.`) && name.endsWith('.tmp')) fs.rmSync(path.join(path.dirname(this.file), name), { force: true })
+    }
     if (!encryptionUsable(this.box, this.platform)) return { ok: false, reason: 'encryption_unavailable' }
     // From here on a write replaces whatever is on disk, readable or not.
     this.writable = true
@@ -101,23 +108,30 @@ export class KnowledgeLoginStore {
     return new Map(this.logins)
   }
 
-  /** Adds or replaces the login of `bindingId` once it is on disk. */
+  /** Adds or replaces the login of `bindingId` once it is on disk. Rejected,
+   * and without effect, when the binding is marked unusable or removed after
+   * this call (the write queued by that tightening then fixes the disk). */
   put(bindingId: string, login: KnowledgeLogin): Promise<void> {
+    const since = this.clock
+    const superseded = () => (this.tightened.get(bindingId) ?? 0) > since
     return this.enqueue(async () => {
-      const next = new Map(this.logins).set(bindingId, { ...login })
-      await this.write(next)
-      this.logins = next
+      if (superseded()) throw new Error('Knowledge login superseded by a later change')
+      await this.write(new Map(this.logins).set(bindingId, { ...login }))
+      if (superseded()) throw new Error('Knowledge login superseded by a later change')
+      this.logins.set(bindingId, { ...login })
     })
   }
 
   markUnusable(bindingId: string): Promise<void> {
     const login = this.logins.get(bindingId)
     if (login) this.logins.set(bindingId, { ...login, unusable: true })
+    this.tightened.set(bindingId, ++this.clock)
     return this.enqueue(() => this.write(this.logins))
   }
 
   remove(bindingId: string): Promise<void> {
     this.logins.delete(bindingId)
+    this.tightened.set(bindingId, ++this.clock)
     return this.enqueue(() => this.write(this.logins))
   }
 
@@ -133,9 +147,15 @@ export class KnowledgeLoginStore {
       throw new Error('Knowledge logins cannot be saved: secure storage is unavailable')
     }
     const plain = JSON.stringify({ v: VERSION, logins: Object.fromEntries(logins) })
-    const tmp = `${this.file}.tmp`
-    await fs.promises.mkdir(path.dirname(this.file), { recursive: true })
-    await fs.promises.writeFile(tmp, this.box.encryptString(plain), { mode: 0o600 })
-    await fs.promises.rename(tmp, this.file)
+    // A fresh name, created exclusively: `mode` applies only to a new file.
+    const tmp = `${this.file}.${randomBytes(8).toString('hex')}.tmp`
+    await fs.promises.mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 })
+    try {
+      await fs.promises.writeFile(tmp, this.box.encryptString(plain), { mode: 0o600, flag: 'wx' })
+      await fs.promises.rename(tmp, this.file)
+    } catch (err) {
+      await fs.promises.rm(tmp, { force: true })
+      throw err
+    }
   }
 }

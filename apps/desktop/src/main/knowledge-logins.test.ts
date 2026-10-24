@@ -127,10 +127,114 @@ describe('KnowledgeLoginStore (KB-HOST-01 PR-B2a)', () => {
     expect(again.list().size).toBe(20)
   })
 
-  it('clears a temporary file left by a crash before reading', () => {
-    fs.writeFileSync(`${file()}.tmp`, 'partial')
+  it('clears temporary files left by a crash before reading', () => {
+    fs.writeFileSync(`${file()}.0123abcd.tmp`, 'partial')
+    fs.writeFileSync(path.join(dir, 'unrelated.tmp'), 'keep')
     new KnowledgeLoginStore(dir, fakeBox(), 'darwin').load()
-    expect(fs.existsSync(`${file()}.tmp`)).toBe(false)
+    expect(fs.readdirSync(dir)).toEqual(['unrelated.tmp'])
+  })
+
+  it('creates a missing directory private to the user', async () => {
+    const nested = path.join(dir, 'a', 'b')
+    const store = new KnowledgeLoginStore(nested, fakeBox(), 'darwin')
+    store.load()
+    await store.put('b1', login('R1'))
+    expect(fs.statSync(nested).mode & 0o777).toBe(0o700)
+    expect(fs.readdirSync(nested)).toEqual(['knowledge-logins.bin'])
+  })
+
+  it('a tightening made while a put is being written survives that put, in memory and on disk', async () => {
+    let store: KnowledgeLoginStore | null = null
+    let tightenOnce: (() => void) | null = null
+    const box = fakeBox({
+      encryptString: (plain) => {
+        // Runs inside the put's write, after it took its snapshot.
+        const hook = tightenOnce
+        tightenOnce = null
+        hook?.()
+        return Buffer.from(`enc:${Buffer.from(plain).toString('base64')}`)
+      },
+    })
+    store = new KnowledgeLoginStore(dir, box, 'darwin')
+    store.load()
+    await store.put('b1', login('R1'))
+    await store.put('b3', login('R3'))
+
+    let tightening: Promise<void>[] = []
+    tightenOnce = () => {
+      tightening = [store!.markUnusable('b1'), store!.remove('b3')]
+    }
+    await store.put('b2', login('R2'))
+    await Promise.all(tightening)
+
+    expect(store.list().get('b1')?.unusable).toBe(true)
+    expect(store.list().has('b3')).toBe(false)
+    expect(store.list().get('b2')).toEqual(login('R2'))
+    const again = new KnowledgeLoginStore(dir, box, 'darwin')
+    again.load()
+    expect([...again.list()]).toEqual([
+      ['b1', login('R1', { unusable: true })],
+      ['b2', login('R2')],
+    ])
+  })
+
+  it.each(['markUnusable', 'remove'] as const)('a %s of the binding while its put is written wins', async (tighten) => {
+    let hook: (() => void) | null = null
+    const box = fakeBox({
+      encryptString: (plain) => {
+        const run = hook
+        hook = null
+        run?.()
+        return Buffer.from(`enc:${Buffer.from(plain).toString('base64')}`)
+      },
+    })
+    const store = new KnowledgeLoginStore(dir, box, 'darwin')
+    store.load()
+    await store.put('b1', login('OLD'))
+    let tightening: Promise<void> = Promise.resolve()
+    hook = () => {
+      tightening = store[tighten]('b1')
+    }
+    await expect(store.put('b1', login('NEW'))).rejects.toThrow('superseded')
+    await tightening
+    const expected = tighten === 'remove' ? undefined : login('OLD', { unusable: true })
+    expect(store.list().get('b1')).toEqual(expected)
+    const again = new KnowledgeLoginStore(dir, box, 'darwin')
+    again.load()
+    expect(again.list().get('b1')).toEqual(expected)
+  })
+
+  it('a remove queued after a put supersedes it', async () => {
+    const store = new KnowledgeLoginStore(dir, fakeBox(), 'darwin')
+    store.load()
+    await store.put('b1', login('OLD'))
+    const replacing = store.put('b1', login('NEW'))
+    const removing = store.remove('b1')
+    await expect(replacing).rejects.toThrow('superseded')
+    await removing
+    expect(store.list().has('b1')).toBe(false)
+  })
+
+  it('a put is superseded by a later tightening of the same binding, and never reaches the disk', async () => {
+    const encrypted: string[] = []
+    const box = fakeBox()
+    const recording = fakeBox({ encryptString: (plain) => (encrypted.push(plain), box.encryptString(plain)) })
+    const store = new KnowledgeLoginStore(dir, recording, 'darwin')
+    store.load()
+    await store.put('b1', login('OLD'))
+    const replacing = store.put('b1', login('NEW'))
+    const marking = store.markUnusable('b1')
+    await expect(replacing).rejects.toThrow('superseded')
+    await marking
+    expect(encrypted.some((plain) => plain.includes('NEW'))).toBe(false)
+    expect(store.list().get('b1')).toEqual(login('OLD', { unusable: true }))
+    const again = new KnowledgeLoginStore(dir, box, 'darwin')
+    again.load()
+    expect(again.list().get('b1')).toEqual(login('OLD', { unusable: true }))
+
+    // A put called after the tightening is a fresh login and counts.
+    await store.put('b1', login('RELOGIN'))
+    expect(store.list().get('b1')).toEqual(login('RELOGIN'))
   })
 
   it('never logs the material', async () => {
