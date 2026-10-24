@@ -1776,12 +1776,27 @@ impl RunManager {
         // result, so what the run remembers and which tools it may use both
         // follow the strictest turn of its session.
         if let (Some(_), Some(sid)) = (self.memory.as_ref(), run.session_id.as_deref()) {
-            let own = self.run_assertion_source_ref(&run_id).await.classification;
-            let floor = match self
-                .store
-                .merge_session_floor(sid, own, prior_context_range.is_some(), &now_iso8601())
-                .await
-            {
+            // This run's own classification, read back from the tags just
+            // written. A failed read must fail the run rather than fold to
+            // `Unknown`: a restricted recall would otherwise enter the floor
+            // one step looser than it is.
+            let floor = match self.store.run_policy_snapshot(&run_id).await {
+                Ok(snapshot) => {
+                    let own = agent24_store::strictest_classification(
+                        snapshot.sources.iter().map(|source| source.classification),
+                    );
+                    self.store
+                        .merge_session_floor(
+                            sid,
+                            own,
+                            prior_context_range.is_some(),
+                            &now_iso8601(),
+                        )
+                        .await
+                }
+                Err(err) => Err(err),
+            };
+            let floor = match floor {
                 Ok(floor) => floor,
                 Err(err) => {
                     self.finish_failed(
