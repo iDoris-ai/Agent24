@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import DocumentsPage from './Documents'
 import { readableSize } from './DocumentDetail'
 import { cancelImport, getImportState, resetImportStore } from './importStore'
@@ -578,23 +578,61 @@ describe('DocumentsPage: a document and its text', () => {
   it('opens a document: its details, its head revision\'s text by page, then the next page on demand', async () => {
     const m = mount({ lists: [page([1])] })
     reading(m, [() => ok(detail(1))], [
-      () => ok(text([block('b1', '第一段', 1), block('b2', '第二段', 1), block('b3', '第三段', 2)], 'cc01', [{ reason: 'image', page: 3 }])),
-      () => ok(text([block('b4', '第四段', 3)])),
+      () => ok(text([block('b1', '第一段', 1), block('b2', '第二段', 1), block('b3', '第三段', 2)], 'cc01', [{ reason: 'image', page: 2 }, { reason: 'image', page: 3 }])),
+      // Page 3 was cut short and is read on: its region comes again.
+      () => ok(text([block('b4', '第四段', 3)], null, [{ reason: 'image', page: 3 }, { reason: 'image', page: 4 }])),
     ])
     render(<DocumentsPage />)
-    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    const title = await screen.findByRole('button', { name: '通告 1' })
+    title.focus()
+    fireEvent.click(title)
     const panel = await screen.findByRole('region', { name: '文档详情' })
+    expect(within(panel).getByRole('heading')).toHaveFocus()
     await waitFor(() => expect(panel).toHaveTextContent('第三段'))
     expect(panel).toHaveTextContent('application/pdf · 2.0 KB · 第 2 版')
-    expect(screen.getByRole('note')).toHaveTextContent('部分内容未能识别（1 处）')
+    expect(screen.getByRole('note')).toHaveTextContent('部分内容未能识别（涉及 2 页）')
     expect(screen.getAllByText(/^第 \d 页$/).map((e) => e.textContent)).toEqual(['第 1 页', '第 2 页'])
     expect(reads(m)).toEqual([{ op: 'readText', documentId: doc(1).document_id, revision: 2 }])
-    fireEvent.click(screen.getAllByRole('button', { name: '加载更多' }).at(-1)!)
+    fireEvent.click(screen.getByRole('button', { name: '加载更多正文' }))
     await waitFor(() => expect(panel).toHaveTextContent('第四段'))
+    expect(screen.getByRole('note')).toHaveTextContent('部分内容未能识别（涉及 3 页）')
     expect(reads(m)[1]).toEqual({ op: 'readText', documentId: doc(1).document_id, revision: 2, cursor: 'cc01' })
     expect(panel).toHaveTextContent('第一段')
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
     expect(screen.queryByRole('region', { name: '文档详情' })).not.toBeInTheDocument()
+    expect(title).toHaveFocus()
+  })
+
+  it('a next page read after a failed one clears what the failure said', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [
+      () => ok(text([block('b1', '第一段', 1)], 'cc01')),
+      () => err(503, 'engine_unavailable', '引擎忙'),
+      () => ok(text([block('b2', '第二段', 2)])),
+    ])
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    fireEvent.click(await screen.findByRole('button', { name: '加载更多正文' }))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('引擎忙（engine_unavailable）'))
+    fireEvent.click(screen.getByRole('button', { name: '加载更多正文' }))
+    await waitFor(() => expect(screen.getByText('第二段')).toBeInTheDocument())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(reads(m)[2]).toMatchObject({ cursor: 'cc01' })
+  })
+
+  it('no text on a page read is not "no text": more may follow, or the pages were not parsed', async () => {
+    const m = mount({ lists: [page([1, 2])] })
+    reading(m, [() => ok(detail(1)), () => ok(detail(2))], [
+      () => ok(text([], 'cc01')),
+      () => ok(text([], null, [{ reason: 'image', page: 1 }])),
+    ])
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    await screen.findByRole('button', { name: '加载更多正文' })
+    expect(screen.queryByText('这份文档没有读出文字。')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '通告 2' }))
+    await waitFor(() => expect(screen.getByRole('note')).toHaveTextContent('涉及 1 页'))
+    expect(screen.queryByText('这份文档没有读出文字。')).not.toBeInTheDocument()
   })
 
   it('a reply for a document no longer open is dropped', async () => {

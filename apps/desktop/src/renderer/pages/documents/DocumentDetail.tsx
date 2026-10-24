@@ -25,13 +25,16 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
   const api = window.agent24.documents
   const [detail, setDetail] = useState<Detail | null>(null)
   const [blocks, setBlocks] = useState<Block[]>([])
-  const [unparsed, setUnparsed] = useState(0)
+  // The pages read so far that were not fully parsed: a page cut short is
+  // read on from its middle, so the same page can come back (§3.1).
+  const [unparsed, setUnparsed] = useState<ReadonlySet<number>>(new Set())
   const [more, setMore] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // Each document opened starts a new generation; a reply for an earlier
   // one (or after closing) is dropped.
   const generation = useRef(0)
+  const heading = useRef<HTMLDivElement>(null)
 
   /** The next page of the head revision's text, appended. */
   const read = async (gen: number, head: Detail, cursor?: string) => {
@@ -48,8 +51,10 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
       setError(describeError(res))
       return
     }
+    setError(null)
     setBlocks((prev) => (cursor === undefined ? res.data.blocks : [...prev, ...res.data.blocks]))
-    if (res.data.parse_status === 'partial') setUnparsed(res.data.unparsed_regions?.length ?? 0)
+    const pages = (res.data.unparsed_regions ?? []).flatMap((r) => (r.page === undefined ? [] : [r.page]))
+    if (pages.length > 0) setUnparsed((prev) => new Set([...prev, ...pages]))
     setMore(res.data.next_cursor)
   }
 
@@ -57,9 +62,10 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     const gen = ++generation.current
     setDetail(null)
     setBlocks([])
-    setUnparsed(0)
+    setUnparsed(new Set())
     setMore(null)
     setError(null)
+    heading.current?.focus()
     void api.request({ op: 'get', documentId }).then((res) => {
       if (gen !== generation.current) return
       if (!res.ok) {
@@ -78,7 +84,7 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
   return (
     <section aria-label={t('detail.label')} style={{ border: '1px solid var(--border)', borderRadius: 6, padding: 12, margin: '12px 0' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div role="heading" aria-level={2} style={{ fontWeight: 600 }}>
+        <div role="heading" aria-level={2} tabIndex={-1} ref={heading} style={{ fontWeight: 600 }}>
           {detail?.title ?? ''}
         </div>
         <button className="btn btn-ghost" onClick={onClose}>
@@ -95,13 +101,13 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
           })}
         </p>
       )}
-      {unparsed > 0 && <p role="note">{t('detail.partial', { count: unparsed })}</p>}
+      {unparsed.size > 0 && <p role="note">{t('detail.partial', { count: unparsed.size })}</p>}
       {error && (
         <div role="alert" style={ALERT}>
           {error}
         </div>
       )}
-      {detail && !loading && !error && blocks.length === 0 && (
+      {detail && !loading && !error && blocks.length === 0 && !more && unparsed.size === 0 && (
         <p style={{ color: 'var(--muted)' }}>{t('detail.noText')}</p>
       )}
       <div style={{ fontSize: 13, whiteSpace: 'pre-wrap' }}>
@@ -116,7 +122,7 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
       </div>
       {more && detail && (
         <button className="btn btn-ghost" onClick={() => void read(generation.current, detail, more)} disabled={loading}>
-          {t('list.loadMore')}
+          {t('detail.loadMore')}
         </button>
       )}
     </section>
