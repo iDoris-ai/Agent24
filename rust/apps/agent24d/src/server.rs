@@ -40,6 +40,9 @@ pub struct AppState {
     /// router is built.
     pub auth_mode: AuthMode,
     pub capabilities: Option<crate::capabilities::CapabilityStore>,
+    /// KB-HOST-01: the Knowledge bindings the product host activated, in
+    /// memory only (see `crate::knowledge_host`).
+    pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -658,6 +661,7 @@ impl AppState {
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
             capabilities: None,
+            knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -787,6 +791,7 @@ fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
         Operation::ModuleAdmin => "module.admin",
         Operation::CapabilityMint => "capability.mint",
         Operation::CapabilityRevoke => "capability.revoke",
+        Operation::KnowledgeHost => "knowledge.host",
         Operation::Shutdown => "shutdown",
         Operation::ModelsRead => "models.read",
         Operation::WorkspaceResolve => "workspace.resolve",
@@ -1013,7 +1018,7 @@ async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next)
 /// Capability policy is deliberately closed. Until durable workspace/session
 /// ownership lands, Creative can use only the global model catalogue. Every
 /// other existing or future route maps to a host-only operation by default.
-fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
+pub(crate) fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
     use crate::capabilities::Operation;
     if method == Method::GET && path == "/api/v1/models" {
         Operation::ModelsRead
@@ -1024,6 +1029,10 @@ fn required_operation(method: &Method, path: &str) -> crate::capabilities::Opera
         && path.ends_with("/revoke")
     {
         Operation::CapabilityRevoke
+    } else if path.starts_with("/api/v1/host/knowledge/") {
+        // Host-only, and never in the Creative allow-list; the handlers also
+        // refuse legacy mode and any non-host audience (crate::knowledge_host).
+        Operation::KnowledgeHost
     } else {
         Operation::ModelsAdmin
     }
@@ -1070,6 +1079,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/capabilities/{capability_id}/revoke",
             post(revoke_capability),
+        )
+        .route(
+            "/api/v1/host/knowledge/bindings/{binding_id}",
+            axum::routing::put(crate::knowledge_host::change).delete(crate::knowledge_host::change),
         )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
@@ -3192,6 +3205,8 @@ pub(crate) mod tests {
         "/capabilities/creative", // OD-M11 (PAUSED): capability contract is out of scope.
         "/capabilities/{capability_id}/revoke", // OD-M11 (PAUSED): capability contract is out of scope.
         "/events", // WebSocket protocol is documented by protocol/events.schema.json.
+        // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
+        "/host/knowledge/bindings/{binding_id}",
     ];
 
     // Module-owned contract paths appear in OpenAPI but are not literal routes
@@ -3462,7 +3477,7 @@ pub(crate) mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    async fn capability_state() -> (AppState, String, String) {
+    pub(crate) async fn capability_state() -> (AppState, String, String) {
         let mut state = state().await;
         let now = crate::capabilities::unix_now();
         let store = crate::capabilities::CapabilityStore::new("daemon-test");

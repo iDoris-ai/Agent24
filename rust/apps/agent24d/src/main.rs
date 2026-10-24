@@ -28,6 +28,7 @@ mod events_emit;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
+mod knowledge_host;
 #[cfg(not(unix))]
 mod host_bootstrap {
     #![allow(

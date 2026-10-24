@@ -202,6 +202,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "decide",
     "events",
     "health",
+    // KB-HOST-01: `/api/v1/host/knowledge/*`, the desktop host's private interface.
+    "host",
     // M1-T10: `/api/v1/memory/assertions`, `/api/v1/memory/assertions/{id}`,
     // `/api/v1/memory/settings` — the personal-memory REST surface.
     "memory",
