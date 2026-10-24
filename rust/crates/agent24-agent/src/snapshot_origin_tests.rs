@@ -174,34 +174,89 @@ async fn recall_snapshot_stores_null_recall_ref() {
     manager.cancel_run(&run.id).await.unwrap();
 }
 
+async fn stored_recall_ref(store: &Store, run_id: &str, seq: i64) -> Option<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT recall_ref FROM run_message_origins WHERE run_id = ? AND seq = ?",
+    )
+    .bind(run_id)
+    .bind(seq)
+    .fetch_optional(agent24_store::test_hooks::pool(store))
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
-async fn persist_message_does_not_write_run_message_origins() {
+async fn persist_message_writes_assistant_and_tool_result_without_recall_ref() {
     let (manager, _, store) = manager_with(Arc::new(FixedProvider)).await;
     let run = manager.start_run(create()).await.unwrap();
     assert_eq!(
         wait_terminal(&store, &run.id).await.status,
         RunStatus::Completed
     );
-    let before = origin_count(&store, &run.id).await;
     let thread = store.list_run_messages(&run.id).await.unwrap();
-    let assistant = seq_of(&thread, "pong");
+    let pong = seq_of(&thread, "pong");
+    assert_eq!(
+        present(&store, &run.id, pong).await,
+        MessageOrigin::Assistant
+    );
+    assert_eq!(stored_recall_ref(&store, &run.id, pong).await, Some(None));
+
+    let before = origin_count(&store, &run.id).await;
     manager
-        .persist_message(&run.id, &Msg::assistant(Some("later tool note".into()), vec![]))
+        .persist_message(
+            &run.id,
+            &Msg::assistant(Some("later answer".into()), vec![]),
+        )
         .await
         .unwrap();
-    let after_thread = store.list_run_messages(&run.id).await.unwrap();
-    assert_eq!(after_thread.len(), thread.len() + 1);
-    assert_eq!(after_thread.last().unwrap().content.as_deref(), Some("later tool note"));
+    manager
+        .persist_message(&run.id, &Msg::tool_result("call_1", "tool body"))
+        .await
+        .unwrap();
+    manager
+        .persist_message(&run.id, &Msg::user("plain user"))
+        .await
+        .unwrap();
+    manager
+        .persist_message(&run.id, &Msg::system("plain system"))
+        .await
+        .unwrap();
+
+    let after = store.list_run_messages(&run.id).await.unwrap();
+    assert_eq!(after.len(), thread.len() + 4);
+    let later = seq_of(&after, "later answer");
+    let tool = seq_of(&after, "tool body");
+    let user = seq_of(&after, "plain user");
+    let system = seq_of(&after, "plain system");
+    assert_eq!(
+        present(&store, &run.id, later).await,
+        MessageOrigin::Assistant
+    );
+    assert_eq!(stored_recall_ref(&store, &run.id, later).await, Some(None));
+    assert_eq!(
+        present(&store, &run.id, tool).await,
+        MessageOrigin::ToolResult
+    );
+    assert_eq!(stored_recall_ref(&store, &run.id, tool).await, Some(None));
+    assert_eq!(
+        after
+            .iter()
+            .find(|row| row.seq == tool)
+            .unwrap()
+            .tool_call_id
+            .as_deref(),
+        Some("call_1")
+    );
+    assert!(matches!(
+        store.read_run_message_origin(&run.id, user).await.unwrap(),
+        MessageOriginLookup::Missing
+    ));
     assert!(matches!(
         store
-            .read_run_message_origin(&run.id, after_thread.last().unwrap().seq)
+            .read_run_message_origin(&run.id, system)
             .await
             .unwrap(),
         MessageOriginLookup::Missing
     ));
-    assert!(matches!(
-        store.read_run_message_origin(&run.id, assistant).await.unwrap(),
-        MessageOriginLookup::Missing
-    ));
-    assert_eq!(origin_count(&store, &run.id).await, before);
+    assert_eq!(origin_count(&store, &run.id).await, before + 2);
 }

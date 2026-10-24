@@ -796,18 +796,51 @@ impl RunManager {
     async fn persist_message(&self, run_id: &str, msg: &Msg) -> Result<(), StoreError> {
         let tool_calls =
             serde_json::to_value(&msg.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
-        if let Err(err) = self
-            .store
-            .append_run_message(
-                run_id,
-                &msg.role,
-                msg.content.as_deref(),
-                &tool_calls,
-                msg.tool_call_id.as_deref(),
-                &now_iso8601(),
-            )
-            .await
-        {
+        let message = agent24_store::PendingRunMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls,
+            tool_call_id: msg.tool_call_id.clone(),
+        };
+        let appended = match msg.role.as_str() {
+            "assistant" => {
+                self.store
+                    .append_originated_run_messages(
+                        run_id,
+                        &[OriginatedRunMessage {
+                            message,
+                            origin: MessageOrigin::Assistant,
+                        }],
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+            "tool" => {
+                self.store
+                    .append_originated_run_messages(
+                        run_id,
+                        &[OriginatedRunMessage {
+                            message,
+                            origin: MessageOrigin::ToolResult,
+                        }],
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+            _ => {
+                self.store
+                    .append_run_message(
+                        run_id,
+                        &message.role,
+                        message.content.as_deref(),
+                        &message.tool_calls,
+                        message.tool_call_id.as_deref(),
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+        };
+        if let Err(err) = appended {
             tracing::warn!("run {run_id}: message thread append failed: {err}");
             return Err(err);
         }
