@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
+use crate::engine::Requester;
 use crate::error::ApiError;
 use crate::extract::handler::{self, Fail, Prepared, Schema};
 use crate::extractions;
@@ -366,7 +367,8 @@ async fn read_range(state: &AppState, arguments: Map<String, Value>) -> Outcome 
     };
     let storage = ready(state).await?;
     let (id, rev) = (&args.document_id, args.revision);
-    completed(text::read_range(state, &storage, id, rev, params, PAYLOAD_BYTES).await)
+    let by = Requester::Tool("read_range".to_owned());
+    completed(text::read_range(state, &storage, id, rev, params, PAYLOAD_BYTES, by).await)
 }
 
 async fn find(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -379,7 +381,8 @@ async fn find(state: &AppState, arguments: Map<String, Value>) -> Outcome {
         require_complete: args.require_complete.unwrap_or(false),
     };
     let storage = ready(state).await?;
-    completed(find::search(state, &storage, &args.document_id, req, PAYLOAD_BYTES).await)
+    let by = Requester::Tool("find".to_owned());
+    completed(find::search(state, &storage, &args.document_id, req, PAYLOAD_BYTES, by).await)
 }
 
 async fn extraction_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {

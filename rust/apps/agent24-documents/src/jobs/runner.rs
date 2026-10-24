@@ -184,6 +184,12 @@ impl Claim {
         &self.attempt.job_id
     }
 
+    /// Which attempt of the job this is.
+    #[must_use]
+    pub fn attempt(&self) -> i64 {
+        self.attempt.attempt
+    }
+
     /// The job's input, as written when the job was created.
     #[must_use]
     pub fn input(&self) -> Option<&Value> {

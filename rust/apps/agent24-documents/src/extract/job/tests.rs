@@ -436,6 +436,9 @@ async fn a_job_waiting_for_its_layer_sees_its_cancel() {
         "{:?}",
         cancelled.elapsed()
     );
+    // The build goes on, asked for by this attempt: what a revocation stops.
+    let this = Requester::Job { id, attempt: 1 };
+    assert_eq!(env.state.layers().stop(|r| *r == this).len(), 1);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retried_extract_job_runs_again() {

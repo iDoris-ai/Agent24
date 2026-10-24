@@ -18,6 +18,7 @@ use super::{
     PAGE_BYTES, Position, Revision, coverage, current_layer, cursor_layer, decode_cursor,
     encode_cursor, geometry, last_page, revision, within,
 };
+use crate::engine::Requester;
 use crate::error::ApiError;
 use crate::state::{AppState, Ready, Storage};
 use crate::text_layer::{Block, ParseStatus, TextLayer, sha256_address};
@@ -55,7 +56,7 @@ pub async fn find(
 ) -> Result<Json<FindResult>, ApiError> {
     let UrlPath(id) = path.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let Json(req) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
-    search(&state, &storage, &id, req, PAGE_BYTES)
+    search(&state, &storage, &id, req, PAGE_BYTES, Requester::Page)
         .await
         .map(Json)
 }
@@ -68,6 +69,7 @@ pub(crate) async fn search(
     id: &str,
     req: FindRequest,
     budget: usize,
+    by: Requester,
 ) -> Result<FindResult, ApiError> {
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     let chars = req.query.chars().count();
@@ -98,7 +100,7 @@ pub(crate) async fn search(
             (address, layer, at)
         }
         None => {
-            let (address, layer) = current_layer(state, storage, &r).await?;
+            let (address, layer) = current_layer(state, storage, &r, by).await?;
             (
                 address,
                 layer,
