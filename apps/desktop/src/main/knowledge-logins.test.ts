@@ -250,6 +250,40 @@ describe('KnowledgeLoginStore (KB-HOST-01 PR-B2a)', () => {
     expect(again.list().get('b1')).toEqual(login('CALLED'))
   })
 
+  it('stores exactly the four fields, so a login carrying more does not make the file unreadable', async () => {
+    const store = new KnowledgeLoginStore(dir, fakeBox(), 'darwin')
+    store.load()
+    await store.put('a', login('A'))
+    const carryingMore = { ...login('B'), expiresAt: 1 }
+    await store.put('b', carryingMore)
+    expect(store.list().get('b')).toEqual(login('B'))
+    const again = new KnowledgeLoginStore(dir, fakeBox(), 'darwin')
+    expect(again.load()).toEqual({ ok: true })
+    expect([...again.list().keys()].sort()).toEqual(['a', 'b'])
+    expect(again.list().get('b')).toEqual(login('B'))
+  })
+
+  it('a secure storage that throws counts as unavailable instead of failing the load', () => {
+    const throwing = fakeBox({
+      getSelectedStorageBackend: () => {
+        throw new Error('backend unknown')
+      },
+    })
+    expect(new KnowledgeLoginStore(dir, throwing, 'linux').load()).toEqual({ ok: false, reason: 'encryption_unavailable' })
+    const unavailable = fakeBox({
+      isEncryptionAvailable: () => {
+        throw new Error('not ready')
+      },
+    })
+    expect(new KnowledgeLoginStore(dir, unavailable, 'darwin').load()).toEqual({ ok: false, reason: 'encryption_unavailable' })
+  })
+
+  it('a directory it cannot list does not fail the load', () => {
+    const notADir = path.join(dir, 'not-a-dir')
+    fs.writeFileSync(notADir, '')
+    expect(() => new KnowledgeLoginStore(notADir, fakeBox(), 'darwin').load()).not.toThrow()
+  })
+
   it('never logs the material', async () => {
     const spies = (['log', 'warn', 'error', 'info', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}))
     fs.writeFileSync(file(), 'garbage')

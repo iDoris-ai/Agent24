@@ -40,10 +40,14 @@ const VERSION = 1
 
 /** On Linux, safeStorage may "encrypt" with a hard-coded key (`basic_text`). */
 export function encryptionUsable(box: SecretBox, platform: NodeJS.Platform = process.platform): boolean {
-  if (!box.isEncryptionAvailable()) return false
-  if (platform !== 'linux') return true
-  const backend = box.getSelectedStorageBackend?.() ?? 'unknown'
-  return backend !== 'basic_text' && backend !== 'unknown'
+  try {
+    if (!box.isEncryptionAvailable()) return false
+    if (platform !== 'linux') return true
+    const backend = box.getSelectedStorageBackend?.() ?? 'unknown'
+    return backend !== 'basic_text' && backend !== 'unknown'
+  } catch {
+    return false
+  }
 }
 
 function isLogin(value: unknown): value is KnowledgeLogin {
@@ -80,8 +84,13 @@ export class KnowledgeLoginStore {
   load(): LoadResult {
     this.logins = new Map()
     this.writable = false
-    for (const name of fs.existsSync(path.dirname(this.file)) ? fs.readdirSync(path.dirname(this.file)) : []) {
-      if (name.startsWith(`${FILE}.`) && name.endsWith('.tmp')) fs.rmSync(path.join(path.dirname(this.file), name), { force: true })
+    // Best effort: a leftover temporary file is never read, only wasted space.
+    try {
+      for (const name of fs.existsSync(path.dirname(this.file)) ? fs.readdirSync(path.dirname(this.file)) : []) {
+        if (name.startsWith(`${FILE}.`) && name.endsWith('.tmp')) fs.rmSync(path.join(path.dirname(this.file), name), { force: true })
+      }
+    } catch {
+      // Listing or removing failed; reading the file below decides the result.
     }
     if (!encryptionUsable(this.box, this.platform)) return { ok: false, reason: 'encryption_unavailable' }
     // From here on a write replaces whatever is on disk, readable or not.
@@ -116,7 +125,13 @@ export class KnowledgeLoginStore {
   put(bindingId: string, login: KnowledgeLogin): Promise<void> {
     const since = this.clock
     const superseded = () => (this.tightened.get(bindingId) ?? 0) > since
-    const value = { ...login }
+    // Exactly the four fields: an extra one would make the whole file unreadable.
+    const value: KnowledgeLogin = {
+      profileId: login.profileId,
+      material: login.material,
+      unusable: login.unusable,
+      temporary: login.temporary,
+    }
     return this.enqueue(async () => {
       if (superseded()) throw new Error('Knowledge login superseded by a later change')
       await this.write(new Map(this.logins).set(bindingId, value))
