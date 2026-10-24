@@ -410,6 +410,30 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     expect(daemonConnection()).toBeNull()
   })
 
+  it('a dead external daemon\'s credential is gone before the fallback child is ready', async () => {
+    let healthy = true
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5558, token: 'external', pid: 4245 }),
+      checkHealth: vi.fn(() => Promise.resolve(healthy)),
+    }
+    // The fallback child never announces readiness (no stdout).
+    const silentChild = (): ChildProcess => {
+      const ee = new EventEmitter() as unknown as ChildProcess
+      Object.assign(ee, { pid: 9, stdout: null, stderr: null, kill: vi.fn().mockReturnValue(true) })
+      return ee
+    }
+    const manager = new BackendManager({ external, spawnProcess: silentChild })
+    await manager.start()
+    expect(daemonConnection()).not.toBeNull()
+
+    healthy = false
+    const tick = (manager as unknown as { tick(): Promise<void> }).tick.bind(manager)
+    for (let i = 0; i < 3; i++) await tick() // MAX_HEALTH_FAILURES
+    expect(manager.isExternalDaemon()).toBe(false)
+    expect(daemonConnection()).toBeNull()
+    manager.stop()
+  })
+
   it('the node mock takes no credential and is still reachable', async () => {
     process.env['AGENT24_BACKEND'] = 'node'
     const manager = await startWith({ port: 8765 })
