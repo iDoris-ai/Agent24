@@ -291,6 +291,9 @@ export class BackendManager {
   // app stop). A probe that was awaiting a health check when one of those ran
   // must not act on its stale result.
   private lifecycle = 0
+  // Set by stop() (app quit): start() may still be awaiting its first probe
+  // then, and must neither spawn nor arm the health loop afterwards.
+  private disposed = false
 
   constructor(deps: BackendManagerDeps = {}) {
     this.external = deps.external ?? defaultExternalDaemonSource
@@ -300,6 +303,7 @@ export class BackendManager {
 
   async start(): Promise<void> {
     if ((await this.tryReuseExternal()) === 'none') this.spawnChild()
+    if (this.disposed) return
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
   }
 
@@ -580,6 +584,7 @@ export class BackendManager {
 
   stop(): void {
     this.lifecycle += 1
+    this.disposed = true
     if (this.healthTimer) {
       clearInterval(this.healthTimer)
       this.healthTimer = null

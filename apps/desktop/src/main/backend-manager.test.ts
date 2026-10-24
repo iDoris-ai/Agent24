@@ -662,6 +662,23 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
       }
     })
 
+    it('app quit during the first probe of start(): no child and no health loop afterwards', async () => {
+      vi.useFakeTimers()
+      try {
+        const m = blockedManager()
+        m.holdNextProbe()
+        const starting = m.manager.start()
+        m.manager.stop()
+        m.answer(false)
+        await starting
+        await vi.advanceTimersByTimeAsync(25_000) // five health intervals
+        expect(m.spawnProcess).not.toHaveBeenCalled()
+        expect(vi.getTimerCount()).toBe(0)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
     it('stop during a failing health tick of our own child starts no replacement', async () => {
       const spawnProcess = vi.fn(() => childAnnouncing({ port: 4312, auth_mode: 'capabilities', product_host_token: 'mine' }))
       let probe: ((alive: boolean) => void) | null = null
