@@ -2442,6 +2442,11 @@ export interface components {
             expires_at: string;
             /** @enum {string} */
             status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";
+            /**
+             * @description Only for a revoked one: whether the module said it stopped the work the grant started (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded, as for a revocation made outside this daemon.
+             * @enum {string}
+             */
+            stop?: "confirmed" | "unconfirmed" | "not_running";
         };
         ModuleToolCard: {
             module: string;
@@ -2476,6 +2481,11 @@ export interface components {
             tool: string | null;
             /** @constant */
             status: "revoked";
+            /**
+             * @description What the module answered when told (K1-6a-G §2.5): `confirmed`, it stopped the work the grants started; `unconfirmed`, no 2xx within the bound, so that work may still run; `not_running`, it had no run. The revocation stands in every case.
+             * @enum {string}
+             */
+            stop: "confirmed" | "unconfirmed" | "not_running";
         };
         /**
          * @description A batch of atomic ops. `status` MUST be `pending` on submit — the server

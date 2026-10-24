@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::module_tool_runtime::RevocationStop;
 use crate::server::{AppState, error_response};
 
 fn storage_error(action: &'static str, err: impl std::fmt::Display) -> Response {
@@ -29,6 +30,10 @@ struct AuthorizationView {
     decided_at: String,
     expires_at: String,
     status: &'static str,
+    /// For a revoked one: whether the module said it stopped what the
+    /// grant started (K1-6a-G §2.5); none recorded reads `unconfirmed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +73,7 @@ fn view(record: agent24_store::ModuleConsentRecord, status: &'static str) -> Aut
         decided_at: record.decided_at,
         expires_at: record.expires_at,
         status,
+        stop: None,
     }
 }
 
@@ -99,7 +105,16 @@ async fn authorization_views(state: &AppState) -> Result<Vec<AuthorizationView>,
             agent24_store::ConsentLookup::Stale(_) => "stale",
             agent24_store::ConsentLookup::NotGranted => "not_granted",
         };
-        views.push(view(record, status));
+        let mut view = view(record, status);
+        if status == "revoked" {
+            let stop = state
+                .store
+                .revocation_stop_state(&view.module, &view.tool)
+                .await
+                .map_err(|err| Box::new(storage_error("resolve_stop", err)))?;
+            view.stop = Some(stop.unwrap_or_else(|| "unconfirmed".to_owned()));
+        }
+        views.push(view);
     }
     Ok(views)
 }
@@ -130,17 +145,63 @@ pub async fn export(State(state): State<AppState>) -> Response {
     }
 }
 
+/// Tells a module a revocation ended its grants of an operation (`"*"`:
+/// every tool) at an instant, and gives what it answered (K1-6a-G §2.5).
+pub type RevocationNotice = std::sync::Arc<
+    dyn Fn(String, String, String) -> futures::future::BoxFuture<'static, RevocationStop>
+        + Send
+        + Sync,
+>;
+
+/// The revocation is written first and stands whatever the module answers;
+/// the answer says whether the work the grants started has stopped, and
+/// only a recorded `confirmed` claims it has.
 async fn revoke(state: AppState, module: String, tool: Option<String>) -> Response {
     let now = Utc::now().to_rfc3339();
-    match state
+    let generation = match state
         .store
-        .revoke_module_consent(&module, tool.as_deref(), &now)
+        .revoke_module_consent_tracked(&module, tool.as_deref(), &now)
         .await
     {
-        Ok(()) => Json(serde_json::json!({ "module": module, "tool": tool, "status": "revoked" }))
-            .into_response(),
-        Err(err) => storage_error("revoke", err),
+        Ok(generation) => generation,
+        Err(err) => return storage_error("revoke", err),
+    };
+    let operation = tool.clone().unwrap_or_else(|| "*".to_owned());
+    let stop = match &state.module_tool_cards {
+        Some(cards) => (cards.notice)(module.clone(), operation, now.clone()).await,
+        None => RevocationStop::NotRunning,
+    };
+    let recorded = state
+        .store
+        .record_revocation_stop(&module, tool.as_deref(), generation, stop.word())
+        .await;
+    let stop = match recorded {
+        Ok(true) => stop,
+        // Not recorded, or a later revocation took its place: unconfirmed,
+        // as the list reads it.
+        Ok(false) => RevocationStop::Unconfirmed,
+        Err(err) => {
+            tracing::error!(module, error = %err, "a revocation's stop could not be recorded");
+            RevocationStop::Unconfirmed
+        }
+    };
+    if stop == RevocationStop::Unconfirmed {
+        let detail = serde_json::json!({ "module": module, "tool": tool });
+        if let Err(err) = state
+            .store
+            .append_audit(&now, "host", "module_consent.stop_unconfirmed", &detail)
+            .await
+        {
+            tracing::error!(module, error = %err, "an unconfirmed stop could not be audited");
+        }
     }
+    Json(serde_json::json!({
+        "module": module,
+        "tool": tool,
+        "status": "revoked",
+        "stop": stop.word(),
+    }))
+    .into_response()
 }
 
 pub async fn revoke_module(Path(module): Path<String>, State(state): State<AppState>) -> Response {
@@ -193,6 +254,7 @@ impl ToolCardSource {
 pub struct ModuleToolCards {
     pub tools: std::sync::Arc<std::collections::HashMap<(String, String), ToolCardSource>>,
     pub artifact: agent24_policy::consent_gate::ArtifactSource,
+    pub notice: RevocationNotice,
 }
 
 #[derive(Serialize)]

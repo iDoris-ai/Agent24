@@ -1624,6 +1624,24 @@ pub async fn serve(
     let module_tool_cards = crate::consent_routes::ModuleToolCards {
         tools: StdArc::new(card_sources),
         artifact: module_tool_runtime.artifact_source(),
+        notice: {
+            let runtime = module_tool_runtime.clone();
+            StdArc::new(
+                move |module: String, operation: String, revoked_at: String| {
+                    let runtime = runtime.clone();
+                    Box::pin(async move {
+                        runtime
+                            .notify_revoked(
+                                &module,
+                                &operation,
+                                &revoked_at,
+                                crate::module_tool_runtime::REVOCATION_NOTICE_WITHIN,
+                            )
+                            .await
+                    }) as futures::future::BoxFuture<'static, _>
+                },
+            )
+        },
     };
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
         StdArc::clone(&module_tool_runtime),
@@ -3710,6 +3728,7 @@ pub(crate) mod tests {
         let mut old = summary.clone();
         old.module = "old-module".to_owned();
         state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
+            notice: answering(crate::module_tool_runtime::RevocationStop::NotRunning),
             tools: StdArc::new(std::collections::HashMap::from([
                 (
                     ("doc-module".to_owned(), "read_document".to_owned()),
@@ -3783,6 +3802,117 @@ pub(crate) mod tests {
         );
     }
 
+    /// A revocation notice that answers `stop` and keeps what it was told.
+    fn answering_into(
+        stop: crate::module_tool_runtime::RevocationStop,
+        told: StdArc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) -> crate::consent_routes::RevocationNotice {
+        StdArc::new(move |module: String, operation: String, _: String| {
+            told.lock().unwrap().push((module, operation));
+            Box::pin(async move { stop }) as futures::future::BoxFuture<'static, _>
+        })
+    }
+
+    fn answering(
+        stop: crate::module_tool_runtime::RevocationStop,
+    ) -> crate::consent_routes::RevocationNotice {
+        answering_into(stop, StdArc::default())
+    }
+
+    /// K1-6a-G §2.5: a revocation tells the module and answers with what it
+    /// said; the list shows it for each revoked grant, and a revocation no
+    /// answer was recorded for — or one replaced since — reads unconfirmed,
+    /// as does one the module did not confirm, which is audited too.
+    #[tokio::test]
+    async fn a_revocation_answers_whether_the_module_stopped() {
+        use crate::module_tool_runtime::RevocationStop::{Confirmed, NotRunning, Unconfirmed};
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, summary) = decision_state(&running, &dir.path().join("os.json")).await;
+        let store = state.store.clone();
+        let told = StdArc::new(std::sync::Mutex::new(Vec::new()));
+        let with = |stop| {
+            let mut state = state.clone();
+            let cards = state.module_tool_cards.as_mut().unwrap();
+            cards.notice = answering_into(stop, StdArc::clone(&told));
+            build_router(state)
+        };
+        let delete = |router: Router, uri: &'static str| async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            body_json(response).await["stop"].clone()
+        };
+        let stop_listed = |store: agent24_store::Store| async move {
+            let views = authorization_list(store).await;
+            views["authorizations"][0]["stop"].clone()
+        };
+        let grant =
+            || store.grant_module_consent(&summary, "2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z");
+        grant().await.unwrap();
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        assert_eq!(
+            told.lock().unwrap().pop(),
+            Some(("doc-module".to_owned(), "read_document".to_owned()))
+        );
+        assert_eq!(stop_listed(store.clone()).await, "confirmed");
+        let module = "/api/v1/module-consents/modules/doc-module";
+        assert_eq!(delete(with(Unconfirmed), module).await, "unconfirmed");
+        assert_eq!(
+            told.lock().unwrap().pop(),
+            Some(("doc-module".to_owned(), "*".to_owned()))
+        );
+        assert_eq!(stop_listed(store.clone()).await, "unconfirmed");
+        let audited = store.list_audit().await.unwrap();
+        assert!(
+            audited
+                .iter()
+                .any(|e| e.action == "module_consent.stop_unconfirmed")
+        );
+        assert_eq!(delete(with(NotRunning), module).await, "not_running");
+        assert_eq!(stop_listed(store.clone()).await, "not_running");
+        // Revoked outside this route (the CLI's lifecycle revocation):
+        // nothing recorded, so unconfirmed.
+        store
+            .revoke_module_consent("doc-module", None, "2026-10-24T01:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(stop_listed(store.clone()).await, "unconfirmed");
+        let no_cards = build_router(AppState {
+            module_tool_cards: None,
+            ..state.clone()
+        });
+        assert_eq!(delete(no_cards, module).await, "not_running");
+        grant().await.unwrap();
+        let views = authorization_list(store.clone()).await;
+        assert!(views["authorizations"][0].get("stop").is_none(), "{views}");
+    }
+
+    async fn authorization_list(store: agent24_store::Store) -> serde_json::Value {
+        let mut state = state().await;
+        state.store = store;
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/module-consents")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_json(response).await
+    }
+
     /// A state with one grants-protocol tool (`doc-module.read_document`,
     /// kinds `doc`) and one older one, running while `running` holds, and
     /// decisions open against `os_json`.
@@ -3811,6 +3941,7 @@ pub(crate) mod tests {
         };
         let running = StdArc::clone(running);
         state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
+            notice: answering(crate::module_tool_runtime::RevocationStop::NotRunning),
             tools: StdArc::new(std::collections::HashMap::from([
                 (
                     ("doc-module".to_owned(), "read_document".to_owned()),
