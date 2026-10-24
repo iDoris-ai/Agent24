@@ -589,6 +589,7 @@ mod tests {
         let tags = store.list_run_source_tags("run_old_schema").await.unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
         assert_eq!(tags[0].source.source_id, "doc_legacy");
 
         let snap = store.run_policy_snapshot("run_old_schema").await.unwrap();
@@ -611,6 +612,7 @@ mod tests {
         let tags = store.list_run_source_tags("run_malformed").await.unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
     }
 
     #[tokio::test]
@@ -628,6 +630,29 @@ mod tests {
         let tags = store.list_run_source_tags("run_bad_columns").await.unwrap();
         assert_eq!(tags[0].seq, 7);
         assert_eq!(tags[0].source.mode, SourceMode::LocalOnly);
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_tag_whose_payload_names_another_source_is_unknown() {
+        // Reverse: without the source_id cross-check, a row could carry an
+        // `Ordinary` payload copied from another source and be trusted.
+        let store = store_with_run("run_mismatch").await;
+        let ordinary = SourceRef::user_input("run_mismatch", "2026-10-08T00:00:00Z");
+        sqlx::query(
+            "INSERT INTO run_source_tags (run_id, seq, source_id, schema_version, tag_json, created_at) \
+             VALUES (?, 0, 'memory_assertion:a1', ?, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind("run_mismatch")
+        .bind(SOURCE_TAG_SCHEMA_VERSION)
+        .bind(serde_json::to_string(&ordinary).unwrap())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let tags = store.list_run_source_tags("run_mismatch").await.unwrap();
+        assert_eq!(tags[0].source.source_id, "memory_assertion:a1");
+        assert_eq!(tags[0].source.classification, SourceClassification::Unknown);
     }
 
     #[tokio::test]
