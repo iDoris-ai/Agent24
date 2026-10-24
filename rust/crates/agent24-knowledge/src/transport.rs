@@ -7,8 +7,10 @@
 //! (base URL, credential), never by the caller: the trait takes an operation, not
 //! a URL. A real transport therefore never follows a redirect (the credential
 //! header would go along to wherever it points; a 3xx comes back as a
-//! [`TransportResponse`]), and never resends on its own: a retry is a new request
-//! with a new `request_id` (R6.6), decided by the Provider.
+//! [`TransportResponse`]), and never resends a request the server may have
+//! received: a retry is a new request with a new `request_id` (R6.6), decided by
+//! the Provider. (An HTTP client may move a request that was never written to a
+//! fresh connection; that is not a resend.)
 
 use std::fmt;
 use std::time::Duration;

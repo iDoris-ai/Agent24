@@ -10,9 +10,12 @@ description = "Agent24 Knowledge v1 wire types (docs/knowledge/CONTRACT-READONLY
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["time"] }
+url = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }
 
 [lints]
 workspace = true

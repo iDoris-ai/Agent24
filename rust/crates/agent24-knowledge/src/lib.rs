@@ -14,11 +14,13 @@
 //!   Only `ChunkExpectedRevision::chunk_revision` (r9: a hit's `null` may be sent
 //!   back, the server ignores the value).
 //!
-//! For the transport and the Mock, see `transport.rs` and `mock.rs`.
+//! For the transport, its HTTP implementation and the Mock, see `transport.rs`,
+//! `http.rs` and `mock.rs`.
 
 mod capabilities;
 mod common;
 mod error;
+mod http;
 mod local_cancelled;
 mod mock;
 mod read;
@@ -29,6 +31,7 @@ mod transport;
 pub use capabilities::*;
 pub use common::*;
 pub use error::*;
+pub use http::*;
 pub use local_cancelled::*;
 pub use mock::*;
 pub use read::*;

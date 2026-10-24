@@ -151,9 +151,11 @@ name = "agent24-knowledge"
 version = "0.5.1"
 dependencies = [
  "async-trait",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]
