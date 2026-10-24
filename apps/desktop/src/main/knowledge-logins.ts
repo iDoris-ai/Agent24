@@ -90,7 +90,7 @@ export class KnowledgeLoginStore {
         if (name.startsWith(`${FILE}.`) && name.endsWith('.tmp')) fs.rmSync(path.join(path.dirname(this.file), name), { force: true })
       }
     } catch {
-      // Listing or removing failed; reading the file below decides the result.
+      // Listing or removing failed; whatever is left over is never read.
     }
     if (!encryptionUsable(this.box, this.platform)) return { ok: false, reason: 'encryption_unavailable' }
     // From here on a write replaces whatever is on disk, readable or not.
@@ -132,6 +132,8 @@ export class KnowledgeLoginStore {
       unusable: login.unusable,
       temporary: login.temporary,
     }
+    // The types too: a value from IPC or JSON can carry anything at run time.
+    if (!isLogin(value)) return Promise.reject(new Error('Knowledge login is malformed'))
     return this.enqueue(async () => {
       if (superseded()) throw new Error('Knowledge login superseded by a later change')
       await this.write(new Map(this.logins).set(bindingId, value))

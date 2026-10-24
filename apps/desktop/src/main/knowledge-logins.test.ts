@@ -284,6 +284,20 @@ describe('KnowledgeLoginStore (KB-HOST-01 PR-B2a)', () => {
     expect(() => new KnowledgeLoginStore(notADir, fakeBox(), 'darwin').load()).not.toThrow()
   })
 
+  it('refuses a login whose values have the wrong type, and the other logins survive', async () => {
+    const store = new KnowledgeLoginStore(dir, fakeBox(), 'darwin')
+    store.load()
+    await store.put('a', login('A'))
+    for (const bad of [{ unusable: undefined }, { material: 42 }, { profileId: null }, { temporary: 'no' }]) {
+      const value = { ...login('B'), ...bad } as unknown as KnowledgeLogin
+      await expect(store.put('b', value)).rejects.toThrow('malformed')
+    }
+    expect(store.list().has('b')).toBe(false)
+    const again = new KnowledgeLoginStore(dir, fakeBox(), 'darwin')
+    expect(again.load()).toEqual({ ok: true })
+    expect([...again.list().keys()]).toEqual(['a'])
+  })
+
   it('never logs the material', async () => {
     const spies = (['log', 'warn', 'error', 'info', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}))
     fs.writeFileSync(file(), 'garbage')
