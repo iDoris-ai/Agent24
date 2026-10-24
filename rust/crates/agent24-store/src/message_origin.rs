@@ -111,12 +111,42 @@ fn decode_origin_row(row: &SqliteRow, requested_seq: i64) -> MessageOriginLookup
     let Some(origin) = origin_from_row(&kind, recall_ref) else {
         return MessageOriginLookup::Unreadable { seq };
     };
+    if !stored_message_matches_digest(row, &instance_digest) {
+        return MessageOriginLookup::Unreadable { seq };
+    }
     MessageOriginLookup::Present(StoredMessageOrigin {
         seq,
         schema_version,
         origin,
         instance_digest,
     })
+}
+
+fn stored_message_matches_digest(row: &SqliteRow, instance_digest: &str) -> bool {
+    let Ok(role) = row.try_get::<String, _>("role") else {
+        return false;
+    };
+    let Ok(content) = row.try_get::<Option<String>, _>("content") else {
+        return false;
+    };
+    let Ok(raw_calls) = row.try_get::<String, _>("tool_calls") else {
+        return false;
+    };
+    let Ok(tool_calls) = serde_json::from_str::<Value>(&raw_calls) else {
+        return false;
+    };
+    let Ok(tool_call_id) = row.try_get::<Option<String>, _>("tool_call_id") else {
+        return false;
+    };
+    let Ok(recomputed) = message_instance_digest(
+        &role,
+        content.as_deref(),
+        &tool_calls,
+        tool_call_id.as_deref(),
+    ) else {
+        return false;
+    };
+    recomputed == instance_digest
 }
 
 fn try_origin_parts(row: &SqliteRow) -> Option<(i64, String, String, Option<String>)> {
@@ -179,8 +209,11 @@ impl Store {
         seq: i64,
     ) -> Result<MessageOriginLookup> {
         let row = sqlx::query(
-            "SELECT seq, schema_version, kind, instance_digest, recall_ref \
-             FROM run_message_origins WHERE run_id = ? AND seq = ?",
+            "SELECT o.seq, o.schema_version, o.kind, o.instance_digest, o.recall_ref, \
+                    m.role, m.content, m.tool_calls, m.tool_call_id \
+             FROM run_message_origins o \
+             LEFT JOIN run_messages m ON m.run_id = o.run_id AND m.seq = o.seq \
+             WHERE o.run_id = ? AND o.seq = ?",
         )
         .bind(run_id)
         .bind(seq)

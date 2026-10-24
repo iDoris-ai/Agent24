@@ -244,6 +244,80 @@ async fn unknown_origin_version_is_unreadable_and_not_no_recall() {
     assert_eq!(messages(&store, "run_bad_ver").await, 1);
 }
 
+#[tokio::test]
+async fn tampered_message_content_is_unreadable_and_not_no_recall() {
+    let store = store_with_run("run_bad_body").await;
+    let tags_before = tags(&store, "run_bad_body").await;
+    store
+        .append_originated_run_messages(
+            "run_bad_body",
+            &[row(
+                "user",
+                Some("a"),
+                MessageOrigin::HostRecall {
+                    recall_ref: Some("mem:1".to_owned()),
+                },
+            )],
+            NOW,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE run_messages SET content = 'changed' WHERE run_id = ?")
+        .bind("run_bad_body")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let lookup = store
+        .read_run_message_origin("run_bad_body", 0)
+        .await
+        .unwrap();
+    assert!(matches!(lookup, MessageOriginLookup::Unreadable { seq: 0 }));
+    assert!(!format!("{lookup:?}").contains("NoRecall"));
+    assert_eq!(tags(&store, "run_bad_body").await, tags_before);
+    assert_eq!(messages(&store, "run_bad_body").await, 1);
+    assert_eq!(
+        store.list_run_messages("run_bad_body").await.unwrap()[0]
+            .content
+            .as_deref(),
+        Some("changed")
+    );
+}
+
+#[tokio::test]
+async fn tampered_instance_digest_is_unreadable_and_not_no_recall() {
+    let store = store_with_run("run_bad_digest").await;
+    let tags_before = tags(&store, "run_bad_digest").await;
+    store
+        .append_originated_run_messages(
+            "run_bad_digest",
+            &[row("user", Some("a"), MessageOrigin::UserPrompt)],
+            NOW,
+        )
+        .await
+        .unwrap();
+    let other = message_instance_digest("user", Some("other"), &json!([]), None).unwrap();
+    sqlx::query("UPDATE run_message_origins SET instance_digest = ? WHERE run_id = ?")
+        .bind(&other)
+        .bind("run_bad_digest")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let lookup = store
+        .read_run_message_origin("run_bad_digest", 0)
+        .await
+        .unwrap();
+    assert!(matches!(lookup, MessageOriginLookup::Unreadable { seq: 0 }));
+    assert!(!format!("{lookup:?}").contains("NoRecall"));
+    assert_eq!(tags(&store, "run_bad_digest").await, tags_before);
+    assert_eq!(messages(&store, "run_bad_digest").await, 1);
+    assert_eq!(
+        store.list_run_messages("run_bad_digest").await.unwrap()[0]
+            .content
+            .as_deref(),
+        Some("a")
+    );
+}
+
 async fn present(store: &Store, run_id: &str, seq: i64) -> agent24_store::StoredMessageOrigin {
     match store.read_run_message_origin(run_id, seq).await.unwrap() {
         MessageOriginLookup::Present(origin) => origin,
