@@ -136,9 +136,13 @@ fn a_host_holds_a_bounded_number_of_bindings() {
 fn the_routes_map_to_a_host_only_operation() {
     use crate::capabilities::Operation;
     for method in [Method::PUT, Method::DELETE] {
-        let operation =
-            crate::server::required_operation(&method, "/api/v1/host/knowledge/bindings/b1");
-        assert_eq!(operation, Operation::KnowledgeHost);
+        for path in [
+            "/api/v1/host/knowledge/bindings/b1",
+            "/api/v1/host/knowledge/bindings/b1/credential",
+        ] {
+            let operation = crate::server::required_operation(&method, path);
+            assert_eq!(operation, Operation::KnowledgeHost, "{method} {path}");
+        }
     }
     assert!(!Operation::creative_allowlist().contains(&Operation::KnowledgeHost));
     assert_eq!(
@@ -170,6 +174,113 @@ async fn the_handler_itself_refuses_any_audience_but_the_product_host() {
     assert_eq!(host_capability(&legacy, Some(validate(&host))), None);
 }
 
+fn bearer(value: &str) -> Credential {
+    Credential::Bearer(value.to_owned())
+}
+
+#[test]
+fn credential_follows_pushes_revokes_and_deactivation() {
+    let registry = KnowledgeHostRegistry::default();
+    let now = unix_now();
+    let later = now + 600;
+    // Only an active binding takes a credential; the refusal leaves no record.
+    assert_eq!(
+        registry.push_credential("host", "b1", 1, bearer("c1"), later),
+        Err(ChangeError::BindingInactive)
+    );
+    assert_eq!(registry.record("host", "b1"), None);
+
+    registry.apply("host", "b1", 1, Change::Activate).unwrap();
+    registry
+        .push_credential("host", "b1", 2, bearer("c2"), later)
+        .unwrap();
+    let current = registry.credential("host", "b1", now).unwrap();
+    assert_eq!((current.credential, current.seq), (bearer("c2"), 2));
+
+    // A revoke drops C at once and leaves the binding active.
+    registry
+        .apply("host", "b1", 3, Change::RevokeCredential)
+        .unwrap();
+    assert_eq!(registry.credential("host", "b1", now), None);
+    assert!(registry.is_active("host", "b1"));
+
+    registry
+        .push_credential("host", "b1", 4, Credential::ApiKey("k4".into()), later)
+        .unwrap();
+    assert_eq!(
+        registry.credential("host", "b1", now).unwrap().credential,
+        Credential::ApiKey("k4".into())
+    );
+    // Deactivation drops C too, and reactivating does not bring it back.
+    registry.apply("host", "b1", 5, Change::Deactivate).unwrap();
+    assert_eq!(registry.credential("host", "b1", now), None);
+    registry.apply("host", "b1", 6, Change::Activate).unwrap();
+    assert_eq!(registry.credential("host", "b1", now), None);
+}
+
+#[test]
+fn a_push_overtaken_by_a_revoke_cannot_bring_the_old_credential_back() {
+    let registry = KnowledgeHostRegistry::default();
+    let later = unix_now() + 600;
+    registry.apply("host", "b1", 1, Change::Activate).unwrap();
+    // The revoke (seq 3) arrives before the push it supersedes (seq 2).
+    registry
+        .apply("host", "b1", 3, Change::RevokeCredential)
+        .unwrap();
+    assert_eq!(
+        registry.push_credential("host", "b1", 2, bearer("old"), later),
+        Err(ChangeError::StaleSequence)
+    );
+    assert_eq!(registry.credential("host", "b1", unix_now()), None);
+    // A revoke may also come before the binding was ever activated.
+    registry
+        .apply("host", "b2", 2, Change::RevokeCredential)
+        .unwrap();
+    assert_eq!(
+        registry.apply("host", "b2", 1, Change::Activate),
+        Err(ChangeError::StaleSequence)
+    );
+}
+
+#[test]
+fn a_credential_is_not_handed_out_once_it_has_expired() {
+    let registry = KnowledgeHostRegistry::default();
+    let expires_at = unix_now() + 10;
+    registry.apply("host", "b1", 1, Change::Activate).unwrap();
+    registry
+        .push_credential("host", "b1", 2, bearer("c"), expires_at)
+        .unwrap();
+    assert!(registry.credential("host", "b1", expires_at - 1).is_some());
+    assert_eq!(registry.credential("host", "b1", expires_at), None);
+}
+
+#[test]
+fn a_credential_belongs_to_the_host_capability_that_pushed_it() {
+    let registry = KnowledgeHostRegistry::default();
+    let later = unix_now() + 600;
+    registry.apply("host-a", "b1", 1, Change::Activate).unwrap();
+    registry
+        .push_credential("host-a", "b1", 2, bearer("a"), later)
+        .unwrap();
+    assert_eq!(registry.credential("host-b", "b1", unix_now()), None);
+    // Another host cannot push onto host-a's binding either.
+    assert_eq!(
+        registry.push_credential("host-b", "b1", 3, bearer("b"), later),
+        Err(ChangeError::BindingInactive)
+    );
+}
+
+#[test]
+fn debug_output_never_carries_the_credential() {
+    let current = CurrentCredential {
+        credential: bearer("SECRET-BEARER"),
+        seq: 1,
+        expires_at: 0,
+    };
+    let printed = format!("{current:?} {:?}", Credential::ApiKey("SECRET-KEY".into()));
+    assert!(!printed.contains("SECRET"), "{printed}");
+}
+
 // ---- over HTTP, through the kernel router and its auth layer ----
 
 const BINDING: &str = "/api/v1/host/knowledge/bindings/b1";
@@ -188,6 +299,128 @@ async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, String)
     let status = res.status();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+const CREDENTIAL: &str = "/api/v1/host/knowledge/bindings/b1/credential";
+
+fn every_route() -> [(Method, &'static str); 4] {
+    [
+        (Method::PUT, BINDING),
+        (Method::DELETE, BINDING),
+        (Method::PUT, CREDENTIAL),
+        (Method::DELETE, CREDENTIAL),
+    ]
+}
+
+fn with_body(method: Method, path: &str, bearer: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+fn credential_body(value: &str, lifetime: u64) -> String {
+    serde_json::json!({ "kind": "bearer", "value": value, "expires_at": unix_now() + lifetime })
+        .to_string()
+}
+
+#[tokio::test]
+async fn the_host_pushes_and_revokes_a_credential() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state);
+    let put = |seq: u64, body: String| {
+        with_body(
+            Method::PUT,
+            &format!("{CREDENTIAL}?seq={seq}"),
+            &host,
+            &body,
+        )
+    };
+
+    // Not active yet.
+    let (status, body) = send(&router, put(1, credential_body("TOKEN-1", 600))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("binding_inactive"));
+
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    let (status, body) = send(&router, put(2, credential_body("TOKEN-2", 600))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(body.is_empty());
+    let host_id = registry.only_host();
+    let current = registry.credential(&host_id, "b1", unix_now()).unwrap();
+    assert_eq!((current.credential, current.seq), (bearer("TOKEN-2"), 2));
+
+    let api_key =
+        serde_json::json!({ "kind": "api_key", "value": "KEY-3", "expires_at": unix_now() + 600 });
+    let (status, _) = send(&router, put(3, api_key.to_string())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        registry
+            .credential(&host_id, "b1", unix_now())
+            .unwrap()
+            .credential,
+        Credential::ApiKey("KEY-3".into())
+    );
+
+    let (status, body) = send(
+        &router,
+        request(Method::DELETE, &format!("{CREDENTIAL}?seq=4"), &host),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(body.is_empty());
+    assert_eq!(registry.credential(&host_id, "b1", unix_now()), None);
+    assert!(registry.is_active(&host_id, "b1"));
+}
+
+#[tokio::test]
+async fn a_malformed_credential_push_changes_nothing_and_echoes_nothing() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state);
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    let host_id = registry.only_host();
+    let now = unix_now();
+    let body = |kind: &str, value: &str, expires_at: u64| {
+        serde_json::json!({ "kind": kind, "value": value, "expires_at": expires_at }).to_string()
+    };
+    let too_long = format!("SECRET{}", "x".repeat(MAX_CREDENTIAL_BYTES));
+    for (query, payload) in [
+        ("", body("bearer", "SECRET", now + 60)),
+        ("?seq=0", body("bearer", "SECRET", now + 60)),
+        ("?seq=2", "{\"kind\":\"bearer\",\"value\":\"SECRET\"".to_owned()),
+        ("?seq=2", body("cookie", "SECRET", now + 60)),
+        ("?seq=2", body("bearer", "", now + 60)),
+        ("?seq=2", body("bearer", "SECRET WITH SPACE", now + 60)),
+        ("?seq=2", body("bearer", "SECRET\u{e9}", now + 60)),
+        ("?seq=2", body("bearer", &too_long, now + 60)),
+        ("?seq=2", body("bearer", "SECRET", now)),
+        (
+            "?seq=2",
+            serde_json::json!({ "kind": "bearer", "value": "SECRET", "expires_at": now + 60, "seq": 9 })
+                .to_string(),
+        ),
+    ] {
+        let req = with_body(Method::PUT, &format!("{CREDENTIAL}{query}"), &host, &payload);
+        let (status, response) = send(&router, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query} {}", &payload[..payload.len().min(80)]);
+        assert!(response.contains("invalid_request"));
+        assert!(!response.contains("SECRET"), "{response}");
+    }
+    assert_eq!(registry.credential(&host_id, "b1", now), None);
+    assert_eq!(registry.record(&host_id, "b1"), Some((true, 1)));
 }
 
 #[tokio::test]
@@ -229,15 +462,17 @@ async fn a_creative_runtime_is_refused() {
     let (state, _, creative) = crate::server::tests::capability_state().await;
     let registry = state.knowledge_host.clone();
     let router = build_router(state);
-    for method in [Method::PUT, Method::DELETE] {
+    for (method, path) in every_route() {
         // The auth layer already refuses it (`knowledge.host` is not in the
         // Creative allow-list); the handler's audience check is the backstop.
-        let (status, _) = send(
-            &router,
-            request(method, &format!("{BINDING}?seq=1"), &creative),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        let req = with_body(
+            method,
+            &format!("{path}?seq=1"),
+            &creative,
+            &credential_body("t", 60),
+        );
+        let (status, _) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
     }
     assert!(registry.is_empty());
 }
@@ -248,13 +483,15 @@ async fn the_legacy_shared_token_is_refused() {
     let token = state.token.to_string();
     let registry = state.knowledge_host.clone();
     let router = build_router(state);
-    for method in [Method::PUT, Method::DELETE] {
-        let (status, body) = send(
-            &router,
-            request(method, &format!("{BINDING}?seq=1"), &token),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+    for (method, path) in every_route() {
+        let req = with_body(
+            method,
+            &format!("{path}?seq=1"),
+            &token,
+            &credential_body("t", 60),
+        );
+        let (status, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
         assert!(body.contains("host_authority_required"));
     }
     assert!(registry.is_empty());
@@ -270,6 +507,12 @@ async fn a_malformed_request_changes_nothing() {
         BINDING.to_owned(),
         format!("{BINDING}?seq=x"),
         format!("{BINDING}?seq=-1"),
+        // Sequence numbers start at 1.
+        format!("{BINDING}?seq=0"),
+        "/api/v1/host/knowledge/bindings/.?seq=1".to_owned(),
+        "/api/v1/host/knowledge/bindings/..?seq=1".to_owned(),
+        "/api/v1/host/knowledge/bindings/%2E%2E?seq=1".to_owned(),
+        "/api/v1/host/knowledge/bindings/%2E/credential?seq=1".to_owned(),
         format!("/api/v1/host/knowledge/bindings/{long_id}?seq=1"),
         "/api/v1/host/knowledge/bindings/b%01?seq=1".to_owned(),
         "/api/v1/host/knowledge/bindings/..%2F..%2Fx?seq=1".to_owned(),
