@@ -789,7 +789,7 @@ impl RunManager {
         run_id: &str,
         session_id: Option<&str>,
         prompt: &str,
-        has_assistant_history: bool,
+        has_non_user_history: bool,
     ) -> (
         Vec<Msg>,
         Option<ExplicitRememberState>,
@@ -802,9 +802,10 @@ impl RunManager {
             format!("user_input:{run_id}"),
             agent24_store::SourceClassification::Ordinary,
         )];
-        // Interim until 6b.4c: assistant turns the client sends back cannot be
-        // classified yet, so they are an Unknown source.
-        if has_assistant_history {
+        // Interim until 6b.4c: client-supplied history in any role other than
+        // `user` (assistant, system, tool, or a role this code does not know)
+        // cannot be classified yet, so it is an Unknown source.
+        if has_non_user_history {
             sources.push((
                 format!("chat_history:{run_id}"),
                 agent24_store::SourceClassification::Unknown,
@@ -4125,27 +4126,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_chat_prelude_counts_client_assistant_history_as_unknown() {
+    async fn the_chat_prelude_counts_client_non_user_history_as_unknown() {
         let provider = Arc::new(RecordingProvider {
             seen: StdMutex::new(vec![]),
         });
         let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
         seed_session(&store, "sess_hist").await;
-        for (has_assistant_history, expected) in [
+        for (has_non_user_history, expected) in [
             (false, agent24_store::SourceClassification::Ordinary),
             (true, agent24_store::SourceClassification::Unknown),
         ] {
             let (_, _, source_ref) = manager
-                .chat_memory_prelude(
-                    "run_hist",
-                    Some("sess_hist"),
-                    "hello",
-                    has_assistant_history,
-                )
+                .chat_memory_prelude("run_hist", Some("sess_hist"), "hello", has_non_user_history)
                 .await;
             assert_eq!(
                 source_ref.classification, expected,
-                "{has_assistant_history}"
+                "{has_non_user_history}"
             );
         }
     }

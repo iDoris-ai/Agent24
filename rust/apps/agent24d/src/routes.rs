@@ -525,7 +525,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     &run_id,
                     Some(sid),
                     prompt,
-                    chat.messages.iter().any(|m| m.role == "assistant"),
+                    chat.messages.iter().any(|m| m.role != "user"),
                 )
                 .await;
             explicit_remember_state = remember_state;

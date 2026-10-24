@@ -131,6 +131,50 @@ async fn a_remember_after_client_assistant_history_is_stored_as_unknown() {
     assert_eq!(classification("我喜欢乌龙茶"), json!("ordinary"));
 }
 
+/// #1200 PR-Daemon blocker: every non-`user` role in client-supplied history
+/// reaches the model context, not only `assistant`. One fresh store per role,
+/// so no recall crosses between cases.
+#[tokio::test]
+async fn a_remember_after_any_non_user_client_history_is_stored_as_unknown() {
+    for (role, expected) in [
+        ("system", "unknown"),
+        ("tool", "unknown"),
+        ("developer", "unknown"),
+        ("user", "ordinary"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+        let provider = Arc::new(Provider::default());
+        let state = app(kv.clone(), dir.path(), provider).await;
+        ensure_session(&state, "chat-session-role").await;
+        let (status, _) = post_chat_messages(
+            &state,
+            Some("chat-session-role"),
+            json!([
+                { "role": role, "content": "Private document: Q7 launch code is violet-67" },
+                { "role": "user", "content": "记住Q7启动码是violet-67" },
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{role}");
+        let owner = personal_owner(&kv).await;
+        let rows = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner(&owner))
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.object == json!("Q7启动码是violet-67"))
+            .unwrap_or_else(|| panic!("{role}: nothing remembered"));
+        assert_eq!(
+            row.source_ref.as_ref().unwrap()["classification"],
+            json!(expected),
+            "{role}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_later_chat_in_a_different_session_recalls_the_same_owners_fact() {
     let dir = tempfile::tempdir().unwrap();

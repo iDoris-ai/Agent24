@@ -46,9 +46,6 @@ pub const RECALL_END_MARKER: &str = "\n[记忆数据结束]";
 /// budget by itself.
 const MAX_FACT_CHARS: usize = 500;
 
-/// Append-only session memory. Callers inject the personal partition key with
-/// `with_owner`; the daemon catalogue wiring belongs to M1-T05. Legacy blobs
-/// are read only for first import and never updated: downgrades are unsupported.
 /// One fact [`SessionMemory::recall`] injected, with the classification its
 /// assertion was written with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +54,9 @@ pub(crate) struct RecalledAssertion {
     pub(crate) classification: agent24_store::SourceClassification,
 }
 
+/// Append-only session memory. Callers inject the personal partition key with
+/// `with_owner`; the daemon catalogue wiring belongs to M1-T05. Legacy blobs
+/// are read only for first import and never updated: downgrades are unsupported.
 pub struct SessionMemory {
     kv: KvStore,
     log: SessionLog,
