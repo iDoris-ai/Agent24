@@ -24,14 +24,16 @@ use std::fmt;
 use std::sync::Mutex;
 
 use agent24_protocol::state_file::AuthMode;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::capabilities::{Audience, Authorization, UnixSeconds, unix_now};
+use agent24_domain::http::read_body_or_response;
+
 use crate::server::{AppState, error_response};
 
 /// Bindings one host may hold records for, deactivated ones included.
@@ -367,11 +369,16 @@ pub async fn push_credential(
     authorization: Option<Extension<Authorization>>,
     Path(binding_id): Path<String>,
     query: Result<Query<SeqQuery>, QueryRejection>,
-    body: Bytes,
+    req: Request<Body>,
 ) -> Response {
     let (host, seq) = match host_and_seq(&state, authorization, &binding_id, query) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
+    };
+    // The kernel's body cap and its 413 envelope, like every other handler.
+    let body = match read_body_or_response(req).await {
+        Ok(body) => body,
+        Err(refused) => return refused,
     };
     let Ok(body) = serde_json::from_slice::<CredentialBody>(&body) else {
         return invalid_request();

@@ -402,6 +402,14 @@ async fn a_malformed_credential_push_changes_nothing_and_echoes_nothing() {
         ("?seq=0", body("bearer", "SECRET", now + 60)),
         ("?seq=2", "{\"kind\":\"bearer\",\"value\":\"SECRET\"".to_owned()),
         ("?seq=2", body("cookie", "SECRET", now + 60)),
+        // serde's own messages would quote these: "unknown variant `SECRET`",
+        // "invalid type: sequence" next to the value.
+        ("?seq=2", body("SECRET", "x", now + 60)),
+        (
+            "?seq=2",
+            serde_json::json!({ "kind": "bearer", "value": ["SECRET"], "expires_at": now + 60 })
+                .to_string(),
+        ),
         ("?seq=2", body("bearer", "", now + 60)),
         ("?seq=2", body("bearer", "SECRET WITH SPACE", now + 60)),
         ("?seq=2", body("bearer", "SECRET\u{e9}", now + 60)),
@@ -420,6 +428,28 @@ async fn a_malformed_credential_push_changes_nothing_and_echoes_nothing() {
         assert!(!response.contains("SECRET"), "{response}");
     }
     assert_eq!(registry.credential(&host_id, "b1", now), None);
+    assert_eq!(registry.record(&host_id, "b1"), Some((true, 1)));
+}
+
+#[tokio::test]
+async fn a_credential_push_over_the_kernel_body_cap_is_refused() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state);
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    let host_id = registry.only_host();
+    // A short credential padded with whitespace: valid JSON, over 1 MiB.
+    let padding = " ".repeat(agent24_domain::http::MAX_BODY_BYTES);
+    let payload = format!("{}{padding}", credential_body("TOKEN", 600));
+    let req = with_body(Method::PUT, &format!("{CREDENTIAL}?seq=2"), &host, &payload);
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(body.contains("payload_too_large"), "{body}");
+    assert_eq!(registry.credential(&host_id, "b1", unix_now()), None);
     assert_eq!(registry.record(&host_id, "b1"), Some((true, 1)));
 }
 
