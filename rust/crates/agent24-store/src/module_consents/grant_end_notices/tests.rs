@@ -92,6 +92,36 @@ async fn a_revocation_tells_the_grants_it_ends() {
     assert_eq!(ends(&store).await.len(), 3);
 }
 
+/// `*` named as the tool revokes the whole module (its key): the end tells
+/// every grant of it in force.
+#[tokio::test]
+async fn a_revocation_of_the_tool_named_star_tells_every_grant() {
+    let store = Store::open_memory().await.unwrap();
+    let (t, u) = (grant(&store, "t").await, grant(&store, "u").await);
+    let all = store
+        .revoke_module_consent_tracked("m", Some("*"), AT)
+        .await
+        .unwrap();
+    let notice = store.grant_end_notice(all).await.unwrap().unwrap();
+    assert_eq!(notice.op, "*");
+    assert_eq!(notice.authorization_refs, refs(&[&t, &u]));
+}
+
+/// The stop route revokes the whole module, then advances its epoch: the
+/// revocation's end tells every grant, and the advance, finding none left
+/// untold, writes none.
+#[tokio::test]
+async fn an_advance_after_a_revocation_of_the_module_writes_no_second_end() {
+    let store = Store::open_memory().await.unwrap();
+    let t = grant(&store, "t").await;
+    store.invalidate_module_consents("m").await.unwrap();
+    store.advance_module_enable_epoch("m").await.unwrap();
+    let told = ends(&store).await;
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].reason, GrantEndReason::Revoked);
+    assert_eq!(told[0].authorization_refs, refs(&[&t]));
+}
+
 /// A decision replacing a granted row writes its end, at the decision's
 /// instant, under the decision's generation — an expired grant's too (the
 /// A5b gate, #1190) — unless its end was told: by an expiry notice, or a

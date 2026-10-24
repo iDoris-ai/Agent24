@@ -681,8 +681,10 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
-        // Read before the revocation covers them (§2.5.1).
-        let ended = grant_end_notices::untold(&mut tx, module, op, None).await?;
+        // Read before the revocation covers them (§2.5.1); `*` named as a
+        // tool is the whole module, as its key says.
+        let tool = op.filter(|op| *op != "*");
+        let ended = grant_end_notices::untold(&mut tx, module, tool, None).await?;
         sqlx::query(
             "INSERT INTO module_consent_revocations (module, op, revoked_at, generation)
              VALUES (?, ?, ?, ?)
