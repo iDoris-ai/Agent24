@@ -783,18 +783,22 @@ impl RunManager {
     /// [`ExplicitRememberState`] (`None` when it is not an explicit
     /// remember at all) — the caller needs it, independent of the model's
     /// own reply, to build a deterministic `memory_receipt` once the turn is
-    /// committed.
+    /// committed. K1-6b.4c: an error means the session floor could not be
+    /// recorded; the caller must not call the model.
     pub async fn chat_memory_prelude(
         &self,
         run_id: &str,
         session_id: Option<&str>,
         prompt: &str,
         has_assistant_history: bool,
-    ) -> (
-        Vec<Msg>,
-        Option<ExplicitRememberState>,
-        agent24_store::AssertionSourceRef,
-    ) {
+    ) -> Result<
+        (
+            Vec<Msg>,
+            Option<ExplicitRememberState>,
+            agent24_store::AssertionSourceRef,
+        ),
+        StoreError,
+    > {
         // K1-6b.4b: this stateless surface persists no run tags, so the
         // sources of its model context are folded here: the caller's own
         // messages (user input, Ordinary) plus every recalled fact.
@@ -802,20 +806,12 @@ impl RunManager {
             format!("user_input:{run_id}"),
             agent24_store::SourceClassification::Ordinary,
         )];
-        // Interim until 6b.4c: assistant turns the client sends back cannot be
-        // classified yet, so they are an Unknown source.
-        if has_assistant_history {
-            sources.push((
-                format!("chat_history:{run_id}"),
-                agent24_store::SourceClassification::Unknown,
-            ));
-        }
         let Some(memory) = self.memory.as_ref() else {
-            return (
+            return Ok((
                 Vec::new(),
                 None,
                 agent24_store::AssertionSourceRef::from_sources(sources),
-            );
+            ));
         };
         let mut prelude = Vec::new();
         match memory.recall(prompt).await {
@@ -860,11 +856,28 @@ impl RunManager {
         } else {
             None
         };
-        (
+        // K1-6b.4c (ADR-K1-02 §2.2): assistant turns the client sends back
+        // are this session's earlier replies, classified by its floor (no
+        // stored floor: Unknown). The merge happens before the model call;
+        // a failure fails the request.
+        if let Some(sid) = session_id {
+            let own = agent24_store::AssertionSourceRef::from_sources(sources.clone());
+            let floor = self
+                .store
+                .merge_session_floor(
+                    sid,
+                    own.classification,
+                    has_assistant_history,
+                    &now_iso8601(),
+                )
+                .await?;
+            sources.push((format!("session_floor:{sid}"), floor));
+        }
+        Ok((
             prelude,
             explicit_state,
             agent24_store::AssertionSourceRef::from_sources(sources),
-        )
+        ))
     }
 
     /// M1-T12: the SAME post-answer commit `drive_new`'s run loop performs
@@ -1752,6 +1765,60 @@ impl RunManager {
                     &run_id,
                     "source_policy_unavailable",
                     &format!("failed to persist recalled memory source policy: {err}"),
+                )
+                .await;
+                return;
+            }
+        }
+        // K1-6b.4c (ADR-K1-02 §2.2): earlier turns of the session are a
+        // source of this run. Merge this run's own classification into the
+        // session floor before the model call and tag the run with the
+        // result, so what the run remembers and which tools it may use both
+        // follow the strictest turn of its session.
+        if let (Some(_), Some(sid)) = (self.memory.as_ref(), run.session_id.as_deref()) {
+            // This run's own classification, read back from the tags just
+            // written. A failed read must fail the run rather than fold to
+            // `Unknown`: a restricted recall would otherwise enter the floor
+            // one step looser than it is.
+            let floor = match self.store.run_policy_snapshot(&run_id).await {
+                Ok(snapshot) => {
+                    let own = agent24_store::strictest_classification(
+                        snapshot.sources.iter().map(|source| source.classification),
+                    );
+                    self.store
+                        .merge_session_floor(
+                            sid,
+                            own,
+                            prior_context_range.is_some(),
+                            &now_iso8601(),
+                        )
+                        .await
+                }
+                Err(err) => Err(err),
+            };
+            let floor = match floor {
+                Ok(floor) => floor,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to read or persist session source floor: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let seq = prior_context_range.map_or(user_msg_seq, |(start, _)| start);
+            let tag = agent24_store::SourceRef::session_floor(sid, floor, now_iso8601());
+            if let Err(err) = self
+                .store
+                .tag_run_source(&run_id, seq, &tag, &now_iso8601())
+                .await
+            {
+                self.finish_failed(
+                    &run_id,
+                    "source_policy_unavailable",
+                    &format!("failed to persist session source policy: {err}"),
                 )
                 .await;
                 return;
@@ -4098,7 +4165,8 @@ pub(crate) mod tests {
         let prompt = format!("记住 {remembered}");
         let (_, _, source_ref) = manager
             .chat_memory_prelude("run_chat", Some("sess_chat_write"), &prompt, false)
-            .await;
+            .await
+            .unwrap();
         let outcome = manager
             .chat_remember_turn("sess_chat_write", &prompt, "ok", source_ref)
             .await;
@@ -4109,9 +4177,22 @@ pub(crate) mod tests {
         );
     }
 
+    async fn process_egress_allowed_in(manager: &Arc<RunManager>, run: &Run) -> bool {
+        manager
+            .tool_context_for(run, "tc")
+            .await
+            .unwrap()
+            .authorize_egress_if_restricted(
+                agent24_domain::EgressPurpose::ProcessExecution,
+                agent24_domain::EgressDestination::unknown(),
+            )
+            .await
+            .is_ok()
+    }
+
     #[tokio::test]
-    async fn a_memory_written_after_earlier_turns_of_its_session_is_unknown() {
-        use agent24_store::SourceClassification::{Ordinary, Unknown};
+    async fn an_ordinary_session_stays_ordinary_across_turns() {
+        use agent24_store::SourceClassification::Ordinary;
         let provider = Arc::new(RecordingProvider {
             seen: StdMutex::new(vec![]),
         });
@@ -4119,35 +4200,138 @@ pub(crate) mod tests {
         seed_session(&store, "sess_turns").await;
         run_in_session(&manager, &store, "sess_turns", "记住 alpha is first").await;
         assert_eq!(stored_classification(&kv, "alpha is first").await, Ordinary);
-        // The second run carries the first turn as untagged prior context.
-        run_in_session(&manager, &store, "sess_turns", "记住 beta is second").await;
-        assert_eq!(stored_classification(&kv, "beta is second").await, Unknown);
+        // The second run carries the first turn as session context.
+        let run = run_in_session(&manager, &store, "sess_turns", "记住 beta is second").await;
+        assert_eq!(stored_classification(&kv, "beta is second").await, Ordinary);
+        assert!(process_egress_allowed_in(&manager, &run).await);
     }
 
     #[tokio::test]
-    async fn the_chat_prelude_counts_client_assistant_history_as_unknown() {
+    async fn a_restricted_earlier_turn_restricts_the_later_turns_of_its_session() {
+        use agent24_memory::assertion::AssertionStore;
+        use agent24_store::SourceClassification::Restricted;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_floor").await;
+        seed_memory(&kv, "a-teal", Some(Restricted)).await;
+        run_in_session(&manager, &store, "sess_floor", "what colour is teal").await;
+        // The fact itself is gone; the later turn sees it only as session
+        // context, which the session floor still classifies.
+        kv.assertions()
+            .retract(&"a-teal".to_owned(), "test-owner", &now_iso8601())
+            .await
+            .unwrap();
+        let run = run_in_session(&manager, &store, "sess_floor", "记住 beta is second").await;
+        assert_eq!(
+            stored_classification(&kv, "beta is second").await,
+            Restricted
+        );
+        let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+        let floor = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_id == "session_floor:sess_floor")
+            .unwrap_or_else(|| panic!("no session floor tag in {:?}", snapshot.sources));
+        assert_eq!(floor.classification, Restricted);
+        assert_eq!(floor.kind, agent24_store::SourceKind::SessionContext);
+        assert!(!process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
+    async fn prior_session_context_without_a_recorded_floor_is_unknown() {
+        use agent24_store::SourceClassification::Unknown;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_lost").await;
+        run_in_session(&manager, &store, "sess_lost", "记住 alpha is first").await;
+        // The earlier turn is in the session, but its floor is not.
+        sqlx::raw_sql("DELETE FROM session_source_floor")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let run = run_in_session(&manager, &store, "sess_lost", "记住 beta is second").await;
+        assert_eq!(stored_classification(&kv, "beta is second").await, Unknown);
+        assert!(!process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
+    async fn a_session_floor_that_cannot_be_written_stops_the_run_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_nofloor").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_floor BEFORE INSERT ON session_source_floor \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = run_in_session(&manager, &store, "sess_nofloor", "hello").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chat_prelude_classifies_client_history_by_the_session_floor() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
         let provider = Arc::new(RecordingProvider {
             seen: StdMutex::new(vec![]),
         });
         let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
-        seed_session(&store, "sess_hist").await;
-        for (has_assistant_history, expected) in [
-            (false, agent24_store::SourceClassification::Ordinary),
-            (true, agent24_store::SourceClassification::Unknown),
+        store
+            .merge_session_floor("chat_restricted", Restricted, false, &now_iso8601())
+            .await
+            .unwrap();
+        // (session, client history has assistant turns, classification)
+        for (sid, has_assistant_history, expected) in [
+            ("chat_a", false, Ordinary),
+            // chat_a's floor now exists: its own earlier replies are Ordinary.
+            ("chat_a", true, Ordinary),
+            // No floor: replies the server has no record of are Unknown.
+            ("chat_b", true, Unknown),
+            ("chat_restricted", true, Restricted),
+            ("chat_restricted", false, Restricted),
         ] {
             let (_, _, source_ref) = manager
-                .chat_memory_prelude(
-                    "run_hist",
-                    Some("sess_hist"),
-                    "hello",
-                    has_assistant_history,
-                )
-                .await;
+                .chat_memory_prelude("run_hist", Some(sid), "hello", has_assistant_history)
+                .await
+                .unwrap();
             assert_eq!(
                 source_ref.classification, expected,
-                "{has_assistant_history}"
+                "{sid} {has_assistant_history}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_chat_prelude_whose_floor_cannot_be_written_fails() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_floor BEFORE INSERT ON session_source_floor \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert!(
+            manager
+                .chat_memory_prelude("run_x", Some("chat_x"), "hello", false)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -4194,7 +4378,8 @@ pub(crate) mod tests {
             }
             let (prelude, _, source_ref) = manager
                 .chat_memory_prelude("run_chat", Some("sess_chat"), "what colour is teal", false)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(prelude.is_empty(), seeded.is_none(), "{seeded:?}");
             assert_eq!(source_ref.classification, expected, "{seeded:?}");
             assert!(
