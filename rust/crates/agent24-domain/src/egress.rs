@@ -151,6 +151,7 @@ impl dyn EgressGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct ExactGrant {
         resource: &'static str,
@@ -262,5 +263,37 @@ mod tests {
             7,
         );
         assert!(unknown.authorize(&grant).await.is_err());
+    }
+
+    struct RevocableGrant(AtomicBool);
+
+    #[async_trait]
+    impl EgressGate for RevocableGrant {
+        async fn check(&self, _request: &EgressRequest) -> Result<(), EgressDecision> {
+            self.0
+                .load(Ordering::SeqCst)
+                .then_some(())
+                .ok_or(EgressDecision)
+        }
+    }
+
+    /// ADR-K1-02 §2.2: `authorize` consults the live gate on every call and
+    /// caches nothing, so a revocation between two calls denies the second.
+    /// Expiry is the gate's own decision and is not modelled here.
+    #[tokio::test]
+    async fn an_authorized_request_is_rechecked_against_the_live_gate_after_revocation() {
+        let grant = RevocableGrant(AtomicBool::new(true));
+        let request = EgressRequest::remote(
+            vec![
+                EgressResource::cloud_authorized("doc:a", "rev-1", 2)
+                    .with_authorization_ref("grant-a"),
+            ],
+            EgressPurpose::ModelInference,
+            EgressDestination::exact("provider:a"),
+            9,
+        );
+        assert!(request.authorize(&grant).await.is_ok());
+        grant.0.store(false, Ordering::SeqCst);
+        assert!(request.authorize(&grant).await.is_err());
     }
 }

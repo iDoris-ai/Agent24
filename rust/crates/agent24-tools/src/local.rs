@@ -664,6 +664,27 @@ mod tests {
         assert!(marker.exists(), "ordinary shell command should spawn");
     }
 
+    #[tokio::test]
+    async fn shell_exec_runs_argv_without_shell_interpretation_for_ordinary_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let mut input = Map::new();
+        input.insert(
+            "argv".to_owned(),
+            serde_json::json!(["/usr/bin/printf", "[%s]", "$HOME", "two words", "a;b"]),
+        );
+        let out = tool
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 0);
+        // Each argv entry arrives as exactly one argument, unexpanded. Output
+        // alone cannot tell direct exec from a shell with perfect quoting;
+        // direct exec is `Command::new(program).args(args)` in `call`.
+        assert_eq!(parsed["stdout"], "[$HOME][two words][a;b]");
+    }
+
     /// FU-103/J-6, end-to-end through `ShellExecTool::call` (not just the
     /// `env_whitelist` unit — this proves the tool actually wires it in).
     /// Re-execs the test binary with a real ambient `secret_test_key` set on
@@ -710,6 +731,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!output.contains("leaked-if-this-appears-in-child-stdout"));
+        // An empty child environment would also pass the line above.
+        assert!(
+            output.contains("PATH="),
+            "PATH must reach the child: {output}"
+        );
     }
 
     #[tokio::test]

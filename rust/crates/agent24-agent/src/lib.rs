@@ -624,11 +624,14 @@ impl RunManager {
                 let resources = snapshot
                     .sources
                     .into_iter()
-                    // User-authored prompt text is present in every run and
-                    // does not by itself represent selected sensitive source
-                    // material for tool egress. Selected/unknown sources keep
-                    // the strict source policy from 6b.2.
-                    .filter(|source| source.kind != agent24_store::SourceKind::UserInput)
+                    // ADR-K1-02 §2.1.1: only the host-assigned classification
+                    // decides whether a source is tool egress material, never
+                    // its kind. `Ordinary` sources (user input today, ordinary
+                    // recalled memory later) do not restrict tools; Restricted
+                    // and Unknown sources, of any kind, keep the strict policy.
+                    .filter(|source| {
+                        source.classification != agent24_store::SourceClassification::Ordinary
+                    })
                     .map(|source| agent24_domain::EgressResource {
                         resource_id: source.source_id,
                         revision: source.revision_digest,
@@ -3221,6 +3224,100 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// K1-6b.4a (ADR-K1-02 §2.1.1, §5 item 9): tool egress is restricted by a
+    /// source's classification, not its kind. Returns whether a process
+    /// egress check passes for a run tagged with exactly `sources`.
+    async fn process_egress_allowed_for(sources: Vec<agent24_store::SourceRef>) -> bool {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let now = now_iso8601();
+        let run = Run {
+            id: format!("run_{}", ulid()),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::Running,
+            input: RunInput {
+                prompt: "classified".into(),
+                workspace_id: None,
+                model_override: None,
+                mode: RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now.clone(),
+            started_at: Some(now.clone()),
+            ended_at: None,
+        };
+        store.insert_run(&run).await.unwrap();
+        for source in &sources {
+            store
+                .tag_run_source(&run.id, 0, source, &now)
+                .await
+                .unwrap();
+        }
+        let ctx = manager.tool_context_for(&run, "tc").await.unwrap();
+        ctx.authorize_egress_if_restricted(
+            agent24_domain::EgressPurpose::ProcessExecution,
+            agent24_domain::EgressDestination::unknown(),
+        )
+        .await
+        .is_ok()
+    }
+
+    fn classified(
+        mut source: agent24_store::SourceRef,
+        classification: agent24_store::SourceClassification,
+    ) -> agent24_store::SourceRef {
+        source.classification = classification;
+        source
+    }
+
+    #[tokio::test]
+    async fn ordinary_sources_of_any_kind_do_not_restrict_tool_egress() {
+        use agent24_store::{SourceClassification, SourceRef};
+        let now = now_iso8601();
+        let user = SourceRef::user_input("run_x", now.clone());
+        assert_eq!(user.classification, SourceClassification::Ordinary);
+        assert!(process_egress_allowed_for(vec![user.clone()]).await);
+        // A non-user-input source the host has classified Ordinary (the shape
+        // ordinary recalled memory takes in 6b.4c) is not egress material.
+        let ordinary_recall = classified(
+            SourceRef::unknown_memory(now),
+            SourceClassification::Ordinary,
+        );
+        assert!(process_egress_allowed_for(vec![user, ordinary_recall]).await);
+    }
+
+    #[tokio::test]
+    async fn restricted_or_unknown_sources_of_any_kind_restrict_tool_egress() {
+        use agent24_store::{SourceClassification, SourceRef};
+        let now = now_iso8601();
+        let user = SourceRef::user_input("run_x", now.clone());
+        for source in [
+            SourceRef::unknown_memory(now.clone()),
+            classified(
+                SourceRef::selected_material("doc-1", None, now.clone()),
+                SourceClassification::Restricted,
+            ),
+            // Kind alone must not exempt a source: user input the host has
+            // not classified Ordinary keeps the strict policy.
+            classified(
+                SourceRef::user_input("run_y", now.clone()),
+                SourceClassification::Restricted,
+            ),
+            classified(
+                SourceRef::user_input("run_y", now.clone()),
+                SourceClassification::Unknown,
+            ),
+        ] {
+            assert!(
+                !process_egress_allowed_for(vec![user.clone(), source.clone()]).await,
+                "{source:?} must restrict process egress"
+            );
+        }
     }
 
     #[tokio::test]
