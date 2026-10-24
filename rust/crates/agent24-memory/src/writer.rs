@@ -37,6 +37,7 @@
 //! silent omissions.
 
 use agent24_core::util::now_iso8601;
+use agent24_store::{AssertionSourceRef, strictest_classification};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -92,7 +93,9 @@ impl Candidate {
         self
     }
     /// Attach the host-authored provenance persisted atomically with this
-    /// assertion. Callers must not derive it from the assertion id.
+    /// assertion. Callers must not derive it from the assertion id. An
+    /// identical re-assert keeps whichever of the stored and this
+    /// provenance has the stricter classification.
     pub fn with_source_ref(mut self, source_ref: Value) -> Self {
         self.source_ref = Some(source_ref);
         self
@@ -377,13 +380,24 @@ impl WriteGate {
                                 && audit_row.get::<String, _>("origin_trust") == "system"
                                 && body_matches;
                             if audit_matches {
-                                // K1-6b.4b: an identical re-assert still records
-                                // the provenance it was proposed with. The caller
-                                // passes one at least as strict as the stored one.
+                                // K1-6b.4b: an identical re-assert keeps the
+                                // stricter classification of the stored and the
+                                // proposed provenance. Merging here, inside this
+                                // `BEGIN IMMEDIATE` transaction, means concurrent
+                                // re-asserts can never lower it.
                                 let stored_source_ref = row
                                     .get::<Option<String>, _>("source_ref")
                                     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-                                if c.source_ref.is_some() && c.source_ref != stored_source_ref {
+                                let stored_class = AssertionSourceRef::classification_of(
+                                    stored_source_ref.as_ref(),
+                                );
+                                let tightens = c.source_ref.as_ref().is_some_and(|proposed| {
+                                    let proposed_class =
+                                        AssertionSourceRef::classification_of(Some(proposed));
+                                    strictest_classification([stored_class, proposed_class])
+                                        != stored_class
+                                });
+                                if tightens {
                                     sqlx::query(
                                         "UPDATE mem_assertions SET source_ref = ? WHERE id = ?",
                                     )
@@ -520,7 +534,12 @@ mod tests {
     use crate::KvStore;
     use crate::assertion::{AssertionStore, BeliefQuery};
     use crate::event::{EventQuery, EventStore};
+    use agent24_store::SourceClassification;
     use serde_json::json;
+
+    fn source_ref(classification: SourceClassification) -> Value {
+        AssertionSourceRef::from_sources([("user_input:r1".to_owned(), classification)]).to_value()
+    }
 
     async fn gate() -> (KvStore, WriteGate) {
         let kv = KvStore::open_memory().await.unwrap();
@@ -573,10 +592,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_identical_reassert_records_its_new_source_reference() {
+    async fn an_identical_reassert_records_a_stricter_source_reference() {
         let (kv, gate) = gate().await;
-        let first = json!({"classification": "ordinary"});
-        let second = json!({"classification": "restricted"});
+        let first = source_ref(SourceClassification::Ordinary);
+        let second = source_ref(SourceClassification::Restricted);
         for source in [&first, &second] {
             gate.propose(vec![
                 cand("c_again", "u1", "fact", Trust::UserSaid)
@@ -591,6 +610,33 @@ mod tests {
         assert_eq!(stored[0].source_ref.as_ref(), Some(&second));
         // Still one commit audit: the re-assert is the idempotent path.
         assert_eq!(audits(&kv, "u1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_identical_reassert_never_lowers_the_stored_classification() {
+        // Reverse: replacing the stored provenance whenever it differed let a
+        // later ordinary re-assert (e.g. a concurrent session) overwrite a
+        // restricted one.
+        let (kv, gate) = gate().await;
+        let restricted = source_ref(SourceClassification::Restricted);
+        let unreadable = json!({"classification": "ordinary"});
+        let proposals = [
+            restricted.clone(),
+            source_ref(SourceClassification::Ordinary),
+            source_ref(SourceClassification::Unknown),
+            unreadable,
+        ];
+        for source in proposals {
+            gate.propose(vec![
+                cand("c_keep", "u1", "fact", Trust::UserSaid)
+                    .with_source_ref(source)
+                    .remember(),
+            ])
+            .await
+            .unwrap();
+        }
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&restricted));
     }
 
     #[tokio::test]
