@@ -205,6 +205,66 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /module-consents/modules/{module}/tools/{tool}/card:
+    parameters:
+      - name: module
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tool
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getModuleToolCard
+      x-milestone: K1-6a
+      tags: [tools]
+      summary: What a grant of one module tool would cover
+      description: >-
+        Built by the host from the tool's manifest declaration (risk, output
+        privacy, resource kinds, reversible draft); the module's own
+        description text is not shown. `fingerprint`, `module_version` and
+        `artifact` are what a grant must repeat, and what dispatch compares
+        it with (K1-6a-G §2.1).
+      responses:
+        "200":
+          description: The tool's card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleToolCard"
+        "404":
+          description: No such module tool
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Host authority required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `protocol_too_old`: the module does not require the grants
+            protocol, so it cannot be told its grants were revoked (§2.6).
+            `no_package_identity`: no running package identity to grant
+            against (not running, not yet observed by this daemon start, or
+            an ephemeral daemon).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /health:
     get:
       operationId: getHealth
@@ -4597,6 +4657,31 @@ components:
         decided_at: { type: string, format: date-time }
         expires_at: { type: string, format: date-time }
         status: { type: string, enum: [granted, denied, revoked, expired, stale, not_granted] }
+
+    ModuleToolCard:
+      type: object
+      required: [module, tool, module_version, scope_summary, host_risk, source, reversible_draft, resource_kinds, fingerprint, artifact]
+      additionalProperties: false
+      properties:
+        module: { type: string }
+        tool: { type: string }
+        module_version: { type: string }
+        scope_summary:
+          type: object
+          required: [readable, writable, external]
+          additionalProperties: false
+          properties:
+            readable: { type: [string, "null"] }
+            writable: { type: [string, "null"] }
+            external: { type: [string, "null"] }
+        host_risk: { type: string, enum: [low, medium, high] }
+        source: { type: string, enum: [first_party, manual_install] }
+        reversible_draft: { type: boolean }
+        resource_kinds:
+          type: array
+          items: { type: string }
+        fingerprint: { type: string }
+        artifact: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
 
     ModuleAuthorizationRevocation:
       type: object
