@@ -996,6 +996,9 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
             &format!("no domain OS named {name:?}; this daemon provides {known:?}"),
         );
     }
+    // Held to the end: a decision written after the revocation but before
+    // the epoch advances, or while the module still runs, would outlive it.
+    let _control = state.os_control.lock().await;
     let revoked = state.store.invalidate_module_consents(&name).await;
     let handed = hand_off(
         state.supervisors.as_deref(),
@@ -1738,6 +1741,35 @@ mod tests {
         assert_eq!(j["name"], "remote");
         assert_eq!(j["stopped"], true);
         assert!(j.get("modules").is_none(), "{j}");
+    }
+
+    /// K1-6a-G §2.1 F7: a stop waits for `os_control`, which a module tool
+    /// decision holds from its checks to its write.
+    #[tokio::test]
+    async fn a_stop_waits_for_os_control() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut st = crate::server::tests::state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("sin91", MountOutcome::Mounted)]);
+        let token = st.token.to_string();
+        let held = st.os_control.clone().lock_owned().await;
+        let router = crate::server::build_router_with_modules(st, axum::Router::new());
+        let task = tokio::spawn(
+            router.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/os/sin91/stop")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+        drop(held);
+        assert!(task.await.unwrap().unwrap().status().is_success());
     }
 
     #[tokio::test]

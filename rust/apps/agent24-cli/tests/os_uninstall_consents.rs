@@ -109,6 +109,26 @@ fn an_install_whose_grants_cannot_be_revoked_is_undone() {
     assert_ok(&agent24(home.path(), &["os", "install", &src]));
 }
 
+/// A store that opens but cannot write the revocation fails the command
+/// too, not only one that cannot open (#1157 review S1).
+#[test]
+fn an_uninstall_whose_revocation_cannot_be_written_fails() {
+    let home = tmp_home();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = home.path().join(".agent24/agent24.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = agent24_store::Store::open(&db).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE INSERT ON module_consent_generations \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+    });
+    assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "ghost"]));
+}
+
 /// No HOME, no store to reach: the uninstall stands, and says any grants
 /// were not revoked rather than nothing (review G3; failing it would break
 /// the `A24_OS_PACKAGES` install the CLI documents for containers).
