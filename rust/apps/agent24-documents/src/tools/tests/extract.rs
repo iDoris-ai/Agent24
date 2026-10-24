@@ -379,3 +379,57 @@ async fn arguments_or_a_context_outside_the_schema_are_invalid_input() {
     let rows = "SELECT (SELECT count(*) FROM jobs) + (SELECT count(*) FROM oplog)";
     assert_eq!(scalar::<i64>(&env, rows).await, 0);
 }
+
+/// Each acceptance: the job, its attempt, and the call's operation and grant.
+async fn acceptances(env: &Env) -> Vec<(String, i64, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT job_id, attempt, operation, authorization_ref FROM job_acceptances ORDER BY rowid",
+    )
+    .fetch_all(env.storage.db.pool())
+    .await
+    .unwrap()
+}
+
+/// K1-06a-grant-path §2.5: a call records the attempt its job's work goes on
+/// in, under its grant, so the grant's end stops it: a new job, one queued
+/// again, one already working (the page's too). One with no work left to do
+/// records nothing, and neither does the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_records_the_attempt_its_work_goes_on_in() {
+    let env = env(Some(script(vec![failing(), failing(), failing()]))).await;
+    let at = |id: &str, attempt| {
+        (
+            id.to_owned(),
+            attempt,
+            "extract".to_owned(),
+            Some("auth-1".to_owned()),
+        )
+    };
+    let a = job_id(&submit(&env, args()).await);
+    assert_eq!(acceptances(&env).await, vec![at(&a, 1)]);
+    assert_eq!(ended(&env, &a).await.0, "failed");
+    assert_eq!(submit(&env, args()).await, done("queued", &a, false));
+    assert_eq!(ended(&env, &a).await.0, "failed");
+    // A cancelled job is not revived by a key hit (§7): no work goes on.
+    set(&env, &a, "cancelled").await;
+    submit(&env, args()).await;
+    for status in ["queued", "running", "cancelling"] {
+        set(&env, &a, status).await;
+        submit(&env, args()).await;
+    }
+    let mut expected = vec![at(&a, 1), at(&a, 2)];
+    expected.extend([at(&a, 2), at(&a, 2), at(&a, 2)]);
+    assert_eq!(acceptances(&env).await, expected);
+
+    let page = json!({ "revision": 1, "schema": schema("另一个说明") });
+    let (_, job) = rest_post(&env, DOC, &page).await;
+    let b = job["job_id"].as_str().unwrap().to_owned();
+    assert_eq!(acceptances(&env).await.len(), 5, "the page records none");
+    // Its worker ends first, its supervisor too, so none races the status
+    // set below.
+    assert_eq!(ended(&env, &b).await.0, "failed");
+    crate::jobs::runner::tests::wait_for_done(&b, 1).await;
+    set(&env, &b, "running").await;
+    submit(&env, other()).await;
+    assert_eq!(acceptances(&env).await.last(), Some(&at(&b, 1)));
+}

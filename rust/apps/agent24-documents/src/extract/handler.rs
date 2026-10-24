@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use super::job::{Input, schema_sha256, spawn};
 use super::{EXTRACTOR_VERSION, Field};
+use crate::authorization::{self, Accepted};
 use crate::engine::pdfkit;
 use crate::error::ApiError;
 use crate::extractions::is_field_key;
@@ -121,6 +122,7 @@ pub async fn extract(
         request,
         input,
         Origin::Page,
+        None,
     ));
     match task.await {
         Ok(Ok((job, _))) => {
@@ -241,8 +243,10 @@ impl From<sqlx::Error> for Fail {
 /// it as it is; a failed or interrupted one is queued again, attempt + 1.
 /// A claim from a run, new or replayed, appends its `oplog` row in the same
 /// transaction, so the row and the job commit or roll back together; the
-/// page's writes none, its job records it (ADR-DOC-01 D9). A request whose
-/// hash differs is 422 before anything is written.
+/// page's writes none, its job records it (ADR-DOC-01 D9). A tool call
+/// `accepted` for a job still working records the attempt it relies on, so
+/// the end of its authorization stops it (K1-06a-grant-path §2.5). A request
+/// whose hash differs is 422 before anything is written.
 /// Answers the job as this claim leaves it, and whether a worker started.
 pub(crate) async fn claim(
     state: AppState,
@@ -251,6 +255,7 @@ pub(crate) async fn claim(
     request: String,
     input: Input,
     origin: Origin,
+    accepted: Option<Accepted>,
 ) -> Result<(Job, bool), Fail> {
     let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
     let hit: Option<(String, String)> = sqlx::query_as(
@@ -317,6 +322,11 @@ pub(crate) async fn claim(
     let job = load(&mut *tx, &job_id)
         .await?
         .ok_or_else(|| Fail::Api(ApiError::internal("the job vanished")))?;
+    if let (Origin::Run(run), Some(accepted)) = (&origin, &accepted)
+        && matches!(job.status.as_str(), "queued" | "running" | "cancelling")
+    {
+        authorization::record(&mut tx, &job.job_id, job.attempt, run, accepted).await?;
+    }
     tx.commit().await?;
     if let Some(attempt) = attempt {
         spawn(state, storage, job_id, attempt);

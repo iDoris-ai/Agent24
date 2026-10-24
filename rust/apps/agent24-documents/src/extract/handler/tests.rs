@@ -384,6 +384,7 @@ async fn claim_as(env: &Env, origin: Origin) -> (Job, bool) {
         request,
         input,
         origin,
+        None,
     )
     .await
     {
