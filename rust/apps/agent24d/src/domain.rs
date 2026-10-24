@@ -929,6 +929,22 @@ impl Supervisors {
         self.lock().disabled.contains_key(name)
     }
 
+    /// Records `name` as a module `os disable` asked to stop, its stop
+    /// reporting through `status` — what `disable` leaves, without a run.
+    #[cfg(test)]
+    pub fn mark_disabled(
+        &self,
+        name: &str,
+        status: tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
+    ) {
+        let current = agent24_os_proto::drain::Current::new(
+            agent24_os_proto::drain::Generation::serving_package("/nonexistent".into(), None),
+        );
+        self.lock()
+            .disabled
+            .insert(name.to_owned(), Disabled { current, status });
+    }
+
     /// A module an earlier `os disable` asked to stop.
     #[must_use]
     pub fn disabled_slot(&self, name: &str) -> Option<Disabled> {
@@ -3085,7 +3101,6 @@ raise SystemExit(3)
         }
     }
 
-    /// `disable` takes one module out of the list and stops it — once — and
     /// K1-6a-G §2.5: a disabled module is surely stopped only once its stop
     /// says the process is gone; never once the shutdown owns every run.
     #[test]
@@ -3094,16 +3109,7 @@ raise SystemExit(3)
         let supervisors = Supervisors::default();
         assert!(supervisors.surely_stopped("never-started"));
         let (status, rx) = tokio::sync::watch::channel(Status::Stopping);
-        let current = agent24_os_proto::drain::Current::new(
-            agent24_os_proto::drain::Generation::serving_package("/nonexistent".into(), None),
-        );
-        supervisors.lock().disabled.insert(
-            "m".to_owned(),
-            Disabled {
-                current,
-                status: rx,
-            },
-        );
+        supervisors.mark_disabled("m", rx);
         assert!(!supervisors.surely_stopped("m"), "still stopping");
         status.send_replace(Status::StopFailed {
             error: "x".to_owned(),
@@ -3115,6 +3121,7 @@ raise SystemExit(3)
         assert!(!supervisors.surely_stopped("never-started"));
     }
 
+    /// `disable` takes one module out of the list and stops it — once — and
     /// hands that stop to the shutdown rather than the module itself, so
     /// the shutdown waits for it and does not stop it twice (SUP-5).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

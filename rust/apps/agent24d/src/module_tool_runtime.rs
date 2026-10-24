@@ -1042,6 +1042,20 @@ mod tests {
             |within| runtime.notify_revoked("fake_module", "*", "2026-10-24T00:00:00Z", within);
         let within = Duration::from_secs(2);
         assert_eq!(notify(within).await, RevocationStop::NotRunning);
+        // Out of the list but still draining from a disable: not yet gone.
+        let supervisors = Arc::new(Supervisors::default());
+        assert!(
+            runtime
+                .supervisors_slot()
+                .set(Arc::clone(&supervisors))
+                .is_ok()
+        );
+        let (stop, status) =
+            tokio::sync::watch::channel(agent24_os_proto::supervisor::Status::Stopping);
+        supervisors.mark_disabled("fake_module", status);
+        assert_eq!(notify(within).await, RevocationStop::Unconfirmed);
+        stop.send_replace(agent24_os_proto::supervisor::Status::Stopped);
+        assert_eq!(notify(within).await, RevocationStop::NotRunning);
         let generation = agent24_os_proto::drain::Generation::serving_package(sock.clone(), None);
         assert!(generation.ready());
         runtime.test_slots.lock().unwrap().insert(
