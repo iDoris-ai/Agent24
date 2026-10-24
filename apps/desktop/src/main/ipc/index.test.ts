@@ -15,7 +15,7 @@ vi.mock('../backend-manager', () => ({
   daemonConnection: () => ({ port: 4100, authHeaders: { Authorization: 'Bearer secret' } }),
 }))
 
-import { registerIpcHandlers } from './index'
+import { registerIpcHandlers, reachesHostInterface } from './index'
 import { IpcChannels } from '../../shared/ipc-types'
 
 describe('backend:endpoint hands the renderer the port only (KB-HOST-01 PR-A1)', () => {
@@ -26,5 +26,35 @@ describe('backend:endpoint hands the renderer the port only (KB-HOST-01 PR-A1)',
     const result = await handler!({})
     expect(result).toEqual({ port: 4100 })
     expect(JSON.stringify(result)).not.toContain('secret')
+  })
+})
+
+describe('the generic backend proxy never reaches the host interface (KB-HOST-01 PR-B1a)', () => {
+  const proxy = async (path: string) => {
+    registerIpcHandlers()
+    const handler = handlers.get(IpcChannels.BackendProxy)!
+    return (await handler({}, { method: 'PUT', path })) as { status: number; data: unknown }
+  }
+
+  it.each([
+    '/api/v1/host/knowledge/bindings/b1?seq=1',
+    '/api/v1/host',
+    '/API/v1/Host/knowledge/bindings/b1',
+    '/api/v1/./host/knowledge/bindings/b1',
+    '/api/v1/models/../host/knowledge/bindings/b1',
+    '/api/v1//host/knowledge/bindings/b1',
+    '/api/v1/%68ost/knowledge/bindings/b1',
+    '/api/v1/host%2Fknowledge',
+    '/api/v1\\host/knowledge/bindings/b1',
+    // Encoded `/` and `..` inside the id: the daemon routes the raw path.
+    '/api/v1/host/knowledge/bindings/..%2F..%2F..%2Fx?seq=1',
+  ])('refuses %s without sending it', async (path) => {
+    const res = await proxy(path)
+    expect(res.status).toBe(403)
+    expect(JSON.stringify(res.data)).toContain('host_interface_private')
+  })
+
+  it.each(['/api/v1/hosts', '/api/v1/sessions?next=/api/v1/host/x', '/api/v1/tool-overrides/foo%'])('still proxies %s', async (path) => {
+    expect(reachesHostInterface(path)).toBe(false)
   })
 })
