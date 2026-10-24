@@ -46,14 +46,15 @@ describe('the generic backend proxy never reaches the host interface (KB-HOST-01
     '/api/v1/%68ost/knowledge/bindings/b1',
     '/api/v1/host%2Fknowledge',
     '/api/v1\\host/knowledge/bindings/b1',
-    '/api/v1/%E0%A4%A',
+    // Encoded `/` and `..` inside the id: the daemon routes the raw path.
+    '/api/v1/host/knowledge/bindings/..%2F..%2F..%2Fx?seq=1',
   ])('refuses %s without sending it', async (path) => {
     const res = await proxy(path)
     expect(res.status).toBe(403)
     expect(JSON.stringify(res.data)).toContain('host_interface_private')
   })
 
-  it.each(['/api/v1/hosts', '/api/v1/sessions?next=/api/v1/host/x'])('still proxies %s', async (path) => {
+  it.each(['/api/v1/hosts', '/api/v1/sessions?next=/api/v1/host/x', '/api/v1/tool-overrides/foo%'])('still proxies %s', async (path) => {
     expect(reachesHostInterface(path)).toBe(false)
   })
 })

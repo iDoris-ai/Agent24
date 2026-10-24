@@ -272,6 +272,8 @@ async fn a_malformed_request_changes_nothing() {
         format!("{BINDING}?seq=-1"),
         format!("/api/v1/host/knowledge/bindings/{long_id}?seq=1"),
         "/api/v1/host/knowledge/bindings/b%01?seq=1".to_owned(),
+        "/api/v1/host/knowledge/bindings/..%2F..%2Fx?seq=1".to_owned(),
+        "/api/v1/host/knowledge/bindings/a%5Cb?seq=1".to_owned(),
     ] {
         let (status, body) = send(&router, request(Method::PUT, &path, &host)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");

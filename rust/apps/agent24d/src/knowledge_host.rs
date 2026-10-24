@@ -114,8 +114,14 @@ fn host_capability(
     }
 }
 
+/// Opaque, but never a path: an encoded `/` or `\` in the URL must not turn
+/// into one after routing.
 fn valid_binding_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_BINDING_ID_BYTES && !value.chars().any(char::is_control)
+    !value.is_empty()
+        && value.len() <= MAX_BINDING_ID_BYTES
+        && !value
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
 }
 
 fn change_response(result: Result<(), ChangeError>) -> Response {
