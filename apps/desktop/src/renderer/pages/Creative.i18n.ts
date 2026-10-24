@@ -50,7 +50,7 @@ export const creativeMessages = defineMessages({
     'download.failed': 'ดาวน์โหลดคอมโพเนนต์ iDoris Design ไม่สำเร็จ: {error}',
     'download.unknownError': 'ข้อผิดพลาดที่ไม่ทราบสาเหตุ',
     'download.prompt': 'Design ต้องดาวน์โหลดคอมโพเนนต์ iDoris Design เพิ่มเติม (ประมาณ {size} MiB) จึงจะใช้งานได้',
-    'download.paused': 'หยุดดาวน์โหลดคอมโพเนนต์ iDoris Design ชั่วคราว: บันทึกแล้ว {received} / {total} MiB (ยังไม่ได้ติดตั้ง ไม่กระทบเวอร์ชันที่รันอยู่)',
+    'download.paused': 'หยุดดาวน์โหลดคอมโพเนนต์ iDoris Design ชั่วคราว: ดาวน์โหลดไว้แล้ว {received} / {total} MiB (ยังไม่ได้ติดตั้ง ไม่กระทบเวอร์ชันที่ใช้อยู่)',
     'download.waitingNetwork': 'รอเครือข่าย',
     'download.etaMinutesSeconds': 'เหลือประมาณ {minutes} นาที {seconds} วินาที',
     'download.etaSecondsOnly': 'เหลือประมาณ {seconds} วินาที',
