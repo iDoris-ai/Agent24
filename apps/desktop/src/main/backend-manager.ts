@@ -287,6 +287,10 @@ export class BackendManager {
   // could double-count failures or spawn a second child while the first
   // tick is still mid-recovery (PR #602 review).
   private tickInFlight = false
+  // Bumped by every manual lifecycle action (start/stop/restart from the tray,
+  // app stop). A probe that was awaiting a health check when one of those ran
+  // must not act on its stale result.
+  private lifecycle = 0
 
   constructor(deps: BackendManagerDeps = {}) {
     this.external = deps.external ?? defaultExternalDaemonSource
@@ -305,9 +309,11 @@ export class BackendManager {
    * A healthy capability-mode daemon belongs to another host: its authority
    * never reaches this file, and spawning our own would only lose the lock,
    * so that is `foreign` and nothing is spawned. */
-  private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'none'> {
+  private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'none' | 'superseded'> {
+    const lifecycle = this.lifecycle
     const state = this.external.read()
     const healthy = state !== null && (await this.external.checkHealth({ port: state.port }))
+    if (lifecycle !== this.lifecycle) return 'superseded'
     if (!state || !healthy) {
       this.foreignPid = null
       return 'none'
@@ -316,6 +322,9 @@ export class BackendManager {
       if (this.foreignPid !== state.pid) {
         console.warn(`[backend:${this.kind}] daemon pid ${state.pid} serves this data dir in capability mode for another host — waiting for it to exit`)
       }
+      // Coming from a reused legacy daemon that died: its port and token must
+      // not outlive it here either.
+      this.disconnectExternal()
       this.foreignPid = state.pid
       return 'foreign'
     }
@@ -363,6 +372,7 @@ export class BackendManager {
 
   /** Tray "启动 daemon": clear a prior manual stop and (re)spawn if needed. */
   startDaemon(): void {
+    this.lifecycle += 1
     this.userStopped = false
     this.failureCount = 0
     if (!this.child && !this.isExternal) this.spawnChild()
@@ -376,6 +386,7 @@ export class BackendManager {
    * pins the tray to "stopped" and suspends the health loop, exactly as a
    * real stop would, but the external process itself is left untouched. */
   stopDaemon(): void {
+    this.lifecycle += 1
     this.userStopped = true
     this.lastHealthy = false
     if (this.isExternal) {
@@ -390,6 +401,7 @@ export class BackendManager {
    * reason as stopDaemon() above — "restart" here means "stop reusing it and
    * bring up a desktop-managed one instead". */
   restart(): void {
+    this.lifecycle += 1
     this.userStopped = false
     this.failureCount = 0
     this.lastHealthy = false
@@ -497,7 +509,9 @@ export class BackendManager {
         return
       }
 
+      const lifecycle = this.lifecycle
       const alive = await this.external.checkHealth(getBackendEndpoint())
+      if (lifecycle !== this.lifecycle) return
       this.lastHealthy = alive
       if (alive) {
         this.failureCount = 0
@@ -565,6 +579,7 @@ export class BackendManager {
   }
 
   stop(): void {
+    this.lifecycle += 1
     if (this.healthTimer) {
       clearInterval(this.healthTimer)
       this.healthTimer = null

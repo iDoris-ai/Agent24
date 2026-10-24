@@ -15,6 +15,7 @@ import {
   selectedAuthMode,
   type DaemonAuthMode,
   type ExternalDaemonSource,
+  type ExternalDaemonState,
 } from './backend-manager'
 
 describe('deriveStatus (F1b tray daemon status)', () => {
@@ -586,6 +587,98 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
     await (manager as unknown as { tick(): Promise<void> }).tick()
     expect(spawnProcess).toHaveBeenCalledTimes(1)
     manager.stop()
+  })
+
+  it('a reused legacy daemon that dies while another host takes the data dir leaves no connection behind', async () => {
+    let healthyLegacy = true
+    let record: ExternalDaemonState = { port: 5561, token: 'legacy', pid: 4248, authMode: 'legacy' }
+    const spawnProcess = vi.fn(() => childAnnouncing({ port: 4310, auth_mode: 'capabilities', product_host_token: 'mine' }))
+    const external: ExternalDaemonSource = {
+      read: () => record,
+      // The legacy daemon answers until it dies; the other host's always does.
+      checkHealth: ({ port }) => Promise.resolve(port === 5562 || (port === 5561 && healthyLegacy)),
+    }
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    expect(manager.isExternalDaemon()).toBe(true)
+
+    healthyLegacy = false
+    record = { port: 5562, token: '', pid: 4249, authMode: 'capabilities' }
+    const tick = (manager as unknown as { tick(): Promise<void> }).tick.bind(manager)
+    for (let i = 0; i < 3; i++) await tick() // MAX_HEALTH_FAILURES
+    expect(manager.status()).toBe('blocked')
+    expect(manager.foreignDaemonPid()).toBe(4249)
+    expect(manager.isExternalDaemon()).toBe(false)
+    expect(manager.externalDaemonPid()).toBeNull()
+    expect(daemonConnection()).toBeNull()
+    expect(spawnProcess).not.toHaveBeenCalled()
+    manager.stop()
+  })
+
+  describe('a tray action during a pending probe wins over its stale result', () => {
+    function blockedManager() {
+      let probe: ((alive: boolean) => void) | null = null
+      const spawnProcess = vi.fn(() => childAnnouncing({ port: 4311, auth_mode: 'capabilities', product_host_token: 'mine' }))
+      const external: ExternalDaemonSource = {
+        read: () => ({ port: 5563, token: '', pid: 4250, authMode: 'capabilities' }),
+        checkHealth: vi.fn().mockResolvedValue(true),
+      }
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      const holdNextProbe = () => {
+        vi.mocked(external.checkHealth).mockImplementationOnce(() => new Promise((resolve) => { probe = resolve }))
+      }
+      const tick = (manager as unknown as { tick(): Promise<void> }).tick.bind(manager)
+      return { manager, spawnProcess, holdNextProbe, tick, answer: (alive: boolean) => probe!(alive) }
+    }
+
+    it('stop or app quit: the foreign daemon going away meanwhile starts nothing', async () => {
+      for (const action of ['stopDaemon', 'stop'] as const) {
+        const m = blockedManager()
+        await m.manager.start()
+        expect(m.manager.status()).toBe('blocked')
+        m.holdNextProbe()
+        const pending = m.tick()
+        m.manager[action]()
+        m.answer(false)
+        await pending
+        expect(m.spawnProcess).not.toHaveBeenCalled()
+        m.manager.stop()
+      }
+    })
+
+    it('restart or start: exactly one child, and a late `foreign` answer does not re-block it', async () => {
+      for (const action of ['restart', 'startDaemon'] as const) for (const alive of [false, true]) {
+        const m = blockedManager()
+        await m.manager.start()
+        m.holdNextProbe()
+        const pending = m.tick()
+        m.manager[action]()
+        m.answer(alive)
+        await pending
+        expect(m.spawnProcess).toHaveBeenCalledTimes(1)
+        expect(m.manager.foreignDaemonPid()).toBeNull()
+        expect(m.manager.status()).not.toBe('blocked')
+        m.manager.stop()
+      }
+    })
+
+    it('stop during a failing health tick of our own child starts no replacement', async () => {
+      const spawnProcess = vi.fn(() => childAnnouncing({ port: 4312, auth_mode: 'capabilities', product_host_token: 'mine' }))
+      let probe: ((alive: boolean) => void) | null = null
+      const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(false) }
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      await manager.start()
+      const tick = (manager as unknown as { tick(): Promise<void> }).tick.bind(manager)
+      for (let i = 0; i < 2; i++) await tick() // one short of MAX_HEALTH_FAILURES
+      vi.mocked(external.checkHealth).mockImplementationOnce(() => new Promise((resolve) => { probe = resolve }))
+      const pending = tick()
+      manager.stopDaemon()
+      probe!(false)
+      await pending
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.status()).toBe('stopped')
+      manager.stop()
+    })
   })
 
   it('a stale capability record (daemon not answering) does not block: spawns its own', async () => {
