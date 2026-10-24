@@ -1297,6 +1297,25 @@ impl RunManager {
             return;
         }
 
+        // Missing or unreadable origins must not settle a parked tool or
+        // dispatch a sibling such as explore. Failed is legal only from
+        // Running, so the refusal enters Running without RunStarted.
+        if !self.persisted_origins_allow_send(&run_id).await {
+            if let Err(err) = self
+                .store
+                .transition_run(&run_id, RunStatus::Running, RunPatch::default())
+                .await
+            {
+                tracing::error!(
+                    "run {run_id}: resume source refusal could not enter running: {err}"
+                );
+                return;
+            }
+            self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                .await;
+            return;
+        }
+
         // 3. Reconstruct the conversation and return the run to Running.
         // M1-T07.1 M4 (review #674 round 2 ③): re-validating the recall
         // block used to happen ONLY here, which misses the common case of
@@ -2810,8 +2829,8 @@ pub(crate) mod tests {
 
     /// Answers "pong" and records the messages it was handed, so a test can
     /// assert what context the loop actually built.
-    struct RecordingProvider {
-        seen: StdMutex<Vec<Vec<Msg>>>,
+    pub(super) struct RecordingProvider {
+        pub(super) seen: StdMutex<Vec<Vec<Msg>>>,
     }
 
     #[async_trait]
@@ -4828,6 +4847,191 @@ mod approval_tests {
         }
     }
 
+    /// [`resume_harness`] plus `explore`, sharing the recording router so a
+    /// test can see a provider call made from the sub-agent.
+    async fn resume_harness_with_explorer(
+        workdir: std::path::PathBuf,
+    ) -> (Harness, Arc<RecordingProvider>) {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let router = Arc::new(ModelRouter::with_defaults(vec![(
+            provider.clone() as Arc<dyn agent24_models::ModelProvider>,
+            Tier::Local,
+        )]));
+        let explorer = crate::subagent::ExplorerSubagent::new(
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::read_only(workdir.clone())),
+        );
+        let tools = ToolRegistry::builtin(workdir)
+            .with(Arc::new(explorer))
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let manager = RunManager::new(
+            store.clone(),
+            router,
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        (
+            Harness {
+                manager,
+                broker,
+                store,
+                events,
+            },
+            provider,
+        )
+    }
+
+    /// Park shell_exec (approval target) and explore on one assistant turn.
+    /// `sourced` writes UserPrompt and Assistant origins. Otherwise the rows
+    /// are legacy `append_run_message` calls with no origin rows.
+    async fn resume_shell_and_explore(
+        sourced: bool,
+        decision_kind: &str,
+        reason: Option<&str>,
+        shell_token: &str,
+    ) -> (Harness, Arc<RecordingProvider>, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, provider) = resume_harness_with_explorer(dir.path().to_path_buf()).await;
+        let shell_args = serde_json::json!({ "argv": ["/bin/echo", shell_token] });
+        let explore_args = serde_json::json!({ "task": "SECRET-TASK-1197" });
+        let calls = serde_json::json!([
+            {
+                "id": "call_shell",
+                "name": "shell_exec",
+                "arguments": shell_args.to_string()
+            },
+            {
+                "id": "call_explore",
+                "name": "explore",
+                "arguments": explore_args.to_string()
+            }
+        ]);
+        let run = run_in("run_1", RunStatus::AwaitingApproval);
+        h.store.insert_run(&run).await.unwrap();
+        if sourced {
+            seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
+        } else {
+            h.store
+                .append_run_message(
+                    "run_1",
+                    "user",
+                    Some("run echo"),
+                    &serde_json::json!([]),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            h.store
+                .append_run_message("run_1", "assistant", None, &calls, None, &now_iso8601())
+                .await
+                .unwrap();
+        }
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            shell_args.as_object().unwrap().clone(),
+        );
+        h.store.insert_approval(&approval).await.unwrap();
+        h.broker
+            .resolve("apr_1", decision(decision_kind, reason))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        (h, provider, done)
+    }
+
+    fn assert_resume_refused_before_tools(h: &Harness, provider: &RecordingProvider, done: &Run) {
+        let error = done.error.clone().unwrap();
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(error.code, SOURCE_UNPROVEN_CODE);
+        assert_eq!(error.message, SOURCE_UNPROVEN_MESSAGE);
+        assert!(provider.seen.lock().unwrap().is_empty());
+        assert!(
+            !h.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.started")
+        );
+    }
+
+    async fn assert_shell_did_not_run(h: &Harness) {
+        assert!(h.store.list_tool_calls("run_1").await.unwrap().is_empty());
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert_eq!(thread.len(), 2);
+        assert!(thread.iter().all(|message| message.role != "tool"));
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_approve_does_not_run_shell_or_call_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(false, "approve", None, "must-not-run").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_deny_does_not_run_shell_or_call_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(false, "deny", Some("not this time"), "must-not-run").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
+    }
+
+    #[tokio::test]
+    async fn sourced_resume_with_explore_still_completes_and_calls_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(true, "approve", None, "sourced-ok").await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.output.unwrap().text, "pong");
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().any(|messages| {
+            messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some("SECRET-TASK-1197"))
+        }));
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert!(thread.iter().any(|message| {
+            message.role == "tool"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("sourced-ok"))
+        }));
+        assert!(
+            h.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.started")
+        );
+    }
+
     #[rustfmt::skip]
     async fn assert_bound_recovery_followup_stops(h:&Harness,run:&Run,call:&agent24_models::ToolCallRequest,lease:&str){assert!(matches!(h.manager.run_tool_call(run,call,&CancellationToken::new(),true).await,Err(ParkedCallStop::RecoveryStopped)));let tool_calls:i64=sqlx::query_scalar("SELECT count(*) FROM tool_calls WHERE run_id='run_1'").fetch_one(agent24_store::test_hooks::pool(&h.store)).await.unwrap();assert_eq!(tool_calls,0);sqlx::query("UPDATE runs SET status='running',ended_at=NULL WHERE id='run_1'").execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();sqlx::query("UPDATE workspace_leases SET released_at=NULL WHERE lease_id=?").bind(lease).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();}
     /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
@@ -5033,7 +5237,7 @@ mod approval_tests {
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)").bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)").bind(WS).bind(&locator).bind(pm.dev().to_le_bytes().to_vec()).bind(pm.ino().to_le_bytes().to_vec()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        h.store.append_run_message("run_1","user",Some("two"),&serde_json::json!([]),None,&now_iso8601()).await.unwrap(); let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); h.store.append_run_message("run_1","assistant",None,&calls,None,&now_iso8601()).await.unwrap(); let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
+        let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); seed_proven_parked_thread(&h.store,"run_1","two",calls).await; let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); assert!(h.manager.tool_context_for(&run,"preflight").await.is_ok()); sqlx::raw_sql(&format!("CREATE TRIGGER lose_resume_authority AFTER INSERT ON run_messages WHEN NEW.run_id='run_1' AND NEW.role='tool' AND NEW.tool_call_id='call_provider_1' BEGIN UPDATE workspace_leases SET released_at='{now}' WHERE lease_id='{LEASE}'; END;")).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); h.manager.resume_run("run_1".into(),"apr_1".into()).await.unwrap(); assert_eq!(wait_terminal(&h.store,"run_1").await.status,RunStatus::Cancelled);
         assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().len(),0); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
     }
