@@ -102,10 +102,15 @@ pub struct AppState {
     /// What a module tool's card is made from (K1-6a-G §2.1); `None`
     /// until `serve` assembles the module tools.
     pub module_tool_cards: Option<crate::consent_routes::ModuleToolCards>,
+    /// How module tool decisions are taken; `None` (the default, and always
+    /// on an ephemeral daemon) answers every decision 403.
+    pub module_grants: Option<crate::consent_routes::GrantSettings>,
     /// Held across the config write and the hand-off of a hot disable's stop
     /// in `PATCH /api/v1/os/{name}` — not across the wait that follows — so
     /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
-    /// answers with is rendered after, and shows the state then.
+    /// answers with is rendered after, and shows the state then. A module
+    /// tool decision holds it from its checks to its write, and a stop for
+    /// the whole stop, so neither lands inside the other (K1-6a-G §2.1 F7).
     pub os_control: Arc<tokio::sync::Mutex<()>>,
     /// What `GET /api/v1/shutdown` answers — fixed at start-up (SHUT-1c).
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
@@ -684,6 +689,7 @@ impl AppState {
             module_status: Arc::new(std::collections::HashMap::new()),
             supervisors: None,
             module_tool_cards: None,
+            module_grants: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_report: Arc::new(crate::lifecycle::report(
                 &crate::lifecycle::Params::default(),
@@ -1093,7 +1099,8 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         .route(
             "/api/v1/module-consents/modules/{module}/tools/{tool}",
-            axum::routing::delete(crate::consent_routes::revoke_tool),
+            axum::routing::delete(crate::consent_routes::revoke_tool)
+                .post(crate::consent_routes::decide),
         )
         .route(
             "/api/v1/module-consents/modules/{module}/tools/{tool}/card",
@@ -1329,6 +1336,13 @@ pub async fn serve(
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
     validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
+    let module_grants = crate::consent_routes::grant_settings(
+        std::env::var("A24_MODULE_TOOL_GRANTS").ok().as_deref(),
+        std::env::var("A24_MODULE_GRANT_MAX_DAYS").ok().as_deref(),
+        ephemeral,
+        crate::os_config::config_path(),
+    )
+    .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
     let (mut host_ready, parent_liveness) = match (auth_mode, host_bootstrap_stdio) {
         (AuthMode::Capabilities, true) => {
             let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
@@ -2378,6 +2392,7 @@ pub async fn serve(
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
     state.module_tool_cards = Some(module_tool_cards);
+    state.module_grants = module_grants;
     state.shutdown_report = Arc::new(report);
     // A3-2b (design §4/§5): the real attach registry — same "start empty,
     // replace once real data is ready" pattern as `os_reports` above, and for
@@ -3674,7 +3689,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(none_assembled.status(), StatusCode::NOT_FOUND);
         let mut state = state().await;
-        let summary = agent24_store::ToolPermissionSummary::new(
+        let mut summary = agent24_store::ToolPermissionSummary::new(
             "doc-module",
             "read_document",
             "1.2.3",
@@ -3684,6 +3699,7 @@ pub(crate) mod tests {
             None,
             agent24_store::HostRiskLevel::High,
         );
+        summary.reversible_draft = true;
         let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
         let source = |takes_grants| crate::consent_routes::ToolCardSource {
             summary: summary.clone(),
@@ -3744,6 +3760,10 @@ pub(crate) mod tests {
         assert_eq!(body["host_risk"], "high");
         assert_eq!(body["source"], "manual_install");
         assert_eq!(body["scope_summary"]["readable"], "local documents");
+        // What the manifest declares, shown as declared; the gate still
+        // grants no draft exception on this path (`gate_request`).
+        assert_eq!(body["reversible_draft"], true);
+        assert!(!gate.reversible_draft_declared);
         let response =
             get("/api/v1/module-consents/modules/doc-module/tools/write_document/card").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -3763,10 +3783,292 @@ pub(crate) mod tests {
         );
     }
 
+    /// A state with one grants-protocol tool (`doc-module.read_document`,
+    /// kinds `doc`) and one older one, running while `running` holds, and
+    /// decisions open against `os_json`.
+    async fn decision_state(
+        running: &StdArc<std::sync::atomic::AtomicBool>,
+        os_json: &std::path::Path,
+    ) -> (AppState, agent24_store::ToolPermissionSummary) {
+        let mut state = state().await;
+        let summary = agent24_store::ToolPermissionSummary::new(
+            "doc-module",
+            "read_document",
+            "1.2.3",
+            agent24_store::ConsentSource::ManualInstall,
+            None,
+            None,
+            None,
+            agent24_store::HostRiskLevel::High,
+        );
+        let source = |module: &str, takes_grants| crate::consent_routes::ToolCardSource {
+            summary: agent24_store::ToolPermissionSummary {
+                module: module.to_owned(),
+                ..summary.clone()
+            },
+            resource_kinds: vec!["doc".to_owned()],
+            takes_grants,
+        };
+        let running = StdArc::clone(running);
+        state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
+            tools: StdArc::new(std::collections::HashMap::from([
+                (
+                    ("doc-module".to_owned(), "read_document".to_owned()),
+                    source("doc-module", true),
+                ),
+                (
+                    ("old-module".to_owned(), "read_document".to_owned()),
+                    source("old-module", false),
+                ),
+            ])),
+            artifact: StdArc::new(move |_: &str| {
+                running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| "sha256:abc".to_owned())
+            }),
+        });
+        state.module_grants = Some(crate::consent_routes::GrantSettings {
+            max_days: 30,
+            os_config: os_json.to_owned(),
+        });
+        (state, summary)
+    }
+
+    const DECIDE: &str = "/api/v1/module-consents/modules/doc-module/tools/read_document";
+
+    fn decision(
+        summary: &agent24_store::ToolPermissionSummary,
+        patch: serde_json::Value,
+    ) -> String {
+        let mut body = serde_json::json!({
+            "decision": "granted",
+            "fingerprint": summary.scope_fingerprint(),
+            "module_version": "1.2.3",
+            "artifact": "sha256:abc",
+            "resources": ["doc:a1"],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339(),
+        });
+        for (key, value) in patch.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body.to_string()
+    }
+
+    async fn post(router: &Router, uri: &str, body: String) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", "Bearer testtoken")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    /// K1-6a-G §2.1, criteria 6, 7 and 14: a decision is written only on the
+    /// card as the tool is checked now, with the switch on, the module
+    /// enabled and running, a bounded expiry and resources of declared
+    /// kinds; anything else writes nothing.
+    #[tokio::test]
+    async fn a_module_tool_decision_is_written_only_on_the_card_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let os_json = dir.path().join("os.json");
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, summary) = decision_state(&running, &os_json).await;
+        let store = state.store.clone();
+        let closed = build_router(AppState {
+            module_grants: None,
+            ..state.clone()
+        });
+        let router = build_router(state);
+        let code = |(status, body): (StatusCode, serde_json::Value)| {
+            (
+                status,
+                body["error"]["code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        };
+        let expect = |status: StatusCode, code: &str| (status, code.to_owned());
+        let ok = decision(&summary, serde_json::json!({}));
+        assert_eq!(
+            code(post(&closed, DECIDE, ok.clone()).await),
+            expect(StatusCode::FORBIDDEN, "grants_closed")
+        );
+        let (status, _) = post(&router, &format!("{DECIDE}x"), ok.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            code(
+                post(
+                    &router,
+                    "/api/v1/module-consents/modules/old-module/tools/read_document",
+                    ok.clone()
+                )
+                .await
+            ),
+            expect(StatusCode::CONFLICT, "protocol_too_old")
+        );
+        let (status, _) = post(&router, DECIDE, "{".to_owned()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let in_days = |days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339();
+        let many: Vec<String> = (0..257).map(|i| format!("doc:d{i}")).collect();
+        for patch in [
+            serde_json::json!({ "expires_at": null }),
+            serde_json::json!({ "expires_at": "next week" }),
+            serde_json::json!({ "expires_at": in_days(31) }),
+            serde_json::json!({ "expires_at": in_days(-1) }),
+            serde_json::json!({ "resources": ["doc:a b"] }),
+            serde_json::json!({ "resources": ["page:a1"] }),
+            serde_json::json!({ "resources": many }),
+            serde_json::json!({ "decision": "denied" }),
+        ] {
+            assert_eq!(
+                code(post(&router, DECIDE, decision(&summary, patch.clone())).await),
+                expect(StatusCode::UNPROCESSABLE_ENTITY, "invalid_decision"),
+                "{patch}"
+            );
+        }
+        for patch in [
+            serde_json::json!({ "fingerprint": "sha256:other" }),
+            serde_json::json!({ "module_version": "1.2.4" }),
+            serde_json::json!({ "artifact": "sha256:other" }),
+        ] {
+            assert_eq!(
+                code(post(&router, DECIDE, decision(&summary, patch.clone())).await),
+                expect(StatusCode::CONFLICT, "card_changed"),
+                "{patch}"
+            );
+        }
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            code(post(&router, DECIDE, ok.clone()).await),
+            expect(StatusCode::CONFLICT, "no_package_identity")
+        );
+        running.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(&os_json, r#"{"domainOs":{"doc-module":{"enabled":false}}}"#).unwrap();
+        assert_eq!(
+            code(post(&router, DECIDE, ok.clone()).await),
+            expect(StatusCode::CONFLICT, "module_disabled")
+        );
+        std::fs::write(&os_json, "not json").unwrap();
+        assert_eq!(
+            code(post(&router, DECIDE, ok.clone()).await),
+            expect(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        );
+        assert!(store.list_module_consents().await.unwrap().is_empty());
+
+        std::fs::remove_file(&os_json).unwrap();
+        let both = decision(
+            &summary,
+            serde_json::json!({ "resources": ["doc:b2", "doc:a1", "doc:b2"] }),
+        );
+        let (status, body) = post(&router, DECIDE, both).await;
+        assert_eq!(
+            (status, &body["status"]),
+            (StatusCode::OK, &serde_json::json!("granted"))
+        );
+        let records = store.list_module_consents().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].resources, ["doc:a1", "doc:b2"]);
+        assert_eq!(records[0].artifact.as_deref(), Some("sha256:abc"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let lookup = |store: agent24_store::Store| {
+            let (fingerprint, now) = (summary.scope_fingerprint(), now.clone());
+            async move {
+                store
+                    .lookup_module_consent(
+                        "doc-module",
+                        "read_document",
+                        "1.2.3",
+                        &fingerprint,
+                        &now,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(matches!(
+            lookup(store.clone()).await,
+            agent24_store::ConsentLookup::Granted(_)
+        ));
+        let denial = decision(
+            &summary,
+            serde_json::json!({ "decision": "denied", "resources": [] }),
+        );
+        let (status, body) = post(&router, DECIDE, denial).await;
+        assert_eq!(
+            (status, &body["status"]),
+            (StatusCode::OK, &serde_json::json!("denied"))
+        );
+        assert!(matches!(
+            lookup(store).await,
+            agent24_store::ConsentLookup::Denied(_)
+        ));
+    }
+
+    /// K1-6a-G §2.1 F7 and #1157's S2: a decision waits for `os_control`,
+    /// so no enable, disable or stop lands between its checks and its write.
+    #[tokio::test]
+    async fn a_module_tool_decision_waits_for_os_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, summary) = decision_state(&running, &dir.path().join("os.json")).await;
+        let (store, control) = (state.store.clone(), state.os_control.clone());
+        let router = build_router(state);
+        let held = control.lock_owned().await;
+        let body = decision(&summary, serde_json::json!({}));
+        let task = tokio::spawn(async move { post(&router, DECIDE, body).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+        assert!(store.list_module_consents().await.unwrap().is_empty());
+        drop(held);
+        assert_eq!(task.await.unwrap().0, StatusCode::OK);
+    }
+
+    /// The host's switch and bound (K1-6a-G §2.1): off by default and on an
+    /// ephemeral daemon; a bound past 90 days, or none, stops the start.
+    #[test]
+    fn module_tool_decisions_open_only_on_the_host_switch() {
+        use crate::consent_routes::{GrantSettings, grant_settings};
+        let path = || Some(std::path::PathBuf::from("/x/os.json"));
+        let open = |days| {
+            Ok(Some(GrantSettings {
+                max_days: days,
+                os_config: "/x/os.json".into(),
+            }))
+        };
+        assert_eq!(grant_settings(None, None, false, path()), Ok(None));
+        assert_eq!(grant_settings(Some("0"), None, false, path()), Ok(None));
+        assert_eq!(grant_settings(Some("1"), None, false, path()), open(30));
+        assert_eq!(
+            grant_settings(Some("1"), Some("90"), false, path()),
+            open(90)
+        );
+        assert_eq!(grant_settings(Some("1"), Some("1"), false, path()), open(1));
+        assert_eq!(grant_settings(Some("1"), None, true, path()), Ok(None));
+        assert_eq!(grant_settings(Some("1"), None, false, None), Ok(None));
+        for bad in ["0", "91", "-1", "30d", ""] {
+            assert!(
+                grant_settings(None, Some(bad), false, path()).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(grant_settings(Some("yes"), None, false, path()).is_err());
+    }
+
     #[tokio::test]
     async fn module_consent_routes_reject_creative_identity() {
         let (state, _host, creative) = capability_state().await;
         let state_again = state.clone();
+        let state_post = state.clone();
         let router = build_router(state);
         let response = router
             .oneshot(
@@ -3785,6 +4087,18 @@ pub(crate) mod tests {
                     .uri("/api/v1/module-consents/modules/doc-module/tools/read_document/card")
                     .header("Authorization", format!("Bearer {creative}"))
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = build_router(state_post)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(DECIDE)
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
