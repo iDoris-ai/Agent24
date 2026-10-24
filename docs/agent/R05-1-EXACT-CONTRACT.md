@@ -82,7 +82,9 @@ clestons 在本 PR 精确 head 上 APPROVE 之后，下一片代码才是 H03 �
 
 在那一片之前，不得改 `request_messages_for`，不得改发送路径，不得写新建会话回执，不得移动审批 grant。
 
-adr-s9 仍开。它问 `docs/adr/ADR-MEMORY-P1-LIFECYCLE-AND-PURGE.md` 第 9 节有没有接受或修订记录。没有该记录时，adr-s9 仍挡住 P1-02c、purge 和 #794。本稿不关闭 adr-s9。本稿的 APPROVE 也不代替该记录。
+adr-s9 仍开。它问 `docs/adr/ADR-MEMORY-P1-LIFECYCLE-AND-PURGE.md` 第 9 节有没有接受或修订记录。没有该记录时，adr-s9 仍挡住 P1-02c 和 purge。本稿不关闭 adr-s9。本稿的 APPROVE 也不代替该记录。
+
+#794 的剩余根确认、撤销、根内免问和根外恢复仍按 PLAN 第 6 节单独核。ADR 第 9 节不给 #794 增加依赖。本 PR 不改 #794。
 
 ## 7. 本片边界
 
@@ -92,5 +94,5 @@ adr-s9 仍开。它问 `docs/adr/ADR-MEMORY-P1-LIFECYCLE-AND-PURGE.md` 第 9 节
 - 不改 migrations、Rust、协议或 OpenAPI。
 - 不重开 D5，不加迁移。
 - 不实现 H03，不开 H04。
-- 不启动 purge，不做 P1-02c，不碰 #794。
+- 不启动 purge，不做 P1-02c。本 PR 不改 #794；这是本片范围，不是 ADR 第 9 节对 #794 的新依赖。
 - 本稿不代外审打勾。
