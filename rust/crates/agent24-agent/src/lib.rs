@@ -37,9 +37,9 @@ use agent24_protocol::{
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{
-    MessageOrigin, OriginatedRunMessage, RunAdmission, RunAdmissionDenial, RunMessage, RunPatch,
-    RunTerminalTransition, SnapshotRunMessage, Store, StoreError, WorkspaceInstant,
-    WorkspaceLeaseId, WorkspaceStoreError,
+    MessageOrigin, MessageOriginLookup, OriginatedRunMessage, RunAdmission, RunAdmissionDenial,
+    RunMessage, RunPatch, RunTerminalTransition, SnapshotRunMessage, Store, StoreError,
+    WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
 };
 use agent24_tools::{
     GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
@@ -60,6 +60,27 @@ pub fn merge_source_policy(
 /// Completion→tools round trips per run before the run is failed. A model
 /// stuck asking for tools forever must terminate deterministically.
 pub const MAX_ITERATIONS: usize = 10;
+
+const SOURCE_UNPROVEN_CODE: &str = "source_unproven";
+const SOURCE_UNPROVEN_MESSAGE: &str =
+    "无法证明本线程已落盘消息的来源，已停止发送。请新建会话。不要自动复制旧 recall 或待执行工具。";
+
+fn origin_allows_send(lookup: &MessageOriginLookup) -> bool {
+    match lookup {
+        // A stored HostRecall with a SQL NULL recall_ref is still unproven.
+        MessageOriginLookup::Present(stored) => !matches!(
+            stored.origin,
+            MessageOrigin::HostRecall { recall_ref: None }
+        ),
+        MessageOriginLookup::Missing | MessageOriginLookup::Unreadable { .. } => false,
+    }
+}
+
+fn unproven_source_failure(run: &Run) -> bool {
+    run.error
+        .as_ref()
+        .is_some_and(|error| error.code == SOURCE_UNPROVEN_CODE)
+}
 
 /// Cap for the externally-visible `output_summary` (full output goes back to
 /// the model; full input is audit-only in the store row).
@@ -1666,6 +1687,9 @@ impl RunManager {
                 final_run.status,
                 RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
             )
+            // Refusing the send keeps the snapshot. Reclaiming prior-context
+            // rows here would delete bytes this failure promised to leave.
+            && !unproven_source_failure(&final_run)
             && let Err(err) = self
                 .store
                 .delete_run_message_range(&run_id, start, end)
@@ -1737,6 +1761,33 @@ impl RunManager {
         normalize_for_provider(&rebuilt)
     }
 
+    /// Stored seq order, not message text. A read error is the same refusal
+    /// as a missing or unreadable row: the provider is not called.
+    async fn persisted_origins_allow_send(&self, run_id: &str) -> bool {
+        let messages = match self.store.list_run_messages(run_id).await {
+            Ok(messages) => messages,
+            Err(err) => {
+                tracing::warn!(run_id, error = %err, "message origin read failed");
+                return false;
+            }
+        };
+        for message in messages {
+            match self
+                .store
+                .read_run_message_origin(run_id, message.seq)
+                .await
+            {
+                Ok(lookup) if origin_allows_send(&lookup) => {}
+                Ok(_) => return false,
+                Err(err) => {
+                    tracing::warn!(run_id, seq = message.seq, error = %err, "message origin read failed");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
     /// a resumed one ([`resume_run`]): each builds the `messages` prefix its own
     /// way (fresh: prior context + prompt; resumed: reconstructed thread + the
@@ -1753,6 +1804,11 @@ impl RunManager {
         let mut usage_total = zero_usage();
 
         for _ in 0..MAX_ITERATIONS {
+            if !self.persisted_origins_allow_send(&run_id).await {
+                self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                    .await;
+                return;
+            }
             // Recomputed each turn: in plan mode only the read-only subset plus
             // `propose_plan` is offered; the instant a plan is approved
             // `plan_mode` flips false and the full set is advertised (H8).
@@ -2451,6 +2507,9 @@ pub(crate) mod tests {
     }
     mod snapshot_origin_tests {
         include!("snapshot_origin_tests.rs");
+    }
+    mod source_send_gate_tests {
+        include!("source_send_gate_tests.rs");
     }
 
     use super::*;
@@ -4757,22 +4816,8 @@ mod approval_tests {
             ended_at: None,
         };
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
         let approval = Approval {
             id: "apr_1".to_owned(),
             run_id: "run_1".to_owned(),
@@ -4964,22 +5009,8 @@ mod approval_tests {
         let mut run = run_in("run_1", RunStatus::AwaitingApproval);
         run.session_id = Some("sess_1".to_owned());
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
         let mut approval = seed_approval(
             "apr_1",
             "run_1",
@@ -5086,22 +5117,8 @@ mod approval_tests {
             ended_at: None,
         };
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
         let approval = Approval {
             id: "apr_1".to_owned(),
             run_id: "run_1".to_owned(),
@@ -5141,6 +5158,43 @@ mod approval_tests {
             !text.contains("should-not-run"),
             "denied tool ran anyway: {text}"
         );
+    }
+
+    /// The parked thread a current run would have stored: user prompt and the
+    /// assistant tool call, each with a present origin and no recall ref.
+    async fn seed_proven_parked_thread(
+        store: &Store,
+        run_id: &str,
+        prompt: &str,
+        call: serde_json::Value,
+    ) {
+        store
+            .append_originated_run_messages(
+                run_id,
+                &[
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "user".into(),
+                            content: Some(prompt.into()),
+                            tool_calls: serde_json::json!([]),
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::UserPrompt,
+                    },
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "assistant".into(),
+                            content: None,
+                            tool_calls: call,
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::Assistant,
+                    },
+                ],
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
     }
 
     /// A run row in a given status, for seeding crash/parked state directly.
