@@ -53,6 +53,14 @@ export function documentsRoute(req: unknown): Route | null {
       const documentId = id('documentId', DOCUMENT_ID)
       return documentId ? { method: 'GET', path: `${BASE}/documents/${documentId}` } : null
     }
+    case 'readText': {
+      const documentId = id('documentId', DOCUMENT_ID)
+      const { revision, cursor } = r
+      if (!documentId || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1) return null
+      if (cursor !== undefined && (typeof cursor !== 'string' || !CURSOR.test(cursor))) return null
+      const path = `${BASE}/documents/${documentId}/revisions/${revision}/text`
+      return { method: 'GET', path: cursor === undefined ? path : `${path}?cursor=${cursor}` }
+    }
     case 'job':
     case 'cancelJob':
     case 'retryJob': {
