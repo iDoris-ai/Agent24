@@ -77,9 +77,9 @@ export default function ChatPage() {
         // v1 error envelope { error: { code, message } }
         const err = (res.data as { error?: { code?: string; message?: string } } | null)?.error
         // The catch below picks its message by `code`. `proxyToBackend`
-        // answers `backend_not_ready` (503) whenever `getBackendEndpoint()`
-        // is null, i.e. the daemon's ready line never arrived
-        // (apps/desktop/src/main/ipc/index.ts). That is a daemon-startup
+        // answers `backend_not_ready` (503) whenever `daemonConnection()`
+        // is null, i.e. the daemon's ready line never arrived or left no
+        // credential (apps/desktop/src/main/ipc/index.ts). That is a daemon-startup
         // failure, not an unreachable model service, so it must not read
         // like one — 2026-10-16 install acceptance followed the wrong one.
         const failure = new Error(err?.message ?? `HTTP ${res.status}`) as Error & { code?: string }

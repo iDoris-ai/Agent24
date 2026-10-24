@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -10,6 +11,7 @@ import {
   readExternalDaemonState,
   BackendManager,
   getBackendEndpoint,
+  daemonConnection,
   type ExternalDaemonSource,
 } from './backend-manager'
 
@@ -144,7 +146,9 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     expect(spawnProcess).not.toHaveBeenCalled()
     expect(manager.isExternalDaemon()).toBe(true)
     expect(manager.externalDaemonPid()).toBe(4242)
-    expect(getBackendEndpoint()).toEqual({ port: 5555, token: 'tok' })
+    expect(getBackendEndpoint()).toEqual({ port: 5555 })
+    expect(daemonConnection()).toEqual({ port: 5555, authHeaders: { Authorization: 'Bearer tok' } })
+    expect(external.checkHealth).toHaveBeenCalledWith({ port: 5555 })
     expect(manager.status()).toBe('running')
 
     manager.stop()
@@ -278,7 +282,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     })
     const external: ExternalDaemonSource = {
       read: () => (externalAvailable ? { port: 5555, token: 'tok', pid: 4242 } : null),
-      checkHealth: vi.fn((endpoint: { port: number; token: string } | null) => {
+      checkHealth: vi.fn((endpoint: { port: number } | null) => {
         // The external daemon's own endpoint is only healthy once it
         // becomes available; a self-spawned child's endpoint (currentEndpoint
         // stays null here since stdout is null / no ready line ever arrives,
@@ -314,11 +318,138 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     // third self-managed child, and the earlier self-spawned children should
     // have been killed rather than left running alongside the external one.
     expect(manager.isExternalDaemon()).toBe(true)
-    expect(getBackendEndpoint()).toEqual({ port: 5555, token: 'tok' })
+    expect(getBackendEndpoint()).toEqual({ port: 5555 })
     expect(spawnProcess).toHaveBeenCalledTimes(2) // no third spawn
     expect(children[0].kill).toHaveBeenCalledWith('SIGTERM')
     expect(children[1].kill).toHaveBeenCalledWith('SIGTERM')
 
+    manager.stop()
+  })
+})
+
+describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () => {
+  const savedBackend = process.env['AGENT24_BACKEND']
+
+  afterEach(() => {
+    if (savedBackend === undefined) delete process.env['AGENT24_BACKEND']
+    else process.env['AGENT24_BACKEND'] = savedBackend
+  })
+
+  function childAnnouncing(ready: Record<string, unknown>): ChildProcess {
+    const stdout = new PassThrough()
+    const ee = new EventEmitter() as unknown as ChildProcess
+    Object.assign(ee, { pid: 7, stdout, stderr: null, kill: vi.fn().mockReturnValue(true) })
+    setImmediate(() => stdout.write(JSON.stringify({ type: 'ready', ...ready }) + '\n'))
+    return ee
+  }
+
+  async function startWith(ready: Record<string, unknown>): Promise<BackendManager> {
+    const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
+    const manager = new BackendManager({ external, spawnProcess: () => childAnnouncing(ready) })
+    await manager.start()
+    await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
+    return manager
+  }
+
+  it('the rust ready token becomes a bearer header, never part of the endpoint', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const manager = await startWith({ port: 4100, token: 'secret' })
+    expect(getBackendEndpoint()).toEqual({ port: 4100 })
+    expect(daemonConnection()).toEqual({ port: 4100, authHeaders: { Authorization: 'Bearer secret' } })
+    manager.stop()
+  })
+
+  it('a rust daemon that announced no token gets no connection: nothing is sent without a credential', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const manager = await startWith({ port: 4101 })
+    expect(getBackendEndpoint()).toEqual({ port: 4101 })
+    expect(daemonConnection()).toBeNull()
+    manager.stop()
+  })
+
+  it('the health tick probes the current port', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const checkHealth = vi.fn().mockResolvedValue(true)
+    const external: ExternalDaemonSource = { read: () => null, checkHealth }
+    const manager = new BackendManager({ external, spawnProcess: () => childAnnouncing({ port: 4102, token: 't' }) })
+    await manager.start()
+    await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
+    await (manager as unknown as { tick(): Promise<void> }).tick()
+    expect(checkHealth).toHaveBeenLastCalledWith({ port: 4102 })
+    manager.stop()
+  })
+
+  it('no credential outlives its daemon: exit, error, restart and stop all clear it', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const children: ChildProcess[] = []
+    const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
+    const manager = new BackendManager({
+      external,
+      spawnProcess: () => {
+        const child = childAnnouncing({ port: 4200 + children.length, token: `t${children.length}` })
+        children.push(child)
+        return child
+      },
+    })
+    await manager.start()
+    await vi.waitFor(() => expect(daemonConnection()).not.toBeNull())
+
+    children[0].emit('exit', 1)
+    expect(daemonConnection()).toBeNull()
+
+    manager.restart()
+    await vi.waitFor(() => expect(daemonConnection()?.port).toBe(4201))
+    children[1].emit('error', new Error('spawn failed'))
+    expect(daemonConnection()).toBeNull()
+
+    manager.restart()
+    expect(daemonConnection()).toBeNull()
+    await vi.waitFor(() => expect(daemonConnection()?.port).toBe(4202))
+
+    manager.stop()
+    expect(daemonConnection()).toBeNull()
+  })
+
+  it('a dead external daemon\'s credential is gone before the fallback child is ready', async () => {
+    let healthy = true
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5558, token: 'external', pid: 4245 }),
+      checkHealth: vi.fn(() => Promise.resolve(healthy)),
+    }
+    // The fallback child never announces readiness (no stdout).
+    const silentChild = (): ChildProcess => {
+      const ee = new EventEmitter() as unknown as ChildProcess
+      Object.assign(ee, { pid: 9, stdout: null, stderr: null, kill: vi.fn().mockReturnValue(true) })
+      return ee
+    }
+    const manager = new BackendManager({ external, spawnProcess: silentChild })
+    await manager.start()
+    expect(daemonConnection()).not.toBeNull()
+
+    healthy = false
+    const tick = (manager as unknown as { tick(): Promise<void> }).tick.bind(manager)
+    for (let i = 0; i < 3; i++) await tick() // MAX_HEALTH_FAILURES
+    expect(manager.isExternalDaemon()).toBe(false)
+    expect(daemonConnection()).toBeNull()
+    manager.stop()
+  })
+
+  it('the node mock takes no credential and is still reachable', async () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    const manager = await startWith({ port: 8765 })
+    expect(daemonConnection()).toEqual({ port: 8765, authHeaders: {} })
+    manager.stop()
+  })
+
+  it('a reused external record without a token (capability mode) gets no connection', async () => {
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5556, token: '', pid: 4243 }),
+      checkHealth: vi.fn().mockResolvedValue(true),
+    }
+    const manager = new BackendManager({ external, spawnProcess: vi.fn() })
+    await manager.start()
+    expect(getBackendEndpoint()).toEqual({ port: 5556 })
+    expect(daemonConnection()).toBeNull()
     manager.stop()
   })
 })

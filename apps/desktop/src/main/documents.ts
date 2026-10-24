@@ -4,7 +4,7 @@
 // pattern first, and does not go through the generic `backendProxy`.
 
 import http from 'node:http'
-import type { BackendEndpoint } from './backend-manager'
+import type { DaemonConnection } from './backend-manager'
 import type { ModuleEvent } from './agentear-events'
 import type { DocumentsError, DocumentsEvent, DocumentsResponse } from '../shared/ipc-types'
 
@@ -86,7 +86,7 @@ function failed(status: number, code: string, message: string): Reply {
  * of a POST is then unknown; it is never retried here), or once the reply
  * passes `maxBytes`. */
 export function httpSender(
-  endpoint: () => BackendEndpoint | null,
+  endpoint: () => DaemonConnection | null,
   host = '127.0.0.1',
   timeoutMs = TIMEOUT_MS,
   maxBytes = MAX_REPLY_BYTES,
@@ -95,7 +95,7 @@ export function httpSender(
     new Promise((resolve) => {
       const ep = endpoint()
       if (!ep) {
-        resolve(failed(503, 'backend_not_ready', 'Backend daemon has not announced readiness yet'))
+        resolve(failed(503, 'backend_not_ready', 'Backend daemon is not ready (no announced port or credential)'))
         return
       }
       let settled = false
@@ -106,8 +106,7 @@ export function httpSender(
         outReq.destroy()
         resolve(reply)
       }
-      const headers: Record<string, string | number> = { ...options.headers }
-      if (ep.token) headers['Authorization'] = `Bearer ${ep.token}`
+      const headers: Record<string, string | number> = { ...options.headers, ...ep.authHeaders }
       if (options.body) headers['Content-Length'] = options.body.length
       const outReq = http.request({ host, port: ep.port, path: route.path, method: route.method, headers }, (res) => {
         const chunks: Buffer[] = []

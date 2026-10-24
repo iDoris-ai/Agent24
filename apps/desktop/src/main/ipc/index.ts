@@ -4,7 +4,7 @@
 import http from 'node:http'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
-import { getBackendEndpoint } from '../backend-manager'
+import { daemonConnection, getBackendEndpoint } from '../backend-manager'
 import { documentsCall, httpSender } from '../documents'
 import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
@@ -74,25 +74,26 @@ const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 function proxyToBackend(req: BackendProxyRequest): Promise<BackendProxyResponse> {
   return new Promise((resolve) => {
     const body = req.body !== undefined ? JSON.stringify(req.body) : undefined
-    // Endpoint comes from the backend's ready line (dynamic port + token for
-    // agent24d; fixed 8765 + empty token for the node mock)
-    const endpoint = getBackendEndpoint()
-    if (!endpoint) {
+    // Port and credential come from the backend's ready line (dynamic port +
+    // token for agent24d; fixed 8765 and no credential for the node mock).
+    // Without a usable credential nothing is sent.
+    const conn = daemonConnection()
+    if (!conn) {
       resolve({
         ok: false,
         status: 503,
-        data: { error: { code: 'backend_not_ready', message: 'Backend daemon has not announced readiness yet' } },
+        data: { error: { code: 'backend_not_ready', message: 'Backend daemon is not ready (no announced port or credential)' } },
       })
       return
     }
     const options: http.RequestOptions = {
       host: BACKEND_HOST,
-      port: endpoint.port,
+      port: conn.port,
       path: req.path,
       method: req.method,
       headers: {
         'Content-Type': 'application/json',
-        ...(endpoint.token ? { 'Authorization': 'Bearer ' + endpoint.token } : {}),
+        ...conn.authHeaders,
         ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
       },
     }
@@ -291,7 +292,7 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
     const endpoint = getBackendEndpoint()
     return endpoint ? { port: endpoint.port } : null
   })
-  const sendToDocuments = httpSender(getBackendEndpoint, BACKEND_HOST)
+  const sendToDocuments = httpSender(daemonConnection, BACKEND_HOST)
   ipcMain.handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, sendToDocuments),
   )
