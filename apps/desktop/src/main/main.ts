@@ -214,7 +214,20 @@ process.on('unhandledRejection', (reason) => {
   console.error('[main] unhandledRejection', reason)
 })
 
+// One desktop per user. Its daemon runs in capability mode, so a second copy
+// could neither share that daemon nor start its own while the first holds the
+// daemon's singleton lock; a second launch brings the first window forward.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
+// Until whenReady below has created the first window (after the CSP hook and
+// IPC handlers are in place), a second launch has nothing to bring forward and
+// must not create a window of its own.
+app.on('second-instance', () => {
+  if (mainWin) showOrCreateWindow()
+})
+
 app.whenReady().then(async () => {
+  if (!isPrimaryInstance) return
   const idorisStatus = await idorisStatusProviderPromise
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
@@ -332,6 +345,7 @@ const STATUS_META: Record<BackendStatus, { title: string; label: string }> = {
   running: { title: '⚡A24', label: '● daemon：运行中' },
   starting: { title: '…A24', label: '○ daemon：启动中…' },
   stopped: { title: '⚠️A24', label: '✕ daemon：已停止' },
+  blocked: { title: '⚠️A24', label: '✕ daemon：被另一个 Agent24 占用' },
 }
 
 // Rebuild the tray title, tooltip, and context menu from the live daemon status.
@@ -344,7 +358,10 @@ function refreshTray(): void {
   // DEP-A5: an external daemon (reused from `agent24 daemon start`, not
   // spawned by this app) gets a visibly different label — the whole point of
   // requirement #2 is that the user can tell them apart before hitting stop.
-  const label = external ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）` : meta.label
+  const foreign = backendManager.foreignDaemonPid()
+  const label = external
+    ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）`
+    : foreign !== null ? `${meta.label}（pid ${foreign}）` : meta.label
   if (process.platform === 'darwin') tray.setTitle(meta.title)
   tray.setToolTip(`Agent24 — ${label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
 
