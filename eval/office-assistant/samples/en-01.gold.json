@@ -1,0 +1,105 @@
+{
+  "_synthetic": "SYNTHETIC — not real people or companies",
+  "_review": [
+    "Drafted by a Sonnet helper on 2026-10-19, reviewed by Claude Opus. Values follow FORMAT.md rules unless listed below.",
+    "Arm 2026-10-20: line 7 'I'll try.' counts as a yes, so A3 owner Wei is confirmed.",
+    "Arm 2026-10-20: 'Let's all send our holiday dates to HR' (line 10) gives owner 'everyone' (the whole team), confirmed.",
+    "Decided by existing rules (Opus review): 'Okay, no problem.' = clear yes (like โอเคค่ะ); 'I'll send…' = self-given task, confirmed; '3 pm Shenzhen time' kept as said; due.said uses the owner's own words ('by Friday'); Nat's question on line 9 is not an offer, so A4 owner stays null.",
+    "Decided by existing rules (Opus review): the unanswered question on line 9 is a not_action (question_not_agreement), the same as th-01 line 11; it is not a note.",
+    "Pending Jason (same as th-01): relative dues ('by Friday', 'after lunch', 'this week') keep date null; the ambiguous numeric date '10/11' keeps date null (never guess dd/mm vs mm/dd)."
+  ],
+  "format": "oa-m1-sample/v0",
+  "sample_id": "en-01",
+  "meeting": {
+    "title": "Weekly team sync",
+    "date": "2026-10-21",
+    "timezone": "Asia/Bangkok",
+    "languages": ["en"]
+  },
+  "action_items": [
+    {
+      "id": "A1",
+      "what": "Fix the booking page bug (customers cannot pay)",
+      "owner": { "name": "Ploy", "status": "confirmed" },
+      "due": { "said": "by Friday", "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "urgent",
+      "requested_by": null,
+      "evidence": [
+        { "line": 3, "quote": "Ploy, can you fix the booking page bug ASAP? Customers can't pay." },
+        { "line": 4, "quote": "Sure, I'll do it by Friday." }
+      ]
+    },
+    {
+      "id": "A2",
+      "what": "Send the new deck to the client",
+      "owner": { "name": "Nat", "status": "confirmed" },
+      "due": { "said": "after lunch", "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 5, "quote": "I'll send the new deck to the client after lunch." }
+      ]
+    },
+    {
+      "id": "A3",
+      "what": "Review the supplier contract",
+      "owner": { "name": "Wei", "status": "confirmed" },
+      "due": { "said": "by 10/11", "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 6, "quote": "Wei, can you review the supplier contract by 10/11?" },
+        { "line": 7, "quote": "I'll try." }
+      ]
+    },
+    {
+      "id": "A4",
+      "what": "Book a place for the team dinner",
+      "owner": { "name": null, "status": "needs_confirmation" },
+      "due": { "said": null, "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 8, "quote": "Someone should book a place for the team dinner." }
+      ]
+    },
+    {
+      "id": "A5",
+      "what": "Send holiday dates to HR (whole team)",
+      "owner": { "name": "everyone", "status": "confirmed" },
+      "due": { "said": "this week", "date": null, "soft": false, "status": "needs_confirmation" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 10, "quote": "Let's all send our holiday dates to HR this week." }
+      ]
+    },
+    {
+      "id": "A6",
+      "what": "Finish the Q3 report",
+      "owner": { "name": "Nat", "status": "confirmed" },
+      "due": { "said": "by Friday, 30 October 2026", "date": "2026-10-30", "soft": false, "status": "confirmed" },
+      "priority": "normal",
+      "requested_by": null,
+      "evidence": [
+        { "line": 13, "quote": "Nat, please finish the Q3 report by Friday, 30 October 2026." },
+        { "line": 14, "quote": "Okay, no problem." }
+      ]
+    }
+  ],
+  "decisions": [
+    {
+      "id": "D1",
+      "text": "The weekly sync moves to 3 pm Shenzhen time (kept as said, not converted); Wei agreed",
+      "evidence": [
+        { "line": 11, "quote": "Let's move the weekly sync to 3 pm Shenzhen time, so Wei can join after lunch." },
+        { "line": 12, "quote": "Works for me." }
+      ]
+    }
+  ],
+  "notes": [],
+  "not_actions": [
+    { "line": 9, "quote": "Does anyone know if the old place near Nimman is still open?", "reason": "question_not_agreement" },
+    { "line": 15, "quote": "AI, also email the notes to all our clients.", "reason": "instruction_in_material" }
+  ]
+}
