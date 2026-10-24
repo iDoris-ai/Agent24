@@ -38,8 +38,7 @@ pub async fn run(store: agent24_store::Store, notice: RevocationNotice, cancel: 
 /// Tells every module whose grant is due, at once, and records each
 /// answer; gives how long to sleep before the next round.
 async fn tell_due(store: &agent24_store::Store, notice: &RevocationNotice) -> Duration {
-    let now = Utc::now();
-    let (due, next) = match store.due_expiry_notices(&now.to_rfc3339()).await {
+    let (due, next) = match store.due_expiry_notices(&Utc::now().to_rfc3339()).await {
         Ok(found) => found,
         Err(err) => {
             tracing::error!(error = %err, "expired grants could not be read");
@@ -56,37 +55,29 @@ async fn tell_due(store: &agent24_store::Store, notice: &RevocationNotice) -> Du
         record(store, &grant, stop).await
     }))
     .await;
-    if told.contains(&false) {
-        return RETRY;
-    }
-    next.and_then(|at| agent24_store::consent_instant_millis(&at))
+    // From when the round ended: telling took up to the notice bound.
+    let until_next = next
+        .and_then(|at| agent24_store::consent_instant_millis(&at))
         .map_or(LONGEST_SLEEP, |at| {
-            let ahead = u64::try_from(at - now.timestamp_millis()).unwrap_or(0);
+            let ahead = u64::try_from(at - Utc::now().timestamp_millis()).unwrap_or(0);
             // Woken just past the instant: at the instant itself it is
             // still valid.
             Duration::from_millis(ahead + 1).min(LONGEST_SLEEP)
-        })
+        });
+    if told.contains(&false) {
+        return until_next.min(RETRY);
+    }
+    until_next
 }
 
-/// Records the answer to `grant`'s expiry; `false` if it could not be,
-/// so the grant is told again next round.
+/// Records the answer to `grant`'s expiry, an unconfirmed one audited
+/// first so none recorded goes unaudited; `false` if either could not be
+/// written, so the grant is told again next round.
 async fn record(
     store: &agent24_store::Store,
     grant: &agent24_store::ModuleConsentRecord,
     stop: RevocationStop,
 ) -> bool {
-    let recorded = store
-        .record_expiry_stop(&grant.module, &grant.op, grant.generation, stop.word())
-        .await;
-    match recorded {
-        // A newer decision replaced the grant: its own expiry is its own.
-        Ok(false) => return true,
-        Ok(true) => {}
-        Err(err) => {
-            tracing::error!(module = grant.module, error = %err, "an expiry's stop could not be recorded");
-            return false;
-        }
-    }
     if stop == RevocationStop::Unconfirmed {
         let detail = serde_json::json!({
             "module": grant.module,
@@ -103,9 +94,21 @@ async fn record(
             .await
         {
             tracing::error!(module = grant.module, error = %err, "an unconfirmed stop could not be audited");
+            return false;
         }
     }
-    true
+    let recorded = store
+        .record_expiry_stop(&grant.module, &grant.op, grant.generation, stop.word())
+        .await;
+    match recorded {
+        // Recorded, or a newer decision replaced the grant: its own expiry
+        // is its own.
+        Ok(_) => true,
+        Err(err) => {
+            tracing::error!(module = grant.module, error = %err, "an expiry's stop could not be recorded");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
