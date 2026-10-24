@@ -383,6 +383,33 @@ async fn admitted(l: &Arc<Layers>, env: &Env, content: &str, started: usize, by:
     }
 }
 
+/// Asks for `content`'s layer `by` until `by` is one of its build's
+/// requesters: a slow first lookup may end a short wait before it joins.
+async fn joined(l: &Arc<Layers>, env: &Env, content: &str, by: Requester) {
+    let start = std::time::Instant::now();
+    loop {
+        let got = l
+            .layer(
+                &env.storage,
+                content,
+                PDF,
+                Duration::from_millis(20),
+                by.clone(),
+            )
+            .await;
+        assert_eq!(got, Err(LayerFailure::Pending));
+        if l.building
+            .lock()
+            .unwrap()
+            .values()
+            .any(|b| b.by.contains(&by))
+        {
+            return;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "never joined");
+    }
+}
+
 fn tool(op: &str) -> Requester {
     Requester::Tool(op.to_owned())
 }
@@ -472,16 +499,7 @@ async fn a_build_shared_with_a_page_stops_for_the_tool_that_also_asked() {
         tokio::spawn(async move { l.layer(&s, &c, PDF, WAIT, Requester::Page).await })
     };
     wait_until(|| f.running.load(SeqCst) == 1).await;
-    let joined = l
-        .layer(
-            &env.storage,
-            &content,
-            PDF,
-            Duration::from_millis(20),
-            tool("read_range"),
-        )
-        .await;
-    assert_eq!(joined, Err(LayerFailure::Pending));
+    joined(&l, &env, &content, tool("read_range")).await;
     let stopped = stop_tool(&l, "read_range");
     assert_eq!(stopped.len(), 1);
     assert_eq!(ended(stopped[0].clone()).await, Err(LayerFailure::Stopped));
