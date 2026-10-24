@@ -19,6 +19,7 @@ use axum::extract::{FromRef, FromRequestParts};
 use axum::http::request::Parts;
 use sqlx::migrate::MigrateError;
 
+use crate::authorization::Calls;
 use crate::blob::{BlobError, BlobStore};
 use crate::db::{Db, DbError};
 use crate::engine::Layers;
@@ -113,6 +114,8 @@ struct Inner {
     events: Events,
     /// Text layers, and the engine that reads them (none on Linux).
     layers: Arc<Layers>,
+    /// The tool calls in flight, against the ends of their authorizations.
+    calls: Arc<Calls>,
     /// The model extractions ask: the kernel's, once it has offered one.
     model: OnceLock<Arc<dyn Model>>,
     reopen_interval: Duration,
@@ -178,6 +181,7 @@ impl AppState {
             data_dir: data_dir.to_owned(),
             events,
             layers,
+            calls: Arc::default(),
             model: OnceLock::new(),
             reopen_interval,
             current: Mutex::new(current),
@@ -201,6 +205,7 @@ impl AppState {
             data_dir: data_dir.to_owned(),
             events: Events::default(),
             layers: Layers::new(None),
+            calls: Arc::default(),
             model: OnceLock::new(),
             reopen_interval,
             current: Mutex::new(Err(cause)),
@@ -216,6 +221,12 @@ impl AppState {
     #[must_use]
     pub fn layers(&self) -> &Arc<Layers> {
         &self.0.layers
+    }
+
+    /// The tool calls in flight, against the ends of their authorizations.
+    #[must_use]
+    pub fn calls(&self) -> &Arc<Calls> {
+        &self.0.calls
     }
 
     /// The model extractions ask, if the kernel offered this module one.

@@ -646,3 +646,28 @@ async fn a_read_s_build_is_asked_for_by_its_tool_or_its_page() {
     stop_once_asked(&state, &Requester::Page).await;
     assert_eq!(page.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+/// K1-06a-grant-path §2.5: a read whose authorization ends while it runs
+/// answers `permission_denied`, though its build ended otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_its_authorization_ends_under_gives_nothing() {
+    let (_dir, state) = env_with(Some(Arc::new(Stuck))).await;
+    let read = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let args = json!({ "document_id": DOC, "revision": 1, "query": "a" });
+            call(&state, "find", args).await
+        }
+    });
+    let start = std::time::Instant::now();
+    while state.calls().in_flight() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "never began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // What the notice does first: the end, then the call's build stops.
+    state.calls().end("find");
+    stop_once_asked(&state, &Requester::Tool("find".to_owned())).await;
+    let answer = tokio::time::timeout(Duration::from_secs(2), read).await;
+    let answer = answer.expect("the call goes on").unwrap();
+    assert_kernel_error(&answer, ModuleToolErrorCode::PermissionDenied);
+}
