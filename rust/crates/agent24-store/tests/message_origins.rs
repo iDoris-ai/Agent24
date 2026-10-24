@@ -1,11 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::str::FromStr;
+
 use agent24_store::test_hooks;
 use agent24_store::{
     MessageOrigin, MessageOriginLookup, OriginatedRunMessage, PendingRunMessage,
     SnapshotRunMessage, Store, message_instance_digest,
 };
 use serde_json::{Value, json};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 const NOW: &str = "2026-10-24T00:00:00Z";
 
@@ -385,4 +388,167 @@ async fn present(store: &Store, run_id: &str, seq: i64) -> agent24_store::Stored
         MessageOriginLookup::Present(origin) => origin,
         other => panic!("expected present origin, got {other:?}"),
     }
+}
+
+fn tool_row(content: &str, tool_call_id: &str, origin: MessageOrigin) -> OriginatedRunMessage {
+    OriginatedRunMessage {
+        message: PendingRunMessage {
+            role: "tool".to_owned(),
+            content: Some(content.to_owned()),
+            tool_calls: json!([]),
+            tool_call_id: Some(tool_call_id.to_owned()),
+        },
+        origin,
+    }
+}
+
+#[tokio::test]
+async fn assistant_or_tool_result_with_recall_ref_is_not_present() {
+    let store = store_with_run("run_new_kinds").await;
+    store
+        .append_originated_run_messages(
+            "run_new_kinds",
+            &[
+                row("assistant", Some("answer"), MessageOrigin::Assistant),
+                tool_row("out", "call_1", MessageOrigin::ToolResult),
+            ],
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        present(&store, "run_new_kinds", 0).await.origin,
+        MessageOrigin::Assistant
+    );
+    assert_eq!(
+        present(&store, "run_new_kinds", 1).await.origin,
+        MessageOrigin::ToolResult
+    );
+    let thread = store.list_run_messages("run_new_kinds").await.unwrap();
+    assert_eq!(thread[1].tool_call_id.as_deref(), Some("call_1"));
+    let recall_refs: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT recall_ref FROM run_message_origins WHERE run_id = ? ORDER BY seq",
+    )
+    .bind("run_new_kinds")
+    .fetch_all(test_hooks::pool(&store))
+    .await
+    .unwrap();
+    assert_eq!(recall_refs, vec![None, None]);
+
+    sqlx::query(
+        "UPDATE run_message_origins SET recall_ref = 'call_1' WHERE run_id = ? AND seq = 0",
+    )
+    .bind("run_new_kinds")
+    .execute(test_hooks::pool(&store))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE run_message_origins SET recall_ref = '' WHERE run_id = ? AND seq = 1")
+        .bind("run_new_kinds")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    for seq in [0_i64, 1] {
+        let lookup = store
+            .read_run_message_origin("run_new_kinds", seq)
+            .await
+            .unwrap();
+        assert!(
+            matches!(lookup, MessageOriginLookup::Unreadable { seq: got } if got == seq),
+            "{lookup:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rebuilt_origin_table_keeps_old_rows_and_does_not_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.db");
+    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.migrations = migrator
+        .migrations
+        .iter()
+        .filter(|migration| migration.version < 22)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    migrator.run(&pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO runs (id, status, input, usage, created_at) VALUES ('run_old', 'queued', '{}', '{}', ?)",
+    )
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (seq, role, content) in [(0_i64, "user", "kept"), (1_i64, "assistant", "unmapped")] {
+        sqlx::query(
+            "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, tool_call_id, created_at) \
+             VALUES ('run_old', ?, ?, ?, '[]', NULL, ?)",
+        )
+        .bind(seq)
+        .bind(role)
+        .bind(content)
+        .bind(NOW)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let digest = message_instance_digest("user", Some("kept"), &json!([]), None).unwrap();
+    sqlx::query(
+        "INSERT INTO run_message_origins (run_id, seq, schema_version, kind, instance_digest, recall_ref) \
+         VALUES ('run_old', 0, 1, 'UserPrompt', ?, NULL)",
+    )
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let kinds: Vec<(i64, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT seq, kind, recall_ref, schema_version FROM run_message_origins WHERE run_id = 'run_old' ORDER BY seq",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kinds, vec![(0, "UserPrompt".to_owned(), None, 1)]);
+    let message_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM run_messages WHERE run_id = 'run_old'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(message_count, 2);
+
+    let host_system = sqlx::query(
+        "INSERT INTO run_message_origins (run_id, seq, schema_version, kind, instance_digest, recall_ref) \
+         VALUES ('run_old', 1, 1, 'HostSystem', ?, NULL)",
+    )
+    .bind(&digest)
+    .execute(&pool)
+    .await;
+    assert!(host_system.is_err(), "{host_system:?}");
+    sqlx::query(
+        "INSERT INTO run_message_origins (run_id, seq, schema_version, kind, instance_digest, recall_ref) \
+         VALUES ('run_old', 1, 1, 'Assistant', ?, NULL)",
+    )
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let assistant: String = sqlx::query_scalar(
+        "SELECT kind FROM run_message_origins WHERE run_id = 'run_old' AND seq = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(assistant, "Assistant");
 }

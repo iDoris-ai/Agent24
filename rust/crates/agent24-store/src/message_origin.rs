@@ -24,6 +24,8 @@ pub enum MessageOrigin {
     HostRecall { recall_ref: Option<String> },
     UserPrompt,
     SessionHistory,
+    Assistant,
+    ToolResult,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +95,8 @@ fn origin_columns(origin: &MessageOrigin) -> Result<(&'static str, Option<&str>)
         },
         MessageOrigin::UserPrompt => Ok(("UserPrompt", None)),
         MessageOrigin::SessionHistory => Ok(("SessionHistory", None)),
+        MessageOrigin::Assistant => Ok(("Assistant", None)),
+        MessageOrigin::ToolResult => Ok(("ToolResult", None)),
     }
 }
 
@@ -103,6 +107,8 @@ fn origin_from_row(kind: &str, recall_ref: Option<String>) -> Option<MessageOrig
         }
         "UserPrompt" if recall_ref.is_none() => Some(MessageOrigin::UserPrompt),
         "SessionHistory" if recall_ref.is_none() => Some(MessageOrigin::SessionHistory),
+        "Assistant" if recall_ref.is_none() => Some(MessageOrigin::Assistant),
+        "ToolResult" if recall_ref.is_none() => Some(MessageOrigin::ToolResult),
         _ => None,
     }
 }
