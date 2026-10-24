@@ -14,7 +14,6 @@
 use agent24_memory::{
     KvStore,
     artifact::checksum,
-    assertion::{AssertionStore, BeliefQuery},
     event::{EventId, Origin, Scope, Trust},
     writer::{Candidate, MemoryWriter, WriteDecision},
 };
@@ -238,30 +237,6 @@ pub(super) async fn persist(
     // write path, so the gate is still "one early check at retain", just
     // one transaction deeper.
     let id = checksum(&format!("{owner}{object}"));
-    // K1-6b.4b: the id is content-addressed, so remembering identical text
-    // again lands on the same current assertion. Its classification never
-    // loosens, and a re-assert that does not tighten it leaves the stored
-    // provenance untouched (so the write stays idempotent).
-    let stored = kv
-        .assertions()
-        .beliefs_as_of(&BeliefQuery::owner(owner))
-        .await?
-        .into_iter()
-        .find(|assertion| assertion.id == id)
-        .map(|assertion| assertion.source_ref);
-    let source_ref = match stored {
-        None => Some(source_ref.to_value()),
-        Some(stored_ref) => {
-            let stored_class =
-                agent24_store::AssertionSourceRef::classification_of(stored_ref.as_ref());
-            let merged = source_ref.at_least(stored_class);
-            if merged.classification == stored_class {
-                stored_ref
-            } else {
-                Some(merged.to_value())
-            }
-        }
-    };
     let candidate = Candidate::new(
         id,
         Scope::owner(owner),
@@ -271,13 +246,12 @@ pub(super) async fn persist(
         origin,
     )
     .with_evidence(vec![evidence])
-    .remember();
     // K1-6b.4b (ADR-K1-02 §5 item 10): the classification commits in the
-    // same row and transaction as the body.
-    let candidate = match source_ref {
-        Some(source_ref) => candidate.with_source_ref(source_ref),
-        None => candidate,
-    };
+    // same row and transaction as the body. The id is content-addressed, so
+    // remembering identical text again lands on the same assertion, and the
+    // write gate keeps the stricter classification of the two.
+    .with_source_ref(source_ref.to_value())
+    .remember();
 
     let decisions = kv.write_gate().propose(vec![candidate]).await?;
     Ok(match decisions.into_iter().next() {
@@ -308,6 +282,10 @@ mod tests {
     use super::explicit_remember;
     use super::persist;
     use agent24_memory::event::{Origin, Trust};
+    use agent24_memory::{
+        KvStore,
+        assertion::{AssertionStore, BeliefQuery},
+    };
 
     fn ordinary_context() -> agent24_store::AssertionSourceRef {
         agent24_store::AssertionSourceRef::from_sources([(
@@ -315,10 +293,6 @@ mod tests {
             agent24_store::SourceClassification::Ordinary,
         )])
     }
-    use agent24_memory::{
-        KvStore,
-        assertion::{AssertionStore, BeliefQuery},
-    };
 
     #[test]
     fn recognizes_only_the_supported_leading_forms() {
