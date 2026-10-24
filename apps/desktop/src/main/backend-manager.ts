@@ -4,8 +4,10 @@
 // as an explicit opt-in for the legacy mock).
 // Both backends speak the same v1 protocol and announce themselves via the
 // SPEC-002 §4 ready line: the manager scans child stdout for the first
-// {"type":"ready","port":…,"token":…} JSON line and exposes it to the IPC
-// proxy layer, so the renderer never cares which backend is running.
+// {"type":"ready","port":…} JSON line and exposes the port to the IPC proxy
+// layer, so the renderer never cares which backend is running. The credential
+// on that line (`token`, or `product_host_token` in capability mode) stays in
+// this module.
 
 import { fork, spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
@@ -54,6 +56,15 @@ export function daemonConnection(): DaemonConnection | null {
   if (auth.kind === 'none') return { port, authHeaders: {} }
   if (!auth.token) return null
   return { port, authHeaders: { Authorization: `Bearer ${auth.token}` } }
+}
+
+/** How the desktop asks agent24d to authenticate. Capability mode needs the
+ * daemon to verify that stdin/stdout are private pipes, which it can do only
+ * on Unix; Windows and the node mock keep the single legacy token. */
+export type DaemonAuthMode = 'legacy' | 'capabilities'
+
+export function selectedAuthMode(kind: BackendKind, platform: NodeJS.Platform = process.platform): DaemonAuthMode {
+  return kind === 'rust' && platform !== 'win32' ? 'capabilities' : 'legacy'
 }
 
 export function selectedBackend(): BackendKind {
@@ -117,6 +128,7 @@ export interface ExternalDaemonState {
   port: number
   token: string
   pid: number
+  authMode: DaemonAuthMode
 }
 
 /** Mirrors `agent24_protocol::state_file::state_path()` (Rust), i.e.
@@ -141,10 +153,13 @@ export function readExternalDaemonState(): ExternalDaemonState | null {
   if (!statePath) return null
   try {
     const raw = fs.readFileSync(statePath, 'utf8')
-    const parsed = JSON.parse(raw) as { port?: unknown; token?: unknown; pid?: unknown }
+    const parsed = JSON.parse(raw) as { port?: unknown; token?: unknown; pid?: unknown; auth_mode?: unknown }
     if (typeof parsed.port !== 'number' || typeof parsed.pid !== 'number') return null
     const token = typeof parsed.token === 'string' ? parsed.token : ''
-    return { port: parsed.port, token, pid: parsed.pid }
+    // Only a legacy record (or one from before `auth_mode` existed) shares its
+    // token through this file; any other mode keeps host authority private.
+    const legacy = parsed.auth_mode === undefined || parsed.auth_mode === 'legacy_single_token'
+    return { port: parsed.port, token, pid: parsed.pid, authMode: legacy ? 'legacy' : 'capabilities' }
   } catch {
     return null
   }
@@ -164,7 +179,9 @@ export interface BackendManagerDeps {
   /** Spawns/forks the backend child process. Defaulted to the real
    * spawn/fork call below; tests inject a fake so `spawnChild()` never
    * touches a real binary. */
-  spawnProcess?: (kind: BackendKind) => ChildProcess
+  spawnProcess?: (kind: BackendKind, authMode: DaemonAuthMode) => ChildProcess
+  /** Defaults to `selectedAuthMode(kind)`. */
+  authMode?: DaemonAuthMode
 }
 
 // `/api/v1/health` takes no credential, so none is sent.
@@ -188,9 +205,17 @@ function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
   })
 }
 
-function defaultSpawnProcess(kind: BackendKind): ChildProcess {
+function defaultSpawnProcess(kind: BackendKind, authMode: DaemonAuthMode): ChildProcess {
   if (kind === 'rust') {
     const bin = resolveRustBinary()
+    if (authMode === 'capabilities') {
+      // stdin is a pipe this process holds open for the child's lifetime: the
+      // daemon treats EOF there as its host going away and shuts down.
+      return spawn(bin, ['serve', '--port', '0', '--auth-mode', 'capabilities', '--host-bootstrap-stdio'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env },
+      })
+    }
     return spawn(bin, ['serve', '--port', '0'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env },
@@ -204,6 +229,25 @@ function defaultSpawnProcess(kind: BackendKind): ChildProcess {
   })
 }
 
+interface ReadyLine {
+  type?: string
+  port?: number
+  token?: unknown
+  product_host_token?: unknown
+  auth_mode?: unknown
+}
+
+/** The credential the ready line hands over in the mode this manager asked
+ * for; '' (so no connection) when the daemon answered in another mode. */
+function readyToken(ready: ReadyLine, authMode: DaemonAuthMode): string {
+  if (authMode === 'capabilities') {
+    return ready.auth_mode === 'capabilities' && typeof ready.product_host_token === 'string'
+      ? ready.product_host_token
+      : ''
+  }
+  return ready.auth_mode !== 'capabilities' && typeof ready.token === 'string' ? ready.token : ''
+}
+
 const defaultExternalDaemonSource: ExternalDaemonSource = {
   read: readExternalDaemonState,
   checkHealth,
@@ -215,7 +259,8 @@ export class BackendManager {
   private failureCount = 0
   private readonly kind: BackendKind = selectedBackend()
   private readonly external: ExternalDaemonSource
-  private readonly spawnProcess: (kind: BackendKind) => ChildProcess
+  private readonly spawnProcess: (kind: BackendKind, authMode: DaemonAuthMode) => ChildProcess
+  private readonly authMode: DaemonAuthMode
   // F1b: last observed health (drives the tray status), and whether the user
   // deliberately stopped the daemon — while true, the health loop must NOT
   // auto-respawn it (that would defeat a manual stop).
@@ -238,6 +283,7 @@ export class BackendManager {
   constructor(deps: BackendManagerDeps = {}) {
     this.external = deps.external ?? defaultExternalDaemonSource
     this.spawnProcess = deps.spawnProcess ?? defaultSpawnProcess
+    this.authMode = deps.authMode ?? selectedAuthMode(this.kind)
   }
 
   async start(): Promise<void> {
@@ -252,6 +298,11 @@ export class BackendManager {
   private async tryReuseExternal(): Promise<boolean> {
     const state = this.external.read()
     if (!state) return false
+    if (state.authMode !== 'legacy') {
+      // Its host authority went to whoever started it, never to this file.
+      console.warn(`[backend:${this.kind}] daemon pid ${state.pid} runs in capability mode for another host — not reusing it`)
+      return false
+    }
     const healthy = await this.external.checkHealth({ port: state.port })
     if (!healthy) return false
     this.isExternal = true
@@ -343,7 +394,7 @@ export class BackendManager {
     this.isExternal = false
     this.externalPid = null
 
-    this.child = this.spawnProcess(this.kind)
+    this.child = this.spawnProcess(this.kind, this.authMode)
     this.wireChild(this.child)
     console.log(`[backend:${this.kind}] spawned pid`, this.child.pid)
   }
@@ -359,11 +410,13 @@ export class BackendManager {
         // SPEC-002 §4: scan for the first type=="ready" JSON line — it is not
         // necessarily the first stdout line (init logs may precede it)
         try {
-          const parsed = JSON.parse(line) as { type?: string; port?: number; token?: string }
-          if (parsed.type === 'ready' && typeof parsed.port === 'number') {
-            if (this.child === child) {
+          const parsed = JSON.parse(line) as ReadyLine
+          // A ready line carries the credential: it is never echoed to the log,
+          // even when malformed.
+          if (parsed.type === 'ready') {
+            if (typeof parsed.port === 'number' && this.child === child) {
               const auth: DaemonAuth =
-                this.kind === 'node' ? { kind: 'none' } : { kind: 'bearer', token: parsed.token ?? '' }
+                this.kind === 'node' ? { kind: 'none' } : { kind: 'bearer', token: readyToken(parsed, this.authMode) }
               current = { port: parsed.port, auth }
               console.log(`[backend:${this.kind}] ready on port ${parsed.port}`)
             }

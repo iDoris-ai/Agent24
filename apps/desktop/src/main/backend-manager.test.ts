@@ -12,6 +12,8 @@ import {
   BackendManager,
   getBackendEndpoint,
   daemonConnection,
+  selectedAuthMode,
+  type DaemonAuthMode,
   type ExternalDaemonSource,
 } from './backend-manager'
 
@@ -64,7 +66,7 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
 
   it('parses a well-formed daemon.json (mirrors the Rust DaemonState shape)', () => {
     writeState({ port: 4321, token: 'abc', pid: 999, version: '0.5.0', generation: 'g1', auth_mode: 'legacy_single_token' })
-    expect(readExternalDaemonState()).toEqual({ port: 4321, token: 'abc', pid: 999 })
+    expect(readExternalDaemonState()).toEqual({ port: 4321, token: 'abc', pid: 999, authMode: 'legacy' })
   })
 
   it('returns null when the file is absent', () => {
@@ -83,9 +85,16 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
     expect(readExternalDaemonState()).toBeNull()
   })
 
-  it('treats a capability-mode record (empty token) as reusable too', () => {
+  it('marks a capability-mode record, which shares no token', () => {
     writeState({ port: 1, pid: 2, auth_mode: 'capabilities', generation: 'g1' })
-    expect(readExternalDaemonState()).toEqual({ port: 1, token: '', pid: 2 })
+    expect(readExternalDaemonState()).toEqual({ port: 1, token: '', pid: 2, authMode: 'capabilities' })
+  })
+
+  it('treats an unknown auth_mode as not shareable, and a record without one as legacy', () => {
+    writeState({ port: 1, token: 'x', pid: 2, auth_mode: 'something_new' })
+    expect(readExternalDaemonState()?.authMode).toBe('capabilities')
+    writeState({ port: 1, token: 'x', pid: 2 })
+    expect(readExternalDaemonState()?.authMode).toBe('legacy')
   })
 
   it('returns null when HOME is unset — mirrors the Rust state_dir() contract', () => {
@@ -118,7 +127,7 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
     fs.mkdirSync(dataDir, { recursive: true })
     fs.writeFileSync(path.join(dataDir, 'daemon.json'), JSON.stringify({ port: 2222, token: 'iso', pid: 2 }))
     process.env['AGENT24_DATA_DIR'] = dataDir
-    expect(readExternalDaemonState()).toEqual({ port: 2222, token: 'iso', pid: 2 })
+    expect(readExternalDaemonState()).toEqual({ port: 2222, token: 'iso', pid: 2, authMode: 'legacy' })
   })
 })
 
@@ -136,7 +145,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
   it('daemon.json present and healthy → reuses it, never spawns', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
-      read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy' }),
       checkHealth: vi.fn().mockResolvedValue(true),
     }
     const manager = new BackendManager({ external, spawnProcess })
@@ -158,7 +167,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     const child = fakeChild(222)
     const spawnProcess = vi.fn(() => child)
     const external: ExternalDaemonSource = {
-      read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy' }),
       checkHealth: vi.fn().mockResolvedValue(false),
     }
     const manager = new BackendManager({ external, spawnProcess })
@@ -188,7 +197,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
   it('stopDaemon() on a reused external daemon disconnects but never kills it', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
-      read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy' }),
       checkHealth: vi.fn().mockResolvedValue(true),
     }
     const manager = new BackendManager({ external, spawnProcess })
@@ -212,7 +221,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
   it('stop() (app quit) on a reused external daemon disconnects but never kills it', async () => {
     const spawnProcess = vi.fn(() => fakeChild(111))
     const external: ExternalDaemonSource = {
-      read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy' }),
       checkHealth: vi.fn().mockResolvedValue(true),
     }
     const manager = new BackendManager({ external, spawnProcess })
@@ -229,7 +238,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     const child = fakeChild(111)
     const spawnProcess = vi.fn(() => child)
     const external: ExternalDaemonSource = {
-      read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy' }),
       checkHealth: vi.fn().mockResolvedValue(true),
     }
     const manager = new BackendManager({ external, spawnProcess })
@@ -281,7 +290,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
       return child
     })
     const external: ExternalDaemonSource = {
-      read: () => (externalAvailable ? { port: 5555, token: 'tok', pid: 4242 } : null),
+      read: () => (externalAvailable ? { port: 5555, token: 'tok', pid: 4242, authMode: 'legacy' } : null),
       checkHealth: vi.fn((endpoint: { port: number } | null) => {
         // The external daemon's own endpoint is only healthy once it
         // becomes available; a self-spawned child's endpoint (currentEndpoint
@@ -343,9 +352,9 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     return ee
   }
 
-  async function startWith(ready: Record<string, unknown>): Promise<BackendManager> {
+  async function startWith(ready: Record<string, unknown>, authMode: DaemonAuthMode = 'legacy'): Promise<BackendManager> {
     const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
-    const manager = new BackendManager({ external, spawnProcess: () => childAnnouncing(ready) })
+    const manager = new BackendManager({ external, authMode, spawnProcess: () => childAnnouncing(ready) })
     await manager.start()
     await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
     return manager
@@ -371,7 +380,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     delete process.env['AGENT24_BACKEND']
     const checkHealth = vi.fn().mockResolvedValue(true)
     const external: ExternalDaemonSource = { read: () => null, checkHealth }
-    const manager = new BackendManager({ external, spawnProcess: () => childAnnouncing({ port: 4102, token: 't' }) })
+    const manager = new BackendManager({ external, authMode: 'legacy', spawnProcess: () => childAnnouncing({ port: 4102, token: 't' }) })
     await manager.start()
     await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
     await (manager as unknown as { tick(): Promise<void> }).tick()
@@ -385,6 +394,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
     const manager = new BackendManager({
       external,
+      authMode: 'legacy',
       spawnProcess: () => {
         const child = childAnnouncing({ port: 4200 + children.length, token: `t${children.length}` })
         children.push(child)
@@ -413,7 +423,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
   it('a dead external daemon\'s credential is gone before the fallback child is ready', async () => {
     let healthy = true
     const external: ExternalDaemonSource = {
-      read: () => ({ port: 5558, token: 'external', pid: 4245 }),
+      read: () => ({ port: 5558, token: 'external', pid: 4245, authMode: 'legacy' }),
       checkHealth: vi.fn(() => Promise.resolve(healthy)),
     }
     // The fallback child never announces readiness (no stdout).
@@ -441,15 +451,112 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
     manager.stop()
   })
 
-  it('a reused external record without a token (capability mode) gets no connection', async () => {
+  it('a reused legacy record without a token gets no connection', async () => {
     const external: ExternalDaemonSource = {
-      read: () => ({ port: 5556, token: '', pid: 4243 }),
+      read: () => ({ port: 5556, token: '', pid: 4243, authMode: 'legacy' }),
       checkHealth: vi.fn().mockResolvedValue(true),
     }
     const manager = new BackendManager({ external, spawnProcess: vi.fn() })
     await manager.start()
     expect(getBackendEndpoint()).toEqual({ port: 5556 })
     expect(daemonConnection()).toBeNull()
+    manager.stop()
+  })
+})
+
+describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
+  const savedBackend = process.env['AGENT24_BACKEND']
+
+  afterEach(() => {
+    if (savedBackend === undefined) delete process.env['AGENT24_BACKEND']
+    else process.env['AGENT24_BACKEND'] = savedBackend
+    vi.restoreAllMocks()
+  })
+
+  function childAnnouncing(ready: Record<string, unknown>): ChildProcess {
+    const stdout = new PassThrough()
+    const ee = new EventEmitter() as unknown as ChildProcess
+    Object.assign(ee, { pid: 8, stdout, stderr: null, kill: vi.fn().mockReturnValue(true) })
+    setImmediate(() => stdout.write(JSON.stringify({ type: 'ready', ...ready }) + '\n'))
+    return ee
+  }
+
+  it('the rust daemon runs in capability mode except on Windows; the node mock stays legacy', () => {
+    expect(selectedAuthMode('rust', 'darwin')).toBe('capabilities')
+    expect(selectedAuthMode('rust', 'linux')).toBe('capabilities')
+    expect(selectedAuthMode('rust', 'win32')).toBe('legacy')
+    expect(selectedAuthMode('node', 'darwin')).toBe('legacy')
+  })
+
+  it('spawns in capability mode and takes the host token from the private ready line', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const spawnProcess = vi.fn(() =>
+      childAnnouncing({ port: 4300, auth_mode: 'capabilities', product_host_token: 'host', generation: 'g' }),
+    )
+    const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
+    expect(spawnProcess).toHaveBeenCalledWith('rust', 'capabilities')
+    expect(getBackendEndpoint()).toEqual({ port: 4300 })
+    expect(daemonConnection()).toEqual({ port: 4300, authHeaders: { Authorization: 'Bearer host' } })
+    manager.stop()
+  })
+
+  it('a daemon that answers in the other mode gets no connection', async () => {
+    delete process.env['AGENT24_BACKEND']
+    const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
+    const asksCapabilities = new BackendManager({
+      external,
+      authMode: 'capabilities',
+      spawnProcess: () => childAnnouncing({ port: 4301, token: 'legacy-token' }),
+    })
+    await asksCapabilities.start()
+    await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
+    expect(daemonConnection()).toBeNull()
+    asksCapabilities.stop()
+
+    const asksLegacy = new BackendManager({
+      external,
+      authMode: 'legacy',
+      spawnProcess: () => childAnnouncing({ port: 4302, auth_mode: 'capabilities', product_host_token: 'host', token: 'x' }),
+    })
+    await asksLegacy.start()
+    await vi.waitFor(() => expect(getBackendEndpoint()).not.toBeNull())
+    expect(daemonConnection()).toBeNull()
+    asksLegacy.stop()
+  })
+
+  it('never reuses an external daemon in capability mode; spawns its own instead', async () => {
+    const checkHealth = vi.fn().mockResolvedValue(true)
+    const spawnProcess = vi.fn(() =>
+      childAnnouncing({ port: 4303, auth_mode: 'capabilities', product_host_token: 'mine' }),
+    )
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5557, token: '', pid: 4244, authMode: 'capabilities' }),
+      checkHealth,
+    }
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    expect(checkHealth).not.toHaveBeenCalled()
+    expect(manager.isExternalDaemon()).toBe(false)
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(daemonConnection()?.port).toBe(4303))
+    manager.stop()
+  })
+
+  it('a ready line is never echoed to the log, even when malformed', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const external: ExternalDaemonSource = { read: () => null, checkHealth: vi.fn().mockResolvedValue(true) }
+    const manager = new BackendManager({
+      external,
+      authMode: 'capabilities',
+      spawnProcess: () => childAnnouncing({ port: 'not-a-number', product_host_token: 'leaky' }),
+    })
+    await manager.start()
+    await new Promise((r) => setTimeout(r, 50))
+    expect(getBackendEndpoint()).toBeNull()
+    expect(log.mock.calls.flat().join(' ')).not.toContain('leaky')
     manager.stop()
   })
 })

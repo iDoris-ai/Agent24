@@ -214,7 +214,15 @@ process.on('unhandledRejection', (reason) => {
   console.error('[main] unhandledRejection', reason)
 })
 
+// One desktop per user. Its daemon runs in capability mode, so a second copy
+// could neither share that daemon nor start its own while the first holds the
+// daemon's singleton lock; a second launch brings the first window forward.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
+app.on('second-instance', () => showOrCreateWindow())
+
 app.whenReady().then(async () => {
+  if (!isPrimaryInstance) return
   const idorisStatus = await idorisStatusProviderPromise
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
