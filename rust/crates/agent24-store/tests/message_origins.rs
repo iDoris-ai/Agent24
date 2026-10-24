@@ -2,8 +2,8 @@
 
 use agent24_store::test_hooks;
 use agent24_store::{
-    MessageOrigin, MessageOriginLookup, OriginatedRunMessage, PendingRunMessage, Store,
-    message_instance_digest,
+    MessageOrigin, MessageOriginLookup, OriginatedRunMessage, PendingRunMessage,
+    SnapshotRunMessage, Store, message_instance_digest,
 };
 use serde_json::{Value, json};
 
@@ -316,6 +316,68 @@ async fn tampered_instance_digest_is_unreadable_and_not_no_recall() {
             .as_deref(),
         Some("a")
     );
+}
+
+fn notice(text: &str) -> SnapshotRunMessage {
+    SnapshotRunMessage::PauseNotice(PendingRunMessage {
+        role: "system".to_owned(),
+        content: Some(text.to_owned()),
+        tool_calls: json!([]),
+        tool_call_id: None,
+    })
+}
+
+#[tokio::test]
+async fn snapshot_origin_failure_leaves_the_message_count_unchanged() {
+    let store = store_with_run("run_snap_fail").await;
+    let before = messages(&store, "run_snap_fail").await;
+    trigger(
+        &store,
+        "CREATE TRIGGER reject_snapshot_origin BEFORE INSERT ON run_message_origins \
+         BEGIN SELECT RAISE(FAIL, 'origin rejected'); END",
+    )
+    .await;
+    let batch = [
+        notice("notice"),
+        SnapshotRunMessage::Originated(row("user", Some("prompt"), MessageOrigin::UserPrompt)),
+    ];
+    assert!(
+        store
+            .append_snapshot_run_messages("run_snap_fail", &batch, NOW)
+            .await
+            .is_err()
+    );
+    assert_eq!(messages(&store, "run_snap_fail").await, before);
+    assert_eq!(tags(&store, "run_snap_fail").await, 0);
+    assert!(matches!(
+        store
+            .read_run_message_origin("run_snap_fail", 0)
+            .await
+            .unwrap(),
+        MessageOriginLookup::Missing
+    ));
+}
+
+#[tokio::test]
+async fn snapshot_empty_recall_ref_rolls_back_the_pause_notice() {
+    let store = store_with_run("run_empty_ref").await;
+    let batch = [
+        notice("notice"),
+        SnapshotRunMessage::Originated(row(
+            "user",
+            Some("block"),
+            MessageOrigin::HostRecall {
+                recall_ref: Some(String::new()),
+            },
+        )),
+    ];
+    assert!(
+        store
+            .append_snapshot_run_messages("run_empty_ref", &batch, NOW)
+            .await
+            .is_err()
+    );
+    assert_eq!(messages(&store, "run_empty_ref").await, 0);
 }
 
 async fn present(store: &Store, run_id: &str, seq: i64) -> agent24_store::StoredMessageOrigin {

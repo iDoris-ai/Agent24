@@ -37,8 +37,9 @@ use agent24_protocol::{
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{
-    RunAdmission, RunAdmissionDenial, RunMessage, RunPatch, RunTerminalTransition, Store,
-    StoreError, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
+    MessageOrigin, OriginatedRunMessage, RunAdmission, RunAdmissionDenial, RunMessage, RunPatch,
+    RunTerminalTransition, SnapshotRunMessage, Store, StoreError, WorkspaceInstant,
+    WorkspaceLeaseId, WorkspaceStoreError,
 };
 use agent24_tools::{
     GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
@@ -1485,14 +1486,32 @@ impl RunManager {
         // `thread_to_messages(&thread)` to rebuild from — a partially
         // persisted snapshot would silently resume with less context than the
         // first call saw. M3: the write itself is now ONE transaction
-        // (`append_run_messages_tx`), not N independent single-row appends —
+        // (`append_snapshot_run_messages`), not N independent single-row appends —
         // a mid-batch failure must leave NOTHING behind, not an unpredictable
         // prefix, which is what fail-closed actually requires.
+        let pending_of = |msg: &Msg| agent24_store::PendingRunMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls: serde_json::to_value(&msg.tool_calls)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            tool_call_id: msg.tool_call_id.clone(),
+        };
+        let originated = |msg: &Msg, origin: MessageOrigin| {
+            SnapshotRunMessage::Originated(OriginatedRunMessage {
+                message: pending_of(msg),
+                origin,
+            })
+        };
         let prior_context_len = prior_context.len();
         let mut snapshot = Vec::with_capacity(prior_context_len + 3);
+        let mut rows = Vec::with_capacity(prior_context_len + 3);
         let mut recalled_ids = None;
         if let Some((recalled, ids)) = recall {
             recalled_ids = Some(ids);
+            rows.push(originated(
+                &recalled,
+                MessageOrigin::HostRecall { recall_ref: None },
+            ));
             snapshot.push(recalled);
         }
         if write_skipped {
@@ -1501,7 +1520,9 @@ impl RunManager {
             // resume (M2) must replay exactly what THIS run's first call
             // saw, not re-decide anything against whatever the pause switch
             // says by the time it resumes.
-            snapshot.push(Msg::system(retain::PAUSED_WRITE_NOTICE));
+            let notice = Msg::system(retain::PAUSED_WRITE_NOTICE);
+            rows.push(SnapshotRunMessage::PauseNotice(pending_of(&notice)));
+            snapshot.push(notice);
         }
         // M3 growth control: the seq range `prior_context` will occupy in
         // THIS run's own `run_messages`, so it can be reclaimed once the run
@@ -1512,28 +1533,23 @@ impl RunManager {
             let start = snapshot.len() as i64;
             (start, start + prior_context_len as i64 - 1)
         });
-        snapshot.extend(prior_context);
-        snapshot.push(Msg::user(run.input.prompt.clone()));
+        for msg in prior_context {
+            rows.push(originated(&msg, MessageOrigin::SessionHistory));
+            snapshot.push(msg);
+        }
+        let prompt = Msg::user(run.input.prompt.clone());
+        rows.push(originated(&prompt, MessageOrigin::UserPrompt));
+        snapshot.push(prompt);
         // K1-6b.1 (ADR-K1-02 §6): the seq this run's own user-input message
         // will be assigned by the batch append below. Valid because THIS
-        // call is always the run's first `append_run_messages_tx` (a fresh
+        // call is always the run's first `append_snapshot_run_messages` (a fresh
         // run's `MAX(seq)` starts at -1), so each row's assigned seq equals
-        // its index in `snapshot`/`pending` — the user message is pushed
+        // its index in `snapshot`/`rows` — the user message is pushed
         // last, so its seq is `snapshot.len() - 1`.
         let user_msg_seq = (snapshot.len() - 1) as i64;
-        let pending: Vec<agent24_store::PendingRunMessage> = snapshot
-            .iter()
-            .map(|msg| agent24_store::PendingRunMessage {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-                tool_calls: serde_json::to_value(&msg.tool_calls)
-                    .unwrap_or_else(|_| serde_json::json!([])),
-                tool_call_id: msg.tool_call_id.clone(),
-            })
-            .collect();
         if let Err(err) = self
             .store
-            .append_run_messages_tx(&run_id, &pending, &now_iso8601())
+            .append_snapshot_run_messages(&run_id, &rows, &now_iso8601())
             .await
         {
             self.finish_failed(
@@ -2399,6 +2415,9 @@ pub(crate) mod tests {
     }
     mod session_failure_tests {
         include!("session_failure_tests.rs");
+    }
+    mod snapshot_origin_tests {
+        include!("snapshot_origin_tests.rs");
     }
 
     use super::*;
