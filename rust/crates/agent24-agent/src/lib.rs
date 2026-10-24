@@ -4240,6 +4240,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn prior_session_context_without_a_recorded_floor_is_unknown() {
+        use agent24_store::SourceClassification::Unknown;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_lost").await;
+        run_in_session(&manager, &store, "sess_lost", "记住 alpha is first").await;
+        // The earlier turn is in the session, but its floor is not.
+        sqlx::raw_sql("DELETE FROM session_source_floor")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let run = run_in_session(&manager, &store, "sess_lost", "记住 beta is second").await;
+        assert_eq!(stored_classification(&kv, "beta is second").await, Unknown);
+        assert!(!process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
     async fn a_session_floor_that_cannot_be_written_stops_the_run_before_the_model() {
         let provider = Arc::new(RecordingProvider {
             seen: StdMutex::new(vec![]),
