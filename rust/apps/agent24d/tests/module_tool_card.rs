@@ -228,6 +228,15 @@ fn a_decision_on_the_running_card_is_written() {
         })
         .to_string()
     };
+    // A field the request does not define is refused, not ignored.
+    let mut extra: serde_json::Value =
+        serde_json::from_str(&decision(&card["fingerprint"])).unwrap();
+    extra["scope"] = "everything".into();
+    let (status, body) = send(&d, "POST", DECIDE, &extra.to_string());
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (422, &"invalid_request".into())
+    );
     let (status, body) = send(&d, "POST", DECIDE, &decision(&"sha256:other".into()));
     assert_eq!(
         (status, &body["error"]["code"]),
