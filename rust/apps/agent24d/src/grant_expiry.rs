@@ -10,7 +10,7 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use crate::consent_routes::RevocationNotice;
-use crate::module_tool_runtime::RevocationStop;
+use crate::module_tool_runtime::{GrantEnd, RevocationStop};
 
 /// The longest the task sleeps: an expiry a clock jump moved is told this
 /// late at most.
@@ -46,11 +46,13 @@ async fn tell_due(store: &agent24_store::Store, notice: &RevocationNotice) -> Du
         }
     };
     let told = futures::future::join_all(due.into_iter().map(|grant| async move {
-        let stop = notice(
-            grant.module.clone(),
-            grant.op.clone(),
-            grant.expires_at.clone(),
-        )
+        let stop = notice(GrantEnd {
+            module: grant.module.clone(),
+            operation: grant.op.clone(),
+            ended_at: grant.expires_at.clone(),
+            reason: "expired",
+            authorization_refs: Some(vec![grant.authorization_ref()]),
+        })
         .await;
         record(store, &grant, stop).await
     }))
@@ -133,21 +135,22 @@ mod tests {
     }
 
     /// K1-6a-G §2.5 (A5b): a grant is told to its module once it expires,
-    /// with its tool and its expiry instant, and only once; an answer the
-    /// module did not confirm is recorded and audited as an expiry.
+    /// with its tool, its expiry instant and its reference (§2.5.1), and
+    /// only once; an answer the module did not confirm is recorded and
+    /// audited as an expiry.
     #[tokio::test]
     async fn an_expiring_grant_is_told_once() {
         let store = agent24_store::Store::open_memory().await.unwrap();
         let expires = (Utc::now() + chrono::Duration::milliseconds(300)).to_rfc3339();
-        store
+        let granted = store
             .grant_module_consent(&summary("t"), &Utc::now().to_rfc3339(), &expires)
             .await
             .unwrap();
-        let told = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+        let told = Arc::new(Mutex::new(Vec::<GrantEnd>::new()));
         let notice: RevocationNotice = {
             let told = Arc::clone(&told);
-            Arc::new(move |module: String, op: String, at: String| {
-                told.lock().unwrap().push((module, op, at));
+            Arc::new(move |end| {
+                told.lock().unwrap().push(end);
                 Box::pin(async { RevocationStop::Unconfirmed })
                     as futures::future::BoxFuture<'static, _>
             })
@@ -174,10 +177,18 @@ mod tests {
         {
             let told = told.lock().unwrap();
             assert_eq!(told.len(), 1, "told once, a refusal never");
-            assert_eq!((told[0].0.as_str(), told[0].1.as_str()), ("m", "t"));
             assert_eq!(
-                agent24_store::consent_instant_millis(&told[0].2),
+                (told[0].module.as_str(), told[0].operation.as_str()),
+                ("m", "t")
+            );
+            assert_eq!(
+                agent24_store::consent_instant_millis(&told[0].ended_at),
                 agent24_store::consent_instant_millis(&expires)
+            );
+            assert_eq!(told[0].reason, "expired");
+            assert_eq!(
+                told[0].authorization_refs,
+                Some(vec![granted.authorization_ref()])
             );
         }
         let audited = store.list_audit().await.unwrap();
