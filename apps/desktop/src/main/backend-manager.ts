@@ -73,11 +73,13 @@ export function selectedBackend(): BackendKind {
 }
 
 /** Daemon lifecycle status surfaced to the tray (F1b). */
-export type BackendStatus = 'running' | 'starting' | 'stopped'
+export type BackendStatus = 'running' | 'starting' | 'stopped' | 'blocked'
 
 /** Pure derivation of the tray status from the manager's observable state.
  * Exported so the state machine is unit-testable without spawning a process:
  * - a user-initiated stop pins `stopped` (the health loop won't auto-respawn);
+ * - a capability-mode daemon of another host serving this data dir is
+ *   `blocked`: there is nothing to connect to and nothing this app may start;
  * - a healthy endpoint is `running`;
  * - anything else (spawned but not yet ready, or briefly between respawns) is
  *   `starting`. */
@@ -85,8 +87,10 @@ export function deriveStatus(s: {
   userStopped: boolean
   hasEndpoint: boolean
   healthy: boolean
+  foreignHost?: boolean
 }): BackendStatus {
   if (s.userStopped) return 'stopped'
+  if (s.foreignHost) return 'blocked'
   if (s.hasEndpoint && s.healthy) return 'running'
   return 'starting'
 }
@@ -245,7 +249,8 @@ function readyToken(ready: ReadyLine, authMode: DaemonAuthMode): string {
       ? ready.product_host_token
       : ''
   }
-  return ready.auth_mode !== 'capabilities' && typeof ready.token === 'string' ? ready.token : ''
+  const legacy = ready.auth_mode === undefined || ready.auth_mode === 'legacy_single_token'
+  return legacy && typeof ready.token === 'string' ? ready.token : ''
 }
 
 const defaultExternalDaemonSource: ExternalDaemonSource = {
@@ -271,6 +276,9 @@ export class BackendManager {
   // lifecycle action that would otherwise kill a process we don't own.
   private isExternal = false
   private externalPid: number | null = null
+  // Set while a healthy capability-mode daemon of another host serves this
+  // data dir (see tryReuseExternal); nothing is spawned until it is gone.
+  private foreignPid: number | null = null
   // Reentrancy guard for tick(): setInterval doesn't wait for a previous
   // callback to resolve before scheduling the next one, and the failure-
   // threshold branch below now awaits a second health probe (tryReuseExternal)
@@ -287,24 +295,31 @@ export class BackendManager {
   }
 
   async start(): Promise<void> {
-    const reused = await this.tryReuseExternal()
-    if (!reused) this.spawnChild()
+    if ((await this.tryReuseExternal()) === 'none') this.spawnChild()
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
   }
 
   /** DEP-A5 step 1: before spawning anything, check whether a daemon started
    * outside this app (typically `agent24 daemon start`) is already up and
-   * healthy — if so, point at it instead of racing it for the singleton lock. */
-  private async tryReuseExternal(): Promise<boolean> {
+   * healthy — if so, point at it instead of racing it for the singleton lock.
+   * A healthy capability-mode daemon belongs to another host: its authority
+   * never reaches this file, and spawning our own would only lose the lock,
+   * so that is `foreign` and nothing is spawned. */
+  private async tryReuseExternal(): Promise<'reused' | 'foreign' | 'none'> {
     const state = this.external.read()
-    if (!state) return false
-    if (state.authMode !== 'legacy') {
-      // Its host authority went to whoever started it, never to this file.
-      console.warn(`[backend:${this.kind}] daemon pid ${state.pid} runs in capability mode for another host — not reusing it`)
-      return false
+    const healthy = state !== null && (await this.external.checkHealth({ port: state.port }))
+    if (!state || !healthy) {
+      this.foreignPid = null
+      return 'none'
     }
-    const healthy = await this.external.checkHealth({ port: state.port })
-    if (!healthy) return false
+    if (state.authMode !== 'legacy') {
+      if (this.foreignPid !== state.pid) {
+        console.warn(`[backend:${this.kind}] daemon pid ${state.pid} serves this data dir in capability mode for another host — waiting for it to exit`)
+      }
+      this.foreignPid = state.pid
+      return 'foreign'
+    }
+    this.foreignPid = null
     this.isExternal = true
     this.externalPid = state.pid
     current = { port: state.port, auth: { kind: 'bearer', token: state.token } }
@@ -312,7 +327,12 @@ export class BackendManager {
     console.log(
       `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
     )
-    return true
+    return 'reused'
+  }
+
+  /** pid of another host's capability-mode daemon while it blocks this app. */
+  foreignDaemonPid(): number | null {
+    return this.foreignPid
   }
 
   /** True while the current endpoint is a daemon this manager discovered
@@ -332,6 +352,7 @@ export class BackendManager {
       userStopped: this.userStopped,
       hasEndpoint: current !== null,
       healthy: this.lastHealthy,
+      foreignHost: this.foreignPid !== null,
     })
   }
 
@@ -393,6 +414,7 @@ export class BackendManager {
     // always produces a desktop-owned child — never external past this point.
     this.isExternal = false
     this.externalPid = null
+    this.foreignPid = null
 
     this.child = this.spawnProcess(this.kind, this.authMode)
     this.wireChild(this.child)
@@ -467,6 +489,14 @@ export class BackendManager {
         return
       }
 
+      // Another host's daemon holds this data dir: wait for it to go away
+      // instead of starting one that cannot take the singleton lock.
+      if (this.foreignPid !== null) {
+        this.lastHealthy = false
+        if ((await this.tryReuseExternal()) === 'none') this.spawnChild()
+        return
+      }
+
       const alive = await this.external.checkHealth(getBackendEndpoint())
       this.lastHealthy = alive
       if (alive) {
@@ -509,8 +539,7 @@ export class BackendManager {
         // re-spawned forever every MAX_HEALTH_FAILURES ticks, even once the
         // real (CLI-owned) daemon is up and healthy. Only fall back to
         // spawning our own when the external daemon is still not reachable.
-        const reused = await this.tryReuseExternal()
-        if (!reused) {
+        if ((await this.tryReuseExternal()) === 'none') {
           this.spawnChild()
         }
       }
