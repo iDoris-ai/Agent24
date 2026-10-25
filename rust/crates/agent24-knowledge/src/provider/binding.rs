@@ -22,6 +22,8 @@ pub enum Leave {
     Logout,
     /// The profile removed: disabled first, then `retired`.
     Remove,
+    /// The identity changed (S3.5): `retired`.
+    Retire,
 }
 
 /// How the same binding is activated again (S3.3).
@@ -99,7 +101,7 @@ impl BindingState {
         self.credentials.discard();
         match event {
             Leave::Unselect | Leave::Logout => self.activated = false,
-            Leave::Remove => self.retired = true,
+            Leave::Remove | Leave::Retire => self.retired = true,
             Leave::Off | Leave::Disable => {}
         }
         Effects {
