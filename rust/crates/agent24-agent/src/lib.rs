@@ -1736,7 +1736,9 @@ impl RunManager {
             let request = CompletionRequest {
                 messages: self.request_messages_for(&messages, &run_id).await,
                 model: run.input.model_override.clone(),
-                tools: self.tool_specs_for(plan_mode).await,
+                tools: self
+                    .tool_specs_for(plan_mode, run.input.knowledge_binding_id.is_some())
+                    .await,
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
@@ -2141,12 +2143,13 @@ impl RunManager {
     }
 
     /// The tool specs advertised this turn: the full advert set normally, or the
-    /// read-only subset plus `propose_plan` in plan mode (H8).
-    async fn tool_specs_for(&self, plan_mode: bool) -> Vec<ToolSpec> {
+    /// read-only subset plus `propose_plan` in plan mode (H8). A run that names
+    /// no Knowledge binding is offered no tool that needs one (`knowledge_bound`).
+    async fn tool_specs_for(&self, plan_mode: bool, knowledge_bound: bool) -> Vec<ToolSpec> {
         let adverts = if plan_mode {
-            self.tools.live_plan_adverts().await
+            self.tools.live_plan_adverts(knowledge_bound).await
         } else {
-            self.tools.live_adverts().await
+            self.tools.live_adverts(knowledge_bound).await
         };
         let mut specs: Vec<ToolSpec> = adverts
             .into_iter()
@@ -4061,6 +4064,100 @@ pub(crate) mod tests {
         assert!(matches!(err, AgentError::SessionNotFound(_)));
     }
 
+    /// Records the tool names offered on each model call.
+    struct ToolNamesProvider {
+        offered: StdMutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolNamesProvider {
+        fn name(&self) -> &str {
+            "tool-names"
+        }
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            let names = req.tools.iter().map(|t| t.name.clone()).collect();
+            self.offered.lock().unwrap().push(names);
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: usage_one(),
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    struct KnowledgeOnlyTool;
+
+    #[async_trait]
+    impl agent24_tools::Tool for KnowledgeOnlyTool {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new(
+                "kb_read",
+                "builtin",
+                "reads Knowledge",
+                agent24_protocol::RiskClass::Read,
+            )
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn needs_knowledge_binding(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _ctx: &agent24_tools::ToolContext,
+            _input: &serde_json::Map<String, serde_json::Value>,
+            _cancel: &CancellationToken,
+        ) -> Result<String, agent24_tools::ToolError> {
+            Ok("ok".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_run_that_names_a_knowledge_binding_is_offered_a_tool_that_needs_one() {
+        let provider = Arc::new(ToolNamesProvider {
+            offered: StdMutex::new(vec![]),
+        });
+        let tools = ToolRegistry::new().with(Arc::new(KnowledgeOnlyTool));
+        let (manager, _sink, store) = manager_with_tools(provider.clone(), tools).await;
+        let unbound = manager.start_run(create()).await.unwrap();
+        wait_terminal(&store, &unbound.id).await;
+        let bound = manager
+            .start_run(RunCreate {
+                knowledge_binding_id: Some("b1".to_owned()),
+                ..create()
+            })
+            .await
+            .unwrap();
+        wait_terminal(&store, &bound.id).await;
+        let offered = provider.offered.lock().unwrap().clone();
+        assert_eq!(
+            offered,
+            vec![Vec::<String>::new(), vec!["kb_read".to_owned()]]
+        );
+        // The same holds in plan mode, next to `propose_plan`.
+        let names =
+            |specs: Vec<ToolSpec>| -> Vec<String> { specs.into_iter().map(|s| s.name).collect() };
+        assert_eq!(
+            names(manager.tool_specs_for(true, false).await),
+            vec!["propose_plan"]
+        );
+        assert_eq!(
+            names(manager.tool_specs_for(true, true).await),
+            vec!["kb_read", "propose_plan"]
+        );
+    }
+
     /// Notes, on its first call, what `before_execute` had recorded by then.
     struct FirstStepProvider {
         noted: Arc<StdMutex<Option<String>>>,
@@ -4628,7 +4725,7 @@ mod approval_tests {
         let h = scripted_plan_harness(dir.path().to_path_buf(), vec![]).await;
         let plan: Vec<String> = h
             .manager
-            .tool_specs_for(true)
+            .tool_specs_for(true, false)
             .await
             .into_iter()
             .map(|s| s.name)
@@ -4645,7 +4742,7 @@ mod approval_tests {
         );
         let full: Vec<String> = h
             .manager
-            .tool_specs_for(false)
+            .tool_specs_for(false, false)
             .await
             .into_iter()
             .map(|s| s.name)
