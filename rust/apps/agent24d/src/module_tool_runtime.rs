@@ -416,10 +416,11 @@ mod tests {
 
     use super::*;
 
-    /// #1202 G6: a module on the `resource_kinds` protocol only, holding a
-    /// grant from a daemon that let it take one, gets no authorization: its
-    /// tool is neither advertised nor dispatched. One on the grants
-    /// protocol gets one.
+    /// #1202 G6: a module not on the grants protocol gets no authorization
+    /// at all, so no grant it holds (an older daemon's) is ever read: its
+    /// tool is neither advertised nor dispatched. One on it gets one.
+    /// `serve` builds every tool's through this
+    /// (`serve_authorizes_module_tools_by_protocol`).
     #[tokio::test]
     async fn only_a_module_on_the_grants_protocol_is_authorized() {
         let store = Store::open_memory().await.unwrap();
@@ -433,10 +434,6 @@ mod tests {
             None,
             HostRiskLevel::Low,
         );
-        store
-            .grant_module_consent(&summary, "2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z")
-            .await
-            .unwrap();
         let source = |takes_grants| crate::consent_routes::ToolCardSource {
             summary: summary.clone(),
             resource_kinds: Vec::new(),

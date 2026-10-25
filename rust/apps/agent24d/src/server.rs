@@ -3060,6 +3060,28 @@ pub(crate) mod tests {
     /// `// crate::usage_recorder::stop_usage_writer(...)` plus
     /// `drop(usage_recorder); drop(usage_writer);` turns this red; reverting
     /// turns it green again.
+    /// #1202 G6 (Codex A5c-2a round 2): `serve` builds each module tool's
+    /// authorization through `tool_authorization`, which refuses a module
+    /// not on the grants protocol, never `store_authorization` directly,
+    /// which would let a grant from an older daemon hold. Scanned with
+    /// `//`-comments stripped, as the test below.
+    #[test]
+    fn serve_authorizes_module_tools_by_protocol() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let code: String = body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("crate::module_tool_runtime::tool_authorization("));
+        assert!(!code.contains("store_authorization("));
+    }
+
     #[test]
     fn stop_usage_writer_is_called_after_the_supervisors_have_stopped() {
         let src = include_str!("server.rs");
