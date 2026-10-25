@@ -241,7 +241,12 @@ async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
     let pending = |now: &'static str| {
         let store = store.clone();
         async move {
-            let pending = store.pending_grant_end_notices(now).await.unwrap();
+            let (pending, next) = store.pending_grant_end_notices(now).await.unwrap();
+            let due = crate::consent_instant_millis("2026-10-25T00:10:30Z");
+            assert_eq!(
+                next,
+                due.filter(|due| Some(*due) > crate::consent_instant_millis(now))
+            );
             pending.iter().map(|n| n.generation).collect::<Vec<_>>()
         }
     };
@@ -493,6 +498,7 @@ async fn a_revocation_settles_only_the_ends_it_covers() {
                 .pending_grant_end_notices("2026-10-26T00:00:00Z")
                 .await
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|end| end.generation)
                 .collect::<Vec<_>>()
@@ -558,4 +564,25 @@ async fn a_revocation_settles_only_the_ends_it_covers() {
     assert!(pending().await.is_empty());
     assert!(carried(&store, revoke(None).await).await.is_empty());
     assert_eq!(settled(&store, other).await, None, "another module's");
+}
+
+/// The instant given is when the earliest revocation held back is due,
+/// whichever was written first.
+#[tokio::test]
+async fn the_next_instant_is_the_earliest_revocation_s() {
+    let store = Store::open_memory().await.unwrap();
+    store
+        .revoke_module_consent_tracked("m", Some("t"), "2026-10-25T00:10:00Z")
+        .await
+        .unwrap();
+    store
+        .revoke_module_consent_tracked("m", Some("u"), "2026-10-25T00:10:05Z")
+        .await
+        .unwrap();
+    let (pending, next) = store
+        .pending_grant_end_notices("2026-10-25T00:10:06Z")
+        .await
+        .unwrap();
+    assert!(pending.is_empty());
+    assert_eq!(next, crate::consent_instant_millis("2026-10-25T00:10:30Z"));
 }

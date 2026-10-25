@@ -302,6 +302,17 @@ pub struct ModuleToolCards {
     pub notice: RevocationNotice,
 }
 
+impl ModuleToolCards {
+    /// Whether `module` is on the grants protocol (§2.6): a tool of it
+    /// takes grants. One with no tool here is not.
+    #[must_use]
+    pub fn on_grants_protocol(&self, module: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|((of, _), source)| of == module && source.takes_grants)
+    }
+}
+
 #[derive(Serialize)]
 struct CardView {
     module: String,

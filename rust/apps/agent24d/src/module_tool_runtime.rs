@@ -8,7 +8,8 @@ use agent24_domain::tool::{
 };
 use agent24_os_proto::drain::{DrainState, Generation};
 use agent24_os_proto::kernel_call::{
-    KernelLimits, KernelRequest, KernelRequestIds, send_kernel_request, send_module_tool_request,
+    KernelLimits, KernelRequest, KernelRequestIds, send_kernel_request_until,
+    send_module_tool_request,
 };
 use agent24_tools::{ModuleToolAuthorization, ModuleToolContext, ModuleToolRuntime};
 use async_trait::async_trait;
@@ -151,7 +152,26 @@ impl AgentModuleToolRuntime {
             total: within,
             max_response_bytes: MAX_TOOL_RESPONSE_BYTES,
         };
-        match send_kernel_request(&generation, &self.request_ids, request, limits, None).await {
+        // A notice in flight holds a drain that begins meanwhile — a disable
+        // writes its ends before handing the stop over — so a run that stops
+        // running is not waited on: the stop ends it, unconfirmed here like
+        // a notice that found it draining, unless its 2xx was already read.
+        let cancel = CancellationToken::new();
+        let sending =
+            send_kernel_request_until(&generation, &self.request_ids, request, limits, &cancel);
+        tokio::pin!(sending);
+        let sent = loop {
+            tokio::select! {
+                biased;
+                sent = &mut sending => break sent,
+                () = tokio::time::sleep(Duration::from_millis(10)), if !cancel.is_cancelled() => {
+                    if generation.state() != DrainState::Running {
+                        cancel.cancel();
+                    }
+                }
+            }
+        };
+        match sent {
             Ok(response) if response.status.is_success() => RevocationStop::Confirmed,
             _ => RevocationStop::Unconfirmed,
         }
@@ -1084,6 +1104,7 @@ mod tests {
     /// is unconfirmed; only a module with no run has nothing running.
     #[tokio::test]
     async fn a_revocation_is_told_to_the_running_module() {
+        use axum::response::IntoResponse;
         let sock = std::path::PathBuf::from(format!(
             "/tmp/a24-revoke-{}-{}.sock",
             std::process::id(),
@@ -1095,17 +1116,28 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let told = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let answer = Arc::new(std::sync::Mutex::new(axum::http::StatusCode::OK));
+        let body_released = Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new().route(
             "/api/v1/fake_module/_a24/authorization/revoked",
             axum::routing::post({
                 let (told, answer) = (Arc::clone(&told), Arc::clone(&answer));
+                let body_released = Arc::clone(&body_released);
                 move |axum::Json(body): axum::Json<Value>| async move {
                     told.lock().unwrap().push(body);
                     let status = *answer.lock().unwrap();
                     if status == axum::http::StatusCode::ACCEPTED {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
-                    status
+                    if status == axum::http::StatusCode::CREATED {
+                        // The head goes out at once, the body only once the
+                        // test lets it.
+                        let body = futures::stream::once(async move {
+                            body_released.notified().await;
+                            Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
+                        });
+                        return (status, axum::body::Body::from_stream(body)).into_response();
+                    }
+                    status.into_response()
                 }
             }),
         );
@@ -1168,6 +1200,21 @@ mod tests {
                 "reason": "epoch",
             })
         );
+        // None ended (#1202 G2, #1227 Low): an empty list, not a missing
+        // one, so the module stops nothing rather than by operation.
+        assert_eq!(
+            runtime.notify_revoked(&end(Some(Vec::new())), within).await,
+            RevocationStop::Confirmed
+        );
+        assert_eq!(
+            told.lock().unwrap()[2],
+            serde_json::json!({
+                "operation": "*",
+                "revoked_at": "2026-10-24T00:00:00Z",
+                "reason": "epoch",
+                "authorization_refs": [],
+            })
+        );
         *answer.lock().unwrap() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
         assert_eq!(notify(within).await, RevocationStop::Unconfirmed);
         // Answered only after the bound: unconfirmed, and no later.
@@ -1178,6 +1225,46 @@ mod tests {
             RevocationStop::Unconfirmed
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        // A drain that begins while it waits is not held (#1231 CI): the
+        // notice lets go of the run at once, unconfirmed.
+        let waiting = tokio::spawn({
+            let (runtime, end) = (Arc::clone(&runtime), told_refs.clone());
+            async move { runtime.notify_revoked(&end, Duration::from_secs(30)).await }
+        });
+        while generation.in_flight() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let draining = std::time::Instant::now();
+        assert!(generation.begin_drain(draining, Duration::from_secs(30)));
+        assert_eq!(waiting.await.unwrap(), RevocationStop::Unconfirmed);
+        assert!(draining.elapsed() < Duration::from_secs(2));
+        assert_eq!(generation.in_flight(), 0);
+        // Unless the module's 2xx head was read already: that stands (v2, L2).
+        let generation = agent24_os_proto::drain::Generation::serving_package(sock.clone(), None);
+        runtime.test_slots.lock().unwrap().insert(
+            "fake_module".to_owned(),
+            agent24_os_proto::drain::Current::new(Arc::clone(&generation)),
+        );
+        assert!(generation.ready());
+        *answer.lock().unwrap() = axum::http::StatusCode::CREATED;
+        let before = told.lock().unwrap().len();
+        let waiting = tokio::spawn({
+            let (runtime, end) = (Arc::clone(&runtime), told_refs.clone());
+            async move { runtime.notify_revoked(&end, Duration::from_secs(30)).await }
+        });
+        while told.lock().unwrap().len() == before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The head is on its way once the module has it; give it time to
+        // land. The body is held until after the answer, so only the head
+        // can have confirmed it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let draining = std::time::Instant::now();
+        assert!(generation.begin_drain(draining, Duration::from_secs(30)));
+        assert_eq!(waiting.await.unwrap(), RevocationStop::Confirmed);
+        assert!(draining.elapsed() < Duration::from_secs(2));
+        assert_eq!(generation.in_flight(), 0);
+        body_released.notify_one();
         let _ = std::fs::remove_file(&sock);
     }
 
