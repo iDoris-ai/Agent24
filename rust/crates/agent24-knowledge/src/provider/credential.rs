@@ -314,6 +314,8 @@ impl Credentials {
     ) -> Outcome {
         self.revoked_before = true;
         self.current = None;
+        // An issuance sent before does not bring a credential back.
+        self.issuing = None;
         let third = self.revocations.record(now);
         let Some(phase) = connection.phase() else {
             return Outcome::Done(Effects {
