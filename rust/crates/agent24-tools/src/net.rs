@@ -604,16 +604,24 @@ mod tests {
             .with_egress_policy(gate, resources, generation)
     }
 
-    /// Both host kinds a fetch can name: a domain (gated before DNS) and an
-    /// IP literal (gated before the request is sent).
+    /// Every host kind a fetch can name: an IPv4 or IPv6 literal (gated
+    /// before the request is sent) and a domain (gated before DNS).
     async fn assert_refused_before_any_request(ctx: &ToolContext) {
-        let (url, _, served) = counting_fixture("must not be served").await;
+        let (url, port, served) = counting_fixture("must not be served").await;
         let tool = HttpFetchTool::new(true);
-        let err = tool
-            .call(ctx, &input(&url), &CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        // A domain whose lookup could only fail: ungated, the fetch would
+        // fail at DNS instead of being denied.
+        for refused in [
+            url.clone(),
+            format!("http://[::1]:{port}/"),
+            "http://example.invalid/".to_owned(),
+        ] {
+            let err = tool
+                .call(ctx, &input(&refused), &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::Denied(_)), "{refused}: {err}");
+        }
         // The fixture accepts connections in order, so once an ordinary fetch
         // after the refused one has been answered, any connection the refused
         // fetch had opened would already be counted.
@@ -666,6 +674,59 @@ mod tests {
 
     /// A restricted run as production builds it: source resources, but no
     /// egress gate installed.
+    #[tokio::test]
+    async fn every_resource_of_the_run_is_checked_not_only_the_first() {
+        let ctx = scoped_ctx(
+            Arc::new(FixtureGrant),
+            vec![granted_resource(), local_only_but_otherwise_granted()],
+            7,
+        );
+        assert_refused_before_any_request(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_granted_run_whose_policy_then_became_unavailable_is_refused() {
+        let ctx = scoped_ctx(Arc::new(FixtureGrant), vec![granted_resource()], 7)
+            .with_egress_policy_unavailable();
+        assert_refused_before_any_request(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn an_incompletely_granted_resource_is_refused_even_by_a_permissive_gate() {
+        for (missing, resource) in [
+            (
+                "revision",
+                EgressResource {
+                    revision: None,
+                    ..granted_resource()
+                },
+            ),
+            (
+                "authorization ref",
+                EgressResource {
+                    authorization_ref: None,
+                    ..granted_resource()
+                },
+            ),
+            (
+                "policy version",
+                EgressResource {
+                    policy_version: 0,
+                    ..granted_resource()
+                },
+            ),
+        ] {
+            let ctx = scoped_ctx(Arc::new(FixtureGrant), vec![resource], 7);
+            let (url, _, served) = counting_fixture("must not be served").await;
+            let err = HttpFetchTool::new(true)
+                .call(&ctx, &input(&url), &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::Denied(_)), "{missing}: {err}");
+            assert_eq!(connections(&served), 0, "{missing}");
+        }
+    }
+
     #[tokio::test]
     async fn a_restricted_run_without_an_egress_gate_is_refused_before_any_request() {
         let ctx = ToolContext::legacy("run_test", None, None, "tc_test")

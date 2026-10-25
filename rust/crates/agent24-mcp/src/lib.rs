@@ -522,9 +522,11 @@ for line in sys.stdin:
  if ident is None: continue
  if method=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'egress-fixture','version':'1'}}
  elif method=='tools/list': result={'tools':[{'name':'echo','description':'records each call','inputSchema':{'type':'object','properties':{}}}]}
- elif method=='tools/call':
+ elif method=='tools/call' and req.get('params',{}).get('name')=='echo':
   open(log,'a').write('called\n')
   result={'content':[{'type':'text','text':'echoed'}],'isError':False}
+ elif method=='tools/call':
+  print(json.dumps({'jsonrpc':'2.0','id':ident,'error':{'code':-32602,'message':'unknown tool'}}),flush=True); continue
  else: result={}
  print(json.dumps({'jsonrpc':'2.0','id':ident,'result':result}),flush=True)
 "#;
