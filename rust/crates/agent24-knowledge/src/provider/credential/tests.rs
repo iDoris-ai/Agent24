@@ -569,7 +569,7 @@ fn a_response_sent_with_a_discarded_credential_moves_nothing() {
 }
 
 #[test]
-fn the_renewal_round_ends_once_the_binding_is_servable_again() {
+fn the_renewal_round_lasts_through_ready_for_the_invalid_class_only() {
     let now = Instant::now();
     // An expired credential's renewal refused there is a revocation signal.
     let (mut connection, mut credentials, credential) = ready(now);
@@ -581,16 +581,15 @@ fn the_renewal_round_ends_once_the_binding_is_servable_again() {
         .unwrap();
     let outcome = credentials.issued(&mut connection, renew, Issued::Refused, now);
     assert!(effects(outcome).invalidation.is_some());
-    // An invalid credential there is a first one again.
+    // The new credential of that round invalid again, even once `ready`:
+    // the renewal fails too.
     let (mut connection, mut credentials, credential) = ready(now);
     credentials.response(&mut connection, credential, Signal::Invalid, now);
     let renewed = granted(&mut connection, &mut credentials, now);
     probed(&mut connection, READY);
-    assert_eq!(
-        credentials.response(&mut connection, renewed, Signal::Invalid, now),
-        Outcome::Done(Effects::default())
-    );
-    assert_eq!(connection.phase(), Some(Loading));
+    let outcome = credentials.response(&mut connection, renewed, Signal::Invalid, now);
+    assert!(effects(outcome).placeholder);
+    assert_eq!(connection.phase(), Some(Unavailable(U::CredentialRejected)));
 }
 
 #[test]
