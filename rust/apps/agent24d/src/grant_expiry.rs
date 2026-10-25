@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::consent_routes::RevocationNotice;
@@ -34,7 +35,13 @@ pub async fn run(
 ) {
     let mut changes = store.subscribe_module_consent_changes();
     loop {
-        let sleep = tell_due(&store, &notice, &on_grants_protocol).await;
+        // A round that panics ends that round, not the task: every expiry
+        // and end after it would go untold (#1190 Low).
+        let round = std::panic::AssertUnwindSafe(tell_due(&store, &notice, &on_grants_protocol));
+        let sleep = round.catch_unwind().await.unwrap_or_else(|_| {
+            tracing::error!("a round of grant-end notices panicked; tried again later");
+            RETRY
+        });
         tokio::select! {
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(sleep) => {}
@@ -77,14 +84,14 @@ async fn tell_due(
     let (due, next) = expiries.unwrap_or_default();
     let (ends, next_end) = outbox.unwrap_or_default();
     let expired = due.into_iter().map(|grant| async move {
-        let stop = notice(GrantEnd {
+        let end = GrantEnd {
             module: grant.module.clone(),
             operation: grant.op.clone(),
             ended_at: grant.expires_at.clone(),
             reason: "expired",
             authorization_refs: Some(vec![grant.authorization_ref()]),
-        })
-        .await;
+        };
+        let stop = tell(notice, end).await;
         record(store, &grant, stop).await
     });
     let ended = ends.into_iter().map(|end| async move {
@@ -92,14 +99,14 @@ async fn tell_due(
         if by_reference_only && !on_grants_protocol(&end.module) {
             return record_end(store, &end, RevocationStop::Unconfirmed).await;
         }
-        let stop = notice(GrantEnd {
+        let told = GrantEnd {
             module: end.module.clone(),
             operation: end.op.clone(),
             ended_at: end.ended_at.clone(),
             reason: end.reason.word(),
             authorization_refs: Some(end.authorization_refs.clone()),
-        })
-        .await;
+        };
+        let stop = tell(notice, told).await;
         record_end(store, &end, stop).await
     });
     let (expired, ended) = futures::future::join(
@@ -123,6 +130,23 @@ async fn tell_due(
         return until_next.min(RETRY);
     }
     until_next
+}
+
+/// Tells `end` and gives the module's answer; a notice that panics is
+/// one that could not be confirmed, recorded and audited as such, and
+/// leaves the other modules' notices of the round (#1190 Low).
+async fn tell(notice: &RevocationNotice, end: GrantEnd) -> RevocationStop {
+    let module = end.module.clone();
+    std::panic::AssertUnwindSafe(async { notice(end).await })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            tracing::error!(
+                module,
+                "telling a grant's end panicked; recorded unconfirmed"
+            );
+            RevocationStop::Unconfirmed
+        })
 }
 
 /// Records the answer to `end`, as [`record`] does an expiry's; a
@@ -596,5 +620,101 @@ mod tests {
             .await
             .expect("the task outlived its cancel")
             .unwrap();
+    }
+
+    /// #1190 Low: a notice that panics is recorded unconfirmed, audited so,
+    /// and the other modules of the round are told all the same.
+    #[tokio::test]
+    async fn a_notice_that_panics_is_unconfirmed_and_the_others_are_told() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        for module in ["a", "b"] {
+            store
+                .revoke_module_consent(module, None, &Utc::now().to_rfc3339())
+                .await
+                .unwrap();
+        }
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let notice: RevocationNotice = {
+            let told = Arc::clone(&told);
+            Arc::new(move |end: GrantEnd| {
+                assert_ne!(end.module, "a", "a's notice panics");
+                told.lock().unwrap().push(end);
+                Box::pin(async { RevocationStop::Confirmed })
+                    as futures::future::BoxFuture<'static, _>
+            })
+        };
+        let pending = tell_due(&store, &notice, &on_protocol()).await;
+        assert!(pending <= LONGEST_SLEEP);
+        let told: Vec<_> = told
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.module.clone())
+            .collect();
+        assert_eq!(told, ["b"]);
+        assert!(
+            store
+                .pending_grant_end_notices("2099-01-01T00:00:00Z")
+                .await
+                .unwrap()
+                .0
+                .is_empty(),
+            "both answered"
+        );
+        let audited: Vec<_> = store
+            .list_audit()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.action == "module_consent.stop_unconfirmed")
+            .map(|e| e.detail["module"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(audited, ["a"]);
+    }
+
+    /// #1190 Low: a round that panics outside any notice ends that round,
+    /// not the task: the next change wakes it, and it tells what is due.
+    #[tokio::test]
+    async fn the_task_outlives_a_round_that_panics() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let (at, until) = ("2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z");
+        store
+            .grant_module_consent(&summary("t"), at, until)
+            .await
+            .unwrap();
+        store.advance_module_enable_epoch("m").await.unwrap();
+        let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_panics: OnGrantsProtocol = {
+            let rounds = Arc::clone(&rounds);
+            Arc::new(move |_: &str| {
+                let n = rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_ne!(n, 0, "the first round panics");
+                true
+            })
+        };
+        let (told, notice) = telling(RevocationStop::Confirmed);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run(store.clone(), notice, first_panics, cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rounds.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the first round never ran");
+        // A change written wakes the task, if it is still there.
+        store
+            .revoke_module_consent("z", None, &Utc::now().to_rfc3339())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !told.lock().unwrap().iter().any(|e| e.reason == "epoch") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the epoch's end was never told");
+        cancel.cancel();
+        task.await.unwrap();
     }
 }
