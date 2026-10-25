@@ -433,3 +433,43 @@ async fn a_call_records_the_attempt_its_work_goes_on_in() {
     submit(&env, other()).await;
     assert_eq!(acceptances(&env).await.last(), Some(&at(&b, 1)));
 }
+
+/// #1201 G3/G4: an acceptance names the call it came from, its run and its
+/// tool call. A replay of a succeeded job starts no work and records none;
+/// nor does the page's own retry of a failed job, which no call asked for.
+#[tokio::test]
+async fn an_acceptance_names_its_call_and_work_no_call_asked_for_records_none() {
+    let env = env(Some(script(vec![answer("present"), failing(), failing()]))).await;
+    let a = job_id(&submit(&env, args()).await);
+    assert_eq!(ended(&env, &a).await.0, "succeeded");
+    let named: (String, String) =
+        sqlx::query_as("SELECT run_id, tool_call_id FROM job_acceptances")
+            .fetch_one(env.storage.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(named, ("run-1".to_owned(), "call-1".to_owned()));
+    assert_eq!(submit(&env, args()).await, done("succeeded", &a, true));
+    assert_eq!(
+        acceptances(&env).await.len(),
+        1,
+        "a succeeded replay records none"
+    );
+
+    let b = job_id(&submit(&env, other()).await);
+    assert_eq!(ended(&env, &b).await.0, "failed");
+    crate::jobs::runner::tests::wait_for_done(&b, 1).await;
+    let retry = Request::post(format!("/jobs/{b}/retry"))
+        .body(Body::empty())
+        .unwrap();
+    let res = crate::router(env.state.clone())
+        .oneshot(retry)
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.status());
+    assert_eq!(row(&env, &b).await.1, 2);
+    assert_eq!(
+        acceptances(&env).await.len(),
+        2,
+        "the page's retry records none"
+    );
+}

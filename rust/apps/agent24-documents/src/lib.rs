@@ -202,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         // Kernel-only: the kernel proxy answers 404 to clients when the first
         // segment after the namespace canonicalises to `_a24`.
         .route("/_a24/tools/{op}", post(tools::call_tool))
+        .route("/_a24/authorization/revoked", post(authorization::revoked))
         .with_state(state)
 }
 

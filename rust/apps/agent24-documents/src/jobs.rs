@@ -134,7 +134,7 @@ impl Row {
     }
 }
 
-const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+pub(crate) const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
 pub async fn load<'e, E: sqlx::SqliteExecutor<'e>>(
     executor: E,

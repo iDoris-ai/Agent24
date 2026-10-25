@@ -208,7 +208,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         authorization_ref: context.authorization_ref.clone(),
     };
     let scope = &scope;
-    let claim_holds = in_flight.clone();
+    let claim_holds = in_flight.hold();
     let work = async move {
         // The scope is checked here, for every operation, before it runs
         // (K1-06a §4.1): an operation `admit` has no row for never runs.
@@ -252,8 +252,9 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         }
     };
     // Its authorization ended while it ran (K1-06a-grant-path §2.5): what it
-    // found is not given.
-    if in_flight.ended() {
+    // found is not given. Decided as it leaves the ledger, so an end cannot
+    // fall between the check and the answer (#1206 gate 1).
+    if in_flight.finish() {
         return Envelope::error(PERMISSION_DENIED, false);
     }
     envelope
@@ -416,7 +417,7 @@ async fn extract(
     state: &AppState,
     run: Run,
     accepted: Accepted,
-    in_flight: Arc<Call>,
+    in_flight: Call,
     arguments: Map<String, Value>,
 ) -> Outcome {
     // The oplog's CHECK would refuse it inside the claim, read as a

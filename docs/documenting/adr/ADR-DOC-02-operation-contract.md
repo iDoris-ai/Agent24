@@ -291,7 +291,7 @@
 | `change_set_committed` | 409 | `change_set_committed` / `false` | change set 已冻结；REST 的 `details.revision` |
 | `upload_offset_mismatch` | 409 | `upload_offset_mismatch` / `false` | REST 的 `details.received_offset` |
 | `stale_index` | 409 | `stale_index` / `false` | 仅在请求 `require_fresh` 时报错；默认在结果里标出索引的 revision（§7） |
-| `permission_denied` | 403 | `permission_denied` / `false` | OS 侧拒绝。此码在内核码表里（`agent24-domain/src/tool.rs:509`），内核保留它，`module_code` 为空 |
+| `permission_denied` | 403 | `permission_denied` / `false` | OS 侧拒绝；授权结束时仍在途的工具调用也回此码（§7）。此码在内核码表里（`agent24-domain/src/tool.rs:509`），内核保留它，`module_code` 为空 |
 | `knowledge_unavailable` | 503 | `knowledge_unavailable` / `true` | `retryable: true` |
 | `engine_unavailable` | 503 | `engine_unavailable` / `true` | REST 是 `engine_unavailable`，`details.engine`，`retryable: true`。工具路径原样返回这一码，`retryable:true`（DOC-1-06b，2026-10-18） |
 | `storage_unavailable` | 503 | 见下 | `data_dir` 或 DB 不可用；与知识关闭是不同状态。REST 的 `details.cause` 说明原因；`retryable` **按原因定**（见表下说明） |
@@ -339,6 +339,13 @@
   - 事件只是提示，**job 行才是权威**；断线后用 `GET /jobs/{id}` 对账。
   - **payload 结构**（#705）：见 `openapi.yaml` 的 `DocumentsJobProgressEvent`、`DocumentsJobFinishedEvent`、`DocumentsDocumentImportedEvent`、`DocumentsRevisionCommittedEvent`；字段是闭集，客户端仍忽略不认识的 kind 与字段。`job.finished` 带 `attempt` 与 `error_code`（取值同 job 的 `error.code`）；启动恢复置为 `interrupted` / `cancelled` 的 job 也发一次（尽力而为，受同样的限流，最多 256 条；David 确认，2026-10-10）。
 - **agent run 取消**：内核目前不会通知模块。run 取消后 job 继续运行，结果保留（Q7）。
+- **授权结束**（K1-06a-grant-path §2.5，DOC-1-37/38）：内核撤销或到期时发 `POST _a24/authorization/revoked` `{operation, revoked_at}`，`operation` 为 `"*"` 表示整个模块。
+  - **在途调用**：模块先记下这次结束，再停其余工作。通知到达时仍在途的该操作调用，不论查到什么，都回 `permission_denied`（`retryable:false`），不给内容；应答等这些调用都结束（`extract` 的 claim 任务结束才算）。已经通过这道检查、正在写回应答的调用照常回答，相当于构建「pin 已开始」；检查和退出在途登记在同一把锁里，所以之后的结束也不再等它。通知之后开始的调用不受这次结束影响：按操作名一概拒绝会误拒新授予下的调用，分清被结束授予的迟到调用要靠授予的引用（A5c-3）。
+  - **按调用归属，不按时间**：工具调用接受（新建、重排或命中在途）一个 job attempt 时，在 claim 的同一事务里记一行 `job_acceptances`（操作、`authorization_ref`、run 与调用 id）。通知在写锁下找出该操作接受过的、job 当前那次 attempt，等待期间每轮重扫（在途调用的 claim 可能在通知之后才提交）：`queued` 直接置 `cancelled`（`message` 为 `cancelled: its authorization ended`），`running` 置 `cancelling` 并记入 `job_revocations`，worker 到安全点结算成 `cancelled` 时 `message` 同样是这句（用户取消仍是 `cancelled by the user`）。页面自己的 job、只被更早 attempt 接受过的 job 不受影响（当前 attempt 是用户自己的重试）。
+  - **文本层构建**：该操作的工具调用请求过的构建先中止（不碰存储）；该操作接受过的任一 attempt（含已结束的、被重试取代的）请求过的构建也中止，等待期间每轮重扫，attempt 停下前新请求的构建同样中止。这些构建一并中止，页面也在等的也中止（宁可多停），页面拿到可重试的 `engine_unavailable`。中止停在安全点：等引擎时立刻停（与拿到引擎同时就绪时停优先），解析中丢掉解析（引擎子进程被杀），解析刚结束、哪怕解析失败也停，查到别处刚 pin 好的层也不交出；写存储开始后不再中止。
+  - **宁可多停的范围**：构建按操作名归属，不按授予：一个操作的授权结束，会停掉该操作所有在途构建，包括等待期间新授予下的调用请求的；等待期间每轮重扫 job，也会取消新授予下刚接受的 attempt。通知目前只带操作名，A5c 带上 `authorization_ref` 后可以收窄。
+  - **应答**：8 秒内在途调用都结束、这些 attempt 都离开 `queued`/`running`/`cancelling`、构建都结束，回 204；否则回 503，内核记为「停止未确认」。8 秒也限住存储：写锁拿不到同样回 503。正在进行的模型调用不会被打断，所以运行中的抽取常常在 8 秒内停不下来，回 503 是如实的。
+  - 之后才到达、带失效引用的旧调用由 A5c 处理。
 
 ## 8. 可用性与发现（README §10.3）
 
