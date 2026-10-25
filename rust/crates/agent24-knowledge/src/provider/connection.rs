@@ -3,7 +3,7 @@
 //! state, like the gate; the events that move a binding in and out of the
 //! connection phase, and the credential events, come in the next slices.
 
-use super::gate::Gate;
+use super::gate::{CallId, Closed, Gate, Invalidation};
 use super::state::{ConnectionPhase, Probe, UnavailableCause, judge_connection};
 use crate::common::Generation;
 
@@ -67,11 +67,28 @@ impl Connection {
         &self.gate
     }
 
-    /// For calls in flight and invalidations. A generation's persistence is
-    /// confirmed through [`Connection::confirm_generation`], which also leaves
-    /// `local_storage`.
-    pub fn gate_mut(&mut self) -> &mut Gate {
-        &mut self.gate
+    // The gate is changed only through the methods below, so a generation's
+    // persistence is confirmed through `confirm_generation`, which also leaves
+    // `local_storage`.
+
+    pub fn open_call(&mut self) -> Result<(CallId, Generation), Closed> {
+        self.gate.open_call()
+    }
+
+    pub fn send(&mut self, call: CallId, request_id: &str) -> Result<Generation, Closed> {
+        self.gate.send(call, request_id)
+    }
+
+    pub fn finish_request(&mut self, call: CallId, request_id: &str) {
+        self.gate.finish_request(call, request_id);
+    }
+
+    pub fn close_call(&mut self, call: CallId) {
+        self.gate.close_call(call);
+    }
+
+    pub fn invalidate(&mut self) -> Invalidation {
+        self.gate.invalidate()
     }
 
     pub fn phase(&self) -> Option<ConnectionPhase> {
@@ -102,9 +119,10 @@ impl Connection {
         round == self.round
     }
 
-    /// Leaves the connection phase. No result moves a binding outside it, and
-    /// coming back starts a new round.
+    /// Leaves the connection phase, ending the round: nothing sent in it
+    /// counts any more.
     pub fn leave(&mut self) {
+        self.new_round();
         self.phase = None;
     }
 

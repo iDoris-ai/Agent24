@@ -25,7 +25,7 @@ fn loading(once_servable: bool) -> Connection {
 #[test]
 fn a_probe_moves_the_phase_without_touching_the_generation_or_calls() {
     let mut connection = loading(true);
-    let (call, _) = connection.gate_mut().open_call().unwrap();
+    let (call, _) = connection.open_call().unwrap();
     let ticket = connection.probe().unwrap();
     assert_eq!(
         connection.apply_probe(ticket, READY),
@@ -108,7 +108,7 @@ fn a_reason_that_waits_for_the_user_and_the_outside_send_no_probe_and_take_no_re
     assert_eq!(outside.phase(), None);
     // Nor while a generation change is pending (S1.5).
     let mut connection = loading(true);
-    connection.gate_mut().invalidate();
+    connection.invalidate();
     assert!(connection.persist_pending());
     assert_eq!(connection.probe(), None);
 }
@@ -195,7 +195,7 @@ fn entering_loading_with_a_change_not_yet_persisted_is_local_storage_until_confi
     let mut connection = loading(false);
     let ticket = connection.probe().unwrap();
     connection.apply_probe(ticket, READY);
-    let next = connection.gate_mut().invalidate().to_persist.unwrap();
+    let next = connection.invalidate().to_persist.unwrap();
     assert_eq!(connection.confirm_once_servable(), None);
     assert_eq!(connection.phase(), Some(Unavailable(U::LocalStorage)));
     assert!(connection.confirm_generation(next).is_some());
@@ -205,7 +205,7 @@ fn entering_loading_with_a_change_not_yet_persisted_is_local_storage_until_confi
     let mut connection = loading(true);
     let ticket = connection.probe().unwrap();
     connection.apply_probe(ticket, READY);
-    let next = connection.gate_mut().invalidate().to_persist.unwrap();
+    let next = connection.invalidate().to_persist.unwrap();
     connection.fail(U::AccessRevoked);
     assert_eq!(connection.confirm_generation(next), None);
     assert_eq!(connection.phase(), Some(Unavailable(U::AccessRevoked)));
@@ -218,6 +218,11 @@ fn a_round_stays_current_until_the_binding_loads_again_or_fails() {
     assert!(connection.is_current(first));
     connection.fail(U::Dependency);
     assert!(!connection.is_current(first));
+    // Leaving ends the round too: an issuance sent before logging out, being
+    // disabled or unselected does not count.
+    let before = connection.start_loading().unwrap();
+    connection.leave();
+    assert!(!connection.is_current(before));
     let second = connection.start_loading().unwrap();
     assert!(connection.is_current(second));
     assert!(!connection.is_current(first));
@@ -227,7 +232,7 @@ fn a_round_stays_current_until_the_binding_loads_again_or_fails() {
 fn a_result_arriving_while_a_change_is_pending_does_not_move_the_binding() {
     let mut connection = loading(true);
     let ticket = connection.probe().unwrap();
-    connection.gate_mut().invalidate();
+    connection.invalidate();
     assert_eq!(connection.apply_probe(ticket, READY), ProbeApplied::Ignored);
     assert_eq!(connection.phase(), Some(Loading));
 }
