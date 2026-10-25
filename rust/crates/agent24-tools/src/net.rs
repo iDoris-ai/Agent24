@@ -533,4 +533,219 @@ mod tests {
         assert_eq!(parsed["status"], 302);
         assert_eq!(parsed["location"], "http://169.254.169.254/");
     }
+
+    // ── K1-6b.5c (ADR-K1-02 §2.4): the http_fetch egress matrix ───────────
+
+    /// Like [`fixture`], but counts the connections it accepts, so a refused
+    /// fetch can be shown to have sent nothing.
+    async fn counting_fixture(
+        body: &'static str,
+    ) -> (String, u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/"), addr.port(), connections)
+    }
+
+    fn connections(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A gate that allows exactly one request and nothing else.
+    struct ExactGate(EgressRequest);
+    #[async_trait]
+    impl EgressGate for ExactGate {
+        async fn check(&self, request: &EgressRequest) -> Result<(), EgressDecision> {
+            if *request == self.0 {
+                Ok(())
+            } else {
+                Err(EgressDecision)
+            }
+        }
+    }
+
+    fn granted_resource() -> EgressResource {
+        EgressResource::cloud_authorized("doc-1", "rev-1", 3).with_authorization_ref("grant-1")
+    }
+
+    fn scoped_ctx(
+        gate: Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        generation: u64,
+    ) -> ToolContext {
+        ToolContext::legacy("run_test", None, None, "tc_test")
+            .with_egress_policy(gate, resources, generation)
+    }
+
+    /// Both host kinds a fetch can name: a domain (gated before DNS) and an
+    /// IP literal (gated before the request is sent).
+    async fn assert_refused_before_any_request(ctx: &ToolContext) {
+        let (url, _, served) = counting_fixture("must not be served").await;
+        let err = HttpFetchTool::new(true)
+            .call(ctx, &input(&url), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert_eq!(connections(&served), 0);
+
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&lookups);
+        let result = resolve_domain_with_egress(
+            ctx,
+            EgressDestination::exact("https://example.invalid:443"),
+            move || async move {
+                resolver_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![SocketAddr::from(([93, 184, 216, 34], 443))])
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
+        assert_eq!(connections(&lookups), 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_only_source_is_refused_before_any_request() {
+        // Even a gate that allows everything: LocalOnly material never leaves.
+        let ctx = scoped_ctx(
+            Arc::new(FixtureGrant),
+            vec![EgressResource::local_only("doc-1", "rev-1")],
+            1,
+        );
+        assert_refused_before_any_request(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_fetch_whose_source_policy_is_unavailable_is_refused_before_any_request() {
+        let ctx =
+            ToolContext::legacy("run_test", None, None, "tc_test").with_egress_policy_unavailable();
+        assert_refused_before_any_request(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn an_exact_grant_fetches_only_what_it_names() {
+        let (url, port, served) = counting_fixture("granted").await;
+        let destination = format!("http://127.0.0.1:{port}");
+        let grant = |purpose, destination: &str| -> Arc<dyn EgressGate> {
+            Arc::new(ExactGate(EgressRequest::remote(
+                vec![granted_resource()],
+                purpose,
+                EgressDestination::exact(destination),
+                7,
+            )))
+        };
+        let tool = HttpFetchTool::new(true);
+        let fetch = |ctx: ToolContext| {
+            let tool = &tool;
+            let url = url.clone();
+            async move {
+                tool.call(&ctx, &input(&url), &CancellationToken::new())
+                    .await
+            }
+        };
+
+        let out = fetch(scoped_ctx(
+            grant(EgressPurpose::HttpFetch, &destination),
+            vec![granted_resource()],
+            7,
+        ))
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["body"], "granted");
+        assert_eq!(connections(&served), 1);
+
+        // Each element changed on its own, everything else as granted.
+        let other = |f: fn(&mut EgressResource)| {
+            let mut resource = granted_resource();
+            f(&mut resource);
+            vec![resource]
+        };
+        let exact = grant(EgressPurpose::HttpFetch, &destination);
+        let mismatches: Vec<(&str, ToolContext)> = vec![
+            (
+                "resource",
+                scoped_ctx(exact.clone(), other(|r| r.resource_id = "doc-2".into()), 7),
+            ),
+            (
+                "revision",
+                scoped_ctx(
+                    exact.clone(),
+                    other(|r| r.revision = Some("rev-2".into())),
+                    7,
+                ),
+            ),
+            (
+                "authorization",
+                scoped_ctx(
+                    exact.clone(),
+                    other(|r| r.authorization_ref = Some("grant-2".into())),
+                    7,
+                ),
+            ),
+            (
+                "policy version",
+                scoped_ctx(exact.clone(), other(|r| r.policy_version = 4), 7),
+            ),
+            (
+                "generation",
+                scoped_ctx(exact.clone(), vec![granted_resource()], 8),
+            ),
+            (
+                "destination",
+                scoped_ctx(
+                    grant(EgressPurpose::HttpFetch, "http://127.0.0.1:1"),
+                    vec![granted_resource()],
+                    7,
+                ),
+            ),
+            (
+                "purpose",
+                scoped_ctx(
+                    grant(EgressPurpose::ModelInference, &destination),
+                    vec![granted_resource()],
+                    7,
+                ),
+            ),
+        ];
+        for (what, ctx) in mismatches {
+            let err = fetch(ctx).await.unwrap_err();
+            assert!(matches!(err, ToolError::Denied(_)), "{what}: {err}");
+            assert_eq!(connections(&served), 1, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_fetch_of_an_ip_literal_needs_no_egress_policy() {
+        let (url, _, served) = counting_fixture("ordinary").await;
+        let out = HttpFetchTool::new(true)
+            .call(
+                &ToolContext::legacy("run_test", None, None, "tc_test"),
+                &input(&url),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], 200);
+        assert_eq!(parsed["body"], "ordinary");
+        assert_eq!(connections(&served), 1);
+    }
 }

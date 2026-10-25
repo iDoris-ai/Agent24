@@ -508,4 +508,237 @@ mod tests {
             "test baseline assumption broke: Command should inherit by default:\n{stdout}"
         );
     }
+
+    // ── K1-6b.5c (ADR-K1-02 §2.4): the MCP client tool egress matrix ──────
+
+    /// A stdio MCP server with one tool, `echo`, that appends a line to the
+    /// file named by its first argument each time it is actually called.
+    const FIXTURE_SERVER: &str = r#"import json,sys
+log=sys.argv[1]
+for line in sys.stdin:
+ try: req=json.loads(line)
+ except Exception: continue
+ method=req.get('method'); ident=req.get('id')
+ if ident is None: continue
+ if method=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'egress-fixture','version':'1'}}
+ elif method=='tools/list': result={'tools':[{'name':'echo','description':'records each call','inputSchema':{'type':'object','properties':{}}}]}
+ elif method=='tools/call':
+  open(log,'a').write('called\n')
+  result={'content':[{'type':'text','text':'echoed'}],'isError':False}
+ else: result={}
+ print(json.dumps({'jsonrpc':'2.0','id':ident,'result':result}),flush=True)
+"#;
+
+    struct Fixture {
+        tool: McpTool,
+        log: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        async fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("server.py");
+            let log = dir.path().join("calls.log");
+            std::fs::write(&script, FIXTURE_SERVER).unwrap();
+            let spec = McpServerSpec::new(
+                "fixture",
+                "python3",
+                vec![
+                    "-u".to_owned(),
+                    script.to_string_lossy().into_owned(),
+                    log.to_string_lossy().into_owned(),
+                ],
+            );
+            let server = Arc::new(
+                McpServer::connect(&spec, CancellationToken::new())
+                    .await
+                    .unwrap(),
+            );
+            let listed = server.list_tools().await.unwrap();
+            let tool = McpTool::new(Arc::clone(&server), &listed[0]);
+            Self {
+                tool,
+                log,
+                _dir: dir,
+            }
+        }
+
+        async fn call(&self, ctx: &ToolContext) -> Result<String, ToolError> {
+            self.tool
+                .call(ctx, &Map::new(), &CancellationToken::new())
+                .await
+        }
+
+        /// How many times the server actually ran the tool.
+        fn calls(&self) -> usize {
+            std::fs::read_to_string(&self.log)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        }
+    }
+
+    struct AllowAll;
+    #[async_trait]
+    impl agent24_domain::EgressGate for AllowAll {
+        async fn check(
+            &self,
+            _request: &agent24_domain::EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            Ok(())
+        }
+    }
+
+    /// A gate that allows exactly one request and nothing else.
+    struct ExactGate(agent24_domain::EgressRequest);
+    #[async_trait]
+    impl agent24_domain::EgressGate for ExactGate {
+        async fn check(
+            &self,
+            request: &agent24_domain::EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            if *request == self.0 {
+                Ok(())
+            } else {
+                Err(agent24_domain::EgressDecision)
+            }
+        }
+    }
+
+    fn granted_resource() -> agent24_domain::EgressResource {
+        agent24_domain::EgressResource::cloud_authorized("doc-1", "rev-1", 3)
+            .with_authorization_ref("grant-1")
+    }
+
+    fn scoped_ctx(
+        gate: Arc<dyn agent24_domain::EgressGate>,
+        resources: Vec<agent24_domain::EgressResource>,
+        generation: u64,
+    ) -> ToolContext {
+        ToolContext::legacy("run_test", None, None, "tc_test")
+            .with_egress_policy(gate, resources, generation)
+    }
+
+    fn grant(purpose: EgressPurpose, destination: &str) -> Arc<dyn agent24_domain::EgressGate> {
+        Arc::new(ExactGate(agent24_domain::EgressRequest::remote(
+            vec![granted_resource()],
+            purpose,
+            EgressDestination::exact(destination),
+            7,
+        )))
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_run_calls_an_mcp_tool_without_egress_policy() {
+        let fixture = Fixture::start().await;
+        let out = fixture
+            .call(&ToolContext::legacy("run_test", None, None, "tc_test"))
+            .await
+            .unwrap();
+        assert_eq!(out, "echoed");
+        assert_eq!(fixture.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_or_unknown_source_never_reaches_the_mcp_server() {
+        let fixture = Fixture::start().await;
+        let cases = [
+            // Even a gate that allows everything: LocalOnly material never leaves.
+            (
+                "local-only",
+                scoped_ctx(
+                    Arc::new(AllowAll),
+                    vec![agent24_domain::EgressResource::local_only("doc-1", "rev-1")],
+                    1,
+                ),
+            ),
+            (
+                "policy unavailable",
+                ToolContext::legacy("run_test", None, None, "tc_test")
+                    .with_egress_policy_unavailable(),
+            ),
+        ];
+        for (what, ctx) in cases {
+            let err = fixture.call(&ctx).await.unwrap_err();
+            assert!(matches!(err, ToolError::Denied(_)), "{what}: {err}");
+        }
+        assert_eq!(fixture.calls(), 0);
+    }
+
+    /// Exact-triple gate checks with a test gate. The destination is the
+    /// label `mcp:{server}:{tool}`: it says which tool may receive the
+    /// material, not where the server process itself sends it (ADR-K1-02
+    /// §2.4 item 3).
+    #[tokio::test]
+    async fn an_exact_grant_reaches_only_the_mcp_tool_it_names() {
+        let fixture = Fixture::start().await;
+        let named = "mcp:fixture:echo";
+        fixture
+            .call(&scoped_ctx(
+                grant(EgressPurpose::McpTool, named),
+                vec![granted_resource()],
+                7,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fixture.calls(), 1);
+
+        let other = |f: fn(&mut agent24_domain::EgressResource)| {
+            let mut resource = granted_resource();
+            f(&mut resource);
+            vec![resource]
+        };
+        let exact = grant(EgressPurpose::McpTool, named);
+        let mismatches = [
+            (
+                "resource",
+                scoped_ctx(exact.clone(), other(|r| r.resource_id = "doc-2".into()), 7),
+            ),
+            (
+                "revision",
+                scoped_ctx(
+                    exact.clone(),
+                    other(|r| r.revision = Some("rev-2".into())),
+                    7,
+                ),
+            ),
+            (
+                "authorization",
+                scoped_ctx(
+                    exact.clone(),
+                    other(|r| r.authorization_ref = Some("grant-2".into())),
+                    7,
+                ),
+            ),
+            (
+                "policy version",
+                scoped_ctx(exact.clone(), other(|r| r.policy_version = 4), 7),
+            ),
+            (
+                "generation",
+                scoped_ctx(exact.clone(), vec![granted_resource()], 8),
+            ),
+            (
+                "destination",
+                scoped_ctx(
+                    grant(EgressPurpose::McpTool, "mcp:fixture:other"),
+                    vec![granted_resource()],
+                    7,
+                ),
+            ),
+            (
+                "purpose",
+                scoped_ctx(
+                    grant(EgressPurpose::HttpFetch, named),
+                    vec![granted_resource()],
+                    7,
+                ),
+            ),
+        ];
+        for (what, ctx) in mismatches {
+            let err = fixture.call(&ctx).await.unwrap_err();
+            assert!(matches!(err, ToolError::Denied(_)), "{what}: {err}");
+        }
+        assert_eq!(fixture.calls(), 1);
+    }
 }
