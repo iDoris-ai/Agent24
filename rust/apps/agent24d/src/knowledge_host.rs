@@ -22,8 +22,15 @@
 //!
 //! A binding id is the string axum's `Path` decodes from the URL, so `b1` and
 //! `%62%31` name the same binding. It is only ever a key in this map.
+//!
+//! A run may name a binding (`RunCreate.knowledge_binding_id`, PR-C): only the
+//! host that activated it can, and the run is pinned to that host and that
+//! activation, its generation. The pin lives in memory, like the records
+//! (decided 2026-10-25): a restarted daemon has a new host capability, so a
+//! pin could not match again wherever it was kept, and a run that names a
+//! binding but has no pin is refused, never bound anew.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 
@@ -43,6 +50,8 @@ use crate::server::{AppState, error_response};
 /// Bindings one host may hold records for, deactivated ones included.
 pub const MAX_BINDINGS_PER_HOST: usize = 1024;
 const MAX_BINDING_ID_BYTES: usize = 256;
+/// Run pins kept; the oldest goes first, and its run is then refused.
+const MAX_PINNED_RUNS: usize = 4096;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
 
 /// How the Knowledge service expects C to be presented. `Debug` never prints
@@ -75,7 +84,45 @@ pub struct CurrentCredential {
 struct Entry {
     seq: u64,
     active: bool,
+    /// The sequence number of the activation in effect: the generation.
+    activated_seq: u64,
     credential: Option<CurrentCredential>,
+}
+
+/// What a run was bound to when it was created (design v2 §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunBinding {
+    pub host: String,
+    pub binding: String,
+    pub generation: u64,
+}
+
+/// Why a run has no usable binding; Knowledge tools refuse with its code.
+// Consumed by the Knowledge tools (PR-E).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnowledgeRefusal {
+    /// The run names no binding.
+    Unbound,
+    /// It names one, but not one active under the host and generation it was
+    /// pinned to, or the pin is gone.
+    Stale,
+}
+
+impl KnowledgeRefusal {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Unbound => "knowledge_unbound",
+            Self::Stale => "knowledge_binding_stale",
+        }
+    }
+}
+
+#[derive(Default)]
+struct RunPins {
+    pins: HashMap<String, RunBinding>,
+    order: VecDeque<String>,
 }
 
 /// A change that carries nothing but its sequence number.
@@ -103,6 +150,7 @@ pub enum ChangeError {
 #[derive(Default)]
 pub struct KnowledgeHostRegistry {
     entries: Mutex<HashMap<(String, String), Entry>>,
+    runs: Mutex<RunPins>,
 }
 
 impl KnowledgeHostRegistry {
@@ -117,6 +165,7 @@ impl KnowledgeHostRegistry {
             match change {
                 Change::Activate => {
                     entry.active = true;
+                    entry.activated_seq = seq;
                     entry.credential = None;
                 }
                 Change::Deactivate => {
@@ -203,6 +252,53 @@ impl KnowledgeHostRegistry {
         Ok(())
     }
 
+    /// The generation of `binding` if `host` has it active. A missing record
+    /// or a poisoned lock counts as inactive.
+    pub fn generation(&self, host: &str, binding: &str) -> Option<u64> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(&(host.to_owned(), binding.to_owned()))?;
+        entry.active.then_some(entry.activated_seq)
+    }
+
+    /// Pins `run_id` to what it was bound to at creation.
+    pub fn pin_run(&self, run_id: &str, binding: RunBinding) {
+        let Ok(mut runs) = self.runs.lock() else {
+            return;
+        };
+        if runs.pins.insert(run_id.to_owned(), binding).is_none() {
+            runs.order.push_back(run_id.to_owned());
+        }
+        while runs.order.len() > MAX_PINNED_RUNS {
+            if let Some(oldest) = runs.order.pop_front() {
+                runs.pins.remove(&oldest);
+            }
+        }
+    }
+
+    /// The binding a run may use now: the one it names in its persisted input
+    /// (`selector`), still active under the host and generation it was pinned
+    /// to. Nothing else is looked up, so a run never moves to a new binding.
+    // Consumed by the Knowledge tools (PR-E).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn resolve_run(
+        &self,
+        run_id: &str,
+        selector: Option<&str>,
+    ) -> Result<RunBinding, KnowledgeRefusal> {
+        let selector = selector.ok_or(KnowledgeRefusal::Unbound)?;
+        let pin = self
+            .runs
+            .lock()
+            .ok()
+            .and_then(|runs| runs.pins.get(run_id).cloned())
+            .filter(|pin| pin.binding == selector)
+            .ok_or(KnowledgeRefusal::Stale)?;
+        match self.generation(&pin.host, &pin.binding) {
+            Some(generation) if generation == pin.generation => Ok(pin),
+            _ => Err(KnowledgeRefusal::Stale),
+        }
+    }
+
     /// Whether `host` has `binding` active.
     // Consumed by run binding (PR-C) and the Provider (KB-C1-01).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -286,9 +382,10 @@ pub struct SeqQuery {
 }
 
 /// Why a request was refused before it reached the registry.
-enum Refused {
+pub enum Refused {
     NotHost,
     Malformed,
+    Inactive,
 }
 
 impl IntoResponse for Refused {
@@ -300,6 +397,11 @@ impl IntoResponse for Refused {
                 "Only the product host may use this interface",
             ),
             Self::Malformed => invalid_request(),
+            Self::Inactive => error_response(
+                StatusCode::CONFLICT,
+                "knowledge_binding_inactive",
+                "The product host has no active Knowledge binding by that id",
+            ),
         }
     }
 }
@@ -321,6 +423,29 @@ fn host_and_seq(
         }
         _ => Err(Refused::Malformed),
     }
+}
+
+/// Checks a run's `knowledge_binding_id` at creation and returns what to pin
+/// the run to: only the product host may name a binding, and only one it has
+/// active.
+pub fn bind_run(
+    state: &AppState,
+    authorization: Option<Extension<Authorization>>,
+    binding_id: &str,
+) -> Result<RunBinding, Refused> {
+    let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
+    if !valid_binding_id(binding_id) {
+        return Err(Refused::Malformed);
+    }
+    let generation = state
+        .knowledge_host
+        .generation(&host, binding_id)
+        .ok_or(Refused::Inactive)?;
+    Ok(RunBinding {
+        host,
+        binding: binding_id.to_owned(),
+        generation,
+    })
 }
 
 /// `PUT /api/v1/host/knowledge/bindings/{binding_id}?seq=n` activates the
