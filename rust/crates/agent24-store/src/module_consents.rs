@@ -609,7 +609,7 @@ async fn advance_enable_epoch(
     if !ended.is_empty() {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let reason = GrantEndReason::Epoch;
-        grant_end_notices::write(tx, module, "*", &ended, reason, &now, epoch).await?;
+        grant_end_notices::write(tx, module, "*", &ended, &[], reason, &now, epoch).await?;
     }
     Ok(epoch)
 }
@@ -685,6 +685,7 @@ impl Store {
         // tool is the whole module, as its key says.
         let tool = op.filter(|op| *op != "*");
         let ended = grant_end_notices::untold(&mut tx, module, tool, None).await?;
+        let unconfirmed = grant_end_notices::unconfirmed(&mut tx, module, tool).await?;
         sqlx::query(
             "INSERT INTO module_consent_revocations (module, op, revoked_at, generation)
              VALUES (?, ?, ?, ?)
@@ -705,6 +706,7 @@ impl Store {
             module,
             key,
             &ended,
+            &unconfirmed,
             reason,
             &revoked_at,
             generation,
@@ -990,7 +992,7 @@ impl Store {
         if !replaced.is_empty() {
             let reason = GrantEndReason::Replaced;
             let (op, at) = (&summary.op, &decided_at);
-            grant_end_notices::write(&mut tx, module, op, &replaced, reason, at, generation)
+            grant_end_notices::write(&mut tx, module, op, &replaced, &[], reason, at, generation)
                 .await?;
         }
         tx.commit().await?;

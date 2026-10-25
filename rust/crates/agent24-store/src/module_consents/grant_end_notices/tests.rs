@@ -76,6 +76,13 @@ async fn a_revocation_tells_the_grants_it_ends() {
     );
     assert_eq!(notice.authorization_refs, refs(&[&t]));
     assert_eq!(notice.ended_at, "2026-10-25T00:10:00.000Z");
+    // Confirmed stopped: not told again (an unconfirmed one is, case 24).
+    assert!(
+        store
+            .record_grant_end_stop(notice.id, "confirmed")
+            .await
+            .unwrap()
+    );
     let module = store
         .revoke_module_consent_tracked("m", None, at)
         .await
@@ -83,6 +90,12 @@ async fn a_revocation_tells_the_grants_it_ends() {
     let notice = store.grant_end_notice(module).await.unwrap().unwrap();
     assert_eq!(notice.op, "*");
     assert_eq!(notice.authorization_refs, refs(&[&u]), "t's end was told");
+    assert!(
+        store
+            .record_grant_end_stop(notice.id, "not_running")
+            .await
+            .unwrap()
+    );
     let again = store
         .revoke_module_consent_tracked("m", Some("t"), at)
         .await
@@ -242,4 +255,106 @@ async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
     );
     assert_eq!(pending("2026-10-25T00:10:30Z").await, vec![replaced]);
     assert!(store.pending_grant_end_notices("later").await.is_err());
+}
+
+/// #1202 B1, case 24: a revocation tells again every end of its scope not
+/// confirmed stopped, pending or unconfirmed, so its own answer covers
+/// them; one confirmed or of another tool it does not.
+#[tokio::test]
+async fn a_revocation_tells_again_the_ends_not_confirmed_stopped() {
+    let store = Store::open_memory().await.unwrap();
+    let answered = |store: &Store, state: &'static str| {
+        let store = store.clone();
+        async move {
+            let last = ends(&store).await.pop().unwrap();
+            assert!(store.record_grant_end_stop(last.id, state).await.unwrap());
+        }
+    };
+    let a = grant(&store, "t").await;
+    let b = grant(&store, "t").await;
+    answered(&store, "unconfirmed").await;
+    let c = grant(&store, "u").await;
+    let u = grant(&store, "u").await;
+    answered(&store, "confirmed").await;
+    let e = grant(&store, "w").await;
+    deny(&store, "w").await;
+    let tool = store
+        .revoke_module_consent_tracked("m", Some("t"), AT)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .grant_end_notice(tool)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_refs,
+        refs(&[&a, &b]),
+        "the tool's own and its replaced one, not w's"
+    );
+    let module = store
+        .revoke_module_consent_tracked("m", None, AT)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .grant_end_notice(module)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_refs,
+        refs(&[&a, &b, &e, &u]),
+        "c was confirmed stopped"
+    );
+    let _ = c;
+}
+
+/// K1-6a-G §2.5.1 (#1202 G1): a grant is told by the end of its decision,
+/// expired or not: expired and not yet told, a revocation tells it; told
+/// expired but not confirmed stopped, a replacement tells it again; told
+/// and confirmed, it does not.
+#[tokio::test]
+async fn an_expired_grant_is_told_until_confirmed_stopped() {
+    let store = Store::open_memory().await.unwrap();
+    let lapsed = |op: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .grant_module_consent(&summary("m", op), AT, "2026-10-25T00:00:01.000Z")
+                .await
+                .unwrap()
+        }
+    };
+    let t = lapsed("t").await;
+    let revoked = store
+        .revoke_module_consent_tracked("m", Some("t"), "2026-10-25T00:10:00Z")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .grant_end_notice(revoked)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_refs,
+        refs(&[&t])
+    );
+    let (u, v) = (lapsed("u").await, lapsed("v").await);
+    store
+        .record_expiry_stop("m", "u", u.generation, "unconfirmed")
+        .await
+        .unwrap();
+    store
+        .record_expiry_stop("m", "v", v.generation, "confirmed")
+        .await
+        .unwrap();
+    let before = ends(&store).await.len();
+    grant(&store, "u").await;
+    grant(&store, "v").await;
+    let after = ends(&store).await;
+    assert_eq!(after.len(), before + 1, "v was confirmed stopped");
+    assert_eq!(
+        (after[before].op.as_str(), &after[before].authorization_refs),
+        ("u", &refs(&[&u]))
+    );
 }

@@ -5,7 +5,9 @@
 //! notice), and a decision replacing a granted row or an enable epoch
 //! advance that ended grants not told yet. A crash before the notice, or a
 //! later decision replacing the row, so loses none: every row not answered
-//! yet stays pending for the notifier (A5c-2).
+//! yet stays pending for the notifier (A5c-2). A revocation also carries the
+//! references of every end of its scope not confirmed stopped, so its answer
+//! never claims a stop an earlier, unconfirmed notice left open (#1202 B1).
 
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -68,8 +70,9 @@ pub struct GrantEndNotice {
 }
 
 /// The granted rows of `module` (`op`: that tool's only; `epoch`: of that
-/// enable epoch only) whose end it was not told yet: no revocation covers
-/// them and no expiry of them was told.
+/// enable epoch only), expired or not, whose end it was not told yet: no
+/// revocation covers them, written being told (its row is), and no expiry
+/// of them was told, but for one the module did not confirm stopped.
 pub(super) async fn untold(
     tx: &mut Tx<'_>,
     module: &str,
@@ -80,7 +83,8 @@ pub(super) async fn untold(
         "SELECT c.* FROM module_consents c
          WHERE c.module = ?1 AND (?2 IS NULL OR c.op = ?2)
            AND (?3 IS NULL OR c.enable_epoch = ?3)
-           AND c.decision = ?4 AND c.expiry_stop_state IS NULL
+           AND c.decision = ?4
+           AND (c.expiry_stop_state IS NULL OR c.expiry_stop_state = 'unconfirmed')
            AND NOT EXISTS (SELECT 1 FROM module_consent_revocations r
                WHERE r.module = c.module AND r.op IN (c.op, '*')
                  AND r.generation >= c.generation)",
@@ -94,13 +98,39 @@ pub(super) async fn untold(
     rows.iter().map(row_to_record).collect()
 }
 
-/// Writes, in `tx`, that the write `generation` ended `ended` for
-/// `module`'s `op` (`*`: every tool) at `ended_at`.
+/// The references of `module`'s ends (`op`: that tool's and the whole
+/// module's only) told but not confirmed stopped, or not told yet: a
+/// revocation tells them again (#1202 B1), so its own answer covers them.
+pub(super) async fn unconfirmed(
+    tx: &mut Tx<'_>,
+    module: &str,
+    op: Option<&str>,
+) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT authorization_refs FROM module_grant_end_notices
+         WHERE module = ?1 AND (?2 IS NULL OR op IN (?2, '*'))
+           AND (stop_state IS NULL OR stop_state = 'unconfirmed')",
+    )
+    .bind(module)
+    .bind(op)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut refs = Vec::new();
+    for row in rows {
+        refs.extend(parse_refs(&row)?);
+    }
+    Ok(refs)
+}
+
+/// Writes, in `tx`, that the write `generation` ended `ended`, and the
+/// references `also`, for `module`'s `op` (`*`: every tool) at `ended_at`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn write(
     tx: &mut Tx<'_>,
     module: &str,
     op: &str,
     ended: &[ModuleConsentRecord],
+    also: &[String],
     reason: GrantEndReason,
     ended_at: &str,
     generation: i64,
@@ -108,6 +138,7 @@ pub(super) async fn write(
     let mut refs: Vec<String> = ended
         .iter()
         .map(ModuleConsentRecord::authorization_ref)
+        .chain(also.iter().cloned())
         .collect();
     refs.sort();
     refs.dedup();
@@ -132,10 +163,14 @@ pub(super) async fn write(
     Ok(())
 }
 
-fn row_to_notice(row: &SqliteRow) -> Result<GrantEndNotice> {
-    let refs = serde_json::from_str(&row.get::<String, _>("authorization_refs")).map_err(|_| {
+fn parse_refs(stored: &str) -> Result<Vec<String>> {
+    serde_json::from_str(stored).map_err(|_| {
         StoreError::Conflict("a stored grant end's references are malformed".to_owned())
-    })?;
+    })
+}
+
+fn row_to_notice(row: &SqliteRow) -> Result<GrantEndNotice> {
+    let refs = parse_refs(&row.get::<String, _>("authorization_refs"))?;
     Ok(GrantEndNotice {
         id: row.get("id"),
         module: row.get("module"),
