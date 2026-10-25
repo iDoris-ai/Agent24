@@ -30,7 +30,7 @@ use sqlx::sqlite::SqliteRow;
 use crate::{Result, Store, StoreError};
 
 mod grant_end_notices;
-pub use grant_end_notices::{GrantEndNotice, GrantEndReason};
+pub use grant_end_notices::{GrantEndNotice, GrantEndReason, GrantEndStop};
 
 // ── Domain types ─────────────────────────────────────────────────────────
 

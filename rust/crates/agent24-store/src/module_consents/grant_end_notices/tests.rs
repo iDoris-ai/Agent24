@@ -79,7 +79,7 @@ async fn a_revocation_tells_the_grants_it_ends() {
     // Confirmed stopped: not told again (an unconfirmed one is, case 24).
     assert!(
         store
-            .record_grant_end_stop(notice.id, "confirmed")
+            .record_grant_end_stop(notice.id, GrantEndStop::Confirmed)
             .await
             .unwrap()
     );
@@ -92,7 +92,7 @@ async fn a_revocation_tells_the_grants_it_ends() {
     assert_eq!(notice.authorization_refs, refs(&[&u]), "t's end was told");
     assert!(
         store
-            .record_grant_end_stop(notice.id, "not_running")
+            .record_grant_end_stop(notice.id, GrantEndStop::NotRunning)
             .await
             .unwrap()
     );
@@ -258,10 +258,15 @@ async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
         vec![revoked, replaced, unrouted]
     );
     let id = store.grant_end_notice(revoked).await.unwrap().unwrap().id;
-    assert!(store.record_grant_end_stop(id, "confirmed").await.unwrap());
+    assert!(
+        store
+            .record_grant_end_stop(id, GrantEndStop::Confirmed)
+            .await
+            .unwrap()
+    );
     assert!(
         !store
-            .record_grant_end_stop(id, "unconfirmed")
+            .record_grant_end_stop(id, GrantEndStop::Unconfirmed)
             .await
             .unwrap()
     );
@@ -278,7 +283,7 @@ async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
 #[tokio::test]
 async fn a_revocation_tells_again_the_ends_not_confirmed_stopped() {
     let store = Store::open_memory().await.unwrap();
-    let answered = |store: &Store, state: &'static str| {
+    let answered = |store: &Store, state: GrantEndStop| {
         let store = store.clone();
         async move {
             let last = ends(&store).await.pop().unwrap();
@@ -287,10 +292,10 @@ async fn a_revocation_tells_again_the_ends_not_confirmed_stopped() {
     };
     let a = grant(&store, "t").await;
     let b = grant(&store, "t").await;
-    answered(&store, "unconfirmed").await;
+    answered(&store, GrantEndStop::Unconfirmed).await;
     let c = grant(&store, "u").await;
     let u = grant(&store, "u").await;
-    answered(&store, "confirmed").await;
+    answered(&store, GrantEndStop::Confirmed).await;
     let e = grant(&store, "w").await;
     deny(&store, "w").await;
     let tool = store
@@ -408,7 +413,7 @@ async fn an_expired_grant_is_told_until_confirmed_stopped() {
 
 /// Records `state` as the module's answer to the end the write
 /// `generation` wrote.
-async fn answer(store: &Store, generation: i64, state: &str) {
+async fn answer(store: &Store, generation: i64, state: GrantEndStop) {
     let end = store.grant_end_notice(generation).await.unwrap().unwrap();
     assert!(store.record_grant_end_stop(end.id, state).await.unwrap());
 }
@@ -435,7 +440,7 @@ async fn a_confirmed_revocation_settles_the_ends_it_carried() {
             .revoke_module_consent_tracked("m", Some("t"), AT)
             .await
             .unwrap();
-        answer(&store, lost, "unconfirmed").await;
+        answer(&store, lost, GrantEndStop::Unconfirmed).await;
         let a = grant(&store, "t").await;
         let settling = store
             .revoke_module_consent_tracked("m", Some("t"), AT)
@@ -446,7 +451,7 @@ async fn a_confirmed_revocation_settles_the_ends_it_carried() {
             2,
             "{a:?} and the lost one's"
         );
-        answer(&store, settling, "confirmed").await;
+        answer(&store, settling, GrantEndStop::Confirmed).await;
     }
     let a = grant(&store, "t").await;
     let next = store
@@ -502,12 +507,12 @@ async fn a_revocation_settles_only_the_ends_it_covers() {
         .revoke_module_consent_tracked("n", Some("t"), AT)
         .await
         .unwrap();
-    answer(&store, other, "unconfirmed").await;
+    answer(&store, other, GrantEndStop::Unconfirmed).await;
     let a = grant(&store, "t").await;
     let lost = revoke(Some("t")).await;
-    answer(&store, lost, "unconfirmed").await;
+    answer(&store, lost, GrantEndStop::Unconfirmed).await;
     let unconfirmed = revoke(Some("t")).await;
-    answer(&store, unconfirmed, "unconfirmed").await;
+    answer(&store, unconfirmed, GrantEndStop::Unconfirmed).await;
     assert_eq!(
         settled(&store, lost).await,
         None,
@@ -515,7 +520,7 @@ async fn a_revocation_settles_only_the_ends_it_covers() {
     );
     grant(&store, "t").await;
     let replaced = grant(&store, "t").await.generation;
-    answer(&store, replaced, "confirmed").await;
+    answer(&store, replaced, GrantEndStop::Confirmed).await;
     assert_eq!(settled(&store, lost).await, None, "a confirmed replacement");
     let x = grant(&store, "x").await;
     store.advance_module_enable_epoch("m").await.unwrap();
@@ -531,7 +536,7 @@ async fn a_revocation_settles_only_the_ends_it_covers() {
         pending().await,
         vec![epoch, p.generation, told_never, tool, after]
     );
-    answer(&store, tool, "confirmed").await;
+    answer(&store, tool, GrantEndStop::Confirmed).await;
     let by = store.grant_end_notice(tool).await.unwrap().unwrap().id;
     for end in [lost, unconfirmed, p.generation, told_never] {
         assert_eq!(settled(&store, end).await, Some(by));
@@ -549,7 +554,7 @@ async fn a_revocation_settles_only_the_ends_it_covers() {
     assert!(!again.contains(&a.authorization_ref()) && !again.contains(&p.authorization_ref()));
     // The module's revocation settles every end, the module's too.
     let module = revoke(None).await;
-    answer(&store, module, "confirmed").await;
+    answer(&store, module, GrantEndStop::Confirmed).await;
     assert!(pending().await.is_empty());
     assert!(carried(&store, revoke(None).await).await.is_empty());
     assert_eq!(settled(&store, other).await, None, "another module's");

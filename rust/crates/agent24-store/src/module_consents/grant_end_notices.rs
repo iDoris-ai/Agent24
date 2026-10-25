@@ -56,6 +56,29 @@ impl GrantEndReason {
     }
 }
 
+/// What a module answered to an end (K1-6a-G §2.5): typed, so a misspelt
+/// answer cannot leave a row neither pending nor carried (#1222 gate 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantEndStop {
+    /// It reached a safe point and stopped the work.
+    Confirmed,
+    /// It did not say so in time, or could not be asked.
+    Unconfirmed,
+    /// No run of it was there to stop.
+    NotRunning,
+}
+
+impl GrantEndStop {
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unconfirmed => "unconfirmed",
+            Self::NotRunning => "not_running",
+        }
+    }
+}
+
 /// One end of grants to tell a module of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantEndNotice {
@@ -232,14 +255,14 @@ impl Store {
     /// first answer `confirmed` settles, in the same transaction, the ends
     /// it carried not confirmed stopped (#1202 G7): the module's all, a
     /// tool's that tool's only, not the module's (`*`).
-    pub async fn record_grant_end_stop(&self, id: i64, stop_state: &str) -> Result<bool> {
+    pub async fn record_grant_end_stop(&self, id: i64, stop: GrantEndStop) -> Result<bool> {
         let mut tx = self.pool().begin().await?;
         let recorded = sqlx::query(
             "UPDATE module_grant_end_notices SET stop_state = ?
              WHERE id = ? AND stop_state IS NULL
              RETURNING module, op, reason",
         )
-        .bind(stop_state)
+        .bind(stop.word())
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -247,7 +270,7 @@ impl Store {
             return Ok(false);
         };
         let reason: String = recorded.get("reason");
-        if stop_state == "confirmed" && reason == GrantEndReason::Revoked.word() {
+        if stop == GrantEndStop::Confirmed && reason == GrantEndReason::Revoked.word() {
             sqlx::query(
                 "UPDATE module_grant_end_notices SET settled_by = ?1
                  WHERE module = ?2 AND (?3 = '*' OR op = ?3) AND id < ?1

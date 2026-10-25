@@ -37,7 +37,7 @@ fn install(home: &Path) {
         "name: noted\nversion: \"0.1.0\"\nroute_namespace: /api/v1/noted\n\
          event_module: noted\ndata_dir: ~/.agent24/os/noted/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         min_daemon_protocol: 2\n\
+         min_daemon_protocol: 3\n\
          spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
@@ -54,7 +54,7 @@ fn install(home: &Path) {
         "name: idle\nversion: \"0.1.0\"\nroute_namespace: /api/v1/idle\n\
          event_module: idle\ndata_dir: ~/.agent24/os/idle/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         min_daemon_protocol: 2\n\
+         min_daemon_protocol: 3\n\
          spawn:\n  command: \"false\"\n  args: []\n\
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
