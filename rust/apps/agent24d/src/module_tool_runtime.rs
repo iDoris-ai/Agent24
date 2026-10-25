@@ -8,9 +8,10 @@ use agent24_domain::tool::{
 };
 use agent24_os_proto::drain::{DrainState, Generation};
 use agent24_os_proto::kernel_call::{
-    KernelLimits, KernelRequest, KernelRequestIds, send_kernel_request, send_module_tool_request,
+    KernelLimits, KernelRequest, KernelRequestIds, send_kernel_request_until,
+    send_module_tool_request,
 };
-use agent24_tools::{ModuleToolAuthorization, ModuleToolContext, ModuleToolRuntime};
+use agent24_tools::{ModuleRun, ModuleToolAuthorization, ModuleToolContext, ModuleToolRuntime};
 use async_trait::async_trait;
 use axum::body::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,29 @@ impl RevocationStop {
             Self::NotRunning => "not_running",
         }
     }
+}
+
+impl From<RevocationStop> for agent24_store::GrantEndStop {
+    fn from(stop: RevocationStop) -> Self {
+        match stop {
+            RevocationStop::Confirmed => Self::Confirmed,
+            RevocationStop::Unconfirmed => Self::Unconfirmed,
+            RevocationStop::NotRunning => Self::NotRunning,
+        }
+    }
+}
+
+/// An end of grants told to their module (K1-6a-G §2.5.1): of `operation`
+/// (`"*"`: every tool), at `ended_at`, for `reason`. `authorization_refs`
+/// are the grants it ended; `None` when they could not be read, and the
+/// module then stops by operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantEnd {
+    pub module: String,
+    pub operation: String,
+    pub ended_at: String,
+    pub reason: &'static str,
+    pub authorization_refs: Option<Vec<String>>,
 }
 
 pub struct AgentModuleToolRuntime {
@@ -90,18 +114,13 @@ impl AgentModuleToolRuntime {
         self.supervisors.get()?.running_slot(module)
     }
 
-    /// Tells `module` that its grants of `operation` (`"*"`: every tool)
-    /// were revoked at `revoked_at`, and waits, at most `within`, for it to
-    /// say it stopped what they started (K1-6a-G §2.5). A run that is
-    /// starting, draining or stopping is still a run, so it is unconfirmed;
-    /// not running means none can be alive (`Supervisors::surely_stopped`).
-    pub async fn notify_revoked(
-        &self,
-        module: &str,
-        operation: &str,
-        revoked_at: &str,
-        within: Duration,
-    ) -> RevocationStop {
+    /// Tells `end.module` that `end` ended its grants, and waits, at most
+    /// `within`, for it to say it stopped what they started (K1-6a-G §2.5).
+    /// A run that is starting, draining or stopping is still a run, so it is
+    /// unconfirmed; not running means none can be alive
+    /// (`Supervisors::surely_stopped`).
+    pub async fn notify_revoked(&self, end: &GrantEnd, within: Duration) -> RevocationStop {
+        let module = end.module.as_str();
         let Some(current) = self.slot(module) else {
             // Out of the list is not gone: a disabled run drains first.
             return match self.supervisors.get() {
@@ -116,7 +135,14 @@ impl AgentModuleToolRuntime {
             return RevocationStop::Unconfirmed;
         }
         let namespace = agent24_domain::DomainOsManifest::declared_namespace(module);
-        let body = serde_json::json!({ "operation": operation, "revoked_at": revoked_at });
+        let mut body = serde_json::json!({
+            "operation": end.operation,
+            "revoked_at": end.ended_at,
+            "reason": end.reason,
+        });
+        if let Some(refs) = &end.authorization_refs {
+            body["authorization_refs"] = serde_json::json!(refs);
+        }
         let request = KernelRequest {
             path: format!("{namespace}/_a24/authorization/revoked"),
             extra_headers: Vec::new(),
@@ -126,7 +152,26 @@ impl AgentModuleToolRuntime {
             total: within,
             max_response_bytes: MAX_TOOL_RESPONSE_BYTES,
         };
-        match send_kernel_request(&generation, &self.request_ids, request, limits, None).await {
+        // A notice in flight holds a drain that begins meanwhile — a disable
+        // writes its ends before handing the stop over — so a run that stops
+        // running is not waited on: the stop ends it, unconfirmed here like
+        // a notice that found it draining, unless its 2xx was already read.
+        let cancel = CancellationToken::new();
+        let sending =
+            send_kernel_request_until(&generation, &self.request_ids, request, limits, &cancel);
+        tokio::pin!(sending);
+        let sent = loop {
+            tokio::select! {
+                biased;
+                sent = &mut sending => break sent,
+                () = tokio::time::sleep(Duration::from_millis(10)), if !cancel.is_cancelled() => {
+                    if generation.state() != DrainState::Running {
+                        cancel.cancel();
+                    }
+                }
+            }
+        };
+        match sent {
             Ok(response) if response.status.is_success() => RevocationStop::Confirmed,
             _ => RevocationStop::Unconfirmed,
         }
@@ -173,6 +218,10 @@ impl AgentModuleToolRuntime {
 
 #[async_trait]
 impl ModuleToolRuntime for AgentModuleToolRuntime {
+    fn current_run(&self, module: &str) -> Option<ModuleRun> {
+        self.generation(module).ok().map(ModuleRun::new)
+    }
+
     async fn check_available(
         &self,
         module: &str,
@@ -194,9 +243,28 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ModuleToolResult, ModuleToolCallError> {
-        self.check_available(&context.module_id, &context.operation)
-            .await?;
-        let generation = self.generation(&context.module_id)?;
+        if !self
+            .operations
+            .contains(&(context.module_id.clone(), context.operation.clone()))
+        {
+            return Err(Self::unavailable());
+        }
+        let generation = self
+            .slot(&context.module_id)
+            .ok_or(ModuleToolCallError::ModuleUnavailable)?
+            .get();
+        // K1-6a-G §2.5.1: only to the run the grant was last checked under,
+        // asked before whether it is up: a run started since, ready or not,
+        // may have missed a notice its predecessor confirmed, and keeps no
+        // ended reference across the restart.
+        if !context.run.as_ref().is_some_and(|run| run.is(&generation)) {
+            return Err(stale_package());
+        }
+        // Stopped running since it was checked: a restart or a stop, so
+        // stopped before dispatch (`unsent_to`).
+        if generation.state() != DrainState::Running {
+            return Err(stale_package());
+        }
         // K1-6a-G §2.2: the call goes only to a run of the package the grant
         // was given for; the module may have restarted on another since the
         // lookup, which no consent change announces.
@@ -227,8 +295,24 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
             },
             &cancel,
         )
-        .await?;
+        .await
+        .map_err(|error| unsent_to(&generation, error))?;
         Ok(result)
+    }
+}
+
+/// A call not sent (`ModuleUnavailable`) because the run it is bound to
+/// stopped running since it was checked — drained or revoked for a restart
+/// or a stop, before admission or at it — is stopped before dispatch, as a
+/// run replaced is (K1-6a-G §2.5.1, case 23; Codex A5c-2c C1): `Cancelled`,
+/// which the caller reports as `permission_denied`. A run still up that
+/// could not be reached stays unavailable, and any other error stands.
+fn unsent_to(generation: &Generation, error: ModuleToolCallError) -> ModuleToolCallError {
+    match error {
+        ModuleToolCallError::ModuleUnavailable if generation.state() != DrainState::Running => {
+            stale_package()
+        }
+        error => error,
     }
 }
 
@@ -238,8 +322,8 @@ fn serves_granted_package(generation: &Generation, expected: Option<&str>) -> bo
     expected.is_some() && generation.artifact() == expected
 }
 
-/// What a call gets when the running package is not the one granted: the
-/// host's own cancellation, before anything is sent (K1-6a-G §2.5), which
+/// What a call gets when the running package is not the one granted, or
+/// the run is not the one checked against: the host's own cancellation, before anything is sent (K1-6a-G §2.5), which
 /// the caller reports as `permission_denied`.
 fn stale_package() -> ModuleToolCallError {
     ModuleToolCallError::Cancelled
@@ -341,6 +425,25 @@ pub(crate) fn store_authorization(
     .with_artifact_source(artifact)
 }
 
+/// A module tool's authorization, or none for a module not on the grants
+/// protocol (K1-6a-G §2.6, #1202 G6): a grant it holds from before the
+/// protocol it needs moved (an older daemon's) does not hold, so its tool is
+/// neither advertised nor dispatched. Its card still answers, with 409.
+pub(crate) fn tool_authorization(
+    source: &crate::consent_routes::ToolCardSource,
+    store: &agent24_store::Store,
+    artifact: agent24_policy::consent_gate::ArtifactSource,
+) -> Option<Arc<dyn agent24_tools::ModuleToolAuthorization>> {
+    source.takes_grants.then(|| {
+        Arc::new(store_authorization(
+            store,
+            source.gate_request(),
+            Arc::new(consent_clock),
+            artifact,
+        )) as Arc<dyn agent24_tools::ModuleToolAuthorization>
+    })
+}
+
 /// What this start sees of each of `modules` (K1-6a-G §2.1 F3): recorded,
 /// advancing an enable epoch where it changed, and only then are the
 /// module's grants let hold. A module this fails for keeps none.
@@ -371,6 +474,59 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// #1202 G6: a module not on the grants protocol gets no authorization
+    /// at all, so no grant it holds (an older daemon's) is ever read: its
+    /// tool is neither advertised nor dispatched. One on it gets one.
+    /// `serve` builds every tool's through this
+    /// (`serve_authorizes_module_tools_by_protocol`).
+    #[tokio::test]
+    async fn only_a_module_on_the_grants_protocol_is_authorized() {
+        let store = Store::open_memory().await.unwrap();
+        let summary = ToolPermissionSummary::new(
+            "legacy",
+            "read",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("docs".to_owned()),
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        let source = |takes_grants| crate::consent_routes::ToolCardSource {
+            summary: summary.clone(),
+            resource_kinds: Vec::new(),
+            takes_grants,
+        };
+        let artifact: agent24_policy::consent_gate::ArtifactSource = Arc::new(|_: &str| None);
+        assert!(tool_authorization(&source(false), &store, artifact.clone()).is_none());
+        assert!(tool_authorization(&source(true), &store, artifact).is_some());
+    }
+
+    /// Codex A5c-2c C1: a call not sent because its run stopped since it was
+    /// checked is cancelled; one not sent to a run still up stays
+    /// unavailable, and an error that may have been sent stands.
+    #[test]
+    fn a_call_not_sent_to_a_run_gone_is_cancelled() {
+        let generation = agent24_os_proto::drain::Generation::serving_package(
+            std::path::PathBuf::from("/nonexistent/upstream.sock"),
+            Some("sha256:b".to_owned()),
+        );
+        assert!(generation.ready());
+        assert!(matches!(
+            unsent_to(&generation, ModuleToolCallError::ModuleUnavailable),
+            ModuleToolCallError::ModuleUnavailable
+        ));
+        assert!(generation.begin_drain(std::time::Instant::now(), Duration::from_secs(5)));
+        assert!(matches!(
+            unsent_to(&generation, ModuleToolCallError::ModuleUnavailable),
+            ModuleToolCallError::Cancelled
+        ));
+        assert!(matches!(
+            unsent_to(&generation, ModuleToolCallError::ResultUnknown),
+            ModuleToolCallError::ResultUnknown
+        ));
+    }
 
     #[test]
     fn gate_five_recognises_the_adopted_documents_module_id() {
@@ -421,6 +577,8 @@ mod tests {
         dispatched: std::sync::Mutex<Vec<(Vec<String>, String)>>,
         /// `(expected_artifact, the context as sent on the wire)`.
         contexts: std::sync::Mutex<Vec<(Option<String>, String)>>,
+        /// The module's run now; replaced, it restarted.
+        run: std::sync::Mutex<Arc<()>>,
     }
 
     type Hook = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
@@ -438,6 +596,10 @@ mod tests {
 
     #[async_trait]
     impl ModuleToolRuntime for FakeModule {
+        fn current_run(&self, _: &str) -> Option<ModuleRun> {
+            Some(ModuleRun::new(Arc::clone(&self.run.lock().unwrap())))
+        }
+
         async fn check_available(&self, _: &str, _: &str) -> Result<(), ModuleToolCallError> {
             self.check_entered.notify_one();
             run_hook(&self.on_check);
@@ -461,6 +623,14 @@ mod tests {
             _: Duration,
             cancel: CancellationToken,
         ) -> Result<ModuleToolResult, ModuleToolCallError> {
+            // As the daemon's runtime: only to the run the call is bound to.
+            if !context
+                .run
+                .as_ref()
+                .is_some_and(|run| run.is(&self.run.lock().unwrap()))
+            {
+                return Err(ModuleToolCallError::Cancelled);
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.contexts.lock().unwrap().push((
                 context.expected_artifact.clone(),
@@ -723,6 +893,7 @@ mod tests {
             on_invoke: Hook::default(),
             dispatched: std::sync::Mutex::default(),
             contexts: std::sync::Mutex::default(),
+            run: std::sync::Mutex::default(),
         });
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
@@ -1012,6 +1183,7 @@ mod tests {
     /// is unconfirmed; only a module with no run has nothing running.
     #[tokio::test]
     async fn a_revocation_is_told_to_the_running_module() {
+        use axum::response::IntoResponse;
         let sock = std::path::PathBuf::from(format!(
             "/tmp/a24-revoke-{}-{}.sock",
             std::process::id(),
@@ -1023,24 +1195,47 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let told = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let answer = Arc::new(std::sync::Mutex::new(axum::http::StatusCode::OK));
+        let body_released = Arc::new(tokio::sync::Notify::new());
+        let head_written = Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new().route(
             "/api/v1/fake_module/_a24/authorization/revoked",
             axum::routing::post({
                 let (told, answer) = (Arc::clone(&told), Arc::clone(&answer));
+                let body_released = Arc::clone(&body_released);
+                let head_written = Arc::clone(&head_written);
                 move |axum::Json(body): axum::Json<Value>| async move {
                     told.lock().unwrap().push(body);
                     let status = *answer.lock().unwrap();
                     if status == axum::http::StatusCode::ACCEPTED {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
-                    status
+                    if status == axum::http::StatusCode::CREATED {
+                        // The head goes out at once, the body only once the
+                        // test lets it. The body is first asked for once the
+                        // head is written, and it is flushed while the body
+                        // waits.
+                        let body = futures::stream::once(async move {
+                            head_written.notify_one();
+                            body_released.notified().await;
+                            Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
+                        });
+                        return (status, axum::body::Body::from_stream(body)).into_response();
+                    }
+                    status.into_response()
                 }
             }),
         );
         tokio::spawn(async move { axum::serve(listener, app).await });
         let runtime = AgentModuleToolRuntime::new(HashSet::new());
-        let notify =
-            |within| runtime.notify_revoked("fake_module", "*", "2026-10-24T00:00:00Z", within);
+        let end = |authorization_refs| GrantEnd {
+            module: "fake_module".to_owned(),
+            operation: "*".to_owned(),
+            ended_at: "2026-10-24T00:00:00Z".to_owned(),
+            reason: "epoch",
+            authorization_refs,
+        };
+        let told_refs = end(Some(vec!["ga1:a".to_owned()]));
+        let notify = |within| runtime.notify_revoked(&told_refs, within);
         let within = Duration::from_secs(2);
         assert_eq!(notify(within).await, RevocationStop::NotRunning);
         // Out of the list but still draining from a disable: not yet gone.
@@ -1069,7 +1264,40 @@ mod tests {
         assert_eq!(notify(within).await, RevocationStop::Confirmed);
         assert_eq!(
             told.lock().unwrap()[0],
-            serde_json::json!({ "operation": "*", "revoked_at": "2026-10-24T00:00:00Z" })
+            serde_json::json!({
+                "operation": "*",
+                "revoked_at": "2026-10-24T00:00:00Z",
+                "reason": "epoch",
+                "authorization_refs": ["ga1:a"],
+            })
+        );
+        // References not read: none sent, and the module stops by operation.
+        assert_eq!(
+            runtime.notify_revoked(&end(None), within).await,
+            RevocationStop::Confirmed
+        );
+        assert_eq!(
+            told.lock().unwrap()[1],
+            serde_json::json!({
+                "operation": "*",
+                "revoked_at": "2026-10-24T00:00:00Z",
+                "reason": "epoch",
+            })
+        );
+        // None ended (#1202 G2, #1227 Low): an empty list, not a missing
+        // one, so the module stops nothing rather than by operation.
+        assert_eq!(
+            runtime.notify_revoked(&end(Some(Vec::new())), within).await,
+            RevocationStop::Confirmed
+        );
+        assert_eq!(
+            told.lock().unwrap()[2],
+            serde_json::json!({
+                "operation": "*",
+                "revoked_at": "2026-10-24T00:00:00Z",
+                "reason": "epoch",
+                "authorization_refs": [],
+            })
         );
         *answer.lock().unwrap() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
         assert_eq!(notify(within).await, RevocationStop::Unconfirmed);
@@ -1081,6 +1309,46 @@ mod tests {
             RevocationStop::Unconfirmed
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        // A drain that begins while it waits is not held (#1231 CI): the
+        // notice lets go of the run at once, unconfirmed.
+        let waiting = tokio::spawn({
+            let (runtime, end) = (Arc::clone(&runtime), told_refs.clone());
+            async move { runtime.notify_revoked(&end, Duration::from_secs(30)).await }
+        });
+        while generation.in_flight() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let draining = std::time::Instant::now();
+        assert!(generation.begin_drain(draining, Duration::from_secs(30)));
+        assert_eq!(waiting.await.unwrap(), RevocationStop::Unconfirmed);
+        assert!(draining.elapsed() < Duration::from_secs(2));
+        assert_eq!(generation.in_flight(), 0);
+        // Unless the module's 2xx head was read already: that stands (v2, L2).
+        let generation = agent24_os_proto::drain::Generation::serving_package(sock.clone(), None);
+        runtime.test_slots.lock().unwrap().insert(
+            "fake_module".to_owned(),
+            agent24_os_proto::drain::Current::new(Arc::clone(&generation)),
+        );
+        assert!(generation.ready());
+        *answer.lock().unwrap() = axum::http::StatusCode::CREATED;
+        let waiting = tokio::spawn({
+            let (runtime, end) = (Arc::clone(&runtime), told_refs.clone());
+            async move { runtime.notify_revoked(&end, Duration::from_secs(30)).await }
+        });
+        // Written by the module (#1231 PR-Daemon L6): the time given is for
+        // the kernel to read a head already sent, not for the module to send
+        // it. The body is held until after the answer, so only the head can
+        // have confirmed it.
+        tokio::time::timeout(Duration::from_secs(5), head_written.notified())
+            .await
+            .expect("the module writes the head");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let draining = std::time::Instant::now();
+        assert!(generation.begin_drain(draining, Duration::from_secs(30)));
+        assert_eq!(waiting.await.unwrap(), RevocationStop::Confirmed);
+        assert!(draining.elapsed() < Duration::from_secs(2));
+        assert_eq!(generation.in_flight(), 0);
+        body_released.notify_one();
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -1119,23 +1387,30 @@ mod tests {
     }
 
     /// The runtime itself turns away a call for a package other than the one
-    /// running, before anything is sent: a grant for A never reaches B.
+    /// running, before anything is sent: a grant for A never reaches B. So
+    /// it does one bound to another run of the same package (K1-6a-G
+    /// §2.5.1, case 23): a run started since the grant's last check.
     #[tokio::test]
     async fn invoke_refuses_a_run_of_another_package_before_sending() {
         let runtime = AgentModuleToolRuntime::new(HashSet::from([(
             "fake_module".to_owned(),
             "write_local".to_owned(),
         )]));
-        let generation = agent24_os_proto::drain::Generation::serving_package(
-            std::path::PathBuf::from("/nonexistent/upstream.sock"),
-            Some("sha256:b".to_owned()),
-        );
-        assert!(generation.ready());
-        runtime.test_slots.lock().unwrap().insert(
-            "fake_module".to_owned(),
-            agent24_os_proto::drain::Current::new(generation),
-        );
-        let invoke = |expected: Option<&str>| {
+        let start = || {
+            let generation = agent24_os_proto::drain::Generation::serving_package(
+                std::path::PathBuf::from("/nonexistent/upstream.sock"),
+                Some("sha256:b".to_owned()),
+            );
+            assert!(generation.ready());
+            runtime.test_slots.lock().unwrap().insert(
+                "fake_module".to_owned(),
+                agent24_os_proto::drain::Current::new(generation),
+            );
+        };
+        start();
+        let checked = runtime.current_run("fake_module");
+        assert!(checked.is_some());
+        let invoke = |expected: Option<&str>, run: Option<ModuleRun>| {
             runtime.invoke(
                 ModuleToolContext {
                     run_id: "run".to_owned(),
@@ -1146,6 +1421,7 @@ mod tests {
                     authorized_resources: Vec::new(),
                     authorization_ref: "ga1:x".to_owned(),
                     expected_artifact: expected.map(str::to_owned),
+                    run,
                 },
                 Map::new(),
                 Duration::from_secs(1),
@@ -1154,14 +1430,45 @@ mod tests {
         };
         for expected in [Some("sha256:a"), None] {
             assert!(
-                matches!(invoke(expected).await, Err(ModuleToolCallError::Cancelled)),
+                matches!(
+                    invoke(expected, checked.clone()).await,
+                    Err(ModuleToolCallError::Cancelled)
+                ),
                 "{expected:?}"
             );
         }
-        // The package granted is the one running: the call goes out, and
-        // fails only on the socket that is not there.
+        // The package granted is the one running, the run the one checked:
+        // the call goes out, and fails only on the socket that is not there.
         assert!(!matches!(
-            invoke(Some("sha256:b")).await,
+            invoke(Some("sha256:b"), checked.clone()).await,
+            Err(ModuleToolCallError::Cancelled)
+        ));
+        assert!(matches!(
+            invoke(Some("sha256:b"), None).await,
+            Err(ModuleToolCallError::Cancelled)
+        ));
+        start();
+        assert!(matches!(
+            invoke(Some("sha256:b"), checked).await,
+            Err(ModuleToolCallError::Cancelled)
+        ));
+        // The run checked is still the slot's but draining for a restart or
+        // a stop (Codex A5c-2c C1): stopped before dispatch, not unavailable.
+        let checked = runtime.current_run("fake_module");
+        let draining = runtime.slot("fake_module").unwrap().get();
+        assert!(draining.begin_drain(std::time::Instant::now(), Duration::from_secs(5)));
+        assert!(matches!(
+            invoke(Some("sha256:b"), checked).await,
+            Err(ModuleToolCallError::Cancelled)
+        ));
+        // Restarting, the new run not up yet: still not the run checked.
+        let checked = runtime.current_run("fake_module");
+        runtime.test_slots.lock().unwrap().insert(
+            "fake_module".to_owned(),
+            agent24_os_proto::drain::Current::new(agent24_os_proto::drain::Generation::starting()),
+        );
+        assert!(matches!(
+            invoke(Some("sha256:b"), checked).await,
             Err(ModuleToolCallError::Cancelled)
         ));
     }
@@ -2050,6 +2357,7 @@ mod tests {
             on_invoke: Hook::default(),
             dispatched: std::sync::Mutex::default(),
             contexts: std::sync::Mutex::default(),
+            run: std::sync::Mutex::default(),
         });
         let other: Arc<dyn agent24_domain::tool::ModuleToolAdvertView> = Arc::new(TestAdvertView {
             authorization: other_auth.clone(),
@@ -2435,8 +2743,9 @@ mod tests {
 
     /// A grant whose feed, currency and validity a test drives directly
     /// (K1-6a-G §2.5): `current` decides every lookup; `one_shot` makes
-    /// every lookup after the first fail, as a revocation the feed never
-    /// announced would.
+    /// every lookup after the two before dispatch fail (the grant's and
+    /// the last check's, §2.5.1), as a revocation the feed never announced
+    /// while the call ran would.
     struct FeedAuthorization {
         feed: tokio::sync::broadcast::Sender<agent24_store::ModuleConsentChange>,
         current: AtomicBool,
@@ -2452,6 +2761,8 @@ mod tests {
         /// The first lookup answers, then a change to this tool is
         /// announced; the grant stays current.
         announce_on_first: AtomicBool,
+        /// Run as the first re-check starts.
+        on_recheck: Hook,
     }
 
     impl FeedAuthorization {
@@ -2466,6 +2777,7 @@ mod tests {
                 slow_rechecks: AtomicBool::new(false),
                 hang_rechecks: AtomicBool::new(false),
                 announce_on_first: AtomicBool::new(false),
+                on_recheck: Hook::default(),
             })
         }
 
@@ -2485,14 +2797,18 @@ mod tests {
             _: &str,
             _: &ToolContext,
         ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
-            let first = self.lookups.fetch_add(1, Ordering::SeqCst) == 0;
+            let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
+            let first = lookup == 0;
+            if !first {
+                run_hook(&self.on_recheck);
+            }
             if !first && self.hang_rechecks.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
             if !first && self.slow_rechecks.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            if !first && self.one_shot {
+            if lookup >= 2 && self.one_shot {
                 self.current.store(false, Ordering::SeqCst);
             }
             if first && self.announce_on_first.load(Ordering::SeqCst) {
@@ -2807,6 +3123,93 @@ mod tests {
         );
     }
 
+    /// K1-6a-G §2.5.1, case 23: a call goes only to the run taken before
+    /// the grant's last check. A restart while that check runs may follow
+    /// a notice the old run confirmed: the call is not sent, `cancelled`,
+    /// and the model sees `permission_denied`.
+    #[tokio::test]
+    async fn a_restart_during_the_last_check_leaves_the_call_unsent() {
+        let authorization = FeedAuthorization::new(8, false, None);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(Arc::clone(&authorization) as Arc<dyn ModuleToolAuthorization>),
+        )
+        .await;
+        // A change arrives once the module is checked: settled by the last
+        // check, during which the module restarts.
+        hook(&runtime.on_check, {
+            let authorization = Arc::clone(&authorization);
+            move || authorization.announce("write_local")
+        });
+        hook(&authorization.on_recheck, {
+            let runtime = Arc::clone(&runtime);
+            move || *runtime.run.lock().unwrap() = Arc::default()
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(
+            authorization.lookups.load(Ordering::SeqCst),
+            2,
+            "re-checked"
+        );
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
+    /// K1-6a-G §2.5.1 (A5c-2b review C1): the grant is looked up again
+    /// once the run is taken, even with nothing on the feed: an end is
+    /// announced only after it commits, and may be told to the module
+    /// first. Ended so, the call is not sent.
+    #[tokio::test]
+    async fn an_end_not_yet_announced_is_caught_by_the_last_check() {
+        let authorization = FeedAuthorization::new(8, false, None);
+        let (registry, runtime, _, store, _tool) = fixture_using(
+            RiskClass::Read,
+            false,
+            true,
+            true,
+            None,
+            Some(Arc::clone(&authorization) as Arc<dyn ModuleToolAuthorization>),
+        )
+        .await;
+        hook(&runtime.on_check, {
+            let authorization = Arc::clone(&authorization);
+            move || authorization.current.store(false, Ordering::SeqCst)
+        });
+        let error = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(
+            rows.last().unwrap().detail["terminal"]["result"],
+            "cancelled"
+        );
+    }
+
     /// K1-6a-G §4 case 3 (review round 2, G1): a change taken before
     /// dispatch is settled even when the module turns out unavailable: the
     /// call ends as a revocation, not as the module's own error.
@@ -2900,7 +3303,6 @@ mod tests {
     #[tokio::test]
     async fn a_hung_recheck_still_ends_at_the_deadline() {
         let authorization = FeedAuthorization::new(8, false, Some(Duration::from_millis(300)));
-        authorization.hang_rechecks.store(true, Ordering::SeqCst);
         let (registry, runtime, _, _, _tool) = fixture_using(
             RiskClass::Read,
             false,
@@ -2912,6 +3314,8 @@ mod tests {
         .await;
         let started = std::time::Instant::now();
         let call = call_in_module(registry, &runtime).await;
+        // Hung from now: the check before dispatch answered (§2.5.1).
+        authorization.hang_rechecks.store(true, Ordering::SeqCst);
         authorization.announce("write_local");
         assert_unknown_module_error(stopped_within(call).await, "result_unknown");
         assert!(
