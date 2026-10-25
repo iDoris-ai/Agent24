@@ -3,11 +3,20 @@
 //! stdout is reserved for newline-delimited JSON-RPC. Agent24 execution stays
 //! in `agent24d`: this module only maps ACP sessions/prompts onto the existing
 //! REST + WebSocket run protocol.
+//!
+//! K1-6b.5c-2 (ADR-K1-02 §2.4): the ACP client is outside the kernel, so a
+//! run's model deltas and failure message are relayed only once its peer view
+//! (`/api/v1/peer/runs/{id}`) says it is not withheld. The view is read once,
+//! at the first delta or failure: sources are tagged before the first model
+//! call, so by then the classification is final.
 
 use std::collections::HashSet;
+use std::future::Future;
 
-use agent24_protocol::{Event, EventBody, Run, RunCreate, RunMode, Session, SessionCreate};
-use futures_util::StreamExt;
+use agent24_protocol::{
+    Event, EventBody, PeerRun, Run, RunCreate, RunMode, Session, SessionCreate,
+};
+use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_tungstenite::tungstenite;
@@ -18,6 +27,11 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const AGENT_ERROR: i64 = -32000;
+
+/// What the ACP client sees in place of a withheld run's content. Fixed, so
+/// nothing about the run can reach the client through it.
+const WITHHELD_NOTICE: &str = "this run used sources that are not ordinary, so its content \
+     is not shared with connected tools; open it in Agent24 to see it";
 
 #[derive(Default)]
 struct BridgeState {
@@ -169,7 +183,7 @@ async fn run_prompt(
     // between POST /runs and the WebSocket handshake.
     let ws_url = format!("{}/api/v1/events", ep.base.replacen("http", "ws", 1));
     let request = ws_request(&ws_url, &ep.token)?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+    let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| format!("connecting event stream: {e}"))?;
 
@@ -200,33 +214,104 @@ async fn run_prompt(
         .await
         .map_err(|e| format!("reading run: {e}"))?;
 
-    while let Some(frame) = socket.next().await {
-        let frame = frame.map_err(|e| format!("reading event stream: {e}"))?;
-        let tungstenite::Message::Text(text) = frame else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<Event>(&text) else {
-            continue;
-        };
-        match event.body {
-            EventBody::ModelDelta(delta) if delta.run_id == run.id => {
-                write_frame(
-                    stdout,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "method": "session/update",
-                        "params": {
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "agent_message_chunk",
-                                "content": { "text": delta.text }
-                            }
-                        }
-                    }),
-                )
-                .await?;
+    let events = socket.filter_map(|frame| async move {
+        match frame {
+            Err(e) => Some(Err(format!("reading event stream: {e}"))),
+            Ok(tungstenite::Message::Text(text)) => {
+                serde_json::from_str::<Event>(&text).ok().map(Ok)
             }
-            EventBody::RunCompleted(done) if done.run_id == run.id => {
+            Ok(_) => None,
+        }
+    });
+    relay_run(Box::pin(events), &run.id, session_id, stdout, || {
+        peer_run(ep, &run.id)
+    })
+    .await
+}
+
+async fn peer_run(ep: &Endpoint, run_id: &str) -> Result<PeerRun, String> {
+    let response = bearer(
+        ep,
+        client().get(format!("{}/api/v1/peer/runs/{run_id}", ep.base)),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("reading peer run: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "reading peer run: daemon returned {}",
+            response.status()
+        ));
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| format!("reading peer run: {e}"))
+}
+
+/// Whether a run's content may be relayed, decided once from its peer view.
+/// A failed read withholds, like a withheld view.
+#[derive(Default)]
+struct RelayGate {
+    relay: Option<bool>,
+}
+
+impl RelayGate {
+    fn decided(&self) -> bool {
+        self.relay.is_some()
+    }
+
+    async fn relays<F>(&mut self, check: impl FnOnce() -> F) -> bool
+    where
+        F: Future<Output = Result<PeerRun, String>>,
+    {
+        if let Some(relay) = self.relay {
+            return relay;
+        }
+        let relay = matches!(check().await, Ok(view) if !view.withheld);
+        self.relay = Some(relay);
+        relay
+    }
+}
+
+fn message_chunk(session_id: &str, text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "text": text }
+            }
+        }
+    })
+}
+
+/// Relay one run's events to the ACP client until it ends.
+async fn relay_run<W, F>(
+    mut events: impl Stream<Item = Result<Event, String>> + Unpin,
+    run_id: &str,
+    session_id: &str,
+    out: &mut W,
+    mut check: impl FnMut() -> F,
+) -> Result<Value, String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    F: Future<Output = Result<PeerRun, String>>,
+{
+    let mut gate = RelayGate::default();
+    while let Some(event) = events.next().await {
+        match event?.body {
+            EventBody::ModelDelta(delta) if delta.run_id == run_id => {
+                let first = !gate.decided();
+                if gate.relays(&mut check).await {
+                    write_frame(out, &message_chunk(session_id, &delta.text)).await?;
+                } else if first {
+                    write_frame(out, &message_chunk(session_id, WITHHELD_NOTICE)).await?;
+                }
+            }
+            EventBody::RunCompleted(done) if done.run_id == run_id => {
                 return Ok(json!({
                     "stopReason": "end_turn",
                     "usage": {
@@ -235,10 +320,13 @@ async fn run_prompt(
                     }
                 }));
             }
-            EventBody::RunFailed(failed) if failed.run_id == run.id => {
-                return Err(format!("run failed: {}", failed.error.message));
+            EventBody::RunFailed(failed) if failed.run_id == run_id => {
+                if gate.relays(&mut check).await {
+                    return Err(format!("run failed: {}", failed.error.message));
+                }
+                return Err(format!("run failed: {WITHHELD_NOTICE}"));
             }
-            EventBody::RunCancelled(cancelled) if cancelled.run_id == run.id => {
+            EventBody::RunCancelled(cancelled) if cancelled.run_id == run_id => {
                 return Err("run cancelled".to_owned());
             }
             _ => {}
@@ -272,7 +360,10 @@ fn ws_request(url: &str, token: &str) -> Result<tungstenite::handshake::client::
     Ok(request)
 }
 
-async fn write_frame(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<(), String> {
+async fn write_frame<W>(stdout: &mut W, value: &Value) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut encoded = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     encoded.push(b'\n');
     stdout
@@ -293,6 +384,167 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent24_protocol::{
+        ErrorBody, ModelDeltaPayload, RunCompletedPayload, RunFailedPayload, RunOutputPayload,
+        RunStatus, Usage,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── K1-6b.5c-2: deltas and failures wait for the peer view ──────────────
+
+    const SECRET: &str = "SECRET-7f3a";
+
+    fn event(body: EventBody) -> Result<Event, String> {
+        Ok(Event {
+            v: 1,
+            seq: 0,
+            ts: "2026-10-25T00:00:00Z".to_owned(),
+            body,
+        })
+    }
+
+    fn delta(run_id: &str, text: &str) -> Result<Event, String> {
+        event(EventBody::ModelDelta(ModelDeltaPayload {
+            run_id: run_id.to_owned(),
+            text: text.to_owned(),
+        }))
+    }
+
+    fn failed(run_id: &str) -> Result<Event, String> {
+        event(EventBody::RunFailed(RunFailedPayload {
+            run_id: run_id.to_owned(),
+            error: ErrorBody {
+                code: "internal".to_owned(),
+                message: format!("error {SECRET}"),
+                details: None,
+                hint: None,
+            },
+        }))
+    }
+
+    fn completed(run_id: &str) -> Result<Event, String> {
+        event(EventBody::RunCompleted(RunCompletedPayload {
+            run_id: run_id.to_owned(),
+            output: RunOutputPayload {
+                text: format!("output {SECRET}"),
+            },
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+                cost_usd: 0.0,
+            },
+        }))
+    }
+
+    fn view(withheld: bool) -> Result<PeerRun, String> {
+        Ok(PeerRun {
+            id: "run_1".to_owned(),
+            status: RunStatus::Running,
+            withheld,
+            prompt: None,
+            output: None,
+            error: None,
+            notice: withheld.then(|| "withheld".to_owned()),
+        })
+    }
+
+    /// Relays `events` for run_1 with `answer` as its peer view; returns the
+    /// result, what the ACP client was sent, and how often the view was read.
+    async fn relay(
+        events: Vec<Result<Event, String>>,
+        answer: fn() -> Result<PeerRun, String>,
+    ) -> (Result<Value, String>, String, usize) {
+        let checks = AtomicUsize::new(0);
+        let mut out = Vec::new();
+        let result = relay_run(
+            futures_util::stream::iter(events),
+            "run_1",
+            "sess_1",
+            &mut out,
+            || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                async move { answer() }
+            },
+        )
+        .await;
+        (
+            result,
+            String::from_utf8(out).unwrap_or_default(),
+            checks.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_run_streams_its_deltas_after_one_check() {
+        let (result, sent, checks) = relay(
+            vec![delta("run_1", "a"), delta("run_1", "b"), completed("run_1")],
+            || view(false),
+        )
+        .await;
+        assert_eq!(result.unwrap()["stopReason"], "end_turn");
+        let chunks: Vec<Value> = sent
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            chunks,
+            [message_chunk("sess_1", "a"), message_chunk("sess_1", "b")]
+        );
+        assert_eq!(checks, 1);
+    }
+
+    #[tokio::test]
+    async fn a_withheld_or_unreadable_run_sends_only_the_notice() {
+        let answers: [fn() -> Result<PeerRun, String>; 2] =
+            [|| view(true), || Err("daemon unreachable".to_owned())];
+        for answer in answers {
+            let (result, sent, checks) = relay(
+                vec![
+                    delta("run_1", &format!("a {SECRET}")),
+                    delta("run_1", &format!("b {SECRET}")),
+                    failed("run_1"),
+                ],
+                answer,
+            )
+            .await;
+            assert_eq!(
+                result.unwrap_err(),
+                format!("run failed: {WITHHELD_NOTICE}")
+            );
+            assert_eq!(
+                sent.lines().collect::<Vec<_>>(),
+                [message_chunk("sess_1", WITHHELD_NOTICE).to_string()]
+            );
+            assert!(!sent.contains(SECRET), "{sent}");
+            assert_eq!(checks, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_any_delta_checks_the_peer_view_first() {
+        let (result, _, checks) = relay(vec![failed("run_1")], || view(false)).await;
+        assert_eq!(result.unwrap_err(), format!("run failed: error {SECRET}"));
+        assert_eq!(checks, 1);
+
+        let (result, sent, checks) = relay(vec![failed("run_1")], || view(true)).await;
+        let err = result.unwrap_err();
+        assert_eq!(err, format!("run failed: {WITHHELD_NOTICE}"));
+        assert!(sent.is_empty(), "{sent}");
+        assert_eq!(checks, 1);
+    }
+
+    #[tokio::test]
+    async fn another_runs_events_are_ignored_without_a_check() {
+        let (result, sent, checks) = relay(
+            vec![delta("run_2", SECRET), failed("run_2"), completed("run_1")],
+            || view(true),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(sent.is_empty(), "{sent}");
+        assert_eq!(checks, 0);
+    }
 
     #[test]
     fn extracts_only_text_prompt_parts_in_order() {

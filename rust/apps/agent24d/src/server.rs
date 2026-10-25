@@ -1228,6 +1228,12 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         .route("/api/v1/runs/{id}", get(crate::runs::get_run))
         .route("/api/v1/runs/{id}/cancel", post(crate::runs::cancel_run))
+        // K1-6b.5c-2: the redacted views the MCP server and ACP bridge relay.
+        .route("/api/v1/peer/runs", get(crate::peer_runs::list_peer_runs))
+        .route(
+            "/api/v1/peer/runs/{id}",
+            get(crate::peer_runs::get_peer_run),
+        )
         .fallback(fallback)
         .with_state(state.clone());
 
@@ -4735,6 +4741,7 @@ pub(crate) mod tests {
             ("POST", "/api/v1/chat"),
             ("GET", "/api/v1/sessions"),
             ("POST", "/api/v1/runs"),
+            ("GET", "/api/v1/peer/runs"),
             ("GET", "/api/v1/events"),
             ("GET", "/api/v1/approvals"),
             ("GET", "/api/v1/tools"),
