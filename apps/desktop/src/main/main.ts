@@ -344,7 +344,8 @@ app.whenReady().then(async () => {
   // crashes, or is toggled from the menu itself.
   trayTimer = setInterval(() => {
     refreshTray()
-    // Replays the wanted Knowledge bindings once the daemon was restarted.
+    // Replays the wanted Knowledge bindings on a restarted daemon and retries
+    // changes that did not land.
     knowledgeHost?.sync()
   }, 4_000)
   // ─────────────────────────────────────────────────────────────────────────
