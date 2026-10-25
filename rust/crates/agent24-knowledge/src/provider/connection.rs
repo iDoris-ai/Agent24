@@ -131,6 +131,13 @@ impl Connection {
         }
     }
 
+    /// Lets `loading` try again whatever reason was kept: a manual retry, a
+    /// configuration change, a sidecar restart or a new handshake (S1.4),
+    /// persisted by the caller first (S1.10).
+    pub fn release_all(&mut self) {
+        self.held = None;
+    }
+
     /// Whether `round` is the current one.
     pub fn is_current(&self, round: Round) -> bool {
         round == self.round

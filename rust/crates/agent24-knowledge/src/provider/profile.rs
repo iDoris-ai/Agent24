@@ -3,11 +3,11 @@
 //! identity changes that retire its binding. Pure state, like the binding;
 //! the caller persists the retirement and the new binding (I1, I6).
 
-use super::binding::{Activation, BindingState, Leave};
-use super::connection::Connection;
+use super::binding::{Activation, BindingState, Leave, Sidecar};
+use super::connection::{Connection, Round};
 use super::credential::{Credentials, Effects};
 use super::placeholder::{Attempt, Placeholder};
-use super::state::Target;
+use super::state::{Switches, Target};
 
 /// What the profile awaits before its binding is activated (S1.13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +47,15 @@ pub struct Retired {
     /// retirement (S3.5); if that fails, [`Placeholder::creation_failed`]
     /// with this attempt.
     pub create: Option<Attempt>,
+}
+
+/// What a sidecar `starting` retried (S2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retried {
+    /// The binding entered `loading`.
+    Loading(Round),
+    /// The placeholder makes a handshake attempt.
+    Attempt(Attempt),
 }
 
 #[derive(Debug)]
@@ -93,14 +102,20 @@ impl Profile {
     }
 
     /// S3.3 on the profile: a binding takes it as in [`BindingState::leave`];
-    /// unselecting is remembered either way.
+    /// unselecting is remembered either way. On the placeholder, logging out
+    /// ends the login in flight and any binding it was creating.
     pub fn leave(&mut self, event: Leave) -> Effects {
         if event == Leave::Unselect {
             self.selected = false;
         }
         match &mut self.slot {
             Slot::Bound(binding) => binding.leave(event),
-            Slot::Placeholder(_) => Effects::default(),
+            Slot::Placeholder(placeholder) => {
+                if event == Leave::Logout {
+                    placeholder.cancel();
+                }
+                Effects::default()
+            }
         }
     }
 
@@ -131,9 +146,14 @@ impl Profile {
     /// `None` without a binding; a placeholder's attempt in flight no longer
     /// counts.
     pub fn change_identity(&mut self, change: IdentityChange) -> Option<Retired> {
-        if let Slot::Placeholder(placeholder) = &mut self.slot {
-            placeholder.cancel();
-            return None;
+        match &mut self.slot {
+            Slot::Placeholder(placeholder) => {
+                placeholder.cancel();
+                return None;
+            }
+            // Removed: it takes no event, and nothing follows it.
+            Slot::Bound(binding) if binding.retired() => return None,
+            Slot::Bound(_) => {}
         }
         let mut fresh = Placeholder::following(self.next_attempt);
         let create = (change != IdentityChange::Endpoint).then(|| fresh.creating());
@@ -152,15 +172,22 @@ impl Profile {
         })
     }
 
-    /// The new binding (and any retirement before it) is persisted. It is
-    /// activated when selected with nothing awaiting confirmation. Refused
-    /// under `UnsavedSettings`, which only the host's confirmation clears.
-    pub fn bind(&mut self, connection: Connection, credentials: Credentials) -> bool {
+    /// The new binding of `attempt` (and any retirement before it) is
+    /// persisted. It is activated when selected with nothing awaiting
+    /// confirmation. Refused under `UnsavedSettings`, which only the host's
+    /// confirmation clears, and once `attempt` no longer creates: a later
+    /// attempt, a logout or an identity change came first.
+    pub fn bind(
+        &mut self,
+        attempt: Attempt,
+        connection: Connection,
+        credentials: Credentials,
+    ) -> bool {
         let unsaved = self.confirmation == Some(Confirmation::UnsavedSettings);
         let Slot::Placeholder(placeholder) = &self.slot else {
             return false;
         };
-        if unsaved {
+        if unsaved || !placeholder.creates(attempt) {
             return false;
         }
         self.next_attempt = placeholder.next();
@@ -171,6 +198,23 @@ impl Profile {
             activated,
         )));
         true
+    }
+
+    /// S2.2 for a local-managed profile: the binding takes the sidecar's
+    /// state as in [`BindingState::sidecar`]; on `starting` a placeholder
+    /// holding `dependency` tries again when it would retry by backoff (S2.5).
+    pub fn sidecar(&mut self, sidecar: Sidecar, switches: Switches) -> Option<Retried> {
+        let unsaved = self.confirmation == Some(Confirmation::UnsavedSettings);
+        match &mut self.slot {
+            Slot::Bound(binding) => binding.sidecar(sidecar).map(Retried::Loading),
+            Slot::Placeholder(placeholder)
+                if sidecar == Sidecar::Starting
+                    && placeholder.retries_by_itself(switches, self.selected, unsaved) =>
+            {
+                Some(Retried::Attempt(placeholder.attempt()))
+            }
+            Slot::Placeholder(_) => None,
+        }
     }
 
     /// The user's confirmation of the new principal is persisted.

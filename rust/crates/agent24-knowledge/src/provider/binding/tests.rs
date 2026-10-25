@@ -315,3 +315,170 @@ fn logging_in_again_without_logging_out_retries_too() {
         Some(Unavailable(Incompatible))
     );
 }
+
+#[test]
+fn without_a_credential_dependency_retries_through_loading_never_a_probe() {
+    // #1228 note 1: a renewal whose issuer is unreachable drops the
+    // credential in `dependency`.
+    let mut binding = ready();
+    let old = binding.credentials().current().unwrap();
+    let (connection, credentials) = binding.parts_mut();
+    let Outcome::Done(expired) =
+        credentials.response(connection, old, Signal::Expired, Instant::now())
+    else {
+        unreachable!()
+    };
+    let renew = expired.renew.unwrap();
+    credentials.issued(connection, renew, Issued::Unreachable, Instant::now());
+    let dependency = Some(Unavailable(state::UnavailableCause::Dependency));
+    assert_eq!(binding.connection().phase(), dependency);
+    assert_eq!(binding.credentials().current(), None);
+    assert_eq!(binding.probe(), None);
+    let Some(Retry::Issue(ticket)) = binding.backoff() else {
+        panic!("no issuance")
+    };
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    assert_eq!(binding.probe(), None);
+    let (connection, credentials) = binding.parts_mut();
+    let granted = Issued::Granted { narrowed: false };
+    credentials.issued(connection, ticket, granted, Instant::now());
+    assert_eq!(binding.backoff(), None);
+    let probe = binding.probe().unwrap();
+    binding.parts_mut().0.apply_probe(probe, READY);
+    assert_eq!(binding.connection().phase(), Some(Ready));
+    assert!(binding.credentials().current().is_some());
+}
+
+#[test]
+fn with_a_credential_backoff_probes_and_only_in_a_reason_that_retries() {
+    let mut binding = ready();
+    assert_eq!(binding.backoff(), None);
+    let probe = binding.probe().unwrap();
+    binding.parts_mut().0.apply_probe(probe, Probe::NoAnswer);
+    let Some(Retry::Probe(probe)) = binding.backoff() else {
+        panic!("no probe")
+    };
+    binding.parts_mut().0.apply_probe(probe, READY);
+    assert_eq!(binding.connection().phase(), Some(Ready));
+    // Not in a reason that waits for the user, with or without a credential.
+    let mut binding = stuck(state::UnavailableCause::Incompatible);
+    assert_eq!(binding.backoff(), None);
+    let mut binding = stuck(state::UnavailableCause::AccessRevoked);
+    assert_eq!(binding.credentials().current(), None);
+    assert_eq!(binding.backoff(), None);
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(state::UnavailableCause::AccessRevoked))
+    );
+}
+
+#[test]
+fn a_retry_lets_a_reason_that_waits_for_the_user_go() {
+    use state::UnavailableCause::{AccessRevoked, Incompatible, LocalStorage};
+    for cause in [Incompatible, AccessRevoked] {
+        let mut binding = stuck(cause);
+        assert!(binding.retry().is_some(), "{cause:?}");
+        assert_eq!(binding.connection().phase(), Some(Loading));
+    }
+    // Revoked: a new issuance follows.
+    let mut binding = stuck(AccessRevoked);
+    binding.retry().unwrap();
+    let (connection, credentials) = binding.parts_mut();
+    assert!(credentials.issue(connection).is_some());
+    // Kept while out of the connection phase: let go there too.
+    let mut binding = stuck(Incompatible);
+    let off = binding.leave(Leave::Off);
+    persisted(&mut binding, &off);
+    assert_eq!(binding.retry(), None);
+    assert!(binding.connect(CLEAR).is_some());
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    // Nothing to retry in `ready`, in `local_storage`, or once retired.
+    let mut binding = ready();
+    let round = binding.connection().round();
+    assert_eq!(binding.retry(), None);
+    assert!(binding.connection().is_current(round));
+    let (connection, credentials) = binding.parts_mut();
+    credentials.revoke(connection, Instant::now());
+    let round = binding.connection().round();
+    assert_eq!(binding.retry(), None);
+    assert!(binding.connection().is_current(round));
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(LocalStorage))
+    );
+    let mut binding = stuck(Incompatible);
+    let removed = binding.leave(Leave::Remove);
+    persisted(&mut binding, &removed);
+    assert_eq!(binding.retry(), None);
+}
+
+#[test]
+fn a_sidecar_going_down_is_dependency_without_increment() {
+    use state::UnavailableCause::{Dependency, Incompatible};
+    for down in [
+        Sidecar::Degraded,
+        Sidecar::Failed,
+        Sidecar::Stopping,
+        Sidecar::Stopped,
+    ] {
+        let mut binding = ready();
+        assert_eq!(binding.sidecar(down), None);
+        assert_eq!(binding.connection().phase(), Some(Unavailable(Dependency)));
+        assert_eq!(binding.connection().gate().reported(), 1);
+        assert!(binding.credentials().current().is_some());
+        // A reason that waits for the user stays.
+        let mut binding = stuck(Incompatible);
+        binding.sidecar(down);
+        assert_eq!(
+            binding.connection().phase(),
+            Some(Unavailable(Incompatible))
+        );
+        // Out of the connection phase nothing moves.
+        let mut binding = ready();
+        let off = binding.leave(Leave::Off);
+        persisted(&mut binding, &off);
+        binding.sidecar(down);
+        assert_eq!(binding.connection().phase(), None);
+    }
+    for up in [Sidecar::Ready, Sidecar::Healthy] {
+        let mut binding = ready();
+        assert_eq!(binding.sidecar(up), None);
+        assert_eq!(binding.connection().phase(), Some(Ready));
+    }
+}
+
+#[test]
+fn a_sidecar_starting_retries_an_unavailable_binding_only() {
+    use state::UnavailableCause::Incompatible;
+    let mut binding = stuck(Incompatible);
+    assert!(binding.sidecar(Sidecar::Starting).is_some());
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    let mut binding = ready();
+    binding.sidecar(Sidecar::Stopped);
+    assert!(binding.sidecar(Sidecar::Starting).is_some());
+    let mut binding = ready();
+    let round = binding.connection().round();
+    assert_eq!(binding.sidecar(Sidecar::Starting), None);
+    assert!(binding.connection().is_current(round));
+}
+
+#[test]
+fn back_in_loading_no_probe_goes_out_before_the_issuance() {
+    // #1229 P1: Off, persisted, On: `loading` without a credential; a probe
+    // racing the issuance would reach `ready` with nothing to send.
+    let mut binding = ready();
+    let off = binding.leave(Leave::Off);
+    persisted(&mut binding, &off);
+    binding.connect(CLEAR).unwrap();
+    assert_eq!(binding.credentials().current(), None);
+    assert_eq!(binding.probe(), None);
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    let (connection, credentials) = binding.parts_mut();
+    let ticket = credentials.issue(connection).unwrap();
+    let granted = Issued::Granted { narrowed: false };
+    credentials.issued(connection, ticket, granted, Instant::now());
+    let probe = binding.probe().unwrap();
+    binding.parts_mut().0.apply_probe(probe, READY);
+    assert_eq!(binding.connection().phase(), Some(Ready));
+    assert!(binding.credentials().current().is_some());
+}

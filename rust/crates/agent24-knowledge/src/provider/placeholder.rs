@@ -121,8 +121,16 @@ impl Placeholder {
     /// changed: a late failure never overwrites a newer reason.
     pub fn creation_failed(&mut self, attempt: Attempt) {
         if self.creating == Some(attempt) {
+            self.creating = None;
             self.failure = Some(PlaceholderFailure::Dependency);
         }
+    }
+
+    /// Whether `attempt`'s binding may still be created: no later attempt,
+    /// no cancel, no failed creation since it returned
+    /// [`Settled::Create`].
+    pub fn creates(&self, attempt: Attempt) -> bool {
+        self.creating == Some(attempt)
     }
 
     /// S2.5: only `dependency` retries by backoff, and only while selected,
