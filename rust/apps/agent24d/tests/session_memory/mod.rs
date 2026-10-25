@@ -155,6 +155,7 @@ async fn run(state: &AppState, prompt: &str) -> Run {
 async fn run_in_session(state: &AppState, session_id: &str, prompt: &str) -> Run {
     let response = crate::runs::create_run(
         State(state.clone()),
+        None,
         Request::builder()
             .method("POST")
             .uri("/api/v1/runs")

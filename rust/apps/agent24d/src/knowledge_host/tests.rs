@@ -603,3 +603,211 @@ async fn a_malformed_request_changes_nothing() {
     }
     assert!(registry.is_empty());
 }
+
+// ── run binding (PR-C) ────────────────────────────────────────────────────────
+
+fn pin(host: &str, binding: &str, generation: u64) -> RunBinding {
+    RunBinding {
+        host: host.to_owned(),
+        binding: binding.to_owned(),
+        generation,
+    }
+}
+
+#[test]
+fn the_generation_moves_with_each_activation_only() {
+    let registry = KnowledgeHostRegistry::default();
+    let later = unix_now() + 600;
+    assert_eq!(registry.generation("host", "b1"), None);
+    registry.apply("host", "b1", 1, Change::Activate).unwrap();
+    assert_eq!(registry.generation("host", "b1"), Some(1));
+    // Rotating or revoking C is not a new generation.
+    registry
+        .push_credential("host", "b1", 2, bearer("c"), later)
+        .unwrap();
+    registry
+        .apply("host", "b1", 3, Change::RevokeCredential)
+        .unwrap();
+    assert_eq!(registry.generation("host", "b1"), Some(1));
+    registry.apply("host", "b1", 4, Change::Deactivate).unwrap();
+    assert_eq!(registry.generation("host", "b1"), None);
+    registry.apply("host", "b1", 5, Change::Activate).unwrap();
+    assert_eq!(registry.generation("host", "b1"), Some(5));
+    // Another host's records are its own.
+    assert_eq!(registry.generation("other", "b1"), None);
+}
+
+#[test]
+fn a_run_resolves_only_to_the_binding_host_and_generation_it_was_pinned_to() {
+    let registry = KnowledgeHostRegistry::default();
+    registry.apply("host", "b1", 1, Change::Activate).unwrap();
+    registry.pin_run("run_1", pin("host", "b1", 1));
+
+    assert_eq!(
+        registry.resolve_run("run_1", Some("b1")),
+        Ok(pin("host", "b1", 1))
+    );
+    // No selector: unbound, whatever is pinned.
+    assert_eq!(
+        registry.resolve_run("run_1", None),
+        Err(KnowledgeRefusal::Unbound)
+    );
+    // A selector without a pin (say, after a restart) is never bound anew.
+    assert_eq!(
+        registry.resolve_run("run_2", Some("b1")),
+        Err(KnowledgeRefusal::Stale)
+    );
+    // A selector that is not the pinned binding.
+    assert_eq!(
+        registry.resolve_run("run_1", Some("b2")),
+        Err(KnowledgeRefusal::Stale)
+    );
+
+    // Deactivated, then activated again: a new generation, so the run is stale.
+    registry.apply("host", "b1", 2, Change::Deactivate).unwrap();
+    assert_eq!(
+        registry.resolve_run("run_1", Some("b1")),
+        Err(KnowledgeRefusal::Stale)
+    );
+    registry.apply("host", "b1", 3, Change::Activate).unwrap();
+    assert_eq!(
+        registry.resolve_run("run_1", Some("b1")),
+        Err(KnowledgeRefusal::Stale)
+    );
+
+    // The same binding and generation under another host does not count.
+    registry.apply("other", "b1", 1, Change::Activate).unwrap();
+    registry.pin_run("run_3", pin("host", "b1", 1));
+    assert_eq!(
+        registry.resolve_run("run_3", Some("b1")),
+        Err(KnowledgeRefusal::Stale)
+    );
+
+    assert_eq!(KnowledgeRefusal::Unbound.code(), "knowledge_unbound");
+    assert_eq!(KnowledgeRefusal::Stale.code(), "knowledge_binding_stale");
+}
+
+#[test]
+fn the_oldest_run_pin_goes_first_once_the_cap_is_reached() {
+    let registry = KnowledgeHostRegistry::default();
+    registry.apply("host", "b1", 1, Change::Activate).unwrap();
+    for i in 0..=MAX_PINNED_RUNS {
+        registry.pin_run(&format!("run_{i}"), pin("host", "b1", 1));
+    }
+    assert_eq!(
+        registry.resolve_run("run_0", Some("b1")),
+        Err(KnowledgeRefusal::Stale)
+    );
+    assert!(registry.resolve_run("run_1", Some("b1")).is_ok());
+    let last = format!("run_{MAX_PINNED_RUNS}");
+    assert!(registry.resolve_run(&last, Some("b1")).is_ok());
+    // Pinning a run again does not take a second place in line.
+    registry.pin_run("run_1", pin("host", "b1", 1));
+    assert_eq!(registry.runs.lock().unwrap().order.len(), MAX_PINNED_RUNS);
+    registry.pin_run("run_new", pin("host", "b1", 1));
+    assert_eq!(
+        registry.resolve_run("run_1", Some("b1")),
+        Err(KnowledgeRefusal::Stale)
+    );
+    assert!(registry.resolve_run("run_2", Some("b1")).is_ok());
+}
+
+fn create_run_request(bearer: &str, body: serde_json::Value) -> Request<Body> {
+    with_body(Method::POST, "/api/v1/runs", bearer, &body.to_string())
+}
+
+async fn run_count(state: &AppState) -> usize {
+    state.store.list_runs(None).await.unwrap().len()
+}
+
+#[tokio::test]
+async fn the_host_creates_a_run_pinned_to_a_binding_it_activated() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state.clone());
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=7"), &host),
+    )
+    .await;
+    let host_id = registry.only_host();
+
+    let (status, body) = send(
+        &router,
+        create_run_request(
+            &host,
+            serde_json::json!({ "prompt": "hi", "knowledge_binding_id": "b1" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let run: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(run["input"]["knowledge_binding_id"], "b1");
+    let run_id = run["id"].as_str().unwrap();
+    assert_eq!(
+        registry.resolve_run(run_id, Some("b1")),
+        Ok(pin(&host_id, "b1", 7))
+    );
+    // The selector is in the stored run, where a tool reads it.
+    let stored = state.store.get_run(run_id).await.unwrap().unwrap();
+    assert_eq!(stored.input.knowledge_binding_id.as_deref(), Some("b1"));
+
+    // Without the field nothing changes: no binding, null on the wire.
+    let (status, body) = send(
+        &router,
+        create_run_request(&host, serde_json::json!({ "prompt": "hi" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(run["input"]["knowledge_binding_id"].is_null());
+    assert_eq!(
+        registry.resolve_run(run["id"].as_str().unwrap(), None),
+        Err(KnowledgeRefusal::Unbound)
+    );
+}
+
+#[tokio::test]
+async fn a_run_naming_a_binding_it_may_not_use_is_refused_and_not_created() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let router = build_router(state.clone());
+    send(
+        &router,
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host),
+    )
+    .await;
+    send(
+        &router,
+        request(Method::DELETE, &format!("{BINDING}?seq=2"), &host),
+    )
+    .await;
+    for (binding, status, code) in [
+        ("b1", StatusCode::CONFLICT, "knowledge_binding_inactive"),
+        ("never", StatusCode::CONFLICT, "knowledge_binding_inactive"),
+        ("..", StatusCode::BAD_REQUEST, "invalid_request"),
+        ("a/b", StatusCode::BAD_REQUEST, "invalid_request"),
+        ("", StatusCode::BAD_REQUEST, "invalid_request"),
+    ] {
+        let req = create_run_request(
+            &host,
+            serde_json::json!({ "prompt": "hi", "knowledge_binding_id": binding }),
+        );
+        let (got, body) = send(&router, req).await;
+        assert_eq!(got, status, "{binding}: {body}");
+        assert!(body.contains(code), "{binding}: {body}");
+    }
+    assert_eq!(run_count(&state).await, 0);
+
+    // The legacy shared token has no host identity.
+    let legacy = crate::server::tests::state().await;
+    let token = legacy.token.to_string();
+    let router = build_router(legacy.clone());
+    let req = create_run_request(
+        &token,
+        serde_json::json!({ "prompt": "hi", "knowledge_binding_id": "b1" }),
+    );
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("host_authority_required"));
+    assert_eq!(run_count(&legacy).await, 0);
+}
