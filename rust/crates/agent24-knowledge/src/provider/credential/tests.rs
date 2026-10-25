@@ -649,3 +649,32 @@ fn a_narrowing_in_a_reason_that_retries_starts_a_new_loading_round() {
     persisted(&mut connection, &effects).unwrap();
     assert_eq!(connection.phase(), Some(Loading));
 }
+
+#[test]
+fn the_two_windows_count_apart() {
+    let now = Instant::now();
+    // Two revocation-class events, then an invalid credential: a first one.
+    let (mut connection, mut credentials, _) = ready(now);
+    for _ in 0..2 {
+        let effects = effects(credentials.narrow(&mut connection, now));
+        persisted(&mut connection, &effects);
+    }
+    let credential = granted(&mut connection, &mut credentials, now);
+    probed(&mut connection, READY);
+    assert_eq!(
+        credentials.response(&mut connection, credential, Signal::Invalid, now),
+        Outcome::Done(Effects::default())
+    );
+    assert_eq!(connection.phase(), Some(Loading));
+}
+
+#[test]
+fn an_event_exactly_ten_minutes_later_is_outside_the_window() {
+    let start = Instant::now();
+    let (mut connection, mut credentials, _) = ready(start);
+    for at in [0, 1, 600] {
+        let effects = effects(credentials.narrow(&mut connection, start + Duration::from_secs(at)));
+        persisted(&mut connection, &effects);
+    }
+    assert_eq!(connection.phase(), Some(Loading));
+}
