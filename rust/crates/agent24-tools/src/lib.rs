@@ -407,6 +407,15 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether only a run that names a Knowledge binding is offered this tool
+    /// (KB-HOST-01 PR-D). Declared, like [`Tool::target_arg`]: the registry
+    /// leaves such a tool out of every advert set for a run without a binding.
+    /// Not advertising it is not the refusal; a call that comes anyway is
+    /// refused by the tool itself.
+    fn needs_knowledge_binding(&self) -> bool {
+        false
+    }
+
     /// Per-tool execution budget, enforced by the registry
     fn timeout(&self) -> Duration {
         Duration::from_secs(30)
@@ -1249,6 +1258,9 @@ impl ToolRegistry {
     /// interactive gate, requires-approval tools are NOT advertised —
     /// offering a tool that dispatch always denies just burns model
     /// iterations. With one (C4), they are advertised and gated per call.
+    ///
+    /// No run is known here, so a tool that needs a Knowledge binding is left
+    /// out, as for a run without one.
     pub fn adverts(&self) -> Vec<ToolAdvert> {
         self.tools
             .values()
@@ -1256,6 +1268,7 @@ impl ToolRegistry {
                 let info = t.info();
                 self.allowed.contains(&info.name)
                     && (self.interactive_gate || !self.effective_risk(&info).requires_approval())
+                    && !t.needs_knowledge_binding()
             })
             .map(|t| {
                 let info = t.info();
@@ -1268,12 +1281,15 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub async fn live_adverts(&self) -> Vec<ToolAdvert> {
+    /// As [`Self::adverts`], asking each tool whether it is advertisable now,
+    /// for a run that names a Knowledge binding or not (`knowledge_bound`).
+    pub async fn live_adverts(&self, knowledge_bound: bool) -> Vec<ToolAdvert> {
         let mut adverts = Vec::new();
         for tool in self.tools.values() {
             let info = tool.info();
             if self.allowed.contains(&info.name)
                 && (self.interactive_gate || !self.effective_risk(&info).requires_approval())
+                && (knowledge_bound || !tool.needs_knowledge_binding())
                 && tool.advertisable().await
             {
                 adverts.push(ToolAdvert {
@@ -1286,8 +1302,8 @@ impl ToolRegistry {
         adverts
     }
 
-    pub async fn live_plan_adverts(&self) -> Vec<ToolAdvert> {
-        self.live_adverts()
+    pub async fn live_plan_adverts(&self, knowledge_bound: bool) -> Vec<ToolAdvert> {
+        self.live_adverts(knowledge_bound)
             .await
             .into_iter()
             .filter(|a| self.tool_risk_class(&a.name) == Some(RiskClass::Read))
@@ -1607,6 +1623,63 @@ mod tests {
                 () = cancel.cancelled() => Err(ToolError::Cancelled),
             }
         }
+    }
+
+    /// Advertised only to a run that names a Knowledge binding.
+    struct NeedsBinding(&'static str, RiskClass);
+
+    #[async_trait]
+    impl Tool for NeedsBinding {
+        fn info(&self) -> ToolInfo {
+            ToolInfo::new(self.0, "builtin", "needs a binding", self.1)
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn needs_knowledge_binding(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _ctx: &ToolContext,
+            _input: &Map<String, Value>,
+            _cancel: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            Ok("ok".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_needs_a_knowledge_binding_is_advertised_only_to_a_bound_run() {
+        let reg = ToolRegistry::new()
+            .with(Arc::new(SlowTool))
+            .with(Arc::new(NeedsBinding("kb_read", RiskClass::Read)))
+            .with(Arc::new(NeedsBinding("kb_send", RiskClass::External)))
+            .with_unlisted(Arc::new(NeedsBinding("kb_unlisted", RiskClass::Read)));
+        let names = |adverts: Vec<ToolAdvert>| {
+            let mut names: Vec<String> = adverts.into_iter().map(|a| a.name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(reg.live_adverts(false).await), vec!["slow"]);
+        assert_eq!(names(reg.live_plan_adverts(false).await), vec!["slow"]);
+        // Bound: offered, and every other rule still applies (the whitelist;
+        // requires-approval without a gate; plan mode reads only).
+        assert_eq!(names(reg.live_adverts(true).await), vec!["kb_read", "slow"]);
+        assert_eq!(
+            names(reg.live_plan_adverts(true).await),
+            vec!["kb_read", "slow"]
+        );
+        // Without a run, as without a binding.
+        assert_eq!(names(reg.adverts()), vec!["slow"]);
+        assert_eq!(names(reg.plan_adverts()), vec!["slow"]);
+        // Every tool still lists, and a call is still dispatched to the tool.
+        assert!(reg.list().iter().any(|t| t.name == "kb_read"));
+        let out = reg
+            .dispatch("kb_read", &ctx(), &Map::new(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out, "ok");
     }
 
     struct StalledInterruptedAudit;
