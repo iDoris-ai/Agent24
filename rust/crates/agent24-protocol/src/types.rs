@@ -459,17 +459,19 @@ pub struct RunCreate {
 /// K1-6b.5c-2 (ADR-K1-02 §2.4): a run as a peer bridge (the MCP server, the
 /// ACP bridge) may relay it. Content is present only when `withheld` is false
 /// and the run has ended; a run any of whose sources is not Ordinary — or
-/// whose sources cannot be read, or that called a tool (tool results carry no
-/// source tags yet) — carries only its id, status and `notice`.
+/// whose sources cannot be read, or that (or an earlier run of its session)
+/// called a tool or recalled a memory, since tool results carry no source
+/// tags yet — carries only its id, status and `notice`.
 /// An allowlist, not a filtered [`Run`]: a field added to `Run` later never
 /// reaches a peer by default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PeerRun {
     pub id: String,
     pub status: RunStatus,
-    /// True unless every source tagged on the run so far is Ordinary and the
-    /// run has called no tool. Sources are tagged before the first model
-    /// call, so the value only changes again when the run starts a tool.
+    /// True unless every source tagged on the run so far is Ordinary and
+    /// neither the run nor an earlier run of its session has called a tool or
+    /// recalled a memory. Sources are tagged before the first model call, so
+    /// the value only changes again when the run starts a tool.
     pub withheld: bool,
     /// Present only for an ended run that is not withheld
     pub prompt: Option<String>,

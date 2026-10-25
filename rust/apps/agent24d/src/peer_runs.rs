@@ -7,11 +7,16 @@
 //! all, or a failed tag read all withhold it (David 2026-10-25, option 丙).
 //!
 //! Tool results are not tagged yet (ADR-K1-02 §2.1 says they should be), so
-//! a run that called any tool has sources nobody recorded: until they are
-//! tagged it counts as `Unknown` here (David 2026-10-25, option A).
+//! until they are (6b.5f), what a tool returned reaches later runs without a
+//! trace: through the session's memory of earlier turns, or through a fact
+//! remembered from it and recalled elsewhere. A run is therefore also
+//! `Unknown` here when it, or an earlier run of its session, called a tool or
+//! recalled a memory (David 2026-10-25, option A).
+
+use std::collections::HashMap;
 
 use agent24_protocol::{PeerRun, Run, RunStatus};
-use agent24_store::{SourceClassification, strictest_classification};
+use agent24_store::{SourceClassification, SourceKind, strictest_classification};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -24,31 +29,42 @@ use crate::server::{AppState, error_response};
 pub(crate) const WITHHELD_NOTICE: &str = "this run used sources that are not ordinary, so its \
      content is not shared with connected tools; open it in Agent24 to see it";
 
-/// The strictest classification of a run's sources as a peer may rely on
-/// them.
-///
-/// A run that called a tool has untagged sources, so it is `Unknown`. Every
-/// tool call is recorded before the tool runs, and a call that cannot be
-/// recorded does not run.
-///
-/// A run that ended before all its tags were written (a failed tag read or
-/// write stops it) has only some of them. The one source that can shape such
-/// a run's own prompt is the self-wake schedule that wrote it, so that
-/// schedule's recorded classification counts whether or not its tag made it
-/// onto the run.
-async fn peer_classification(state: &AppState, run: &Run) -> SourceClassification {
-    match state.store.list_tool_calls(&run.id).await {
-        Ok(calls) if calls.is_empty() => {}
-        Ok(_) => return SourceClassification::Unknown,
+/// What a peer may rely on from one run's own record.
+struct RunEvidence {
+    /// The strictest classification of the run's tagged sources.
+    ///
+    /// A run that ended before all its tags were written (a failed tag read
+    /// or write stops it) has only some of them. The one source that can
+    /// shape such a run's own prompt is the self-wake schedule that wrote it,
+    /// so that schedule's recorded classification counts whether or not its
+    /// tag made it onto the run.
+    classification: SourceClassification,
+    /// The run took in content no tag describes: it called a tool (every
+    /// call is recorded before the tool runs, and a call that cannot be
+    /// recorded does not run) or recalled a memory, whose stored
+    /// classification cannot account for tool results either.
+    untraced: bool,
+}
+
+impl RunEvidence {
+    const UNREADABLE: Self = Self {
+        classification: SourceClassification::Unknown,
+        untraced: true,
+    };
+}
+
+async fn run_evidence(state: &AppState, run: &Run) -> RunEvidence {
+    let calls = match state.store.list_tool_calls(&run.id).await {
+        Ok(calls) => calls,
         Err(err) => {
             tracing::warn!(
                 run_id = %run.id,
                 error = %err,
                 "run tool calls unreadable; withholding the run from peers"
             );
-            return SourceClassification::Unknown;
+            return RunEvidence::UNREADABLE;
         }
-    }
+    };
     let tags = match state.store.list_run_source_tags(&run.id).await {
         Ok(tags) => tags,
         Err(err) => {
@@ -57,7 +73,7 @@ async fn peer_classification(state: &AppState, run: &Run) -> SourceClassificatio
                 error = %err,
                 "run source tags unreadable; withholding the run from peers"
             );
-            return SourceClassification::Unknown;
+            return RunEvidence::UNREADABLE;
         }
     };
     let origin = match run.schedule_id.as_deref() {
@@ -73,20 +89,59 @@ async fn peer_classification(state: &AppState, run: &Run) -> SourceClassificatio
                     error = %err,
                     "schedule source origin unreadable; withholding the run from peers"
                 );
-                return SourceClassification::Unknown;
+                return RunEvidence::UNREADABLE;
             }
         },
         None => None,
     };
-    strictest_classification(
-        tags.into_iter()
-            .map(|tag| tag.source.classification)
-            .chain(origin),
-    )
+    let recalled = tags
+        .iter()
+        .any(|tag| tag.source.kind == SourceKind::MemoryRecall);
+    RunEvidence {
+        classification: strictest_classification(
+            tags.into_iter()
+                .map(|tag| tag.source.classification)
+                .chain(origin),
+        ),
+        untraced: !calls.is_empty() || recalled,
+    }
 }
 
-async fn peer_view(state: &AppState, run: Run) -> PeerRun {
-    let classification = peer_classification(state, &run).await;
+/// Evidence for each run, read once. `runs` must hold every run of each
+/// session it touches.
+async fn evidence_by_run(state: &AppState, runs: &[Run]) -> HashMap<String, RunEvidence> {
+    let mut evidence = HashMap::with_capacity(runs.len());
+    for run in runs {
+        evidence.insert(run.id.clone(), run_evidence(state, run).await);
+    }
+    evidence
+}
+
+/// The classification a peer may rely on for `run`: its own, or `Unknown`
+/// when it or an earlier run of its session took in untraced content.
+fn peer_classification(
+    run: &Run,
+    runs: &[Run],
+    evidence: &HashMap<String, RunEvidence>,
+) -> SourceClassification {
+    let own = evidence.get(&run.id).unwrap_or(&RunEvidence::UNREADABLE);
+    let earlier_untraced = run.session_id.is_some()
+        && runs.iter().any(|other| {
+            other.id != run.id
+                && other.session_id == run.session_id
+                && other.created_at <= run.created_at
+                && evidence
+                    .get(&other.id)
+                    .is_none_or(|evidence| evidence.untraced)
+        });
+    if own.untraced || earlier_untraced {
+        SourceClassification::Unknown
+    } else {
+        own.classification
+    }
+}
+
+fn peer_view(run: Run, classification: SourceClassification) -> PeerRun {
     if classification != SourceClassification::Ordinary {
         return PeerRun {
             id: run.id,
@@ -115,38 +170,56 @@ async fn peer_view(state: &AppState, run: Run) -> PeerRun {
     }
 }
 
+fn storage_error(err: agent24_store::StoreError) -> Response {
+    tracing::error!("store error: {err}");
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "storage error",
+    )
+}
+
 pub async fn list_peer_runs(State(state): State<AppState>) -> Response {
     let runs = match state.store.list_runs(None).await {
         Ok(runs) => runs,
-        Err(err) => {
-            tracing::error!("store error: {err}");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "storage error",
-            );
-        }
+        Err(err) => return storage_error(err),
     };
-    let mut views = Vec::with_capacity(runs.len());
-    for run in runs {
-        views.push(peer_view(&state, run).await);
-    }
+    let evidence = evidence_by_run(&state, &runs).await;
+    let classifications: Vec<_> = runs
+        .iter()
+        .map(|run| peer_classification(run, &runs, &evidence))
+        .collect();
+    let views: Vec<PeerRun> = runs
+        .into_iter()
+        .zip(classifications)
+        .map(|(run, classification)| peer_view(run, classification))
+        .collect();
     Json(serde_json::json!({ "runs": views })).into_response()
 }
 
 pub async fn get_peer_run(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.store.get_run(&id).await {
-        Ok(Some(run)) => Json(peer_view(&state, run).await).into_response(),
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "not_found", &format!("run {id}")),
-        Err(err) => {
-            tracing::error!("store error: {err}");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "storage error",
-            )
+    let run = match state.store.get_run(&id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, "not_found", &format!("run {id}"));
         }
-    }
+        Err(err) => return storage_error(err),
+    };
+    // The run and every run of its session: an earlier turn's untraced
+    // content can be in this one's context.
+    let runs = match run.session_id.as_deref() {
+        Some(session_id) => match state.store.list_runs(None).await {
+            Ok(runs) => runs
+                .into_iter()
+                .filter(|other| other.session_id.as_deref() == Some(session_id))
+                .collect(),
+            Err(err) => return storage_error(err),
+        },
+        None => vec![run.clone()],
+    };
+    let evidence = evidence_by_run(&state, &runs).await;
+    let classification = peer_classification(&run, &runs, &evidence);
+    Json(peer_view(run, classification)).into_response()
 }
 
 #[cfg(test)]
@@ -437,11 +510,51 @@ mod tests {
         // Control: the same Ordinary run without a tool call is relayed.
         assert!(!peer_run(&state, "run_tool").await.0.withheld);
 
+        call_tool(&state, "run_tool").await;
+        let (view, body) = peer_run(&state, "run_tool").await;
+        assert_withheld(&view, &body);
+        let (_, list) = get(&state, "/api/v1/peer/runs").await;
+        assert!(
+            !list.contains(SECRET),
+            "withheld content reached a peer: {list}"
+        );
+    }
+
+    async fn session(state: &AppState, id: &str) {
+        state
+            .store
+            .insert_session(&agent24_protocol::Session {
+                id: id.to_owned(),
+                title: id.to_owned(),
+                channel: "cli".to_owned(),
+                workspace_id: None,
+                created_at: now_iso8601(),
+                updated_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// An Ordinary, completed run of `session_id` created at `created_at`.
+    async fn turn(state: &AppState, id: &str, session_id: &str, created_at: &str) {
+        let mut turn = run(id, RunStatus::Completed);
+        turn.session_id = Some(session_id.to_owned());
+        turn.created_at = created_at.to_owned();
+        state.store.insert_run(&turn).await.unwrap();
+        let tag = SourceRef::user_input(id, now_iso8601());
+        state
+            .store
+            .tag_run_source(id, 0, &tag, &now_iso8601())
+            .await
+            .unwrap();
+    }
+
+    async fn call_tool(state: &AppState, run_id: &str) {
         state
             .store
             .insert_tool_call(&agent24_protocol::ToolCall {
-                id: "tc_1".to_owned(),
-                run_id: "run_tool".to_owned(),
+                id: format!("tc_{run_id}"),
+                run_id: run_id.to_owned(),
                 tool: "fs_read".to_owned(),
                 input: serde_json::Map::new(),
                 status: agent24_protocol::ToolCallStatus::Completed,
@@ -451,13 +564,70 @@ mod tests {
             })
             .await
             .unwrap();
-        let (view, body) = peer_run(&state, "run_tool").await;
-        assert_withheld(&view, &body);
+    }
+
+    #[tokio::test]
+    async fn a_later_turn_of_a_session_whose_earlier_turn_called_a_tool_is_withheld() {
+        let state = crate::server::tests::state().await;
+        session(&state, "sess_a").await;
+        session(&state, "sess_b").await;
+        turn(&state, "run_before", "sess_a", "2026-10-25T10:00:00Z").await;
+        turn(&state, "run_tool", "sess_a", "2026-10-25T10:01:00Z").await;
+        turn(&state, "run_after", "sess_a", "2026-10-25T10:02:00Z").await;
+        turn(&state, "run_elsewhere", "sess_b", "2026-10-25T10:03:00Z").await;
+        // Control: nothing untraced yet, every turn is relayed.
+        for id in ["run_before", "run_tool", "run_after", "run_elsewhere"] {
+            assert!(!peer_run(&state, id).await.0.withheld, "{id}");
+        }
+
+        call_tool(&state, "run_tool").await;
+        for id in ["run_tool", "run_after"] {
+            let (view, body) = peer_run(&state, id).await;
+            assert_withheld(&view, &body);
+        }
+        // A turn before the tool call never saw its result, and another
+        // session is not affected.
+        assert!(!peer_run(&state, "run_before").await.0.withheld);
+        assert!(!peer_run(&state, "run_elsewhere").await.0.withheld);
+
         let (_, list) = get(&state, "/api/v1/peer/runs").await;
-        assert!(
-            !list.contains(SECRET),
-            "withheld content reached a peer: {list}"
-        );
+        let runs: Vec<PeerRun> = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&list).unwrap()["runs"].clone(),
+        )
+        .unwrap();
+        let withheld: Vec<(&str, bool)> =
+            runs.iter().map(|r| (r.id.as_str(), r.withheld)).collect();
+        for expected in [
+            ("run_before", false),
+            ("run_tool", true),
+            ("run_after", true),
+            ("run_elsewhere", false),
+        ] {
+            assert!(withheld.contains(&expected), "{expected:?} in {withheld:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_that_recalled_a_memory_and_the_turns_after_it_are_withheld() {
+        let state = crate::server::tests::state().await;
+        session(&state, "sess_r").await;
+        turn(&state, "run_recall", "sess_r", "2026-10-25T10:00:00Z").await;
+        turn(&state, "run_next", "sess_r", "2026-10-25T10:01:00Z").await;
+        assert!(!peer_run(&state, "run_next").await.0.withheld);
+
+        // The recalled fact was stored as Ordinary: its classification cannot
+        // account for a tool result it was remembered from.
+        let recall =
+            SourceRef::recalled_memory("a_1", SourceClassification::Ordinary, now_iso8601());
+        state
+            .store
+            .tag_run_source("run_recall", 1, &recall, &now_iso8601())
+            .await
+            .unwrap();
+        for id in ["run_recall", "run_next"] {
+            let (view, body) = peer_run(&state, id).await;
+            assert_withheld(&view, &body);
+        }
     }
 
     #[tokio::test]

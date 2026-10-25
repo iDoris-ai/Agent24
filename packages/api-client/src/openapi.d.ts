@@ -462,9 +462,10 @@ export interface paths {
          * List runs as a peer bridge may relay them
          * @description K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
          *     runs here instead of /runs. A run's prompt, output and error appear
-         *     only when every source tagged on it is ordinary, it has called no
-         *     tool (tool results carry no source tags yet), and it has ended; any
-         *     other run carries only its id, status and a fixed notice.
+         *     only when every source tagged on it is ordinary, neither it nor an
+         *     earlier run of its session has called a tool or recalled a memory
+         *     (tool results carry no source tags yet), and it has ended; any other
+         *     run carries only its id, status and a fixed notice.
          */
         get: operations["listPeerRuns"];
         put?: never;
@@ -1536,7 +1537,8 @@ export interface components {
             status: components["schemas"]["RunStatus"];
             /**
              * @description True unless every source tagged on the run so far is ordinary and
-             *     the run has called no tool. Sources are tagged before the first
+             *     neither the run nor an earlier run of its session has called a
+             *     tool or recalled a memory. Sources are tagged before the first
              *     model call, so the value only changes again when the run starts a
              *     tool.
              */

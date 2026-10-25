@@ -127,7 +127,7 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 | POST | `/runs` | `{session_id?, prompt, model_override?}` → Run（202，异步执行；进度走 WS） | M-C |
 | GET | `/runs/{id}` · GET `/runs?status=…` | Run 查询 | M-C |
 | POST | `/runs/{id}/cancel` | 请求取消（幂等；任何状态可调） | M-C |
-| GET | `/peer/runs` · `/peer/runs/{id}` | PeerRun：给 MCP server、ACP 桥转发用的 run 视图。只有来源全是 Ordinary、没调用过工具（工具结果还没有来源标签）且已结束的 run 才带 prompt、输出、错误；其余只有 id、status、`withheld: true` 和固定提示（ADR-K1-02 §2.4） | K1-6b |
+| GET | `/peer/runs` · `/peer/runs/{id}` | PeerRun：给 MCP server、ACP 桥转发用的 run 视图。只有来源全是 Ordinary、本 run 和同会话更早的 run 都没调用过工具也没召回过记忆（工具结果还没有来源标签）、且已结束的 run 才带 prompt、输出、错误；其余只有 id、status、`withheld: true` 和固定提示（ADR-K1-02 §2.4） | K1-6b |
 | GET | `/approvals?status=pending` | 待审批列表（TUI/UI 轮询兜底） | M-C |
 | POST | `/approvals/{id}` | body = Decision；对已决议/过期返回 409 `approval_already_resolved` | M-C |
 | POST | `/schedules` | 创建（body = Schedule 去 id/last_run_at/next_run_at/consecutive_failures；`enabled` 默认 true、`delivery` 默认 `[]`）→ 201 Schedule | M-C |
