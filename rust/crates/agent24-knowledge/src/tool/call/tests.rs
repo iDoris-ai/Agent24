@@ -117,12 +117,21 @@ fn search_arguments_are_parsed_strictly() {
     assert_eq!(q.query, "差旅");
     assert_eq!(q.knowledge_base_ids.unwrap().as_slice(), ["kb-a", "kb-b"]);
     assert_eq!(q.max_results.unwrap().get(), 5);
+    // A lone BOM is no whitespace to `str::trim`, nor to the pattern.
+    assert_eq!(
+        parse_search(&input(json!({ "query": "\u{feff}" })))
+            .unwrap()
+            .query,
+        "\u{feff}"
+    );
     let bare = parse_search(&input(json!({ "query": "差旅" }))).unwrap();
     assert!(bare.knowledge_base_ids.is_none() && bare.max_results.is_none());
     for bad in [
         json!({}),
         json!({ "query": "" }),
         json!({ "query": "  " }),
+        // Blank as `str::trim` sees it, the set the schema's pattern spells out.
+        json!({ "query": "\u{0085}\u{3000}\t" }),
         json!({ "query": 3 }),
         json!({ "query": "差旅", "knowledge_base_ids": [] }),
         json!({ "query": "差旅", "knowledge_base_ids": ["kb-a", ""] }),
@@ -384,7 +393,7 @@ fn the_advertised_schemas_match_the_parser() {
         .cloned()
         .collect();
     assert_eq!(keys, ["knowledge_base_ids", "max_results", "query"]);
-    let text = json!({ "type": "string", "pattern": "\\S" });
+    let text = json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF" });
     assert_eq!(s["properties"]["query"], text);
     assert_eq!(
         s["properties"]["knowledge_base_ids"],

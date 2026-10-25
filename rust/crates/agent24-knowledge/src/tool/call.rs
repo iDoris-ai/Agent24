@@ -109,7 +109,7 @@ fn object(properties: Value, required: &str) -> Value {
 
 /// The JSON Schema advertised for `knowledge.search`.
 pub fn search_parameters() -> Value {
-    let text = json!({ "type": "string", "pattern": "\\S" });
+    let text = json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF" });
     let ids = json!({ "type": "array", "minItems": 1, "items": text });
     let max = json!({ "type": "integer", "minimum": 1 });
     let properties = json!({ "query": text, "knowledge_base_ids": ids, "max_results": max });
@@ -119,7 +119,7 @@ pub fn search_parameters() -> Value {
 /// The JSON Schema advertised for `knowledge.read`. A citation read passes
 /// the `chunk_id` and `content_tag` of the hit it cites.
 pub fn read_parameters() -> Value {
-    let text = json!({ "type": "string", "pattern": "\\S" });
+    let text = json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF" });
     let keys = ["knowledge_id", "chunk_id", "content_tag", "cursor"];
     let properties = keys
         .map(|k| (k.to_owned(), text.clone()))
