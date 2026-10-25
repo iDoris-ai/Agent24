@@ -1080,9 +1080,17 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/capabilities/{capability_id}/revoke",
             post(revoke_capability),
         )
+        // The desktop's generic proxy refuses these by their raw path
+        // (`reachesHostInterface`); that holds only while routing matches the
+        // raw path, so never decode or normalize the path before routing.
         .route(
             "/api/v1/host/knowledge/bindings/{binding_id}",
             axum::routing::put(crate::knowledge_host::change).delete(crate::knowledge_host::change),
+        )
+        .route(
+            "/api/v1/host/knowledge/bindings/{binding_id}/credential",
+            axum::routing::put(crate::knowledge_host::push_credential)
+                .delete(crate::knowledge_host::revoke_credential),
         )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
@@ -3207,6 +3215,7 @@ pub(crate) mod tests {
         "/events", // WebSocket protocol is documented by protocol/events.schema.json.
         // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
         "/host/knowledge/bindings/{binding_id}",
+        "/host/knowledge/bindings/{binding_id}/credential",
     ];
 
     // Module-owned contract paths appear in OpenAPI but are not literal routes
