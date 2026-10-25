@@ -175,3 +175,59 @@ fn a_confirmation_after_leaving_records_once_servable_without_entering_loading()
         ProbeApplied::Moved(Ready)
     );
 }
+
+#[test]
+fn entering_loading_with_a_change_not_yet_persisted_is_local_storage_until_confirmed() {
+    // At start: the start's increment is pending (S1.4, S4.2).
+    let mut connection = Connection::new(Gate::restored(1), true);
+    assert_eq!(connection.start_loading(), None);
+    assert_eq!(connection.phase(), Some(Unavailable(U::LocalStorage)));
+    assert_eq!(connection.probe(), None);
+    // A confirmation of another value changes nothing.
+    assert_eq!(connection.confirm_generation(5), None);
+    assert_eq!(connection.phase(), Some(Unavailable(U::LocalStorage)));
+    let round = connection.confirm_generation(2).unwrap();
+    assert!(connection.is_current(round));
+    assert_eq!(connection.phase(), Some(Loading));
+    assert!(connection.probe().is_some());
+
+    // Two things pending: "once servable" alone does not leave local_storage.
+    let mut connection = loading(false);
+    let ticket = connection.probe().unwrap();
+    connection.apply_probe(ticket, READY);
+    let next = connection.gate_mut().invalidate().to_persist.unwrap();
+    assert_eq!(connection.confirm_once_servable(), None);
+    assert_eq!(connection.phase(), Some(Unavailable(U::LocalStorage)));
+    assert!(connection.confirm_generation(next).is_some());
+    assert_eq!(connection.phase(), Some(Loading));
+
+    // Confirming outside local_storage keeps the phase.
+    let mut connection = loading(true);
+    let ticket = connection.probe().unwrap();
+    connection.apply_probe(ticket, READY);
+    let next = connection.gate_mut().invalidate().to_persist.unwrap();
+    connection.fail(U::AccessRevoked);
+    assert_eq!(connection.confirm_generation(next), None);
+    assert_eq!(connection.phase(), Some(Unavailable(U::AccessRevoked)));
+}
+
+#[test]
+fn a_round_stays_current_until_the_binding_loads_again_or_fails() {
+    let mut connection = Connection::new(Gate::new(1), true);
+    let first = connection.start_loading().unwrap();
+    assert!(connection.is_current(first));
+    connection.fail(U::Dependency);
+    assert!(!connection.is_current(first));
+    let second = connection.start_loading().unwrap();
+    assert!(connection.is_current(second));
+    assert!(!connection.is_current(first));
+}
+
+#[test]
+fn a_result_arriving_while_a_change_is_pending_does_not_move_the_binding() {
+    let mut connection = loading(true);
+    let ticket = connection.probe().unwrap();
+    connection.gate_mut().invalidate();
+    assert_eq!(connection.apply_probe(ticket, READY), ProbeApplied::Ignored);
+    assert_eq!(connection.phase(), Some(Loading));
+}

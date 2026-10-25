@@ -5,13 +5,19 @@
 
 use super::gate::Gate;
 use super::state::{ConnectionPhase, Probe, UnavailableCause, judge_connection};
+use crate::common::Generation;
+
+/// A `loading` round: what is sent in it (probes, the credential issuance)
+/// counts only while it is the current one (S3.4; S3.1, credential ownership).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Round(u64);
 
 /// A probe the caller is about to send. Its result is applied only within the
 /// round it was sent in, and only if no later probe's result was applied
 /// (S3.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeTicket {
-    round: u64,
+    round: Round,
     seq: u64,
 }
 
@@ -34,7 +40,7 @@ pub struct Connection {
     gate: Gate,
     /// `None` outside the connection phase (`registered`, `disabled`).
     phase: Option<ConnectionPhase>,
-    round: u64,
+    round: Round,
     next_probe: u64,
     applied_probe: Option<u64>,
     /// "Once servable" is persisted (S1.12); it is never taken back.
@@ -49,7 +55,7 @@ impl Connection {
         Self {
             gate,
             phase: None,
-            round: 0,
+            round: Round(0),
             next_probe: 0,
             applied_probe: None,
             once_servable,
@@ -61,6 +67,9 @@ impl Connection {
         &self.gate
     }
 
+    /// For calls in flight and invalidations. A generation's persistence is
+    /// confirmed through [`Connection::confirm_generation`], which also leaves
+    /// `local_storage`.
     pub fn gate_mut(&mut self) -> &mut Gate {
         &mut self.gate
     }
@@ -75,10 +84,22 @@ impl Connection {
     }
 
     /// Enters `loading` in a new round: every probe and issuance of an earlier
-    /// round no longer counts.
-    pub fn start_loading(&mut self) {
+    /// round no longer counts. With a change not yet persisted it is
+    /// `unavailable(local_storage)` instead, and `None` (S1.4); `loading`
+    /// follows once that is confirmed.
+    pub fn start_loading(&mut self) -> Option<Round> {
+        if self.persist_pending() {
+            self.fail(UnavailableCause::LocalStorage);
+            return None;
+        }
         self.new_round();
         self.phase = Some(ConnectionPhase::Loading);
+        Some(self.round)
+    }
+
+    /// Whether `round` is the current one.
+    pub fn is_current(&self, round: Round) -> bool {
+        round == self.round
     }
 
     /// Leaves the connection phase. No result moves a binding outside it, and
@@ -97,7 +118,7 @@ impl Connection {
     /// Probe numbers keep growing across rounds, so the last applied one need
     /// not be reset.
     fn new_round(&mut self) {
-        self.round += 1;
+        self.round = Round(self.round.0 + 1);
     }
 
     /// A probe may go out from `loading`, a servable phase, or an
@@ -132,7 +153,8 @@ impl Connection {
             Some(_) => true,
             None => false,
         };
-        if !current || !movable {
+        // A change not yet persisted holds the binding where it is.
+        if !current || !movable || self.persist_pending() {
             return ProbeApplied::Ignored;
         }
         self.applied_probe = Some(ticket.seq);
@@ -146,17 +168,30 @@ impl Connection {
         ProbeApplied::Moved(phase)
     }
 
-    /// "Once servable" is persisted: back to `loading` for a new probe
-    /// (S1.4, `local_storage`).
-    pub fn confirm_once_servable(&mut self) {
+    /// "Once servable" is persisted. Returns the new round if the binding left
+    /// `local_storage` for `loading`.
+    pub fn confirm_once_servable(&mut self) -> Option<Round> {
         if !self.once_servable_pending {
-            return;
+            return None;
         }
         self.once_servable = true;
         self.once_servable_pending = false;
-        if self.phase == Some(ConnectionPhase::Unavailable(UnavailableCause::LocalStorage)) {
-            self.start_loading();
-        }
+        self.leave_local_storage()
+    }
+
+    /// The generation `value` is persisted ([`Gate::confirm`]). Returns the new
+    /// round if the binding left `local_storage` for `loading`.
+    pub fn confirm_generation(&mut self, value: Generation) -> Option<Round> {
+        self.gate.confirm(value);
+        self.leave_local_storage()
+    }
+
+    /// S1.4: `local_storage` goes back to `loading` once nothing is pending;
+    /// [`Connection::start_loading`] keeps it there while something still is.
+    fn leave_local_storage(&mut self) -> Option<Round> {
+        let stored =
+            self.phase == Some(ConnectionPhase::Unavailable(UnavailableCause::LocalStorage));
+        if stored { self.start_loading() } else { None }
     }
 }
 
