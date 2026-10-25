@@ -197,7 +197,9 @@ fn a_chunk_read_falls_back_to_current_text_unless_every_check_holds() {
 
 #[test]
 fn a_document_read_is_current_text_with_its_display_and_cursor() {
-    let (request, response) = fixture("read.document.json");
+    let (request, mut response) = fixture("read.document.json");
+    response["segments"][0]["text"] = json!("第一条：出差须提前审批。");
+    response["segments"][1]["text"] = json!("第二条：住宿按城市分档。");
     let out = read(&request, &response);
     let segments = out["evidence"].as_array().unwrap();
     assert_eq!(segments.len(), 2);
@@ -211,6 +213,10 @@ fn a_document_read_is_current_text_with_its_display_and_cursor() {
         assert_eq!(segment["text"], wire["text"]);
     }
     assert_eq!(segments[0]["chunk_id"], "chk-70");
+    // Each text stays with its own chunk.
+    assert_eq!(segments[0]["text"], "第一条：出差须提前审批。");
+    assert_eq!(segments[1]["chunk_id"], "chk-71");
+    assert_eq!(segments[1]["text"], "第二条：住宿按城市分档。");
     // kb-d was asked for and left out of the effective scope.
     assert_eq!(out["scope_narrowed"], true);
     assert_eq!(out["display"], response["display"]);
