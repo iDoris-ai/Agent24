@@ -2408,6 +2408,10 @@ pub async fn serve(
     tokio::spawn(crate::grant_expiry::run(
         state.store.clone(),
         module_tool_cards.notice.clone(),
+        {
+            let cards = module_tool_cards.clone();
+            StdArc::new(move |module: &str| cards.on_grants_protocol(module))
+        },
         cancel.child_token(),
     ));
     state.module_tool_cards = Some(module_tool_cards);
@@ -3059,6 +3063,21 @@ pub(crate) mod tests {
             .join("\n");
         assert!(code.contains("crate::module_tool_runtime::tool_authorization("));
         assert!(!code.contains("store_authorization("));
+        // The notifier asks the same cards (A5c-2b).
+        assert!(code.contains("cards.on_grants_protocol(module)"));
+    }
+
+    /// #1202 G6 (A5c-2b): a module is on the grants protocol when a tool of
+    /// it takes grants; one whose tools do not, or with none, is not.
+    #[tokio::test]
+    async fn the_cards_say_which_modules_are_on_the_grants_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (state, _) = decision_state(&running, &dir.path().join("os.json")).await;
+        let cards = state.module_tool_cards.unwrap();
+        assert!(cards.on_grants_protocol("doc-module"));
+        assert!(!cards.on_grants_protocol("old-module"));
+        assert!(!cards.on_grants_protocol("absent"));
     }
 
     // ---- ME4-4.2.3b (design §6.3/v3.1 M-2, J19 variant 2a) -------------------

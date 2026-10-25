@@ -22,10 +22,19 @@ const LONGEST_SLEEP: Duration = Duration::from_secs(300);
 /// How soon a round that could not read or record is tried again.
 const RETRY: Duration = Duration::from_secs(30);
 
-pub async fn run(store: agent24_store::Store, notice: RevocationNotice, cancel: CancellationToken) {
+/// Whether a module is on the grants protocol (K1-6a-G §2.6): it stops by
+/// reference, so a `replaced` or `epoch` end may be told to it (#1202 G6).
+pub type OnGrantsProtocol = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+pub async fn run(
+    store: agent24_store::Store,
+    notice: RevocationNotice,
+    on_grants_protocol: OnGrantsProtocol,
+    cancel: CancellationToken,
+) {
     let mut changes = store.subscribe_module_consent_changes();
     loop {
-        let sleep = tell_due(&store, &notice).await;
+        let sleep = tell_due(&store, &notice, &on_grants_protocol).await;
         tokio::select! {
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(sleep) => {}
@@ -41,8 +50,16 @@ pub async fn run(store: agent24_store::Store, notice: RevocationNotice, cancel: 
 
 /// Tells every module whose grant is due, and every end not answered, at
 /// once, and records each answer; gives how long to sleep before the next
-/// round.
-async fn tell_due(store: &agent24_store::Store, notice: &RevocationNotice) -> Duration {
+/// round. A `replaced` or `epoch` end of a module not on the grants
+/// protocol is not told: it does not stop by reference, so it would stop
+/// work a newer grant let in, or the whole module (#1202 G6). It is
+/// recorded `unconfirmed`, never as stopped, and a later revocation
+/// carries its references.
+async fn tell_due(
+    store: &agent24_store::Store,
+    notice: &RevocationNotice,
+    on_grants_protocol: &OnGrantsProtocol,
+) -> Duration {
     let now = Utc::now().to_rfc3339();
     // Each read on its own: an outbox that cannot be read holds back no
     // expiry, nor the other way round.
@@ -71,6 +88,10 @@ async fn tell_due(store: &agent24_store::Store, notice: &RevocationNotice) -> Du
         record(store, &grant, stop).await
     });
     let ended = ends.into_iter().map(|end| async move {
+        let by_reference_only = end.reason != agent24_store::GrantEndReason::Revoked;
+        if by_reference_only && !on_grants_protocol(&end.module) {
+            return record_end(store, &end, RevocationStop::Unconfirmed).await;
+        }
         let stop = notice(GrantEnd {
             module: end.module.clone(),
             operation: end.op.clone(),
@@ -228,6 +249,11 @@ mod tests {
         )
     }
 
+    /// Every module on the grants protocol.
+    fn on_protocol() -> OnGrantsProtocol {
+        Arc::new(|_: &str| true)
+    }
+
     /// A notice that answers `stop` and keeps what it was told.
     fn telling(stop: RevocationStop) -> (Arc<Mutex<Vec<GrantEnd>>>, RevocationNotice) {
         let told = Arc::new(Mutex::new(Vec::new()));
@@ -249,7 +275,7 @@ mod tests {
         count: usize,
     ) {
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(store.clone(), notice, cancel.clone()));
+        let task = tokio::spawn(run(store.clone(), notice, on_protocol(), cancel.clone()));
         tokio::time::timeout(Duration::from_secs(10), async {
             while told.lock().unwrap().len() < count {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -264,6 +290,64 @@ mod tests {
             .await
             .expect("the task outlived its cancel")
             .unwrap();
+    }
+
+    /// #1202 G6: a `replaced` or `epoch` end of a module not on the grants
+    /// protocol is not told, but recorded `unconfirmed` and audited as such;
+    /// a revocation's still is.
+    #[tokio::test]
+    async fn a_module_off_the_grants_protocol_is_told_no_replacement_nor_epoch() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let (at, until) = ("2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z");
+        store
+            .grant_module_consent(&summary("t"), at, until)
+            .await
+            .unwrap();
+        store
+            .grant_module_consent(&summary("t"), at, until)
+            .await
+            .unwrap();
+        store.advance_module_enable_epoch("m").await.unwrap();
+        store
+            .revoke_module_consent("n", None, &Utc::now().to_rfc3339())
+            .await
+            .unwrap();
+        let (told, notice) = telling(RevocationStop::Confirmed);
+        let cancel = CancellationToken::new();
+        let off: OnGrantsProtocol = Arc::new(|_: &str| false);
+        let task = tokio::spawn(run(store.clone(), notice, off, cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !store
+                .pending_grant_end_notices("2099-01-01T00:00:00Z")
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the ends were never answered");
+        cancel.cancel();
+        task.await.unwrap();
+        let told: Vec<_> = told
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|end| (end.module.clone(), end.reason))
+            .collect();
+        assert_eq!(told, vec![("n".to_owned(), "revoked")]);
+        let mut audited: Vec<String> = store
+            .list_audit()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.action == "module_consent.stop_unconfirmed")
+            .map(|e| e.detail["reason"].as_str().unwrap().to_owned())
+            .collect();
+        audited.sort();
+        assert_eq!(audited, ["epoch", "replaced"]);
     }
 
     /// K1-6a-G §2.5.1, cases 19, 20 and 22: ends no route answered are told
@@ -464,7 +548,7 @@ mod tests {
             .unwrap();
         let (told, notice) = telling(RevocationStop::Unconfirmed);
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(store.clone(), notice, cancel.clone()));
+        let task = tokio::spawn(run(store.clone(), notice, on_protocol(), cancel.clone()));
         tokio::time::timeout(Duration::from_secs(10), async {
             while store.expiry_stop_state("m", "t").await.unwrap().is_none() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
