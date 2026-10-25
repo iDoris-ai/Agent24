@@ -1440,4 +1440,281 @@ mod tests {
         // why a caller drawing conclusions must not use it.
         assert_eq!(router.models(&CancellationToken::new()).await.len(), 1);
     }
+
+    // ── K1-6b.5b (ADR-K1-02 §2.4, §5): the remote model egress matrix ──────
+
+    /// A remote provider that counts both inference and discovery calls, with
+    /// a destination the test chooses (`None`: it cannot say where it sends).
+    struct CountingRemote {
+        destination: Option<&'static str>,
+        completions: StdMutex<usize>,
+        listings: StdMutex<usize>,
+    }
+
+    impl CountingRemote {
+        fn at(destination: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                destination,
+                completions: StdMutex::new(0),
+                listings: StdMutex::new(0),
+            })
+        }
+        fn completions(&self) -> usize {
+            *self.completions.lock().unwrap()
+        }
+        fn listings(&self) -> usize {
+            *self.listings.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingRemote {
+        fn name(&self) -> &str {
+            "counting-remote"
+        }
+        fn outbound_destination(&self) -> Option<String> {
+            self.destination.map(str::to_owned)
+        }
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            *self.completions.lock().unwrap() += 1;
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("from remote".to_owned()), vec![]),
+                usage: Usage::default(),
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<crate::Model>, ModelError> {
+            *self.listings.lock().unwrap() += 1;
+            Ok(vec![])
+        }
+    }
+
+    /// A gate that allows exactly one request and nothing else.
+    struct ExactGate(EgressRequest);
+
+    #[async_trait]
+    impl EgressGate for ExactGate {
+        async fn check(
+            &self,
+            request: &EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            if *request == self.0 {
+                Ok(())
+            } else {
+                Err(agent24_domain::EgressDecision)
+            }
+        }
+    }
+
+    const REMOTE_AT: &str = "https://models.example/v1";
+
+    fn granted_resource() -> EgressResource {
+        EgressResource::cloud_authorized("doc-1", "rev-1", 3).with_authorization_ref("grant-1")
+    }
+
+    /// The one request the exact gate allows: this resource, inference, this
+    /// destination, generation 7.
+    fn granted(purpose: EgressPurpose) -> EgressRequest {
+        EgressRequest::remote(
+            vec![granted_resource()],
+            purpose,
+            EgressDestination::exact(REMOTE_AT),
+            7,
+        )
+    }
+
+    /// Each element of the granted scope changed on its own, everything else
+    /// as granted: (what changed, resources, authorization generation).
+    fn mismatched_scopes() -> Vec<(&'static str, Vec<EgressResource>, u64)> {
+        let other = |f: fn(&mut EgressResource)| {
+            let mut resource = granted_resource();
+            f(&mut resource);
+            vec![resource]
+        };
+        vec![
+            ("resource", other(|r| r.resource_id = "doc-2".into()), 7),
+            ("revision", other(|r| r.revision = Some("rev-2".into())), 7),
+            (
+                "authorization",
+                other(|r| r.authorization_ref = Some("grant-2".into())),
+                7,
+            ),
+            ("policy version", other(|r| r.policy_version = 4), 7),
+            ("generation", vec![granted_resource()], 8),
+        ]
+    }
+
+    fn any_privacy() -> TaskProfile {
+        TaskProfile {
+            privacy: Privacy::Any,
+            complexity: Complexity::Simple,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_provider_that_cannot_name_its_destination_is_never_called() {
+        let remote = CountingRemote::at(None);
+        let router = router(vec![(remote.clone(), Tier::Remote)]);
+        let (gate, resources) = authorized_test_scope();
+        let result = router
+            .complete_with_egress(
+                any_privacy(),
+                &req(),
+                &CancellationToken::new(),
+                gate.clone(),
+                resources.clone(),
+                1,
+            )
+            .await;
+        assert!(result.is_err());
+        let inventory = router
+            .models_detailed_with_egress(&CancellationToken::new(), gate, resources, 1)
+            .await;
+        assert!(
+            inventory.failures[0].contains("outbound policy denied"),
+            "{:?}",
+            inventory.failures
+        );
+        assert_eq!((remote.completions(), remote.listings()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn an_exact_grant_lets_the_remote_provider_serve_only_that_request() {
+        let remote = CountingRemote::at(Some(REMOTE_AT));
+        let elsewhere = CountingRemote::at(Some("https://elsewhere.example/v1"));
+        let elsewhere_router = router(vec![(elsewhere.clone(), Tier::Remote)]);
+        let router = router(vec![(remote.clone(), Tier::Remote)]);
+        let gate: Arc<dyn EgressGate> = Arc::new(ExactGate(granted(EgressPurpose::ModelInference)));
+        let served = router
+            .complete_served_with_egress(
+                any_privacy(),
+                &req(),
+                &CancellationToken::new(),
+                gate.clone(),
+                vec![granted_resource()],
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.tier, Tier::Remote);
+        assert_eq!(remote.completions(), 1);
+
+        // Every other scope: the remote provider is never called again.
+        for (what, resources, generation) in mismatched_scopes() {
+            let result = router
+                .complete_served_with_egress(
+                    any_privacy(),
+                    &req(),
+                    &CancellationToken::new(),
+                    gate.clone(),
+                    resources,
+                    generation,
+                )
+                .await;
+            assert!(result.is_err(), "{what}");
+            assert_eq!(remote.completions(), 1, "{what}");
+        }
+
+        // Another destination, and a grant for another purpose.
+        let discovery_only: Arc<dyn EgressGate> =
+            Arc::new(ExactGate(granted(EgressPurpose::ModelDiscovery)));
+        for (what, router, gate) in [
+            ("destination", &elsewhere_router, gate.clone()),
+            ("purpose", &router, discovery_only),
+        ] {
+            let result = router
+                .complete_served_with_egress(
+                    any_privacy(),
+                    &req(),
+                    &CancellationToken::new(),
+                    gate,
+                    vec![granted_resource()],
+                    7,
+                )
+                .await;
+            assert!(result.is_err(), "{what}");
+        }
+        assert_eq!((remote.completions(), elsewhere.completions()), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn model_discovery_never_lists_a_remote_provider_through_the_default_gate() {
+        let remote = CountingRemote::at(Some(REMOTE_AT));
+        let local = Lister("local", vec!["llama"]);
+        let router = router(vec![
+            (remote.clone(), Tier::Remote),
+            (Arc::new(local), Tier::Local),
+        ]);
+        let inventory = router.models_detailed(&CancellationToken::new()).await;
+        assert_eq!(remote.listings(), 0);
+        assert_eq!(inventory.models.len(), 1);
+        assert!(
+            inventory
+                .failures
+                .iter()
+                .any(|f| f.contains("counting-remote: outbound policy denied")),
+            "{:?}",
+            inventory.failures
+        );
+    }
+
+    #[tokio::test]
+    async fn model_discovery_needs_a_grant_for_the_discovery_purpose() {
+        let remote = CountingRemote::at(Some(REMOTE_AT));
+        let elsewhere = CountingRemote::at(Some("https://elsewhere.example/v1"));
+        let elsewhere_router = router(vec![(elsewhere.clone(), Tier::Remote)]);
+        let router = router(vec![(remote.clone(), Tier::Remote)]);
+        let inference_only: Arc<dyn EgressGate> =
+            Arc::new(ExactGate(granted(EgressPurpose::ModelInference)));
+        let _ = router
+            .models_detailed_with_egress(
+                &CancellationToken::new(),
+                inference_only,
+                vec![granted_resource()],
+                7,
+            )
+            .await;
+        assert_eq!(remote.listings(), 0);
+
+        let discovery: Arc<dyn EgressGate> =
+            Arc::new(ExactGate(granted(EgressPurpose::ModelDiscovery)));
+        for (what, resources, generation) in mismatched_scopes() {
+            let _ = router
+                .models_detailed_with_egress(
+                    &CancellationToken::new(),
+                    discovery.clone(),
+                    resources,
+                    generation,
+                )
+                .await;
+            assert_eq!(remote.listings(), 0, "{what}");
+        }
+        let _ = elsewhere_router
+            .models_detailed_with_egress(
+                &CancellationToken::new(),
+                discovery.clone(),
+                vec![granted_resource()],
+                7,
+            )
+            .await;
+        assert_eq!(elsewhere.listings(), 0, "destination");
+
+        let inventory = router
+            .models_detailed_with_egress(
+                &CancellationToken::new(),
+                discovery,
+                vec![granted_resource()],
+                7,
+            )
+            .await;
+        assert!(inventory.failures.is_empty(), "{:?}", inventory.failures);
+        assert_eq!(remote.listings(), 1);
+    }
 }
