@@ -1116,10 +1116,12 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let told = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let answer = Arc::new(std::sync::Mutex::new(axum::http::StatusCode::OK));
+        let body_released = Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new().route(
             "/api/v1/fake_module/_a24/authorization/revoked",
             axum::routing::post({
                 let (told, answer) = (Arc::clone(&told), Arc::clone(&answer));
+                let body_released = Arc::clone(&body_released);
                 move |axum::Json(body): axum::Json<Value>| async move {
                     told.lock().unwrap().push(body);
                     let status = *answer.lock().unwrap();
@@ -1127,9 +1129,10 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                     if status == axum::http::StatusCode::CREATED {
-                        // The head goes out at once, the body only later.
-                        let body = futures::stream::once(async {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        // The head goes out at once, the body only once the
+                        // test lets it.
+                        let body = futures::stream::once(async move {
+                            body_released.notified().await;
                             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
                         });
                         return (status, axum::body::Body::from_stream(body)).into_response();
@@ -1252,13 +1255,16 @@ mod tests {
         while told.lock().unwrap().len() == before {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // The head is on its way once the module has it; give it time to land.
+        // The head is on its way once the module has it; give it time to
+        // land. The body is held until after the answer, so only the head
+        // can have confirmed it.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let draining = std::time::Instant::now();
         assert!(generation.begin_drain(draining, Duration::from_secs(30)));
         assert_eq!(waiting.await.unwrap(), RevocationStop::Confirmed);
         assert!(draining.elapsed() < Duration::from_secs(2));
         assert_eq!(generation.in_flight(), 0);
+        body_released.notify_one();
         let _ = std::fs::remove_file(&sock);
     }
 
