@@ -26,9 +26,11 @@ pub enum Dropped {
     Cancelled,
 }
 
-/// A call not invalidated was admitted under the value in effect and nothing
-/// is pending: calls open only while nothing is pending, an invalidation
-/// marks every call, and a confirmation forgets the marked ones.
+/// Invariant: a call that is not invalidated was admitted under the value now
+/// in effect, and nothing is pending. Calls open only while nothing is
+/// pending; every generation change starts with an invalidation, which marks
+/// every call; and a confirmation forgets the marked calls. `Gate` changes
+/// the generation in no other way.
 #[derive(Debug)]
 struct Call {
     generation: Generation,
@@ -41,7 +43,7 @@ struct Call {
 pub struct Invalidation {
     /// The value to persist; `None` once the generation is exhausted.
     pub to_persist: Option<Generation>,
-    /// The calls to abort and answer with `cancelled`.
+    /// The calls to abort and answer with `cancelled`, in no particular order.
     pub aborted: Vec<CallId>,
 }
 
@@ -154,8 +156,10 @@ impl Gate {
         if !self.admission_open() {
             return Err(Closed);
         }
+        // Never reached in practice, but an id is never handed out twice.
+        let next = self.next_call.checked_add(1).ok_or(Closed)?;
         let id = CallId(self.next_call);
-        self.next_call += 1;
+        self.next_call = next;
         self.calls.insert(
             id,
             Call {
@@ -211,7 +215,8 @@ impl Gate {
 
     /// S4.6's last check, just before the call's result joins the model's
     /// context: the generation it was admitted under is still the one in
-    /// effect, it was not invalidated, and nothing is pending. The binding's
+    /// effect and nothing is pending. Checking that the call is not
+    /// invalidated is enough, by the invariant on `Call`. The binding's
     /// state (`disabled`, `registered`, `retired`) is the caller's to check
     /// under the same lock.
     pub fn may_append(&self, call: CallId) -> Result<(), Dropped> {
