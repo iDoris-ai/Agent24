@@ -267,3 +267,37 @@ fn an_identity_change_on_the_placeholder_drops_the_attempt_in_flight() {
     let settled = placeholder(&mut profile).settle(attempt, Attempted::Identified);
     assert_eq!(settled, Settled::Ignored);
 }
+
+#[test]
+fn a_sidecar_starting_retries_a_placeholder_holding_dependency_when_it_would_back_off() {
+    use crate::provider::binding::Sidecar;
+    let holding = |failure, selected| {
+        Profile::new(
+            Slot::Placeholder(Placeholder::new(Some(failure))),
+            selected,
+            None,
+        )
+    };
+    let mut profile = holding(PlaceholderFailure::Dependency, true);
+    assert_eq!(profile.sidecar(Sidecar::Healthy, CLEAR), None);
+    assert!(matches!(
+        profile.sidecar(Sidecar::Starting, CLEAR),
+        Some(Retried::Attempt(_))
+    ));
+    let off = Switches {
+        off: true,
+        profile_disabled: false,
+    };
+    assert_eq!(profile.sidecar(Sidecar::Starting, off), None);
+    let mut profile = holding(PlaceholderFailure::Dependency, false);
+    assert_eq!(profile.sidecar(Sidecar::Starting, CLEAR), None);
+    let mut profile = holding(PlaceholderFailure::InstanceUnidentified, true);
+    assert_eq!(profile.sidecar(Sidecar::Starting, CLEAR), None);
+    // A binding takes it as its own.
+    let mut profile = bound();
+    assert_eq!(profile.sidecar(Sidecar::Stopped, CLEAR), None);
+    assert!(matches!(
+        profile.sidecar(Sidecar::Starting, CLEAR),
+        Some(Retried::Loading(_))
+    ));
+}

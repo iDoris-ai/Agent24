@@ -3,10 +3,11 @@
 //! user and configuration events that take it out of the connection phase or
 //! back in. Pure state, like its parts. Persisting what an event asks for,
 //! and refusing a loosening while a tightening is not yet persisted (I1), are
-//! the persistence slice's; identity changes and the placeholder come next.
+//! the persistence slice's; identity changes and the placeholder are in
+//! `profile`.
 
-use super::connection::{Connection, Round};
-use super::credential::{Credentials, Effects};
+use super::connection::{Connection, ProbeTicket, Round};
+use super::credential::{Credentials, Effects, Issuance};
 use super::state::{self, ConnectionPhase, Switches, UnavailableCause};
 
 /// An event that takes the binding out of the connection phase (S3.3).
@@ -33,6 +34,28 @@ pub enum Activation {
     Reselect,
     /// The same principal logged in again.
     Relogin,
+}
+
+/// The sidecar's state: an input to a local-managed binding, not a service
+/// state (S2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sidecar {
+    Starting,
+    Ready,
+    Healthy,
+    Degraded,
+    Failed,
+    Stopping,
+    Stopped,
+}
+
+/// What a backoff tick in `dependency` or `not_ready` sends (S1.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retry {
+    /// No credential to probe with: a new `loading` round issues one first
+    /// (#1228 note 1).
+    Issue(Issuance),
+    Probe(ProbeTicket),
 }
 
 #[derive(Debug)]
@@ -146,6 +169,64 @@ impl BindingState {
             return None;
         }
         self.connection.start_loading()
+    }
+
+    /// A probe goes out only with a current credential, so no probe moves
+    /// the binding to a servable phase without one (#1228 note 1).
+    pub fn probe(&mut self) -> Option<ProbeTicket> {
+        self.credentials.current()?;
+        self.connection.probe()
+    }
+
+    /// The backoff of `dependency` and `not_ready`: a probe with the current
+    /// credential, or without one a new `loading` round and its issuance.
+    pub fn backoff(&mut self) -> Option<Retry> {
+        match self.connection.phase()? {
+            ConnectionPhase::Unavailable(cause) if cause.retries_automatically() => {}
+            _ => return None,
+        }
+        if self.credentials.current().is_some() {
+            return self.probe().map(Retry::Probe);
+        }
+        self.connection.start_loading()?;
+        self.credentials.issue(&self.connection).map(Retry::Issue)
+    }
+
+    /// A manual retry, a configuration change, a sidecar restart or a new
+    /// handshake of the same instance (S1.4): every kept reason is let go,
+    /// and an `unavailable` binding enters `loading` in a new round. Leaving
+    /// a reason that does not retry by itself is a loosening the caller has
+    /// persisted first (S1.10, I1). A retired binding is out of the
+    /// connection phase for good, so it never enters `loading` here.
+    pub fn retry(&mut self) -> Option<Round> {
+        self.connection.release_all();
+        match self.connection.phase()? {
+            ConnectionPhase::Unavailable(cause) if cause != UnavailableCause::LocalStorage => {
+                self.connection.start_loading()
+            }
+            _ => None,
+        }
+    }
+
+    /// S2.2: `starting` retries as [`BindingState::retry`]; a sidecar going
+    /// down makes the binding `unavailable(dependency)` in the connection
+    /// phase, no increment. A reason that does not retry by itself, or
+    /// `local_storage`, stays: `dependency` would retry it by backoff.
+    pub fn sidecar(&mut self, sidecar: Sidecar) -> Option<Round> {
+        let down = match sidecar {
+            Sidecar::Starting => return self.retry(),
+            Sidecar::Ready | Sidecar::Healthy => false,
+            Sidecar::Degraded | Sidecar::Failed | Sidecar::Stopping | Sidecar::Stopped => true,
+        };
+        let movable = match self.connection.phase() {
+            Some(ConnectionPhase::Unavailable(cause)) => cause.retries_automatically(),
+            Some(_) => true,
+            None => false,
+        };
+        if down && movable {
+            self.connection.fail(UnavailableCause::Dependency);
+        }
+        None
     }
 }
 

@@ -3,11 +3,11 @@
 //! identity changes that retire its binding. Pure state, like the binding;
 //! the caller persists the retirement and the new binding (I1, I6).
 
-use super::binding::{Activation, BindingState, Leave};
-use super::connection::Connection;
+use super::binding::{Activation, BindingState, Leave, Sidecar};
+use super::connection::{Connection, Round};
 use super::credential::{Credentials, Effects};
-use super::placeholder::Placeholder;
-use super::state::Target;
+use super::placeholder::{Attempt, Placeholder};
+use super::state::{Switches, Target};
 
 /// What the profile awaits before its binding is activated (S1.13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +46,15 @@ pub struct Retired {
     /// Create the new binding now, persisted together with or after the
     /// retirement (S3.5).
     pub create: bool,
+}
+
+/// What a sidecar `starting` retried (S2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retried {
+    /// The binding entered `loading`.
+    Loading(Round),
+    /// The placeholder makes a handshake attempt.
+    Attempt(Attempt),
 }
 
 #[derive(Debug)]
@@ -169,6 +178,23 @@ impl Profile {
             activated,
         )));
         true
+    }
+
+    /// S2.2 for a local-managed profile: the binding takes the sidecar's
+    /// state as in [`BindingState::sidecar`]; on `starting` a placeholder
+    /// holding `dependency` tries again when it would retry by backoff (S2.5).
+    pub fn sidecar(&mut self, sidecar: Sidecar, switches: Switches) -> Option<Retried> {
+        let unsaved = self.confirmation == Some(Confirmation::UnsavedSettings);
+        match &mut self.slot {
+            Slot::Bound(binding) => binding.sidecar(sidecar).map(Retried::Loading),
+            Slot::Placeholder(placeholder)
+                if sidecar == Sidecar::Starting
+                    && placeholder.retries_by_itself(switches, self.selected, unsaved) =>
+            {
+                Some(Retried::Attempt(placeholder.attempt()))
+            }
+            Slot::Placeholder(_) => None,
+        }
     }
 
     /// The user's confirmation of the new principal is persisted.
