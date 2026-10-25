@@ -3467,6 +3467,13 @@ pub(crate) mod tests {
     /// source's classification, not its kind. Returns whether a process
     /// egress check passes for a run tagged with exactly `sources`.
     async fn process_egress_allowed_for(sources: Vec<agent24_store::SourceRef>) -> bool {
+        process_egress_allowed_when(sources, false).await
+    }
+
+    async fn process_egress_allowed_when(
+        sources: Vec<agent24_store::SourceRef>,
+        source_reads_fail: bool,
+    ) -> bool {
         let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
         let now = now_iso8601();
         let run = Run {
@@ -3494,6 +3501,9 @@ pub(crate) mod tests {
                 .tag_run_source(&run.id, 0, source, &now)
                 .await
                 .unwrap();
+        }
+        if source_reads_fail {
+            agent24_store::test_hooks::fail_source_tag_reads(&store);
         }
         let ctx = manager.tool_context_for(&run, "tc").await.unwrap();
         ctx.authorize_egress_if_restricted(
@@ -3555,6 +3565,24 @@ pub(crate) mod tests {
                 "{source:?} must restrict process egress"
             );
         }
+    }
+
+    /// K1-6b.5d: `tool_context_for` restricts tool egress when a run has no
+    /// source tags at all (ADR-K1-02 §2.1.1 item 4: missing evidence is not
+    /// permission) and when its tags cannot be read. The same Ordinary run,
+    /// readable, is allowed.
+    #[tokio::test]
+    async fn a_run_with_no_readable_sources_restricts_tool_egress() {
+        let user = agent24_store::SourceRef::user_input("run_x", now_iso8601());
+        assert!(process_egress_allowed_for(vec![user.clone()]).await);
+        assert!(
+            !process_egress_allowed_for(vec![]).await,
+            "no tags must restrict"
+        );
+        assert!(
+            !process_egress_allowed_when(vec![user], true).await,
+            "unreadable tags must restrict"
+        );
     }
 
     #[tokio::test]
@@ -5730,6 +5758,17 @@ mod approval_tests {
         workdir: std::path::PathBuf,
         extra: Option<Arc<dyn agent24_tools::Tool>>,
     ) -> Harness {
+        resume_harness_using(workdir, extra, true).await
+    }
+
+    /// `fixture_egress: false` builds tool egress as production does: no
+    /// gate on the registry and no test policy, so a run's own source tags
+    /// alone decide what its tools may do.
+    async fn resume_harness_using(
+        workdir: std::path::PathBuf,
+        extra: Option<Arc<dyn agent24_tools::Tool>>,
+        fixture_egress: bool,
+    ) -> Harness {
         let store = Store::open_memory().await.unwrap();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = Arc::clone(&events);
@@ -5741,8 +5780,10 @@ mod approval_tests {
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
         let (egress_gate, _resources, generation) = fixture_egress_policy();
         let mut tools = ToolRegistry::builtin(workdir)
-            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
-            .with_egress_gate(Arc::clone(&egress_gate));
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        if fixture_egress {
+            tools = tools.with_egress_gate(Arc::clone(&egress_gate));
+        }
         if let Some(tool) = extra {
             tools.register_module_tool(tool).unwrap();
         }
@@ -5761,8 +5802,12 @@ mod approval_tests {
             Arc::new(tools),
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
-        )
-        .with_test_egress_policy(egress_gate, Vec::new(), generation);
+        );
+        let manager = if fixture_egress {
+            manager.with_test_egress_policy(egress_gate, Vec::new(), generation)
+        } else {
+            manager
+        };
         Harness {
             manager,
             broker,
@@ -5875,6 +5920,105 @@ mod approval_tests {
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
             "no tool result was recorded for the resumed call"
         );
+    }
+
+    /// K1-6b.5d: a run parked on a shell_exec approval when the daemon
+    /// stopped is restored, approved and resumed. Resume rebuilds the tool
+    /// context from the run's persisted tags (the session floor is not merged
+    /// again, #1204 G4), so a Restricted source still refuses the child: it
+    /// never spawns. The same run with only Ordinary sources spawns, so the
+    /// fixture would show a leak.
+    #[tokio::test]
+    async fn a_restricted_run_resumed_after_a_restart_still_cannot_spawn() {
+        for restricted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("child-ran");
+            let h = resume_harness_using(dir.path().to_path_buf(), None, false).await;
+            let run = Run {
+                id: "run_1".to_owned(),
+                session_id: None,
+                workspace_id: None,
+                status: RunStatus::AwaitingApproval,
+                input: RunInput {
+                    prompt: "touch it".to_owned(),
+                    workspace_id: None,
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: now_iso8601(),
+                started_at: Some(now_iso8601()),
+                ended_at: None,
+            };
+            h.store.insert_run(&run).await.unwrap();
+            h.store
+                .append_run_message(
+                    "run_1",
+                    "user",
+                    Some("touch it"),
+                    &serde_json::json!([]),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            let user = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+            h.store
+                .tag_run_source("run_1", 0, &user, &now_iso8601())
+                .await
+                .unwrap();
+            if restricted {
+                let mut material =
+                    agent24_store::SourceRef::selected_material("doc-1", None, now_iso8601());
+                material.classification = agent24_store::SourceClassification::Restricted;
+                h.store
+                    .tag_run_source("run_1", 0, &material, &now_iso8601())
+                    .await
+                    .unwrap();
+            }
+            let args = serde_json::json!({ "argv": ["/usr/bin/touch", marker] });
+            let call = serde_json::json!([{
+                "id": "call_provider_1",
+                "name": "shell_exec",
+                "arguments": args.to_string()
+            }]);
+            h.store
+                .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+                .await
+                .unwrap();
+            let approval = seed_approval(
+                "apr_1",
+                "run_1",
+                "tc_internal_1",
+                args.as_object().unwrap().clone(),
+            );
+            h.store.insert_approval(&approval).await.unwrap();
+
+            assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (1, 0));
+            h.broker
+                .resolve("apr_1", decision("approve", None))
+                .await
+                .unwrap();
+            h.manager
+                .resume_run("run_1".to_owned(), "apr_1".to_owned())
+                .await
+                .unwrap();
+            wait_terminal(&h.store, "run_1").await;
+
+            assert_eq!(marker.exists(), !restricted, "restricted: {restricted}");
+            if restricted {
+                let thread = h.store.list_run_messages("run_1").await.unwrap();
+                let result = thread
+                    .iter()
+                    .find(|m| m.role == "tool")
+                    .and_then(|m| m.content.clone())
+                    .expect("the refused call still gets a tool result");
+                assert!(result.contains("outbound"), "{result}");
+            }
+        }
     }
 
     /// Says its approval names no grant the first time, as a module tool
