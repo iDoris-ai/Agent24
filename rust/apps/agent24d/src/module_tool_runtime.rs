@@ -1168,6 +1168,21 @@ mod tests {
                 "reason": "epoch",
             })
         );
+        // None ended (#1202 G2, #1227 Low): an empty list, not a missing
+        // one, so the module stops nothing rather than by operation.
+        assert_eq!(
+            runtime.notify_revoked(&end(Some(Vec::new())), within).await,
+            RevocationStop::Confirmed
+        );
+        assert_eq!(
+            told.lock().unwrap()[2],
+            serde_json::json!({
+                "operation": "*",
+                "revoked_at": "2026-10-24T00:00:00Z",
+                "reason": "epoch",
+                "authorization_refs": [],
+            })
+        );
         *answer.lock().unwrap() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
         assert_eq!(notify(within).await, RevocationStop::Unconfirmed);
         // Answered only after the bound: unconfirmed, and no later.
