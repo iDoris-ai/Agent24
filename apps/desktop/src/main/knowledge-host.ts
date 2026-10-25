@@ -1,20 +1,14 @@
 // Main's side of the daemon's private Knowledge host interface (KB-HOST-01
-// PR-B2b; #1085 design v2 §1–2, UI-BRIDGE U1.4, U4.9–U4.11). Main activates
-// and deactivates bindings in the daemon, hands it the short-lived credential
-// C of an active binding or takes it back, and owns the long-term logins.
-// C and the logins never reach a log line, an error message or any renderer.
+// PR-B2b; #1085 design v2 §1–2, UI-BRIDGE U1.4, U4.9–U4.11): bindings, their
+// short-lived credential C, and the long-term logins. C and the logins never
+// reach a log line, an error message or any renderer.
 //
-// Every request carries a sequence number the daemon requires to grow per
-// binding: here it is the wall clock in milliseconds, bumped past the last one
-// handed out, so it keeps growing across main restarts (decided 2026-10-25).
-// A request the daemon calls stale did not land; it is sent again under a new
-// number.
-//
-// The daemon keeps its records per host capability, so a restarted daemon has
-// none. This module remembers which bindings should be active and their C, and
-// replays that state once it sees a new daemon connection, before anything
-// else is sent for those bindings. Everything for one binding runs one at a
-// time, so a refresh and a destroy never overlap (decided 2026-10-25).
+// Sequence numbers are wall-clock milliseconds bumped past the last one, so
+// they keep growing across main restarts; a change the daemon calls stale is
+// sent again under a new one. A restarted daemon has no records, so the
+// bindings that should be active, and their C, are replayed on a new daemon
+// connection ahead of anything else for them. Everything for one binding runs
+// one at a time: a refresh and a destroy never overlap (decided 2026-10-25).
 
 import http from 'node:http'
 import { daemonConnection, type DaemonConnection } from './backend-manager'
@@ -32,31 +26,14 @@ export interface KnowledgeCredential {
   expiresAt: number
 }
 
-export type HostResult =
-  | { ok: true }
-  | {
-      ok: false
-      reason:
-        | 'not_started'
-        | 'invalid_binding'
-        | 'login_unavailable'
-        | 'credential_unavailable'
-        | 'not_saved'
-        | 'daemon_unavailable'
-        | 'binding_inactive'
-        | 'stale_sequence'
-        | 'refused'
-    }
+type Failure = 'not_started' | 'invalid_binding' | 'login_unavailable' | 'credential_unavailable' | 'not_saved'
+  | 'daemon_unavailable' | 'binding_inactive' | 'stale_sequence' | 'refused'
 
-type Failure = Extract<HostResult, { ok: false }>['reason']
+export type HostResult = { ok: true } | { ok: false; reason: Failure }
 
 /** One request to the daemon: its status and the `error.code` of its body. */
-export type HostTransport = (
-  connection: DaemonConnection,
-  method: 'PUT' | 'DELETE',
-  path: string,
-  body?: string,
-) => Promise<{ status: number; code?: string }>
+export type HostTransport = (connection: DaemonConnection, method: 'PUT' | 'DELETE', path: string, body?: string)
+  => Promise<{ status: number; code?: string }>
 
 /** The same rule as the daemon's `valid_binding_id`: opaque, but never a path. */
 export function validBindingId(id: unknown): id is string {
@@ -88,10 +65,6 @@ export class SequenceClock {
   }
 }
 
-interface Wanted {
-  credential: KnowledgeCredential | null
-}
-
 export interface KnowledgeHostDeps {
   connection?: () => DaemonConnection | null
   transport?: HostTransport
@@ -103,22 +76,14 @@ export interface KnowledgeHostDeps {
 export class KnowledgeHost {
   private started: LoadResult | null = null
   // Bindings that should be active in the daemon, with their current C.
-  private readonly wanted = new Map<string, Wanted>()
+  private readonly wanted = new Map<string, { credential: KnowledgeCredential | null }>()
   private readonly locks = new Map<string, Promise<unknown>>()
   private connectionKey: string | null = null
-  private readonly connection: () => DaemonConnection | null
-  private readonly transport: HostTransport
-  private readonly clock: SequenceClock
-  private readonly nowSeconds: () => number
+  private readonly deps: Required<KnowledgeHostDeps>
 
-  constructor(
-    private readonly logins: KnowledgeLoginStore,
-    deps: KnowledgeHostDeps = {},
-  ) {
-    this.connection = deps.connection ?? daemonConnection
-    this.transport = deps.transport ?? httpTransport
-    this.clock = deps.clock ?? new SequenceClock()
-    this.nowSeconds = deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000))
+  constructor(private readonly logins: KnowledgeLoginStore, deps: KnowledgeHostDeps = {}) {
+    const nowSeconds = () => Math.floor(Date.now() / 1000)
+    this.deps = { connection: daemonConnection, transport: httpTransport, clock: new SequenceClock(), nowSeconds, ...deps }
   }
 
   /** Loads the logins, once, before anything may change them (G4). A load
@@ -136,7 +101,7 @@ export class KnowledgeHost {
   /** On a new daemon connection, queues the replay of every wanted binding
    * ahead of whatever is sent for it next. Cheap to call often. */
   sync(): void {
-    const conn = this.connection()
+    const conn = this.deps.connection()
     if (!conn) return
     const key = `${conn.port} ${conn.authHeaders['Authorization'] ?? ''}`
     if (key === this.connectionKey) return
@@ -175,10 +140,7 @@ export class KnowledgeHost {
 
   /** Gets a new C from the binding's login and pushes it, never alongside a
    * destroy of the same binding (G5). */
-  refresh(
-    bindingId: string,
-    obtain: (login: Readonly<KnowledgeLogin>) => Promise<KnowledgeCredential>,
-  ): Promise<HostResult> {
+  refresh(bindingId: string, obtain: (login: Readonly<KnowledgeLogin>) => Promise<KnowledgeCredential>): Promise<HostResult> {
     return this.operate(bindingId, async () => {
       const login = this.logins.list().get(bindingId)
       if (!login || login.unusable) return failure('login_unavailable')
@@ -202,10 +164,7 @@ export class KnowledgeHost {
       // Never replayed again, whatever happens below.
       this.wanted.delete(bindingId)
       // Handled at once: the daemon call below must not leave a rejection unobserved.
-      const marked = this.logins.markUnusable(bindingId).then(
-        () => true,
-        () => false,
-      )
+      const marked = this.logins.markUnusable(bindingId).then(() => true, () => false)
       await this.send(bindingId, 'DELETE', '')
       if (!(await marked)) return failure('not_saved')
       try {
@@ -228,10 +187,7 @@ export class KnowledgeHost {
   private exclusive<T>(bindingId: string, task: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(bindingId) ?? Promise.resolve()
     const run = previous.then(task)
-    const settled = run.then(
-      () => {},
-      () => {},
-    )
+    const settled = run.then(() => {}, () => {})
     this.locks.set(bindingId, settled)
     void settled.then(() => {
       if (this.locks.get(bindingId) === settled) this.locks.delete(bindingId)
@@ -252,7 +208,7 @@ export class KnowledgeHost {
     if (!wanted) return
     const credential = wanted.credential
     const activated = await this.send(bindingId, 'PUT', '')
-    if (!activated.ok || !credential || credential.expiresAt <= this.nowSeconds()) return
+    if (!activated.ok || !credential || credential.expiresAt <= this.deps.nowSeconds()) return
     // A push queued after this replay may have replaced C meanwhile; it sends its own.
     if (this.wanted.get(bindingId)?.credential === credential) {
       await this.send(bindingId, 'PUT', '/credential', credentialBody(credential))
@@ -263,12 +219,12 @@ export class KnowledgeHost {
   private async send(bindingId: string, method: 'PUT' | 'DELETE', suffix: string, body?: string): Promise<HostResult> {
     let last: Failure = 'stale_sequence'
     for (let attempt = 0; attempt < MAX_STALE_RETRIES; attempt++) {
-      const conn = this.connection()
+      const conn = this.deps.connection()
       if (!conn) return failure('daemon_unavailable')
-      const path = `${BINDINGS}/${encodeURIComponent(bindingId)}${suffix}?seq=${this.clock.next()}`
+      const path = `${BINDINGS}/${encodeURIComponent(bindingId)}${suffix}?seq=${this.deps.clock.next()}`
       let response: { status: number; code?: string }
       try {
-        response = await this.transport(conn, method, path, body)
+        response = await this.deps.transport(conn, method, path, body)
       } catch {
         return failure('daemon_unavailable')
       }
@@ -303,23 +259,21 @@ const httpTransport: HostTransport = (connection, method, path, body) =>
       headers['Content-Type'] = 'application/json'
       headers['Content-Length'] = String(Buffer.byteLength(body))
     }
-    const req = http.request(
-      { host: '127.0.0.1', port: connection.port, method, path, headers, timeout: REQUEST_TIMEOUT_MS },
-      (res) => {
-        const chunks: Buffer[] = []
-        res.on('data', (chunk: Buffer) => chunks.push(chunk))
-        res.on('end', () => {
-          let code: string | undefined
-          try {
-            const parsed = JSON.parse(Buffer.concat(chunks).toString()) as { error?: { code?: unknown } }
-            if (typeof parsed.error?.code === 'string') code = parsed.error.code
-          } catch {
-            // No JSON body: a success, or an error without the envelope.
-          }
-          resolve({ status: res.statusCode ?? 0, code })
-        })
-      },
-    )
+    const options = { host: '127.0.0.1', port: connection.port, method, path, headers, timeout: REQUEST_TIMEOUT_MS }
+    const req = http.request(options, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('end', () => {
+        let code: string | undefined
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString()) as { error?: { code?: unknown } }
+          if (typeof parsed.error?.code === 'string') code = parsed.error.code
+        } catch {
+          // No JSON body: a success, or an error without the envelope.
+        }
+        resolve({ status: res.statusCode ?? 0, code })
+      })
+    })
     req.on('timeout', () => req.destroy(new Error('timeout')))
     req.on('error', () => reject(new Error('Knowledge host request failed')))
     req.end(body)
