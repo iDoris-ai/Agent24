@@ -230,6 +230,9 @@ pub(crate) async fn stop(state: &AppState, operation: &str, wait: Duration) -> b
 /// Of the job attempts asking for builds, those `operation`'s calls were
 /// accepted for, whichever attempt of the job they are: a build an earlier,
 /// accepted attempt asked for may go on serving a later one, and stops.
+/// The rows are read as a set (#1201 G2): repeated rows of one attempt
+/// count once, and a row without an `authorization_ref` counts as any
+/// other, the operation deciding until ends name references (A5c-3).
 async fn accepted_of(
     storage: &Storage,
     operation: &str,

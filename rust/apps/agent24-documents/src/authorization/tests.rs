@@ -207,6 +207,19 @@ async fn queued_attempts_its_calls_were_accepted_for_are_cancelled() {
         job(&env, id, "queued", 1).await;
     }
     accept(&env, &ids[0], 1, "extract").await;
+    // Read as a set: a repeated row, and one with no reference, count once.
+    accept(&env, &ids[0], 1, "extract").await;
+    let run = Run {
+        run_id: "run-1".into(),
+        tool_call_id: "call-unnamed".into(),
+    };
+    let unnamed = Accepted {
+        operation: "extract".into(),
+        authorization_ref: None,
+    };
+    let mut conn = env.storage.db.pool().acquire().await.unwrap();
+    record(&mut conn, &ids[0], 1, &run, &unnamed).await.unwrap();
+    drop(conn);
     // ids[1] is the page's own. ids[2]'s call was for an earlier attempt:
     sqlx::query("UPDATE jobs SET attempt = 2 WHERE id = ?")
         .bind(&ids[2])
