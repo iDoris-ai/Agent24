@@ -1,6 +1,6 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
@@ -19,6 +19,8 @@ import {
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { createIdorisStatusProvider } from './idoris-admin'
+import { KnowledgeHost } from './knowledge-host'
+import { KnowledgeLoginStore } from './knowledge-logins'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -67,6 +69,8 @@ let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
 let creativeServeWeb: CreativeServeWeb | null = null
+// KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
+let knowledgeHost: KnowledgeHost | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
@@ -266,6 +270,11 @@ app.whenReady().then(async () => {
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
   void backendManager.start()
+  // safeStorage needs the app ready. The logins load once, here, before
+  // anything can change them; the reason is logged, never the contents.
+  knowledgeHost = new KnowledgeHost(new KnowledgeLoginStore(app.getPath('userData'), safeStorage))
+  const knowledgeLogins = knowledgeHost.start()
+  if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -333,7 +342,12 @@ app.whenReady().then(async () => {
   refreshTray()
   // Poll so the menu-bar title/tooltip and menu track the daemon as it starts,
   // crashes, or is toggled from the menu itself.
-  trayTimer = setInterval(refreshTray, 4_000)
+  trayTimer = setInterval(() => {
+    refreshTray()
+    // Replays the wanted Knowledge bindings on a restarted daemon and retries
+    // changes that did not land.
+    knowledgeHost?.sync()
+  }, 4_000)
   // ─────────────────────────────────────────────────────────────────────────
 
   // macOS: re-open window when dock icon clicked with no windows open
