@@ -3966,7 +3966,7 @@ pub(crate) mod tests {
                     let row = pending.last().unwrap();
                     assert!(
                         store
-                            .record_grant_end_stop(row.id, "not_running")
+                            .record_grant_end_stop(row.id, agent24_store::GrantEndStop::NotRunning)
                             .await
                             .unwrap()
                     );
@@ -3981,9 +3981,22 @@ pub(crate) mod tests {
         assert_eq!(delete(build_router(late), module).await, "unconfirmed");
         assert_eq!(stop_listed(store.clone()).await, "not_running");
         assert_eq!(unconfirmed(store.clone()).await, 3);
-        grant().await.unwrap();
+        let fresh = grant().await.unwrap();
         let views = authorization_list(store.clone()).await;
         assert!(views["authorizations"][0].get("stop").is_none(), "{views}");
+        // A route's confirmed answer settles what its revocation carried
+        // (#1202 G7, #1222 gate 3): an end left unconfirmed is carried by the
+        // next revocation, and once that is confirmed, by none after it.
+        let carries = |fresh: &agent24_store::ModuleConsentRecord| {
+            let told = pop().unwrap().authorization_refs.unwrap();
+            told.contains(&fresh.authorization_ref())
+        };
+        assert_eq!(delete(with(Unconfirmed), DECIDE).await, "unconfirmed");
+        assert!(carries(&fresh));
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        assert!(carries(&fresh), "carried while unconfirmed");
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        assert!(!carries(&fresh), "settled by the route's confirmed answer");
     }
 
     /// Deletes `uri` through `state`, and gives the stop it answered.

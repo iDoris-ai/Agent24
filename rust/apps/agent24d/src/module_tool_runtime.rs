@@ -43,6 +43,16 @@ impl RevocationStop {
     }
 }
 
+impl From<RevocationStop> for agent24_store::GrantEndStop {
+    fn from(stop: RevocationStop) -> Self {
+        match stop {
+            RevocationStop::Confirmed => Self::Confirmed,
+            RevocationStop::Unconfirmed => Self::Unconfirmed,
+            RevocationStop::NotRunning => Self::NotRunning,
+        }
+    }
+}
+
 /// An end of grants told to their module (K1-6a-G §2.5.1): of `operation`
 /// (`"*"`: every tool), at `ended_at`, for `reason`. `authorization_refs`
 /// are the grants it ended; `None` when they could not be read, and the

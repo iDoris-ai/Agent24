@@ -212,7 +212,7 @@ async fn revoke(state: AppState, module: String, tool: Option<String>) -> Respon
     let answered = match &ended {
         Some(ended) if audited => state
             .store
-            .record_grant_end_stop(ended.id, stop.word())
+            .record_grant_end_stop(ended.id, stop.into())
             .await
             .inspect_err(|err| tracing::error!(module, error = %err, "a revocation's end could not be answered"))
             .unwrap_or(false),
