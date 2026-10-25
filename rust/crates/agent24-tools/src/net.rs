@@ -586,6 +586,15 @@ mod tests {
         EgressResource::cloud_authorized("doc-1", "rev-1", 3).with_authorization_ref("grant-1")
     }
 
+    /// Granted in every respect except that it is marked LocalOnly, so only
+    /// the flag itself can refuse it.
+    fn local_only_but_otherwise_granted() -> EgressResource {
+        EgressResource {
+            local_only: true,
+            ..granted_resource()
+        }
+    }
+
     fn scoped_ctx(
         gate: Arc<dyn EgressGate>,
         resources: Vec<EgressResource>,
@@ -599,12 +608,23 @@ mod tests {
     /// IP literal (gated before the request is sent).
     async fn assert_refused_before_any_request(ctx: &ToolContext) {
         let (url, _, served) = counting_fixture("must not be served").await;
-        let err = HttpFetchTool::new(true)
+        let tool = HttpFetchTool::new(true);
+        let err = tool
             .call(ctx, &input(&url), &CancellationToken::new())
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
-        assert_eq!(connections(&served), 0);
+        // The fixture accepts connections in order, so once an ordinary fetch
+        // after the refused one has been answered, any connection the refused
+        // fetch had opened would already be counted.
+        tool.call(
+            &ToolContext::legacy("run_test", None, None, "tc_test"),
+            &input(&url),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(connections(&served), 1, "only the ordinary fetch connected");
 
         let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&lookups);
@@ -626,9 +646,30 @@ mod tests {
         // Even a gate that allows everything: LocalOnly material never leaves.
         let ctx = scoped_ctx(
             Arc::new(FixtureGrant),
-            vec![EgressResource::local_only("doc-1", "rev-1")],
-            1,
+            vec![local_only_but_otherwise_granted()],
+            7,
         );
+        assert_refused_before_any_request(&ctx).await;
+
+        // Control: the same resource without the flag is fetched.
+        let (url, _, served) = counting_fixture("granted").await;
+        HttpFetchTool::new(true)
+            .call(
+                &scoped_ctx(Arc::new(FixtureGrant), vec![granted_resource()], 7),
+                &input(&url),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(connections(&served), 1);
+    }
+
+    /// A restricted run as production builds it: source resources, but no
+    /// egress gate installed.
+    #[tokio::test]
+    async fn a_restricted_run_without_an_egress_gate_is_refused_before_any_request() {
+        let ctx = ToolContext::legacy("run_test", None, None, "tc_test")
+            .with_egress_resources(vec![granted_resource()]);
         assert_refused_before_any_request(&ctx).await;
     }
 

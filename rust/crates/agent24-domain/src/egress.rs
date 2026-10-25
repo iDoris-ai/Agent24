@@ -265,6 +265,35 @@ mod tests {
         assert!(unknown.authorize(&grant).await.is_err());
     }
 
+    /// K1-6b.5c: `local_only` refuses on its own. Everything else about the
+    /// resource is granted, and the same resource without the flag passes.
+    #[tokio::test]
+    async fn the_local_only_flag_alone_refuses_an_otherwise_granted_resource() {
+        let grant = ExactGrant {
+            resource: "selected_material:payroll",
+            revision: "rev-1",
+            authorization_ref: "grant",
+            policy_version: 2,
+            purpose: EgressPurpose::ModelInference,
+            destination: "provider:acme",
+            generation: 7,
+        };
+        let request = |local_only| {
+            let mut resource =
+                EgressResource::cloud_authorized("selected_material:payroll", "rev-1", 2)
+                    .with_authorization_ref("grant");
+            resource.local_only = local_only;
+            EgressRequest::remote(
+                vec![resource],
+                EgressPurpose::ModelInference,
+                EgressDestination::exact("provider:acme"),
+                7,
+            )
+        };
+        assert!(request(false).authorize(&grant).await.is_ok());
+        assert!(request(true).authorize(&grant).await.is_err());
+    }
+
     struct RevocableGrant(AtomicBool);
 
     #[async_trait]

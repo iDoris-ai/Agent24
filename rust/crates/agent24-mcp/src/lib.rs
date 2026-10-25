@@ -610,6 +610,15 @@ for line in sys.stdin:
             .with_authorization_ref("grant-1")
     }
 
+    /// Granted in every respect except that it is marked LocalOnly, so only
+    /// the flag itself can refuse it.
+    fn local_only_but_otherwise_granted() -> agent24_domain::EgressResource {
+        agent24_domain::EgressResource {
+            local_only: true,
+            ..granted_resource()
+        }
+    }
+
     fn scoped_ctx(
         gate: Arc<dyn agent24_domain::EgressGate>,
         resources: Vec<agent24_domain::EgressResource>,
@@ -648,8 +657,8 @@ for line in sys.stdin:
                 "local-only",
                 scoped_ctx(
                     Arc::new(AllowAll),
-                    vec![agent24_domain::EgressResource::local_only("doc-1", "rev-1")],
-                    1,
+                    vec![local_only_but_otherwise_granted()],
+                    7,
                 ),
             ),
             (
@@ -657,12 +666,26 @@ for line in sys.stdin:
                 ToolContext::legacy("run_test", None, None, "tc_test")
                     .with_egress_policy_unavailable(),
             ),
+            // A restricted run as production builds it: source resources, but
+            // no egress gate installed.
+            (
+                "no gate",
+                ToolContext::legacy("run_test", None, None, "tc_test")
+                    .with_egress_resources(vec![granted_resource()]),
+            ),
         ];
         for (what, ctx) in cases {
             let err = fixture.call(&ctx).await.unwrap_err();
             assert!(matches!(err, ToolError::Denied(_)), "{what}: {err}");
         }
         assert_eq!(fixture.calls(), 0);
+
+        // Control: the same resource without the LocalOnly flag reaches it.
+        fixture
+            .call(&scoped_ctx(Arc::new(AllowAll), vec![granted_resource()], 7))
+            .await
+            .unwrap();
+        assert_eq!(fixture.calls(), 1);
     }
 
     /// Exact-triple gate checks with a test gate. The destination is the
