@@ -344,18 +344,25 @@ pub(crate) async fn stop(state: &AppState, ended: &Ended, wait: Duration) -> boo
     let stopped = tokio::time::timeout(wait, async {
         let storage = state.storage().await.ok()?;
         let mut working = HashSet::new();
+        let mut swept = false;
         loop {
             // Each round, the calls still in flight, then the jobs and the
             // builds: an attempt a call's claim commits until it ends, and a
             // build asked for until an attempt stops or by a call accepted
-            // before the notice, are found.
+            // before the notice, are found. Once a sweep began with no such
+            // call left, every claim of theirs was in it: the write lock is
+            // not taken again, and what is accepted after is not this
+            // notice's.
             let calls_left = calls.before_an_end(ended);
-            working.extend(
-                cancel_jobs(&storage, ended)
-                    .await
-                    .map_err(|e| tracing::error!(error = %e, "documents: an ended authorization's jobs could not be cancelled"))
-                    .ok()?,
-            );
+            if !swept {
+                working.extend(
+                    cancel_jobs(&storage, ended)
+                        .await
+                        .map_err(|e| tracing::error!(error = %e, "documents: an ended authorization's jobs could not be cancelled"))
+                        .ok()?,
+                );
+                swept = calls_left == 0;
+            }
             let still = still_working(&storage, &working).await.ok()?;
             let accepted = accepted_of(&storage, ended, &layers.job_requesters())
                 .await

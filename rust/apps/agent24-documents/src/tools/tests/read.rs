@@ -761,3 +761,99 @@ async fn a_read_that_would_succeed_gives_nothing_once_its_authorization_ends() {
     let other = String::from_utf8_lossy(&other).into_owned();
     assert!(other.contains(quote), "{other}");
 }
+
+/// [`Gated`], telling `parsed` once its parse has answered.
+struct Told {
+    gated: Gated,
+    parsed: Arc<tokio::sync::Notify>,
+}
+
+impl Engine for Told {
+    fn engine(&self) -> EngineRef {
+        self.gated.engine()
+    }
+    fn config(&self) -> Value {
+        self.gated.config()
+    }
+    fn parse(&self, content: &str, media: &str, path: &Path) -> Parse {
+        let parse = self.gated.parse(content, media, path);
+        let parsed = Arc::clone(&self.parsed);
+        Box::pin(async move {
+            let layer = parse.await;
+            parsed.notify_one();
+            layer
+        })
+    }
+}
+
+/// #1213 R4: a build told to stop once its pin has begun finishes it and
+/// ends Ok; its call still gives none of the text, and the notice is
+/// answered, once the call is out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_that_pins_after_the_stop_still_gives_its_call_nothing() {
+    let (open, parsed) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let inner = fixed(vec![vec!["the needle".into()]], vec![], 0).unwrap();
+    let engine = Told {
+        gated: Gated {
+            inner,
+            open: Arc::clone(&open),
+        },
+        parsed: Arc::clone(&parsed),
+    };
+    let (_dir, state) = env_with(Some(Arc::new(engine))).await;
+    let read = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let args = json!({ "document_id": DOC, "revision": 1, "query": "needle" });
+            call(&state, "find", args).await
+        }
+    });
+    let start = std::time::Instant::now();
+    while state.calls().in_flight() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "never began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The pin waits on the write lock held here, past the build's last
+    // stop check.
+    let storage = state.storage().await.unwrap();
+    let mut lock = storage.db.pool().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    open.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), parsed.notified())
+        .await
+        .expect("never parsed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let notice = tokio::spawn({
+        let state = state.clone();
+        async move {
+            crate::authorization::stop(
+                &state,
+                &crate::authorization::Ended::by_operation("find"),
+                Duration::from_secs(5),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!read.is_finished(), "the pin was not waiting");
+    sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+    drop(lock);
+    let answer = tokio::time::timeout(Duration::from_secs(5), read).await;
+    let answer = answer.expect("the read answers").unwrap();
+    assert_kernel_error(&answer, ModuleToolErrorCode::PermissionDenied);
+    assert!(!String::from_utf8_lossy(&answer).contains("needle"));
+    assert!(notice.await.unwrap());
+    assert_eq!(state.calls().in_flight(), 0);
+    // The build itself ended Ok: its layer is pinned.
+    let pinned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM text_layers")
+        .fetch_one(storage.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(pinned, 1);
+}
