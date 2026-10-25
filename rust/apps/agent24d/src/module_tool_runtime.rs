@@ -260,8 +260,10 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
         if !context.run.as_ref().is_some_and(|run| run.is(&generation)) {
             return Err(stale_package());
         }
+        // Stopped running since it was checked: a restart or a stop, so
+        // stopped before dispatch (`unsent_to`).
         if generation.state() != DrainState::Running {
-            return Err(ModuleToolCallError::ModuleUnavailable);
+            return Err(stale_package());
         }
         // K1-6a-G §2.2: the call goes only to a run of the package the grant
         // was given for; the module may have restarted on another since the
@@ -293,8 +295,24 @@ impl ModuleToolRuntime for AgentModuleToolRuntime {
             },
             &cancel,
         )
-        .await?;
+        .await
+        .map_err(|error| unsent_to(&generation, error))?;
         Ok(result)
+    }
+}
+
+/// A call not sent (`ModuleUnavailable`) because the run it is bound to
+/// stopped running since it was checked — drained or revoked for a restart
+/// or a stop, before admission or at it — is stopped before dispatch, as a
+/// run replaced is (K1-6a-G §2.5.1, case 23; Codex A5c-2c C1): `Cancelled`,
+/// which the caller reports as `permission_denied`. A run still up that
+/// could not be reached stays unavailable, and any other error stands.
+fn unsent_to(generation: &Generation, error: ModuleToolCallError) -> ModuleToolCallError {
+    match error {
+        ModuleToolCallError::ModuleUnavailable if generation.state() != DrainState::Running => {
+            stale_package()
+        }
+        error => error,
     }
 }
 
@@ -483,6 +501,31 @@ mod tests {
         let artifact: agent24_policy::consent_gate::ArtifactSource = Arc::new(|_: &str| None);
         assert!(tool_authorization(&source(false), &store, artifact.clone()).is_none());
         assert!(tool_authorization(&source(true), &store, artifact).is_some());
+    }
+
+    /// Codex A5c-2c C1: a call not sent because its run stopped since it was
+    /// checked is cancelled; one not sent to a run still up stays
+    /// unavailable, and an error that may have been sent stands.
+    #[test]
+    fn a_call_not_sent_to_a_run_gone_is_cancelled() {
+        let generation = agent24_os_proto::drain::Generation::serving_package(
+            std::path::PathBuf::from("/nonexistent/upstream.sock"),
+            Some("sha256:b".to_owned()),
+        );
+        assert!(generation.ready());
+        assert!(matches!(
+            unsent_to(&generation, ModuleToolCallError::ModuleUnavailable),
+            ModuleToolCallError::ModuleUnavailable
+        ));
+        assert!(generation.begin_drain(std::time::Instant::now(), Duration::from_secs(5)));
+        assert!(matches!(
+            unsent_to(&generation, ModuleToolCallError::ModuleUnavailable),
+            ModuleToolCallError::Cancelled
+        ));
+        assert!(matches!(
+            unsent_to(&generation, ModuleToolCallError::ResultUnknown),
+            ModuleToolCallError::ResultUnknown
+        ));
     }
 
     #[test]
@@ -1400,6 +1443,15 @@ mod tests {
             Err(ModuleToolCallError::Cancelled)
         ));
         start();
+        assert!(matches!(
+            invoke(Some("sha256:b"), checked).await,
+            Err(ModuleToolCallError::Cancelled)
+        ));
+        // The run checked is still the slot's but draining for a restart or
+        // a stop (Codex A5c-2c C1): stopped before dispatch, not unavailable.
+        let checked = runtime.current_run("fake_module");
+        let draining = runtime.slot("fake_module").unwrap().get();
+        assert!(draining.begin_drain(std::time::Instant::now(), Duration::from_secs(5)));
         assert!(matches!(
             invoke(Some("sha256:b"), checked).await,
             Err(ModuleToolCallError::Cancelled)
