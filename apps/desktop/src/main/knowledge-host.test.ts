@@ -251,6 +251,56 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(daemon.sent.map((r) => r.method + ' ' + r.path.split('/').slice(-1)[0])).toEqual(['PUT b1', 'PUT b2'])
   })
 
+  it('tries a replay again on the next sync() until it lands, one at a time', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1')
+    await host.pushCredential('b1', credential('C1'))
+    daemon.sent.length = 0
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    daemon.respondWith(() => ({ status: 503, code: 'knowledge_host_unavailable' }))
+    host.sync()
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent).toHaveLength(1))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(daemon.sent).toHaveLength(1)
+
+    daemon.respondWith(() => ({ status: 204 }))
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent).toHaveLength(3))
+    expect(daemon.sent.slice(1).map((r) => `${r.method} ${r.path}`)).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`])
+    host.sync()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(daemon.sent).toHaveLength(3)
+  })
+
+  it('activates again and re-pushes when the daemon says the binding is not active', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1')
+    daemon.respondWith(() => ({ status: 409, code: 'binding_inactive' }))
+    expect(await host.pushCredential('b1', credential('C1'))).toEqual({ ok: false, reason: 'binding_inactive' })
+    daemon.sent.length = 0
+    daemon.respondWith(() => ({ status: 204 }))
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent.map((r) => `${r.method} ${r.path}`)).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+  })
+
+  it('reconciles a change that did not land for a passing reason, and not one the daemon refused', async () => {
+    const host = makeHost()
+    host.start()
+    daemon.respondWith(() => ({ status: 503 }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+    daemon.respondWith(() => ({ status: 400, code: 'invalid_request' }))
+    expect(await host.activate('b2')).toEqual({ ok: false, reason: 'refused' })
+    daemon.sent.length = 0
+    daemon.respondWith(() => ({ status: 204 }))
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent.map((r) => `${r.method} ${r.path}`)).toEqual([`PUT ${B1}`]))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(daemon.sent).toHaveLength(1)
+  })
+
   it('replays on sync() alone, without waiting for a change', async () => {
     const host = makeHost()
     host.start()
@@ -327,6 +377,25 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(order).toHaveLength(3)
   })
 
+  it('reports a destroy whose daemon drop failed, and drops the binding on a later sync()', async () => {
+    const host = makeHost()
+    host.start()
+    await store.put('b1', login('REFRESH'))
+    await host.activate('b1')
+    await host.pushCredential('b1', credential('C1'))
+    daemon.respondWith(() => ({ status: 503, code: 'knowledge_host_unavailable' }))
+    expect(await host.destroy('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+    // The login is gone all the same; only the daemon is behind.
+    expect(store.list().has('b1')).toBe(false)
+    daemon.sent.length = 0
+    daemon.respondWith(() => ({ status: 204 }))
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent.map((r) => `${r.method} ${r.path}`)).toEqual([`DELETE ${B1}`]))
+    host.sync()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(daemon.sent).toHaveLength(1)
+  })
+
   it('does not report a destroy as done when the unusable mark or the removal is not saved', async () => {
     const host = makeHost()
     host.start()
@@ -375,6 +444,23 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
       expect(JSON.parse(seen[1]!.body)).toEqual({ kind: 'bearer', value: 'C1', expires_at: NOW + 600 })
     } finally {
       await new Promise((resolve) => server.close(resolve))
+    }
+    // A response cut short does not hang the binding's queue.
+    const cut = http.createServer((_req, res) => {
+      res.writeHead(409, { 'Content-Type': 'application/json' })
+      res.write('{"error":{"co')
+      setTimeout(() => res.socket?.destroy(), 20)
+    })
+    await new Promise<void>((resolve) => cut.listen(0, '127.0.0.1', resolve))
+    const cutPort = (cut.address() as { port: number }).port
+    try {
+      const host = new KnowledgeHost(store, { connection: () => ({ port: cutPort, authHeaders: {} }) })
+      host.start()
+      expect(await host.activate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+      expect(await host.deactivate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+    } finally {
+      cut.closeAllConnections()
+      await new Promise((resolve) => cut.close(resolve))
     }
     // Nothing listens there any more.
     const gone = new KnowledgeHost(store, { connection: () => ({ port, authHeaders: {} }) })

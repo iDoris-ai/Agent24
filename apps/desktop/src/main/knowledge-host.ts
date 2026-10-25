@@ -7,8 +7,10 @@
 // they keep growing across main restarts; a change the daemon calls stale is
 // sent again under a new one. A restarted daemon has no records, so the
 // bindings that should be active, and their C, are replayed on a new daemon
-// connection ahead of anything else for them. Everything for one binding runs
-// one at a time: a refresh and a destroy never overlap (decided 2026-10-25).
+// connection, queued for each binding ahead of what is sent for it after that
+// point. A change that did not land for a passing reason is reconciled the same
+// way on every sync() until it does. Everything for one binding runs one at a
+// time: a refresh and a destroy never overlap (decided 2026-10-25).
 
 import http from 'node:http'
 import { daemonConnection, type DaemonConnection } from './backend-manager'
@@ -18,6 +20,8 @@ const BINDINGS = '/api/v1/host/knowledge/bindings'
 const MAX_BINDING_ID_BYTES = 256
 const MAX_STALE_RETRIES = 3
 const REQUEST_TIMEOUT_MS = 5_000
+// Failures that say nothing about the change itself: it is tried again.
+const PASSING: readonly Failure[] = ['daemon_unavailable', 'binding_inactive', 'stale_sequence']
 
 export interface KnowledgeCredential {
   kind: 'bearer' | 'api_key'
@@ -79,6 +83,9 @@ export class KnowledgeHost {
   private readonly wanted = new Map<string, { credential: KnowledgeCredential | null }>()
   private readonly locks = new Map<string, Promise<unknown>>()
   private connectionKey: string | null = null
+  // Bindings whose daemon record may differ from `wanted`, and those queued to be fixed.
+  private unsynced = new Set<string>()
+  private readonly reconciling = new Set<string>()
   private readonly deps: Required<KnowledgeHostDeps>
 
   constructor(private readonly logins: KnowledgeLoginStore, deps: KnowledgeHostDeps = {}) {
@@ -98,16 +105,24 @@ export class KnowledgeHost {
     return this.started
   }
 
-  /** On a new daemon connection, queues the replay of every wanted binding
-   * ahead of whatever is sent for it next. Cheap to call often. */
+  /** Queues a reconcile for every binding that may be out of step: all wanted
+   * ones on a new daemon connection (it has no records, so nothing is left to
+   * remove), else those whose last change did not land. Cheap to call often. */
   sync(): void {
     const conn = this.deps.connection()
     if (!conn) return
     const key = `${conn.port} ${conn.authHeaders['Authorization'] ?? ''}`
-    if (key === this.connectionKey) return
-    this.connectionKey = key
-    for (const bindingId of this.wanted.keys()) {
-      void this.exclusive(bindingId, () => this.replay(bindingId))
+    if (key !== this.connectionKey) {
+      this.connectionKey = key
+      this.unsynced = new Set(this.wanted.keys())
+    }
+    for (const bindingId of this.unsynced) {
+      if (this.reconciling.has(bindingId)) continue
+      this.reconciling.add(bindingId)
+      void this.exclusive(bindingId, () => {
+        this.reconciling.delete(bindingId)
+        return this.reconcile(bindingId)
+      })
     }
   }
 
@@ -115,14 +130,14 @@ export class KnowledgeHost {
     return this.operate(bindingId, async () => {
       // Activating drops C in the daemon; it is pushed again afterwards.
       this.wanted.set(bindingId, { credential: null })
-      return this.send(bindingId, 'PUT', '')
+      return this.track(bindingId, await this.send(bindingId, 'PUT', ''))
     })
   }
 
   deactivate(bindingId: string): Promise<HostResult> {
     return this.operate(bindingId, async () => {
       this.wanted.delete(bindingId)
-      return this.send(bindingId, 'DELETE', '')
+      return this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
     })
   }
 
@@ -134,7 +149,7 @@ export class KnowledgeHost {
     return this.operate(bindingId, async () => {
       const wanted = this.wanted.get(bindingId)
       if (wanted) wanted.credential = null
-      return this.send(bindingId, 'DELETE', '/credential')
+      return this.track(bindingId, await this.send(bindingId, 'DELETE', '/credential'))
     })
   }
 
@@ -158,21 +173,22 @@ export class KnowledgeHost {
    * marks it unusable, drops C and the binding in the daemon, then removes
    * the login. Remote revocation needs a server contract that does not exist
    * yet. When the unusable mark or the removal is not saved, the destroy did
-   * not finish and is reported so (G2'); the tightening stays in memory. */
+   * not finish and is reported so (G2'); the tightening stays in memory. When
+   * the daemon did not drop the binding, that is reported, and retried. */
   destroy(bindingId: string): Promise<HostResult> {
     return this.operate(bindingId, async () => {
       // Never replayed again, whatever happens below.
       this.wanted.delete(bindingId)
       // Handled at once: the daemon call below must not leave a rejection unobserved.
       const marked = this.logins.markUnusable(bindingId).then(() => true, () => false)
-      await this.send(bindingId, 'DELETE', '')
+      const dropped = this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
       if (!(await marked)) return failure('not_saved')
       try {
         await this.logins.remove(bindingId)
       } catch {
         return failure('not_saved')
       }
-      return { ok: true }
+      return dropped
     })
   }
 
@@ -200,19 +216,30 @@ export class KnowledgeHost {
     if (!wanted) return failure('binding_inactive')
     const copy: KnowledgeCredential = { kind: credential.kind, value: credential.value, expiresAt: credential.expiresAt }
     wanted.credential = copy
-    return this.send(bindingId, 'PUT', '/credential', credentialBody(copy))
+    return this.track(bindingId, await this.send(bindingId, 'PUT', '/credential', credentialBody(copy)))
   }
 
-  private async replay(bindingId: string): Promise<void> {
+  /** Marks the binding for a reconcile when its change did not land for a passing reason. */
+  private track(bindingId: string, result: HostResult): HostResult {
+    if (!result.ok && PASSING.includes(result.reason)) this.unsynced.add(bindingId)
+    return result
+  }
+
+  /** Brings the daemon's record in line with `wanted`: activated with its
+   * unexpired C, or dropped. Runs under the binding's turn. */
+  private async reconcile(bindingId: string): Promise<void> {
+    // A new connection replaces the set; this run then only answers to the old one.
+    const unsynced = this.unsynced
+    if (!unsynced.has(bindingId)) return
     const wanted = this.wanted.get(bindingId)
-    if (!wanted) return
-    const credential = wanted.credential
-    const activated = await this.send(bindingId, 'PUT', '')
-    if (!activated.ok || !credential || credential.expiresAt <= this.deps.nowSeconds()) return
-    // A push queued after this replay may have replaced C meanwhile; it sends its own.
-    if (this.wanted.get(bindingId)?.credential === credential) {
-      await this.send(bindingId, 'PUT', '/credential', credentialBody(credential))
+    const result = await this.send(bindingId, wanted ? 'PUT' : 'DELETE', '')
+    if (!result.ok) return
+    const credential = wanted?.credential
+    if (credential && credential.expiresAt > this.deps.nowSeconds()) {
+      const pushed = await this.send(bindingId, 'PUT', '/credential', credentialBody(credential))
+      if (!pushed.ok && PASSING.includes(pushed.reason)) return
     }
+    unsynced.delete(bindingId)
   }
 
   /** Sends one change, again under a new number while the daemon calls it stale. */
@@ -262,6 +289,8 @@ const httpTransport: HostTransport = (connection, method, path, body) =>
     const options = { host: '127.0.0.1', port: connection.port, method, path, headers, timeout: REQUEST_TIMEOUT_MS }
     const req = http.request(options, (res) => {
       const chunks: Buffer[] = []
+      // A response cut short emits 'error' (ECONNRESET) and never 'end'.
+      res.on('error', () => reject(new Error('Knowledge host request failed')))
       res.on('data', (chunk: Buffer) => chunks.push(chunk))
       res.on('end', () => {
         let code: string | undefined
