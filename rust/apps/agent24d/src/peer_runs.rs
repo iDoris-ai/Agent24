@@ -20,18 +20,51 @@ use crate::server::{AppState, error_response};
 pub(crate) const WITHHELD_NOTICE: &str = "this run used sources that are not ordinary, so its \
      content is not shared with connected tools; open it in Agent24 to see it";
 
-async fn peer_view(state: &AppState, run: Run) -> PeerRun {
-    let classification = match state.store.list_run_source_tags(&run.id).await {
-        Ok(tags) => strictest_classification(tags.into_iter().map(|tag| tag.source.classification)),
+/// The strictest classification of a run's sources as a peer may rely on
+/// them. A run that ended before all its tags were written (a failed tag
+/// read or write stops it) has only some of them; the one source that can
+/// shape such a run's own prompt is the self-wake schedule that wrote it, so
+/// that schedule's recorded classification counts whether or not its tag
+/// made it onto the run.
+async fn peer_classification(state: &AppState, run: &Run) -> SourceClassification {
+    let tags = match state.store.list_run_source_tags(&run.id).await {
+        Ok(tags) => tags,
         Err(err) => {
             tracing::warn!(
                 run_id = %run.id,
                 error = %err,
                 "run source tags unreadable; withholding the run from peers"
             );
-            SourceClassification::Unknown
+            return SourceClassification::Unknown;
         }
     };
+    let origin = match run.schedule_id.as_deref() {
+        Some(schedule_id) => match state
+            .store
+            .schedule_origin_classification(schedule_id)
+            .await
+        {
+            Ok(origin) => origin,
+            Err(err) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    error = %err,
+                    "schedule source origin unreadable; withholding the run from peers"
+                );
+                return SourceClassification::Unknown;
+            }
+        },
+        None => None,
+    };
+    strictest_classification(
+        tags.into_iter()
+            .map(|tag| tag.source.classification)
+            .chain(origin),
+    )
+}
+
+async fn peer_view(state: &AppState, run: Run) -> PeerRun {
+    let classification = peer_classification(state, &run).await;
     if classification != SourceClassification::Ordinary {
         return PeerRun {
             id: run.id,
@@ -327,6 +360,46 @@ mod tests {
         let (view, body) = peer_run(&state, "run_live").await;
         assert_eq!(view.status, RunStatus::Completed);
         assert_withheld(&view, &body);
+    }
+
+    #[tokio::test]
+    async fn a_self_wake_that_failed_before_its_origin_was_tagged_is_withheld() {
+        let state = crate::server::tests::state().await;
+        // The run failed after its user-input tag and before its schedule
+        // origin tag: the only tag on it is Ordinary.
+        let mut wake = run("run_wake", RunStatus::Failed);
+        wake.schedule_id = Some("wake_1".to_owned());
+        state.store.insert_run(&wake).await.unwrap();
+        let tag = SourceRef::user_input("run_wake", now_iso8601());
+        state
+            .store
+            .tag_run_source("run_wake", 0, &tag, &now_iso8601())
+            .await
+            .unwrap();
+        state
+            .store
+            .record_schedule_origin(
+                "wake_1",
+                "run_origin",
+                SourceClassification::Restricted,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let (view, body) = peer_run(&state, "run_wake").await;
+        assert_withheld(&view, &body);
+
+        // Control: a schedule the user created has no recorded origin.
+        let mut user = run("run_user_schedule", RunStatus::Failed);
+        user.schedule_id = Some("user_1".to_owned());
+        state.store.insert_run(&user).await.unwrap();
+        let tag = SourceRef::user_input("run_user_schedule", now_iso8601());
+        state
+            .store
+            .tag_run_source("run_user_schedule", 0, &tag, &now_iso8601())
+            .await
+            .unwrap();
+        assert!(!peer_run(&state, "run_user_schedule").await.0.withheld);
     }
 
     #[tokio::test]

@@ -312,6 +312,11 @@ where
                 }
             }
             EventBody::RunCompleted(done) if done.run_id == run_id => {
+                // Token counts measure the run's input and output, so a
+                // withheld run ends without them.
+                if !gate.relays(&mut check).await {
+                    return Ok(json!({ "stopReason": "end_turn" }));
+                }
                 return Ok(json!({
                     "stopReason": "end_turn",
                     "usage": {
@@ -482,7 +487,9 @@ mod tests {
             || view(false),
         )
         .await;
-        assert_eq!(result.unwrap()["stopReason"], "end_turn");
+        let result = result.unwrap();
+        assert_eq!(result["stopReason"], "end_turn");
+        assert_eq!(result["usage"]["outputTokens"], 2);
         let chunks: Vec<Value> = sent
             .lines()
             .map(|line| serde_json::from_str(line).unwrap_or_default())
@@ -535,13 +542,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_withheld_run_completes_without_its_token_counts() {
+        let (result, sent, checks) = relay(vec![completed("run_1")], || view(true)).await;
+        assert_eq!(result.unwrap(), json!({ "stopReason": "end_turn" }));
+        assert!(sent.is_empty(), "{sent}");
+        assert_eq!(checks, 1);
+    }
+
+    #[tokio::test]
     async fn another_runs_events_are_ignored_without_a_check() {
         let (result, sent, checks) = relay(
-            vec![delta("run_2", SECRET), failed("run_2"), completed("run_1")],
+            vec![
+                delta("run_2", SECRET),
+                failed("run_2"),
+                event(EventBody::RunCancelled(
+                    agent24_protocol::RunCancelledPayload {
+                        run_id: "run_1".to_owned(),
+                    },
+                )),
+            ],
             || view(true),
         )
         .await;
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap_err(), "run cancelled");
         assert!(sent.is_empty(), "{sent}");
         assert_eq!(checks, 0);
     }
