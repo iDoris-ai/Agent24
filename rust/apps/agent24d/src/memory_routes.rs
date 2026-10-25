@@ -756,6 +756,7 @@ mod tests {
     async fn run_in_session(state: &AppState, session_id: &str, prompt: &str) {
         let response = crate::runs::create_run(
             State(state.clone()),
+            None,
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/runs")

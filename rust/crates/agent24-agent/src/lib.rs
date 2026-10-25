@@ -824,6 +824,26 @@ impl RunManager {
         create: RunCreate,
         schedule_id: Option<String>,
     ) -> Result<Run, AgentError> {
+        self.start_run_inner(create, schedule_id, |_| {}).await
+    }
+
+    /// As [`start_run`], with `before_execute` called once the run is stored
+    /// and before it starts executing, so whatever it records about the run
+    /// is there before the run's first step.
+    pub async fn start_run_then(
+        self: &Arc<Self>,
+        create: RunCreate,
+        before_execute: impl FnOnce(&Run),
+    ) -> Result<Run, AgentError> {
+        self.start_run_inner(create, None, before_execute).await
+    }
+
+    async fn start_run_inner(
+        self: &Arc<Self>,
+        create: RunCreate,
+        schedule_id: Option<String>,
+        before_execute: impl FnOnce(&Run),
+    ) -> Result<Run, AgentError> {
         if let Some(session_id) = &create.session_id
             && self.store.get_session(session_id).await?.is_none()
         {
@@ -845,6 +865,7 @@ impl RunManager {
                 workspace_id: create.workspace_id,
                 model_override: create.model_override,
                 mode: create.mode,
+                knowledge_binding_id: create.knowledge_binding_id,
             },
             output: None,
             error: None,
@@ -866,6 +887,7 @@ impl RunManager {
             self.cancels.lock().await.remove(&run.id);
             return Err(err);
         }
+        before_execute(&run);
 
         // Supervised execution: execute() runs in its OWN task whose join
         // result is observed. A panic anywhere in the execution path (the
@@ -2865,6 +2887,7 @@ pub(crate) mod tests {
                 prompt: "workspace run".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -2886,6 +2909,7 @@ pub(crate) mod tests {
                 prompt: "workspace run two".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -2901,6 +2925,7 @@ pub(crate) mod tests {
                 prompt: "must not downgrade".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap_err();
@@ -2940,6 +2965,7 @@ pub(crate) mod tests {
                 prompt: "try a tool".into(),
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3072,6 +3098,7 @@ pub(crate) mod tests {
                 workspace_id: None,
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -3135,6 +3162,7 @@ pub(crate) mod tests {
                     prompt: "fail admission".into(),
                     model_override: None,
                     mode: RunMode::Normal,
+                    knowledge_binding_id: None,
                 })
                 .await,
             Err(AgentError::Workspace(WorkspaceStoreError::Database))
@@ -3171,6 +3199,7 @@ pub(crate) mod tests {
                 workspace_id: Some(workspace_id),
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -3249,6 +3278,7 @@ pub(crate) mod tests {
                 prompt: "hang".into(),
                 model_override: None,
                 mode: RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3296,6 +3326,7 @@ pub(crate) mod tests {
                     workspace_id: Some(workspace_id),
                     model_override: None,
                     mode: RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -3423,6 +3454,7 @@ pub(crate) mod tests {
                     workspace_id: Some(workspace_id),
                     model_override: None,
                     mode: RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -3519,6 +3551,7 @@ pub(crate) mod tests {
                 prompt: prompt.to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3585,6 +3618,7 @@ pub(crate) mod tests {
                 prompt: "first question".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3605,6 +3639,7 @@ pub(crate) mod tests {
                 prompt: "second question".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3661,6 +3696,7 @@ pub(crate) mod tests {
                     prompt: prompt.to_owned(),
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 })
                 .await
                 .unwrap();
@@ -3809,6 +3845,7 @@ pub(crate) mod tests {
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3883,6 +3920,7 @@ pub(crate) mod tests {
                 prompt: "a".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3898,6 +3936,7 @@ pub(crate) mod tests {
                 prompt: "b".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
@@ -3947,6 +3986,7 @@ pub(crate) mod tests {
             prompt: "hi".to_owned(),
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
+            knowledge_binding_id: None,
         }
     }
 
@@ -4014,10 +4054,106 @@ pub(crate) mod tests {
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::SessionNotFound(_)));
+    }
+
+    /// Notes, on its first call, what `before_execute` had recorded by then.
+    struct FirstStepProvider {
+        noted: Arc<StdMutex<Option<String>>>,
+        at_first_step: StdMutex<Option<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for FirstStepProvider {
+        fn name(&self) -> &str {
+            "first-step"
+        }
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            let noted = self.noted.lock().unwrap().clone();
+            self.at_first_step.lock().unwrap().get_or_insert(noted);
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: usage_one(),
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn before_execute_is_done_before_the_run_takes_its_first_step() {
+        let noted = Arc::new(StdMutex::new(None));
+        let provider = Arc::new(FirstStepProvider {
+            noted: noted.clone(),
+            at_first_step: StdMutex::new(None),
+        });
+        let (manager, _sink, store) = manager_with(provider.clone()).await;
+        let run = manager
+            .start_run_then(create(), |run| {
+                // Slow on purpose: a run already executing would reach the
+                // model on the other worker meanwhile and find nothing noted.
+                std::thread::sleep(Duration::from_millis(300));
+                *noted.lock().unwrap() = Some(run.id.clone());
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&store, &run.id).await.status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            *provider.at_first_step.lock().unwrap(),
+            Some(Some(run.id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn before_execute_is_not_called_for_a_run_that_was_not_created() {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let mut called = false;
+        let err = manager
+            .start_run_then(
+                RunCreate {
+                    session_id: Some("sess_nope".to_owned()),
+                    ..create()
+                },
+                |_| called = true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::SessionNotFound(_)));
+        assert!(!called);
+        // Nor for one the workspace admission denies (no session bound to the
+        // workspace): the run was never stored.
+        let err = manager
+            .start_run_then(
+                RunCreate {
+                    workspace_id: Some(
+                        agent24_protocol::WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5")
+                            .unwrap(),
+                    ),
+                    ..create()
+                },
+                |_| called = true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::WorkspaceAdmission(_)), "{err:?}");
+        assert!(!called);
+        assert!(store.list_runs(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4432,6 +4568,7 @@ mod approval_tests {
             prompt: "do the thing".to_owned(),
             model_override: None,
             mode: RunMode::Plan,
+            knowledge_binding_id: None,
         }
     }
 
@@ -4695,6 +4832,7 @@ mod approval_tests {
                 workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -4800,6 +4938,7 @@ mod approval_tests {
             workspace_id: Some(workspace_id.clone()),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         };
         sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
             .bind(WS)
@@ -4866,7 +5005,7 @@ mod approval_tests {
         let dir=tempfile::tempdir().unwrap(); let h=resume_harness(dir.path().to_path_buf()).await; let workspace_id=agent24_protocol::WorkspaceId::parse(WS).unwrap(); let now=workspace_timestamp(now_iso8601()); let expires=WorkspaceInstant::parse(&now).unwrap().checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap()).unwrap();
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')").bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"session".into(),channel:"desktop".into(),workspace_id:Some(workspace_id.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap();
-        let input=RunInput{prompt:"run echo".into(),workspace_id:Some(workspace_id),model_override:None,mode:RunMode::Normal};
+        let input=RunInput{prompt:"run echo".into(),workspace_id:Some(workspace_id),model_override:None,mode:RunMode::Normal,knowledge_binding_id:None};
         sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'running',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); let payload=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let mut approval=seed_approval("apr_1","run_1","tc_internal_1",payload.as_object().unwrap().clone()); approval.status=ApprovalStatus::Approved; approval.decision=Some(decision("approve",None)); approval.decided_at=Some(now_iso8601());
@@ -4886,7 +5025,7 @@ mod approval_tests {
         let now=workspace_timestamp(now_iso8601()); let expires=WorkspaceInstant::parse(&now).unwrap().checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap()).unwrap(); let locator=format!("{WS}.g1"); let parent=state.path().join("workspace-roots"); let root=parent.join(&locator); std::fs::create_dir(&root).unwrap(); std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap(); let pm=std::fs::metadata(&parent).unwrap(); let rm=std::fs::metadata(&root).unwrap();
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)").bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)").bind(WS).bind(&locator).bind(pm.dev().to_le_bytes().to_vec()).bind(pm.ino().to_le_bytes().to_vec()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal,knowledge_binding_id:None}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         h.store.append_run_message("run_1","user",Some("two"),&serde_json::json!([]),None,&now_iso8601()).await.unwrap(); let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); h.store.append_run_message("run_1","assistant",None,&calls,None,&now_iso8601()).await.unwrap(); let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); assert!(h.manager.tool_context_for(&run,"preflight").await.is_ok()); sqlx::raw_sql(&format!("CREATE TRIGGER lose_resume_authority AFTER INSERT ON run_messages WHEN NEW.run_id='run_1' AND NEW.role='tool' AND NEW.tool_call_id='call_provider_1' BEGIN UPDATE workspace_leases SET released_at='{now}' WHERE lease_id='{LEASE}'; END;")).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); h.manager.resume_run("run_1".into(),"apr_1".into()).await.unwrap(); assert_eq!(wait_terminal(&h.store,"run_1").await.status,RunStatus::Cancelled);
         assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().len(),0); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
@@ -4997,6 +5136,7 @@ mod approval_tests {
                 workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -5076,6 +5216,7 @@ mod approval_tests {
                 workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
             },
             output: None,
             error: None,
@@ -5448,6 +5589,7 @@ mod approval_tests {
             workspace_id: Some(workspace_id),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         };
         sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
             .bind(WS).bind(serde_json::to_string(&input).unwrap())
@@ -5547,6 +5689,7 @@ mod approval_tests {
             workspace_id: Some(agent24_protocol::WorkspaceId::parse(WS).unwrap()),
             model_override: None,
             mode: RunMode::Normal,
+            knowledge_binding_id: None,
         };
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
             .bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();

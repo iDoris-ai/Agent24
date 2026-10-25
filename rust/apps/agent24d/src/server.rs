@@ -387,6 +387,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     // to approve the plan, so a fired schedule always runs
                     // Normal.
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 };
                 match self
                     .runs
@@ -4401,6 +4402,7 @@ pub(crate) mod tests {
                     workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,
@@ -4886,6 +4888,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 workspace_id: None,
+                knowledge_binding_id: None,
             })
             .await
             .unwrap();
