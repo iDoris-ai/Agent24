@@ -117,8 +117,14 @@
    - 测试要覆盖：分类中途变化、分类缺失、受限内容不外泄。
 4. **运行中途的工具结果没有来源标签**（6b.5c-2 第 1 轮 Codex 评审发现，2026-10-25）：
    - ADR §2.1 要求「模块/MCP/HTTP/Exec 输出都成为带标签的数据块」，追溯不到来源时视作敏感。可 `RunManager::execute` 只在第一次调模型之前打标签（用户输入、召回、schedule 来源、会话下限），`run_tool_call` 的结果直接进模型上下文，不打标签。
-   - 所以一个 run 即使用模块工具读了受限文档、用 fs_read 读了文件，它的标签仍然全是 Ordinary。影响两处：一是工具出口门（`tool_context_for` 只看这些标签，读过受限文档后再调 http_fetch，按 Ordinary 放行）；二是 MCP server 和 ACP 桥的 peer 视图。
-   - **David 2026-10-25 定 A**（Claude、Codex、Fable 三方都选 A）：peer 视图先用临时规则，run 只要有过工具调用记录就扣下，ACP 在工具启动后重查（6b.5c-2）。给工具结果打标签另开一片（§7 的 6b.5f），同时修工具出口门；那一片落地后再放宽这条临时规则。
+   - 所以一个 run 即使用模块工具读了受限文档、用 fs_read 读了文件，它的标签仍然全是 Ordinary。影响三处：
+     - 工具出口门：`tool_context_for` 只看这些标签，读过受限文档后再调 http_fetch，按 Ordinary 放行。
+     - 会话下限和记忆：下限在调模型之前、只按标签合并；`run_assertion_source_ref` 也只看标签。所以工具读到的内容可以经会话记忆进入同会话的后续轮，或者记成 Ordinary 的断言、在别的会话里被召回，而这些后来的 run 自己没有工具调用。
+     - MCP server 和 ACP 桥的 peer 视图。
+   - **David 2026-10-25 定**：
+     - 先只在 peer 视图里用临时规则（6b.5c-2）：run 自己、或同会话更早的 run 调用过工具或召回过记忆，就扣下；ACP 在本 run 的工具启动后重查。第一次定的是「本 run 调过工具就扣下」（Claude、Codex、Fable 都选这一项）；第 2 轮评审发现跨 run 传播，又定按会话算（Claude、Fable 选这一项；Codex 选在源头打 Unknown 标签，并自认那会改变目标）。
+     - 会话下限、记忆分类和工具出口门这次不改：在源头打 Unknown 会让调过任何工具的 run 及其会话后续轮的 shell_exec、http_fetch 等全被拒。
+     - 给工具结果打标签另开一片（§7 的 6b.5f），同时修工具出口门、会话下限和记忆分类；那一片落地后再放宽 peer 视图的临时规则。已经记成 Ordinary 的旧断言不会自动更正，6b.5f 要说明怎么处理。
 5. **Hyphae `/comm/send`**：只能由用户经 REST 直接调用，没有 Tool 包装，也不带 run 资料。视为用户直接操作，不在 agent 出口矩阵内。
 
 ## 7. 后续切片
@@ -128,5 +134,5 @@
 | 6b.5b 模型类 | **已补**（见上表标 6b.5b 的测试）。没有补的：模块模型回调的 (b)，要等 §6 第 2 条接上来源继承以后才有可测的政策读取 |
 | 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用、精确目的地正例和逐项不匹配负例，以及 Ordinary 下 IP 字面量分支和端到端取回；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3 条，可能要拆成单独一片） |
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
-| 6b.5f 工具结果打标签 | §6 第 4 条：每类工具结果（fs_read、http_fetch、MCP、模块工具、子 agent）的分类先定方案；结果进上下文时打标签，工具出口门和 peer 视图都按它判定；然后放宽 6b.5c-2 的临时规则 |
+| 6b.5f 工具结果打标签 | §6 第 4 条：每类工具结果（fs_read、http_fetch、MCP、模块工具、子 agent）的分类先定方案；结果进上下文时打标签，工具出口门、会话下限、记忆分类和 peer 视图都按它判定；处理已记成 Ordinary 的旧断言；然后放宽 6b.5c-2 的临时规则 |
 | 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已接、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
