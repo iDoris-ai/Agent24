@@ -12,9 +12,10 @@
 //!
 //! Run content reaches the caller only through the kernel's peer views
 //! (`/api/v1/peer/runs`, K1-6b.5c-2): a run whose sources are not all Ordinary,
-//! or whose session has called a tool or recalled a memory (tool results carry
-//! no source tags yet), comes back as its status and a fixed notice, never its
-//! prompt, output or error.
+//! or that may have taken in an untagged tool result (it called a tool,
+//! recalled a memory, was started by a self-wake, or has session context),
+//! comes back as its status and a fixed notice, never its prompt, output or
+//! error.
 //!
 //! It deliberately does NOT expose raw `shell_exec`/`fs_write` as MCP tools:
 //! that would hand a third party an un-gated execution path. Every side effect
@@ -120,9 +121,9 @@ impl Agent24Server {
             Tool::new(
                 Cow::Borrowed("agent24_list_runs"),
                 Cow::Borrowed(
-                    "List this agent24d's runs and their status (read-only). A run that \
-                     used sources that are not ordinary, or whose session called a tool or \
-                     recalled a memory, shows only its status.",
+                    "List this agent24d's runs and their status (read-only). Only a \
+                     self-contained run (ordinary sources, no tools, no memory, no session \
+                     context) shows its content; any other shows only its status.",
                 ),
                 empty_obj,
             ),

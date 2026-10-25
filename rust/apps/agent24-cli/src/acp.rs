@@ -10,6 +10,8 @@
 //! the first delta, failure or completion — sources are tagged before the
 //! first model call — and read again after each tool the run starts, since
 //! the kernel withholds a run that called a tool (its results are untagged).
+//! Every prompt here runs in a session, so while the daemon keeps session
+//! memory the kernel withholds all of them.
 
 use std::collections::HashSet;
 use std::future::Future;
