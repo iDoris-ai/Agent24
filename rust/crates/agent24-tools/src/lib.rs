@@ -1343,11 +1343,12 @@ impl Tool for ModuleTool {
             }
             available = self.runtime.check_available(&self.module, &self.operation) => available,
         };
-        // K1-6a-G §2.5.1: the run is taken, then the grant is looked up once
-        // more whatever the feed holds: an end is announced only after it
-        // commits, an expiry never. An end told to a run before it was taken
-        // had committed, so the lookup fails; one told later reaches this
-        // run, or the call goes to none.
+        // K1-6a-G §2.5.1: the run is taken, then the grant is re-read
+        // whatever the feed holds (`recheck`: is this grant reference still
+        // current): an end is announced only after it commits, an expiry
+        // never. An end told to a run before it was taken had committed, so
+        // the re-read fails; one told later reaches this run, or the call
+        // goes to none.
         let run = self.runtime.current_run(&self.module);
         watch.recheck = true;
         // The wait above may have taken a change and been dropped before it
