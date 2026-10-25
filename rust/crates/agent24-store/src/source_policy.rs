@@ -64,6 +64,12 @@ pub enum SourceKind {
     /// A recalled assertion. This identifies the retrieval path; it is not
     /// itself a sensitivity classification.
     MemoryRecall,
+    /// Earlier turns of the run's session (K1-6b.4c), classified by the
+    /// session's source floor.
+    SessionContext,
+    /// A prompt a kernel-created schedule (a self-wake) carries from the
+    /// run that created it (K1-6b.4d).
+    ScheduleOrigin,
 }
 
 /// Sensitivity classification is independent from processing mode and source
@@ -132,6 +138,46 @@ impl SourceRef {
             source_id: "unknown:memory".to_owned(),
             kind: SourceKind::MemoryRecall,
             classification: SourceClassification::Unknown,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Earlier turns of a session entering a run's context. Its
+    /// classification is the session's floor as returned by
+    /// [`Store::merge_session_floor`].
+    pub fn session_floor(
+        session_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("session_floor:{session_id}"),
+            kind: SourceKind::SessionContext,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// The prompt of a run started by a kernel-created schedule. Its
+    /// classification is the one recorded when the schedule was created
+    /// ([`Store::record_schedule_origin`]).
+    pub fn schedule_origin(
+        schedule_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("schedule_origin:{schedule_id}"),
+            kind: SourceKind::ScheduleOrigin,
+            classification,
             revision_digest: None,
             mode: SourceMode::LocalOnly,
             policy_version: 0,
@@ -379,6 +425,23 @@ impl AssertionSourceRef {
     }
 }
 
+fn classification_column(classification: SourceClassification) -> &'static str {
+    match classification {
+        SourceClassification::Ordinary => "ordinary",
+        SourceClassification::Unknown => "unknown",
+        SourceClassification::Restricted => "restricted",
+    }
+}
+
+/// A stored floor this crate does not recognize reads as `Unknown`.
+fn classification_from_column(raw: &str) -> SourceClassification {
+    match raw {
+        "ordinary" => SourceClassification::Ordinary,
+        "restricted" => SourceClassification::Restricted,
+        _ => SourceClassification::Unknown,
+    }
+}
+
 /// Strictest classification: `Restricted` over `Unknown` over `Ordinary`;
 /// an empty input is `Unknown`.
 pub fn strictest_classification(
@@ -435,6 +498,9 @@ impl Store {
     /// use [`Store::run_policy_snapshot`] instead of treating an empty
     /// result as "unrestricted".
     pub async fn list_run_source_tags(&self, run_id: &str) -> Result<Vec<StoredSourceTag>> {
+        if crate::test_hooks::source_tag_reads_fail(self) {
+            return Err(sqlx::Error::Protocol("injected source tag read failure".into()).into());
+        }
         let rows = sqlx::query(
             "SELECT seq, source_id, schema_version, tag_json, created_at \
              FROM run_source_tags WHERE run_id = ? ORDER BY seq ASC, source_id ASC",
@@ -443,6 +509,84 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
         Ok(rows.iter().map(decode_tag_row).collect())
+    }
+
+    /// K1-6b.4c (ADR-K1-02 §2.2): merge one turn's own classification into
+    /// its session's floor and return the floor after the merge. Read and
+    /// write share one `BEGIN IMMEDIATE` transaction, so concurrent turns can
+    /// never lower it. A turn with prior context but no stored floor counts
+    /// that context as `Unknown`.
+    pub async fn merge_session_floor(
+        &self,
+        session_id: &str,
+        own: SourceClassification,
+        has_prior_context: bool,
+        now: &str,
+    ) -> Result<SourceClassification> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT classification FROM session_source_floor WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let prior = match stored.as_deref() {
+            Some(raw) => Some(classification_from_column(raw)),
+            None => has_prior_context.then_some(SourceClassification::Unknown),
+        };
+        let merged = strictest_classification(prior.into_iter().chain([own]));
+        sqlx::query(
+            "INSERT INTO session_source_floor (session_id, classification, updated_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+                classification = excluded.classification, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(session_id)
+        .bind(classification_column(merged))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(merged)
+    }
+
+    /// K1-6b.4d (ADR-K1-02 §2.2): record, before the schedule itself is
+    /// written, the classification a kernel-created schedule carries from the
+    /// run that created it.
+    pub async fn record_schedule_origin(
+        &self,
+        schedule_id: &str,
+        origin_run_id: &str,
+        classification: SourceClassification,
+        now: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schedule_source_origin (schedule_id, origin_run_id, classification, created_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(schedule_id)
+        .bind(origin_run_id)
+        .bind(classification_column(classification))
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The classification recorded for a kernel-created schedule; `None` for
+    /// a schedule the user created.
+    pub async fn schedule_origin_classification(
+        &self,
+        schedule_id: &str,
+    ) -> Result<Option<SourceClassification>> {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT classification FROM schedule_source_origin WHERE schedule_id = ?",
+        )
+        .bind(schedule_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(stored.as_deref().map(classification_from_column))
     }
 
     /// The run's fail-closed effective policy (ADR-K1-02 §2.1), folded from
@@ -781,6 +925,130 @@ mod tests {
             assert_eq!(tag.mode, SourceMode::LocalOnly);
             assert_eq!(tag.source_id, "memory_assertion:a-1");
         }
+    }
+
+    #[tokio::test]
+    async fn a_session_floor_starts_at_its_first_turn_and_never_lowers() {
+        use SourceClassification::{Ordinary, Restricted, Unknown};
+        let store = Store::open_memory().await.unwrap();
+        let now = "2026-10-25T00:00:00Z";
+        let merge = |own, prior| store.merge_session_floor("s1", own, prior, now);
+        assert_eq!(merge(Ordinary, false).await.unwrap(), Ordinary);
+        assert_eq!(merge(Ordinary, true).await.unwrap(), Ordinary);
+        assert_eq!(merge(Restricted, true).await.unwrap(), Restricted);
+        // Reverse: an ordinary later turn, with or without prior context.
+        assert_eq!(merge(Ordinary, true).await.unwrap(), Restricted);
+        assert_eq!(merge(Ordinary, false).await.unwrap(), Restricted);
+        assert_eq!(merge(Unknown, true).await.unwrap(), Restricted);
+        // Another session is unaffected.
+        let other = store
+            .merge_session_floor("s2", Ordinary, false, now)
+            .await
+            .unwrap();
+        assert_eq!(other, Ordinary);
+    }
+
+    #[tokio::test]
+    async fn prior_context_without_a_stored_floor_is_unknown() {
+        let store = Store::open_memory().await.unwrap();
+        let floor = store
+            .merge_session_floor("legacy", SourceClassification::Ordinary, true, "t")
+            .await
+            .unwrap();
+        assert_eq!(floor, SourceClassification::Unknown);
+    }
+
+    #[tokio::test]
+    async fn concurrent_floor_merges_never_lose_the_strictest() {
+        // A file database: `open_memory` has one connection, which would
+        // serialize the merges and hide a missing write lock.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("floor.db")).await.unwrap();
+        let merges = (0..64).map(|i| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let own = if i == 7 {
+                    SourceClassification::Restricted
+                } else {
+                    SourceClassification::Ordinary
+                };
+                store
+                    .merge_session_floor("s", own, false, "t")
+                    .await
+                    .unwrap()
+            })
+        });
+        for merge in merges.collect::<Vec<_>>() {
+            merge.await.unwrap();
+        }
+        let floor = store
+            .merge_session_floor("s", SourceClassification::Ordinary, true, "t")
+            .await
+            .unwrap();
+        assert_eq!(floor, SourceClassification::Restricted);
+    }
+
+    #[test]
+    fn an_unrecognized_stored_floor_reads_as_unknown() {
+        assert_eq!(
+            classification_from_column("ORDINARY"),
+            SourceClassification::Unknown
+        );
+        assert_eq!(
+            classification_from_column(""),
+            SourceClassification::Unknown
+        );
+        for c in [
+            SourceClassification::Ordinary,
+            SourceClassification::Unknown,
+            SourceClassification::Restricted,
+        ] {
+            assert_eq!(classification_from_column(classification_column(c)), c);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_floor_tag_round_trips_with_its_classification() {
+        let store = store_with_run("run_floor").await;
+        let tag = SourceRef::session_floor("s1", SourceClassification::Restricted, "t");
+        store
+            .tag_run_source("run_floor", 2, &tag, "t")
+            .await
+            .unwrap();
+        let tags = store.list_run_source_tags("run_floor").await.unwrap();
+        assert_eq!(tags[0].source, tag);
+        assert_eq!(tags[0].source.kind, SourceKind::SessionContext);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_origin_round_trips_and_user_schedules_have_none() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .record_schedule_origin("wake_1", "run_1", SourceClassification::Restricted, "t")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .schedule_origin_classification("wake_1")
+                .await
+                .unwrap(),
+            Some(SourceClassification::Restricted)
+        );
+        assert_eq!(
+            store
+                .schedule_origin_classification("user_sched")
+                .await
+                .unwrap(),
+            None
+        );
+        // An origin is recorded once; a second write for the same schedule is
+        // an error rather than a silent overwrite.
+        assert!(
+            store
+                .record_schedule_origin("wake_1", "run_2", SourceClassification::Ordinary, "t")
+                .await
+                .is_err()
+        );
     }
 
     #[test]

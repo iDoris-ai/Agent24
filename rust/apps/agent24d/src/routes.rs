@@ -516,13 +516,34 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // response built below can report a deterministic `memory_receipt` —
     // never inferred from the model's own reply text.
     let mut explicit_remember_state: Option<agent24_agent::ExplicitRememberState> = None;
+    let mut memory_source_ref = agent24_store::AssertionSourceRef::from_sources([]);
     let messages = match (chat.session_id.as_deref(), latest_user_message.as_deref()) {
         (Some(sid), Some(prompt)) => {
-            let (prelude, remember_state) = state
+            let prelude = state
                 .runs
-                .chat_memory_prelude(&run_id, Some(sid), prompt)
+                .chat_memory_prelude(
+                    &run_id,
+                    Some(sid),
+                    prompt,
+                    chat.messages.iter().any(|m| m.role != "user"),
+                )
                 .await;
+            // K1-6b.4c: the session floor could not be recorded, so this
+            // turn's sources are unknown; fail before the model call. The
+            // store error stays in the daemon log, not the response.
+            let (prelude, remember_state, source_ref) = match prelude {
+                Ok(prelude) => prelude,
+                Err(err) => {
+                    tracing::error!(run_id = %run_id, error = %err, "chat session source floor not recorded");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "source_policy_unavailable",
+                        "failed to persist session source policy",
+                    );
+                }
+            };
             explicit_remember_state = remember_state;
+            memory_source_ref = source_ref;
             let combined: Vec<agent24_models::Msg> =
                 prelude.into_iter().chain(base_messages.clone()).collect();
             agent24_agent::normalize_for_provider(&combined)
@@ -630,7 +651,10 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
             let memory_receipt = if let (Some(sid), Some(prompt)) =
                 (chat.session_id.as_deref(), latest_user_message.as_deref())
             {
-                let outcome = state.runs.chat_remember_turn(sid, prompt, &text).await;
+                let outcome = state
+                    .runs
+                    .chat_remember_turn(sid, prompt, &text, memory_source_ref)
+                    .await;
                 explicit_remember_state.and(match outcome {
                     agent24_agent::MemoryWriteOutcome::Saved => Some(MemoryReceipt::Saved),
                     agent24_agent::MemoryWriteOutcome::SkippedPaused => {

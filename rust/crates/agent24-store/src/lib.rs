@@ -150,6 +150,7 @@ pub struct Store {
     module_consent_changes: tokio::sync::broadcast::Sender<ModuleConsentChange>,
     terminal_commit_ack_gate:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>>,
+    fail_source_tag_reads: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Store {
@@ -175,6 +176,7 @@ impl Store {
             module_consent_revocations,
             module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
+            fail_source_tag_reads: std::sync::Arc::default(),
         })
     }
 
@@ -196,6 +198,7 @@ impl Store {
             module_consent_revocations,
             module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
+            fail_source_tag_reads: std::sync::Arc::default(),
         })
     }
 
@@ -227,6 +230,22 @@ pub mod test_hooks {
         gate
     }
 
+    /// K1-6b.4c: make every later read of run source tags on this store
+    /// (and its clones) fail as if SQLite had returned an error. Tag rows
+    /// that do not decode are already fail-closed, and a trigger cannot stop
+    /// a `SELECT`, so only this hook reaches the read-error branches.
+    pub fn fail_source_tag_reads(store: &super::Store) {
+        store
+            .fail_source_tag_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn source_tag_reads_fail(store: &super::Store) -> bool {
+        store
+            .fail_source_tag_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) async fn terminal_commit_ack_boundary(store: &super::Store) {
         let gate = store
             .terminal_commit_ack_gate
@@ -256,6 +275,7 @@ pub mod test_hooks {
             module_consent_revocations,
             module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
+            fail_source_tag_reads: std::sync::Arc::default(),
         }
     }
 
