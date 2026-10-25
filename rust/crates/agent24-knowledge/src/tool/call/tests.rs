@@ -128,6 +128,9 @@ fn search_arguments_are_parsed_strictly() {
         json!({ "query": "差旅", "knowledge_base_ids": ["kb-a", ""] }),
         json!({ "query": "差旅", "max_results": 0 }),
         json!({ "query": "差旅", "max_results": -1 }),
+        json!({ "query": "差旅", "knowledge_base_ids": null }),
+        json!({ "query": "差旅", "max_results": null }),
+        json!({ "query": null }),
         json!({ "query": "差旅", "scope": { "knowledge_base_ids": ["kb-a"] } }),
     ] {
         assert!(
@@ -162,6 +165,9 @@ fn read_arguments_are_parsed_strictly() {
         json!({ "knowledge_id": "doc-1", "cursor": " " }),
         json!({ "knowledge_id": "doc-1", "content_tag": "ct-chk-11" }),
         json!({ "knowledge_id": "doc-1", "generation": 7 }),
+        json!({ "knowledge_id": "doc-1", "chunk_id": "chk-11", "content_tag": null }),
+        json!({ "knowledge_id": "doc-1", "chunk_id": null }),
+        json!({ "knowledge_id": "doc-1", "cursor": null }),
     ] {
         assert!(
             matches!(parse_read(&input(bad.clone())), Err(Refused::Invalid(_))),
@@ -305,6 +311,16 @@ fn a_local_refusal_is_unavailable_with_its_reason() {
         (Some("dependency"), Some(true))
     );
     assert_eq!(out["advice"], "知识库依赖的服务暂时不可用，可以稍后重试。");
+    // Held by unsaved settings: no retry until the user confirms them.
+    let out = read_refusal(Failure::Local(Refusal {
+        reason: LocalReason::Dependency,
+        retryable: false,
+    }));
+    assert_eq!(out["retryable"], false);
+    assert_eq!(
+        out["advice"],
+        "知识库依赖的服务不可用，要等用户确认设置后才会重试。"
+    );
 }
 
 #[test]
@@ -352,7 +368,7 @@ fn every_local_reason_has_its_own_advice() {
         R::NotReady,
         R::Dependency,
     ];
-    let advice: std::collections::HashSet<_> = all.iter().map(|r| local_advice(*r)).collect();
+    let advice: std::collections::HashSet<_> = all.iter().map(|r| local_advice(*r, true)).collect();
     assert_eq!(advice.len(), all.len());
 }
 
@@ -368,7 +384,7 @@ fn the_advertised_schemas_match_the_parser() {
         .cloned()
         .collect();
     assert_eq!(keys, ["knowledge_base_ids", "max_results", "query"]);
-    let text = json!({ "type": "string", "minLength": 1 });
+    let text = json!({ "type": "string", "pattern": "\\S" });
     assert_eq!(s["properties"]["query"], text);
     assert_eq!(
         s["properties"]["knowledge_base_ids"],
@@ -391,4 +407,9 @@ fn the_advertised_schemas_match_the_parser() {
     for key in &keys {
         assert_eq!(r["properties"][key.as_str()], text, "{key}");
     }
+    assert_eq!(
+        r["dependentRequired"],
+        json!({ "content_tag": ["chunk_id"] })
+    );
+    assert!(s.get("dependentRequired").is_none());
 }

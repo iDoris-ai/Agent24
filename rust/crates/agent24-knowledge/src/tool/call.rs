@@ -83,7 +83,9 @@ pub enum Refused {
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
     query: String,
+    #[serde(default, deserialize_with = "crate::opt::deserialize")]
     knowledge_base_ids: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "crate::opt::deserialize")]
     max_results: Option<PositiveInt>,
 }
 
@@ -91,24 +93,23 @@ struct SearchArgs {
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
     knowledge_id: String,
+    #[serde(default, deserialize_with = "crate::opt::deserialize")]
     chunk_id: Option<String>,
+    #[serde(default, deserialize_with = "crate::opt::deserialize")]
     content_tag: Option<String>,
+    #[serde(default, deserialize_with = "crate::opt::deserialize")]
     cursor: Option<String>,
 }
 
 /// An object schema with one required key and nothing beyond `properties`.
 fn object(properties: Value, required: &str) -> Value {
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": [required],
-        "additionalProperties": false
-    })
+    json!({ "type": "object", "properties": properties,
+            "required": [required], "additionalProperties": false })
 }
 
 /// The JSON Schema advertised for `knowledge.search`.
 pub fn search_parameters() -> Value {
-    let text = json!({ "type": "string", "minLength": 1 });
+    let text = json!({ "type": "string", "pattern": "\\S" });
     let ids = json!({ "type": "array", "minItems": 1, "items": text });
     let max = json!({ "type": "integer", "minimum": 1 });
     let properties = json!({ "query": text, "knowledge_base_ids": ids, "max_results": max });
@@ -118,25 +119,23 @@ pub fn search_parameters() -> Value {
 /// The JSON Schema advertised for `knowledge.read`. A citation read passes
 /// the `chunk_id` and `content_tag` of the hit it cites.
 pub fn read_parameters() -> Value {
-    let text = json!({ "type": "string", "minLength": 1 });
+    let text = json!({ "type": "string", "pattern": "\\S" });
     let keys = ["knowledge_id", "chunk_id", "content_tag", "cursor"];
     let properties = keys
         .map(|k| (k.to_owned(), text.clone()))
         .into_iter()
         .collect();
-    object(Value::Object(properties), "knowledge_id")
+    let mut schema = object(Value::Object(properties), "knowledge_id");
+    schema["dependentRequired"] = json!({ "content_tag": ["chunk_id"] });
+    schema
 }
 
-/// An empty string or list is refused here, never sent on (READONLY R2.4).
+/// An empty or blank string is refused here, never sent on (READONLY R2.4).
 fn filled(name: &str, value: String) -> Result<String, Refused> {
     if value.trim().is_empty() {
         return Err(Refused::Invalid(format!("{name} must not be empty")));
     }
     Ok(value)
-}
-
-fn filled_opt(name: &str, value: Option<String>) -> Result<Option<String>, Refused> {
-    value.map(|v| filled(name, v)).transpose()
 }
 
 fn args<T: for<'de> Deserialize<'de>>(input: &Map<String, Value>) -> Result<T, Refused> {
@@ -167,11 +166,12 @@ pub fn parse_search(input: &Map<String, Value>) -> Result<SearchQuery, Refused> 
 
 pub fn parse_read(input: &Map<String, Value>) -> Result<ReadQuery, Refused> {
     let a: ReadArgs = args(input)?;
+    let opt = |name, v: Option<String>| v.map(|v| filled(name, v)).transpose();
     let query = ReadQuery {
         knowledge_id: filled("knowledge_id", a.knowledge_id)?,
-        chunk_id: filled_opt("chunk_id", a.chunk_id)?,
-        content_tag: filled_opt("content_tag", a.content_tag)?,
-        cursor: filled_opt("cursor", a.cursor)?,
+        chunk_id: opt("chunk_id", a.chunk_id)?,
+        content_tag: opt("content_tag", a.content_tag)?,
+        cursor: opt("cursor", a.cursor)?,
     };
     if query.content_tag.is_some() && query.chunk_id.is_none() {
         return Err(Refused::Invalid("content_tag needs chunk_id".into()));
@@ -219,7 +219,7 @@ fn server_advice(code: ErrorCode, reason: Option<&str>, retryable: bool) -> &'st
     }
 }
 
-fn local_advice(reason: LocalReason) -> &'static str {
+fn local_advice(reason: LocalReason, retryable: bool) -> &'static str {
     use LocalReason as R;
     match reason {
         R::KnowledgeOff => "知识库功能已关闭，本次不可用。",
@@ -230,7 +230,8 @@ fn local_advice(reason: LocalReason) -> &'static str {
         R::AccessRevoked => "知识库访问权限已被撤销。",
         R::InstanceUnidentified => "无法确认本机知识库实例。",
         R::NotReady => "知识库尚未就绪，可以稍后重试。",
-        R::Dependency => "知识库依赖的服务暂时不可用，可以稍后重试。",
+        R::Dependency if retryable => "知识库依赖的服务暂时不可用，可以稍后重试。",
+        R::Dependency => "知识库依赖的服务不可用，要等用户确认设置后才会重试。",
     }
 }
 
@@ -249,7 +250,7 @@ fn refusal(kind: &'static str, failure: Failure) -> Refused {
             "unavailable".into(),
             Some(reason.as_str().into()),
             retryable,
-            local_advice(reason),
+            local_advice(reason, retryable),
         ),
         Failure::Unbound => ("knowledge_unbound".into(), None, false, UNBOUND),
         Failure::BindingStale => ("knowledge_binding_stale".into(), None, false, STALE),
