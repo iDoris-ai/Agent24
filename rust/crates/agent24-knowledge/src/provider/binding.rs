@@ -22,6 +22,8 @@ pub enum Leave {
     Logout,
     /// The profile removed: disabled first, then `retired`.
     Remove,
+    /// The identity changed (S3.5): `retired`.
+    Retire,
 }
 
 /// How the same binding is activated again (S3.3).
@@ -99,7 +101,7 @@ impl BindingState {
         self.credentials.discard();
         match event {
             Leave::Unselect | Leave::Logout => self.activated = false,
-            Leave::Remove => self.retired = true,
+            Leave::Remove | Leave::Retire => self.retired = true,
             Leave::Off | Leave::Disable => {}
         }
         Effects {
@@ -117,15 +119,22 @@ impl BindingState {
     pub fn activate(&mut self, how: Activation) {
         self.activated = true;
         if how == Activation::Relogin {
-            use UnavailableCause::{AccessRevoked, CredentialRejected};
-            // Still in that reason: out first, so `connect` enters `loading`.
-            let phase = self.connection.phase();
-            if let Some(ConnectionPhase::Unavailable(AccessRevoked | CredentialRejected)) = phase {
-                self.connection.leave();
-            }
-            self.connection.release(CredentialRejected);
-            self.connection.release(AccessRevoked);
+            self.relogin();
         }
+    }
+
+    /// The same principal logged in again, without activating: a login only
+    /// remembered while unselected or awaiting confirmation (S3.3) still
+    /// lets `credential_rejected` and `access_revoked` be retried later.
+    pub fn relogin(&mut self) {
+        use UnavailableCause::{AccessRevoked, CredentialRejected};
+        // Still in that reason: out first, so `connect` enters `loading`.
+        let phase = self.connection.phase();
+        if let Some(ConnectionPhase::Unavailable(AccessRevoked | CredentialRejected)) = phase {
+            self.connection.leave();
+        }
+        self.connection.release(CredentialRejected);
+        self.connection.release(AccessRevoked);
     }
 
     /// Enters `loading` in a new round once activated with neither switch on
