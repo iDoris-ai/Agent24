@@ -43,6 +43,29 @@ impl RevocationStop {
     }
 }
 
+impl From<RevocationStop> for agent24_store::GrantEndStop {
+    fn from(stop: RevocationStop) -> Self {
+        match stop {
+            RevocationStop::Confirmed => Self::Confirmed,
+            RevocationStop::Unconfirmed => Self::Unconfirmed,
+            RevocationStop::NotRunning => Self::NotRunning,
+        }
+    }
+}
+
+/// An end of grants told to their module (K1-6a-G §2.5.1): of `operation`
+/// (`"*"`: every tool), at `ended_at`, for `reason`. `authorization_refs`
+/// are the grants it ended; `None` when they could not be read, and the
+/// module then stops by operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantEnd {
+    pub module: String,
+    pub operation: String,
+    pub ended_at: String,
+    pub reason: &'static str,
+    pub authorization_refs: Option<Vec<String>>,
+}
+
 pub struct AgentModuleToolRuntime {
     supervisors: Arc<OnceLock<Arc<Supervisors>>>,
     operations: Arc<HashSet<(String, String)>>,
@@ -90,18 +113,13 @@ impl AgentModuleToolRuntime {
         self.supervisors.get()?.running_slot(module)
     }
 
-    /// Tells `module` that its grants of `operation` (`"*"`: every tool)
-    /// were revoked at `revoked_at`, and waits, at most `within`, for it to
-    /// say it stopped what they started (K1-6a-G §2.5). A run that is
-    /// starting, draining or stopping is still a run, so it is unconfirmed;
-    /// not running means none can be alive (`Supervisors::surely_stopped`).
-    pub async fn notify_revoked(
-        &self,
-        module: &str,
-        operation: &str,
-        revoked_at: &str,
-        within: Duration,
-    ) -> RevocationStop {
+    /// Tells `end.module` that `end` ended its grants, and waits, at most
+    /// `within`, for it to say it stopped what they started (K1-6a-G §2.5).
+    /// A run that is starting, draining or stopping is still a run, so it is
+    /// unconfirmed; not running means none can be alive
+    /// (`Supervisors::surely_stopped`).
+    pub async fn notify_revoked(&self, end: &GrantEnd, within: Duration) -> RevocationStop {
+        let module = end.module.as_str();
         let Some(current) = self.slot(module) else {
             // Out of the list is not gone: a disabled run drains first.
             return match self.supervisors.get() {
@@ -116,7 +134,14 @@ impl AgentModuleToolRuntime {
             return RevocationStop::Unconfirmed;
         }
         let namespace = agent24_domain::DomainOsManifest::declared_namespace(module);
-        let body = serde_json::json!({ "operation": operation, "revoked_at": revoked_at });
+        let mut body = serde_json::json!({
+            "operation": end.operation,
+            "revoked_at": end.ended_at,
+            "reason": end.reason,
+        });
+        if let Some(refs) = &end.authorization_refs {
+            body["authorization_refs"] = serde_json::json!(refs);
+        }
         let request = KernelRequest {
             path: format!("{namespace}/_a24/authorization/revoked"),
             extra_headers: Vec::new(),
@@ -341,6 +366,25 @@ pub(crate) fn store_authorization(
     .with_artifact_source(artifact)
 }
 
+/// A module tool's authorization, or none for a module not on the grants
+/// protocol (K1-6a-G §2.6, #1202 G6): a grant it holds from before the
+/// protocol it needs moved (an older daemon's) does not hold, so its tool is
+/// neither advertised nor dispatched. Its card still answers, with 409.
+pub(crate) fn tool_authorization(
+    source: &crate::consent_routes::ToolCardSource,
+    store: &agent24_store::Store,
+    artifact: agent24_policy::consent_gate::ArtifactSource,
+) -> Option<Arc<dyn agent24_tools::ModuleToolAuthorization>> {
+    source.takes_grants.then(|| {
+        Arc::new(store_authorization(
+            store,
+            source.gate_request(),
+            Arc::new(consent_clock),
+            artifact,
+        )) as Arc<dyn agent24_tools::ModuleToolAuthorization>
+    })
+}
+
 /// What this start sees of each of `modules` (K1-6a-G §2.1 F3): recorded,
 /// advancing an enable epoch where it changed, and only then are the
 /// module's grants let hold. A module this fails for keeps none.
@@ -371,6 +415,34 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// #1202 G6: a module not on the grants protocol gets no authorization
+    /// at all, so no grant it holds (an older daemon's) is ever read: its
+    /// tool is neither advertised nor dispatched. One on it gets one.
+    /// `serve` builds every tool's through this
+    /// (`serve_authorizes_module_tools_by_protocol`).
+    #[tokio::test]
+    async fn only_a_module_on_the_grants_protocol_is_authorized() {
+        let store = Store::open_memory().await.unwrap();
+        let summary = ToolPermissionSummary::new(
+            "legacy",
+            "read",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("docs".to_owned()),
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        let source = |takes_grants| crate::consent_routes::ToolCardSource {
+            summary: summary.clone(),
+            resource_kinds: Vec::new(),
+            takes_grants,
+        };
+        let artifact: agent24_policy::consent_gate::ArtifactSource = Arc::new(|_: &str| None);
+        assert!(tool_authorization(&source(false), &store, artifact.clone()).is_none());
+        assert!(tool_authorization(&source(true), &store, artifact).is_some());
+    }
 
     #[test]
     fn gate_five_recognises_the_adopted_documents_module_id() {
@@ -1039,8 +1111,15 @@ mod tests {
         );
         tokio::spawn(async move { axum::serve(listener, app).await });
         let runtime = AgentModuleToolRuntime::new(HashSet::new());
-        let notify =
-            |within| runtime.notify_revoked("fake_module", "*", "2026-10-24T00:00:00Z", within);
+        let end = |authorization_refs| GrantEnd {
+            module: "fake_module".to_owned(),
+            operation: "*".to_owned(),
+            ended_at: "2026-10-24T00:00:00Z".to_owned(),
+            reason: "epoch",
+            authorization_refs,
+        };
+        let told_refs = end(Some(vec!["ga1:a".to_owned()]));
+        let notify = |within| runtime.notify_revoked(&told_refs, within);
         let within = Duration::from_secs(2);
         assert_eq!(notify(within).await, RevocationStop::NotRunning);
         // Out of the list but still draining from a disable: not yet gone.
@@ -1069,7 +1148,25 @@ mod tests {
         assert_eq!(notify(within).await, RevocationStop::Confirmed);
         assert_eq!(
             told.lock().unwrap()[0],
-            serde_json::json!({ "operation": "*", "revoked_at": "2026-10-24T00:00:00Z" })
+            serde_json::json!({
+                "operation": "*",
+                "revoked_at": "2026-10-24T00:00:00Z",
+                "reason": "epoch",
+                "authorization_refs": ["ga1:a"],
+            })
+        );
+        // References not read: none sent, and the module stops by operation.
+        assert_eq!(
+            runtime.notify_revoked(&end(None), within).await,
+            RevocationStop::Confirmed
+        );
+        assert_eq!(
+            told.lock().unwrap()[1],
+            serde_json::json!({
+                "operation": "*",
+                "revoked_at": "2026-10-24T00:00:00Z",
+                "reason": "epoch",
+            })
         );
         *answer.lock().unwrap() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
         assert_eq!(notify(within).await, RevocationStop::Unconfirmed);

@@ -29,6 +29,9 @@ use sqlx::sqlite::SqliteRow;
 
 use crate::{Result, Store, StoreError};
 
+mod grant_end_notices;
+pub use grant_end_notices::{GrantEndNotice, GrantEndReason, GrantEndStop};
+
 // ── Domain types ─────────────────────────────────────────────────────────
 
 /// Where a module came from (ADR §4). Jason's 2026-10-07 ruling (issue
@@ -580,16 +583,21 @@ async fn record_enablement(
     Ok(())
 }
 
-/// Set `module`'s enable epoch to a fresh write generation.
+/// Set `module`'s enable epoch to a fresh write generation; the grants of
+/// the epoch it ends are told ended (§2.5.1).
 async fn advance_enable_epoch(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     module: &str,
 ) -> Result<i64> {
+    // A write first: a deferred transaction holds the write lock before it
+    // reads what it ends.
     let epoch: i64 = sqlx::query_scalar(
         "INSERT INTO module_consent_generations DEFAULT VALUES RETURNING generation",
     )
     .fetch_one(&mut **tx)
     .await?;
+    let current = current_enable_epoch(tx, module).await?;
+    let ended = grant_end_notices::untold(tx, module, None, Some(current)).await?;
     sqlx::query(
         "INSERT INTO module_enable_epochs (module, epoch) VALUES (?, ?)
          ON CONFLICT (module) DO UPDATE SET epoch = excluded.epoch",
@@ -598,6 +606,11 @@ async fn advance_enable_epoch(
     .bind(epoch)
     .execute(&mut **tx)
     .await?;
+    if !ended.is_empty() {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let reason = GrantEndReason::Epoch;
+        grant_end_notices::write(tx, module, "*", &ended, &[], reason, &now, epoch, false).await?;
+    }
     Ok(epoch)
 }
 
@@ -639,27 +652,31 @@ impl Store {
 
     /// Persist a revocation for one tool (`op: Some`) or every tool in a
     /// module (`op: None`), then broadcast it. `now` must be RFC 3339; invalid
-    /// timestamps fail before any write or notification.
+    /// timestamps fail before any write or notification. No route tells
+    /// the module: its end is pending for the notifier at once (§2.5.1).
     pub async fn revoke_module_consent(
         &self,
         module: &str,
         op: Option<&str>,
         now: &str,
     ) -> Result<()> {
-        self.revoke_module_consent_tracked(module, op, now)
-            .await
-            .map(|_| ())
+        self.revoke(module, op, now, false).await.map(|_| ())
     }
 
-    /// [`Self::revoke_module_consent`], returning the revocation's write
-    /// generation: the key [`Self::record_revocation_stop`] records the
-    /// module's answer under (K1-6a-G §2.5).
+    /// [`Self::revoke_module_consent`] for the route that tells the module
+    /// itself, returning the revocation's write generation: the key
+    /// [`Self::record_revocation_stop`] records the module's answer under
+    /// (K1-6a-G §2.5). Its end is left to the route a while.
     pub async fn revoke_module_consent_tracked(
         &self,
         module: &str,
         op: Option<&str>,
         now: &str,
     ) -> Result<i64> {
+        self.revoke(module, op, now, true).await
+    }
+
+    async fn revoke(&self, module: &str, op: Option<&str>, now: &str, routed: bool) -> Result<i64> {
         let (_, revoked_at) = parse_instant(now)?;
         let key = op.unwrap_or("*");
         let mut tx = self.pool().begin().await?;
@@ -668,6 +685,11 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
+        // Read before the revocation covers them (§2.5.1); `*` named as a
+        // tool is the whole module, as its key says.
+        let tool = op.filter(|op| *op != "*");
+        let ended = grant_end_notices::untold(&mut tx, module, tool, None).await?;
+        let unconfirmed = grant_end_notices::unconfirmed(&mut tx, module, tool).await?;
         sqlx::query(
             "INSERT INTO module_consent_revocations (module, op, revoked_at, generation)
              VALUES (?, ?, ?, ?)
@@ -681,6 +703,19 @@ impl Store {
         .bind(&revoked_at)
         .bind(generation)
         .execute(&mut *tx)
+        .await?;
+        let reason = GrantEndReason::Revoked;
+        grant_end_notices::write(
+            &mut tx,
+            module,
+            key,
+            &ended,
+            &unconfirmed,
+            reason,
+            &revoked_at,
+            generation,
+            routed,
+        )
         .await?;
         tx.commit().await?;
         let _ = self
@@ -913,6 +948,10 @@ impl Store {
         .fetch_one(&mut *tx)
         .await?;
         let enable_epoch = current_enable_epoch(&mut tx, &summary.module).await?;
+        // The granted row this decision replaces, if its end was not told
+        // yet: told now, with its reference (§2.5.1).
+        let module = &summary.module;
+        let replaced = grant_end_notices::untold(&mut tx, module, Some(&summary.op), None).await?;
         let row = sqlx::query(
             "INSERT INTO module_consents
                 (module, op, module_version, scope_fingerprint, source, risk,
@@ -947,7 +986,7 @@ impl Store {
         .bind(&summary.writable)
         .bind(&summary.external)
         .bind(decision_str(decision))
-        .bind(decided_at)
+        .bind(&decided_at)
         .bind(expires_at)
         .bind(&resources)
         .bind(&scope.artifact)
@@ -955,6 +994,22 @@ impl Store {
         .bind(enable_epoch)
         .fetch_one(&mut *tx)
         .await?;
+        if !replaced.is_empty() {
+            let reason = GrantEndReason::Replaced;
+            let (op, at) = (&summary.op, &decided_at);
+            grant_end_notices::write(
+                &mut tx,
+                module,
+                op,
+                &replaced,
+                &[],
+                reason,
+                at,
+                generation,
+                false,
+            )
+            .await?;
+        }
         tx.commit().await?;
         let record = row_to_record(&row)?;
         self.announce_module_consent_change(&summary.module, Some(&summary.op));

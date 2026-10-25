@@ -1611,36 +1611,29 @@ pub async fn serve(
                 matches!(&entry.build, crate::domain::Build::Package(p) if p.manifest.takes_grants())
             }),
         };
-        let request = source.gate_request();
-        let authorization = StdArc::new(crate::module_tool_runtime::store_authorization(
+        let authorization = crate::module_tool_runtime::tool_authorization(
+            &source,
             &store,
-            request,
-            StdArc::new(crate::module_tool_runtime::consent_clock),
             module_tool_runtime.artifact_source(),
-        ));
+        );
         card_sources.insert((module.clone(), operation.clone()), source);
-        module_authorizations.insert((module, operation), authorization);
+        if let Some(authorization) = authorization {
+            module_authorizations.insert((module, operation), authorization);
+        }
     }
     let module_tool_cards = crate::consent_routes::ModuleToolCards {
         tools: StdArc::new(card_sources),
         artifact: module_tool_runtime.artifact_source(),
         notice: {
             let runtime = module_tool_runtime.clone();
-            StdArc::new(
-                move |module: String, operation: String, revoked_at: String| {
-                    let runtime = runtime.clone();
-                    Box::pin(async move {
-                        runtime
-                            .notify_revoked(
-                                &module,
-                                &operation,
-                                &revoked_at,
-                                crate::module_tool_runtime::REVOCATION_NOTICE_WITHIN,
-                            )
-                            .await
-                    }) as futures::future::BoxFuture<'static, _>
-                },
-            )
+            StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
+                let runtime = runtime.clone();
+                Box::pin(async move {
+                    runtime
+                        .notify_revoked(&end, crate::module_tool_runtime::REVOCATION_NOTICE_WITHIN)
+                        .await
+                }) as futures::future::BoxFuture<'static, _>
+            })
         },
     };
     let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
@@ -2409,8 +2402,9 @@ pub async fn serve(
             .unwrap_or_default(),
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
-    // K1-6a-G §2.5 (A5b): told once the modules run, so a grant that
-    // expired while the daemon was down reaches the run that is up now.
+    // K1-6a-G §2.5 (A5b), §2.5.1: told once the modules run, so a grant
+    // that expired, or an end not told, while the daemon was down reaches
+    // the run that is up now.
     tokio::spawn(crate::grant_expiry::run(
         state.store.clone(),
         module_tool_cards.notice.clone(),
@@ -3042,6 +3036,29 @@ pub(crate) mod tests {
              spawn_cancel_root(shutdown.modules_cut_off()) — design \
              docs/design/ME4-S2-model-callback.md §3.3"
         );
+    }
+
+    /// #1202 G6 (Codex A5c-2a round 2): `serve` builds each module tool's
+    /// authorization through `tool_authorization`, which refuses a module
+    /// not on the grants protocol, never `store_authorization` directly,
+    /// which would let a grant from an older daemon hold. Scanned with
+    /// `//`-comments stripped, as
+    /// `stop_usage_writer_is_called_after_the_supervisors_have_stopped`.
+    #[test]
+    fn serve_authorizes_module_tools_by_protocol() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let code: String = body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("crate::module_tool_runtime::tool_authorization("));
+        assert!(!code.contains("store_authorization("));
     }
 
     // ---- ME4-4.2.3b (design §6.3/v3.1 M-2, J19 variant 2a) -------------------
@@ -3812,10 +3829,10 @@ pub(crate) mod tests {
     /// A revocation notice that answers `stop` and keeps what it was told.
     fn answering_into(
         stop: crate::module_tool_runtime::RevocationStop,
-        told: StdArc<std::sync::Mutex<Vec<(String, String)>>>,
+        told: StdArc<std::sync::Mutex<Vec<crate::module_tool_runtime::GrantEnd>>>,
     ) -> crate::consent_routes::RevocationNotice {
-        StdArc::new(move |module: String, operation: String, _: String| {
-            told.lock().unwrap().push((module, operation));
+        StdArc::new(move |end| {
+            told.lock().unwrap().push(end);
             Box::pin(async move { stop }) as futures::future::BoxFuture<'static, _>
         })
     }
@@ -3829,7 +3846,8 @@ pub(crate) mod tests {
     /// K1-6a-G §2.5: a revocation tells the module and answers with what it
     /// said; the list shows it for each revoked grant, and a revocation no
     /// answer was recorded for — or one replaced since — reads unconfirmed,
-    /// as does one the module did not confirm, which is audited too.
+    /// as does one the module did not confirm, which is audited too. It
+    /// tells the grants it ended (§2.5.1), and answers its outbox row.
     #[tokio::test]
     async fn a_revocation_answers_whether_the_module_stopped() {
         use crate::module_tool_runtime::RevocationStop::{Confirmed, NotRunning, Unconfirmed};
@@ -3865,7 +3883,7 @@ pub(crate) mod tests {
         };
         let grant =
             || store.grant_module_consent(&summary, "2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z");
-        grant().await.unwrap();
+        let granted = grant().await.unwrap();
         assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
         let unconfirmed = |store: agent24_store::Store| async move {
             store
@@ -3881,29 +3899,53 @@ pub(crate) mod tests {
             0,
             "a confirmed stop is not audited"
         );
+        let told_end = |operation: &str, refs: Vec<String>| {
+            Some(crate::module_tool_runtime::GrantEnd {
+                module: "doc-module".to_owned(),
+                operation: operation.to_owned(),
+                ended_at: String::new(),
+                reason: "revoked",
+                authorization_refs: Some(refs),
+            })
+        };
+        let pop = || {
+            told.lock()
+                .unwrap()
+                .pop()
+                .map(|end| crate::module_tool_runtime::GrantEnd {
+                    ended_at: String::new(),
+                    ..end
+                })
+        };
         assert_eq!(
-            told.lock().unwrap().pop(),
-            Some(("doc-module".to_owned(), "read_document".to_owned()))
+            pop(),
+            told_end("read_document", vec![granted.authorization_ref()])
         );
         assert_eq!(stop_listed(store.clone()).await, "confirmed");
         let module = "/api/v1/module-consents/modules/doc-module";
         assert_eq!(delete(with(Unconfirmed), module).await, "unconfirmed");
-        assert_eq!(
-            told.lock().unwrap().pop(),
-            Some(("doc-module".to_owned(), "*".to_owned()))
-        );
+        // The grant was told already: the module's revocation ends none.
+        assert_eq!(pop(), told_end("*", Vec::new()));
         assert_eq!(stop_listed(store.clone()).await, "unconfirmed");
+        let pending = store
+            .pending_grant_end_notices("2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(
+            pending.is_empty(),
+            "each route answers its own: {pending:?}"
+        );
         assert_eq!(unconfirmed(store.clone()).await, 1);
         // A later revocation of the key while the module answers: the answer
         // is not this revocation's, so it is not confirmed.
         let mut racing = state.clone();
         racing.module_tool_cards.as_mut().unwrap().notice = {
             let store = store.clone();
-            StdArc::new(move |module: String, _: String, _: String| {
+            StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
                 let store = store.clone();
                 Box::pin(async move {
                     store
-                        .revoke_module_consent_tracked(&module, None, "2026-10-24T00:30:00Z")
+                        .revoke_module_consent_tracked(&end.module, None, "2026-10-24T00:30:00Z")
                         .await
                         .unwrap();
                     Confirmed
@@ -3932,9 +3974,121 @@ pub(crate) mod tests {
         });
         assert_eq!(delete(no_cards, module).await, "not_running");
         assert_eq!(unconfirmed(store.clone()).await, 2);
-        grant().await.unwrap();
+        // The notifier answered the row first (§2.5.1): its answer stands,
+        // on the row and on the revocation, and the route claims none.
+        let mut late = state.clone();
+        late.module_tool_cards.as_mut().unwrap().notice = {
+            let store = store.clone();
+            StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
+                let store = store.clone();
+                Box::pin(async move {
+                    let pending = store
+                        .pending_grant_end_notices("2099-01-01T00:00:00Z")
+                        .await
+                        .unwrap();
+                    let row = pending.last().unwrap();
+                    assert!(
+                        store
+                            .record_grant_end_stop(row.id, agent24_store::GrantEndStop::NotRunning)
+                            .await
+                            .unwrap()
+                    );
+                    store
+                        .record_revocation_stop(&end.module, None, row.generation, "not_running")
+                        .await
+                        .unwrap();
+                    Confirmed
+                }) as futures::future::BoxFuture<'static, _>
+            })
+        };
+        assert_eq!(delete(build_router(late), module).await, "unconfirmed");
+        assert_eq!(stop_listed(store.clone()).await, "not_running");
+        assert_eq!(unconfirmed(store.clone()).await, 3);
+        let fresh = grant().await.unwrap();
         let views = authorization_list(store.clone()).await;
         assert!(views["authorizations"][0].get("stop").is_none(), "{views}");
+        // A route's confirmed answer settles what its revocation carried
+        // (#1202 G7, #1222 gate 3): an end left unconfirmed is carried by the
+        // next revocation, and once that is confirmed, by none after it.
+        let carries = |fresh: &agent24_store::ModuleConsentRecord| {
+            let told = pop().unwrap().authorization_refs.unwrap();
+            told.contains(&fresh.authorization_ref())
+        };
+        assert_eq!(delete(with(Unconfirmed), DECIDE).await, "unconfirmed");
+        assert!(carries(&fresh));
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        assert!(carries(&fresh), "carried while unconfirmed");
+        assert_eq!(delete(with(Confirmed), DECIDE).await, "confirmed");
+        assert!(!carries(&fresh), "settled by the route's confirmed answer");
+    }
+
+    /// Deletes `uri` through `state`, and gives the stop it answered.
+    async fn revoked_stop(state: AppState, uri: &str) -> serde_json::Value {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await["stop"].clone()
+    }
+
+    /// K1-6a-G §2.5.1 (A5c-2a review round 2): a revocation whose route
+    /// cannot audit an unconfirmed answer, or cannot read its row, leaves
+    /// both answers to the notifier: the row stays unanswered and the
+    /// revocation records nothing; the route claims no stop. Unread, the
+    /// module is told no references, and stops by operation.
+    #[tokio::test]
+    async fn a_revocation_the_route_cannot_finish_is_left_to_the_notifier() {
+        use crate::module_tool_runtime::RevocationStop::{Confirmed, Unconfirmed};
+        let pool = |store: &agent24_store::Store| agent24_store::test_hooks::pool(store).clone();
+        let left = |store: agent24_store::Store| async move {
+            let pending = store
+                .pending_grant_end_notices("2099-01-01T00:00:00Z")
+                .await
+                .unwrap();
+            let recorded = store
+                .revocation_stop_state("doc-module", "read_document")
+                .await
+                .unwrap();
+            (pending.len(), recorded)
+        };
+        // The audit fails.
+        let dir = tempfile::tempdir().unwrap();
+        let running = StdArc::new(std::sync::atomic::AtomicBool::new(true));
+        let (mut state, _) = decision_state(&running, &dir.path().join("os.json")).await;
+        let store = state.store.clone();
+        state.module_tool_cards.as_mut().unwrap().notice = answering(Unconfirmed);
+        sqlx::query("CREATE TRIGGER reject_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(FAIL, 'offline'); END")
+            .execute(&pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(revoked_stop(state, DECIDE).await, "unconfirmed");
+        assert_eq!(left(store).await, (1, None));
+        // The row cannot be read.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _) = decision_state(&running, &dir.path().join("os.json")).await;
+        let store = state.store.clone();
+        let told = StdArc::new(std::sync::Mutex::new(Vec::new()));
+        state.module_tool_cards.as_mut().unwrap().notice =
+            answering_into(Confirmed, StdArc::clone(&told));
+        sqlx::query("CREATE TRIGGER garble AFTER INSERT ON module_grant_end_notices BEGIN UPDATE module_grant_end_notices SET authorization_refs = 'x' WHERE id = NEW.id; END")
+            .execute(&pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(revoked_stop(state, DECIDE).await, "unconfirmed");
+        assert_eq!(told.lock().unwrap()[0].authorization_refs, None);
+        let recorded = store
+            .revocation_stop_state("doc-module", "read_document")
+            .await
+            .unwrap();
+        assert_eq!(recorded, None);
     }
 
     /// K1-6a-G §2.5 (A5b): an expired grant lists what its module answered

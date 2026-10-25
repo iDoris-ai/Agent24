@@ -909,4 +909,59 @@ mod tests {
         assert!(t.len() <= 200 + 4);
         assert!(t.ends_with('…'));
     }
+
+    /// K1-6b.5b (ADR-K1-02 §2.4 (a)): the model assessor judges the tool
+    /// payload local-only. With only a remote provider configured it has
+    /// nothing to ask, and the remote provider never sees the payload.
+    #[tokio::test]
+    async fn the_model_assessor_never_sends_a_payload_to_a_remote_model() {
+        use agent24_models::router::Tier;
+        use agent24_models::{CompletionResponse, ModelError, ModelProvider};
+
+        struct Remote(StdMutex<usize>);
+        #[async_trait]
+        impl ModelProvider for Remote {
+            fn name(&self) -> &str {
+                "remote"
+            }
+            fn outbound_destination(&self) -> Option<String> {
+                Some("https://models.example/v1".to_owned())
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                *self.0.lock().unwrap() += 1;
+                Err(ModelError::Unavailable("must not be called".to_owned()))
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+
+        let remote = Arc::new(Remote(StdMutex::new(0)));
+        let assessor = ModelRiskAssessor::new(Arc::new(ModelRouter::with_defaults(vec![(
+            remote.clone(),
+            Tier::Remote,
+        )])));
+        let mut payload = Map::new();
+        payload.insert(
+            "argv".to_owned(),
+            Value::String("cat secrets.txt".to_owned()),
+        );
+        let result = assessor
+            .assess(&input("exec", &payload), &CancellationToken::new())
+            .await;
+        match result {
+            Err(AssessError::Unavailable(message)) => {
+                assert!(message.contains("local-only"), "{message}");
+            }
+            other => panic!("expected an unavailable assessor, got {other:?}"),
+        }
+        assert_eq!(*remote.0.lock().unwrap(), 0);
+    }
 }
