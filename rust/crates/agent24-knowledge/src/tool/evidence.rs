@@ -145,7 +145,8 @@ pub fn render_search(request: &SearchRequest, response: &SearchResponse) -> Stri
 
 /// Whether the response is the whole chunk the request named, checked
 /// against the `content_tag` it expected: the only exact citation (R4.7).
-/// A continuation page is not the whole chunk on its own.
+/// A continuation page, or a page with more to follow (`next_cursor` also
+/// pages by `page.limit`, R4.5), is not the whole chunk on its own.
 fn citable(request: &ReadRequest, response: &ReadResponse) -> bool {
     let ReadTarget::Chunk {
         chunk_id,
@@ -160,6 +161,7 @@ fn citable(request: &ReadRequest, response: &ReadResponse) -> bool {
     };
     first_page
         && !response.truncated
+        && response.next_cursor.is_none()
         && response.knowledge_id == request.knowledge_id
         && segment.chunk_id == *chunk_id
         && segment.content_tag == expected.content_tag
