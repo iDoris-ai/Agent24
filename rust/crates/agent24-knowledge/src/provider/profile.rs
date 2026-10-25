@@ -102,14 +102,20 @@ impl Profile {
     }
 
     /// S3.3 on the profile: a binding takes it as in [`BindingState::leave`];
-    /// unselecting is remembered either way.
+    /// unselecting is remembered either way. On the placeholder, logging out
+    /// ends the login in flight and any binding it was creating.
     pub fn leave(&mut self, event: Leave) -> Effects {
         if event == Leave::Unselect {
             self.selected = false;
         }
         match &mut self.slot {
             Slot::Bound(binding) => binding.leave(event),
-            Slot::Placeholder(_) => Effects::default(),
+            Slot::Placeholder(placeholder) => {
+                if event == Leave::Logout {
+                    placeholder.cancel();
+                }
+                Effects::default()
+            }
         }
     }
 
@@ -140,9 +146,14 @@ impl Profile {
     /// `None` without a binding; a placeholder's attempt in flight no longer
     /// counts.
     pub fn change_identity(&mut self, change: IdentityChange) -> Option<Retired> {
-        if let Slot::Placeholder(placeholder) = &mut self.slot {
-            placeholder.cancel();
-            return None;
+        match &mut self.slot {
+            Slot::Placeholder(placeholder) => {
+                placeholder.cancel();
+                return None;
+            }
+            // Removed: it takes no event, and nothing follows it.
+            Slot::Bound(binding) if binding.retired() => return None,
+            Slot::Bound(_) => {}
         }
         let mut fresh = Placeholder::following(self.next_attempt);
         let create = (change != IdentityChange::Endpoint).then(|| fresh.creating());
@@ -161,15 +172,22 @@ impl Profile {
         })
     }
 
-    /// The new binding (and any retirement before it) is persisted. It is
-    /// activated when selected with nothing awaiting confirmation. Refused
-    /// under `UnsavedSettings`, which only the host's confirmation clears.
-    pub fn bind(&mut self, connection: Connection, credentials: Credentials) -> bool {
+    /// The new binding of `attempt` (and any retirement before it) is
+    /// persisted. It is activated when selected with nothing awaiting
+    /// confirmation. Refused under `UnsavedSettings`, which only the host's
+    /// confirmation clears, and once `attempt` no longer creates: a later
+    /// attempt, a logout or an identity change came first.
+    pub fn bind(
+        &mut self,
+        attempt: Attempt,
+        connection: Connection,
+        credentials: Credentials,
+    ) -> bool {
         let unsaved = self.confirmation == Some(Confirmation::UnsavedSettings);
         let Slot::Placeholder(placeholder) = &self.slot else {
             return false;
         };
-        if unsaved {
+        if unsaved || !placeholder.creates(attempt) {
             return false;
         }
         self.next_attempt = placeholder.next();
