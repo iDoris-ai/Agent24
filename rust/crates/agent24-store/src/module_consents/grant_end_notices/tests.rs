@@ -219,8 +219,9 @@ async fn an_epoch_advance_tells_the_grants_of_the_epoch_it_ends() {
 }
 
 /// Ends are pending until answered, oldest first: a replacement's at once,
-/// a revocation's only once its route had its chance; the first answer
-/// stands.
+/// a revocation's only once its route had its chance, but one no route
+/// tells (a disable's, a stop's: #1202 Low 2) at once too; the first
+/// answer stands.
 #[tokio::test]
 async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
     let store = Store::open_memory().await.unwrap();
@@ -232,6 +233,11 @@ async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
         .unwrap();
     grant(&store, "u").await;
     let replaced = grant(&store, "u").await.generation;
+    store
+        .revoke_module_consent("m", Some("u"), at)
+        .await
+        .unwrap();
+    let unrouted = ends(&store).await.pop().unwrap().generation;
     let pending = |now: &'static str| {
         let store = store.clone();
         async move {
@@ -239,11 +245,17 @@ async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
             pending.iter().map(|n| n.generation).collect::<Vec<_>>()
         }
     };
-    assert_eq!(pending("2026-10-25T00:10:00Z").await, vec![replaced]);
-    assert_eq!(pending("2026-10-25T00:10:29.999Z").await, vec![replaced]);
+    assert_eq!(
+        pending("2026-10-25T00:10:00Z").await,
+        vec![replaced, unrouted]
+    );
+    assert_eq!(
+        pending("2026-10-25T00:10:29.999Z").await,
+        vec![replaced, unrouted]
+    );
     assert_eq!(
         pending("2026-10-25T00:10:30Z").await,
-        vec![revoked, replaced]
+        vec![revoked, replaced, unrouted]
     );
     let id = store.grant_end_notice(revoked).await.unwrap().unwrap().id;
     assert!(store.record_grant_end_stop(id, "confirmed").await.unwrap());
@@ -253,7 +265,10 @@ async fn ends_are_pending_until_answered_a_revocation_s_after_its_route() {
             .await
             .unwrap()
     );
-    assert_eq!(pending("2026-10-25T00:10:30Z").await, vec![replaced]);
+    assert_eq!(
+        pending("2026-10-25T00:10:30Z").await,
+        vec![replaced, unrouted]
+    );
     assert!(store.pending_grant_end_notices("later").await.is_err());
 }
 
@@ -331,8 +346,8 @@ async fn a_revocation_tells_again_the_ends_not_confirmed_stopped() {
 
 /// K1-6a-G §2.5.1 (#1202 G1): a grant is told by the end of its decision,
 /// expired or not: expired and not yet told, a revocation tells it; told
-/// expired but not confirmed stopped, a replacement tells it again; told
-/// and confirmed, it does not.
+/// expired but not confirmed stopped, a replacement or a revocation tells
+/// it again; told and confirmed, it does not.
 #[tokio::test]
 async fn an_expired_grant_is_told_until_confirmed_stopped() {
     let store = Store::open_memory().await.unwrap();
@@ -377,4 +392,165 @@ async fn an_expired_grant_is_told_until_confirmed_stopped() {
         (after[before].op.as_str(), &after[before].authorization_refs),
         ("u", &refs(&[&u]))
     );
+    // Case 26 (#1202 Low 1): told expired but not confirmed stopped, a
+    // revocation tells it again too.
+    let w = lapsed("w").await;
+    store
+        .record_expiry_stop("m", "w", w.generation, "unconfirmed")
+        .await
+        .unwrap();
+    let revoked = store
+        .revoke_module_consent_tracked("m", Some("w"), "2026-10-25T00:10:00Z")
+        .await
+        .unwrap();
+    assert_eq!(carried(&store, revoked).await, refs(&[&w]));
+}
+
+/// Records `state` as the module's answer to the end the write
+/// `generation` wrote.
+async fn answer(store: &Store, generation: i64, state: &str) {
+    let end = store.grant_end_notice(generation).await.unwrap().unwrap();
+    assert!(store.record_grant_end_stop(end.id, state).await.unwrap());
+}
+
+async fn carried(store: &Store, generation: i64) -> Vec<String> {
+    store
+        .grant_end_notice(generation)
+        .await
+        .unwrap()
+        .unwrap()
+        .authorization_refs
+}
+
+/// #1202 G7: a revocation confirmed stopped settles the ends it carried, so
+/// lost notices do not pile up on every later one: after 100 cycles of an
+/// unconfirmed revocation then a confirmed one, the next carries its own
+/// reference only.
+#[tokio::test]
+async fn a_confirmed_revocation_settles_the_ends_it_carried() {
+    let store = Store::open_memory().await.unwrap();
+    for _ in 0..100 {
+        grant(&store, "t").await;
+        let lost = store
+            .revoke_module_consent_tracked("m", Some("t"), AT)
+            .await
+            .unwrap();
+        answer(&store, lost, "unconfirmed").await;
+        let a = grant(&store, "t").await;
+        let settling = store
+            .revoke_module_consent_tracked("m", Some("t"), AT)
+            .await
+            .unwrap();
+        assert_eq!(
+            carried(&store, settling).await.len(),
+            2,
+            "{a:?} and the lost one's"
+        );
+        answer(&store, settling, "confirmed").await;
+    }
+    let a = grant(&store, "t").await;
+    let next = store
+        .revoke_module_consent_tracked("m", Some("t"), AT)
+        .await
+        .unwrap();
+    assert_eq!(carried(&store, next).await, refs(&[&a]));
+}
+
+/// The revocation that settled the end the write `generation` wrote.
+async fn settled(store: &Store, generation: i64) -> Option<i64> {
+    sqlx::query_scalar("SELECT settled_by FROM module_grant_end_notices WHERE generation = ?")
+        .bind(generation)
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+}
+
+/// #1202 G7: settled are only the ends a confirmed revocation carried and
+/// covers: of its tool, not the module's (`*`), for a tool's; all for the
+/// module's; none written after it, nor by an unconfirmed revocation or a
+/// confirmed replacement. A settled end is neither pending nor carried.
+#[tokio::test]
+async fn a_revocation_settles_only_the_ends_it_covers() {
+    let store = Store::open_memory().await.unwrap();
+    let revoke = |op: Option<&'static str>| {
+        let store = store.clone();
+        async move {
+            store
+                .revoke_module_consent_tracked("m", op, AT)
+                .await
+                .unwrap()
+        }
+    };
+    let pending = || {
+        let store = store.clone();
+        async move {
+            store
+                .pending_grant_end_notices("2026-10-26T00:00:00Z")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|end| end.generation)
+                .collect::<Vec<_>>()
+        }
+    };
+    let elsewhere = summary("n", "t");
+    store
+        .grant_module_consent(&elsewhere, AT, UNTIL)
+        .await
+        .unwrap();
+    let other = store
+        .revoke_module_consent_tracked("n", Some("t"), AT)
+        .await
+        .unwrap();
+    answer(&store, other, "unconfirmed").await;
+    let a = grant(&store, "t").await;
+    let lost = revoke(Some("t")).await;
+    answer(&store, lost, "unconfirmed").await;
+    let unconfirmed = revoke(Some("t")).await;
+    answer(&store, unconfirmed, "unconfirmed").await;
+    assert_eq!(
+        settled(&store, lost).await,
+        None,
+        "an unconfirmed revocation"
+    );
+    grant(&store, "t").await;
+    let replaced = grant(&store, "t").await.generation;
+    answer(&store, replaced, "confirmed").await;
+    assert_eq!(settled(&store, lost).await, None, "a confirmed replacement");
+    let x = grant(&store, "x").await;
+    store.advance_module_enable_epoch("m").await.unwrap();
+    let epoch = ends(&store).await.pop().unwrap().generation;
+    let p = grant(&store, "t").await;
+    let told_never = grant(&store, "t").await.generation;
+    let tool = revoke(Some("t")).await;
+    let d = grant(&store, "t").await;
+    let after = grant(&store, "t").await.generation;
+    // p replaced the epoch's stale grant: an end of its own, as is the
+    // tool's revocation, past its route's grace.
+    assert_eq!(
+        pending().await,
+        vec![epoch, p.generation, told_never, tool, after]
+    );
+    answer(&store, tool, "confirmed").await;
+    let by = store.grant_end_notice(tool).await.unwrap().unwrap().id;
+    for end in [lost, unconfirmed, p.generation, told_never] {
+        assert_eq!(settled(&store, end).await, Some(by));
+    }
+    for end in [epoch, after, replaced] {
+        assert_eq!(
+            settled(&store, end).await,
+            None,
+            "the module's, later, or confirmed"
+        );
+    }
+    assert_eq!(pending().await, vec![epoch, after]);
+    let again = carried(&store, revoke(Some("t")).await).await;
+    assert!(again.contains(&x.authorization_ref()) && again.contains(&d.authorization_ref()));
+    assert!(!again.contains(&a.authorization_ref()) && !again.contains(&p.authorization_ref()));
+    // The module's revocation settles every end, the module's too.
+    let module = revoke(None).await;
+    answer(&store, module, "confirmed").await;
+    assert!(pending().await.is_empty());
+    assert!(carried(&store, revoke(None).await).await.is_empty());
+    assert_eq!(settled(&store, other).await, None, "another module's");
 }

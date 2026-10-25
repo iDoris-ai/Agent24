@@ -609,7 +609,7 @@ async fn advance_enable_epoch(
     if !ended.is_empty() {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let reason = GrantEndReason::Epoch;
-        grant_end_notices::write(tx, module, "*", &ended, &[], reason, &now, epoch).await?;
+        grant_end_notices::write(tx, module, "*", &ended, &[], reason, &now, epoch, false).await?;
     }
     Ok(epoch)
 }
@@ -652,27 +652,31 @@ impl Store {
 
     /// Persist a revocation for one tool (`op: Some`) or every tool in a
     /// module (`op: None`), then broadcast it. `now` must be RFC 3339; invalid
-    /// timestamps fail before any write or notification.
+    /// timestamps fail before any write or notification. No route tells
+    /// the module: its end is pending for the notifier at once (§2.5.1).
     pub async fn revoke_module_consent(
         &self,
         module: &str,
         op: Option<&str>,
         now: &str,
     ) -> Result<()> {
-        self.revoke_module_consent_tracked(module, op, now)
-            .await
-            .map(|_| ())
+        self.revoke(module, op, now, false).await.map(|_| ())
     }
 
-    /// [`Self::revoke_module_consent`], returning the revocation's write
-    /// generation: the key [`Self::record_revocation_stop`] records the
-    /// module's answer under (K1-6a-G §2.5).
+    /// [`Self::revoke_module_consent`] for the route that tells the module
+    /// itself, returning the revocation's write generation: the key
+    /// [`Self::record_revocation_stop`] records the module's answer under
+    /// (K1-6a-G §2.5). Its end is left to the route a while.
     pub async fn revoke_module_consent_tracked(
         &self,
         module: &str,
         op: Option<&str>,
         now: &str,
     ) -> Result<i64> {
+        self.revoke(module, op, now, true).await
+    }
+
+    async fn revoke(&self, module: &str, op: Option<&str>, now: &str, routed: bool) -> Result<i64> {
         let (_, revoked_at) = parse_instant(now)?;
         let key = op.unwrap_or("*");
         let mut tx = self.pool().begin().await?;
@@ -710,6 +714,7 @@ impl Store {
             reason,
             &revoked_at,
             generation,
+            routed,
         )
         .await?;
         tx.commit().await?;
@@ -992,8 +997,18 @@ impl Store {
         if !replaced.is_empty() {
             let reason = GrantEndReason::Replaced;
             let (op, at) = (&summary.op, &decided_at);
-            grant_end_notices::write(&mut tx, module, op, &replaced, &[], reason, at, generation)
-                .await?;
+            grant_end_notices::write(
+                &mut tx,
+                module,
+                op,
+                &replaced,
+                &[],
+                reason,
+                at,
+                generation,
+                false,
+            )
+            .await?;
         }
         tx.commit().await?;
         let record = row_to_record(&row)?;

@@ -7,7 +7,8 @@
 //! later decision replacing the row, so loses none: every row not answered
 //! yet stays pending for the notifier (A5c-2). A revocation also carries the
 //! references of every end of its scope not confirmed stopped, so its answer
-//! never claims a stop an earlier, unconfirmed notice left open (#1202 B1).
+//! never claims a stop an earlier, unconfirmed notice left open (#1202 B1);
+//! confirmed, it settles them, so no later one carries them again (G7).
 
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -19,6 +20,8 @@ type Tx<'c> = sqlx::Transaction<'c, sqlx::Sqlite>;
 
 /// How long a revocation's notice is left to the route that wrote it, which
 /// waits for the module 10 s at most: the notifier sends it only past this.
+/// A revocation no route tells (a disable's, a stop's, a package change's)
+/// is not left: the module may run on (#1202 Low 2).
 const ROUTE_GRACE_MILLIS: i64 = 30_000;
 
 /// What ended the grants.
@@ -109,7 +112,8 @@ pub(super) async fn unconfirmed(
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT authorization_refs FROM module_grant_end_notices
          WHERE module = ?1 AND (?2 IS NULL OR op IN (?2, '*'))
-           AND (stop_state IS NULL OR stop_state = 'unconfirmed')",
+           AND (stop_state IS NULL OR stop_state = 'unconfirmed')
+           AND settled_by IS NULL",
     )
     .bind(module)
     .bind(op)
@@ -123,7 +127,8 @@ pub(super) async fn unconfirmed(
 }
 
 /// Writes, in `tx`, that the write `generation` ended `ended`, and the
-/// references `also`, for `module`'s `op` (`*`: every tool) at `ended_at`.
+/// references `also`, for `module`'s `op` (`*`: every tool) at `ended_at`;
+/// `routed` when a route tells it itself.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write(
     tx: &mut Tx<'_>,
@@ -134,6 +139,7 @@ pub(super) async fn write(
     reason: GrantEndReason,
     ended_at: &str,
     generation: i64,
+    routed: bool,
 ) -> Result<()> {
     let mut refs: Vec<String> = ended
         .iter()
@@ -149,8 +155,8 @@ pub(super) async fn write(
     let refs = serde_json::to_string(&refs).expect("references always serialize");
     sqlx::query(
         "INSERT INTO module_grant_end_notices
-            (module, op, authorization_refs, reason, ended_at, generation)
-         VALUES (?, ?, ?, ?, ?, ?)",
+            (module, op, authorization_refs, reason, ended_at, generation, routed)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(module)
     .bind(op)
@@ -158,6 +164,7 @@ pub(super) async fn write(
     .bind(reason.word())
     .bind(ended_at)
     .bind(generation)
+    .bind(routed)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -183,20 +190,22 @@ fn row_to_notice(row: &SqliteRow) -> Result<GrantEndNotice> {
 }
 
 impl Store {
-    /// The ends not answered yet as of `now`, oldest first: a replacement's
-    /// or an epoch's at once, a revocation's once its route had its chance
+    /// The ends not answered nor settled yet as of `now`, oldest first: a
+    /// replacement's, an epoch's or a revocation no route tells at once, a
+    /// routed revocation's once its route had its chance
     /// ([`ROUTE_GRACE_MILLIS`] after it ended).
     pub async fn pending_grant_end_notices(&self, now: &str) -> Result<Vec<GrantEndNotice>> {
         let (now, _) = parse_instant(now)?;
         let rows = sqlx::query(
-            "SELECT * FROM module_grant_end_notices WHERE stop_state IS NULL ORDER BY id",
+            "SELECT * FROM module_grant_end_notices
+             WHERE stop_state IS NULL AND settled_by IS NULL ORDER BY id",
         )
         .fetch_all(self.pool())
         .await?;
         let mut pending = Vec::new();
         for row in &rows {
             let notice = row_to_notice(row)?;
-            let routes = notice.reason == GrantEndReason::Revoked
+            let routes = row.get::<bool, _>("routed")
                 && parse_instant(&notice.ended_at)
                     .is_ok_and(|(ended, _)| now < ended + ROUTE_GRACE_MILLIS);
             if !routes {
@@ -219,17 +228,40 @@ impl Store {
     }
 
     /// Records what the module answered to end `id`; the first answer
-    /// stands, so `false` when one was already recorded.
+    /// stands, so `false` when one was already recorded. A revocation's
+    /// first answer `confirmed` settles, in the same transaction, the ends
+    /// it carried not confirmed stopped (#1202 G7): the module's all, a
+    /// tool's that tool's only, not the module's (`*`).
     pub async fn record_grant_end_stop(&self, id: i64, stop_state: &str) -> Result<bool> {
-        let updated = sqlx::query(
+        let mut tx = self.pool().begin().await?;
+        let recorded = sqlx::query(
             "UPDATE module_grant_end_notices SET stop_state = ?
-             WHERE id = ? AND stop_state IS NULL",
+             WHERE id = ? AND stop_state IS NULL
+             RETURNING module, op, reason",
         )
         .bind(stop_state)
         .bind(id)
-        .execute(self.pool())
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(updated.rows_affected() == 1)
+        let Some(recorded) = recorded else {
+            return Ok(false);
+        };
+        let reason: String = recorded.get("reason");
+        if stop_state == "confirmed" && reason == GrantEndReason::Revoked.word() {
+            sqlx::query(
+                "UPDATE module_grant_end_notices SET settled_by = ?1
+                 WHERE module = ?2 AND (?3 = '*' OR op = ?3) AND id < ?1
+                   AND (stop_state IS NULL OR stop_state = 'unconfirmed')
+                   AND settled_by IS NULL",
+            )
+            .bind(id)
+            .bind(recorded.get::<String, _>("module"))
+            .bind(recorded.get::<String, _>("op"))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 }
 
