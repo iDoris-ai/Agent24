@@ -672,8 +672,6 @@ mod tests {
         assert_eq!(connections(&served), 1);
     }
 
-    /// A restricted run as production builds it: source resources, but no
-    /// egress gate installed.
     #[tokio::test]
     async fn every_resource_of_the_run_is_checked_not_only_the_first() {
         let ctx = scoped_ctx(
@@ -727,6 +725,8 @@ mod tests {
         }
     }
 
+    /// A restricted run as production builds it: source resources, but no
+    /// egress gate installed.
     #[tokio::test]
     async fn a_restricted_run_without_an_egress_gate_is_refused_before_any_request() {
         let ctx = ToolContext::legacy("run_test", None, None, "tc_test")
