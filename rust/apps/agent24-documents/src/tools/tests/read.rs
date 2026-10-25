@@ -646,3 +646,88 @@ async fn a_read_s_build_is_asked_for_by_its_tool_or_its_page() {
     stop_once_asked(&state, &Requester::Page).await;
     assert_eq!(page.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+/// K1-06a-grant-path §2.5: a read whose authorization ends while it runs
+/// answers `permission_denied`, though its build ended otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_its_authorization_ends_under_gives_nothing() {
+    let (_dir, state) = env_with(Some(Arc::new(Stuck))).await;
+    let read = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let args = json!({ "document_id": DOC, "revision": 1, "query": "a" });
+            call(&state, "find", args).await
+        }
+    });
+    let start = std::time::Instant::now();
+    while state.calls().in_flight() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "never began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // What the notice does first: the end, then the call's build stops.
+    state.calls().end("find");
+    stop_once_asked(&state, &Requester::Tool("find".to_owned())).await;
+    let answer = tokio::time::timeout(Duration::from_secs(2), read).await;
+    let answer = answer.expect("the call goes on").unwrap();
+    assert_kernel_error(&answer, ModuleToolErrorCode::PermissionDenied);
+}
+
+/// [`Fixed`], answering only once `open` is notified.
+struct Gated {
+    inner: Fixed,
+    open: Arc<tokio::sync::Notify>,
+}
+
+impl Engine for Gated {
+    fn engine(&self) -> EngineRef {
+        self.inner.engine()
+    }
+    fn config(&self) -> Value {
+        self.inner.config()
+    }
+    fn parse(&self, content: &str, media: &str, path: &Path) -> Parse {
+        let parse = self.inner.parse(content, media, path);
+        let open = Arc::clone(&self.open);
+        Box::pin(async move {
+            open.notified().await;
+            parse.await
+        })
+    }
+}
+
+/// #1206 B2: a read that would find its text, overtaken by its
+/// authorization's end before it answers, answers `permission_denied` and
+/// gives none of it. A call begun after the end is not overtaken (#1206
+/// B1): telling it from a late call of the ended grant needs the grant's
+/// reference (A5c-3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_that_would_succeed_gives_nothing_once_its_authorization_ends() {
+    let open = Arc::new(tokio::sync::Notify::new());
+    let inner = fixed(vec![vec!["the needle".into()]], vec![], 0).unwrap();
+    let engine = Gated {
+        inner,
+        open: Arc::clone(&open),
+    };
+    let (_dir, state) = env_with(Some(Arc::new(engine))).await;
+    let find = |state: AppState| async move {
+        let args = json!({ "document_id": DOC, "revision": 1, "query": "needle" });
+        call(&state, "find", args).await
+    };
+    let read = tokio::spawn(find(state.clone()));
+    let start = std::time::Instant::now();
+    while state.calls().in_flight() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "never began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    state.calls().end("find");
+    open.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(5), read).await;
+    let answer = answer.expect("the read answers").unwrap();
+    assert_kernel_error(&answer, ModuleToolErrorCode::PermissionDenied);
+    let quote = r#""quote":"needle""#;
+    assert!(!String::from_utf8_lossy(&answer).contains("needle"));
+    // Begun after the end, the same read answers with its text.
+    let after = find(state.clone()).await;
+    let after = String::from_utf8_lossy(&after).into_owned();
+    assert!(after.contains(quote), "{after}");
+}

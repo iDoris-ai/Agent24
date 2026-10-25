@@ -26,7 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::authorization::Accepted;
+use crate::authorization::{Accepted, Call};
 use crate::documents::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::engine::Requester;
 use crate::error::ApiError;
@@ -192,6 +192,8 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
     if op != call.context.operation {
         return Envelope::error(INVALID_INPUT, false);
     }
+    // In flight from here, so the end of its authorization waits for it.
+    let in_flight = state.calls().begin(op);
     // Once per call, before any operation reads storage (K1-06a §2.2).
     let Ok(scope) = Scope::parse(call.context.authorized_resources.as_ref()) else {
         return Envelope::error(PERMISSION_DENIED, false);
@@ -206,12 +208,13 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         authorization_ref: context.authorization_ref.clone(),
     };
     let scope = &scope;
+    let claim_holds = in_flight.clone();
     let work = async move {
         // The scope is checked here, for every operation, before it runs
         // (K1-06a §4.1): an operation `admit` has no row for never runs.
         admit(state, scope, op, &arguments).await?;
         match op {
-            "extract" => extract(state, run, accepted, arguments).await,
+            "extract" => extract(state, run, accepted, claim_holds, arguments).await,
             "list" => list(state, scope, arguments).await,
             "get" => get(state, arguments).await,
             "job_get" => job_get(state, arguments).await,
@@ -234,7 +237,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
     // (retryable) while the claim still commits and starts its worker; the
     // retry hits the same key and replays that job (`replayed: true` unless
     // it has since failed and runs again; one more `oplog` row either way).
-    match tokio::time::timeout(budget, work).await {
+    let envelope = match tokio::time::timeout(budget, work).await {
         Ok(outcome) => outcome.unwrap_or_else(|refused| refused),
         Err(_) => {
             // Never the arguments: they may carry document content.
@@ -247,7 +250,13 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             );
             Envelope::error(INTERNAL, true)
         }
+    };
+    // Its authorization ended while it ran (K1-06a-grant-path §2.5): what it
+    // found is not given.
+    if in_flight.ended() {
+        return Envelope::error(PERMISSION_DENIED, false);
     }
+    envelope
 }
 
 /// `GET /documents`'s query, typed: `cursor?`, `limit?` (1 to 200). A field
@@ -407,6 +416,7 @@ async fn extract(
     state: &AppState,
     run: Run,
     accepted: Accepted,
+    in_flight: Arc<Call>,
     arguments: Map<String, Value>,
 ) -> Outcome {
     // The oplog's CHECK would refuse it inside the claim, read as a
@@ -434,9 +444,10 @@ async fn extract(
     .await
     .map_err(|e| refused(&e))?;
     // In a task of its own: dropped at the deadline, this call must not stop
-    // the claim halfway from the worker start that belongs with it.
+    // the claim halfway from the worker start that belongs with it. The
+    // call stays in flight until the claim ends.
     let origin = Origin::Run(run);
-    let task = tokio::spawn(handler::claim(
+    let claim = handler::claim(
         state.clone(),
         storage.clone(),
         key,
@@ -444,7 +455,11 @@ async fn extract(
         input,
         origin,
         Some(accepted),
-    ));
+    );
+    let task = tokio::spawn(async move {
+        let _in_flight = in_flight;
+        claim.await
+    });
     match task.await {
         Ok(Ok((job, started))) => Ok(Envelope::Completed {
             payload: json!({ "status": job.status, "job_id": job.job_id }),

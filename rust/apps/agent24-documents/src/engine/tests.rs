@@ -550,3 +550,41 @@ async fn a_build_stopped_as_its_parse_ends_pins_nothing() {
     assert_eq!(pinned.await.unwrap(), None);
     assert_eq!(f.parses.load(SeqCst), 1);
 }
+
+/// A layer pinned since the read's lookup is not given to a build told to
+/// stop meanwhile.
+#[tokio::test]
+async fn a_stopped_build_does_not_hand_over_a_layer_pinned_since_its_lookup() {
+    let (env, f) = (env().await, fake());
+    let content = stored(&env, "x");
+    text_layer::pin(&env.storage, &content, &layer_of("x"))
+        .await
+        .unwrap();
+    let engine: Arc<dyn Engine> = f.clone();
+    let key = LayerKey::of(engine.as_ref(), &content);
+    let (stop, stopped) = watch::channel(false);
+    stop.send_replace(true);
+    let got = build(engine, env.storage.clone(), key, PDF.into(), stopped).await;
+    assert_eq!(got, Err(LayerFailure::Stopped));
+    assert_eq!(f.parses.load(SeqCst), 0);
+}
+
+/// A parse that fails as its build is told to stop ends stopped, not as
+/// the engine's failure.
+#[tokio::test]
+async fn a_build_stopped_as_its_parse_fails_ends_stopped() {
+    let (env, f) = (env().await, fake());
+    *f.answer.lock().unwrap() = Some(Err(EngineError::Unsupported));
+    let l = layers(&f);
+    let stopping = Arc::downgrade(&l);
+    *f.then.lock().unwrap() = Some(Arc::new(move || {
+        if let Some(l) = stopping.upgrade() {
+            stop_tool(&l, "find");
+        }
+    }));
+    let content = stored(&env, "late");
+    let got = l
+        .layer(&env.storage, &content, PDF, WAIT, tool("find"))
+        .await;
+    assert_eq!(got, Err(LayerFailure::Stopped));
+}
