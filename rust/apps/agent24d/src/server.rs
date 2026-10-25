@@ -1611,15 +1611,15 @@ pub async fn serve(
                 matches!(&entry.build, crate::domain::Build::Package(p) if p.manifest.takes_grants())
             }),
         };
-        let request = source.gate_request();
-        let authorization = StdArc::new(crate::module_tool_runtime::store_authorization(
+        let authorization = crate::module_tool_runtime::tool_authorization(
+            &source,
             &store,
-            request,
-            StdArc::new(crate::module_tool_runtime::consent_clock),
             module_tool_runtime.artifact_source(),
-        ));
+        );
         card_sources.insert((module.clone(), operation.clone()), source);
-        module_authorizations.insert((module, operation), authorization);
+        if let Some(authorization) = authorization {
+            module_authorizations.insert((module, operation), authorization);
+        }
     }
     let module_tool_cards = crate::consent_routes::ModuleToolCards {
         tools: StdArc::new(card_sources),

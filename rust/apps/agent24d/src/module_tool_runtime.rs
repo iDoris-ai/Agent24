@@ -366,6 +366,25 @@ pub(crate) fn store_authorization(
     .with_artifact_source(artifact)
 }
 
+/// A module tool's authorization, or none for a module not on the grants
+/// protocol (K1-6a-G §2.6, #1202 G6): a grant it holds from before the
+/// protocol it needs moved (an older daemon's) does not hold, so its tool is
+/// neither advertised nor dispatched. Its card still answers, with 409.
+pub(crate) fn tool_authorization(
+    source: &crate::consent_routes::ToolCardSource,
+    store: &agent24_store::Store,
+    artifact: agent24_policy::consent_gate::ArtifactSource,
+) -> Option<Arc<dyn agent24_tools::ModuleToolAuthorization>> {
+    source.takes_grants.then(|| {
+        Arc::new(store_authorization(
+            store,
+            source.gate_request(),
+            Arc::new(consent_clock),
+            artifact,
+        )) as Arc<dyn agent24_tools::ModuleToolAuthorization>
+    })
+}
+
 /// What this start sees of each of `modules` (K1-6a-G §2.1 F3): recorded,
 /// advancing an enable epoch where it changed, and only then are the
 /// module's grants let hold. A module this fails for keeps none.
@@ -396,6 +415,37 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// #1202 G6: a module on the `resource_kinds` protocol only, holding a
+    /// grant from a daemon that let it take one, gets no authorization: its
+    /// tool is neither advertised nor dispatched. One on the grants
+    /// protocol gets one.
+    #[tokio::test]
+    async fn only_a_module_on_the_grants_protocol_is_authorized() {
+        let store = Store::open_memory().await.unwrap();
+        let summary = ToolPermissionSummary::new(
+            "legacy",
+            "read",
+            "1.0.0",
+            ConsentSource::FirstParty,
+            Some("docs".to_owned()),
+            None,
+            None,
+            HostRiskLevel::Low,
+        );
+        store
+            .grant_module_consent(&summary, "2026-10-24T00:00:00Z", "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        let source = |takes_grants| crate::consent_routes::ToolCardSource {
+            summary: summary.clone(),
+            resource_kinds: Vec::new(),
+            takes_grants,
+        };
+        let artifact: agent24_policy::consent_gate::ArtifactSource = Arc::new(|_: &str| None);
+        assert!(tool_authorization(&source(false), &store, artifact.clone()).is_none());
+        assert!(tool_authorization(&source(true), &store, artifact).is_some());
+    }
 
     #[test]
     fn gate_five_recognises_the_adopted_documents_module_id() {
