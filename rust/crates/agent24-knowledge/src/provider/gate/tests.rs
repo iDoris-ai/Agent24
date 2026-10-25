@@ -162,6 +162,8 @@ fn a_generation_is_never_used_twice_so_an_exhausted_binding_stays_closed() {
     assert_eq!(to_persist, None);
     assert_eq!(aborted, vec![call]);
     assert!(gate.exhausted());
+    // Pending for good, whichever way it got there.
+    assert!(gate.generation_pending());
     assert!(!gate.admission_open());
     assert_eq!(
         gate.accept(call, "r1", Some(u64::MAX)),
@@ -180,6 +182,7 @@ fn a_generation_is_never_used_twice_so_an_exhausted_binding_stays_closed() {
     // Restored at the top: the start's increment has nowhere to go.
     let mut gate = Gate::restored(u64::MAX);
     assert!(gate.exhausted());
+    assert!(gate.generation_pending());
     assert!(!gate.confirm(u64::MAX));
     assert_eq!(gate.open_call(), Err(Closed));
     // Short of the top nothing is exhausted.

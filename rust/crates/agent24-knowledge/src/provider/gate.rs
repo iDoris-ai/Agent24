@@ -13,8 +13,8 @@ use crate::local_cancelled::{CancelledCode, CancelledDetails, CancelledError, Lo
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CallId(u64);
 
-/// Admission is closed: an invalidation is in effect, or a generation is not
-/// yet persisted.
+/// Admission is closed: an invalidation is in effect, a generation is not yet
+/// persisted, or none is left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Closed;
 
@@ -94,9 +94,10 @@ impl Gate {
     }
 
     /// A generation change is not yet confirmed persisted (part of S1.7's
-    /// `persist_pending`).
+    /// `persist_pending`). An exhausted binding counts: its last invalidation
+    /// can never be confirmed.
     pub fn generation_pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.exhausted
     }
 
     /// No new call or sub-request is admitted while a change is pending, nor
