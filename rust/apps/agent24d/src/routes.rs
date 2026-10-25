@@ -1090,7 +1090,7 @@ mod tests {
         state
             .store
             .record_call_timing(&agent24_store::NewCallTiming {
-                ts: "2026-09-25T00:00:00Z".to_owned(),
+                ts: days_ago(2),
                 source: "chat".to_owned(),
                 total_ms: 100,
                 ok: true,
@@ -1101,7 +1101,7 @@ mod tests {
         state
             .store
             .record_call_timing(&agent24_store::NewCallTiming {
-                ts: "2026-09-27T00:00:00Z".to_owned(),
+                ts: days_ago(1),
                 source: "module:agentear".to_owned(),
                 model_id: Some("Qwen3.6-35B-A3B-MLX-8bit".to_owned()),
                 tier: Some("local".to_owned()),
@@ -1160,7 +1160,7 @@ mod tests {
             state
                 .store
                 .record_call_timing(&agent24_store::NewCallTiming {
-                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    ts: days_ago(1),
                     source: source.to_owned(),
                     total_ms: ms,
                     ok: true,
@@ -1184,7 +1184,7 @@ mod tests {
             state
                 .store
                 .record_call_timing(&agent24_store::NewCallTiming {
-                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    ts: days_ago(1),
                     source: "chat".to_owned(),
                     model_id: Some("m1".to_owned()),
                     total_ms: ms,
@@ -1203,6 +1203,13 @@ mod tests {
         assert_eq!(summary[0]["count"], 5);
         assert_eq!(summary[0]["p50_ms"], 300);
         assert_eq!(summary[0]["max_ms"], 500);
+    }
+
+    /// Relative to now: the recorder prunes rows older than
+    /// `RETENTION_MAX_AGE_DAYS` when the state starts, so a fixed date stops
+    /// passing once it is that old.
+    fn days_ago(days: u64) -> String {
+        agent24_core::util::iso8601_before(std::time::Duration::from_secs(days * 86_400))
     }
 
     async fn get(router: axum::Router, token: &str, uri: &str) -> (StatusCode, serde_json::Value) {
