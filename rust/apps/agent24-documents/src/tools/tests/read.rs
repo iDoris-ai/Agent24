@@ -816,31 +816,47 @@ async fn a_build_that_pins_after_the_stop_still_gives_its_call_nothing() {
         assert!(start.elapsed() < Duration::from_secs(5), "never began");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // The pin waits on the write lock held here, past the build's last
-    // stop check.
+    // The pin waits on the write lock held here. It stores the layer's blob
+    // first, past the build's last stop check: once there are two blobs
+    // (the content's and the layer's), the build is pinning.
     let storage = state.storage().await.unwrap();
     let mut lock = storage.db.pool().acquire().await.unwrap();
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *lock)
         .await
         .unwrap();
+    let content: String = sqlx::query_scalar("SELECT content_sha256 FROM revisions")
+        .fetch_one(storage.db.pool())
+        .await
+        .unwrap();
+    let objects = storage.blobs.path_of(&content).unwrap();
+    let objects = objects.parent().unwrap().parent().unwrap();
+    let blobs = || {
+        std::fs::read_dir(objects)
+            .unwrap()
+            .map(|shard| std::fs::read_dir(shard.unwrap().path()).unwrap().count())
+            .sum::<usize>()
+    };
     open.notify_one();
     tokio::time::timeout(Duration::from_secs(5), parsed.notified())
         .await
         .expect("never parsed");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let start = std::time::Instant::now();
+    while blobs() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(5), "never pinned");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let ended = crate::authorization::Ended::by_operation("find");
     let notice = tokio::spawn({
-        let state = state.clone();
-        async move {
-            crate::authorization::stop(
-                &state,
-                &crate::authorization::Ended::by_operation("find"),
-                Duration::from_secs(5),
-            )
-            .await
-        }
+        let (state, ended) = (state.clone(), ended.clone());
+        async move { crate::authorization::stop(&state, &ended, Duration::from_secs(5)).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The call is told of the end before the pin can finish.
+    let start = std::time::Instant::now();
+    while state.calls().before_an_end(&ended) == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "never ended");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(!read.is_finished(), "the pin was not waiting");
     sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
     drop(lock);

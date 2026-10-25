@@ -666,8 +666,18 @@ async fn after_a_sweep_with_no_call_left_the_notice_only_waits() {
     }
     job(&env, &later, "queued", 1).await;
     accept(&env, &later, 1, "extract").await;
-    // Rounds go on while the running attempt has not stopped.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Builds the operation's calls ask for are stopped round by round. The
+    // second, asked for once the first is stopped, is stopped by a round
+    // begun after `later` was accepted: one that would have swept it first.
+    for _ in 0..2 {
+        let read = reading(&env, Requester::Tool(Accepted::bare("extract")));
+        let read = tokio::time::timeout(Duration::from_secs(5), read).await;
+        assert!(matches!(
+            read.expect("no round after").unwrap(),
+            Err(LayerFailure::Stopped)
+        ));
+    }
+    assert_eq!(status(&env, &later).await, ("queued".into(), None));
     settle_once_cancelling(env.storage.clone(), running.clone()).await;
     assert!(notice.await.unwrap());
     assert_eq!(status(&env, &later).await, ("queued".into(), None));
