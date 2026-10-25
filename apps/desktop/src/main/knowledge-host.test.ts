@@ -274,6 +274,21 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(daemon.sent).toHaveLength(3)
   })
 
+  it('gives up a reconcile the daemon refuses instead of asking again on every sync()', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1')
+    daemon.sent.length = 0
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    daemon.respondWith(() => ({ status: 409, code: 'too_many_bindings' }))
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent).toHaveLength(1))
+    host.sync()
+    host.sync()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(daemon.sent).toHaveLength(1)
+  })
+
   it('activates again and re-pushes when the daemon says the binding is not active', async () => {
     const host = makeHost()
     host.start()
@@ -289,10 +304,10 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
   it('reconciles a change that did not land for a passing reason, and not one the daemon refused', async () => {
     const host = makeHost()
     host.start()
-    daemon.respondWith(() => ({ status: 503 }))
-    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
     daemon.respondWith(() => ({ status: 400, code: 'invalid_request' }))
     expect(await host.activate('b2')).toEqual({ ok: false, reason: 'refused' })
+    daemon.respondWith(() => ({ status: 503 }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
     daemon.sent.length = 0
     daemon.respondWith(() => ({ status: 204 }))
     host.sync()

@@ -233,7 +233,11 @@ export class KnowledgeHost {
     if (!unsynced.has(bindingId)) return
     const wanted = this.wanted.get(bindingId)
     const result = await this.send(bindingId, wanted ? 'PUT' : 'DELETE', '')
-    if (!result.ok) return
+    if (!result.ok) {
+      // A refusal will not change by asking again.
+      if (!PASSING.includes(result.reason)) unsynced.delete(bindingId)
+      return
+    }
     const credential = wanted?.credential
     if (credential && credential.expiresAt > this.deps.nowSeconds()) {
       const pushed = await this.send(bindingId, 'PUT', '/credential', credentialBody(credential))
