@@ -307,6 +307,26 @@ async fn a_revocation_tells_again_the_ends_not_confirmed_stopped() {
         "c was confirmed stopped"
     );
     let _ = c;
+    // A tool's revocation carries the whole module's ends too: an epoch's
+    // not confirmed stopped holds the tool's reference.
+    let x = grant(&store, "x").await;
+    store.advance_module_enable_epoch("m").await.unwrap();
+    let epoch = ends(&store).await.pop().unwrap();
+    assert_eq!(epoch.op, "*");
+    let tool = store
+        .revoke_module_consent_tracked("m", Some("y"), AT)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .grant_end_notice(tool)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_refs
+            .contains(&x.authorization_ref()),
+        "the epoch's end, not confirmed, is carried by a tool's revocation"
+    );
 }
 
 /// K1-6a-G §2.5.1 (#1202 G1): a grant is told by the end of its decision,
