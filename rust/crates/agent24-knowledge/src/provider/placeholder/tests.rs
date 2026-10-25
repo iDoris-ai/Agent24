@@ -51,6 +51,7 @@ fn each_failure_is_recorded_with_its_reason_and_an_identity_asks_for_a_binding()
         placeholder.settle(attempt, Attempted::Identified),
         Settled::Create
     );
+    assert_eq!(placeholder.failure(), Some(F::Dependency));
     // The binding could not be persisted.
     let mut placeholder = Placeholder::new(None);
     placeholder.creation_failed();
