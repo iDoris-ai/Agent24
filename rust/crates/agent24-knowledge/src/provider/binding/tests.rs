@@ -196,7 +196,12 @@ fn stuck(cause: state::UnavailableCause) -> BindingState {
             let value = effects.invalidation.unwrap().to_persist.unwrap();
             connection.confirm_generation(value);
             let ticket = credentials.issue(connection).unwrap();
-            credentials.issued(connection, ticket, Issued::Refused, Instant::now());
+            let refused = credentials.issued(connection, ticket, Issued::Refused, Instant::now());
+            let Outcome::Done(refused) = refused else {
+                panic!("{refused:?}")
+            };
+            let value = refused.invalidation.unwrap().to_persist.unwrap();
+            connection.confirm_generation(value);
         }
     }
     assert_eq!(binding.connection().phase(), Some(Unavailable(cause)));
@@ -285,4 +290,28 @@ fn logging_in_again_retries_a_rejected_credential() {
     assert_eq!(binding.connection().phase(), rejected);
     back(&mut binding, Leave::Logout, Some(Activation::Relogin));
     assert_eq!(binding.connection().phase(), Some(Loading));
+}
+
+#[test]
+fn logging_in_again_without_logging_out_retries_too() {
+    use state::UnavailableCause::{AccessRevoked, Incompatible};
+    // Still in the reason, after Off and On or never left.
+    let mut binding = stuck(AccessRevoked);
+    back(&mut binding, Leave::Off, None);
+    binding.activate(Activation::Relogin);
+    assert!(binding.connect(CLEAR).is_some());
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    let mut binding = stuck(AccessRevoked);
+    binding.activate(Activation::Relogin);
+    assert!(binding.connect(CLEAR).is_some());
+    // Another reason stays where it is.
+    let mut binding = stuck(Incompatible);
+    let round = binding.connection().round();
+    binding.activate(Activation::Relogin);
+    assert_eq!(binding.connect(CLEAR), None);
+    assert!(binding.connection().is_current(round));
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(Incompatible))
+    );
 }

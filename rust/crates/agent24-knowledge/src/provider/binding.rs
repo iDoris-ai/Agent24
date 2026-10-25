@@ -111,14 +111,20 @@ impl BindingState {
 
     /// The same binding again, no increment (S3.3, S4.3); the caller has
     /// persisted the loosening first (I1). Logging in again also retries
-    /// `credential_rejected` and `access_revoked` (S1.4). A retired binding
+    /// `credential_rejected` and `access_revoked` (S1.4), logged out first or
+    /// not; [`BindingState::connect`] then enters `loading`. A retired binding
     /// still never connects.
     pub fn activate(&mut self, how: Activation) {
         self.activated = true;
         if how == Activation::Relogin {
-            self.connection
-                .release(UnavailableCause::CredentialRejected);
-            self.connection.release(UnavailableCause::AccessRevoked);
+            use UnavailableCause::{AccessRevoked, CredentialRejected};
+            // Still in that reason: out first, so `connect` enters `loading`.
+            let phase = self.connection.phase();
+            if let Some(ConnectionPhase::Unavailable(AccessRevoked | CredentialRejected)) = phase {
+                self.connection.leave();
+            }
+            self.connection.release(CredentialRejected);
+            self.connection.release(AccessRevoked);
         }
     }
 
