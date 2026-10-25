@@ -4136,7 +4136,8 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(matches!(err, AgentError::SessionNotFound(_)));
         assert!(!called);
-        // Nor for one its workspace does not admit: the run was never stored.
+        // Nor for one the workspace admission denies (no session bound to the
+        // workspace): the run was never stored.
         let err = manager
             .start_run_then(
                 RunCreate {
