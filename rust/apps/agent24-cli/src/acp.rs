@@ -6,9 +6,10 @@
 //!
 //! K1-6b.5c-2 (ADR-K1-02 §2.4): the ACP client is outside the kernel, so a
 //! run's model deltas and failure message are relayed only once its peer view
-//! (`/api/v1/peer/runs/{id}`) says it is not withheld. The view is read once,
-//! at the first delta or failure: sources are tagged before the first model
-//! call, so by then the classification is final.
+//! (`/api/v1/peer/runs/{id}`) says it is not withheld. The view is read at
+//! the first delta, failure or completion — sources are tagged before the
+//! first model call — and read again after each tool the run starts, since
+//! the kernel withholds a run that called a tool (its results are untagged).
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -249,16 +250,18 @@ async fn peer_run(ep: &Endpoint, run_id: &str) -> Result<PeerRun, String> {
         .map_err(|e| format!("reading peer run: {e}"))
 }
 
-/// Whether a run's content may be relayed, decided once from its peer view.
-/// A failed read withholds, like a withheld view.
+/// Whether a run's content may be relayed, decided from its peer view and
+/// kept until the run starts a tool. A failed read withholds, like a withheld
+/// view.
 #[derive(Default)]
 struct RelayGate {
     relay: Option<bool>,
 }
 
 impl RelayGate {
-    fn decided(&self) -> bool {
-        self.relay.is_some()
+    /// The run started a tool: what it streams next may rest on the result.
+    fn forget(&mut self) {
+        self.relay = None;
     }
 
     async fn relays<F>(&mut self, check: impl FnOnce() -> F) -> bool
@@ -301,13 +304,15 @@ where
     F: Future<Output = Result<PeerRun, String>>,
 {
     let mut gate = RelayGate::default();
+    let mut notified = false;
     while let Some(event) = events.next().await {
         match event?.body {
+            EventBody::ToolStarted(started) if started.run_id == run_id => gate.forget(),
             EventBody::ModelDelta(delta) if delta.run_id == run_id => {
-                let first = !gate.decided();
                 if gate.relays(&mut check).await {
                     write_frame(out, &message_chunk(session_id, &delta.text)).await?;
-                } else if first {
+                } else if !notified {
+                    notified = true;
                     write_frame(out, &message_chunk(session_id, WITHHELD_NOTICE)).await?;
                 }
             }
@@ -538,6 +543,70 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err, format!("run failed: {WITHHELD_NOTICE}"));
         assert!(sent.is_empty(), "{sent}");
+        assert_eq!(checks, 1);
+    }
+
+    fn tool_started(run_id: &str) -> Result<Event, String> {
+        event(EventBody::ToolStarted(
+            agent24_protocol::ToolStartedPayload {
+                run_id: run_id.to_owned(),
+                tool_call_id: "tc_1".to_owned(),
+                tool: "fs_read".to_owned(),
+                input_summary: String::new(),
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn deltas_after_a_tool_starts_wait_for_a_fresh_check() {
+        // The kernel withholds a run once it has called a tool: the second
+        // check answers withheld.
+        let checks = AtomicUsize::new(0);
+        let mut out = Vec::new();
+        let result = relay_run(
+            futures_util::stream::iter(vec![
+                delta("run_1", "before"),
+                tool_started("run_1"),
+                delta("run_1", &format!("after {SECRET}")),
+                delta("run_1", &format!("more {SECRET}")),
+                completed("run_1"),
+            ]),
+            "run_1",
+            "sess_1",
+            &mut out,
+            || {
+                let n = checks.fetch_add(1, Ordering::SeqCst);
+                async move { view(n > 0) }
+            },
+        )
+        .await;
+        let sent = String::from_utf8(out).unwrap_or_default();
+        assert_eq!(
+            sent.lines().collect::<Vec<_>>(),
+            [
+                message_chunk("sess_1", "before").to_string(),
+                message_chunk("sess_1", WITHHELD_NOTICE).to_string(),
+            ]
+        );
+        assert!(!sent.contains(SECRET), "{sent}");
+        assert_eq!(result.unwrap(), json!({ "stopReason": "end_turn" }));
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn another_runs_tool_does_not_trigger_a_fresh_check() {
+        let (result, sent, checks) = relay(
+            vec![
+                delta("run_1", "a"),
+                tool_started("run_2"),
+                delta("run_1", "b"),
+                completed("run_1"),
+            ],
+            || view(false),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(sent.lines().count(), 2, "{sent}");
         assert_eq!(checks, 1);
     }
 

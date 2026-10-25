@@ -5,6 +5,10 @@
 //! `/api/v1/runs`. A run's prompt, output and error leave only when every
 //! source tagged on it is Ordinary; a Restricted or Unknown source, no tags at
 //! all, or a failed tag read all withhold it (David 2026-10-25, option 丙).
+//!
+//! Tool results are not tagged yet (ADR-K1-02 §2.1 says they should be), so
+//! a run that called any tool has sources nobody recorded: until they are
+//! tagged it counts as `Unknown` here (David 2026-10-25, option A).
 
 use agent24_protocol::{PeerRun, Run, RunStatus};
 use agent24_store::{SourceClassification, strictest_classification};
@@ -21,12 +25,30 @@ pub(crate) const WITHHELD_NOTICE: &str = "this run used sources that are not ord
      content is not shared with connected tools; open it in Agent24 to see it";
 
 /// The strictest classification of a run's sources as a peer may rely on
-/// them. A run that ended before all its tags were written (a failed tag
-/// read or write stops it) has only some of them; the one source that can
-/// shape such a run's own prompt is the self-wake schedule that wrote it, so
-/// that schedule's recorded classification counts whether or not its tag
-/// made it onto the run.
+/// them.
+///
+/// A run that called a tool has untagged sources, so it is `Unknown`. Every
+/// tool call is recorded before the tool runs, and a call that cannot be
+/// recorded does not run.
+///
+/// A run that ended before all its tags were written (a failed tag read or
+/// write stops it) has only some of them. The one source that can shape such
+/// a run's own prompt is the self-wake schedule that wrote it, so that
+/// schedule's recorded classification counts whether or not its tag made it
+/// onto the run.
 async fn peer_classification(state: &AppState, run: &Run) -> SourceClassification {
+    match state.store.list_tool_calls(&run.id).await {
+        Ok(calls) if calls.is_empty() => {}
+        Ok(_) => return SourceClassification::Unknown,
+        Err(err) => {
+            tracing::warn!(
+                run_id = %run.id,
+                error = %err,
+                "run tool calls unreadable; withholding the run from peers"
+            );
+            return SourceClassification::Unknown;
+        }
+    }
     let tags = match state.store.list_run_source_tags(&run.id).await {
         Ok(tags) => tags,
         Err(err) => {
@@ -400,6 +422,42 @@ mod tests {
             .await
             .unwrap();
         assert!(!peer_run(&state, "run_user_schedule").await.0.withheld);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_called_a_tool_is_withheld_until_tool_results_are_tagged() {
+        let state = crate::server::tests::state().await;
+        insert(
+            &state,
+            "run_tool",
+            RunStatus::Completed,
+            &[SourceClassification::Ordinary],
+        )
+        .await;
+        // Control: the same Ordinary run without a tool call is relayed.
+        assert!(!peer_run(&state, "run_tool").await.0.withheld);
+
+        state
+            .store
+            .insert_tool_call(&agent24_protocol::ToolCall {
+                id: "tc_1".to_owned(),
+                run_id: "run_tool".to_owned(),
+                tool: "fs_read".to_owned(),
+                input: serde_json::Map::new(),
+                status: agent24_protocol::ToolCallStatus::Completed,
+                output_summary: None,
+                started_at: now_iso8601(),
+                ended_at: Some(now_iso8601()),
+            })
+            .await
+            .unwrap();
+        let (view, body) = peer_run(&state, "run_tool").await;
+        assert_withheld(&view, &body);
+        let (_, list) = get(&state, "/api/v1/peer/runs").await;
+        assert!(
+            !list.contains(SECRET),
+            "withheld content reached a peer: {list}"
+        );
     }
 
     #[tokio::test]
