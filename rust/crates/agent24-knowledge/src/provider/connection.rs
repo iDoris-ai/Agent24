@@ -46,6 +46,9 @@ pub struct Connection {
     /// "Once servable" is persisted (S1.12); it is never taken back.
     once_servable: bool,
     once_servable_pending: bool,
+    /// A reason that does not retry by itself, kept across leaving the
+    /// connection phase: coming back does not retry it (S1.4).
+    held: Option<UnavailableCause>,
 }
 
 impl Connection {
@@ -60,6 +63,7 @@ impl Connection {
             applied_probe: None,
             once_servable,
             once_servable_pending: false,
+            held: None,
         }
     }
 
@@ -103,8 +107,13 @@ impl Connection {
     /// Enters `loading` in a new round: every probe and issuance of an earlier
     /// round no longer counts. With a change not yet persisted it is
     /// `unavailable(local_storage)` instead, and `None` (S1.4); `loading`
-    /// follows once that is confirmed.
+    /// follows once that is confirmed. A reason kept by leaving comes back
+    /// instead, also `None`.
     pub fn start_loading(&mut self) -> Option<Round> {
+        if let Some(cause) = self.held {
+            self.fail(cause);
+            return None;
+        }
         if self.persist_pending() {
             self.fail(UnavailableCause::LocalStorage);
             return None;
@@ -112,6 +121,14 @@ impl Connection {
         self.new_round();
         self.phase = Some(ConnectionPhase::Loading);
         Some(self.round)
+    }
+
+    /// Lets `loading` try again a reason kept by [`Connection::leave`]: a
+    /// loosening (S1.10) the caller has persisted.
+    pub fn release(&mut self, cause: UnavailableCause) {
+        if self.held == Some(cause) {
+            self.held = None;
+        }
     }
 
     /// Whether `round` is the current one.
@@ -129,8 +146,14 @@ impl Connection {
     }
 
     /// Leaves the connection phase, ending the round: nothing sent in it
-    /// counts any more.
+    /// counts any more. A reason that does not retry by itself is kept.
     pub fn leave(&mut self) {
+        if let Some(ConnectionPhase::Unavailable(cause)) = self.phase
+            && !cause.retries_automatically()
+            && cause != UnavailableCause::LocalStorage
+        {
+            self.held = Some(cause);
+        }
         self.new_round();
         self.phase = None;
     }
