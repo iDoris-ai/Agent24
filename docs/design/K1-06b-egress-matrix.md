@@ -51,7 +51,7 @@
 
 | 消费方 | (a) | (b) | (c) | (d) |
 |---|---|---|---|---|
-| **http_fetch** | **缺**：LocalOnly 资源 → 拒绝、DNS 零次 | `net.rs` `denied_fetch_does_not_invoke_dns_resolver`；**缺**：`with_egress_policy_unavailable()` | 正例：`net.rs` `fetches_a_fixture_body`；`lib.rs` `model_fetches_a_url_through_http_fetch`（精确匹配的 `FixtureEgressGate`）；**缺**：逐项不匹配的负例 | `net.rs` `ordinary_fetch_does_not_require_egress_policy_before_dns`；`tools/src/lib.rs` `ordinary_http_fetch_is_advertised_without_egress_policy` |
+| **http_fetch** | **缺**：LocalOnly 资源 → 拒绝、DNS 零次 | `net.rs` `denied_fetch_does_not_invoke_dns_resolver`；**缺**：`with_egress_policy_unavailable()` | 只有部分正例：`net.rs` `fetches_a_fixture_body` 用的 gate 无条件放行，不看三元组；`lib.rs` `model_fetches_a_url_through_http_fetch` 的 `FixtureEgressGate` 精确比对资源、用途和代次，但目的地只比前缀 `http://127.0.0.1:`（任何端口都放行）。**缺**：精确目的地的正例，以及逐项不匹配的负例 | 部分：`net.rs` `ordinary_fetch_does_not_require_egress_policy_before_dns`（只测域名主机的 DNS 前一步）；`tools/src/lib.rs` `ordinary_http_fetch_is_advertised_without_egress_policy`（只测通告）。**缺**：IP 字面量主机分支在 Ordinary、无 gate 时放行；Ordinary 下端到端取回成功 |
 | **MCP client 工具** | **缺** | **缺** | **缺**（见下方注） | **缺** |
 
 另有 SSRF 测试：`net.rs` 里的 `public_ip_classification`、`private_targets_are_denied`、`redirects_are_returned_not_followed`。
@@ -82,8 +82,8 @@
 | 日志、计时、用量 | 本机，没有网络客户端 |
 | 导出 | 只有 `/api/v1/module-consents/export`，交给本机 REST 调用方的是授权元数据（`server.rs` `module_consent_export_contains_metadata_only_and_revoke_broadcasts`） |
 | 模块投递 | 走模块的本机代次通道，载荷不带会话内容 |
-| 续轮（会话下限，6b.4c） | (a)：`lib.rs` `a_restricted_earlier_turn_restricts_the_later_turns_of_its_session`、`prior_session_context_without_a_recorded_floor_is_unknown`、`the_chat_prelude_classifies_client_history_by_the_session_floor`<br>(b)：见 run_loop 一行<br>(d)：`an_ordinary_session_stays_ordinary_across_turns`<br>残余风险：会话已有下限时，客户端搬来的历史按这条下限计（#1203 G1，David 接受） |
-| self-wake（6b.4d） | (a)：`lib.rs` `a_self_wake_run_carries_the_classification_recorded_at_creation`、`a_restricted_self_wake_raises_its_session_floor_for_later_turns`；`self_wake.rs` `a_wake_records_the_strictest_source_of_the_run_that_created_it`<br>(b)：`a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model`、`a_wake_whose_sources_cannot_be_recorded_is_not_created`<br>(d)：`a_user_schedule_run_has_no_schedule_origin` |
+| 续轮（会话下限，6b.4c） | (a)：`lib.rs` `a_restricted_earlier_turn_restricts_the_later_turns_of_its_session`、`prior_session_context_without_a_recorded_floor_is_unknown`（都断言工具出口被拒）<br>分类传播（不算 (a)，只断言分类）：`the_chat_prelude_classifies_client_history_by_the_session_floor`<br>(b)：见 run_loop 一行<br>(d)：`an_ordinary_session_stays_ordinary_across_turns`<br>残余风险：会话已有下限时，客户端搬来的历史按这条下限计（#1203 G1，David 接受） |
+| self-wake（6b.4d） | (a)：`lib.rs` `a_self_wake_run_carries_the_classification_recorded_at_creation`（断言工具出口被拒）<br>分类传播（不算 (a)）：`lib.rs` `a_restricted_self_wake_raises_its_session_floor_for_later_turns`（只断言写入记忆的分类）；`self_wake.rs` `a_wake_records_the_strictest_source_of_the_run_that_created_it`（只断言记下的分类）<br>(b)：`a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model`、`a_wake_whose_sources_cannot_be_recorded_is_not_created`<br>(d)：`a_user_schedule_run_has_no_schedule_origin` |
 | 恢复停放的 run | (a) 只有直接调 `run_loop` 的那一条。**缺**：带受限来源的 run 经 `drive_resume`/`restore_pending_approvals` 恢复后，shell_exec 被拒、零 spawn。恢复时不重新合并下限（#1204 G4，David 定） |
 | 模型 override | 只换 model id：`ModelRouter::route` 只看 tier 顺序和健康状况，不读 `req.model`。**缺**：钉住「override 不改路由 tier」的测试 |
 
@@ -116,6 +116,6 @@
 | 片 | 补什么 |
 |---|---|
 | 6b.5b 模型类 | REST chat 远端桩 (a)；Guardian 接 router 加远端桩 (a)；子 agent 两个读失败分支 (b)；provider 目的地未知 (b)；模型发现 (a)(b)(c)；router 层三元组逐项负例 (c)；`task_profile_for_run` 读失败加远端桩 (b) |
-| 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用和逐项不匹配负例；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3 条，可能要拆成单独一片） |
+| 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用、精确目的地正例和逐项不匹配负例，以及 Ordinary 下 IP 字面量分支和端到端取回；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3 条，可能要拆成单独一片） |
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
 | 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§6 第 2 条已接、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
