@@ -25,6 +25,8 @@ pub struct CredentialId(u64);
 pub struct Issuance {
     round: Round,
     seq: u64,
+    /// The renewal after an invalid-class response: refused, it fails too.
+    after_invalid: bool,
 }
 
 /// What the issuer answered.
@@ -110,7 +112,8 @@ pub struct Credentials {
     /// A revocation-class event since creation ends S3.1's exception for good.
     revoked_before: bool,
     /// The round renewing after an invalid-class response, the only one in
-    /// which "the renewal fails too" is judged; rounds never come back.
+    /// which "the renewal fails too" is judged, and only until the binding
+    /// is servable again; rounds never come back.
     renewal: Option<Round>,
     revocations: Window,
     invalids: Window,
@@ -142,7 +145,8 @@ impl Credentials {
         if !due || connection.persist_pending() || self.issuing_in(connection) {
             return None;
         }
-        Some(self.ticket(connection))
+        let after_invalid = self.renewing(connection);
+        Some(self.ticket(connection, after_invalid))
     }
 
     /// Applies the issuer's answer to `ticket`.
@@ -157,7 +161,6 @@ impl Credentials {
             return Outcome::Ignored;
         }
         self.issuing = None;
-        let renewing = self.renewal == Some(ticket.round);
         match answer {
             Issued::Granted { narrowed: false } => {
                 self.adopt(connection);
@@ -167,7 +170,7 @@ impl Credentials {
                 self.revocation(connection, Revocation::Narrowing, now)
             }
             Issued::OtherPrincipal => Outcome::OtherPrincipal,
-            Issued::Refused if renewing => self.renewal_failed(connection),
+            Issued::Refused if ticket.after_invalid => self.renewal_failed(connection),
             Issued::Refused if self.excepted(connection) => self.rejected(connection),
             Issued::Refused | Issued::Revoked => {
                 self.revocation(connection, Revocation::Signal, now)
@@ -208,7 +211,7 @@ impl Credentials {
                     return Outcome::Done(Effects::default());
                 }
                 Outcome::Done(Effects {
-                    renew: Some(self.ticket(connection)),
+                    renew: Some(self.ticket(connection, false)),
                     ..Effects::default()
                 })
             }
@@ -231,10 +234,11 @@ impl Credentials {
         self.issuing.is_some_and(|i| connection.is_current(i.round))
     }
 
-    fn ticket(&mut self, connection: &Connection) -> Issuance {
+    fn ticket(&mut self, connection: &Connection, after_invalid: bool) -> Issuance {
         let ticket = Issuance {
             round: connection.round(),
             seq: self.next_issuance,
+            after_invalid,
         };
         self.next_issuance += 1;
         self.issuing = Some(ticket);
@@ -274,7 +278,7 @@ impl Credentials {
             return Outcome::Done(Effects::default());
         }
         let third = self.invalids.record(now);
-        if third || self.renewal.is_some_and(|r| connection.is_current(r)) {
+        if third || self.renewing(connection) {
             return self.renewal_failed(connection);
         }
         self.current = None;
@@ -282,10 +286,20 @@ impl Credentials {
         Outcome::Done(Effects::default())
     }
 
-    /// The renewal fails too: no increment, a placeholder for every KB.
+    /// Still renewing after an invalid-class response: its round, and not
+    /// servable since.
+    fn renewing(&self, connection: &Connection) -> bool {
+        let servable = connection.phase().is_some_and(ConnectionPhase::is_servable);
+        self.renewal.is_some_and(|r| connection.is_current(r)) && !servable
+    }
+
+    /// The renewal fails too: no increment, a placeholder for every KB; a
+    /// reason a probe gave meanwhile that does not retry by itself stays.
     fn renewal_failed(&mut self, connection: &mut Connection) -> Outcome {
         self.current = None;
-        connection.fail(UnavailableCause::CredentialRejected);
+        if active(connection) {
+            connection.fail(UnavailableCause::CredentialRejected);
+        }
         Outcome::Done(Effects {
             placeholder: true,
             ..Effects::default()

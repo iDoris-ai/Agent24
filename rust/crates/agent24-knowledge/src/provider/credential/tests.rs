@@ -567,3 +567,58 @@ fn a_response_sent_with_a_discarded_credential_moves_nothing() {
     assert_eq!(credentials.current(), Some(current));
     assert_eq!(connection.gate().reported(), 1);
 }
+
+#[test]
+fn the_renewal_round_ends_once_the_binding_is_servable_again() {
+    let now = Instant::now();
+    // An expired credential's renewal refused there is a revocation signal.
+    let (mut connection, mut credentials, credential) = ready(now);
+    credentials.response(&mut connection, credential, Signal::Invalid, now);
+    let renewed = granted(&mut connection, &mut credentials, now);
+    probed(&mut connection, READY);
+    let renew = effects(credentials.response(&mut connection, renewed, Signal::Expired, now))
+        .renew
+        .unwrap();
+    let outcome = credentials.issued(&mut connection, renew, Issued::Refused, now);
+    assert!(effects(outcome).invalidation.is_some());
+    // An invalid credential there is a first one again.
+    let (mut connection, mut credentials, credential) = ready(now);
+    credentials.response(&mut connection, credential, Signal::Invalid, now);
+    let renewed = granted(&mut connection, &mut credentials, now);
+    probed(&mut connection, READY);
+    assert_eq!(
+        credentials.response(&mut connection, renewed, Signal::Invalid, now),
+        Outcome::Done(Effects::default())
+    );
+    assert_eq!(connection.phase(), Some(Loading));
+}
+
+#[test]
+fn a_renewal_failing_after_a_probe_found_the_binding_incompatible_keeps_that_reason() {
+    let now = Instant::now();
+    let (mut connection, mut credentials, credential) = ready(now);
+    credentials.response(&mut connection, credential, Signal::Invalid, now);
+    let ticket = credentials.issue(&connection).unwrap();
+    probed(&mut connection, Probe::Incompatible);
+    let outcome = credentials.issued(&mut connection, ticket, Issued::Refused, now);
+    assert!(effects(outcome).placeholder);
+    assert_eq!(connection.phase(), Some(Unavailable(U::Incompatible)));
+}
+
+#[test]
+fn a_binding_never_servable_whose_renewal_is_refused_fails_with_a_placeholder() {
+    let now = Instant::now();
+    let (mut connection, mut credentials) = loading(false, false);
+    let credential = granted(&mut connection, &mut credentials, now);
+    credentials.response(&mut connection, credential, Signal::Invalid, now);
+    let ticket = credentials.issue(&connection).unwrap();
+    assert_eq!(
+        credentials.issued(&mut connection, ticket, Issued::Refused, now),
+        Outcome::Done(Effects {
+            placeholder: true,
+            ..Effects::default()
+        })
+    );
+    assert_eq!(connection.phase(), Some(Unavailable(U::CredentialRejected)));
+    assert_eq!(connection.gate().reported(), 1);
+}
