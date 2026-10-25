@@ -623,6 +623,27 @@ pub struct ModuleToolContext {
     /// to hold the run it sends to against. Never sent to the module.
     #[serde(skip)]
     pub expected_artifact: Option<String>,
+    /// The run the grant was last checked under (K1-6a-G §2.5.1), for the
+    /// runtime to send to no other. Never sent to the module.
+    #[serde(skip)]
+    pub run: Option<ModuleRun>,
+}
+
+/// One run of a module, as a runtime knows it: the same run only while it
+/// is the same allocation, which this handle keeps alive.
+#[derive(Clone)]
+pub struct ModuleRun(Arc<dyn std::any::Any + Send + Sync>);
+
+impl ModuleRun {
+    pub fn new<T: std::any::Any + Send + Sync>(run: Arc<T>) -> Self {
+        Self(run)
+    }
+
+    /// Whether this is `run`.
+    #[must_use]
+    pub fn is<T: std::any::Any + Send + Sync>(&self, run: &Arc<T>) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&self.0), Arc::as_ptr(run))
+    }
 }
 
 #[async_trait]
@@ -744,6 +765,11 @@ impl ModuleToolAuthorization for DenyModuleToolAuthorization {
 
 #[async_trait]
 pub trait ModuleToolRuntime: Send + Sync {
+    /// `module`'s run now, which a call is then bound to (K1-6a-G §2.5.1);
+    /// `None`: no run, or a runtime that binds none.
+    fn current_run(&self, _module: &str) -> Option<ModuleRun> {
+        None
+    }
     async fn check_available(
         &self,
         module: &str,
@@ -1317,6 +1343,13 @@ impl Tool for ModuleTool {
             }
             available = self.runtime.check_available(&self.module, &self.operation) => available,
         };
+        // K1-6a-G §2.5.1: the run is taken, then the grant is looked up once
+        // more whatever the feed holds: an end is announced only after it
+        // commits, an expiry never. An end told to a run before it was taken
+        // had committed, so the lookup fails; one told later reaches this
+        // run, or the call goes to none.
+        let run = self.runtime.current_run(&self.module);
+        watch.recheck = true;
         // The wait above may have taken a change and been dropped before it
         // re-read the grant: settle it here, still before anything is sent
         // and before the module's own unavailability is reported.
@@ -1358,6 +1391,7 @@ impl Tool for ModuleTool {
             authorized_resources: grant.authorized_resources,
             authorization_ref: grant.authorization_ref,
             expected_artifact: grant.artifact,
+            run,
         };
         let call_cancel = cancel.child_token();
         let invoked = tokio::select! {
