@@ -111,3 +111,17 @@ fn only_dependency_retries_by_itself_and_only_when_nothing_holds_it() {
         assert!(!Placeholder::new(failure).retries_by_itself(CLEAR, true, false));
     }
 }
+
+#[test]
+fn a_following_placeholder_numbers_on_and_a_cancelled_attempt_does_not_count() {
+    let mut earlier = Placeholder::new(None);
+    let old = earlier.attempt();
+    let mut later = Placeholder::following(earlier.next());
+    let fresh = later.attempt();
+    assert_ne!(fresh, old);
+    assert_eq!(later.settle(old, Attempted::Identified), Settled::Ignored);
+    assert_eq!(later.next(), earlier.next() + 1);
+    later.cancel();
+    assert_eq!(later.settle(fresh, Attempted::Identified), Settled::Ignored);
+    assert_eq!(later.failure(), None);
+}
