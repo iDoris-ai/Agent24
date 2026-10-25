@@ -471,8 +471,9 @@ pub struct PeerRun {
     pub status: RunStatus,
     /// True unless every source tagged on the run so far is Ordinary and the
     /// run has called no tool, recalled no memory, was not started by a
-    /// kernel-created schedule and has no session context (no session, or a
-    /// daemon without session memory). Sources are tagged before the first
+    /// kernel-created schedule and has no session context (no session, or it
+    /// ran — and the daemon runs — without session memory). Sources are tagged
+    /// before the first
     /// model call, so the value only changes again when the run starts a
     /// tool.
     pub withheld: bool,

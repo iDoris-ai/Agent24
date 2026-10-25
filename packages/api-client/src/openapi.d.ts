@@ -465,8 +465,9 @@ export interface paths {
          *     only when every source tagged on it is ordinary, it has ended, and —
          *     while tool results carry no source tags — it cannot have taken one in:
          *     it called no tool, recalled no memory, was not started by a
-         *     kernel-created schedule, and has no session context (no session, or a
-         *     daemon without session memory). Any other run carries only its id,
+         *     kernel-created schedule, and has no session context (no session, or it
+         *     ran, and the daemon runs, without session memory). Any other run
+         *     carries only its id,
          *     status and a fixed notice.
          */
         get: operations["listPeerRuns"];

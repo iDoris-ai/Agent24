@@ -395,6 +395,8 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use agent24_protocol::{
         ErrorBody, ModelDeltaPayload, RunCompletedPayload, RunFailedPayload, RunOutputPayload,

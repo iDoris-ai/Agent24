@@ -12,8 +12,8 @@
 //! runs), through a remembered fact recalled elsewhere, through a self-wake
 //! prompt. Until it is tagged, only a run that cannot have taken any of it in
 //! is relayed: no tool call, no recalled memory, not started by a
-//! kernel-created schedule, and no session context — no session, or a daemon
-//! without session memory (David 2026-10-26, option A).
+//! kernel-created schedule, and no session context — no session, or it ran,
+//! and the daemon runs, without session memory (David 2026-10-26, option A).
 
 use agent24_protocol::{PeerRun, Run, RunStatus};
 use agent24_store::{SourceClassification, SourceKind, strictest_classification};
@@ -35,6 +35,8 @@ pub(crate) const WITHHELD_NOTICE: &str = "this run used sources that are not ord
 async fn peer_classification(state: &AppState, run: &Run) -> SourceClassification {
     const UNKNOWN: SourceClassification = SourceClassification::Unknown;
     // Earlier turns of a session reach the model only through session memory.
+    // Whether the run had it is fixed when it ran (its session-floor tag says
+    // so, below); the daemon having it now covers a run whose tags cannot say.
     if run.session_id.is_some() && state.memory_kv.is_some() {
         return UNKNOWN;
     }
@@ -84,11 +86,14 @@ async fn peer_classification(state: &AppState, run: &Run) -> SourceClassificatio
         }
     };
     // A recalled fact's stored classification cannot account for a tool
-    // result it was remembered from.
-    if tags
-        .iter()
-        .any(|tag| tag.source.kind == SourceKind::MemoryRecall)
-    {
+    // result it was remembered from; a session-floor tag means the run ran
+    // with session memory, so earlier turns were in its context.
+    if tags.iter().any(|tag| {
+        matches!(
+            tag.source.kind,
+            SourceKind::MemoryRecall | SourceKind::SessionContext
+        )
+    }) {
         return UNKNOWN;
     }
     strictest_classification(tags.into_iter().map(|tag| tag.source.classification))
@@ -503,6 +508,21 @@ mod tests {
         ordinary(&state, run("run_alone", RunStatus::Completed)).await;
         // Control: without session memory a session carries no earlier turns.
         assert!(!peer_run(&state, "run_turn").await.0.withheld);
+
+        // The daemon kept session memory when this turn ran (its floor tag
+        // says so) but not now: still withheld.
+        let floor =
+            SourceRef::session_floor("sess_1", SourceClassification::Ordinary, now_iso8601());
+        let mut earlier = run("run_earlier", RunStatus::Completed);
+        earlier.session_id = Some("sess_1".to_owned());
+        ordinary(&state, earlier).await;
+        state
+            .store
+            .tag_run_source("run_earlier", 1, &floor, &now_iso8601())
+            .await
+            .unwrap();
+        let (view, body) = peer_run(&state, "run_earlier").await;
+        assert_withheld(&view, &body);
 
         state.memory_kv = Some(agent24_memory::KvStore::open_memory().await.unwrap());
         let (view, body) = peer_run(&state, "run_turn").await;
