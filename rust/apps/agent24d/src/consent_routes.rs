@@ -371,8 +371,8 @@ fn protocol_too_old(module: &str) -> Response {
         "protocol_too_old",
         &format!(
             "{module:?} does not require kernel protocol {}, so it cannot be told \
-             its grants were revoked",
-            agent24_domain::RESOURCE_KINDS_PROTOCOL
+             its grants ended",
+            agent24_domain::GRANT_END_REFS_PROTOCOL
         ),
     )
 }

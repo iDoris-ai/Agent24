@@ -403,16 +403,25 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// The kernel↔module PROTOCOL version this build speaks. Separate from the schema
 /// version: a manifest can be v1 while the protocol moves, and vice versa.
 ///
-/// 2 (K1-6a-G §2.6): tools may declare `resource_kinds`. `ab/kernel` moved
-/// from 1; `main` is already at 2 for another change, so merging `main` into
-/// `ab/kernel` must move this AND [`RESOURCE_KINDS_PROTOCOL`] to 3.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+/// 2 (K1-6a-G §2.6): tools may declare `resource_kinds`. 3 (§2.5.1, A5c):
+/// the module stops by reference, so it may hold tool grants. `ab/kernel`
+/// moved from 1; `main` is already at 2 for another change, so merging
+/// `main` into `ab/kernel` must move this and [`GRANT_END_REFS_PROTOCOL`] to
+/// 4, and [`RESOURCE_KINDS_PROTOCOL`] to 3.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
 
 /// The first protocol whose kernels read `tools[].resource_kinds`. A manifest
 /// that declares the field must require at least this, so an older kernel
 /// refuses it at the version check rather than at `deny_unknown_fields`.
 pub const RESOURCE_KINDS_PROTOCOL: u32 = 2;
 const _: () = assert!(RESOURCE_KINDS_PROTOCOL <= DAEMON_PROTOCOL_VERSION);
+
+/// The first protocol whose modules stop by reference (K1-6a-G §2.5.1): told
+/// the grants that ended, a module stops exactly their work and refuses late
+/// calls carrying them. Only such a module takes grants, so a `replaced` or
+/// `epoch` notice never stops work a newer grant let in (#1202 G6).
+pub const GRANT_END_REFS_PROTOCOL: u32 = 3;
+const _: () = assert!(GRANT_END_REFS_PROTOCOL <= DAEMON_PROTOCOL_VERSION);
 
 /// The wire shape of `domain-os.yml`. PRIVATE, and the only MANIFEST type that
 /// derives `Deserialize`, so a caller cannot skip validation by deserializing
@@ -1056,10 +1065,10 @@ impl DomainOsManifest {
     }
 
     /// Whether the module speaks the protocol that grants need (K1-6a-G
-    /// §2.6): an older one cannot be told its grants were revoked, so none
-    /// is offered to it.
+    /// §2.6, [`GRANT_END_REFS_PROTOCOL`]): an older one cannot be told its
+    /// grants ended by reference, so none is offered to it.
     pub fn takes_grants(&self) -> bool {
-        self.min_daemon_protocol >= u64::from(RESOURCE_KINDS_PROTOCOL)
+        self.min_daemon_protocol >= u64::from(GRANT_END_REFS_PROTOCOL)
     }
 }
 
@@ -2632,7 +2641,8 @@ mod tool_manifest_tests {
     }
 
     /// K1-6a-G §2.6: only a manifest that requires the grants protocol
-    /// takes grants; one that names an older protocol, or none, does not.
+    /// takes grants; one that names an older protocol, the `resource_kinds`
+    /// one too (#1202 G6), or none, does not.
     #[test]
     fn only_a_manifest_on_the_grants_protocol_takes_grants() {
         let on = |p: Option<u32>| {
@@ -2641,8 +2651,9 @@ mod tool_manifest_tests {
                 .unwrap()
                 .takes_grants()
         };
-        assert!(on(Some(RESOURCE_KINDS_PROTOCOL)));
-        assert!(!on(Some(RESOURCE_KINDS_PROTOCOL - 1)));
+        assert!(on(Some(GRANT_END_REFS_PROTOCOL)));
+        assert!(!on(Some(GRANT_END_REFS_PROTOCOL - 1)));
+        assert!(!on(Some(RESOURCE_KINDS_PROTOCOL)));
         assert!(!on(None));
     }
 
