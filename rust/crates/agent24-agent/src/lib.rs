@@ -2753,6 +2753,40 @@ pub(crate) mod tests {
         assert!(remote.seen.lock().unwrap().is_empty());
     }
 
+    /// K1-6b.5b (ADR-K1-02 §2.4 (b)): a run whose source tags cannot be read
+    /// is routed local-only, not with the caller's base profile, so a
+    /// remote-only router has nothing to serve it with.
+    #[tokio::test]
+    async fn a_run_whose_sources_cannot_be_read_is_routed_local_only() {
+        use agent24_models::router::Privacy;
+        let remote = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let store = Store::open_memory().await.unwrap();
+        let manager = RunManager::new(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                remote.clone(),
+                Tier::Remote,
+            )])),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(RecordingSink(StdMutex::new(vec![]))),
+            CancellationToken::new(),
+        );
+        agent24_store::test_hooks::fail_source_tag_reads(&store);
+        let profile = manager
+            .task_profile_for_run("run_unreadable", TaskProfile::default())
+            .await;
+        assert_eq!(profile.privacy, Privacy::LocalOnly);
+
+        let run = manager.start_run(create()).await.unwrap();
+        let run = wait_terminal(&store, &run.id).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let error = run.error.expect("a failed run carries its error");
+        assert!(error.message.contains("local-only"), "{error:?}");
+        assert!(remote.seen.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn cloud_authorized_policy_preserves_the_base_profile() {
         use agent24_models::router::Privacy;

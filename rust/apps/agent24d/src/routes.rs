@@ -912,6 +912,89 @@ mod tests {
         })
     }
 
+    /// K1-6b.5b: a remote provider that counts every call, and the only one
+    /// the daemon has.
+    struct CountingRemote(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CountingRemote {
+        fn name(&self) -> &str {
+            "counting-remote"
+        }
+        fn outbound_destination(&self) -> Option<String> {
+            Some("https://models.example/v1".to_owned())
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, ModelError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ModelError::Unavailable("must not be called".into()))
+        }
+        async fn models(&self, _cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    async fn state_with_remote_only(remote: std::sync::Arc<CountingRemote>) -> AppState {
+        crate::server::AppState::new(crate::server::AppDeps {
+            token: "testtoken".to_owned(),
+            router: std::sync::Arc::new(ModelRouter::with_defaults(vec![(remote, Tier::Remote)])),
+            tools: agent24_tools::ToolRegistry::new(),
+            store: agent24_store::Store::open_memory().await.unwrap(),
+            shutdown: crate::server::Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            workspace_service: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: std::sync::Arc::new(
+                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+            ),
+            packages_root: std::sync::Arc::new(
+                tempfile::tempdir().expect("tempdir").path().to_path_buf(),
+            ),
+        })
+    }
+
+    /// K1-6b.5b (ADR-K1-02 §2.4 (a)): `/api/v1/chat` routes local-only, so a
+    /// daemon whose only provider is remote answers 503 and the remote
+    /// provider is never called.
+    #[tokio::test]
+    async fn post_chat_never_reaches_a_remote_only_provider() {
+        let remote = std::sync::Arc::new(CountingRemote(std::sync::atomic::AtomicUsize::new(0)));
+        let state = state_with_remote_only(remote.clone()).await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"my private note"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "provider_unavailable", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("local-only")),
+            "{body}"
+        );
+        assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// Review M3: a provider that DOES report a `model_id` — `Stub` above
     /// deliberately reports `None` (so tests using it also cover "the
     /// provider didn't say"), so this is a separate type rather than
