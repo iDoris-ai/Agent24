@@ -119,7 +119,7 @@ fn an_unselected_or_logged_out_binding_stays_registered_until_activated_again() 
         persisted(&mut binding, &effects);
         assert_eq!(binding.connect(CLEAR), None, "{event:?}");
         assert_eq!(state(&binding, CLEAR), Some(ServiceState::Registered));
-        binding.activate();
+        binding.activate(Activation::Reselect);
         assert!(binding.connect(CLEAR).is_some());
         assert_eq!(
             state(&binding, CLEAR),
@@ -136,7 +136,7 @@ fn a_removed_binding_is_retired_for_good() {
     let effects = binding.leave(Leave::Remove);
     assert!(binding.retired());
     persisted(&mut binding, &effects);
-    binding.activate();
+    binding.activate(Activation::Reselect);
     assert_eq!(binding.connect(CLEAR), None);
     assert_eq!(state(&binding, CLEAR), None);
     assert_eq!(binding.leave(Leave::Disable), Effects::default());
@@ -174,5 +174,115 @@ fn a_disabled_profile_keeps_the_binding_out_until_enabled() {
     let (connection, credentials) = binding.parts_mut();
     let outcome = credentials.response(connection, old, Signal::Revoked, Instant::now());
     assert_eq!(outcome, Outcome::Recheck);
+    assert_eq!(binding.connection().phase(), Some(Loading));
+}
+
+/// A `ready` binding that a probe then found incompatible, or that a
+/// revocation made `access_revoked`.
+fn stuck(cause: state::UnavailableCause) -> BindingState {
+    let mut binding = ready();
+    let (connection, credentials) = binding.parts_mut();
+    match cause {
+        state::UnavailableCause::Incompatible => {
+            let probe = connection.probe().unwrap();
+            connection.apply_probe(probe, Probe::Incompatible);
+        }
+        _ => {
+            let effects = credentials.revoke(connection, Instant::now());
+            let effects = match effects {
+                Outcome::Done(effects) => effects,
+                other => panic!("{other:?}"),
+            };
+            let value = effects.invalidation.unwrap().to_persist.unwrap();
+            connection.confirm_generation(value);
+            let ticket = credentials.issue(connection).unwrap();
+            credentials.issued(connection, ticket, Issued::Refused, Instant::now());
+        }
+    }
+    assert_eq!(binding.connection().phase(), Some(Unavailable(cause)));
+    binding
+}
+
+/// Leaves with `event`, persists, activates again as `how`, connects.
+fn back(binding: &mut BindingState, event: Leave, how: Option<Activation>) {
+    let effects = binding.leave(event);
+    if effects.invalidation.is_some() {
+        persisted(binding, &effects);
+    }
+    if let Some(how) = how {
+        binding.activate(how);
+    }
+    binding.connect(CLEAR);
+}
+
+#[test]
+fn coming_back_does_not_retry_a_reason_that_waits_for_the_user() {
+    use state::UnavailableCause::{AccessRevoked, Incompatible};
+    for cause in [Incompatible, AccessRevoked] {
+        let mut binding = stuck(cause);
+        back(&mut binding, Leave::Off, None);
+        assert_eq!(binding.connection().phase(), Some(Unavailable(cause)));
+        back(&mut binding, Leave::Unselect, Some(Activation::Reselect));
+        assert_eq!(binding.connection().phase(), Some(Unavailable(cause)));
+        assert_eq!(binding.parts_mut().0.probe(), None);
+    }
+}
+
+#[test]
+fn logging_in_again_retries_a_rejected_or_revoked_credential_only() {
+    use state::UnavailableCause::{AccessRevoked, Incompatible};
+    let mut binding = stuck(AccessRevoked);
+    back(&mut binding, Leave::Logout, Some(Activation::Relogin));
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    let mut binding = stuck(Incompatible);
+    back(&mut binding, Leave::Logout, Some(Activation::Relogin));
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(Incompatible))
+    );
+}
+
+#[test]
+fn leaving_while_waiting_for_persistence_keeps_nothing() {
+    let mut binding = ready();
+    let (connection, credentials) = binding.parts_mut();
+    credentials.revoke(connection, Instant::now());
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(state::UnavailableCause::LocalStorage))
+    );
+    let off = binding.leave(Leave::Off);
+    persisted(&mut binding, &off);
+    assert!(binding.connect(CLEAR).is_some());
+    assert_eq!(binding.connection().phase(), Some(Loading));
+}
+
+#[test]
+fn coming_back_retries_a_reason_that_retries_by_itself() {
+    let mut binding = ready();
+    let (connection, _) = binding.parts_mut();
+    let probe = connection.probe().unwrap();
+    connection.apply_probe(probe, Probe::NoAnswer);
+    back(&mut binding, Leave::Off, None);
+    assert_eq!(binding.connection().phase(), Some(Loading));
+}
+
+#[test]
+fn logging_in_again_retries_a_rejected_credential() {
+    // Never servable: a refused issuance is credential_rejected (S3.1).
+    let mut binding = BindingState::new(
+        Connection::new(Gate::new(1), false),
+        Credentials::new(false),
+        true,
+    );
+    binding.connect(CLEAR).unwrap();
+    let (connection, credentials) = binding.parts_mut();
+    let ticket = credentials.issue(connection).unwrap();
+    credentials.issued(connection, ticket, Issued::Refused, Instant::now());
+    let rejected = Some(Unavailable(state::UnavailableCause::CredentialRejected));
+    assert_eq!(binding.connection().phase(), rejected);
+    back(&mut binding, Leave::Logout, Some(Activation::Reselect));
+    assert_eq!(binding.connection().phase(), rejected);
+    back(&mut binding, Leave::Logout, Some(Activation::Relogin));
     assert_eq!(binding.connection().phase(), Some(Loading));
 }

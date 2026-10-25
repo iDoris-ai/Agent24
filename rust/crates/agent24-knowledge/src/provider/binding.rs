@@ -7,7 +7,7 @@
 
 use super::connection::{Connection, Round};
 use super::credential::{Credentials, Effects};
-use super::state::{self, ConnectionPhase, Switches};
+use super::state::{self, ConnectionPhase, Switches, UnavailableCause};
 
 /// An event that takes the binding out of the connection phase (S3.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,15 @@ pub enum Leave {
     Logout,
     /// The profile removed: disabled first, then `retired`.
     Remove,
+}
+
+/// How the same binding is activated again (S3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    /// The profile selected again.
+    Reselect,
+    /// The same principal logged in again.
+    Relogin,
 }
 
 #[derive(Debug)]
@@ -100,11 +109,17 @@ impl BindingState {
         }
     }
 
-    /// Selected again, or the same principal logged in again: the same
-    /// binding, no increment (S3.3, S4.3). The caller has persisted the
-    /// loosening first (I1). A retired binding still never connects.
-    pub fn activate(&mut self) {
+    /// The same binding again, no increment (S3.3, S4.3); the caller has
+    /// persisted the loosening first (I1). Logging in again also retries
+    /// `credential_rejected` and `access_revoked` (S1.4). A retired binding
+    /// still never connects.
+    pub fn activate(&mut self, how: Activation) {
         self.activated = true;
+        if how == Activation::Relogin {
+            self.connection
+                .release(UnavailableCause::CredentialRejected);
+            self.connection.release(UnavailableCause::AccessRevoked);
+        }
     }
 
     /// Enters `loading` in a new round once activated with neither switch on
