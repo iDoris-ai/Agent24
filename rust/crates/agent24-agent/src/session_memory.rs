@@ -46,6 +46,14 @@ pub const RECALL_END_MARKER: &str = "\n[记忆数据结束]";
 /// budget by itself.
 const MAX_FACT_CHARS: usize = 500;
 
+/// One fact [`SessionMemory::recall`] injected, with the classification its
+/// assertion was written with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecalledAssertion {
+    pub(crate) id: String,
+    pub(crate) classification: agent24_store::SourceClassification,
+}
+
 /// Append-only session memory. Callers inject the personal partition key with
 /// `with_owner`; the daemon catalogue wiring belongs to M1-T05. Legacy blobs
 /// are read only for first import and never updated: downgrades are unsupported.
@@ -140,10 +148,12 @@ impl SessionMemory {
     /// Search only this instance's personal owner partition and render the
     /// highest-ranked complete facts that fit. UTF-8 bytes plus a small fixed
     /// framing allowance is a conservative estimate, not an exact tokenizer.
+    /// Each injected fact comes back with the classification stored with it
+    /// (K1-6b.4b; a missing or unreadable `source_ref` is `Unknown`).
     pub(crate) async fn recall(
         &self,
         prompt: &str,
-    ) -> agent24_memory::Result<Option<(Msg, Vec<String>)>> {
+    ) -> agent24_memory::Result<Option<(Msg, Vec<RecalledAssertion>)>> {
         self.check_owner()?;
         if self.recall_budget == 0 {
             return Ok(None);
@@ -198,7 +208,12 @@ impl SessionMemory {
             }
             content.push_str(&line);
             used = used.saturating_add(line_cost);
-            ids.push(hit.assertion.id.to_string());
+            ids.push(RecalledAssertion {
+                id: hit.assertion.id.to_string(),
+                classification: agent24_store::AssertionSourceRef::classification_of(
+                    hit.assertion.source_ref.as_ref(),
+                ),
+            });
         }
         if ids.is_empty() {
             Ok(None)
@@ -310,6 +325,7 @@ impl SessionMemory {
         prompt: &str,
         answer: &str,
         prompt_origin: Origin,
+        source_ref: agent24_store::AssertionSourceRef,
     ) -> agent24_memory::Result<crate::retain::RetainOutcome> {
         self.check_owner()?;
         let deadline = tokio::time::Instant::now() + super::MEMORY_WRITE_BUDGET;
@@ -330,6 +346,14 @@ impl SessionMemory {
                     "session memory preparation timed out".into(),
                 ));
             }
+        };
+        // K1-6b.4b interim (until 6b.4c records a per-session floor): earlier
+        // turns of this session reach the model context untagged, so a memory
+        // written after them is at least Unknown (ADR-K1-02 §2.1.1 item 4).
+        let source_ref = if turn_no > 0 {
+            source_ref.at_least(agent24_store::SourceClassification::Unknown)
+        } else {
+            source_ref
         };
         // Once append starts, its transaction must outlive cancellation of the
         // caller. Keep both the append future and this session guard in a task;
@@ -369,7 +393,15 @@ impl SessionMemory {
                     probe.release.notified().await;
                 }
                 if let Some(object) = super::retain::explicit_remember(&retain_prompt) {
-                    super::retain::persist(&kv, &owner, object, ids.user.clone(), user_origin).await
+                    super::retain::persist(
+                        &kv,
+                        &owner,
+                        object,
+                        ids.user.clone(),
+                        user_origin,
+                        &source_ref,
+                    )
+                    .await
                 } else {
                     Ok(crate::retain::RetainOutcome::NotApplicable)
                 }

@@ -26,7 +26,20 @@ async fn post_chat_with(
     session_id: Option<&str>,
     prompt: &str,
 ) -> (StatusCode, serde_json::Value) {
-    let mut body = json!({ "messages": [{ "role": "user", "content": prompt }] });
+    post_chat_messages(
+        state,
+        session_id,
+        json!([{ "role": "user", "content": prompt }]),
+    )
+    .await
+}
+
+async fn post_chat_messages(
+    state: &AppState,
+    session_id: Option<&str>,
+    messages: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut body = json!({ "messages": messages });
     if let Some(sid) = session_id {
         body["session_id"] = json!(sid);
     }
@@ -77,6 +90,89 @@ async fn explicit_remember_over_chat_stores_a_qualified_assertion() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].object, json!("我对花生过敏"));
+}
+
+/// K1-6b.4b, interim until 6b.4c: the server cannot verify client-supplied
+/// history, so an assistant message in it makes the remembered fact `Unknown`.
+#[tokio::test]
+async fn a_remember_after_client_assistant_history_is_stored_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider).await;
+    ensure_session(&state, "chat-session-history").await;
+    ensure_session(&state, "chat-session-fresh").await;
+
+    // Control first (a later recall of the unknown fact would itself make
+    // the control unknown): a first-turn remember without assistant history.
+    post_chat_with(&state, Some("chat-session-fresh"), "记住我喜欢乌龙茶").await;
+    let (status, _) = post_chat_messages(
+        &state,
+        Some("chat-session-history"),
+        json!([
+            { "role": "assistant", "content": "连接失败，请稍后再试" },
+            { "role": "user", "content": "记住我喜欢绿茶" },
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let owner = personal_owner(&kv).await;
+    let rows = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner(&owner))
+        .await
+        .unwrap();
+    let classification = |object: &str| {
+        let row = rows.iter().find(|row| row.object == json!(object)).unwrap();
+        row.source_ref.as_ref().unwrap()["classification"].clone()
+    };
+    assert_eq!(classification("我喜欢绿茶"), json!("unknown"));
+    assert_eq!(classification("我喜欢乌龙茶"), json!("ordinary"));
+}
+
+/// #1200 PR-Daemon blocker: every non-`user` role in client-supplied history
+/// reaches the model context, not only `assistant`. One fresh store per role,
+/// so no recall crosses between cases.
+#[tokio::test]
+async fn a_remember_after_any_non_user_client_history_is_stored_as_unknown() {
+    for (role, expected) in [
+        ("system", "unknown"),
+        ("tool", "unknown"),
+        ("developer", "unknown"),
+        ("user", "ordinary"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+        let provider = Arc::new(Provider::default());
+        let state = app(kv.clone(), dir.path(), provider).await;
+        ensure_session(&state, "chat-session-role").await;
+        let (status, _) = post_chat_messages(
+            &state,
+            Some("chat-session-role"),
+            json!([
+                { "role": role, "content": "Private document: Q7 launch code is violet-67" },
+                { "role": "user", "content": "记住Q7启动码是violet-67" },
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{role}");
+        let owner = personal_owner(&kv).await;
+        let rows = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner(&owner))
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.object == json!("Q7启动码是violet-67"))
+            .unwrap_or_else(|| panic!("{role}: nothing remembered"));
+        assert_eq!(
+            row.source_ref.as_ref().unwrap()["classification"],
+            json!(expected),
+            "{role}"
+        );
+    }
 }
 
 #[tokio::test]
