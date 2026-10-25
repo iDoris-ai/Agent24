@@ -44,8 +44,9 @@ pub struct Retired {
     /// Invalidated if it was in the connection phase; placeholders always.
     pub effects: Effects,
     /// Create the new binding now, persisted together with or after the
-    /// retirement (S3.5).
-    pub create: bool,
+    /// retirement (S3.5); if that fails, [`Placeholder::creation_failed`]
+    /// with this attempt.
+    pub create: Option<Attempt>,
 }
 
 /// What a sidecar `starting` retried (S2.2).
@@ -139,14 +140,15 @@ impl Profile {
     /// `None` without a binding; a placeholder's attempt in flight no longer
     /// counts.
     pub fn change_identity(&mut self, change: IdentityChange) -> Option<Retired> {
-        let fresh = Slot::Placeholder(Placeholder::following(self.next_attempt));
-        let mut binding = match std::mem::replace(&mut self.slot, fresh) {
-            Slot::Bound(binding) => binding,
-            Slot::Placeholder(mut placeholder) => {
-                placeholder.cancel();
-                self.slot = Slot::Placeholder(placeholder);
-                return None;
-            }
+        if let Slot::Placeholder(placeholder) = &mut self.slot {
+            placeholder.cancel();
+            return None;
+        }
+        let mut fresh = Placeholder::following(self.next_attempt);
+        let create = (change != IdentityChange::Endpoint).then(|| fresh.creating());
+        let Slot::Bound(mut binding) = std::mem::replace(&mut self.slot, Slot::Placeholder(fresh))
+        else {
+            return None;
         };
         let effects = binding.leave(Leave::Retire);
         if change == IdentityChange::Principal {
@@ -155,7 +157,7 @@ impl Profile {
         Some(Retired {
             binding: *binding,
             effects,
-            create: change != IdentityChange::Endpoint,
+            create,
         })
     }
 

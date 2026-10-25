@@ -51,9 +51,42 @@ fn each_failure_is_recorded_with_its_reason_and_an_identity_asks_for_a_binding()
         placeholder.settle(attempt, Attempted::Identified),
         Settled::Create
     );
+    assert_eq!(placeholder.failure(), Some(F::Dependency));
     // The binding could not be persisted.
     let mut placeholder = Placeholder::new(None);
-    placeholder.creation_failed();
+    let attempt = placeholder.attempt();
+    placeholder.settle(attempt, Attempted::Identified);
+    placeholder.creation_failed(attempt);
+    assert_eq!(placeholder.failure(), Some(F::Dependency));
+}
+
+#[test]
+fn a_late_creation_failure_never_overwrites_a_newer_reason() {
+    // #1230 note 1: Create, then a new attempt refused, then the failure to
+    // persist the first one's binding arrives.
+    let mut placeholder = Placeholder::new(None);
+    let created = placeholder.attempt();
+    placeholder.settle(created, Attempted::Identified);
+    let refused = placeholder.attempt();
+    placeholder.settle(refused, Attempted::Rejected);
+    placeholder.creation_failed(created);
+    assert_eq!(placeholder.failure(), Some(F::CredentialRejected));
+    assert!(!placeholder.retries_by_itself(CLEAR, true, false));
+    // Only the attempt that created counts, and only once; a cancel ends it.
+    let mut placeholder = Placeholder::new(None);
+    let created = placeholder.creating();
+    placeholder.creation_failed(refused);
+    assert_eq!(placeholder.failure(), None);
+    placeholder.cancel();
+    placeholder.creation_failed(created);
+    assert_eq!(placeholder.failure(), None);
+    let mut placeholder = Placeholder::new(None);
+    let created = placeholder.creating();
+    assert_eq!(
+        placeholder.settle(created, Attempted::Rejected),
+        Settled::Ignored
+    );
+    placeholder.creation_failed(created);
     assert_eq!(placeholder.failure(), Some(F::Dependency));
 }
 

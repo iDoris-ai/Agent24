@@ -27,8 +27,8 @@ pub enum Attempted {
 pub enum Settled {
     /// Not the attempt in flight: nothing changes.
     Ignored,
-    /// Create the binding; [`Placeholder::creation_failed`] if it cannot be
-    /// persisted.
+    /// Create the binding; [`Placeholder::creation_failed`] with the same
+    /// attempt if it cannot be persisted.
     Create,
     Failed(PlaceholderFailure),
 }
@@ -37,6 +37,8 @@ pub enum Settled {
 pub struct Placeholder {
     failure: Option<PlaceholderFailure>,
     attempt: Option<Attempt>,
+    /// The attempt whose binding is being persisted (S2.5, S3.5).
+    creating: Option<Attempt>,
     next: u64,
 }
 
@@ -68,6 +70,7 @@ impl Placeholder {
     /// counts.
     pub fn cancel(&mut self) {
         self.attempt = None;
+        self.creating = None;
     }
 
     pub fn failure(&self) -> Option<PlaceholderFailure> {
@@ -80,6 +83,17 @@ impl Placeholder {
         let attempt = Attempt(self.next);
         self.next += 1;
         self.attempt = Some(attempt);
+        self.creating = None;
+        attempt
+    }
+
+    /// A binding created without an attempt on the placeholder, after an
+    /// identity change (S3.5), numbered like one so a later attempt
+    /// supersedes it.
+    pub fn creating(&mut self) -> Attempt {
+        let attempt = self.attempt();
+        self.attempt = None;
+        self.creating = Some(attempt);
         attempt
     }
 
@@ -89,7 +103,10 @@ impl Placeholder {
         }
         self.attempt = None;
         let failure = match attempted {
-            Attempted::Identified => return Settled::Create,
+            Attempted::Identified => {
+                self.creating = Some(attempt);
+                return Settled::Create;
+            }
             Attempted::Unreachable => PlaceholderFailure::Dependency,
             Attempted::Rejected => PlaceholderFailure::CredentialRejected,
             Attempted::Unidentified => PlaceholderFailure::InstanceUnidentified,
@@ -98,10 +115,14 @@ impl Placeholder {
         Settled::Failed(failure)
     }
 
-    /// The new binding, or the retirement it waits for (S3.5), could not be
-    /// persisted: the binding is dropped and `dependency` is recorded.
-    pub fn creation_failed(&mut self) {
-        self.failure = Some(PlaceholderFailure::Dependency);
+    /// The new binding of `attempt`, or the retirement it waits for (S3.5),
+    /// could not be persisted: the binding is dropped and `dependency` is
+    /// recorded. Ignored once a later attempt started or the identity
+    /// changed: a late failure never overwrites a newer reason.
+    pub fn creation_failed(&mut self, attempt: Attempt) {
+        if self.creating == Some(attempt) {
+            self.failure = Some(PlaceholderFailure::Dependency);
+        }
     }
 
     /// S2.5: only `dependency` retries by backoff, and only while selected,

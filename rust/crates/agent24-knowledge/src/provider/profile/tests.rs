@@ -74,7 +74,7 @@ fn an_identity_change_retires_the_binding_and_leaves_a_placeholder() {
         assert_eq!(invalidation.aborted.len(), 1, "{change:?}");
         assert!(retired.effects.placeholder);
         assert!(retired.binding.retired());
-        assert_eq!(retired.create, change != IdentityChange::Endpoint);
+        assert_eq!(retired.create.is_some(), change != IdentityChange::Endpoint);
         assert!(matches!(profile.slot(), Slot::Placeholder(_)));
         assert_eq!(state(&profile), Some(ServiceState::Registered));
         // Without a binding there is nothing to retire.
@@ -120,13 +120,13 @@ fn a_new_principal_awaits_confirmation_before_its_binding_is_activated() {
 #[test]
 fn a_new_instance_is_activated_at_once_and_a_failed_creation_records_dependency() {
     let mut profile = bound();
-    profile.change_identity(IdentityChange::Instance).unwrap();
+    let retired = profile.change_identity(IdentityChange::Instance).unwrap();
     assert_eq!(profile.confirmation(), None);
     // The retirement could not be persisted: no new binding yet.
     let Slot::Placeholder(placeholder) = profile.slot_mut() else {
         unreachable!()
     };
-    placeholder.creation_failed();
+    placeholder.creation_failed(retired.create.unwrap());
     assert_eq!(
         profile.target(),
         Target::Placeholder {
