@@ -621,3 +621,31 @@ fn a_binding_never_servable_whose_renewal_is_refused_fails_with_a_placeholder() 
     assert_eq!(connection.phase(), Some(Unavailable(U::CredentialRejected)));
     assert_eq!(connection.gate().reported(), 1);
 }
+
+#[test]
+fn a_revocation_drops_the_issuance_in_flight_too() {
+    let now = Instant::now();
+    // Narrowed in a reason that does not retry: same round, yet the
+    // issuance sent before is not adopted afterwards.
+    let (mut connection, mut credentials) = loading(true, false);
+    let ticket = credentials.issue(&connection).unwrap();
+    probed(&mut connection, Probe::Incompatible);
+    let effects = effects(credentials.narrow(&mut connection, now));
+    persisted(&mut connection, &effects);
+    assert_eq!(
+        credentials.issued(&mut connection, ticket, GRANTED, now),
+        Outcome::Ignored
+    );
+    assert_eq!(credentials.current(), None);
+}
+
+#[test]
+fn a_narrowing_in_a_reason_that_retries_starts_a_new_loading_round() {
+    let now = Instant::now();
+    let (mut connection, mut credentials, _) = ready(now);
+    probed(&mut connection, Probe::NoAnswer);
+    let effects = effects(credentials.narrow(&mut connection, now));
+    assert_eq!(connection.phase(), Some(Unavailable(U::LocalStorage)));
+    persisted(&mut connection, &effects).unwrap();
+    assert_eq!(connection.phase(), Some(Loading));
+}
