@@ -377,12 +377,13 @@ async fn build(
     mut stop: watch::Receiver<bool>,
 ) -> Result<String, LayerFailure> {
     // A build that finished between this one's lookup and its start: not
-    // given to a build told to stop meanwhile.
-    let pinned = key.pinned(&storage).await?;
+    // given to a build told to stop meanwhile. Stopped wins over a failed
+    // lookup too (#1206 gate 3).
+    let pinned = key.pinned(&storage).await;
     if *stop.borrow() {
         return Err(LayerFailure::Stopped);
     }
-    if let Some(address) = pinned {
+    if let Some(address) = pinned? {
         return Ok(address);
     }
     let path = storage

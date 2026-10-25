@@ -569,6 +569,33 @@ async fn a_stopped_build_does_not_hand_over_a_layer_pinned_since_its_lookup() {
     assert_eq!(f.parses.load(SeqCst), 0);
 }
 
+/// A build told to stop whose second lookup fails ends stopped, not as
+/// storage's failure (#1206 gate 3).
+#[tokio::test]
+async fn a_stopped_build_whose_lookup_fails_ends_stopped() {
+    let (env, f) = (env().await, fake());
+    let content = stored(&env, "x");
+    let engine: Arc<dyn Engine> = f.clone();
+    env.storage.db.pool().close().await;
+    let unstopped = watch::channel(false).1;
+    let key = LayerKey::of(engine.as_ref(), &content);
+    let got = build(
+        engine.clone(),
+        env.storage.clone(),
+        key,
+        PDF.into(),
+        unstopped,
+    )
+    .await;
+    assert!(matches!(got, Err(LayerFailure::Storage(..))), "{got:?}");
+    let (stop, stopped) = watch::channel(false);
+    stop.send_replace(true);
+    let key = LayerKey::of(engine.as_ref(), &content);
+    let got = build(engine, env.storage.clone(), key, PDF.into(), stopped).await;
+    assert_eq!(got, Err(LayerFailure::Stopped));
+    assert_eq!(f.parses.load(SeqCst), 0);
+}
+
 /// A parse that fails as its build is told to stop ends stopped, not as
 /// the engine's failure.
 #[tokio::test]

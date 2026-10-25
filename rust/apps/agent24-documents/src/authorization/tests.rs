@@ -543,6 +543,52 @@ async fn a_claim_its_call_commits_after_the_notice_is_cancelled() {
     assert_eq!(status(&env, &id).await.0, "cancelled");
 }
 
+/// A build a call in flight asks for after the notice's first pass, its
+/// call then answering, is stopped before the answer: one notice, as the
+/// kernel sends (#1206 gate 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_a_call_asks_for_after_the_first_pass_stops_before_the_answer() {
+    let env = env().await;
+    let call = env.state.calls().begin("find");
+    let notice = {
+        let state = env.state.clone();
+        tokio::spawn(async move { stop(&state, "find", Duration::from_secs(5)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let read = reading(&env, Requester::Tool("find".into()));
+    let start = std::time::Instant::now();
+    while !read.is_finished() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never stopped");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(call.finish());
+    assert!(notice.await.unwrap());
+    assert!(matches!(read.await.unwrap(), Err(LayerFailure::Stopped)));
+}
+
+/// A call's answer is decided as it leaves the ledger: an end after it
+/// does not count it. Its claim's hold counts as begun when the call did,
+/// and stays in flight after the call answers (#1206 gate 1).
+#[test]
+fn a_call_answered_before_an_end_is_not_counted_and_its_claim_is() {
+    let calls = Arc::new(Calls::default());
+    let find = calls.begin("find");
+    assert!(!find.finish());
+    calls.end("find");
+    assert_eq!(calls.before_an_end("find"), 0, "answered before the end");
+    let find = calls.begin("find");
+    calls.end("find");
+    assert!(find.finish(), "the end came first");
+    let extract = calls.begin("extract");
+    calls.end("extract");
+    let claim = extract.hold();
+    assert!(extract.finish());
+    assert!(claim.ended(), "begun when its call did");
+    assert_eq!(calls.before_an_end("extract"), 1, "its claim still holds");
+    drop(claim);
+    assert_eq!(calls.in_flight(), 0);
+}
+
 /// A call knows whether its operation's authorization, or the whole
 /// module's, ended since it began; those still in flight are counted.
 #[test]

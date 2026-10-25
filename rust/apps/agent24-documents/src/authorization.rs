@@ -90,18 +90,23 @@ impl Calls {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A call of `operation` begins; it is in flight until the last clone
-    /// of what this returns is dropped.
+    /// A call of `operation` begins; it is in flight until what this
+    /// returns is finished or dropped.
     #[must_use]
-    pub fn begin(self: &Arc<Self>, operation: &str) -> Arc<Call> {
+    pub fn begin(self: &Arc<Self>, operation: &str) -> Call {
         let mut ledger = self.ledger();
-        let (id, since) = (ledger.next, ledger.ended(operation));
+        let since = ledger.ended(operation);
+        self.register(&mut ledger, operation.to_owned(), since)
+    }
+
+    fn register(self: &Arc<Self>, ledger: &mut Ledger, operation: String, since: u64) -> Call {
+        let id = ledger.next;
         ledger.next += 1;
-        ledger.live.insert(id, (operation.to_owned(), since));
-        Arc::new(Call {
+        ledger.live.insert(id, (operation, since));
+        Call {
             calls: self.clone(),
             id,
-        })
+        }
     }
 
     /// How many calls are in flight.
@@ -152,6 +157,33 @@ impl Call {
             .live
             .get(&self.id)
             .is_some_and(|(op, since)| *since != ledger.ended(op))
+    }
+
+    /// The call's answer is decided: whether its authorization ended
+    /// since it began, decided as it stops being in flight, under one lock.
+    /// An end after this does not count it, as if it answered before the
+    /// end; an end before it does, and it gives nothing.
+    #[must_use]
+    pub fn finish(self) -> bool {
+        let mut ledger = self.calls.ledger();
+        let ended = ledger
+            .live
+            .remove(&self.id)
+            .is_some_and(|(op, since)| since != ledger.ended(&op));
+        drop(ledger);
+        ended
+    }
+
+    /// Another hold on the call's place in flight, for work it leaves
+    /// running (`extract`'s claim): the end waits for it too, and it counts
+    /// as begun when the call did.
+    #[must_use]
+    pub fn hold(&self) -> Call {
+        let mut ledger = self.calls.ledger();
+        // Always there: only `finish`, which takes the call, and its drop
+        // remove it.
+        let (operation, since) = ledger.live.get(&self.id).cloned().unwrap_or_default();
+        self.calls.register(&mut ledger, operation, since)
     }
 }
 
