@@ -618,7 +618,7 @@ async fn stop_once_asked(state: &AppState, by: &Requester) {
 }
 
 /// K1-06a-grant-path §2.5: a read's build is asked for by its tool's
-/// operation, or by the page; stopped, the read is retryable.
+/// operation and grant, or by the page; stopped, the read is retryable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_s_build_is_asked_for_by_its_tool_or_its_page() {
     let (_dir, state) = env_with(Some(Arc::new(Stuck))).await;
@@ -633,7 +633,12 @@ async fn a_read_s_build_is_asked_for_by_its_tool_or_its_page() {
             let state = state.clone();
             async move { call(&state, op, args).await }
         });
-        stop_once_asked(&state, &Requester::Tool(op.to_owned())).await;
+        // Asked for under the call's grant (K1-06a §2.5.1).
+        let by = crate::authorization::Accepted {
+            operation: op.to_owned(),
+            authorization_ref: Some("auth-1".to_owned()),
+        };
+        stop_once_asked(&state, &Requester::Tool(by)).await;
         assert_module_error(&read.await.unwrap(), "engine_unavailable", true);
     }
     let page = tokio::spawn({
@@ -665,7 +670,14 @@ async fn a_read_its_authorization_ends_under_gives_nothing() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let wait = Duration::from_secs(5);
-    assert!(crate::authorization::stop(&state, "find", wait).await);
+    assert!(
+        crate::authorization::stop(
+            &state,
+            &crate::authorization::Ended::by_operation("find"),
+            wait
+        )
+        .await
+    );
     let answer = tokio::time::timeout(Duration::from_secs(2), read).await;
     let answer = answer.expect("the call goes on").unwrap();
     assert_kernel_error(&answer, ModuleToolErrorCode::PermissionDenied);
@@ -697,8 +709,8 @@ impl Engine for Gated {
 /// #1206 B2: a read that would find its text, overtaken by its
 /// authorization's end before it answers, answers `permission_denied` and
 /// gives none of it. A call begun after the end is not overtaken (#1206
-/// B1): telling it from a late call of the ended grant needs the grant's
-/// reference (A5c-3).
+/// B1). Ended by its grant's reference (A5c-3), a late call under that
+/// grant is refused on arrival; one under another grant answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_that_would_succeed_gives_nothing_once_its_authorization_ends() {
     let open = Arc::new(tokio::sync::Notify::new());
@@ -718,7 +730,9 @@ async fn a_read_that_would_succeed_gives_nothing_once_its_authorization_ends() {
         assert!(start.elapsed() < Duration::from_secs(5), "never began");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    state.calls().end("find");
+    state
+        .calls()
+        .end(&crate::authorization::Ended::by_operation("find"));
     open.notify_one();
     let answer = tokio::time::timeout(Duration::from_secs(5), read).await;
     let answer = answer.expect("the read answers").unwrap();
@@ -729,4 +743,21 @@ async fn a_read_that_would_succeed_gives_nothing_once_its_authorization_ends() {
     let after = find(state.clone()).await;
     let after = String::from_utf8_lossy(&after).into_owned();
     assert!(after.contains(quote), "{after}");
+    let ended = crate::authorization::Ended {
+        operation: "find".into(),
+        refs: Some(["auth-1".to_owned()].into()),
+    };
+    state.calls().end(&ended);
+    assert_kernel_error(
+        &find(state.clone()).await,
+        ModuleToolErrorCode::PermissionDenied,
+    );
+    assert_eq!(state.calls().in_flight(), 0);
+    let mut context = context_with("find", &[DOC]);
+    context["authorization_ref"] = json!("auth-2");
+    let args = json!({ "document_id": DOC, "revision": 1, "query": "needle" });
+    let body = json!({ "context": context, "arguments": args });
+    let other = post_to(&state, "find", body.to_string()).await;
+    let other = String::from_utf8_lossy(&other).into_owned();
+    assert!(other.contains(quote), "{other}");
 }

@@ -135,8 +135,8 @@ type Outcome = Option<Result<String, LayerFailure>>;
 pub enum Requester {
     /// A page of the app, through REST.
     Page,
-    /// A tool call of this operation.
-    Tool(String),
+    /// A tool call, accepted as this operation under this grant.
+    Tool(crate::authorization::Accepted),
     /// An attempt of a job.
     Job { id: String, attempt: i64 },
 }
