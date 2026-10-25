@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::module_tool_runtime::RevocationStop;
+use crate::module_tool_runtime::{GrantEnd, RevocationStop};
 use crate::server::{AppState, error_response};
 
 fn storage_error(action: &'static str, err: impl std::fmt::Display) -> Response {
@@ -154,12 +154,10 @@ pub async fn export(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Tells a module a revocation ended its grants of an operation (`"*"`:
-/// every tool) at an instant, and gives what it answered (K1-6a-G §2.5).
+/// Tells a module an end of its grants, and gives what it answered
+/// (K1-6a-G §2.5, §2.5.1).
 pub type RevocationNotice = std::sync::Arc<
-    dyn Fn(String, String, String) -> futures::future::BoxFuture<'static, RevocationStop>
-        + Send
-        + Sync,
+    dyn Fn(GrantEnd) -> futures::future::BoxFuture<'static, RevocationStop> + Send + Sync,
 >;
 
 /// The revocation is written first and stands whatever the module answers;
@@ -175,35 +173,73 @@ async fn revoke(state: AppState, module: String, tool: Option<String>) -> Respon
         Ok(generation) => generation,
         Err(err) => return storage_error("revoke", err),
     };
-    let operation = tool.clone().unwrap_or_else(|| "*".to_owned());
+    // §2.5.1: the grants it ended, as written with it; unread, the module
+    // stops by operation, and the notifier tells the row once it is due.
+    let ended = state
+        .store
+        .grant_end_notice(generation)
+        .await
+        .inspect_err(
+            |err| tracing::error!(module, error = %err, "a revocation's ends could not be read"),
+        )
+        .ok()
+        .flatten();
+    let end = GrantEnd {
+        module: module.clone(),
+        operation: tool.clone().unwrap_or_else(|| "*".to_owned()),
+        ended_at: now.clone(),
+        reason: "revoked",
+        authorization_refs: ended.as_ref().map(|end| end.authorization_refs.clone()),
+    };
     let stop = match &state.module_tool_cards {
-        Some(cards) => (cards.notice)(module.clone(), operation, now.clone()).await,
+        Some(cards) => (cards.notice)(end).await,
         None => RevocationStop::NotRunning,
     };
-    let recorded = state
-        .store
-        .record_revocation_stop(&module, tool.as_deref(), generation, stop.word())
-        .await;
-    let stop = match recorded {
-        Ok(true) => stop,
-        // Not recorded, or a later revocation took its place: unconfirmed,
-        // as the list reads it.
-        Ok(false) => RevocationStop::Unconfirmed,
-        Err(err) => {
-            tracing::error!(module, error = %err, "a revocation's stop could not be recorded");
-            RevocationStop::Unconfirmed
-        }
-    };
-    if stop == RevocationStop::Unconfirmed {
+    let audit_unconfirmed = || async {
         let detail = serde_json::json!({ "module": module, "tool": tool });
-        if let Err(err) = state
+        state
             .store
             .append_audit(&now, "host", "module_consent.stop_unconfirmed", &detail)
             .await
-        {
-            tracing::error!(module, error = %err, "an unconfirmed stop could not be audited");
-        }
+            .inspect_err(|err| tracing::error!(module, error = %err, "an unconfirmed stop could not be audited"))
+            .is_ok()
+    };
+    // An unconfirmed answer is audited before its row is answered: a row
+    // left unanswered is told again by the notifier, which audits it.
+    let audited = stop != RevocationStop::Unconfirmed || audit_unconfirmed().await;
+    // The row's first answer stands (§2.5.1); the revocation records only
+    // the answer its row took, so the list never reads another.
+    let answered = match &ended {
+        Some(ended) if audited => state
+            .store
+            .record_grant_end_stop(ended.id, stop.into())
+            .await
+            .inspect_err(|err| tracing::error!(module, error = %err, "a revocation's end could not be answered"))
+            .unwrap_or(false),
+        // Audit failed, or the row unread (a revocation always writes one):
+        // left to the notifier, which answers the row and the revocation.
+        Some(_) | None => false,
+    };
+    let recorded = if answered {
+        state
+            .store
+            .record_revocation_stop(&module, tool.as_deref(), generation, stop.word())
+            .await
+            .inspect_err(|err| tracing::error!(module, error = %err, "a revocation's stop could not be recorded"))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    // Not recorded, answered first by the notifier, or a later revocation
+    // took its place: unconfirmed, as the list reads it.
+    if !recorded && stop != RevocationStop::Unconfirmed {
+        audit_unconfirmed().await;
     }
+    let stop = if recorded {
+        stop
+    } else {
+        RevocationStop::Unconfirmed
+    };
     Json(serde_json::json!({
         "module": module,
         "tool": tool,
@@ -264,6 +300,17 @@ pub struct ModuleToolCards {
     pub tools: std::sync::Arc<std::collections::HashMap<(String, String), ToolCardSource>>,
     pub artifact: agent24_policy::consent_gate::ArtifactSource,
     pub notice: RevocationNotice,
+}
+
+impl ModuleToolCards {
+    /// Whether `module` is on the grants protocol (§2.6): a tool of it
+    /// takes grants. One with no tool here is not.
+    #[must_use]
+    pub fn on_grants_protocol(&self, module: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|((of, _), source)| of == module && source.takes_grants)
+    }
 }
 
 #[derive(Serialize)]
@@ -335,8 +382,8 @@ fn protocol_too_old(module: &str) -> Response {
         "protocol_too_old",
         &format!(
             "{module:?} does not require kernel protocol {}, so it cannot be told \
-             its grants were revoked",
-            agent24_domain::RESOURCE_KINDS_PROTOCOL
+             its grants ended",
+            agent24_domain::GRANT_END_REFS_PROTOCOL
         ),
     )
 }
