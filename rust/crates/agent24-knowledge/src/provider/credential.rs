@@ -57,16 +57,14 @@ pub enum Signal {
 pub struct Effects {
     /// The event invalidated: abort these calls and persist this value (S4.5).
     pub invalidation: Option<Invalidation>,
-    /// Advance the evidence epoch and record a placeholder rule covering every
-    /// KB (S5.6).
+    /// Advance the evidence epoch, add a placeholder rule for every KB (S5.6).
     pub placeholder: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Done(Effects),
-    /// From an ended round or not the issuance in flight: nothing adopted,
-    /// nothing moves.
+    /// From an ended round, or not the issuance in flight: nothing moves.
     Ignored,
     /// Granted for another principal: nothing adopted; S3.5 for the caller.
     OtherPrincipal,
@@ -75,19 +73,11 @@ pub enum Outcome {
     Recheck,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Current {
-    id: CredentialId,
-    /// The round it took effect in.
-    round: Round,
-}
-
 #[derive(Debug, Default)]
 struct Window(VecDeque<Instant>);
 
 impl Window {
-    /// Records an event at `now`; whether it is at least the third within
-    /// the window.
+    /// Records an event at `now`: whether it is the third within the window.
     fn record(&mut self, now: Instant) -> bool {
         self.0.retain(|t| now.duration_since(*t) < WINDOW);
         self.0.push_back(now);
@@ -103,12 +93,12 @@ enum Revocation {
 
 #[derive(Debug)]
 pub struct Credentials {
-    current: Option<Current>,
+    /// With the round it took effect in.
+    current: Option<(CredentialId, Round)>,
     issuing: Option<Issuance>,
     next_issuance: u64,
     next_credential: u64,
-    /// A revocation-class event happened since the binding was created; it
-    /// ends S3.1's exception for good.
+    /// A revocation-class event since creation ends S3.1's exception for good.
     revoked_before: bool,
     revocations: Window,
 }
@@ -128,13 +118,13 @@ impl Credentials {
     }
 
     pub fn current(&self) -> Option<CredentialId> {
-        self.current.map(|c| c.id)
+        self.current.map(|(id, _)| id)
     }
 
-    /// The issuance of a `loading` round without a credential. One at a time.
+    /// A `loading` round's issuance: no credential, nothing pending. One at a time.
     pub fn issue(&mut self, connection: &Connection) -> Option<Issuance> {
         let due = connection.phase() == Some(ConnectionPhase::Loading) && self.current.is_none();
-        if !due || self.issuing_in(connection) {
+        if !due || connection.persist_pending() || self.issuing_in(connection) {
             return None;
         }
         Some(self.ticket(connection))
@@ -165,8 +155,11 @@ impl Credentials {
             Issued::Refused | Issued::Revoked => {
                 self.revocation(connection, Revocation::Signal, now)
             }
+            // A probe may have moved it within the round (S1.4, S4.6).
             Issued::Unreachable => {
-                connection.fail(UnavailableCause::Dependency);
+                if active(connection) {
+                    connection.fail(UnavailableCause::Dependency);
+                }
                 Outcome::Done(Effects::default())
             }
         }
@@ -181,13 +174,11 @@ impl Credentials {
         signal: Signal,
         now: Instant,
     ) -> Outcome {
-        let Some(current) = self.current.filter(|c| c.id == credential) else {
+        let Some((_, round)) = self.current.filter(|(id, _)| *id == credential) else {
             return Outcome::Recheck;
         };
         match signal {
-            Signal::Revoked
-                if self.excepted(connection) && connection.is_current(current.round) =>
-            {
+            Signal::Revoked if self.excepted(connection) && connection.is_current(round) => {
                 self.rejected(connection)
             }
             Signal::Revoked => self.revocation(connection, Revocation::Signal, now),
@@ -220,10 +211,7 @@ impl Credentials {
     }
 
     fn adopt(&mut self, connection: &Connection) {
-        self.current = Some(Current {
-            id: CredentialId(self.next_credential),
-            round: connection.round(),
-        });
+        self.current = Some((CredentialId(self.next_credential), connection.round()));
         self.next_credential += 1;
     }
 
@@ -252,14 +240,13 @@ impl Credentials {
         self.revoked_before = true;
         self.current = None;
         let third = self.revocations.record(now);
-        let mut effects = Effects {
-            placeholder: true,
-            ..Effects::default()
-        };
         let Some(phase) = connection.phase() else {
-            return Outcome::Done(effects);
+            return Outcome::Done(Effects {
+                invalidation: None,
+                placeholder: true,
+            });
         };
-        effects.invalidation = Some(connection.invalidate());
+        let invalidation = Some(connection.invalidate());
         match (kind, phase) {
             _ if third => connection.fail(UnavailableCause::AccessRevoked),
             (Revocation::Narrowing, ConnectionPhase::Unavailable(cause))
@@ -271,7 +258,20 @@ impl Credentials {
                 connection.start_loading();
             }
         }
-        Outcome::Done(effects)
+        Outcome::Done(Effects {
+            invalidation,
+            placeholder: true,
+        })
+    }
+}
+
+/// The connection phase, and in `unavailable` only a reason that retries by
+/// itself.
+fn active(connection: &Connection) -> bool {
+    match connection.phase() {
+        Some(ConnectionPhase::Unavailable(cause)) => cause.retries_automatically(),
+        Some(_) => true,
+        None => false,
     }
 }
 

@@ -85,6 +85,10 @@ fn an_issuance_counts_only_in_its_round_and_one_goes_out_at_a_time() {
         Outcome::Ignored
     );
     assert_eq!(credentials.current(), Some(adopted));
+    // With a change pending persistence, nothing is issued.
+    let (mut pending, mut fresh) = loading(true, false);
+    pending.invalidate();
+    assert_eq!(fresh.issue(&pending), None);
     // With a credential, or outside `loading`, nothing is issued.
     assert_eq!(credentials.issue(&connection), None);
     connection.leave();
@@ -210,6 +214,14 @@ fn the_third_revocation_within_ten_minutes_stops_issuing_again() {
         start + Duration::from_secs(600),
     );
     assert_eq!(connection.phase(), Some(Loading));
+    // Events outside the connection phase count too.
+    let (mut connection, mut credentials, _) = ready(start);
+    connection.leave();
+    credentials.revoke(&mut connection, start);
+    credentials.revoke(&mut connection, start + Duration::from_secs(60));
+    connection.start_loading();
+    credentials.narrow(&mut connection, start + Duration::from_secs(120));
+    assert_eq!(connection.phase(), Some(Unavailable(U::AccessRevoked)));
 }
 
 #[test]
@@ -304,6 +316,15 @@ fn an_unreachable_issuer_is_dependency_and_another_principal_is_handed_back() {
     );
     assert_eq!(connection.phase(), Some(Unavailable(U::Dependency)));
     assert_eq!(connection.gate().reported(), 1);
+    // No issuance until the binding is `loading` again.
+    assert_eq!(credentials.issue(&connection), None);
+    // Late, after a probe found the binding incompatible within the round:
+    // that reason stays.
+    let (mut connection, mut credentials) = loading(true, false);
+    let ticket = credentials.issue(&connection).unwrap();
+    probed(&mut connection, Probe::Incompatible);
+    credentials.issued(&mut connection, ticket, Issued::Unreachable, now);
+    assert_eq!(connection.phase(), Some(Unavailable(U::Incompatible)));
     let (mut connection, mut credentials) = loading(true, false);
     let ticket = credentials.issue(&connection).unwrap();
     assert_eq!(
