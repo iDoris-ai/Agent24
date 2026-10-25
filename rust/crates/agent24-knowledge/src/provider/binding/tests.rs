@@ -461,3 +461,24 @@ fn a_sidecar_starting_retries_an_unavailable_binding_only() {
     assert_eq!(binding.sidecar(Sidecar::Starting), None);
     assert!(binding.connection().is_current(round));
 }
+
+#[test]
+fn back_in_loading_no_probe_goes_out_before_the_issuance() {
+    // #1229 P1: Off, persisted, On: `loading` without a credential; a probe
+    // racing the issuance would reach `ready` with nothing to send.
+    let mut binding = ready();
+    let off = binding.leave(Leave::Off);
+    persisted(&mut binding, &off);
+    binding.connect(CLEAR).unwrap();
+    assert_eq!(binding.credentials().current(), None);
+    assert_eq!(binding.probe(), None);
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    let (connection, credentials) = binding.parts_mut();
+    let ticket = credentials.issue(connection).unwrap();
+    let granted = Issued::Granted { narrowed: false };
+    credentials.issued(connection, ticket, granted, Instant::now());
+    let probe = binding.probe().unwrap();
+    binding.parts_mut().0.apply_probe(probe, READY);
+    assert_eq!(binding.connection().phase(), Some(Ready));
+    assert!(binding.credentials().current().is_some());
+}
