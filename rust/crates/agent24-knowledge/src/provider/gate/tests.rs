@@ -30,7 +30,11 @@ fn an_invalidation_closes_admission_and_drops_everything_in_flight_at_once() {
     let mut gate = Gate::new(4);
     let first = sending(&mut gate, "r1");
     let second = sending(&mut gate, "r2");
-    let (next, mut aborted) = gate.invalidate();
+    let Invalidation {
+        to_persist,
+        mut aborted,
+    } = gate.invalidate();
+    let next = to_persist.unwrap();
     aborted.sort_by_key(|c| c.0);
     assert_eq!(next, 5);
     assert_eq!(aborted, vec![first, second]);
@@ -58,7 +62,7 @@ fn an_invalidation_closes_admission_and_drops_everything_in_flight_at_once() {
 fn the_new_value_takes_effect_only_once_persisted_and_admission_reopens() {
     let mut gate = Gate::new(4);
     let call = sending(&mut gate, "r1");
-    let (next, _) = gate.invalidate();
+    let next = gate.invalidate().to_persist.unwrap();
     assert!(gate.confirm(next));
     assert_eq!(gate.generation(), 5);
     assert!(!gate.generation_pending());
@@ -78,8 +82,12 @@ fn the_new_value_takes_effect_only_once_persisted_and_admission_reopens() {
 #[test]
 fn increments_while_pending_stack_and_only_the_newest_takes_effect() {
     let mut gate = Gate::new(4);
-    let (first, _) = gate.invalidate();
-    let (second, aborted) = gate.invalidate();
+    let first = gate.invalidate().to_persist.unwrap();
+    let Invalidation {
+        to_persist,
+        aborted,
+    } = gate.invalidate();
+    let second = to_persist.unwrap();
     assert_eq!((first, second), (5, 6));
     assert!(aborted.is_empty());
     // The overtaken confirmation is ignored; admission stays closed.
@@ -100,7 +108,7 @@ fn a_restored_binding_admits_nothing_until_the_starts_increment_is_persisted() {
     assert_eq!(gate.reported(), 10);
     assert_eq!(gate.open_call(), Err(Closed));
     // An invalidation before that goes on from the pending value.
-    let (next, _) = gate.invalidate();
+    let next = gate.invalidate().to_persist.unwrap();
     assert_eq!(next, 11);
     assert!(gate.confirm(11));
     assert!(gate.open_call().is_ok());
@@ -139,4 +147,41 @@ fn a_result_is_appended_only_under_the_generation_it_was_admitted_with() {
     assert_eq!(gate.may_append(call), Ok(()));
     gate.invalidate();
     assert_eq!(gate.may_append(call), Err(Dropped::Cancelled));
+}
+
+#[test]
+fn a_generation_is_never_used_twice_so_an_exhausted_binding_stays_closed() {
+    // At the top: the invalidation still takes effect, but there is no value
+    // to persist and admission never reopens.
+    let mut gate = Gate::new(u64::MAX);
+    let call = sending(&mut gate, "r1");
+    let Invalidation {
+        to_persist,
+        aborted,
+    } = gate.invalidate();
+    assert_eq!(to_persist, None);
+    assert_eq!(aborted, vec![call]);
+    assert!(gate.exhausted());
+    assert!(!gate.admission_open());
+    assert_eq!(
+        gate.accept(call, "r1", Some(u64::MAX)),
+        Err(Dropped::Cancelled)
+    );
+    assert!(!gate.confirm(u64::MAX));
+    assert_eq!(gate.open_call(), Err(Closed));
+    // One below: the last value is pending, and the next invalidation leaves
+    // nothing, so not even that value's late confirmation reopens.
+    let mut gate = Gate::new(u64::MAX - 1);
+    assert_eq!(gate.invalidate().to_persist, Some(u64::MAX));
+    assert_eq!(gate.invalidate().to_persist, None);
+    assert!(!gate.confirm(u64::MAX));
+    assert!(!gate.admission_open());
+    assert_eq!(gate.invalidate().to_persist, None);
+    // Restored at the top: the start's increment has nowhere to go.
+    let mut gate = Gate::restored(u64::MAX);
+    assert!(gate.exhausted());
+    assert!(!gate.confirm(u64::MAX));
+    assert_eq!(gate.open_call(), Err(Closed));
+    // Short of the top nothing is exhausted.
+    assert!(!Gate::restored(u64::MAX - 1).exhausted());
 }

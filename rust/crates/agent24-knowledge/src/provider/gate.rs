@@ -36,12 +36,24 @@ struct Call {
     invalidated: bool,
 }
 
+/// What an invalidation asks of the caller.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Invalidation {
+    /// The value to persist; `None` once the generation is exhausted.
+    pub to_persist: Option<Generation>,
+    /// The calls to abort and answer with `cancelled`.
+    pub aborted: Vec<CallId>,
+}
+
 #[derive(Debug)]
 pub struct Gate {
     /// The value in effect: confirmed persisted.
     generation: Generation,
     /// The value waiting for its persistence to be confirmed.
     pending: Option<Generation>,
+    /// No greater value is left: a value is never used twice (S4.1, I4), so
+    /// admission stays closed for good.
+    exhausted: bool,
     calls: HashMap<CallId, Call>,
     next_call: u64,
 }
@@ -52,6 +64,7 @@ impl Gate {
         Self {
             generation: value,
             pending: None,
+            exhausted: false,
             calls: HashMap::new(),
             next_call: 0,
         }
@@ -61,8 +74,10 @@ impl Gate {
     /// (S4.2) must be persisted before anything is admitted. Persist
     /// [`Gate::reported`] and [`Gate::confirm`] it.
     pub fn restored(last: Generation) -> Self {
+        let next = last.checked_add(1);
         Self {
-            pending: Some(last.saturating_add(1)),
+            pending: next,
+            exhausted: next.is_none(),
             ..Self::new(last)
         }
     }
@@ -84,18 +99,27 @@ impl Gate {
         self.pending.is_some()
     }
 
-    /// No new call or sub-request is admitted while a change is pending.
+    /// No new call or sub-request is admitted while a change is pending, nor
+    /// ever again once the generation is exhausted.
     pub fn admission_open(&self) -> bool {
-        self.pending.is_none()
+        self.pending.is_none() && !self.exhausted
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// S4.5: in one step, close admission and mark every call in flight
     /// invalidated, so nothing goes out under the old value; the next value is
-    /// the one already pending plus one (S4.4). Returns the value to persist
-    /// and the calls to abort and answer with `cancelled`.
-    pub fn invalidate(&mut self) -> (Generation, Vec<CallId>) {
-        let next = self.reported().saturating_add(1);
-        self.pending = Some(next);
+    /// the one already pending plus one (S4.4). The invalidation takes effect
+    /// even when no greater value is left; the binding is then exhausted.
+    pub fn invalidate(&mut self) -> Invalidation {
+        // Once exhausted, the value reported is already `u64::MAX`.
+        let next = self.reported().checked_add(1);
+        match next {
+            Some(value) => self.pending = Some(value),
+            None => self.exhausted = true,
+        }
         let mut aborted = Vec::new();
         for (id, call) in &mut self.calls {
             if !call.invalidated {
@@ -103,7 +127,10 @@ impl Gate {
                 aborted.push(*id);
             }
         }
-        (next, aborted)
+        Invalidation {
+            to_persist: next,
+            aborted,
+        }
     }
 
     /// Persistence of `value` is confirmed. Only the newest pending value takes
@@ -111,7 +138,7 @@ impl Gate {
     /// (S4.4). A failed or unknown outcome is not reported: the value stays
     /// pending and admission closed.
     pub fn confirm(&mut self, value: Generation) -> bool {
-        if self.pending != Some(value) {
+        if self.exhausted || self.pending != Some(value) {
             return false;
         }
         self.generation = value;

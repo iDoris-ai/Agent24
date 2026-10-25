@@ -343,6 +343,32 @@ fn a_new_call_gets_the_first_row_of_the_table_that_holds() {
     });
     assert_eq!(admit_on(reverify, Search), refused(R::NotReady, true));
 
+    // Each row on its own, not hidden by a row above (PR-Daemon #1221 G-1):
+    // `persist_pending` on a binding that is not retired; the operation a
+    // `Degraded { servable: Read }` binding serves; a re-verification over a
+    // reason that does not retry; both switches on.
+    let pending = Target::Binding(Binding {
+        persist_pending: true,
+        ..bound(Ready)
+    });
+    assert_eq!(admit_on(pending, Search), refused(R::LocalStorage, false));
+    let read_only = Target::Binding(bound(Degraded { servable: Read }));
+    assert_eq!(admit_on(read_only, Read), Ok(()));
+    assert_eq!(admit_on(read_only, Search), refused(R::NotReady, true));
+    let reverify_revoked = Target::Binding(Binding {
+        reverify_pending: true,
+        ..bound(Unavailable(U::AccessRevoked))
+    });
+    assert_eq!(admit_on(reverify_revoked, Read), refused(R::NotReady, true));
+    let both = Switches {
+        off: true,
+        profile_disabled: true,
+    };
+    assert_eq!(
+        admit(both, ready, false, Search),
+        refused(R::KnowledgeOff, false)
+    );
+
     // Rows 7 and 8: the binding's own reason.
     for (cause, reason, retryable) in [
         (U::Dependency, R::Dependency, true),

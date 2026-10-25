@@ -71,8 +71,10 @@ pub enum Probe {
     /// readiness probe was sent.
     Incompatible,
     /// The readiness answer. `search_ready` and `read_ready` say whether that
-    /// operation's `state` is `ready`; any other value, known or not, is not
-    /// (R6.2). `ingest` and the per-KB readiness take no part.
+    /// operation's `state` is `ready`; any other value is not, an unknown one
+    /// included (R6.2), which whoever reads the response must decode as such:
+    /// [`Probe::answered`] only takes a decoded one. `ingest` and the per-KB
+    /// readiness take no part.
     Answered {
         live: bool,
         search_ready: bool,
