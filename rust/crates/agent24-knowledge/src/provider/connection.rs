@@ -1,7 +1,7 @@
 //! The connection part of one binding: its [`Gate`], its connection phase and
 //! the rounds probes belong to (CONTRACT-STATE-v1 S3.4, S1.12, S1.3). Pure
-//! state, like the gate; the events that move a binding in and out of the
-//! connection phase, and the credential events, come in the next slices.
+//! state, like the gate; the credential events are in `credential`, the
+//! events that move a binding in and out of the connection phase come next.
 
 use super::gate::{CallId, Closed, Gate, Invalidation};
 use super::state::{ConnectionPhase, Probe, UnavailableCause, judge_connection};
@@ -117,6 +117,15 @@ impl Connection {
     /// Whether `round` is the current one.
     pub fn is_current(&self, round: Round) -> bool {
         round == self.round
+    }
+
+    pub fn round(&self) -> Round {
+        self.round
+    }
+
+    /// S1.12: servable at least once, persisted or not yet.
+    pub fn ever_servable(&self) -> bool {
+        self.once_servable || self.once_servable_pending
     }
 
     /// Leaves the connection phase, ending the round: nothing sent in it

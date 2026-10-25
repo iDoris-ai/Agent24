@@ -236,3 +236,33 @@ fn a_result_arriving_while_a_change_is_pending_does_not_move_the_binding() {
     assert_eq!(connection.apply_probe(ticket, READY), ProbeApplied::Ignored);
     assert_eq!(connection.phase(), Some(Loading));
 }
+
+#[test]
+fn loading_waits_for_once_servable_even_after_leaving() {
+    let mut connection = loading(false);
+    let round = connection.start_loading().unwrap();
+    let ticket = connection.probe().unwrap();
+    assert_eq!(
+        connection.apply_probe(ticket, READY),
+        ProbeApplied::PersistOnceServable
+    );
+    // Waiting for the persistence ends the round.
+    assert!(!connection.is_current(round));
+    connection.leave();
+    assert_eq!(connection.start_loading(), None);
+    assert_eq!(connection.phase(), Some(Unavailable(U::LocalStorage)));
+    assert!(connection.confirm_once_servable().is_some());
+    assert_eq!(connection.phase(), Some(Loading));
+}
+
+#[test]
+fn the_same_probe_applies_once() {
+    let mut connection = loading(true);
+    let ticket = connection.probe().unwrap();
+    connection.apply_probe(ticket, READY);
+    assert_eq!(
+        connection.apply_probe(ticket, Probe::NoAnswer),
+        ProbeApplied::Ignored
+    );
+    assert_eq!(connection.phase(), Some(Ready));
+}
