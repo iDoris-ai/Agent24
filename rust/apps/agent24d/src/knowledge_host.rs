@@ -13,8 +13,12 @@
 //! its credential share one counter. The high-water mark outlives
 //! deactivation, so a change that arrives after a later one cannot undo it: a
 //! push overtaken by a revoke or a deactivation cannot bring the old C back.
+//! Every change but a push drops C, so C is there only while the newest change
+//! applied is the push that set it; a removal overtaken by a reactivation is
+//! refused, but the reactivation has already dropped C.
 //! A host that does not know whether a change landed sends the state it wants
-//! again under a new number.
+//! again under a new number. A binding whose mark reaches `u64::MAX` takes no
+//! further change until the daemon restarts.
 //!
 //! A binding id is the string axum's `Path` decodes from the URL, so `b1` and
 //! `%62%31` name the same binding. It is only ever a key in this map.
@@ -25,7 +29,7 @@ use std::sync::Mutex;
 
 use agent24_protocol::state_file::AuthMode;
 use axum::body::Body;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -77,6 +81,7 @@ struct Entry {
 /// A change that carries nothing but its sequence number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
+    /// Also drops the credential: the host pushes C again after activating.
     Activate,
     /// Also drops the credential.
     Deactivate,
@@ -110,7 +115,10 @@ impl KnowledgeHostRegistry {
     ) -> Result<(), ChangeError> {
         self.change(host, binding, seq, |entry| {
             match change {
-                Change::Activate => entry.active = true,
+                Change::Activate => {
+                    entry.active = true;
+                    entry.credential = None;
+                }
                 Change::Deactivate => {
                     entry.active = false;
                     entry.credential = None;
@@ -143,9 +151,9 @@ impl KnowledgeHostRegistry {
         })
     }
 
-    /// C of an active binding of `host`, unless it has expired by `now`. Only
-    /// an active binding holds one: a push needs the binding active, and
-    /// deactivation drops it.
+    /// C of an active binding of `host`, unless it has expired by `now`; an
+    /// expired C is dropped here. Only an active binding holds one: a push
+    /// needs the binding active, and deactivation drops it.
     // Consumed by run binding (PR-C) and the Provider (KB-C1-01).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn credential(
@@ -154,12 +162,16 @@ impl KnowledgeHostRegistry {
         binding: &str,
         now: UnixSeconds,
     ) -> Option<CurrentCredential> {
-        let entries = self.entries.lock().ok()?;
-        let entry = entries.get(&(host.to_owned(), binding.to_owned()))?;
-        entry
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.get_mut(&(host.to_owned(), binding.to_owned()))?;
+        if entry
             .credential
-            .clone()
-            .filter(|current| current.expires_at > now)
+            .as_ref()
+            .is_some_and(|current| current.expires_at <= now)
+        {
+            entry.credential = None;
+        }
+        entry.credential.clone()
     }
 
     /// Applies `apply` to a copy of the record and stores it only when `seq`
@@ -292,16 +304,21 @@ impl IntoResponse for Refused {
     }
 }
 
-/// The host making the request and the change's sequence number.
+/// The host making the request, the binding and the change's sequence number.
+/// An id that is not UTF-8 gets the same answer as any other malformed one.
 fn host_and_seq(
     state: &AppState,
     authorization: Option<Extension<Authorization>>,
-    binding_id: &str,
+    path: Result<Path<String>, PathRejection>,
     query: Result<Query<SeqQuery>, QueryRejection>,
-) -> Result<(String, u64), Refused> {
+) -> Result<(String, String, u64), Refused> {
     let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
-    match query {
-        Ok(Query(SeqQuery { seq })) if seq > 0 && valid_binding_id(binding_id) => Ok((host, seq)),
+    match (path, query) {
+        (Ok(Path(binding_id)), Ok(Query(SeqQuery { seq })))
+            if seq > 0 && valid_binding_id(&binding_id) =>
+        {
+            Ok((host, binding_id, seq))
+        }
         _ => Err(Refused::Malformed),
     }
 }
@@ -312,10 +329,10 @@ pub async fn change(
     State(state): State<AppState>,
     authorization: Option<Extension<Authorization>>,
     method: Method,
-    Path(binding_id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     query: Result<Query<SeqQuery>, QueryRejection>,
 ) -> Response {
-    let (host, seq) = match host_and_seq(&state, authorization, &binding_id, query) {
+    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
     };
@@ -333,10 +350,10 @@ pub async fn change(
 pub async fn revoke_credential(
     State(state): State<AppState>,
     authorization: Option<Extension<Authorization>>,
-    Path(binding_id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     query: Result<Query<SeqQuery>, QueryRejection>,
 ) -> Response {
-    let (host, seq) = match host_and_seq(&state, authorization, &binding_id, query) {
+    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
     };
@@ -367,11 +384,11 @@ struct CredentialBody {
 pub async fn push_credential(
     State(state): State<AppState>,
     authorization: Option<Extension<Authorization>>,
-    Path(binding_id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     query: Result<Query<SeqQuery>, QueryRejection>,
     req: Request<Body>,
 ) -> Response {
-    let (host, seq) = match host_and_seq(&state, authorization, &binding_id, query) {
+    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
         Ok(found) => found,
         Err(refused) => return refused.into_response(),
     };

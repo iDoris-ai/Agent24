@@ -252,6 +252,32 @@ fn a_credential_is_not_handed_out_once_it_has_expired() {
         .unwrap();
     assert!(registry.credential("host", "b1", expires_at - 1).is_some());
     assert_eq!(registry.credential("host", "b1", expires_at), None);
+    // Dropped, not merely hidden: an earlier clock does not see it again.
+    assert_eq!(registry.credential("host", "b1", expires_at - 1), None);
+}
+
+#[test]
+fn a_reactivation_that_overtakes_a_removal_does_not_keep_the_credential() {
+    let registry = KnowledgeHostRegistry::default();
+    let later = unix_now() + 600;
+    for (binding, removal) in [("b1", Change::Deactivate), ("b2", Change::RevokeCredential)] {
+        registry
+            .apply("host", binding, 1, Change::Activate)
+            .unwrap();
+        registry
+            .push_credential("host", binding, 2, bearer("c2"), later)
+            .unwrap();
+        // The host removed C (3) and then activated again (4); 4 arrives first.
+        registry
+            .apply("host", binding, 4, Change::Activate)
+            .unwrap();
+        assert_eq!(
+            registry.apply("host", binding, 3, removal),
+            Err(ChangeError::StaleSequence)
+        );
+        assert_eq!(registry.credential("host", binding, unix_now()), None);
+        assert_eq!(registry.record("host", binding), Some((true, 4)));
+    }
 }
 
 #[test]
@@ -379,6 +405,18 @@ async fn the_host_pushes_and_revokes_a_credential() {
     assert!(body.is_empty());
     assert_eq!(registry.credential(&host_id, "b1", unix_now()), None);
     assert!(registry.is_active(&host_id, "b1"));
+
+    // The longest C there may be.
+    let longest = "x".repeat(MAX_CREDENTIAL_BYTES);
+    let (status, _) = send(&router, put(5, credential_body(&longest, 600))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        registry
+            .credential(&host_id, "b1", unix_now())
+            .unwrap()
+            .credential,
+        bearer(&longest)
+    );
 }
 
 #[tokio::test]
@@ -524,6 +562,15 @@ async fn the_legacy_shared_token_is_refused() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
         assert!(body.contains("host_authority_required"));
     }
+    // Refused before the body is read: neither a malformed nor an oversized
+    // one gets further than the host check.
+    let oversized = " ".repeat(agent24_domain::http::MAX_BODY_BYTES + 1);
+    for payload in ["not json", oversized.as_str()] {
+        let req = with_body(Method::PUT, &format!("{CREDENTIAL}?seq=1"), &token, payload);
+        let (status, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("host_authority_required"));
+    }
     assert!(registry.is_empty());
 }
 
@@ -547,6 +594,8 @@ async fn a_malformed_request_changes_nothing() {
         "/api/v1/host/knowledge/bindings/b%01?seq=1".to_owned(),
         "/api/v1/host/knowledge/bindings/..%2F..%2Fx?seq=1".to_owned(),
         "/api/v1/host/knowledge/bindings/a%5Cb?seq=1".to_owned(),
+        // Not UTF-8 once decoded.
+        "/api/v1/host/knowledge/bindings/%C0%AF?seq=1".to_owned(),
     ] {
         let (status, body) = send(&router, request(Method::PUT, &path, &host)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
