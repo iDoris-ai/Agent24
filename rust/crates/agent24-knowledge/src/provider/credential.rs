@@ -112,8 +112,8 @@ pub struct Credentials {
     /// A revocation-class event since creation ends S3.1's exception for good.
     revoked_before: bool,
     /// The round renewing after an invalid-class response, the only one in
-    /// which "the renewal fails too" is judged, and only until the binding
-    /// is servable again; rounds never come back.
+    /// which "the renewal fails too" is judged. A round lasts until the next
+    /// `loading` or failure, through `ready` too (S3.4); rounds never come back.
     renewal: Option<Round>,
     revocations: Window,
     invalids: Window,
@@ -286,11 +286,9 @@ impl Credentials {
         Outcome::Done(Effects::default())
     }
 
-    /// Still renewing after an invalid-class response: its round, and not
-    /// servable since.
+    /// Still in the round renewing after an invalid-class response.
     fn renewing(&self, connection: &Connection) -> bool {
-        let servable = connection.phase().is_some_and(ConnectionPhase::is_servable);
-        self.renewal.is_some_and(|r| connection.is_current(r)) && !servable
+        self.renewal.is_some_and(|r| connection.is_current(r))
     }
 
     /// The renewal fails too: no increment, a placeholder for every KB; a
