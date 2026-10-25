@@ -49,6 +49,27 @@ impl Placeholder {
         }
     }
 
+    /// A placeholder taking over from an earlier one of the same profile:
+    /// attempts go on numbering from `next`, so an answer to an attempt of
+    /// the earlier one never counts.
+    pub fn following(next: u64) -> Self {
+        Self {
+            next,
+            ..Self::default()
+        }
+    }
+
+    /// The first number not handed out yet.
+    pub fn next(&self) -> u64 {
+        self.next
+    }
+
+    /// The identity it was trying changed: the attempt in flight no longer
+    /// counts.
+    pub fn cancel(&mut self) {
+        self.attempt = None;
+    }
+
     pub fn failure(&self) -> Option<PlaceholderFailure> {
         self.failure
     }

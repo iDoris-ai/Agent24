@@ -189,3 +189,81 @@ fn a_selection_on_the_placeholder_carries_over_to_the_binding() {
     profile.bind(connection, credentials);
     assert!(binding(&mut profile).connect(CLEAR).is_some());
 }
+
+#[test]
+fn logging_in_again_while_unselected_activates_nothing_but_still_lets_go() {
+    use crate::provider::credential::Outcome;
+    let mut profile = bound();
+    // Revoked, then refused: access_revoked, held once the binding leaves.
+    let (connection, credentials) = binding(&mut profile).parts_mut();
+    let Outcome::Done(revoked) = credentials.revoke(connection, Instant::now()) else {
+        unreachable!()
+    };
+    connection.confirm_generation(revoked.invalidation.unwrap().to_persist.unwrap());
+    let ticket = credentials.issue(connection).unwrap();
+    let refused = credentials.issued(connection, ticket, Issued::Refused, Instant::now());
+    let Outcome::Done(refused) = refused else {
+        unreachable!()
+    };
+    connection.confirm_generation(refused.invalidation.unwrap().to_persist.unwrap());
+    let unselect = profile.leave(Leave::Unselect);
+    let value = unselect.invalidation.unwrap().to_persist.unwrap();
+    binding(&mut profile)
+        .parts_mut()
+        .0
+        .confirm_generation(value);
+    profile.activate(Activation::Relogin);
+    assert_eq!(binding(&mut profile).connect(CLEAR), None);
+    assert_eq!(state(&profile), Some(ServiceState::Registered));
+    // Selected again: the login let access_revoked go.
+    profile.activate(Activation::Reselect);
+    assert!(binding(&mut profile).connect(CLEAR).is_some());
+    let phase = binding(&mut profile).connection().phase();
+    assert_eq!(phase, Some(ConnectionPhase::Loading));
+}
+
+fn placeholder(profile: &mut Profile) -> &mut Placeholder {
+    match profile.slot_mut() {
+        Slot::Placeholder(placeholder) => placeholder,
+        Slot::Bound(_) => panic!("bound"),
+    }
+}
+
+#[test]
+fn an_attempt_of_an_earlier_placeholder_never_counts_on_a_later_one() {
+    use crate::provider::placeholder::{Attempted, Settled};
+    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), true, None);
+    let first = placeholder(&mut profile).attempt();
+    let stale = placeholder(&mut profile).attempt();
+    assert_eq!(
+        placeholder(&mut profile).settle(stale, Attempted::Identified),
+        Settled::Create
+    );
+    let (connection, credentials) = parts(1);
+    assert!(profile.bind(connection, credentials));
+    profile.change_identity(IdentityChange::Endpoint).unwrap();
+    let fresh = placeholder(&mut profile).attempt();
+    assert_ne!(fresh, first);
+    assert_ne!(fresh, stale);
+    // Answers to the earlier placeholder's attempts arrive late.
+    for late in [first, stale] {
+        let settled = placeholder(&mut profile).settle(late, Attempted::Rejected);
+        assert_eq!(settled, Settled::Ignored);
+    }
+    assert_eq!(placeholder(&mut profile).failure(), None);
+    let settled = placeholder(&mut profile).settle(fresh, Attempted::Rejected);
+    assert_eq!(
+        settled,
+        Settled::Failed(PlaceholderFailure::CredentialRejected)
+    );
+}
+
+#[test]
+fn an_identity_change_on_the_placeholder_drops_the_attempt_in_flight() {
+    use crate::provider::placeholder::{Attempted, Settled};
+    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), true, None);
+    let attempt = placeholder(&mut profile).attempt();
+    assert!(profile.change_identity(IdentityChange::Endpoint).is_none());
+    let settled = placeholder(&mut profile).settle(attempt, Attempted::Identified);
+    assert_eq!(settled, Settled::Ignored);
+}

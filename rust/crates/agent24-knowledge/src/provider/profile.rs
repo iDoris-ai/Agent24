@@ -53,6 +53,9 @@ pub struct Profile {
     slot: Slot,
     selected: bool,
     confirmation: Option<Confirmation>,
+    /// Where the placeholder after the binding numbers its attempts from, so
+    /// the earlier placeholder's never count there (S2.5).
+    next_attempt: u64,
 }
 
 impl Profile {
@@ -61,6 +64,7 @@ impl Profile {
             slot,
             selected,
             confirmation,
+            next_attempt: 0,
         }
     }
 
@@ -100,13 +104,16 @@ impl Profile {
     }
 
     /// Selected again or logged in again; the binding is activated only when
-    /// nothing awaits confirmation (S1.13).
+    /// selected with nothing awaiting confirmation (S1.2, S1.13).
     pub fn activate(&mut self, how: Activation) {
         if how == Activation::Reselect {
             self.selected = true;
         }
-        if let (Slot::Bound(binding), None) = (&mut self.slot, self.confirmation) {
-            binding.activate(how);
+        let ready = self.selected && self.confirmation.is_none();
+        match &mut self.slot {
+            Slot::Bound(binding) if ready => binding.activate(how),
+            Slot::Bound(binding) if how == Activation::Relogin => binding.relogin(),
+            Slot::Bound(_) | Slot::Placeholder(_) => {}
         }
     }
 
@@ -120,13 +127,15 @@ impl Profile {
 
     /// S3.5: the binding is retired (invalidated if in the connection phase,
     /// placeholders in any state) and the profile is a placeholder again.
-    /// `None` without a binding.
+    /// `None` without a binding; a placeholder's attempt in flight no longer
+    /// counts.
     pub fn change_identity(&mut self, change: IdentityChange) -> Option<Retired> {
-        let fresh = Slot::Placeholder(Placeholder::new(None));
+        let fresh = Slot::Placeholder(Placeholder::following(self.next_attempt));
         let mut binding = match std::mem::replace(&mut self.slot, fresh) {
             Slot::Bound(binding) => binding,
-            placeholder => {
-                self.slot = placeholder;
+            Slot::Placeholder(mut placeholder) => {
+                placeholder.cancel();
+                self.slot = Slot::Placeholder(placeholder);
                 return None;
             }
         };
@@ -146,9 +155,13 @@ impl Profile {
     /// under `UnsavedSettings`, which only the host's confirmation clears.
     pub fn bind(&mut self, connection: Connection, credentials: Credentials) -> bool {
         let unsaved = self.confirmation == Some(Confirmation::UnsavedSettings);
-        if unsaved || matches!(self.slot, Slot::Bound(_)) {
+        let Slot::Placeholder(placeholder) = &self.slot else {
+            return false;
+        };
+        if unsaved {
             return false;
         }
+        self.next_attempt = placeholder.next();
         let activated = self.selected && self.confirmation.is_none();
         self.slot = Slot::Bound(Box::new(BindingState::new(
             connection,
