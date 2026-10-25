@@ -22,11 +22,41 @@ function thaiBlock(source: string): string {
   return lines.slice(start, end < 0 ? undefined : end + 1).join('\n')
 }
 
-// Every `key: 'value'` pair in a th block (key may be quoted; several pairs can share one line).
+// One `key: value` pair. Key: 'quoted' (any characters, so `a-b` and `a:b` work), "quoted" or a bare word.
+// Value: 'single', "double" or `backtick` quotes. Several pairs can share one line.
+const ENTRY =
+  /\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|([\w.]+))\s*:\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`)\s*,?/y
+
+// Parse the body lines of a th block (not the `th: {` line or the closing brace). `rest` is whatever
+// on a line could not be read as an entry; blank lines and `//` comments are fine.
+function parseThaiBlock(source: string): { entries: Array<{ key: string; value: string }>; unparsed: Array<{ line: number; text: string }> } {
+  const entries: Array<{ key: string; value: string }> = []
+  const unparsed: Array<{ line: number; text: string }> = []
+  const lines = thaiBlock(source).split('\n')
+  const closed = lines.length > 1 && /^ {2}\}/.test(lines[lines.length - 1])
+  for (let i = 1; i < (closed ? lines.length - 1 : lines.length); i++) {
+    const text = lines[i]
+    let pos = 0
+    for (;;) {
+      ENTRY.lastIndex = pos // sticky: a failed match resets lastIndex, so keep our own position
+      const m = ENTRY.exec(text)
+      if (!m) break
+      entries.push({ key: m[1] ?? m[2] ?? m[3], value: m[4] ?? m[5] ?? m[6] })
+      pos = ENTRY.lastIndex
+    }
+    const rest = text.slice(pos).trim()
+    if (rest !== '' && !rest.startsWith('//')) unparsed.push({ line: i + 1, text: text.trim() })
+  }
+  return { entries, unparsed }
+}
+
 function thaiEntries(source: string): Array<{ key: string; value: string }> {
-  const out: Array<{ key: string; value: string }> = []
-  for (const m of thaiBlock(source).matchAll(/'?([\w.]+)'?:\s*'((?:[^'\\]|\\.)*)'/g)) out.push({ key: m[1], value: m[2] })
-  return out
+  return parseThaiBlock(source).entries
+}
+
+// Lines in a th block that look like entries but could not be read (line numbers count from the `th: {` line).
+function thaiUnparsed(source: string): Array<{ line: number; text: string }> {
+  return parseThaiBlock(source).unparsed
 }
 
 function thaiValue(file: string, key: string): string | undefined {
@@ -69,6 +99,40 @@ describe('Thai UI copy', () => {
       expect(hits).toEqual([])
     })
   }
+
+  // The parser must not silently skip entries (OA-M1-07, answers review of #1175, Low 2).
+  it('parser reads dash and colon keys and single, double and backtick values', () => {
+    const src = [
+      '  th: {',
+      "    'nav.modules-manager': 'โมดูล', \"a:b\": \"ค่า\",",
+      '    plain: `ข้อความ`,',
+      "    // a comment",
+      "    'it': 'it\\'s ok',",
+      '  },',
+    ].join('\n')
+    expect(thaiEntries(src)).toEqual([
+      { key: 'nav.modules-manager', value: 'โมดูล' },
+      { key: 'a:b', value: 'ค่า' },
+      { key: 'plain', value: 'ข้อความ' },
+      { key: 'it', value: "it\\'s ok" },
+    ])
+    expect(thaiUnparsed(src)).toEqual([])
+  })
+
+  it('parser reports a th line it cannot read (so the gap cannot come back)', () => {
+    const src = ['  th: {', "    'a': 'ok',", "    'b': 'first half'", "      + 'second half',", '    c: someVariable,', '  },'].join('\n')
+    expect(thaiUnparsed(src).map((u) => u.line)).toEqual([4, 5])
+  })
+
+  it('reads every th entry in the real files, none left unparsed', () => {
+    const left: string[] = []
+    for (const file of files) {
+      for (const u of thaiUnparsed(readFileSync(file, 'utf8'))) left.push(`${file.slice(RENDERER_DIR.length + 1)}:${u.line} ${u.text.slice(0, 60)}`)
+    }
+    expect(left).toEqual([])
+    expect(thaiValue('App.i18n.ts', 'nav.modules-manager')).toBeTruthy()
+    expect(thaiValue('pages/ModulesManager.i18n.ts', 'tier.third-party')).toBeTruthy()
+  })
 
   it('App menu names match the page names', () => {
     expect(thaiValue('App.i18n.ts', 'nav.schedules')).toBe('กำหนดการ')
