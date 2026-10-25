@@ -15,8 +15,8 @@ fn ready_response(live: bool, search: &str, read: &str) -> ReadyResponse {
     .unwrap()
 }
 
-fn answered(compatible: bool, ready: &ReadyResponse) -> ConnectionPhase {
-    judge_connection(Probe::Answered { compatible, ready })
+fn answered(ready: &ReadyResponse) -> ConnectionPhase {
+    judge_connection(Probe::answered(ready))
 }
 
 fn bound(phase: ConnectionPhase) -> Binding {
@@ -54,35 +54,57 @@ fn refused(reason: LocalReason, retryable: bool) -> Result<(), Refusal> {
 fn the_connection_phase_follows_capabilities_liveness_and_search_and_read_only() {
     use ConnectionPhase::{Degraded, Unavailable};
     use UnavailableCause as U;
-    let both = ready_response(true, "ready", "ready");
-    assert_eq!(answered(true, &both), ConnectionPhase::Ready);
     assert_eq!(
-        answered(true, &ready_response(true, "ready", "not_ready")),
+        answered(&ready_response(true, "ready", "ready")),
+        ConnectionPhase::Ready
+    );
+    assert_eq!(
+        answered(&ready_response(true, "ready", "not_ready")),
         Degraded { servable: Search }
     );
     assert_eq!(
-        answered(true, &ready_response(true, "disabled", "ready")),
+        answered(&ready_response(true, "disabled", "ready")),
         Degraded { servable: Read }
     );
     assert_eq!(
-        answered(true, &ready_response(true, "not_ready", "disabled")),
+        answered(&ready_response(true, "not_ready", "disabled")),
         Unavailable(U::NotReady)
     );
     // Not live is a dependency, whatever the operations say.
     assert_eq!(
-        answered(true, &ready_response(false, "ready", "ready")),
+        answered(&ready_response(false, "ready", "ready")),
         Unavailable(U::Dependency)
     );
-    // Incompatible comes first: it does not retry by itself.
+    // Incompatible is known before any readiness answer (R9.4).
     assert_eq!(
-        answered(false, &ready_response(false, "ready", "ready")),
+        judge_connection(Probe::Incompatible),
         Unavailable(U::Incompatible)
     );
-    assert_eq!(answered(false, &both), Unavailable(U::Incompatible));
     assert_eq!(
         judge_connection(Probe::NoAnswer),
         Unavailable(U::Dependency)
     );
+    // A state the decoder did not know arrives as not ready (R6.2).
+    let unknown_read = Probe::Answered {
+        live: true,
+        search_ready: true,
+        read_ready: false,
+    };
+    assert_eq!(
+        judge_connection(unknown_read),
+        Degraded { servable: Search }
+    );
+    // `ingest` and the per-KB readiness are not read.
+    let mut ready = ready_response(true, "ready", "ready");
+    ready.knowledge_bases = Some(
+        serde_json::from_value(serde_json::json!([
+            { "knowledge_base_id": "kb1", "score_space": "s1",
+              "search": { "state": "not_ready", "reason": "index_building" },
+              "read": { "state": "not_ready", "reason": "index_building" } }
+        ]))
+        .unwrap(),
+    );
+    assert_eq!(answered(&ready), ConnectionPhase::Ready);
 }
 
 #[test]

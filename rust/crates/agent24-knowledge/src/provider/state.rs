@@ -62,34 +62,48 @@ impl ConnectionPhase {
     }
 }
 
-/// What a probe of the connection came back with (S1.3): capability discovery
-/// and a `knowledge.ready` without a scope.
-#[derive(Clone, Copy, Debug)]
-pub enum Probe<'a> {
+/// What capability discovery and an unscoped `knowledge.ready` gave (S1.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
     /// Unreachable, or no answer in time.
     NoAnswer,
-    /// `compatible` is the capability judgement (R9.4), made by the caller.
+    /// Capability discovery judged the server incompatible (R9.4), so no
+    /// readiness probe was sent.
+    Incompatible,
+    /// The readiness answer. `search_ready` and `read_ready` say whether that
+    /// operation's `state` is `ready`; any other value, known or not, is not
+    /// (R6.2). `ingest` and the per-KB readiness take no part.
     Answered {
-        compatible: bool,
-        ready: &'a ReadyResponse,
+        live: bool,
+        search_ready: bool,
+        read_ready: bool,
     },
 }
 
-/// The connection phase a probe leads to (S1.3). A per-KB readiness
-/// (`knowledge_bases`) never changes it, and neither does `ingest`.
-pub fn judge_connection(probe: Probe<'_>) -> ConnectionPhase {
-    let (compatible, ready) = match probe {
-        Probe::NoAnswer => return ConnectionPhase::Unavailable(UnavailableCause::Dependency),
-        Probe::Answered { compatible, ready } => (compatible, ready),
+impl Probe {
+    /// The readiness answer of a compatible server.
+    pub fn answered(ready: &ReadyResponse) -> Self {
+        Self::Answered {
+            live: ready.live,
+            search_ready: ready.operations.search.state == OperationStatus::Ready,
+            read_ready: ready.operations.read.state == OperationStatus::Ready,
+        }
+    }
+}
+
+/// The connection phase a probe leads to (S1.3).
+pub fn judge_connection(probe: Probe) -> ConnectionPhase {
+    use UnavailableCause as U;
+    let (search, read) = match probe {
+        Probe::NoAnswer => return ConnectionPhase::Unavailable(U::Dependency),
+        Probe::Incompatible => return ConnectionPhase::Unavailable(U::Incompatible),
+        Probe::Answered { live: false, .. } => return ConnectionPhase::Unavailable(U::Dependency),
+        Probe::Answered {
+            search_ready,
+            read_ready,
+            ..
+        } => (search_ready, read_ready),
     };
-    if !compatible {
-        return ConnectionPhase::Unavailable(UnavailableCause::Incompatible);
-    }
-    if !ready.live {
-        return ConnectionPhase::Unavailable(UnavailableCause::Dependency);
-    }
-    let search = ready.operations.search.state == OperationStatus::Ready;
-    let read = ready.operations.read.state == OperationStatus::Ready;
     match (search, read) {
         (true, true) => ConnectionPhase::Ready,
         (true, false) => ConnectionPhase::Degraded {
@@ -98,7 +112,7 @@ pub fn judge_connection(probe: Probe<'_>) -> ConnectionPhase {
         (false, true) => ConnectionPhase::Degraded {
             servable: DataOperation::Read,
         },
-        (false, false) => ConnectionPhase::Unavailable(UnavailableCause::NotReady),
+        (false, false) => ConnectionPhase::Unavailable(U::NotReady),
     }
 }
 
@@ -268,8 +282,7 @@ pub fn admit(
             UnavailableCause::CredentialRejected => refuse(R::CredentialRejected, false),
             UnavailableCause::AccessRevoked => refuse(R::AccessRevoked, false),
             UnavailableCause::InstanceUnidentified => refuse(R::InstanceUnidentified, false),
-            // Not a row of its own: `local_storage` is the state of a binding
-            // whose loosening is not yet persisted, so it gets that row's answer.
+            // No row of its own: a loosening not yet persisted, as in row 2.
             UnavailableCause::LocalStorage => refuse(R::LocalStorage, false),
         },
     }
