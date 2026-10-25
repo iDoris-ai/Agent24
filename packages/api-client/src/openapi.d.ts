@@ -451,6 +451,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/peer/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List runs as a peer bridge may relay them
+         * @description K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
+         *     runs here instead of /runs. A run's prompt, output and error appear
+         *     only when every source tagged on it is ordinary, it has ended, and —
+         *     while tool results carry no source tags — it cannot have taken one in:
+         *     it called no tool, recalled no memory, was not started by a
+         *     kernel-created schedule, and has no session context (no session, or it
+         *     ran, and the daemon runs, without session memory). Any other run
+         *     carries only its id,
+         *     status and a fixed notice.
+         */
+        get: operations["listPeerRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/peer/runs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one run as a peer bridge may relay it */
+        get: operations["getPeerRun"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/approvals": {
         parameters: {
             query?: never;
@@ -1485,6 +1530,31 @@ export interface components {
             started_at: string | null;
             /** Format: date-time */
             ended_at: string | null;
+        };
+        /**
+         * @description K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
+         *     filtered Run, so a field added to Run later is not relayed by default.
+         */
+        PeerRun: {
+            id: string;
+            status: components["schemas"]["RunStatus"];
+            /**
+             * @description True unless every source tagged on the run so far is ordinary and
+             *     the run called no tool, recalled no memory, was not started by a
+             *     kernel-created schedule and has no session context. Sources are
+             *     tagged before the first model call, so afterwards the value only
+             *     changes when the run starts a tool or the daemon restarts with
+             *     session memory turned on or off.
+             */
+            withheld: boolean;
+            /** @description Present only for an ended run that is not withheld */
+            prompt: string | null;
+            /** @description Present only for a completed run that is not withheld */
+            output: components["schemas"]["RunOutput"] | null;
+            /** @description Present only for a failed run that is not withheld */
+            error: components["schemas"]["ErrorBody"] | null;
+            /** @description Fixed explanation, present exactly when withheld is true */
+            notice: string | null;
         };
         RunCreate: {
             /** @description Omit/null to create a transient run */
@@ -3687,6 +3757,51 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Run"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listPeerRuns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Peer run list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        runs: components["schemas"]["PeerRun"][];
+                    };
+                };
+            };
+        };
+    };
+    getPeerRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Peer run */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PeerRun"];
                 };
             };
             404: components["responses"]["NotFound"];
