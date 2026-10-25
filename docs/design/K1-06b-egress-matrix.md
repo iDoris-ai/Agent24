@@ -101,7 +101,14 @@
    - `agent24_run` 把 run 的最终输出交给外部 MCP 对端；
    - `agent24_list_runs` 返回所有 run 的 prompt 和输出；
    - 不按来源分类过滤。
-   对端可能把内容转发给它自己的云模型。§2.4 第 2 条点名了「MCP client/server 工具」。要不要把它当出口、怎么处理（过滤、拒绝，还是视为用户直接操作），**待 David 定**，在 6b.5c 之前定下来。
+   对端可能把内容转发给它自己的云模型。§2.4 第 2 条点名了「MCP client/server 工具」。
+   **David 2026-10-25 定：视为出口，按分类过滤**（Claude、Codex、Fable 三方都选这一项）。在 6b.5c 实现，要求如下：
+   - 内核权威分类为 Ordinary 的 run，照常返回文本。
+   - Restricted、Unknown 或分类读不出来时，只返回状态和固定提示；`agent24_list_runs` 不给这些 run 的 prompt 和输出。
+   - 错误消息同样过滤。
+   - 分类可能在 run 中途因召回而收紧，所以 ACP 的流式增量要等分类确定后再放行，或者每段增量按当时的分类判定，不能先流出去再检查。
+   - 内核要把 run 的分类暴露给桥（一个字段或一个按分类过滤的端点）。
+   - 测试要覆盖：分类中途变化、分类缺失、受限内容不外泄。
 4. **Hyphae `/comm/send`**：只能由用户经 REST 直接调用，没有 Tool 包装，也不带 run 资料。视为用户直接操作，不在 agent 出口矩阵内。
 
 ## 7. 后续切片
@@ -109,6 +116,6 @@
 | 片 | 补什么 |
 |---|---|
 | 6b.5b 模型类 | REST chat 远端桩 (a)；Guardian 接 router 加远端桩 (a)；子 agent 两个读失败分支 (b)；provider 目的地未知 (b)；模型发现 (a)(b)(c)；router 层三元组逐项负例 (c)；`task_profile_for_run` 读失败加远端桩 (b) |
-| 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用和逐项不匹配负例；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；§6 第 3 条定下来以后的处理 |
+| 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用和逐项不匹配负例；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3 条，可能要拆成单独一片） |
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
 | 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§6 第 2 条已接、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
