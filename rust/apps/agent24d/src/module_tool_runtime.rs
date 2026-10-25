@@ -1196,11 +1196,13 @@ mod tests {
         let told = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let answer = Arc::new(std::sync::Mutex::new(axum::http::StatusCode::OK));
         let body_released = Arc::new(tokio::sync::Notify::new());
+        let head_written = Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new().route(
             "/api/v1/fake_module/_a24/authorization/revoked",
             axum::routing::post({
                 let (told, answer) = (Arc::clone(&told), Arc::clone(&answer));
                 let body_released = Arc::clone(&body_released);
+                let head_written = Arc::clone(&head_written);
                 move |axum::Json(body): axum::Json<Value>| async move {
                     told.lock().unwrap().push(body);
                     let status = *answer.lock().unwrap();
@@ -1209,8 +1211,11 @@ mod tests {
                     }
                     if status == axum::http::StatusCode::CREATED {
                         // The head goes out at once, the body only once the
-                        // test lets it.
+                        // test lets it. The body is first asked for once the
+                        // head is written, and it is flushed while the body
+                        // waits.
                         let body = futures::stream::once(async move {
+                            head_written.notify_one();
                             body_released.notified().await;
                             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
                         });
@@ -1326,17 +1331,17 @@ mod tests {
         );
         assert!(generation.ready());
         *answer.lock().unwrap() = axum::http::StatusCode::CREATED;
-        let before = told.lock().unwrap().len();
         let waiting = tokio::spawn({
             let (runtime, end) = (Arc::clone(&runtime), told_refs.clone());
             async move { runtime.notify_revoked(&end, Duration::from_secs(30)).await }
         });
-        while told.lock().unwrap().len() == before {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // The head is on its way once the module has it; give it time to
-        // land. The body is held until after the answer, so only the head
-        // can have confirmed it.
+        // Written by the module (#1231 PR-Daemon L6): the time given is for
+        // the kernel to read a head already sent, not for the module to send
+        // it. The body is held until after the answer, so only the head can
+        // have confirmed it.
+        tokio::time::timeout(Duration::from_secs(5), head_written.notified())
+            .await
+            .expect("the module writes the head");
         tokio::time::sleep(Duration::from_millis(300)).await;
         let draining = std::time::Instant::now();
         assert!(generation.begin_drain(draining, Duration::from_secs(30)));
