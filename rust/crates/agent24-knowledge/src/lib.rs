@@ -15,7 +15,7 @@
 //!   back, the server ignores the value).
 //!
 //! For the transport, its HTTP implementation and the Mock, see `transport.rs`,
-//! `http.rs` and `mock.rs`.
+//! `http.rs` and `mock.rs`; for the Provider's state, `provider/` (KB-C1-04).
 
 mod capabilities;
 mod common;
@@ -23,6 +23,7 @@ mod error;
 mod http;
 mod local_cancelled;
 mod mock;
+pub mod provider;
 mod read;
 mod ready;
 mod search;
