@@ -824,6 +824,26 @@ impl RunManager {
         create: RunCreate,
         schedule_id: Option<String>,
     ) -> Result<Run, AgentError> {
+        self.start_run_inner(create, schedule_id, |_| {}).await
+    }
+
+    /// As [`start_run`], with `before_execute` called once the run is stored
+    /// and before it starts executing, so whatever it records about the run
+    /// is there before the run's first step.
+    pub async fn start_run_then(
+        self: &Arc<Self>,
+        create: RunCreate,
+        before_execute: impl FnOnce(&Run),
+    ) -> Result<Run, AgentError> {
+        self.start_run_inner(create, None, before_execute).await
+    }
+
+    async fn start_run_inner(
+        self: &Arc<Self>,
+        create: RunCreate,
+        schedule_id: Option<String>,
+        before_execute: impl FnOnce(&Run),
+    ) -> Result<Run, AgentError> {
         if let Some(session_id) = &create.session_id
             && self.store.get_session(session_id).await?.is_none()
         {
@@ -867,6 +887,7 @@ impl RunManager {
             self.cancels.lock().await.remove(&run.id);
             return Err(err);
         }
+        before_execute(&run);
 
         // Supervised execution: execute() runs in its OWN task whose join
         // result is observed. A panic anywhere in the execution path (the

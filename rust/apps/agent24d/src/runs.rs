@@ -187,9 +187,8 @@ pub async fn create_run(
             "prompt is required",
         );
     }
-    // Checked before the run exists, pinned right after `start_run` returns.
-    // The run already executes by then; a Knowledge tool reached before the
-    // pin (only an instant model could) is refused as stale, the safe side.
+    // Checked before the run exists, pinned once it is stored and before it
+    // executes, so its first Knowledge tool call already finds the pin.
     let binding = match create.knowledge_binding_id.as_deref() {
         None => None,
         Some(id) => match crate::knowledge_host::bind_run(&state, authorization, id) {
@@ -197,13 +196,17 @@ pub async fn create_run(
             Err(refused) => return refused.into_response(),
         },
     };
-    match state.runs.start_run(create).await {
-        Ok(run) => {
+    let pins = &state.knowledge_host;
+    let started = state
+        .runs
+        .start_run_then(create, |run| {
             if let Some(binding) = binding {
-                state.knowledge_host.pin_run(&run.id, binding);
+                pins.pin_run(&run.id, binding);
             }
-            (StatusCode::ACCEPTED, Json(run)).into_response()
-        }
+        })
+        .await;
+    match started {
+        Ok(run) => (StatusCode::ACCEPTED, Json(run)).into_response(),
         Err(err) => map_agent_error(err),
     }
 }
