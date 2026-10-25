@@ -1,8 +1,10 @@
 //! The host-side KnowledgeProvider (KB-C1-04, CONTRACT-STATE-v1), built up in
 //! slices: the state judgements (`state`), one binding's generation and calls
-//! in flight (`gate`), its connection phase and probe rounds (`connection`)
-//! and its credentials (`credential`); events and persistence follow.
+//! in flight (`gate`), its connection phase and probe rounds (`connection`),
+//! its credentials (`credential`) and the binding as a whole with its user and
+//! configuration events (`binding`); identity changes and persistence follow.
 
+pub mod binding;
 pub mod connection;
 pub mod credential;
 pub mod gate;
