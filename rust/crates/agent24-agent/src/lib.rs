@@ -4061,6 +4061,100 @@ pub(crate) mod tests {
         assert!(matches!(err, AgentError::SessionNotFound(_)));
     }
 
+    /// Notes, on its first call, what `before_execute` had recorded by then.
+    struct FirstStepProvider {
+        noted: Arc<StdMutex<Option<String>>>,
+        at_first_step: StdMutex<Option<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for FirstStepProvider {
+        fn name(&self) -> &str {
+            "first-step"
+        }
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            let noted = self.noted.lock().unwrap().clone();
+            self.at_first_step.lock().unwrap().get_or_insert(noted);
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: usage_one(),
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn before_execute_is_done_before_the_run_takes_its_first_step() {
+        let noted = Arc::new(StdMutex::new(None));
+        let provider = Arc::new(FirstStepProvider {
+            noted: noted.clone(),
+            at_first_step: StdMutex::new(None),
+        });
+        let (manager, _sink, store) = manager_with(provider.clone()).await;
+        let run = manager
+            .start_run_then(create(), |run| {
+                // Slow on purpose: a run already executing would reach the
+                // model on the other worker meanwhile and find nothing noted.
+                std::thread::sleep(Duration::from_millis(300));
+                *noted.lock().unwrap() = Some(run.id.clone());
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&store, &run.id).await.status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            *provider.at_first_step.lock().unwrap(),
+            Some(Some(run.id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn before_execute_is_not_called_for_a_run_that_was_not_created() {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let mut called = false;
+        let err = manager
+            .start_run_then(
+                RunCreate {
+                    session_id: Some("sess_nope".to_owned()),
+                    ..create()
+                },
+                |_| called = true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::SessionNotFound(_)));
+        assert!(!called);
+        // Nor for one its workspace does not admit: the run was never stored.
+        let err = manager
+            .start_run_then(
+                RunCreate {
+                    workspace_id: Some(
+                        agent24_protocol::WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5")
+                            .unwrap(),
+                    ),
+                    ..create()
+                },
+                |_| called = true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::WorkspaceAdmission(_)), "{err:?}");
+        assert!(!called);
+        assert!(store.list_runs(None).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn panicking_provider_still_lands_a_terminal_state() {
         // review #36: a panic in the execution path must not wedge the run
