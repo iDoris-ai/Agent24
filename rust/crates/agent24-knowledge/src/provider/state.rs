@@ -185,6 +185,37 @@ pub fn derive(switches: Switches, target: Target) -> Option<ServiceState> {
     })
 }
 
+/// A READONLY request kind the Provider may be about to send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outgoing {
+    /// Capability discovery or a readiness probe.
+    Probe,
+    Data(DataOperation),
+}
+
+/// S1.5: only a servable state sends `search` or `read`; `loading` and an
+/// `unavailable` that retries by itself send only probes; nothing else sends.
+/// This is about the binding's state; whether a given call may go out is
+/// [`admit`], which every dispatch checks.
+pub fn may_send(switches: Switches, target: Target, outgoing: Outgoing) -> bool {
+    let Target::Binding(binding) = target else {
+        return false;
+    };
+    if binding.persist_pending {
+        return false;
+    }
+    match (derive(switches, target), outgoing) {
+        (Some(ServiceState::Connected(phase)), Outgoing::Data(op)) => phase.serves(op),
+        (Some(ServiceState::Connected(phase)), Outgoing::Probe) => match phase {
+            ConnectionPhase::Unavailable(cause) => cause.retries_automatically(),
+            ConnectionPhase::Loading
+            | ConnectionPhase::Ready
+            | ConnectionPhase::Degraded { .. } => true,
+        },
+        _ => false,
+    }
+}
+
 /// The `reason` of a Provider-local `unavailable` (§6, S6.1): the local set
 /// plus the two READONLY reasons the table reuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
