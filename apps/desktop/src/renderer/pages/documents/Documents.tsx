@@ -35,8 +35,11 @@ export default function DocumentsPage() {
   const [listError, setListError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
   const [open, setOpen] = useState<string | null>(null)
-  // The title that opened the details, given focus back when they close.
+  // The title that opened the details, given focus back when they close;
+  // the page's title if a reload has since taken its row away (a document
+  // from a later page is not on the new first one).
   const opener = useRef<HTMLButtonElement | null>(null)
+  const pageTitle = useRef<HTMLDivElement>(null)
   // Each reload starts a new generation; a reply from an older one (or from
   // an unmounted page) is dropped, so pages never mix or repeat.
   const generation = useRef(0)
@@ -106,7 +109,7 @@ export default function DocumentsPage() {
   const { importing, progress, job, error } = imp
   return (
     <div className="content">
-      <div className="page-title" role="heading" aria-level={1}>
+      <div className="page-title" role="heading" aria-level={1} tabIndex={-1} ref={pageTitle}>
         {t('title')}
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
@@ -145,7 +148,15 @@ export default function DocumentsPage() {
           {error ?? listError}
         </div>
       )}
-      {open && <DocumentDetail documentId={open} onClose={() => { setOpen(null); opener.current?.focus() }} />}
+      {open && (
+        <DocumentDetail
+          documentId={open}
+          onClose={() => {
+            setOpen(null)
+            ;(opener.current?.isConnected ? opener.current : pageTitle.current)?.focus()
+          }}
+        />
+      )}
       {docs.length === 0 ? (
         <p style={{ color: 'var(--muted)' }}>{t('list.empty')}</p>
       ) : (

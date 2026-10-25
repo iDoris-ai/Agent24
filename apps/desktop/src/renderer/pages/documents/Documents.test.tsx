@@ -614,6 +614,23 @@ describe('DocumentsPage: a document and its text', () => {
     expect(title).toHaveFocus()
   })
 
+  it('closing a document whose row a reload took away gives focus to the page\'s title', async () => {
+    // Document 2 is on the second page; the reload after an import shows a first page without it.
+    const m = mount({ lists: [page([1], 'c1'), page([2]), page([3])] })
+    reading(m, [() => ok(detail(2))], [() => ok(text([block('b1', '第一段', 1)]))])
+    render(<DocumentsPage />)
+    await screen.findByRole('button', { name: '通告 1' })
+    fireEvent.click(screen.getByRole('button', { name: '加载更多' }))
+    const title = await screen.findByRole('button', { name: '通告 2' })
+    fireEvent.click(title)
+    await screen.findByRole('region', { name: '文档详情' })
+    act(() => m.event?.({ kind: 'document.imported', payload: { document_id: doc(3).document_id } }))
+    await waitFor(() => expect(screen.getByText('通告 3')).toBeInTheDocument())
+    expect(title).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    expect(screen.getByRole('heading', { level: 1 })).toHaveFocus()
+  })
+
   it('a next page read after a failed one clears what the failure said', async () => {
     const m = mount({ lists: [page([1])] })
     reading(m, [() => ok(detail(1))], [
