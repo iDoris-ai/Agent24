@@ -486,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn granted_fake_module_is_advertised_and_callable() {
         let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
-        assert_eq!(registry.live_adverts().await.len(), 1);
+        assert_eq!(registry.live_adverts(false).await.len(), 1);
         let mut arguments = Map::new();
         arguments.insert(
             "credential".to_owned(),
@@ -519,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn missing_consent_is_not_advertised_and_never_reaches_fake_module() {
         let (registry, runtime, _, store) = fixture(RiskClass::Read, false, true).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
         let error = registry
             .dispatch(
                 "fake_module.write_local",
@@ -575,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn write_local_module_tool_asks_existing_approval_gate_every_call() {
         let (registry, runtime, approvals, _) = fixture(RiskClass::WriteLocal, true, true).await;
-        assert_eq!(registry.live_adverts().await.len(), 1);
+        assert_eq!(registry.live_adverts(false).await.len(), 1);
         for _ in 0..2 {
             registry
                 .dispatch(
@@ -594,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn stopped_module_tool_returns_module_unavailable_without_dispatch() {
         let (registry, runtime, _, _) = fixture(RiskClass::Read, true, false).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
         let error = registry
             .dispatch(
                 "fake_module.write_local",
