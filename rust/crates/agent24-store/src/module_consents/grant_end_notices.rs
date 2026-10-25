@@ -1,11 +1,11 @@
 //! K1-6a-G §2.5.1 (A5c): the ends of grants a module must be told of, with
 //! their references, so the module can stop exactly their work and refuse
 //! late calls carrying them. A row is written in the transaction of the
-//! write that ended them: every revocation (its route always sends a
-//! notice), and a decision replacing a granted row or an enable epoch
+//! write that ended them: every revocation (each is told, by its route or
+//! the notifier), and a decision replacing a granted row or an enable epoch
 //! advance that ended grants not told yet. A crash before the notice, or a
 //! later decision replacing the row, so loses none: every row not answered
-//! yet stays pending for the notifier (A5c-2). A revocation also carries the
+//! nor settled stays pending for the notifier (A5c-2). A revocation also carries the
 //! references of every end of its scope not confirmed stopped, so its answer
 //! never claims a stop an earlier, unconfirmed notice left open (#1202 B1);
 //! confirmed, it settles them, so no later one carries them again (G7).
