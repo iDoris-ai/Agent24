@@ -172,6 +172,19 @@ async fn settle_once_cancelling(storage: Arc<Storage>, id: String) {
     .expect("the attempt was never asked to stop");
 }
 
+/// Waits until a build `by` asked for is under way, so a notice that
+/// should leave it alone has it to leave.
+async fn building(env: &Env, by: &Requester) {
+    let start = std::time::Instant::now();
+    while !env.state.layers().requested_by(by) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no build by {by:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// A read of the layer, waiting on its build, asked for `by`.
 fn reading(env: &Env, by: Requester) -> tokio::task::JoinHandle<Result<String, LayerFailure>> {
     let (layers, storage, content) = (
@@ -782,10 +795,14 @@ async fn a_notice_naming_grants_stops_only_their_jobs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notice_naming_grants_stops_only_their_builds() {
     let env = env().await;
-    let new = reading(&env, Requester::Tool(under("find", "ga1:new")));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let by_new = Requester::Tool(under("find", "ga1:new"));
+    let new = reading(&env, by_new.clone());
+    building(&env, &by_new).await;
     assert!(stop(&env.state, &naming(ALL, &["ga1:old"]), SHORT).await);
-    assert!(!new.is_finished(), "another grant's build stopped");
+    assert!(
+        env.state.layers().requested_by(&by_new),
+        "another grant's build stopped"
+    );
     assert_eq!(
         stop_until_ended_by(&env, &naming("list", &["ga1:new"]), new).await,
         Err(LayerFailure::Stopped)
@@ -797,11 +814,11 @@ async fn a_notice_naming_grants_stops_only_their_builds() {
         id: id.clone(),
         attempt: 1,
     };
-    let read = reading(&env, by);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let read = reading(&env, by.clone());
+    building(&env, &by).await;
     assert!(stop(&env.state, &naming(ALL, &["ga1:new"]), SHORT).await);
     assert!(
-        !read.is_finished(),
+        env.state.layers().requested_by(&by),
         "another grant's attempt's build stopped"
     );
     tokio::spawn(settle_once_cancelling(env.storage.clone(), id));

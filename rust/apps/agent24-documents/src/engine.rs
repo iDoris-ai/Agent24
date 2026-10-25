@@ -200,6 +200,13 @@ impl Layers {
         })
     }
 
+    /// Whether a build not yet finished was asked for `by`.
+    #[cfg(test)]
+    pub(crate) fn requested_by(&self, by: &Requester) -> bool {
+        let building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        building.values().any(|b| b.by.contains(by))
+    }
+
     /// The job attempts that asked for builds not yet finished.
     pub fn job_requesters(&self) -> Vec<(String, i64)> {
         let building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
