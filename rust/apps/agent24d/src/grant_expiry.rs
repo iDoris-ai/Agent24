@@ -622,12 +622,13 @@ mod tests {
             .unwrap();
     }
 
-    /// #1190 Low: a notice that panics is recorded unconfirmed, audited so,
-    /// and the other modules of the round are told all the same.
+    /// #1190 Low: a notice that panics, as it is called or while it runs,
+    /// is recorded unconfirmed, audited so, and the other modules of the
+    /// round are told all the same.
     #[tokio::test]
     async fn a_notice_that_panics_is_unconfirmed_and_the_others_are_told() {
         let store = agent24_store::Store::open_memory().await.unwrap();
-        for module in ["a", "b"] {
+        for module in ["a", "b", "c"] {
             store
                 .revoke_module_consent(module, None, &Utc::now().to_rfc3339())
                 .await
@@ -637,10 +638,14 @@ mod tests {
         let notice: RevocationNotice = {
             let told = Arc::clone(&told);
             Arc::new(move |end: GrantEnd| {
-                assert_ne!(end.module, "a", "a's notice panics");
+                assert_ne!(end.module, "a", "a's notice panics as it is called");
+                let module = end.module.clone();
                 told.lock().unwrap().push(end);
-                Box::pin(async { RevocationStop::Confirmed })
-                    as futures::future::BoxFuture<'static, _>
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    assert_ne!(module, "c", "c's notice panics while it runs");
+                    RevocationStop::Confirmed
+                }) as futures::future::BoxFuture<'static, _>
             })
         };
         let pending = tell_due(&store, &notice, &on_protocol()).await;
@@ -651,7 +656,7 @@ mod tests {
             .iter()
             .map(|e| e.module.clone())
             .collect();
-        assert_eq!(told, ["b"]);
+        assert_eq!(told, ["b", "c"]);
         assert!(
             store
                 .pending_grant_end_notices("2099-01-01T00:00:00Z")
@@ -659,9 +664,9 @@ mod tests {
                 .unwrap()
                 .0
                 .is_empty(),
-            "both answered"
+            "all answered"
         );
-        let audited: Vec<_> = store
+        let audited: std::collections::BTreeSet<String> = store
             .list_audit()
             .await
             .unwrap()
@@ -669,7 +674,7 @@ mod tests {
             .filter(|e| e.action == "module_consent.stop_unconfirmed")
             .map(|e| e.detail["module"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(audited, ["a"]);
+        assert_eq!(audited, ["a".to_owned(), "c".to_owned()].into());
     }
 
     /// #1190 Low: a round that panics outside any notice ends that round,
