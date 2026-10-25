@@ -7,6 +7,13 @@
 //! stops too. A 2xx says all of it reached a safe point; anything else is
 //! recorded by the kernel as a stop it could not confirm. A call of the
 //! operation still in flight answers `permission_denied`, not what it found.
+//!
+//! A notice naming the grants it ended (`authorization_refs`, §2.5.1) stops
+//! only their work, whatever its `operation`: a new grant's work goes on.
+//! The references are remembered, in memory, for as long as this process
+//! runs: a call under one of them is refused, arriving or in flight. Work
+//! under no reference is stopped by operation, as is all of it when the
+//! notice names none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -41,6 +48,59 @@ pub struct Accepted {
     pub authorization_ref: Option<String>,
 }
 
+impl Accepted {
+    /// A call of `operation` under no reference.
+    #[must_use]
+    pub fn bare(operation: &str) -> Self {
+        Self {
+            operation: operation.to_owned(),
+            authorization_ref: None,
+        }
+    }
+}
+
+/// An end of authorization: `operation`'s (the whole module's: `*`), and
+/// the grants it ended, when the notice names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ended {
+    pub operation: String,
+    pub refs: Option<HashSet<String>>,
+}
+
+impl Ended {
+    /// An end naming no grants: all of `operation`'s work stops.
+    #[must_use]
+    pub fn by_operation(operation: &str) -> Self {
+        Self {
+            operation: operation.to_owned(),
+            refs: None,
+        }
+    }
+
+    /// Whether work `accepted` stops: by its reference when both name one,
+    /// otherwise by operation. Mirrored by [`COVERS`] for the stored rows.
+    #[must_use]
+    pub fn covers(&self, accepted: &Accepted) -> bool {
+        match (&self.refs, &accepted.authorization_ref) {
+            (Some(refs), Some(reference)) => refs.contains(reference),
+            _ => self.operation == ALL || accepted.operation == self.operation,
+        }
+    }
+
+    /// The references, as the JSON array [`COVERS`] binds; `None` if none.
+    fn refs_json(&self) -> Option<String> {
+        self.refs.as_ref().map(|refs| {
+            serde_json::Value::from(refs.iter().cloned().collect::<Vec<_>>()).to_string()
+        })
+    }
+}
+
+/// [`Ended::covers`] for a `job_acceptances` row `a`: `?1` the operation,
+/// `?2` the references as a JSON array, or NULL.
+const COVERS: &str = "CASE WHEN ?2 IS NULL OR a.authorization_ref IS NULL
+                           THEN ?1 = '*' OR a.operation = ?1
+                           ELSE a.authorization_ref IN (SELECT value FROM json_each(?2)) END";
+
 /// Records that `run`'s call, `accepted`, relies on the job's attempt, in the
 /// caller's transaction (the claim's).
 pub(crate) async fn record(
@@ -65,23 +125,46 @@ pub(crate) async fn record(
     .map(|_| ())
 }
 
-/// The tool calls in flight, and how many times each operation's
-/// authorization, and the whole module's, has ended.
+/// The tool calls in flight, how many times each operation's
+/// authorization, and the whole module's, has ended, and the grants ended.
 #[derive(Default)]
 pub struct Calls(Mutex<Ledger>);
 
 #[derive(Default)]
 struct Ledger {
+    /// Ends of an operation (`*`: `all`) that stop all of its calls...
     ends: HashMap<String, u64>,
     all: u64,
+    /// ...and those that stop only its calls under no reference.
+    bare_ends: HashMap<String, u64>,
+    bare_all: u64,
+    /// The grants ended: memory only, this process's (K1-06a §2.5.1).
+    ended_refs: HashSet<String>,
     next: u64,
-    /// Each call in flight: its operation, and the ends it began after.
-    live: HashMap<u64, (String, u64)>,
+    /// Each call in flight: what it was accepted as, and the ends that
+    /// count for it when it began.
+    live: HashMap<u64, (Accepted, u64)>,
 }
 
 impl Ledger {
-    fn ended(&self, operation: &str) -> u64 {
-        self.all + self.ends.get(operation).copied().unwrap_or(0)
+    /// The ends that count for a call `accepted` as.
+    fn ends_of(&self, accepted: &Accepted) -> u64 {
+        let op = &accepted.operation;
+        let mut n = self.all + self.ends.get(op).copied().unwrap_or(0);
+        if accepted.authorization_ref.is_none() {
+            n += self.bare_all + self.bare_ends.get(op).copied().unwrap_or(0);
+        }
+        n
+    }
+
+    /// Whether a call `accepted` as, counting `since` ends when it began,
+    /// has had its authorization end.
+    fn ended(&self, (accepted, since): &(Accepted, u64)) -> bool {
+        *since != self.ends_of(accepted)
+            || accepted
+                .authorization_ref
+                .as_ref()
+                .is_some_and(|r| self.ended_refs.contains(r))
     }
 }
 
@@ -90,19 +173,20 @@ impl Calls {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A call of `operation` begins; it is in flight until what this
-    /// returns is finished or dropped.
+    /// A call `accepted` as begins; it is in flight until what this
+    /// returns is finished or dropped. Under a grant already ended, it is
+    /// [`Call::ended`] from the start.
     #[must_use]
-    pub fn begin(self: &Arc<Self>, operation: &str) -> Call {
+    pub fn begin(self: &Arc<Self>, accepted: Accepted) -> Call {
         let mut ledger = self.ledger();
-        let since = ledger.ended(operation);
-        self.register(&mut ledger, operation.to_owned(), since)
+        let since = ledger.ends_of(&accepted);
+        self.register(&mut ledger, accepted, since)
     }
 
-    fn register(self: &Arc<Self>, ledger: &mut Ledger, operation: String, since: u64) -> Call {
+    fn register(self: &Arc<Self>, ledger: &mut Ledger, accepted: Accepted, since: u64) -> Call {
         let id = ledger.next;
         ledger.next += 1;
-        ledger.live.insert(id, (operation, since));
+        ledger.live.insert(id, (accepted, since));
         Call {
             calls: self.clone(),
             id,
@@ -115,28 +199,34 @@ impl Calls {
         self.ledger().live.len()
     }
 
-    /// `operation`'s authorization (the whole module's: `*`) ends: every
-    /// call of it in flight now began before the end.
-    pub fn end(&self, operation: &str) {
+    /// `ended` ends: every call it covers in flight now began before it,
+    /// and a call under one of its grants is refused from now on.
+    pub fn end(&self, ended: &Ended) {
         let mut ledger = self.ledger();
-        if operation == ALL {
-            ledger.all += 1;
+        let ledger = &mut *ledger;
+        let (ends, all) = match &ended.refs {
+            None => (&mut ledger.ends, &mut ledger.all),
+            Some(refs) => {
+                ledger.ended_refs.extend(refs.iter().cloned());
+                (&mut ledger.bare_ends, &mut ledger.bare_all)
+            }
+        };
+        if ended.operation == ALL {
+            *all += 1;
         } else {
-            *ledger.ends.entry(operation.to_owned()).or_default() += 1;
+            *ends.entry(ended.operation.clone()).or_default() += 1;
         }
     }
 
-    /// How many calls of `operation` (any, for `*`) that began before one
-    /// of its ends are still in flight.
+    /// How many calls `ended` covers that began before an end of theirs
+    /// are still in flight.
     #[must_use]
-    pub fn before_an_end(&self, operation: &str) -> usize {
+    pub fn before_an_end(&self, ended: &Ended) -> usize {
         let ledger = self.ledger();
         ledger
             .live
             .values()
-            .filter(|(op, since)| {
-                (operation == ALL || op == operation) && *since != ledger.ended(op)
-            })
+            .filter(|live| ended.covers(&live.0) && ledger.ended(live))
             .count()
     }
 }
@@ -148,15 +238,15 @@ pub struct Call {
 }
 
 impl Call {
-    /// Whether its operation's authorization ended since it began: then
-    /// what it found is not given.
+    /// Whether its authorization ended since it began, or before, under
+    /// a grant ended: then what it found is not given.
     #[must_use]
     pub fn ended(&self) -> bool {
         let ledger = self.calls.ledger();
         ledger
             .live
             .get(&self.id)
-            .is_some_and(|(op, since)| *since != ledger.ended(op))
+            .is_some_and(|live| ledger.ended(live))
     }
 
     /// The call's answer is decided: whether its authorization ended
@@ -166,10 +256,8 @@ impl Call {
     #[must_use]
     pub fn finish(self) -> bool {
         let mut ledger = self.calls.ledger();
-        let ended = ledger
-            .live
-            .remove(&self.id)
-            .is_some_and(|(op, since)| since != ledger.ended(&op));
+        let live = ledger.live.remove(&self.id);
+        let ended = live.is_some_and(|live| ledger.ended(&live));
         drop(ledger);
         ended
     }
@@ -182,8 +270,12 @@ impl Call {
         let mut ledger = self.calls.ledger();
         // Always there: only `finish`, which takes the call, and its drop
         // remove it.
-        let (operation, since) = ledger.live.get(&self.id).cloned().unwrap_or_default();
-        self.calls.register(&mut ledger, operation, since)
+        let (accepted, since) = ledger
+            .live
+            .get(&self.id)
+            .cloned()
+            .unwrap_or_else(|| (Accepted::bare(""), 0));
+        self.calls.register(&mut ledger, accepted, since)
     }
 }
 
@@ -196,35 +288,57 @@ impl Drop for Call {
 #[derive(Deserialize)]
 pub struct Revoked {
     operation: String,
+    /// Absent (or `null`) is not empty: absent stops by operation, empty
+    /// stops no grant's work (K1-06a §2.5.1, #1202 G2).
+    #[serde(default)]
+    authorization_refs: Option<Vec<String>>,
 }
 
-/// `POST /_a24/authorization/revoked` `{operation, revoked_at}`: 204 once the
-/// work is stopped, 503 if it is not within [`STOP_WAIT`].
+/// The longest grant reference taken (`ga1:` and a digest are far shorter).
+const REF_MAX: usize = 256;
+
+/// `POST /_a24/authorization/revoked` `{operation, revoked_at, reason,
+/// authorization_refs}`: 204 once the work is stopped, 503 if it is not
+/// within [`STOP_WAIT`].
 pub async fn revoked(
     State(state): State<AppState>,
     body: Result<Json<Revoked>, JsonRejection>,
 ) -> StatusCode {
-    let Ok(Json(Revoked { operation })) = body else {
+    let Ok(Json(Revoked {
+        operation,
+        authorization_refs,
+    })) = body
+    else {
         return StatusCode::BAD_REQUEST;
     };
     if operation.is_empty() || operation.len() > 64 {
         return StatusCode::BAD_REQUEST;
     }
-    if stop(&state, &operation, STOP_WAIT).await {
+    if authorization_refs
+        .iter()
+        .flatten()
+        .any(|r| r.is_empty() || r.len() > REF_MAX)
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    let ended = Ended {
+        operation,
+        refs: authorization_refs.map(HashSet::from_iter),
+    };
+    if stop(&state, &ended, STOP_WAIT).await {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
 }
 
-/// Stops `operation`'s work and waits up to `wait` for it to stop; whether
-/// it did. Everything, storage included, ends within `wait`.
-pub(crate) async fn stop(state: &AppState, operation: &str, wait: Duration) -> bool {
+/// Stops the work `ended` covers and waits up to `wait` for it to stop;
+/// whether it did. Everything, storage included, ends within `wait`.
+pub(crate) async fn stop(state: &AppState, ended: &Ended, wait: Duration) -> bool {
     let (layers, calls) = (state.layers(), state.calls());
     // First: a call that finishes from now on gives nothing.
-    calls.end(operation);
-    let tool =
-        |by: &Requester| matches!(by, Requester::Tool(op) if operation == ALL || op == operation);
+    calls.end(ended);
+    let tool = |by: &Requester| matches!(by, Requester::Tool(accepted) if ended.covers(accepted));
     // These need no storage: stopped first, whatever follows.
     let mut builds = layers.stop(tool);
     let stopped = tokio::time::timeout(wait, async {
@@ -235,15 +349,15 @@ pub(crate) async fn stop(state: &AppState, operation: &str, wait: Duration) -> b
             // builds: an attempt a call's claim commits until it ends, and a
             // build asked for until an attempt stops or by a call accepted
             // before the notice, are found.
-            let calls_left = calls.before_an_end(operation);
+            let calls_left = calls.before_an_end(ended);
             working.extend(
-                cancel_jobs(&storage, operation)
+                cancel_jobs(&storage, ended)
                     .await
                     .map_err(|e| tracing::error!(error = %e, "documents: an ended authorization's jobs could not be cancelled"))
                     .ok()?,
             );
             let still = still_working(&storage, &working).await.ok()?;
-            let accepted = accepted_of(&storage, operation, &layers.job_requesters())
+            let accepted = accepted_of(&storage, ended, &layers.job_requesters())
                 .await
                 .ok()?;
             builds.extend(layers.stop(|by| {
@@ -263,22 +377,23 @@ pub(crate) async fn stop(state: &AppState, operation: &str, wait: Duration) -> b
 /// accepted for, whichever attempt of the job they are: a build an earlier,
 /// accepted attempt asked for may go on serving a later one, and stops.
 /// The rows are read as a set (#1201 G2): repeated rows of one attempt
-/// count once, and a row without an `authorization_ref` counts as any
-/// other, the operation deciding until ends name references (A5c-3).
+/// count once, and any one `ended` covers ([`COVERS`]) stops the attempt.
 async fn accepted_of(
     storage: &Storage,
-    operation: &str,
+    ended: &Ended,
     asking: &[(String, i64)],
 ) -> Result<HashSet<(String, i64)>, sqlx::Error> {
     let mut accepted = HashSet::new();
+    let refs = ended.refs_json();
     for (id, attempt) in asking {
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM job_acceptances
-             WHERE job_id = ?1 AND attempt = ?2 AND (?3 = '*' OR operation = ?3) LIMIT 1",
-        )
+        let found: Option<i64> = sqlx::query_scalar(&format!(
+            "SELECT 1 FROM job_acceptances a
+             WHERE a.job_id = ?3 AND a.attempt = ?4 AND ({COVERS}) LIMIT 1"
+        ))
+        .bind(&ended.operation)
+        .bind(&refs)
         .bind(id)
         .bind(attempt)
-        .bind(operation)
         .fetch_optional(storage.db.pool())
         .await?;
         if found.is_some() {
@@ -289,22 +404,20 @@ async fn accepted_of(
 }
 
 /// Under the write lock, so a claim commits wholly before or after it: the
-/// jobs' current attempts `operation`'s calls were accepted for that still
+/// jobs' current attempts accepted by calls `ended` covers that still
 /// work. Queued ones are cancelled at once; running ones are asked to stop
 /// at their next safe point, and settle saying why (`job_revocations`).
-async fn cancel_jobs(
-    storage: &Storage,
-    operation: &str,
-) -> Result<Vec<(String, i64)>, sqlx::Error> {
+async fn cancel_jobs(storage: &Storage, ended: &Ended) -> Result<Vec<(String, i64)>, sqlx::Error> {
     let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
-    let jobs: Vec<(String, i64)> = sqlx::query_as(
+    let jobs: Vec<(String, i64)> = sqlx::query_as(&format!(
         "SELECT j.id, j.attempt FROM jobs j
          WHERE j.status IN ('queued', 'running', 'cancelling')
            AND EXISTS (SELECT 1 FROM job_acceptances a
                        WHERE a.job_id = j.id AND a.attempt = j.attempt
-                         AND (?1 = '*' OR a.operation = ?1))",
-    )
-    .bind(operation)
+                         AND ({COVERS}))"
+    ))
+    .bind(&ended.operation)
+    .bind(ended.refs_json())
     .fetch_all(&mut *tx)
     .await?;
     let mut ended = Vec::new();

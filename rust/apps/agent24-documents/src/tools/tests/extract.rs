@@ -473,3 +473,23 @@ async fn an_acceptance_names_its_call_and_work_no_call_asked_for_records_none() 
         "the page's retry records none"
     );
 }
+
+/// K1-06a-grant-path §2.5.1: a call under a grant whose end was told
+/// already is refused on arrival, before it claims: no job, no acceptance,
+/// nothing logged, so no work of the ended grant starts after its notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_call_under_an_ended_grant_is_refused_before_it_claims() {
+    let env = env(Some(script(vec![failing()]))).await;
+    let ended = crate::authorization::Ended {
+        operation: "extract".into(),
+        refs: Some(["auth-1".to_owned()].into()),
+    };
+    env.state.calls().end(&ended);
+    let body = json!({ "context": context_with("extract", &[DOC]), "arguments": args() });
+    let body = post_to(&env.state, "extract", body.to_string()).await;
+    assert_kernel_error(&body, ModuleToolErrorCode::PermissionDenied);
+    let rows = "SELECT (SELECT count(*) FROM jobs) + (SELECT count(*) FROM oplog)
+                     + (SELECT count(*) FROM job_acceptances)";
+    assert_eq!(scalar::<i64>(&env, rows).await, 0);
+    assert_eq!(env.state.calls().in_flight(), 0);
+}

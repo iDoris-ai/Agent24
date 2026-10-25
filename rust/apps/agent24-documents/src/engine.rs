@@ -135,8 +135,8 @@ type Outcome = Option<Result<String, LayerFailure>>;
 pub enum Requester {
     /// A page of the app, through REST.
     Page,
-    /// A tool call of this operation.
-    Tool(String),
+    /// A tool call, accepted as this operation under this grant.
+    Tool(crate::authorization::Accepted),
     /// An attempt of a job.
     Job { id: String, attempt: i64 },
 }
@@ -198,6 +198,13 @@ impl Layers {
             render_queue: AtomicUsize::new(0),
             building: Mutex::default(),
         })
+    }
+
+    /// Whether a build not yet finished was asked for `by`.
+    #[cfg(test)]
+    pub(crate) fn requested_by(&self, by: &Requester) -> bool {
+        let building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        building.values().any(|b| b.by.contains(by))
     }
 
     /// The job attempts that asked for builds not yet finished.

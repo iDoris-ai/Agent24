@@ -411,7 +411,7 @@ async fn joined(l: &Arc<Layers>, env: &Env, content: &str, by: Requester) {
 }
 
 fn tool(op: &str) -> Requester {
-    Requester::Tool(op.to_owned())
+    Requester::Tool(crate::authorization::Accepted::bare(op))
 }
 
 /// Stops the builds `op`'s tool calls asked for.

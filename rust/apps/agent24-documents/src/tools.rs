@@ -192,8 +192,16 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
     if op != call.context.operation {
         return Envelope::error(INVALID_INPUT, false);
     }
-    // In flight from here, so the end of its authorization waits for it.
-    let in_flight = state.calls().begin(op);
+    let accepted = Accepted {
+        operation: op.to_owned(),
+        authorization_ref: call.context.authorization_ref.clone(),
+    };
+    // In flight from here, so the end of its authorization waits for it;
+    // under a grant already ended, refused here (K1-06a §2.5.1).
+    let in_flight = state.calls().begin(accepted.clone());
+    if in_flight.ended() {
+        return Envelope::error(PERMISSION_DENIED, false);
+    }
     // Once per call, before any operation reads storage (K1-06a §2.2).
     let Ok(scope) = Scope::parse(call.context.authorized_resources.as_ref()) else {
         return Envelope::error(PERMISSION_DENIED, false);
@@ -202,10 +210,6 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
     let run = Run {
         run_id: context.run_id.clone(),
         tool_call_id: context.tool_call_id.clone(),
-    };
-    let accepted = Accepted {
-        operation: op.to_owned(),
-        authorization_ref: context.authorization_ref.clone(),
     };
     let scope = &scope;
     let claim_holds = in_flight.hold();
@@ -218,8 +222,8 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "list" => list(state, scope, arguments).await,
             "get" => get(state, arguments).await,
             "job_get" => job_get(state, arguments).await,
-            "read_range" => read_range(state, arguments).await,
-            "find" => find(state, arguments).await,
+            "read_range" => read_range(state, accepted, arguments).await,
+            "find" => find(state, accepted, arguments).await,
             "extraction_get" => extraction_get(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
@@ -372,7 +376,7 @@ async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     completed(jobs::get(&storage, &args.job_id).await)
 }
 
-async fn read_range(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+async fn read_range(state: &AppState, by: Accepted, arguments: Map<String, Value>) -> Outcome {
     let args: ReadRangeArgs = parse(arguments)?;
     let params = TextParams {
         block: args.block,
@@ -382,11 +386,11 @@ async fn read_range(state: &AppState, arguments: Map<String, Value>) -> Outcome 
     };
     let storage = ready(state).await?;
     let (id, rev) = (&args.document_id, args.revision);
-    let by = Requester::Tool("read_range".to_owned());
+    let by = Requester::Tool(by);
     completed(text::read_range(state, &storage, id, rev, params, PAYLOAD_BYTES, by).await)
 }
 
-async fn find(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+async fn find(state: &AppState, by: Accepted, arguments: Map<String, Value>) -> Outcome {
     let args: FindArgs = parse(arguments)?;
     let req = FindRequest {
         revision: args.revision,
@@ -396,7 +400,7 @@ async fn find(state: &AppState, arguments: Map<String, Value>) -> Outcome {
         require_complete: args.require_complete.unwrap_or(false),
     };
     let storage = ready(state).await?;
-    let by = Requester::Tool("find".to_owned());
+    let by = Requester::Tool(by);
     completed(find::search(state, &storage, &args.document_id, req, PAYLOAD_BYTES, by).await)
 }
 
