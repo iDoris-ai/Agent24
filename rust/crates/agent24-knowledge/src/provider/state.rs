@@ -71,8 +71,10 @@ pub enum Probe {
     /// readiness probe was sent.
     Incompatible,
     /// The readiness answer. `search_ready` and `read_ready` say whether that
-    /// operation's `state` is `ready`; any other value, known or not, is not
-    /// (R6.2). `ingest` and the per-KB readiness take no part.
+    /// operation's `state` is `ready`; any other value is not, an unknown one
+    /// included (R6.2), which whoever reads the response must decode as such:
+    /// [`Probe::answered`] only takes a decoded one. `ingest` and the per-KB
+    /// readiness take no part.
     Answered {
         live: bool,
         search_ready: bool,
@@ -183,6 +185,37 @@ pub fn derive(switches: Switches, target: Target) -> Option<ServiceState> {
             Some(phase) => ServiceState::Connected(phase),
         }
     })
+}
+
+/// A READONLY request kind the Provider may be about to send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outgoing {
+    /// Capability discovery or a readiness probe.
+    Probe,
+    Data(DataOperation),
+}
+
+/// S1.5: only a servable state sends `search` or `read`; `loading` and an
+/// `unavailable` that retries by itself send only probes; nothing else sends.
+/// This is about the binding's state; whether a given call may go out is
+/// [`admit`], which every dispatch checks.
+pub fn may_send(switches: Switches, target: Target, outgoing: Outgoing) -> bool {
+    let Target::Binding(binding) = target else {
+        return false;
+    };
+    if binding.persist_pending {
+        return false;
+    }
+    match (derive(switches, target), outgoing) {
+        (Some(ServiceState::Connected(phase)), Outgoing::Data(op)) => phase.serves(op),
+        (Some(ServiceState::Connected(phase)), Outgoing::Probe) => match phase {
+            ConnectionPhase::Unavailable(cause) => cause.retries_automatically(),
+            ConnectionPhase::Loading
+            | ConnectionPhase::Ready
+            | ConnectionPhase::Degraded { .. } => true,
+        },
+        _ => false,
+    }
 }
 
 /// The `reason` of a Provider-local `unavailable` (§6, S6.1): the local set

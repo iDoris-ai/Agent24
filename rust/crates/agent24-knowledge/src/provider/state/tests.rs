@@ -169,6 +169,60 @@ fn the_state_is_disabled_then_registered_then_the_connection_phase() {
 }
 
 #[test]
+fn only_a_servable_binding_sends_content_requests_and_some_send_nothing() {
+    use ConnectionPhase::{Degraded, Loading, Ready, Unavailable};
+    use Outgoing::{Data, Probe};
+    use UnavailableCause as U;
+    let send =
+        |switches, phase, outgoing| may_send(switches, Target::Binding(bound(phase)), outgoing);
+    assert!(send(on(), Ready, Data(Search)));
+    assert!(send(on(), Ready, Data(Read)));
+    assert!(send(on(), Ready, Probe));
+    assert!(send(on(), Degraded { servable: Read }, Data(Read)));
+    assert!(!send(on(), Degraded { servable: Read }, Data(Search)));
+    // `loading` and a retrying `unavailable` only probe.
+    for phase in [
+        Loading,
+        Unavailable(U::Dependency),
+        Unavailable(U::NotReady),
+    ] {
+        assert!(send(on(), phase, Probe), "{phase:?}");
+        assert!(!send(on(), phase, Data(Search)), "{phase:?}");
+    }
+    // A reason that waits for the user, and `local_storage`, send nothing.
+    for cause in [
+        U::Incompatible,
+        U::InstanceUnidentified,
+        U::CredentialRejected,
+        U::AccessRevoked,
+        U::LocalStorage,
+    ] {
+        assert!(!send(on(), Unavailable(cause), Probe), "{cause:?}");
+    }
+    // Nor does a binding with `persist_pending`, a disabled or registered one,
+    // a retired one, or the placeholder.
+    let pending = Binding {
+        persist_pending: true,
+        ..bound(Ready)
+    };
+    assert!(!may_send(on(), Target::Binding(pending), Probe));
+    assert!(!may_send(on(), Target::Binding(pending), Data(Search)));
+    assert!(!send(OFF, Ready, Probe));
+    assert!(!send(PROFILE_DISABLED, Ready, Data(Read)));
+    let idle = Binding {
+        activated: false,
+        ..bound(Ready)
+    };
+    assert!(!may_send(on(), Target::Binding(idle), Probe));
+    let retired = Binding {
+        retired: true,
+        ..bound(Ready)
+    };
+    assert!(!may_send(on(), Target::Binding(retired), Probe));
+    assert!(!may_send(on(), PLACEHOLDER, Probe));
+}
+
+#[test]
 fn a_new_call_gets_the_first_row_of_the_table_that_holds() {
     use ConnectionPhase::{Degraded, Loading, Ready, Unavailable};
     use UnavailableCause as U;
@@ -288,6 +342,32 @@ fn a_new_call_gets_the_first_row_of_the_table_that_holds() {
         ..bound(Ready)
     });
     assert_eq!(admit_on(reverify, Search), refused(R::NotReady, true));
+
+    // Each row on its own, not hidden by a row above (PR-Daemon #1221 G-1):
+    // `persist_pending` on a binding that is not retired; the operation a
+    // `Degraded { servable: Read }` binding serves; a re-verification over a
+    // reason that does not retry; both switches on.
+    let pending = Target::Binding(Binding {
+        persist_pending: true,
+        ..bound(Ready)
+    });
+    assert_eq!(admit_on(pending, Search), refused(R::LocalStorage, false));
+    let read_only = Target::Binding(bound(Degraded { servable: Read }));
+    assert_eq!(admit_on(read_only, Read), Ok(()));
+    assert_eq!(admit_on(read_only, Search), refused(R::NotReady, true));
+    let reverify_revoked = Target::Binding(Binding {
+        reverify_pending: true,
+        ..bound(Unavailable(U::AccessRevoked))
+    });
+    assert_eq!(admit_on(reverify_revoked, Read), refused(R::NotReady, true));
+    let both = Switches {
+        off: true,
+        profile_disabled: true,
+    };
+    assert_eq!(
+        admit(both, ready, false, Search),
+        refused(R::KnowledgeOff, false)
+    );
 
     // Rows 7 and 8: the binding's own reason.
     for (cause, reason, retryable) in [
