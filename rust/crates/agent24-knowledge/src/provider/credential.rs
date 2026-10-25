@@ -219,6 +219,11 @@ impl Credentials {
         }
     }
 
+    /// The binding left the connection phase: the credential goes (S3.3).
+    pub fn discard(&mut self) {
+        self.current = None;
+    }
+
     /// A revocation signal from outside a response: the issuing authority's
     /// notice, or a local-managed rotation of the instance secret.
     pub fn revoke(&mut self, connection: &mut Connection, now: Instant) -> Outcome {
