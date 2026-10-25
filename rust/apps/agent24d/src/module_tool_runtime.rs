@@ -151,9 +151,24 @@ impl AgentModuleToolRuntime {
             total: within,
             max_response_bytes: MAX_TOOL_RESPONSE_BYTES,
         };
-        match send_kernel_request(&generation, &self.request_ids, request, limits, None).await {
-            Ok(response) if response.status.is_success() => RevocationStop::Confirmed,
-            _ => RevocationStop::Unconfirmed,
+        // A notice in flight holds a drain that begins meanwhile — a disable
+        // writes its ends before handing the stop over — so a run that stops
+        // running is not waited on: the stop ends it, unconfirmed here like
+        // a notice that found it draining.
+        let stops_running = async {
+            while generation.state() == DrainState::Running {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            sent = send_kernel_request(&generation, &self.request_ids, request, limits, None) => {
+                match sent {
+                    Ok(response) if response.status.is_success() => RevocationStop::Confirmed,
+                    _ => RevocationStop::Unconfirmed,
+                }
+            }
+            () = stops_running => RevocationStop::Unconfirmed,
         }
     }
 
@@ -1193,6 +1208,20 @@ mod tests {
             RevocationStop::Unconfirmed
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        // A drain that begins while it waits is not held (#1231 CI): the
+        // notice lets go of the run at once, unconfirmed.
+        let waiting = tokio::spawn({
+            let (runtime, end) = (Arc::clone(&runtime), told_refs.clone());
+            async move { runtime.notify_revoked(&end, Duration::from_secs(30)).await }
+        });
+        while generation.in_flight() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let draining = std::time::Instant::now();
+        assert!(generation.begin_drain(draining, Duration::from_secs(30)));
+        assert_eq!(waiting.await.unwrap(), RevocationStop::Unconfirmed);
+        assert!(draining.elapsed() < Duration::from_secs(2));
+        assert_eq!(generation.in_flight(), 0);
         let _ = std::fs::remove_file(&sock);
     }
 
