@@ -570,11 +570,15 @@ for line in sys.stdin:
                 .await
         }
 
-        /// How many times the server actually ran the tool.
+        /// How many times the server actually ran the tool. The fixture
+        /// creates the log on its first call, so only a missing log means
+        /// zero; any other read error fails the test rather than reading as 0.
         fn calls(&self) -> usize {
-            std::fs::read_to_string(&self.log)
-                .map(|text| text.lines().count())
-                .unwrap_or(0)
+            match std::fs::read_to_string(&self.log) {
+                Ok(text) => text.lines().count(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(err) => panic!("reading the fixture's call log: {err}"),
+            }
         }
     }
 
