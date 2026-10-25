@@ -188,3 +188,11 @@ fn a_generation_is_never_used_twice_so_an_exhausted_binding_stays_closed() {
     // Short of the top nothing is exhausted.
     assert!(!Gate::restored(u64::MAX - 1).exhausted());
 }
+
+#[test]
+fn a_call_id_is_never_handed_out_twice() {
+    let mut gate = Gate::new(1);
+    gate.next_call = u64::MAX - 1;
+    assert!(gate.open_call().is_ok());
+    assert_eq!(gate.open_call(), Err(Closed));
+}
