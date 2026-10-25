@@ -63,27 +63,7 @@ async fn repeating_same_explicit_remember_keeps_one_ledger_row() {
     let owner = personal_owner(&kv).await;
     let original = beliefs(&kv, &owner, false).await;
     run(&state, "记住我对花生过敏").await;
-    let again = beliefs(&kv, &owner, false).await;
-    // K1-6b.4b interim: the second remember follows an earlier turn of the
-    // same session, so its classification is raised to Unknown (6b.4c
-    // replaces this with a per-session floor). Everything else is unchanged.
-    let without_source = |rows: &[agent24_memory::assertion::Assertion]| {
-        rows.iter()
-            .cloned()
-            .map(|mut row| {
-                row.source_ref = None;
-                row
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(without_source(&again), without_source(&original));
-    assert_eq!(
-        again[0]
-            .source_ref
-            .as_ref()
-            .and_then(|r| r.get("classification")),
-        Some(&json!("unknown"))
-    );
+    assert_eq!(beliefs(&kv, &owner, false).await, original);
     while let Ok((_, body)) = events.try_recv() {
         assert!(!matches!(body, EventBody::MemoryWriteFailed(_)));
     }

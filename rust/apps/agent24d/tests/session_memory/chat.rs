@@ -92,8 +92,9 @@ async fn explicit_remember_over_chat_stores_a_qualified_assertion() {
     assert_eq!(rows[0].object, json!("我对花生过敏"));
 }
 
-/// K1-6b.4b, interim until 6b.4c: the server cannot verify client-supplied
-/// history, so an assistant message in it makes the remembered fact `Unknown`.
+/// K1-6b.4b/4c: assistant turns in client-supplied history are classified by
+/// the session's floor; a session the server has no floor for makes them,
+/// and so the remembered fact, `Unknown`.
 #[tokio::test]
 async fn a_remember_after_client_assistant_history_is_stored_as_unknown() {
     let dir = tempfile::tempdir().unwrap();
@@ -173,6 +174,110 @@ async fn a_remember_after_any_non_user_client_history_is_stored_as_unknown() {
             "{role}"
         );
     }
+}
+
+/// K1-6b.4c: a chat turn that recalled a restricted fact raises its
+/// session's floor, so a later turn that sends that reply back as history
+/// remembers as restricted — even once the fact itself is gone.
+#[tokio::test]
+async fn a_chat_turn_after_a_restricted_reply_remembers_as_restricted() {
+    use agent24_memory::writer::{Candidate, MemoryWriter};
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider).await;
+    ensure_session(&state, "chat-session-restricted").await;
+    let owner = personal_owner(&kv).await;
+    let restricted = agent24_store::AssertionSourceRef::from_sources([(
+        "seed".to_owned(),
+        agent24_store::SourceClassification::Restricted,
+    )]);
+    kv.write_gate()
+        .propose(vec![
+            Candidate::new(
+                "restricted-fact",
+                Scope::owner(&owner),
+                "user",
+                "said_to_remember",
+                json!("我对花生过敏"),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::UserSaid,
+                },
+            )
+            .with_evidence(vec!["ev-restricted".to_owned()])
+            .with_source_ref(restricted.to_value())
+            .remember(),
+        ])
+        .await
+        .unwrap();
+
+    let (_, first) =
+        post_chat_with(&state, Some("chat-session-restricted"), "我对什么过敏？").await;
+    kv.assertions()
+        .retract(
+            &"restricted-fact".to_owned(),
+            &owner,
+            "2026-10-25T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    let reply = first["message"]["content"].as_str().unwrap().to_owned();
+    let (status, _) = post_chat_messages(
+        &state,
+        Some("chat-session-restricted"),
+        json!([
+            { "role": "user", "content": "我对什么过敏？" },
+            { "role": "assistant", "content": reply },
+            { "role": "user", "content": "记住我喜欢红茶" },
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rows = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner(&owner))
+        .await
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.object == json!("我喜欢红茶"))
+        .unwrap();
+    assert_eq!(
+        row.source_ref.as_ref().unwrap()["classification"],
+        json!("restricted")
+    );
+}
+
+/// K1-6b.4c: a session floor that cannot be recorded leaves this turn's
+/// context unclassified, so the request fails before the model is called.
+#[tokio::test]
+async fn a_chat_turn_whose_session_floor_cannot_be_written_fails_before_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider.clone()).await;
+    ensure_session(&state, "chat-session-nofloor").await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER no_floor BEFORE INSERT ON session_source_floor \
+         BEGIN SELECT RAISE(ABORT, 'no'); END;",
+    )
+    .execute(agent24_store::test_hooks::pool(&state.store))
+    .await
+    .unwrap();
+
+    let (status, body) = post_chat_with(&state, Some("chat-session-nofloor"), "你好").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        body.to_string().contains("source_policy_unavailable"),
+        "{body:?}"
+    );
+    assert!(
+        provider.received.lock().unwrap().is_empty(),
+        "the model must not be called"
+    );
 }
 
 #[tokio::test]
