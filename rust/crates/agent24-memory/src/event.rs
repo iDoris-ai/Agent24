@@ -476,7 +476,7 @@ impl EventLog {
         // must stay the error it always was: the caller's transaction rolls back.
         if inserted.rows_affected() == 0 {
             return Err(crate::MemoryError::Conflict(format!(
-                "event id {:?} already exists",
+                "event already exists (id or seq conflict): {:?}",
                 e.id
             )));
         }
@@ -1264,6 +1264,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::MemoryError::Conflict(_)), "{err:?}");
+        // c1 review note 4: `mem_events_bi_no_replace` ignores an id OR a seq
+        // collision, so the text must not name the id as the only cause.
+        let text = err.to_string();
+        assert!(text.contains("event already exists"), "{text}");
+        assert!(text.contains("id or seq"), "{text}");
+        assert!(!text.contains("event id"), "{text}");
         drop(tx);
         assert_eq!(usage_of(&kv.pool, "u1").await, (1, payload_bytes(&first)));
     }

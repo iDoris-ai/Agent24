@@ -862,10 +862,14 @@ impl ScopedMemory for OsScopedMemory {
         })?;
         let at = ev.at.clone();
         let id = ev.id.clone();
-        self.events
-            .append(&ev)
-            .await
-            .map_err(|e| DomainError::Store(e.to_string()))?;
+        self.events.append(&ev).await.map_err(|e| {
+            let code = e.code();
+            tracing::warn!(code = code.as_str(), error = %e, "module remember failed");
+            DomainError::MemoryWriteFailed {
+                code: code.as_str(),
+                dimension: code.dimension(),
+            }
+        })?;
         Ok(Remembered {
             id: MemoryId::from_kernel(id),
             at,
@@ -1518,7 +1522,16 @@ mod tests {
             .remember(Remember::new("note", serde_json::Map::new()))
             .await
             .unwrap_err();
-        assert!(matches!(err, DomainError::Store(_)), "{err}");
+        assert!(
+            matches!(
+                err,
+                DomainError::MemoryWriteFailed {
+                    code: "memory_quota_rows",
+                    dimension: Some("rows")
+                }
+            ),
+            "{err}"
+        );
 
         // The personal partition is unaffected: write, retract.
         let id = "assertion-t10";
