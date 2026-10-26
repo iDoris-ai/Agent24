@@ -151,6 +151,7 @@ CLI connect、attach_only、daemon start 和 TUI 共用同一探测结果。dock
 | T12 版本回退 | 可信精确前一版本且 restored 才清除；同版本不同 hash、伪版本、未知来源、水位不兼容都拒绝 | 字符串比较；只比小版本；忽略库 hash |
 | T13 服务与发现 | LaunchAgent 真机停靠不重启；systemd 模板交付后同验，SIGTERM 干净退出；docked 无业务 ready，第二实例取锁失败 | 返回迁移 Err；设 Restart=always；docked 发 ready |
 | T14 契约与保留 | OpenAPI/Rust/生成客户端一致；restored 水位真实、失败 unknown；引用快照不被清理，诊断不泄密 | 报编译最高号；按年龄删失败快照；公开原始错误 |
+| T15 预算超支恢复 | 迁移实际用量 G 超过声明值、磁盘被写满时，先释放保留文件，再从快照完整恢复；含 FTS rebuild 的迁移未声明 G 时，CI 报错 | 不设保留文件；保留文件是稀疏的；恢复前不释放保留；漏掉声明检查 |
 
 ## 4. 实现分片（每片目标 ≤300 行）
 
