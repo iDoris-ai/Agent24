@@ -5,9 +5,9 @@
 //! the other side instead of ignoring the difference. Adding an optional
 //! field that an old peer can skip does not bump this.
 
-/// Protocol this build speaks. Shells compare it with the daemon's
-/// `protocol_version` (`GET /api/v1/health` and `daemon.json`) and refuse to
-/// attach when the two differ.
+/// Protocol this build speaks. Shells compare it with the `protocol_version`
+/// advertised by `GET /api/v1/health` and refuse to attach when the two
+/// differ. A version stored in `daemon.json` is not that decision.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Whether `daemon` can serve a client that speaks `client`.

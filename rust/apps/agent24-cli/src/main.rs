@@ -699,7 +699,7 @@ async fn fetch_protocol_version(base: &str, token: &str) -> Result<Option<u32>, 
     }
 }
 
-fn incompatible_daemon_error(daemon: Option<u32>, client: u32) -> String {
+fn incompatible_daemon_error(daemon: Option<u32>, client: u32, recorded: Option<u32>) -> String {
     let reason = match agent24_protocol::protocol_compatibility(daemon, client) {
         Err(reason) => reason,
         Ok(()) => "协议版本不兼容".to_owned(),
@@ -708,21 +708,24 @@ fn incompatible_daemon_error(daemon: Option<u32>, client: u32) -> String {
         Some(version) => version.to_string(),
         None => "未知".to_owned(),
     };
+    let recorded_note = match recorded {
+        Some(version) => format!("daemon.json 记录的协议版本为 {version}。"),
+        None => "daemon.json 没有记录协议版本。".to_owned(),
+    };
     format!(
         "无法接入 daemon：{reason}。daemon 协议版本 {daemon_label}，客户端协议版本 {client}。\
-         请升级较旧的一方，使两边协议版本一致，然后重启常驻 daemon（agent24 daemon start，或 agent24 service install）后再试。\
+         {recorded_note}\
+         请升级较旧的一方，使两边协议版本一致，然后先 agent24 daemon stop 再 agent24 daemon start（或 service install）。\
          协议版本不一致时不要继续使用这个 daemon。"
     )
 }
 
 async fn attach_discovered(state: &DaemonState) -> DiscoveredAttach {
     let client_version = agent24_protocol::PROTOCOL_VERSION;
-    if agent24_protocol::protocol_compatibility(state.protocol_version, client_version).is_err() {
-        return DiscoveredAttach::Incompatible(incompatible_daemon_error(
-            state.protocol_version,
-            client_version,
-        ));
-    }
+    // Probe first. A leftover daemon.json with no protocol_version, or a
+    // record that names another version, must not refuse a port that is
+    // down or a live daemon that actually speaks this protocol. The record
+    // is quoted only after a successful probe.
     let base = format!("http://127.0.0.1:{}", state.port);
     let daemon_protocol = match fetch_protocol_version(&base, discovery_health_token(state)).await {
         Ok(version) => version,
@@ -739,6 +742,7 @@ async fn attach_discovered(state: &DaemonState) -> DiscoveredAttach {
         return DiscoveredAttach::Incompatible(incompatible_daemon_error(
             daemon_protocol,
             client_version,
+            state.protocol_version,
         ));
     }
     if state.auth_mode.is_capabilities() {
@@ -791,7 +795,7 @@ async fn attach_only() -> Result<Option<Endpoint>, String> {
 }
 
 async fn attach_only_from(state: &DaemonState) -> Result<Option<Endpoint>, String> {
-    // Same checks as `connect`: discovery version, then the live `/health`
+    // Same checks as `connect`: probe `/health` first, then the live
     // advertisement. `Ok(None)` only when there is nothing to attach to.
     match attach_discovered(state).await {
         DiscoveredAttach::Ready(endpoint) => Ok(Some(endpoint)),
@@ -2884,6 +2888,17 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("agent24 daemon start"), "{err}");
+        assert!(
+            err.contains("先 agent24 daemon stop 再 agent24 daemon start（或 service install）"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "daemon.json 记录的协议版本为 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
         assert!(err.contains("升级"), "{err}");
     }
 
@@ -2905,7 +2920,116 @@ mod tests {
             )),
             "{err}"
         );
-        assert!(err.contains("agent24 service install"), "{err}");
+        assert!(
+            err.contains("先 agent24 daemon stop 再 agent24 daemon start（或 service install）"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "daemon.json 记录的协议版本为 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
+    }
+
+    /// An old `daemon.json` (no `protocol_version`) whose port is dead is
+    /// absent. Judging the record before the probe used to refuse forever
+    /// and skip the spawn `connect` is allowed to do.
+    #[tokio::test]
+    async fn connect_treats_an_old_daemon_json_on_a_dead_port_as_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut state = DaemonState::new_legacy(port, "tok", 4242, "0.4.0", "gen").unwrap();
+        state.protocol_version = None;
+        match attach_discovered(&state).await {
+            DiscoveredAttach::Unreachable => {}
+            DiscoveredAttach::Incompatible(err) => {
+                panic!("a dead port must be unreachable, not incompatible: {err}")
+            }
+            DiscoveredAttach::Ready(_) => panic!("a dead port must not attach"),
+        }
+    }
+
+    /// The live `/health` advertisement wins. A missing or stale record is
+    /// only extra text on a refusal, not a reason to skip the probe.
+    #[tokio::test]
+    async fn connect_attaches_when_an_old_daemon_json_health_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, hits) = thread_stub(json_reply(&body));
+        let mut state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.4.0", "gen").unwrap();
+        state.protocol_version = None;
+        let DiscoveredAttach::Ready(endpoint) = attach_discovered(&state).await else {
+            panic!(
+                "a live matching /health must attach even when daemon.json has no protocol_version"
+            );
+        };
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the probe has to run before the record is judged"
+        );
+        assert_eq!(endpoint.base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(endpoint.token, "tok");
+    }
+
+    #[tokio::test]
+    async fn connect_attaches_when_recorded_version_disagrees_but_health_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, _) = thread_stub(json_reply(&body));
+        let mut state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        state.protocol_version = Some(9);
+        let DiscoveredAttach::Ready(endpoint) = attach_discovered(&state).await else {
+            panic!("the recorded version must not override a compatible /health");
+        };
+        assert_eq!(endpoint.token, "tok");
+    }
+
+    #[tokio::test]
+    async fn connect_names_the_recorded_version_only_after_a_live_probe() {
+        let body = r#"{"status":"ok","version":"9.9.9","backend":"rust","protocol_version":2,"migrations":{"store":1,"memory":1}}"#;
+        let (port, hits) = thread_stub(json_reply(body));
+        let mut state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        state.protocol_version = Some(9);
+        let DiscoveredAttach::Incompatible(err) = attach_discovered(&state).await else {
+            panic!("live protocol 2 must still be refused");
+        };
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "must probe before judging the record"
+        );
+        assert!(err.contains("daemon 协议版本 2"), "{err}");
+        assert!(err.contains("daemon.json 记录的协议版本为 9"), "{err}");
+        assert!(
+            !err.contains("daemon 协议版本 9，"),
+            "the refusal must follow the live version, not the record: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_200_whose_body_is_not_json() {
+        let (port, _) = thread_stub(json_reply("not-json"));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        match attach_discovered(&state).await {
+            DiscoveredAttach::Incompatible(err) => {
+                assert!(err.contains("daemon 版本过旧，请升级"), "{err}");
+                assert!(err.contains("daemon 协议版本 未知"), "{err}");
+            }
+            DiscoveredAttach::Unreachable => {
+                panic!("a 200 is a live peer, not an absent daemon")
+            }
+            DiscoveredAttach::Ready(_) => panic!("a non-JSON 200 must not be attached"),
+        }
     }
 
     #[tokio::test]

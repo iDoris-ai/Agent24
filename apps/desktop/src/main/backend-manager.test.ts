@@ -292,6 +292,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       expect(logged).toContain('不复用外部 daemon')
       expect(logged).toContain(`daemon 协议版本 ${CLIENT_PROTOCOL_VERSION + 1}`)
       expect(logged).toContain(`客户端协议版本 ${CLIENT_PROTOCOL_VERSION}`)
+      expect(logged).toContain(`daemon.json 记录的协议版本为 ${CLIENT_PROTOCOL_VERSION}`)
       expect(logged).toContain('4242')
 
       manager.stop()
@@ -301,10 +302,10 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     }
   })
 
-  it('does not reuse an old daemon.json that has no protocol_version, and does not kill it', async () => {
+  it('does not reuse a live old daemon whose /health omits protocol_version', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
-      const fetchHealth = vi.fn()
+      const fetchHealth = vi.fn().mockResolvedValue({ ok: true, protocolVersion: null })
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
         read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
@@ -315,11 +316,12 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
 
       await manager.start()
 
-      expect(fetchHealth).not.toHaveBeenCalled()
+      expect(fetchHealth).toHaveBeenCalledTimes(1)
       expect(manager.isExternalDaemon()).toBe(false)
       expect(spawnProcess).not.toHaveBeenCalled()
       expect(manager.status()).toBe('error')
       expect(manager.statusDetail()).toContain('请升级较旧的一方')
+      expect(manager.statusDetail()).toContain('daemon.json 没有记录协议版本')
       expect(manager.statusDetail()).toContain('4242')
       const logged = warn.mock.calls.map((args) => args.join(' ')).join('\n')
       expect(logged).toContain('daemon 版本过旧，请升级')
@@ -328,6 +330,83 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
     } finally {
       warn.mockRestore()
     }
+  })
+
+  it('old daemon.json and an unreachable port spawns exactly once', async () => {
+    const fetchHealth = vi.fn().mockResolvedValue({ ok: false, protocolVersion: null })
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5555, token: 'tok', pid: 4242 }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth,
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+
+    await manager.start()
+
+    expect(fetchHealth).toHaveBeenCalledTimes(1)
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+    expect(manager.isExternalDaemon()).toBe(false)
+    expect(manager.status()).not.toBe('error')
+    expect(manager.statusDetail()).toBeNull()
+
+    manager.stop()
+  })
+
+  it('a 200 whose body is not JSON is incompatible and does not spawn', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not-json', { status: 200 })))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const external: ExternalDaemonSource = {
+        read: () => ({ port: 5555, token: 'tok', pid: 4242, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+        checkHealth: vi.fn(),
+        fetchHealth: fetchDaemonHealth,
+      }
+      const manager = new BackendManager({ external, spawnProcess })
+
+      await manager.start()
+
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(getBackendEndpoint()).toBeNull()
+      expect(manager.status()).toBe('error')
+      expect(manager.statusDetail()).toContain('daemon 版本过旧，请升级')
+      const logged = warn.mock.calls.map((args) => args.join(' ')).join('\n')
+      expect(logged).toContain('不复用外部 daemon')
+
+      manager.stop()
+    } finally {
+      warn.mockRestore()
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('fetchDaemonHealth', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('treats HTTP 200 with a non-JSON body as a live peer with no protocol version', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not-json', {
+      status: 200,
+      headers: { 'content-type': 'text/plain' },
+    })))
+    await expect(fetchDaemonHealth({ port: 5555, token: 'tok' })).resolves.toEqual({
+      ok: true,
+      protocolVersion: null,
+    })
+  })
+
+  it('treats a network failure as absent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED')
+    }))
+    await expect(fetchDaemonHealth({ port: 5555, token: 'tok' })).resolves.toEqual({
+      ok: false,
+      protocolVersion: null,
+    })
   })
 })
 
@@ -468,6 +547,70 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     } finally {
       manager.stop()
       warn.mockRestore()
+    }
+  })
+
+  it('blocked, then the other side becomes compatible → a later tick reuses it', async () => {
+    vi.useFakeTimers()
+    let live = CLIENT_PROTOCOL_VERSION + 1
+    const fetchHealth = vi.fn(async () => ({ ok: true, protocolVersion: live }))
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      checkHealth: vi.fn().mockResolvedValue(true),
+      fetchHealth,
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.status()).toBe('error')
+      expect(manager.isExternalDaemon()).toBe(false)
+
+      live = CLIENT_PROTOCOL_VERSION
+      await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+
+      expect(manager.status()).toBe('running')
+      expect(fetchHealth.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(true)
+      expect(manager.externalDaemonPid()).toBe(4242)
+      expect(getBackendEndpoint()).toEqual({ port: 5555, token: 'tok' })
+      expect(manager.statusDetail()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('blocked, then the occupant stops answering → a later tick clears the block and spawns once', async () => {
+    vi.useFakeTimers()
+    let health: { ok: boolean; protocolVersion: number | null } = {
+      ok: true,
+      protocolVersion: CLIENT_PROTOCOL_VERSION + 1,
+    }
+    const fetchHealth = vi.fn(async () => health)
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth,
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(manager.status()).toBe('error')
+      expect(spawnProcess).not.toHaveBeenCalled()
+
+      health = { ok: false, protocolVersion: null }
+      await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.status()).not.toBe('error')
+      expect(manager.statusDetail()).toBeNull()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(fetchHealth.mock.calls.length).toBeGreaterThanOrEqual(2)
+    } finally {
+      manager.stop()
     }
   })
 })

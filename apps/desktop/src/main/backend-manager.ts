@@ -80,7 +80,8 @@ export type BackendStatus = 'running' | 'starting' | 'stopped' | 'error'
 
 /** Pure derivation of the tray status from the manager's observable state.
  * Exported so the state machine is unit-testable without spawning a process:
- * - an incompatible external daemon pins `error` (no spawn, no retry);
+ * - an incompatible external daemon pins `error` until a later probe finds it
+ *   gone or on this protocol;
  * - a user-initiated stop pins `stopped` (the health loop won't auto-respawn);
  * - a healthy endpoint is `running`;
  * - anything else (spawned but not yet ready, or briefly between respawns) is
@@ -213,7 +214,12 @@ export async function fetchDaemonHealth(endpoint: BackendEndpoint): Promise<Daem
       signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
     })
     if (!response.ok) return { ok: false, protocolVersion: null }
-    return { ok: true, protocolVersion: protocolVersionOf(await response.json()) }
+    try {
+      return { ok: true, protocolVersion: protocolVersionOf(await response.json()) }
+    } catch {
+      // 200 whose body is not JSON: a process is occupying the port.
+      return { ok: true, protocolVersion: null }
+    }
   } catch {
     return { ok: false, protocolVersion: null }
   }
@@ -283,8 +289,9 @@ export class BackendManager {
   private externalPid: number | null = null
   // Set when a discoverable daemon is up but on another protocol. That process
   // holds the singleton lock, so spawning would fail and the health loop would
-  // retry forever. While set, start/tick/restart do not spawn and do not signal
-  // the external pid. Cleared only by a later successful reuse.
+  // retry forever. While set, start/restart do not spawn and do not signal the
+  // external pid. tick keeps probing: a compatible `/health` clears this and
+  // reuses the peer; a failed probe clears it and spawns.
   private blockedReason: string | null = null
   // Reentrancy guard for tick(): setInterval doesn't wait for a previous
   // callback to resolve before scheduling the next one, and the failure-
@@ -313,32 +320,27 @@ export class BackendManager {
   /** DEP-A5 step 1: before spawning anything, check whether a daemon started
    * outside this app (typically `agent24 daemon start`) is already up and
    * healthy — if so, point at it instead of racing it for the singleton lock.
-   * `incompatible` is a live daemon this app must not attach to and must not
-   * spawn over. `absent` is the only outcome that may spawn. */
+   * Probe first. `incompatible` is only a live daemon whose `/health`
+   * `protocol_version` this app must not attach to and must not spawn over.
+   * The version recorded in daemon.json is named in that error; it is not a
+   * reason to skip the probe. `absent` (no record, or the probe did not
+   * connect) is the only outcome that may spawn. */
   private async tryReuseExternal(): Promise<'reused' | 'absent' | 'incompatible'> {
     const state = this.external.read()
-    if (!state) return 'absent'
-    const endpoint: BackendEndpoint = { port: state.port, token: state.token }
-    const refuse = (reason: string): 'incompatible' => {
-      const message =
-        `${reason}。请升级较旧的一方，使两边协议版本一致，然后重新打开本应用。` +
-        `外部 daemon（pid ${state.pid}）仍在运行，本应用不会终止它，也不会再启动另一个。`
-      this.blockedReason = message
-      this.isExternal = false
-      this.externalPid = null
-      this.lastHealthy = false
-      currentEndpoint = null
-      console.warn(
-        `[backend:${this.kind}] 不复用外部 daemon（pid ${state.pid}，port ${state.port}）：${message}`,
-      )
-      return 'incompatible'
+    if (!state) {
+      this.blockedReason = null
+      return 'absent'
     }
-    const recorded = protocolCompatibility(state.protocolVersion ?? null, CLIENT_PROTOCOL_VERSION)
-    if (!recorded.compatible) return refuse(recorded.reason)
+    const endpoint: BackendEndpoint = { port: state.port, token: state.token }
     const health = await this.external.fetchHealth(endpoint)
-    if (!health.ok) return 'absent'
+    if (!health.ok) {
+      // Nothing answered. A leftover daemon.json must not block spawn, and a
+      // peer that previously blocked us has released the lock.
+      this.blockedReason = null
+      return 'absent'
+    }
     const live = protocolCompatibility(health.protocolVersion, CLIENT_PROTOCOL_VERSION)
-    if (!live.compatible) return refuse(live.reason)
+    if (!live.compatible) return this.refuseExternal(state, live.reason)
     this.blockedReason = null
     this.isExternal = true
     this.externalPid = state.pid
@@ -348,6 +350,28 @@ export class BackendManager {
       `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
     )
     return 'reused'
+  }
+
+  /** Live `/health` disagreed. The recorded version is only named in the hint. */
+  private refuseExternal(state: ExternalDaemonState, reason: string): 'incompatible' {
+    const recorded = state.protocolVersion === undefined
+      ? 'daemon.json 没有记录协议版本'
+      : `daemon.json 记录的协议版本为 ${state.protocolVersion}`
+    const message =
+      `${reason}。${recorded}。请升级较旧的一方，使两边协议版本一致，然后重新打开本应用。` +
+      `外部 daemon（pid ${state.pid}）仍在运行，本应用不会终止它，也不会再启动另一个。`
+    const already = this.blockedReason === message
+    this.blockedReason = message
+    this.isExternal = false
+    this.externalPid = null
+    this.lastHealthy = false
+    currentEndpoint = null
+    if (!already) {
+      console.warn(
+        `[backend:${this.kind}] 不复用外部 daemon（pid ${state.pid}，port ${state.port}）：${message}`,
+      )
+    }
+    return 'incompatible'
   }
 
   /** True while the current endpoint is a daemon this manager discovered
@@ -506,10 +530,16 @@ export class BackendManager {
         this.lastHealthy = false
         return
       }
-      // Stop the failure/respawn loop. The external pid is not ours to kill,
-      // and another spawn cannot take the singleton lock it still holds.
+      // The external pid is not ours to kill, and another spawn cannot take
+      // the singleton lock while that peer is still up. Keep probing so an
+      // upgrade (or the peer exiting) recovers without reopening the app.
       if (this.blockedReason !== null) {
         this.lastHealthy = false
+        const outcome = await this.tryReuseExternal()
+        if (outcome === 'absent') {
+          this.failureCount = 0
+          this.spawnChild()
+        }
         return
       }
 
