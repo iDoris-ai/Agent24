@@ -102,31 +102,50 @@ start_daemon() {
   done
   stop_daemon; return 1
 }
+# reap DATA_DIR: kill a daemon the state file names there, if alive. A start
+# that gave up waiting leaves its daemon running (kill_on_drop is off for a
+# resident one), and it may write the file later.
+reap() {
+  local pid
+  pid=$(jq -r '.pid // empty' "$1/daemon.json" 2>/dev/null) || return 0
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
+  echo "a daemon on $1 outlived its start (pid $pid); killing it" >&2
+  kill -KILL "$pid"
+}
 # start_cli BIN_DIR DATA_DIR [VAR=value ...]: `agent24 daemon start`, as a user
 # starts it; 0 once it started, 1 otherwise, its words in DATA_DIR.start.out
 start_cli() {
   local bin=$1; DATA=$2; shift 2
   mkdir -p "$DATA"; rm -f "$DATA/daemon.json"
   env AGENT24_DATA_DIR="$DATA" A24_OS_PACKAGES="$DATA.pk" "$@" perl -e 'alarm shift; exec @ARGV' 60 \
-    "$bin/agent24" daemon start > "$DATA.start.out" 2>&1 || return 1
+    "$bin/agent24" daemon start > "$DATA.start.out" 2>&1 || { reap "$DATA"; return 1; }
   PID=$(jq -r .pid "$DATA/daemon.json"); PORT=$(jq -r .port "$DATA/daemon.json")
   TOKEN=$(jq -r .token "$DATA/daemon.json"); BY_CLI=$bin
 }
 # stop_daemon: `agent24 daemon stop` (or SIGTERM to a daemon started without
-# it), then SIGKILL after 10 s, so no daemon outlives a case
+# it), then SIGKILL after 10 s, so no daemon outlives a case. A `daemon stop`
+# that failed or needed the SIGKILL is counted for U5.
+STOPS=0 STOP_FAILS=""
 stop_daemon() {
   [ -n "$PID" ] || return 0
+  local rc=0
   if [ -n "$BY_CLI" ]; then
-    env AGENT24_DATA_DIR="$DATA" perl -e 'alarm shift; exec @ARGV' 30 "$BY_CLI/agent24" daemon stop > "$DATA.stop.out" 2>&1
+    env AGENT24_DATA_DIR="$DATA" perl -e 'alarm shift; exec @ARGV' 30 "$BY_CLI/agent24" daemon stop > "$DATA.stop.out" 2>&1 || rc=$?
   else
     kill -TERM "$PID" 2>/dev/null
   fi
   for _ in $(seq 1 20); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done
-  kill -0 "$PID" 2>/dev/null && { echo "daemon $PID did not stop; killing it" >&2; kill -KILL "$PID"; }
-  [ -n "$BY_CLI" ] || wait "$PID" 2>/dev/null
+  if kill -0 "$PID" 2>/dev/null; then
+    echo "daemon $PID did not stop; killing it" >&2; kill -KILL "$PID"; rc=killed
+  fi
+  if [ -n "$BY_CLI" ]; then
+    STOPS=$((STOPS + 1)); [ "$rc" = 0 ] || STOP_FAILS="$STOP_FAILS $DATA:$rc"
+  else
+    wait "$PID" 2>/dev/null
+  fi
   PID="" BY_CLI=""
 }
-trap 'stop_daemon' EXIT
+trap 'stop_daemon; reap "$WORK/up"; reap "$WORK/down"' EXIT
 # cli ARGS...: the release's agent24 on the current library, time-limited
 cli() { env AGENT24_DATA_DIR="$DATA" A24_OS_PACKAGES="$DATA.pk" perl -e 'alarm shift; exec @ARGV' 60 "$NEW/agent24" "$@"; }
 
@@ -241,7 +260,7 @@ if start_cli "$NEW" "$WORK/up"; then UP=ok; else UP=fail; fi
 check U1 "agent24 daemon start opens the main library with the release" "$UP" "migration $OLD_VERSION before; $(head -1 "$WORK/up.start.out")"
 [ "$UP" = ok ] || { cat "$WORK/up.start.out" >&2; exit 1; }
 cli daemon status > "$WORK/u2.out" 2>&1; RC=$?
-check U2 "agent24 daemon status after the upgrade" "$( [ $RC = 0 ] && has "$WORK/u2.out" running || echo fail)" "exit $RC; $(head -1 "$WORK/u2.out")"
+check U2 "agent24 daemon status after the upgrade" "$( [ $RC = 0 ] && grep -q '^running · ' "$WORK/u2.out" && echo ok || echo fail)" "exit $RC; $(head -1 "$WORK/u2.out")"
 # Every migration this checkout carries past main's, and at least 19–26
 versions() { ls "$1" | grep -oE '^[0-9]+' | sed 's/^0*//' | sort -nu; }
 WANT=$(versions "$REPO/rust/crates/agent24-store/migrations" | awk -v o="$OLD_VERSION" '$1 > o' | paste -sd, -)
@@ -274,7 +293,11 @@ bridge mcp agent24_run '{"prompt":"NEW-ORDINARY-MARKER"}' > "$WORK/v3.mcp" 2>&1
 bridge acp ACP-MARKER > "$WORK/acp.out" 2>&1
 NEW_RUN=$(run_with NEW-ORDINARY-MARKER); ACP_RUN=$(run_with ACP-MARKER); wait_run "$ACP_RUN"
 N=$(peer "$NEW_RUN"); S=$(withheld "$ACP_RUN")
-M=$(jq -e '.result.content[0].text' "$WORK/v3.mcp" > /dev/null 2>&1 && lacks "$WORK/v3.mcp" "$NOTICE" || echo fail)
+# The MCP answer is that run's own end, as agent24_run gives a shared run back:
+# its output, or its error as `code: message`; any other error text is not
+EXPECT=$(cli runs show "$NEW_RUN" --json 2>/dev/null | jq -r 'if .status == "completed" then (.output.text // "") else "\(.error.code): \(.error.message)" end' 2>/dev/null)
+GOT=$(jq -r '.result.content[0].text // empty' "$WORK/v3.mcp" 2>/dev/null)
+M=$( [ -n "$EXPECT" ] && [ "$GOT" = "$EXPECT" ] && echo ok || echo fail)
 check V3 "a run started over MCP (no session) is shared, an ACP run (a session) is withheld" "$(is "$N/$M/$S" false/ok/ok)" "MCP run $NEW_RUN $N, answer $(jq -c '.result.content[0].text' "$WORK/v3.mcp" 2>/dev/null | cut -c1-80); ACP run $ACP_RUN $S"
 api GET /api/v1/peer/runs; cp "$WORK/r.json" "$WORK/peer.json"
 LEAK=$( [ "$CODE" = 200 ] && peer_list "$WORK/peer.json" || echo fail)
@@ -335,6 +358,8 @@ if start_daemon "$OLD" "$WORK/down"; then R=fail; stop_daemon; else R=$(has "$WO
 check D1 "main refuses the upgraded library and leaves it alone" "$R" "$(grep -m1 -o 'migration [0-9]* was previously applied[^"]*' "$WORK/down.serve.log" | cut -c1-90); dump unchanged: $( [ "$(dump)" = "$BEFORE" ] && echo yes || echo no)"
 if start_cli "$NEW" "$WORK/down"; then R=ok; stop_daemon; else R=fail; fi
 check D2 "the release still opens it afterwards" "$R" "$(head -1 "$WORK/down.start.out")"
+
+check U5 "agent24 daemon stop stops each release daemon it is asked to" "$( [ "$STOPS" -gt 0 ] && [ -z "$STOP_FAILS" ] && echo ok || echo fail)" "$STOPS stops; failed:${STOP_FAILS:- none}"
 
 if [ "$REAL_BEFORE" = absent ]; then [ -e "$REAL" ] && R=fail || R=ok
 else [ -z "$(find "$REAL" -newer "$WORK/.start" -print -quit)" ] && R=ok || R=fail; fi
