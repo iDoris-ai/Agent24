@@ -176,7 +176,7 @@ async fn null_host_recall_does_not_call_the_provider() {
 }
 
 #[tokio::test]
-async fn pause_notice_fails_the_run_and_keeps_snapshot_rows() {
+async fn pause_notice_completes_the_run_and_keeps_snapshot_rows() {
     let provider = Arc::new(RecordingProvider {
         seen: StdMutex::new(vec![]),
     });
@@ -214,23 +214,133 @@ async fn pause_notice_fails_the_run_and_keeps_snapshot_rows() {
         .unwrap();
     insert_grant(&store, &run.id).await;
     let done = wait_settled(&manager, &store, &run.id).await;
-    assert_eq!(done.status, RunStatus::Failed);
-    assert_eq!(done.error, Some(unproven_body()));
-    assert!(provider.seen.lock().unwrap().is_empty());
+    assert_eq!(done.status, RunStatus::Completed);
+    assert_eq!(done.error, None);
+    let seen = provider.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0][0], Msg::system(retain::PAUSED_WRITE_NOTICE));
     let thread = store.list_run_messages(&run.id).await.unwrap();
-    assert_eq!(thread.len(), 4);
+    // The first call saw the snapshot in order: notice, history, history, prompt.
+    let sent: Vec<_> = seen[0].iter().map(|m| m.content.as_deref()).collect();
+    assert_eq!(
+        sent,
+        vec![
+            Some(retain::PAUSED_WRITE_NOTICE),
+            Some("earlier question"),
+            Some("earlier answer"),
+            Some("记住 我喜欢喝茶"),
+        ]
+    );
+    // Once the run is terminal the duplicated history rows are reclaimed
+    // (M3 growth control), leaving notice, prompt and the reply.
+    assert_eq!(thread.len(), 3);
     assert_eq!(thread[0].content.as_deref(), Some(retain::PAUSED_WRITE_NOTICE));
-    assert_eq!(thread[1].content.as_deref(), Some("earlier question"));
-    assert_eq!(thread[2].content.as_deref(), Some("earlier answer"));
-    assert_eq!(thread[3].content.as_deref(), Some("记住 我喜欢喝茶"));
+    assert_eq!(thread[1].content.as_deref(), Some("记住 我喜欢喝茶"));
+    assert_eq!(thread[2].content.as_deref(), Some("pong"));
+    match store
+        .read_run_message_origin(&run.id, thread[0].seq)
+        .await
+        .unwrap()
+    {
+        MessageOriginLookup::Present(stored) => {
+            assert_eq!(stored.origin, MessageOrigin::HostSystem)
+        }
+        other => panic!("expected Present HostSystem, got {other:?}"),
+    }
+    assert_eq!(grant_state(&store).await, ("pending".to_owned(), None, None));
+}
+
+#[tokio::test]
+async fn paused_remember_run_completes_and_provider_gets_notice() {
+    let provider = Arc::new(RecordingProvider {
+        seen: StdMutex::new(vec![]),
+    });
+    let (manager, store, kv) =
+        manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+    seed_session(&store, "gate-pause-ok").await;
+    kv.set_memory_enabled("test-owner", false).await.unwrap();
+    let run = manager
+        .start_run(RunCreate {
+            session_id: Some("gate-pause-ok".into()),
+            workspace_id: None,
+            prompt: "记住 X".into(),
+            model_override: None,
+            mode: RunMode::Normal,
+        })
+        .await
+        .unwrap();
+    let done = wait_settled(&manager, &store, &run.id).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let seen = provider.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let notice = seen[0]
+        .iter()
+        .find(|m| m.content.as_deref() == Some(retain::PAUSED_WRITE_NOTICE))
+        .expect("provider must receive the pause notice verbatim");
+    assert_eq!(*notice, Msg::system(retain::PAUSED_WRITE_NOTICE));
+    let thread = store.list_run_messages(&run.id).await.unwrap();
+    let row = thread
+        .iter()
+        .find(|r| r.content.as_deref() == Some(retain::PAUSED_WRITE_NOTICE))
+        .unwrap();
+    match store.read_run_message_origin(&run.id, row.seq).await.unwrap() {
+        MessageOriginLookup::Present(stored) => {
+            assert_eq!(stored.origin, MessageOrigin::HostSystem)
+        }
+        other => panic!("expected Present HostSystem, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn legacy_unsourced_pause_notice_still_refused() {
+    let provider = Arc::new(RecordingProvider {
+        seen: StdMutex::new(vec![]),
+    });
+    let (manager, _, store) = manager_with(provider.clone()).await;
+    let run = manager.start_run(create()).await.unwrap();
+    assert_eq!(
+        wait_terminal(&store, &run.id).await.status,
+        RunStatus::Completed
+    );
+    // Simulate a pre-0023 run: a pause notice row with no origin row.
+    sqlx::query(
+        "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, tool_call_id, created_at) \
+         VALUES (?, (SELECT COALESCE(MAX(seq), -1) + 1 FROM run_messages WHERE run_id = ?), 'system', ?, '[]', NULL, ?)",
+    )
+    .bind(&run.id)
+    .bind(&run.id)
+    .bind(retain::PAUSED_WRITE_NOTICE)
+    .bind(now_iso8601())
+    .execute(agent24_store::test_hooks::pool(&store))
+    .await
+    .unwrap();
+    let before = store.list_run_messages(&run.id).await.unwrap();
+    let legacy = before
+        .iter()
+        .find(|r| r.content.as_deref() == Some(retain::PAUSED_WRITE_NOTICE))
+        .unwrap();
     assert!(matches!(
         store
-            .read_run_message_origin(&run.id, thread[0].seq)
+            .read_run_message_origin(&run.id, legacy.seq)
             .await
             .unwrap(),
         MessageOriginLookup::Missing
     ));
-    assert_eq!(grant_state(&store).await, ("pending".to_owned(), None, None));
+    provider.seen.lock().unwrap().clear();
+    let running = reopen(&store, &run.id).await;
+    manager
+        .run_loop(
+            running,
+            thread_to_messages(&before),
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+    let done = store.get_run(&run.id).await.unwrap().unwrap();
+    assert_eq!(done.status, RunStatus::Failed);
+    assert_eq!(done.error, Some(unproven_body()));
+    assert!(provider.seen.lock().unwrap().is_empty());
+    assert_eq!(store.list_run_messages(&run.id).await.unwrap(), before);
 }
 
 #[tokio::test]

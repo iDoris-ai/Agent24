@@ -528,14 +528,14 @@ async fn rebuilt_origin_table_keeps_old_rows_and_does_not_backfill() {
             .unwrap();
     assert_eq!(message_count, 2);
 
-    let host_system = sqlx::query(
+    let unknown = sqlx::query(
         "INSERT INTO run_message_origins (run_id, seq, schema_version, kind, instance_digest, recall_ref) \
-         VALUES ('run_old', 1, 1, 'HostSystem', ?, NULL)",
+         VALUES ('run_old', 1, 1, 'Bogus', ?, NULL)",
     )
     .bind(&digest)
     .execute(&pool)
     .await;
-    assert!(host_system.is_err(), "{host_system:?}");
+    assert!(unknown.is_err(), "{unknown:?}");
     sqlx::query(
         "INSERT INTO run_message_origins (run_id, seq, schema_version, kind, instance_digest, recall_ref) \
          VALUES ('run_old', 1, 1, 'Assistant', ?, NULL)",
@@ -551,4 +551,91 @@ async fn rebuilt_origin_table_keeps_old_rows_and_does_not_backfill() {
     .await
     .unwrap();
     assert_eq!(assistant, "Assistant");
+}
+
+#[tokio::test]
+async fn snapshot_pause_notice_is_written_as_present_host_system() {
+    let store = store_with_run("run_host_system").await;
+    store
+        .append_snapshot_run_messages(
+            "run_host_system",
+            &[
+                notice("paused"),
+                SnapshotRunMessage::Originated(row(
+                    "user",
+                    Some("prompt"),
+                    MessageOrigin::UserPrompt,
+                )),
+            ],
+            NOW,
+        )
+        .await
+        .unwrap();
+    match store
+        .read_run_message_origin("run_host_system", 0)
+        .await
+        .unwrap()
+    {
+        MessageOriginLookup::Present(stored) => {
+            assert_eq!(stored.origin, MessageOrigin::HostSystem);
+        }
+        other => panic!("expected Present HostSystem, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn origin_kind_check_rejects_unknown_kind() {
+    let store = store_with_run("run_check").await;
+    store
+        .append_originated_run_messages(
+            "run_check",
+            &[
+                row("user", Some("a"), MessageOrigin::UserPrompt),
+                row("user", Some("b"), MessageOrigin::UserPrompt),
+            ],
+            NOW,
+        )
+        .await
+        .unwrap();
+    let digest = message_instance_digest("user", Some("a"), &json!([]), None).unwrap();
+    let insert = |kind: &'static str, seq: i64| {
+        let digest = digest.clone();
+        let pool = test_hooks::pool(&store).clone();
+        async move {
+            sqlx::query(
+                "INSERT OR REPLACE INTO run_message_origins \
+                 (run_id, seq, schema_version, kind, instance_digest, recall_ref) \
+                 VALUES ('run_check', ?, 1, ?, ?, NULL)",
+            )
+            .bind(seq)
+            .bind(kind)
+            .bind(digest)
+            .execute(&pool)
+            .await
+        }
+    };
+    assert!(insert("Bogus", 0).await.is_err());
+    assert!(insert("HostSystem", 1).await.is_ok());
+}
+
+#[tokio::test]
+async fn host_system_with_recall_ref_is_unreadable() {
+    let store = store_with_run("run_hs_ref").await;
+    store
+        .append_snapshot_run_messages("run_hs_ref", &[notice("paused")], NOW)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE run_message_origins SET recall_ref = '[\"x\"]' WHERE run_id = 'run_hs_ref'",
+    )
+    .execute(test_hooks::pool(&store))
+    .await
+    .unwrap();
+    assert!(matches!(
+        store
+            .read_run_message_origin("run_hs_ref", 0)
+            .await
+            .unwrap(),
+        MessageOriginLookup::Unreadable { seq: 0 }
+    ));
 }

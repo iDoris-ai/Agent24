@@ -864,12 +864,11 @@ mod tests {
 
         let mut events = state.events.subscribe();
         let paused = finish_run(&state, E2E_WRITE_SESSION, "记住我对花生过敏").await;
-        assert_eq!(paused.status, RunStatus::Failed);
-        assert_eq!(
-            paused.error.as_ref().map(|error| error.code.as_str()),
-            Some("source_unproven")
+        assert_eq!(paused.status, RunStatus::Completed);
+        assert!(
+            last_messages_mention(&provider, "记忆已暂停"),
+            "provider must receive the pause notice"
         );
-        assert!(provider.received.lock().unwrap().is_empty());
 
         // H1: no new assertion — the write gate still independently refuses it.
         let rows = kv
