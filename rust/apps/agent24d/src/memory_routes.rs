@@ -231,6 +231,11 @@ pub async fn delete_assertion(State(state): State<AppState>, Path(id): Path<Stri
                     code.as_str(),
                     "the disk is full; free some space and retry the retraction",
                 ),
+                MemoryErrorCode::DiskLow => error_response(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    code.as_str(),
+                    "free disk space is below the retraction floor; free some space and retry",
+                ),
                 MemoryErrorCode::RetractIdTooLong => error_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     code.as_str(),
@@ -1125,6 +1130,59 @@ mod tests {
         let (status, v, raw) = retract_response(&state, "a-disk").await;
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{raw}");
         assert_eq!(v["error"]["code"], "memory_disk_full");
+        assert_no_internals(&raw);
+    }
+
+    struct FixedProbe(u64);
+    impl agent24_memory::disk_gate::DiskProbe for FixedProbe {
+        fn sample(
+            &self,
+            _db: &std::path::Path,
+        ) -> std::io::Result<agent24_memory::disk_gate::DiskSample> {
+            Ok(agent24_memory::disk_gate::DiskSample {
+                free_bytes: self.0,
+                wal_bytes: 0,
+            })
+        }
+    }
+    struct ZeroClock;
+    impl agent24_memory::disk_gate::GateClock for ZeroClock {
+        fn now(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+    }
+
+    /// Make the memory volume pretend to have `free` bytes left (applied AFTER
+    /// seeding, since seeding is itself a content write the gate would refuse).
+    fn pretend_free(state: &mut AppState, kv: &KvStore, dir: &std::path::Path, free: u64) {
+        state.memory_kv = Some(kv.clone().with_disk_gate(
+            agent24_memory::disk_gate::DiskGate::with_probe(
+                &dir.join("memory.sqlite"),
+                std::sync::Arc::new(FixedProbe(free)),
+                std::sync::Arc::new(ZeroClock),
+            ),
+        ));
+    }
+
+    #[tokio::test]
+    async fn retract_with_20_mib_free_still_succeeds_204() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, kv, _admin) = file_state(dir.path()).await;
+        add_assertion(&kv, NUL_OWNER, "a-low", "s", "t", vec!["e".into()]).await;
+        pretend_free(&mut state, &kv, dir.path(), 20 * 1024 * 1024);
+        let (status, ..) = retract_response(&state, "a-low").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn retract_under_16_mib_free_is_507_memory_disk_low() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, kv, _admin) = file_state(dir.path()).await;
+        add_assertion(&kv, NUL_OWNER, "a-low", "s", "t", vec!["e".into()]).await;
+        pretend_free(&mut state, &kv, dir.path(), 15 * 1024 * 1024);
+        let (status, v, raw) = retract_response(&state, "a-low").await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{raw}");
+        assert_eq!(v["error"]["code"], "memory_disk_low");
         assert_no_internals(&raw);
     }
 

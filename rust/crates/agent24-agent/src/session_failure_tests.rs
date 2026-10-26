@@ -560,7 +560,10 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let memory = SessionMemory::new(kv.clone(), Arc::new(UnusedSummarizer))
-        .with_session_log(agent24_memory::session_log::SessionLog::new(pool.clone()))
+        .with_session_log(agent24_memory::session_log::SessionLog::new(
+            pool.clone(),
+            agent24_memory::disk_gate::DiskGate::disabled(),
+        ))
         .with_owner("m1-test-owner".to_owned());
     let manager = RunManager::with_memory(
         store.clone(),

@@ -429,11 +429,21 @@ fn bind_scan_query<'q>(
 #[derive(Clone)]
 pub struct EventLog {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl EventLog {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Append an event on a caller-owned connection with a PLAIN insert — an `id`
@@ -563,6 +573,7 @@ impl EventLog {
 #[async_trait]
 impl EventStore for EventLog {
     async fn append(&self, e: &MemEvent) -> Result<i64> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope_json = serde_json::to_string(&e.scope)?;
         let payload = serde_json::to_string(&e.body)?;
         let causal = serde_json::to_string(&e.causal)?;

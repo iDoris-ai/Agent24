@@ -165,11 +165,21 @@ pub trait MemoryWriter: Send + Sync {
 #[derive(Clone)]
 pub struct WriteGate {
     pool: sqlx::SqlitePool,
+    disk: crate::disk_gate::DiskGate,
 }
 
 impl WriteGate {
     pub(crate) fn new(pool: sqlx::SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            disk: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.disk = gate;
+        self
     }
 
     /// The DETERMINISTIC policy: same candidate → same outcome, no I/O.
@@ -527,6 +537,7 @@ impl WriteGate {
     where
         F: Fn() -> String,
     {
+        self.disk.check(crate::disk_gate::WriteClass::Content)?;
         let assertion = Self::to_assertion(c, qualified);
         let audit = Self::audit_event(c, verdict, None);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -727,6 +738,10 @@ impl WriteGate {
 #[async_trait]
 impl MemoryWriter for WriteGate {
     async fn propose(&self, candidates: Vec<Candidate>) -> Result<Vec<WriteDecision>> {
+        // The disk gate is checked before EVERY item's transaction (in
+        // `commit_with_audit_using_clock` and the reject-audit branch below), not
+        // once per batch: items commit independently, so a disk that fills mid-batch
+        // must refuse the remaining items. The gate's 5 s cache keeps this cheap.
         let mut out = Vec::with_capacity(candidates.len());
         for c in &candidates {
             let decision = match Self::policy(c) {
@@ -743,6 +758,7 @@ impl MemoryWriter for WriteGate {
                     // malformed empty/whitespace-owner candidate has no scope to
                     // file a governance record under, so it is rejected without one.
                     if !c.scope.owner.trim().is_empty() {
+                        self.disk.check(crate::disk_gate::WriteClass::Content)?;
                         let audit = Self::audit_event(c, "reject", Some(&reason));
                         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                         EventLog::append_tx(&mut tx, &audit).await?;

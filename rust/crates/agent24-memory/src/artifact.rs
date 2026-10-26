@@ -116,11 +116,21 @@ pub trait ArtifactStore: Send + Sync {
 #[derive(Clone)]
 pub struct ArtifactCas {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl ArtifactCas {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Every current artifact's `(path, db_checksum)` under `owner`, sorted by
@@ -178,6 +188,7 @@ impl ArtifactStore for ArtifactCas {
     }
 
     async fn cas_write(&self, a: Artifact, expect_version: u64) -> Result<Artifact> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         // BEGIN IMMEDIATE takes the write lock UP FRONT, so the whole
         // read-check-write is serialized against other writers and `busy_timeout`
         // actually applies. A plain DEFERRED begin (`pool.begin()`) instead lets
