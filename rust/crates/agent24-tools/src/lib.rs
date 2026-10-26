@@ -172,6 +172,17 @@ impl ToolContext {
         self.authorize_egress(purpose, destination).await
     }
 
+    /// This context without the results `module` itself returned: their
+    /// ids are host-written ([`agent24_store::SourceRef::tool_result`]), so
+    /// a source from anywhere else never matches.
+    fn without_results_of_module(&self, module: &str) -> Self {
+        let own = format!("{}module:{module}:", agent24_store::TOOL_RESULT_PREFIX);
+        let mut ctx = self.clone();
+        ctx.egress_resources
+            .retain(|resource| !resource.resource_id.starts_with(&own));
+        ctx
+    }
+
     fn with_egress_gate(mut self, gate: Arc<dyn EgressGate>) -> Self {
         self.egress = Some(gate);
         self
@@ -570,10 +581,45 @@ impl ApprovalGate for DenyAllGate {
 }
 
 /// One callable tool. `parameters` is the JSON Schema advertised to the model;
+/// Where a tool's result came from and how the host classifies it
+/// (K1-6b.5f, ADR-K1-02 §2.1). Decided by the host's code for each kind of
+/// tool, so an MCP server or a module process cannot change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultSource {
+    /// `module:{id}` for a module tool, `tool:{name}` otherwise.
+    pub origin: String,
+    pub classification: agent24_store::SourceClassification,
+}
+
+impl ToolResultSource {
+    #[must_use]
+    pub fn ordinary(tool: &str) -> Self {
+        Self {
+            origin: format!("tool:{tool}"),
+            classification: agent24_store::SourceClassification::Ordinary,
+        }
+    }
+
+    #[must_use]
+    pub fn unknown(tool: &str) -> Self {
+        Self {
+            origin: format!("tool:{tool}"),
+            classification: agent24_store::SourceClassification::Unknown,
+        }
+    }
+}
+
 /// `call` returns the string handed back as the tool result message.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn info(&self) -> ToolInfo;
+
+    /// How the host classifies what this tool returns (David 2026-10-26):
+    /// Unknown unless the host can trace it, which only the builtin file
+    /// read, public fetch and receipt-only tools override.
+    fn result_source(&self) -> ToolResultSource {
+        ToolResultSource::unknown(&self.info().name)
+    }
 
     /// Whether this tool always needs a registry-bound egress gate, regardless
     /// of per-run source provenance. Source-aware tools enforce the gate at
@@ -862,6 +908,11 @@ pub struct ModuleTool {
     runtime: Arc<dyn ModuleToolRuntime>,
     audit_store: Store,
     audit_actor: String,
+    /// Whether the manifest says this operation may act or send outside the
+    /// device. Only ever withholds the same-source exception, so a module
+    /// that misstates it gains nothing it did not already hold. True until
+    /// the host says otherwise.
+    declared_outbound: bool,
 }
 
 impl ModuleTool {
@@ -1077,12 +1128,29 @@ impl ModuleTool {
             runtime,
             audit_store,
             audit_actor: audit_actor.into(),
+            declared_outbound: true,
         })
+    }
+
+    /// Record what the manifest declares (K1-6b.5f): `false` only for an
+    /// operation declared neither `external` nor able to send output off the
+    /// device, which may then receive back what this module returned.
+    #[must_use]
+    pub fn with_declared_outbound(mut self, outbound: bool) -> Self {
+        self.declared_outbound = outbound;
+        self
     }
 }
 
 #[async_trait]
 impl Tool for ModuleTool {
+    fn result_source(&self) -> ToolResultSource {
+        ToolResultSource {
+            origin: format!("module:{}", self.module),
+            classification: agent24_store::SourceClassification::Unknown,
+        }
+    }
+
     fn requires_outbound_policy(&self) -> bool {
         // Enforced dynamically at invocation time via
         // `ToolContext::authorize_egress_if_restricted`.
@@ -1279,11 +1347,21 @@ impl Tool for ModuleTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
-        ctx.authorize_egress_if_restricted(
-            EgressPurpose::ModuleTool,
-            EgressDestination::exact(&self.name),
-        )
-        .await?;
+        // Same source (David 2026-10-26): what this module returned earlier
+        // is already the module's, so sending it back is not egress. Every
+        // other source still counts, and an operation declared to act
+        // outside the device gets no exception.
+        let egress = if self.declared_outbound {
+            ctx.clone()
+        } else {
+            ctx.without_results_of_module(&self.module)
+        };
+        egress
+            .authorize_egress_if_restricted(
+                EgressPurpose::ModuleTool,
+                EgressDestination::exact(&self.name),
+            )
+            .await?;
         let Some(capability) = invocation.module.as_ref() else {
             return Err(unknown_module_outcome("result_unknown"));
         };
@@ -1885,6 +1963,15 @@ impl ToolRegistry {
         self.tools
             .get(name.trim())
             .map(|t| self.effective_risk(&t.info()))
+    }
+
+    /// Where `name`'s result comes from and how it is classified
+    /// (K1-6b.5f). A name that is not registered is Unknown.
+    pub fn tool_result_source(&self, name: &str) -> ToolResultSource {
+        self.tools.get(name.trim()).map_or_else(
+            || ToolResultSource::unknown(name.trim()),
+            |tool| tool.result_source(),
+        )
     }
 
     /// Sorted list for `GET /api/v1/tools`.
@@ -2820,6 +2907,26 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].risk_class, RiskClass::Read);
         assert!(!listed[0].requires_approval);
+    }
+
+    /// K1-6b.5f (David 2026-10-26): only what the host can trace or a
+    /// receipt is Ordinary; a command's output, and any name the registry
+    /// does not know, is Unknown.
+    #[test]
+    fn builtin_results_are_classified_by_the_host() {
+        use agent24_store::SourceClassification::{Ordinary, Unknown};
+        let registry = ToolRegistry::builtin(std::path::PathBuf::from("/nonexistent"));
+        for (tool, classification) in [
+            ("fs_read", Ordinary),
+            ("fs_write", Ordinary),
+            ("http_fetch", Ordinary),
+            ("shell_exec", Unknown),
+            ("no_such_tool", Unknown),
+        ] {
+            let source = registry.tool_result_source(tool);
+            assert_eq!(source.classification, classification, "{tool}");
+            assert_eq!(source.origin, format!("tool:{tool}"));
+        }
     }
 
     /// H1 is an additive migration: the gating outcome must be byte-for-byte

@@ -864,6 +864,34 @@ mod tests {
         Store,
         Arc<ModuleTool>,
     ) {
+        fixture_declaring(
+            risk,
+            granted,
+            running,
+            outbound_ready,
+            supplied_store,
+            supplied_authorization,
+            true,
+        )
+        .await
+    }
+
+    /// [`fixture_using`] whose tool's manifest declares `declared_outbound`.
+    async fn fixture_declaring(
+        risk: RiskClass,
+        granted: bool,
+        running: bool,
+        outbound_ready: bool,
+        supplied_store: Option<Store>,
+        supplied_authorization: Option<Arc<dyn ModuleToolAuthorization>>,
+        declared_outbound: bool,
+    ) -> (
+        ToolRegistry,
+        Arc<FakeModule>,
+        Arc<CountingApproval>,
+        Store,
+        Arc<ModuleTool>,
+    ) {
         let store = match supplied_store {
             Some(store) => store,
             None => Store::open_memory().await.unwrap(),
@@ -938,7 +966,8 @@ mod tests {
                 store.clone(),
                 "agent24d",
             )
-            .unwrap(),
+            .unwrap()
+            .with_declared_outbound(declared_outbound),
         );
         let approvals = Arc::new(CountingApproval {
             calls: AtomicUsize::new(0),
@@ -2793,6 +2822,128 @@ mod tests {
             assert!(matches!(error, ToolError::Denied(_)), "{what}: {error}");
         }
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The tag id the agent writes for what `module` returned on `call`.
+    fn result_of(module: &str, call: &str) -> EgressResource {
+        let tag = agent24_store::SourceRef::tool_result(
+            &format!("module:{module}"),
+            call,
+            agent24_store::SourceClassification::Unknown,
+            "2026-10-26T00:00:00Z",
+        );
+        EgressResource::local_only(tag.source_id, "unrevisioned")
+    }
+
+    /// K1-6b.5f (David 2026-10-26, same source): a module may be sent back
+    /// what it returned itself, and only that. The run has no egress gate,
+    /// as production builds it, so any other source refuses.
+    #[tokio::test]
+    async fn a_module_may_receive_back_only_what_it_returned_itself() {
+        let (registry, runtime, _, _, _) =
+            fixture_declaring(RiskClass::Read, true, true, true, None, None, false).await;
+        let call = |resources: Vec<EgressResource>| {
+            let registry = &registry;
+            async move {
+                registry
+                    .dispatch(
+                        "fake_module.write_local",
+                        &context().with_egress_resources(resources),
+                        &Map::new(),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+        call(vec![
+            result_of("fake_module", "tc_1"),
+            result_of("fake_module", "tc_2"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+
+        let refused = [
+            (
+                "another module's result",
+                vec![
+                    result_of("fake_module", "tc_1"),
+                    result_of("other_module", "tc_2"),
+                ],
+            ),
+            (
+                "a module whose id only starts the same",
+                vec![result_of("fake_module_2", "tc_1")],
+            ),
+            (
+                "a tool's result",
+                vec![EgressResource::local_only(
+                    "tool_result:tool:shell_exec:tc_3",
+                    "r",
+                )],
+            ),
+            (
+                "restricted material",
+                vec![
+                    result_of("fake_module", "tc_1"),
+                    EgressResource::local_only("selected_material:private", "rev-1"),
+                ],
+            ),
+        ];
+        for (what, resources) in refused {
+            let Err(error) = call(resources).await else {
+                panic!("{what} must be refused");
+            };
+            assert!(matches!(error, ToolError::Denied(_)), "{what}: {error}");
+        }
+        let Err(error) = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context()
+                    .with_egress_resources(vec![result_of("fake_module", "tc_1")])
+                    .with_egress_policy_unavailable(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("an unreadable policy must be refused");
+        };
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// An operation whose manifest says it may act outside the device gets
+    /// no same-source exception; that is also the default.
+    #[tokio::test]
+    async fn an_outbound_operation_is_not_sent_back_its_own_results() {
+        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
+        let Err(error) = registry
+            .dispatch(
+                "fake_module.write_local",
+                &context().with_egress_resources(vec![result_of("fake_module", "tc_1")]),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        else {
+            panic!("an outbound operation must be refused");
+        };
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The host names a module tool's results after the module, so the
+    /// egress gate can recognise them (K1-6b.5f).
+    #[tokio::test]
+    async fn a_module_tools_results_are_unknown_and_named_after_the_module() {
+        let (registry, _, _, _) = fixture(RiskClass::Read, true, true).await;
+        let source = registry.tool_result_source("fake_module.write_local");
+        assert_eq!(source.origin, "module:fake_module");
+        assert_eq!(
+            source.classification,
+            agent24_store::SourceClassification::Unknown
+        );
     }
 
     /// K1-6a-G §4 case 1: a withheld tool called by name, on either

@@ -112,6 +112,11 @@ fn is_iso8601_utc(s: &str) -> bool {
 
 #[async_trait]
 impl Tool for SelfWakeTool {
+    /// A receipt: it returns no content it read.
+    fn result_source(&self) -> agent24_tools::ToolResultSource {
+        agent24_tools::ToolResultSource::ordinary(&self.info().name)
+    }
+
     fn requires_outbound_policy(&self) -> bool {
         false
     }

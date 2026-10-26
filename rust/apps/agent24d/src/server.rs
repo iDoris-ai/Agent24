@@ -1677,6 +1677,11 @@ pub async fn serve(
             "agent24d",
         ) {
             Ok(tool) => {
+                // K1-6b.5f: what the manifest declares only ever withholds
+                // the same-source exception.
+                let tool = tool.with_declared_outbound(
+                    agent24_policy::tool_summary::declares_outbound(declaration),
+                );
                 if let Err(error) = tools.register_module_tool(StdArc::new(tool)) {
                     tracing::warn!(
                     module,

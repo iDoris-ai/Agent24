@@ -47,6 +47,10 @@ use crate::{Result, Store};
 /// `LocalOnly` WITHOUT attempting to parse `tag_json` — see module docs.
 pub const SOURCE_TAG_SCHEMA_VERSION: i64 = 2;
 
+/// Every [`SourceRef::tool_result`] id starts with this, followed by the
+/// result's origin.
+pub const TOOL_RESULT_PREFIX: &str = "tool_result:";
+
 /// What kind of content entering the run this tag describes. Informational
 /// only in this slice (nothing branches on it yet); an unrecognized value on
 /// read is a decode failure, which already forces the tag to `LocalOnly` via
@@ -70,6 +74,10 @@ pub enum SourceKind {
     /// A prompt a kernel-created schedule (a self-wake) carries from the
     /// run that created it (K1-6b.4d).
     ScheduleOrigin,
+    /// What a tool call returned into the run's context (K1-6b.5f). The
+    /// classification is the host's for that kind of tool, never the tool's
+    /// or module's own claim.
+    ToolResult,
 }
 
 /// Sensitivity classification is independent from processing mode and source
@@ -177,6 +185,28 @@ impl SourceRef {
         Self {
             source_id: format!("schedule_origin:{schedule_id}"),
             kind: SourceKind::ScheduleOrigin,
+            classification,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// What one tool call returned (K1-6b.5f, ADR-K1-02 §2.1). `origin` names
+    /// where the content came from as the host knows it (`module:{id}`,
+    /// `tool:{name}`), so the egress gate can recognise content a module
+    /// sent back to that same module.
+    pub fn tool_result(
+        origin: &str,
+        tool_call_id: &str,
+        classification: SourceClassification,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: format!("{TOOL_RESULT_PREFIX}{origin}:{tool_call_id}"),
+            kind: SourceKind::ToolResult,
             classification,
             revision_digest: None,
             mode: SourceMode::LocalOnly,

@@ -135,6 +135,12 @@ where
 
 #[async_trait]
 impl Tool for HttpFetchTool {
+    /// Public content: private addresses are refused and no credentials are
+    /// sent (David 2026-10-26).
+    fn result_source(&self) -> crate::ToolResultSource {
+        crate::ToolResultSource::ordinary("http_fetch")
+    }
+
     fn requires_outbound_policy(&self) -> bool {
         // Egress authorization is conditional on this run's source resources.
         false
