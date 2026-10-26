@@ -2586,6 +2586,9 @@ pub(crate) mod tests {
     mod source_send_gate_tests {
         include!("source_send_gate_tests.rs");
     }
+    mod send_trim_tests {
+        include!("send_trim_tests.rs");
+    }
 
     use super::*;
     use agent24_memory::{KvStore, session::CompactionPolicy};
