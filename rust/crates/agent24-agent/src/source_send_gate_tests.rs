@@ -302,7 +302,7 @@ async fn legacy_unsourced_pause_notice_still_refused() {
         wait_terminal(&store, &run.id).await.status,
         RunStatus::Completed
     );
-    // Simulate a pre-0023 run: a pause notice row with no origin row.
+    // Simulate a pre-0029 run: a pause notice row with no origin row.
     sqlx::query(
         "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, tool_call_id, created_at) \
          VALUES (?, (SELECT COALESCE(MAX(seq), -1) + 1 FROM run_messages WHERE run_id = ?), 'system', ?, '[]', NULL, ?)",

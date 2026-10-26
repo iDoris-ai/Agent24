@@ -429,11 +429,21 @@ fn bind_scan_query<'q>(
 #[derive(Clone)]
 pub struct EventLog {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl EventLog {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Append an event on a caller-owned connection with a PLAIN insert — an `id`
@@ -470,7 +480,7 @@ impl EventLog {
         .execute(&mut *conn)
         .await
         .map_err(map_quota_error(&e.scope.owner))?;
-        // Migration 0018's `mem_events_bi_no_replace` ignores (RAISE(IGNORE))
+        // Migration 0019's `mem_events_bi_no_replace` ignores (RAISE(IGNORE))
         // an insert whose id already exists instead of letting SQLite raise a
         // UNIQUE error, so a collision now shows up as zero affected rows. It
         // must stay the error it always was: the caller's transaction rolls back.
@@ -563,6 +573,7 @@ impl EventLog {
 #[async_trait]
 impl EventStore for EventLog {
     async fn append(&self, e: &MemEvent) -> Result<i64> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope_json = serde_json::to_string(&e.scope)?;
         let payload = serde_json::to_string(&e.body)?;
         let causal = serde_json::to_string(&e.causal)?;
@@ -1252,7 +1263,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_tx_with_an_existing_id_is_still_an_error_that_rolls_back() {
-        // Since 0018 the SQL layer ignores a same-id insert; append_tx must keep
+        // Since 0019 the SQL layer ignores a same-id insert; append_tx must keep
         // reporting the collision, or a pre-occupied audit id would silently
         // commit a belief its audit does not describe.
         let kv = KvStore::open_memory().await.unwrap();

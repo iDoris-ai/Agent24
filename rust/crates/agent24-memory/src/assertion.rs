@@ -37,7 +37,7 @@ pub enum Forget {
     NotFound,
 }
 
-/// Mirror of migration 0018's cap on an exempt `assertion.retracted` payload
+/// Mirror of migration 0019's cap on an exempt `assertion.retracted` payload
 /// (`LENGTH(CAST(payload AS BLOB)) <= 256`) — a limit on the SERIALIZED payload,
 /// so JSON-escaped characters in an id count double. Keep the two in step.
 pub const RETRACT_EXEMPT_MAX_PAYLOAD_BYTES: usize = 256;
@@ -108,7 +108,7 @@ pub async fn forget(pool: &SqlitePool, owner: &str, id: &str, at: &str) -> Resul
     );
     event.at = at.to_owned();
     if let Err(err) = EventLog::append_tx(&mut tx, &event).await {
-        // The quota exemption (migration 0018) only covers a retraction payload
+        // The quota exemption (migration 0019) only covers a retraction payload
         // of at most `RETRACT_EXEMPT_MAX_PAYLOAD_BYTES`. An id long enough to
         // push past it is charged as ordinary content, so on a full partition
         // the refusal is not "you are out of quota" but "this id cannot be
@@ -279,11 +279,21 @@ pub trait AssertionStore: Send + Sync {
 #[derive(Clone)]
 pub struct AssertionLedger {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl AssertionLedger {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Insert one assertion row on a caller-owned connection — no transaction of
@@ -364,6 +374,7 @@ impl AssertionLedger {
 #[async_trait]
 impl AssertionStore for AssertionLedger {
     async fn assert(&self, a: &Assertion) -> Result<AssertionId> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         // Serialize the whole correction so a superseded row cannot be left open
         // by a crash between the two writes.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -390,6 +401,7 @@ impl AssertionStore for AssertionLedger {
     async fn retract(&self, id: &AssertionId, owner: &str, at: &str) -> Result<()> {
         // Owner-scoped like the assert/supersede path: a foreign id cannot close
         // this owner's belief, and this owner's id cannot reach across tenants.
+        self.gate.check(crate::disk_gate::WriteClass::Retract)?;
         sqlx::query(
             "UPDATE mem_assertions SET recorded_to = ?
              WHERE id = ? AND scope_owner = ? AND recorded_to IS NULL",

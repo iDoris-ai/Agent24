@@ -14,12 +14,12 @@
 | --- | --- | --- | --- |
 | #1166 | `2fabb2282d6a7faebf734c7dc5ff2c6b81e2f805` | 测试片 | daemon 启动恢复测试。不关闭第 2 节的 H03 矩阵。 |
 | #1167 | `5ad99157bc8c290162fb0a315ffe00a18377bd26` | 测试片 | HTTP pause 不改已有 snapshot。不关闭第 2 节的 H03 矩阵。 |
-| #1168 | `c9a19532675ceee98a7fe1bfbb9f503c000fad92` | `54bafa8010ba3d163df4c967188ddeb07888a60f` | 来源表 migration `0021`，消息与来源同一事务，读取时核对 digest。不回填旧行。 |
+| #1168 | `c9a19532675ceee98a7fe1bfbb9f503c000fad92` | `54bafa8010ba3d163df4c967188ddeb07888a60f` | 来源表 migration `0027`（原 0021，10-26 为避让 kernel 迁移改号），消息与来源同一事务，读取时核对 digest。不回填旧行。 |
 | #1170 | `4fbc3728080298bfe2b0c942293c296eff7fa63b` | `860d9ad4c6f7ba555108ceba8db774a82f187f91` | `docs/agent/R05-1-EXACT-CONTRACT.md`。精确契约。不实现 H03。 |
 | #1173 | `9ba7d5ee69880cfc6b8ff555f60148cd59f8146b` | `21f6e0bd5bb9869e4048f2ba19ba1465f17286e8` | `docs/agent/R05-2-D7-KIND-DECISION.md`。D7a–D7f。暂停通知是有类型的无来源行。 |
 | #1181 | `631ff507728273a5f3d84d11b3c0f6b7fcb6ec10` | `d86b6386aa9b825b1a65e2ad9cda4216ea622089` | 第一次快照与来源同一事务。只写快照。 |
 | #1185 | `2207cdc6bf16c937aa9f70c70c9d17fe24c21359` | `201c29fe8ecade668d737c8b548dbbf8a471bcd3` | `docs/agent/R05-3-D7F-KIND-DECISION.md`。CHECK 增加 Assistant、ToolResult。`recall_ref` 为 SQL NULL。 |
-| #1195 | `b680cb0a5d2eba90266e5e9f885bfbd40e761938` | `e2652062d99224e1c69f1bf8b441cb5b2229c2c0` | migration `0022` 重建 CHECK。`persist_message` 写入 Assistant 与 ToolResult。不改 `0021`。不回填。 |
+| #1195 | `b680cb0a5d2eba90266e5e9f885bfbd40e761938` | `e2652062d99224e1c69f1bf8b441cb5b2229c2c0` | migration `0028`（原 0022）重建 CHECK。`persist_message` 写入 Assistant 与 ToolResult。不改 `0027`。不回填。 |
 | #1197 | `9df7d670005b6e8e58b73c470d2268368860a817` | `c25507b0d77441470f22f3796d797ba7734f974e` | 来源无法证明时不发送。恢复路径在执行停住的工具之前核对来源。2026-10-24T21:04:49Z 合并。 |
 | #1205 | `b9e4eb5f059e1d406e562cfbd4ec368ef5b5fc1e` | `1cfb520111311fa736376534fee7b740bddf3689` | 非 assistant 回合在落库和派发工具之前以 `provider_error` 拒绝。2026-10-25T03:35:18Z 合并。 |
 

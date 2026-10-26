@@ -20,7 +20,7 @@
 | D7f4 | 暂停通知不是 `persist_message` 的行。它仍按 D7d 保持无来源，读取继续是 Missing。 | 不得在本建议里加入 HostSystem。 | 待外审 |
 | D7f5 | 客户端、模型或 tool 不得自选 kind。kind 不是 `Msg` 的字段，也不是供应商 JSON 的字段。只有宿主写点可以写入 Assistant 或 ToolResult。 | 不得按 REST 的 role、自报 source、模型正文或 tool 正文选择 kind。 | 待外审 |
 
-以后的迁移片若同时保留已有三种 kind，建议的列约束是 `CHECK (kind IN ('HostRecall', 'UserPrompt', 'SessionHistory', 'Assistant', 'ToolResult'))`。`rust/crates/agent24-store/migrations/0021_run_message_origins.sql` 今天的 CHECK 只有前三个。本稿不改这个文件。HostSystem 不进入这条建议 CHECK。
+以后的迁移片若同时保留已有三种 kind，建议的列约束是 `CHECK (kind IN ('HostRecall', 'UserPrompt', 'SessionHistory', 'Assistant', 'ToolResult'))`。`rust/crates/agent24-store/migrations/0027_run_message_origins.sql` 今天的 CHECK 只有前三个。本稿不改这个文件。HostSystem 不进入这条建议 CHECK。
 
 `docs/adr/ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md` 仍是 DRAFT。它的表里出现过 Assistant、ToolResult 和 HostSystem。存储里没有这三个名字。本稿只把前两个当作建议字面量引用。这不把该 ADR 写成已经落地。
 
