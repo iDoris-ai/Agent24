@@ -66,17 +66,32 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
     }
 }
 
+/// Where to send and what: from stdin (the desktop) or from the argument and
+/// the running daemon. A failure here is a [`Response`] too, so `--json`
+/// still ends with its result line: 400 `invalid_request` for what was
+/// given, 503 `backend_not_ready` for no daemon (the desktop's code for it).
+async fn setup(
+    path: Option<PathBuf>,
+    host_stdin: bool,
+) -> Result<(HttpTransport, PathBuf), Response> {
+    let invalid = |message: String| Response::fail(400, "invalid_request", &message);
+    if host_stdin {
+        let input = host_input(std::io::stdin().lock()).map_err(invalid)?;
+        let transport = HttpTransport::new(&input.base, Some(input.token)).map_err(invalid)?;
+        return Ok((transport, input.path));
+    }
+    let path = path.ok_or_else(|| invalid("a file to import is required".to_owned()))?;
+    let ep = super::attach_only()
+        .await
+        .ok_or_else(|| Response::fail(503, "backend_not_ready", NO_DAEMON))?;
+    let transport = HttpTransport::new(&ep.base, Some(ep.token.clone())).map_err(invalid)?;
+    Ok((transport, path))
+}
+
 async fn import(path: Option<PathBuf>, json: bool, host_stdin: bool) -> Result<(), String> {
-    let (transport, path) = if host_stdin {
-        let input = host_input(std::io::stdin().lock())?;
-        (
-            HttpTransport::new(&input.base, Some(input.token))?,
-            input.path,
-        )
-    } else {
-        let path = path.ok_or("a file to import is required")?;
-        let ep = super::attach_only().await.ok_or(NO_DAEMON)?;
-        (HttpTransport::new(&ep.base, Some(ep.token.clone()))?, path)
+    let (transport, path) = match setup(path, host_stdin).await {
+        Ok(found) => found,
+        Err(res) => return report(&res, json),
     };
     let mut shown = false;
     let mut on_progress = |p: Progress| {
@@ -149,6 +164,17 @@ mod tests {
         assert_eq!(
             host_input(huge.as_bytes()).unwrap_err(),
             "stdin is too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_file_given_is_an_invalid_request_before_any_daemon_is_looked_for() {
+        let Err(res) = setup(None, false).await else {
+            panic!("expected an error")
+        };
+        assert_eq!(
+            res,
+            Response::fail(400, "invalid_request", "a file to import is required")
         );
     }
 

@@ -168,3 +168,12 @@ async fn a_daemon_that_is_not_there_is_backend_unreachable_without_the_address()
         )
     );
 }
+
+#[tokio::test]
+async fn a_path_that_does_not_start_with_a_slash_is_never_sent() {
+    let (base, task) = serve(Some(http("200 OK", "{}", ""))).await;
+    let t = HttpTransport::new(&base, Some("tok".to_owned())).unwrap();
+    let reply = t.send(post("@evil.example/x", b"")).await;
+    assert_eq!(reply, failed(400, "invalid_request", "not a daemon path"));
+    task.abort();
+}

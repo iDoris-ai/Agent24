@@ -72,6 +72,12 @@ fn timed_out() -> Reply {
 
 impl Transport for HttpTransport {
     async fn send(&self, request: Request) -> Reply {
+        // A path not starting with `/` could make the base's host the
+        // userinfo of another (`@host/x`): the bearer must reach 127.0.0.1
+        // only, whatever path a caller passes.
+        if !request.path.starts_with('/') {
+            return failed(400, "invalid_request", "not a daemon path");
+        }
         let url = format!("{}{}", self.base, request.path);
         let mut builder = match request.method {
             Method::Get => self.client.get(url),
