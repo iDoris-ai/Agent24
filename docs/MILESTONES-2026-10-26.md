@@ -6,7 +6,7 @@
 >
 > **依据**：
 > - 架构文档。
-> - ADR-037（🟡 待评审）。依赖它的里程碑标「⏳ADR-037」，ADR 批准前只做设计，不派生产实现。
+> - ADR-037 ✅（#1249，2026-10-26 接受）。原先标「⏳ADR-037」的里程碑现已可以派生产实现，仍按每片独立 PR 和门禁推进。
 > - 2026-10-26 对 git 的核实，见附录。
 
 ---
@@ -50,7 +50,7 @@
 | 里程碑 | 目标 | 出口条件 | 依赖 | 状态 |
 |---|---|---|---|---|
 | **M-REL-1 收口发布** | 集成分支积压按线发到 main，出 **v0.6.0 Mac 正式版** | 各线 release PR 由人开人审并真机验收；v0.6.0 带签名加公证的 arm64 dmg，CLI 也签名；CHANGELOG 补齐 | 各线 open PR 收尾 | 未开始 |
-| **M-CORE-1 本体化（Mac）** | 每用户常驻 daemon 成为产品默认；一方外壳经登记握手接入 | ADR-037 决策 2、3 在 Mac 上落地，含生命周期表、版本协商、迁移备份回滚；桌面退出后日程照跑；TUI 接入同一个 daemon | ⏳ADR-037 | 设计中 |
+| **M-CORE-1 本体化（Mac）** | 每用户常驻 daemon 成为产品默认；一方外壳经登记握手接入 | ADR-037 决策 2、3 在 Mac 上落地，含生命周期表、版本协商、迁移备份回滚与停靠态；桌面退出后日程照跑；TUI 接入同一个 daemon | ADR-037 ✅ | 可开工 |
 | **M-API-1 开发者 API（本机）** | 第三方程序可用分权令牌调用本机 API | G-API-1..5 全过；令牌管理 CLI 和 UI；开发者文档；版本与弃用策略 | M-CORE-1 | 未开始 |
 | **M-TUI-1 TUI 能力对齐** | TUI/CLI 覆盖全部对外能力，视觉功能给兜底 | OpenAPI 覆盖 CI 不降；豁免表经评审；有聊天输入和主要视图 | M-CORE-1（接入方式） | 未开始 |
 | **M-MEM-P1 记忆可控** | 按 PLAN-MEMORY-P1：容量、附件、导出导入、更正、purge、无痕、回执 | P1-11 联合验收；release 由人开 | 两份 ADR 已接受（#1247、#1248） | 进行中 |
@@ -126,7 +126,7 @@
 | REL-7 | 第二档分支里有价值的小件：`repro/1020` 报告进 main；MAINT-01 token 帧校验 cherry-pick；documents WAL 竞态测试修复；Linux 硬件测试 | 各自一个小 PR |
 | REL-8 | v0.6.0 Mac 正式版：签名加公证的 dmg，CLI 和模块包签名（DEP-B3），CHANGELOG 补齐 v0.5.1 之后的内容，发布清单冻结到文件名 | jason 真机 |
 
-### CORE 本体化（M-CORE-1，⏳ADR-037）
+### CORE 本体化（M-CORE-1，ADR-037 ✅）
 CORE-1 平台数据目录统一解析 → CORE-2 服务模式 `--enroll-endpoint` 与 macOS 登记握手（代码签名校验）→ CORE-3 桌面安装 LaunchAgent、退出不停 daemon、托盘「完全退出」→ CORE-4 `/health` 版本协商，`tryReuseExternal` 补验版本 → CORE-5 迁移前自动备份与失败回滚 → CORE-6 TUI 和 CLI 接入常驻 daemon，取消默认的 ephemeral → CORE-7 渲染进程隔离（`backendProxy` 改白名单，或签发页面令牌）→ CORE-8 `node-daemon` 移出安装包 → CORE-9 oMLX 管理从桌面迁回 daemon / iDoris → CORE-10 按子进程模式退路的定位，调整 KB-HOST-01 #1184 与 OD F11.1。
 门：每片单独开 PR；CORE-2 和 CORE-7 属于安全类，需 PR-Daemon APPROVE 并配负向测试。
 
@@ -210,7 +210,7 @@ HW-2 能力梯 → HW-3 `/api/v1/hardware` 与首次运行页 → HW-4 唯一准
 ## 6. 待 jason 拍板
 
 1. **全局评审门**：AGENTS.md 的分级门槛（普通 task 的 CI 全绿即可先合），与 PLAN-MEMORY-P1 写的「所有 PR 都须 PR-Daemon 对精确 head APPROVE」（2026-10-10）不一致。另外，PR 的 300 行是否计入测试和文档？结论写进 AGENTS.md。
-2. **ADR-037**：评审结论（单独 PR）。
+2. ~~ADR-037 评审结论~~：已于 #1249 接受（2026-10-26）。
 3. **v0.6.0**：是否把签名预发布这套流程升格为正式版；是否出 Intel 包。
 4. **暂停线是否恢复**：DEC（D1-3..6）、IDR（R9 三项决策、v0.3.1 发布）、COMM 6b、OA（4 个 open PR 是合是关）、OD 继续暂停？
 5. **PLAN-DECIDE 五档表**：是否正式由 HW-TIERS 1–6 档取代。

@@ -6,13 +6,13 @@
 >
 > **本文怎么写的**：对 main `3a433bb0` 与 9 条集成分支上的 114 份架构、设计、ADR 文档逐份核对过代码，判定每份是现行、被取代、历史记录还是与代码不符。逐份记录和证据见附录 [SOURCE-C1](tracking/2026-10-26/SOURCE-C1-architecture-docs.md)。本文只写结论和裁决。被取代的旧文档**不删正文**，只在索引里标状态并指向替代者。历史上正确、但只写在旧文档里的约束，收在第 7 节。
 >
-> **待评审部分**：第 1 节的产品形态与进程模型来自 ADR-037（提议，走单独评审）。ADR-037 批准前，第 1 节标 🟡；批准后按评审结论修订。
+> **第 1 节依据**：ADR-037（产品形态与进程模型）已于 2026-10-26 经 clestons 在 #1249 批准接受（merge `3ec8d81d`）。本节已按最终评审版修订。
 
 状态标记：✅ 已在产品路径上运行；🟡 已实现但未接入产品路径，或是提议、待评审；📐 只有设计。
 
 ---
 
-## 1. 产品形态（ADR-037，🟡 待评审）
+## 1. 产品形态（ADR-037，✅ 已接受，#1249）
 
 jason 2026-10-26 拍板的产品方向：
 
@@ -29,6 +29,10 @@ jason 2026-10-26 拍板的产品方向：
     - **提升级**：审批决定、授权管理、签发令牌、模块管理、停机。每次都要用户在场证明，可以是桌面确认框，也可以是 Touch ID 这类系统认证。提升与否由 daemon 校验在场证明，不看调用方式；同用户的插件即使调用合法 CLI，也拿不到在场证明。
     
     开发构建首次登记，由可信启动者交给它一次性登记权。不设共享宿主秘密文件。
+
+    无桌面或 SSH 场景（headless）下，提升级只接受 FIDO2 安全密钥或已配对移动设备的确认，不接受 TOTP 或口令（同 UID 进程可以读到这类秘密）。
+
+    残余风险如实写明：能执行一方 CLI 的插件可以拿到日常级权限。迁移失败后进入「停靠」状态，只提供健康和诊断接口，不会被服务管理器反复拉起。
   - 第三方开发者应用、Creative sidecar、插件：只能持有具名、分权、可吊销的令牌。
   - 远程设备（移动端）：走 Hyphae 配对，按作用域授权，作为独立的授权入口，不改变通信层「收到消息不触发 run」的约束。
 - **开发者 API 对外宣传前必须过五道门（G-API）**：路由级资源授权、Host/Origin 校验、OpenAPI 与路由一致性 CI、事件流按令牌过滤与复验、令牌治理（只存 hash、TTL、吊销、限流配额、审计）。
@@ -83,7 +87,7 @@ L0 契约     protocol · domain · sidecar-host-protocol · protocol/*.yaml|jso
 每条都注明出处。完整 54 条及其核验见 [SOURCE-C1 §3](tracking/2026-10-26/SOURCE-C1-architecture-docs.md)。这里只列骨架。
 
 ### 3.1 进程、部署与开发流
-- Rust agent24d 是唯一核心运行时，只绑 127.0.0.1，端口动态分配（ADR-026 ✅）。常驻与客户端模型见 ADR-037（🟡）。
+- Rust agent24d 是唯一核心运行时，只绑 127.0.0.1，端口动态分配（ADR-026 ✅）。常驻与客户端模型见 ADR-037 ✅。
 - 单 daemon、单 SQLite、单用户 `LOCAL_USER`；org/space 跨库属 ADR-030 硬门槛，不碰（`docs/agent/architecture.md`）。
 - 领域 OS 与模块全部进程外：manifest + 握手 + 回调 socket（UDS，fd 3）+ 受约束代理（ADR-029 修订、ADR-031、SPEC-ME3、FU-60）。
 - 大组件按需下载、不进安装包：pin 版本 + sha256、原子落地（Open Design 10-05 裁决；ADR-DOC-01 D6；DEP-A9）。
@@ -111,7 +115,7 @@ L0 契约     protocol · domain · sidecar-host-protocol · protocol/*.yaml|jso
 - ModelRouter 按 `TaskProfile{Privacy, Complexity}` 在 Local / Remote / Lora 间路由，`LocalOnly` 对远端 fail-closed。`from_env` 只构造 oMLX（:8088）和 Ollama；主对话目前仍用 `TaskProfile::default()`。
 - 硬件探测与整机内存账归 Agent24（agent24-hw）；模型选型归 iDoris；分 1–6 数字档；云端补位默认关闭，且必须由路由器强制（ADR-036 ✅，目前只落地了 HW-1）。
 - iDoris 以 OpenAI 兼容 provider 接入（idoris-local / idoris-any），不做成模块（ADR-032）。provider 代码只在 ab/idoris 上。
-- ADR-022 的「默认 MLX」收窄为「Apple Silicon 上默认」，其他平台的默认运行时由 iDoris 按档位选（ADR-037 🟡）。
+- ADR-022 的「默认 MLX」收窄为「Apple Silicon 上默认」，其他平台的默认运行时由 iDoris 按档位选（ADR-037 ✅）。
 
 ### 3.6 工具、审批与策略
 - 工具流水线：normalize → 能力白名单 → 审批门 → 超时执行；MCP 工具走同一条（ADR-026 §6.5）。
@@ -139,13 +143,13 @@ L0 契约     protocol · domain · sidecar-host-protocol · protocol/*.yaml|jso
 
 | 冲突 | 现行方 | 处置 |
 |---|---|---|
-| ADR-020（Node，端口 8765）vs ADR-026 | ADR-026 | ADR-020 补标「已取代」（ADR-037 修订段） |
-| ADR-022 默认 `mlx-lm` vs 代码 oMLX HTTP | 代码 | ADR-022 收窄（ADR-037） |
+| ADR-020（Node，端口 8765）vs ADR-026 | ADR-026 | ADR-020 状态行已改「⛔ 已取代」（#1249） |
+| ADR-022 默认 `mlx-lm` vs 代码 oMLX HTTP | 代码 | ADR-022 状态行已改「已收窄」（#1249） |
 | ADR-024 asyncio 工作流 vs 代码（只有 scheduler） | 代码 | 补标「已取代」 |
 | ADR-017 加密 SQLite vs 代码明文 | 代码 | 改标「未实现」，隐私默认方向保留 |
 | ADR-016（decision.md）worker_thread 沙箱 vs 进程外模块 | ADR-029/031 | 补标「部分取代」；签名增强转为 ME-6 上游需求 |
-| ADR-027 移动端直连 HTTP vs 移动端遥控经 Hyphae | ADR-037 🟡 | ADR-037 批准后补标 |
-| OD ADR-001/005「桌面拥有 capability daemon」、#1184 vs 常驻 daemon | ADR-037 🟡 | ADR-037 批准后，KB-HOST-01 与 OD-M11 F11.1 按「一方本机凭据」改 |
+| ADR-027 移动端直连 HTTP vs 移动端遥控经 Hyphae | ADR-037 ✅ | 已在 #1249 补标「部分取代」 |
+| OD ADR-001/005「桌面拥有 capability daemon」、#1184 vs 常驻 daemon | ADR-037 ✅ | KB-HOST-01 与 OD-M11 F11.1 降为子进程模式退路（CORE-10） |
 | SPEC-001 §2/§3（`feat/*`、Copilot 评审）vs AGENTS.md | AGENTS.md | SPEC-001 补标局部过期 |
 | ADR-K1-02：main 版 vs ab/kernel 版（§2.1.1） | ab/kernel 版 | 随 K1 第二批 release 合入 main |
 | ADR-DOC-02：main 版 vs ab/documenting 版 | ab/documenting 版 | 随 Documenting r6 合入 |
@@ -169,7 +173,7 @@ L0 契约     protocol · domain · sidecar-host-protocol · protocol/*.yaml|jso
 
 | 想了解 | 现行权威 | 历史 / 被取代（只作出处） |
 |---|---|---|
-| 产品形态、进程模型 | 本文 §1；`decision.md` ADR-037（🟡） | ADR-018、ADR-020、ADR-027（移动端部分） |
+| 产品形态、进程模型 | 本文 §1；`decision.md` ADR-037 ✅ | ADR-018、ADR-020、ADR-027（移动端部分） |
 | 分层与依赖 | 本文 §2；`ARCHITECTURE-LAYERS.md`（按 §2 的修正读） | `architecture/kernel-boundary.html`（08-22 快照）、`specs/SPEC-001` 布局部分 |
 | 架构决策日志 | `decision.md`、`ADR-026-rust-core-polyglot.md`、`adr/ADR-K1-01..04`、`documenting/adr/ADR-DOC-01..03`、`open-design-workspace/design/ADR-001..006` | `ADR-016-consume-auraai-packages.md`（被 ADR-026 §6 取代） |
 | 法律（不变量） | `laws/README`、`APPROVAL`（L-APPR-5/8 待修）、`CONTEXT`、`MEMORY` | — |
