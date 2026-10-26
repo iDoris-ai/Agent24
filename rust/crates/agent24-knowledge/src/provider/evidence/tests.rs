@@ -191,6 +191,7 @@ fn what_was_persisted_comes_back_as_it_was() {
             timeouts: 0,
         }),
         tombstones: BTreeSet::new(),
+        visible: kbs(&["d"]),
     };
     let mut evidence = E::restore(saved);
     assert_eq!(evidence.epoch(), 4);
@@ -203,4 +204,144 @@ fn what_was_persisted_comes_back_as_it_was() {
     assert_eq!(evidence.passed(7), Passed::Release);
     evidence.register(["c"]);
     assert_eq!(evidence.recheck().map(|r| r.version), Some(8));
+}
+
+fn listed(all: &[&'static str]) -> Scope<&'static str> {
+    Scope::Listed(kbs(all))
+}
+
+fn removed(all: &[&'static str]) -> BTreeSet<&'static str> {
+    kbs(all)
+}
+
+#[test]
+fn a_kb_asked_for_and_visible_but_left_out_was_removed() {
+    let mut evidence = E::default();
+    // A ready probe without scope only adds.
+    let probe = evidence.observe(&kbs(&[]), &listed(&["a", "b"]), true);
+    assert_eq!(probe.added, kbs(&["a", "b"]));
+    // ST-28b: Q = {a, b}, only a in effect.
+    let out = evidence.observe(&kbs(&["a", "b"]), &listed(&["a"]), true);
+    assert_eq!(
+        out,
+        Observed {
+            added: kbs(&[]),
+            removed: removed(&["b"])
+        }
+    );
+    // Out of the set: a second omission tells nothing new.
+    let again = evidence.observe(&kbs(&["a", "b"]), &listed(&["a"]), true);
+    assert_eq!(again.removed, kbs(&[]));
+    // ST-28c: another Q's answer is never compared; `empty_scope` removes
+    // every KB of its own Q that was visible.
+    let mut evidence = E::default();
+    evidence.observe(&kbs(&["a", "b"]), &listed(&["a", "b"]), true);
+    assert_eq!(
+        evidence
+            .observe(&kbs(&["a"]), &listed(&["a"]), true)
+            .removed,
+        kbs(&[])
+    );
+    let out = evidence.observe(&kbs(&["b", "x"]), &Scope::Empty, true);
+    assert_eq!(out.removed, removed(&["b"]));
+    // ST-28a: `empty_scope` over KBs never visible is no narrowing.
+    assert_eq!(
+        evidence.observe(&kbs(&["y"]), &Scope::Empty, true).removed,
+        kbs(&[])
+    );
+}
+
+#[test]
+fn only_a_request_on_the_current_credential_tells_a_removal() {
+    // EV-34: a request sent before the renewal comes back narrower.
+    let mut evidence = E::default();
+    evidence.observe(&kbs(&["a", "b"]), &listed(&["a", "b"]), true);
+    let stale = evidence.observe(&kbs(&["a", "b", "c"]), &listed(&["a", "c"]), false);
+    assert_eq!(
+        stale,
+        Observed {
+            added: kbs(&["c"]),
+            removed: kbs(&[])
+        }
+    );
+    // EV-25: what joined is then compared on the current credential.
+    let out = evidence.observe(&kbs(&["a", "b", "c"]), &listed(&["a"]), true);
+    assert_eq!(out.removed, removed(&["b", "c"]));
+}
+
+#[test]
+fn evidence_not_yet_placed_counts_as_visible() {
+    // ST-28e: after a restart the set lacks b, but evidence of b stands.
+    let mut evidence = E::restore(Saved::default());
+    evidence.delivered("b", 0);
+    assert_eq!(
+        evidence.observe(&kbs(&["b"]), &Scope::Empty, true).removed,
+        removed(&["b"])
+    );
+    // Placed by a rule since: no longer.
+    let mut evidence = E::default();
+    evidence.delivered("b", 0);
+    evidence.place(Kbs::All);
+    assert_eq!(
+        evidence.observe(&kbs(&["b"]), &Scope::Empty, true).removed,
+        kbs(&[])
+    );
+    // The latest delivery counts, whatever the order.
+    evidence.delivered("b", 1);
+    evidence.delivered("b", 0);
+    assert_eq!(
+        evidence.observe(&kbs(&["b"]), &Scope::Empty, true).removed,
+        removed(&["b"])
+    );
+    // Restored as persisted.
+    let saved = Saved {
+        visible: kbs(&["d"]),
+        ..Saved::default()
+    };
+    let mut restored = E::restore(saved);
+    assert_eq!(
+        restored.observe(&kbs(&["d"]), &Scope::Empty, true).removed,
+        removed(&["d"])
+    );
+}
+
+#[test]
+fn a_kb_being_deleted_neither_joins_nor_narrows() {
+    // ST-28g: b visible, with evidence; the host deletes it.
+    let mut evidence = E::default();
+    evidence.observe(&kbs(&[]), &listed(&["a", "b"]), true);
+    evidence.delivered("b", 0);
+    evidence.tombstone("b");
+    let out = evidence.observe(&kbs(&["a", "b"]), &listed(&["a", "b"]), true);
+    assert_eq!(out, Observed::default());
+    let out = evidence.observe(&kbs(&["a", "b"]), &listed(&["a"]), true);
+    assert_eq!(out, Observed::default());
+    // ST-28h: the delete failed. Its evidence makes it visible again.
+    evidence.kept(&"b");
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, true);
+    assert_eq!(out.removed, removed(&["b"]));
+    // Deleted: covered by its rule, and gone from the set.
+    let mut evidence = E::default();
+    evidence.observe(&kbs(&[]), &listed(&["b"]), true);
+    evidence.delivered("b", 0);
+    evidence.tombstone("b");
+    evidence.deleted("b");
+    assert_eq!(
+        evidence.observe(&kbs(&["b"]), &Scope::Empty, true),
+        Observed::default()
+    );
+    // Read back unresolved: the same.
+    let saved = Saved {
+        tombstones: kbs(&["b"]),
+        visible: kbs(&["a"]),
+        ..Saved::default()
+    };
+    let mut restored = E::restore(saved);
+    restored.delivered("b", 0);
+    let out = restored.observe(&kbs(&["a", "b"]), &listed(&["a", "b"]), true);
+    assert_eq!(out, Observed::default());
+    assert_eq!(
+        restored.observe(&kbs(&["b"]), &Scope::Empty, true),
+        Observed::default()
+    );
 }

@@ -1,10 +1,9 @@
 //! The evidence one binding delivered, and what the history sent to the model
 //! shows of it (CONTRACT-STATE-v1 S5.6): the evidence epoch and placeholder
-//! rules, pending re-verification (S3.1) and deletion tombstones (S5.10).
-//! Pure: the host assembles the history, sends the recheck and the deletion,
-//! and persists every change here (S1.10). The last visible set and the
-//! narrowing it tells come with the next slice; the records, with the one
-//! after.
+//! rules, pending re-verification (S3.1), deletion tombstones, and the last
+//! visible set with the narrowing it tells (S5.10). Pure: the host assembles
+//! the history, sends the recheck and the deletion, and persists every
+//! change here (S1.10). Wiring into the binding and the records come later.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -81,6 +80,26 @@ pub enum Tombstone {
     Unresolved,
 }
 
+/// What an accepted response tells of the KBs visible (S5.10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scope<K> {
+    /// The `effective_scope` of a search or read that succeeded, or the KBs
+    /// a ready probe listed.
+    Listed(BTreeSet<K>),
+    /// `forbidden/empty_scope`: no KB asked for is visible. Another
+    /// `forbidden` tells nothing.
+    Empty,
+}
+
+/// What a response changed in the last visible set; the caller persists both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Observed<K> {
+    pub added: BTreeSet<K>,
+    /// Not empty: the server narrowed the scope. The caller handles it as a
+    /// narrowing (S3.1: `Credentials::narrow`), whose rule covers every KB.
+    pub removed: BTreeSet<K>,
+}
+
 /// The state as persisted, to restore at restart.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Saved<K> {
@@ -89,6 +108,7 @@ pub struct Saved<K> {
     pub version: u64,
     pub pending: Option<Pending<K>>,
     pub tombstones: BTreeSet<K>,
+    pub visible: BTreeSet<K>,
 }
 
 /// S3.1: after the third recheck in a row that timed out, no recheck is sent
@@ -104,6 +124,10 @@ pub struct Evidence<K> {
     version: u64,
     pending: Option<Pending<K>>,
     tombstones: BTreeMap<K, Tombstone>,
+    visible: BTreeSet<K>,
+    /// Per KB, the latest epoch its evidence was delivered at: not covered
+    /// by a rule, it counts as visible (S5.10).
+    delivered: BTreeMap<K, u64>,
 }
 
 impl<K> Default for Evidence<K> {
@@ -114,12 +138,15 @@ impl<K> Default for Evidence<K> {
             version: 0,
             pending: None,
             tombstones: BTreeMap::new(),
+            visible: BTreeSet::new(),
+            delivered: BTreeMap::new(),
         }
     }
 }
 
 impl<K: Ord + Clone> Evidence<K> {
-    /// What was persisted: every tombstone is unresolved.
+    /// What was persisted: every tombstone is unresolved. The evidence in the
+    /// history comes back through [`Evidence::delivered`].
     pub fn restore(saved: Saved<K>) -> Self {
         let tombstones = saved.tombstones.into_iter();
         Self {
@@ -128,6 +155,8 @@ impl<K: Ord + Clone> Evidence<K> {
             version: saved.version,
             pending: saved.pending,
             tombstones: tombstones.map(|kb| (kb, Tombstone::Unresolved)).collect(),
+            visible: saved.visible,
+            delivered: BTreeMap::new(),
         }
     }
 
@@ -155,15 +184,7 @@ impl<K: Ord + Clone> Evidence<K> {
     /// placeholder, held back or not (S3.1); evidence whose binding is not in
     /// the state after a restart is the caller's to replace (I5).
     pub fn shown(&self, retired: bool, delivered: &Delivered<K>) -> Shown {
-        let covers = |r: &Rule<K>| match &r.kbs {
-            Kbs::All => true,
-            Kbs::One(kb) => *kb == delivered.kb,
-        };
-        let placed = self
-            .rules
-            .iter()
-            .any(|r| delivered.epoch < r.epoch && covers(r));
-        if retired || placed {
+        if retired || self.placed(&delivered.kb, delivered.epoch) {
             return Shown::Placeholder;
         }
         // Evidence delivered after the registration is held back too.
@@ -254,6 +275,7 @@ impl<K: Ord + Clone> Evidence<K> {
     /// unresolved stays so while the host deletes again: the earlier delete
     /// may have gone through.
     pub fn tombstone(&mut self, kb: K) {
+        self.visible.remove(&kb);
         self.tombstones.entry(kb).or_insert(Tombstone::Pending);
     }
 
@@ -272,6 +294,53 @@ impl<K: Ord + Clone> Evidence<K> {
 
     pub fn tombstone_of(&self, kb: &K) -> Option<Tombstone> {
         self.tombstones.get(kb).copied()
+    }
+
+    /// Evidence of `kb` admitted at `epoch` was delivered.
+    pub fn delivered(&mut self, kb: K, epoch: u64) {
+        let latest = self.delivered.entry(kb).or_insert(epoch);
+        *latest = (*latest).max(epoch);
+    }
+
+    /// An accepted response to a request over `asked` (`asked` empty for a
+    /// ready probe without scope). What it lists joins the set; a KB asked
+    /// for that it leaves out, and that was visible, was removed. Only a
+    /// request sent with the current credential tells a removal (S3.1
+    /// ownership). A KB with a tombstone neither joins nor is removed.
+    pub fn observe(&mut self, asked: &BTreeSet<K>, scope: &Scope<K>, current: bool) -> Observed<K> {
+        let none = BTreeSet::new();
+        let listed = match scope {
+            Scope::Listed(kbs) => kbs,
+            Scope::Empty => &none,
+        };
+        let live = |kb: &&K| !self.tombstones.contains_key(*kb);
+        let removed: BTreeSet<K> = asked
+            .iter()
+            .filter(|kb| current && !listed.contains(*kb) && live(kb) && self.visible(kb))
+            .cloned()
+            .collect();
+        let added: BTreeSet<K> = listed
+            .iter()
+            .filter(|kb| live(kb) && !self.visible.contains(*kb))
+            .cloned()
+            .collect();
+        self.visible.retain(|kb| !removed.contains(kb));
+        self.visible.extend(added.iter().cloned());
+        Observed { added, removed }
+    }
+
+    /// In the set, or of evidence delivered and not covered by a rule.
+    fn visible(&self, kb: &K) -> bool {
+        let uncovered = self.delivered.get(kb).is_some_and(|e| !self.placed(kb, *e));
+        self.visible.contains(kb) || uncovered
+    }
+
+    fn placed(&self, kb: &K, epoch: u64) -> bool {
+        let covers = |r: &Rule<K>| match &r.kbs {
+            Kbs::All => true,
+            Kbs::One(one) => one == kb,
+        };
+        self.rules.iter().any(|r| epoch < r.epoch && covers(r))
     }
 
     fn covering(&self, pending: &Pending<K>) -> Recheck<K> {
