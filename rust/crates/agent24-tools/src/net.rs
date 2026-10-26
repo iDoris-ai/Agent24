@@ -204,6 +204,11 @@ impl Tool for HttpFetchTool {
                 url.scheme()
             )));
         }
+        // reqwest would send userinfo as Basic auth; the result is classified
+        // as uncredentialed public content, so credentials never leave.
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(ToolError::Invalid("url must not carry credentials".into()));
+        }
         let host = url
             .host()
             .ok_or_else(|| ToolError::Invalid("url has no host".into()))?
@@ -573,6 +578,24 @@ mod tests {
 
     fn connections(counter: &std::sync::atomic::AtomicUsize) -> usize {
         counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_url_carrying_credentials_is_refused_before_any_request() {
+        let (_, port, accepted) = counting_fixture("never served").await;
+        let tool = HttpFetchTool::new(true);
+        for url in [
+            format!("http://user:secret@127.0.0.1:{port}/"),
+            format!("http://user@127.0.0.1:{port}/"),
+            format!("http://:secret@127.0.0.1:{port}/"),
+        ] {
+            let err = tool
+                .call(&ctx(), &input(&url), &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::Invalid(_)), "{url}: {err}");
+        }
+        assert_eq!(connections(&accepted), 0);
     }
 
     /// A gate that allows exactly one request and nothing else.
