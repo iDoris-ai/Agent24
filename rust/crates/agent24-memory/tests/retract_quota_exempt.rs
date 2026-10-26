@@ -844,3 +844,99 @@ async fn moving_a_pre_upgrade_retraction_row_keeps_it_a_class() {
     assert_eq!((q.0, q.2), (1, 0));
     assert_usage_consistent(&admin, "Q").await;
 }
+
+// ---- REPLACE guard (mem_events_bi_no_replace) --------------------------------
+
+async fn snapshot(pool: &SqlitePool) -> Vec<(i64, String, String, String)> {
+    sqlx::query_as("SELECT seq, id, kind, payload FROM mem_events ORDER BY seq")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+const REPLACE_FORMS: [&str; 3] = [
+    "INSERT OR REPLACE INTO",
+    "REPLACE INTO",
+    "INSERT OR IGNORE INTO",
+];
+
+#[tokio::test]
+async fn replace_by_id_cannot_swap_an_exempt_row_for_an_over_quota_row() {
+    for form in REPLACE_FORMS {
+        let f = with_exempt_and_a_rows().await;
+        let rows = snapshot(&f.admin).await;
+        let counters = usage(&f.admin, PERSONAL).await;
+        let big = "x".repeat(5000);
+        // Same id as the exempt retraction, but an ordinary, large note.
+        sqlx::query(&format!(
+            "{form} mem_events (id, scope_owner, scope, kind, payload, origin_source, origin_trust, at)
+             VALUES ('exempt-1', ?, '{{}}', 'note', ?, 't', 'user_said', 'now')"
+        ))
+        .bind(PERSONAL)
+        .bind(format!("{{\"pad\":\"{big}\"}}"))
+        .execute(&f.admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot(&f.admin).await,
+            rows,
+            "{form}: stored events unchanged"
+        );
+        assert_eq!(usage(&f.admin, PERSONAL).await, counters, "{form}");
+        assert_eq!(exempt_table_rows(&f.admin).await, 1, "{form}");
+        assert_usage_consistent(&f.admin, PERSONAL).await;
+    }
+}
+
+#[tokio::test]
+async fn replace_by_seq_with_a_new_id_cannot_leave_a_ghost_or_a_stale_record() {
+    for victim in ["a-1", "exempt-1"] {
+        let f = with_exempt_and_a_rows().await;
+        let seq: i64 = sqlx::query_scalar("SELECT seq FROM mem_events WHERE id = ?")
+            .bind(victim)
+            .fetch_one(&f.admin)
+            .await
+            .unwrap();
+        let rows = snapshot(&f.admin).await;
+        let counters = usage(&f.admin, PERSONAL).await;
+        sqlx::query(
+            "INSERT OR REPLACE INTO mem_events (seq, id, scope_owner, scope, kind, payload, origin_source, origin_trust, at)
+             VALUES (?, 'fresh-id', 'other', '{}', 'note', '{}', 't', 'user_said', 'now')",
+        )
+        .bind(seq)
+        .execute(&f.admin)
+        .await
+        .unwrap();
+        assert_eq!(snapshot(&f.admin).await, rows, "{victim}");
+        assert_eq!(usage(&f.admin, PERSONAL).await, counters, "{victim}");
+        assert_eq!(usage(&f.admin, "other").await, (0, 0, 0, 0), "{victim}");
+        assert_eq!(exempt_table_rows(&f.admin).await, 1, "{victim}");
+        assert_usage_consistent(&f.admin, PERSONAL).await;
+    }
+}
+
+#[tokio::test]
+async fn idempotent_replay_still_works_at_the_quota_boundary() {
+    let f = with_exempt_and_a_rows().await;
+    // Both the A-class row and the exempt row replay as no-ops while full.
+    let a = event("a-1", PERSONAL, "note", json!({"n": 1}));
+    let first = f.kv.events().append(&a).await.unwrap();
+    assert_eq!(f.kv.events().append(&a).await.unwrap(), first);
+    let ex = event(
+        "exempt-1",
+        PERSONAL,
+        "assertion.retracted",
+        json!({"assertion_id": "a"}),
+    );
+    f.kv.events().append(&ex).await.unwrap();
+    // A same-id replay with different content is still a Rust-level conflict,
+    // not a silent success and not a quota error.
+    let err =
+        f.kv.events()
+            .append(&event("a-1", PERSONAL, "note", json!({"n": 2})))
+            .await
+            .unwrap_err();
+    assert!(matches!(err, MemoryError::Conflict(_)), "{err:?}");
+    assert_eq!(exempt_table_rows(&f.admin).await, 1);
+    assert_usage_consistent(&f.admin, PERSONAL).await;
+}

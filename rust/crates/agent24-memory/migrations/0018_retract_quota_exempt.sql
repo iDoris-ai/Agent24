@@ -153,6 +153,30 @@ BEGIN
     SELECT RAISE(ABORT, 'mem_events.id is immutable');
 END;
 
+-- REPLACE GUARD. The quota gate below deliberately skips an already-existing id
+-- (a same-id replay must not turn into a spurious QuotaExceeded). That skip would
+-- also let `INSERT OR REPLACE` / `REPLACE INTO` swap an exempt row for an
+-- over-quota ordinary one, and with recursive_triggers=OFF SQLite does NOT fire
+-- AFTER DELETE for the row it replaces, so the usage counters and the
+-- `mem_event_quota_exempt` record would be left describing a row that is gone.
+-- Fix: a row whose `id` (or an explicitly supplied `seq`) already exists is
+-- dropped with RAISE(IGNORE) before SQLite can resolve the conflict, so no
+-- conflict resolution (REPLACE included) ever deletes a stored event.
+--   * `INSERT .. ON CONFLICT(id) DO NOTHING` (EventLog::append) keeps its
+--     semantics: no row, no RETURNING row, the Rust replay check runs.
+--   * a PLAIN `INSERT` of an existing id used to fail with a UNIQUE error; it is
+--     now ignored silently, so `EventLog::append_tx` checks rows_affected()
+--     and reports the collision itself.
+-- Unique columns of mem_events: `id` and `seq` (INTEGER PRIMARY KEY) only.
+-- NEW.seq is not the supplied value when none is given (an auto rowid placeholder
+-- that never matches a stored row), so the seq arm only fires for an explicit seq.
+CREATE TRIGGER mem_events_bi_no_replace BEFORE INSERT ON mem_events
+WHEN EXISTS (SELECT 1 FROM mem_events WHERE id = new.id)
+     OR EXISTS (SELECT 1 FROM mem_events WHERE seq = new.seq)
+BEGIN
+    SELECT RAISE(IGNORE);
+END;
+
 -- The gate: identical to 0014 (including the `id` replay guard and the
 -- COALESCE-outside-the-subquery fix) except that an exempt row is skipped.
 CREATE TRIGGER mem_events_bi_quota BEFORE INSERT ON mem_events
