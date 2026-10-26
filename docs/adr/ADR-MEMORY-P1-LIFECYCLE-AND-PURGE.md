@@ -1,6 +1,6 @@
 # ADR-MEMORY-P1：个人记忆生命周期与清除权
 
-> **DRAFT / 待外审，2026-10-23。** P1-01 仅获授权编写设计；本文不是已批准法律、迁移或生产实现许可。基线 `f16e65a95f9732f4e00cb288f967e40e0978eb7b`；本轮只读源码与给定报告，没有读取真实记忆库、执行清除或重跑探针。下文“应/必须”均是拟议验收要求，须外部设计批准后实施。
+> **PROPOSED / 待外审接受，2026-10-26 修订（原 DRAFT 2026-10-23）。** 第 9 节五项已由产品负责人 jason 于 2026-10-26 拍板。本修订在精确 head 上被 clestons APPROVE，即作为 adr-s9 的外审接受记录。接受的是设计与首版范围，不批准任何迁移或生产实现；PLAN 各行的格式外审和实现门不变。P1-01 仅获授权编写设计；本文不是已批准法律、迁移或生产实现许可。基线 `f16e65a95f9732f4e00cb288f967e40e0978eb7b`；本轮只读源码与给定报告，没有读取真实记忆库、执行清除或重跑探针。下文“应/必须”均是拟议验收要求，须外部设计批准后实施。
 
 ## 1. 权威、问题与决策范围
 
@@ -16,7 +16,7 @@ Agent24 主线是“用户输入 → 上下文/召回 → 模型 → 工具审�
 
 | 操作 | 新行为与读取 | 原文、历史和恢复 | 回执要表达的事实 |
 |---|---|---|---|
-| 暂停 pause（已有） | 停止新开始 run 的记忆写入与跨 session recall；不等于停聊天日志 | assertion/原始对话保留；按 `putMemorySettings`，既有审批恢复使用已存 snapshot，不按新开关重决定；真实撤回重校验仍独立生效 | “已暂停记忆；历史保留；已开始的审批恢复按原快照” |
+| 暂停 pause（已有） | 停止新开始 run 的记忆写入与跨 session recall；不等于停聊天日志 | assertion/原始对话保留；按 `putMemorySettings`，既有审批恢复在通过来源核对后使用已存 snapshot，不按新开关重决定；来源无法证明时，#1197 在 `drive_resume` 中以 `source_unproven` 拒绝恢复（`agent24-agent/src/lib.rs`）；真实撤回重校验仍独立生效 | “已暂停记忆；历史保留；已开始的审批在来源可证明时按原快照恢复，否则不恢复” |
 | 撤回 retract（已有） | assertion 不再作为当前有效记忆召回；真实 host recall 的请求副本需按当前契约裁剪 | 原文、审计与旧版本保留；再次明确 remember 可重申，不能靠清审计绕 H02 | “不再用于当前记忆召回；原始对话仍保留” |
 | 更正 supersede（拟议） | 用户选择旧断言并提交新值，建立修订链；当前召回用有效新值；冲突可并存并标来源 | 旧值仍可按 valid-time/recorded-time 查询；未知有效日期留空，不能用写入时间伪造；purge 后 as-of 也不可返回旧正文 | “已更正；旧版本保留”；F11 `asserted_by` 来自可信身份 |
 | 清除 purge（拟议） | 按确认的目标闭包封锁后清除受控正文及派生物；所有查询/重建/恢复受 tombstone 约束 | 不可撤销；不自动清掉同一用户的所有文档/模块；全个人范围或指定会话范围须分别预览 | 逐副本显示已清除/处理中/失败/不受控；逻辑阻断不冒充清理完成 |
@@ -38,7 +38,7 @@ purge 不等同于撤回；暂停不等同于无痕；更正不等同于物理�
 | 可编辑 artifacts/偏好：`artifact.rs`、migration 0003/0008、`reconcile.rs` | 覆盖 body、历史版本及磁盘投影的来源闭包；全局 `kv` 逐 namespace/key 定义映射。用户维护的权威文件不自动删除：预览中显式选择，否则说明不在范围；无法判归属则拒绝执行该范围。 |
 | 工具正文/附件：`trace.rs`、migration 0009 `mem_trace_nodes/refs` | 已有 DB 内完整工具正文，不能当成 P1 磁盘附件已上线。拟议大输出附件按 owner 内去重；引用与 blob 分开删除，剩余合法引用保留，多 owner 共用 blob 默认禁用。 |
 | 冷归档 / JSON+Markdown 导出包 | P1 能力尚待实现；托管包登记 owner、对象 ID、来源与删除世代，包含原文、修订和状态。压缩不是删除；受控包需删除/重写并验证；用户复制出去的包见 §7。 |
-| Run/thread/snapshot：`agent24-agent/src/lib.rs`、`agent24-store` migration 0004/0016 | `run_messages` 的 content/tool_calls、runs 的 prompt/诊断字段及 source tags 需逐字段核；Run 表不自带 personal-owner 隔离，必须有可信 run→owner/来源绑定。含目标内容的运行暂停/取消后清理；未知来源不得默认不相关。 |
+| Run/thread/snapshot：`agent24-agent/src/lib.rs`、`agent24-store` migration 0004/0016 | `run_messages` 的 content/tool_calls、runs 的 prompt/诊断字段及 source tags 需逐字段核；Run 表不自带 personal-owner 隔离，必须有可信 run→owner/来源绑定。消息来源已由独立表 `run_message_origins`（migration 0021、0022，#1168/#1195）落地；K1 `run_source_tags` 只管隐私/路由，二者正交，见 [ADR-MEMORY-RECALL-MESSAGE-ORIGINS](ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md)。含目标内容的运行暂停/取消后清理；未知来源不得默认不相关。 |
 | 诊断/审计/缓存：`agent24-memory/src/trace.rs`、`agent24-store` decision/model timing、daemon tracing/events | 发布前补“字段→写点→读取者→删除动作”清单，含桌面历史、错误正文、工具参数/输出、临时文件和遥测。当前没有证明全链无副本；仅允许清单内回执，禁止把广播事件缺席当删除成功。 |
 | 备份、SQLite WAL/journal/空闲页 | 当前完整受控备份恢复协议未核得，P1 新增恢复门。DB DELETE 只保证应用逻辑不可读；checkpoint/压实及托管文件清理另验，不宣称 SSD/系统快照上的取证级擦除。 |
 | 外部模块索引/模型缓存 | Documenting/Knowledge/Media/AgentEar 各自资产不可按名字认领。登记宿主对象→模块副本映射、删除能力/回执和失联状态；未接线标 N/A，已存在但失控标不受控，不能混为“已清除”。 |
@@ -98,16 +98,20 @@ P1 承诺限 Agent24 控制的逻辑数据、已登记可清理的本地文件�
 | 断电、满盘、权限错误、模块失联、超时重试 | 每阶段 crash 注入、持久进度与幂等；失败保持 partial，不回滚成可读；清理意图可独立持久化 |
 | 本机管理员任意改 DB/替换所有控制凭证、恶意外部模型保存 | 不在本地应用可证明边界；检测到缺失/不一致 fail-closed，不把 hash 或 localhost 解释成完整安全隔离 |
 
-验收使用合成双 owner 数据，经真实 daemon/API/provider spy/磁盘重开验证；默认绿测试不能替代显式红测。覆盖 pause 与 purge 差异、更正 as-of、JSON 恢复、引用混合与离线副本、每步崩溃/取消、满配额执行 purge、备份回滚与缺控制库、无痕异常退出和工具失败；实际发布另做 jason 真机链。P02 同进程/冷恢复 marker history 已补红证，P03 HTTP/资格变化/no-session 已补观察；H02 固定时钟同秒重申已确定审计 ID 碰撞红证但未修复；仍须补完整同文三来源修复矩阵和新发送屏障验证。旧观察测试不证明拟议 purge 屏障已实现。
+验收使用合成双 owner 数据，经真实 daemon/API/provider spy/磁盘重开验证；默认绿测试不能替代显式红测。覆盖 pause 与 purge 差异、更正 as-of、JSON 恢复、引用混合与离线副本、每步崩溃/取消、满配额执行 purge、备份回滚与缺控制库、无痕异常退出和工具失败；实际发布另做 jason 真机链。P02 同进程/冷恢复 marker history 已补红证，P03 HTTP/资格变化/no-session 已补观察；H02 固定时钟同秒重申的审计 ID 碰撞已由 #1152（merge 7dd6f08f）修复，见 `agent24-memory/src/writer.rs` 的避碰写入（`commit_with_audit_using_clock`，测试 `h02_reassert_skips_occupied_suffix_without_reusing_events`）；仍须补完整同文三来源修复矩阵和新发送屏障验证。旧观察测试不证明拟议 purge 屏障已实现。
 
-## 9. 高影响待决项（均未批准）
+## 9. 高影响决策（jason 2026-10-26 已决）
 
-| 待外审决策 | 优先推荐与代价 / 未决定时的门 |
-|---|---|
-| 清除粒度与混合来源 | 首版会话闭包/全个人域，完整展示连带删除；牺牲句子级便捷以避免错删。未批准不做破坏性实现。 |
-| tombstone 信任锚与保留期 | 业务数据根外的控制库＋用户分离保存的恢复凭证；清单至少保留到所有可恢复受控包退休，保留期不猜数字。整机回滚/新机新鲜度机制须外审定案，不能先上线 restore。 |
-| 加密导出与密钥生命周期 | 可恢复包默认加密、明文单独选择；接受密钥丢失不能恢复。算法、密钥备份/轮换、内容派生 ID 的隐私匹配另做格式安全评审。 |
-| purge 对在途运行/外部副本的承诺 | fence 后停止新派发，清退受影响运行，逐副本报告；不承诺撤销已发送请求。P03 确定旧承诺/新要求后再冻结发送接缝。 |
-| 无痕首版工具/provider 范围 | 从最小可证明路径开始，禁止未知持久落点；不可只测 EventLog。能力白名单与例外文案须外审。 |
+以下五项已由产品负责人 jason 于 2026-10-26 拍板。本节在外审 APPROVE 后才算被接受；接受的是设计与首版范围，不批准迁移或生产实现。每项的“放开”只指相关计划行可以开始格式或设计工作，各行自身的格式外审和实现门不变。
 
-来源方案优先复核/扩展 K1 `0016_run_source_tags` 与真实 seq 实例绑定的适配性；其 LocalOnly 路由标签不自动证明 host recall，不能照抄旧 `0015` 草案或把历史 snapshot 默认补为 NoRecall。来源兼容、生命周期变更、purge/无痕/迁移/导入格式均须各自精确版本外审；本 ADR 获批也不替代实现 PR 门禁。
+**① 清除粒度（已决）。** 决定：purge 首版只做“全个人域”。归属无法证明时拒绝执行。按会话删除延后。原因：当前 `SessionHistory` 分类没有历史源对象边，证明不了会话闭包（`rust/crates/agent24-store/src/message_origin.rs`）。放开：P1-02c、P1-04/05/06 的格式设计、P1-08 全域设计。仍挡住：按会话删除。风险：全域删除粒度粗，用户想删一段对话时只能删全部；预览必须明示这一点。
+
+**② 恢复信任锚（已决）。** 决定：恢复前用独立、在线、单调的锚验证数据没被回滚。验证失败则拒绝恢复。首版不退休 tombstone。放开：P1-04b 导回、P1-05c/d、P1-08c。没有锚就延期离线恢复。风险：`0001_initial` 的 `audit_log` 哈希链（`prev_hash`/`hash`）与业务数据同在一个库里，可以随整库一起回滚，所以不能当锚（`rust/crates/agent24-store/migrations/0001_initial.sql`）。
+
+**③ 加密（已决）。** 决定：恢复包默认认证加密，密钥与包分开保存（macOS 钥匙串）。密钥丢失则不可恢复。明文导出必须用户单独选择。放开：P1-05a/b 与 P1-04b 格式。风险：包加密不保护 tombstone 里可猜的内容 ID。`agent24-agent/src/retain.rs` 的 `persist` 用 `checksum(owner ‖ object)` 生成 ID，知道正文候选的人可以离线验证猜测。
+
+**④ 在途与外部副本（已决）。** 决定：fence 之后不再授予新的发送或工具许可。已授权在途的尽力取消。受控但失联的副本保持 `partial`。失控副本单独列出。不承诺“全部清除”。放开：P1-05 并发与 P1-08→09 的设计。风险：模型路由 fallback 复用同一请求（`agent24-models/src/router.rs`，按 route 循环调用 `provider.complete(req, …)`），循环前检查不足以提供发送线性化。
+
+**⑤ 无痕首版（已决）。** 决定：零工具、零模块，只允许一个经过全落点验收的本地 provider。验收前入口禁用。放开：只放开 P1-09 的最小路径。风险：普通 run 路径会持久写 snapshot（`append_snapshot_run_messages`，`agent24-agent/src/lib.rs`），无痕不能复用普通运行路径。
+
+来源方案已落地：消息来源由独立表 `run_message_origins`（migration 0021、0022，#1168/#1195）承载，K1 `run_source_tags` 只管隐私/路由，二者正交，见 [ADR-MEMORY-RECALL-MESSAGE-ORIGINS](ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md)。生命周期变更、purge/无痕/迁移/导入格式均须各自精确版本外审；本 ADR 获接受也不替代实现 PR 门禁。
