@@ -7,7 +7,8 @@
 //! it up, and its offset is written instead.
 //!
 //! The caller runs the writes as [`super::journal`] orders them and reports
-//! each back. Identity changes, calls and the start follow in later slices.
+//! each back. New bindings are in `create`; identity changes, calls and the
+//! start follow in later slices.
 
 use std::collections::HashMap;
 
@@ -20,6 +21,10 @@ use super::member::{Left, Member};
 use super::profile::Profile;
 use super::record::{Change, Ids, Of};
 use super::replay::Record;
+
+mod create;
+
+pub use create::Created;
 
 /// What an event or a report asks of the caller.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,6 +66,8 @@ enum Then<I: Ids> {
         ticket: Loosening,
         switch: Loose<I::Profile>,
     },
+    /// A new binding, in [`Host::creations`].
+    Create { ticket: Loosening },
 }
 
 #[derive(Debug)]
@@ -72,17 +79,24 @@ pub struct Host<I: Ids> {
     /// Loosenings written and not yet confirmed.
     pending: HashMap<Loose<I::Profile>, Loosening>,
     journal: Journal<I, Then<I>>,
+    /// The highest generation value used or written, for any binding: a new
+    /// binding's first value goes past it (S4.4, A.4).
+    highest: u64,
+    creations: Vec<create::Creation<I>>,
 }
 
 impl<I: Ids> Host<I> {
-    /// `next_seq` is the number the log's next record takes.
-    pub fn new(off: bool, seal_present: bool, next_seq: u64) -> Self {
+    /// `next_seq` is the number the log's next record takes; `highest` the
+    /// highest generation value it holds, or more (A.4).
+    pub fn new(off: bool, seal_present: bool, next_seq: u64, highest: u64) -> Self {
         Self {
             off,
             members: Vec::new(),
             ledger: Ledger::new(seal_present),
             pending: HashMap::new(),
             journal: Journal::new(next_seq),
+            highest,
+            creations: Vec::new(),
         }
     }
 
@@ -240,6 +254,8 @@ impl<I: Ids> Host<I> {
         }
         out.aborted.extend(left.aborted);
         let values = left.generations;
+        let written = values.iter().map(|(_, value)| *value);
+        self.highest = written.fold(self.highest, u64::max);
         self.journal
             .push(left.changes, Then::Tight { ticket, values });
     }
@@ -253,7 +269,9 @@ impl<I: Ids> Host<I> {
     pub fn written(&mut self, attempt: Attempt, outcome: Written) -> Output<I> {
         let mut out = Output::default();
         match self.journal.written(attempt, outcome) {
-            Report::Ignored | Report::Failed(Then::Loose { .. }) => return out,
+            Report::Ignored | Report::Failed(Then::Loose { .. } | Then::Create { .. }) => {
+                return out;
+            }
             Report::Failed(Then::Tight { ticket, .. }) => {
                 self.ledger.record_failed(*ticket);
                 return out;
@@ -275,8 +293,12 @@ impl<I: Ids> Host<I> {
                     self.apply(switch, &mut out);
                 }
             }
+            Report::Durable(Then::Create { ticket }) => self.created(ticket, &mut out),
         }
-        out.seal = self.ledger.reseal().map(SealWrite::Rebuild);
+        // A tightening on the way deleted the seal: no rebuild yet.
+        if let Some(op) = self.ledger.reseal() {
+            out.seal = Some(SealWrite::Rebuild(op));
+        }
         out
     }
 

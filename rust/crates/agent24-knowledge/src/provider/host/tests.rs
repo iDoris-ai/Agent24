@@ -12,7 +12,7 @@ use crate::provider::replay::Entry;
 use crate::provider::state::{ConnectionPhase, Switches};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct T;
+pub(super) struct T;
 
 impl Ids for T {
     type Profile = &'static str;
@@ -23,10 +23,10 @@ impl Ids for T {
     type Kb = &'static str;
 }
 
-type H = Host<T>;
-type C = Change<T>;
+pub(super) type H = Host<T>;
+pub(super) type C = Change<T>;
 
-fn of(profile: &'static str, binding: u32) -> Of<T> {
+pub(super) fn of(profile: &'static str, binding: u32) -> Of<T> {
     Of { profile, binding }
 }
 
@@ -47,8 +47,8 @@ fn loading() -> Profile<&'static str> {
 
 /// "a" bound to binding 7 and loading, "b" a selected placeholder; Off is
 /// off and the seal present. The log's next record is 10.
-fn host() -> H {
-    let mut host = H::new(false, true, 10);
+pub(super) fn host() -> H {
+    let mut host = H::new(false, true, 10, 1);
     host.insert(Member::new("a", loading(), Some(7), false));
     let placeholder = Slot::Placeholder(Placeholder::new(None));
     let b = Profile::new(placeholder, true, None);
@@ -56,14 +56,14 @@ fn host() -> H {
     host
 }
 
-fn phase(host: &H, id: &'static str) -> Option<ConnectionPhase> {
+pub(super) fn phase(host: &H, id: &'static str) -> Option<ConnectionPhase> {
     match host.profile(&id).unwrap().slot() {
         Slot::Bound(binding) => binding.connection().phase(),
         Slot::Placeholder(_) => panic!("{id} is a placeholder"),
     }
 }
 
-fn write(host: &mut H) -> (Attempt, u64, Vec<C>) {
+pub(super) fn write(host: &mut H) -> (Attempt, u64, Vec<C>) {
     match host.take_write() {
         Some((
             attempt,
@@ -76,7 +76,7 @@ fn write(host: &mut H) -> (Attempt, u64, Vec<C>) {
     }
 }
 
-fn durable(host: &mut H) -> Output<T> {
+pub(super) fn durable(host: &mut H) -> Output<T> {
     let (attempt, _, _) = write(host);
     host.written(attempt, Written::Durable)
 }
@@ -171,7 +171,7 @@ fn an_unconfirmed_tightening_refuses_the_loosenings_it_covers() {
         "b still waits"
     );
 
-    let mut host = H::new(true, true, 1);
+    let mut host = H::new(true, true, 1, 1);
     host.insert(Member::new("a", loading(), Some(7), true));
     host.disable("x");
     host.turn_off();
@@ -298,7 +298,7 @@ fn off_aborts_the_calls_in_flight() {
         unreachable!()
     };
     let (call, _) = binding.connection_mut().open_call().unwrap();
-    let mut host = H::new(false, true, 1);
+    let mut host = H::new(false, true, 1, 1);
     host.insert(Member::new("a", profile, Some(7), false));
     assert_eq!(host.turn_off().aborted, [(of("a", 7), call)]);
 }
@@ -447,7 +447,7 @@ fn a_selection_awaiting_confirmation_does_not_activate() {
     );
     let awaited = Some(Confirmation::PrincipalChanged);
     let profile = Profile::new(Slot::Bound(Box::new(binding)), false, awaited);
-    let mut host = H::new(false, true, 1);
+    let mut host = H::new(false, true, 1, 1);
     host.insert(Member::new("a", profile, Some(7), false));
     host.select("a").unwrap();
     assert!(durable(&mut host).loading.is_empty());

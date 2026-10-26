@@ -5,11 +5,13 @@
 //! reports a generation back once it is confirmed persisted.
 
 use super::binding::{Leave, WithRule};
-use super::connection::Round;
-use super::gate::CallId;
+use super::connection::{Connection, Round};
+use super::credential::Credentials;
+use super::gate::{CallId, Gate};
+use super::placeholder::{Attempt, Attempted, Settled};
 use super::profile::{Profile, Slot};
 use super::record::{Change, Ids, Of};
-use super::state::Switches;
+use super::state::{PlaceholderFailure, Switches};
 
 #[derive(Debug)]
 pub struct Member<I: Ids> {
@@ -18,6 +20,8 @@ pub struct Member<I: Ids> {
     /// The id of the profile's binding, while it has one.
     binding: Option<I::Binding>,
     disabled: bool,
+    /// The principal last confirmed (S1.13).
+    confirmed: Option<I::Principal>,
 }
 
 /// What events on members persist and abort; one write's worth.
@@ -57,7 +61,17 @@ impl<I: Ids> Member<I> {
             profile,
             binding,
             disabled,
+            confirmed: None,
         }
+    }
+
+    /// With the principal last confirmed, as persisted.
+    pub fn with_confirmed(self, confirmed: Option<I::Principal>) -> Self {
+        Self { confirmed, ..self }
+    }
+
+    pub fn confirmed(&self) -> Option<&I::Principal> {
+        self.confirmed.as_ref()
     }
 
     pub fn id(&self) -> &I::Profile {
@@ -110,6 +124,63 @@ impl<I: Ids> Member<I> {
                 left.generations.push((of, value));
             }
         }
+    }
+
+    /// Starts a login or handshake on the placeholder; `None` while bound.
+    pub fn attempt(&mut self) -> Option<Attempt> {
+        match self.profile.slot_mut() {
+            Slot::Placeholder(placeholder) => Some(placeholder.attempt()),
+            Slot::Bound(_) => None,
+        }
+    }
+
+    /// How `attempt` ended, as [`super::placeholder::Placeholder::settle`].
+    pub fn settle(&mut self, attempt: Attempt, attempted: Attempted) -> Settled {
+        match self.profile.slot_mut() {
+            Slot::Placeholder(placeholder) => placeholder.settle(attempt, attempted),
+            Slot::Bound(_) => Settled::Ignored,
+        }
+    }
+
+    /// `attempt`'s binding was not written: `dependency`, and the placeholder
+    /// retries by backoff (S2.5).
+    pub fn creation_failed(&mut self, attempt: Attempt) {
+        if let Slot::Placeholder(placeholder) = self.profile.slot_mut() {
+            placeholder.creation_failed(attempt);
+        }
+    }
+
+    /// The placeholder's recorded reason.
+    pub fn failure(&self) -> Option<PlaceholderFailure> {
+        match self.profile.slot() {
+            Slot::Placeholder(placeholder) => placeholder.failure(),
+            Slot::Bound(_) => None,
+        }
+    }
+
+    /// `attempt`'s binding is persisted with its first `value` and, when it
+    /// needed no confirmation, its principal as confirmed (S2.5, S4.4,
+    /// S1.13). False once the attempt no longer creates, as
+    /// [`Profile::bind`].
+    pub fn bind(
+        &mut self,
+        attempt: Attempt,
+        binding: I::Binding,
+        value: u64,
+        confirmed: Option<I::Principal>,
+    ) -> bool {
+        let connection = Connection::new(Gate::new(value), false);
+        if !self
+            .profile
+            .bind(attempt, connection, Credentials::new(false))
+        {
+            return false;
+        }
+        self.binding = Some(binding);
+        if confirmed.is_some() {
+            self.confirmed = confirmed;
+        }
+        true
     }
 
     /// The binding enters `loading` if the switches and its state let it.
