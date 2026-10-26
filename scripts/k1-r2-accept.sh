@@ -34,6 +34,7 @@ resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))'
 REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
 WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/k1r2-accept.$$}")
 case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
+[ -z "$(ls -A "$WORK" 2>/dev/null)" ] || { echo "--work must be new or empty: $WORK" >&2; exit 2; }
 mkdir -p "$WORK" || exit 2
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
