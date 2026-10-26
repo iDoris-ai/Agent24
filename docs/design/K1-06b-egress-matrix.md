@@ -131,7 +131,7 @@
      - 给工具结果打标签另开一片（§7 的 6b.5f），同时修工具出口门、会话下限、记忆分类和 self-wake 的来源分类；那一片落地后再放宽 peer 视图的规则。已经记成 Ordinary 的旧断言和 schedule 不做兼容：David 已定不做兼容、清库。
    - **David 2026-10-26 对 6b.5f 的两项决定**：
      - 分类按工具定：fs_read、explorer 的输出记 Ordinary，因为来源能追溯到工作区根目录里的具体路径；http_fetch 取回的公网内容记 Ordinary；shell_exec、MCP、模块工具的输出记 Unknown，因为来源追溯不到；fs_write、self_wake 返回回执，不含读到的资料。Claude、Fable 选这一项；Codex 选「本地结果都算普通」，那要修订 ADR §2.1。David 接受的代价：跑过 shell_exec 以后，本 run 和同会话后面的轮次不能再用 shell_exec、http_fetch、MCP、模块工具；工作区文件经 fs_read→http_fetch 外发这条链仍开着，和现在一样。
-     - 同源回送不拦：模块工具的输出记 Unknown，标签上由内核记下来源模块。发往模块 X 的调用不计来自 X 自己的 Unknown，因为 X 本来就持有这些内容（ADR §2.1.1 第 3、5 条：按动作实际携带的数据判定，可信宿主可用不可伪造的绑定收窄）。其他来源的 Unknown 和 Restricted 照拦；External 操作不享受这条例外；读不到来源时照拒。同源靠注册表里的绑定来认，不看模块自报的 `output_privacy`。来源模块要带着身份传到同会话后面的轮次。三方都选这一项。这样 Documenting 的对话入口可以在同一个模块内连续调用。
+     - 同源回送不拦：模块工具的输出记 Unknown，标签上由内核记下来源模块。发往模块 X 的调用不计来自 X 自己的 Unknown，因为 X 本来就持有这些内容。ADR 目前没有这条例外：它沿用 §2.1.1 第 3、5 条「按动作实际携带的数据判定、由可信宿主收窄」的方向，但第 5 条要证明的是载荷，这里证明的只是接收方，所以 6b.5f-1 落地时要同步补进 ADR §2.1.1。其他来源的 Unknown 和 Restricted 照拦；External 操作不享受这条例外；读不到来源时照拒。同源靠注册表里的绑定来认，不看模块自报的 `output_privacy`。来源模块要带着身份传到同会话后面的轮次。三方都选这一项。这样 Documenting 的对话入口可以在同一个模块内连续调用。
 5. **Hyphae `/comm/send`**：只能由用户经 REST 直接调用，没有 Tool 包装，也不带 run 资料。视为用户直接操作，不在 agent 出口矩阵内。
 
 ## 7. 后续切片
