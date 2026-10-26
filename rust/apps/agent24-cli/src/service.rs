@@ -474,12 +474,16 @@ mod tests {
                     //   reported it the moment ME-3b-3's `which()` began reading
                     //   PATH on the daemon side: the READING was right, the
                     //   conclusion would have been wrong.
+                    // - LOCALAPPDATA: read only by the Windows branch of
+                    //   `data_dir()` (ADR-037); launchd/LaunchAgents exist on
+                    //   macOS only, and a Windows login-task service inherits
+                    //   the user environment, so there is nothing to pass through.
                     if let Some(name) = name {
                         let shouty = !name.is_empty()
                             && name
                                 .chars()
                                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-                        if shouty && !matches!(name.as_str(), "HOME" | "PATH") {
+                        if shouty && !matches!(name.as_str(), "HOME" | "PATH" | "LOCALAPPDATA") {
                             found.push(name);
                         }
                     }

@@ -1,0 +1,29 @@
+{
+  "$comment": "ADR-037 decision 3 platform data-dir contract. Shared by rust/crates/agent24-protocol (data_dir.rs) and apps/desktop (data-dir.test.ts). Each case: platform + env -> expected path or error code. Absent env keys are unset; empty string is set-but-empty. Windows paths are checked as literal strings, so both implementations must be platform-parametrised, not host-dependent.",
+  "cases": [
+    { "name": "mac default keeps ~/.agent24", "platform": "macos", "env": { "HOME": "/Users/u" }, "expect": { "path": "/Users/u/.agent24" } },
+    { "name": "linux default keeps ~/.agent24", "platform": "linux", "env": { "HOME": "/home/u" }, "expect": { "path": "/home/u/.agent24" } },
+    { "name": "windows default is LOCALAPPDATA\\Agent24", "platform": "windows", "env": { "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local", "HOME": "C:\\Users\\u" }, "expect": { "path": "C:\\Users\\u\\AppData\\Local\\Agent24" } },
+    { "name": "windows ignores HOME", "platform": "windows", "env": { "LOCALAPPDATA": "D:\\L", "HOME": "/home/ignored" }, "expect": { "path": "D:\\L\\Agent24" } },
+    { "name": "windows trailing separator trimmed", "platform": "windows", "env": { "LOCALAPPDATA": "C:\\L\\" }, "expect": { "path": "C:\\L\\Agent24" } },
+    { "name": "windows missing LOCALAPPDATA errors, no HOME fallback", "platform": "windows", "env": { "HOME": "C:\\Users\\u" }, "expect": { "error": "localappdata_unset" } },
+    { "name": "windows empty LOCALAPPDATA errors", "platform": "windows", "env": { "LOCALAPPDATA": "", "HOME": "C:\\Users\\u" }, "expect": { "error": "localappdata_unset" } },
+    { "name": "windows relative LOCALAPPDATA errors", "platform": "windows", "env": { "LOCALAPPDATA": "AppData\\Local" }, "expect": { "error": "localappdata_unset" } },
+    { "name": "mac env override wins as-is", "platform": "macos", "env": { "AGENT24_DATA_DIR": "/tmp/x", "HOME": "/Users/u" }, "expect": { "path": "/tmp/x" } },
+    { "name": "linux env override needs no HOME", "platform": "linux", "env": { "AGENT24_DATA_DIR": "/srv/a24" }, "expect": { "path": "/srv/a24" } },
+    { "name": "env override keeps trailing slash as-is", "platform": "linux", "env": { "AGENT24_DATA_DIR": "/srv/a24/", "HOME": "/home/u" }, "expect": { "path": "/srv/a24/" } },
+    { "name": "windows env override wins as-is", "platform": "windows", "env": { "AGENT24_DATA_DIR": "E:\\data", "LOCALAPPDATA": "C:\\L" }, "expect": { "path": "E:\\data" } },
+    { "name": "windows env override needs no LOCALAPPDATA", "platform": "windows", "env": { "AGENT24_DATA_DIR": "E:\\data" }, "expect": { "path": "E:\\data" } },
+    { "name": "windows env override with forward slash drive path is absolute", "platform": "windows", "env": { "AGENT24_DATA_DIR": "E:/data" }, "expect": { "path": "E:/data" } },
+    { "name": "windows UNC env override is absolute", "platform": "windows", "env": { "AGENT24_DATA_DIR": "\\\\srv\\share\\a24" }, "expect": { "path": "\\\\srv\\share\\a24" } },
+    { "name": "relative env override is ignored (falls back, mac)", "platform": "macos", "env": { "AGENT24_DATA_DIR": "rel/dir", "HOME": "/Users/u" }, "expect": { "path": "/Users/u/.agent24" } },
+    { "name": "relative env override is ignored (falls back, windows)", "platform": "windows", "env": { "AGENT24_DATA_DIR": "rel\\dir", "LOCALAPPDATA": "C:\\L" }, "expect": { "path": "C:\\L\\Agent24" } },
+    { "name": "relative env override with no HOME errors", "platform": "linux", "env": { "AGENT24_DATA_DIR": "rel/dir" }, "expect": { "error": "home_unset" } },
+    { "name": "empty env override falls back", "platform": "linux", "env": { "AGENT24_DATA_DIR": "", "HOME": "/home/u" }, "expect": { "path": "/home/u/.agent24" } },
+    { "name": "posix path is not absolute on windows", "platform": "windows", "env": { "AGENT24_DATA_DIR": "/tmp/x", "LOCALAPPDATA": "C:\\L" }, "expect": { "path": "C:\\L\\Agent24" } },
+    { "name": "drive path is not absolute on posix", "platform": "linux", "env": { "AGENT24_DATA_DIR": "C:\\x", "HOME": "/home/u" }, "expect": { "path": "/home/u/.agent24" } },
+    { "name": "linux missing HOME errors", "platform": "linux", "env": {}, "expect": { "error": "home_unset" } },
+    { "name": "mac empty HOME errors", "platform": "macos", "env": { "HOME": "" }, "expect": { "error": "home_unset" } },
+    { "name": "HOME trailing slash normalised", "platform": "macos", "env": { "HOME": "/Users/u/" }, "expect": { "path": "/Users/u/.agent24" } }
+  ]
+}

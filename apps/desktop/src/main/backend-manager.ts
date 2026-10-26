@@ -12,6 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import readline from 'node:readline'
+import { tryDataDir } from './data-dir'
 
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
@@ -99,17 +100,11 @@ export interface ExternalDaemonState {
 }
 
 /** Mirrors `agent24_protocol::state_file::state_path()` (Rust), i.e.
- * `state_dir()/daemon.json`: `AGENT24_DATA_DIR` (non-empty, absolute) is the
- * data root as-is; otherwise `$HOME/.agent24`; no `HOME` → null. Reads the
- * env directly (not `os.homedir()`) so this stays in lockstep with where the
- * daemon itself looks, and so tests can point it at an isolated dir without
- * touching the real one. */
+ * `data_dir()/daemon.json`, with the data root from the one shared resolver
+ * (`./data-dir`, ADR-037); unresolvable root → null. */
 export function daemonStatePath(): string | null {
-  const dataDir = process.env['AGENT24_DATA_DIR']
-  if (dataDir && path.isAbsolute(dataDir)) return path.join(dataDir, 'daemon.json')
-  const home = process.env['HOME']
-  if (!home) return null
-  return path.join(home, '.agent24', 'daemon.json')
+  const dir = tryDataDir()
+  return dir === null ? null : path.join(dir, 'daemon.json')
 }
 
 /** Read + parse `daemon.json`. Absent, unreadable, or malformed all mean the
