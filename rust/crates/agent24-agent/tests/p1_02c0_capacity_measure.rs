@@ -7,7 +7,7 @@
 //! explicit-remember `retain::persist` -> `WriteGate`). Only synthetic data in a
 //! temp dir; no user library is opened. Default quotas are never changed.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use agent24_agent::{EventSink, RunManager, SessionMemory};
+use agent24_agent::{EventSink, MemoryWriteOutcome, RunManager, SessionMemory};
 use agent24_memory::KvStore;
 use agent24_memory::session::Summarizer;
 use agent24_models::Msg;
@@ -107,11 +107,19 @@ async fn run_tier(tier: Tier) {
         let ulen = rng.range(tier.user.0, tier.user.1);
         let alen = rng.range(tier.assistant.0, tier.assistant.1);
         let mut prompt = synth(&mut rng, ulen);
-        if t % REMEMBER_EVERY == 0 {
+        let remembers = t % REMEMBER_EVERY == 0;
+        if remembers {
             prompt = format!("记住 {prompt}");
         }
         let answer = synth(&mut rng, alen);
-        m.chat_remember_turn(&sid, &prompt, &answer).await;
+        let outcome = m.chat_remember_turn(&sid, &prompt, &answer).await;
+        let want = if remembers {
+            MemoryWriteOutcome::Saved
+        } else {
+            MemoryWriteOutcome::NotApplicable
+        };
+        // A failed or skipped write would silently under-count capacity.
+        assert_eq!(outcome, want, "turn {t}: unexpected write outcome");
         wal_peak = wal_peak.max(file_len(&wal));
         if (t + 1) % 1000 == 0 {
             let (rows, bytes): (i64, i64) =
@@ -180,9 +188,36 @@ async fn run_tier(tier: Tier) {
         tier.name,
         sizes[n - 1]
     );
+    let by_kind_counts: Vec<(String, i64)> =
+        by_kind.iter().map(|(k, c, _)| (k.clone(), *c)).collect();
     for (k, c, b) in by_kind {
         println!("MEASURE tier={} kind={k} rows={c} bytes={b}", tier.name);
     }
+    // Expected rows from the synthetic shape: 2 messages per turn, one
+    // write_decision per explicit remember, one summary per compaction
+    // (simulated from the default policy: fold to 20 when the tail exceeds 40).
+    let (mut want_summaries, mut tail) = (0usize, 0usize);
+    for t in 0..TURNS {
+        if t % SESSION_TURNS == 0 {
+            tail = 0;
+        }
+        tail += 2;
+        if tail > 40 {
+            want_summaries += 1;
+            tail = 20;
+        }
+    }
+    let count = |k: &str| {
+        by_kind_counts
+            .iter()
+            .find(|(kind, _)| kind == k)
+            .map_or(0, |(_, c)| *c as usize)
+    };
+    let want_decisions = TURNS.div_ceil(REMEMBER_EVERY);
+    assert_eq!(count("message"), 2 * TURNS);
+    assert_eq!(count("session.summary"), want_summaries);
+    assert_eq!(count("mem.write_decision"), want_decisions);
+    assert_eq!(n, 2 * TURNS + want_summaries + want_decisions);
     assert_eq!(
         last.0 as usize, n,
         "quota row_count must equal mem_events rows"

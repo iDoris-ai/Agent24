@@ -27,7 +27,7 @@
 export CARGO_TARGET_DIR=$HOME/Dev/auraai/Agent24/rust/target; ulimit -n 4096
 cd rust && cargo test -p agent24-agent --test p1_02c0_capacity_measure -- --ignored --nocapture --test-threads=1
 ```
-退出码 **0**（2 passed，36.17 s；短档 10.1 s，长档 25.8 s）。
+退出码 **0**（2 passed）。用例逐轮断言写入回执（显式记住轮必须是 `Saved`，其余轮必须是 `NotApplicable`），结束时断言 `message` / `session.summary` / `mem.write_decision` 三种 kind 的行数等于按合成形态算出的预期值（6000 / 240 / 150），因此部分写入失败会使用例 panic 而不是低估容量。加这些断言后重跑，数字与上表逐项相同。
 
 机器：Apple M1 Max，macOS 26.4.1（`sysctl -n machdep.cpu.brand_string` / `sw_vers -productVersion`），本机 APFS 临时目录。
 
