@@ -9,6 +9,8 @@ import {
   daemonStatePath,
   readExternalDaemonState,
   BackendManager,
+  selectedBackend,
+  resolveRustBinary,
   getBackendEndpoint,
   type ExternalDaemonSource,
 } from './backend-manager'
@@ -320,5 +322,97 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     expect(children[1].kill).toHaveBeenCalledWith('SIGTERM')
 
     manager.stop()
+  })
+})
+
+describe('selectedBackend (ADR-037 / CORE-8: node-daemon not shipped)', () => {
+  const prevB = process.env['AGENT24_BACKEND']
+  const prevN = process.env['NODE_ENV']
+  const restore = (k: string, v: string | undefined) => {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  afterEach(() => {
+    restore('AGENT24_BACKEND', prevB)
+    restore('NODE_ENV', prevN)
+    vi.restoreAllMocks()
+  })
+  const ok = () => '/fake/server.js'
+  const noWarnSpy = () => vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+  it('packaged + AGENT24_BACKEND=node → rust, with a warning', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    const warn = noWarnSpy()
+    expect(selectedBackend(true, ok)).toBe('rust')
+    expect(warn).toHaveBeenCalledOnce()
+  })
+
+  it('dev + AGENT24_BACKEND=node → node', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    expect(selectedBackend(false, ok)).toBe('node')
+  })
+
+  it('unset → rust in both modes', () => {
+    delete process.env['AGENT24_BACKEND']
+    expect(selectedBackend(true, ok)).toBe('rust')
+    expect(selectedBackend(false, ok)).toBe('rust')
+  })
+
+  it('dev + node but node-daemon unresolvable → warn and fall back to rust (no throw)', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    const warn = noWarnSpy()
+    const bad = () => {
+      throw new Error('Cannot find module')
+    }
+    expect(selectedBackend(false, bad)).toBe('rust')
+    expect(warn).toHaveBeenCalledOnce()
+  })
+
+  it('BackendManager: injected isPackaged=true wins over inherited NODE_ENV=development', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    process.env['NODE_ENV'] = 'development'
+    noWarnSpy()
+    expect(new BackendManager({ isPackaged: true, resolveNode: ok }).backendKind()).toBe('rust')
+  })
+
+  it('BackendManager: kind follows the injected isPackaged (false → node)', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    process.env['NODE_ENV'] = 'production'
+    expect(new BackendManager({ isPackaged: false, resolveNode: ok }).backendKind()).toBe('node')
+  })
+
+  it('BackendManager: no injection fails closed (rust)', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    noWarnSpy()
+    expect(new BackendManager({ resolveNode: ok }).backendKind()).toBe('rust')
+  })
+})
+
+describe('resolveRustBinary (ADR-037: packaged decided by injected isPackaged)', () => {
+  const prevN = process.env['NODE_ENV']
+  const prevBin = process.env['AGENT24D_BIN']
+  const prevRes = (process as { resourcesPath?: string }).resourcesPath
+  afterEach(() => {
+    if (prevN === undefined) delete process.env['NODE_ENV']
+    else process.env['NODE_ENV'] = prevN
+    if (prevBin === undefined) delete process.env['AGENT24D_BIN']
+    else process.env['AGENT24D_BIN'] = prevBin
+    ;(process as { resourcesPath?: string }).resourcesPath = prevRes
+  })
+  const exe = process.platform === 'win32' ? 'agent24d.exe' : 'agent24d'
+
+  it('isPackaged=true + inherited NODE_ENV=development → resourcesPath/backend binary', () => {
+    delete process.env['AGENT24D_BIN']
+    process.env['NODE_ENV'] = 'development'
+    ;(process as { resourcesPath?: string }).resourcesPath = '/app/Resources'
+    expect(resolveRustBinary(true)).toBe(path.join('/app/Resources', 'backend', exe))
+  })
+
+  it('isPackaged=false + NODE_ENV=production → rust/target/debug', () => {
+    delete process.env['AGENT24D_BIN']
+    process.env['NODE_ENV'] = 'production'
+    expect(resolveRustBinary(false)).toBe(
+      path.join(path.resolve(__dirname, '..', '..', '..', '..'), 'rust', 'target', 'debug', exe),
+    )
   })
 })

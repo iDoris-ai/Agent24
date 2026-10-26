@@ -143,9 +143,6 @@ jobs:
         working-directory: rust
         run: cargo build --release --bin agent24d
 
-      - name: Build node-daemon
-        run: pnpm --filter @agent24/node-daemon build
-
       - name: Build desktop renderer + electron main
         run: pnpm --filter @agent24/desktop build
 
