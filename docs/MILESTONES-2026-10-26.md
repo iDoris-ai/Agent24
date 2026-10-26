@@ -123,7 +123,8 @@
 | REL-4 | iDoris v0.3.1：IDORIS-07 发布证据包，加上 R9 三项 owner 决策 | jason 决策 |
 | REL-5 | COMM：5b、6b.1、6b.2 拆片带入 main；Hyphae lock 以 main 为准 | — |
 | REL-6 | DEC：D1 L1/L2 发布到 main，或明确继续停在分支上（§6） | jason 决策 |
-| REL-7 | 第二档分支里有价值的小件：`repro/1020` 报告进 main；MAINT-01 token 帧校验 cherry-pick；documents WAL 竞态测试修复；Linux 硬件测试 | 各自一个小 PR |
+| REL-7 | ✅ 2026-10-26 已合入 #1256（WAL 竞态）、#1257（MAINT-01）、#1259（REPRO-1020，已脱敏）；#1258（Linux 硬件测试）待评审。原文：第二档分支里有价值的小件：`repro/1020` 报告进 main；MAINT-01 token 帧校验 cherry-pick；documents WAL 竞态测试修复；Linux 硬件测试 | 各自一个小 PR |
+| REL-9 | 修复 2026-10-26 观察到的偶发测试：① `agent24-comm` `comm_zero_run.rs` 正对照固定等 2 秒（macOS 慢机误红，#1261）；② `agent24d` `domain::tests::a_module_is_stopped_by_the_disable_or_the_shutdown_never_both` disable/close 竞态（#1263）。改为事件/条件等待，不靠固定时长；每条附重复运行证据 | 各自一个小 PR |
 | REL-8 | v0.6.0 Mac 正式版：签名加公证的 dmg，CLI 和模块包签名（DEP-B3），CHANGELOG 补齐 v0.5.1 之后的内容，发布清单冻结到文件名 | jason 真机 |
 
 ### CORE 本体化（M-CORE-1，ADR-037 ✅）
