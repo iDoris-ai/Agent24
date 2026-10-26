@@ -323,8 +323,9 @@ fn serves_granted_package(generation: &Generation, expected: Option<&str>) -> bo
 }
 
 /// What a call gets when the running package is not the one granted, or
-/// the run is not the one checked against: the host's own cancellation, before anything is sent (K1-6a-G §2.5), which
-/// the caller reports as `permission_denied`.
+/// the run is not the one checked against: the host's own cancellation,
+/// before anything is sent (K1-6a-G §2.5), which the caller reports as
+/// `permission_denied`.
 fn stale_package() -> ModuleToolCallError {
     ModuleToolCallError::Cancelled
 }
@@ -525,6 +526,19 @@ mod tests {
         assert!(matches!(
             unsent_to(&generation, ModuleToolCallError::ResultUnknown),
             ModuleToolCallError::ResultUnknown
+        ));
+        // Revoked, not only draining (#1236 PR-Daemon Low): any state but
+        // `Running`. Released through the one public path that revokes.
+        let revoked = agent24_os_proto::drain::Generation::serving_package(
+            std::path::PathBuf::from("/nonexistent/upstream.sock"),
+            Some("sha256:b".to_owned()),
+        );
+        assert!(revoked.ready());
+        agent24_os_proto::attach::AttachSlot::new().release(&revoked);
+        assert_eq!(revoked.state(), DrainState::Revoked);
+        assert!(matches!(
+            unsent_to(&revoked, ModuleToolCallError::ModuleUnavailable),
+            ModuleToolCallError::Cancelled
         ));
     }
 
@@ -782,6 +796,14 @@ mod tests {
 
     /// The package the fixture's grants name, and the one "running".
     const FIXTURE_PACKAGE: &str = "sha256:fixture-package";
+
+    /// Waits at most 10s for `step`, a point a test drives the call to: a
+    /// call that never gets there fails the test, not hangs it (#1144 Low ②).
+    async fn reached<T>(step: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), step)
+            .await
+            .expect("the call never reached the step the test waits for")
+    }
 
     fn fixture_scope() -> agent24_store::GrantScope {
         agent24_store::GrantScope {
@@ -1755,7 +1777,7 @@ mod tests {
                 .dispatch("fake_module.write_local", &context(), &Map::new(), &cancel)
                 .await
         });
-        entered.await;
+        reached(entered).await;
         cancel_task.cancel();
         let agent24_tools::ToolError::Failed(message) = dispatch.await.unwrap().unwrap_err() else {
             panic!("expected structured module error");
@@ -1863,7 +1885,7 @@ mod tests {
                 .dispatch("fake_module.write_local", &context(), &Map::new(), &cancel)
                 .await
         });
-        entered.await;
+        reached(entered).await;
         // Parent cancellation now occurs after PreDispatch and actual runtime
         // entry, so the test exercises the future-drop window deterministically.
         cancel_task.cancel();
@@ -1889,7 +1911,7 @@ mod tests {
 
         // This boundary is after SQLite COMMIT succeeds and before the append
         // result is acknowledged to ModuleTool::call.
-        committed.await;
+        reached(committed).await;
         let rows = store.list_audit().await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].detail["terminal"]["result"], "success");
@@ -1968,7 +1990,7 @@ mod tests {
                     .dispatch("fake_module.write_local", &context(), &Map::new(), &cancel)
                     .await
             });
-            entered.await;
+            reached(entered).await;
             // Occupy the sole audit connection after actual module entry.
             // Holding it past the settle grace drops the original terminal
             // writer, so the interrupted fallback must perform the append.
@@ -2074,7 +2096,7 @@ mod tests {
                 .dispatch("fake_module.write_local", &context(), &Map::new(), &cancel)
                 .await
         });
-        entered.await;
+        reached(entered).await;
         cancel_task.cancel();
 
         assert_unknown_module_error(
@@ -2196,7 +2218,7 @@ mod tests {
                 .dispatch("fake_module.write_local", &context(), &Map::new(), &cancel)
                 .await
         });
-        entered.await;
+        reached(entered).await;
         cancel_task.cancel();
         let error = dispatch.await.unwrap().unwrap_err();
         assert_unknown_module_error(error, "result_unknown");
@@ -2243,7 +2265,7 @@ mod tests {
                 .dispatch("fake_module.write_local", &reused, &Map::new(), &cancel)
                 .await
         });
-        second_auth.await;
+        reached(second_auth).await;
         cancel_task.cancel();
 
         let error = second.await.unwrap().unwrap_err();
@@ -2290,7 +2312,7 @@ mod tests {
                 .call(&direct_ctx, &Map::new(), &CancellationToken::new())
                 .await
         });
-        entered.await;
+        reached(entered).await;
         // Drop the direct call while authorization is still blocked, before it
         // has written a PreDispatch row, then exercise the same recovery hook
         // used by the registry after an expired call.
@@ -2555,7 +2577,7 @@ mod tests {
             );
 
         // Wait until the call is actively executing
-        entered.await;
+        reached(entered).await;
 
         // While active, settlement must be rejected!
         let active_settlement = tool
@@ -2871,7 +2893,7 @@ mod tests {
                 )
                 .await
         });
-        entered.await;
+        reached(entered).await;
         call
     }
 
@@ -2938,7 +2960,7 @@ mod tests {
                 )
                 .await
         });
-        checking.await;
+        reached(checking).await;
         store
             .revoke_module_consent("fake_module", None, "2026-10-08T00:00:00.500Z")
             .await
@@ -3789,6 +3811,24 @@ mod tests {
         assert_eq!(rows[1].detail["terminal"]["result"], "cancelled");
     }
 
+    /// #1143 Low ①: the stored set is held before the approval is: a call
+    /// whose set cannot be dispatched is denied, whatever its approval says,
+    /// not cancelled as an approval that does not cover it would be.
+    #[tokio::test]
+    async fn a_set_that_cannot_be_dispatched_is_denied_before_the_approval_is_held() {
+        let (registry, runtime, _, store) = fixture(RiskClass::WriteLocal, true, true).await;
+        sqlx::query("UPDATE module_consents SET resources = ?")
+            .bind(r#"["not a resource"]"#)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let error = preapprove_write_local(&registry).await.unwrap_err();
+        assert!(error.to_string().contains("permission_denied"), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        let rows = store.list_audit().await.unwrap();
+        assert_eq!(rows[rows.len() - 1].detail["terminal"]["result"], "denied");
+    }
+
     /// Grants every lookup and keeps the last context it was handed.
     struct KeepingAuthorization {
         kept: std::sync::Mutex<Option<ToolContext>>,
@@ -3953,7 +3993,7 @@ mod tests {
                     .await
             }
         });
-        entered.await;
+        reached(entered).await;
         cancel.cancel();
         let error = tokio::time::timeout(Duration::from_millis(500), call)
             .await
