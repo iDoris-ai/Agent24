@@ -218,6 +218,7 @@ fn every_offset_is_a_tightening_over_the_loosening_s_scope() {
         // "Once servable" errs on the strict side either way (A.5).
         let Some(offset) = offset else {
             assert_eq!(change, C::Servable(of("a", 1)));
+            assert_eq!(change.scope(), Some(Scope::profile("a")));
             continue;
         };
         assert_eq!(offset.class(), Class::Tightening, "{change:?}");
@@ -288,6 +289,13 @@ fn only_a_reason_that_holds_across_restarts_is_persisted() {
     ];
     for (stuck, cause) in held {
         assert_eq!(U::from(stuck), cause);
+        // A new reason does not compile until it is listed above.
+        match stuck {
+            S::Incompatible
+            | S::InstanceUnidentified
+            | S::CredentialRejected
+            | S::AccessRevoked => {}
+        }
     }
     let all = [
         U::Dependency,

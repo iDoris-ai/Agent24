@@ -102,7 +102,7 @@ fn the_records_give_back_the_state_in_their_order() {
     assert!(!out.off && out.prompt && out.shut_down);
     let p = &out.profiles["a"];
     assert!(p.selected && !p.disabled && !p.removed);
-    assert_eq!(p.confirmed, Some("u"));
+    assert_eq!(out.confirmed["a"], "u");
     let b = binding(&out, 1);
     assert_eq!((b.identity, b.generation), ("i", 5));
     assert!(b.servable && !b.logged_out && b.revoked && !b.retired);
@@ -146,7 +146,8 @@ fn the_records_give_back_the_state_in_their_order() {
     ]);
     assert!(out.off && !out.prompt);
     let p = &out.profiles["a"];
-    assert!(!p.selected && p.removed && p.disabled && p.confirmed.is_none());
+    assert!(!p.selected && p.removed && p.disabled);
+    assert!(out.confirmed.is_empty());
     let b = binding(&out, 1);
     assert!(b.retired && b.stuck.is_none());
     assert_eq!(out.runs, vec![(7, None)]);
@@ -243,7 +244,7 @@ fn unsaved_settings_is_not_replaced_and_a_confirmation_answers_only_what_awaits(
         },
     ]);
     assert_eq!(out.profiles["a"].awaiting, Some(unsaved));
-    assert_eq!(out.profiles["a"].confirmed, None);
+    assert!(out.confirmed.is_empty());
     let out = replayed(vec![
         C::Await {
             profile: "a",
@@ -260,7 +261,7 @@ fn unsaved_settings_is_not_replaced_and_a_confirmation_answers_only_what_awaits(
         },
     ]);
     assert_eq!(out.profiles["a"].awaiting, Some(pc));
-    assert_eq!(out.profiles["a"].confirmed, Some("v"));
+    assert_eq!(out.confirmed["a"], "v");
 }
 
 #[test]

@@ -232,8 +232,10 @@ impl<I: Ids> Change<I> {
     }
 
     /// A.5: the tightening an abandoned loosening is offset with, over the
-    /// same scope. `None` for "once servable", which errs on the strict side
-    /// either way, and outside loosenings.
+    /// same scope. `None` outside loosenings, and for "once servable": it errs
+    /// on the strict side either way, so the host never abandons a pending
+    /// one. Unwritten, the binding stays `local_storage` (S1.12); landing
+    /// late, it outlives the void.
     pub fn offset(&self) -> Option<Self> {
         Some(match self {
             Self::On => Self::Off,

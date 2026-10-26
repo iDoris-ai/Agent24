@@ -29,27 +29,13 @@ pub struct Record<I: Ids> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Damaged;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProfileState<I: Ids> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProfileState {
     pub disabled: bool,
     pub selected: bool,
     pub removed: bool,
     pub awaiting: Option<Confirmation>,
-    pub confirmed: Option<I::Principal>,
     pub failure: Option<PlaceholderFailure>,
-}
-
-impl<I: Ids> Default for ProfileState<I> {
-    fn default() -> Self {
-        Self {
-            disabled: false,
-            selected: false,
-            removed: false,
-            awaiting: None,
-            confirmed: None,
-            failure: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +60,9 @@ pub struct Replayed<I: Ids> {
     pub off: bool,
     /// The global tightening's prompt still awaits the user (S1.14).
     pub prompt: bool,
-    pub profiles: HashMap<I::Profile, ProfileState<I>>,
+    pub profiles: HashMap<I::Profile, ProfileState>,
+    /// Each profile's last confirmed principal (S1.13).
+    pub confirmed: HashMap<I::Profile, I::Principal>,
     pub bindings: Vec<Bound<I>>,
     pub runs: Vec<(I::Run, RunSet<I>)>,
     /// The highest generation in the log, for any binding: retired ones, and
@@ -99,6 +87,7 @@ pub fn replay<I: Ids>(
         off: true,
         prompt: false,
         profiles: HashMap::new(),
+        confirmed: HashMap::new(),
         bindings: Vec::new(),
         runs: Vec::new(),
         highest: 0,
@@ -184,10 +173,10 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) {
             principal,
             awaited,
         } => {
-            let state = profile(out, p);
+            let state = profile(out, p.clone());
             if state.awaiting == Some(awaited) {
                 state.awaiting = None;
-                state.confirmed = Some(principal);
+                out.confirmed.insert(p, principal);
             }
         }
         Change::PlaceholderFailed {
@@ -213,7 +202,7 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) {
         } => {
             out.highest = out.highest.max(generation);
             if let Some(principal) = confirmed {
-                profile(out, of.profile.clone()).confirmed = Some(principal);
+                out.confirmed.insert(of.profile.clone(), principal);
             }
             out.bindings.push(Bound {
                 of,
@@ -263,7 +252,7 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) {
     }
 }
 
-fn profile<I: Ids>(out: &mut Replayed<I>, p: I::Profile) -> &mut ProfileState<I> {
+fn profile<I: Ids>(out: &mut Replayed<I>, p: I::Profile) -> &mut ProfileState {
     out.profiles.entry(p).or_default()
 }
 
@@ -280,13 +269,11 @@ fn on<I: Ids>(out: &mut Replayed<I>, of: &Of<I>, f: impl FnOnce(&mut Bound<I>)) 
 }
 
 fn run_set<I: Ids>(out: &mut Replayed<I>, run: I::Run) -> &mut RunSet<I> {
-    let at = match out.runs.iter().position(|(r, _)| *r == run) {
-        Some(at) => at,
-        None => {
-            out.runs.push((run, None));
-            out.runs.len() - 1
-        }
-    };
+    let at = out.runs.iter().position(|(r, _)| *r == run);
+    let at = at.unwrap_or_else(|| {
+        out.runs.push((run, None));
+        out.runs.len() - 1
+    });
     &mut out.runs[at].1
 }
 
