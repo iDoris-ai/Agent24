@@ -5,6 +5,8 @@
 //! A refusal is host-built like a result: closed codes and reasons and a
 //! fixed sentence, never the server's own message or hint (READONLY R6.3).
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -325,8 +327,10 @@ pub async fn read(
 /// A citation read cut by `max_bytes` (R4.4): read the same chunk on until
 /// its last page, each page its own request, and join the pages into the
 /// whole chunk when every page names the same chunk and `content_tag`. Past
-/// [`PAGES_MAX`], on a mismatch or on a page refused, the first page stands
-/// as current text with its cursor; a cancelled page cancels the call.
+/// [`PAGES_MAX`], on a cursor coming back or a page of another chunk, the
+/// first page stands as current text with its cursor. A page refused refuses
+/// the call, and one under another generation cancels it (S4.8): either way
+/// the first page is known to be no longer good.
 async fn read_on(
     backend: &dyn KnowledgeBackend,
     run_id: &str,
@@ -338,6 +342,7 @@ async fn read_on(
         return Ok(None);
     };
     let mut text = segment.text.clone();
+    let mut seen = HashSet::from([cursor.clone()]);
     for _ in 1..PAGES_MAX {
         let next = ReadQuery {
             cursor: Some(cursor),
@@ -345,9 +350,11 @@ async fn read_on(
         };
         let page = match backend.read(run_id, next).await {
             Ok((_, page)) => page,
-            Err(Failure::Cancelled(_)) => return Err(Refused::Cancelled),
-            Err(_) => return Ok(None),
+            Err(failure) => return Err(refusal("knowledge.read", failure)),
         };
+        if page.generation != first.generation {
+            return Err(Refused::Cancelled);
+        }
         let [s] = page.segments.as_slice() else {
             return Ok(None);
         };
@@ -365,6 +372,9 @@ async fn read_on(
             whole.next_cursor = None;
             return Ok(Some(whole));
         };
+        if !seen.insert(more.clone()) {
+            return Ok(None);
+        }
         cursor = more;
     }
     Ok(None)

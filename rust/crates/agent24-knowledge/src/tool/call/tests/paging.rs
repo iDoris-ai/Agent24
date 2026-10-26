@@ -114,7 +114,12 @@ fn a_page_of_another_text_leaves_the_first_page_as_current_text() {
 #[allow(clippy::result_large_err)]
 fn past_the_page_limit_the_first_page_stands() {
     let pages = (0..PAGES_MAX)
-        .map(|i| Ok(page(if i == 0 { "一" } else { "又" }, Some("cur-1"))))
+        .map(|i| {
+            Ok(page(
+                if i == 0 { "一" } else { "又" },
+                Some(&format!("cur-{}", i + 1)),
+            ))
+        })
         .collect();
     let backend = Pages::new(pages);
     let out = rendered(&backend, cite());
@@ -123,12 +128,23 @@ fn past_the_page_limit_the_first_page_stands() {
 }
 
 #[test]
-fn a_page_refused_leaves_the_first_page_and_a_cancelled_one_cancels_the_call() {
+fn a_page_refused_refuses_the_call_and_a_cancelled_one_cancels_it() {
+    // The chunk changed under the reader: the first page is no current text.
     let backend = Pages::new(vec![
         Ok(page("一", Some("cur-1"))),
         Err(envelope("read.stale-chunk-cursor.json")),
     ]);
-    assert_first_page(&rendered(&backend, cite()));
+    let out = refused(block(read(&backend, "run-1", &cite())));
+    assert_eq!(out["code"], "stale");
+    assert_eq!(out["kind"], "knowledge.read");
+    let backend = Pages::new(vec![
+        Ok(page("一", Some("cur-1"))),
+        Err(Failure::BindingStale),
+    ]);
+    assert_eq!(
+        refused(block(read(&backend, "run-1", &cite())))["code"],
+        "knowledge_binding_stale"
+    );
 
     let local = fixture("search.cancelled.json")["local"]["result"].clone();
     let backend = Pages::new(vec![
@@ -139,6 +155,30 @@ fn a_page_refused_leaves_the_first_page_and_a_cancelled_one_cancels_the_call() {
         block(read(&backend, "run-1", &cite())),
         Err(Refused::Cancelled)
     );
+}
+
+#[test]
+fn a_page_under_another_generation_cancels_the_call() {
+    // Off then On between the pages: the second is admitted under G + 1.
+    let mut later = page("二", None);
+    later.generation += 1;
+    let backend = Pages::new(vec![Ok(page("一", Some("cur-1"))), Ok(later)]);
+    assert_eq!(
+        block(read(&backend, "run-1", &cite())),
+        Err(Refused::Cancelled)
+    );
+}
+
+#[test]
+fn a_cursor_coming_back_leaves_the_first_page() {
+    // The first page sent again, then a last page: never "一一二" as a citation.
+    let backend = Pages::new(vec![
+        Ok(page("一", Some("cur-1"))),
+        Ok(page("一", Some("cur-1"))),
+        Ok(page("二", None)),
+    ]);
+    assert_first_page(&rendered(&backend, cite()));
+    assert_eq!(backend.cursors().len(), 2);
 }
 
 #[test]
