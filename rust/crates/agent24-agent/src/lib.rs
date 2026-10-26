@@ -979,10 +979,11 @@ impl RunManager {
 
     /// Persist `answer`'s source tag, then hand its content to the model as
     /// the result of `call`. A tag that cannot be written ends the run before
-    /// the content reaches the model; returns false then. In a session with
-    /// memory, a non-ordinary result's origin is recorded with the tag, so
-    /// the session's later turns carry it (K1-6b.5f-2) — the same condition
-    /// under which later turns are given this one's context.
+    /// the content reaches the model; returns false then. In a session, a
+    /// non-ordinary result's origin is recorded with the tag, so the
+    /// session's later turns carry it (K1-6b.5f-2). It is recorded whether or
+    /// not memory is configured now: a run parked without memory may finish,
+    /// and feed later turns, after a restart that has it.
     async fn answer_tool_call(
         &self,
         run: &Run,
@@ -991,7 +992,7 @@ impl RunManager {
         answer: ToolAnswer,
     ) -> bool {
         let run_id = run.id.as_str();
-        let session = self.memory.as_ref().and(run.session_id.as_deref());
+        let session = run.session_id.as_deref();
         if let Some(result) = &answer.source
             && let Err(err) = self
                 .store
@@ -4988,6 +4989,27 @@ pub(crate) mod tests {
                 inherited.is_none()
             );
         }
+    }
+
+    /// Codex 6b.5f-2 r1 C2: the origin is recorded even while memory is not
+    /// configured, since the run may finish after a restart that has it.
+    #[tokio::test]
+    async fn a_session_records_its_tool_result_origins_without_memory() {
+        let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+            agent24_tools::ToolResultSource::unknown("reader"),
+        )));
+        let provider = ScriptedProvider::new(vec![calls("reader", "c1")]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        seed_session(&store, "sess_nomemory").await;
+        let run = run_in_session(&manager, &store, "sess_nomemory", "read it").await;
+        assert_eq!(run.status, RunStatus::Completed, "{:?}", run.error);
+        assert_eq!(
+            store
+                .session_tool_result_origins("sess_nomemory")
+                .await
+                .unwrap(),
+            ["tool:reader"]
+        );
     }
 
     #[tokio::test]

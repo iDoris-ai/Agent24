@@ -18,3 +18,14 @@ CREATE TABLE session_tool_result_origins (
     created_at TEXT NOT NULL,
     PRIMARY KEY (session_id, origin)
 );
+
+-- Codex 6b.5f-2 r1 C1: a session whose runs called tools before this table
+-- existed took in results nobody tagged — before 6b.5f-1 no tool result was.
+-- Which of them were ordinary cannot be told now, and a tool's name does not
+-- prove a module's identity (an MCP tool may contain a dot), so such a
+-- session gets one `tool:legacy` origin: later turns carry it as `unknown`,
+-- without the same-source exception.
+INSERT INTO session_tool_result_origins (session_id, origin, created_at)
+SELECT DISTINCT runs.session_id, 'tool:legacy', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+FROM tool_calls JOIN runs ON runs.id = tool_calls.run_id
+WHERE runs.session_id IS NOT NULL;

@@ -1177,6 +1177,57 @@ mod tests {
         assert_eq!(inherited.kind, SourceKind::ToolResult);
     }
 
+    /// Codex 6b.5f-2 r1 C1: a session whose runs called tools before 0027
+    /// carries one legacy origin; a session without tool calls, and a tool
+    /// call outside any session, record none.
+    #[tokio::test]
+    async fn a_session_that_called_tools_before_0027_carries_a_legacy_origin() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 26)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO sessions (id, title, channel, created_at, updated_at) VALUES \
+                ('s_tools', 't', 'api', 't', 't'), ('s_quiet', 't', 'api', 't', 't'); \
+             INSERT INTO runs (id, session_id, status, input, usage, created_at) VALUES \
+                ('r1', 's_tools', 'completed', '{}', '{}', 't'), \
+                ('r2', 's_tools', 'completed', '{}', '{}', 't'), \
+                ('r3', 's_quiet', 'completed', '{}', '{}', 't'), \
+                ('r4', NULL, 'completed', '{}', '{}', 't'); \
+             INSERT INTO tool_calls (id, run_id, tool, input, status, started_at) VALUES \
+                ('tc1', 'r1', 'shell_exec', '{}', 'ok', 't'), \
+                ('tc2', 'r2', 'docs.find', '{}', 'ok', 't'), \
+                ('tc3', 'r4', 'shell_exec', '{}', 'ok', 't');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        assert_eq!(
+            store.session_tool_result_origins("s_tools").await.unwrap(),
+            ["tool:legacy"]
+        );
+        assert!(
+            store
+                .session_tool_result_origins("s_quiet")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// K1-6b.5f-2: the tag and the session's origin are written together or
     /// not at all, so a later turn never misses an origin whose result was
     /// tagged.
