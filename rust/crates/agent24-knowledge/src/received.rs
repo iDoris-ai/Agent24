@@ -297,12 +297,55 @@ impl WireError {
     }
 
     /// Fixed per code (§6) but for `unavailable`, and for an unknown code its
-    /// own value, false when it gives none.
+    /// own value, false when it gives none. Never more than R3.4 allows: not
+    /// when any partial failure is not retryable, nor for `unavailable` with
+    /// a reason R3.5 makes final, whatever the envelope's own value says.
     pub fn retryable(&self) -> bool {
+        let all = |failures: &Option<NonEmpty<PartialFailure>>| {
+            failures
+                .as_ref()
+                .is_none_or(|f| f.as_slice().iter().all(|f| f.retryable))
+        };
         match &self.details {
-            ErrorDetails::Timeout(_) => true,
-            ErrorDetails::Unavailable(d) => d.retryable,
+            ErrorDetails::Timeout(d) => all(&d.partial_failures),
+            ErrorDetails::Unavailable(d) => {
+                let final_reason = matches!(
+                    d.reason,
+                    Some(UnavailableReason::IndexFailed | UnavailableReason::UnsupportedKbType)
+                );
+                d.retryable && !final_reason && all(&d.partial_failures)
+            }
             ErrorDetails::Other(d) => d.retryable.unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// The echoed `request_id` and `generation` (R6.1), `None` when `null`.
+    pub fn echo(&self) -> (Option<&str>, Option<Generation>) {
+        let (id, generation) = match &self.details {
+            ErrorDetails::InvalidRequest(d) => (&d.request_id, d.generation),
+            ErrorDetails::Unauthorized(d) => (&d.request_id, d.generation),
+            ErrorDetails::Forbidden(d) => (&d.request_id, d.generation),
+            ErrorDetails::NotFound(d) => (&d.request_id, d.generation),
+            ErrorDetails::Stale(d) => (&d.request_id, d.generation),
+            ErrorDetails::Timeout(d) => (&d.request_id, d.generation),
+            ErrorDetails::Unavailable(d) => (&d.request_id, d.generation),
+            ErrorDetails::Internal(d) => (&d.request_id, d.generation),
+            ErrorDetails::Other(d) => (&d.request_id, d.generation),
+        };
+        (id.as_deref(), generation)
+    }
+
+    /// R6.1: only these may echo `null`, as the schema has it; an unknown
+    /// code branches as `internal`, so it may too.
+    fn may_echo_null(&self) -> bool {
+        match &self.details {
+            ErrorDetails::Unauthorized(_) | ErrorDetails::Internal(_) | ErrorDetails::Other(_) => {
+                true
+            }
+            ErrorDetails::InvalidRequest(d) => {
+                d.reason != Some(InvalidRequestReason::MixedScoreSpace)
+            }
             _ => false,
         }
     }
@@ -330,7 +373,14 @@ impl TryFrom<RawError> for WireError {
             "internal" => ErrorDetails::Internal(de(d)?),
             _ => ErrorDetails::Other(de(d)?),
         };
-        Ok(Self { details })
+        let error = Self { details };
+        match error.echo() {
+            (Some(_), Some(_)) => Ok(error),
+            _ if error.may_echo_null() => Ok(error),
+            _ => Err(serde::de::Error::custom(
+                "R6.1: only unauthorized, internal and invalid_request may echo null",
+            )),
+        }
     }
 }
 
@@ -347,14 +397,16 @@ pub enum ErrorDetails {
     Other(OtherDetails),
 }
 
-/// `retryable` must be the code's own value (§6); the echoes may be `null`
-/// or missing.
+/// `retryable` must be the code's own value (§6); the echoes are required
+/// and may be `null` (R6.1; which codes may is checked on the whole error).
 macro_rules! details {
     ($name:ident: $retryable:ty { $($body:tt)* }) => {
         #[derive(Clone, Debug, PartialEq, Deserialize)]
         pub struct $name {
             pub retryable: $retryable,
+            #[serde(deserialize_with = "crate::nullable")]
             pub request_id: Option<String>,
+            #[serde(deserialize_with = "crate::nullable")]
             pub generation: Option<Generation>,
             $($body)*
         }
@@ -396,7 +448,14 @@ details!(UnavailableDetails: bool {
     pub partial_failures: Option<NonEmpty<PartialFailure>>,
 });
 details!(InternalDetails: ConstBool<false> {});
-details!(OtherDetails: Option<bool> {});
+
+/// A code outside v1: its shape is unknown, so nothing in it is required.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct OtherDetails {
+    pub retryable: Option<bool>,
+    pub request_id: Option<String>,
+    pub generation: Option<Generation>,
+}
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct ScoreSpaceGroup {

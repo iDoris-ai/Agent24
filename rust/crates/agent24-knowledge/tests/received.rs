@@ -133,6 +133,111 @@ fn an_unknown_code_branches_as_internal_with_its_own_retryable() {
     assert!(error("timeout", timeout).is_err());
 }
 
+/// R3.4, R3.5: an `unavailable` envelope is never read as more retryable than
+/// its reason and its partial failures allow, whatever its own value says.
+#[test]
+fn an_error_is_never_more_retryable_than_its_parts() {
+    let mixed = body("search.unavailable-mixed.json");
+    let retryable = |v: &Value| decode::<ErrorEnvelope>(v).unwrap().error.retryable();
+    assert!(!retryable(&mixed));
+    // Claims retryable, but its reason is final.
+    let mut v = mixed.clone();
+    v["error"]["details"]["retryable"] = json!(true);
+    assert!(!retryable(&v));
+    // Claims retryable with a retryable reason, but one part is final.
+    v["error"]["details"]["reason"] = json!("overloaded");
+    assert!(!retryable(&v));
+    // Every part retryable: its own value stands.
+    v["error"]["details"]["partial_failures"] = json!([
+        { "knowledge_base_id": "kb-a", "code": "timeout", "reason": "timeout", "retryable": true }
+    ]);
+    assert!(retryable(&v));
+    v["error"]["details"]["retryable"] = json!(false);
+    assert!(!retryable(&v));
+    // Every part retryable, but the reason is final.
+    for reason in ["index_failed", "unsupported_kb_type"] {
+        v["error"]["details"]["retryable"] = json!(true);
+        v["error"]["details"]["reason"] = json!(reason);
+        assert!(!retryable(&v), "{reason}");
+    }
+
+    let mut t = body("search.timeout.json");
+    assert!(retryable(&t));
+    t["error"]["details"]["partial_failures"] = json!([
+        { "knowledge_base_id": "kb-a", "code": "unavailable", "reason": "index_failed", "retryable": false }
+    ]);
+    assert!(!retryable(&t));
+}
+
+/// R6.1: both echoes are required; only `unauthorized`, `internal`, an
+/// unknown code and an `invalid_request` other than `mixed_score_space` may
+/// echo `null`.
+#[test]
+fn echoes_are_required_and_null_only_where_r6_1_allows() {
+    let base = |reason: Option<&str>, id: Value, generation: Value| {
+        let mut d = json!({ "retryable": false, "request_id": id, "generation": generation });
+        if let Some(reason) = reason {
+            d["reason"] = json!(reason);
+        }
+        d
+    };
+    let null = || base(None, Value::Null, Value::Null);
+    let revoked = Some("credential_revoked");
+    let e = error("unauthorized", base(revoked, Value::Null, Value::Null))
+        .unwrap()
+        .error;
+    assert_eq!(e.echo(), (None, None));
+    let e = error("unauthorized", base(revoked, json!("r1"), json!(4)))
+        .unwrap()
+        .error;
+    assert_eq!(e.echo(), (Some("r1"), Some(4)));
+    assert!(
+        error(
+            "unauthorized",
+            json!({ "retryable": false, "reason": "credential_revoked" })
+        )
+        .is_err()
+    );
+    for key in ["request_id", "generation"] {
+        let mut d = base(revoked, json!("r1"), json!(4));
+        d.as_object_mut().unwrap().remove(key);
+        assert!(error("unauthorized", d).is_err(), "missing {key}");
+    }
+    assert!(error("unauthorized", base(revoked, json!("r1"), Value::Null)).is_ok());
+    assert!(error("internal", null()).is_ok());
+    assert!(error("quota_exhausted", json!({})).is_ok());
+    assert!(
+        error(
+            "invalid_request",
+            base(
+                Some("unsupported_protocol_version"),
+                Value::Null,
+                Value::Null
+            )
+        )
+        .is_ok()
+    );
+
+    let mixed = body("search.mixed-score-space.json");
+    assert!(decode::<ErrorEnvelope>(&mixed).is_ok());
+    for key in ["request_id", "generation"] {
+        let mut v = mixed.clone();
+        v["error"]["details"][key] = Value::Null;
+        assert!(
+            decode::<ErrorEnvelope>(&v).is_err(),
+            "mixed_score_space with null {key}"
+        );
+    }
+    assert!(error("not_found", base(None, Value::Null, json!(4))).is_err());
+    assert!(
+        error(
+            "forbidden",
+            base(Some("policy_denied"), json!("r1"), Value::Null)
+        )
+        .is_err()
+    );
+}
+
 /// §0.3: an unknown reason reads as none; an `unauthorized` without a known
 /// one is the invalid-credential class (STATE S3.1), never a revocation.
 #[test]
