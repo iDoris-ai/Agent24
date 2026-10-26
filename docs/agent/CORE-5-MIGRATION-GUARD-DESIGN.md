@@ -47,7 +47,7 @@ G 必须由迁移作者给出保守上界和大库夹具证据；缺失就停靠
 
 快照目录固定 `<data_dir>/migration-snapshots/<UTC紧凑时间>-<随机attempt_id>/`，0700；文件 `agent24.db`、`memory.db`、`manifest.json` 为 0600。名称不直接拼接版本或客户端路径。manifest 记录格式版本、attempt_id、时间、来源成功二进制版本及 SHA-256、目标二进制版本及 SHA-256、两库是否存在、长度、SHA-256、迁移清单摘要、迁移前水位。首次安装来源版本为 null。来源身份由新增 `migration-last-success.json` 提供，正常就绪后原子记录二进制身份与已验证水位；升级前复核它与现库相符。旧安装没有该记录时写 null，不拿当前升级二进制冒充前一版本。
 
-逐库 backup 到 `.partial`，要求 step 返回 SQLITE_DONE 且 finish 返回 SQLITE_OK，再校验完整性与迁移表，再关闭目标连接、fsync 文件、rename 为正式文件、fsync 目录。两个文件都完成后才原子发布 manifest。源维护连接关闭后才建迁移连接。快照不能在任一库已迁移后补拍。半成品不授权迁移。
+逐库 backup 到 `.partial`，要求 step 返回 SQLITE_DONE 且 finish 返回 SQLITE_OK，再校验完整性与迁移表，再关闭目标连接、fsync 文件、rename 为正式文件、fsync 目录。两个文件都完成后才原子发布 manifest。新建的快照目录及 `migration-snapshots/` 都要逐级 fsync 父目录，一直到 data_dir；全部完成后才允许把 phase 写成 migrating（§8 R1）。源维护连接关闭后才建迁移连接。快照不能在任一库已迁移后补拍。半成品不授权迁移。
 
 ### D3 持久状态机与成功清理
 
@@ -145,7 +145,7 @@ CLI connect、attach_only、daemon start 和 TUI 共用同一探测结果。dock
 | T6 重复启动 | 同一版本与 hash 的标记重复启动无 checkpoint、backup、迁移调用；hash 变化亦不自动迁移 | 启动忽略标记；仅比较 semver；更换 hash 即放行 |
 | T7 空间 | 低于预算一字节、空间不可测、G 缺失均在迁移前停靠；快照阶段 ENOSPC 原 schema 不变 | 不计 WAL/staging；用稀疏预留；忽略写失败 |
 | T8 回滚失败 | 注入 close、copy、rename、unlink、fsync 失败，保留证据、两库禁用、retry 拒绝，进程持续监听 | 忽略文件错误；仅凭一个库恢复即 ready；自动删快照 |
-| T9 崩溃重放 | D3、D4 每个持久边界强杀后重启，恢复为完整旧状态或停靠报错，绝无混合双库业务可见 | 提前 committed；去父目录 fsync；信任内存进度 |
+| T9 掉电重放 | 用文件操作层故障注入模拟掉电：丢弃所有未 fsync 的写、rename 和目录项，然后在 D3、D4 的每个持久边界重启。快照完好且没有外部故障时，**必须**恢复成完整的旧状态，不能以停靠报错了事；只有快照或日志确实损坏时才允许停靠。任何情况下业务都看不到混合的两个库 | 提前标 committed；去掉任一级父目录 fsync；信任内存中的进度 |
 | T10 停写 | CLI 两个直接开库入口与 daemon 并发时不写不迁移；busy checkpoint 不生成完整 manifest | 绕过单例锁；未完成快照即迁移 |
 | T11 清标记权限 | 无证明、错代、错 attempt、过期、重放、开发者令牌、ProductHost、TTY 均无副作用；2b/2d 未完拒绝 | legacy bearer 放行；把布尔 authenticated 当证明 |
 | T12 版本回退 | 可信精确前一版本且 restored 才清除；同版本不同 hash、伪版本、未知来源、水位不兼容都拒绝 | 字符串比较；只比小版本；忽略库 hash |
@@ -195,8 +195,18 @@ CLI connect、attach_only、daemon start 和 TUI 共用同一探测结果。dock
 | Q2 | 采纳。2b、2d 和停靠态登记通道全部完成之前，retry 完全不开放，ProductHost 子进程模式也不例外。`health.retry_allowed=false`。安装器换回旧版本的路径保留。 |
 | Q3 | 采纳窄例外：只允许发布 `startup_state="docked"` 的诊断发现，以及最小登记通道；不发业务 ready。CORE-2 冻结稿不改，在 5f 的 PR 里登记这一协调项。 |
 | Q4 | 采纳：semver 必须严格降级，并且 hash 与 `previous_binary` 完全一致。来源未知时，不自动清除标记。 |
-| Q5 | 5a 是硬前置。**G 简化**：如果迁移没有声明 G 的上界，默认 G = S（保守取一倍）。空间预算因此变成 `3*S + R`，不再用 `space_budget_unknown` 停靠，避免原型阶段每个迁移都要附大库证据。迁移作者确知需要更大空间时自行声明。backup 的 Rust 绑定在 5d 之前选定，并验证关闭语义。 |
+| Q5 | 5a 是硬前置。G 的取值见 §8 R2（替代本格原先的「G=S」简化）。backup 的 Rust 绑定在 5d 之前选定，并验证关闭语义。 |
 | Q6 | ADR-037 已于 #1249 接受，状态行已由 DOCS-2（#1304）订正。repair 条款按 ADR 原文设计。条款编号的出入交给 DOCS 线核对，本稿不改动。 |
 | Q7 | 接受：以 guard 日志加「不开业务」作为恢复边界；迁移前日志必须落盘；按每个落盘边界做掉电验收。不承诺任意硬件故障都能自动恢复。 |
 
 本稿评审至多一轮，之后冻结。评审意见中的真问题就地订正，其余登记到对应实现片。
+
+## 8. 外审修订（2026-10-27，Mac mini Codex 一轮；本节优先于前文，修订后冻结）
+
+| # | 来源 | 问题 | 修订 |
+|---|---|---|---|
+| R1 | Codex High | 新建快照目录后只 fsync 了目录内的文件和目录自身，没有 fsync 父目录。如果迁移已经提交部分脚本时掉电，可能出现 migrating 日志已落盘、整套快照目录却丢失的情况，无法恢复 | D2 改为：`<attempt>/`、`migration-snapshots/` 直到 data_dir，逐级 fsync 父目录，全部完成后才写 phase=migrating。guard 日志、标记和 staging 的创建都按同一规则执行。T9 的变异项「去掉任一级父目录 fsync」必须变红 |
+| R2 | Codex Medium | §7 Q5 的「G=S」没有依据。中文 bigram 的 FTS rebuild 会扩充内容和索引，整批在一个事务里产生 WAL，可能超出预算并触发 ENOSPC | 撤回 G=S 的简化。迁移没有声明 G 时，默认 **G = 2·S**；含 FTS rebuild 或整表重写的迁移**必须**声明 G，并附上大库夹具测得的峰值，缺失时在 CI 中报错，不在运行时停靠。另外，恢复预算（staging 所需的 S）在迁移前用真实分配的保留文件占住，迁移期间即使遇到 ENOSPC，也先删除保留文件再执行恢复。新增 T15：G 实际大于声明值、磁盘被写满时，仍能用保留的预算恢复成功 |
+| R3 | Codex Medium | T9 用强杀进程测试，内核缓存不会丢，测不出缺少 fsync 的问题；「或停靠报错」的写法也会放过恢复总是失败的实现 | T9 改为文件操作层故障注入，模拟掉电时丢弃所有未持久化的写入。快照完好时必须恢复成功（见 §3 T9 新文本）|
+
+本稿到此冻结，后续意见登记到实现片。
