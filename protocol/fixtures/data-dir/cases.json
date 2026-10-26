@@ -1,5 +1,5 @@
 {
-  "$comment": "ADR-037 decision 3 platform data-dir contract. Shared by rust/crates/agent24-protocol (data_dir.rs) and apps/desktop (data-dir.test.ts). Each case: platform + env -> expected path or error code. Absent env keys are unset; empty string is set-but-empty. Windows paths are checked as literal strings, so both implementations must be platform-parametrised, not host-dependent.",
+  "$comment": "ADR-037 decision 3 platform data-dir contract. Shared by rust/crates/agent24-protocol (data_dir.rs) and packages/data-dir (index.test.ts). Each case: platform + env -> expected path or error code. Absent env keys are unset; empty string is set-but-empty. Windows paths are checked as literal strings, so both implementations must be platform-parametrised, not host-dependent.",
   "cases": [
     { "name": "mac default keeps ~/.agent24", "platform": "macos", "env": { "HOME": "/Users/u" }, "expect": { "path": "/Users/u/.agent24" } },
     { "name": "linux default keeps ~/.agent24", "platform": "linux", "env": { "HOME": "/home/u" }, "expect": { "path": "/home/u/.agent24" } },

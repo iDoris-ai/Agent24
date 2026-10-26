@@ -5,18 +5,18 @@
 // values (ported from heinu1 / weixin-bot-ilink); the agent24d endpoint is
 // discovered from the daemon's state file, overridable by env.
 
-import path from 'node:path'
-import os from 'node:os'
 import fs from 'node:fs'
-
-const HOME = os.homedir()
+import { dataDir, joinLiteral } from '@agent24/data-dir'
 
 export const CONFIG = {
   // ── WeChat iLink (official bot API) ──────────────────────────────────────
   // Domain only — the `/ilink/bot/*` prefix is in each endpoint path.
   ILINK_BASE: process.env.A24_ILINK_BASE || 'https://ilinkai.weixin.qq.com',
   // Where the bot_token from the QR login is persisted, so you scan only once.
-  TOKEN_FILE: path.join(HOME, '.agent24', 'wechat-token.json'),
+  // Read on each access so AGENT24_DATA_DIR / HOME are the process's current values.
+  get TOKEN_FILE(): string {
+    return joinLiteral(dataDir(), 'wechat-token.json')
+  },
   POLL_TIMEOUT_MS: 40_000,
   RECONNECT_DELAY_MS: 3_000,
   MAX_MSG_LEN: 1800,
@@ -32,7 +32,9 @@ export const CONFIG = {
   // ── agent24d (the local daemon this bridge drives) ───────────────────────
   // The daemon writes its dynamic port + token to this discovery file (Rust
   // side). Env overrides win for tests / non-standard setups.
-  DAEMON_STATE_FILE: path.join(HOME, '.agent24', 'daemon.json'),
+  get DAEMON_STATE_FILE(): string {
+    return joinLiteral(dataDir(), 'daemon.json')
+  },
   // How long to wait for a run to finish before telling the user it is still
   // going (the run keeps running on the daemon).
   RUN_WAIT_TIMEOUT_MS: 600_000,
