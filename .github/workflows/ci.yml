@@ -158,6 +158,11 @@ jobs:
       - name: OpenAPI lint (redocly — structural/spec gate on protocol/openapi.yaml)
         run: pnpm lint:openapi
 
+      - name: TUI coverage (every openapi operation is covered by the CLI or exempted — ADR-037)
+        run: |
+          node scripts/tui-coverage.mjs --self-test
+          node scripts/tui-coverage.mjs
+
       - name: Codegen drift check (api-client must match protocol/)
         run: |
           pnpm gen:api
