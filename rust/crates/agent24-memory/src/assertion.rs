@@ -37,7 +37,7 @@ pub enum Forget {
     NotFound,
 }
 
-/// Mirror of migration 0018's cap on an exempt `assertion.retracted` payload
+/// Mirror of migration 0019's cap on an exempt `assertion.retracted` payload
 /// (`LENGTH(CAST(payload AS BLOB)) <= 256`) — a limit on the SERIALIZED payload,
 /// so JSON-escaped characters in an id count double. Keep the two in step.
 pub const RETRACT_EXEMPT_MAX_PAYLOAD_BYTES: usize = 256;
@@ -108,7 +108,7 @@ pub async fn forget(pool: &SqlitePool, owner: &str, id: &str, at: &str) -> Resul
     );
     event.at = at.to_owned();
     if let Err(err) = EventLog::append_tx(&mut tx, &event).await {
-        // The quota exemption (migration 0018) only covers a retraction payload
+        // The quota exemption (migration 0019) only covers a retraction payload
         // of at most `RETRACT_EXEMPT_MAX_PAYLOAD_BYTES`. An id long enough to
         // push past it is charged as ordinary content, so on a full partition
         // the refusal is not "you are out of quota" but "this id cannot be

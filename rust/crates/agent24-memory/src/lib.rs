@@ -87,7 +87,7 @@ pub enum MemoryError {
     },
     /// P1-02c (c2): a retraction was refused on a full partition because the
     /// serialized retraction payload `{"assertion_id":…}` exceeds the 256-byte
-    /// cap of the retraction quota exemption (migration 0018). The test is on the
+    /// cap of the retraction quota exemption (migration 0019). The test is on the
     /// SERIALIZED bytes, not the id length: a plain id is exempt up to 237 bytes,
     /// but an id with characters JSON escapes (`"`, `\`, control characters)
     /// crosses the cap sooner. Carries no owner key and no id on purpose.
@@ -98,6 +98,15 @@ pub enum MemoryError {
     /// (see [`disk_gate`]). Nothing was written.
     #[error("not enough free disk space on the memory volume")]
     DiskLow,
+    /// P1-02c (c2b, W3): importing a session's legacy KV blob into the event log
+    /// failed. The import is one transaction, so nothing was written and the
+    /// session still has no events: the next call retries it from scratch (that
+    /// absence IS the "import incomplete" mark — no extra state is needed).
+    /// Wraps the cause so [`MemoryError::code`] still classifies it (the import
+    /// writes N+2 rows and can hit the quota), while callers can tell "history
+    /// could not be loaded" from "the history is empty".
+    #[error("session import incomplete: {0}")]
+    SessionImportIncomplete(Box<MemoryError>),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -116,7 +125,7 @@ pub enum MemoryErrorCode {
     DiskFull,
     ReservedKind,
     /// A retraction whose serialized `assertion.retracted` payload exceeds the
-    /// 256-byte quota-exemption cap (migration 0018), so on a full
+    /// 256-byte quota-exemption cap (migration 0019), so on a full
     /// partition it is charged as ordinary content and refused.
     RetractIdTooLong,
     Internal,
@@ -176,6 +185,7 @@ impl MemoryError {
             Self::QuotaExceeded { .. } => MemoryErrorCode::QuotaBytes,
             Self::RetractIdTooLong => MemoryErrorCode::RetractIdTooLong,
             Self::DiskLow => MemoryErrorCode::DiskLow,
+            Self::SessionImportIncomplete(cause) => cause.code(),
             Self::Sqlx(sqlx::Error::Database(db))
                 if db.code().as_deref() == Some(SQLITE_FULL)
                     || db.message().contains("database or disk is full") =>
@@ -1873,7 +1883,13 @@ mod tests {
                 .fetch_one(&upgraded.pool)
                 .await
                 .unwrap();
-        assert_eq!(version, 18);
+        let latest = sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap();
+        assert_eq!(version, latest);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);

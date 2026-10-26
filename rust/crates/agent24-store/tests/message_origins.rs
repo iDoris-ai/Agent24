@@ -476,7 +476,7 @@ async fn rebuilt_origin_table_keeps_old_rows_and_does_not_backfill() {
     migrator.migrations = migrator
         .migrations
         .iter()
-        .filter(|migration| migration.version < 22)
+        .filter(|migration| migration.version < 28)
         .cloned()
         .collect::<Vec<_>>()
         .into();

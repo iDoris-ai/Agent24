@@ -251,6 +251,19 @@ async fn the_retract_id_boundary_is_237_bytes() {
     }
 }
 
+/// c2b (W3): a failed legacy import keeps the code of its cause, so a receipt
+/// can still say "quota" while the type says "history not imported".
+#[test]
+fn a_session_import_failure_keeps_its_causes_code() {
+    let quota = MemoryError::SessionImportIncomplete(Box::new(MemoryError::QuotaExceeded {
+        owner: "k".into(),
+        dimension: "bytes",
+    }));
+    assert_eq!(quota.code(), MemoryErrorCode::QuotaBytes);
+    let other = MemoryError::SessionImportIncomplete(Box::new(MemoryError::Io("x".into())));
+    assert_eq!(other.code(), MemoryErrorCode::Internal);
+}
+
 /// The cap is on the SERIALIZED payload: an id of 130 bytes is far under 237, but
 /// 120 `"` characters serialize to `\"` each and push the payload past 256.
 #[tokio::test]

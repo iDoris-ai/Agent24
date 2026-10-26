@@ -1380,10 +1380,15 @@ export interface components {
             /** @description Server-measured wall-clock milliseconds for this call. */
             latency_ms?: number | null;
             /**
-             * @description M1-T14: deterministic outcome of an explicit "记住…" turn, set by the daemon — never inferred from the model's own reply text. Omitted when this prompt was not an explicit remember, or session_id was omitted. "saved" covers the write-gate's own idempotent reassert/no-op case too (an identical belief already active), not just a fresh commit.
+             * @description M1-T14: deterministic outcome of an explicit "记住…" turn, set by the daemon — never inferred from the model's own reply text. Omitted when this prompt was not an explicit remember (and its conversation write did not fail), or session_id was omitted. "saved" covers the write-gate's own idempotent reassert/no-op case too (an identical belief already active), not just a fresh commit. P1-02c adds the failure shapes, each with `memory_error_code`: "failed" — an explicit remember wrote NOTHING; "not_saved" — an ordinary turn (no explicit remember) was not written to the session history; "partial" — an explicit remember's conversation turn WAS saved but its assertion was not. No failure value ever reads as saved, and the model's own text is not a receipt.
              * @enum {string}
              */
-            memory_receipt?: "saved" | "paused_not_saved" | "failed";
+            memory_receipt?: "saved" | "paused_not_saved" | "failed" | "not_saved" | "partial";
+            /**
+             * @description P1-02c: why the memory write failed. Present exactly when `memory_receipt` is "failed", "not_saved" or "partial". A closed code, never text: no partition key, no storage error message. `memory_disk_low` is reserved (nothing emits it yet).
+             * @enum {string}
+             */
+            memory_error_code?: "memory_quota_rows" | "memory_quota_bytes" | "memory_disk_low" | "memory_disk_full" | "memory_reserved_kind" | "memory_retract_id_too_long" | "memory_internal";
         };
         Session: {
             id: string;

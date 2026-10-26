@@ -321,6 +321,10 @@ pub struct ChatResponse {
     /// play at all).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_receipt: Option<MemoryReceipt>,
+    /// P1-02c: why the write failed, whenever `memory_receipt` is `failed`,
+    /// `not_saved` or `partial`. The closed `memory_*` code set; never text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_error_code: Option<crate::events::MemoryFailureCode>,
 }
 
 /// M1-T14: the deterministic outcome of an explicit "记住…" turn on
@@ -338,6 +342,12 @@ pub enum MemoryReceipt {
     /// The prompt matched an explicit remember and memory is active, but the
     /// write itself failed.
     Failed,
+    /// P1-02c: an ordinary (not explicit-remember) turn whose conversation
+    /// write failed — this turn is not in the session history.
+    NotSaved,
+    /// P1-02c: an explicit remember whose conversation turn WAS saved but whose
+    /// assertion was not — the conversation is kept, the memory is not.
+    Partial,
 }
 
 // ── Session ──────────────────────────────────────────────────────────────────

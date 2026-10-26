@@ -8,7 +8,7 @@ import { chatMessages } from './Chat.i18n'
  *  read off the response field, never off the model's own reply text (the
  *  local model has been observed saying "我记住了" on a turn the server
  *  skipped because memory was paused). */
-type MemoryReceipt = 'saved' | 'paused_not_saved' | 'failed'
+type MemoryReceipt = 'saved' | 'paused_not_saved' | 'failed' | 'partial'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -93,7 +93,7 @@ export default function ChatPage() {
       // an explicit "记住…" and session_id was set; absent otherwise.
       const memoryReceiptRaw = (res.data as { memory_receipt?: unknown } | null)?.memory_receipt
       const memoryReceipt =
-        memoryReceiptRaw === 'saved' || memoryReceiptRaw === 'paused_not_saved' || memoryReceiptRaw === 'failed'
+        memoryReceiptRaw === 'saved' || memoryReceiptRaw === 'paused_not_saved' || memoryReceiptRaw === 'failed' || memoryReceiptRaw === 'partial'
           ? memoryReceiptRaw
           : undefined
       // Review M3: ONLY the server's own reported model_id — never the
