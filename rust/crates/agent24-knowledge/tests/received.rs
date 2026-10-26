@@ -1,14 +1,17 @@
 //! KB-C1-04 6a: the Provider's decoding (`received`) reads every pinned
-//! success body, ignores unknown fields at every level and unknown
+//! response and error body, ignores unknown fields at every level and unknown
 //! reasons, and applies READONLY R6.2's fallbacks; what v1 does not let a
 //! client tolerate is still refused.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent24_knowledge::received::{
-    KbState, PartialFailureCode, ReadResponse, ReadyResponse, SearchResponse,
+    ErrorDetails, ErrorEnvelope, KbState, PartialFailureCode, ReadResponse, ReadyResponse,
+    SearchResponse,
 };
-use agent24_knowledge::{Completeness, IndexState, KbNotReadyReason, OperationStatus};
+use agent24_knowledge::{
+    Completeness, ErrorCode, IndexState, KbNotReadyReason, OperationStatus, UnauthorizedReason,
+};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -77,7 +80,7 @@ struct Entry {
     class: String,
 }
 
-/// Every pinned search, read and ready success body.
+/// Every pinned search, read and ready body, success or error.
 #[test]
 fn every_fixture_body_decodes_and_unknown_fields_change_nothing() {
     let m: Vec<Entry> = serde_json::from_value(load("manifest.json")["fixtures"].clone()).unwrap();
@@ -90,7 +93,7 @@ fn every_fixture_body_decodes_and_unknown_fields_change_nothing() {
         }
         let op = e.file.split('.').next().unwrap();
         failures.extend(match (op, e.class.as_str()) {
-            (_, "reject") => continue,
+            (_, "reject") => tolerant::<ErrorEnvelope>(&e.file, &v),
             ("search", _) => tolerant::<SearchResponse>(&e.file, &v),
             ("read", _) => tolerant::<ReadResponse>(&e.file, &v),
             ("ready", _) => tolerant::<ReadyResponse>(&e.file, &v),
@@ -98,8 +101,74 @@ fn every_fixture_body_decodes_and_unknown_fields_change_nothing() {
         });
         seen += 1;
     }
-    assert_eq!(seen, 12, "success bodies");
+    assert_eq!(seen, 40, "bodies");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn error(code: &str, details: Value) -> Result<ErrorEnvelope, String> {
+    decode(&json!({ "error": { "code": code, "message": "m", "details": details } }))
+}
+
+/// R6.2: an unknown code is `internal`, retried only on its own say-so.
+#[test]
+fn an_unknown_code_branches_as_internal_with_its_own_retryable() {
+    for (retryable, expected) in [
+        (json!(true), true),
+        (json!(false), false),
+        (Value::Null, false),
+    ] {
+        let mut d = json!({ "request_id": "r1", "generation": 3, "x": 1 });
+        if !retryable.is_null() {
+            d["retryable"] = retryable;
+        }
+        let e = error("quota_exhausted", d).unwrap().error;
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(matches!(e.details, ErrorDetails::Other(_)));
+        assert_eq!(e.retryable(), expected, "{e:?}");
+    }
+    // A known code keeps its fixed `retryable` (§6).
+    let internal = json!({ "retryable": true, "request_id": null, "generation": null });
+    assert!(error("internal", internal).is_err());
+    let timeout = json!({ "retryable": false, "request_id": "r", "generation": 1 });
+    assert!(error("timeout", timeout).is_err());
+}
+
+/// §0.3: an unknown reason reads as none; an `unauthorized` without a known
+/// one is the invalid-credential class (STATE S3.1), never a revocation.
+#[test]
+fn an_unknown_reason_reads_as_none() {
+    let mut v = body("search.unauthorized-revoked.json");
+    let ErrorDetails::Unauthorized(d) = decode::<ErrorEnvelope>(&v).unwrap().error.details else {
+        panic!("not unauthorized");
+    };
+    assert_eq!(d.reason, Some(UnauthorizedReason::CredentialRevoked));
+    v["error"]["details"]["reason"] = json!("credential_rotated");
+    let ErrorDetails::Unauthorized(d) = decode::<ErrorEnvelope>(&v).unwrap().error.details else {
+        panic!("not unauthorized");
+    };
+    assert_eq!(d.reason, None);
+
+    let mut v = body("search.unavailable-mixed.json");
+    v["error"]["details"]["reason"] = json!("maintenance");
+    let e = decode::<ErrorEnvelope>(&v).unwrap().error;
+    let ErrorDetails::Unavailable(d) = &e.details else {
+        panic!("not unavailable");
+    };
+    assert_eq!(d.reason, None);
+    assert_eq!(e.retryable(), d.retryable);
+
+    let mut v = body("read.policy-denied.json");
+    v["error"]["details"]["reason"] = json!("region_blocked");
+    let ErrorDetails::Forbidden(d) = decode::<ErrorEnvelope>(&v).unwrap().error.details else {
+        panic!("not forbidden");
+    };
+    assert_eq!(d.reason, None);
+
+    // `null` is no reason; anything but a string is still malformed.
+    v["error"]["details"]["reason"] = Value::Null;
+    assert!(decode::<ErrorEnvelope>(&v).is_ok());
+    v["error"]["details"]["reason"] = json!(7);
+    assert!(decode::<ErrorEnvelope>(&v).is_err());
 }
 
 /// R6.2 for `partial_failures[]`: an unknown code is `internal`, an unknown
