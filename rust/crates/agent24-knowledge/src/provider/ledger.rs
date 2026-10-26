@@ -1,14 +1,9 @@
-//! Persistence bookkeeping (CONTRACT-STATE-v1 S1.10, I1–I3): when a
-//! tightening is committed, when a loosening may be written and when its
-//! confirmation counts, and when the host-level seal is deleted and rebuilt.
-//! Pure state: the caller writes what the ledger asks for and reports the
-//! outcome back, one event at a time.
-//!
-//! The seal holds "every tightening that took effect since it was rebuilt is
-//! persisted". A tightening takes effect at once (S4.5); it is committed (I2)
-//! once either of two independent writes lands: deleting the seal, or its own
-//! record. So a seal present at restart means every committed tightening has
-//! its record, and a missing one means a global tightening (S1.14).
+//! Persistence bookkeeping (CONTRACT-STATE-v1 S1.10, I1–I3), pure state: the
+//! caller writes what the ledger asks for and reports back. The host-level
+//! seal holds "every tightening since its rebuild is persisted". A tightening
+//! takes effect at once (S4.5) and is committed (I2) once deleting the seal or
+//! writing its own record lands; so a seal present at restart means every
+//! committed tightening has its record, and none means a global tightening.
 
 use std::collections::{HashMap, HashSet};
 
@@ -44,9 +39,8 @@ pub struct Ticket(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Loosening(u64);
 
-/// One deletion or rebuild of the seal: its outcome counts only while it is
-/// the one in flight, so a late report of an earlier one never moves the
-/// seal.
+/// One deletion or rebuild of the seal: only the one in flight counts, so a
+/// late report of an earlier one never moves the seal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SealOp(u64);
 
@@ -82,12 +76,7 @@ enum Seal {
     Deleting(SealOp),
     /// Deleted for sure: a restart tightens globally.
     Absent,
-    /// A rebuild in flight; a tightening that came meanwhile deletes it
-    /// again once the rebuild is through.
-    Rebuilding {
-        op: SealOp,
-        then_delete: bool,
-    },
+    Rebuilding(SealOp),
 }
 
 #[derive(Debug)]
@@ -112,6 +101,8 @@ pub struct Ledger<P> {
     loose: HashMap<Loosening, Loose<P>>,
     /// Loosenings in effect: only these satisfy a dependency.
     applied: HashSet<Loosening>,
+    /// A tightening came during the rebuild: delete the seal once it is in.
+    redelete: bool,
     next: u64,
 }
 
@@ -127,6 +118,7 @@ impl<P: Clone + PartialEq> Ledger<P> {
             tight: HashMap::new(),
             loose: HashMap::new(),
             applied: HashSet::new(),
+            redelete: false,
             next: 0,
         }
     }
@@ -149,11 +141,8 @@ impl<P: Clone + PartialEq> Ledger<P> {
         let ticket = Ticket(self.next());
         let unseal = match self.seal {
             Seal::Present => Some(self.deleting()),
-            Seal::Rebuilding { op, .. } => {
-                self.seal = Seal::Rebuilding {
-                    op,
-                    then_delete: true,
-                };
+            Seal::Rebuilding(_) => {
+                self.redelete = true;
                 None
             }
             Seal::Deleting(_) | Seal::Absent => None,
@@ -225,10 +214,8 @@ impl<P: Clone + PartialEq> Ledger<P> {
             return None;
         }
         let op = SealOp(self.next());
-        self.seal = Seal::Rebuilding {
-            op,
-            then_delete: false,
-        };
+        self.seal = Seal::Rebuilding(op);
+        self.redelete = false;
         Some(op)
     }
 
@@ -236,17 +223,10 @@ impl<P: Clone + PartialEq> Ledger<P> {
     /// seal may be there now. Returns the deletion to start if a tightening
     /// came meanwhile.
     pub fn resealed(&mut self, op: SealOp) -> Option<SealOp> {
-        let Seal::Rebuilding {
-            op: current,
-            then_delete,
-        } = self.seal
-        else {
-            return None;
-        };
-        if current != op {
+        if self.seal != Seal::Rebuilding(op) {
             return None;
         }
-        if then_delete {
+        if self.redelete {
             return Some(self.deleting());
         }
         self.seal = Seal::Present;
