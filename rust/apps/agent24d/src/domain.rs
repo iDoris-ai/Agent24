@@ -215,6 +215,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     // route was added, rather than leaving it to be discovered by whoever shipped
     // that module.
     "os",
+    // K1-6b.5c-2: `/api/v1/peer/runs`, the run views peer bridges relay.
+    "peer",
     "runs",
     "schedules",
     "sessions",

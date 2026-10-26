@@ -74,6 +74,7 @@ mod os_memory;
 mod os_memory_page;
 mod os_routes;
 mod overrides;
+mod peer_runs;
 mod routes;
 mod runs;
 mod scheduler_callback;
