@@ -83,9 +83,100 @@ pub enum MemoryError {
         owner: String,
         dimension: &'static str,
     },
+    /// P1-02c (c2): a retraction was refused on a full partition because the
+    /// assertion id is so long that `{"assertion_id":"…"}` exceeds the 256-byte
+    /// cap of the retraction quota exemption (migration 0018, ids up to 237
+    /// bytes are exempt). Carries no owner key and no id on purpose.
+    #[error("assertion id is too long to retract while the partition is full")]
+    RetractIdTooLong,
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+/// P1-02c (c2): the closed set of externally visible memory-failure codes.
+///
+/// This is the ONLY thing a failed write may reveal to an event stream, an HTTP
+/// body or a module: a stable code, never the partition key and never
+/// `MemoryError`'s `Display` (which spells the owner key out with `{owner:?}`).
+/// `memory_disk_low` is reserved for the pre-write disk check (c4); nothing
+/// produces it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryErrorCode {
+    QuotaRows,
+    QuotaBytes,
+    DiskLow,
+    DiskFull,
+    ReservedKind,
+    /// A retraction whose assertion id makes the `assertion.retracted` payload
+    /// exceed the 256-byte quota-exemption cap (migration 0018), so on a full
+    /// partition it is charged as ordinary content and refused.
+    RetractIdTooLong,
+    Internal,
+}
+
+impl MemoryErrorCode {
+    pub const ALL: [Self; 7] = [
+        Self::QuotaRows,
+        Self::QuotaBytes,
+        Self::DiskLow,
+        Self::DiskFull,
+        Self::ReservedKind,
+        Self::RetractIdTooLong,
+        Self::Internal,
+    ];
+
+    /// The wire string. Stable: clients match on it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QuotaRows => "memory_quota_rows",
+            Self::QuotaBytes => "memory_quota_bytes",
+            Self::DiskLow => "memory_disk_low",
+            Self::DiskFull => "memory_disk_full",
+            Self::ReservedKind => "memory_reserved_kind",
+            Self::RetractIdTooLong => "memory_retract_id_too_long",
+            Self::Internal => "memory_internal",
+        }
+    }
+
+    /// The quota dimension (`"rows"` / `"bytes"`) when this is a quota code.
+    pub fn dimension(self) -> Option<&'static str> {
+        match self {
+            Self::QuotaRows => Some("rows"),
+            Self::QuotaBytes => Some("bytes"),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// SQLite primary result code `SQLITE_FULL`: the disk (or `max_page_count`) is full.
+const SQLITE_FULL: &str = "13";
+
+impl MemoryError {
+    /// Classify into the closed [`MemoryErrorCode`] set. Total: anything that is
+    /// not a recognised quota / disk / reserved-kind failure is `Internal`.
+    pub fn code(&self) -> MemoryErrorCode {
+        match self {
+            Self::QuotaExceeded { dimension, .. } if *dimension == "rows" => {
+                MemoryErrorCode::QuotaRows
+            }
+            Self::QuotaExceeded { .. } => MemoryErrorCode::QuotaBytes,
+            Self::RetractIdTooLong => MemoryErrorCode::RetractIdTooLong,
+            Self::Sqlx(sqlx::Error::Database(db))
+                if db.code().as_deref() == Some(SQLITE_FULL)
+                    || db.message().contains("database or disk is full") =>
+            {
+                MemoryErrorCode::DiskFull
+            }
+            _ => MemoryErrorCode::Internal,
+        }
+    }
+}
 
 /// T8.5c-P (design §3.2, v2 "sqlx 预取 High", v4 "常量口径 Medium" M1): the
 /// SQLite connection option `SqliteConnectOptions::row_buffer_size` — the

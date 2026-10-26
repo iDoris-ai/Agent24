@@ -4154,8 +4154,26 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            /** @description `memory_retract_id_too_long` — the memory partition is full and this assertion id is too long (238 bytes or more) for its retraction to fall under the quota exemption, so it was charged as ordinary content and refused. Nothing was changed. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description Personal memory is not available on this daemon */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `memory_disk_full` — the disk holding the memory database is full (SQLITE_FULL). Nothing was changed; free space and retry. The body carries the code and a fixed sentence, never a partition key. */
+            507: {
                 headers: {
                     [name: string]: unknown;
                 };

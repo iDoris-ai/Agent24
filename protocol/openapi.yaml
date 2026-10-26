@@ -1497,6 +1497,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "422":
+          description: >-
+            `memory_retract_id_too_long` — the memory partition is full and
+            this assertion id is too long (238 bytes or more) for its
+            retraction to fall under the quota exemption, so it was charged as
+            ordinary content and refused. Nothing was changed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "507":
+          description: >-
+            `memory_disk_full` — the disk holding the memory database is full
+            (SQLITE_FULL). Nothing was changed; free space and retry. The body
+            carries the code and a fixed sentence, never a partition key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /memory/settings:
     get:

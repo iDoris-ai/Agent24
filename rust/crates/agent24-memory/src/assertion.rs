@@ -37,6 +37,10 @@ pub enum Forget {
     NotFound,
 }
 
+/// Mirror of migration 0018's cap on an exempt `assertion.retracted` payload
+/// (`LENGTH(CAST(payload AS BLOB)) <= 256`). Keep the two in step.
+pub const RETRACT_EXEMPT_MAX_PAYLOAD_BYTES: usize = 256;
+
 /// Close a belief and append its retraction event atomically. Repeated calls
 /// preserve the first withdrawal time and do not append another event.
 pub async fn forget(pool: &SqlitePool, owner: &str, id: &str, at: &str) -> Result<Forget> {
@@ -102,7 +106,20 @@ pub async fn forget(pool: &SqlitePool, owner: &str, id: &str, at: &str) -> Resul
         },
     );
     event.at = at.to_owned();
-    EventLog::append_tx(&mut tx, &event).await?;
+    if let Err(err) = EventLog::append_tx(&mut tx, &event).await {
+        // The quota exemption (migration 0018) only covers a retraction payload
+        // of at most `RETRACT_EXEMPT_MAX_PAYLOAD_BYTES`. An id long enough to
+        // push past it is charged as ordinary content, so on a full partition
+        // the refusal is not "you are out of quota" but "this id cannot be
+        // retracted here" — say so, typed. The transaction is dropped
+        // (rolled back) on this early return, assertion row included.
+        if matches!(err, crate::MemoryError::QuotaExceeded { .. })
+            && serde_json::to_string(&event.body)?.len() > RETRACT_EXEMPT_MAX_PAYLOAD_BYTES
+        {
+            return Err(crate::MemoryError::RetractIdTooLong);
+        }
+        return Err(err);
+    }
     tx.commit().await?;
     Ok(Forget::Forgotten)
 }
