@@ -116,7 +116,7 @@ fn search_arguments_are_parsed_strictly() {
     .unwrap();
     assert_eq!(q.query, "差旅");
     assert_eq!(q.knowledge_base_ids.unwrap().as_slice(), ["kb-a", "kb-b"]);
-    assert_eq!(q.max_results.unwrap().get(), 5);
+    assert_eq!(q.max_results.get(), 5);
     // A lone BOM is no whitespace to `str::trim`, nor to the pattern.
     assert_eq!(
         parse_search(&input(json!({ "query": "\u{feff}" })))
@@ -125,7 +125,8 @@ fn search_arguments_are_parsed_strictly() {
         "\u{feff}"
     );
     let bare = parse_search(&input(json!({ "query": "差旅" }))).unwrap();
-    assert!(bare.knowledge_base_ids.is_none() && bare.max_results.is_none());
+    // Naming no limit asks for the tool's own.
+    assert!(bare.knowledge_base_ids.is_none() && bare.max_results.get() == 50);
     for bad in [
         json!({}),
         json!({ "query": "" }),

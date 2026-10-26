@@ -202,3 +202,35 @@ fn only_a_citation_read_from_its_first_page_reads_on() {
         assert_eq!(backend.cursors().len(), 1);
     }
 }
+
+#[test]
+fn a_last_page_still_marked_cut_leaves_the_first_page() {
+    // Cut with no cursor on: the wire forbids it, so the chunk is not whole.
+    let mut last = page("二", None);
+    last.truncated = true;
+    let backend = Pages::new(vec![Ok(page("一", Some("cur-1"))), Ok(last)]);
+    assert_first_page(&rendered(&backend, cite()));
+}
+
+#[test]
+fn a_cursor_the_wire_would_not_carry_is_never_sent() {
+    let long = "c".repeat(CURSOR_MAX + 1);
+    // The first page's own cursor: nothing more is asked.
+    for bad in [" ", long.as_str()] {
+        let backend = Pages::new(vec![Ok(page("一", Some(bad)))]);
+        let out = rendered(&backend, cite());
+        assert_eq!(out["evidence"][0]["use"], "current_text");
+        assert_eq!(backend.cursors(), [None]);
+    }
+    // A later page's: the pages up to it are asked, no further.
+    let backend = Pages::new(vec![
+        Ok(page("一", Some("cur-1"))),
+        Ok(page("二", Some(&long))),
+    ]);
+    assert_first_page(&rendered(&backend, cite()));
+    assert_eq!(backend.cursors(), [None, Some("cur-1".into())]);
+    // At the limit it still goes out.
+    let edge = "c".repeat(CURSOR_MAX);
+    let backend = Pages::new(vec![Ok(page("一", Some(&edge))), Ok(page("二", None))]);
+    assert_eq!(rendered(&backend, cite())["evidence"][0]["use"], "citation");
+}
