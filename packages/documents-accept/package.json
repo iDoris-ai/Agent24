@@ -7,7 +7,7 @@
   "scripts": {
     "typecheck": "pnpm --filter @agent24/data-dir build && tsc --noEmit -p tsconfig.json",
     "test": "pnpm --filter @agent24/data-dir build && vitest run",
-    "accept": "tsx src/cli.ts"
+    "accept": "pnpm --filter @agent24/data-dir build && tsx src/cli.ts"
   },
   "dependencies": {
     "@agent24/data-dir": "workspace:*",

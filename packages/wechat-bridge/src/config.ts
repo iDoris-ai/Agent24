@@ -17,6 +17,12 @@ export const CONFIG = {
   get TOKEN_FILE(): string {
     return joinLiteral(dataDir(), 'wechat-token.json')
   },
+  // Sibling of TOKEN_FILE. joinLiteral, not path.join: an AGENT24_DATA_DIR that
+  // contains a symlink plus `..` must stay literal, or the session file and the
+  // token file land in different directories.
+  get SESSION_FILE(): string {
+    return joinLiteral(dataDir(), 'wechat-sessions.json')
+  },
   POLL_TIMEOUT_MS: 40_000,
   RECONNECT_DELAY_MS: 3_000,
   MAX_MSG_LEN: 1800,
