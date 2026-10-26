@@ -264,10 +264,17 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
                 e.rules.push(rule);
             }
         }
-        Change::Questioned { of, kbs, version } => evidence(out, &of, |e| {
+        Change::Questioned {
+            of,
+            kbs,
+            version,
+            timeouts,
+        } => evidence(out, &of, |e| {
+            // Pending anew after a release that landed though abandoned: the
+            // count comes back with it.
             let pending = e.pending.get_or_insert_with(|| Pending {
                 kbs: Default::default(),
-                timeouts: 0,
+                timeouts,
             });
             pending.kbs.extend(kbs);
             e.version = e.version.max(version);

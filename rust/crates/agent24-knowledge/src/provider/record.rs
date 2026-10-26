@@ -165,17 +165,21 @@ pub enum Change<I: Ids> {
         rule: Rule<I::Kb>,
     },
     /// Pending re-verification registered: the KBs merge in, `version` is
-    /// the one it advanced to (S3.1).
+    /// the one it advanced to, `timeouts` the count in a row as it stands
+    /// (S3.1). Carrying the count keeps it across a release that landed
+    /// though it was abandoned.
     Questioned {
         of: Of<I>,
         kbs: BTreeSet<I::Kb>,
         version: u64,
+        timeouts: u8,
     },
-    /// Released at `version`, over the KBs then pending.
+    /// Released at `version`, over the KBs and the count then pending.
     Released {
         of: Of<I>,
         kbs: BTreeSet<I::Kb>,
         version: u64,
+        timeouts: u8,
     },
     /// A recheck timed out: the count in a row now.
     TimedOut {
@@ -342,10 +346,16 @@ impl<I: Ids> Change<I> {
                 run: run.clone(),
                 profiles: vec![of.profile.clone()],
             },
-            Self::Released { of, kbs, version } => Self::Questioned {
+            Self::Released {
+                of,
+                kbs,
+                version,
+                timeouts,
+            } => Self::Questioned {
                 of: of.clone(),
                 kbs: kbs.clone(),
                 version: version.saturating_add(1),
+                timeouts: *timeouts,
             },
             Self::TimeoutsCleared { of, from } => Self::TimedOut {
                 of: of.clone(),

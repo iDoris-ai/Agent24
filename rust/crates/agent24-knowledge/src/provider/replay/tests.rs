@@ -452,16 +452,19 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
             of: a(),
             kbs: kbs(&["k"]),
             version: 1,
+            timeouts: 0,
         },
         C::Questioned {
             of: a(),
             kbs: kbs(&["l"]),
             version: 2,
+            timeouts: 0,
         },
         C::Released {
             of: a(),
             kbs: kbs(&["k"]),
             version: 1,
+            timeouts: 0,
         },
         C::TimedOut { of: a(), count: 2 },
         // A tombstone takes its KB out of the set; a deletion ends it.
@@ -510,6 +513,7 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
                 of: a(),
                 kbs: kbs(&["k"]),
                 version: 3,
+                timeouts: 0,
             },
             C::TimedOut { of: a(), count: 2 },
         ];
@@ -523,6 +527,7 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
         of: a(),
         kbs: kbs(&["k"]),
         version: 3,
+        timeouts: 0,
     }]);
     assert_eq!(released.pending, None);
     // An offset re-registering an older version does not take it back.
@@ -530,6 +535,7 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
         of: a(),
         kbs: kbs(&["k"]),
         version: 2,
+        timeouts: 0,
     }]);
     assert_eq!(older.version, 3);
     // A count with nothing pending is not kept.
@@ -561,6 +567,7 @@ fn an_epoch_that_does_not_advance_is_damage() {
                 of: a(),
                 kbs: kbs(&["k"]),
                 version: 1,
+                timeouts: 0,
             }]),
         },
         Record {
@@ -571,6 +578,7 @@ fn an_epoch_that_does_not_advance_is_damage() {
                     of: a(),
                     kbs: kbs(&["k"]),
                     version: 1,
+                    timeouts: 0,
                 },
             ]),
         },
@@ -582,4 +590,41 @@ fn an_epoch_that_does_not_advance_is_damage() {
     let evidence = &replay(1, records).unwrap().bindings[0].evidence;
     assert_eq!(evidence.epoch, 1);
     assert!(evidence.pending.is_some());
+}
+
+#[test]
+fn a_release_that_landed_though_abandoned_keeps_the_count() {
+    // ST-26g: two timeouts in a row persisted; the release is written, then
+    // abandoned for a registration that came meanwhile (I1), yet it lands.
+    let a = || of("a", 1);
+    let questioned = |version, timeouts| C::Questioned {
+        of: a(),
+        kbs: kbs(&["k"]),
+        version,
+        timeouts,
+    };
+    let changes = vec![
+        bind("a", 1, 1),
+        questioned(1, 0),
+        C::TimedOut { of: a(), count: 2 },
+        C::Released {
+            of: a(),
+            kbs: kbs(&["k"]),
+            version: 1,
+            timeouts: 2,
+        },
+    ];
+    // The offset, or the new registration, carries the count back.
+    let released = C::Released {
+        of: a(),
+        kbs: kbs(&["k"]),
+        version: 1,
+        timeouts: 2,
+    };
+    for after in [released.offset().unwrap(), questioned(2, 2)] {
+        let state = replay(1, log([changes.clone(), vec![after]].concat())).unwrap();
+        let pending = state.bindings[0].evidence.pending.clone().unwrap();
+        assert_eq!(pending.timeouts, 2);
+        assert_eq!(state.bindings[0].evidence.version, 2);
+    }
 }
