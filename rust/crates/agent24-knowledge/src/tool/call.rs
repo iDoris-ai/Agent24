@@ -5,6 +5,8 @@
 //! A refusal is host-built like a result: closed codes and reasons and a
 //! fixed sentence, never the server's own message or hint (READONLY R6.3).
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -52,7 +54,10 @@ pub enum Failure {
 
 /// The host side: admission, generation, credentials and transport, for the
 /// run the call belongs to. Every request of one call, each page included,
-/// is admitted and checked against the generation on its own.
+/// is admitted and checked against the generation on its own. The knowledge
+/// bases and documents the model names are intersected with the run's
+/// binding first: one outside it is never sent on, and reads back the same as
+/// one that does not exist (READONLY R2.5, R2.6).
 #[async_trait]
 pub trait KnowledgeBackend: Send + Sync {
     async fn search(
@@ -101,6 +106,23 @@ struct ReadArgs {
     cursor: Option<String>,
 }
 
+/// The wire's length limits (`protocol/knowledge/v1`), checked before
+/// anything is sent; and the tool's own cap on hits, so one search cannot
+/// fill the model's context (the server clamps further, R3.3).
+const QUERY_MAX: usize = 4096;
+const ID_MAX: usize = 256;
+const CURSOR_MAX: usize = 1024;
+const RESULTS_MAX: u64 = 50;
+/// Pages a citation read follows for one chunk before it settles for the
+/// first page as current text.
+const PAGES_MAX: usize = 8;
+
+/// A non-blank string of at most `max` characters; the blank set is the one
+/// `str::trim` strips.
+fn text(max: usize) -> Value {
+    json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF", "maxLength": max })
+}
+
 /// An object schema with one required key and nothing beyond `properties`.
 fn object(properties: Value, required: &str) -> Value {
     json!({ "type": "object", "properties": properties,
@@ -109,31 +131,33 @@ fn object(properties: Value, required: &str) -> Value {
 
 /// The JSON Schema advertised for `knowledge.search`.
 pub fn search_parameters() -> Value {
-    let text = json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF" });
-    let ids = json!({ "type": "array", "minItems": 1, "items": text });
-    let max = json!({ "type": "integer", "minimum": 1 });
-    let properties = json!({ "query": text, "knowledge_base_ids": ids, "max_results": max });
+    let ids = json!({ "type": "array", "minItems": 1, "items": text(ID_MAX) });
+    let max = json!({ "type": "integer", "minimum": 1, "maximum": RESULTS_MAX });
+    let properties =
+        json!({ "query": text(QUERY_MAX), "knowledge_base_ids": ids, "max_results": max });
     object(properties, "query")
 }
 
 /// The JSON Schema advertised for `knowledge.read`. A citation read passes
 /// the `chunk_id` and `content_tag` of the hit it cites.
 pub fn read_parameters() -> Value {
-    let text = json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF" });
-    let keys = ["knowledge_id", "chunk_id", "content_tag", "cursor"];
-    let properties = keys
-        .map(|k| (k.to_owned(), text.clone()))
-        .into_iter()
-        .collect();
-    let mut schema = object(Value::Object(properties), "knowledge_id");
+    let properties = json!({
+        "knowledge_id": text(ID_MAX), "chunk_id": text(ID_MAX),
+        "content_tag": text(ID_MAX), "cursor": text(CURSOR_MAX)
+    });
+    let mut schema = object(properties, "knowledge_id");
     schema["dependentRequired"] = json!({ "content_tag": ["chunk_id"] });
     schema
 }
 
-/// An empty or blank string is refused here, never sent on (READONLY R2.4).
-fn filled(name: &str, value: String) -> Result<String, Refused> {
+/// An empty or blank string is refused here, never sent on (READONLY R2.4),
+/// and so is one longer than the wire allows.
+fn filled(name: &str, value: String, max: usize) -> Result<String, Refused> {
     if value.trim().is_empty() {
         return Err(Refused::Invalid(format!("{name} must not be empty")));
+    }
+    if value.chars().count() > max {
+        return Err(Refused::Invalid(format!("{name} is longer than {max}")));
     }
     Ok(value)
 }
@@ -150,15 +174,20 @@ pub fn parse_search(input: &Map<String, Value>) -> Result<SearchQuery, Refused> 
         Some(ids) => {
             let ids = ids
                 .into_iter()
-                .map(|id| filled("knowledge_base_ids[]", id))
+                .map(|id| filled("knowledge_base_ids[]", id, ID_MAX))
                 .collect::<Result<Vec<_>, _>>()?;
             let ids = NonEmpty::try_from(ids)
                 .map_err(|_| Refused::Invalid("knowledge_base_ids must not be empty".into()))?;
             Some(ids)
         }
     };
+    if a.max_results.is_some_and(|n| n.get() > RESULTS_MAX) {
+        return Err(Refused::Invalid(format!(
+            "max_results is above {RESULTS_MAX}"
+        )));
+    }
     Ok(SearchQuery {
-        query: filled("query", a.query)?,
+        query: filled("query", a.query, QUERY_MAX)?,
         knowledge_base_ids,
         max_results: a.max_results,
     })
@@ -166,12 +195,12 @@ pub fn parse_search(input: &Map<String, Value>) -> Result<SearchQuery, Refused> 
 
 pub fn parse_read(input: &Map<String, Value>) -> Result<ReadQuery, Refused> {
     let a: ReadArgs = args(input)?;
-    let opt = |name, v: Option<String>| v.map(|v| filled(name, v)).transpose();
+    let opt = |name, v: Option<String>, max| v.map(|v| filled(name, v, max)).transpose();
     let query = ReadQuery {
-        knowledge_id: filled("knowledge_id", a.knowledge_id)?,
-        chunk_id: opt("chunk_id", a.chunk_id)?,
-        content_tag: opt("content_tag", a.content_tag)?,
-        cursor: opt("cursor", a.cursor)?,
+        knowledge_id: filled("knowledge_id", a.knowledge_id, ID_MAX)?,
+        chunk_id: opt("chunk_id", a.chunk_id, ID_MAX)?,
+        content_tag: opt("content_tag", a.content_tag, ID_MAX)?,
+        cursor: opt("cursor", a.cursor, CURSOR_MAX)?,
     };
     if query.content_tag.is_some() && query.chunk_id.is_none() {
         return Err(Refused::Invalid("content_tag needs chunk_id".into()));
@@ -255,11 +284,21 @@ fn refusal(kind: &'static str, failure: Failure) -> Refused {
         Failure::Unbound => ("knowledge_unbound".into(), None, false, UNBOUND),
         Failure::BindingStale => ("knowledge_binding_stale".into(), None, false, STALE),
     };
+    refused(kind, &code, reason.as_deref(), retryable, advice)
+}
+
+fn refused(
+    kind: &'static str,
+    code: &str,
+    reason: Option<&str>,
+    retryable: bool,
+    advice: &'static str,
+) -> Refused {
     let out = RefusalOut {
         kind,
         outcome: "refused",
-        code: &code,
-        reason: reason.as_deref(),
+        code,
+        reason,
         retryable,
         advice,
     };
@@ -284,10 +323,74 @@ pub async fn read(
     input: &Map<String, Value>,
 ) -> Result<String, Refused> {
     let query = parse_read(input)?;
-    match backend.read(run_id, query).await {
-        Ok((request, response)) => Ok(render_read(&request, &response)),
-        Err(failure) => Err(refusal("knowledge.read", failure)),
+    let (request, first) = backend
+        .read(run_id, query.clone())
+        .await
+        .map_err(|failure| refusal("knowledge.read", failure))?;
+    let whole = match (&query.content_tag, &query.cursor) {
+        (Some(_), None) => read_on(backend, run_id, query, &first).await?,
+        _ => None,
+    };
+    Ok(render_read(&request, whole.as_ref().unwrap_or(&first)))
+}
+
+/// A citation read cut by `max_bytes` (R4.4): read the same chunk on until
+/// its last page, each page its own request, and join the pages into the
+/// whole chunk when every page names the same chunk and `content_tag`. Past
+/// [`PAGES_MAX`], on a cursor coming back or a page of another chunk, the
+/// first page stands as current text with its cursor. A page refused or of
+/// another `content_tag` refuses the call, and one under another generation
+/// cancels it (S4.8): the first page is known to be no longer good.
+async fn read_on(
+    backend: &dyn KnowledgeBackend,
+    run_id: &str,
+    query: ReadQuery,
+    first: &ReadResponse,
+) -> Result<Option<ReadResponse>, Refused> {
+    let ([segment], Some(mut cursor)) = (first.segments.as_slice(), first.next_cursor.clone())
+    else {
+        return Ok(None);
+    };
+    let mut text = segment.text.clone();
+    let mut seen = HashSet::from([cursor.clone()]);
+    for _ in 1..PAGES_MAX {
+        let next = ReadQuery {
+            cursor: Some(cursor),
+            ..query.clone()
+        };
+        let page = match backend.read(run_id, next).await {
+            Ok((_, page)) => page,
+            Err(failure) => return Err(refusal("knowledge.read", failure)),
+        };
+        if page.generation != first.generation {
+            return Err(Refused::Cancelled);
+        }
+        let [s] = page.segments.as_slice() else {
+            return Ok(None);
+        };
+        if page.knowledge_id != first.knowledge_id || s.chunk_id != segment.chunk_id {
+            return Ok(None);
+        }
+        // The same chunk under another tag: its text changed (R5.1), as a
+        // `stale` would have said.
+        if s.content_tag != segment.content_tag {
+            let advice = server_advice(ErrorCode::Stale, None, false);
+            return Err(refused("knowledge.read", "stale", None, false, advice));
+        }
+        text.push_str(&s.text);
+        let Some(more) = page.next_cursor else {
+            let mut whole = first.clone();
+            whole.segments[0].text = text;
+            whole.truncated = false;
+            whole.next_cursor = None;
+            return Ok(Some(whole));
+        };
+        if !seen.insert(more.clone()) {
+            return Ok(None);
+        }
+        cursor = more;
     }
+    Ok(None)
 }
 
 #[cfg(test)]
