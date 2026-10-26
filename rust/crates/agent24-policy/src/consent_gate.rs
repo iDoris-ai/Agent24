@@ -233,6 +233,14 @@ impl ConsentGateDecision {
     }
 }
 
+/// K1-6a-G §2.2: a grant holds only for the package the user confirmed;
+/// another, or none on either side, is stale. The gate and the grant list
+/// (#1290) both judge by this.
+#[must_use]
+pub fn holds_for_package(granted_for: Option<&str>, running: Option<&str>) -> bool {
+    granted_for.is_some() && granted_for == running
+}
+
 /// Reads a module's current artifact identity (K1-6a-G §2.2), per lookup.
 pub type ArtifactSource = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
@@ -445,10 +453,11 @@ impl ConsentGate for StoreConsentGate {
             ConsentLookup::Revoked(record) => ConsentGateDecision::Deny {
                 reason: ConsentDenyReason::Revoked(record),
             },
-            // K1-6a-G §2.2: a grant holds only for the package the user
-            // confirmed; another, or none on either side, is stale.
             ConsentLookup::Granted(record)
-                if record.artifact.is_none() || record.artifact != request.current_artifact =>
+                if !holds_for_package(
+                    record.artifact.as_deref(),
+                    request.current_artifact.as_deref(),
+                ) =>
             {
                 ConsentGateDecision::Deny {
                     reason: ConsentDenyReason::Stale(record),

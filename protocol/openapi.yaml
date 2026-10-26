@@ -4854,7 +4854,15 @@ components:
         source: { type: string, enum: [first_party, manual_install] }
         decided_at: { type: string, format: date-time }
         expires_at: { type: string, format: date-time }
-        status: { type: string, enum: [granted, denied, revoked, expired, stale, not_granted] }
+        status:
+          description: >-
+            What the dispatch gate would make of a call now: judged against
+            the tool as it is mounted now and the identity of the package
+            running now. A grant for another package, for none, for a module
+            not running or a tool no longer mounted, or for an earlier version
+            or scope of the tool is `stale`.
+          type: string
+          enum: [granted, denied, revoked, expired, stale, not_granted]
         stop:
           description: >-
             Only for a revoked one, or an expired grant: whether the module
