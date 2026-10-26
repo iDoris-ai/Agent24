@@ -49,18 +49,18 @@
 
 | 里程碑 | 目标 | 出口条件 | 依赖 | 状态 |
 |---|---|---|---|---|
-| **M-REL-1 收口发布** | 集成分支积压按线发到 main，出 **v0.6.0 Mac 正式版** | 各线 release PR 由人开人审并真机验收；v0.6.0 带签名加公证的 arm64 dmg，CLI 也签名；CHANGELOG 补齐 | 各线 open PR 收尾 | 未开始 |
-| **M-CORE-1 本体化（Mac）** | 每用户常驻 daemon 成为产品默认；一方外壳经登记握手接入 | ADR-037 决策 2、3 在 Mac 上落地，含生命周期表、版本协商、迁移备份回滚与停靠态；桌面退出后日程照跑；TUI 接入同一个 daemon | ADR-037 ✅ | 可开工 |
+| **M-REL-1 收口发布** | 集成分支积压按线发到 main，出 **v0.6.0 Mac 正式版** | 各线 release PR 由人开人审并真机验收；v0.6.0 带签名加公证的 arm64 dmg，CLI 也签名；CHANGELOG 补齐 | 各线 open PR 收尾 | 进行中 |
+| **M-CORE-1 本体化（Mac）** | 每用户常驻 daemon 成为产品默认；一方外壳经登记握手接入 | ADR-037 决策 2、3 在 Mac 上落地，含生命周期表、版本协商、迁移备份回滚与停靠态；桌面退出后日程照跑；TUI 接入同一个 daemon | ADR-037 ✅ | 进行中 |
 | **M-API-1 开发者 API（本机）** | 第三方程序可用分权令牌调用本机 API | G-API-1..5 全过；令牌管理 CLI 和 UI；开发者文档；版本与弃用策略 | M-CORE-1 | 未开始 |
-| **M-TUI-1 TUI 能力对齐** | TUI/CLI 覆盖全部对外能力，视觉功能给兜底 | OpenAPI 覆盖 CI 不降；豁免表经评审；有聊天输入和主要视图 | M-CORE-1（接入方式） | 未开始 |
+| **M-TUI-1 TUI 能力对齐** | TUI/CLI 覆盖全部对外能力，视觉功能给兜底 | OpenAPI 覆盖 CI 不降；豁免表经评审；有聊天输入和主要视图 | M-CORE-1（接入方式） | 进行中 |
 | **M-MEM-P1 记忆可控** | 按 PLAN-MEMORY-P1：容量、附件、导出导入、更正、purge、无痕、回执 | P1-11 联合验收；release 由人开 | 两份 ADR 已接受（#1247、#1248） | 进行中 |
-| **M-KRN-2 K1 第二批发布** | 授予路径、出站统一、出口矩阵进 main | ab/kernel 的 open PR 收尾；release PR；#708 真实路径验收 | — | 进行中（未发布） |
+| **M-KRN-2 K1 第二批发布** | 授予路径、出站统一、出口矩阵进 main | ab/kernel 的 open PR 收尾；release PR；#708 真实路径验收 | — | 进行中（#1280 已批准，与 main 冲突） |
 | **M-DOC-1 DOC-1 验收** | Documenting 聊天入口打通，DOC-1 整体验收 | chat 入口（#1142）；r6；真机 | M-KRN-2 | 进行中 |
 | **M-KB-1 知识进入主对话** | KB-C1 打通；真实私有数据仍禁用 | KB-C1-04/05；KB-SEC-01b；首次 release | M-KRN-2 | 进行中 |
 | **M-PLT-LNX Linux** | systemd `--user`；运行时 Ollama 或 llama.cpp；Secret Service；hw 探测 | 干净机验收 | M-CORE-1 | 未开始 |
 | **M-PLT-WIN Windows** | 按 WINDOWS-PORT v2 与 ADR-037 落地 | 发布矩阵加入 Windows；干净机验收 | M-PLT-LNX；Windows 签名资格 | 阻塞 |
 | **M-PLT-MOB 移动遥控** | 经 Hyphae 遥控：聊天、审批、状态、预览 | `REMOTE-CONTROL-HYPHAE.md` 回答 ADR-037 列出的必答题后获批；实现与安全验收 | M-API-1 的令牌模型；COMM | 未开始 |
-| **M-DOCS-1 文档治理** | 三份文档成为唯一入口；旧文档标状态；外部链接更新 | 见 §4 DOCS | — | 进行中 |
+| **M-DOCS-1 文档治理** | 三份文档成为唯一入口；旧文档标状态；外部链接更新 | 见 §4 DOCS | — | 进行中（DOCS-2 已合 main） |
 
 建议节奏：
 
