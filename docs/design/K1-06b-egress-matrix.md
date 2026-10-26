@@ -1,17 +1,18 @@
 # K1-6b.5 逐出口矩阵
 
 > **依据**：[ADR-K1-02](../adr/ADR-K1-02-session-dataflow-security-modes.md) §2.4（五类出口）、§2.5（撤除 `has_remote` 过渡门的条件）、§5 第 1–11 条、§6 第 5 条；跟踪 [#735](https://github.com/iDoris-ai/Agent24/issues/735)。
-> **状态**：6b.5a 建表。表里写的是**现有**测试；「缺」列出后续切片（6b.5b–5e）要补的测试，每补一片就在这里勾掉。
+> **状态**：6b.5a 建表；6b.5b 已补模型类。表里写的是**现有**测试；「缺」列出后续切片（6b.5b–5e）要补的测试，每补一片就在这里勾掉。
 > **盘点基准**：K1-6b.4 栈顶（#1204）。测试按 `文件` + 函数名引用，不写行号。
 
 ## 0. 先说清楚的事实
 
 1. **生产里没有获准云处理。**
    - 所有 `SourceRef` 构造器写死 `mode: LocalOnly`、`policy_version: 0`、`authorization_ref: None`（`agent24-store/src/source_policy.rs`）。
-   - 生产代码不调用 `EgressResource::cloud_authorized`、`ToolContext::with_egress_policy` 或 `ToolRegistry::with_egress_gate`，唯一的 gate 是 `deny_all`。
+   - 生产代码不调用 `EgressResource::cloud_authorized`、`ToolContext::with_egress_policy` 或 `ToolRegistry::with_egress_gate`。
+   - 模型侧唯一的 gate 是 `deny_all`；工具侧生产的 `ToolRegistry` 根本不装 gate，受限 run 按下面第 4 条的「没装 gate → 拒绝」处理。
    - 所以 (c) 列只能在 domain、router、http_fetch、MCP 层用测试 gate 做。产品路径上，每个消费方要有一条「模式未支持 → unavailable，零外发」的测试，不能记成云授权正例已通过。
 2. **生产里远端模型对所有资料都不可达，Ordinary 也一样。**
-   - 模型调用都走 `complete`/`complete_served`，模型发现走 `models_detailed`，底下都是 `deny_all` 加空资源（`agent24-models/src/router.rs`）。
+   - 模型调用都走 `complete`/`complete_served`，模型发现走 `models_detailed`，底下都是 `deny_all` 加空资源（`agent24-models/src/router.rs`）。模型发现有两个调用方：`GET /api/v1/models`（经 `models`），以及启动时的 `ModelCatalog::probe`（`agent24d/src/server.rs`，有模块声明模型时才清点）。
    - `complete_with_egress` 只有 router 测试在调用。
 3. **domain 先于 gate 拒绝**（`agent24-domain/src/egress.rs` `EgressRequest::authorize`）。以下情况都在问 gate 之前就拒绝：
    - 请求不是远端；
@@ -38,14 +39,19 @@
 
 | 消费方 | (a) | (b) | (c) | (d) |
 |---|---|---|---|---|
-| **Router** | `router.rs` `local_only_never_falls_back_to_remote`、`local_only_with_cooled_down_local_still_never_uses_remote`、`local_only_uses_lora_as_a_local_tier` | `router.rs` `remote_provider_is_not_called_without_a_host_egress_gate`、`denied_remote_falls_back_to_healthy_local_provider`、`tier_parse_defaults_unknown_to_remote`；**缺**：provider 不报目的地（`outbound_destination()` 为 `None`）时零请求 | 正例：`router.rs` `complex_task_prefers_remote`（放行 gate）。负例只在 domain 层：`egress.rs` `cloud_grant_must_match_resource_purpose_destination_and_generation`（没有换 `resource_id`、`authorization_ref`、`policy_version`）、`an_authorized_request_is_rechecked_against_the_live_gate_after_revocation`；**缺**：router 层用精确匹配 gate 的逐项负例 | `router.rs` `simple_task_prefers_local`、`tier_order_respects_privacy_and_complexity` |
-| **run_loop**（`RunManager::execute`） | `lib.rs` `resumed_thread_cannot_rebuild_remote_permission_from_default_profile`（远端桩，唯一一条） | `lib.rs` `source_tag_write_failure_stops_before_any_model_call`、`a_recall_tag_that_cannot_be_written_stops_the_run_before_the_model`、`a_session_floor_that_cannot_be_written_stops_the_run_before_the_model`、`a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model`、`a_run_whose_own_sources_cannot_be_read_stops_before_the_model`（都用本地 provider）；**缺**：`task_profile_for_run` 读失败分支配远端桩（无会话、无记忆的 run） | 不适用：只调 `router.complete` | `lib.rs` `run_completes_with_full_event_sequence`、`ordinary_sources_of_any_kind_do_not_restrict_tool_egress` |
-| **REST /api/v1/chat** | **缺**：远端桩零请求（现有 routes 测试都是本地 router） | `session_memory/chat.rs` `a_chat_turn_whose_session_floor_cannot_be_written_fails_before_the_model`；`lib.rs` `a_chat_prelude_whose_floor_cannot_be_written_fails` | 不适用 | `routes.rs` `post_chat_records_a_timing_row_on_success`；`chat.rs` `explicit_remember_over_chat_stores_a_qualified_assertion` |
-| **子 agent（explore）** | `subagent.rs` `delegated_call_inherits_persisted_local_only_policy` | **缺**：父 run 快照读失败、`store: None` 两个分支 | 不适用 | `subagent.rs` `a_direct_answer_returns_immediately`、`it_reads_a_file_then_answers` |
+| **Router** | `router.rs` `local_only_never_falls_back_to_remote`、`local_only_with_cooled_down_local_still_never_uses_remote`、`local_only_uses_lora_as_a_local_tier` | `router.rs` `remote_provider_is_not_called_without_a_host_egress_gate`、`denied_remote_falls_back_to_healthy_local_provider`、`tier_parse_defaults_unknown_to_remote`、`a_remote_provider_that_cannot_name_its_destination_is_never_called`（6b.5b） | 正例：`router.rs` `complex_task_prefers_remote`（放行 gate）。负例只在 domain 层：`egress.rs` `cloud_grant_must_match_resource_purpose_destination_and_generation`（没有换 `resource_id`、`authorization_ref`、`policy_version`）、`an_authorized_request_is_rechecked_against_the_live_gate_after_revocation`；router 层：`an_exact_grant_lets_the_remote_provider_serve_only_that_request`（6b.5b，精确匹配 gate：正例，以及资源、修订、授权引用、政策版本、代次、目的地、用途逐项不匹配的负例） | `router.rs` `simple_task_prefers_local`、`tier_order_respects_privacy_and_complexity` |
+| **run_loop**（`RunManager::execute`） | `lib.rs` `resumed_thread_cannot_rebuild_remote_permission_from_default_profile`（远端桩，唯一一条） | `lib.rs` `source_tag_write_failure_stops_before_any_model_call`、`a_recall_tag_that_cannot_be_written_stops_the_run_before_the_model`、`a_session_floor_that_cannot_be_written_stops_the_run_before_the_model`、`a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model`、`a_run_whose_own_sources_cannot_be_read_stops_before_the_model`（都用本地 provider）；`a_run_whose_sources_cannot_be_read_is_routed_local_only`（6b.5b，远端桩） | 不适用：只调 `router.complete` | `lib.rs` `run_completes_with_full_event_sequence`、`ordinary_sources_of_any_kind_do_not_restrict_tool_egress` |
+| **REST /api/v1/chat** | `routes.rs` `post_chat_never_reaches_a_remote_only_provider`（6b.5b） | `session_memory/chat.rs` `a_chat_turn_whose_session_floor_cannot_be_written_fails_before_the_model`；`lib.rs` `a_chat_prelude_whose_floor_cannot_be_written_fails` | 不适用 | `routes.rs` `post_chat_records_a_timing_row_on_success`；`chat.rs` `explicit_remember_over_chat_stores_a_qualified_assertion` |
+| **子 agent（explore）** | `subagent.rs` `delegated_call_inherits_persisted_local_only_policy` | `subagent.rs` `a_delegated_call_whose_parent_policy_cannot_be_read_stays_local_only`、`a_delegated_call_without_a_policy_store_stays_local_only`（6b.5b） | 不适用 | `subagent.rs` `a_direct_answer_returns_immediately`、`it_reads_a_file_then_answers` |
 | **会话压缩** | `session_memory_tests.rs` `local_only_run_compaction_never_falls_back_to_remote` | 不适用：写死 LocalOnly，不读政策 | 不适用 | `session_memory/mod.rs` `successful_compaction_replays_every_original_message_after_daemon_restart` |
 | **模块模型回调** `_a24/model/complete` | `model_callback.rs` `remote_provider_stays_closed_without_a_host_egress_policy`；`me4_model_blackbox.rs` `model_complete_blackbox_round_trip`（远端桩零请求） | **计划/代码差异**：回调不读父 run 的来源（见 §6 第 2 条），所以没有可失败的政策读取 | 无接口可表达 | `model_callback.rs` `a_successful_call_broadcasts_exactly_one_model_call_event_with_no_content` |
-| **Guardian**（默认关闭，`A24_GUARDIAN`） | **缺**：`ModelRiskAssessor` 接 router 加远端桩（现有测试都是 stub assessor） | `guardian.rs` `assessor_error_fails_closed_to_escalation`（只测 stub） | 不适用 | `guardian.rs` `low_risk_auto_approves` |
-| **模型发现** | **缺**：远端桩的 `models()` 计数为 0（`a_partial_sweep_is_incomplete_even_though_it_returned_models` 分不清「被拒」和「调了但失败」） | **缺**：目的地未知、gate 出错 | **缺**：`ModelDiscovery` 用途 | `routes.rs` `get_models_includes_the_daemons_default_model_field` |
+| **Guardian**（默认关闭，`A24_GUARDIAN`） | `guardian.rs` `the_model_assessor_never_sends_a_payload_to_a_remote_model`（6b.5b，接真实 router 和远端桩） | `guardian.rs` `assessor_error_fails_closed_to_escalation`（只测 stub） | 不适用 | `guardian.rs` `low_risk_auto_approves` |
+| **模型发现** | `router.rs` `model_discovery_never_lists_a_remote_provider_through_the_default_gate`（6b.5b，`models()` 计数为 0） | `a_remote_provider_that_cannot_name_its_destination_is_never_called`（6b.5b，同时测 `models_detailed_with_egress`）；gate 拒绝见 (a) | `router.rs` `model_discovery_needs_a_grant_for_the_discovery_purpose`（6b.5b，精确匹配 gate：正例，以及用途、资源、修订、授权引用、政策版本、代次、目的地逐项不匹配的负例） | `routes.rs` `get_models_includes_the_daemons_default_model_field` |
+
+**(a) 列证明的是什么**（#1209 PR-Daemon 的 Gate，2026-10-25 实测）：把 `TaskProfile::tier_order` 里 LocalOnly 对远端的排除去掉（LocalOnly 也排上 Remote），结果如下。
+- 仍然通过：6b.5b 之前的 (a) 测试，即 router 的三条、`delegated_call_inherits_persisted_local_only_policy`、`local_only_run_compaction_never_falls_back_to_remote`、`resumed_thread_cannot_rebuild_remote_permission_from_default_profile`。生产 gate 是 `deny_all`，远端本来就被拒，所以这些测试只证明「远端零调用」，不证明 LocalOnly 排除在起作用。
+- 变红：6b.5b 断言提示里含 `local-only` 的五条（`a_run_whose_sources_cannot_be_read_is_routed_local_only`、子 agent 两条、`the_model_assessor_never_sends_a_payload_to_a_remote_model`、`post_chat_never_reaches_a_remote_only_provider`），加上原有的 `tier_order_respects_privacy_and_complexity`。这段提示只出现在「LocalOnly 且没有本地 provider」那个分支，排除一去掉，就变成 gate 拒绝的提示。
+- **撤门（6b.5e）之前还要补一条**：放行 gate 加有效的云授权资源，任务 profile 是 LocalOnly，远端仍零调用。这样 LocalOnly 排除就是唯一挡住远端的那一层，不再借 `deny_all` 或 domain 的拒绝。
 
 ## 3. 网络类
 
@@ -66,7 +72,7 @@
 | **shell_exec** | `local.rs` `shell_exec_fails_closed_when_child_network_use_cannot_be_bounded`、`local_only_shell_exec_is_denied_even_by_permissive_egress_gate`；**缺**：零副作用断言（两条都用 `/bin/echo`） | `local.rs` `shell_exec_is_denied_when_source_policy_lookup_failed`；`lib.rs` `restricted_or_unknown_sources_of_any_kind_restrict_tool_egress`；**缺**：经 `tool_context_for` 的快照为空、读失败两个分支 | **缺**：CloudAuthorized 加放行 gate 仍被拒（目的地未知） | `local.rs` `shell_exec_runs_for_ordinary_run_without_egress_policy`、`ordinary_shell_exec_runs_after_approval_without_egress_gate`；`lib.rs` `approved_shell_exec_actually_executes` |
 | **模块进程自身出网** | 没有网络沙箱。**已知限制**：只靠调用前的出口门（受限 run 一律拒） | — | — | — |
 
-`has_remote` 过渡门（`module_tool_runtime.rs`）现有测试：
+`has_remote` 过渡门（`module_tool_runtime.rs` 的 `blocked_by_remote_tier_guard`）现有测试：
 - `a_withheld_tool_called_by_name_is_refused_and_audited`
 - `the_guard_refuses_before_authorization_is_looked_up`
 - `a_remote_tier_added_while_running_refuses_the_next_call`
@@ -109,13 +115,27 @@
    - 分类可能在 run 中途因召回而收紧，所以 ACP 的流式增量要等分类确定后再放行，或者每段增量按当时的分类判定，不能先流出去再检查。
    - 内核要把 run 的分类暴露给桥（一个字段或一个按分类过滤的端点）。
    - 测试要覆盖：分类中途变化、分类缺失、受限内容不外泄。
-4. **Hyphae `/comm/send`**：只能由用户经 REST 直接调用，没有 Tool 包装，也不带 run 资料。视为用户直接操作，不在 agent 出口矩阵内。
+4. **运行中途的工具结果没有来源标签**（6b.5c-2 第 1 轮 Codex 评审发现，2026-10-25）：
+   - ADR §2.1 要求「模块/MCP/HTTP/Exec 输出都成为带标签的数据块」，追溯不到来源时视作敏感。可 `RunManager::execute` 只在第一次调模型之前打标签（用户输入、召回、schedule 来源、会话下限），`run_tool_call` 的结果直接进模型上下文，不打标签。
+   - 所以一个 run 即使用模块工具读了受限文档、用 fs_read 读了文件，它的标签仍然全是 Ordinary。工具读到的内容还会经下面几条路进入后来的 run，而那些 run 自己没有工具调用，标签同样全是 Ordinary：
+     - 会话记忆：会话下限在调模型之前、只按标签合并，后续轮从会话上下文读到上一轮的回答。`/chat` 带 session_id 时是临时 run，不进 runs 表、不打标签，但它召回的内容和回答也写进会话记忆。
+     - 长期记忆：`run_assertion_source_ref` 只看标签，工具内容记成 Ordinary 的断言，在别的会话里被召回。
+     - self-wake：schedule 记下的来源分类只看创建它的 run 的标签（`self_wake.rs`），唤醒 prompt 里可以带着工具内容；创建它的 run 没有会话时，被唤醒的 run 也没有。
+   - 受影响的有：工具出口门（`tool_context_for` 只看标签）、会话下限、记忆分类、MCP server 和 ACP 桥的 peer 视图。
+   - **David 的决定**（2026-10-25 至 10-26，三次）：
+     - 第一次：peer 视图里，本 run 调过工具就扣下。Claude、Codex、Fable 都选这一项。
+     - 第二次：第 2 轮评审发现跨 run 传播，改成按会话算。Claude、Fable 选这一项；Codex 选在源头打 Unknown 标签，并自认那会改变目标。
+     - 第三次（现行）：第 3 轮评审又找到 `/chat`、无会话的 self-wake、同会话并发三条路径，按路径推断补不完。改成**只放行自成一体的 run**：标签全是 Ordinary、没调过工具、没召回过记忆、不是内核建的 schedule 触发、没有会话上下文（不带会话，或内核没开会话记忆）。其余一律扣下（6b.5c-2）。三方都选这一项，Codex、Fable 都指出它扩大了代价，David 确认接受。ACP 桥每次 prompt 都建会话，所以开了会话记忆时，ACP 上的 run 全部只发固定提示。
+     - 会话下限、记忆分类和工具出口门这次都不改：在源头打 Unknown，会让调过任何工具的 run 及其会话后续轮的 shell_exec、http_fetch 等全被拒。
+     - 给工具结果打标签另开一片（§7 的 6b.5f），同时修工具出口门、会话下限、记忆分类和 self-wake 的来源分类；那一片落地后再放宽 peer 视图的规则。已经记成 Ordinary 的旧断言和 schedule 不会自动更正，6b.5f 要说明怎么处理。
+5. **Hyphae `/comm/send`**：只能由用户经 REST 直接调用，没有 Tool 包装，也不带 run 资料。视为用户直接操作，不在 agent 出口矩阵内。
 
 ## 7. 后续切片
 
 | 片 | 补什么 |
 |---|---|
-| 6b.5b 模型类 | REST chat 远端桩 (a)；Guardian 接 router 加远端桩 (a)；子 agent 两个读失败分支 (b)；provider 目的地未知 (b)；模型发现 (a)(b)(c)；router 层三元组逐项负例 (c)；`task_profile_for_run` 读失败加远端桩 (b) |
+| 6b.5b 模型类 | **已补**（见上表标 6b.5b 的测试）。没有补的：模块模型回调的 (b)，要等 §6 第 2 条接上来源继承以后才有可测的政策读取 |
 | 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用、精确目的地正例和逐项不匹配负例，以及 Ordinary 下 IP 字面量分支和端到端取回；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3 条，可能要拆成单独一片） |
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
-| 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§6 第 2 条已接、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
+| 6b.5f 工具结果打标签 | §6 第 4 条：每类工具结果（fs_read、http_fetch、MCP、模块工具、子 agent）的分类先定方案；结果进上下文时打标签，工具出口门、会话下限、记忆分类、self-wake 来源分类和 peer 视图都按它判定；处理已记成 Ordinary 的旧断言和 schedule；然后放宽 6b.5c-2 的临时规则 |
+| 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已接、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |

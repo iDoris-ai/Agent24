@@ -1542,8 +1542,9 @@ export interface components {
              * @description True unless every source tagged on the run so far is ordinary and
              *     the run called no tool, recalled no memory, was not started by a
              *     kernel-created schedule and has no session context. Sources are
-             *     tagged before the first model call, so the value only changes
-             *     again when the run starts a tool.
+             *     tagged before the first model call, so afterwards the value only
+             *     changes when the run starts a tool or the daemon restarts with
+             *     session memory turned on or off.
              */
             withheld: boolean;
             /** @description Present only for an ended run that is not withheld */

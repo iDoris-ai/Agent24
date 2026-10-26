@@ -473,9 +473,9 @@ pub struct PeerRun {
     /// run has called no tool, recalled no memory, was not started by a
     /// kernel-created schedule and has no session context (no session, or it
     /// ran — and the daemon runs — without session memory). Sources are tagged
-    /// before the first
-    /// model call, so the value only changes again when the run starts a
-    /// tool.
+    /// before the first model call, so afterwards the value only changes when
+    /// the run starts a tool or the daemon restarts with session memory turned
+    /// on or off.
     pub withheld: bool,
     /// Present only for an ended run that is not withheld
     pub prompt: Option<String>,
