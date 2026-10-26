@@ -575,7 +575,8 @@ impl Store {
     }
 
     /// The classification recorded for a kernel-created schedule; `None` for
-    /// a schedule the user created.
+    /// a schedule the user created. A self-wake from before 0024 reads as
+    /// `Unknown` (migration 0026).
     pub async fn schedule_origin_classification(
         &self,
         schedule_id: &str,
@@ -1048,6 +1049,84 @@ mod tests {
                 .record_schedule_origin("wake_1", "run_2", SourceClassification::Ordinary, "t")
                 .await
                 .is_err()
+        );
+    }
+
+    /// A self-wake left from before 0024 carries `unknown`, not "created by
+    /// the user" (0026), and so does one deleted since whose run is left; a
+    /// user's schedule still has no origin, and one recorded between 0024
+    /// and 0026 keeps its own.
+    #[tokio::test]
+    async fn a_self_wake_from_before_0024_reads_as_unknown() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let up_to = |version: i64| {
+            let mut migrator = sqlx::migrate!("./migrations");
+            migrator.migrations = std::borrow::Cow::Owned(
+                migrator
+                    .migrations
+                    .iter()
+                    .filter(|m| m.version <= version)
+                    .cloned()
+                    .collect(),
+            );
+            migrator
+        };
+        let schedule = |id: &'static str, name: &'static str| {
+            sqlx::query(
+                "INSERT INTO schedules (id, name, enabled, spec, action, delivery) \
+                 VALUES (?, ?, 1, '{}', '{}', '[]')",
+            )
+            .bind(id)
+            .bind(name)
+        };
+        up_to(18).run(&pool).await.unwrap();
+        schedule("wake_old", "self-wake")
+            .execute(&pool)
+            .await
+            .unwrap();
+        schedule("sch_user", "self-wake")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A self-wake that fired and was then deleted: only its run is left.
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at, schedule_id) \
+             VALUES ('run_gone', 'completed', '{}', '{}', '2026-10-08T00:00:00Z', 'wake_gone')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        up_to(25).run(&pool).await.unwrap();
+        schedule("wake_new", "self-wake")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO schedule_source_origin (schedule_id, origin_run_id, classification, created_at) \
+             VALUES ('wake_new', 'run_1', 'restricted', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let store = crate::test_hooks::from_pool(pool);
+        let origin = |id: &'static str| store.schedule_origin_classification(id);
+        assert_eq!(
+            origin("wake_old").await.unwrap(),
+            Some(SourceClassification::Unknown)
+        );
+        assert_eq!(
+            origin("wake_gone").await.unwrap(),
+            Some(SourceClassification::Unknown)
+        );
+        assert_eq!(origin("sch_user").await.unwrap(), None);
+        assert_eq!(
+            origin("wake_new").await.unwrap(),
+            Some(SourceClassification::Restricted)
         );
     }
 
