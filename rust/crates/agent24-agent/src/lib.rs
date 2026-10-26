@@ -493,7 +493,14 @@ enum ParkedCallStop {
 /// cancellation, a timeout, unparseable arguments.
 struct ToolAnswer {
     content: String,
-    source: Option<agent24_store::SourceRef>,
+    source: Option<ResultTag>,
+}
+
+/// A tool result's tag and the origin it names (`module:{id}`,
+/// `tool:{name}`), which a session records for its later turns (K1-6b.5f-2).
+struct ResultTag {
+    origin: String,
+    tag: agent24_store::SourceRef,
 }
 
 impl ToolAnswer {
@@ -892,6 +899,13 @@ impl RunManager {
                 )
                 .await?;
             sources.push((format!("session_floor:{sid}"), floor));
+            // K1-6b.5f-2: what earlier /runs turns of the session took in
+            // from tools (/chat itself offers none).
+            for origin in self.store.session_tool_result_origins(sid).await? {
+                let tag =
+                    agent24_store::SourceRef::session_tool_result(&origin, sid, now_iso8601());
+                sources.push((tag.source_id, tag.classification));
+            }
         }
         Ok((
             prelude,
@@ -949,30 +963,45 @@ impl RunManager {
     }
 
     /// The source tag for what `tool` returned on call `tool_call_id`.
-    fn tool_result_tag(&self, tool: &str, tool_call_id: &str) -> agent24_store::SourceRef {
+    fn tool_result_tag(&self, tool: &str, tool_call_id: &str) -> ResultTag {
         let source = self.tools.tool_result_source(tool);
-        agent24_store::SourceRef::tool_result(
+        let tag = agent24_store::SourceRef::tool_result(
             &source.origin,
             tool_call_id,
             source.classification,
             now_iso8601(),
-        )
+        );
+        ResultTag {
+            origin: source.origin,
+            tag,
+        }
     }
 
     /// Persist `answer`'s source tag, then hand its content to the model as
     /// the result of `call`. A tag that cannot be written ends the run before
-    /// the content reaches the model; returns false then.
+    /// the content reaches the model; returns false then. In a session with
+    /// memory, a non-ordinary result's origin is recorded with the tag, so
+    /// the session's later turns carry it (K1-6b.5f-2) — the same condition
+    /// under which later turns are given this one's context.
     async fn answer_tool_call(
         &self,
-        run_id: &str,
+        run: &Run,
         messages: &mut Vec<Msg>,
         call: &ToolCallRequest,
         answer: ToolAnswer,
     ) -> bool {
-        if let Some(tag) = &answer.source
+        let run_id = run.id.as_str();
+        let session = self.memory.as_ref().and(run.session_id.as_deref());
+        if let Some(result) = &answer.source
             && let Err(err) = self
                 .store
-                .tag_run_source(run_id, messages.len() as i64, tag, &now_iso8601())
+                .tag_tool_result(
+                    run_id,
+                    messages.len() as i64,
+                    &result.tag,
+                    session.map(|sid| (sid, result.origin.as_str())),
+                    &now_iso8601(),
+                )
                 .await
         {
             self.finish_failed(
@@ -1501,7 +1530,7 @@ impl RunManager {
                 }
             };
             if !self
-                .answer_tool_call(&run_id, &mut messages, &call, answer)
+                .answer_tool_call(&run, &mut messages, &call, answer)
                 .await
             {
                 return;
@@ -1940,6 +1969,38 @@ impl RunManager {
                 .await;
                 return;
             }
+            // K1-6b.5f-2: tool results earlier turns took in, one source per
+            // origin. They stay out of the floor merged above, so a module
+            // can still be sent back what it returned itself.
+            let inherited = match self.store.session_tool_result_origins(sid).await {
+                Ok(origins) => origins,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to read session tool result origins: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            for origin in inherited {
+                let tag =
+                    agent24_store::SourceRef::session_tool_result(&origin, sid, now_iso8601());
+                if let Err(err) = self
+                    .store
+                    .tag_run_source(&run_id, seq, &tag, &now_iso8601())
+                    .await
+                {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to persist session source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
         // The audit event names exactly the ids that made it into the
         // now-durable snapshot — emitted only once the snapshot is safely on
@@ -2303,7 +2364,7 @@ impl RunManager {
                 match self.run_tool_call(&run, call, &cancel, false).await {
                     Ok(answer) => {
                         if !self
-                            .answer_tool_call(&run_id, &mut messages, call, answer)
+                            .answer_tool_call(&run, &mut messages, call, answer)
                             .await
                         {
                             return;
@@ -3296,13 +3357,21 @@ pub(crate) mod tests {
         provider: Arc<dyn ModelProvider>,
         summarizer: Arc<dyn Summarizer>,
     ) -> (Arc<RunManager>, Store, KvStore) {
+        manager_with_memory_and_tools(provider, summarizer, ToolRegistry::new()).await
+    }
+
+    async fn manager_with_memory_and_tools(
+        provider: Arc<dyn ModelProvider>,
+        summarizer: Arc<dyn Summarizer>,
+        tools: ToolRegistry,
+    ) -> (Arc<RunManager>, Store, KvStore) {
         let store = Store::open_memory().await.unwrap();
         let sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
         let kv = KvStore::open_memory().await.unwrap();
         let manager = RunManager::with_memory(
             store.clone(),
             Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)])),
-            Arc::new(ToolRegistry::new()),
+            Arc::new(tools),
             sink,
             CancellationToken::new(),
             Some(SessionMemory::new(kv.clone(), summarizer).with_owner("test-owner".into())),
@@ -4868,6 +4937,148 @@ pub(crate) mod tests {
         assert!(
             provider.seen.lock().unwrap().is_empty(),
             "the model must not be called"
+        );
+    }
+
+    // ── K1-6b.5f-2: tool result origins across the turns of a session ──
+
+    /// K1-6b.5f-2: what a tool returned in one turn restricts the later turns
+    /// of its session through its origin, without raising the floor; an
+    /// ordinary result leaves nothing behind.
+    #[tokio::test]
+    async fn a_later_turn_carries_the_origins_of_its_sessions_tool_results() {
+        use agent24_store::SourceClassification::{Ordinary, Unknown};
+        for (source, inherited) in [
+            (
+                agent24_tools::ToolResultSource::unknown("reader"),
+                Some(Unknown),
+            ),
+            (agent24_tools::ToolResultSource::ordinary("reader"), None),
+        ] {
+            let tools = ToolRegistry::new().with(Arc::new(ReadingTool(source)));
+            let provider = ScriptedProvider::new(vec![calls("reader", "c1")]);
+            let (manager, store, _kv) = manager_with_memory_and_tools(
+                Arc::new(provider),
+                Arc::new(UnusedSummarizer),
+                tools,
+            )
+            .await;
+            seed_session(&store, "sess_tools").await;
+            let first = run_in_session(&manager, &store, "sess_tools", "read it").await;
+            assert_eq!(first.status, RunStatus::Completed, "{:?}", first.error);
+            let later = run_in_session(&manager, &store, "sess_tools", "and then").await;
+            let snapshot = store.run_policy_snapshot(&later.id).await.unwrap();
+            let classification_of = |id: &str| {
+                snapshot
+                    .sources
+                    .iter()
+                    .find(|source| source.source_id == id)
+                    .map(|source| source.classification)
+            };
+            assert_eq!(
+                classification_of("session_floor:sess_tools"),
+                Some(Ordinary)
+            );
+            assert_eq!(
+                classification_of("tool_result:tool:reader:session:sess_tools"),
+                inherited
+            );
+            assert_eq!(
+                process_egress_allowed_in(&manager, &later).await,
+                inherited.is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_tool_result_origins_cannot_be_read_stops_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_noorigins").await;
+        sqlx::raw_sql("DROP TABLE session_tool_result_origins")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let run = run_in_session(&manager, &store, "sess_noorigins", "hello").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let error = run.error.expect("a failed run carries its error");
+        assert_eq!(error.code, "source_policy_unavailable");
+        assert!(error.message.contains("tool result origins"), "{error:?}");
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    /// K1-6b.5f-2: a result whose session origin cannot be recorded is not
+    /// tagged either, and never reaches the model.
+    #[tokio::test]
+    async fn a_tool_result_whose_session_origin_cannot_be_written_never_reaches_the_model() {
+        let provider = Arc::new(WatchingProvider {
+            script: ScriptedProvider::new(vec![calls("reader", "c1")]),
+            saw_secret: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+            agent24_tools::ToolResultSource::unknown("reader"),
+        )));
+        let (manager, store, _kv) =
+            manager_with_memory_and_tools(provider.clone(), Arc::new(UnusedSummarizer), tools)
+                .await;
+        seed_session(&store, "sess_noorigin").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_origin BEFORE INSERT ON session_tool_result_origins \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = run_in_session(&manager, &store, "sess_noorigin", "read it").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error.unwrap().code, "source_policy_unavailable");
+        assert!(
+            !provider
+                .saw_secret
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the result reached the model"
+        );
+    }
+
+    /// K1-6b.5f-2: /chat offers no tools, but what earlier /runs turns of its
+    /// session took in from tools is part of its context.
+    #[tokio::test]
+    async fn the_chat_prelude_carries_its_sessions_tool_result_origins() {
+        use agent24_store::SourceClassification::{Ordinary, Unknown};
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        let pool = agent24_store::test_hooks::pool(&store);
+        sqlx::raw_sql(
+            "INSERT INTO session_tool_result_origins (session_id, origin, created_at) \
+             VALUES ('chat_tools', 'tool:shell_exec', 't')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (sid, expected) in [("chat_tools", Unknown), ("chat_plain", Ordinary)] {
+            let (_, _, source_ref) = manager
+                .chat_memory_prelude("run_chat", Some(sid), "hello", false)
+                .await
+                .unwrap();
+            assert_eq!(source_ref.classification, expected, "{sid}");
+        }
+        sqlx::raw_sql("DROP TABLE session_tool_result_origins")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .chat_memory_prelude("run_chat", Some("chat_tools"), "hello", false)
+                .await
+                .is_err()
         );
     }
 
