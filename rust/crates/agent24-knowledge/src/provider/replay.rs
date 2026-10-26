@@ -70,6 +70,8 @@ pub struct Replayed<I: Ids> {
     pub highest: u64,
     /// The last record is a clean shutdown (A.4).
     pub shut_down: bool,
+    /// The number the next record takes: `start` for an empty log.
+    pub next: u64,
 }
 
 /// Replays `records` in the order read. The first number is `start`, the
@@ -92,6 +94,7 @@ pub fn replay<I: Ids>(
         runs: Vec::new(),
         highest: 0,
         shut_down: false,
+        next: start,
     };
     let mut slot: Option<Slot<I>> = None;
     for Record { seq, entry } in records {
@@ -122,6 +125,7 @@ pub fn replay<I: Ids>(
         }
     }
     if let Some(done) = slot {
+        out.next = done.seq.checked_add(1).ok_or(Damaged)?;
         settle(&mut out, done);
     }
     Ok(out)

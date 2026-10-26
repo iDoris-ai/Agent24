@@ -1,0 +1,195 @@
+#![allow(clippy::unwrap_used)]
+
+use super::*;
+use crate::provider::record::Of;
+use crate::provider::replay::{Entry, Record, replay};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct T;
+
+impl Ids for T {
+    type Profile = &'static str;
+    type Binding = u32;
+    type Run = u32;
+    type Principal = &'static str;
+    type Identity = &'static str;
+}
+
+type C = Change<T>;
+
+fn of(profile: &'static str, binding: u32) -> Of<T> {
+    Of { profile, binding }
+}
+
+fn bind(profile: &'static str, binding: u32) -> C {
+    C::Bind {
+        of: of(profile, binding),
+        identity: "i",
+        generation: 1,
+        confirmed: None,
+    }
+}
+
+/// One record per change, numbered from 1.
+fn log(changes: Vec<C>) -> Vec<Record<T>> {
+    (1..)
+        .zip(changes)
+        .map(|(seq, c)| Record {
+            seq,
+            entry: Entry::Changes(vec![c]),
+        })
+        .collect()
+}
+
+fn read(changes: Vec<C>) -> Option<Result<Replayed<T>, Damaged>> {
+    Some(replay(1, log(changes)))
+}
+
+fn unsaved(profile: &'static str) -> C {
+    C::Await {
+        profile,
+        awaited: Confirmation::UnsavedSettings,
+    }
+}
+
+const SEALED: Seal = Seal::Present { next: 1 };
+
+fn same(_: &Bound<T>) -> Found {
+    Found::Same
+}
+
+#[test]
+fn with_nothing_persisted_only_a_confirmed_first_install_starts_clean() {
+    let first = recover(None, Seal::Missing, true, &["a"], same);
+    assert_eq!(first, Recovery::FirstInstall);
+    // Not confirmed (FI-3b, FI-3f), or a seal with no log: damage.
+    let damaged = Recovery::Damaged {
+        writes: vec![
+            C::Off,
+            C::Prompt,
+            C::Unselect("a"),
+            C::Disable("a"),
+            unsaved("a"),
+        ],
+    };
+    assert_eq!(recover(None, Seal::Missing, false, &["a"], same), damaged);
+    assert_eq!(recover(None, SEALED, true, &["a"], same), damaged);
+}
+
+#[test]
+fn a_damaged_log_puts_every_profile_back_unselected_and_disabled() {
+    let out = recover(Some(Err(Damaged)), SEALED, false, &["a", "b"], same);
+    let writes = vec![
+        C::Off,
+        C::Prompt,
+        C::Unselect("a"),
+        C::Disable("a"),
+        unsaved("a"),
+        C::Unselect("b"),
+        C::Disable("b"),
+        unsaved("b"),
+    ];
+    assert_eq!(out, Recovery::Damaged { writes });
+}
+
+#[test]
+fn without_the_seal_the_state_is_tightened_globally() {
+    let changes = vec![C::On, bind("a", 1), bind("b", 2), C::Retire(of("b", 2))];
+    let state = replay(1, log(changes.clone())).unwrap();
+    let writes = vec![C::Off, C::Prompt, C::Retire(of("a", 1)), unsaved("a")];
+    let tightened = Recovery::Tightened {
+        state,
+        writes: writes.clone(),
+    };
+    assert_eq!(
+        recover(read(changes.clone()), Seal::Missing, false, &["a"], same),
+        tightened
+    );
+    // A seal past the log's end: records it had seen are gone (A.2).
+    let past = Seal::Present { next: 6 };
+    assert_eq!(
+        recover(read(changes.clone()), past, false, &["a"], same),
+        tightened
+    );
+    // At the end, or before it (loosenings since): the state stands.
+    for next in [5, 2] {
+        let seal = Seal::Present { next };
+        let out = recover(read(changes.clone()), seal, false, &["a"], same);
+        assert!(matches!(out, Recovery::Normal { retire, .. } if retire.is_empty()));
+    }
+}
+
+#[test]
+fn a_global_tightening_replayed_retires_everything_and_awaits_the_user() {
+    // A new binding awaiting `principal_changed` (FI-8i).
+    let changes = vec![
+        C::On,
+        C::Select("a"),
+        bind("a", 1),
+        C::Await {
+            profile: "a",
+            awaited: Confirmation::PrincipalChanged,
+        },
+        bind("b", 2),
+    ];
+    let Recovery::Tightened { writes, .. } = recover(
+        read(changes.clone()),
+        Seal::Missing,
+        false,
+        &["a", "b"],
+        same,
+    ) else {
+        panic!("not tightened");
+    };
+    let state = replay(1, log([changes, writes].concat())).unwrap();
+    assert!(state.off && state.prompt);
+    assert!(state.bindings.iter().all(|b| b.retired));
+    for p in ["a", "b"] {
+        let awaited = state.profiles[p].awaiting;
+        assert_eq!(awaited, Some(Confirmation::UnsavedSettings), "{p}");
+    }
+    // Once those writes are confirmed the seal is rebuilt: the next start
+    // recovers them as they are and prompts again (FI-8d).
+    let next = Seal::Present { next: state.next };
+    let out = recover(Some(Ok(state.clone())), next, false, &["a", "b"], same);
+    let retire = vec![];
+    assert_eq!(out, Recovery::Normal { state, retire });
+}
+
+#[test]
+fn a_binding_no_longer_configured_as_it_was_is_retired_at_restart() {
+    let changes = vec![
+        C::On,
+        bind("a", 1),
+        bind("b", 2),
+        bind("c", 3),
+        bind("d", 4),
+        bind("e", 5),
+        C::Retire(of("e", 5)),
+        C::Await {
+            profile: "d",
+            awaited: Confirmation::PrincipalChanged,
+        },
+        C::Remove("c"),
+    ];
+    let found = |b: &Bound<T>| match b.of.profile {
+        "a" => Found::Gone,
+        "b" | "d" | "e" => Found::OtherPrincipal,
+        _ => Found::Same,
+    };
+    let out = recover(read(changes), SEALED, false, &["a", "b", "c", "d"], found);
+    let Recovery::Normal { retire, .. } = out else {
+        panic!("not normal");
+    };
+    // Gone, another principal's login, or the profile removed. Not `d`: its
+    // principal is checked at confirmation. Not `e`: retired already.
+    let expected = vec![
+        C::Retire(of("a", 1)),
+        C::Retire(of("b", 2)),
+        C::Retire(of("c", 3)),
+    ];
+    assert_eq!(retire, expected);
+    // Logged out, or the same principal: it stands (FI-6g).
+    let out = recover(read(vec![bind("a", 1)]), SEALED, false, &["a"], same);
+    assert!(matches!(out, Recovery::Normal { retire, .. } if retire.is_empty()));
+}
