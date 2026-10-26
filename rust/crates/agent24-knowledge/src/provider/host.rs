@@ -1,16 +1,17 @@
 //! The Provider's orchestration (KB-C1-04 6c), pure like its parts: the
 //! profiles with their bindings, Knowledge Off and the ledger, driven by the
-//! user's switches, Off and On and a profile's disabling (CONTRACT-STATE-v1
-//! S1.10, S3.3). A tightening takes effect at once and is written; a loosening
-//! is written first and takes effect once confirmed persisted (I1, I2). The opposite action while a loosening is
-//! pending gives it up, and its offset is written instead.
+//! user's switches: Off and On, a profile's disabling and its selection
+//! (CONTRACT-STATE-v1 S1.10, S3.3). A tightening takes effect at once and is
+//! written; a loosening is written first and takes effect once confirmed
+//! persisted (I1, I2). The opposite action while a loosening is pending gives
+//! it up, and its offset is written instead.
 //!
 //! The caller runs the writes as [`super::journal`] orders them and reports
 //! each back. Identity changes, calls and the start follow in later slices.
 
 use std::collections::HashMap;
 
-use super::binding::Leave;
+use super::binding::{Activation, Leave};
 use super::connection::Round;
 use super::gate::CallId;
 use super::journal::{self, Attempt, Journal, Report, SealWrite, Written};
@@ -46,6 +47,7 @@ impl<I: Ids> Default for Output<I> {
 enum Loose<P> {
     On,
     Enable(P),
+    Select(P),
 }
 
 #[derive(Debug)]
@@ -145,6 +147,23 @@ impl<I: Ids> Host<I> {
         }
         let change = Change::Enable(id.clone());
         self.loosen(Loose::Enable(id.clone()), Scope::profile(id), change)
+    }
+
+    pub fn unselect(&mut self, id: I::Profile) -> Output<I> {
+        let change = Change::Unselect(id.clone());
+        // `Profile::leave` remembers the unselection.
+        self.tighten(id, Loose::Select, change, Leave::Unselect, |m| {
+            m.profile().selected()
+        })
+    }
+
+    pub fn select(&mut self, id: I::Profile) -> Result<(), Refused> {
+        match self.member(&id) {
+            Some(m) if !m.profile().selected() => {}
+            _ => return Ok(()),
+        }
+        let change = Change::Select(id.clone());
+        self.loosen(Loose::Select(id.clone()), Scope::profile(id), change)
     }
 
     /// A per-profile tightening: gives up the pending opposite, or else takes
@@ -285,6 +304,12 @@ impl<I: Ids> Host<I> {
             Loose::Enable(id) => {
                 if let Some(m) = self.member(&id) {
                     m.set_disabled(false);
+                    connect(m, off);
+                }
+            }
+            Loose::Select(id) => {
+                if let Some(m) = self.member(&id) {
+                    m.profile_mut().activate(Activation::Reselect);
                     connect(m, off);
                 }
             }
