@@ -79,13 +79,42 @@ impl<'de> Deserialize<'de> for PartialFailureCode {
 
 /// `retryable` is the item's own; without one it is not retried (R6.2).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(from = "RawPartialFailure")]
 pub struct PartialFailure {
     pub knowledge_base_id: String,
     pub code: PartialFailureCode,
-    #[serde(default, deserialize_with = "known")]
     pub reason: Option<PartialFailureReason>,
-    #[serde(default)]
     pub retryable: bool,
+}
+
+#[derive(Deserialize)]
+struct RawPartialFailure {
+    knowledge_base_id: String,
+    code: PartialFailureCode,
+    #[serde(default, deserialize_with = "known")]
+    reason: Option<PartialFailureReason>,
+    #[serde(default)]
+    retryable: bool,
+}
+
+/// The reasons R3.5 makes not retryable: an item that gives one is not
+/// retried, whatever its `retryable` says.
+pub(crate) fn never_retried(reason: Option<PartialFailureReason>) -> bool {
+    matches!(
+        reason,
+        Some(PartialFailureReason::IndexFailed | PartialFailureReason::UnsupportedKbType)
+    )
+}
+
+impl From<RawPartialFailure> for PartialFailure {
+    fn from(r: RawPartialFailure) -> Self {
+        Self {
+            retryable: r.retryable && !never_retried(r.reason),
+            knowledge_base_id: r.knowledge_base_id,
+            code: r.code,
+            reason: r.reason,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

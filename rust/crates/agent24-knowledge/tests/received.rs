@@ -130,6 +130,31 @@ fn a_partial_failure_outside_v1_keeps_its_own_retryable() {
     );
 }
 
+/// R3.5: `index_failed` and `unsupported_kb_type` are never retried, even
+/// when the item says otherwise; other reasons keep the item's own value.
+#[test]
+fn a_partial_failure_with_a_final_reason_is_not_retried() {
+    let mut v = body("search.partial.json");
+    let item = |reason: &str| {
+        json!({ "knowledge_base_id": format!("kb-{reason}"), "code": "unavailable",
+                "reason": reason, "retryable": true })
+    };
+    v["partial_failures"] = json!([
+        item("index_failed"),
+        item("unsupported_kb_type"),
+        item("overloaded")
+    ]);
+    let r = decode::<SearchResponse>(&v).unwrap();
+    let got: Vec<bool> = r
+        .partial_failures
+        .unwrap()
+        .as_slice()
+        .iter()
+        .map(|f| f.retryable)
+        .collect();
+    assert_eq!(got, [false, false, true]);
+}
+
 #[test]
 fn unknown_index_state_and_completeness_read_as_the_stricter_value() {
     let mut v = body("search.ok.json");
