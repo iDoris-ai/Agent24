@@ -1053,8 +1053,9 @@ mod tests {
     }
 
     /// A self-wake left from before 0024 carries `unknown`, not "created by
-    /// the user" (0026); a user's schedule still has no origin, and one
-    /// recorded between 0024 and 0026 keeps its own.
+    /// the user" (0026), and so does one deleted since whose run is left; a
+    /// user's schedule still has no origin, and one recorded between 0024
+    /// and 0026 keeps its own.
     #[tokio::test]
     async fn a_self_wake_from_before_0024_reads_as_unknown() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1091,6 +1092,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // A self-wake that fired and was then deleted: only its run is left.
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at, schedule_id) \
+             VALUES ('run_gone', 'completed', '{}', '{}', '2026-10-08T00:00:00Z', 'wake_gone')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         up_to(25).run(&pool).await.unwrap();
         schedule("wake_new", "self-wake")
             .execute(&pool)
@@ -1108,6 +1117,10 @@ mod tests {
         let origin = |id: &'static str| store.schedule_origin_classification(id);
         assert_eq!(
             origin("wake_old").await.unwrap(),
+            Some(SourceClassification::Unknown)
+        );
+        assert_eq!(
+            origin("wake_gone").await.unwrap(),
             Some(SourceClassification::Unknown)
         );
         assert_eq!(origin("sch_user").await.unwrap(), None);
