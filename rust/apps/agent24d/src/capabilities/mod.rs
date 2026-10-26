@@ -6,6 +6,7 @@
 mod mint;
 mod operations;
 mod revoke;
+mod route_policy;
 mod store;
 mod token;
 mod types;
@@ -14,6 +15,10 @@ mod watch;
 
 pub use mint::CreativeMintRequest;
 pub use operations::{Operation, ResourceScope};
+pub use route_policy::{
+    AssuranceLevel, RouteDecision, RoutePolicy, creative_route_permitted, decide, policies,
+    required_operation,
+};
 pub use store::CapabilityStore;
 pub use token::{CapabilityToken, MintedCapability};
 pub use types::{

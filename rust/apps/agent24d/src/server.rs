@@ -1,5 +1,6 @@
 //! HTTP server: router, auth middleware, ready line, graceful shutdown.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, MatchedPath, Path, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -70,6 +71,11 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// Namespaces that were actually mounted (including disabled and degraded).
+    /// Capability auth uses this when axum did not record a `MatchedPath`
+    /// (`nest_service` / fallback nests). Refused mounts are absent. Empty
+    /// until `serve` fills it, same ordering as `os_reports`.
+    pub module_namespaces: Arc<BTreeSet<String>>,
     /// Where installed (out-of-process) packages live on disk (ME-3a). Computed
     /// once at startup (`agent24_os_packages::packages_root`, same call `serve`
     /// already made) and injected through [`AppDeps`] — unlike `os_reports`, this
@@ -674,6 +680,7 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            module_namespaces: Arc::new(BTreeSet::new()),
             packages_root,
             // Empty for the same reason and until the same moment as `os_reports`
             // above — see that field's comment.
@@ -774,31 +781,7 @@ fn valid_scope_id(value: &str) -> bool {
 }
 
 fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
-    use crate::capabilities::Operation;
-    match operation {
-        Operation::ModelsAdmin => "models.admin",
-        Operation::WorkspaceCreate => "workspace.create",
-        Operation::WorkspaceRelease => "workspace.release",
-        Operation::HostLease => "host.lease",
-        Operation::ApprovalDecision => "approval.decision",
-        Operation::GrantManage => "grant.manage",
-        Operation::OverrideManage => "override.manage",
-        Operation::ScheduleManage => "schedule.manage",
-        Operation::ModuleAdmin => "module.admin",
-        Operation::CapabilityMint => "capability.mint",
-        Operation::CapabilityRevoke => "capability.revoke",
-        Operation::Shutdown => "shutdown",
-        Operation::ModelsRead => "models.read",
-        Operation::WorkspaceResolve => "workspace.resolve",
-        Operation::SessionCreate => "session.create",
-        Operation::SessionRead => "session.read",
-        Operation::SessionTranscript => "session.transcript",
-        Operation::RunCreate => "run.create",
-        Operation::RunRead => "run.read",
-        Operation::RunCancel => "run.cancel",
-        Operation::EventsRead => "events.read",
-        Operation::ApprovalStatusRead => "approval.status",
-    }
+    operation.action()
 }
 
 async fn mint_creative_capability(
@@ -946,86 +929,129 @@ async fn revoke_capability(
 /// This note lives beside the auth middleware rather than beside the proxy
 /// because the person adding such a header is reading this file
 /// (SPEC-ME3-OUT-OF-PROCESS §2.1).
-async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
+async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
     }
+    match state.auth_mode {
+        AuthMode::LegacySingleToken => legacy_auth(state, req, next).await,
+        AuthMode::Capabilities => capability_auth(state, req, next).await,
+    }
+}
+
+/// Single shared token. Does not consult the route catalog or assurance levels.
+async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match state.auth_mode {
-        AuthMode::LegacySingleToken => {
-            if bearer.is_some_and(|presented| {
-                constant_time_eq(presented.as_bytes(), state.token.as_bytes())
-            }) {
-                next.run(req).await
-            } else {
-                error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid bearer token",
-                )
-            }
+    if bearer
+        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
+    {
+        next.run(req).await
+    } else {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        )
+    }
+}
+
+/// Method + matched template → operation. Levels are metadata: they are not a
+/// deny input (2b). Unknown paths are answered here so a fallback cannot run
+/// unauthenticated. HEAD uses the GET row inside [`crate::capabilities::decide`].
+async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    match crate::capabilities::decide(&method, matched.as_deref(), &path, &state.module_namespaces)
+    {
+        crate::capabilities::RouteDecision::UnknownPath => {
+            error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
         }
-        AuthMode::Capabilities => {
-            let Some(store) = state.capabilities.as_ref() else {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "host_authority_unavailable",
-                    "Capability authority unavailable",
-                );
-            };
-            let Some(bearer) = bearer else {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid bearer token",
-                );
-            };
-            let operation = required_operation(req.method(), req.uri().path());
-            match store.validate_bearer(
-                bearer,
-                operation,
-                &crate::capabilities::Resource::global(),
-                crate::capabilities::unix_now(),
-            ) {
-                Ok(authorization) => {
-                    req.extensions_mut().insert(authorization);
-                    next.run(req).await
-                }
-                Err(
-                    crate::capabilities::CapabilityError::OperationDenied
-                    | crate::capabilities::CapabilityError::ResourceDenied
-                    | crate::capabilities::CapabilityError::HostRequired,
-                ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
-                Err(_) => error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid bearer token",
-                ),
-            }
+        crate::capabilities::RouteDecision::MethodNotAllowed => next.run(req).await,
+        crate::capabilities::RouteDecision::Mapped(policy)
+            if policy.level == crate::capabilities::AssuranceLevel::Public =>
+        {
+            next.run(req).await
+        }
+        crate::capabilities::RouteDecision::Mapped(policy) => {
+            authorize(
+                &state,
+                req,
+                next,
+                policy.operation,
+                policy.template,
+                &method,
+            )
+            .await
+        }
+        crate::capabilities::RouteDecision::Module { operation, .. } => {
+            let template = matched.as_deref().unwrap_or("");
+            authorize(&state, req, next, operation, template, &method).await
         }
     }
 }
 
-/// Capability policy is deliberately closed. Until durable workspace/session
-/// ownership lands, Creative can use only the global model catalogue. Every
-/// other existing or future route maps to a host-only operation by default.
-fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
-    use crate::capabilities::Operation;
-    if method == Method::GET && path == "/api/v1/models" {
-        Operation::ModelsRead
-    } else if method == Method::POST && path == "/api/v1/capabilities/creative" {
-        Operation::CapabilityMint
-    } else if method == Method::POST
-        && path.starts_with("/api/v1/capabilities/")
-        && path.ends_with("/revoke")
-    {
-        Operation::CapabilityRevoke
-    } else {
-        Operation::ModelsAdmin
+async fn authorize(
+    state: &AppState,
+    mut req: Request<Body>,
+    next: Next,
+    operation: crate::capabilities::Operation,
+    template: &str,
+    method: &Method,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_authority_unavailable",
+            "Capability authority unavailable",
+        );
+    };
+    let Some(bearer) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        );
+    };
+    match store.validate_bearer(
+        bearer,
+        operation,
+        &crate::capabilities::Resource::global(),
+        crate::capabilities::unix_now(),
+    ) {
+        Ok(authorization) => {
+            // R5: a Creative token that validates still cannot call a route
+            // this mapping newly exposed. Resource scope is not this gate.
+            if authorization.claims.audience == crate::capabilities::Audience::CreativeRuntime
+                && !crate::capabilities::creative_route_permitted(method, template)
+            {
+                return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
+            }
+            req.extensions_mut().insert(authorization);
+            next.run(req).await
+        }
+        Err(
+            crate::capabilities::CapabilityError::OperationDenied
+            | crate::capabilities::CapabilityError::ResourceDenied
+            | crate::capabilities::CapabilityError::HostRequired,
+        ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
+        Err(_) => error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        ),
     }
 }
 
@@ -2339,6 +2365,21 @@ pub async fn serve(
     // Hand the verdicts to the state BEFORE the router clones it, so `/api/v1/os`
     // can report what the mounter actually decided rather than re-deriving it.
     state.os_reports = Arc::new(reports);
+    state.module_namespaces = Arc::new(
+        state
+            .os_reports
+            .iter()
+            .filter(|report| {
+                matches!(
+                    report.outcome,
+                    crate::domain::MountOutcome::Mounted
+                        | crate::domain::MountOutcome::Disabled
+                        | crate::domain::MountOutcome::Degraded(_)
+                )
+            })
+            .map(|report| report.namespace.clone())
+            .collect(),
+    );
     // T8/ME-3g: same ordering reason as `os_reports` just above — `catalogue`
     // is still in scope (only borrowed by `mount_all`, never moved), so this is
     // a cheap O(n) derivation, not a second discovery pass.
@@ -3672,7 +3713,7 @@ pub(crate) mod tests {
         let res = build_router(capability_state)
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/not-a-route")
+                    .uri("/api/v1/models")
                     .header(header::AUTHORIZATION, "Bearer ")
                     .body(Body::empty())
                     .unwrap(),
@@ -3725,7 +3766,8 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(models.status(), StatusCode::OK);
 
-        let default_route = router
+        let unknown = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/not-a-route")
@@ -3735,8 +3777,21 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(default_route.status(), StatusCode::FORBIDDEN);
-        assert_eq!(body_json(default_route).await["error"]["code"], "forbidden");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(unknown).await["error"]["code"], "not_found");
+
+        let closed = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/usage")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(closed).await["error"]["code"], "forbidden");
     }
 
     #[tokio::test]
@@ -4039,7 +4094,6 @@ pub(crate) mod tests {
             ("GET", "/api/v1/approvals"),
             ("GET", "/api/v1/tools"),
             ("POST", "/api/v1/shutdown"),
-            ("GET", "/api/v1/future-unregistered-route"),
         ] {
             let response = router
                 .clone()
@@ -4055,13 +4109,247 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
         }
+
+        let unknown = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/future-unregistered-route")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn attached_probe() -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    fn concrete_path(template: &str) -> String {
+        let mut path = String::new();
+        let mut rest = template;
+        while let Some(start) = rest.find('{') {
+            path.push_str(&rest[..start]);
+            let end = rest[start..].find('}').expect("template brace");
+            path.push('x');
+            rest = &rest[start + end + 1..];
+        }
+        path.push_str(rest);
+        path
+    }
+
+    #[tokio::test]
+    async fn creative_is_refused_on_every_mapped_route_except_models() {
+        let (state, _host, creative) = capability_state().await;
+        let router = router_with_comm(state);
+        for policy in crate::capabilities::policies() {
+            let path = concrete_path(policy.template);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(policy.method)
+                        .uri(&path)
+                        .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let expect = if policy.template == "/api/v1/models"
+                || policy.level == crate::capabilities::AssuranceLevel::Public
+            {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(response.status(), expect, "{} {path}", policy.method);
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_head_follows_get_and_does_not_skip_auth() {
+        let (state, _host, creative) = capability_state().await;
+        let router = build_router(state);
+
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::UNAUTHORIZED);
+
+        let creative_models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(creative_models.status(), StatusCode::OK);
+
+        let usage = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/usage")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage.status(), StatusCode::FORBIDDEN);
+
+        let post_only = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/chat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_only.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn capability_unknown_method_is_405_and_unknown_path_does_not_run_fallback() {
+        let (mut state, host, creative) = capability_state().await;
+        let post_health = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/health")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_health.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        state.module_namespaces = Arc::new(BTreeSet::from(["/api/v1/probe".to_owned()]));
+        let router = Router::new()
+            .route("/api/v1/mounted/secret", get(attached_probe))
+            .fallback(attached_probe)
+            .layer(middleware::from_fn_with_state(state, auth));
+
+        let mounted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mounted/secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mounted.status(), StatusCode::NO_CONTENT);
+        let creative_mounted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mounted/secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(creative_mounted.status(), StatusCode::FORBIDDEN);
+
+        let namespace = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/probe/secret")
+                    .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(namespace.status(), StatusCode::NO_CONTENT);
+
+        for path in ["/api/v1/probe-x", "/api/v1/missing"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(body_json(response).await["error"]["code"], "not_found");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_head_health_stays_unauthorized() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn router_with_comm(state: AppState) -> Router {
+        let modules = Router::new().nest(
+            "/api/v1/comm",
+            agent24_comm::router(agent24_comm::CommState::unconfigured("coverage")),
+        );
+        build_router_with_modules(state, modules)
     }
 
     #[tokio::test]
     async fn attached_routes_are_host_only_in_capability_mode() {
         let (state, host, creative) = capability_state().await;
         let router = Router::new()
-            .fallback(|| async { StatusCode::NO_CONTENT })
+            .route("/api/v1/attached", get(attached_probe).post(attached_probe))
+            .route(
+                "/api/v1/attached/{name}",
+                axum::routing::patch(attached_probe).delete(attached_probe),
+            )
             .layer(middleware::from_fn_with_state(state, auth));
 
         for (method, path) in [
