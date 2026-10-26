@@ -107,12 +107,17 @@ pub(crate) fn pin_outside_dir(
     }))
 }
 
-/// macOS: one open of the whole path that fails on a symlink at any level
-/// (`O_NOFOLLOW_ANY`). Like a plain open, ancestors need only search
-/// permission; opening them one by one would need read permission on each.
+/// macOS 11 (Darwin 20) and later: one open of the whole path that fails on
+/// a symlink at any level (`O_NOFOLLOW_ANY`). Like a plain open, ancestors
+/// need only search permission. Older kernels ignore the flag without an
+/// error, so there the path is walked as elsewhere (each level then needs
+/// read permission: an approved write under an unreadable ancestor fails).
 #[cfg(target_os = "macos")]
 fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
     use std::os::unix::fs::OpenOptionsExt;
+    if !nofollow_any_is_honoured() {
+        return walk_without_following(path);
+    }
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
@@ -120,11 +125,36 @@ fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io:
     Ok(cap_std::fs::Dir::from_std_file(file))
 }
 
+/// Whether this kernel is Darwin 20 (macOS 11) or later, read once. An
+/// unreadable release counts as older: the walk is the closed direction.
+#[cfg(target_os = "macos")]
+fn nofollow_any_is_honoured() -> bool {
+    static HONOURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HONOURED.get_or_init(|| darwin_major().is_some_and(|major| major >= 20))
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_major() -> Option<u32> {
+    let name = rustix::system::uname();
+    name.release()
+        .to_str()
+        .ok()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Elsewhere: walked from the root, no level followed. cap-std opens each
 /// with `O_PATH` where there is one (Linux), so ancestors need only search
 /// permission there too.
 #[cfg(not(target_os = "macos"))]
 fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    walk_without_following(path)
+}
+
+/// The canonical path opened level by level from the root, following none.
+fn walk_without_following(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
     let mut dir = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
     for component in path.components() {
         if let Component::Normal(name) = component {
@@ -733,6 +763,24 @@ mod tests {
             "a level in between"
         );
         assert!(pin_outside_dir(PathBuf::from("relative")).is_err());
+    }
+
+    /// The walk used where `O_NOFOLLOW_ANY` is not honoured refuses a
+    /// symlink at any level as well (#1254 Codex round 3).
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_refuses_a_symlink_at_any_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (real, link) = (root.join("real"), root.join("link"));
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(walk_without_following(&real.join("sub")).is_ok());
+        assert!(walk_without_following(&link).is_err(), "the last level");
+        assert!(
+            walk_without_following(&link.join("sub")).is_err(),
+            "a level in between"
+        );
     }
 
     /// An ancestor the user may search but not read does not stop the pin,
