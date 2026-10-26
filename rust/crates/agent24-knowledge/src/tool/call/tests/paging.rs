@@ -96,15 +96,13 @@ fn a_cut_chunk_is_read_to_its_end_and_cited_whole() {
 
 #[test]
 fn a_page_of_another_text_leaves_the_first_page_as_current_text() {
-    let mut other_tag = page("二", None);
-    other_tag.segments[0].content_tag = "ct-chk-71-v2".into();
     let mut other_chunk = page("二", None);
     other_chunk.segments[0].chunk_id = "chk-72".into();
     let mut other_doc = page("二", None);
     other_doc.knowledge_id = "doc-8".into();
     let mut two = page("二", None);
     two.segments.push(two.segments[0].clone());
-    for second in [other_tag, other_chunk, other_doc, two] {
+    for second in [other_chunk, other_doc, two] {
         let backend = Pages::new(vec![Ok(page("一", Some("cur-1"))), Ok(second)]);
         assert_first_page(&rendered(&backend, cite()));
     }
@@ -155,6 +153,18 @@ fn a_page_refused_refuses_the_call_and_a_cancelled_one_cancels_it() {
         block(read(&backend, "run-1", &cite())),
         Err(Refused::Cancelled)
     );
+}
+
+#[test]
+fn a_page_of_the_chunk_under_another_tag_refuses_as_stale() {
+    let mut changed = page("二", None);
+    changed.segments[0].content_tag = "ct-chk-71-v2".into();
+    let backend = Pages::new(vec![Ok(page("一", Some("cur-1"))), Ok(changed)]);
+    let out = refused(block(read(&backend, "run-1", &cite())));
+    assert_eq!(out["code"], "stale");
+    assert_eq!(out["retryable"], false);
+    assert_eq!(out["advice"], "这段内容已经变化，请重新检索后再读取。");
+    assert!(!out.to_string().contains("ct-chk-71-v2"));
 }
 
 #[test]

@@ -284,11 +284,21 @@ fn refusal(kind: &'static str, failure: Failure) -> Refused {
         Failure::Unbound => ("knowledge_unbound".into(), None, false, UNBOUND),
         Failure::BindingStale => ("knowledge_binding_stale".into(), None, false, STALE),
     };
+    refused(kind, &code, reason.as_deref(), retryable, advice)
+}
+
+fn refused(
+    kind: &'static str,
+    code: &str,
+    reason: Option<&str>,
+    retryable: bool,
+    advice: &'static str,
+) -> Refused {
     let out = RefusalOut {
         kind,
         outcome: "refused",
-        code: &code,
-        reason: reason.as_deref(),
+        code,
+        reason,
         retryable,
         advice,
     };
@@ -328,9 +338,9 @@ pub async fn read(
 /// its last page, each page its own request, and join the pages into the
 /// whole chunk when every page names the same chunk and `content_tag`. Past
 /// [`PAGES_MAX`], on a cursor coming back or a page of another chunk, the
-/// first page stands as current text with its cursor. A page refused refuses
-/// the call, and one under another generation cancels it (S4.8): either way
-/// the first page is known to be no longer good.
+/// first page stands as current text with its cursor. A page refused or of
+/// another `content_tag` refuses the call, and one under another generation
+/// cancels it (S4.8): the first page is known to be no longer good.
 async fn read_on(
     backend: &dyn KnowledgeBackend,
     run_id: &str,
@@ -358,11 +368,14 @@ async fn read_on(
         let [s] = page.segments.as_slice() else {
             return Ok(None);
         };
-        let same = page.knowledge_id == first.knowledge_id
-            && s.chunk_id == segment.chunk_id
-            && s.content_tag == segment.content_tag;
-        if !same {
+        if page.knowledge_id != first.knowledge_id || s.chunk_id != segment.chunk_id {
             return Ok(None);
+        }
+        // The same chunk under another tag: its text changed (R5.1), as a
+        // `stale` would have said.
+        if s.content_tag != segment.content_tag {
+            let advice = server_advice(ErrorCode::Stale, None, false);
+            return Err(refused("knowledge.read", "stale", None, false, advice));
         }
         text.push_str(&s.text);
         let Some(more) = page.next_cursor else {
