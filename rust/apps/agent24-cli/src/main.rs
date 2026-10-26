@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod query;
 mod service;
 mod tui;
 
@@ -88,6 +89,31 @@ enum Command {
     Hw {
         #[command(subcommand)]
         action: HwAction,
+    },
+    /// 会话：列出或读取一条（只读）
+    Session {
+        #[command(subcommand)]
+        action: query::SessionAction,
+    },
+    /// 读取一条 run（只读）
+    Run {
+        #[command(subcommand)]
+        action: query::RunAction,
+    },
+    /// 个人记忆：列出断言或读取暂停开关（只读）
+    Memory {
+        #[command(subcommand)]
+        action: query::MemoryAction,
+    },
+    /// 定时任务：列出或读取一条（只读）
+    Schedule {
+        #[command(subcommand)]
+        action: query::ScheduleAction,
+    },
+    /// 本次 daemon 启动以来的 token / 费用（只读）
+    Usage {
+        #[arg(long, help = "原样输出 JSON 响应")]
+        json: bool,
     },
 }
 
@@ -2410,6 +2436,11 @@ async fn main() -> std::process::ExitCode {
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
         Command::Hw { action } => cmd_hw(action),
+        Command::Session { action } => query::session(action).await,
+        Command::Run { action } => query::run_cmd(action).await,
+        Command::Memory { action } => query::memory(action).await,
+        Command::Schedule { action } => query::schedule(action).await,
+        Command::Usage { json } => query::usage(json).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
