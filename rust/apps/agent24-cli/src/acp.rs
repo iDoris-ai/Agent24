@@ -642,6 +642,33 @@ mod tests {
         assert_eq!(checks, 0);
     }
 
+    #[tokio::test]
+    async fn another_runs_completion_or_cancellation_does_not_end_this_run() {
+        let mut other_completed = completed("run_2");
+        if let Ok(Event {
+            body: EventBody::RunCompleted(done),
+            ..
+        }) = &mut other_completed
+        {
+            done.usage.completion_tokens = 99;
+        }
+        let (result, _, checks) = relay(
+            vec![
+                other_completed,
+                event(EventBody::RunCancelled(
+                    agent24_protocol::RunCancelledPayload {
+                        run_id: "run_2".to_owned(),
+                    },
+                )),
+                completed("run_1"),
+            ],
+            || view(false),
+        )
+        .await;
+        assert_eq!(result.unwrap()["usage"]["outputTokens"], 2);
+        assert_eq!(checks, 1);
+    }
+
     #[test]
     fn extracts_only_text_prompt_parts_in_order() {
         let params = json!({
