@@ -1,32 +1,40 @@
 //! Offline gate for CLI commands that open `agent24.db` (CORE-5 D1).
 //! Lock, then dock markers, then open. An existing file is never migrated.
+//! A missing file is not created: there is nothing to revoke, export, or delete.
 
 use std::path::Path;
 
 const BUSY: &str = "busy: daemon.singleton.lock is held; database not opened";
 
-/// The returned file is the singleton lock. Keep it alive until the query ends.
+/// A database the caller may use, or proof that no database file exists.
 ///
-/// A missing `agent24.db` is initialized with [`agent24_store::Store::open`]
-/// (there is no old schema to upgrade — `os install`/`uninstall` must record
-/// a revocation before any daemon has created the file). An existing file
-/// uses [`agent24_store::Store::open_without_migration`].
-pub(crate) async fn open_offline_store(
-    data_dir: &Path,
-) -> Result<(agent24_store::Store, std::fs::File), String> {
+/// The file is the singleton lock. Keep the value alive until the query ends.
+pub(crate) enum OfflineDb {
+    /// `agent24.db` is absent. No consent or decision row can exist.
+    Absent(std::fs::File),
+    Ready(agent24_store::Store, std::fs::File),
+}
+
+/// Lock, refuse dock markers, then open an existing file without migrating it.
+///
+/// A missing `agent24.db` is [`OfflineDb::Absent`]. It is not created and no
+/// migration runs. Callers treat that as nothing to do.
+pub(crate) async fn open_offline_store(data_dir: &Path) -> Result<OfflineDb, String> {
     let lock = acquire(data_dir)?;
     let path = data_dir.join("agent24.db");
-    let opened = if path.is_file() {
-        agent24_store::Store::open_without_migration(&path).await
+    if path.is_file() {
+        let store = agent24_store::Store::open_without_migration(&path)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(OfflineDb::Ready(store, lock))
     } else if path.exists() {
-        return Err(format!(
+        Err(format!(
             "could not open {}: not a database file",
             path.display()
-        ));
+        ))
     } else {
-        agent24_store::Store::open(&path).await
-    };
-    Ok((opened.map_err(|err| err.to_string())?, lock))
+        Ok(OfflineDb::Absent(lock))
+    }
 }
 
 fn acquire(data_dir: &Path) -> Result<std::fs::File, String> {

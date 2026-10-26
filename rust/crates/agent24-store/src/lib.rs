@@ -182,32 +182,28 @@ impl Store {
     ///
     /// A separate function, not a flag on [`Store::open`]: the daemon keeps
     /// migrating, and an offline caller cannot forget the flag. A missing
-    /// file is schema 0 and is not created. Any other `_sqlx_migrations`
-    /// version closes the pool and returns; no migration runs.
+    /// file is schema 0 and is not created. The applied version is read on a
+    /// read-only connection that does not set `journal_mode` and does not
+    /// create the file. Only a matching version opens the read-write pool.
+    /// `journal_mode=WAL` rewrites the database header and creates `-wal` /
+    /// `-shm`, so a mismatched DELETE file must be refused before that.
     pub async fn open_without_migration(path: &Path) -> Result<Self> {
         let latest = embedded_schema_version();
         if !path.exists() {
             return Err(StoreError::SchemaBehind { current: 0, latest });
         }
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(sqlite_file_options(path, false)?)
-            .await?;
-        let current = match applied_schema_version(&pool).await {
-            Ok(version) => version,
-            Err(err) => {
-                pool.close().await;
-                return Err(err);
-            }
-        };
+        let current = schema_version_readonly(path).await?;
         if current != latest {
-            pool.close().await;
             return Err(if current < latest {
                 StoreError::SchemaBehind { current, latest }
             } else {
                 StoreError::SchemaAhead { current, latest }
             });
         }
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(sqlite_file_options(path, false)?)
+            .await?;
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
         Ok(Self {
             pool,
@@ -248,6 +244,28 @@ fn sqlite_file_options(path: &Path, create_if_missing: bool) -> Result<SqliteCon
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true),
     )
+}
+
+/// Read `_sqlx_migrations` without changing the file.
+///
+/// `mode=ro` / [`SqliteConnectOptions::read_only`] and no `journal_mode`.
+/// `create_if_missing` stays false.
+fn sqlite_readonly_options(path: &Path) -> Result<SqliteConnectOptions> {
+    Ok(
+        SqliteConnectOptions::from_str(&format!("sqlite://{}?mode=ro", path.display()))?
+            .read_only(true)
+            .create_if_missing(false),
+    )
+}
+
+async fn schema_version_readonly(path: &Path) -> Result<i64> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlite_readonly_options(path)?)
+        .await?;
+    let current = applied_schema_version(&pool).await;
+    pool.close().await;
+    current
 }
 
 fn embedded_schema_version() -> i64 {
@@ -405,5 +423,104 @@ pub mod test_hooks {
         .execute(store.pool())
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod open_without_migration_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::str::FromStr;
+
+    fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    }
+
+    async fn delete_mode_database(path: &std::path::Path, ahead: bool) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete)
+                .foreign_keys(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let latest = super::embedded_schema_version();
+        let mut migrator = sqlx::migrate!("./migrations");
+        if !ahead {
+            migrator.migrations = migrator
+                .migrations
+                .iter()
+                .filter(|migration| migration.version < latest)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
+        }
+        migrator.run(&pool).await.unwrap();
+        if ahead {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+                 VALUES (?, 'test schema ahead', 1, ?, 0)",
+            )
+            .bind(latest + 1)
+            .bind(Vec::<u8>::new())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        pool.close().await;
+        assert!(
+            !sidecar(path, "-wal").exists() && !sidecar(path, "-shm").exists(),
+            "DELETE fixture must not already have WAL sidecars"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_without_migration_rejects_a_delete_mode_mismatch_without_rewriting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for ahead in [false, true] {
+            let path = dir
+                .path()
+                .join(if ahead { "ahead.db" } else { "behind.db" });
+            delete_mode_database(&path, ahead).await;
+            let before = std::fs::read(&path).unwrap();
+            let err = match super::Store::open_without_migration(&path).await {
+                Ok(_) => panic!("mismatched schema must be refused"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            if ahead {
+                assert!(message.contains("newer"), "{message}");
+            } else {
+                assert!(message.contains("请先启动 daemon"), "{message}");
+            }
+            assert_eq!(
+                before,
+                std::fs::read(&path).unwrap(),
+                "refusing {message} must not rewrite the database header"
+            );
+            assert!(
+                !sidecar(&path, "-wal").exists(),
+                "refusing a DELETE database must not create a -wal sidecar"
+            );
+            assert!(
+                !sidecar(&path, "-shm").exists(),
+                "refusing a DELETE database must not create a -shm sidecar"
+            );
+        }
     }
 }

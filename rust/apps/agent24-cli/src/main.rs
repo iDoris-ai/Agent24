@@ -855,36 +855,11 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
     };
     match action {
         OsAction::Install { path } => {
-            Some(match agent24_os_packages::install::install(path, &root) {
-                Ok(dest) => {
-                    // Package replacement revokes earlier consent. A failure
-                    // is reported (and makes the command fail) only after the
-                    // lines below, which stay true either way: the files ARE
-                    // installed.
-                    let revoked = match dest.file_name().and_then(|n| n.to_str()) {
-                        Some(module) => invalidate_module_consents(module).await,
-                        None => Err(format!(
-                            "could not revoke module consent: {} has no usable module name",
-                            dest.display()
-                        )),
-                    };
-                    println!("installed {}", dest.display());
-                    println!(
-                        "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
-                    );
-                    // Said out loud because the isolation is deliberate and
-                    // therefore permanent: an ephemeral daemon (`agent24 chat`
-                    // with nothing running) resolves a different packages root
-                    // and will never see this package. Without this line the two
-                    // lines above are, for that user, a promise that never comes
-                    // true.
-                    println!(
-                        "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
-                    );
-                    revoked.map_err(|e| consent_revocation_failed_message(&e))
-                }
-                Err(e) => Err(e.to_string()),
-            })
+            // `attach_only` is `None` for capabilities mode. The consent step
+            // must finish (or be shown impossible) before `install` writes.
+            let state = state_file::state_dir();
+            let online = attach_only().await;
+            Some(install_with_consent(path, &root, state.as_deref(), online.as_ref()).await)
         }
         // Handled before this function is ever called; see `cmd_uninstall`.
         OsAction::Uninstall { .. } => None,
@@ -892,38 +867,85 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
     }
 }
 
-/// `agent24 os uninstall` — file removal decides success or failure by
-/// itself (unchanged contract: works with the daemon down); hot-disable
-/// (FU-61) is a best-effort step tried ONLY after a real removal, whose
-/// outcome can only add an informational line, never flip the `Result` this
-/// function already decided. The one thing that CAN turn a real removal
-/// into an `Err` is a failed consent revocation (ADR-K1-03 §3, fail-closed):
-/// the removal still stands and the hot stop is still tried, but the command
-/// must not report success while the consent may still be live. This split (rather than folding into
-/// `os_local`) exists because the daemon call needs the REAL `bool`
-/// `install::uninstall` returns (was something actually removed just now?)
-/// — `os_local`'s shared `Option<Result<(), String>>` shape has nowhere to
-/// carry that.
+/// `agent24 os uninstall`. Consent is revoked before any file is removed.
+/// A failed revocation leaves the package where it is and fails the command,
+/// so a retry cannot report success just because the package is already gone.
+/// A package that is not installed is still success and does not open the
+/// store. Hot-disable (FU-61) runs only after a real removal.
 async fn cmd_uninstall(name: &str) -> Result<(), String> {
     let root = packages_root()?;
-    match agent24_os_packages::install::uninstall(name, &root) {
-        Err(e) => Err(e.to_string()), // nothing removed: no hot-stop, ever
+    let state = state_file::state_dir();
+    let online = attach_only().await;
+    uninstall_with_consent(name, &root, state.as_deref(), online.as_ref()).await
+}
+
+/// Package files stay untouched until consent revocation has succeeded.
+/// `online == None` is what capabilities mode produces (`attach_only`).
+async fn install_with_consent(
+    src: &std::path::Path,
+    packages_root: &std::path::Path,
+    state_dir: Option<&std::path::Path>,
+    online: Option<&Endpoint>,
+) -> Result<(), String> {
+    let module =
+        agent24_os_packages::install::source_module_name(src).map_err(|e| e.to_string())?;
+    if agent24_os_packages::install::package_is_installed(&module, packages_root)
+        .map_err(|e| e.to_string())?
+    {
+        return Err(
+            agent24_os_packages::install::InstallError::AlreadyInstalled(module).to_string(),
+        );
+    }
+    // Revoke before `install` creates directories. A busy or docked gate must
+    // leave the packages root byte-for-byte unchanged.
+    revoke_module_consent(&module, state_dir, online).await?;
+    match agent24_os_packages::install::install(src, packages_root) {
+        Ok(dest) => {
+            println!("installed {}", dest.display());
+            println!(
+                "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+            );
+            // An ephemeral daemon (`agent24 chat` with nothing running)
+            // resolves a different packages root and will never see this
+            // package.
+            println!(
+                "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Removal happens only after consent revocation succeeds. A missing package
+/// is still a success and does not touch the store: there is nothing to revoke
+/// that this command would have left behind.
+async fn uninstall_with_consent(
+    name: &str,
+    packages_root: &std::path::Path,
+    state_dir: Option<&std::path::Path>,
+    online: Option<&Endpoint>,
+) -> Result<(), String> {
+    match agent24_os_packages::install::package_is_installed(name, packages_root) {
+        Err(e) => return Err(e.to_string()),
         Ok(false) => {
-            // Not an error: the end state the operator asked for is the one
-            // they have. Saying so beats a failure they must decide to
-            // ignore. Idempotent: nothing NEW was removed, so there is
-            // nothing for a hot-stop to respond to.
+            println!("{name} was not installed; nothing to remove");
+            return Ok(());
+        }
+        Ok(true) => {}
+    }
+    revoke_module_consent(name, state_dir, online).await?;
+    match agent24_os_packages::install::uninstall(name, packages_root) {
+        Err(e) => Err(e.to_string()),
+        Ok(false) => {
             println!("{name} was not installed; nothing to remove");
             Ok(())
         }
         Ok(true) => {
             println!("removed {name}");
             println!("  it takes effect at the next daemon start");
-            let revoked = invalidate_module_consents(name).await;
-            // Still tried when the revocation failed: the module must stop
-            // serving either way.
             hot_disable_best_effort(name).await;
-            revoked.map_err(|e| consent_revocation_failed_message(&e))
+            Ok(())
         }
     }
 }
@@ -936,14 +958,24 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
 ///
 /// An attached daemon uses `DELETE /api/v1/module-consents/modules/{module}`
 /// and does not open the database. Otherwise this uses the offline gate.
-async fn invalidate_module_consents(name: &str) -> Result<(), String> {
-    if let Some(ep) = attach_only().await {
-        return revoke_module_consents_online(&ep, name).await;
-    }
-    invalidate_module_consents_in(state_file::state_dir().as_deref(), name).await
+async fn revoke_module_consent(
+    name: &str,
+    state_dir: Option<&std::path::Path>,
+    online: Option<&Endpoint>,
+) -> Result<(), String> {
+    let revoked = if let Some(ep) = online {
+        revoke_module_consents_online(ep, name, state_dir).await
+    } else {
+        invalidate_module_consents_in(state_dir, name).await
+    };
+    revoked.map_err(|e| consent_revocation_failed_message(&e))
 }
 
-async fn revoke_module_consents_online(ep: &Endpoint, name: &str) -> Result<(), String> {
+async fn revoke_module_consents_online(
+    ep: &Endpoint,
+    name: &str,
+    state_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
     let url = format!("{}/api/v1/module-consents/modules/{name}", ep.base);
     match bearer(ep, client().delete(url))
         .timeout(Duration::from_secs(10))
@@ -967,14 +999,12 @@ async fn revoke_module_consents_online(ep: &Endpoint, name: &str) -> Result<(), 
         }
         // Connection failure may use the offline gate. A live daemon holds
         // the lock, so that path returns busy and does not open the database.
-        Err(err) => {
-            match invalidate_module_consents_in(state_file::state_dir().as_deref(), name).await {
-                Ok(()) => Ok(()),
-                Err(offline) => Err(format!(
-                    "could not reach the daemon to revoke {name} module consent ({err}); {offline}"
-                )),
-            }
-        }
+        Err(err) => match invalidate_module_consents_in(state_dir, name).await {
+            Ok(()) => Ok(()),
+            Err(offline) => Err(format!(
+                "could not reach the daemon to revoke {name} module consent ({err}); {offline}"
+            )),
+        },
     }
 }
 
@@ -988,21 +1018,23 @@ async fn invalidate_module_consents_in(
         ));
     };
     // `_lock` must outlive the query: dropping it releases the singleton lock.
-    let (store, _lock) = offline_db::open_offline_store(dir).await.map_err(|err| {
+    // No database file means there is no consent row to revoke, and this must
+    // not create one.
+    match offline_db::open_offline_store(dir).await.map_err(|err| {
         format!("could not open the consent store to revoke {name} module consent: {err}")
-    })?;
-    store
-        .invalidate_module_consents(name)
-        .await
-        .map_err(|err| format!("could not revoke {name} module consent: {err}"))
+    })? {
+        offline_db::OfflineDb::Absent(_lock) => Ok(()),
+        offline_db::OfflineDb::Ready(store, _lock) => store
+            .invalidate_module_consents(name)
+            .await
+            .map_err(|err| format!("could not revoke {name} module consent: {err}")),
+    }
 }
 
-/// The error a package lifecycle command ends with when its consent
-/// revocation did not land: the file change already happened (and was
-/// printed), but the command must not report success.
+/// Consent revocation did not land. Package files have not been changed.
 fn consent_revocation_failed_message(why: &str) -> String {
     format!(
-        "{why}\n  the package change above was made, but an earlier consent for this module may \
+        "{why}\n  the package files were not changed; an earlier consent for this module may \
          still be recorded; fix the state store and re-run the command"
     )
 }
@@ -1185,19 +1217,45 @@ async fn cmd_decide_in(dir: &std::path::Path, action: DecideAction) -> Result<()
         DecideAction::Delete { .. } => {}
     }
     // `_lock` must outlive the query: dropping it releases the singleton lock.
-    let (store, _lock) = offline_db::open_offline_store(dir).await?;
-    match action {
-        DecideAction::Export { point, since, .. } => {
-            let rows = store
-                .export_decision_log(point.as_deref(), since.as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
-            for row in &rows {
-                println!("{}", decision_log_export_line(row)?);
+    match offline_db::open_offline_store(dir).await? {
+        // Nothing was ever recorded, so export is an empty set and delete
+        // removes nothing. Do not create `agent24.db`.
+        offline_db::OfflineDb::Absent(_lock) => decide_without_database(action),
+        offline_db::OfflineDb::Ready(store, _lock) => match action {
+            DecideAction::Export { point, since, .. } => {
+                let rows = store
+                    .export_decision_log(point.as_deref(), since.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for row in &rows {
+                    println!("{}", decision_log_export_line(row)?);
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        DecideAction::Delete { action } => cmd_decide_delete(&store, action).await,
+            DecideAction::Delete { action } => cmd_decide_delete(&store, action).await,
+        },
+    }
+}
+
+/// Same operator-visible outcome as an empty decision log, without a store.
+fn decide_without_database(action: DecideAction) -> Result<(), String> {
+    match action {
+        DecideAction::Export { .. } => Ok(()),
+        DecideAction::Delete { action } => match action {
+            DecideDeleteAction::Id { .. } => {
+                println!("no decision with that id");
+                Ok(())
+            }
+            DecideDeleteAction::Point { point } => {
+                println!("deleted 0 decision(s) at point {point:?}");
+                Ok(())
+            }
+            DecideDeleteAction::All { confirm } => {
+                require_confirm(confirm)?;
+                println!("deleted 0 decision(s)");
+                Ok(())
+            }
+        },
     }
 }
 
@@ -2590,6 +2648,183 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "decide delete must remove the seeded row"
+        );
+    }
+
+    fn write_domain_package(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 requires_models: []\nrequires_apis: []\nrequires_deps: []\n\
+                 kernel_capabilities: []\nimpl_kind: in_process_crate\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Every directory and file under `root`, in order. Directory entries end
+    /// with `/` and carry no bytes, so an added or removed directory is visible
+    /// even when it is empty. File bytes are the contents, not a size.
+    fn package_tree(root: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn walk(
+            base: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut Vec<(String, Option<Vec<u8>>)>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap())
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.file_type().is_symlink() {
+                    let target = std::fs::read_link(&path).unwrap();
+                    out.push((
+                        rel,
+                        Some(target.to_string_lossy().into_owned().into_bytes()),
+                    ));
+                } else if meta.is_dir() {
+                    out.push((format!("{rel}/"), None));
+                    walk(base, &path, out);
+                } else {
+                    out.push((rel, Some(std::fs::read(&path).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if root.exists() {
+            walk(root, root, &mut out);
+        }
+        out
+    }
+
+    fn assert_busy(result: Result<(), String>) -> String {
+        let err = result.expect_err("install/uninstall must fail while the lock is held");
+        assert!(err.contains("busy:"), "expected busy, got {err}");
+        err
+    }
+
+    /// Capabilities mode makes `attach_only` return `None`. This passes that
+    /// `None` in directly and holds `daemon.singleton.lock` in another process.
+    #[tokio::test]
+    async fn install_and_uninstall_stay_busy_and_leave_every_package_entry_unchanged() {
+        let state = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let installed_src = sources.path().join("busyun");
+        let fresh_src = sources.path().join("busyinst");
+        write_domain_package(&installed_src, "busyun");
+        write_domain_package(&fresh_src, "busyinst");
+
+        install_with_consent(&installed_src, packages.path(), Some(state.path()), None)
+            .await
+            .unwrap();
+        let before = package_tree(packages.path());
+        assert!(
+            before.iter().any(|(rel, _)| rel == "busyun/"),
+            "setup must install busyun: {before:?}"
+        );
+        assert!(
+            before.iter().all(|(rel, _)| !rel.starts_with("busyinst")),
+            "busyinst must not be installed yet"
+        );
+
+        let _holder = hold_singleton(state.path());
+
+        assert_busy(
+            install_with_consent(&fresh_src, packages.path(), Some(state.path()), None).await,
+        );
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "a busy install must not add, remove, or rewrite any package entry"
+        );
+        assert_busy(
+            install_with_consent(&fresh_src, packages.path(), Some(state.path()), None).await,
+        );
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "retrying a busy install must still change nothing"
+        );
+
+        assert_busy(
+            uninstall_with_consent("busyun", packages.path(), Some(state.path()), None).await,
+        );
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "a busy uninstall must not remove or rewrite any package entry"
+        );
+        let retry =
+            uninstall_with_consent("busyun", packages.path(), Some(state.path()), None).await;
+        assert_busy(retry);
+        assert_eq!(
+            before,
+            package_tree(packages.path()),
+            "retrying a busy uninstall must stay busy and leave the package in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_database_consent_export_and_delete_succeed_without_creating_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = db_snapshot(dir.path());
+        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Export {
+                jsonl: true,
+                point: None,
+                since: None,
+            },
+        )
+        .await
+        .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::Id {
+                    decision_id: "missing".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::Point {
+                    point: "retain.intent".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::All { confirm: true },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            absent,
+            db_snapshot(dir.path()),
+            "a missing database has nothing to revoke, export, or delete, so no file is created"
         );
     }
 
