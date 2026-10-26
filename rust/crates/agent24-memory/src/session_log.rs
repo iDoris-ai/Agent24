@@ -59,20 +59,18 @@ fn system_origin(source: &str) -> Origin {
 }
 
 impl SessionLog {
-    /// Uses a pool connected to a database already migrated by `KvStore`.
-    pub fn new(pool: SqlitePool) -> Self {
+    /// Uses a pool connected to a database already migrated by `KvStore`. The
+    /// disk gate is a REQUIRED argument so a caller cannot get an ungated log by
+    /// omission; pass `DiskGate::disabled()` explicitly to opt out (tests,
+    /// ephemeral pools). Production code gets a gated one from
+    /// `KvStore::session_log()`.
+    pub fn new(pool: SqlitePool, gate: crate::disk_gate::DiskGate) -> Self {
         Self {
             pool,
-            gate: crate::disk_gate::DiskGate::disabled(),
+            gate,
             #[cfg(test)]
             probe: None,
         }
-    }
-
-    /// Attach the pre-write disk check (P1-02c c4).
-    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
-        self.gate = gate;
-        self
     }
 
     /// The caller's stable turn number distinguishes repeated identical user

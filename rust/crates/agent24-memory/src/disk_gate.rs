@@ -15,9 +15,20 @@
 //! also covers a probe that failed (the gate fails OPEN: an unreadable volume
 //! never blocks a write that SQLite itself would accept).
 //!
-//! The gate is checked once at the entry of each public write operation, BEFORE
-//! its transaction opens, so a refused write leaves no row and a write that is
-//! allowed is not checked again by the inner `append_tx` calls.
+//! The gate is checked at the entry of each write operation, BEFORE its
+//! transaction opens, so a refused write leaves no row and a write that is
+//! allowed is not checked again by the inner `append_tx` calls. A batch API
+//! (`WriteGate::propose`) checks before each item's own transaction.
+//!
+//! **Fail-open on probe errors (accepted trade-off):** if the volume cannot be
+//! read (statvfs error, non-unix platform until PLT-WIN lands) the write is NOT
+//! blocked and a warning is logged; `SQLITE_FULL` -> `memory_disk_full` is the
+//! backstop.
+//!
+//! **CI note:** tests that use `KvStore::open` run against the REAL probe, so a
+//! CI disk with under 512 MiB free would refuse content writes with
+//! `memory_disk_low`. Tests that need deterministic behaviour inject a fake
+//! probe with `KvStore::with_disk_gate`.
 //! An ephemeral (`:memory:`) store has no volume and gets [`DiskGate::disabled`].
 
 use std::io;

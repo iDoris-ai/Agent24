@@ -485,7 +485,7 @@ impl KvStore {
 
     /// A session event-log writer over this store's database.
     pub fn session_log(&self) -> session_log::SessionLog {
-        session_log::SessionLog::new(self.pool.clone()).with_gate(self.disk.clone())
+        session_log::SessionLog::new(self.pool.clone(), self.disk.clone())
     }
 
     /// An [`artifact::ArtifactCas`] over the SAME database file — MD-2b's
@@ -551,18 +551,19 @@ impl KvStore {
     /// consolidation loop, with the default deterministic [`consolidator::CountSynth`].
     pub fn consolidator(&self) -> consolidator::EventConsolidator<consolidator::CountSynth> {
         consolidator::EventConsolidator::new(self.pool.clone(), consolidator::CountSynth)
+            .with_gate(self.disk.clone())
     }
 
     /// An [`knowledge::InstructionStore`] over the SAME database file — MD-7's
     /// layered instruction/knowledge layer with a review-gated auto-memory inbox.
     pub fn knowledge(&self) -> knowledge::InstructionStore {
-        knowledge::InstructionStore::new(self.pool.clone())
+        knowledge::InstructionStore::new(self.pool.clone()).with_gate(self.disk.clone())
     }
 
     /// A [`trace::SymbolicTrace`] over the SAME database file — MD-8's symbolic
     /// task trace (full bodies spilled to refs, prompt keeps symbols + drill-down).
     pub fn trace(&self) -> trace::SymbolicTrace {
-        trace::SymbolicTrace::new(self.pool.clone())
+        trace::SymbolicTrace::new(self.pool.clone()).with_gate(self.disk.clone())
     }
 
     /// A [`vector::VectorRetriever`] over the SAME database file with a chosen

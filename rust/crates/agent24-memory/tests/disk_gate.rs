@@ -10,10 +10,13 @@ use std::time::Duration;
 
 use agent24_memory::artifact::{Artifact, ArtifactStore};
 use agent24_memory::assertion::{Assertion, AssertionStore, Forget};
+use agent24_memory::consolidator::Consolidator;
 use agent24_memory::disk_gate::{
     CACHE_TTL, DiskGate, DiskProbe, DiskSample, GateClock, WriteClass,
 };
 use agent24_memory::event::{EventStore, MemEvent, Origin, Scope, Trust};
+use agent24_memory::knowledge::{Instruction, KnowledgeBase};
+use agent24_memory::trace::TaskTrace;
 use agent24_memory::writer::{Candidate, MemoryWriter};
 use agent24_memory::{KvStore, MemoryError, MemoryErrorCode, OsPartitionIdentity};
 use agent24_models::Msg;
@@ -359,4 +362,102 @@ async fn sqlite_full_maps_to_disk_full_on_content_and_retraction() {
             .await
             .unwrap_err();
     assert_eq!(err.code(), MemoryErrorCode::DiskFull, "retraction path");
+}
+
+fn candidate(id: &str) -> Candidate {
+    Candidate::new(
+        id,
+        Scope::owner(OWNER),
+        "user",
+        "prefers",
+        json!(id),
+        origin(),
+    )
+    .with_evidence(vec!["ev".into()])
+    .remember()
+}
+
+#[tokio::test]
+async fn low_disk_also_refuses_consolidator_knowledge_and_trace() {
+    let f = fixture().await;
+    f.set_free(100 * MIB);
+    let kv = &f.kv;
+    let rows = |t: &'static str| {
+        let f = &f;
+        async move { f.count(t).await }
+    };
+    let (cons, instr, trace) = (
+        rows("mem_consolidations").await,
+        rows("mem_instructions").await,
+        rows("mem_trace_refs").await,
+    );
+
+    let e = kv.consolidator().run_once(OWNER).await.unwrap_err();
+    assert_eq!(e.code(), MemoryErrorCode::DiskLow, "consolidator.run_once");
+
+    let i = Instruction::new("i1", OWNER, "user", 1, "be brief", vec![]);
+    let e = kv.knowledge().add_active(&i).await.unwrap_err();
+    assert_eq!(e.code(), MemoryErrorCode::DiskLow, "knowledge.add_active");
+    let e = kv.knowledge().propose(&i).await.unwrap_err();
+    assert_eq!(e.code(), MemoryErrorCode::DiskLow, "knowledge.propose");
+    let e = kv
+        .knowledge()
+        .approve("i1", OWNER, "user", 1)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), MemoryErrorCode::DiskLow, "knowledge.approve");
+
+    let e = kv
+        .trace()
+        .record(OWNER, "run1", 1, "tool", "sym", "body")
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), MemoryErrorCode::DiskLow, "trace.record");
+
+    assert_eq!(rows("mem_consolidations").await, cons);
+    assert_eq!(rows("mem_instructions").await, instr);
+    assert_eq!(rows("mem_trace_refs").await, trace);
+}
+
+/// A probe that reports plenty of space on its first reading and none after.
+struct FillsUpProbe(AtomicU64);
+
+impl DiskProbe for FillsUpProbe {
+    fn sample(&self, _db: &Path) -> io::Result<DiskSample> {
+        let n = self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(DiskSample {
+            free_bytes: if n == 0 { 10_000 * MIB } else { MIB },
+            wal_bytes: 0,
+        })
+    }
+}
+
+/// A clock that jumps past the cache TTL on every reading, so each gate check
+/// re-probes: this isolates "is the gate consulted per item" from the cache.
+struct JumpingClock(AtomicU64);
+
+impl GateClock for JumpingClock {
+    fn now(&self) -> Duration {
+        Duration::from_secs(self.0.fetch_add(10, Ordering::SeqCst))
+    }
+}
+
+#[tokio::test]
+async fn a_disk_that_fills_mid_batch_refuses_the_remaining_items() {
+    let f = fixture().await;
+    let path = f._dir.path().join("memory.sqlite");
+    let kv = f.kv.clone().with_disk_gate(DiskGate::with_probe(
+        &path,
+        Arc::new(FillsUpProbe(AtomicU64::new(0))),
+        Arc::new(JumpingClock(AtomicU64::new(0))),
+    ));
+    let before = f.count("mem_assertions").await;
+    let err = kv
+        .write_gate()
+        .propose(vec![candidate("b1"), candidate("b2"), candidate("b3")])
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), MemoryErrorCode::DiskLow);
+    // Item 1 committed before the disk filled; items 2 and 3 were refused.
+    assert_eq!(f.count("mem_assertions").await, before + 1);
 }

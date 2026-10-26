@@ -169,6 +169,9 @@ pub enum MemoryRpcError {
     /// P1-02c: SQLITE_FULL on the memory database. Maps to `-32603` carrying
     /// `data.code = memory_disk_full`, so a module can tell it from a bug.
     DiskFull,
+    /// P1-02c c4: the pre-write disk check refused the write. Same wire shape as
+    /// `DiskFull` but `data.code = memory_disk_low`.
+    DiskLow,
 }
 
 impl MemoryRpcError {
@@ -192,6 +195,10 @@ impl MemoryRpcError {
                 .with_data("dimension", serde_json::json!(dimension)),
             Self::DiskFull => RpcError::internal("the memory store has no free disk space")
                 .with_data("code", serde_json::json!("memory_disk_full")),
+            Self::DiskLow => {
+                RpcError::internal("the memory store volume is low on free disk space")
+                    .with_data("code", serde_json::json!("memory_disk_low"))
+            }
             Self::ReservedKind => RpcError::invalid_params(
                 "memory_reserved_kind: this kind is reserved by the kernel",
             )
@@ -242,6 +249,8 @@ pub(crate) fn map_memory_error(e: &MemoryError) -> MemoryRpcError {
             tracing::error!(error = %other, "memory storage error");
             if code == agent24_memory::MemoryErrorCode::DiskFull {
                 MemoryRpcError::DiskFull
+            } else if code == agent24_memory::MemoryErrorCode::DiskLow {
+                MemoryRpcError::DiskLow
             } else {
                 MemoryRpcError::Store("an internal memory storage error occurred".into())
             }
@@ -850,6 +859,14 @@ mod tests {
         assert_eq!(rpc.code, -32603);
         assert_eq!(rpc.data.as_ref().unwrap()["code"], "memory_disk_full");
         assert!(!rpc.message.contains("full database"), "{}", rpc.message);
+        assert!(!rpc.message.contains("sqlite"), "{}", rpc.message);
+    }
+
+    #[test]
+    fn disk_low_maps_to_a_typed_memory_disk_low_rpc_error_not_internal() {
+        let rpc = map_memory_error(&MemoryError::DiskLow).into_rpc_error();
+        assert_eq!(rpc.code, -32603);
+        assert_eq!(rpc.data.as_ref().unwrap()["code"], "memory_disk_low");
         assert!(!rpc.message.contains("sqlite"), "{}", rpc.message);
     }
 
