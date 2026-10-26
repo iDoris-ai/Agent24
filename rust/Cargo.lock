@@ -39,6 +39,7 @@ dependencies = [
 name = "agent24-cli"
 version = "0.5.1"
 dependencies = [
+ "agent24-documents-client",
  "agent24-hw",
  "agent24-mcp",
  "agent24-os-packages",
@@ -127,6 +128,7 @@ dependencies = [
 name = "agent24-documents-client"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
