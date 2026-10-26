@@ -20,8 +20,11 @@
 //! 2. last success < `min_interval` -> skip
 //! 3. a busy result backs off one `idle_after` (no retry bombardment)
 //! 4. empty WAL                     -> skip
-//! 5. otherwise `PRAGMA wal_checkpoint(TRUNCATE)` with `busy_timeout = 0`:
-//!    a reader pinning the WAL yields `busy`, never a wait and never an error.
+//! 5. `PRAGMA wal_checkpoint(PASSIVE)` first (backfill without the writer
+//!    lock); only if it finished everything (`log == checkpointed`, not busy)
+//!    follow with `TRUNCATE`, which then holds the writer lock only briefly.
+//!    Otherwise the round is `partial`/`busy` and waits for the next window.
+//!    `busy_timeout = 0`: a pinned reader is an answer, never a wait or error.
 //!
 //! Results go to `tracing` only (counters + WAL size before/after).
 
@@ -70,7 +73,12 @@ pub enum SkipReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickOutcome {
     Skipped(SkipReason),
-    /// A reader held the WAL; retried after the next idle window.
+    /// Partial: PASSIVE could not backfill everything (a reader pins older
+    /// frames); TRUNCATE was NOT issued.
+    Partial {
+        wal_before: u64,
+    },
+    /// A lock was unavailable; retried after the next idle window.
     Busy {
         wal_before: u64,
     },
@@ -91,6 +99,8 @@ pub struct WalMaintainer {
     retry_not_before: Option<Instant>,
     busy_total: u64,
     ok_total: u64,
+    partial_total: u64,
+    truncate_attempts: u64,
 }
 
 impl KvStore {
@@ -102,14 +112,18 @@ impl KvStore {
         cfg: WalMaintenanceConfig,
         now: Instant,
     ) -> Result<Option<WalMaintainer>> {
-        let mut conn = self.pool.acquire().await?.detach();
+        // Decide file-vs-memory on a POOLED connection and only then detach:
+        // an in-memory pool's single connection IS the database, and
+        // detaching it would destroy the store for everyone else.
+        let mut pooled = self.pool.acquire().await?;
         let file: Option<String> =
             sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-                .fetch_optional(&mut conn)
+                .fetch_optional(&mut *pooled)
                 .await?;
         let Some(file) = file.filter(|f| !f.is_empty()) else {
             return Ok(None);
         };
+        let mut conn = pooled.detach();
         // Never wait on a reader: busy is an answer, not a stall.
         sqlx::query("PRAGMA busy_timeout = 0")
             .execute(&mut conn)
@@ -127,6 +141,8 @@ impl KvStore {
             retry_not_before: None,
             busy_total: 0,
             ok_total: 0,
+            partial_total: 0,
+            truncate_attempts: 0,
         }))
     }
 }
@@ -150,8 +166,40 @@ impl WalMaintainer {
         self.ok_total
     }
 
+    pub fn partial_total(&self) -> u64 {
+        self.partial_total
+    }
+
+    /// How many times TRUNCATE was actually issued (PASSIVE excluded).
+    pub fn truncate_attempts(&self) -> u64 {
+        self.truncate_attempts
+    }
+
     fn wal_bytes(&self) -> u64 {
         std::fs::metadata(&self.wal_path).map_or(0, |m| m.len())
+    }
+
+    fn back_off(&mut self, now: Instant, wal_before: u64, busy: bool) -> TickOutcome {
+        self.retry_not_before = Some(now + self.cfg.idle_after);
+        if busy {
+            self.busy_total += 1;
+        } else {
+            self.partial_total += 1;
+        }
+        tracing::info!(
+            target: "agent24_memory::wal",
+            wal_before,
+            busy_total = self.busy_total,
+            partial_total = self.partial_total,
+            ok_total = self.ok_total,
+            "memory.db wal checkpoint {}; retrying after the next idle window",
+            if busy { "busy" } else { "partial" }
+        );
+        if busy {
+            TickOutcome::Busy { wal_before }
+        } else {
+            TickOutcome::Partial { wal_before }
+        }
     }
 
     /// Observe writes, decide, and (when due) checkpoint. `now` is injected so
@@ -177,23 +225,27 @@ impl WalMaintainer {
         if wal_before == 0 {
             return Ok(TickOutcome::Skipped(SkipReason::Clean));
         }
-        // (busy, log frames, checkpointed frames); busy = 1 means a reader or
-        // writer kept it from finishing.
+        // Step 1: PASSIVE does the heavy backfill WITHOUT the writer lock, so
+        // writers are not stalled however large the WAL has grown. Row is
+        // (busy, log frames, checkpointed frames).
+        let (busy, log, done): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+            .fetch_one(&mut self.conn)
+            .await?;
+        if busy != 0 {
+            return Ok(self.back_off(now, wal_before, true));
+        }
+        // Step 2: only a fully backfilled WAL is worth truncating — then the
+        // TRUNCATE holds the writer lock for next to no backfill work.
+        if log != done {
+            return Ok(self.back_off(now, wal_before, false));
+        }
+        self.truncate_attempts += 1;
         let (busy, _log, _done): (i64, i64, i64) =
             sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
                 .fetch_one(&mut self.conn)
                 .await?;
         if busy != 0 {
-            self.busy_total += 1;
-            self.retry_not_before = Some(now + self.cfg.idle_after);
-            tracing::info!(
-                target: "agent24_memory::wal",
-                wal_before,
-                busy_total = self.busy_total,
-                ok_total = self.ok_total,
-                "memory.db wal checkpoint busy; retrying after the next idle window"
-            );
-            return Ok(TickOutcome::Busy { wal_before });
+            return Ok(self.back_off(now, wal_before, true));
         }
         let wal_after = self.wal_bytes();
         self.ok_total += 1;
@@ -372,8 +424,15 @@ mod tests {
 
         m.tick(t0 + Duration::from_secs(1)).await.unwrap();
         let out = m.tick(t0 + Duration::from_secs(70)).await.unwrap();
-        assert!(matches!(out, TickOutcome::Busy { .. }), "got {out:?}");
-        assert_eq!(m.busy_total(), 1);
+        // The reader pins older frames: PASSIVE cannot backfill everything,
+        // so TRUNCATE must not even be issued.
+        assert!(matches!(out, TickOutcome::Partial { .. }), "got {out:?}");
+        assert_eq!(m.partial_total(), 1);
+        assert_eq!(
+            m.truncate_attempts(),
+            0,
+            "TRUNCATE issued on a partial pass"
+        );
         assert!(wal_len(&dir) > 0);
 
         // Same idle window: backed off, no bombardment.
@@ -381,7 +440,7 @@ mod tests {
             m.tick(t0 + Duration::from_secs(75)).await.unwrap(),
             TickOutcome::Skipped(SkipReason::Backoff)
         );
-        assert_eq!(m.busy_total(), 1);
+        assert_eq!(m.partial_total(), 1);
 
         // Reader goes away; the next idle window succeeds.
         sqlx::query("ROLLBACK").execute(&mut *reader).await.unwrap();
@@ -407,6 +466,103 @@ mod tests {
         assert_eq!(
             m.tick(t0 + Duration::from_secs(400)).await.unwrap(),
             TickOutcome::Skipped(SkipReason::Clean)
+        );
+    }
+
+    use crate::event::{EventStore, MemEvent, Origin, Scope, Trust};
+
+    fn event(id: &str) -> MemEvent {
+        MemEvent::new(
+            id,
+            Scope::owner("u"),
+            "msg",
+            serde_json::json!({"k": id}),
+            Origin {
+                source: "test".to_owned(),
+                trust: Trust::UserSaid,
+            },
+        )
+    }
+
+    async fn event_roundtrip(kv: &KvStore, id: &str) {
+        kv.events().append(&event(id)).await.unwrap();
+        assert!(
+            kv.events()
+                .get("u", &id.to_owned())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_store_survives_maintainer_probe() {
+        let kv = KvStore::open_memory().await.unwrap();
+        event_roundtrip(&kv, "before").await;
+        assert!(
+            kv.wal_maintainer(cfg(), Instant::now())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The single connection IS the database; it must still be there.
+        event_roundtrip(&kv, "after").await;
+    }
+
+    #[tokio::test]
+    async fn detaching_does_not_disturb_the_file_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = store(&dir).await;
+        event_roundtrip(&kv, "before").await;
+        let _m = kv
+            .wal_maintainer(cfg(), Instant::now())
+            .await
+            .unwrap()
+            .unwrap();
+        for i in 0..20 {
+            event_roundtrip(&kv, &format!("after-{i}")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn writers_are_not_stalled_while_a_big_wal_is_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = store(&dir).await;
+        let t0 = Instant::now();
+        let mut m = kv.wal_maintainer(cfg(), t0).await.unwrap().unwrap();
+        // Pin a reader so autocheckpoint cannot keep the WAL small, build ~10 MiB.
+        let mut reader = kv.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN").execute(&mut *reader).await.unwrap();
+        let _: i64 = sqlx::query_scalar("SELECT count(*) FROM kv")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        let blob = "x".repeat(4096);
+        for i in 0..2500 {
+            kv.put("big", &format!("k{i}"), &blob).await.unwrap();
+        }
+        assert!(wal_len(&dir) > 8 * 1024 * 1024);
+        m.tick(t0 + Duration::from_secs(1)).await.unwrap();
+        sqlx::query("ROLLBACK").execute(&mut *reader).await.unwrap();
+        drop(reader);
+
+        let writer = kv.clone();
+        let w = tokio::spawn(async move {
+            let mut worst = Duration::ZERO;
+            for i in 0..50 {
+                let t = Instant::now();
+                writer.put("conc", &format!("w{i}"), &i).await.unwrap();
+                worst = worst.max(t.elapsed());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            worst
+        });
+        let out = m.tick(t0 + Duration::from_secs(70)).await.unwrap();
+        let worst = w.await.unwrap();
+        assert!(matches!(out, TickOutcome::Done { .. }), "got {out:?}");
+        assert!(
+            worst < Duration::from_secs(1),
+            "a write stalled for {worst:?}"
         );
     }
 }

@@ -65,7 +65,12 @@ mod tests {
     #[tokio::test]
     async fn in_memory_store_spawns_nothing() {
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        kv.put("t", "before", &1).await.unwrap();
         assert!(spawn(&kv, fast(), CancellationToken::new()).await.is_none());
+        // Probing must not have destroyed the ephemeral database.
+        kv.put("t", "after", &2).await.unwrap();
+        assert_eq!(kv.fetch::<i32>("t", "before").await.unwrap(), Some(1));
+        assert_eq!(kv.fetch::<i32>("t", "after").await.unwrap(), Some(2));
     }
 
     #[tokio::test]
