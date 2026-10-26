@@ -14,7 +14,7 @@
   - 造旧数据：main 没有写授予、写 self-wake 的产品入口，旧授予和旧 self-wake 只能写进库里；
   - 读迁移结果：`_sqlx_migrations` 和 `schedule_source_origin` 没有对外接口。
 - **不碰用户数据**：每个 daemon 都用工作目录下自己的 `AGENT24_DATA_DIR` 和 `A24_OS_PACKAGES`。Z1 检查 `~/.agent24` 在运行期间没有变化。
-- **不留进程**：`agent24 daemon start` 等不到 ready 就放弃时，常驻的 daemon 不会随 CLI 退出，可能还没写出状态文件，状态文件里的 pid 也可能已经过期。所以启动失败时和脚本退出时，把本次运行开始后才出现的 `<--new>/agent24d serve` 进程都杀掉；不按状态文件里的 pid 杀，免得误杀。同一个 `--new` 目录不要同时跑两份验收。
+- **不留进程**：`agent24 daemon start` 等不到 ready 就放弃时，常驻的 daemon 不会随 CLI 退出，可能还没写出状态文件，状态文件里的 pid 也可能已经过期。所以启动失败时和脚本退出时，把本次运行开始后才出现的 `<--new>/agent24d serve` 进程都杀掉；不按状态文件里的 pid 杀，免得误杀。同一个 `--new` 目录不要同时跑两份验收；`--new` 要是纯 ASCII 路径，因为 `LC_ALL=C` 下 `ps` 会把别的字节转义，路径就匹配不上（脚本开头会检查）。
 - **前提**：先停掉自己的 daemon（`agent24 daemon stop`），不然 Z1 会把它正常的写入当成被碰过；脚本发现 daemon 在跑会直接拒绝运行，这一步在创建任何东西之前。`--work` 不能在 `~/.agent24` 下面：两边都先解析到最终路径（包括悬空的链接和还不存在的子路径），再从 `~/.agent24` 最近一个已存在的上级目录（它本身存在时就是它）比起：`--work` 的已存在上级目录中，凡与它是同一个 inode 的（firmlink、bind mount 会给同一个目录另起名字），就把余下的路径和 `~/.agent24` 缺的那几段不分大小写比较（大小写不敏感的卷上 `~/.Agent24` 就是 `~/.agent24`）。这些都在创建任何东西之前做。`--work` 要么不存在，要么为空，免得上一次的残留混进结果。
 - **环境变量**：调用者 shell 里的 `A24_*`、`AGENT24_*` 全部清掉，daemon 和 CLI 只拿到各条用例自己设的值。
 - **不需要模型**：没有模型时 run 以 `provider_unavailable` 结束，来源标签在调模型之前就写好了，所以 peer 视图的判定照样成立。
@@ -50,7 +50,7 @@
 | S2 | 第 4 条 | `agent24 schedules run-now` 旧 self-wake 和用户计划 | self-wake 的新 run 被扣下，用户计划的 run 可见 |
 | V1 | 第 3 条 | `GET /api/v1/peer/runs/{旧 run}` | `withheld: true`，`notice` 是固定提示，`prompt`、`output`、`error` 都为空（V2、S2、V3 中被扣下的 run 也按这个查） |
 | V2 | 第 3、4 条 | 已删 self-wake 留下的 run | `withheld: true` |
-| V3 | 第 3 条 | MCP `agent24_run` 新建一个 run（不带会话），ACP `session/prompt` 新建一个会话 run | 前者可见，MCP 的应答就是这个 run 自己的结果（输出，或 `code: message` 形式的错误），别的报错不算；后者被扣下 |
+| V3 | 第 3 条 | MCP `agent24_run` 新建一个 run（不带会话），ACP `session/prompt` 新建一个会话 run | 前者可见，MCP 给出了工具应答（不是桥或 JSON-RPC 的报错），`isError` 与 run 的终态对得上，文字就是这个 run 自己的结果（输出，或 `code: message` 形式的错误）；后者被扣下 |
 | V4 | 第 3 条 | 整个 peer 列表 | 至少 6 条；不带会话的新 run 可见；至少 4 条被扣下，每一条都按 V1 的方式查；不含被扣下的 run 的任何标记文字 |
 | V5 | 第 3 条 | MCP `agent24_list_runs`（原样转出 peer 列表） | 和 V4 一样逐条查 |
 | V6 | 第 3 条 | V3 里那次 ACP `session/prompt` 的应答 | 只回固定提示，不带提示词，也不带出错细节 |

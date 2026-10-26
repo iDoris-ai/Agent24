@@ -37,6 +37,9 @@ done
 resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
 NEW=$(resolve "$NEW")
+# reap finds leftover daemons by this path in `ps`, which escapes other bytes
+# under LC_ALL=C
+printf '%s' "$NEW" | grep -q '[^ -~]' && { echo "--new must be an ASCII path: $NEW" >&2; exit 2; }
 WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/k1r2-accept.$$}")
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
@@ -308,8 +311,11 @@ N=$(peer "$NEW_RUN"); S=$(withheld "$ACP_RUN")
 cli runs show "$NEW_RUN" --json > "$WORK/v3.run" 2>/dev/null
 END=$(jq -r .status "$WORK/v3.run" 2>/dev/null)
 EXPECT=$(jq -r 'if .status == "completed" then (.output.text // "") else "\(.error.code): \(.error.message)" end' "$WORK/v3.run" 2>/dev/null)
-GOT=$(jq -r '.result.content[0].text // empty' "$WORK/v3.mcp" 2>/dev/null)
-M=$(case "$END" in (completed|failed) [ "$GOT" = "$EXPECT" ] && echo ok || echo fail ;; (*) echo fail ;; esac)
+GOT=$(jq -r '.result.content[0].text' "$WORK/v3.mcp" 2>/dev/null)
+# A tool answer at all (not a bridge or JSON-RPC error), an error exactly when the run failed
+ANSWERED=$(jq -e --arg end "$END" '(.result.content[0].text | type == "string")
+  and ((.result.isError // false) == ($end == "failed"))' "$WORK/v3.mcp" > /dev/null 2>&1 && echo yes)
+M=$(case "$END" in (completed|failed) [ "$ANSWERED" = yes ] && [ "$GOT" = "$EXPECT" ] && echo ok || echo fail ;; (*) echo fail ;; esac)
 check V3 "a run started over MCP (no session) is shared, an ACP run (a session) is withheld" "$(is "$N/$M/$S" false/ok/ok)" "MCP run $NEW_RUN $N, answer $(jq -c '.result.content[0].text' "$WORK/v3.mcp" 2>/dev/null | cut -c1-80); ACP run $ACP_RUN $S"
 api GET /api/v1/peer/runs; cp "$WORK/r.json" "$WORK/peer.json"
 LEAK=$( [ "$CODE" = 200 ] && peer_list "$WORK/peer.json" || echo fail)
