@@ -962,6 +962,8 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
 /// Method + matched template → operation. Levels are metadata: they are not a
 /// deny input (2b). Unknown paths are answered here so a fallback cannot run
 /// unauthenticated. HEAD uses the GET row inside [`crate::capabilities::decide`].
+/// 404 and 405 come after the bearer is live, so a missing, unknown, or revoked
+/// token cannot enumerate routes. Explicit public routes skip that check.
 async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
@@ -972,9 +974,17 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
     match crate::capabilities::decide(&method, matched.as_deref(), &path, &state.module_namespaces)
     {
         crate::capabilities::RouteDecision::UnknownPath => {
+            if let Some(denied) = capability_token_rejected(&state, &req) {
+                return denied;
+            }
             error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
         }
-        crate::capabilities::RouteDecision::MethodNotAllowed => next.run(req).await,
+        crate::capabilities::RouteDecision::MethodNotAllowed => {
+            if let Some(denied) = capability_token_rejected(&state, &req) {
+                return denied;
+            }
+            next.run(req).await
+        }
         crate::capabilities::RouteDecision::Mapped(policy)
             if policy.level == crate::capabilities::AssuranceLevel::Public =>
         {
@@ -995,6 +1005,38 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
             let template = matched.as_deref().unwrap_or("");
             authorize(&state, req, next, operation, template, &method).await
         }
+    }
+}
+
+/// Missing, unparseable, unknown, revoked, expired, or stale bearers are 401.
+/// A live token returns `None` so the caller can answer 404 or 405.
+fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<Response> {
+    let Some(store) = state.capabilities.as_ref() else {
+        return Some(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_authority_unavailable",
+            "Capability authority unavailable",
+        ));
+    };
+    let Some(bearer) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        ));
+    };
+    match store.require_live_bearer(bearer, crate::capabilities::unix_now()) {
+        Ok(()) => None,
+        Err(_) => Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        )),
     }
 }
 
@@ -4212,7 +4254,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(creative_models.status(), StatusCode::OK);
+        assert_eq!(creative_models.status(), StatusCode::FORBIDDEN);
 
         let usage = router
             .clone()
@@ -4238,7 +4280,100 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(post_only.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(post_only.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn capability_missing_invalid_and_revoked_tokens_cannot_enumerate_routes() {
+        let mut app = state().await;
+        let now = crate::capabilities::unix_now();
+        let store = crate::capabilities::CapabilityStore::new("daemon-test");
+        let live = store
+            .mint_product_host("live-host", Duration::from_secs(3_600), now)
+            .unwrap();
+        let (live_bearer, _, _) = live.into_bearer_parts();
+        let revoked = store
+            .mint_product_host("revoked-host", Duration::from_secs(3_600), now)
+            .unwrap();
+        let (revoked_bearer, revoked_id, _) = revoked.into_bearer_parts();
+        assert!(store.revoke_by_id(&revoked_id));
+        app.enable_capability_auth(store);
+        let router = build_router(app);
+        let invalid = "00".repeat(32);
+        let probes = [
+            (Method::POST, "/api/v1/models"),
+            (Method::GET, "/api/v1/not-a-route"),
+        ];
+        let tokens: [(&str, Option<&str>); 3] = [
+            ("missing", None),
+            ("invalid", Some(invalid.as_str())),
+            ("revoked", Some(revoked_bearer.as_str())),
+        ];
+        for (label, token) in tokens {
+            for (method, path) in &probes {
+                let mut request = Request::builder().method(method.clone()).uri(*path);
+                if let Some(token) = token {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let response = router
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{label} {method} {path}"
+                );
+                assert_eq!(
+                    body_json(response).await["error"]["code"],
+                    "unauthorized",
+                    "{label} {method} {path}"
+                );
+            }
+        }
+
+        for method in [Method::GET, Method::HEAD] {
+            let health = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri("/api/v1/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK, "{method} /api/v1/health");
+        }
+
+        let denied_method = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {live_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let unknown = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, format!("Bearer {live_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(unknown).await["error"]["code"], "not_found");
     }
 
     #[tokio::test]

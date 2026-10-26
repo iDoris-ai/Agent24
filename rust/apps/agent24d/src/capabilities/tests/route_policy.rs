@@ -179,10 +179,10 @@ fn creative_allowlist_is_unchanged_and_new_routes_stay_closed() {
             policy.template
         );
         if policy.method == "GET" {
-            let head = policy.template == "/api/v1/models";
-            assert_eq!(
-                creative_route_permitted(&Method::HEAD, policy.template),
-                head
+            assert!(
+                !creative_route_permitted(&Method::HEAD, policy.template),
+                "HEAD {} must stay closed for Creative",
+                policy.template
             );
         }
     }

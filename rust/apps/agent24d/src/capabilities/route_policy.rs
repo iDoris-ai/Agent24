@@ -166,9 +166,11 @@ pub fn required_operation(method: &Method, matched_route_template: &str) -> Opti
 
 /// Creative may still call only the route it could call before this mapping.
 /// Newly mapped routes stay closed even when their Operation is already on
-/// [`Operation::creative_allowlist`] (CORE-2 R5). HEAD follows GET.
+/// [`Operation::creative_allowlist`] (CORE-2 R5). HEAD is a different request:
+/// base answered `HEAD /api/v1/models` with 403, so a live Creative token still
+/// stops here after the bearer check.
 pub fn creative_route_permitted(method: &Method, template: &str) -> bool {
-    matches!(method.as_str(), "GET" | "HEAD") && template == "/api/v1/models"
+    method == Method::GET && template == "/api/v1/models"
 }
 
 pub fn decide(
