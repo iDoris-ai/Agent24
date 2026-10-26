@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::provider::credential::Issued;
+use crate::provider::evidence::{Kbs, Rule};
 use crate::provider::gate::Gate;
 use crate::provider::placeholder::{Attempted, Settled};
 use crate::provider::state::{
@@ -20,6 +21,8 @@ const READY: Probe = Probe::Answered {
     read_ready: true,
 };
 
+type P = Profile<&'static str>;
+
 fn parts(generation: u64) -> (Connection, Credentials) {
     (
         Connection::new(Gate::new(generation), true),
@@ -28,7 +31,7 @@ fn parts(generation: u64) -> (Connection, Credentials) {
 }
 
 /// A login on the placeholder that came back with an identity.
-fn login(profile: &mut Profile) -> Attempt {
+fn login(profile: &mut P) -> Attempt {
     let placeholder = placeholder(profile);
     let attempt = placeholder.attempt();
     assert_eq!(
@@ -39,8 +42,8 @@ fn login(profile: &mut Profile) -> Attempt {
 }
 
 /// A selected profile whose binding is `ready` with a call in flight.
-fn bound() -> Profile {
-    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), true, None);
+fn bound() -> P {
+    let mut profile = P::new(Slot::Placeholder(Placeholder::new(None)), true, None);
     let (connection, credentials) = parts(1);
     let attempt = login(&mut profile);
     assert!(profile.bind(attempt, connection, credentials));
@@ -48,25 +51,20 @@ fn bound() -> Profile {
         unreachable!()
     };
     binding.connect(CLEAR).unwrap();
-    let (connection, credentials) = binding.parts_mut();
-    let ticket = credentials.issue(connection).unwrap();
-    credentials.issued(
-        connection,
-        ticket,
-        Issued::Granted { narrowed: false },
-        Instant::now(),
-    );
+    let ticket = binding.issue().unwrap();
+    let _ = binding.issued(ticket, Issued::Granted { narrowed: false }, Instant::now());
+    let connection = binding.connection_mut();
     let probe = connection.probe().unwrap();
     connection.apply_probe(probe, READY);
     connection.open_call().unwrap();
     profile
 }
 
-fn state(profile: &Profile) -> Option<ServiceState> {
+fn state(profile: &P) -> Option<ServiceState> {
     derive(CLEAR, profile.target())
 }
 
-fn binding(profile: &mut Profile) -> &mut BindingState {
+fn binding(profile: &mut P) -> &mut BindingState<&'static str> {
     match profile.slot_mut() {
         Slot::Bound(binding) => binding,
         Slot::Placeholder(_) => panic!("no binding"),
@@ -86,6 +84,12 @@ fn an_identity_change_retires_the_binding_and_leaves_a_placeholder() {
         let invalidation = retired.effects.invalidation.as_ref().unwrap();
         assert_eq!(invalidation.aborted.len(), 1, "{change:?}");
         assert!(retired.effects.placeholder);
+        let rule = Rule {
+            epoch: 1,
+            kbs: Kbs::All,
+        };
+        assert_eq!(retired.rule, Some(rule));
+        assert_eq!(retired.binding.evidence().epoch(), 1);
         assert!(retired.binding.retired());
         assert_eq!(retired.create.is_some(), change != IdentityChange::Endpoint);
         assert!(matches!(profile.slot(), Slot::Placeholder(_)));
@@ -98,11 +102,10 @@ fn an_identity_change_retires_the_binding_and_leaves_a_placeholder() {
 #[test]
 fn outside_the_connection_phase_an_identity_change_does_not_increment() {
     let mut profile = bound();
-    let unselect = profile.leave(Leave::Unselect);
+    let unselect = profile.leave(Leave::Unselect).value;
     let value = unselect.invalidation.unwrap().to_persist.unwrap();
     binding(&mut profile)
-        .parts_mut()
-        .0
+        .connection_mut()
         .confirm_generation(value);
     let retired = profile.change_identity(IdentityChange::Instance).unwrap();
     assert_eq!(retired.effects.invalidation, None);
@@ -162,7 +165,7 @@ fn a_new_instance_is_activated_at_once_and_a_failed_creation_records_dependency(
 #[test]
 fn unsaved_settings_take_the_place_of_a_changed_principal_and_bind_nothing() {
     let placeholder = Slot::Placeholder(Placeholder::new(None));
-    let mut profile = Profile::new(placeholder, true, Some(Confirmation::UnsavedSettings));
+    let mut profile = P::new(placeholder, true, Some(Confirmation::UnsavedSettings));
     profile.principal_differs();
     assert_eq!(profile.confirmation(), Some(Confirmation::UnsavedSettings));
     assert_eq!(
@@ -182,8 +185,8 @@ fn unsaved_settings_take_the_place_of_a_changed_principal_and_bind_nothing() {
 
 #[test]
 fn an_unselected_profile_binds_without_activating_until_selected() {
-    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), true, None);
-    profile.leave(Leave::Unselect);
+    let mut profile = P::new(Slot::Placeholder(Placeholder::new(None)), true, None);
+    let _ = profile.leave(Leave::Unselect);
     let attempt = login(&mut profile);
     let (connection, credentials) = parts(1);
     assert!(profile.bind(attempt, connection, credentials));
@@ -193,7 +196,7 @@ fn an_unselected_profile_binds_without_activating_until_selected() {
     // Confirmed while unselected: the binding waits for the selection.
     let mut profile = bound();
     let retired = profile.change_identity(IdentityChange::Principal).unwrap();
-    profile.leave(Leave::Unselect);
+    let _ = profile.leave(Leave::Unselect);
     let (connection, credentials) = parts(3);
     assert!(profile.bind(retired.create.unwrap(), connection, credentials));
     profile.confirm();
@@ -202,7 +205,7 @@ fn an_unselected_profile_binds_without_activating_until_selected() {
 
 #[test]
 fn a_selection_on_the_placeholder_carries_over_to_the_binding() {
-    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), false, None);
+    let mut profile = P::new(Slot::Placeholder(Placeholder::new(None)), false, None);
     profile.activate(Activation::Reselect);
     let attempt = login(&mut profile);
     let (connection, credentials) = parts(1);
@@ -215,22 +218,23 @@ fn logging_in_again_while_unselected_activates_nothing_but_still_lets_go() {
     use crate::provider::credential::Outcome;
     let mut profile = bound();
     // Revoked, then refused: access_revoked, held once the binding leaves.
-    let (connection, credentials) = binding(&mut profile).parts_mut();
-    let Outcome::Done(revoked) = credentials.revoke(connection, Instant::now()) else {
+    let bound = binding(&mut profile);
+    let Outcome::Done(revoked) = bound.revoke(Instant::now()).value else {
         unreachable!()
     };
-    connection.confirm_generation(revoked.invalidation.unwrap().to_persist.unwrap());
-    let ticket = credentials.issue(connection).unwrap();
-    let refused = credentials.issued(connection, ticket, Issued::Refused, Instant::now());
+    let value = revoked.invalidation.unwrap().to_persist.unwrap();
+    bound.connection_mut().confirm_generation(value);
+    let ticket = bound.issue().unwrap();
+    let refused = bound.issued(ticket, Issued::Refused, Instant::now()).value;
     let Outcome::Done(refused) = refused else {
         unreachable!()
     };
-    connection.confirm_generation(refused.invalidation.unwrap().to_persist.unwrap());
-    let unselect = profile.leave(Leave::Unselect);
+    let value = refused.invalidation.unwrap().to_persist.unwrap();
+    bound.connection_mut().confirm_generation(value);
+    let unselect = profile.leave(Leave::Unselect).value;
     let value = unselect.invalidation.unwrap().to_persist.unwrap();
     binding(&mut profile)
-        .parts_mut()
-        .0
+        .connection_mut()
         .confirm_generation(value);
     profile.activate(Activation::Relogin);
     assert_eq!(binding(&mut profile).connect(CLEAR), None);
@@ -242,7 +246,7 @@ fn logging_in_again_while_unselected_activates_nothing_but_still_lets_go() {
     assert_eq!(phase, Some(ConnectionPhase::Loading));
 }
 
-fn placeholder(profile: &mut Profile) -> &mut Placeholder {
+fn placeholder(profile: &mut P) -> &mut Placeholder {
     match profile.slot_mut() {
         Slot::Placeholder(placeholder) => placeholder,
         Slot::Bound(_) => panic!("bound"),
@@ -251,7 +255,7 @@ fn placeholder(profile: &mut Profile) -> &mut Placeholder {
 
 #[test]
 fn an_attempt_of_an_earlier_placeholder_never_counts_on_a_later_one() {
-    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), true, None);
+    let mut profile = P::new(Slot::Placeholder(Placeholder::new(None)), true, None);
     let first = placeholder(&mut profile).attempt();
     let stale = placeholder(&mut profile).attempt();
     assert_eq!(
@@ -279,7 +283,7 @@ fn an_attempt_of_an_earlier_placeholder_never_counts_on_a_later_one() {
 
 #[test]
 fn an_identity_change_on_the_placeholder_drops_the_attempt_in_flight() {
-    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), true, None);
+    let mut profile = P::new(Slot::Placeholder(Placeholder::new(None)), true, None);
     let attempt = placeholder(&mut profile).attempt();
     assert!(profile.change_identity(IdentityChange::Endpoint).is_none());
     let settled = placeholder(&mut profile).settle(attempt, Attempted::Identified);
@@ -290,7 +294,7 @@ fn an_identity_change_on_the_placeholder_drops_the_attempt_in_flight() {
 fn a_sidecar_starting_retries_a_placeholder_holding_dependency_when_it_would_back_off() {
     use crate::provider::binding::Sidecar;
     let holding = |failure, selected| {
-        Profile::new(
+        P::new(
             Slot::Placeholder(Placeholder::new(Some(failure))),
             selected,
             None,
@@ -323,16 +327,16 @@ fn a_sidecar_starting_retries_a_placeholder_holding_dependency_when_it_would_bac
 #[test]
 fn a_creation_binds_only_while_nothing_came_after_it() {
     // #1233 G-A: a login started before logging out creates nothing.
-    let mut profile = Profile::new(Slot::Placeholder(Placeholder::new(None)), true, None);
+    let mut profile = P::new(Slot::Placeholder(Placeholder::new(None)), true, None);
     let attempt = placeholder(&mut profile).attempt();
-    profile.leave(Leave::Logout);
+    let _ = profile.leave(Leave::Logout);
     let settled = placeholder(&mut profile).settle(attempt, Attempted::Identified);
     assert_eq!(settled, Settled::Ignored);
     let (connection, credentials) = parts(1);
     assert!(!profile.bind(attempt, connection, credentials));
     // Answered first, then logged out: the creation is over too.
     let attempt = login(&mut profile);
-    profile.leave(Leave::Logout);
+    let _ = profile.leave(Leave::Logout);
     let (connection, credentials) = parts(1);
     assert!(!profile.bind(attempt, connection, credentials));
     // G-B: the identity changed before the creation was persisted.
@@ -352,7 +356,7 @@ fn a_creation_binds_only_while_nothing_came_after_it() {
     );
     // Unselecting does not end it: the binding waits, unactivated.
     let attempt = login(&mut profile);
-    profile.leave(Leave::Unselect);
+    let _ = profile.leave(Leave::Unselect);
     let (connection, credentials) = parts(1);
     assert!(profile.bind(attempt, connection, credentials));
     assert_eq!(binding(&mut profile).connect(CLEAR), None);
@@ -362,11 +366,10 @@ fn a_creation_binds_only_while_nothing_came_after_it() {
 fn a_removed_binding_takes_no_identity_change() {
     // #1233 note 2.
     let mut profile = bound();
-    let removed = profile.leave(Leave::Remove);
+    let removed = profile.leave(Leave::Remove).value;
     let value = removed.invalidation.unwrap().to_persist.unwrap();
     binding(&mut profile)
-        .parts_mut()
-        .0
+        .connection_mut()
         .confirm_generation(value);
     for change in [
         IdentityChange::Instance,

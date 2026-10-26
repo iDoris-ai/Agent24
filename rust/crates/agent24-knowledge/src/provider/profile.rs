@@ -3,9 +3,10 @@
 //! identity changes that retire its binding. Pure state, like the binding;
 //! the caller persists the retirement and the new binding (I1, I6).
 
-use super::binding::{Activation, BindingState, Leave, Sidecar};
+use super::binding::{Activation, BindingState, Leave, Sidecar, WithRule};
 use super::connection::{Connection, Round};
 use super::credential::{Credentials, Effects};
+use super::evidence::Rule;
 use super::placeholder::{Attempt, Placeholder};
 use super::state::{Switches, Target};
 
@@ -32,17 +33,20 @@ pub enum IdentityChange {
 }
 
 #[derive(Debug)]
-pub enum Slot {
+pub enum Slot<K> {
     Placeholder(Placeholder),
-    Bound(Box<BindingState>),
+    Bound(Box<BindingState<K>>),
 }
 
 /// The binding an identity change retired.
 #[derive(Debug)]
-pub struct Retired {
-    pub binding: BindingState,
+pub struct Retired<K> {
+    /// Its evidence shows as placeholders from now on (S5.6).
+    pub binding: BindingState<K>,
     /// Invalidated if it was in the connection phase; placeholders always.
     pub effects: Effects,
+    /// The placeholder rule, persisted with the retirement.
+    pub rule: Option<Rule<K>>,
     /// Create the new binding now, persisted together with or after the
     /// retirement (S3.5); if that fails, [`Placeholder::creation_failed`]
     /// with this attempt.
@@ -59,8 +63,8 @@ pub enum Retried {
 }
 
 #[derive(Debug)]
-pub struct Profile {
-    slot: Slot,
+pub struct Profile<K> {
+    slot: Slot<K>,
     selected: bool,
     confirmation: Option<Confirmation>,
     /// Where the placeholder after the binding numbers its attempts from, so
@@ -68,8 +72,8 @@ pub struct Profile {
     next_attempt: u64,
 }
 
-impl Profile {
-    pub fn new(slot: Slot, selected: bool, confirmation: Option<Confirmation>) -> Self {
+impl<K: Ord + Clone> Profile<K> {
+    pub fn new(slot: Slot<K>, selected: bool, confirmation: Option<Confirmation>) -> Self {
         Self {
             slot,
             selected,
@@ -78,11 +82,11 @@ impl Profile {
         }
     }
 
-    pub fn slot(&self) -> &Slot {
+    pub fn slot(&self) -> &Slot<K> {
         &self.slot
     }
 
-    pub fn slot_mut(&mut self) -> &mut Slot {
+    pub fn slot_mut(&mut self) -> &mut Slot<K> {
         &mut self.slot
     }
 
@@ -104,7 +108,7 @@ impl Profile {
     /// S3.3 on the profile: a binding takes it as in [`BindingState::leave`];
     /// unselecting is remembered either way. On the placeholder, logging out
     /// ends the login in flight and any binding it was creating.
-    pub fn leave(&mut self, event: Leave) -> Effects {
+    pub fn leave(&mut self, event: Leave) -> WithRule<Effects, K> {
         if event == Leave::Unselect {
             self.selected = false;
         }
@@ -114,7 +118,10 @@ impl Profile {
                 if event == Leave::Logout {
                     placeholder.cancel();
                 }
-                Effects::default()
+                WithRule {
+                    value: Effects::default(),
+                    rule: None,
+                }
             }
         }
     }
@@ -145,7 +152,7 @@ impl Profile {
     /// placeholders in any state) and the profile is a placeholder again.
     /// `None` without a binding; a placeholder's attempt in flight no longer
     /// counts.
-    pub fn change_identity(&mut self, change: IdentityChange) -> Option<Retired> {
+    pub fn change_identity(&mut self, change: IdentityChange) -> Option<Retired<K>> {
         match &mut self.slot {
             Slot::Placeholder(placeholder) => {
                 placeholder.cancel();
@@ -161,13 +168,17 @@ impl Profile {
         else {
             return None;
         };
-        let effects = binding.leave(Leave::Retire);
+        let WithRule {
+            value: effects,
+            rule,
+        } = binding.leave(Leave::Retire);
         if change == IdentityChange::Principal {
             self.principal_differs();
         }
         Some(Retired {
             binding: *binding,
             effects,
+            rule,
             create,
         })
     }
