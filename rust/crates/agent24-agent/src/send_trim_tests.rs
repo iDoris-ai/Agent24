@@ -777,6 +777,7 @@ async fn resume_after_append_binds_kind_by_store_seq() {
     seed_parked_run(
         &store,
         vec![
+            filler("gap"),
             row("user", Some(&full), MessageOrigin::UserPrompt),
             filler("f1"),
             host_recall(&full),
@@ -786,6 +787,17 @@ async fn resume_after_append_binds_kind_by_store_seq() {
         ],
     )
     .await;
+    // Open a hole at the front: stored seqs now start at 1, so a row's seq
+    // never equals its in-memory index and index-based lookup must fail.
+    store.delete_run_message_range("run_1", 0, 0).await.unwrap();
+    let seqs: Vec<i64> = store
+        .list_run_messages("run_1")
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.seq)
+        .collect();
+    assert_eq!(seqs[0], 1);
     let env = resume_env(
         store.clone(),
         Some(memory_of(&kv, Some(OWNER))),

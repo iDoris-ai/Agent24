@@ -2687,15 +2687,26 @@ pub(crate) mod tests {
             .await
             .unwrap();
         run.status = RunStatus::Running;
+        // Replay the stored thread so the send-copy consistency check passes
+        // and the refusal below can only come from the permission check.
+        let thread = store.list_run_messages(&run.id).await.unwrap();
+        remote.seen.lock().unwrap().clear();
         manager
             .run_loop(
-                run,
-                vec![Msg::user("thread text cannot authorize cloud")],
+                run.clone(),
+                thread_to_messages(&thread),
                 false,
                 CancellationToken::new(),
             )
             .await;
         assert!(remote.seen.lock().unwrap().is_empty());
+        let ended = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(ended.status, RunStatus::Failed);
+        assert_ne!(
+            ended.error.as_ref().map(|e| e.code.as_str()),
+            Some(SOURCE_UNPROVEN_CODE),
+            "must reach the permission check, not the source gate"
+        );
     }
 
     #[test]
