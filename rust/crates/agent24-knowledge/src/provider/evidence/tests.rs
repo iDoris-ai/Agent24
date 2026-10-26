@@ -454,3 +454,21 @@ fn an_empty_question_registers_nothing() {
     assert_eq!(evidence.recheck(), None);
     assert_eq!(evidence.passed(0), Passed::Ignored);
 }
+
+#[test]
+fn a_failed_retry_of_a_delete_read_back_does_not_bring_the_kb_back() {
+    // PR-Daemon's probe on #1297 (G-A): the earlier delete may have gone
+    // through; an omission must not then be judged a narrowing.
+    let saved = Saved {
+        tombstones: kbs(&["b"]),
+        visible: kbs(&["a"]),
+        ..Saved::default()
+    };
+    let mut evidence = E::restore(saved);
+    evidence.delivered(["b"], 0);
+    evidence.tombstone("b");
+    assert!(!evidence.kept(&"b"));
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, evidence.epoch(), true);
+    assert_eq!(out, Observed::default());
+    assert_eq!(evidence.shown(false, &at("b", 0)), Shown::Withheld);
+}
