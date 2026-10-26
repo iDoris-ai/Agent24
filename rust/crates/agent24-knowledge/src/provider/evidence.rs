@@ -303,11 +303,19 @@ impl<K: Ord + Clone> Evidence<K> {
     }
 
     /// An accepted response to a request over `asked` (`asked` empty for a
-    /// ready probe without scope). What it lists joins the set; a KB asked
-    /// for that it leaves out, and that was visible, was removed. Only a
-    /// request sent with the current credential tells a removal (S3.1
-    /// ownership). A KB with a tombstone neither joins nor is removed.
-    pub fn observe(&mut self, asked: &BTreeSet<K>, scope: &Scope<K>, current: bool) -> Observed<K> {
+    /// ready probe without scope), admitted at epoch `admitted`. What it
+    /// lists joins the set; a KB asked for that it leaves out, and that was
+    /// visible, was removed. Only a request sent with the current credential
+    /// tells a removal (S3.1 ownership). A KB with a tombstone neither joins
+    /// nor is removed, nor does one a rule placed since the request was
+    /// admitted join: a deletion that succeeded meanwhile (ST-28g).
+    pub fn observe(
+        &mut self,
+        asked: &BTreeSet<K>,
+        scope: &Scope<K>,
+        admitted: u64,
+        current: bool,
+    ) -> Observed<K> {
         let none = BTreeSet::new();
         let listed = match scope {
             Scope::Listed(kbs) => kbs,
@@ -321,7 +329,7 @@ impl<K: Ord + Clone> Evidence<K> {
             .collect();
         let added: BTreeSet<K> = listed
             .iter()
-            .filter(|kb| live(kb) && !self.visible.contains(*kb))
+            .filter(|kb| live(kb) && !self.visible.contains(*kb) && !self.placed(kb, admitted))
             .cloned()
             .collect();
         self.visible.retain(|kb| !removed.contains(kb));
