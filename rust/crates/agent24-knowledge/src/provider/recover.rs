@@ -34,8 +34,9 @@ pub enum Found {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recovery<I: Ids> {
-    /// No persisted state and the host confirms a first install: Off, no
-    /// prompt, nothing tightened. The host creates the seal (A.3).
+    /// No persisted state, no profile configured, and the host confirms a
+    /// first install (no Knowledge evidence in the session history, FI-3f):
+    /// Off, no prompt, nothing tightened. The host creates the seal (A.3).
     FirstInstall,
     /// The persisted state stands. `retire` holds the bindings whose identity
     /// no longer holds, to persist as tightenings before any admission. A
@@ -72,7 +73,9 @@ pub fn recover<I: Ids>(
     found: impl Fn(&Bound<I>) -> Found,
 ) -> Recovery<I> {
     let state = match log {
-        None if first_install && seal == Seal::Missing => return Recovery::FirstInstall,
+        None if first_install && profiles.is_empty() && seal == Seal::Missing => {
+            return Recovery::FirstInstall;
+        }
         None | Some(Err(Damaged)) => {
             let mut writes = global();
             for p in profiles {
@@ -92,7 +95,7 @@ pub fn recover<I: Ids>(
         Seal::Present { .. } | Seal::Missing => {
             let mut writes = global();
             writes.extend(live(&state).map(|b| Change::Retire(b.of.clone())));
-            writes.extend(profiles.iter().map(unsaved));
+            writes.extend(named(&state, profiles).iter().map(unsaved));
             Recovery::Tightened { state, writes }
         }
     }
@@ -109,6 +112,19 @@ fn unsaved<I: Ids>(profile: &I::Profile) -> Change<I> {
         profile: profile.clone(),
         awaited: Confirmation::UnsavedSettings,
     }
+}
+
+/// Configured now, or named in the state: one removed before its removal
+/// was persisted still awaits the user (FI-6d).
+fn named<I: Ids>(state: &Replayed<I>, profiles: &[I::Profile]) -> Vec<I::Profile> {
+    let mut all = profiles.to_vec();
+    let bound = state.bindings.iter().map(|b| &b.of.profile);
+    for p in bound.chain(state.profiles.keys()) {
+        if !all.contains(p) {
+            all.push(p.clone());
+        }
+    }
+    all
 }
 
 fn live<I: Ids>(state: &Replayed<I>) -> impl Iterator<Item = &Bound<I>> {
