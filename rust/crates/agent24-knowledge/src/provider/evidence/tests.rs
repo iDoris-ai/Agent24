@@ -425,10 +425,24 @@ fn evidence_of_several_kbs_shows_by_the_strictest_of_them() {
     assert_eq!(evidence.shown(false, &pack(1)), Shown::Withheld);
     assert!(evidence.release(1));
     assert_eq!(evidence.shown(false, &pack(1)), Shown::Body);
-    // Each of its KBs counts as delivered.
+    // Each of its KBs counts as delivered, and only those.
     let mut evidence = E::default();
+    evidence.delivered(["a"], 0);
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 0, true);
+    assert_eq!(out, Observed::default());
     evidence.delivered(["a", "b"], 0);
     let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 0, true);
+    assert_eq!(out.removed, kbs(&["b"]));
+    // A placeholder for good once a is deleted: b no longer counts by it,
+    // though other evidence of b still would.
+    let mut evidence = E::default();
+    evidence.delivered(["a", "b"], 0);
+    evidence.tombstone("a");
+    evidence.deleted("a");
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 1, true);
+    assert_eq!(out, Observed::default());
+    evidence.delivered(["b"], 0);
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 1, true);
     assert_eq!(out.removed, kbs(&["b"]));
 }
 

@@ -139,9 +139,10 @@ pub struct Evidence<K> {
     pending: Option<Pending<K>>,
     tombstones: BTreeMap<K, Tombstone>,
     visible: BTreeSet<K>,
-    /// Per KB, the latest epoch its evidence was delivered at: not covered
-    /// by a rule, it counts as visible (S5.10).
-    delivered: BTreeMap<K, u64>,
+    /// Per set of KBs one evidence belongs to, the latest epoch such
+    /// evidence was delivered at: not covered by a rule, its KBs count as
+    /// visible (S5.10). Covering one KB covers the evidence (S5.6).
+    delivered: BTreeMap<BTreeSet<K>, u64>,
 }
 
 impl<K> Default for Evidence<K> {
@@ -332,10 +333,12 @@ impl<K: Ord + Clone> Evidence<K> {
 
     /// Evidence of `kbs` admitted at `epoch` was delivered.
     pub fn delivered(&mut self, kbs: impl IntoIterator<Item = K>, epoch: u64) {
-        for kb in kbs {
-            let latest = self.delivered.entry(kb).or_insert(epoch);
-            *latest = (*latest).max(epoch);
+        let kbs: BTreeSet<K> = kbs.into_iter().collect();
+        if kbs.is_empty() {
+            return;
         }
+        let latest = self.delivered.entry(kbs).or_insert(epoch);
+        *latest = (*latest).max(epoch);
     }
 
     /// An accepted response to a request over `asked` (`asked` empty for a
@@ -379,7 +382,11 @@ impl<K: Ord + Clone> Evidence<K> {
 
     /// In the set, or of evidence delivered and not covered by a rule.
     fn visible(&self, kb: &K) -> bool {
-        let uncovered = self.delivered.get(kb).is_some_and(|e| !self.placed(kb, *e));
+        let standing = |(kbs, e): (&BTreeSet<K>, &u64)| !kbs.iter().any(|k| self.placed(k, *e));
+        let uncovered = self
+            .delivered
+            .iter()
+            .any(|entry| entry.0.contains(kb) && standing(entry));
         self.visible.contains(kb) || uncovered
     }
 
