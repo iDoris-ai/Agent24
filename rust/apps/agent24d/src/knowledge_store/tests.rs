@@ -196,6 +196,60 @@ async fn a_record_this_build_cannot_read_exactly_is_damaged() {
     }
 }
 
+/// SQLite checks a column's type and `NOT NULL` when writing, not when
+/// reading: in a damaged file a number may be anything, and must not read as
+/// zero.
+#[tokio::test]
+async fn a_number_that_is_not_an_integer_reads_as_unreadable() {
+    for value in ["NULL", "'7'", "2.5"] {
+        let (_dir, db) = open().await;
+        db.begin(1).await.unwrap();
+        db.rebuild_seal(1).await.unwrap();
+        exec(&db, "DROP TABLE seal").await;
+        exec(&db, "CREATE TABLE seal (id INTEGER PRIMARY KEY, next)").await;
+        exec(&db, &format!("INSERT INTO seal VALUES (1, {value})")).await;
+        assert_eq!(db.read::<T>().await.unwrap().seal, Seal::Missing, "{value}");
+
+        exec(&db, "DROP TABLE log").await;
+        exec(&db, "CREATE TABLE log (id INTEGER PRIMARY KEY, start)").await;
+        exec(&db, &format!("INSERT INTO log VALUES (1, {value})")).await;
+        assert_eq!(log(&db).await, Some(Err(Damaged)), "{value}");
+
+        let (_dir, db) = open().await;
+        db.begin(1).await.unwrap();
+        exec(&db, "DROP TABLE records").await;
+        exec(&db, "CREATE TABLE records (seq, kind, body)").await;
+        let on = r#"{"version":1,"changes":["on"]}"#;
+        exec(
+            &db,
+            &format!("INSERT INTO records VALUES ({value}, 'changes', '{on}')"),
+        )
+        .await;
+        assert_eq!(log(&db).await, Some(Err(Damaged)), "{value}");
+    }
+}
+
+/// A write that fails is reported, never taken as persisted (A.1).
+#[tokio::test]
+async fn a_failed_write_is_reported_and_changes_nothing() {
+    let (_dir, db) = open().await;
+    db.begin(1).await.unwrap();
+    let first = changes(1, vec![C::On]);
+    db.append(&first).await.unwrap();
+    db.rebuild_seal(2).await.unwrap();
+    exec(&db, "PRAGMA query_only = ON").await;
+    assert!(matches!(db.begin(1).await, Err(StoreError::Sqlx(_))));
+    assert!(matches!(db.append(&first).await, Err(StoreError::Sqlx(_))));
+    let second = changes(2, vec![C::Off]);
+    assert!(matches!(db.append(&second).await, Err(StoreError::Sqlx(_))));
+    assert!(matches!(db.rebuild_seal(3).await, Err(StoreError::Sqlx(_))));
+    assert!(matches!(db.delete_seal().await, Err(StoreError::Sqlx(_))));
+    exec(&db, "PRAGMA query_only = OFF").await;
+    let found = db.read::<T>().await.unwrap();
+    assert_eq!(found.log, Some(replay(1, vec![first])));
+    assert_eq!(found.seal, Seal::Present { next: 2 });
+}
+
 #[tokio::test]
 async fn the_seal_is_rebuilt_and_deleted() {
     let (_dir, db) = open().await;

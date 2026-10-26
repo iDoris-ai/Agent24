@@ -11,8 +11,9 @@
 //! the caller issues writes one at a time, in order (ledger.rs).
 //!
 //! The migrations are this database's own. A database with a migration this
-//! build does not have, or with one altered, is refused and left as it is,
-//! never rebuilt: opening fails, and only Knowledge stays closed.
+//! build does not have, or with one altered, is refused, never migrated or
+//! rebuilt: opening fails and its records stay as they are. (The connection
+//! has set WAL by then, which a file this build created already has.)
 
 use std::path::Path;
 use std::time::Duration;
@@ -101,35 +102,42 @@ impl KnowledgeDb {
         &self.pool
     }
 
-    /// The log, replayed from its start, and the seal.
+    /// The log, replayed from its start, and the seal, in one read
+    /// transaction. SQLite checks a column's type when writing, not when
+    /// reading: a number that is not an integer reads as `NULL` here, the
+    /// seal then missing and the log damaged, never as zero.
     pub async fn read<I: StoredIds>(&self) -> Result<Found<I>, StoreError> {
-        let next: Option<i64> = sqlx::query_scalar("SELECT next FROM seal WHERE id = 1")
-            .fetch_optional(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        let next: Option<i64> =
+            sqlx::query_scalar("SELECT next FROM seal WHERE id = 1 AND typeof(next) = 'integer'")
+                .fetch_optional(&mut *tx)
+                .await?;
         let seal = match next.and_then(|next| u64::try_from(next).ok()) {
             Some(next) => Seal::Present { next },
             None => Seal::Missing,
         };
 
-        let start: Option<i64> = sqlx::query_scalar("SELECT start FROM log WHERE id = 1")
-            .fetch_optional(&self.pool)
-            .await?;
-        let rows: Vec<(i64, String, Option<String>)> =
-            sqlx::query_as("SELECT seq, kind, body FROM records ORDER BY seq, kind")
-                .fetch_all(&self.pool)
-                .await?;
+        let start: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT CASE typeof(start) WHEN 'integer' THEN start END FROM log WHERE id = 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let rows: Vec<(Option<i64>, String, Option<String>)> = sqlx::query_as(
+            "SELECT CASE typeof(seq) WHEN 'integer' THEN seq END, kind, body \
+             FROM records ORDER BY seq, kind",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
         let decoded: Result<Vec<Record<I>>, Damaged> = rows
             .into_iter()
             .map(|(seq, kind, body)| record_from_row(seq, &kind, body))
             .collect();
+        let start = start.map(|s| s.and_then(|s| u64::try_from(s).ok()).ok_or(Damaged));
         let log = match (start, decoded) {
             (None, Ok(records)) if records.is_empty() => None,
             (None, _) => Some(Err(Damaged)),
-            (Some(start), Ok(records)) => match u64::try_from(start) {
-                Ok(start) => Some(replay(start, records)),
-                Err(_) => Some(Err(Damaged)),
-            },
-            (Some(_), Err(Damaged)) => Some(Err(Damaged)),
+            (Some(start), decoded) => Some(start.and_then(|start| replay(start, decoded?))),
         };
         Ok(Found { log, seal })
     }
@@ -235,11 +243,11 @@ fn record_columns<I: StoredIds>(
 }
 
 fn record_from_row<I: StoredIds>(
-    seq: i64,
+    seq: Option<i64>,
     kind: &str,
     body: Option<String>,
 ) -> Result<Record<I>, Damaged> {
-    let seq = u64::try_from(seq).map_err(|_| Damaged)?;
+    let seq = seq.and_then(|seq| u64::try_from(seq).ok()).ok_or(Damaged)?;
     let entry = match (kind, body) {
         ("changes", Some(body)) => Entry::Changes(stored::decode::<I>(&body)?),
         ("void", None) => Entry::Void,
