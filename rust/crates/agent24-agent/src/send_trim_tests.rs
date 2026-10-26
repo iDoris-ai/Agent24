@@ -845,3 +845,292 @@ async fn send_copy_drops_host_recall_when_memory_is_none() {
     assert_eq!(count_eq(&sent, "run echo"), 1);
     assert!(host_recall_warned(&log));
 }
+
+// ---- cold-restart matrix (R02/R05 b, R06-H03 c) ----
+// Every test below seeds file-backed stores, drops every handle, reopens the
+// SAME files and goes through `resume_run`. No in-memory store is used.
+
+struct ColdFiles {
+    dir: tempfile::TempDir,
+    store_path: std::path::PathBuf,
+    kv_path: std::path::PathBuf,
+}
+
+/// Seeds a parked run on file-backed stores, optionally revokes one fact, then
+/// drops both handles ("the process is gone"). `rows` receives the fact list.
+async fn cold_seed(
+    texts: &[&str],
+    revoke_idx: Option<usize>,
+    rows: impl FnOnce(&[(String, String)]) -> Vec<OriginatedRunMessage>,
+) -> (ColdFiles, Vec<(String, String)>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("agent.db");
+    let kv_path = dir.path().join("memory.db");
+    let facts;
+    {
+        let store = Store::open(&store_path).await.unwrap();
+        let kv = KvStore::open(&kv_path).await.unwrap();
+        facts = live_assertions(&kv, texts).await;
+        seed_parked_run(&store, rows(&facts)).await;
+        if let Some(i) = revoke_idx {
+            revoke(&kv, &facts[i].0).await;
+        }
+    }
+    (
+        ColdFiles {
+            dir,
+            store_path,
+            kv_path,
+        },
+        facts,
+    )
+}
+
+/// Reopens the same files; `memory` decides how the memory handle is built.
+async fn cold_reopen(
+    files: &ColdFiles,
+    memory: impl FnOnce(&KvStore) -> Option<SessionMemory>,
+) -> ResumeEnv {
+    let store = Store::open(&files.store_path).await.unwrap();
+    let kv = KvStore::open(&files.kv_path).await.unwrap();
+    let memory = memory(&kv);
+    resume_env(store, memory, files.dir.path().to_path_buf())
+}
+
+/// Renames the assertion ledger table in the on-disk memory DB, so a query
+/// with a VALID owner passes `check_owner()` and then fails inside
+/// `beliefs_as_of` (a real read-layer failure). Done after the handles that
+/// seeded the file are gone, through a separate connection.
+async fn break_assertion_table(files: &ColdFiles) {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&files.kv_path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE mem_assertions RENAME TO mem_assertions_broken")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn cold_resume_drops_host_recall_when_memory_is_none() {
+    let (log, _guard) = capture_warns();
+    let (files, facts) = cold_seed(&["fact alive"], None, |facts| {
+        let shaped = block(&[&facts[0]]);
+        vec![
+            host_recall(&shaped),
+            filler("f1"),
+            row("user", Some(&shaped), MessageOrigin::SessionHistory),
+            filler("f2"),
+            row("user", Some("run echo"), MessageOrigin::UserPrompt),
+            parked_assistant(),
+        ]
+    })
+    .await;
+    let shaped = block(&[&facts[0]]);
+    let env = cold_reopen(&files, |_| None).await;
+    let done = approve_and_resume(&env).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let sent = first_send(&env.provider);
+    assert_eq!(
+        count_eq(&sent, &shaped),
+        1,
+        "HostRecall gone, only the SessionHistory copy remains"
+    );
+    assert_eq!(count_eq(&sent, "run echo"), 1);
+    assert!(host_recall_warned(&log));
+    // Stored HostRecall row is untouched.
+    let stored = env.store.list_run_messages("run_1").await.unwrap();
+    assert_eq!(stored[0].content.as_deref(), Some(shaped.as_str()));
+}
+
+#[tokio::test]
+async fn cold_resume_drops_host_recall_when_active_ids_fail() {
+    let (log, _guard) = capture_warns();
+    let (files, facts) = cold_seed(&["fact alive"], None, |facts| {
+        let shaped = block(&[&facts[0]]);
+        vec![
+            host_recall(&shaped),
+            filler("f1"),
+            row("user", Some(&shaped), MessageOrigin::SessionHistory),
+            filler("f2"),
+            row("user", Some("run echo"), MessageOrigin::UserPrompt),
+            parked_assistant(),
+        ]
+    })
+    .await;
+    let shaped = block(&[&facts[0]]);
+    // The owner is valid, so `check_owner()` passes; the ledger table is gone,
+    // so `beliefs_as_of` itself fails.
+    break_assertion_table(&files).await;
+    let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
+    let done = approve_and_resume(&env).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let sent = first_send(&env.provider);
+    assert_eq!(
+        count_eq(&sent, &shaped),
+        1,
+        "HostRecall gone, only the SessionHistory copy remains"
+    );
+    assert_eq!(count_eq(&sent, "run echo"), 1);
+    assert!(host_recall_warned(&log));
+    let warns = log.0.lock().unwrap().join("\n");
+    assert!(
+        warns.contains("could not re-validate HostRecall"),
+        "the read-failure branch must be the one that fired: {warns}"
+    );
+    assert!(
+        warns.contains("mem_assertions"),
+        "the error must come from the ledger query: {warns}"
+    );
+    assert!(
+        !warns.contains("owner is not configured"),
+        "must not be the check_owner() failure: {warns}"
+    );
+}
+
+#[tokio::test]
+async fn cold_resume_three_same_text_origins_each_by_kind() {
+    let (files, facts) = cold_seed(&["fact alive", "fact revoked"], Some(1), |facts| {
+        let full = block(&[&facts[0], &facts[1]]);
+        vec![
+            host_recall(&full),
+            filler("f1"),
+            row("user", Some(&full), MessageOrigin::UserPrompt),
+            filler("f2"),
+            row("user", Some(&full), MessageOrigin::SessionHistory),
+            parked_assistant(),
+        ]
+    })
+    .await;
+    let full = block(&[&facts[0], &facts[1]]);
+    let pruned = block(&[&facts[0]]);
+    let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
+    let done = approve_and_resume(&env).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let sent = first_send(&env.provider);
+    assert_eq!(count_eq(&sent, &pruned), 1, "only the HostRecall row is trimmed");
+    assert_eq!(count_eq(&sent, &full), 2, "UserPrompt + SessionHistory verbatim");
+}
+
+#[tokio::test]
+async fn cold_resume_leaves_origin_rows_and_digests_unchanged() {
+    let (files, facts) = cold_seed(&["fact alive", "fact revoked"], Some(1), |facts| {
+        let full = block(&[&facts[0], &facts[1]]);
+        vec![
+            host_recall(&full),
+            filler("f1"),
+            row("user", Some(&full), MessageOrigin::UserPrompt),
+            filler("f2"),
+            row("user", Some(&full), MessageOrigin::SessionHistory),
+            filler("f3"),
+            parked_assistant(),
+        ]
+    })
+    .await;
+    let full = block(&[&facts[0], &facts[1]]);
+    let pruned = block(&[&facts[0]]);
+    let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
+    let snapshot = |store: Store| async move {
+        let rows = store.list_run_messages("run_1").await.unwrap();
+        let mut origins = vec![];
+        for r in &rows {
+            origins.push(store.read_run_message_origin("run_1", r.seq).await.unwrap());
+        }
+        (rows, origins)
+    };
+    let before = snapshot(env.store.clone()).await;
+    assert_eq!(before.0.len(), 7);
+    let done = approve_and_resume(&env).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    // The trim really happened on the send copy: exactly one message is the
+    // recall block with only the live fact, and the revoked line survives only
+    // in the two verbatim (non-HostRecall) copies.
+    let sent = first_send(&env.provider);
+    assert_eq!(count_eq(&sent, &pruned), 1, "HostRecall trimmed to live ids");
+    assert_eq!(count_eq(&sent, &full), 2, "UserPrompt + SessionHistory verbatim");
+    let with_revoked = sent
+        .iter()
+        .filter(|m| m.content.as_deref().is_some_and(|c| c.contains("fact revoked")))
+        .count();
+    assert_eq!(with_revoked, 2, "revoked line only in the two verbatim rows");
+    // `drive_resume` does no history reclaim (that lives only at the end of
+    // `execute`), so ALL seeded rows must still be present and identical:
+    // body, kind, recall_ref and digest. Resume only appends after them.
+    let after = snapshot(env.store.clone()).await;
+    assert!(after.0.len() >= before.0.len(), "seeded rows disappeared");
+    assert_eq!(after.0[..before.0.len()], before.0[..], "message rows changed");
+    assert_eq!(after.1[..before.1.len()], before.1[..], "origin rows or digests changed");
+}
+
+#[tokio::test]
+async fn cold_resume_delivers_host_system_notice_verbatim() {
+    let (files, _facts) = cold_seed(&["fact alive"], None, |_| {
+        vec![
+            row(
+                "system",
+                Some(retain::PAUSED_WRITE_NOTICE),
+                MessageOrigin::HostSystem,
+            ),
+            row("user", Some("run echo"), MessageOrigin::UserPrompt),
+            parked_assistant(),
+        ]
+    })
+    .await;
+    let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
+    let done = approve_and_resume(&env).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let sent = first_send(&env.provider);
+    assert_eq!(sent[0], Msg::system(retain::PAUSED_WRITE_NOTICE));
+    assert_eq!(count_eq(&sent, "run echo"), 1);
+}
+
+#[tokio::test]
+async fn cold_resume_binds_kind_by_store_seq_with_seq_hole() {
+    // Cold version of `resume_after_append_binds_kind_by_store_seq`: a
+    // recall-shaped UserPrompt at position 0 and the real HostRecall later.
+    let (files, facts) = cold_seed(&["fact alive", "fact revoked"], Some(1), |facts| {
+        let full = block(&[&facts[0], &facts[1]]);
+        vec![
+            filler("gap"),
+            row("user", Some(&full), MessageOrigin::UserPrompt),
+            filler("f1"),
+            host_recall(&full),
+            filler("f2"),
+            row("user", Some(&full), MessageOrigin::SessionHistory),
+            parked_assistant(),
+        ]
+    })
+    .await;
+    let full = block(&[&facts[0], &facts[1]]);
+    let pruned = block(&[&facts[0]]);
+    let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
+    // Open a hole at the front of the reopened file: stored seqs now start at
+    // 1, so a row's seq never equals its in-memory index.
+    env.store
+        .delete_run_message_range("run_1", 0, 0)
+        .await
+        .unwrap();
+    let seqs: Vec<i64> = env
+        .store
+        .list_run_messages("run_1")
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.seq)
+        .collect();
+    assert_eq!(seqs[0], 1);
+    let done = approve_and_resume(&env).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let sent = first_send(&env.provider);
+    assert!(sent.iter().any(|m| m.role == "tool"));
+    assert_eq!(count_eq(&sent, &pruned), 1, "non-zero-position HostRecall trimmed");
+    assert_eq!(count_eq(&sent, &full), 2, "UserPrompt + SessionHistory verbatim");
+    assert_eq!(sent[0], Msg::user(full));
+}
