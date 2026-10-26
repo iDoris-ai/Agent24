@@ -659,6 +659,8 @@ mod tests {
             .env("ALL_PROXY", &proxy_url)
             .env_remove("NO_PROXY")
             .env_remove("no_proxy")
+            // A CGI-style environment makes reqwest ignore HTTP_PROXY.
+            .env_remove("REQUEST_METHOD")
             .status()
             .unwrap();
         assert!(status.success());
