@@ -28,11 +28,13 @@ done
 for t in curl jq sqlite3 python3 perl node; do
   command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
 done
-REAL="${HOME:-/nonexistent}/.agent24"; [ -d "$REAL" ] && REAL=$(cd "$REAL" && pwd -P)
-inside() { case "$1/" in "$REAL"/*|"${HOME:-/nonexistent}/.agent24"/*) return 0 ;; esac; return 1; }
+# Both sides fully resolved, dangling links and not-yet-created tails included,
+# before anything is created.
+resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
 WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/k1r2-accept.XXXX")}
-inside "$WORK" || { mkdir -p "$WORK" && WORK=$(cd "$WORK" && pwd -P); }
-inside "$WORK" && { echo "--work must not be inside $REAL" >&2; exit 2; }
+case "$(resolve "$WORK")/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
+mkdir -p "$WORK" && WORK=$(cd "$WORK" && pwd -P)
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
 # Only what each case sets reaches a daemon or the CLI.
@@ -187,8 +189,11 @@ MCP=$( (grep -q NEW-ORDINARY-MARKER "$WORK/mcp.runs" && grep -qF "$NOTICE" "$WOR
 check V5 "MCP agent24_list_runs shows the shared run and hides the rest" "$MCP" "$WORK/mcp.out"
 
 cat > "$WORK/acp.py" <<'EOF'
-import json, subprocess, sys
+import json, signal, subprocess, sys
 p = subprocess.Popen([sys.argv[1], "acp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+def give_up(*_):
+    p.kill(); p.wait(); sys.exit("acp timed out")
+signal.signal(signal.SIGALRM, give_up); signal.alarm(60)
 def call(i, method, params):
     p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params}) + "\n"); p.stdin.flush()
     seen = []
@@ -202,7 +207,7 @@ sid = call(2, "session/new", {"cwd": "/", "mcpServers": []})[0]["result"]["sessi
 print("\n".join(call(3, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "ACP-MARKER"}]})[1]))
 p.stdin.close(); p.wait(timeout=10)
 EOF
-AGENT24_DATA_DIR="$DATA" limit 60 python3 -I "$WORK/acp.py" "$NEW/agent24" > "$WORK/acp.out" 2>&1
+AGENT24_DATA_DIR="$DATA" python3 -I "$WORK/acp.py" "$NEW/agent24" > "$WORK/acp.out" 2>&1
 ACP=$( (grep -qF "$NOTICE" "$WORK/acp.out" && ! grep -qE 'ACP-MARKER|provider' "$WORK/acp.out") && echo ok || echo fail)
 check V6 "an ACP prompt (always in a session) gets only the fixed notice" "$ACP" "$WORK/acp.out"
 stop_daemon
