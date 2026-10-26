@@ -12,6 +12,28 @@ use super::ledger::Scope;
 use super::profile::Confirmation;
 use super::state::{PlaceholderFailure, UnavailableCause};
 
+/// A reason that does not retry by itself and holds across restarts (S1.4).
+/// `dependency` and `not_ready` back off instead; `local_storage` follows
+/// `persist_pending`, which a restart derives anew.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StuckCause {
+    Incompatible,
+    InstanceUnidentified,
+    CredentialRejected,
+    AccessRevoked,
+}
+
+impl From<StuckCause> for UnavailableCause {
+    fn from(cause: StuckCause) -> Self {
+        match cause {
+            StuckCause::Incompatible => Self::Incompatible,
+            StuckCause::InstanceUnidentified => Self::InstanceUnidentified,
+            StuckCause::CredentialRejected => Self::CredentialRejected,
+            StuckCause::AccessRevoked => Self::AccessRevoked,
+        }
+    }
+}
+
 /// The host's identifiers and values: the crate only compares them. The
 /// implementing marker derives what the records do.
 pub trait Ids: Clone + Debug + Eq {
@@ -90,12 +112,14 @@ pub enum Change<I: Ids> {
         of: Of<I>,
         value: u64,
     },
-    /// Servable for the first time (S1.12): never taken back.
+    /// Servable for the first time (S1.12): never taken back. It closes S3.1's
+    /// exception, so it is the one loosening that outlives a void.
     Servable(Of<I>),
     /// Logged out (S3.3).
     Logout(Of<I>),
-    /// The same principal logged in again. Not listed in S1.10; a loosening,
-    /// so I1 holds it back.
+    /// The same principal logged in again. Not listed in S1.10; a loosening
+    /// (I1). One written before a tightening of its profile commits is for
+    /// the wiring to recheck (slice 6).
     Relogin(Of<I>),
     /// A revocation-class event since the binding was created: S3.1's
     /// exception is over for good. Not listed in S1.10; a tightening, as
@@ -104,12 +128,12 @@ pub enum Change<I: Ids> {
     /// Into a reason that does not retry by itself (S1.4).
     Stuck {
         of: Of<I>,
-        cause: UnavailableCause,
+        cause: StuckCause,
     },
     /// Out of it, with the reason left.
     Unstuck {
         of: Of<I>,
-        cause: UnavailableCause,
+        cause: StuckCause,
     },
     /// A run left with no binding, over the profiles of what bound it.
     RunUnbound {
@@ -264,12 +288,15 @@ impl<I: Ids> Change<I> {
     /// A.1: this record landed late on a sequence number already given up.
     /// The stricter of the two stands: a loosening is ignored (I1, like the
     /// late confirmation of an abandoned one), a tightening kept (I2), a
-    /// generation value kept (only ever higher values follow, S4.4). A clean
-    /// shutdown is ignored: it would let the next start's increment be the
-    /// small one (A.4).
+    /// generation value kept (only ever higher values follow, S4.4). "Once
+    /// servable" is kept: dropping it would bring S3.1's exception back, and
+    /// when unsure the binding counts as servable (S1.12). It admits nothing:
+    /// after a restart a binding waits for its raised generation (S1.14). A
+    /// clean shutdown is ignored: it would let the next start's increment be
+    /// the small one (A.4).
     pub fn outlives_void(&self) -> bool {
         match self.class() {
-            Class::Loosening => false,
+            Class::Loosening => matches!(self, Self::Servable(_)),
             Class::Lifecycle => !matches!(self, Self::Shutdown),
             Class::Tightening | Class::Generation => true,
         }

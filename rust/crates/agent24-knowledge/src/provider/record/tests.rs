@@ -26,7 +26,7 @@ fn every() -> Vec<(C, Class)> {
     let a = of("a", 1);
     let pc = Confirmation::PrincipalChanged;
     let fail = PlaceholderFailure::CredentialRejected;
-    let stuck = UnavailableCause::AccessRevoked;
+    let stuck = StuckCause::AccessRevoked;
     vec![
         (C::Off, Tightening),
         (C::On, Loosening),
@@ -133,7 +133,7 @@ fn an_abandoned_loosening_is_offset_by_its_counterpart() {
     let a = of("a", 1);
     let pc = Confirmation::UnsavedSettings;
     let fail = PlaceholderFailure::Dependency;
-    let cause = UnavailableCause::Incompatible;
+    let cause = StuckCause::Incompatible;
     let pairs = [
         (C::On, C::Off),
         (C::PromptConfirmed, C::Prompt),
@@ -230,13 +230,16 @@ fn a_change_counts_for_its_profile_or_the_host() {
     assert_eq!(C::Enable("a").scope(), Some(Scope::profile("a")));
     // A binding's change counts for its profile.
     assert_eq!(C::Retire(of("b", 9)).scope(), Some(Scope::profile("b")));
+    assert_eq!(C::Remove("c").scope(), Some(Scope::profile("c")));
     // A run counts for every profile it names, each once.
     let bound = C::RunBound {
         run: 1,
         bindings: vec![of("a", 1), of("b", 2)],
-        candidates: vec![("b", "j"), ("c", "k")],
+        candidates: vec![("b", "j"), ("c", "k"), ("d", "l")],
     };
-    assert_eq!(bound.scope(), Some(Scope::Profiles(vec!["a", "b", "c"])));
+    let named = Scope::Profiles(vec!["a", "b", "c", "d"]);
+    assert_eq!(bound.scope(), Some(named.clone()));
+    assert_eq!(bound.offset().unwrap().scope(), Some(named));
     // A run naming no profile is host level, never an empty scope.
     let empty = C::RunBound {
         run: 1,
@@ -262,10 +265,82 @@ fn a_change_counts_for_its_profile_or_the_host() {
 fn on_a_number_given_up_the_stricter_record_stands() {
     for (change, class) in every() {
         let outlives = match class {
-            Class::Loosening => false,
+            // Keeping "once servable" closes S3.1's exception: the stricter.
+            Class::Loosening => change == C::Servable(of("a", 1)),
             Class::Tightening | Class::Generation => true,
             Class::Lifecycle => change == C::Started,
         };
         assert_eq!(change.outlives_void(), outlives, "{change:?}");
+    }
+}
+
+#[test]
+fn only_a_reason_that_holds_across_restarts_is_persisted() {
+    use StuckCause as S;
+    use UnavailableCause as U;
+    let held = [
+        (S::Incompatible, U::Incompatible),
+        (S::InstanceUnidentified, U::InstanceUnidentified),
+        (S::CredentialRejected, U::CredentialRejected),
+        (S::AccessRevoked, U::AccessRevoked),
+    ];
+    for (stuck, cause) in held {
+        assert_eq!(U::from(stuck), cause);
+    }
+    let all = [
+        U::Dependency,
+        U::NotReady,
+        U::Incompatible,
+        U::InstanceUnidentified,
+        U::CredentialRejected,
+        U::AccessRevoked,
+        U::LocalStorage,
+    ];
+    for cause in all {
+        let holds = !cause.retries_automatically() && cause != U::LocalStorage;
+        assert_eq!(held.iter().any(|(_, c)| *c == cause), holds, "{cause:?}");
+    }
+}
+
+#[test]
+fn every_reason_has_the_same_class_and_counterpart() {
+    use PlaceholderFailure as F;
+    use StuckCause as S;
+    let a = of("a", 1);
+    for cause in [
+        S::Incompatible,
+        S::InstanceUnidentified,
+        S::CredentialRejected,
+        S::AccessRevoked,
+    ] {
+        let into = C::Stuck {
+            of: a.clone(),
+            cause,
+        };
+        let out = C::Unstuck {
+            of: a.clone(),
+            cause,
+        };
+        assert_eq!(into.class(), Class::Tightening, "{cause:?}");
+        assert_eq!(out.class(), Class::Loosening, "{cause:?}");
+        assert_eq!(out.offset(), Some(into), "{cause:?}");
+    }
+    // S1.10 counts every failure the placeholder records, whatever retries.
+    for failure in [
+        F::Dependency,
+        F::CredentialRejected,
+        F::InstanceUnidentified,
+    ] {
+        let failed = C::PlaceholderFailed {
+            profile: "a",
+            failure,
+        };
+        let cleared = C::PlaceholderCleared {
+            profile: "a",
+            failure,
+        };
+        assert_eq!(failed.class(), Class::Tightening, "{failure:?}");
+        assert_eq!(cleared.class(), Class::Loosening, "{failure:?}");
+        assert_eq!(cleared.offset(), Some(failed), "{failure:?}");
     }
 }
