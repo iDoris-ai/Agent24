@@ -352,7 +352,7 @@ fn request(read: &Read) -> Result<(reqwest::Method, String, View), String> {
                     "/api/v1/memory/assertions",
                     &[("q", q.as_deref()), ("limit", limit.as_deref())],
                 ),
-                View::rows("assertions", &["id", "subject", "predicate", "object"]),
+                View::rows("assertions", &["id", "text", "status", "recorded_at"]),
             )
         }
         Read::MemorySettings => (
@@ -625,22 +625,22 @@ mod tests {
         session_list_gets_sessions,
         Read::Sessions,
         "GET /api/v1/sessions HTTP/1.1",
-        r#"{"sessions":[{"id":"s1","title":"hello","channel":"cli","updated_at":"t"}]}"#,
-        "s1"
+        r#"{"sessions":[{"id":"s1","title":"hello title","channel":"cli","workspace_id":null,"created_at":"2026-10-26T01:00:00Z","updated_at":"2026-10-26T02:00:00Z"}]}"#,
+        "hello title"
     );
     case!(
         session_get_encodes_the_path_segment,
         Read::Session { id: "a/b c".into() },
         "GET /api/v1/sessions/a%2Fb%20c HTTP/1.1",
-        r#"{"id":"a/b c","title":"hello","channel":"cli"}"#,
-        "hello"
+        r#"{"id":"a/b c","title":"hello title","channel":"cli","workspace_id":null,"created_at":"2026-10-26T01:00:00Z","updated_at":"2026-10-26T02:00:00Z"}"#,
+        "hello title"
     );
     case!(
         run_get_gets_one_run,
         Read::Run { id: "run_1".into() },
         "GET /api/v1/runs/run_1 HTTP/1.1",
-        r#"{"id":"run_1","status":"completed","session_id":"s1","created_at":"t"}"#,
-        "run_1"
+        r#"{"id":"run_1","session_id":"s1","workspace_id":null,"status":"completed","input":{"text":"hi"},"output":{"text":"done"},"error":null,"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"cost_usd":0.0},"schedule_id":"sch_9","created_at":"2026-10-26T01:00:00Z","started_at":null,"ended_at":null}"#,
+        "sch_9"
     );
     case!(
         memory_list_sends_q_and_limit,
@@ -649,8 +649,8 @@ mod tests {
             limit: Some(3)
         },
         "GET /api/v1/memory/assertions?q=hello%20world&limit=3 HTTP/1.1",
-        r#"{"assertions":[{"id":"m1","subject":"sky","predicate":"is","object":"blue"}]}"#,
-        "sky"
+        r#"{"assertions":[{"id":"m1","text":"我对花生过敏","recorded_at":"2026-10-26T01:00:00Z","status":"active","evidence":["ev1"],"session":null}]}"#,
+        "我对花生过敏"
     );
     case!(
         memory_settings_gets_the_pause_switch,
@@ -663,15 +663,15 @@ mod tests {
         schedule_list_gets_schedules,
         Read::Schedules,
         "GET /api/v1/schedules HTTP/1.1",
-        r#"{"schedules":[{"id":"sch_1","name":"digest","enabled":true,"effective_enabled":true}]}"#,
-        "digest"
+        r#"{"schedules":[{"id":"sch_1","name":"daily digest","enabled":true,"spec":{"kind":"interval","every_seconds":60},"action":null,"delivery":[],"last_run_at":null,"next_run_at":"2026-10-27T00:00:00Z","consecutive_failures":0,"owner":null,"user_suspended":false,"system_disabled_reason":null,"effective_enabled":true,"disabled_by":null}]}"#,
+        "daily digest"
     );
     case!(
         schedule_get_gets_one_schedule,
         Read::Schedule { id: "sch_1".into() },
         "GET /api/v1/schedules/sch_1 HTTP/1.1",
-        r#"{"id":"sch_1","name":"digest","enabled":false,"next_run_at":null}"#,
-        "digest"
+        r#"{"id":"sch_1","name":"daily digest","enabled":false,"spec":{"kind":"interval","every_seconds":60},"action":null,"delivery":[],"last_run_at":"2026-10-26T00:00:00Z","next_run_at":null,"consecutive_failures":0,"owner":null,"user_suspended":false,"system_disabled_reason":null,"effective_enabled":false,"disabled_by":"user"}"#,
+        "daily digest"
     );
     case!(
         usage_gets_token_totals,
@@ -762,6 +762,123 @@ mod tests {
         r#"{"hardware_tier":"t2","effective_tier":"t1","reasons":["ram"]}"#,
         "effective_tier: t1"
     );
+
+    /// Minimal text extraction from `protocol/openapi.yaml` (no YAML
+    /// dependency): the `required:` list and the property names (8-space
+    /// indent) of one `components.schemas` entry.
+    fn schema_fields(name: &str) -> (Vec<String>, Vec<String>) {
+        const YAML: &str = include_str!("../../../../protocol/openapi.yaml");
+        let head = format!("    {name}:");
+        let mut lines = YAML.lines().skip_while(|l| *l != head).skip(1);
+        let mut block = Vec::new();
+        for l in lines.by_ref() {
+            if !l.trim().is_empty() && !l.starts_with("     ") {
+                break;
+            }
+            block.push(l);
+        }
+        assert!(!block.is_empty(), "schema {name} not found");
+        let props = block
+            .iter()
+            .filter(|l| l.starts_with("        ") && !l.starts_with("         "))
+            .filter_map(|l| l.trim().strip_suffix(':').map(str::to_owned))
+            .collect();
+        let at = block
+            .iter()
+            .position(|l| l.trim_start().starts_with("required:"));
+        let mut required = Vec::new();
+        if let Some(at) = at {
+            let mut text = String::new();
+            for l in &block[at..] {
+                text.push_str(l);
+                text.push(' ');
+                if l.contains(']') {
+                    break;
+                }
+            }
+            let inner = text.split_once('[').map(|x| x.1).unwrap_or("");
+            let inner = inner.split(']').next().unwrap_or("");
+            required = inner
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        (required, props)
+    }
+
+    /// The 200 response of `operation_id` must wrap its list in `key`
+    /// (`required: [key]` between this operationId and the next).
+    fn wrapper_requires(operation_id: &str, key: &str) -> bool {
+        const YAML: &str = include_str!("../../../../protocol/openapi.yaml");
+        let tag = format!("operationId: {operation_id}");
+        let Some(start) = YAML.find(&tag) else {
+            return false;
+        };
+        let rest = &YAML[start + tag.len()..];
+        let end = rest.find("operationId:").unwrap_or(rest.len());
+        rest[..end].contains(&format!("required: [{key}]"))
+    }
+
+    /// Mechanical contract check: every field a View reads is a documented
+    /// property of the schema its endpoint returns, and (except the one
+    /// documented optional) is `required` so it is always on the wire.
+    #[test]
+    fn views_only_read_fields_the_contract_defines() {
+        // (read, response schema, list operationId when wrapped)
+        let table: Vec<(Read, &str, Option<&str>)> = vec![
+            (Read::Sessions, "Session", Some("listSessions")),
+            (Read::Session { id: "x".into() }, "Session", None),
+            (Read::Run { id: "x".into() }, "Run", None),
+            (Read::Usage, "Usage", None),
+            (
+                Read::Memory {
+                    q: None,
+                    limit: None,
+                },
+                "MemoryAssertion",
+                Some("listMemoryAssertions"),
+            ),
+            (Read::MemorySettings, "MemorySettings", None),
+            (Read::Schedules, "Schedule", Some("listSchedules")),
+            (Read::Schedule { id: "x".into() }, "Schedule", None),
+        ];
+        // Documented-but-optional properties (Usage.cost_usd has a default).
+        let optional = [("Usage", "cost_usd")];
+        for (read, schema, op) in table {
+            let (_, _, view) = request(&read).unwrap();
+            let (required, props) = schema_fields(schema);
+            assert!(!props.is_empty(), "{schema}: no properties parsed");
+            assert!(!view.fields.is_empty());
+            for f in view.fields {
+                assert!(
+                    props.iter().any(|p| p == f),
+                    "{schema} has no property `{f}`"
+                );
+                assert!(
+                    required.iter().any(|r| r == f) || optional.contains(&(schema, *f)),
+                    "{schema}.{f} is not required"
+                );
+            }
+            match (view.list_key, op) {
+                (Some(key), Some(op)) => {
+                    assert!(wrapper_requires(op, key), "{op} does not wrap in `{key}`")
+                }
+                (None, None) => {}
+                other => panic!("list/wrapper mismatch: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn schema_parser_has_a_positive_control() {
+        let (required, props) = schema_fields("MemoryAssertion");
+        assert!(required.iter().any(|r| r == "text"));
+        assert!(props.iter().any(|p| p == "recorded_at"));
+        assert!(!props.iter().any(|p| p == "subject"));
+        assert!(wrapper_requires("listMemoryAssertions", "assertions"));
+        assert!(!wrapper_requires("listMemoryAssertions", "items"));
+    }
 
     #[test]
     fn blank_id_is_rejected() {
