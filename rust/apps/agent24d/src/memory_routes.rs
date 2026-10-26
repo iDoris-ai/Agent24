@@ -225,6 +225,15 @@ pub async fn delete_assertion(State(state): State<AppState>, Path(id): Path<Stri
             // goes to the log.
             let code = err.code();
             tracing::error!(code = code.as_str(), "retracting assertion {id}: {err}");
+            kv.rejections()
+                .note(&agent24_memory::rejections::Rejection {
+                    owner_kind: agent24_memory::rejections::OwnerKind::Personal,
+                    owner_key: &owner,
+                    code,
+                    rejected_kind: Some("assertion.retracted"),
+                    count_at: None,
+                })
+                .await;
             match code {
                 MemoryErrorCode::DiskFull => error_response(
                     StatusCode::INSUFFICIENT_STORAGE,

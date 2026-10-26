@@ -679,6 +679,7 @@ pub struct OsScopedMemory {
     key: String,
     module: String,
     events: agent24_memory::event::EventLog,
+    rejections: agent24_memory::rejections::Rejections,
 }
 
 impl OsScopedMemory {
@@ -687,7 +688,23 @@ impl OsScopedMemory {
             key: partition.key.clone(),
             module: partition.module.clone(),
             events: kv.events(),
+            rejections: kv.rejections(),
         }
+    }
+
+    /// P1-02c c3 (D3): leave an audit row for a refused write. Best effort: the
+    /// trail write can itself fail on a full disk or quota, in which case it is
+    /// logged inside `note` and the caller's original error stands unchanged.
+    async fn note_rejection(&self, code: agent24_memory::MemoryErrorCode, kind: Option<&str>) {
+        self.rejections
+            .note(&agent24_memory::rejections::Rejection {
+                owner_kind: agent24_memory::rejections::OwnerKind::Module,
+                owner_key: &self.key,
+                code,
+                rejected_kind: kind,
+                count_at: None,
+            })
+            .await;
     }
 
     /// Mint an id for a module's memory.
@@ -856,20 +873,30 @@ impl OsScopedMemory {
 #[async_trait::async_trait]
 impl ScopedMemory for OsScopedMemory {
     async fn remember(&self, what: Remember) -> agent24_domain::Result<Remembered> {
-        let ev = self.build_remember_event(what).map_err(|r| match r {
-            RememberRefusal::Invalid(m) => DomainError::Memory(m),
-            RememberRefusal::ReservedKind => DomainError::MemoryReservedKind,
-        })?;
+        let refused_kind = what.kind.clone();
+        let ev = match self.build_remember_event(what) {
+            Ok(ev) => ev,
+            Err(RememberRefusal::Invalid(m)) => return Err(DomainError::Memory(m)),
+            Err(RememberRefusal::ReservedKind) => {
+                self.note_rejection(
+                    agent24_memory::MemoryErrorCode::ReservedKind,
+                    Some(&refused_kind),
+                )
+                .await;
+                return Err(DomainError::MemoryReservedKind);
+            }
+        };
         let at = ev.at.clone();
         let id = ev.id.clone();
-        self.events.append(&ev).await.map_err(|e| {
+        if let Err(e) = self.events.append(&ev).await {
             let code = e.code();
             tracing::warn!(code = code.as_str(), error = %e, "module remember failed");
-            DomainError::MemoryWriteFailed {
+            self.note_rejection(code, Some(&ev.kind)).await;
+            return Err(DomainError::MemoryWriteFailed {
                 code: code.as_str(),
                 dimension: code.dimension(),
-            }
-        })?;
+            });
+        }
         Ok(Remembered {
             id: MemoryId::from_kernel(id),
             at,
@@ -971,10 +998,19 @@ impl OsScopedMemory {
         admission: Arc<Semaphore>,
         what: Remember,
     ) -> Result<Remembered, MemoryRpcError> {
-        let ev = self.build_remember_event(what).map_err(|r| match r {
-            RememberRefusal::Invalid(m) => MemoryRpcError::Invalid(m),
-            RememberRefusal::ReservedKind => MemoryRpcError::ReservedKind,
-        })?;
+        let refused_kind = what.kind.clone();
+        let ev = match self.build_remember_event(what) {
+            Ok(ev) => ev,
+            Err(RememberRefusal::Invalid(m)) => return Err(MemoryRpcError::Invalid(m)),
+            Err(RememberRefusal::ReservedKind) => {
+                self.note_rejection(
+                    agent24_memory::MemoryErrorCode::ReservedKind,
+                    Some(&refused_kind),
+                )
+                .await;
+                return Err(MemoryRpcError::ReservedKind);
+            }
+        };
         let Some(mut reservation) = Reservation::reserve(limiter, MEMORY_COST_REMEMBER) else {
             return Err(MemoryRpcError::application(
                 ErrorKind::RateLimited,
@@ -982,6 +1018,8 @@ impl OsScopedMemory {
             ));
         };
         let events = self.events.clone();
+        let rejections = self.rejections.clone();
+        let owner_key = self.key.clone();
         let outcome = bind_to_lifecycle(lifecycle, async move {
             let _permit = admission.acquire_owned().await.map_err(|_| {
                 MemoryRpcError::Store("connection admission semaphore closed".into())
@@ -989,10 +1027,18 @@ impl OsScopedMemory {
             // About to touch the shared pool — see `Reservation::mark_touched`
             // for the precise (conservative) meaning of this boundary.
             reservation.mark_touched();
-            events
-                .append(&ev)
-                .await
-                .map_err(|e| crate::os_memory_page::map_memory_error(&e))?;
+            if let Err(e) = events.append(&ev).await {
+                rejections
+                    .note(&agent24_memory::rejections::Rejection {
+                        owner_kind: agent24_memory::rejections::OwnerKind::Module,
+                        owner_key: &owner_key,
+                        code: e.code(),
+                        rejected_kind: Some(&ev.kind),
+                        count_at: None,
+                    })
+                    .await;
+                return Err(crate::os_memory_page::map_memory_error(&e));
+            }
             reservation.commit();
             Ok(Remembered {
                 id: MemoryId::from_kernel(ev.id.clone()),
@@ -1445,6 +1491,11 @@ mod tests {
             m.recent(10).await.unwrap().is_empty(),
             "nothing was written"
         );
+        // c3: the refusals left an audit row (rate-limited to one per 60 s).
+        let rows = kv.rejections().list(&m.key).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].code, "memory_reserved_kind");
+        assert_eq!(rows[0].suppressed_count, RESERVED_KINDS.len() as i64 - 1);
         // Near misses are ordinary kinds.
         for kind in ["assertions", "memory", "sessions.x", "note.assertion.x"] {
             m.remember(Remember::new(kind, serde_json::Map::new()))

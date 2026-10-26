@@ -18,6 +18,7 @@ mod eval_m1;
 pub mod event;
 pub mod knowledge;
 pub mod reconcile;
+pub mod rejections;
 pub mod replay;
 pub mod retriever;
 pub mod session;
@@ -464,6 +465,11 @@ impl KvStore {
     /// cross-store transaction seam is MD-2b work.)
     pub fn events(&self) -> event::EventLog {
         event::EventLog::new(self.pool.clone())
+    }
+
+    /// P1-02c c3: the failed-write audit trail and session-gap ranges.
+    pub fn rejections(&self) -> rejections::Rejections {
+        rejections::Rejections::new(self.pool.clone())
     }
 
     /// A session event-log writer over this store's database.
@@ -1852,7 +1858,7 @@ mod tests {
                 .fetch_one(&upgraded.pool)
                 .await
                 .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 20);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);
