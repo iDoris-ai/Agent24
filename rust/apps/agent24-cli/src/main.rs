@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod offline_db;
 mod query;
 mod service;
 mod tui;
@@ -79,9 +80,8 @@ enum Command {
     /// Serve Agent24 as an ACP agent over newline-delimited JSON-RPC on stdio.
     /// Open Design uses this bridge for its Creative runtime.
     Acp,
-    /// Export/delete the local decision log (D0-2; `docs/agent/PLAN-DECIDE.md`
-    /// §2.1-§2.3). Like `os install`/`uninstall`, this does NOT go through the
-    /// daemon — see `cmd_decide`'s doc comment.
+    /// Export/delete the local decision log (D0-2). No daemon route exists, so
+    /// this uses the offline database gate — see `cmd_decide`.
     Decide {
         #[command(subcommand)]
         action: DecideAction,
@@ -933,8 +933,49 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
 /// at all, a store that will not open, a write that does not land — is an
 /// `Err` the caller turns into a visible, non-zero result. Never a silent
 /// skip.
+///
+/// An attached daemon uses `DELETE /api/v1/module-consents/modules/{module}`
+/// and does not open the database. Otherwise this uses the offline gate.
 async fn invalidate_module_consents(name: &str) -> Result<(), String> {
+    if let Some(ep) = attach_only().await {
+        return revoke_module_consents_online(&ep, name).await;
+    }
     invalidate_module_consents_in(state_file::state_dir().as_deref(), name).await
+}
+
+async fn revoke_module_consents_online(ep: &Endpoint, name: &str) -> Result<(), String> {
+    let url = format!("{}/api/v1/module-consents/modules/{name}", ep.base);
+    match bearer(ep, client().delete(url))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() => Ok(()),
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if body["error"]["message"].as_str().is_some() {
+                Err(format!(
+                    "could not revoke {name} module consent: {}",
+                    daemon_error_line(&body)
+                ))
+            } else {
+                Err(format!(
+                    "could not revoke {name} module consent: daemon returned {status}"
+                ))
+            }
+        }
+        // Connection failure may use the offline gate. A live daemon holds
+        // the lock, so that path returns busy and does not open the database.
+        Err(err) => {
+            match invalidate_module_consents_in(state_file::state_dir().as_deref(), name).await {
+                Ok(()) => Ok(()),
+                Err(offline) => Err(format!(
+                    "could not reach the daemon to revoke {name} module consent ({err}); {offline}"
+                )),
+            }
+        }
+    }
 }
 
 async fn invalidate_module_consents_in(
@@ -946,15 +987,14 @@ async fn invalidate_module_consents_in(
             "could not revoke {name} module consent: no state directory (set HOME)"
         ));
     };
-    let store = agent24_store::Store::open(&dir.join("agent24.db"))
-        .await
-        .map_err(|e| {
-            format!("could not open the consent store to revoke {name} module consent: {e}")
-        })?;
+    // `_lock` must outlive the query: dropping it releases the singleton lock.
+    let (store, _lock) = offline_db::open_offline_store(dir).await.map_err(|err| {
+        format!("could not open the consent store to revoke {name} module consent: {err}")
+    })?;
     store
         .invalidate_module_consents(name)
         .await
-        .map_err(|e| format!("could not revoke {name} module consent: {e}"))
+        .map_err(|err| format!("could not revoke {name} module consent: {err}"))
 }
 
 /// The error a package lifecycle command ends with when its consent
@@ -1121,26 +1161,6 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     out
 }
 
-/// `agent24 decide export`/`delete` — D0-2 (`docs/agent/PLAN-DECIDE.md`
-/// §2.1-§2.3). Unlike every other CLI command except `os install`/`uninstall`
-/// (see `os_local`'s doc comment), this does NOT go through the daemon: the
-/// decision log is a local-only privacy feature (§2.3 — "日志只存本地…永不
-/// 上传"), and a user must be able to export or delete their own data even
-/// if the daemon that would otherwise own `~/.agent24/agent24.db` is not
-/// running (or has crashed) — the same shape of argument `os install` makes
-/// for not depending on "someone reading", just for "someone running".
-/// SQLite's WAL mode (how `Store::open` already connects) supports a second
-/// process reading/writing the same file concurrently with a running
-/// daemon's own connection pool; this is not a new concurrency hazard.
-///
-/// This talks to `agent24-store` directly, NOT through
-/// `agent24_decide::log::DecisionLog` — that trait is D0-2's write-path
-/// contract for whatever D1 component actually runs decisions (composed
-/// inside `agent24d`, see `docs/decision.md` ADR-034). Export/delete are
-/// read/delete-only maintenance operations on already-written rows; they
-/// have no need for an abstraction over "which store backs this", because
-/// for a local CLI tool SQLite-via-`agent24-store` IS the implementation,
-/// today and for the foreseeable future.
 fn cmd_hw(action: HwAction) -> Result<(), String> {
     match action {
         HwAction::Probe => {
@@ -1152,15 +1172,20 @@ fn cmd_hw(action: HwAction) -> Result<(), String> {
     }
 }
 
+/// `agent24 decide export`/`delete` (D0-2). No export/delete route exists,
+/// so this always uses the offline gate and does not migrate.
 async fn cmd_decide(action: DecideAction) -> Result<(), String> {
+    let dir = agent24_protocol::state_file::state_dir().ok_or_else(|| "HOME not set".to_owned())?;
+    cmd_decide_in(&dir, action).await
+}
+
+async fn cmd_decide_in(dir: &std::path::Path, action: DecideAction) -> Result<(), String> {
     match &action {
         DecideAction::Export { jsonl, .. } => require_jsonl(*jsonl)?,
         DecideAction::Delete { .. } => {}
     }
-    let dir = agent24_protocol::state_file::state_dir().ok_or_else(|| "HOME not set".to_owned())?;
-    let store = agent24_store::Store::open(&dir.join("agent24.db"))
-        .await
-        .map_err(|e| e.to_string())?;
+    // `_lock` must outlive the query: dropping it releases the singleton lock.
+    let (store, _lock) = offline_db::open_offline_store(dir).await?;
     match action {
         DecideAction::Export { point, since, .. } => {
             let rows = store
@@ -2335,9 +2360,237 @@ mod tests {
     #[tokio::test]
     async fn consent_revocation_succeeds_with_a_writable_store() {
         let dir = tempfile::tempdir().unwrap();
+        migrated_db(dir.path()).await;
         invalidate_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap();
+    }
+
+    // ── CORE-5a / T10: offline entries share the daemon lock and dock markers ──
+
+    /// `fs2` exclusive locks are per process on macOS, so a second try in this
+    /// process would not look held (FU-61). The child holds the real lock.
+    #[test]
+    #[ignore = "spawned by the offline lock test; holds daemon.singleton.lock until stdin closes"]
+    fn offline_db_lock_holder() {
+        let Ok(dir) = std::env::var("AGENT24_HOLD_SINGLETON_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let lock = agent24_protocol::state_file::try_acquire_singleton_in(&dir)
+            .expect("lock io")
+            .expect("singleton lock already held");
+        std::fs::write(dir.join("holder.ready"), b"1").expect("ready");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        drop(lock);
+    }
+
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn hold_singleton(dir: &std::path::Path) -> KillOnDrop {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::offline_db_lock_holder", "--ignored"])
+            .env("AGENT24_HOLD_SINGLETON_DIR", dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = dir.join("holder.ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if ready.exists() {
+                return KillOnDrop(child);
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut err = String::new();
+                if let Some(stderr) = child.stderr.as_mut() {
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut err);
+                }
+                panic!("lock holder exited {status}: {err}");
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("lock holder did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn db_snapshot(dir: &std::path::Path) -> String {
+        ["agent24.db", "agent24.db-wal", "agent24.db-shm"]
+            .into_iter()
+            .map(|name| match std::fs::metadata(dir.join(name)) {
+                Ok(meta) => format!("{name}:{}:{:?}", meta.len(), meta.modified().ok()),
+                Err(_) => format!("{name}:absent"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn migrated_db(dir: &std::path::Path) {
+        let store = agent24_store::Store::open(&dir.join("agent24.db"))
+            .await
+            .unwrap();
+        agent24_store::test_hooks::checkpoint(&store).await.unwrap();
+        drop(store);
+        let _ = std::fs::remove_file(dir.join("agent24.db-wal"));
+        let _ = std::fs::remove_file(dir.join("agent24.db-shm"));
+    }
+
+    async fn both(dir: &std::path::Path) -> (Result<(), String>, Result<(), String>) {
+        let consent = invalidate_module_consents_in(Some(dir), "mod").await;
+        let decide = cmd_decide_in(
+            dir,
+            DecideAction::Export {
+                jsonl: true,
+                point: None,
+                since: None,
+            },
+        )
+        .await;
+        (consent, decide)
+    }
+
+    fn assert_rejected(got: &(Result<(), String>, Result<(), String>), needle: &str) {
+        for (label, result) in [("consent", &got.0), ("decide", &got.1)] {
+            let err = result.as_ref().expect_err(label);
+            assert!(err.contains(needle), "{label}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_entries_return_busy_without_touching_the_database_when_the_singleton_lock_is_held()
+     {
+        let empty = tempfile::tempdir().unwrap();
+        let _empty_holder = hold_singleton(empty.path());
+        let absent = db_snapshot(empty.path());
+        assert_rejected(&both(empty.path()).await, "busy:");
+        assert_eq!(
+            absent,
+            db_snapshot(empty.path()),
+            "busy must not create a database file"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        migrated_db(dir.path()).await;
+        let before = db_snapshot(dir.path());
+        assert!(
+            before.contains("agent24.db-shm:absent"),
+            "quiesce failed: {before}"
+        );
+        let _holder = hold_singleton(dir.path());
+        assert_rejected(&both(dir.path()).await, "busy:");
+        assert_eq!(
+            before,
+            db_snapshot(dir.path()),
+            "busy must not open the database"
+        );
+    }
+
+    async fn refuse_marker(name: &str, needle: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        migrated_db(dir.path()).await;
+        std::fs::write(dir.path().join(name), b"{}").unwrap();
+        let before = db_snapshot(dir.path());
+        assert_rejected(&both(dir.path()).await, needle);
+        assert_eq!(
+            before,
+            db_snapshot(dir.path()),
+            "{name} must be refused before the database is opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_entries_return_docked_when_migration_failed_exists() {
+        refuse_marker("migration_failed", "docked: migration_failed").await;
+    }
+
+    #[tokio::test]
+    async fn offline_entries_return_docked_when_migration_guard_log_exists() {
+        refuse_marker("migration-guard.json", "docked: migration-guard.json").await;
+    }
+
+    #[tokio::test]
+    async fn offline_entries_refuse_a_behind_schema_and_leave_the_version_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let latest = agent24_store::test_hooks::embedded_schema_version();
+        agent24_store::test_hooks::prepare_db_stopped_before(&path, latest)
+            .await
+            .unwrap();
+        let before = agent24_store::test_hooks::applied_schema_version(&path)
+            .await
+            .unwrap();
+        assert!(
+            before < latest,
+            "fixture must be behind ({before} < {latest})"
+        );
+        assert_rejected(&both(dir.path()).await, "请先启动 daemon 完成升级");
+        let after = agent24_store::test_hooks::applied_schema_version(&path)
+            .await
+            .unwrap();
+        assert_eq!(before, after, "offline open must not migrate");
+    }
+
+    #[tokio::test]
+    async fn offline_entries_run_when_the_lock_is_free_and_the_schema_is_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        store
+            .insert_decision_log(&agent24_store::NewDecisionLogEntry {
+                decision_id: "d1".to_owned(),
+                ts: "2026-10-07T00:00:00Z".to_owned(),
+                schema_version: 1,
+                point: "retain.intent".to_owned(),
+                input: None,
+                context_json: None,
+                question_json: "[]".to_owned(),
+                layers_json: "[]".to_owned(),
+                final_action: "execute".to_owned(),
+                hw_tier: None,
+            })
+            .await
+            .unwrap();
+        agent24_store::test_hooks::checkpoint(&store).await.unwrap();
+        drop(store);
+
+        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap();
+        cmd_decide_in(
+            dir.path(),
+            DecideAction::Delete {
+                action: DecideDeleteAction::Id {
+                    decision_id: "d1".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let store = agent24_store::Store::open_without_migration(&path)
+            .await
+            .unwrap();
+        let revocations = agent24_store::test_hooks::revocation_count(&store, "consent-mod")
+            .await
+            .unwrap();
+        assert_eq!(revocations, 1, "consent revocation must land");
+        let remaining = store.export_decision_log(None, None).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "decide delete must remove the seeded row"
+        );
     }
 
     // ── D0-2 `agent24 decide` guards (pre-pr-check T2) ──────────────────────
