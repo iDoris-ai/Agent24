@@ -219,7 +219,12 @@ impl Tool for HttpFetchTool {
 
         // Resolve-then-pin: every address the name resolves to must be public,
         // and the actual connection is restricted to exactly those addresses.
+        //
+        // No proxy: the default client honours HTTP_PROXY/ALL_PROXY, which
+        // would both send the host's proxy credentials with the request and
+        // let the proxy resolve and connect past the pin (Codex 6b.5f-1 r2).
         let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(25));
@@ -578,6 +583,109 @@ mod tests {
 
     fn connections(counter: &std::sync::atomic::AtomicUsize) -> usize {
         counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    // ── http_fetch must not honour HTTP_PROXY ─────────────────────────────
+    //
+    // Same shape as agent24-worker's FU-74 test: a child process gets
+    // HTTP_PROXY/ALL_PROXY pointed at a counting stub, and the stub's count
+    // shows whether the request went through it. The positive control (a
+    // bare default client) proves the env was live for the child. The port
+    // variable is lowercase so agent24-cli's passthrough scanner ignores it.
+
+    /// A blocking stub on its own thread: counts connections, answers 200.
+    fn thread_stub() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { continue };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        (port, count)
+    }
+
+    fn proxy_child_target() -> String {
+        let port = std::env::var("http_fetch_proxy_target_port")
+            .expect("run_proxy_child must set http_fetch_proxy_target_port");
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    /// Child: the production path.
+    #[tokio::test]
+    #[ignore = "child process of http_fetch_ignores_http_proxy"]
+    async fn proxy_child_http_fetch() {
+        let _ = HttpFetchTool::new(true)
+            .call(
+                &ctx(),
+                &input(&proxy_child_target()),
+                &CancellationToken::new(),
+            )
+            .await;
+    }
+
+    /// Child: positive control, the bare default client.
+    #[tokio::test]
+    #[ignore = "child process of http_fetch_ignores_http_proxy"]
+    async fn proxy_child_default_client() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let _ = client
+            .get(proxy_child_target())
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    fn run_proxy_child(test: &str, target: u16, proxy: u16) {
+        let proxy_url = format!("http://alice:secret@127.0.0.1:{proxy}");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--ignored", "--nocapture"])
+            .env("http_fetch_proxy_target_port", target.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn http_fetch_ignores_http_proxy() {
+        let (target_port, target) = thread_stub();
+        let (proxy_port, proxy) = thread_stub();
+        run_proxy_child(
+            "net::tests::proxy_child_http_fetch",
+            target_port,
+            proxy_port,
+        );
+        assert_eq!(connections(&proxy), 0, "the proxy saw http_fetch's request");
+        assert_eq!(connections(&target), 1);
+
+        run_proxy_child(
+            "net::tests::proxy_child_default_client",
+            target_port,
+            proxy_port,
+        );
+        assert_eq!(
+            connections(&proxy),
+            1,
+            "HTTP_PROXY was not live for the child"
+        );
     }
 
     #[tokio::test]
