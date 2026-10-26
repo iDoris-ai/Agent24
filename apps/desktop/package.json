@@ -21,21 +21,21 @@
     "pack:open-design": "node scripts/pack-open-design-component.mjs",
     "test:stage-open-design": "node --test scripts/stage-open-design-resources.test.mjs",
     "test:pack-open-design": "node --test scripts/pack-open-design-component.test.mjs",
-    "build:mac": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --mac",
-    "build:win": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --win",
-    "build:linux": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --linux",
+    "build:mac": "pnpm build:rust && pnpm build && electron-builder --mac",
+    "build:win": "pnpm build:rust && pnpm build && electron-builder --win",
+    "build:linux": "pnpm build:rust && pnpm build && electron-builder --linux",
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
     "@agent24/api-client": "workspace:*",
-    "@agent24/node-daemon": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.21.1"
   },
   "devDependencies": {
+    "@agent24/node-daemon": "workspace:*",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^22.0.0",
@@ -67,13 +67,6 @@
       "package.json"
     ],
     "extraResources": [
-      {
-        "from": "../../packages/node-daemon/dist",
-        "to": "backend",
-        "filter": [
-          "**/*"
-        ]
-      },
       {
         "from": ".open-design-component",
         "to": ".",

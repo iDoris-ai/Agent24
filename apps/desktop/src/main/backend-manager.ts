@@ -1,7 +1,7 @@
 // Backend process manager — supervises the daemon child process.
 // AGENT24_BACKEND=node|rust selects the implementation (default: rust since
-// v0.1.0 — the Rust agent24d is the shipping backend; `node` stays available
-// as an explicit opt-in for the legacy mock).
+// v0.1.0 — the Rust agent24d is the shipping backend; `node` is a dev-only
+// opt-in for the reference mock, ignored in packaged builds per ADR-037).
 // Both backends speak the same v1 protocol and announce themselves via the
 // SPEC-002 §4 ready line: the manager scans child stdout for the first
 // {"type":"ready","port":…,"token":…} JSON line and exposes it to the IPC
@@ -35,9 +35,21 @@ export function getBackendEndpoint(): BackendEndpoint | null {
   return currentEndpoint
 }
 
-export function selectedBackend(): BackendKind {
-  // Default rust (v0.1.0); only an explicit `node` opts into the legacy mock.
-  return process.env['AGENT24_BACKEND'] === 'node' ? 'node' : 'rust'
+export function selectedBackend(packaged: boolean = !isDev): BackendKind {
+  // Default rust (v0.1.0); only an explicit `node` opts into the reference
+  // implementation — and only in dev. ADR-037 decision 1 (CORE-8): the Node
+  // daemon is no longer shipped in installers, so a packaged build ignores
+  // AGENT24_BACKEND=node with a warning and falls back to Rust (rather than
+  // throwing: a stray env var must not brick an installed app, and there is no
+  // server.js to launch anyway).
+  if (process.env['AGENT24_BACKEND'] !== 'node') return 'rust'
+  if (packaged) {
+    console.warn(
+      '[backend] AGENT24_BACKEND=node ignored in packaged builds (ADR-037: node-daemon is a dev/contract-test reference only); using rust',
+    )
+    return 'rust'
+  }
+  return 'node'
 }
 
 /** Daemon lifecycle status surfaced to the tray (F1b). */
@@ -69,7 +81,9 @@ function resolveNodeEntry(): string {
     // Workspace dep: @agent24/node-daemon main → packages/node-daemon/dist/server.js
     return require.resolve('@agent24/node-daemon')
   }
-  return path.join(process.resourcesPath, 'backend', 'server.js')
+  // ADR-037: no node-daemon in installers; selectedBackend() never yields
+  // 'node' when packaged, so reaching here is a bug.
+  throw new Error('node backend is not available in packaged builds (ADR-037)')
 }
 
 function resolveRustBinary(): string {

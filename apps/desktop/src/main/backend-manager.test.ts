@@ -9,6 +9,7 @@ import {
   daemonStatePath,
   readExternalDaemonState,
   BackendManager,
+  selectedBackend,
   getBackendEndpoint,
   type ExternalDaemonSource,
 } from './backend-manager'
@@ -320,5 +321,32 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     expect(children[1].kill).toHaveBeenCalledWith('SIGTERM')
 
     manager.stop()
+  })
+})
+
+describe('selectedBackend (ADR-037 / CORE-8: node-daemon not shipped)', () => {
+  const prev = process.env['AGENT24_BACKEND']
+  afterEach(() => {
+    if (prev === undefined) delete process.env['AGENT24_BACKEND']
+    else process.env['AGENT24_BACKEND'] = prev
+    vi.restoreAllMocks()
+  })
+
+  it('packaged + AGENT24_BACKEND=node → rust, with a warning', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    expect(selectedBackend(true)).toBe('rust')
+    expect(warn).toHaveBeenCalledOnce()
+  })
+
+  it('dev + AGENT24_BACKEND=node → node', () => {
+    process.env['AGENT24_BACKEND'] = 'node'
+    expect(selectedBackend(false)).toBe('node')
+  })
+
+  it('unset → rust in both modes', () => {
+    delete process.env['AGENT24_BACKEND']
+    expect(selectedBackend(true)).toBe('rust')
+    expect(selectedBackend(false)).toBe('rust')
   })
 })
