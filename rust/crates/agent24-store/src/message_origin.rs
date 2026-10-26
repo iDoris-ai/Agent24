@@ -21,11 +21,15 @@ const INSERT_ORIGIN: &str = "INSERT INTO run_message_origins \
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageOrigin {
-    HostRecall { recall_ref: Option<String> },
+    HostRecall {
+        recall_ref: Option<String>,
+    },
     UserPrompt,
     SessionHistory,
     Assistant,
     ToolResult,
+    /// Host-generated system notice (the memory pause notice). `recall_ref` is NULL.
+    HostSystem,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +39,7 @@ pub struct OriginatedRunMessage {
 }
 
 /// One row of the first model-call snapshot.
-/// `PauseNotice` is the only variant that writes no `run_message_origins` row.
+/// `PauseNotice` is written with a `HostSystem` origin row in the same transaction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SnapshotRunMessage {
     Originated(OriginatedRunMessage),
@@ -97,6 +101,7 @@ fn origin_columns(origin: &MessageOrigin) -> Result<(&'static str, Option<&str>)
         MessageOrigin::SessionHistory => Ok(("SessionHistory", None)),
         MessageOrigin::Assistant => Ok(("Assistant", None)),
         MessageOrigin::ToolResult => Ok(("ToolResult", None)),
+        MessageOrigin::HostSystem => Ok(("HostSystem", None)),
     }
 }
 
@@ -109,6 +114,7 @@ fn origin_from_row(kind: &str, recall_ref: Option<String>) -> Option<MessageOrig
         "SessionHistory" if recall_ref.is_none() => Some(MessageOrigin::SessionHistory),
         "Assistant" if recall_ref.is_none() => Some(MessageOrigin::Assistant),
         "ToolResult" if recall_ref.is_none() => Some(MessageOrigin::ToolResult),
+        "HostSystem" if recall_ref.is_none() => Some(MessageOrigin::HostSystem),
         _ => None,
     }
 }
@@ -218,7 +224,7 @@ impl Store {
     }
 
     /// The whole snapshot commits in one `BEGIN IMMEDIATE`, or none of it does.
-    /// A pause notice writes no origin row. An empty slice does not start a transaction.
+    /// A pause notice writes a `HostSystem` origin row. An empty slice does not start a transaction.
     pub async fn append_snapshot_run_messages(
         &self,
         run_id: &str,
@@ -231,8 +237,8 @@ impl Store {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         for row in messages {
             let (message, origin) = match row {
-                SnapshotRunMessage::Originated(row) => (&row.message, Some(&row.origin)),
-                SnapshotRunMessage::PauseNotice(message) => (message, None),
+                SnapshotRunMessage::Originated(row) => (&row.message, &row.origin),
+                SnapshotRunMessage::PauseNotice(message) => (message, &MessageOrigin::HostSystem),
             };
             let tool_calls_json = serde_json::to_string(&message.tool_calls)?;
             sqlx::query(INSERT_MESSAGE)
@@ -245,9 +251,6 @@ impl Store {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
-            let Some(origin) = origin else {
-                continue;
-            };
             let (kind, recall_ref) = origin_columns(origin)?;
             let digest = message_instance_digest(
                 &message.role,
