@@ -57,6 +57,9 @@ fn an_empty_log_is_off_with_nothing_else() {
     assert!(out.off && !out.prompt && !out.shut_down);
     assert!(out.profiles.is_empty() && out.bindings.is_empty() && out.runs.is_empty());
     assert_eq!(out.highest, 0);
+    // The next record takes the number the log starts at.
+    assert_eq!(out.next, 1);
+    assert_eq!(replay(5, Vec::<Record<T>>::new()).unwrap().next, 5);
 }
 
 #[test]
@@ -211,6 +214,8 @@ fn numbers_that_skip_go_back_or_disagree_are_damage() {
     assert_eq!(replay(4, vec![at(1, on())]), Err(Damaged));
     let last = vec![at(u64::MAX, off()), at(0, on())];
     assert_eq!(replay(u64::MAX, last), Err(Damaged));
+    // No number would be left for the next record.
+    assert_eq!(replay(u64::MAX, vec![at(u64::MAX, off())]), Err(Damaged));
     // The same write or void again is a retry.
     let out = replay(
         4,
@@ -221,7 +226,10 @@ fn numbers_that_skip_go_back_or_disagree_are_damage() {
             at(5, Entry::Void),
         ],
     );
-    assert!(!out.unwrap().off);
+    let out = out.unwrap();
+    assert!(!out.off);
+    // A void takes its number too.
+    assert_eq!(out.next, 6);
 }
 
 #[test]
@@ -261,6 +269,20 @@ fn unsaved_settings_is_not_replaced_and_a_confirmation_answers_only_what_awaits(
         },
     ]);
     assert_eq!(out.profiles["a"].awaiting, Some(pc));
+    // Clearing `unsaved_settings` confirms no principal (S1.13).
+    assert!(out.confirmed.is_empty());
+    let out = replayed(vec![
+        C::Await {
+            profile: "a",
+            awaited: pc,
+        },
+        C::Confirm {
+            profile: "a",
+            principal: "v",
+            awaited: pc,
+        },
+    ]);
+    assert_eq!(out.profiles["a"].awaiting, None);
     assert_eq!(out.confirmed["a"], "v");
 }
 
@@ -375,4 +397,26 @@ fn only_a_shutdown_last_of_all_is_clean() {
     let mut records = log(vec![C::Shutdown]);
     records.push(at(2, Entry::Void));
     assert!(!replay(1, records).unwrap().shut_down);
+}
+
+#[test]
+fn a_binding_bound_twice_or_below_its_profile_s_values_is_damage() {
+    let damaged = |changes| replay(1, log(changes));
+    // The same binding again (S2.6).
+    let twice = vec![bind("a", 1, 1), C::Retire(of("a", 1)), bind("a", 1, 5)];
+    assert_eq!(damaged(twice), Err(Damaged));
+    // A first value not past one its profile used, retired or raised (S4.4).
+    let below = vec![
+        bind("a", 1, 1),
+        C::Generation {
+            of: of("a", 1),
+            value: 9,
+        },
+        C::Retire(of("a", 1)),
+        bind("a", 2, 9),
+    ];
+    assert_eq!(damaged(below), Err(Damaged));
+    // Past it, or another profile's first value: sound.
+    let sound = vec![bind("a", 1, 9), bind("a", 2, 10), bind("b", 3, 1)];
+    assert_eq!(damaged(sound).unwrap().bindings.len(), 3);
 }

@@ -6,8 +6,8 @@
 //! the profile with its identity changes (`profile`), what the history shows
 //! of the evidence a binding delivered (`evidence`), and what is persisted
 //! when, with the seal that tells a restart whether it can trust that
-//! (`ledger`), the records it is persisted as (`record`) and how they are
-//! read back (`replay`).
+//! (`ledger`), the records it is persisted as (`record`), how they are read
+//! back (`replay`) and what a restart makes of them (`recover`).
 
 pub mod binding;
 pub mod connection;
@@ -18,5 +18,6 @@ pub mod ledger;
 pub mod placeholder;
 pub mod profile;
 pub mod record;
+pub mod recover;
 pub mod replay;
 pub mod state;
