@@ -92,9 +92,8 @@ export function importFile(
         take(pending.slice(0, nl))
         pending = pending.slice(nl + 1)
       }
-      // A whole line, or the start of one, past the bound: stop.
-      const nl = pending.indexOf('\n')
-      if ((nl < 0 ? pending.length : nl) > MAX_LINE_CHARS) {
+      // What is left is a line past the bound or the start of one.
+      if (pending.length > MAX_LINE_CHARS) {
         pending = ''
         child.kill()
         settle(fail(502, 'invalid_response', 'the import tool wrote a line too long'))
