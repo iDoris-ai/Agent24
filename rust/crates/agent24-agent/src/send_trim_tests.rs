@@ -897,6 +897,27 @@ async fn cold_reopen(
     resume_env(store, memory, files.dir.path().to_path_buf())
 }
 
+/// Renames the assertion ledger table in the on-disk memory DB, so a query
+/// with a VALID owner passes `check_owner()` and then fails inside
+/// `beliefs_as_of` (a real read-layer failure). Done after the handles that
+/// seeded the file are gone, through a separate connection.
+async fn break_assertion_table(files: &ColdFiles) {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&files.kv_path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE mem_assertions RENAME TO mem_assertions_broken")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn cold_resume_drops_host_recall_when_memory_is_none() {
     let (log, _guard) = capture_warns();
@@ -945,8 +966,10 @@ async fn cold_resume_drops_host_recall_when_active_ids_fail() {
     })
     .await;
     let shaped = block(&[&facts[0]]);
-    // A memory handle whose owner is unset: `active_ids()` returns an error.
-    let env = cold_reopen(&files, |kv| Some(memory_of(kv, None))).await;
+    // The owner is valid, so `check_owner()` passes; the ledger table is gone,
+    // so `beliefs_as_of` itself fails.
+    break_assertion_table(&files).await;
+    let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
     let done = approve_and_resume(&env).await;
     assert_eq!(done.status, RunStatus::Completed);
     let sent = first_send(&env.provider);
@@ -957,6 +980,19 @@ async fn cold_resume_drops_host_recall_when_active_ids_fail() {
     );
     assert_eq!(count_eq(&sent, "run echo"), 1);
     assert!(host_recall_warned(&log));
+    let warns = log.0.lock().unwrap().join("\n");
+    assert!(
+        warns.contains("could not re-validate HostRecall"),
+        "the read-failure branch must be the one that fired: {warns}"
+    );
+    assert!(
+        warns.contains("mem_assertions"),
+        "the error must come from the ledger query: {warns}"
+    );
+    assert!(
+        !warns.contains("owner is not configured"),
+        "must not be the check_owner() failure: {warns}"
+    );
 }
 
 #[tokio::test]
@@ -985,17 +1021,21 @@ async fn cold_resume_three_same_text_origins_each_by_kind() {
 
 #[tokio::test]
 async fn cold_resume_leaves_origin_rows_and_digests_unchanged() {
-    let (files, _facts) = cold_seed(&["fact alive", "fact revoked"], Some(1), |facts| {
+    let (files, facts) = cold_seed(&["fact alive", "fact revoked"], Some(1), |facts| {
         let full = block(&[&facts[0], &facts[1]]);
         vec![
             host_recall(&full),
             filler("f1"),
             row("user", Some(&full), MessageOrigin::UserPrompt),
+            filler("f2"),
             row("user", Some(&full), MessageOrigin::SessionHistory),
+            filler("f3"),
             parked_assistant(),
         ]
     })
     .await;
+    let full = block(&[&facts[0], &facts[1]]);
+    let pruned = block(&[&facts[0]]);
     let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
     let snapshot = |store: Store| async move {
         let rows = store.list_run_messages("run_1").await.unwrap();
@@ -1006,32 +1046,27 @@ async fn cold_resume_leaves_origin_rows_and_digests_unchanged() {
         (rows, origins)
     };
     let before = snapshot(env.store.clone()).await;
-    assert_eq!(before.0.len(), 5);
+    assert_eq!(before.0.len(), 7);
     let done = approve_and_resume(&env).await;
     assert_eq!(done.status, RunStatus::Completed);
-    assert!(mentions(&first_send(&env.provider), RECALL_PREFIX), "sent a trimmed recall");
+    // The trim really happened on the send copy: exactly one message is the
+    // recall block with only the live fact, and the revoked line survives only
+    // in the two verbatim (non-HostRecall) copies.
+    let sent = first_send(&env.provider);
+    assert_eq!(count_eq(&sent, &pruned), 1, "HostRecall trimmed to live ids");
+    assert_eq!(count_eq(&sent, &full), 2, "UserPrompt + SessionHistory verbatim");
+    let with_revoked = sent
+        .iter()
+        .filter(|m| m.content.as_deref().is_some_and(|c| c.contains("fact revoked")))
+        .count();
+    assert_eq!(with_revoked, 2, "revoked line only in the two verbatim rows");
+    // `drive_resume` does no history reclaim (that lives only at the end of
+    // `execute`), so ALL seeded rows must still be present and identical:
+    // body, kind, recall_ref and digest. Resume only appends after them.
     let after = snapshot(env.store.clone()).await;
-    // Resume appends the tool result and final assistant (and a terminal run
-    // may reclaim duplicated history rows), so compare per seq: every row that
-    // survives must be byte-identical to what was seeded, kind and digest too.
-    let mut compared = 0;
-    for (i, b) in before.0.iter().enumerate() {
-        if let Some(j) = after.0.iter().position(|a| a.seq == b.seq) {
-            assert_eq!(after.0[j], *b, "message body changed at seq {}", b.seq);
-            assert_eq!(after.1[j], before.1[i], "origin/digest changed at seq {}", b.seq);
-            compared += 1;
-        }
-    }
-    // The HostRecall (seq 0) and UserPrompt rows must have survived and been compared.
-    assert!(compared >= 3, "too few rows compared: {compared}");
-    assert_eq!(after.0[0].seq, before.0[0].seq);
-    assert!(after.0[0].content.as_deref().unwrap().contains("fact revoked"));
-    assert!(
-        after
-            .0
-            .iter()
-            .any(|a| a.seq == before.0[2].seq && a.content == before.0[2].content)
-    );
+    assert!(after.0.len() >= before.0.len(), "seeded rows disappeared");
+    assert_eq!(after.0[..before.0.len()], before.0[..], "message rows changed");
+    assert_eq!(after.1[..before.1.len()], before.1[..], "origin rows or digests changed");
 }
 
 #[tokio::test]
@@ -1054,4 +1089,48 @@ async fn cold_resume_delivers_host_system_notice_verbatim() {
     let sent = first_send(&env.provider);
     assert_eq!(sent[0], Msg::system(retain::PAUSED_WRITE_NOTICE));
     assert_eq!(count_eq(&sent, "run echo"), 1);
+}
+
+#[tokio::test]
+async fn cold_resume_binds_kind_by_store_seq_with_seq_hole() {
+    // Cold version of `resume_after_append_binds_kind_by_store_seq`: a
+    // recall-shaped UserPrompt at position 0 and the real HostRecall later.
+    let (files, facts) = cold_seed(&["fact alive", "fact revoked"], Some(1), |facts| {
+        let full = block(&[&facts[0], &facts[1]]);
+        vec![
+            filler("gap"),
+            row("user", Some(&full), MessageOrigin::UserPrompt),
+            filler("f1"),
+            host_recall(&full),
+            filler("f2"),
+            row("user", Some(&full), MessageOrigin::SessionHistory),
+            parked_assistant(),
+        ]
+    })
+    .await;
+    let full = block(&[&facts[0], &facts[1]]);
+    let pruned = block(&[&facts[0]]);
+    let env = cold_reopen(&files, |kv| Some(memory_of(kv, Some(OWNER)))).await;
+    // Open a hole at the front of the reopened file: stored seqs now start at
+    // 1, so a row's seq never equals its in-memory index.
+    env.store
+        .delete_run_message_range("run_1", 0, 0)
+        .await
+        .unwrap();
+    let seqs: Vec<i64> = env
+        .store
+        .list_run_messages("run_1")
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.seq)
+        .collect();
+    assert_eq!(seqs[0], 1);
+    let done = approve_and_resume(&env).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let sent = first_send(&env.provider);
+    assert!(sent.iter().any(|m| m.role == "tool"));
+    assert_eq!(count_eq(&sent, &pruned), 1, "non-zero-position HostRecall trimmed");
+    assert_eq!(count_eq(&sent, &full), 2, "UserPrompt + SessionHistory verbatim");
+    assert_eq!(sent[0], Msg::user(full));
 }
