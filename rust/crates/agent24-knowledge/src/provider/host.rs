@@ -269,9 +269,8 @@ impl<I: Ids> Host<I> {
     pub fn written(&mut self, attempt: Attempt, outcome: Written) -> Output<I> {
         let mut out = Output::default();
         match self.journal.written(attempt, outcome) {
-            Report::Ignored | Report::Failed(Then::Loose { .. } | Then::Create { .. }) => {
-                return out;
-            }
+            Report::Ignored | Report::Failed(Then::Loose { .. }) => return out,
+            Report::Failed(Then::Create { .. }) => return out,
             Report::Failed(Then::Tight { ticket, .. }) => {
                 self.ledger.record_failed(*ticket);
                 return out;
@@ -295,10 +294,8 @@ impl<I: Ids> Host<I> {
             }
             Report::Durable(Then::Create { ticket }) => self.created(ticket, &mut out),
         }
-        // A tightening on the way deleted the seal: no rebuild yet.
-        if let Some(op) = self.ledger.reseal() {
-            out.seal = Some(SealWrite::Rebuild(op));
-        }
+        // A tightening on the way may have deleted it: no rebuild yet.
+        out.seal = self.ledger.reseal().map(SealWrite::Rebuild).or(out.seal);
         out
     }
 

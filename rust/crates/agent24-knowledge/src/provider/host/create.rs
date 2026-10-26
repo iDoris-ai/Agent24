@@ -1,8 +1,8 @@
 //! New bindings (KB-C1-04 6c-2a; CONTRACT-STATE-v1 S2.5, S4.4, S1.13): a
 //! login or handshake on a placeholder that comes back with an identity is
 //! written as a binding with its first generation value, a loosening, and
-//! binds once that is confirmed persisted (I1). The caller mints the
-//! binding's id and never uses it again (design F5).
+//! binds once that is confirmed persisted (I1). The caller mints a fresh
+//! id for the binding (design F5).
 //!
 //! A failed attempt's reason is persisted, a tightening, except
 //! `dependency`: it retries by backoff whatever is persisted, so it stays in
@@ -19,7 +19,7 @@ use crate::provider::state::PlaceholderFailure;
 /// What a login or handshake that came back with an identity creates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Created<I: Ids> {
-    /// Minted by the caller, never used before.
+    /// Fresh, minted by the caller.
     pub binding: I::Binding,
     pub identity: I::Identity,
     pub principal: I::Principal,
@@ -82,15 +82,10 @@ impl<I: Ids> Host<I> {
     }
 
     fn write_creation(&mut self, id: I::Profile, attempt: Attempt, created: Created<I>) {
-        let scope = Scope::profile(id.clone());
-        let loosened = match self.highest.checked_add(1) {
-            Some(value) => self
-                .ledger
-                .loosen(scope, None, self.off)
-                .ok()
-                .map(|t| (value, t)),
-            None => None,
-        };
+        let loosened = self.highest.checked_add(1).and_then(|value| {
+            let scope = Scope::profile(id.clone());
+            Some((value, self.ledger.loosen(scope, None, self.off).ok()?))
+        });
         let Some(m) = self.member(&id) else {
             return;
         };
@@ -98,11 +93,8 @@ impl<I: Ids> Host<I> {
             m.creation_failed(attempt);
             return;
         };
-        let confirmed = m
-            .profile()
-            .confirmation()
-            .is_none()
-            .then_some(created.principal);
+        let awaited = m.profile().confirmation();
+        let confirmed = awaited.is_none().then_some(created.principal);
         let of = Of {
             profile: id.clone(),
             binding: created.binding,
@@ -143,13 +135,10 @@ impl<I: Ids> Host<I> {
     ) -> Output<I> {
         debug_assert_ne!(attempted, Attempted::Identified);
         let mut out = Output::default();
-        let Some(m) = self.member(&id) else {
-            return out;
-        };
-        let Settled::Failed(failure) = m.settle(attempt, attempted) else {
-            return out;
-        };
-        if failure != PlaceholderFailure::Dependency {
+        if let Some(m) = self.member(&id)
+            && let Settled::Failed(failure) = m.settle(attempt, attempted)
+            && failure != PlaceholderFailure::Dependency
+        {
             let change = Change::PlaceholderFailed {
                 profile: id.clone(),
                 failure,
@@ -161,11 +150,10 @@ impl<I: Ids> Host<I> {
     }
 
     /// A new binding's write is confirmed: it binds and connects, or, its
-    /// attempt superseded or its profile removed meanwhile, it is retired at
-    /// once (A.5). The rest of the write stands as a restart reads it: its
-    /// principal is confirmed (S1.13), and the reason it cleared is written
-    /// back unless a newer one took its place or a later creation, written
-    /// after it, clears it again and settles it in turn.
+    /// attempt superseded or its profile removed, it is retired (A.5). The
+    /// rest stands as a restart reads it: its principal is confirmed (S1.13),
+    /// and the reason it cleared is written back unless a newer one replaced
+    /// it or a later creation, written after it, clears it again.
     pub(super) fn created(&mut self, ticket: Loosening, out: &mut Output<I>) {
         let Some(i) = self.creations.iter().position(|c| c.ticket == ticket) else {
             return;

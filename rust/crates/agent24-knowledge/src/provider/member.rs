@@ -142,8 +142,7 @@ impl<I: Ids> Member<I> {
         }
     }
 
-    /// `attempt`'s binding was not written: `dependency`, and the placeholder
-    /// retries by backoff (S2.5).
+    /// `attempt`'s binding was not written: `dependency`, by backoff (S2.5).
     pub fn creation_failed(&mut self, attempt: Attempt) {
         if let Slot::Placeholder(placeholder) = self.profile.slot_mut() {
             placeholder.creation_failed(attempt);
@@ -158,10 +157,9 @@ impl<I: Ids> Member<I> {
         }
     }
 
-    /// `attempt`'s binding is persisted with its first `value` and, when it
-    /// needed no confirmation, its principal as confirmed (S2.5, S4.4,
-    /// S1.13). False once the attempt no longer creates, as
-    /// [`Profile::bind`].
+    /// `attempt`'s binding is persisted with its first `value`, and its
+    /// principal if it needed no confirmation (S2.5, S4.4, S1.13). False once
+    /// the attempt no longer creates, as [`Profile::bind`].
     pub fn bind(
         &mut self,
         attempt: Attempt,
@@ -170,10 +168,8 @@ impl<I: Ids> Member<I> {
         confirmed: Option<I::Principal>,
     ) -> bool {
         let connection = Connection::new(Gate::new(value), false);
-        if !self
-            .profile
-            .bind(attempt, connection, Credentials::new(false))
-        {
+        let credentials = Credentials::new(false);
+        if !self.profile.bind(attempt, connection, credentials) {
             return false;
         }
         self.binding = Some(binding);
