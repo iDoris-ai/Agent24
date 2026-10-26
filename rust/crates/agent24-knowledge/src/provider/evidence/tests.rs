@@ -3,7 +3,10 @@ use super::*;
 type E = Evidence<&'static str>;
 
 fn at(kb: &'static str, epoch: u64) -> Delivered<&'static str> {
-    Delivered { kb, epoch }
+    Delivered {
+        kbs: kbs(&[kb]),
+        epoch,
+    }
 }
 
 fn kbs(all: &[&'static str]) -> BTreeSet<&'static str> {
@@ -42,7 +45,7 @@ fn a_pending_reverification_holds_back_its_kbs_until_the_current_version_passes(
     let mut evidence = E::default();
     assert_eq!(evidence.recheck(), None);
     assert_eq!(evidence.passed(0), Passed::Ignored);
-    evidence.register(["a"]);
+    assert!(evidence.register(["a"]));
     assert!(evidence.reverify_pending());
     let first = Recheck {
         kbs: kbs(&["a"]),
@@ -54,7 +57,7 @@ fn a_pending_reverification_holds_back_its_kbs_until_the_current_version_passes(
     assert_eq!(evidence.shown(false, &at("a", 5)), Shown::Withheld);
     assert_eq!(evidence.shown(false, &at("b", 0)), Shown::Body);
     // ST-18r: registered again while version 1 is rechecked.
-    evidence.register(["b"]);
+    assert!(evidence.register(["b"]));
     let merged = Recheck {
         kbs: kbs(&["a", "b"]),
         version: 2,
@@ -71,7 +74,7 @@ fn a_pending_reverification_holds_back_its_kbs_until_the_current_version_passes(
     assert_eq!(evidence.passed(2), Passed::Ignored);
     assert!(!evidence.release(2));
     // Versions go on: a new registration is not released by an old answer.
-    evidence.register(["c"]);
+    assert!(evidence.register(["c"]));
     assert_eq!(evidence.recheck().map(|r| r.version), Some(3));
     assert!(!evidence.release(2));
     assert!(evidence.reverify_pending());
@@ -81,7 +84,7 @@ fn a_pending_reverification_holds_back_its_kbs_until_the_current_version_passes(
 fn the_third_timeout_in_a_row_stops_rechecks_until_a_retry() {
     let mut evidence = E::default();
     evidence.timed_out();
-    evidence.register(["a"]);
+    assert!(evidence.register(["a"]));
     // A timeout with nothing pending counted for nothing.
     for _ in 0..2 {
         evidence.timed_out();
@@ -98,7 +101,7 @@ fn the_third_timeout_in_a_row_stops_rechecks_until_a_retry() {
     // once the caller persists the reset.
     evidence.timed_out();
     evidence.timed_out();
-    evidence.register(["b"]);
+    assert!(evidence.register(["b"]));
     assert!(matches!(evidence.passed(1), Passed::Again(_)));
     evidence.retry();
     evidence.timed_out();
@@ -125,7 +128,7 @@ fn the_third_timeout_in_a_row_stops_rechecks_until_a_retry() {
 #[test]
 fn a_recheck_revoked_turns_what_it_held_back_into_placeholders() {
     let mut evidence = E::default();
-    evidence.register(["a"]);
+    assert!(evidence.register(["a"]));
     let rule = evidence.revoked();
     assert_eq!(rule.kbs, Kbs::All);
     assert!(!evidence.reverify_pending());
@@ -133,7 +136,7 @@ fn a_recheck_revoked_turns_what_it_held_back_into_placeholders() {
     assert_eq!(evidence.shown(false, &at("b", 0)), Shown::Placeholder);
     assert_eq!(evidence.shown(false, &at("a", rule.epoch)), Shown::Body);
     // ST-18p: retired with a reverification still pending.
-    evidence.register(["a"]);
+    assert!(evidence.register(["a"]));
     assert_eq!(
         evidence.shown(true, &at("a", rule.epoch)),
         Shown::Placeholder
@@ -147,7 +150,7 @@ fn a_tombstone_withholds_only_once_read_back_unresolved() {
     assert_eq!(evidence.tombstone_of(&"b"), Some(Tombstone::Pending));
     // ST-28h: while deleting the evidence stays; a failure takes it back.
     assert_eq!(evidence.shown(false, &at("b", 0)), Shown::Body);
-    evidence.kept(&"b");
+    assert!(evidence.kept(&"b"));
     assert_eq!(evidence.tombstone_of(&"b"), None);
     assert_eq!(evidence.epoch(), 0);
     // FI-5d: read back with no outcome, held back until the host finds out.
@@ -166,7 +169,12 @@ fn a_tombstone_withholds_only_once_read_back_unresolved() {
     restored.deleted("b");
     assert_eq!(restored.shown(false, &at("b", 0)), Shown::Placeholder);
     assert_eq!(restored.tombstone_of(&"b"), None);
-    restored.kept(&"c");
+    // A failed retry of the delete proves nothing (S5.12): still held back
+    // until a recheck finds c listed.
+    restored.tombstone("c");
+    assert!(!restored.kept(&"c"));
+    assert_eq!(restored.shown(false, &at("c", 0)), Shown::Withheld);
+    restored.found(&"c");
     assert_eq!(restored.shown(false, &at("c", 0)), Shown::Body);
 }
 
@@ -202,7 +210,7 @@ fn what_was_persisted_comes_back_as_it_was() {
     assert_eq!(evidence.place(Kbs::All).epoch, 5);
     // The version goes on from the one persisted.
     assert_eq!(evidence.passed(7), Passed::Release);
-    evidence.register(["c"]);
+    assert!(evidence.register(["c"]));
     assert_eq!(evidence.recheck().map(|r| r.version), Some(8));
 }
 
@@ -295,7 +303,7 @@ fn only_a_request_on_the_current_credential_tells_a_removal() {
 fn evidence_not_yet_placed_counts_as_visible() {
     // ST-28e: after a restart the set lacks b, but evidence of b stands.
     let mut evidence = E::restore(Saved::default());
-    evidence.delivered("b", 0);
+    evidence.delivered(["b"], 0);
     assert_eq!(
         evidence
             .observe(&kbs(&["b"]), &Scope::Empty, evidence.epoch(), true)
@@ -304,7 +312,7 @@ fn evidence_not_yet_placed_counts_as_visible() {
     );
     // Placed by a rule since: no longer.
     let mut evidence = E::default();
-    evidence.delivered("b", 0);
+    evidence.delivered(["b"], 0);
     evidence.place(Kbs::All);
     assert_eq!(
         evidence
@@ -313,8 +321,8 @@ fn evidence_not_yet_placed_counts_as_visible() {
         kbs(&[])
     );
     // The latest delivery counts, whatever the order.
-    evidence.delivered("b", 1);
-    evidence.delivered("b", 0);
+    evidence.delivered(["b"], 1);
+    evidence.delivered(["b"], 0);
     assert_eq!(
         evidence
             .observe(&kbs(&["b"]), &Scope::Empty, evidence.epoch(), true)
@@ -340,7 +348,7 @@ fn a_kb_being_deleted_neither_joins_nor_narrows() {
     // ST-28g: b visible, with evidence; the host deletes it.
     let mut evidence = E::default();
     evidence.observe(&kbs(&[]), &listed(&["a", "b"]), evidence.epoch(), true);
-    evidence.delivered("b", 0);
+    evidence.delivered(["b"], 0);
     evidence.tombstone("b");
     let out = evidence.observe(
         &kbs(&["a", "b"]),
@@ -352,13 +360,13 @@ fn a_kb_being_deleted_neither_joins_nor_narrows() {
     let out = evidence.observe(&kbs(&["a", "b"]), &listed(&["a"]), evidence.epoch(), true);
     assert_eq!(out, Observed::default());
     // ST-28h: the delete failed. Its evidence makes it visible again.
-    evidence.kept(&"b");
+    assert!(evidence.kept(&"b"));
     let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, evidence.epoch(), true);
     assert_eq!(out.removed, removed(&["b"]));
     // Deleted: covered by its rule, and gone from the set.
     let mut evidence = E::default();
     evidence.observe(&kbs(&[]), &listed(&["b"]), evidence.epoch(), true);
-    evidence.delivered("b", 0);
+    evidence.delivered(["b"], 0);
     evidence.tombstone("b");
     evidence.deleted("b");
     // A search admitted before the deletion comes back listing b: it does
@@ -387,7 +395,7 @@ fn a_kb_being_deleted_neither_joins_nor_narrows() {
         ..Saved::default()
     };
     let mut restored = E::restore(saved);
-    restored.delivered("b", 0);
+    restored.delivered(["b"], 0);
     let out = restored.observe(
         &kbs(&["a", "b"]),
         &listed(&["a", "b"]),
@@ -399,4 +407,68 @@ fn a_kb_being_deleted_neither_joins_nor_narrows() {
         restored.observe(&kbs(&["b"]), &Scope::Empty, restored.epoch(), true),
         Observed::default()
     );
+}
+
+#[test]
+fn evidence_of_several_kbs_shows_by_the_strictest_of_them() {
+    // S5.6: a ContextPack belongs to every source KB.
+    let pack = |epoch| Delivered {
+        kbs: kbs(&["a", "b"]),
+        epoch,
+    };
+    let mut evidence = E::default();
+    assert!(evidence.register(["b"]));
+    assert_eq!(evidence.shown(false, &pack(0)), Shown::Withheld);
+    evidence.tombstone("a");
+    evidence.deleted("a");
+    assert_eq!(evidence.shown(false, &pack(0)), Shown::Placeholder);
+    assert_eq!(evidence.shown(false, &pack(1)), Shown::Withheld);
+    assert!(evidence.release(1));
+    assert_eq!(evidence.shown(false, &pack(1)), Shown::Body);
+    // Each of its KBs counts as delivered, and only those.
+    let mut evidence = E::default();
+    evidence.delivered(["a"], 0);
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 0, true);
+    assert_eq!(out, Observed::default());
+    evidence.delivered(["a", "b"], 0);
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 0, true);
+    assert_eq!(out.removed, kbs(&["b"]));
+    // A placeholder for good once a is deleted: b no longer counts by it,
+    // though other evidence of b still would.
+    let mut evidence = E::default();
+    evidence.delivered(["a", "b"], 0);
+    evidence.tombstone("a");
+    evidence.deleted("a");
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 1, true);
+    assert_eq!(out, Observed::default());
+    evidence.delivered(["b"], 0);
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, 1, true);
+    assert_eq!(out.removed, kbs(&["b"]));
+}
+
+#[test]
+fn an_empty_question_registers_nothing() {
+    let mut evidence = E::default();
+    assert!(!evidence.register(Vec::new()));
+    assert!(!evidence.reverify_pending());
+    assert_eq!(evidence.recheck(), None);
+    assert_eq!(evidence.passed(0), Passed::Ignored);
+}
+
+#[test]
+fn a_failed_retry_of_a_delete_read_back_does_not_bring_the_kb_back() {
+    // PR-Daemon's probe on #1297 (G-A): the earlier delete may have gone
+    // through; an omission must not then be judged a narrowing.
+    let saved = Saved {
+        tombstones: kbs(&["b"]),
+        visible: kbs(&["a"]),
+        ..Saved::default()
+    };
+    let mut evidence = E::restore(saved);
+    evidence.delivered(["b"], 0);
+    evidence.tombstone("b");
+    assert!(!evidence.kept(&"b"));
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, evidence.epoch(), true);
+    assert_eq!(out, Observed::default());
+    assert_eq!(evidence.shown(false, &at("b", 0)), Shown::Withheld);
 }

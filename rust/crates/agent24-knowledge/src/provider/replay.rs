@@ -284,13 +284,23 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
             e.version = e.version.max(version);
         }),
         Change::Released { of, version, .. } => on(out, &of, |b| {
-            if b.evidence.version == version {
+            // Written twice, the second finds nothing pending: what the
+            // first kept for its offset stays.
+            if b.evidence.version == version && b.evidence.pending.is_some() {
                 b.released = b.evidence.pending.take();
             }
         }),
         Change::TimedOut { of, count } => on(out, &of, |b| {
             if let Some(p) = counted(b) {
                 p.timeouts = count;
+            }
+        }),
+        // A clearing that landed though abandoned may be followed by a
+        // timeout written meanwhile, counted from the uncleared value: its
+        // offset never lowers the count.
+        Change::TimeoutsRestored { of, count } => on(out, &of, |b| {
+            if let Some(p) = counted(b) {
+                p.timeouts = p.timeouts.max(count);
             }
         }),
         Change::TimeoutsCleared { of, .. } => on(out, &of, |b| {

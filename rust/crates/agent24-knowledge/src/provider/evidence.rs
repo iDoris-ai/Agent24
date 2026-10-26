@@ -23,11 +23,12 @@ pub struct Rule<K> {
     pub kbs: Kbs<K>,
 }
 
-/// A piece of evidence the binding delivered: its KB, and the epoch when its
-/// request was admitted.
+/// A piece of evidence the binding delivered: the KBs it belongs to (a
+/// ContextPack's are all its sources, S5.6), and the epoch when its request
+/// was admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivered<K> {
-    pub kb: K,
+    pub kbs: BTreeSet<K>,
     pub epoch: u64,
 }
 
@@ -138,9 +139,10 @@ pub struct Evidence<K> {
     pending: Option<Pending<K>>,
     tombstones: BTreeMap<K, Tombstone>,
     visible: BTreeSet<K>,
-    /// Per KB, the latest epoch its evidence was delivered at: not covered
-    /// by a rule, it counts as visible (S5.10).
-    delivered: BTreeMap<K, u64>,
+    /// Per set of KBs one evidence belongs to, the latest epoch such
+    /// evidence was delivered at: not covered by a rule, its KBs count as
+    /// visible (S5.10). Covering one KB covers the evidence (S5.6).
+    delivered: BTreeMap<BTreeSet<K>, u64>,
 }
 
 impl<K> Default for Evidence<K> {
@@ -193,20 +195,20 @@ impl<K: Ord + Clone> Evidence<K> {
         rule
     }
 
-    /// For the history sent to the model. Evidence of a retired binding is a
-    /// placeholder, held back or not (S3.1); evidence whose binding is not in
-    /// the state after a restart is the caller's to replace (I5).
+    /// For the history sent to the model, by any of the evidence's KBs: a
+    /// placeholder if a rule covers one, else held back if one is. Evidence
+    /// of a retired binding is a placeholder, held back or not (S3.1);
+    /// evidence whose binding is not in the state after a restart is the
+    /// caller's to replace (I5).
     pub fn shown(&self, retired: bool, delivered: &Delivered<K>) -> Shown {
-        if retired || self.placed(&delivered.kb, delivered.epoch) {
+        let kbs = &delivered.kbs;
+        if retired || kbs.iter().any(|kb| self.placed(kb, delivered.epoch)) {
             return Shown::Placeholder;
         }
         // Evidence delivered after the registration is held back too.
-        let questioned = self
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.kbs.contains(&delivered.kb));
-        let unresolved = self.tombstones.get(&delivered.kb) == Some(&Tombstone::Unresolved);
-        if questioned || unresolved {
+        let questioned = |kb: &K| self.pending.as_ref().is_some_and(|p| p.kbs.contains(kb));
+        let unresolved = |kb: &K| self.tombstones.get(kb) == Some(&Tombstone::Unresolved);
+        if kbs.iter().any(|kb| questioned(kb) || unresolved(kb)) {
             Shown::Withheld
         } else {
             Shown::Body
@@ -220,14 +222,22 @@ impl<K: Ord + Clone> Evidence<K> {
 
     /// A revocation signal came back on a discarded credential for a request
     /// over `kbs` (credential `Outcome::Recheck`). A tightening: the KBs
-    /// merge into those pending and the version advances.
-    pub fn register(&mut self, kbs: impl IntoIterator<Item = K>) {
+    /// merge into those pending and the version advances. Q is never empty
+    /// (S3.1: a request with no KB scope, an issuance, takes its credential's
+    /// granted scope); an empty one registers nothing and returns false.
+    #[must_use]
+    pub fn register(&mut self, kbs: impl IntoIterator<Item = K>) -> bool {
+        let kbs: BTreeSet<K> = kbs.into_iter().collect();
+        if kbs.is_empty() {
+            return false;
+        }
         self.version += 1;
         let pending = self.pending.get_or_insert_with(|| Pending {
             kbs: BTreeSet::new(),
             timeouts: 0,
         });
         pending.kbs.extend(kbs);
+        true
     }
 
     /// The recheck due, if one is pending and rechecks have not stopped. The
@@ -300,8 +310,20 @@ impl<K: Ord + Clone> Evidence<K> {
     }
 
     /// The deletion failed, its withdrawal persisted (a loosening): the KB is
-    /// as before.
-    pub fn kept(&mut self, kb: &K) {
+    /// as before. Only for a tombstone of this run: one read back unresolved
+    /// stays, since a delete that went through before cannot be told from a
+    /// KB not there (S5.12). False if nothing was withdrawn.
+    pub fn kept(&mut self, kb: &K) -> bool {
+        let pending = self.tombstones.get(kb) == Some(&Tombstone::Pending);
+        if pending {
+            self.tombstones.remove(kb);
+        }
+        pending
+    }
+
+    /// The recheck of S1.14 saw `kb` listed again, so it is still there: any
+    /// tombstone of it is withdrawn, a loosening once persisted.
+    pub fn found(&mut self, kb: &K) {
         self.tombstones.remove(kb);
     }
 
@@ -309,9 +331,13 @@ impl<K: Ord + Clone> Evidence<K> {
         self.tombstones.get(kb).copied()
     }
 
-    /// Evidence of `kb` admitted at `epoch` was delivered.
-    pub fn delivered(&mut self, kb: K, epoch: u64) {
-        let latest = self.delivered.entry(kb).or_insert(epoch);
+    /// Evidence of `kbs` admitted at `epoch` was delivered.
+    pub fn delivered(&mut self, kbs: impl IntoIterator<Item = K>, epoch: u64) {
+        let kbs: BTreeSet<K> = kbs.into_iter().collect();
+        if kbs.is_empty() {
+            return;
+        }
+        let latest = self.delivered.entry(kbs).or_insert(epoch);
         *latest = (*latest).max(epoch);
     }
 
@@ -356,7 +382,11 @@ impl<K: Ord + Clone> Evidence<K> {
 
     /// In the set, or of evidence delivered and not covered by a rule.
     fn visible(&self, kb: &K) -> bool {
-        let uncovered = self.delivered.get(kb).is_some_and(|e| !self.placed(kb, *e));
+        let standing = |(kbs, e): (&BTreeSet<K>, &u64)| !kbs.iter().any(|k| self.placed(k, *e));
+        let uncovered = self
+            .delivered
+            .iter()
+            .any(|entry| entry.0.contains(kb) && standing(entry));
         self.visible.contains(kb) || uncovered
     }
 

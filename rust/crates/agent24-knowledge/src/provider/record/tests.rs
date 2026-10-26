@@ -171,6 +171,13 @@ fn every() -> Vec<(C, Class)> {
             Loosening,
         ),
         (
+            C::TimeoutsRestored {
+                of: a.clone(),
+                count: 1,
+            },
+            Tightening,
+        ),
+        (
             C::Tombstone {
                 of: a.clone(),
                 kb: "k",
@@ -304,7 +311,7 @@ fn an_abandoned_loosening_is_offset_by_its_counterpart() {
                 of: a.clone(),
                 from: 2,
             },
-            C::TimedOut {
+            C::TimeoutsRestored {
                 of: a.clone(),
                 count: 2,
             },
@@ -377,6 +384,7 @@ fn a_change_counts_for_its_profile_or_the_host() {
                 | C::Released { .. }
                 | C::TimedOut { .. }
                 | C::TimeoutsCleared { .. }
+                | C::TimeoutsRestored { .. }
                 | C::Tombstone { .. }
                 | C::TombstoneWithdrawn { .. }
                 | C::Seen { .. }
