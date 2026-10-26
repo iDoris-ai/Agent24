@@ -8,6 +8,7 @@ use axum::extract::{Path as UrlPath, State};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::authorization::ENDED;
 use crate::db::Db;
 use crate::error::{ApiError, CODES};
 use crate::id::{IdKind, is_id};
@@ -159,7 +160,8 @@ pub async fn load<'e, E: sqlx::SqliteExecutor<'e>>(
 /// At startup, before any worker runs: a job that was queued or running
 /// has no worker any more and becomes `interrupted` (the next call with its
 /// key re-queues it, §7); one that was cancelling ends `cancelled`, with no
-/// output committed (its result and status share a transaction). Returns
+/// output committed (its result and status share a transaction), and says
+/// its authorization ended if that is why it was cancelling. Returns
 /// up to [`RECOVERED_SHOWN`] of the jobs it ended, to announce.
 pub async fn recover(db: &Db) -> Result<Vec<Recovered>, sqlx::Error> {
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -175,7 +177,10 @@ pub async fn recover(db: &Db) -> Result<Vec<Recovered>, sqlx::Error> {
         "UPDATE jobs SET updated_at = {NOW},
                 status = CASE status WHEN 'cancelling' THEN 'cancelled' ELSE 'interrupted' END,
                 error = CASE status WHEN 'cancelling'
-                        THEN json_object('code', 'cancelled', 'message', 'cancelled before a restart')
+                        THEN json_object('code', 'cancelled', 'message',
+                             CASE WHEN EXISTS (SELECT 1 FROM job_revocations r
+                                               WHERE r.job_id = jobs.id AND r.attempt = jobs.attempt)
+                                  THEN '{ENDED}' ELSE 'cancelled before a restart' END)
                         ELSE error END
          WHERE status IN ('queued', 'running', 'cancelling')"
     ))

@@ -423,6 +423,31 @@ async fn a_build_an_ended_attempt_asked_for_stops_too() {
     );
 }
 
+/// The whole module's end (`*`) stops a build an accepted attempt asked
+/// for, whichever operation it was accepted for; another operation's end
+/// leaves it (#1213).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_whole_module_s_end_stops_an_accepted_attempt_s_build() {
+    let env = env().await;
+    let id = job_id(1);
+    job(&env, &id, "cancelled", 1).await;
+    accept(&env, &id, 1, "extract").await;
+    let read = reading(
+        &env,
+        Requester::Job {
+            id: id.clone(),
+            attempt: 1,
+        },
+    );
+    asking(&env, &id, 1).await;
+    assert!(stop(&env.state, &Ended::by_operation("find"), SHORT).await);
+    assert!(!read.is_finished(), "another operation's end stopped it");
+    assert_eq!(
+        stop_until_ended(&env, ALL, read).await,
+        Err(LayerFailure::Stopped)
+    );
+}
+
 /// Waits until the job's attempt asks for a build.
 async fn asking(env: &Env, id: &str, attempt: i64) {
     asking_or(env, id, attempt, || false).await;
@@ -614,6 +639,50 @@ async fn a_claim_its_call_commits_after_the_notice_is_cancelled() {
     assert_eq!(status(&env, &id).await.0, "cancelled");
 }
 
+/// Once a sweep ran with no call of the notice's left, the notice waits on
+/// what it found without taking the write lock again: a job accepted after
+/// (by a call begun after the end) is not cancelled by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_a_sweep_with_no_call_left_the_notice_only_waits() {
+    let env = env().await;
+    let (running, later) = (job_id(1), job_id(2));
+    job(&env, &running, "running", 1).await;
+    accept(&env, &running, 1, "extract").await;
+    let notice = {
+        let state = env.state.clone();
+        tokio::spawn(async move {
+            stop(
+                &state,
+                &Ended::by_operation("extract"),
+                Duration::from_secs(5),
+            )
+            .await
+        })
+    };
+    let start = std::time::Instant::now();
+    while status(&env, &running).await.0 != "cancelling" {
+        assert!(start.elapsed() < Duration::from_secs(5), "never swept");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    job(&env, &later, "queued", 1).await;
+    accept(&env, &later, 1, "extract").await;
+    // Builds the operation's calls ask for are stopped round by round. The
+    // second, asked for once the first is stopped, is stopped by a round
+    // begun after `later` was accepted: one that would have swept it first.
+    for _ in 0..2 {
+        let read = reading(&env, Requester::Tool(Accepted::bare("extract")));
+        let read = tokio::time::timeout(Duration::from_secs(5), read).await;
+        assert!(matches!(
+            read.expect("no round after").unwrap(),
+            Err(LayerFailure::Stopped)
+        ));
+    }
+    assert_eq!(status(&env, &later).await, ("queued".into(), None));
+    settle_once_cancelling(env.storage.clone(), running.clone()).await;
+    assert!(notice.await.unwrap());
+    assert_eq!(status(&env, &later).await, ("queued".into(), None));
+}
+
 /// A build a call in flight asks for after the notice's first pass, its
 /// call then answering, is stopped before the answer: one notice, as the
 /// kernel sends (#1206 gate 2).
@@ -641,7 +710,8 @@ async fn a_build_a_call_asks_for_after_the_first_pass_stops_before_the_answer() 
 
 /// A call's answer is decided as it leaves the ledger: an end after it
 /// does not count it. Its claim's hold counts as begun when the call did,
-/// and stays in flight after the call answers (#1206 gate 1).
+/// ends before included, and stays in flight after the call answers
+/// (#1206 gate 1).
 #[test]
 fn a_call_answered_before_an_end_is_not_counted_and_its_claim_is() {
     let calls = Arc::new(Calls::default());
@@ -668,6 +738,12 @@ fn a_call_answered_before_an_end_is_not_counted_and_its_claim_is() {
     );
     drop(claim);
     assert_eq!(calls.in_flight(), 0);
+    // After that end, a call and its claim begin with it counted (#1234 F1).
+    let extract = calls.begin(Accepted::bare("extract"));
+    let claim = extract.hold();
+    assert!(!extract.finish());
+    assert!(!claim.ended(), "begun after the end");
+    assert!(!claim.finish());
 }
 
 /// A call knows whether its operation's authorization, or the whole
