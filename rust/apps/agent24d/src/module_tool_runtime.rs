@@ -2787,7 +2787,9 @@ mod tests {
             ),
         ];
         for (what, ctx) in mismatches {
-            let error = call(ctx).await.unwrap_err();
+            let Err(error) = call(ctx).await else {
+                panic!("a grant mismatched in {what} must be refused");
+            };
             assert!(matches!(error, ToolError::Denied(_)), "{what}: {error}");
         }
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
