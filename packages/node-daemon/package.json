@@ -2,7 +2,7 @@
   "name": "@agent24/node-daemon",
   "version": "0.5.1",
   "private": true,
-  "description": "Agent24 backend daemon (Node) — M-A+: mock/reference implementation of the v1 protocol",
+  "description": "Agent24 backend daemon (Node) — M-A+: mock/reference implementation of the v1 protocol. 仅契约测试与开发参考，不进安装包（ADR-037）",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",

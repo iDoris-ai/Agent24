@@ -1,7 +1,7 @@
 // Backend process manager — supervises the daemon child process.
 // AGENT24_BACKEND=node|rust selects the implementation (default: rust since
-// v0.1.0 — the Rust agent24d is the shipping backend; `node` stays available
-// as an explicit opt-in for the legacy mock).
+// v0.1.0 — the Rust agent24d is the shipping backend; `node` is a dev-only
+// opt-in for the reference mock, ignored in packaged builds per ADR-037).
 // Both backends speak the same v1 protocol and announce themselves via the
 // SPEC-002 §4 ready line: the manager scans child stdout for the first
 // {"type":"ready","port":…,"token":…} JSON line and exposes it to the IPC
@@ -18,7 +18,6 @@ const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
 const MAX_HEALTH_FAILURES = 3
 
-const isDev = process.env['NODE_ENV'] === 'development'
 
 export type BackendKind = 'node' | 'rust'
 
@@ -36,9 +35,40 @@ export function getBackendEndpoint(): BackendEndpoint | null {
   return currentEndpoint
 }
 
-export function selectedBackend(): BackendKind {
-  // Default rust (v0.1.0); only an explicit `node` opts into the legacy mock.
-  return process.env['AGENT24_BACKEND'] === 'node' ? 'node' : 'rust'
+/** Dev-only: workspace dep @agent24/node-daemon main → packages/node-daemon/dist/server.js */
+function resolveNodeEntry(): string {
+  return require.resolve('@agent24/node-daemon')
+}
+
+/** `packaged` MUST come from Electron's `app.isPackaged` (injected by main.ts).
+ * It is deliberately NOT derived from NODE_ENV: an installed app can inherit
+ * NODE_ENV=development from its launching shell, and that must not unlock the
+ * node backend. Default `true` = fail closed (never node unless told dev).
+ *
+ * ADR-037 decision 1 (CORE-8): node-daemon is not shipped in installers, so:
+ * - packaged + AGENT24_BACKEND=node → warn, use rust;
+ * - dev + node but the dependency cannot be resolved → warn, use rust (never
+ *   throw: a stray env var must not brick the app). */
+export function selectedBackend(
+  packaged: boolean = true,
+  resolveNode: () => string = resolveNodeEntry,
+): BackendKind {
+  if (process.env['AGENT24_BACKEND'] !== 'node') return 'rust'
+  if (packaged) {
+    console.warn(
+      '[backend] AGENT24_BACKEND=node ignored in packaged builds (ADR-037: node-daemon is a dev/contract-test reference only); using rust',
+    )
+    return 'rust'
+  }
+  try {
+    resolveNode()
+  } catch (err) {
+    console.warn(
+      `[backend] AGENT24_BACKEND=node requested but @agent24/node-daemon is not resolvable (${String(err)}); using rust`,
+    )
+    return 'rust'
+  }
+  return 'node'
 }
 
 /** Daemon lifecycle status surfaced to the tray (F1b). */
@@ -65,19 +95,13 @@ function repoRootDev(): string {
   return path.join(__dirname, '..', '..', '..', '..')
 }
 
-function resolveNodeEntry(): string {
-  if (isDev) {
-    // Workspace dep: @agent24/node-daemon main → packages/node-daemon/dist/server.js
-    return require.resolve('@agent24/node-daemon')
-  }
-  return path.join(process.resourcesPath, 'backend', 'server.js')
-}
-
-function resolveRustBinary(): string {
+/** `packaged` = Electron `app.isPackaged` (injected), NOT NODE_ENV: an installed
+ * app may inherit NODE_ENV=development and must still use its bundled binary. */
+export function resolveRustBinary(packaged: boolean): string {
   const override = process.env['AGENT24D_BIN']
   if (override) return override
   const exe = process.platform === 'win32' ? 'agent24d.exe' : 'agent24d'
-  if (isDev) {
+  if (!packaged) {
     return path.join(repoRootDev(), 'rust', 'target', 'debug', exe)
   }
   // Packaged: electron-builder copies the platform-native release binary into
@@ -139,6 +163,11 @@ export interface BackendManagerDeps {
    * spawn/fork call below; tests inject a fake so `spawnChild()` never
    * touches a real binary. */
   spawnProcess?: (kind: BackendKind) => ChildProcess
+  /** Electron `app.isPackaged`, injected by main.ts. Omitted → treated as
+   * packaged (fail closed). */
+  isPackaged?: boolean
+  /** Test seam for the dev-time node-daemon resolution. */
+  resolveNode?: () => string
 }
 
 function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
@@ -164,9 +193,9 @@ function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
   })
 }
 
-function defaultSpawnProcess(kind: BackendKind): ChildProcess {
+function defaultSpawnProcess(kind: BackendKind, packaged: boolean): ChildProcess {
   if (kind === 'rust') {
-    const bin = resolveRustBinary()
+    const bin = resolveRustBinary(packaged)
     return spawn(bin, ['serve', '--port', '0'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env },
@@ -189,7 +218,7 @@ export class BackendManager {
   private child: ChildProcess | null = null
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
-  private readonly kind: BackendKind = selectedBackend()
+  private readonly kind: BackendKind
   private readonly external: ExternalDaemonSource
   private readonly spawnProcess: (kind: BackendKind) => ChildProcess
   // F1b: last observed health (drives the tray status), and whether the user
@@ -212,8 +241,10 @@ export class BackendManager {
   private tickInFlight = false
 
   constructor(deps: BackendManagerDeps = {}) {
+    this.kind = selectedBackend(deps.isPackaged ?? true, deps.resolveNode)
     this.external = deps.external ?? defaultExternalDaemonSource
-    this.spawnProcess = deps.spawnProcess ?? defaultSpawnProcess
+    const packaged = deps.isPackaged ?? true
+    this.spawnProcess = deps.spawnProcess ?? ((kind) => defaultSpawnProcess(kind, packaged))
   }
 
   async start(): Promise<void> {
