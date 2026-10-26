@@ -2516,7 +2516,7 @@ export interface components {
             /** Format: date-time */
             expires_at: string;
             /**
-             * @description What the dispatch gate would make of a call now: judged against the tool as it is mounted now and the identity of the package running now. A grant for another package, for none, for a module not running or a tool no longer mounted, or for an earlier version or scope of the tool is `stale`.
+             * @description What the dispatch gate would make of a call now: judged against the tool as it is mounted now and the identity of the package running now. A grant for another package, for none, for a module not running, not on the grants protocol or a tool no longer mounted, or for an earlier version or scope of the tool is `stale`.
              * @enum {string}
              */
             status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";

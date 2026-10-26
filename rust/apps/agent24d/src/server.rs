@@ -4183,7 +4183,8 @@ pub(crate) mod tests {
     /// for the tool and the package as they are now. Only the grant for the
     /// running package reads granted; one with no package identity, one for
     /// another package (replaced in place), one whose package is not
-    /// running, one whose tool is not mounted and one given for an earlier
+    /// running, one whose tool is not mounted, one of a module not on the
+    /// grants protocol (never dispatched, §2.6) and one given for an earlier
     /// version of the tool all read stale.
     #[tokio::test]
     async fn the_list_calls_stale_what_the_gate_would_refuse() {
@@ -4223,13 +4224,13 @@ pub(crate) mod tests {
             ..summary.clone()
         };
         grant(gone, Some("sha256:abc")).await;
-        // Given for 1.0.0 of a tool that is 1.2.3 now: judged by what it is now.
-        let older = agent24_store::ToolPermissionSummary {
+        // Version, scope and package all match, but the module is not on the
+        // grants protocol: the gate never dispatches it.
+        let old_protocol = agent24_store::ToolPermissionSummary {
             module: "old-module".to_owned(),
-            module_version: "1.0.0".to_owned(),
             ..summary.clone()
         };
-        grant(older, Some("sha256:abc")).await;
+        grant(old_protocol, Some("sha256:abc")).await;
 
         grant(summary.clone(), Some("sha256:abc")).await;
         assert_eq!(
@@ -4239,6 +4240,13 @@ pub(crate) mod tests {
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(statuses(state.clone()).await.0, "stale");
         running.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Given for 1.0.0 of a tool that is 1.2.3 now: judged by what it is now.
+        let earlier = agent24_store::ToolPermissionSummary {
+            module_version: "1.0.0".to_owned(),
+            ..summary.clone()
+        };
+        grant(earlier, Some("sha256:abc")).await;
+        assert_eq!(statuses(state.clone()).await.0, "stale");
         grant(summary.clone(), Some("sha256:replaced-in-place")).await;
         assert_eq!(statuses(state.clone()).await.0, "stale");
         grant(summary, None).await;
