@@ -162,6 +162,23 @@ fn a_stray_report_never_moves_the_seal() {
 }
 
 #[test]
+fn a_late_report_of_an_earlier_rebuild_is_not_taken_for_the_current_one() {
+    let mut ledger = fresh(false);
+    let first = ledger.reseal().unwrap();
+    assert_eq!(ledger.resealed(first), None);
+    let t = ledger.tighten(Scope::Host);
+    ledger.seal_deleted(t.unseal.unwrap());
+    ledger.record_durable(t.ticket);
+    let second = ledger.reseal().unwrap();
+    // The first rebuild reported again: the second is still in flight, so a
+    // tightening now waits for it and deletes the seal after it.
+    assert_eq!(ledger.resealed(first), None);
+    let late = ledger.tighten(p("a"));
+    assert!(late.unseal.is_none() && !ledger.committed(late.ticket));
+    assert!(ledger.resealed(second).is_some());
+}
+
+#[test]
 fn an_unconfirmed_tightening_refuses_loosenings_in_its_scope() {
     let mut ledger = fresh(true);
     let a = ledger.tighten(p("a"));
@@ -251,6 +268,17 @@ fn an_abandoned_loosening_is_offset_over_its_own_scope() {
 }
 
 #[test]
+fn an_abandoned_profile_loosening_is_offset_over_that_profile_only() {
+    let mut ledger = fresh(true);
+    let bind = ledger.loosen(p("a"), None, false).unwrap();
+    let offset = ledger.abandon(bind).unwrap();
+    assert!(ledger.loosen(p("b"), None, false).is_ok());
+    assert!(ledger.loosen(p("a"), None, false).is_err());
+    ledger.record_durable(offset.ticket);
+    assert!(ledger.loosen(p("a"), None, false).is_ok());
+}
+
+#[test]
 fn an_abandoned_loosening_never_satisfies_a_dependency() {
     let mut ledger = fresh(false);
     let bind = ledger.loosen(p("a"), None, false).unwrap();
@@ -272,4 +300,10 @@ fn a_confirmed_loosening_can_no_longer_be_abandoned() {
     assert_eq!(ledger.loosening_durable(on), Confirmed::Applied);
     assert_eq!(ledger.abandon(on), None);
     assert_eq!(ledger.loosening_durable(on), Confirmed::Ignored);
+}
+
+#[test]
+#[should_panic]
+fn an_empty_scope_is_a_caller_bug() {
+    fresh(true).tighten(Scope::Profiles(Vec::new()));
 }
