@@ -163,6 +163,7 @@ fn an_event_in_the_connection_phase_writes_its_rule_and_its_generation() {
             C::Generation { of: OF, value: 2 },
         ];
         assert_eq!(left.changes, changes, "{event:?}");
+        assert_eq!(left.generations, [(OF, 2)], "{event:?}");
         assert_eq!(left.aborted, [(OF, call)], "{event:?}");
     }
 }
@@ -212,7 +213,9 @@ fn a_confirmed_generation_brings_local_storage_back_to_loading() {
     assert_eq!(member.confirm_generation(&OF, 2), None, "once");
 }
 
+/// `Member::new` checks it in debug builds.
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic]
 fn a_bound_slot_needs_its_binding_id() {
     let profile = loading().profile;
@@ -220,6 +223,7 @@ fn a_bound_slot_needs_its_binding_id() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic]
 fn a_placeholder_has_no_binding_id() {
     let placeholder = Slot::Placeholder(Placeholder::new(None));
