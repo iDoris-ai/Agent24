@@ -86,7 +86,7 @@ describe('importFile through agent24 documents import', () => {
   it('a CLI that cannot start is backend_unreachable, without the error text', async () => {
     const cli = fakeCli([], { error: true })
     const res = await importFile('/a.pdf', () => EP, () => {}, cli.spawn, 'agent24')
-    expect(res).toEqual({ ok: false, status: 503, error: { code: 'backend_unreachable', message: 'the import tool could not be started' } })
+    expect(res).toEqual({ ok: false, status: 503, error: { code: 'backend_unreachable', message: 'the documents tool could not be started' } })
     const throwing: Spawner = () => {
       throw new Error('EACCES /secret/path')
     }
@@ -95,10 +95,10 @@ describe('importFile through agent24 documents import', () => {
 
   it('an exit with no result, or a result that does not fit, is invalid_response; stderr is never shown', async () => {
     const none = await importFile('/a.pdf', () => EP, () => {}, fakeCli([progress(0, 5)], { stderr: '/Users/me/a.pdf' }).spawn, 'agent24')
-    expect(none).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the import tool ended without a result' } })
+    expect(none).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the documents tool ended without a result' } })
     for (const bad of [{ ok: true, status: 200 }, { ok: false, status: 409, error: { code: 1 } }, { ok: false, status: 409 }]) {
       const res = await importFile('/a.pdf', () => EP, () => {}, fakeCli([result(bad)]).spawn, 'agent24')
-      expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the import tool gave a result that does not fit' } })
+      expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the documents tool gave a result that does not fit' } })
     }
   })
 
@@ -107,7 +107,7 @@ describe('importFile through agent24 documents import', () => {
     for (const lines of [['x'.repeat(4 * 1024 * 1024 + 1)], [long], ['x'.repeat(4 * 1024 * 1024 - 1), 'xx\n' + result({ ok: true, status: 200, data: JOB })]]) {
       const cli = fakeCli(lines)
       const res = await importFile('/a.pdf', () => EP, () => {}, cli.spawn, 'agent24')
-      expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the import tool wrote a line too long' } })
+      expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the documents tool wrote a line too long' } })
       expect(cli.killed()).toBe(true)
     }
   })
