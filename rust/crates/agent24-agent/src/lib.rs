@@ -463,6 +463,27 @@ fn prune_stale_recall_message(msg: Msg, active: &std::collections::HashSet<Strin
     }
 }
 
+/// Shape one message that is PROVEN (by its persisted origin) to be a
+/// `HostRecall`. Unlike [`prune_stale_recall_message`], which deliberately
+/// passes a malformed lookalike through for the old text-based decision, a
+/// proven HostRecall that is not a well-formed recall block is dropped: it
+/// cannot be re-validated, so it must not reach the provider.
+fn shape_host_recall(msg: Msg, active: &std::collections::HashSet<String>) -> Option<Msg> {
+    let content = msg.content.as_deref()?;
+    if msg.role != "user" || !content.starts_with(RECALL_PREFIX) {
+        return None;
+    }
+    let body = content.strip_suffix(RECALL_END_MARKER)?;
+    let has_id = body
+        .split("\n- [id=")
+        .skip(1)
+        .any(|entry| entry.find(' ').is_some_and(|space| space > 0));
+    if !has_id {
+        return None;
+    }
+    prune_stale_recall_message(msg, active)
+}
+
 /// The still-unanswered tool calls of the reconstructed thread's LAST
 /// tool-calling assistant turn, in request order. `None` when there is no such
 /// turn (an inconsistent resume — the caller aborts). Returns the full ordered
@@ -1761,64 +1782,103 @@ impl RunManager {
         }
     }
 
-    /// M1-T07.1 M4 (review #674 round 2 ③): builds the SAME shape
-    /// `normalize_for_provider` always built, but first re-validates the
-    /// recall block — if any — against the CURRENT ledger. Called fresh on
-    /// EVERY iteration of [`Self::run_loop`], so this is the ONE place that
-    /// covers all three ways a recall block can go stale before the model
-    /// sees it again: a cold-restart resume (`drive_resume` rebuilding from
-    /// `thread_to_messages`), an approval answered while the run is still
-    /// parked in the SAME process (the in-memory broker wakes the task
-    /// directly — no `drive_resume` involved at all), and — in principle —
-    /// a very slow approval wait spanning multiple loop iterations. Never
-    /// mutates `messages` itself, only the copy returned for this request.
+    /// R05-5 4b: the request-only send copy. Each message is shaped by the
+    /// origin kind PERSISTED for its stored seq (`list_run_messages` plus
+    /// `read_run_message_origin`), never by its text or its in-memory index:
     ///
-    /// Round 2 ②: only `messages[0]` is ever treated as a candidate recall
-    /// block — a POSITION check, not a content-prefix scan over the whole
-    /// thread. The snapshot (`execute`) always puts the recall message (if
-    /// any) first, so this is exactly where it would be; scanning every
-    /// message for a `RECALL_PREFIX` match would also treat a bound run's
-    /// own prompt as a recall block if an adversarial user typed text that
-    /// happened to start with that exact prefix.
-    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Vec<Msg> {
-        let Some(memory) = self.memory.as_ref() else {
-            return normalize_for_provider(messages);
-        };
-        let Some(first) = messages.first() else {
-            return normalize_for_provider(messages);
-        };
-        // Round 2 ②: require BOTH the header AND the end marker, not just
-        // the prefix — a real recall block always has this exact shape, so
-        // this is still unambiguous, but it closes the (already-vanishing,
-        // position-0-only) case of a context-free run's very first turn
-        // happening to be the user's OWN prompt and that prompt merely
-        // STARTING WITH the same prefix text without the matching suffix:
-        // such a message is left alone rather than risk getting dropped by
-        // `prune_stale_recall_message` failing to parse it as a real block.
-        if first.role != "user"
-            || !first
-                .content
-                .as_deref()
-                .is_some_and(|c| c.starts_with(RECALL_PREFIX) && c.ends_with(RECALL_END_MARKER))
-        {
-            return normalize_for_provider(messages);
-        }
-        let mut rebuilt = messages.to_vec();
-        match memory.active_ids().await {
-            Ok(active) => match prune_stale_recall_message(first.clone(), &active) {
-                Some(pruned) => rebuilt[0] = pruned,
-                None => {
-                    rebuilt.remove(0);
-                }
-            },
+    /// - `HostRecall` is re-validated against the CURRENT ledger line by line
+    ///   (a retracted id must not reach the model again). A HostRecall that is
+    ///   fully stale, malformed (role not user, no content, no header / end
+    ///   marker, no parsable id), or cannot be re-validated (`active_ids()`
+    ///   failed, or there is no memory) is dropped from the copy with a warn.
+    /// - every other kind (user prompt, session history, assistant, tool
+    ///   result, and any future kind) is sent verbatim, even when its text is
+    ///   shaped exactly like a recall block.
+    ///
+    /// `messages` is the run loop's in-memory thread; it must be provably the
+    /// stored thread (same length, same bytes per seq) or the send is refused
+    /// (`None`) — position is never trusted. Called fresh on EVERY iteration so
+    /// a cold resume, an approval answered in-process, and a long approval wait
+    /// all see the current ledger. Never mutates the store or `messages`; the
+    /// shaping (before `normalize_for_provider`, which merges adjacent user
+    /// turns and would erase the kind boundaries) only affects this copy.
+    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Option<Vec<Msg>> {
+        let stored = match self.store.list_run_messages(run_id).await {
+            Ok(stored) => stored,
             Err(err) => {
-                tracing::warn!(
-                    "run {run_id}: could not re-validate recalled memory; dropping the recall block for this request: {err}"
-                );
-                rebuilt.remove(0);
+                tracing::warn!(run_id, error = %err, "send copy: could not read the stored thread");
+                return None;
+            }
+        };
+        if stored.len() != messages.len()
+            || thread_to_messages(&stored)
+                .iter()
+                .zip(messages)
+                .any(|(a, b)| a != b)
+        {
+            tracing::warn!(
+                run_id,
+                "send copy: the in-memory thread does not match the stored thread; refusing to send"
+            );
+            return None;
+        }
+        // Resolved lazily, once, and only if a HostRecall is actually present.
+        let mut active: Option<Option<std::collections::HashSet<String>>> = None;
+        let mut shaped = Vec::with_capacity(messages.len());
+        for (row, msg) in stored.iter().zip(messages) {
+            let origin = match self.store.read_run_message_origin(run_id, row.seq).await {
+                Ok(MessageOriginLookup::Present(stored_origin)) => stored_origin.origin,
+                Ok(_) => return None,
+                Err(err) => {
+                    tracing::warn!(run_id, seq = row.seq, error = %err, "message origin read failed");
+                    return None;
+                }
+            };
+            match origin {
+                MessageOrigin::HostRecall { recall_ref: None } => return None,
+                MessageOrigin::HostRecall {
+                    recall_ref: Some(_),
+                } => {
+                    if active.is_none() {
+                        active = Some(match self.memory.as_ref() {
+                            None => {
+                                tracing::warn!(
+                                    run_id,
+                                    "run {run_id}: no memory to re-validate HostRecall; dropping it from the send copy"
+                                );
+                                None
+                            }
+                            Some(memory) => match memory.active_ids().await {
+                                Ok(ids) => Some(ids),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        run_id,
+                                        "run {run_id}: could not re-validate HostRecall; dropping it from the send copy: {err}"
+                                    );
+                                    None
+                                }
+                            },
+                        });
+                    }
+                    let kept = match active.as_ref().and_then(Option::as_ref) {
+                        Some(ids) => shape_host_recall(msg.clone(), ids),
+                        None => None,
+                    };
+                    match kept {
+                        Some(kept) => shaped.push(kept),
+                        None => {
+                            tracing::warn!(
+                                run_id,
+                                seq = row.seq,
+                                "dropping a HostRecall row from the send copy (stale, malformed or unverifiable)"
+                            );
+                        }
+                    }
+                }
+                _ => shaped.push(msg.clone()),
             }
         }
-        normalize_for_provider(&rebuilt)
+        Some(normalize_for_provider(&shaped))
     }
 
     /// Stored seq order, not message text. A read error is the same refusal
@@ -1876,8 +1936,13 @@ impl RunManager {
             // re-validated against the CURRENT ledger and reshaped fresh
             // every iteration via `request_messages_for` — request-only,
             // never applied back to `messages` itself.
+            let Some(send_messages) = self.request_messages_for(&messages, &run_id).await else {
+                self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                    .await;
+                return;
+            };
             let request = CompletionRequest {
-                messages: self.request_messages_for(&messages, &run_id).await,
+                messages: send_messages,
                 model: run.input.model_override.clone(),
                 tools: self.tool_specs_for(plan_mode).await,
                 response_format: None,
@@ -2587,6 +2652,9 @@ pub(crate) mod tests {
     mod source_send_gate_tests {
         include!("source_send_gate_tests.rs");
     }
+    mod send_trim_tests {
+        include!("send_trim_tests.rs");
+    }
 
     use super::*;
     use agent24_memory::{KvStore, session::CompactionPolicy};
@@ -2620,15 +2688,26 @@ pub(crate) mod tests {
             .await
             .unwrap();
         run.status = RunStatus::Running;
+        // Replay the stored thread so the send-copy consistency check passes
+        // and the refusal below can only come from the permission check.
+        let thread = store.list_run_messages(&run.id).await.unwrap();
+        remote.seen.lock().unwrap().clear();
         manager
             .run_loop(
-                run,
-                vec![Msg::user("thread text cannot authorize cloud")],
+                run.clone(),
+                thread_to_messages(&thread),
                 false,
                 CancellationToken::new(),
             )
             .await;
         assert!(remote.seen.lock().unwrap().is_empty());
+        let ended = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(ended.status, RunStatus::Failed);
+        assert_ne!(
+            ended.error.as_ref().map(|e| e.code.as_str()),
+            Some(SOURCE_UNPROVEN_CODE),
+            "must reach the permission check, not the source gate"
+        );
     }
 
     #[test]
