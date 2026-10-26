@@ -679,7 +679,7 @@ pub struct OsScopedMemory {
     key: String,
     module: String,
     events: agent24_memory::event::EventLog,
-    rejections: agent24_memory::rejections::Rejections,
+    rejections: Arc<agent24_memory::rejections::QueuedRejections>,
 }
 
 impl OsScopedMemory {
@@ -688,23 +688,22 @@ impl OsScopedMemory {
             key: partition.key.clone(),
             module: partition.module.clone(),
             events: kv.events(),
-            rejections: kv.rejections(),
+            rejections: kv.queued_rejections(),
         }
     }
 
     /// P1-02c c3 (D3): leave an audit row for a refused write. Best effort: the
     /// trail write can itself fail on a full disk or quota, in which case it is
     /// logged inside `note` and the caller's original error stands unchanged.
-    async fn note_rejection(&self, code: agent24_memory::MemoryErrorCode, kind: Option<&str>) {
+    fn note_rejection(&self, code: agent24_memory::MemoryErrorCode, kind: Option<&str>) {
         self.rejections
-            .note(&agent24_memory::rejections::Rejection {
+            .enqueue(&agent24_memory::rejections::Rejection {
                 owner_kind: agent24_memory::rejections::OwnerKind::Module,
                 owner_key: &self.key,
                 code,
                 rejected_kind: kind,
                 count_at: None,
-            })
-            .await;
+            });
     }
 
     /// Mint an id for a module's memory.
@@ -881,8 +880,7 @@ impl ScopedMemory for OsScopedMemory {
                 self.note_rejection(
                     agent24_memory::MemoryErrorCode::ReservedKind,
                     Some(&refused_kind),
-                )
-                .await;
+                );
                 return Err(DomainError::MemoryReservedKind);
             }
         };
@@ -891,7 +889,7 @@ impl ScopedMemory for OsScopedMemory {
         if let Err(e) = self.events.append(&ev).await {
             let code = e.code();
             tracing::warn!(code = code.as_str(), error = %e, "module remember failed");
-            self.note_rejection(code, Some(&ev.kind)).await;
+            self.note_rejection(code, Some(&ev.kind));
             return Err(DomainError::MemoryWriteFailed {
                 code: code.as_str(),
                 dimension: code.dimension(),
@@ -999,17 +997,14 @@ impl OsScopedMemory {
         what: Remember,
     ) -> Result<Remembered, MemoryRpcError> {
         let refused_kind = what.kind.clone();
-        let ev = match self.build_remember_event(what) {
-            Ok(ev) => ev,
+        // A reserved-kind refusal is audited, but only AFTER the request has
+        // passed the rate limiter and connection admission and inside the module
+        // lifecycle binding (so a disabled module leaves no trace), and only by
+        // a non-blocking enqueue. `Invalid` stays unaudited and early.
+        let (ev, refused) = match self.build_remember_event(what) {
+            Ok(ev) => (Some(ev), false),
             Err(RememberRefusal::Invalid(m)) => return Err(MemoryRpcError::Invalid(m)),
-            Err(RememberRefusal::ReservedKind) => {
-                self.note_rejection(
-                    agent24_memory::MemoryErrorCode::ReservedKind,
-                    Some(&refused_kind),
-                )
-                .await;
-                return Err(MemoryRpcError::ReservedKind);
-            }
+            Err(RememberRefusal::ReservedKind) => (None, true),
         };
         let Some(mut reservation) = Reservation::reserve(limiter, MEMORY_COST_REMEMBER) else {
             return Err(MemoryRpcError::application(
@@ -1024,19 +1019,26 @@ impl OsScopedMemory {
             let _permit = admission.acquire_owned().await.map_err(|_| {
                 MemoryRpcError::Store("connection admission semaphore closed".into())
             })?;
+            let audit = |code: agent24_memory::MemoryErrorCode, kind: &str| {
+                rejections.enqueue(&agent24_memory::rejections::Rejection {
+                    owner_kind: agent24_memory::rejections::OwnerKind::Module,
+                    owner_key: &owner_key,
+                    code,
+                    rejected_kind: Some(kind),
+                    count_at: None,
+                });
+            };
+            let Some(ev) = ev else {
+                debug_assert!(refused);
+                audit(agent24_memory::MemoryErrorCode::ReservedKind, &refused_kind);
+                return Err(MemoryRpcError::ReservedKind);
+            };
             // About to touch the shared pool — see `Reservation::mark_touched`
             // for the precise (conservative) meaning of this boundary.
             reservation.mark_touched();
             if let Err(e) = events.append(&ev).await {
-                rejections
-                    .note(&agent24_memory::rejections::Rejection {
-                        owner_kind: agent24_memory::rejections::OwnerKind::Module,
-                        owner_key: &owner_key,
-                        code: e.code(),
-                        rejected_kind: Some(&ev.kind),
-                        count_at: None,
-                    })
-                    .await;
+                // Pin the original result first; the audit is only enqueued.
+                audit(e.code(), &ev.kind);
                 return Err(crate::os_memory_page::map_memory_error(&e));
             }
             reservation.commit();
@@ -1463,6 +1465,23 @@ mod tests {
         .unwrap();
     }
 
+    /// The audit trail is written by a background task; wait (bounded) for it to
+    /// reach `want` rows instead of asserting at an arbitrary instant.
+    async fn audit_rows(
+        kv: &agent24_memory::KvStore,
+        key: &str,
+        want: usize,
+    ) -> Vec<agent24_memory::rejections::RejectionRow> {
+        for _ in 0..200 {
+            let rows = kv.rejections().list(key).await.unwrap();
+            if rows.len() >= want {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        kv.rejections().list(key).await.unwrap()
+    }
+
     const RESERVED_KINDS: [&str; 7] = [
         "assertion.retracted",
         "assertion.reasserted",
@@ -1492,7 +1511,14 @@ mod tests {
             "nothing was written"
         );
         // c3: the refusals left an audit row (rate-limited to one per 60 s).
-        let rows = kv.rejections().list(&m.key).await.unwrap();
+        let mut rows = audit_rows(&kv, &m.key, 1).await;
+        for _ in 0..200 {
+            if rows[0].suppressed_count == RESERVED_KINDS.len() as i64 - 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            rows = kv.rejections().list(&m.key).await.unwrap();
+        }
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].code, "memory_reserved_kind");
         assert_eq!(rows[0].suppressed_count, RESERVED_KINDS.len() as i64 - 1);
@@ -1530,6 +1556,146 @@ mod tests {
             m.recent(10).await.unwrap().is_empty(),
             "nothing was written"
         );
+    }
+
+    #[tokio::test]
+    async fn c3_oop_reserved_kind_refusal_is_audited() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let err = m
+            .remember_checked(
+                None,
+                generous_limiter(),
+                admission(4),
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, MemoryRpcError::ReservedKind);
+        let rows = audit_rows(&kv, &m.key, 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].code, "memory_reserved_kind");
+    }
+
+    #[tokio::test]
+    async fn c3_oop_reserved_kind_is_not_audited_when_rate_limited_or_admission_closed() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        // No tokens at all: refused by the limiter before any audit.
+        let err = m
+            .remember_checked(
+                None,
+                Arc::new(RateLimiter::new(0.0, 0.0)),
+                admission(4),
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_ne!(err, MemoryRpcError::ReservedKind);
+        // Admission closed: refused before any audit.
+        let closed = admission(1);
+        closed.close();
+        let _ = m
+            .remember_checked(
+                None,
+                generous_limiter(),
+                closed,
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(kv.rejections().list(&m.key).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn c3_quota_refusals_are_audited_on_both_entries() {
+        for oop in [false, true] {
+            let (_dir, kv, admin) = file_store().await;
+            let m = handle(&kv, "alice", "sin90").await;
+            m.remember(Remember::new("note", serde_json::Map::new()))
+                .await
+                .unwrap();
+            pin_quota(&admin, &m.key, 1).await;
+            if oop {
+                let err = m
+                    .remember_checked(
+                        None,
+                        generous_limiter(),
+                        admission(4),
+                        Remember::new("note", serde_json::Map::new()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, MemoryRpcError::Quota { .. }), "{err:?}");
+            } else {
+                let err = m
+                    .remember(Remember::new("note", serde_json::Map::new()))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, DomainError::MemoryWriteFailed { .. }),
+                    "{err:?}"
+                );
+            }
+            let rows = audit_rows(&kv, &m.key, 1).await;
+            assert_eq!(rows.len(), 1, "oop={oop} {rows:?}");
+            assert_eq!(rows[0].code, "memory_quota_rows", "oop={oop}");
+            assert_eq!(rows[0].rejected_kind.as_deref(), Some("note"));
+        }
+    }
+
+    /// A blocked audit table must not delay or replace the original answer, and a
+    /// flood of refused calls must only ever occupy the bounded queue.
+    #[tokio::test]
+    async fn c3_a_blocked_audit_never_delays_the_request_and_a_full_queue_drops() {
+        let (dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        // Hold the database write lock from a separate connection.
+        use sqlx::Connection as _;
+        let mut locker = sqlx::SqliteConnection::connect(&format!(
+            "sqlite://{}",
+            dir.path().join("memory.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut locker)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let n = agent24_memory::rejections::QUEUE_CAPACITY + 50;
+        for _ in 0..n {
+            let err = m
+                .remember_checked(
+                    None,
+                    generous_limiter(),
+                    admission(4),
+                    Remember::new("mem.x", serde_json::Map::new()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err, MemoryRpcError::ReservedKind);
+        }
+        for _ in 0..5 {
+            let err = m
+                .remember(Remember::new("mem.x", serde_json::Map::new()))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DomainError::MemoryReservedKind));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "requests waited on the audit: {:?}",
+            started.elapsed()
+        );
+        // The worker took at most one item off the queue (and is stuck on it).
+        assert!(
+            kv.queued_rejections().dropped_count() >= 54,
+            "dropped = {}",
+            kv.queued_rejections().dropped_count()
+        );
+        sqlx::query("ROLLBACK").execute(&mut locker).await.unwrap();
     }
 
     #[tokio::test]

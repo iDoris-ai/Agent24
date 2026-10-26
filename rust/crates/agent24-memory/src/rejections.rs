@@ -47,6 +47,54 @@ pub struct Rejection<'a> {
     pub count_at: Option<i64>,
 }
 
+/// Capacity of the asynchronous audit queue. Past it, audit rows are dropped
+/// (and counted), never waited for.
+pub const QUEUE_CAPACITY: usize = 256;
+
+struct Owned {
+    owner_kind: OwnerKind,
+    owner_key: String,
+    code: MemoryErrorCode,
+    rejected_kind: Option<String>,
+    count_at: Option<i64>,
+}
+
+/// Fire-and-forget front of [`Rejections`]: a bounded queue drained by one
+/// background task. `enqueue` never awaits and never fails the caller, so a
+/// flood of refused writes costs at most `QUEUE_CAPACITY` queued items, and a
+/// blocked audit table cannot delay or replace the original error.
+pub struct QueuedRejections {
+    tx: tokio::sync::mpsc::Sender<Owned>,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+impl QueuedRejections {
+    pub fn enqueue(&self, r: &Rejection<'_>) {
+        let item = Owned {
+            owner_kind: r.owner_kind,
+            owner_key: r.owner_key.to_owned(),
+            code: r.code,
+            rejected_kind: r.rejected_kind.map(str::to_owned),
+            count_at: r.count_at,
+        };
+        if self.tx.try_send(item).is_err() {
+            let n = self
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            tracing::warn!(
+                dropped_total = n,
+                "write-rejection audit queue full; dropped"
+            );
+        }
+    }
+
+    /// Audit rows dropped because the queue was full or its worker was gone.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectionRow {
     pub code: String,
@@ -79,6 +127,30 @@ fn opaque_owner(owner_key: &str) -> String {
 impl Rejections {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Start the background drain. Outside a tokio runtime no worker exists and
+    /// every enqueue is counted as dropped.
+    pub fn spawn_queue(self, capacity: usize) -> QueuedRejections {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Owned>(capacity);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                while let Some(o) = rx.recv().await {
+                    self.note(&Rejection {
+                        owner_kind: o.owner_kind,
+                        owner_key: &o.owner_key,
+                        code: o.code,
+                        rejected_kind: o.rejected_kind.as_deref(),
+                        count_at: o.count_at,
+                    })
+                    .await;
+                }
+            });
+        }
+        QueuedRejections {
+            tx,
+            dropped: Default::default(),
+        }
     }
 
     /// Best-effort record: a failure here is logged and swallowed so it can never

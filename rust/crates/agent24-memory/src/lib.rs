@@ -373,6 +373,8 @@ pub struct KvStore {
     /// wrong one with the wrong pool). The ephemeral/file-backed split is now
     /// guaranteed by the two constructors below, not by caller convention.
     oop_admission: Option<Arc<tokio::sync::Semaphore>>,
+    /// P1-02c c3: lazily started bounded audit queue (shared by every clone).
+    rejection_queue: Arc<std::sync::OnceLock<Arc<rejections::QueuedRejections>>>,
 }
 
 impl KvStore {
@@ -406,6 +408,7 @@ impl KvStore {
             oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
                 (KVSTORE_MAX_CONNECTIONS - 1) as usize,
             ))),
+            rejection_queue: Default::default(),
         })
     }
 
@@ -435,6 +438,7 @@ impl KvStore {
         Ok(Self {
             pool,
             oop_admission: None,
+            rejection_queue: Default::default(),
         })
     }
 
@@ -470,6 +474,19 @@ impl KvStore {
     /// P1-02c c3: the failed-write audit trail and session-gap ranges.
     pub fn rejections(&self) -> rejections::Rejections {
         rejections::Rejections::new(self.pool.clone())
+    }
+
+    /// The bounded, asynchronous audit queue: callers `enqueue` and never wait
+    /// on the audit write. Must first be called from inside a tokio runtime.
+    pub fn queued_rejections(&self) -> Arc<rejections::QueuedRejections> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime to host the worker: hand back an inert queue (every
+            // enqueue is counted as dropped) and do not cache it.
+            return Arc::new(self.rejections().spawn_queue(rejections::QUEUE_CAPACITY));
+        }
+        self.rejection_queue
+            .get_or_init(|| Arc::new(self.rejections().spawn_queue(rejections::QUEUE_CAPACITY)))
+            .clone()
     }
 
     /// A session event-log writer over this store's database.
@@ -1421,6 +1438,7 @@ mod tests {
         let kv = KvStore {
             pool: pool_migrated_up_to(&dir.path().join("m.db"), 16).await,
             oop_admission: None,
+            rejection_queue: Default::default(),
         };
 
         let columns = sqlx::query("PRAGMA table_info(mem_os_partitions)")

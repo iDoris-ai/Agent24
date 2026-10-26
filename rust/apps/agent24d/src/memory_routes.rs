@@ -225,15 +225,14 @@ pub async fn delete_assertion(State(state): State<AppState>, Path(id): Path<Stri
             // goes to the log.
             let code = err.code();
             tracing::error!(code = code.as_str(), "retracting assertion {id}: {err}");
-            kv.rejections()
-                .note(&agent24_memory::rejections::Rejection {
+            kv.queued_rejections()
+                .enqueue(&agent24_memory::rejections::Rejection {
                     owner_kind: agent24_memory::rejections::OwnerKind::Personal,
                     owner_key: &owner,
                     code,
                     rejected_kind: Some("assertion.retracted"),
                     count_at: None,
-                })
-                .await;
+                });
             match code {
                 MemoryErrorCode::DiskFull => error_response(
                     StatusCode::INSUFFICIENT_STORAGE,
@@ -1135,6 +1134,21 @@ mod tests {
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{raw}");
         assert_eq!(v["error"]["code"], "memory_disk_full");
         assert_no_internals(&raw);
+        // c3: the failed retraction left an audit row (written in the background).
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = kv.rejections().list(NUL_OWNER).await.unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].code, "memory_disk_full");
+        assert_eq!(
+            rows[0].rejected_kind.as_deref(),
+            Some("assertion.retracted")
+        );
     }
 
     #[tokio::test]
