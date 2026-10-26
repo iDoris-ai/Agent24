@@ -12,10 +12,10 @@
 //!
 //! Run content reaches the caller only through the kernel's peer views
 //! (`/api/v1/peer/runs`, K1-6b.5c-2): a run whose sources are not all Ordinary,
-//! or that may have taken in an untagged tool result (it called a tool,
-//! recalled a memory, was started by a self-wake, or has session context),
-//! comes back as its status and a fixed notice, never its prompt, output or
-//! error. A failed daemon call relays only its HTTP status, never the error
+//! that made a tool call without its own result tag (K1-6b.5f-3), or that may
+//! have taken in an earlier run's tool results (it recalled a memory, was
+//! started by a self-wake, or has session context), comes back as its status
+//! and a fixed notice, never its prompt, output or error. A failed daemon call relays only its HTTP status, never the error
 //! body.
 //!
 //! It deliberately does NOT expose raw `shell_exec`/`fs_write` as MCP tools:

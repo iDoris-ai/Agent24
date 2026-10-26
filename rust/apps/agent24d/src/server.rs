@@ -1668,37 +1668,14 @@ pub async fn serve(
         },
     );
     let advert_view_dyn: StdArc<dyn agent24_domain::tool::ModuleToolAdvertView> = advert_view;
-    for (_, registered) in module_registry.iter() {
-        let module = registered.module();
-        let declaration = registered.declaration();
-        let Some(authorization) =
-            module_authorizations.get(&(module.to_owned(), declaration.operation().to_owned()))
-        else {
-            continue;
-        };
-        match crate::module_tool_runtime::assemble_module_tool(
-            module,
-            declaration,
-            StdArc::clone(&advert_view_dyn),
-            StdArc::clone(authorization),
-            StdArc::clone(&module_tool_runtime_dyn),
-            store.clone(),
-        ) {
-            Ok(tool) => {
-                if let Err(error) = tools.register_module_tool(StdArc::new(tool)) {
-                    tracing::warn!(
-                    module,
-                    operation = declaration.operation(),
-                    %error,
-                    "module tool was not registered"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(module, operation = declaration.operation(), %error, "module tool was not assembled")
-            }
-        }
-    }
+    crate::module_tool_runtime::register_module_tools(
+        &mut tools,
+        &module_registry,
+        &module_authorizations,
+        &advert_view_dyn,
+        &module_tool_runtime_dyn,
+        &store,
+    );
     // H9: register the read-only explorer subagent. It runs against a registry
     // that holds ONLY read builtins and NOT itself, so the sub-run cannot write,
     // execute, or recurse — the guarantees are structural, not policy-checked.

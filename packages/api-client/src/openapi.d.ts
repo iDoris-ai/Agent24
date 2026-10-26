@@ -462,13 +462,12 @@ export interface paths {
          * List runs as a peer bridge may relay them
          * @description K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
          *     runs here instead of /runs. A run's prompt, output and error appear
-         *     only when every source tagged on it is ordinary, it has ended, and —
-         *     while tool results carry no source tags — it cannot have taken one in:
-         *     it called no tool, recalled no memory, was not started by a
-         *     kernel-created schedule, and has no session context (no session, or it
-         *     ran, and the daemon runs, without session memory). Any other run
-         *     carries only its id,
-         *     status and a fixed notice.
+         *     only when every source tagged on it is ordinary, it has ended, each
+         *     tool call it made has its own result tag (K1-6b.5f-3), and it cannot
+         *     have taken in an earlier run's tool results: it recalled no memory,
+         *     was not started by a kernel-created schedule, and has no session
+         *     context (no session, or it ran, and the daemon runs, without session
+         *     memory). Any other run carries only its id, status and a fixed notice.
          */
         get: operations["listPeerRuns"];
         put?: never;
@@ -1539,12 +1538,14 @@ export interface components {
             id: string;
             status: components["schemas"]["RunStatus"];
             /**
-             * @description True unless every source tagged on the run so far is ordinary and
-             *     the run called no tool, recalled no memory, was not started by a
-             *     kernel-created schedule and has no session context. Sources are
-             *     tagged before the first model call, so afterwards the value only
-             *     changes when the run starts a tool or the daemon restarts with
-             *     session memory turned on or off.
+             * @description True unless every source tagged on the run so far is ordinary,
+             *     each tool call it made has its own result tag (K1-6b.5f-3), and
+             *     it recalled no memory, was not started by a kernel-created
+             *     schedule and has no session context. Sources are tagged before the
+             *     first model call and a tool's result before the model sees it, so
+             *     afterwards the value only changes while a tool runs (true from its
+             *     start until its result is tagged, then as that tag says) or when
+             *     the daemon restarts with session memory turned on or off.
              */
             withheld: boolean;
             /** @description Present only for an ended run that is not withheld */
