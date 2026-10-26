@@ -82,6 +82,14 @@ fn a_complete_search_has_no_failures_and_a_narrowed_scope_is_flagged() {
 }
 
 #[test]
+fn a_whole_snippet_is_not_marked_truncated() {
+    let (request, mut response) = fixture("search.partial.json");
+    response["hits"][0]["snippet"]["truncated"] = json!(false);
+    let out = search(&request, &response);
+    assert_eq!(out["evidence"][0]["snippet_truncated"], false);
+}
+
+#[test]
 fn a_hit_not_fresh_is_possibly_stale() {
     let (request, mut response) = fixture("search.partial.json");
     for state in ["stale", "unknown"] {
@@ -141,6 +149,13 @@ fn only_a_whole_checked_chunk_is_a_citation() {
     assert_eq!(segment["text"], "住宿标准：一线城市每晚 600 元。");
     assert_eq!(out["truncated"], false);
     assert!(out.get("next_cursor").is_none());
+}
+
+#[test]
+fn a_first_page_asked_with_a_null_cursor_is_still_a_citation() {
+    let (mut request, response) = whole_chunk();
+    request["page"] = json!({ "cursor": null, "limit": 5 });
+    assert_eq!(read(&request, &response)["evidence"][0]["use"], "citation");
 }
 
 #[test]

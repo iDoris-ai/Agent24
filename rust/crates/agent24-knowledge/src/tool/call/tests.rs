@@ -393,15 +393,15 @@ fn the_advertised_schemas_match_the_parser() {
         .cloned()
         .collect();
     assert_eq!(keys, ["knowledge_base_ids", "max_results", "query"]);
-    let text = json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF" });
-    assert_eq!(s["properties"]["query"], text);
+    let text = |max: usize| json!({ "type": "string", "pattern": "[^\\s\\u0085]|\\uFEFF", "maxLength": max });
+    assert_eq!(s["properties"]["query"], text(4096));
     assert_eq!(
         s["properties"]["knowledge_base_ids"],
-        json!({ "type": "array", "minItems": 1, "items": text })
+        json!({ "type": "array", "minItems": 1, "items": text(256) })
     );
     assert_eq!(
         s["properties"]["max_results"],
-        json!({ "type": "integer", "minimum": 1 })
+        json!({ "type": "integer", "minimum": 1, "maximum": 50 })
     );
     let r = read_parameters();
     assert_eq!(r["required"], json!(["knowledge_id"]));
@@ -413,12 +413,44 @@ fn the_advertised_schemas_match_the_parser() {
         .cloned()
         .collect();
     assert_eq!(keys, ["chunk_id", "content_tag", "cursor", "knowledge_id"]);
-    for key in &keys {
-        assert_eq!(r["properties"][key.as_str()], text, "{key}");
+    for key in ["chunk_id", "content_tag", "knowledge_id"] {
+        assert_eq!(r["properties"][key], text(256), "{key}");
     }
+    assert_eq!(r["properties"]["cursor"], text(1024));
     assert_eq!(
         r["dependentRequired"],
         json!({ "content_tag": ["chunk_id"] })
     );
     assert!(s.get("dependentRequired").is_none());
 }
+
+#[test]
+fn arguments_longer_than_the_wire_allows_are_refused() {
+    let long = |n: usize| "长".repeat(n);
+    let ok = |v: Value| parse_search(&input(v)).is_ok();
+    assert!(ok(json!({ "query": long(4096) })));
+    assert!(!ok(json!({ "query": long(4097) })));
+    assert!(ok(
+        json!({ "query": "q", "knowledge_base_ids": [long(256)] })
+    ));
+    assert!(!ok(
+        json!({ "query": "q", "knowledge_base_ids": [long(257)] })
+    ));
+    assert!(ok(json!({ "query": "q", "max_results": 50 })));
+    assert!(!ok(json!({ "query": "q", "max_results": 51 })));
+    let ok = |v: Value| parse_read(&input(v)).is_ok();
+    for key in ["chunk_id", "cursor"] {
+        let max = if key == "cursor" { 1024 } else { 256 };
+        assert!(ok(json!({ "knowledge_id": "d", key: long(max) })), "{key}");
+        assert!(
+            !ok(json!({ "knowledge_id": "d", key: long(max + 1) })),
+            "{key}"
+        );
+    }
+    assert!(ok(json!({ "knowledge_id": long(256) })));
+    assert!(!ok(json!({ "knowledge_id": long(257) })));
+    let tag = |n| json!({ "knowledge_id": "d", "chunk_id": "c", "content_tag": long(n) });
+    assert!(ok(tag(256)) && !ok(tag(257)));
+}
+
+mod paging;
