@@ -1503,7 +1503,7 @@ argv 会暴露给 process listing；env 容易被继承/诊断 dump；0600 普�
 ## ADR-037：产品形态与进程模型 —— agent24d 是本体，外壳都是客户端
 
 **日期**：2026-10-26
-**状态**：🟡 提议（产品方向由 jason 2026-10-26 拍板；本文待 Codex 挑战与 clestons 评审，批准前不派生产实现）
+**状态**：✅ 采纳（2026-10-26，#1249 合入；经 Codex 三轮、PR-Daemon 两轮评审）
 **事实基线**：main `3a433bb0` 只读调查，逐条证据见 [`docs/tracking/2026-10-26/SOURCE-ADR-037-facts.md`](tracking/2026-10-26/SOURCE-ADR-037-facts.md)。这份清单随本 PR 入库。
 
 ### 背景
@@ -1595,7 +1595,7 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
 4. **TUI 的「全功能」定义为能力对齐，视觉类功能给兜底。** OpenAPI 的每个对外操作，必须在 CLI 子命令或 TUI 视图中有入口，或者在豁免表里写明理由。豁免限于纯视觉能力，例如 Open Design 画布、富文件预览，TUI 给出「在桌面或浏览器打开」的链接。CI 增加覆盖检查（覆盖不降，豁免表变化需评审）。TUI 仍是客户端，不是第二个运行时（ADR-026 #11 不变），但不再只是「运维面」：要有聊天输入、日程、记忆、模块、文档、审批这些视图。恢复测试场景下，TUI 在桌面不可用时要能独立拉起并诊断 daemon。
 
 5. **平台顺序：先 Mac，再 Linux，后 Windows；靠可替换部件推进，不分叉核心。**
-   - **Mac**（当前）：arm64 先行，签名加公证的流程已经跑通（预发布 `v0.5.1-preview.20261016.2`）。正式版沿用这套流程，CLI 和模块包的签名（DEP-B3）一并补上。Intel 包要不要出另行决定。默认运行时 oMLX。
+   - **Mac**（当前）：arm64 先行。预发布 `v0.5.1-preview.20261016.2` 的说明声称该包已签名并公证。仓库里目前没有可重复的签名、公证、entitlements 和内嵌 daemon 签名配置。补齐这条流水线是 DEP-B 的任务，也是 macOS 身份校验投产的前置（见 `docs/agent/CORE-2-ENROLL-DESIGN.md` §D9，该文件在 `ab/core` 分支）。CLI 和模块包的签名（DEP-B3）在同一条流水线里补上。Intel 包要不要出另行决定。默认运行时 oMLX。
    - **Linux**：服务化用 systemd `--user`；运行时用 Ollama 或 llama.cpp 后端（目前只有 Ollama）；密钥存储用 Secret Service；`agent24-hw` 补齐 Linux 探测。
    - **Windows**：按 `docs/design/WINDOWS-PORT.md`（v2）用命名管道替代 UDS 和 fd 继承，`os-fd`、`os-cwd`、`workspace` 中的 Unix 路径都要按该文处置表改写；服务化用登录计划任务；凭据文件用 ACL；钥匙串开启 Windows feature；运行时同 Linux。CI 发布矩阵加入 Windows。
    - 默认运行时按平台和硬件档位选择，ADR-022 的「默认 MLX」收窄为「Apple Silicon 上默认 MLX」，选型归 iDoris（ADR-036）。
