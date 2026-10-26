@@ -18,7 +18,9 @@
 
 ## 2. 推荐决定：窄来源映射，不重载 K1 隐私标签
 
-独立、版本化的逐消息来源映射 `run_message_origins`，复用 `(run_id,seq)` 身份及存储事务，不把 HostRecall 塞进现有 SourceKind 后依赖 LocalOnly fallback 猜来源。表、读写 API 与外键已落地：migration `0021`（#1168）、migration `0022`（#1195），实现在 `rust/crates/agent24-store/src/message_origin.rs`。
+独立、版本化的逐消息来源映射 `run_message_origins`，复用 `(run_id,seq)` 身份及存储事务，不把 HostRecall 塞进现有 SourceKind 后依赖 LocalOnly fallback 猜来源。表、读写 API 与外键已落地：migration `0027`（#1168）、migration `0028`（#1195），实现在 `rust/crates/agent24-store/src/message_origin.rs`。
+
+> 改号说明（2026-10-26，memory-p1-65）：为避让 ab/kernel 先合入 main 的 store 迁移 0019–0026，本线 store 迁移 0021/0022/0023 改号为 0027/0028/0029，memory 迁移 0018 改号为 0019。docs/agent/R05-* 等历史评审稿中的旧编号（0021/0022/0023）保持原文，对应关系以此处为准。
 
 新消息实例的来源记录规则如下。暂停通知等宿主系统性通知的 `HostSystem` 见 R05-5 第 3 节；在其迁移落地前，暂停通知仍是无来源行，读出来是 Missing 并被拒发。
 

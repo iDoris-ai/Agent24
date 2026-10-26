@@ -86,7 +86,7 @@ pub enum MemoryError {
     },
     /// P1-02c (c2): a retraction was refused on a full partition because the
     /// serialized retraction payload `{"assertion_id":…}` exceeds the 256-byte
-    /// cap of the retraction quota exemption (migration 0018). The test is on the
+    /// cap of the retraction quota exemption (migration 0019). The test is on the
     /// SERIALIZED bytes, not the id length: a plain id is exempt up to 237 bytes,
     /// but an id with characters JSON escapes (`"`, `\`, control characters)
     /// crosses the cap sooner. Carries no owner key and no id on purpose.
@@ -111,7 +111,7 @@ pub enum MemoryErrorCode {
     DiskFull,
     ReservedKind,
     /// A retraction whose serialized `assertion.retracted` payload exceeds the
-    /// 256-byte quota-exemption cap (migration 0018), so on a full
+    /// 256-byte quota-exemption cap (migration 0019), so on a full
     /// partition it is charged as ordinary content and refused.
     RetractIdTooLong,
     Internal,
@@ -1852,7 +1852,13 @@ mod tests {
                 .fetch_one(&upgraded.pool)
                 .await
                 .unwrap();
-        assert_eq!(version, 18);
+        let latest = sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap();
+        assert_eq!(version, latest);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);

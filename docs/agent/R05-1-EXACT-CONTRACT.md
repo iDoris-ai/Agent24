@@ -8,7 +8,7 @@
 
 ## 1. 过期句子
 
-`docs/agent/R05-0-SOURCE-CONTRACT-REVIEW-PACKET.md` 第 4 节写下一片才是存储原子。该句已过期。存储原子已按协调者后续命令落地。实现 head 是 `54bafa8010ba3d163df4c967188ddeb07888a60f`。#1168 的 merge 是 `c9a19532675ceee98a7fe1bfbb9f503c000fad92`。表是 `run_message_origins`。迁移文件是 `rust/crates/agent24-store/migrations/0021_run_message_origins.sql`。本稿不重开 D5，也不再加迁移。
+`docs/agent/R05-0-SOURCE-CONTRACT-REVIEW-PACKET.md` 第 4 节写下一片才是存储原子。该句已过期。存储原子已按协调者后续命令落地。实现 head 是 `54bafa8010ba3d163df4c967188ddeb07888a60f`。#1168 的 merge 是 `c9a19532675ceee98a7fe1bfbb9f503c000fad92`。表是 `run_message_origins`。迁移文件是 `rust/crates/agent24-store/migrations/0027_run_message_origins.sql`。本稿不重开 D5，也不再加迁移。
 
 #1152 同秒审计 ID 已合并。merge 是 `7dd6f08f2e979e2e4e54caa23e4c3834cd97fc5d`。`docs/agent/PLAN-MEMORY-P1.md` 里「修复未完成」是过期文字。本稿不改那份计划。
 

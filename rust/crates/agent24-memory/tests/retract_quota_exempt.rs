@@ -1,7 +1,7 @@
 //! P1-02c c1 (design D1, tests T1-T4 and the catalog half of T9): retraction by a
 //! PERSONAL owner is exempt from the A-class quota gate and counted separately.
 //!
-//! The gate under test is the `mem_events_bi_quota` trigger (migration 0018), so
+//! The gate under test is the `mem_events_bi_quota` trigger (migration 0019), so
 //! every case drives real SQL against a real file database with the real
 //! migrations applied; nothing here stubs the trigger out.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -745,7 +745,7 @@ async fn event_id_cannot_be_rewritten_under_the_persisted_class() {
     assert!(err.to_string().contains("immutable"), "{err}");
 }
 
-/// Database upgraded from 0017 holding one pre-0018 personal retraction row.
+/// Database upgraded from before 0019 holding one pre-0019 personal retraction row.
 async fn upgraded_with_old_row() -> (tempfile::TempDir, KvStore, SqlitePool, (i64, i64)) {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
@@ -765,7 +765,7 @@ async fn upgraded_with_old_row() -> (tempfile::TempDir, KvStore, SqlitePool, (i6
     migrator.migrations = migrator
         .migrations
         .iter()
-        .filter(|m| m.version < 18)
+        .filter(|m| m.version < 19)
         .cloned()
         .collect::<Vec<_>>()
         .into();
