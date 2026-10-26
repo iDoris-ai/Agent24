@@ -192,12 +192,16 @@ function selfTest() {
   expect('stale exemption (already covered) is red', f4.errors.some((e) => e.includes('stale exemption')));
   // --- Codex challenge round 1 (counter-examples; each must be red before the fix, green after) ---
   const withCli = (extra) => check({ openapi, exemptions, cliFiles: [...cliFiles, extra] });
-  const redTimings = (r) => !r.coveredIds.has('listTimings'); // not counted as covered (it is exempted, so assert on coverage, not on errors)
-  expect('block-commented request is NOT coverage', redTimings(withCli('/* client().get(format!("{}/api/v1/timings", b)) */')));
-  expect('path literal outside the call args is NOT coverage', redTimings(withCli('fn x(){ client().get("/old"); let s = "/api/v1/timings"; }')));
-  expect('trailing-comment request is NOT coverage', redTimings(withCli('fn x(){ foo(); } // client().get("/api/v1/timings")')));
-  expect('real .get(format!(..)) call IS coverage', !redTimings(withCli('fn x(){ bearer(&ep, client().get(format!("{}/api/v1/timings", ep.base))); }')));
-  expect('Method::GET tuple call IS coverage', !redTimings(withCli('fn x(){ let t = (reqwest::Method::GET, "/api/v1/timings".to_owned(), None); }')));
+  // Probe an exempted GET the real CLI does not call. listTimings was the probe
+  // until TUI-2a2 covered it; a covered probe would make the negative controls
+  // pass for the wrong reason. Assert on coverage, not on errors.
+  const stillExempt = (r) => !r.coveredIds.has('sin90ListDirections');
+  const probe = '/api/v1/sin90/directions';
+  expect('block-commented request is NOT coverage', stillExempt(withCli(`/* client().get(format!("{}${probe}", b)) */`)));
+  expect('path literal outside the call args is NOT coverage', stillExempt(withCli(`fn x(){ client().get("/old"); let s = "${probe}"; }`)));
+  expect('trailing-comment request is NOT coverage', stillExempt(withCli(`fn x(){ foo(); } // client().get("${probe}")`)));
+  expect('real .get(format!(..)) call IS coverage', !stillExempt(withCli(`fn x(){ bearer(&ep, client().get(format!("{}${probe}", ep.base))); }`)));
+  expect('Method::GET tuple call IS coverage', !stillExempt(withCli(`fn x(){ let t = (reqwest::Method::GET, "${probe}".to_owned(), None); }`)));
   const withPath = (key, extra = '      operationId: quotedNew\n') =>
     openapi.replace(/^  \/chat:/m, `  ${key}:\n    get:\n${extra}      responses: {}\n  /chat:`);
   for (const key of ['"/new"', "'/new'"]) {

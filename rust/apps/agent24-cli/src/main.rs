@@ -80,8 +80,8 @@ enum Command {
     /// Open Design uses this bridge for its Creative runtime.
     Acp,
     /// Export/delete the local decision log (D0-2; `docs/agent/PLAN-DECIDE.md`
-    /// §2.1-§2.3). Like `os install`/`uninstall`, this does NOT go through the
-    /// daemon — see `cmd_decide`'s doc comment.
+    /// §2.1-§2.3). export/delete do NOT go through the daemon — see
+    /// `cmd_decide`. `profile` is the exception: a read-only daemon GET.
     Decide {
         #[command(subcommand)]
         action: DecideAction,
@@ -116,6 +116,38 @@ enum Command {
         #[arg(long, help = "原样输出 JSON 响应")]
         json: bool,
     },
+    /// 模型调用耗时：逐行，或 --summary 汇总（只读）
+    Timings {
+        /// 按 source、model、step 汇总
+        #[arg(long)]
+        summary: bool,
+        /// 只看这个 source（不能和 --summary 一起用）
+        #[arg(long)]
+        source: Option<String>,
+        /// 时间下界，原样传给 timing store
+        #[arg(long)]
+        since: Option<String>,
+        /// 条数。daemon 默认 500，上限 5000（不能和 --summary 一起用）
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, help = "原样输出 JSON 响应")]
+        json: bool,
+    },
+    /// 模块工具授权：列出或导出（只读）
+    Consent {
+        #[command(subcommand)]
+        action: query::ConsentAction,
+    },
+    /// 模块审批（只读）
+    Approval {
+        #[command(subcommand)]
+        action: query::ApprovalAction,
+    },
+    /// 工具清单、长期授权、风险覆盖（只读）
+    Tools {
+        #[command(subcommand)]
+        action: query::ToolsAction,
+    },
 }
 
 /// `agent24 hw …` (HW-1).
@@ -149,6 +181,11 @@ enum DecideAction {
     Delete {
         #[command(subcommand)]
         action: DecideDeleteAction,
+    },
+    /// 读取硬件档位与决策模型有效档（只读，走 daemon）
+    Profile {
+        #[arg(long, help = "原样输出 JSON 响应")]
+        json: bool,
     },
 }
 
@@ -1156,6 +1193,7 @@ async fn cmd_decide(action: DecideAction) -> Result<(), String> {
     match &action {
         DecideAction::Export { jsonl, .. } => require_jsonl(*jsonl)?,
         DecideAction::Delete { .. } => {}
+        DecideAction::Profile { json } => return query::decide_profile(*json).await,
     }
     let dir = agent24_protocol::state_file::state_dir().ok_or_else(|| "HOME not set".to_owned())?;
     let store = agent24_store::Store::open(&dir.join("agent24.db"))
@@ -1173,6 +1211,7 @@ async fn cmd_decide(action: DecideAction) -> Result<(), String> {
             Ok(())
         }
         DecideAction::Delete { action } => cmd_decide_delete(&store, action).await,
+        DecideAction::Profile { .. } => unreachable!("profile returns before the store opens"),
     }
 }
 
@@ -2296,6 +2335,16 @@ async fn main() -> std::process::ExitCode {
         Command::Memory { action } => query::memory(action).await,
         Command::Schedule { action } => query::schedule(action).await,
         Command::Usage { json } => query::usage(json).await,
+        Command::Timings {
+            summary,
+            source,
+            since,
+            limit,
+            json,
+        } => query::timings(summary, source, since, limit, json).await,
+        Command::Consent { action } => query::consent(action).await,
+        Command::Approval { action } => query::approval(action).await,
+        Command::Tools { action } => query::tools(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

@@ -1,5 +1,6 @@
-//! TUI-2a：daemon 的只读 GET。这一批是 session / run / memory / schedule / usage。
-//! timings、consent、approval、tools、decide profile 留到 TUI-2a2。
+//! TUI-2a / TUI-2a2：daemon 的只读 GET。
+//! session / run / memory / schedule / usage，以及 timings、consent、
+//! approval、tools、decide profile。
 //! 写操作留给 TUI-2b（CORE-2 提升级在场证明）。
 //!
 //! 路径字面量必须写在 `Method::GET` 元组里，`scripts/tui-coverage.mjs` 才认。
@@ -70,6 +71,66 @@ pub enum ScheduleAction {
     },
 }
 
+#[derive(clap::Subcommand)]
+pub enum ConsentAction {
+    /// 列出模块工具授权
+    List {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// 导出模块工具授权
+    Export {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ApprovalAction {
+    /// 模块审批（gate / advise），与 run 审批队列分开
+    Module {
+        #[command(subcommand)]
+        action: ModuleApprovalAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ModuleApprovalAction {
+    /// 列出模块审批
+    List {
+        /// pending、approved、denied 或 timed_out
+        #[arg(long)]
+        decision: Option<String>,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// 读取一条模块审批
+    Get {
+        id: String,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ToolsAction {
+    /// 列出已注册工具
+    List {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// 列出目标级长期授权
+    Grants {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// 列出本地风险覆盖
+    Overrides {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+}
+
 #[derive(Debug)]
 enum Read {
     Sessions,
@@ -89,6 +150,24 @@ enum Read {
     Schedule {
         id: String,
     },
+    Timings {
+        summary: bool,
+        source: Option<String>,
+        since: Option<String>,
+        limit: Option<u32>,
+    },
+    Consents,
+    ConsentExport,
+    ModuleApprovals {
+        decision: Option<String>,
+    },
+    ModuleApproval {
+        id: String,
+    },
+    Tools,
+    StandingGrants,
+    ToolOverrides,
+    DecideProfile,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +224,55 @@ pub async fn usage(json: bool) -> Result<(), String> {
     run(Read::Usage, json).await
 }
 
+pub async fn timings(
+    summary: bool,
+    source: Option<String>,
+    since: Option<String>,
+    limit: Option<u32>,
+    json: bool,
+) -> Result<(), String> {
+    run(
+        Read::Timings {
+            summary,
+            source,
+            since,
+            limit,
+        },
+        json,
+    )
+    .await
+}
+
+pub async fn consent(action: ConsentAction) -> Result<(), String> {
+    let (read, json) = match action {
+        ConsentAction::List { json } => (Read::Consents, json),
+        ConsentAction::Export { json } => (Read::ConsentExport, json),
+    };
+    run(read, json).await
+}
+
+pub async fn approval(action: ApprovalAction) -> Result<(), String> {
+    let ApprovalAction::Module { action } = action;
+    let (read, json) = match action {
+        ModuleApprovalAction::List { decision, json } => (Read::ModuleApprovals { decision }, json),
+        ModuleApprovalAction::Get { id, json } => (Read::ModuleApproval { id }, json),
+    };
+    run(read, json).await
+}
+
+pub async fn tools(action: ToolsAction) -> Result<(), String> {
+    let (read, json) = match action {
+        ToolsAction::List { json } => (Read::Tools, json),
+        ToolsAction::Grants { json } => (Read::StandingGrants, json),
+        ToolsAction::Overrides { json } => (Read::ToolOverrides, json),
+    };
+    run(read, json).await
+}
+
+pub async fn decide_profile(json: bool) -> Result<(), String> {
+    run(Read::DecideProfile, json).await
+}
+
 async fn run(read: Read, json: bool) -> Result<(), String> {
     let ep = super::connect().await?;
     let result = execute(&ep, &read, json).await;
@@ -176,7 +304,11 @@ fn with_query(path: &str, pairs: &[(&str, Option<&str>)]) -> String {
 }
 
 fn request(read: &Read) -> Result<(reqwest::Method, String, View), String> {
-    if let Read::Session { id } | Read::Run { id } | Read::Schedule { id } = read {
+    if let Read::Session { id }
+    | Read::Run { id }
+    | Read::Schedule { id }
+    | Read::ModuleApproval { id } = read
+    {
         reject_blank(id)?;
     }
     Ok(match read {
@@ -247,6 +379,92 @@ fn request(read: &Read) -> Result<(reqwest::Method, String, View), String> {
                 "next_run_at",
                 "last_run_at",
             ]),
+        ),
+        Read::Timings {
+            summary: true,
+            since,
+            source,
+            limit,
+        } => {
+            if source.is_some() || limit.is_some() {
+                return Err("--source and --limit apply to the list, not --summary".to_owned());
+            }
+            (
+                reqwest::Method::GET,
+                with_query("/api/v1/timings/summary", &[("since", since.as_deref())]),
+                View::rows(
+                    "summary",
+                    &[
+                        "source", "model_id", "step", "count", "p50_ms", "p95_ms", "max_ms",
+                    ],
+                ),
+            )
+        }
+        Read::Timings {
+            summary: false,
+            source,
+            since,
+            limit,
+        } => {
+            let limit = limit.map(|n| n.to_string());
+            (
+                reqwest::Method::GET,
+                with_query(
+                    "/api/v1/timings",
+                    &[
+                        ("source", source.as_deref()),
+                        ("since", since.as_deref()),
+                        ("limit", limit.as_deref()),
+                    ],
+                ),
+                View::rows(
+                    "timings",
+                    &["id", "source", "model_id", "step", "total_ms", "ok"],
+                ),
+            )
+        }
+        Read::Consents => (
+            reqwest::Method::GET,
+            "/api/v1/module-consents".to_owned(),
+            View::rows("authorizations", &["module", "tool", "host_risk", "status"]),
+        ),
+        Read::ConsentExport => (
+            reqwest::Method::GET,
+            "/api/v1/module-consents/export".to_owned(),
+            View::rows("authorizations", &["module", "tool", "host_risk", "status"]),
+        ),
+        Read::ModuleApprovals { decision } => (
+            reqwest::Method::GET,
+            with_query(
+                "/api/v1/module-approvals",
+                &[("decision", decision.as_deref())],
+            ),
+            View::rows("module_approvals", &["id", "module", "action", "decision"]),
+        ),
+        Read::ModuleApproval { id } => (
+            reqwest::Method::GET,
+            format!("/api/v1/module-approvals/{}", super::qs_encode(id)),
+            View::one(&["id", "module", "kind", "action", "decision", "target"]),
+        ),
+        Read::Tools => (
+            reqwest::Method::GET,
+            "/api/v1/tools".to_owned(),
+            View::rows("tools", &["name", "source", "risk_class"]),
+        ),
+        Read::StandingGrants => (
+            reqwest::Method::GET,
+            "/api/v1/standing-grants".to_owned(),
+            View::rows("standing_grants", &["id", "scope_kind", "tool", "target"]),
+        ),
+        Read::ToolOverrides => (
+            reqwest::Method::GET,
+            "/api/v1/tool-overrides".to_owned(),
+            View::rows("overrides", &["pattern", "risk_class", "source"]),
+        ),
+        Read::DecideProfile => (
+            reqwest::Method::GET,
+            "/api/v1/decide/profile".to_owned(),
+            View::one(&["hardware_tier", "effective_tier", "reasons"]),
         ),
     })
 }
@@ -462,11 +680,118 @@ mod tests {
         r#"{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7,"cost_usd":0.1}"#,
         "total_tokens: 7"
     );
+    case!(
+        timings_list_sends_source_since_and_limit,
+        Read::Timings {
+            summary: false,
+            source: Some("chat".into()),
+            since: Some("2026-01-01T00:00:00Z".into()),
+            limit: Some(2),
+        },
+        "GET /api/v1/timings?source=chat&since=2026-01-01T00%3A00%3A00Z&limit=2 HTTP/1.1",
+        r#"{"timings":[{"id":1,"source":"chat","model_id":"m","step":"llm","total_ms":12,"ok":true}]}"#,
+        "chat"
+    );
+    case!(
+        timings_summary_sends_since,
+        Read::Timings {
+            summary: true,
+            source: None,
+            since: Some("t0".into()),
+            limit: None,
+        },
+        "GET /api/v1/timings/summary?since=t0 HTTP/1.1",
+        r#"{"summary":[{"source":"chat","model_id":"m","step":"llm","count":2,"p50_ms":10,"p95_ms":20,"max_ms":30}]}"#,
+        "chat"
+    );
+    case!(
+        consent_list_gets_authorizations,
+        Read::Consents,
+        "GET /api/v1/module-consents HTTP/1.1",
+        r#"{"authorizations":[{"module":"sin90","tool":"fs","host_risk":"low","status":"granted"}]}"#,
+        "sin90"
+    );
+    case!(
+        consent_export_gets_the_export,
+        Read::ConsentExport,
+        "GET /api/v1/module-consents/export HTTP/1.1",
+        r#"{"authorizations":[{"module":"sin90","tool":"fs","host_risk":"high","status":"revoked"}]}"#,
+        "revoked"
+    );
+    case!(
+        module_approval_list_sends_decision,
+        Read::ModuleApprovals {
+            decision: Some("pending".into())
+        },
+        "GET /api/v1/module-approvals?decision=pending HTTP/1.1",
+        r#"{"module_approvals":[{"id":"a1","module":"sin90","action":"write","decision":"pending"}]}"#,
+        "sin90"
+    );
+    case!(
+        module_approval_get_encodes_the_path_segment,
+        Read::ModuleApproval { id: "a/b".into() },
+        "GET /api/v1/module-approvals/a%2Fb HTTP/1.1",
+        r#"{"id":"a/b","module":"sin90","kind":"advise","action":"write","decision":"pending","target":null}"#,
+        "advise"
+    );
+    case!(
+        tools_list_gets_tools,
+        Read::Tools,
+        "GET /api/v1/tools HTTP/1.1",
+        r#"{"tools":[{"name":"fs_read","source":"builtin","risk_class":"read"}]}"#,
+        "fs_read"
+    );
+    case!(
+        standing_grants_lists_grants,
+        Read::StandingGrants,
+        "GET /api/v1/standing-grants HTTP/1.1",
+        r#"{"standing_grants":[{"id":"g1","scope_kind":"session","tool":"http","target":"ops-alerts"}]}"#,
+        "ops-alerts"
+    );
+    case!(
+        tool_overrides_lists_overrides,
+        Read::ToolOverrides,
+        "GET /api/v1/tool-overrides HTTP/1.1",
+        r#"{"overrides":[{"pattern":"mcp_fs_*","risk_class":"read","source":"cli"}]}"#,
+        "mcp_fs_*"
+    );
+    case!(
+        decide_profile_gets_tiers,
+        Read::DecideProfile,
+        "GET /api/v1/decide/profile HTTP/1.1",
+        r#"{"hardware_tier":"t2","effective_tier":"t1","reasons":["ram"]}"#,
+        "effective_tier: t1"
+    );
 
     #[test]
     fn blank_id_is_rejected() {
-        let err = request(&Read::Session { id: "  ".into() }).unwrap_err();
-        assert!(err.contains("blank"), "{err}");
+        for read in [
+            Read::Session { id: "  ".into() },
+            Read::ModuleApproval { id: " ".into() },
+        ] {
+            let err = request(&read).unwrap_err();
+            assert!(err.contains("blank"), "{err}");
+        }
+    }
+
+    #[test]
+    fn timings_summary_rejects_list_only_filters() {
+        let err = request(&Read::Timings {
+            summary: true,
+            source: Some("chat".into()),
+            since: None,
+            limit: None,
+        })
+        .unwrap_err();
+        assert!(err.contains("--summary"), "{err}");
+        let err = request(&Read::Timings {
+            summary: true,
+            source: None,
+            since: None,
+            limit: Some(1),
+        })
+        .unwrap_err();
+        assert!(err.contains("--summary"), "{err}");
     }
 
     #[tokio::test]
