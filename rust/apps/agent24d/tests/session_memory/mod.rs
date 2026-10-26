@@ -336,6 +336,9 @@ mod chat;
 #[path = "pause_http_snapshot.rs"]
 mod pause_http_snapshot;
 
+#[path = "p03_http_observation.rs"]
+mod p03_http_observation;
+
 #[tokio::test]
 async fn successful_compaction_replays_every_original_message_after_daemon_restart() {
     restart_and_replay(false).await;
