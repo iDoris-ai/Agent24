@@ -227,10 +227,16 @@ mod tests {
         );
         let seen = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let n = sock.read(&mut buf).unwrap();
+            // Until the end of the head: the requests here carry no body.
+            let mut got = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).unwrap();
+                assert!(n > 0, "the client closed before its request ended");
+                got.extend_from_slice(&buf[..n]);
+            }
             sock.write_all(reply.as_bytes()).unwrap();
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+            String::from_utf8_lossy(&got).into_owned()
         });
         let ep = Endpoint {
             base,
