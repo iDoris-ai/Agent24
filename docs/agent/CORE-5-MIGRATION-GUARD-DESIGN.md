@@ -186,3 +186,17 @@ CLI connect、attach_only、daemon start 和 TUI 共用同一探测结果。dock
 | Q5 | F12 的 CLI 会绕过锁自动迁移；G 上界与 backup Rust 绑定尚无实现证据 | 5a 为硬前置；各迁移声明 G 并保留恢复空间；5d 前选绑定并证明关闭语义，不能先上线保护宣称 |
 | Q6 | ADR 标提议；任务把 repair 归决策 4，而 F3 显示条文在决策 2 | 本稿按指定条文设计，不改 ADR 状态与编号。协调者确认接受范围并由 DOCS 线订正 |
 | Q7 | 双库 rename 不能一次原子提交；磁盘彻底不可写时标记也可能失败 | 接受 guard 日志加不开业务的恢复边界；要求迁移前日志持久化、恢复预算和逐边界掉电验收，不声称任意硬件故障都可自动恢复 |
+
+## 7. 协调者裁决（2026-10-27，Opus）
+
+| # | 裁决 |
+|---|---|
+| Q1 | 沿用 CORE-4（PR #1301，分支 `ab/core-04-health-version`）的字段：`protocol_version`，以及 `migrations.{store,memory}`。这两个字段取 `_sqlx_migrations` 中 `success=1` 的 `MAX(version)`，查询失败时报 0 并打 warn。5f 以 #1301 合入为前置，停靠时 `migrations` 报恢复后的实际值。恢复失败时，在 `reason` 里标 `unknown`，`migrations` 字段本身保持 CORE-4 的形状不变，不另起一套契约。 |
+| Q2 | 采纳。2b、2d 和停靠态登记通道全部完成之前，retry 完全不开放，ProductHost 子进程模式也不例外。`health.retry_allowed=false`。安装器换回旧版本的路径保留。 |
+| Q3 | 采纳窄例外：只允许发布 `startup_state="docked"` 的诊断发现，以及最小登记通道；不发业务 ready。CORE-2 冻结稿不改，在 5f 的 PR 里登记这一协调项。 |
+| Q4 | 采纳：semver 必须严格降级，并且 hash 与 `previous_binary` 完全一致。来源未知时，不自动清除标记。 |
+| Q5 | 5a 是硬前置。**G 简化**：如果迁移没有声明 G 的上界，默认 G = S（保守取一倍）。空间预算因此变成 `3*S + R`，不再用 `space_budget_unknown` 停靠，避免原型阶段每个迁移都要附大库证据。迁移作者确知需要更大空间时自行声明。backup 的 Rust 绑定在 5d 之前选定，并验证关闭语义。 |
+| Q6 | ADR-037 已于 #1249 接受，状态行已由 DOCS-2（#1304）订正。repair 条款按 ADR 原文设计。条款编号的出入交给 DOCS 线核对，本稿不改动。 |
+| Q7 | 接受：以 guard 日志加「不开业务」作为恢复边界；迁移前日志必须落盘；按每个落盘边界做掉电验收。不承诺任意硬件故障都能自动恢复。 |
+
+本稿评审至多一轮，之后冻结。评审意见中的真问题就地订正，其余登记到对应实现片。
