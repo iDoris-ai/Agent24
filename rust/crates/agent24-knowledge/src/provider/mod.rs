@@ -7,9 +7,11 @@
 //! of the evidence a binding delivered (`evidence`), and what is persisted
 //! when, with the seal that tells a restart whether it can trust that
 //! (`ledger`), the records it is persisted as (`record`), how they are read
-//! back (`replay`) and what a restart makes of them (`recover`).
+//! back (`replay`) and what a restart makes of them (`recover`); and the
+//! budgets calls run under (`budget`).
 
 pub mod binding;
+pub mod budget;
 pub mod connection;
 pub mod credential;
 pub mod evidence;
