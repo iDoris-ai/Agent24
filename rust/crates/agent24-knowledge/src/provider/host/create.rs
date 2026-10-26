@@ -33,6 +33,8 @@ pub(super) struct Creation<I: Ids> {
     of: Of<I>,
     value: u64,
     confirmed: Option<I::Principal>,
+    /// The placeholder's reason the write clears.
+    cleared: Option<PlaceholderFailure>,
 }
 
 impl<I: Ids> Host<I> {
@@ -112,7 +114,8 @@ impl<I: Ids> Host<I> {
             confirmed: confirmed.clone(),
         }];
         // A reason persisted for the placeholder no longer holds.
-        if let Some(failure) = m.failure().filter(|f| *f != PlaceholderFailure::Dependency) {
+        let cleared = m.failure().filter(|f| *f != PlaceholderFailure::Dependency);
+        if let Some(failure) = cleared {
             changes.push(Change::PlaceholderCleared {
                 profile: id,
                 failure,
@@ -125,6 +128,7 @@ impl<I: Ids> Host<I> {
             of,
             value,
             confirmed,
+            cleared,
         });
         self.journal.push(changes, Then::Create { ticket });
     }
@@ -158,7 +162,9 @@ impl<I: Ids> Host<I> {
 
     /// A new binding's write is confirmed: it binds and connects, or, its
     /// attempt superseded or its profile removed meanwhile, it is retired at
-    /// once (A.5).
+    /// once (A.5). The rest of the write stands as a restart reads it: its
+    /// principal is confirmed (S1.13), and the reason it cleared is written
+    /// back unless a newer one took its place.
     pub(super) fn created(&mut self, ticket: Loosening, out: &mut Output<I>) {
         let Some(i) = self.creations.iter().position(|c| c.ticket == ticket) else {
             return;
@@ -170,15 +176,25 @@ impl<I: Ids> Host<I> {
         let off = self.off;
         let binding = c.of.binding.clone();
         if let Some(m) = self.member(&c.of.profile)
-            && m.bind(c.attempt, binding, c.value, c.confirmed)
+            && m.bind(c.attempt, binding, c.value, c.confirmed.clone())
         {
             if let Some(round) = m.connect(off) {
                 out.loading.push((c.of.profile, round));
             }
             return;
         }
-        let tightening = self.ledger.tighten(Scope::profile(c.of.profile.clone()));
-        self.tightened(tightening, Left::new(Change::Retire(c.of)), out);
+        let profile = c.of.profile.clone();
+        let mut left = Left::new(Change::Retire(c.of));
+        if let Some(m) = self.member(&profile) {
+            m.confirm_principal(c.confirmed);
+            if let Some(failure) = c.cleared.filter(|f| m.failure() == Some(*f)) {
+                let profile = profile.clone();
+                left.changes
+                    .push(Change::PlaceholderFailed { profile, failure });
+            }
+        }
+        let tightening = self.ledger.tighten(Scope::profile(profile));
+        self.tightened(tightening, left, out);
     }
 }
 

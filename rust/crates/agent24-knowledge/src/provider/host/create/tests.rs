@@ -6,6 +6,7 @@ use crate::provider::journal::{SealWrite, Written};
 use crate::provider::member::Member;
 use crate::provider::placeholder::Placeholder;
 use crate::provider::profile::{Profile, Slot};
+use crate::provider::replay::{Record, replay};
 use crate::provider::state::ConnectionPhase;
 
 fn created(binding: u32, principal: &'static str) -> Created<T> {
@@ -29,6 +30,17 @@ fn bind(binding: u32, generation: u64, confirmed: Option<&'static str>) -> C {
 fn confirmed(host: &mut H) -> (Vec<C>, Output<T>) {
     let (attempt, _, changes) = write(host);
     (changes, host.written(attempt, Written::Durable))
+}
+
+/// As [`confirmed`], keeping the record for a replay.
+fn step(host: &mut H, log: &mut Vec<Record<T>>) -> Vec<C> {
+    let (attempt, record) = host.take_write().unwrap();
+    log.push(record);
+    host.written(attempt, Written::Durable);
+    match &log.last().unwrap().entry {
+        crate::provider::replay::Entry::Changes(changes) => changes.clone(),
+        other => panic!("{other:?}"),
+    }
 }
 
 fn confirmed_principal(host: &H, id: &'static str) -> Option<&'static str> {
@@ -272,4 +284,71 @@ fn a_binding_created_while_off_does_not_connect() {
     assert!(bound(&host, "b"));
     assert!(out.loading.is_empty());
     assert_eq!(phase(&host, "b"), None);
+}
+
+/// The write of a binding retired at once stands as a restart reads it
+/// (S1.13, A.5): its principal is confirmed, so a login as another awaits
+/// confirmation, restart or not.
+#[test]
+fn a_superseded_binding_confirms_its_principal_as_a_restart_would() {
+    let mut log = Vec::new();
+    let mut host = host();
+    let attempt = host.attempt(&"b").unwrap();
+    host.identified("b", attempt, created(8, "alice"));
+    host.attempt(&"b").unwrap();
+    step(&mut host, &mut log);
+    assert_eq!(step(&mut host, &mut log), vec![C::Retire(of("b", 8))]);
+    assert_eq!(replay(10, log).unwrap().confirmed.get("b"), Some(&"alice"));
+    assert_eq!(confirmed_principal(&host, "b"), Some("alice"));
+
+    let attempt = host.attempt(&"b").unwrap();
+    host.identified("b", attempt, created(9, "bob"));
+    let awaited = C::Await {
+        profile: "b",
+        awaited: Confirmation::PrincipalChanged,
+    };
+    assert_eq!(write(&mut host).2, vec![awaited]);
+}
+
+/// A.5: the reason the retired binding's write cleared is written back with
+/// the retirement, so memory and a restart agree; a newer reason stands.
+#[test]
+fn a_superseded_binding_writes_back_the_reason_it_cleared() {
+    let rejected = PlaceholderFailure::CredentialRejected;
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    step(&mut host, &mut log);
+    let attempt = host.attempt(&"b").unwrap();
+    host.identified("b", attempt, created(8, "alice"));
+    host.attempt(&"b").unwrap();
+    step(&mut host, &mut log);
+    let failed = C::PlaceholderFailed {
+        profile: "b",
+        failure: rejected,
+    };
+    assert_eq!(
+        step(&mut host, &mut log),
+        vec![C::Retire(of("b", 8)), failed]
+    );
+    assert_eq!(failure(&host, "b"), Some(rejected));
+    let replayed = replay(10, log).unwrap();
+    assert_eq!(replayed.profiles.get("b").unwrap().failure, Some(rejected));
+
+    let unidentified = PlaceholderFailure::InstanceUnidentified;
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    step(&mut host, &mut log);
+    let attempt = host.attempt(&"b").unwrap();
+    host.identified("b", attempt, created(8, "alice"));
+    let newer = host.attempt(&"b").unwrap();
+    host.attempt_failed("b", newer, Attempted::Unidentified);
+    step(&mut host, &mut log);
+    step(&mut host, &mut log);
+    assert_eq!(step(&mut host, &mut log), vec![C::Retire(of("b", 8))]);
+    assert_eq!(failure(&host, "b"), Some(unidentified));
+    let replayed = replay(10, log).unwrap();
+    assert_eq!(
+        replayed.profiles.get("b").unwrap().failure,
+        Some(unidentified)
+    );
 }

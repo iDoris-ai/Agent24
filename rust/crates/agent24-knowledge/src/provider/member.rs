@@ -177,10 +177,15 @@ impl<I: Ids> Member<I> {
             return false;
         }
         self.binding = Some(binding);
-        if confirmed.is_some() {
-            self.confirmed = confirmed;
-        }
+        self.confirm_principal(confirmed);
         true
+    }
+
+    /// A principal recorded as confirmed; `None` keeps the last.
+    pub fn confirm_principal(&mut self, principal: Option<I::Principal>) {
+        if principal.is_some() {
+            self.confirmed = principal;
+        }
     }
 
     /// The binding enters `loading` if the switches and its state let it.
