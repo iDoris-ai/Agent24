@@ -74,3 +74,18 @@ export function tryDataDir(): string | null {
     throw error
   }
 }
+
+/** Literal join for the target platform: no `..`/`.` folding (unlike
+ * `path.join`, which would collapse them and read a different file than the
+ * Rust side's `PathBuf::join`). Trailing separators of `dir` are trimmed. */
+export function joinLiteralFor(platform: DataDirPlatform, dir: string, ...parts: string[]): string {
+  const sep = platform === 'windows' ? '\\' : '/'
+  const base = dir.replace(platform === 'windows' ? /[\\/]+$/ : /\/+$/, '')
+  return [base, ...parts].join(sep)
+}
+
+/** [joinLiteralFor] for the host platform. Use for every path derived from
+ * `dataDir()` that must agree with the daemon. */
+export function joinLiteral(dir: string, ...parts: string[]): string {
+  return joinLiteralFor(currentDataDirPlatform(), dir, ...parts)
+}

@@ -476,8 +476,9 @@ mod tests {
                     //   conclusion would have been wrong.
                     // - LOCALAPPDATA: read only by the Windows branch of
                     //   `data_dir()` (ADR-037); launchd/LaunchAgents exist on
-                    //   macOS only, and a Windows login-task service inherits
-                    //   the user environment, so there is nothing to pass through.
+                    //   macOS only. There is currently no Windows service; when
+                    //   one is added, check whether LOCALAPPDATA must be passed
+                    //   through.
                     if let Some(name) = name {
                         let shouty = !name.is_empty()
                             && name

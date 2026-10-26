@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import readline from 'node:readline'
-import { tryDataDir } from './data-dir'
+import { joinLiteral, tryDataDir } from './data-dir'
 
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
@@ -104,7 +104,7 @@ export interface ExternalDaemonState {
  * (`./data-dir`, ADR-037); unresolvable root → null. */
 export function daemonStatePath(): string | null {
   const dir = tryDataDir()
-  return dir === null ? null : path.join(dir, 'daemon.json')
+  return dir === null ? null : joinLiteral(dir, 'daemon.json')
 }
 
 /** Read + parse `daemon.json`. Absent, unreadable, or malformed all mean the
