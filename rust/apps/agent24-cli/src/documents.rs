@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use agent24_documents_client::http::HttpTransport;
-use agent24_documents_client::{Progress, Response, call, import_file};
+use agent24_documents_client::{Progress, Response, call, import_file, refused, route};
 use clap::Subcommand;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -243,7 +243,7 @@ async fn request_op(request: Option<String>, json: bool, host_stdin: bool) -> Re
             })
     } else {
         match request.map(|r| serde_json::from_str::<Value>(&r)) {
-            Some(Ok(req)) => daemon().await.map(|t| (t, req)),
+            Some(Ok(req)) => return operation(req, json).await,
             Some(Err(_)) => Err(invalid("the operation must be one JSON object".to_owned())),
             None => Err(invalid("an operation is required".to_owned())),
         }
@@ -254,13 +254,21 @@ async fn request_op(request: Option<String>, json: bool, host_stdin: bool) -> Re
     }
 }
 
-/// One of the named operations, against the running daemon.
+/// One operation against the running daemon.
 async fn operation(req: Value, json: bool) -> Result<(), String> {
-    let res = match daemon().await {
-        Ok(transport) => call(&req, &transport).await,
+    report(&against_daemon(&req).await, json)
+}
+
+/// A request that is not one is [`refused`] before the daemon is looked
+/// for, so it is 400 with or without one, as on the desktop.
+async fn against_daemon(req: &Value) -> Response {
+    if route(req).is_none() {
+        return refused();
+    }
+    match daemon().await {
+        Ok(transport) => call(req, &transport).await,
         Err(res) => res,
-    };
-    report(&res, json)
+    }
 }
 
 async fn import(path: Option<PathBuf>, json: bool, host_stdin: bool) -> Result<(), String> {
@@ -373,6 +381,17 @@ mod tests {
                 host_input::<HostRequest>(bad, SHAPE).unwrap_err(),
                 r#"stdin must be one JSON object {"base","token","request"}"#
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_request_is_refused_before_any_daemon_is_looked_for() {
+        for req in [
+            json!({"op": "list", "limit": 0}),
+            json!({"op": "get", "documentId": "bad"}),
+            json!({"op": "proxy"}),
+        ] {
+            assert_eq!(against_daemon(&req).await, refused(), "{req}");
         }
     }
 

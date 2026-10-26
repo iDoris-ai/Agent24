@@ -13,6 +13,6 @@ pub mod response;
 pub mod transport;
 
 pub use import::{CHUNK_BYTES, Progress, import_file};
-pub use ops::{call, route};
+pub use ops::{call, refused, route};
 pub use response::{ApiError, Response, to_response};
 pub use transport::{Method, Reply, Request, Transport};

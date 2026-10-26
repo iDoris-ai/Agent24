@@ -74,12 +74,16 @@ pub fn route(req: &Value) -> Option<Request> {
     })
 }
 
-/// Runs one allowed operation; anything else is refused here, unsent, as
-/// 400 `invalid_request`.
+/// The answer to a request [`route`] does not take: 400 `invalid_request`.
+pub fn refused() -> Response {
+    Response::fail(400, "invalid_request", "not an allowed documents operation")
+}
+
+/// Runs one allowed operation; anything else is [`refused`] here, unsent.
 pub async fn call<T: Transport + Sync>(req: &Value, transport: &T) -> Response {
     match route(req) {
         Some(request) => to_response(transport.send(request).await),
-        None => Response::fail(400, "invalid_request", "not an allowed documents operation"),
+        None => refused(),
     }
 }
 
