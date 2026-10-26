@@ -10,7 +10,7 @@
 //! record. So a seal present at restart means every committed tightening has
 //! its record, and a missing one means a global tightening (S1.14).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// What a change covers. A binding's changes count for its profile: a
 /// profile has at most one activated binding (S4.9), and I1 blocks by
@@ -36,16 +36,26 @@ impl<P: PartialEq> Scope<P> {
     }
 }
 
+/// A tightening, from [`Ledger::tighten`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket(u64);
 
+/// A loosening, from [`Ledger::loosen`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Loosening(u64);
+
+/// One deletion or rebuild of the seal: its outcome counts only while it is
+/// the one in flight, so a late report of an earlier one never moves the
+/// seal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SealOp(u64);
+
 /// A tightening to write: its record (or a write outside the log such as
-/// clearing a long-lived login, FI-7c), and the seal's deletion when
-/// `unseal`.
+/// clearing a long-lived login, FI-7c), and the seal's deletion if `unseal`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tightening {
     pub ticket: Ticket,
-    pub unseal: bool,
+    pub unseal: Option<SealOp>,
 }
 
 /// A loosening refused (I1): dropped, not queued; the local result follows
@@ -69,14 +79,15 @@ pub enum Confirmed {
 enum Seal {
     /// Rebuilt and not deleted since.
     Present,
-    /// A deletion in flight.
-    Deleting,
+    Deleting(SealOp),
     /// Deleted for sure: a restart tightens globally.
     Absent,
     /// A rebuild in flight; a tightening that came meanwhile deletes it
-    /// again once the rebuild is through (the host orders both under one
-    /// lock).
-    Rebuilding { then_delete: bool },
+    /// again once the rebuild is through.
+    Rebuilding {
+        op: SealOp,
+        then_delete: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -87,7 +98,8 @@ struct Tight<P> {
 }
 
 #[derive(Debug)]
-struct Loose {
+struct Loose<P> {
+    scope: Scope<P>,
     abandoned: bool,
 }
 
@@ -97,7 +109,9 @@ pub struct Ledger<P> {
     /// Tightenings whose record is not yet confirmed.
     tight: HashMap<Ticket, Tight<P>>,
     /// Loosenings written and not yet confirmed, abandoned ones included.
-    loose: HashMap<Ticket, Loose>,
+    loose: HashMap<Loosening, Loose<P>>,
+    /// Loosenings in effect: only these satisfy a dependency.
+    applied: HashSet<Loosening>,
     next: u64,
 }
 
@@ -112,30 +126,37 @@ impl<P: Clone + PartialEq> Ledger<P> {
             },
             tight: HashMap::new(),
             loose: HashMap::new(),
+            applied: HashSet::new(),
             next: 0,
         }
     }
 
-    fn ticket(&mut self) -> Ticket {
+    fn next(&mut self) -> u64 {
         self.next += 1;
-        Ticket(self.next)
+        self.next
+    }
+
+    fn deleting(&mut self) -> SealOp {
+        let op = SealOp(self.next());
+        self.seal = Seal::Deleting(op);
+        op
     }
 
     /// A tightening has taken effect in memory. With the seal already gone it
     /// is committed at once; otherwise once the seal's deletion or its record
-    /// lands.
+    /// lands. During a rebuild the deletion comes from [`Ledger::resealed`].
     pub fn tighten(&mut self, scope: Scope<P>) -> Tightening {
-        let ticket = self.ticket();
+        let ticket = Ticket(self.next());
         let unseal = match self.seal {
-            Seal::Present => {
-                self.seal = Seal::Deleting;
-                true
+            Seal::Present => Some(self.deleting()),
+            Seal::Rebuilding { op, .. } => {
+                self.seal = Seal::Rebuilding {
+                    op,
+                    then_delete: true,
+                };
+                None
             }
-            Seal::Rebuilding { .. } => {
-                self.seal = Seal::Rebuilding { then_delete: true };
-                true
-            }
-            Seal::Deleting | Seal::Absent => false,
+            Seal::Deleting(_) | Seal::Absent => None,
         };
         let committed = self.seal == Seal::Absent;
         let entry = Tight {
@@ -158,7 +179,8 @@ impl<P: Clone + PartialEq> Ledger<P> {
     }
 
     /// The record's write failed or its outcome is unknown: still
-    /// unconfirmed, retried by the caller; "some settings not saved" shows.
+    /// unconfirmed, retried by the caller without waiting for the user (I2);
+    /// "some settings not saved" shows meanwhile.
     pub fn record_failed(&mut self, ticket: Ticket) {
         if let Some(t) = self.tight.get_mut(&ticket) {
             t.failed = true;
@@ -170,10 +192,10 @@ impl<P: Clone + PartialEq> Ledger<P> {
         self.tight.values().any(|t| t.failed)
     }
 
-    /// The seal's deletion is confirmed: every tightening in effect is
+    /// The deletion `op` is confirmed: every tightening in effect is
     /// committed.
-    pub fn seal_deleted(&mut self) {
-        if self.seal != Seal::Deleting {
+    pub fn seal_deleted(&mut self, op: SealOp) {
+        if self.seal != Seal::Deleting(op) {
             return;
         }
         self.seal = Seal::Absent;
@@ -182,52 +204,66 @@ impl<P: Clone + PartialEq> Ledger<P> {
         }
     }
 
-    /// The deletion failed or its outcome is unknown: the seal may still be
-    /// there. Returns whether to try again: some tightening is not committed.
-    pub fn seal_delete_failed(&mut self) -> bool {
-        if self.seal != Seal::Deleting {
-            return false;
+    /// The deletion `op` failed or its outcome is unknown: the seal may still
+    /// be there. While some tightening is not committed, returns the deletion
+    /// to try again.
+    pub fn seal_delete_failed(&mut self, op: SealOp) -> Option<SealOp> {
+        if self.seal != Seal::Deleting(op) {
+            return None;
         }
-        let retry = self.tight.values().any(|t| !t.committed);
-        self.seal = if retry { Seal::Deleting } else { Seal::Present };
-        retry
+        if self.tight.values().any(|t| !t.committed) {
+            return Some(self.deleting());
+        }
+        self.seal = Seal::Present;
+        None
     }
 
-    /// Whether to rebuild the seal now: it is gone and every tightening is
-    /// confirmed, writes outside the log included.
-    pub fn reseal(&mut self) -> bool {
+    /// The rebuild to start now, if any: the seal is gone and every
+    /// tightening is confirmed, writes outside the log included.
+    pub fn reseal(&mut self) -> Option<SealOp> {
         if self.seal != Seal::Absent || !self.tight.is_empty() {
-            return false;
+            return None;
         }
-        self.seal = Seal::Rebuilding { then_delete: false };
-        true
+        let op = SealOp(self.next());
+        self.seal = Seal::Rebuilding {
+            op,
+            then_delete: false,
+        };
+        Some(op)
     }
 
-    /// The rebuild landed, or its outcome is unknown: either way the seal may
-    /// be there now. Returns whether to delete it again right away.
-    pub fn resealed(&mut self) -> bool {
-        let Seal::Rebuilding { then_delete } = self.seal else {
-            return false;
+    /// The rebuild `op` landed, or its outcome is unknown: either way the
+    /// seal may be there now. Returns the deletion to start if a tightening
+    /// came meanwhile.
+    pub fn resealed(&mut self, op: SealOp) -> Option<SealOp> {
+        let Seal::Rebuilding {
+            op: current,
+            then_delete,
+        } = self.seal
+        else {
+            return None;
         };
-        self.seal = if then_delete {
-            Seal::Deleting
-        } else {
-            Seal::Present
-        };
-        then_delete
+        if current != op {
+            return None;
+        }
+        if then_delete {
+            return Some(self.deleting());
+        }
+        self.seal = Seal::Present;
+        None
     }
 
     /// I1: whether a loosening over `scope` may be written. Refused while a
     /// tightening it depends on is unconfirmed, or while the loosening
-    /// `after` it depends on is not yet in effect.
+    /// `after` it depends on is not in effect.
     pub fn loosen(
         &mut self,
-        scope: &Scope<P>,
-        after: Option<Ticket>,
+        scope: Scope<P>,
+        after: Option<Loosening>,
         off: bool,
-    ) -> Result<Ticket, Refused> {
-        let blocked = self.tight.values().any(|t| t.scope.blocks(scope));
-        let waiting = after.is_some_and(|a| self.loose.contains_key(&a));
+    ) -> Result<Loosening, Refused> {
+        let blocked = self.tight.values().any(|t| t.scope.blocks(&scope));
+        let waiting = after.is_some_and(|a| !self.applied.contains(&a));
         if blocked || waiting {
             return Err(if off {
                 Refused::KnowledgeOff
@@ -235,27 +271,37 @@ impl<P: Clone + PartialEq> Ledger<P> {
                 Refused::LocalStorage
             });
         }
-        let ticket = self.ticket();
-        self.loose.insert(ticket, Loose { abandoned: false });
+        let ticket = Loosening(self.next());
+        let entry = Loose {
+            scope,
+            abandoned: false,
+        };
+        self.loose.insert(ticket, entry);
         Ok(ticket)
     }
 
     /// The loosening's record is confirmed persisted.
-    pub fn loosening_durable(&mut self, ticket: Ticket) -> Confirmed {
+    pub fn loosening_durable(&mut self, ticket: Loosening) -> Confirmed {
         match self.loose.remove(&ticket) {
-            Some(Loose { abandoned: false }) => Confirmed::Applied,
+            Some(Loose {
+                abandoned: false, ..
+            }) => {
+                self.applied.insert(ticket);
+                Confirmed::Applied
+            }
             _ => Confirmed::Ignored,
         }
     }
 
     /// The user acted against a loosening still pending, or its write failed
-    /// and the caller gives it up: it is abandoned, and the tightening that
-    /// offsets it is written (I1). `None` once it is confirmed or abandoned
+    /// and the caller gives it up: it is abandoned, and a tightening over its
+    /// own scope offsets it (I1). `None` once it is confirmed or abandoned
     /// already; the opposite action is then an ordinary tightening.
-    pub fn abandon(&mut self, ticket: Ticket, offset: Scope<P>) -> Option<Tightening> {
+    pub fn abandon(&mut self, ticket: Loosening) -> Option<Tightening> {
         let loose = self.loose.get_mut(&ticket).filter(|l| !l.abandoned)?;
         loose.abandoned = true;
-        Some(self.tighten(offset))
+        let scope = loose.scope.clone();
+        Some(self.tighten(scope))
     }
 }
 
