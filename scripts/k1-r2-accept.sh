@@ -5,10 +5,9 @@
 #   scripts/k1-r2-accept.sh --old <main bin dir> --new <release bin dir> [--work <dir>]
 #
 # Each bin dir holds `agent24d` and `agent24` (`cargo build -p agent24d -p agent24-cli`).
-# Every daemon runs on its own AGENT24_DATA_DIR under --work; the user's
-# ~/.agent24 is never opened, and the run fails if it changed. No model is
-# needed: runs end `provider_unavailable`, which is enough for every check.
-# Needs curl, jq, sqlite3, python3 and node.
+# Every daemon runs on its own AGENT24_DATA_DIR under --work (Z1 checks the
+# user's ~/.agent24, so stop your own daemon first). No model is needed.
+# Needs curl, jq, sqlite3, python3, perl and node.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -22,18 +21,22 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$OLD" ] && [ -n "$NEW" ] || { sed -n 2,11p "$0" >&2; exit 2; }
+[ -n "$OLD" ] && [ -n "$NEW" ] || { sed -n 2,10p "$0" >&2; exit 2; }
 for b in "$OLD/agent24d" "$OLD/agent24" "$NEW/agent24d" "$NEW/agent24"; do
   [ -x "$b" ] || { echo "missing binary: $b" >&2; exit 2; }
 done
-for t in curl jq sqlite3 python3 node; do
+for t in curl jq sqlite3 python3 perl node; do
   command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
 done
+REAL="${HOME:-/nonexistent}/.agent24"; [ -d "$REAL" ] && REAL=$(cd "$REAL" && pwd -P)
+inside() { case "$1/" in "$REAL"/*|"${HOME:-/nonexistent}/.agent24"/*) return 0 ;; esac; return 1; }
 WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/k1r2-accept.XXXX")}
-mkdir -p "$WORK"
-WORK=$(cd "$WORK" && pwd)
-REAL="${HOME:-/nonexistent}/.agent24"
-case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
+inside "$WORK" || { mkdir -p "$WORK" && WORK=$(cd "$WORK" && pwd -P); }
+inside "$WORK" && { echo "--work must not be inside $REAL" >&2; exit 2; }
+[ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
+  && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
+# Only what each case sets reaches a daemon or the CLI.
+for v in $(env | grep -oE '^(A24|AGENT24)_[A-Z0-9_]+'); do unset "$v"; done
 
 REPORT="$WORK/report.md"
 FAILS=0
@@ -54,6 +57,7 @@ check() {
 is() { [ "$1" = "$2" ] && echo ok || echo fail; }
 has() { grep -qF -- "$2" "$1" && echo ok || echo fail; }
 lacks() { grep -qF -- "$2" "$1" && echo fail || echo ok; }
+limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }
 
 PID="" PORT="" TOKEN="" DATA=""
 # start_daemon BIN_DIR DATA_DIR [VAR=value ...]: 0 once ready, 1 if it exited.
@@ -62,22 +66,23 @@ start_daemon() {
   mkdir -p "$DATA"; rm -f "$DATA/daemon.json"
   env AGENT24_DATA_DIR="$DATA" A24_OS_PACKAGES="$DATA.pk" "$@" \
     "$bin/agent24d" serve > "$DATA.serve.log" 2>&1 &
-  local child=$!
+  PID=$!
   for _ in $(seq 1 60); do
     if [ -s "$DATA/daemon.json" ]; then
-      PID=$(jq -r .pid "$DATA/daemon.json"); PORT=$(jq -r .port "$DATA/daemon.json")
-      TOKEN=$(jq -r .token "$DATA/daemon.json"); return 0
+      PORT=$(jq -r .port "$DATA/daemon.json"); TOKEN=$(jq -r .token "$DATA/daemon.json"); return 0
     fi
-    kill -0 "$child" 2>/dev/null || { wait "$child"; return 1; }
+    kill -0 "$PID" 2>/dev/null || { wait "$PID"; PID=""; return 1; }
     sleep 0.5
   done
-  kill -TERM "$child"; return 1
+  stop_daemon; return 1
 }
+# stop_daemon: SIGTERM, then SIGKILL after 10 s, so no daemon outlives a case
 stop_daemon() {
   [ -n "$PID" ] || return 0
   kill -TERM "$PID" 2>/dev/null
   for _ in $(seq 1 20); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done
-  PID=""
+  kill -0 "$PID" 2>/dev/null && { echo "daemon $PID ignored SIGTERM; killing it" >&2; kill -KILL "$PID"; }
+  wait "$PID" 2>/dev/null; PID=""
 }
 trap 'stop_daemon' EXIT
 
@@ -98,6 +103,12 @@ wait_run() {
 }
 peer() { api GET "/api/v1/peer/runs/$1"; jq -r .withheld "$WORK/r.json"; }
 NOTICE="this run used sources that are not ordinary, so its content is not shared with connected tools; open it in Agent24 to see it"
+# withheld ID: ok when a peer gets the run withheld, with the notice and nothing else
+withheld() {
+  api GET "/api/v1/peer/runs/$1"
+  jq -e --arg n "$NOTICE" '.withheld == true and .notice == $n and .prompt == null and .output == null and .error == null' \
+    "$WORK/r.json" > /dev/null && echo ok || echo fail
+}
 db() { sqlite3 "$DATA/agent24.db" "$1"; }
 iso() { python3 -c "import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"; }
 # grant MODULE OP AT: a granted row as an earlier build wrote it (no artifact)
@@ -125,7 +136,6 @@ grant documents find "$(iso -3600)"
 OLD_VERSION=$(db "SELECT max(version) FROM _sqlx_migrations")
 echo "old library: migration $OLD_VERSION, schedule $SCH, run $OLD_RUN"
 cp -R "$WORK/old" "$WORK/up"
-cp -R "$WORK/old" "$WORK/old-copy"
 
 echo "== 2. upgrade with the release ($NEW)"
 if start_daemon "$NEW" "$WORK/up"; then UP=ok; else UP=fail; fi
@@ -141,26 +151,27 @@ api GET "/api/v1/runs/$OLD_RUN"
 check U4 "old schedules and runs are still there" "$( (grep -qx "$SCH" "$WORK/ids" && grep -qx wake_01ACCEPTOLD "$WORK/ids" && grep -q OLD-RUN-MARKER "$WORK/r.json") && echo ok || echo fail)" "schedule $SCH, wake_01ACCEPTOLD, run $OLD_RUN"
 
 S1=$(consent_status node-ref echo); S2=$(consent_status documents find)
-check G1 "a grant from before the upgrade is stale" "$(is "$S1/$S2" stale/stale)" "node-ref/echo $S1, documents/find $S2" \
-  "the list does not compare the package artifact; the gate refuses the call (#1290)"
+# Known only as #1290 shows it (listed granted); a lost grant still fails.
+K=""; [ "$S1/$S2" = granted/granted ] && K="the list does not compare the package artifact; the gate refuses the call (#1290)"
+check G1 "a grant from before the upgrade is stale" "$(is "$S1/$S2" stale/stale)" "node-ref/echo $S1, documents/find $S2" "$K"
 api POST /api/v1/module-consents/modules/node-ref/tools/echo '{}'
 check G2 "the grant POST is closed by default" "$(is "$CODE/$(jq -r .error.code "$WORK/r.json")" 403/grants_closed)" "$CODE $(jq -c .error.code "$WORK/r.json")"
 
 ORIGIN=$(db "SELECT group_concat(schedule_id || '=' || classification, ' ') FROM (SELECT * FROM schedule_source_origin ORDER BY schedule_id)")
 check S1 "self-wakes from before the upgrade read as unknown, the user's schedule has no origin" "$(is "$ORIGIN" "wake_01ACCEPTGONE=unknown wake_01ACCEPTOLD=unknown")" "$ORIGIN"
-check V1 "an old run is withheld from peers" "$(is "$(peer "$OLD_RUN")/$(jq -r .notice "$WORK/r.json")" "true/$NOTICE")" "$OLD_RUN"
-check V2 "a run of a deleted old self-wake is withheld" "$(is "$(peer run_01ACCEPTWAKEGONE)" true)" "run_01ACCEPTWAKEGONE"
+check V1 "an old run is withheld from peers" "$(withheld "$OLD_RUN")" "$OLD_RUN"
+check V2 "a run of a deleted old self-wake is withheld" "$(withheld run_01ACCEPTWAKEGONE)" "run_01ACCEPTWAKEGONE"
 
 api POST /api/v1/schedules/wake_01ACCEPTOLD/run_now; WAKE_RUN=$(jq -r .run_id "$WORK/r.json"); wait_run "$WAKE_RUN"
 api POST "/api/v1/schedules/$SCH/run_now"; USER_RUN=$(jq -r .run_id "$WORK/r.json"); wait_run "$USER_RUN"
-W=$(peer "$WAKE_RUN"); U=$(peer "$USER_RUN"); UP_PROMPT=$(jq -r .prompt "$WORK/r.json")
-check S2 "an old self-wake firing now is withheld, the user's schedule is not" "$(is "$W/$U/$UP_PROMPT" "true/false/USER-SCHEDULE-MARKER")" "wake run $WAKE_RUN $W; user run $USER_RUN $U"
+W=$(withheld "$WAKE_RUN"); U=$(peer "$USER_RUN"); UP_PROMPT=$(jq -r .prompt "$WORK/r.json")
+check S2 "an old self-wake firing now is withheld, the user's schedule is not" "$(is "$W/$U/$UP_PROMPT" "ok/false/USER-SCHEDULE-MARKER")" "wake run $WAKE_RUN $W; user run $USER_RUN $U"
 
 api POST /api/v1/runs '{"prompt":"NEW-ORDINARY-MARKER"}'; NEW_RUN=$(jq -r .id "$WORK/r.json"); wait_run "$NEW_RUN"
 api POST /api/v1/sessions '{}'; SESS=$(jq -r .id "$WORK/r.json")
 api POST /api/v1/runs "{\"prompt\":\"SESSION-MARKER\",\"session_id\":\"$SESS\"}"; SESS_RUN=$(jq -r .id "$WORK/r.json"); wait_run "$SESS_RUN"
-N=$(peer "$NEW_RUN"); S=$(peer "$SESS_RUN")
-check V3 "a new run with no session is shared, a session run is withheld" "$(is "$N/$S" false/true)" "$NEW_RUN $N; $SESS_RUN $S"
+N=$(peer "$NEW_RUN"); S=$(withheld "$SESS_RUN")
+check V3 "a new run with no session is shared, a session run is withheld" "$(is "$N/$S" false/ok)" "$NEW_RUN $N; $SESS_RUN $S"
 api GET /api/v1/peer/runs; cp "$WORK/r.json" "$WORK/peer.json"
 LEAK=$( [ "$CODE" = 200 ] && [ "$(jq '.runs | length' "$WORK/peer.json")" -ge 6 ] && echo ok || echo fail)
 for m in OLD-RUN-MARKER WAKE-MARKER SESSION-MARKER; do [ "$(lacks "$WORK/peer.json" "$m")" = ok ] || LEAK=fail; done
@@ -169,7 +180,7 @@ check V4 "the peer list carries no withheld content" "$LEAK" "$WORK/peer.json"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"accept","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agent24_list_runs","arguments":{}}}' \
-  | (cat; sleep 5) | AGENT24_DATA_DIR="$DATA" "$NEW/agent24" mcp 2> "$WORK/mcp.err" | grep '"id":2' > "$WORK/mcp.out"
+  | (cat; sleep 5) | AGENT24_DATA_DIR="$DATA" limit 30 "$NEW/agent24" mcp 2> "$WORK/mcp.err" | grep '"id":2' > "$WORK/mcp.out"
 jq -r '.result.content[0].text' "$WORK/mcp.out" > "$WORK/mcp.runs" 2>/dev/null
 MCP=$( (grep -q NEW-ORDINARY-MARKER "$WORK/mcp.runs" && grep -qF "$NOTICE" "$WORK/mcp.runs" \
   && ! grep -qE 'OLD-RUN-MARKER|WAKE-MARKER|SESSION-MARKER' "$WORK/mcp.runs") && echo ok || echo fail)
@@ -191,7 +202,7 @@ sid = call(2, "session/new", {"cwd": "/", "mcpServers": []})[0]["result"]["sessi
 print("\n".join(call(3, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "ACP-MARKER"}]})[1]))
 p.stdin.close(); p.wait(timeout=10)
 EOF
-AGENT24_DATA_DIR="$DATA" python3 -I "$WORK/acp.py" "$NEW/agent24" > "$WORK/acp.out" 2>&1
+AGENT24_DATA_DIR="$DATA" limit 60 python3 -I "$WORK/acp.py" "$NEW/agent24" > "$WORK/acp.out" 2>&1
 ACP=$( (grep -qF "$NOTICE" "$WORK/acp.out" && ! grep -qE 'ACP-MARKER|provider' "$WORK/acp.out") && echo ok || echo fail)
 check V6 "an ACP prompt (always in a session) gets only the fixed notice" "$ACP" "$WORK/acp.out"
 stop_daemon
@@ -207,7 +218,7 @@ for bad in A24_MODULE_TOOL_GRANTS=yes A24_MODULE_GRANT_MAX_DAYS=91; do
 done
 
 echo "== 4. a protocol-1 module, install and disable"
-INST=$(AGENT24_DATA_DIR="$WORK/up" A24_OS_PACKAGES="$WORK/up.pk" "$NEW/agent24" os install "$REPO/examples/node-module" 2>&1); RC=$?
+AGENT24_DATA_DIR="$WORK/up" A24_OS_PACKAGES="$WORK/up.pk" "$NEW/agent24" os install "$REPO/examples/node-module" > "$WORK/g5.out" 2>&1; RC=$?
 DATA="$WORK/up"; S=$(sqlite3 "$DATA/agent24.db" "SELECT count(*) FROM module_consent_revocations WHERE module = 'node-ref'")
 check G5 "os install revokes earlier grants of the name" "$(is "$RC/$S" 0/1)" "exit $RC; revocation rows $S"
 grant node-ref echo "$(iso 1)"; sleep 2
@@ -231,8 +242,11 @@ check H3 "for comparison: main exits non-zero there" "$( [ $RC != 0 ] && echo ok
 
 echo "== 6. no way back"
 cp -R "$WORK/up" "$WORK/down"; rm -f "$WORK/down/daemon.json"
+dump() { sqlite3 "$WORK/down/agent24.db" .dump | shasum; }
+BEFORE=$(dump)
 if start_daemon "$OLD" "$WORK/down"; then R=fail; stop_daemon; else R=$(has "$WORK/down.serve.log" "previously applied but is missing"); fi
-check D1 "main refuses the upgraded library and leaves it alone" "$R" "$(grep -m1 -o 'migration [0-9]* was previously applied[^"]*' "$WORK/down.serve.log" | cut -c1-120)"
+[ "$(dump)" = "$BEFORE" ] || R=fail
+check D1 "main refuses the upgraded library and leaves it alone" "$R" "$(grep -m1 -o 'migration [0-9]* was previously applied[^"]*' "$WORK/down.serve.log" | cut -c1-90); dump unchanged: $( [ "$(dump)" = "$BEFORE" ] && echo yes || echo no)"
 if start_daemon "$NEW" "$WORK/down"; then R=ok; stop_daemon; else R=fail; fi
 check D2 "the release still opens it afterwards" "$R" "$WORK/down.serve.log"
 

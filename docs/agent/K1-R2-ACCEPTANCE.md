@@ -6,8 +6,10 @@
   - 造旧数据：main 没有写授予、写 self-wake 的产品入口，旧授予和旧 self-wake 只能写进库里；
   - 读迁移结果：`_sqlx_migrations` 和 `schedule_source_origin` 没有对外接口。
 - **不碰用户数据**：每个 daemon 都用工作目录下自己的 `AGENT24_DATA_DIR` 和 `A24_OS_PACKAGES`。Z1 检查 `~/.agent24` 在运行期间没有变化。
+- **前提**：先停掉自己的 daemon（`agent24 daemon stop`），不然 Z1 会把它正常的写入当成被碰过；脚本发现 daemon 在跑会直接拒绝运行。`--work` 不能在 `~/.agent24` 下面，经符号链接指过去也不行。
+- **环境变量**：调用者 shell 里的 `A24_*`、`AGENT24_*` 全部清掉，daemon 和 CLI 只拿到各条用例自己设的值。
 - **不需要模型**：没有模型时 run 以 `provider_unavailable` 结束，来源标签在调模型之前就写好了，所以 peer 视图的判定照样成立。
-- **依赖**：curl、jq、sqlite3、python3、node（P1 要起示例模块 `examples/node-module`）。
+- **依赖**：curl、jq、sqlite3、python3、perl（给 MCP 和 ACP 的交互限时）、node（P1 要起示例模块 `examples/node-module`）。
 
 ## 准备：一份 main 写的旧库
 
@@ -27,7 +29,7 @@
 | U2 | 升级 | `GET /api/v1/health` | 200 |
 | U3 | 升级 | 读 `_sqlx_migrations` | store 库补上 19–26，memory 库到 18 |
 | U4 | 升级 | 读计划和旧 run | 原来的计划、self-wake 和 run 都在 |
-| G1 | 第 1 条 | `GET /api/v1/module-consents` | 旧授予是 `stale`。**已知局限 #1290**：列表不比对制品身份，仍显示 `granted`（派发门照样拒绝），脚本记为 KNOWN；修好后应为 PASS |
+| G1 | 第 1 条 | `GET /api/v1/module-consents` | 旧授予是 `stale`。**已知局限 #1290**：列表不比对制品身份，仍显示 `granted`，但派发门照样拒绝。只有两条都显示 `granted` 时记 KNOWN，其他结果（比如授予丢了）照样记 FAIL；修好后应为 PASS |
 | G2 | 第 2 条 | 不设开关时 `POST …/modules/node-ref/tools/echo` | 403 `grants_closed` |
 | G3 | 第 2 条 | `A24_MODULE_TOOL_GRANTS=1`、`A24_MODULE_GRANT_MAX_DAYS=90` 再 POST | 不再是 `grants_closed` |
 | G4 | 第 2 条 | 开关写成 `yes`，或期限写成 91 | daemon 拒绝启动，并点名是哪个变量 |
@@ -36,7 +38,7 @@
 | G6 | 第 5 条 | 给 node-ref 补一条更新的授予，`PATCH /api/v1/os/node-ref {"enabled":false}` | 200，授予变成 `revoked` |
 | S1 | 第 4 条 | 读 `schedule_source_origin` | 两个 `wake_` 都是 `unknown`，用户计划没有记录 |
 | S2 | 第 4 条 | 立即触发旧 self-wake 和用户计划 | self-wake 的新 run 被扣下，用户计划的 run 可见 |
-| V1 | 第 3 条 | `GET /api/v1/peer/runs/{旧 run}` | `withheld: true`，只有固定提示 |
+| V1 | 第 3 条 | `GET /api/v1/peer/runs/{旧 run}` | `withheld: true`，`notice` 是固定提示，`prompt`、`output`、`error` 都为空（V2、S2、V3 中被扣下的 run 也按这个查） |
 | V2 | 第 3、4 条 | 已删 self-wake 留下的 run | `withheld: true` |
 | V3 | 第 3 条 | 新建一个不带会话的 run 和一个会话 run | 前者可见，后者被扣下 |
 | V4 | 第 3 条 | 整个 peer 列表 | 不含被扣下的 run 的任何标记文字 |
@@ -45,7 +47,7 @@
 | H1 | 第 5 条 | 没有 HOME 时 `agent24 os install` | 退出 0，说明授予没有撤销 |
 | H2 | 第 5 条 | 没有 HOME 时 `agent24 os uninstall` | 退出 0，同样说明 |
 | H3 | 第 5 条（对照） | main 在同样条件下 install | 非 0 退出 |
-| D1 | 升级 | main 打开升级后的库 | 拒绝启动（`migration 19 was previously applied but is missing`），不改库 |
+| D1 | 升级 | main 打开升级后的库 | 拒绝启动（`migration 19 was previously applied but is missing`），前后 `.dump` 的哈希相同 |
 | D2 | 升级 | 发布 head 再打开它 | 正常就绪 |
 | Z1 | 隔离 | 运行前后的 `~/.agent24` | 没有变化 |
 
