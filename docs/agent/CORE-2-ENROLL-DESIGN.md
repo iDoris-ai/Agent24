@@ -219,16 +219,17 @@ ADR-037 决策 5 写「签名加公证流程已跑通」。facts §4 只证实�
 | POST | /comm/daemon/stop | CommWrite | 提升 |
 | POST | /comm/send | CommWrite | 提升 |
 | GET | /comm/history | CommRead | 日常 |
-| POST | /comm/inbox/pull | CommWrite | 提升，待 Q2 |
+| POST | /comm/inbox/pull | CommWrite | 提升（见 §10 R2） |
 | GET | /comm/outbox | CommRead | 日常 |
 | POST | /comm/outbox/{event_id}/retry | CommWrite | 提升 |
-| POST | /comm/outbox/clear | CommWrite | 提升，待 Q2 |
+| POST | /comm/outbox/clear | CommWrite | 提升 |
 
 模块动态路由另列，不混入上述固定路由覆盖率：
 
 | 方法 | 路径 | Operation | 等级 |
 |---|---|---|---|
-| 模块实际注册的每个方法 | /<已挂载模块命名空间>/** | ModuleRoute | 日常，待外审裁决 |
+| GET/HEAD | /<已委托模块命名空间>/** | ModuleRoute | 日常 |
+| 其余方法 | /<已委托模块命名空间>/** | ModuleRoute | 日常；无委托记录或路由集摘要不符时拒绝（见 §10 R1） |
 
 ModuleRoute 是新增的模块专用兜底，不复用 ModelsAdmin 或 ModuleRead。模块路由的具体方法由模块注册记录决定，不声称枚举所有未来模块。未知命名空间没有此兜底。现有 WorkspaceCreate、WorkspaceRelease、HostLease、WorkspaceResolve、SessionTranscript 等无路由项不人为补造路由。开发者令牌路由尚不存在，未来签发映射 CapabilityMint、吊销映射 CapabilityRevoke，均提升级；列表等新路由随 G-API 设计补表。
 
@@ -325,3 +326,15 @@ ModuleRoute 是新增的模块专用兜底，不复用 ModelsAdmin 或 ModuleRea
 | Q8 | 接受 §4 列出的残余风险，不追加 OS 隔离或通道证明。日后如需更强的进程绑定，另立 ADR。 |
 
 本稿评审至多一轮，之后冻结。评审意见中的真问题在本文订正，其余登记到实现片。
+
+## 10. 外审修订（2026-10-26，Mac mini Codex + Grok 各一轮；本节优先于 §9，修订后冻结）
+
+| # | 来源 | 问题 | 修订 |
+|---|---|---|---|
+| R1 | Codex High、Grok High | §9 Q1 的前提是「启用模块是提升级操作」，但 `os_config.rs` 对缺失或空配置默认全部启用，记录里也只有 enabled。首次启动或旧配置升级后，日常令牌可以直接调用未经委托的模块副作用路由 | Q1 改判。capability 模式下新增**模块委托记录**：绑定模块名、模块版本和已注册路由集的摘要，只能经提升级操作（D4）建立。GET/HEAD 在委托存在时归日常级。其余方法在没有委托记录、或路由集摘要与当前注册不一致时一律拒绝，返回可识别的 `module_delegation_required`。legacy 模式不变。首次启动和旧配置升级都**不自动生成**委托记录。新增 T19：首次启动、升级、路由集变化、版本变化四个负例，以及委托后通过的正例。实现排进 2a（映射）和 2b（委托记录的存储与 D4 建立），必须在 2f 向外壳发放日常令牌之前交付 |
+| R2 | Grok High、Codex Low | §9 Q2 的前提是「拉取不对外、不删数据」，但 `inbox/pull` 会用钥匙串口令、按调用方指定的 `as` 解密并写入 history，用的是和 unlock、send 同一份凭据 | Q2 改判。对外的 `POST /comm/inbox/pull` 维持提升级 `CommWrite`，§3 已同步。`CommSync` 只给 daemon 内部轮询用，不挂 HTTP 路由，忽略 `as`，只拉默认身份。T2 以 §3 修订后的表为准 |
+| R3 | Grok Medium | Q6 没有禁止开发者令牌带签发权限，24 小时上限可以被无证明续签绕过 | 开发者令牌的作用域**不得包含** `CapabilityMint`、`CapabilityRevoke` 或任何令牌治理 Operation。签发端点只接受带当次 D4 授权的 `FirstPartyShell`。补负例：开发者令牌调用签发返回拒绝；带签发作用域的签发请求被拒绝 |
+| R4 | Grok Medium | Q3 的登记权没有核对目标确实是申请者的子进程；续期只检查进程还活着，转交出去的 bearer 也能拿来续期，并把原令牌顶掉 | 登记权兑换时，daemon 用 `peer_cred` 取目标 pid，核对它的父进程 pid 就是申请者绑定的 pid，并且两边的启动时间一致，不一致就拒绝；登记权换到的令牌只有日常级。续期只能在原 UDS 登记连接上进行，并核对 `peer_cred` 的 pid 与令牌绑定一致；HTTP 上不提供续期。T10、T12 各补一个负例 |
+| R5 | Grok Medium | 分片中间态会放大权限：2a 先把 Creative 白名单里的 Session、Run、Cancel、Events 接到新路由，而收紧要到 2b；2e 先开服务模式，但永不过期的 ProductHost 要到 2b 才禁止 | 2a 新接的路由对 Creative **一律不放行**，白名单维持现状，扩充留到 G-API 设计。2e 的服务模式在启动时就不铸 ProductHost；`--enroll-endpoint` 之下，ready 行和 daemon.json 都不含任何秘密。T17 的「服务不铸宿主」断言提前到 2e |
+
+修订后 §9 的 Q1、Q2 以本节为准，Q3、Q6 按本节收紧。本稿到此冻结，后续意见登记到实现片。
