@@ -94,7 +94,7 @@ async fn live_assertions(kv: &KvStore, texts: &[&str]) -> Vec<(String, String)> 
             kv,
             OWNER,
             text,
-            format!("event-{i}").into(),
+            format!("event-{i}"),
             Origin {
                 source: "test".into(),
                 trust: Trust::UserSaid,
