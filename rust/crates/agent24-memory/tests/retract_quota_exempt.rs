@@ -387,6 +387,47 @@ async fn t2_malformed_or_non_object_payloads_take_the_a_gate_without_erroring() 
     }
 }
 
+#[tokio::test]
+async fn t2_payloads_that_make_the_exemption_expression_null_take_the_a_gate() {
+    // Three-valued logic: a missing key makes json_type(..) NULL, and an
+    // unguarded NOT(NULL) is NULL, which would skip the BEFORE gate while the
+    // AFTER trigger still counted the row. Every shape below must be refused by
+    // the quota while the owner is exactly full, again and again with fresh ids.
+    let bodies: [(&str, Value); 8] = [
+        ("missing key", json!({"x": "a"})),
+        ("wrong key name", json!({"assertion_ids": "a"})),
+        ("null value", json!({"assertion_id": null})),
+        ("empty object", json!({})),
+        ("json null literal", Value::Null),
+        ("number", json!(7)),
+        ("string", json!("assertion_id")),
+        ("array", json!(["a"])),
+    ];
+    for (label, body) in bodies {
+        let f = fixture().await;
+        f.kv.events()
+            .append(&event("seed", PERSONAL, "note", json!({"n": 1})))
+            .await
+            .unwrap();
+        fill_to_current(&f, PERSONAL).await;
+        let before = usage(&f.admin, PERSONAL).await;
+        for i in 0..3 {
+            let err =
+                f.kv.events()
+                    .append(&event(
+                        &format!("probe-{i}"),
+                        PERSONAL,
+                        "assertion.retracted",
+                        body.clone(),
+                    ))
+                    .await
+                    .expect_err(label);
+            assert!(is_quota(&err), "{label}: {err:?}");
+        }
+        assert_eq!(usage(&f.admin, PERSONAL).await, before, "{label}");
+    }
+}
+
 // ---- T3 -------------------------------------------------------------------
 
 #[tokio::test]
@@ -497,10 +538,215 @@ async fn t4_exempt_rows_do_not_move_the_a_class_counters() {
         .unwrap();
 }
 
-// ---- migration shape ------------------------------------------------------
+// ---- persisted billing class (UPDATE / DELETE) ----------------------------
+
+/// The counters must equal what the rows and the persisted-class table say,
+/// and nothing may be negative.
+async fn assert_usage_consistent(pool: &SqlitePool, owner: &str) {
+    let (rows, bytes, er, eb) = usage(pool, owner).await;
+    let (want_er, want_eb): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(e.payload AS BLOB))), 0) FROM mem_events e
+         JOIN mem_event_quota_exempt x ON x.event_id = e.id WHERE e.scope_owner = ?",
+    )
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let (all_rows, all_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(payload AS BLOB))), 0) FROM mem_events
+         WHERE scope_owner = ?",
+    )
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        rows >= 0 && bytes >= 0 && er >= 0 && eb >= 0,
+        "{owner}: negative counter"
+    );
+    assert_eq!((er, eb), (want_er, want_eb), "{owner}: exempt counters");
+    assert_eq!(
+        (rows, bytes),
+        (all_rows - want_er, all_bytes - want_eb),
+        "{owner}: A counters"
+    );
+}
+
+async fn exempt_table_rows(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM mem_event_quota_exempt")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// One exempt retraction ("exempt-1") and one A-class note ("a-1") for PERSONAL.
+async fn with_exempt_and_a_rows() -> Fixture {
+    let f = fixture().await;
+    f.kv.events()
+        .append(&event("a-1", PERSONAL, "note", json!({"n": 1})))
+        .await
+        .unwrap();
+    fill_to_current(&f, PERSONAL).await;
+    f.kv.events()
+        .append(&event(
+            "exempt-1",
+            PERSONAL,
+            "assertion.retracted",
+            json!({"assertion_id": "a"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exempt_table_rows(&f.admin).await, 1);
+    assert_usage_consistent(&f.admin, PERSONAL).await;
+    f
+}
 
 #[tokio::test]
-async fn upgrade_does_not_backfill_old_retractions_and_new_ones_are_exempt() {
+async fn delete_of_an_exempt_row_decrements_the_exempt_counters_only() {
+    let f = with_exempt_and_a_rows().await;
+    let before = usage(&f.admin, PERSONAL).await;
+    sqlx::query("DELETE FROM mem_events WHERE id='exempt-1'")
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    let after = usage(&f.admin, PERSONAL).await;
+    assert_eq!((after.0, after.1), (before.0, before.1));
+    assert_eq!((after.2, after.3), (0, 0));
+    assert_eq!(
+        exempt_table_rows(&f.admin).await,
+        0,
+        "the record goes with the row"
+    );
+    assert_usage_consistent(&f.admin, PERSONAL).await;
+}
+
+#[tokio::test]
+async fn delete_of_an_a_class_row_decrements_the_a_counters_only() {
+    let f = with_exempt_and_a_rows().await;
+    let before = usage(&f.admin, PERSONAL).await;
+    sqlx::query("DELETE FROM mem_events WHERE id='a-1'")
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    let after = usage(&f.admin, PERSONAL).await;
+    assert_eq!((after.0, after.1), (0, 0));
+    assert_eq!((after.2, after.3), (before.2, before.3));
+    assert_usage_consistent(&f.admin, PERSONAL).await;
+}
+
+#[tokio::test]
+async fn owner_move_transfers_each_row_within_its_own_class() {
+    for moved in ["a-1", "exempt-1"] {
+        let f = with_exempt_and_a_rows().await;
+        // The target is neither personal nor module-recorded: the class travels
+        // with the row, not with the destination's catalog state.
+        let before = usage(&f.admin, PERSONAL).await;
+        sqlx::query("UPDATE mem_events SET scope_owner='other' WHERE id=?")
+            .bind(moved)
+            .execute(&f.admin)
+            .await
+            .unwrap();
+        let (p, o) = (
+            usage(&f.admin, PERSONAL).await,
+            usage(&f.admin, "other").await,
+        );
+        if moved == "a-1" {
+            assert_eq!((p.0, p.2), (before.0 - 1, before.2), "{moved}");
+            assert_eq!((o.0, o.2), (1, 0), "{moved}");
+        } else {
+            assert_eq!((p.0, p.2), (before.0, before.2 - 1), "{moved}");
+            assert_eq!((o.0, o.2), (0, 1), "{moved}");
+        }
+        assert_usage_consistent(&f.admin, PERSONAL).await;
+        assert_usage_consistent(&f.admin, "other").await;
+    }
+}
+
+#[tokio::test]
+async fn catalog_change_after_the_write_does_not_change_how_a_row_is_released() {
+    // Exempt row written while PERSONAL is personal; the partition is then
+    // reclassified. Deleting must still release the exempt counter.
+    let f = with_exempt_and_a_rows().await;
+    sqlx::query("UPDATE mem_os_partitions SET space_kind='module' WHERE owner_key=?")
+        .bind(PERSONAL)
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM mem_events WHERE id='exempt-1'")
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    assert_eq!(usage(&f.admin, PERSONAL).await.2, 0);
+    assert_usage_consistent(&f.admin, PERSONAL).await;
+
+    // Converse: a retraction-shaped row written while the owner is a MODULE is
+    // A-class; making the owner personal afterwards must not turn its release
+    // into an exempt decrement.
+    f.kv.events()
+        .append(&event(
+            "late",
+            PERSONAL,
+            "assertion.retracted",
+            json!({"assertion_id": "z"}),
+        ))
+        .await
+        .expect_err("a module-classified owner is at its quota");
+    set_quota(&f.admin, PERSONAL, 100, 10_000_000).await;
+    f.kv.events()
+        .append(&event(
+            "late",
+            PERSONAL,
+            "assertion.retracted",
+            json!({"assertion_id": "z"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exempt_table_rows(&f.admin).await, 0, "billed A-class");
+    sqlx::query("UPDATE mem_os_partitions SET space_kind='personal' WHERE owner_key=?")
+        .bind(PERSONAL)
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM mem_events WHERE id='late'")
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    assert_eq!(usage(&f.admin, PERSONAL).await.2, 0);
+    assert_usage_consistent(&f.admin, PERSONAL).await;
+}
+
+#[tokio::test]
+async fn broken_bookkeeping_aborts_instead_of_being_clamped_away() {
+    let f = with_exempt_and_a_rows().await;
+    sqlx::query("UPDATE mem_owner_usage SET row_count = 0 WHERE owner=?")
+        .bind(PERSONAL)
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    let err = sqlx::query("DELETE FROM mem_events WHERE id='a-1'")
+        .execute(&f.admin)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("mem_quota:underflow"), "{err}");
+    let err = sqlx::query("UPDATE mem_events SET scope_owner='other' WHERE id='a-1'")
+        .execute(&f.admin)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("mem_quota:underflow"), "{err}");
+}
+
+#[tokio::test]
+async fn event_id_cannot_be_rewritten_under_the_persisted_class() {
+    let f = with_exempt_and_a_rows().await;
+    let err = sqlx::query("UPDATE mem_events SET id='renamed' WHERE id='exempt-1'")
+        .execute(&f.admin)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("immutable"), "{err}");
+}
+
+/// Database upgraded from 0017 holding one pre-0018 personal retraction row.
+async fn upgraded_with_old_row() -> (tempfile::TempDir, KvStore, SqlitePool, (i64, i64)) {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
     let dir = tempfile::tempdir().unwrap();
@@ -536,10 +782,8 @@ async fn upgrade_does_not_backfill_old_retractions_and_new_ones_are_exempt() {
         .execute(&pool)
         .await
         .unwrap();
-    let insert = "INSERT INTO mem_events (id, scope_owner, scope, kind, payload, origin_source, origin_trust, at)
-         VALUES (?, 'P', '{}', 'assertion.retracted', '{\"assertion_id\":\"a\"}', 't', 'user_said', 'now')";
-    sqlx::query(insert)
-        .bind("old")
+    sqlx::query("INSERT INTO mem_events (id, scope_owner, scope, kind, payload, origin_source, origin_trust, at)
+         VALUES ('old', 'P', '{}', 'assertion.retracted', '{\"assertion_id\":\"a\"}', 't', 'user_said', 'now')")
         .execute(&pool)
         .await
         .unwrap();
@@ -550,24 +794,53 @@ async fn upgrade_does_not_backfill_old_retractions_and_new_ones_are_exempt() {
             .unwrap();
     assert_eq!(old.0, 1);
     pool.close().await;
-
     let kv = KvStore::open(&path).await.unwrap();
     let admin = SqlitePool::connect(&format!("sqlite://{}", path.display()))
         .await
         .unwrap();
+    (dir, kv, admin, old)
+}
+
+#[tokio::test]
+async fn upgrade_does_not_backfill_old_retractions_and_new_ones_are_exempt() {
+    let (_dir, _kv, admin, old) = upgraded_with_old_row().await;
     assert_eq!(
         usage(&admin, "P").await,
         (old.0, old.1, 0, 0),
-        "no backfill: the old row stays an A-class row"
+        "no backfill"
     );
-    let _ = kv;
+    assert_eq!(exempt_table_rows(&admin).await, 0);
     set_quota(&admin, "P", 1, 10_000_000).await;
-    sqlx::query(insert)
-        .bind("new")
+    sqlx::query("INSERT INTO mem_events (id, scope_owner, scope, kind, payload, origin_source, origin_trust, at)
+         VALUES ('new', 'P', '{}', 'assertion.retracted', '{\"assertion_id\":\"a\"}', 't', 'user_said', 'now')")
         .execute(&admin)
         .await
         .unwrap();
     let after = usage(&admin, "P").await;
-    assert_eq!((after.0, after.1), (old.0, old.1));
-    assert_eq!(after.2, 1);
+    assert_eq!((after.0, after.1, after.2), (old.0, old.1, 1));
+}
+
+#[tokio::test]
+async fn deleting_a_pre_upgrade_retraction_row_releases_the_a_counters() {
+    let (_dir, _kv, admin, old) = upgraded_with_old_row().await;
+    assert_eq!(old.0, 1);
+    sqlx::query("DELETE FROM mem_events WHERE id='old'")
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_eq!(usage(&admin, "P").await, (0, 0, 0, 0));
+    assert_usage_consistent(&admin, "P").await;
+}
+
+#[tokio::test]
+async fn moving_a_pre_upgrade_retraction_row_keeps_it_a_class() {
+    let (_dir, _kv, admin, _old) = upgraded_with_old_row().await;
+    sqlx::query("UPDATE mem_events SET scope_owner='Q' WHERE id='old'")
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_eq!(usage(&admin, "P").await, (0, 0, 0, 0));
+    let q = usage(&admin, "Q").await;
+    assert_eq!((q.0, q.2), (1, 0));
+    assert_usage_consistent(&admin, "Q").await;
 }

@@ -1677,6 +1677,7 @@ mod tests {
                 "mem_events_ai_usage".to_owned(),
                 "mem_events_au_owner_usage".to_owned(),
                 "mem_events_bi_quota".to_owned(),
+                "mem_events_bu_id_immutable".to_owned(),
                 "mem_events_bu_payload_immutable".to_owned(),
             ]
         );
