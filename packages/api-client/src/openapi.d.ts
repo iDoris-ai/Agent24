@@ -1342,6 +1342,13 @@ export interface components {
             cut_requests: string[];
             omitted_records: number;
         };
+        /** @description Latest successful sqlx migration on each database the daemon migrates. Read from `_sqlx_migrations` (`MAX(version)` where `success = 1`). 0 means this process has no successful row to report. */
+        HealthMigrations: {
+            /** @description Run database (`agent24.db`). */
+            store: number;
+            /** @description Memory database (`memory.db`). */
+            memory: number;
+        };
         Health: {
             /** @constant */
             status: "ok";
@@ -1352,6 +1359,9 @@ export interface components {
              * @example rust
              */
             backend: string;
+            /** @description Wire protocol version (`PROTOCOL_VERSION`, currently 1). Increment by 1 when a wire change is incompatible (a field removed or renamed, a changed meaning, or a difference a peer must refuse). Adding an optional field does not bump this. Shells refuse a daemon whose value differs from their own, and treat a missing value as an old daemon. */
+            protocol_version: number;
+            migrations: components["schemas"]["HealthMigrations"];
         };
         ChatMessage: {
             /**

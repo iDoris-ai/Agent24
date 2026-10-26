@@ -719,11 +719,30 @@ impl AppState {
 
 pub use agent24_domain::http::{error_response, error_response_with_hint};
 
-async fn health() -> Json<Health> {
+async fn health(State(state): State<AppState>) -> Json<Health> {
+    let store = match state.store.latest_applied_migration().await {
+        Ok(version) => version,
+        Err(err) => {
+            tracing::warn!("health: run database migration watermark: {err}");
+            0
+        }
+    };
+    let memory = match &state.memory_kv {
+        Some(kv) => match kv.latest_applied_migration().await {
+            Ok(version) => version,
+            Err(err) => {
+                tracing::warn!("health: memory database migration watermark: {err}");
+                0
+            }
+        },
+        None => 0,
+    };
     Json(Health {
         status: "ok".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         backend: "rust".to_owned(),
+        protocol_version: agent24_protocol::PROTOCOL_VERSION,
+        migrations: agent24_protocol::HealthMigrations { store, memory },
     })
 }
 
@@ -3512,6 +3531,51 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn health_reports_protocol_version_and_applied_migrations() {
+        let mut app = state().await;
+        let memory = agent24_memory::KvStore::open_memory().await.unwrap();
+        let store_applied: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(agent24_store::test_hooks::pool(&app.store))
+                .await
+                .unwrap();
+        let memory_applied: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(agent24_memory::test_hooks::pool(&memory))
+                .await
+                .unwrap();
+        let store_applied = store_applied.unwrap();
+        let memory_applied = memory_applied.unwrap();
+        assert!(store_applied > 0, "run database has no applied migration");
+        assert!(
+            memory_applied > 0,
+            "memory database has no applied migration"
+        );
+        app.memory_kv = Some(memory);
+
+        let res = build_router(app)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["backend"], "rust");
+        assert!(json["version"].as_str().is_some());
+        assert_eq!(
+            json["protocol_version"].as_u64(),
+            Some(u64::from(agent24_protocol::PROTOCOL_VERSION))
+        );
+        assert_eq!(json["migrations"]["store"].as_i64(), Some(store_applied));
+        assert_eq!(json["migrations"]["memory"].as_i64(), Some(memory_applied));
     }
 
     #[tokio::test]

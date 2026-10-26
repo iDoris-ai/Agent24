@@ -12,6 +12,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import readline from 'node:readline'
+import {
+  CLIENT_PROTOCOL_VERSION,
+  protocolCompatibility,
+  protocolVersionOf,
+} from './protocol-compatibility'
 
 const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
@@ -120,6 +125,14 @@ export interface ExternalDaemonState {
   port: number
   token: string
   pid: number
+  /** Absent when daemon.json was written before version negotiation. */
+  protocolVersion?: number
+}
+
+/** One `GET /api/v1/health`. `protocolVersion: null` means the field is absent. */
+export interface DaemonHealthProbe {
+  ok: boolean
+  protocolVersion: number | null
 }
 
 /** Mirrors `agent24_protocol::state_file::state_path()` (Rust), i.e.
@@ -144,10 +157,20 @@ export function readExternalDaemonState(): ExternalDaemonState | null {
   if (!statePath) return null
   try {
     const raw = fs.readFileSync(statePath, 'utf8')
-    const parsed = JSON.parse(raw) as { port?: unknown; token?: unknown; pid?: unknown }
+    const parsed = JSON.parse(raw) as {
+      port?: unknown
+      token?: unknown
+      pid?: unknown
+      protocol_version?: unknown
+    }
     if (typeof parsed.port !== 'number' || typeof parsed.pid !== 'number') return null
     const token = typeof parsed.token === 'string' ? parsed.token : ''
-    return { port: parsed.port, token, pid: parsed.pid }
+    const state: ExternalDaemonState = { port: parsed.port, token, pid: parsed.pid }
+    const recorded = parsed.protocol_version
+    if (typeof recorded === 'number' && Number.isInteger(recorded) && recorded >= 0) {
+      state.protocolVersion = recorded
+    }
+    return state
   } catch {
     return null
   }
@@ -158,6 +181,8 @@ export function readExternalDaemonState(): ExternalDaemonState | null {
 export interface ExternalDaemonSource {
   read(): ExternalDaemonState | null
   checkHealth(endpoint: BackendEndpoint | null): Promise<boolean>
+  /** Body of `GET /api/v1/health`, including the protocol version. */
+  fetchHealth(endpoint: BackendEndpoint): Promise<DaemonHealthProbe>
 }
 
 /** Constructor-injectable seams. Both default to the real implementations —
@@ -173,6 +198,22 @@ export interface BackendManagerDeps {
   isPackaged?: boolean
   /** Test seam for the dev-time node-daemon resolution. */
   resolveNode?: () => string
+}
+
+/** Production probe for `tryReuseExternal`. Tests stub `globalThis.fetch`. */
+export async function fetchDaemonHealth(endpoint: BackendEndpoint): Promise<DaemonHealthProbe> {
+  const headers: Record<string, string> = {}
+  if (endpoint.token) headers['Authorization'] = `Bearer ${endpoint.token}`
+  try {
+    const response = await fetch(`http://127.0.0.1:${endpoint.port}/api/v1/health`, {
+      headers,
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    })
+    if (!response.ok) return { ok: false, protocolVersion: null }
+    return { ok: true, protocolVersion: protocolVersionOf(await response.json()) }
+  } catch {
+    return { ok: false, protocolVersion: null }
+  }
 }
 
 function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
@@ -217,6 +258,7 @@ function defaultSpawnProcess(kind: BackendKind, packaged: boolean): ChildProcess
 const defaultExternalDaemonSource: ExternalDaemonSource = {
   read: readExternalDaemonState,
   checkHealth,
+  fetchHealth: fetchDaemonHealth,
 }
 
 export class BackendManager {
@@ -265,8 +307,20 @@ export class BackendManager {
     const state = this.external.read()
     if (!state) return false
     const endpoint: BackendEndpoint = { port: state.port, token: state.token }
-    const healthy = await this.external.checkHealth(endpoint)
-    if (!healthy) return false
+    const refuse = (reason: string): boolean => {
+      // Visible, and nothing else: do not attach, and do not signal the
+      // external process. A later spawn is this app's own child.
+      console.warn(
+        `[backend:${this.kind}] 不复用外部 daemon（pid ${state.pid}，port ${state.port}）：${reason}`,
+      )
+      return false
+    }
+    const recorded = protocolCompatibility(state.protocolVersion ?? null, CLIENT_PROTOCOL_VERSION)
+    if (!recorded.compatible) return refuse(recorded.reason)
+    const health = await this.external.fetchHealth(endpoint)
+    if (!health.ok) return false
+    const live = protocolCompatibility(health.protocolVersion, CLIENT_PROTOCOL_VERSION)
+    if (!live.compatible) return refuse(live.reason)
     this.isExternal = true
     this.externalPid = state.pid
     currentEndpoint = endpoint

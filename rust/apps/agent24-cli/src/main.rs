@@ -574,6 +574,10 @@ fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState,
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let protocol_version = value
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok());
     let state = DaemonState {
         port,
         token,
@@ -581,6 +585,7 @@ fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState,
         version: value["version"].as_str().unwrap_or("").to_owned(),
         generation: value["generation"].as_str().unwrap_or("").to_owned(),
         auth_mode,
+        protocol_version,
     };
     state
         .validate()
@@ -640,18 +645,107 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
     }
 }
 
-/// Attached if a live daemon is discoverable and healthy; standalone otherwise.
+/// What `connect` should do with a daemon `read_live` already found.
+enum DiscoveredAttach {
+    Ready(Endpoint),
+    /// Protocol mismatch, or a capability daemon that still has no host bearer.
+    /// `connect` returns this to the user and does not spawn another daemon.
+    Incompatible(String),
+    /// Nothing answered. `connect` may spawn an ephemeral daemon.
+    Unreachable,
+}
+
+#[derive(serde::Deserialize)]
+struct HealthAdvertisement {
+    #[serde(default)]
+    protocol_version: Option<u32>,
+}
+
+/// `Ok(None)` is a live daemon that did not advertise a protocol version
+/// (an old `/health`). `Err` means the probe itself failed.
+async fn fetch_protocol_version(base: &str, token: &str) -> Result<Option<u32>, ()> {
+    let req = client().get(format!("{base}/api/v1/health"));
+    let req = if token.is_empty() {
+        req
+    } else {
+        req.bearer_auth(token)
+    };
+    let response = req
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if !response.status().is_success() {
+        return Err(());
+    }
+    match response.json::<HealthAdvertisement>().await {
+        Ok(body) => Ok(body.protocol_version),
+        // A 200 that is not the health object is still a live peer we must
+        // not attach to, and must not paper over by spawning a second daemon.
+        Err(_) => Ok(None),
+    }
+}
+
+fn incompatible_daemon_error(daemon: Option<u32>, client: u32) -> String {
+    let reason = match agent24_protocol::protocol_compatibility(daemon, client) {
+        Err(reason) => reason,
+        Ok(()) => "协议版本不兼容".to_owned(),
+    };
+    let daemon_label = match daemon {
+        Some(version) => version.to_string(),
+        None => "未知".to_owned(),
+    };
+    format!(
+        "无法接入 daemon：{reason}。daemon 协议版本 {daemon_label}，客户端协议版本 {client}。\
+         请升级较旧的一方，使两边协议版本一致，然后重启常驻 daemon（agent24 daemon start，或 agent24 service install）后再试。\
+         协议版本不一致时不要继续使用这个 daemon。"
+    )
+}
+
+async fn attach_discovered(state: &DaemonState) -> DiscoveredAttach {
+    let client_version = agent24_protocol::PROTOCOL_VERSION;
+    if agent24_protocol::protocol_compatibility(state.protocol_version, client_version).is_err() {
+        return DiscoveredAttach::Incompatible(incompatible_daemon_error(
+            state.protocol_version,
+            client_version,
+        ));
+    }
+    let base = format!("http://127.0.0.1:{}", state.port);
+    let daemon_protocol = match fetch_protocol_version(&base, discovery_health_token(state)).await {
+        Ok(version) => version,
+        Err(()) => {
+            if state.auth_mode.is_capabilities() {
+                // Health is deliberately anonymous, but it never grants the
+                // bearer needed by the operation that called `connect`.
+                return DiscoveredAttach::Incompatible(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+            }
+            return DiscoveredAttach::Unreachable;
+        }
+    };
+    if agent24_protocol::protocol_compatibility(daemon_protocol, client_version).is_err() {
+        return DiscoveredAttach::Incompatible(incompatible_daemon_error(
+            daemon_protocol,
+            client_version,
+        ));
+    }
+    if state.auth_mode.is_capabilities() {
+        return DiscoveredAttach::Incompatible(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+    }
+    match endpoint_from_state(state.clone()) {
+        Ok(endpoint) => DiscoveredAttach::Ready(endpoint),
+        Err(err) => DiscoveredAttach::Incompatible(err),
+    }
+}
+
+/// Attached if a live daemon is discoverable, healthy, and on this protocol.
+/// An incompatible daemon is an error: do not attach, and do not spawn another.
+/// Standalone (ephemeral) only when nothing is there to attach to.
 async fn connect() -> Result<Endpoint, String> {
     if let Some(state) = state_file::read_live() {
-        let base = format!("http://127.0.0.1:{}", state.port);
-        if state.auth_mode.is_capabilities() {
-            // Health is deliberately anonymous, but it never grants the
-            // bearer needed by the operation that called `connect`.
-            let _ = health_ok(&base, "").await;
-            return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
-        }
-        if health_ok(&base, discovery_health_token(&state)).await {
-            return endpoint_from_state(state);
+        match attach_discovered(&state).await {
+            DiscoveredAttach::Ready(endpoint) => return Ok(endpoint),
+            DiscoveredAttach::Incompatible(err) => return Err(err),
+            DiscoveredAttach::Unreachable => {}
         }
     }
     let (state, child) = spawn_daemon(true).await?;
@@ -2714,10 +2808,74 @@ mod tests {
 
     fn health_ok_reply() -> String {
         let body = r#"{"status":"ok"}"#;
+        json_reply(body)
+    }
+
+    fn json_reply(body: &str) -> String {
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_daemon_on_a_different_protocol_version() {
+        let body = r#"{"status":"ok","version":"9.9.9","backend":"rust","protocol_version":2,"migrations":{"store":1,"memory":1}}"#;
+        let (port, _) = thread_stub(json_reply(body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        let DiscoveredAttach::Incompatible(err) = attach_discovered(&state).await else {
+            panic!("connect must refuse a daemon on another protocol version");
+        };
+        assert!(err.contains("协议版本不兼容"), "{err}");
+        assert!(err.contains("daemon 协议版本 2"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "客户端协议版本 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
+        assert!(err.contains("agent24 daemon start"), "{err}");
+        assert!(err.contains("升级"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_an_old_health_body_without_protocol_version() {
+        let body = r#"{"status":"ok","version":"0.4.0","backend":"rust"}"#;
+        let (port, _) = thread_stub(json_reply(body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.4.0", "gen").unwrap();
+        let DiscoveredAttach::Incompatible(err) = attach_discovered(&state).await else {
+            panic!("connect must refuse an old daemon whose /health has no protocol_version");
+        };
+        assert!(err.contains("daemon 版本过旧，请升级"), "{err}");
+        assert!(err.contains("daemon 协议版本 未知"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "客户端协议版本 {}",
+                agent24_protocol::PROTOCOL_VERSION
+            )),
+            "{err}"
+        );
+        assert!(err.contains("agent24 service install"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connect_attaches_when_health_protocol_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, _) = thread_stub(json_reply(&body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.5.1", "gen").unwrap();
+        let DiscoveredAttach::Ready(endpoint) = attach_discovered(&state).await else {
+            panic!("a matching protocol version must still attach");
+        };
+        assert_eq!(endpoint.base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(endpoint.token, "tok");
+        assert!(endpoint.child.is_none());
     }
 
     fn target_port() -> u16 {
