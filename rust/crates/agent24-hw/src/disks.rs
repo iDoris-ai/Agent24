@@ -252,4 +252,106 @@ mod tests {
             Some(200 * 1024 * 1024 * 1024)
         );
     }
+
+    /// Same component length in `visible` and `all` but different free bytes
+    /// (e.g. a duplicated / bind mount entry): the user-visible one must win.
+    /// The existing same-depth test uses equal values and cannot tell them apart.
+    #[test]
+    fn same_length_prefers_visible_with_distinct_values() {
+        let visible = vec![d("/", 1), d("/srv/data", 10)];
+        let all = vec![d("/", 1), d("/srv/data", 99)];
+        let p = Path::new("/srv/data/models");
+        assert_eq!(free_bytes_for_path(&visible, &all, p), Some(10));
+    }
+
+    /// Linux absolute-path boundary counterexamples (run on a real Linux host).
+    #[cfg(target_os = "linux")]
+    mod linux_paths {
+        use super::*;
+
+        #[test]
+        fn linux_home_vs_homework_boundary_counterexample() {
+            // `/homework` shares the string prefix `/home` but not the component.
+            let visible = vec![d("/", 1), d("/home", 2)];
+            let all = visible.clone();
+            assert_eq!(
+                free_bytes_for_path(&visible, &all, Path::new("/homework/models")),
+                Some(1)
+            );
+            assert_eq!(
+                free_bytes_for_path(&visible, &all, Path::new("/home/u/.omlx/models")),
+                Some(2)
+            );
+            // Exact mount point itself belongs to that mount.
+            assert_eq!(
+                free_bytes_for_path(&visible, &all, Path::new("/home")),
+                Some(2)
+            );
+        }
+
+        #[test]
+        fn linux_trailing_slash_and_repeated_separator_are_same_component_length() {
+            let visible = vec![d("/", 1), d("/mnt/data/", 5)];
+            let all = vec![d("/", 1), d("/mnt//data", 9)];
+            // Both normalize to [/, mnt, data]: same length, visible wins.
+            assert_eq!(
+                free_bytes_for_path(&visible, &all, Path::new("/mnt/data/models")),
+                Some(5)
+            );
+        }
+
+        #[test]
+        fn linux_deeper_filtered_tmpfs_and_overlay_mounts_win() {
+            // Deeper mounts that `is_user_visible_volume` filters out still
+            // own the path; `/` must not be reported for them.
+            assert!(!is_user_visible_volume(
+                "/var/lib/docker/overlay2/x/merged",
+                "overlay",
+                "overlay",
+                100,
+                false
+            ));
+            assert!(!is_user_visible_volume(
+                "/run/user/1000",
+                "tmpfs",
+                "tmpfs",
+                100,
+                false
+            ));
+            let visible = vec![d("/", 50)];
+            let all = vec![
+                d("/", 50),
+                d("/run/user/1000", 3),
+                d("/var/lib/docker/overlay2/x/merged", 4),
+            ];
+            assert_eq!(
+                free_bytes_for_path(&visible, &all, Path::new("/run/user/1000/m")),
+                Some(3)
+            );
+            assert_eq!(
+                free_bytes_for_path(
+                    &visible,
+                    &all,
+                    Path::new("/var/lib/docker/overlay2/x/merged/m")
+                ),
+                Some(4)
+            );
+            // Sibling of the filtered mount falls back to `/`.
+            assert_eq!(
+                free_bytes_for_path(&visible, &all, Path::new("/run/user/10000/m")),
+                Some(50)
+            );
+        }
+
+        /// Windows-style strings are static fixtures here: on Linux they are a
+        /// single relative component, so nothing matches. This is NOT a
+        /// Windows run and proves nothing about Windows behaviour.
+        #[test]
+        fn windows_style_strings_are_static_fixture_only_on_linux() {
+            let visible = vec![d("C:\\", 5)];
+            let p = Path::new("C:\\Users\\me\\models");
+            assert!(!p.is_absolute());
+            assert_eq!(free_bytes_for_path(&visible, &visible, p), None);
+        }
+    }
 }

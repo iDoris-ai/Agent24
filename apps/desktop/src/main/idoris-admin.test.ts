@@ -44,6 +44,44 @@ describe('iDoris Admin launch handoff', () => {
     expect(parseTokenFrame(Buffer.from(`${TOKEN}\nextra`))).toBeNull()
   })
 
+  it('rejects a high-bit 0xe1 token frame that ascii decoding would mask', () => {
+    expect(parseTokenFrame(Buffer.concat([Buffer.alloc(64, 0xe1), Buffer.from('\n')]))).toBeNull()
+  })
+
+  it('rejects a high-bit 0xb0 token frame that ascii decoding would mask', () => {
+    expect(parseTokenFrame(Buffer.concat([Buffer.alloc(64, 0xb0), Buffer.from('\n')]))).toBeNull()
+  })
+
+  describe('rejects malformed token frames (parameterized)', () => {
+    const withByteAt = (index: number, byte: number): Buffer => {
+      const frame = Buffer.from(`${TOKEN}\n`)
+      frame[index] = byte
+      return frame
+    }
+    const cases: Array<[string, Buffer]> = []
+    for (const [position, index] of [['first', 0], ['middle', 31], ['last', 63]] as const) {
+      for (const byte of [0x80, 0xe1, 0xff, 0x00, 0x09, 0x1f, 0x7f]) {
+        cases.push([`byte 0x${byte.toString(16).padStart(2, '0')} at ${position} position`, withByteAt(index, byte)])
+      }
+    }
+    cases.push(['no LF terminator (64 bytes)', Buffer.from(TOKEN)])
+    cases.push(['CR instead of LF', Buffer.from(`${TOKEN}\r`)])
+    cases.push(['NUL instead of LF', Buffer.concat([Buffer.from(TOKEN), Buffer.from([0])])])
+    cases.push(['LF in the wrong position (inside token)', Buffer.from(`${'a'.repeat(31)}\n${'a'.repeat(32)}\n`)])
+    cases.push(['LF first, token shifted', Buffer.from(`\n${'a'.repeat(63)}`)])
+    cases.push(['extra trailing LF', Buffer.from(`${TOKEN}\n\n`)])
+    cases.push(['63 hex + LF (length 64)', Buffer.from(`${'a'.repeat(63)}\n`)])
+    cases.push(['65 hex + LF (length 66)', Buffer.from(`${'a'.repeat(65)}\n`)])
+    cases.push(['64 hex + 2 bytes (length 66)', Buffer.from(`${TOKEN}ab`)])
+    cases.push(['empty frame', Buffer.alloc(0)])
+    it.each(cases)('%s', (_name, frame) => {
+      expect(parseTokenFrame(frame)).toBeNull()
+    })
+    it('still accepts the canonical frame', () => {
+      expect(parseTokenFrame(Buffer.from(`${TOKEN}\n`))).toBe(TOKEN)
+    })
+  })
+
   it('reads once and closes the inherited fd before returning', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-idoris-token-'))
     const file = path.join(dir, 'frame')
@@ -87,6 +125,7 @@ describe('iDoris Admin status transport', () => {
     expect(parseStatusResponse(VALID_STATUS)).toEqual(VALID_STATUS)
     expect(parseStatusResponse({ ...VALID_STATUS, token: TOKEN })).toBeNull()
     expect(parseStatusResponse({ ...VALID_STATUS, capacity: { state: 'observed', entries: [{ ...VALID_STATUS.capacity.entries[0], estimated_memory_gb: -1 }] } })).toBeNull()
+    expect(parseStatusResponse({ ...VALID_STATUS, capacity: { state: 'observed', entries: [{ ...VALID_STATUS.capacity.entries[0], admission_status: ['ready'] }] } })).toBeNull()
   })
 
   it('projects only the frozen backends/models contracts', () => {
