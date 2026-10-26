@@ -263,3 +263,65 @@ fn a_session_import_failure_keeps_its_causes_code() {
     let other = MemoryError::SessionImportIncomplete(Box::new(MemoryError::Io("x".into())));
     assert_eq!(other.code(), MemoryErrorCode::Internal);
 }
+
+/// The cap is on the SERIALIZED payload: an id of 130 bytes is far under 237, but
+/// 120 `"` characters serialize to `\"` each and push the payload past 256.
+#[tokio::test]
+async fn an_escaped_character_id_crosses_the_cap_before_237_bytes() {
+    let f = fixture().await;
+    let id = assert_object(&f.kv, &"\"".repeat(120)).await;
+    assert!(
+        id.len() < 237,
+        "plain length {} is under the plain cap",
+        id.len()
+    );
+    pin_to_current_rows(&f).await;
+    let err =
+        f.kv.forget(PERSONAL, &id, &now_iso8601())
+            .await
+            .unwrap_err();
+    assert_eq!(err.code(), MemoryErrorCode::RetractIdTooLong, "{err:?}");
+    let live =
+        f.kv.assertions()
+            .beliefs_as_of(&BeliefQuery::owner(PERSONAL))
+            .await
+            .unwrap();
+    assert_eq!(live.len(), 1, "rolled back");
+}
+
+/// A driver error whose PRIMARY code is 13 but whose message matches nothing the
+/// classifier would recognise by text: only the code check can classify it.
+#[derive(Debug)]
+struct OddFull;
+impl std::fmt::Display for OddFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unrecognisable driver wording")
+    }
+}
+impl std::error::Error for OddFull {}
+impl sqlx::error::DatabaseError for OddFull {
+    fn message(&self) -> &str {
+        "unrecognisable driver wording"
+    }
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some("13".into())
+    }
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::Other
+    }
+}
+
+#[test]
+fn primary_code_13_alone_classifies_as_disk_full() {
+    let err = MemoryError::from(sqlx::Error::Database(Box::new(OddFull)));
+    assert_eq!(err.code(), MemoryErrorCode::DiskFull);
+}

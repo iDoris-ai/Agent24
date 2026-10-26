@@ -4159,7 +4159,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description `memory_retract_id_too_long` — the memory partition is full and this assertion id is too long (238 bytes or more) for its retraction to fall under the quota exemption, so it was charged as ordinary content and refused. Nothing was changed. */
+            /** @description `memory_retract_id_too_long` — the memory partition is full and the serialized retraction payload `{"assertion_id":…}` exceeds 256 bytes, so it falls outside the quota exemption, was charged as ordinary content and refused. The test is on the serialized bytes, not the id length: an id containing characters that JSON escapes (`"`, `\`, control characters) crosses the limit sooner than a plain one. Nothing was changed. */
             422: {
                 headers: {
                     [name: string]: unknown;
