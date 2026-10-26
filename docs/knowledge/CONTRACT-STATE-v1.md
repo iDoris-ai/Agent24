@@ -67,7 +67,7 @@
 ## 2. profile 与 binding 身份
 
 - **S2.1** 两种 profile 共用本文的状态与事件。local-managed：principal 是本机唯一用户（R1.4），激活时自动绑定；服务端身份是受控握手得到的实例标识；`loading` 另需 sidecar 可用并完成握手；没有注销事件；撤权来源是本实例撤销凭据或轮换本实例秘密。remote：principal 由签发权威认定（R1.3），登录后绑定；服务端身份是端点与租户（或 profile 配置修订号）；`loading` 另需向签发服务取凭据。
-- **S2.2** sidecar 状态是输入不是服务状态：进入 `starting` 时 `unavailable` 的 binding 与记有 `dependency` 的占位重试；`ready`、`healthy` 不单独改变服务状态（health ≠ ready，R8.1）；`degraded`、`failed`、`stopping`、`stopped` 使连接阶段的 binding 进入 `unavailable`（`dependency`），不递增。
+- **S2.2** sidecar 状态是输入不是服务状态：进入 `starting` 时 `unavailable` 的 binding 与记有 `dependency` 的占位重试；`ready`、`healthy` 不单独改变服务状态（health ≠ ready，R8.1）；`degraded`、`failed`、`stopping`、`stopped` 使连接阶段的 binding 进入 `unavailable`（`dependency`），不递增；已处于不自动重试的 `reason` 或 `local_storage` 时不变。
 - **S2.3** Off 不停止 sidecar。停用或移除 local-managed profile 时，先完成作废（S4.5），再按 KB-LITE-04② 的所有权语义停止 sidecar。
 - **S2.4** **binding 身份**：remote 为 profile × principal × 端点 × 租户（或配置修订号）；local-managed 为 profile × principal × 实例标识。任一项变化即新 binding，旧 binding `retired`。实例标识只取自 KB-LITE-01a 的受控握手，不取 HTTP 自报值；同一实例重启（标识不变）不算换实例、generation 不变。握手拿不到标识时不新建 binding、不递增，记 `instance_unidentified`。
 - **S2.5** **未绑定占位**：状态按 S1.2 派生为 `registered` 或 `disabled`，没有 generation，不准入任何请求。登录（remote）或握手（local-managed）在占位上进行，不是 READONLY 请求；成功后新 binding 连同初值持久化确认，才进入 `loading` 并发 READONLY 请求。失败时占位记下 `reason`（`dependency`、`credential_rejected`、`instance_unidentified`）：`dependency` 在占位被选用、Off 与停用都为假、profile 不带 `unsaved_settings` 时按退避重试；另两者只在手动重试、重新握手或重新登录后再试。登录或握手的结果只在属于当前尝试时生效。
@@ -80,7 +80,7 @@
   - **撤权信号**：`unauthorized/credential_revoked`；签发权威通知撤销或拒绝续签；local-managed 轮换本实例秘密。**范围变窄**：同一 principal 续签后凭据范围移除了任一 KB 或操作（同时有新增也算）；或凭据未变而服务端收窄（S5.10）。二者合称撤权类事件。
   - **撤权类事件的结果**：在连接阶段，作废在途请求并递增 generation（S4.5），按 S5.6 占位。`ready`、`degraded` 回到 `loading` 重签，重签被拒进入 `unavailable`（`access_revoked`）；`loading`、`unavailable` 中的撤权信号进入 `unavailable`（`access_revoked`）并丢弃内存凭据；范围变窄进入新一轮 `loading`，但处于不自动重试的 `reason` 时只作废与占位，`reason` 不变。在 `registered`、`disabled` 中不递增，仍按 S5.6 占位。由已接受响应派生的撤权事件不因前置状态改变而丢弃（S4.6）。
   - **例外**：binding 从未可服务（S1.12），且自建立以来未发生撤权类事件时，`loading` 中签发被拒，或本轮新签发的凭据被以撤权信号拒绝，进入 `unavailable`（`credential_rejected`），不递增、不占位。
-  - **窗口上限**：同一 binding 10 分钟内第 3 次撤权类事件仍作废、递增、占位，但一律进入 `unavailable`（`access_revoked`），不再自动重签。
+  - **窗口上限**：同一 binding 10 分钟内第 3 次撤权类事件仍作废、递增、占位，但一律进入 `unavailable`（`access_revoked`），不再自动重签。`registered`、`disabled` 中的撤权类事件也计入窗口；第 3 次落在这两种状态时仍只占位，不递增、不改变状态。
   - **`credential_expired`**：先续签。续签成功且同一 principal、范围相同或更宽，状态不变（`unavailable` 时回到 `loading`），不递增；principal 不同按 S3.5；范围变窄按撤权类事件；续签被拒按撤权信号（满足例外时按例外）；签发方不可达进入 `unavailable`（`dependency`），不递增。
   - **凭据无效类**：`unauthorized` 且 `reason` 为 `credential_invalid`、`credential_missing` 或未知值。连接阶段（`unavailable` 只限 `dependency`、`not_ready`，其他 `reason` 不变）第一次出现时不算撤权：不递增、不作废在途、不占位；立即停止准入，丢弃当前凭据，进入新一轮 `loading` 续签一次。**续签也失败**（续签被拒，或这一轮新凭据仍得凭据无效类）只在这一轮内判定：进入 `unavailable`（`credential_rejected`），按 S5.6 记一条适用全部 KB 的占位规则，不递增，不声称已撤权。签发方明示撤销按撤权信号；不可达进入 `unavailable`（`dependency`），不占位。同一 binding 10 分钟内第 3 次凭据无效类事件直接按续签也失败处理。
   - **凭据归属**：签发与续签的结果属于发起它的那一轮 `loading`（或占位上的那次尝试），轮次已变时到达的凭据不采用、不触发转移。只有用当前凭据发出的请求，其凭据类响应才按上面处理；用已丢弃凭据发出的请求，其 `credential_expired`、凭据无效类与范围信息不触发转移、不占位、不判收窄，结果换成本地 `not_ready`。
