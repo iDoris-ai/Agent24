@@ -32,9 +32,22 @@
 1. **内容和成功审计照旧受配额约束（A 类）。** 包括消息、断言、重申、会话摘要、trace、导入，以及 `mem.write_decision`（含正文，与内容在同一事务，R05/H02 现状不变）。新增 kind 默认都是 A 类。
 2. **只有撤回豁免配额。** 触发器对 `kind = 'assertion.retracted'` 的行跳过配额比较，但必须同时满足以下三条，否则仍按 A 类处理：
    - **写入者**：只有宿主撤回路径会写这个 kind（`assertion.rs` 的 `forget`）。
-   - **owner 类别**：`scope_owner` 是 personal owner（不是 `os:` 前缀）。模块 owner 不享受豁免，它们没有 ADR 要求的「用户撤回」语义。
-   - **payload**：只有 `{"assertion_id": …}`（现状已经如此），长度上限 256 字节，在触发器里检查。
-3. **豁免有结构上界，不会无限增长。** 一次撤回只能作用于一条当前有效的断言（`forget` 已经要求断言有效，撤回后即失效）。要让同一条断言再次被撤回，必须先重申它，而重申属于 A 类、受配额约束。因此在任一时刻，豁免撤回的累计行数不超过「曾经有效的断言数」，而后者本身受 A 类配额约束。结论：豁免撤回的总行数 ≤ 基础 `max_rows`，字节数 ≤ 256 × `max_rows`（默认约 49 MiB）。这是证明，不是估计值；需要 T2 测试来固定。
+   - **owner 类别**：`scope_owner` 是 personal owner。判断方式是在 SQL 里精确关联分区目录（`mem_os_partitions` 的 `space_kind` 为 personal，或者 personal owner 目录表），**不能用字符串前缀判断**。模块 owner 是含 NUL 的版本化键（`os_memory.rs:252`）。模块 owner 不享受豁免，因为它们没有 ADR 要求的「用户撤回」语义。
+   - **payload**：触发器逐项检查以下四点：
+     - `json_valid(payload)`；
+     - 顶层只有一个键 `assertion_id`（`(SELECT COUNT(*) FROM json_each(payload)) = 1`）；
+     - `json_type(payload,'$.assertion_id') = 'text'`；
+     - `LENGTH(CAST(payload AS BLOB)) <= 256`。
+
+     现有写法本来就只写这一个键。
+3. **豁免有结构上界，按「生效次数」证明。**
+   - `forget` 只在断言当前有效时才写撤回事件；对已经失效的断言，它返回 `AlreadyForgotten`，不写事件（`assertion.rs:42–66`）。
+   - 一条断言要从失效重新变为有效，唯一的生产路径是重申。重申一定会追加一行 A 类事件（`writer.rs:671–709`）。除此之外，没有其他生产路径能写 `assertion.retracted`，也没有其他路径能复活断言。
+   - 因此每一行豁免撤回，都唯一对应它之前的一次生效（首次断言或重申），而每次生效都写过至少一行 A 类事件。
+   - 结论：**豁免撤回的行数，不超过历史上写入的 A 类生效事件数**，后者每一行在写入时都通过了 A 类门。字节数不超过 256 × 该行数。
+   - 这个上界跟「当前」的 `max_rows` 无关。D8 把限额调低之后，豁免行累计超过新的 `max_rows` 是合法的，因为对应的生效行都是在旧限额下合法写入的。这一点要写进 T2。
+
+   这是证明，不是估计值，由 T2 固定。
 4. **用量计数分开。** `mem_owner_usage` 新增 `exempt_row_count` 和 `exempt_byte_count` 两列；A 类门只比较 A 类计数，豁免行不会挤占内容额度。告警（D6）同时报两组计数。
 5. **模块不能写保留 kind。** 进程内和进程外两个模块写入入口都拒绝以下 kind：`assertion.*`、`mem.*`、`session.*`，以及将来的 purge 控制类 kind。返回类型化错误 `reserved_kind`。需要补两条伪造测试（T9）。
 6. **purge 控制记录不进 `mem_events`。** ADR §5 已经要求「独立恢复控制存储」，所以 purge 的意图、fence 和世代记录存在独立的控制表或控制库，不受 `mem_owner_quota` 约束，空间由 P1-08 设计。本稿只确认一点：purge 不会因为记忆满额而写不下控制记录。
@@ -80,8 +93,9 @@
 
 第 1 版提出用 HostSystem 来源把缺口说明注入后续上下文。这与 R05-5:72 冲突（HostSystem 当前唯一的写点是暂停通知），会动到来源契约，所以第 2 版不注入：
 
-- 一轮写入失败后，在 `mem_write_rejections` 里记 `kind=session.turn`、`session_id`、轮次号。
-- 用户可见：该轮的回执（D2）是 `not_saved`；会话页在缺口处显示「此处 N 轮未保存」，数据来自 `mem_write_rejections`。
+- 一轮写入失败后，在**独立的** `mem_session_gaps` 表里记录区间：`session_id`、`turn_from`、`turn_to`、错误码、`first_at`、`last_at`。相邻的失败轮次合并成同一个区间。这张表**不做环形覆盖**，每个连续缺口占一行，行数受会话轮次约束，随会话的 purge 一起清除，不受 `mem_owner_quota` 约束。
+- `mem_write_rejections`（D3）按 owner 和错误码聚合，只供审计使用，它的环形覆盖不影响缺口展示。
+- 用户可见：该轮回执（D2）是 `not_saved`；会话页在缺口处显示「此处 N 轮未保存」，数据来自 `mem_session_gaps`。
 - 模型可见：**不处理**。后续上下文照现状不含失败轮次，也不插入说明。如果以后要让模型知道缺口，另开一份 R05 契约修订（R05-6）：定义唯一写点，来源与 digest 同一事务，并经过发送门和冷恢复测试。本稿不批准这件事。
 
 ### D5 磁盘
@@ -125,12 +139,12 @@
 | 门 | 断言 | 片 |
 |---|---|---|
 | T1 满额撤回 | 把 personal owner 的配额设为当前用量，撤回成功、断言失效；去掉豁免分支后测试变红 | c1 |
-| T2 豁免上界 | 反复「重申 → 撤回」直到 A 类配额满：重申先被拒，此后再无可撤回的有效断言；豁免行数不超过曾经有效的断言数；payload 超过 256 B 的伪撤回走 A 类门 | c1 |
+| T2 豁免上界 | 对同一条断言反复「重申 → 撤回」，直到 A 类配额满：重申先被拒，此后没有可撤回的有效断言；豁免行数不超过 A 类生效事件数；D8 调低限额之后豁免累计超过新 `max_rows` 仍合法；以下 payload 都按 A 类门处理：多键、非字符串、超过 256 B、owner 只是前缀相似但不在 personal 目录里 | c1 |
 | T3 内容仍拒 | 满额后新增消息、断言或重申被拒，`mem_events` 没有新增内容行；`mem.write_decision` 与断言一起回滚 | c1 |
 | T4 计数分离 | 豁免撤回不增加 A 类计数，A 类门不受影响 | c1 |
 | T5 回执 | W1–W7 各路径在满额时都给出类型化失败回执；run 结束事件 `memory_persisted:false`；`partial` 组合（轮次已存、断言未存）有专门用例；任何回执都不出现「已记住」 | c2 |
 | T6 不泄露 | 失败事件和 HTTP 错误体里不含分区键、`{owner:?}` 转义文本或 Display 原文 | c2 |
-| T7 失败留痕 | 拒绝时 `mem_write_rejections` 有一行；60 秒内重复拒绝只累加 `suppressed_count`；超过 1000 行时环形覆盖 | c3 |
+| T7 失败留痕 | 拒绝时 `mem_write_rejections` 有一行；60 秒内重复拒绝只累加 `suppressed_count`；超过 1000 行时环形覆盖；环形覆盖之后，`mem_session_gaps` 里的缺口区间仍然完整，相邻失败会被合并 | c3 |
 | T8 磁盘 | 模拟卷剩余不足：A 类返回 `memory_disk_low`，剩余 ≥16 MiB 时撤回成功、<16 MiB 时返回 507；注入 SQLITE_FULL 映射为 `memory_disk_full`（A 类和撤回都测）；缓存过期后重新读取 | c4 |
 | T9 模块伪造 | 进程内、进程外模块入口都无法写 `assertion.retracted` / `mem.*` / `session.*`（返回 `memory_reserved_kind`）；模块 owner 的撤回不享受豁免 | c1 |
 | T10 分区隔离 | 模块 owner 写满不影响 personal 的写入和撤回 | c1 |
@@ -143,7 +157,7 @@
 | c0 | D9 测量报告（只读、合成库） | — |
 | c1 | 迁移 0024：撤回豁免（personal、宿主写点、payload 上限）、豁免计数列、模块保留 kind 拒绝；T1–T4、T9、T10 | — |
 | c2 | 类型化错误码与 W1–W7 回执、`memory_persisted`、`partial`；T5、T6 | c1 |
-| c3 | `mem_write_rejections` 表、限频与环形上限、会话缺口展示数据；T7 | c1 |
+| c3 | `mem_write_rejections` 表（限频、环形上限）与 `mem_session_gaps` 区间表；T7 | c1 |
 | c4 | 磁盘写前检查与 SQLITE_FULL 映射；T8 | c2 |
 | c5 | 空闲时 `wal_checkpoint(TRUNCATE)` | — |
 | c6 | owner 限额调整入口（提升级）与 `mem_quota_changes`；T11 | c1；ADR-037 在场证明（CORE-2） |
@@ -157,6 +171,11 @@
 - 跨 owner 的全局上限：模块数量增长时，总量会叠加。这一条记为风险，等 P1-03 告警上线后再决定。
 
 ## 6. 修订记录
+
+**第 3 版**，回应第二轮挑战（无 High，3 条 Medium）：
+- D1.3 的上界改为按「生效次数」证明，并说明限额调低后的情况。
+- D1.2 判断 personal owner 改为精确关联分区目录，payload 四项校验。
+- 会话缺口改用独立的 `mem_session_gaps` 区间表，不做环形覆盖。
 
 **第 2 版**，回应 Mac mini Codex 第一轮挑战：
 
