@@ -4476,6 +4476,237 @@ pub(crate) mod tests {
         build_router_with_modules(state, modules)
     }
 
+    fn function_span(src: &str, signature: &str) -> std::ops::Range<usize> {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("missing {signature}"));
+        let end = src[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("unclosed {signature}"));
+        start..start + end
+    }
+
+    fn route_interior(src: &str) -> &str {
+        let mut depth = 1;
+        let mut in_str = false;
+        let mut escaped = false;
+        for (index, ch) in src.char_indices() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_str = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[..index];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced .route(");
+    }
+
+    fn rust_string(src: &str) -> Option<(&str, &str)> {
+        let src = src.trim_start();
+        let mut chars = src.char_indices();
+        if chars.next()?.1 != '"' {
+            return None;
+        }
+        let mut escaped = false;
+        for (index, ch) in chars {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => return Some((&src[1..index], &src[index + 1..])),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn method_names(expr: &str) -> Vec<&'static str> {
+        const NAMES: &[&str] = &["get", "post", "put", "patch", "delete", "head"];
+        let mut found = Vec::new();
+        let bytes = expr.as_bytes();
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut index = 0;
+        while index < bytes.len() {
+            let ch = bytes[index] as char;
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_str = false;
+                }
+                index += 1;
+                continue;
+            }
+            if ch == '"' {
+                in_str = true;
+                index += 1;
+                continue;
+            }
+            if let Some(name) = NAMES
+                .iter()
+                .copied()
+                .find(|name| expr[index..].starts_with(name))
+            {
+                let end = index + name.len();
+                let boundary = index == 0
+                    || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
+                if boundary && expr[end..].starts_with('(') {
+                    found.push(name);
+                }
+            }
+            index += 1;
+        }
+        found
+    }
+
+    /// Every `.route(` in the production function. Unparseable calls, calls with
+    /// no method, and duplicate method/template pairs fail closed.
+    fn parsed_routes(src: &str, signature: &str, prefix: &str) -> BTreeSet<(String, String)> {
+        let span = function_span(src, signature);
+        let body = &src[span.clone()];
+        let mut routes = BTreeSet::new();
+        let mut offset = 0;
+        while let Some(found) = body[offset..].find(".route(") {
+            let at = offset + found;
+            let interior = route_interior(&body[at + ".route(".len()..]);
+            let (path, after) = rust_string(interior)
+                .unwrap_or_else(|| panic!("unparseable .route( near {signature}"));
+            let methods = method_names(after);
+            assert!(!methods.is_empty(), "no method on {path}");
+            for name in methods {
+                let template = if path.starts_with("/api/v1") {
+                    path.to_owned()
+                } else {
+                    format!("{prefix}{path}")
+                };
+                assert!(
+                    routes.insert((name.to_ascii_uppercase(), template.clone())),
+                    "duplicate {name} {template}"
+                );
+            }
+            offset = at + ".route(".len() + interior.len();
+        }
+        assert!(!routes.is_empty(), "{signature} registered no routes");
+        let tests_at = src.find("mod tests").unwrap_or(src.len());
+        let mut stray = 0;
+        let mut search = 0;
+        while let Some(found) = src[search..].find(".route(") {
+            let at = search + found;
+            if !span.contains(&at) && at < tests_at {
+                stray += 1;
+            }
+            search = at + 1;
+        }
+        assert_eq!(stray, 0, "{signature} is not the only production registrar");
+        routes
+    }
+
+    #[tokio::test]
+    async fn registered_routes_match_the_operation_catalog() {
+        let kernel_src = include_str!("server.rs");
+        let comm_src = include_str!("../../../crates/agent24-comm/src/router.rs");
+        let kernel = parsed_routes(kernel_src, "pub fn build_router_with_modules", "");
+        let comm = parsed_routes(comm_src, "pub fn router(", "/api/v1/comm");
+        assert!(kernel.len() >= 50, "kernel scan saw only {}", kernel.len());
+        let comm_paths = comm
+            .iter()
+            .map(|(_, path)| path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            comm_paths.len() >= 16,
+            "comm scan saw only {}",
+            comm_paths.len()
+        );
+
+        let mut registered = kernel.clone();
+        registered.extend(comm.iter().cloned());
+        let catalog = crate::capabilities::policies()
+            .iter()
+            .map(|policy| (policy.method.to_owned(), policy.template.to_owned()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(registered, catalog);
+
+        let empty = BTreeSet::new();
+        for (method_name, template) in &registered {
+            let decision = crate::capabilities::decide(
+                &Method::from_bytes(method_name.as_bytes()).unwrap(),
+                Some(template),
+                template,
+                &empty,
+            );
+            assert!(
+                matches!(decision, crate::capabilities::RouteDecision::Mapped(_)),
+                "{method_name} {template} fell into the module fallback"
+            );
+        }
+
+        let state = state().await;
+        let router = router_with_comm(state);
+        let trace = Method::from_bytes(b"TRACE").unwrap();
+        let mut templates = BTreeSet::new();
+        for (_, template) in &registered {
+            templates.insert(template.clone());
+        }
+        for template in templates {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(trace.clone())
+                        .uri(concrete_path(&template))
+                        .header(header::AUTHORIZATION, "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{template}"
+            );
+            let allow = response
+                .headers()
+                .get(header::ALLOW)
+                .unwrap_or_else(|| panic!("no Allow on {template}"))
+                .to_str()
+                .unwrap();
+            let got = allow
+                .split(',')
+                .map(|part| part.trim().to_owned())
+                .collect::<BTreeSet<_>>();
+            let mut expect = registered
+                .iter()
+                .filter(|(_, path)| path == &template)
+                .map(|(method_name, _)| method_name.clone())
+                .collect::<BTreeSet<_>>();
+            if expect.contains("GET") {
+                expect.insert("HEAD".to_owned());
+            }
+            assert_eq!(got, expect, "{template} Allow: {allow}");
+        }
+    }
+
     #[tokio::test]
     async fn attached_routes_are_host_only_in_capability_mode() {
         let (state, host, creative) = capability_state().await;
