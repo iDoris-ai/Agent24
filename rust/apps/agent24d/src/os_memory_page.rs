@@ -155,6 +155,9 @@ pub enum MemoryRpcError {
     /// A closed [`ErrorKind`] application error (rate limiting, timeout) —
     /// maps to `-32000` with that `kind`.
     Application(ErrorKind, String),
+    /// P1-02c: the module tried to write a kernel-reserved kind. Maps to
+    /// `-32602` carrying the stable code `memory_reserved_kind` in `data.code`.
+    ReservedKind,
 }
 
 impl MemoryRpcError {
@@ -169,6 +172,10 @@ impl MemoryRpcError {
             Self::Invalid(m) => RpcError::invalid_params(m),
             Self::Store(m) => RpcError::internal(m),
             Self::Application(kind, m) => RpcError::application(kind, m),
+            Self::ReservedKind => RpcError::invalid_params(
+                "memory_reserved_kind: this kind is reserved by the kernel",
+            )
+            .with_data("code", serde_json::json!("memory_reserved_kind")),
         }
     }
 }
