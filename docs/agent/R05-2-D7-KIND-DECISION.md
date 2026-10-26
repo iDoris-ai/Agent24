@@ -19,7 +19,7 @@
 | D7e | REST 的 role 等于 system、客户端自报 source、模型或 tool 指定 kind，都不是宿主构造证明。 | 不得据此写入 HostRecall、UserPrompt 或 SessionHistory。 | 待外审 |
 | D7f | 本轮运行中宿主经 persist_message 写入的 assistant 与 tool 行，包括冷恢复要重放的 assistant tool_calls 行，不是 D7c 的 prior context。不得把它们标成 HostRecall、UserPrompt 或 SessionHistory，也不得把它们声明为永久无来源。永久无来源会让带 tool call 的冷恢复在写点切换之后仍被 D1 排除，和 D1「不得一律停发」冲突。决定是以后另片增加存储 kind。本稿不选 CHECK 字符串，不加迁移。写点切换不得给这些行写 kind，也不得把它们送进 `append_originated_run_messages`。H03 在该迁移片被外审接受之前不得派出。因此本稿不关闭 R05-1 的 D7。 | 不得在本片实现该迁移，不得改发送路径。 | 待外审 |
 
-非空 assertion id 集合是 HostRecall 的构造条件。`session_memory` 的召回只在收集到的 `ids` Vec 非空时返回一个块；一个块携带预算内放进正文的全部 id，上界是这次召回的 top-k。检查的是这个 Vec 是否为空，不是单个 `hit.assertion.id` 非空。现有字段仍是 `recall_ref`。本稿不规定这个集合怎么写进该字段，以后的实现也不得先把 `recall_ref` 写成单个 id。`rust/crates/agent24-store/migrations/0021_run_message_origins.sql` 的 CHECK 只有 HostRecall、UserPrompt、SessionHistory。ADR 里的 HostSystem、Assistant、ToolResult 不是本片的存储 kind。空字符串 `recall_ref` 的既有拒绝不变。本稿不改读取。
+非空 assertion id 集合是 HostRecall 的构造条件。`session_memory` 的召回只在收集到的 `ids` Vec 非空时返回一个块；一个块携带预算内放进正文的全部 id，上界是这次召回的 top-k。检查的是这个 Vec 是否为空，不是单个 `hit.assertion.id` 非空。现有字段仍是 `recall_ref`。本稿不规定这个集合怎么写进该字段，以后的实现也不得先把 `recall_ref` 写成单个 id。`rust/crates/agent24-store/migrations/0027_run_message_origins.sql` 的 CHECK 只有 HostRecall、UserPrompt、SessionHistory。ADR 里的 HostSystem、Assistant、ToolResult 不是本片的存储 kind。空字符串 `recall_ref` 的既有拒绝不变。本稿不改读取。
 
 ## 2. 当前生产快照
 

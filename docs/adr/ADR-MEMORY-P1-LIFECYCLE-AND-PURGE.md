@@ -38,7 +38,7 @@ purge 不等同于撤回；暂停不等同于无痕；更正不等同于物理�
 | 可编辑 artifacts/偏好：`artifact.rs`、migration 0003/0008、`reconcile.rs` | 覆盖 body、历史版本及磁盘投影的来源闭包；全局 `kv` 逐 namespace/key 定义映射。用户维护的权威文件不自动删除：预览中显式选择，否则说明不在范围；无法判归属则拒绝执行该范围。 |
 | 工具正文/附件：`trace.rs`、migration 0009 `mem_trace_nodes/refs` | 已有 DB 内完整工具正文，不能当成 P1 磁盘附件已上线。拟议大输出附件按 owner 内去重；引用与 blob 分开删除，剩余合法引用保留，多 owner 共用 blob 默认禁用。 |
 | 冷归档 / JSON+Markdown 导出包 | P1 能力尚待实现；托管包登记 owner、对象 ID、来源与删除世代，包含原文、修订和状态。压缩不是删除；受控包需删除/重写并验证；用户复制出去的包见 §7。 |
-| Run/thread/snapshot：`agent24-agent/src/lib.rs`、`agent24-store` migration 0004/0016 | `run_messages` 的 content/tool_calls、runs 的 prompt/诊断字段及 source tags 需逐字段核；Run 表不自带 personal-owner 隔离，必须有可信 run→owner/来源绑定。消息来源已由独立表 `run_message_origins`（migration 0021、0022，#1168/#1195）落地；K1 `run_source_tags` 只管隐私/路由，二者正交，见 [ADR-MEMORY-RECALL-MESSAGE-ORIGINS](ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md)。含目标内容的运行暂停/取消后清理；未知来源不得默认不相关。 |
+| Run/thread/snapshot：`agent24-agent/src/lib.rs`、`agent24-store` migration 0004/0016 | `run_messages` 的 content/tool_calls、runs 的 prompt/诊断字段及 source tags 需逐字段核；Run 表不自带 personal-owner 隔离，必须有可信 run→owner/来源绑定。消息来源已由独立表 `run_message_origins`（migration 0027、0028，#1168/#1195）落地；K1 `run_source_tags` 只管隐私/路由，二者正交，见 [ADR-MEMORY-RECALL-MESSAGE-ORIGINS](ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md)。含目标内容的运行暂停/取消后清理；未知来源不得默认不相关。 |
 | 诊断/审计/缓存：`agent24-memory/src/trace.rs`、`agent24-store` decision/model timing、daemon tracing/events | 发布前补“字段→写点→读取者→删除动作”清单，含桌面历史、错误正文、工具参数/输出、临时文件和遥测。当前没有证明全链无副本；仅允许清单内回执，禁止把广播事件缺席当删除成功。 |
 | 备份、SQLite WAL/journal/空闲页 | 当前完整受控备份恢复协议未核得，P1 新增恢复门。DB DELETE 只保证应用逻辑不可读；checkpoint/压实及托管文件清理另验，不宣称 SSD/系统快照上的取证级擦除。 |
 | 外部模块索引/模型缓存 | Documenting/Knowledge/Media/AgentEar 各自资产不可按名字认领。登记宿主对象→模块副本映射、删除能力/回执和失联状态；未接线标 N/A，已存在但失控标不受控，不能混为“已清除”。 |
@@ -114,4 +114,4 @@ P1 承诺限 Agent24 控制的逻辑数据、已登记可清理的本地文件�
 
 **⑤ 无痕首版（已决）。** 决定：零工具、零模块，只允许一个经过全落点验收的本地 provider。验收前入口禁用。放开：只放开 P1-09 的最小路径。风险：普通 run 路径会持久写 snapshot（`append_snapshot_run_messages`，`agent24-agent/src/lib.rs`），无痕不能复用普通运行路径。
 
-来源方案已落地：消息来源由独立表 `run_message_origins`（migration 0021、0022，#1168/#1195）承载，K1 `run_source_tags` 只管隐私/路由，二者正交，见 [ADR-MEMORY-RECALL-MESSAGE-ORIGINS](ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md)。生命周期变更、purge/无痕/迁移/导入格式均须各自精确版本外审；本 ADR 获接受也不替代实现 PR 门禁。
+来源方案已落地：消息来源由独立表 `run_message_origins`（migration 0027、0028，#1168/#1195）承载，K1 `run_source_tags` 只管隐私/路由，二者正交，见 [ADR-MEMORY-RECALL-MESSAGE-ORIGINS](ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md)。生命周期变更、purge/无痕/迁移/导入格式均须各自精确版本外审；本 ADR 获接受也不替代实现 PR 门禁。

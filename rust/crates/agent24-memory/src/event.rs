@@ -470,7 +470,7 @@ impl EventLog {
         .execute(&mut *conn)
         .await
         .map_err(map_quota_error(&e.scope.owner))?;
-        // Migration 0018's `mem_events_bi_no_replace` ignores (RAISE(IGNORE))
+        // Migration 0019's `mem_events_bi_no_replace` ignores (RAISE(IGNORE))
         // an insert whose id already exists instead of letting SQLite raise a
         // UNIQUE error, so a collision now shows up as zero affected rows. It
         // must stay the error it always was: the caller's transaction rolls back.
@@ -1252,7 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_tx_with_an_existing_id_is_still_an_error_that_rolls_back() {
-        // Since 0018 the SQL layer ignores a same-id insert; append_tx must keep
+        // Since 0019 the SQL layer ignores a same-id insert; append_tx must keep
         // reporting the collision, or a pre-occupied audit id would silently
         // commit a belief its audit does not describe.
         let kv = KvStore::open_memory().await.unwrap();
