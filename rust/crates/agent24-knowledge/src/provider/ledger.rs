@@ -144,6 +144,7 @@ impl<P: Clone + PartialEq> Ledger<P> {
     /// A tightening has taken effect in memory. With the seal already gone it
     /// is committed at once; otherwise once the seal's deletion or its record
     /// lands. During a rebuild the deletion comes from [`Ledger::resealed`].
+    /// `scope` must not be empty: an empty one blocks nothing (#1265).
     pub fn tighten(&mut self, scope: Scope<P>) -> Tightening {
         debug_assert!(!scope.is_empty());
         let ticket = Ticket(self.next());
@@ -247,7 +248,8 @@ impl<P: Clone + PartialEq> Ledger<P> {
 
     /// I1: whether a loosening over `scope` may be written. Refused while a
     /// tightening it depends on is unconfirmed, or while the loosening
-    /// `after` it depends on is not in effect.
+    /// `after` it depends on is not in effect. `scope` must not be empty, as
+    /// for [`Ledger::tighten`].
     pub fn loosen(
         &mut self,
         scope: Scope<P>,

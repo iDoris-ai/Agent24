@@ -497,3 +497,21 @@ fn every_reason_has_the_same_class_and_counterpart() {
         assert_eq!(cleared.offset(), Some(failed), "{failure:?}");
     }
 }
+
+/// #1267: a host writing `Stuck` converts back from the binding's cause; the
+/// causes that do not persist are refused, each as itself.
+#[test]
+fn only_the_causes_that_persist_convert_to_a_stuck_cause() {
+    use UnavailableCause as U;
+    for stuck in [
+        StuckCause::Incompatible,
+        StuckCause::InstanceUnidentified,
+        StuckCause::CredentialRejected,
+        StuckCause::AccessRevoked,
+    ] {
+        assert_eq!(StuckCause::try_from(U::from(stuck)), Ok(stuck));
+    }
+    for cause in [U::Dependency, U::NotReady, U::LocalStorage] {
+        assert_eq!(StuckCause::try_from(cause), Err(cause));
+    }
+}
