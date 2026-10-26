@@ -24,7 +24,8 @@ use crate::{
 pub struct SearchQuery {
     pub query: String,
     pub knowledge_base_ids: Option<NonEmpty<String>>,
-    pub max_results: Option<PositiveInt>,
+    /// The model's, or [`RESULTS_MAX`] when it names none.
+    pub max_results: PositiveInt,
 }
 
 /// What the model asks to read: a document page by page, or one chunk;
@@ -112,7 +113,7 @@ struct ReadArgs {
 const QUERY_MAX: usize = 4096;
 const ID_MAX: usize = 256;
 const CURSOR_MAX: usize = 1024;
-const RESULTS_MAX: u64 = 50;
+const RESULTS_MAX: PositiveInt = PositiveInt::MIN.saturating_add(49);
 /// Pages a citation read follows for one chunk before it settles for the
 /// first page as current text.
 const PAGES_MAX: usize = 8;
@@ -132,7 +133,7 @@ fn object(properties: Value, required: &str) -> Value {
 /// The JSON Schema advertised for `knowledge.search`.
 pub fn search_parameters() -> Value {
     let ids = json!({ "type": "array", "minItems": 1, "items": text(ID_MAX) });
-    let max = json!({ "type": "integer", "minimum": 1, "maximum": RESULTS_MAX });
+    let max = json!({ "type": "integer", "minimum": 1, "maximum": RESULTS_MAX.get() });
     let properties =
         json!({ "query": text(QUERY_MAX), "knowledge_base_ids": ids, "max_results": max });
     object(properties, "query")
@@ -181,7 +182,8 @@ pub fn parse_search(input: &Map<String, Value>) -> Result<SearchQuery, Refused> 
             Some(ids)
         }
     };
-    if a.max_results.is_some_and(|n| n.get() > RESULTS_MAX) {
+    let max_results = a.max_results.unwrap_or(RESULTS_MAX);
+    if max_results > RESULTS_MAX {
         return Err(Refused::Invalid(format!(
             "max_results is above {RESULTS_MAX}"
         )));
@@ -189,7 +191,7 @@ pub fn parse_search(input: &Map<String, Value>) -> Result<SearchQuery, Refused> 
     Ok(SearchQuery {
         query: filled("query", a.query, QUERY_MAX)?,
         knowledge_base_ids,
-        max_results: a.max_results,
+        max_results,
     })
 }
 
@@ -337,10 +339,12 @@ pub async fn read(
 /// A citation read cut by `max_bytes` (R4.4): read the same chunk on until
 /// its last page, each page its own request, and join the pages into the
 /// whole chunk when every page names the same chunk and `content_tag`. Past
-/// [`PAGES_MAX`], on a cursor coming back or a page of another chunk, the
-/// first page stands as current text with its cursor. A page refused or of
-/// another `content_tag` refuses the call, and one under another generation
-/// cancels it (S4.8): the first page is known to be no longer good.
+/// [`PAGES_MAX`], on a cursor coming back or one the wire would not carry, a
+/// page of another chunk, or a last page still marked cut, the first page
+/// stands as current text with its cursor. A page refused refuses the call,
+/// whatever the refusal: the model may ask again. A page under another
+/// `content_tag` refuses it as `stale`, and one under another generation
+/// cancels it (S4.8).
 async fn read_on(
     backend: &dyn KnowledgeBackend,
     run_id: &str,
@@ -354,6 +358,10 @@ async fn read_on(
     let mut text = segment.text.clone();
     let mut seen = HashSet::from([cursor.clone()]);
     for _ in 1..PAGES_MAX {
+        // A cursor is the server's, yet it goes out under the same limits.
+        if filled("cursor", cursor.clone(), CURSOR_MAX).is_err() {
+            return Ok(None);
+        }
         let next = ReadQuery {
             cursor: Some(cursor),
             ..query.clone()
@@ -379,6 +387,10 @@ async fn read_on(
         }
         text.push_str(&s.text);
         let Some(more) = page.next_cursor else {
+            // Cut with nowhere to go on (the wire forbids it): not whole.
+            if page.truncated {
+                return Ok(None);
+            }
             let mut whole = first.clone();
             whole.segments[0].text = text;
             whole.truncated = false;
