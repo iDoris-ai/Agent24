@@ -73,9 +73,13 @@ function resolveNodeEntry(): string {
 }
 
 function resolveRustBinary(): string {
-  const override = process.env['AGENT24D_BIN']
-  if (override) return override
-  const exe = process.platform === 'win32' ? 'agent24d.exe' : 'agent24d'
+  return process.env['AGENT24D_BIN'] || resolveBundledRustBinary('agent24d')
+}
+
+/** A Rust binary the app ships: `agent24d`, or the `agent24` CLI whose
+ * commands main runs (documents-import.ts). */
+export function resolveBundledRustBinary(name: string): string {
+  const exe = process.platform === 'win32' ? `${name}.exe` : name
   if (isDev) {
     return path.join(repoRootDev(), 'rust', 'target', 'debug', exe)
   }

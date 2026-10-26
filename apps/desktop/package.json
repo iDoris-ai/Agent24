@@ -92,6 +92,10 @@
         {
           "from": "../../rust/target/release/agent24d",
           "to": "backend/agent24d"
+        },
+        {
+          "from": "../../rust/target/release/agent24",
+          "to": "backend/agent24"
         }
       ]
     },
@@ -103,6 +107,10 @@
         {
           "from": "../../rust/target/release/agent24d.exe",
           "to": "backend/agent24d.exe"
+        },
+        {
+          "from": "../../rust/target/release/agent24.exe",
+          "to": "backend/agent24.exe"
         }
       ]
     },
@@ -118,6 +126,10 @@
         {
           "from": "../../rust/target/release/agent24d",
           "to": "backend/agent24d"
+        },
+        {
+          "from": "../../rust/target/release/agent24",
+          "to": "backend/agent24"
         }
       ]
     },
