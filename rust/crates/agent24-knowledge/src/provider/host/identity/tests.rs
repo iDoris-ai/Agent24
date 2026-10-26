@@ -57,7 +57,8 @@ fn step(host: &mut H, log: &mut Vec<Record<T>>) -> Vec<C> {
     }
 }
 
-/// The log before the host's: "a" bound to binding 7 at generation 1.
+/// The log before the host's, as [`restored`] holds it: On, "a" selected
+/// and bound to binding 7 at generation 1, "alice" confirmed.
 fn before() -> Vec<Record<T>> {
     let bind = C::Bind {
         of: of("a", 7),
@@ -65,8 +66,28 @@ fn before() -> Vec<Record<T>> {
         generation: 1,
         confirmed: Some("alice"),
     };
-    let entry = Entry::Changes(vec![bind]);
+    let entry = Entry::Changes(vec![C::On, C::Select("a"), bind]);
     vec![Record { seq: 9, entry }]
+}
+
+/// What a restart from [`before`] holds; "a" is loading.
+fn restored() -> H {
+    let mut host = awaiting(None);
+    let a = host.members.iter_mut().find(|m| *m.id() == "a").unwrap();
+    a.confirm_principal(Some("alice"));
+    host
+}
+
+/// Memory and a replay of `log` agree on "a"'s principal, selection and
+/// awaited confirmation, and on Off.
+fn agree(host: &H, log: Vec<Record<T>>) {
+    let replayed = replay(9, log).unwrap();
+    let a = host.members.iter().find(|m| *m.id() == "a").unwrap();
+    assert_eq!(replayed.confirmed.get("a"), a.confirmed());
+    let state = &replayed.profiles["a"];
+    assert_eq!(state.selected, a.profile().selected());
+    assert_eq!(state.awaiting, a.profile().confirmation());
+    assert_eq!(replayed.off, host.is_off());
 }
 
 fn placed(changes: &[C]) -> bool {
@@ -86,7 +107,7 @@ fn awaits(changes: &[C]) -> bool {
 #[test]
 fn another_instance_retires_the_binding_and_binds_after_it() {
     let mut log = before();
-    let mut host = host();
+    let mut host = restored();
     let change = IdentityChange::Instance;
     let out = host.identity_changed("a", change, Some(created(9, "alice")));
     assert!(matches!(out.seal, Some(SealWrite::Delete(_))));
@@ -108,7 +129,8 @@ fn another_instance_retires_the_binding_and_binds_after_it() {
     assert_eq!(phase(&host, "a"), Some(ConnectionPhase::Loading));
     assert!(host.take_write().is_none());
 
-    let replayed = replay(9, log).unwrap();
+    let replayed = replay(9, log.clone()).unwrap();
+    agree(&host, log);
     let found = |binding| replayed.bindings.iter().find(|b| b.of == of("a", binding));
     assert!(found(7).unwrap().retired);
     let new = found(9).unwrap();
@@ -122,7 +144,7 @@ fn another_instance_retires_the_binding_and_binds_after_it() {
 #[test]
 fn another_principal_awaits_confirmation_and_its_binding_waits() {
     let mut log = before();
-    let mut host = host();
+    let mut host = restored();
     let change = IdentityChange::Principal;
     host.identity_changed("a", change, Some(created(9, "bob")));
     let awaited = C::Await {
@@ -136,9 +158,7 @@ fn another_principal_awaits_confirmation_and_its_binding_waits() {
 
     let awaiting = Some(Confirmation::PrincipalChanged);
     assert_eq!(host.profile(&"a").unwrap().confirmation(), awaiting);
-    let replayed = replay(9, log).unwrap();
-    assert_eq!(replayed.profiles["a"].awaiting, awaiting);
-    assert_eq!(replayed.confirmed.get("a"), Some(&"alice"));
+    agree(&host, log);
 }
 
 /// S3.5: another endpoint or tenant leaves the placeholder, to log in again.
@@ -196,8 +216,8 @@ fn a_later_attempt_drops_the_waiting_binding() {
     assert!(!bound(&host));
 }
 
-/// S3.5 on a placeholder: nothing to retire, nothing written, and the
-/// attempt in flight no longer counts.
+/// S3.5 on a placeholder: nothing to retire, nothing written; the attempt in
+/// flight no longer counts and is retried by backoff.
 #[test]
 fn on_a_placeholder_the_attempt_in_flight_no_longer_counts() {
     let mut host = host();
@@ -213,6 +233,38 @@ fn on_a_placeholder_the_attempt_in_flight_no_longer_counts() {
     };
     host.identified("b", attempt, late);
     assert!(host.take_write().is_none());
+    let Slot::Placeholder(b) = host.profile(&"b").unwrap().slot() else {
+        panic!("b is bound");
+    };
+    assert_eq!(b.failure(), Some(PlaceholderFailure::Dependency));
+
+    // Another endpoint waits for a new login instead.
+    let mut host = super::super::tests::host();
+    host.attempt(&"b").unwrap();
+    host.identity_changed("b", IdentityChange::Endpoint, None);
+    let Slot::Placeholder(b) = host.profile(&"b").unwrap().slot() else {
+        panic!("b is bound");
+    };
+    assert_eq!(b.failure(), None);
+}
+
+/// S3.5: another change while the retirement is unconfirmed drops the new
+/// binding and retries by backoff; the retry binds after the retirement.
+#[test]
+fn a_change_while_the_retirement_is_unconfirmed_retries() {
+    let mut host = host();
+    let change = IdentityChange::Instance;
+    host.identity_changed("a", change, Some(created(9, "alice")));
+    let out = host.identity_changed("a", change, Some(created(10, "alice")));
+    assert_eq!(out, Output::default());
+    assert_eq!(failure(&host), Some(PlaceholderFailure::Dependency));
+    assert_eq!(confirmed(&mut host).0[0], C::Retire(of("a", 7)));
+    assert!(host.take_write().is_none());
+
+    let attempt = host.attempt(&"a").unwrap();
+    host.identified("a", attempt, created(10, "alice"));
+    assert_eq!(confirmed(&mut host).0, vec![bind(10, 3, Some("alice"))]);
+    assert!(bound(&host));
 }
 
 /// S3.5: outside the connection phase the retirement does not invalidate;
@@ -234,7 +286,7 @@ fn outside_the_connection_phase_nothing_is_invalidated() {
 }
 
 /// "a" bound to binding 7 and loading, awaiting `confirmation`.
-fn awaiting(confirmation: Confirmation) -> H {
+fn awaiting(confirmation: Option<Confirmation>) -> H {
     let mut binding = BindingState::new(
         Connection::new(Gate::new(1), true),
         Credentials::new(false),
@@ -246,7 +298,7 @@ fn awaiting(confirmation: Confirmation) -> H {
     };
     binding.connect(clear);
     let slot = Slot::Bound(Box::new(binding));
-    let profile = Profile::new(slot, true, Some(confirmation));
+    let profile = Profile::new(slot, true, confirmation);
     let mut host = H::new(false, true, 10, 1);
     host.insert(Member::new("a", profile, Some(7), false));
     host
@@ -256,7 +308,7 @@ fn awaiting(confirmation: Confirmation) -> H {
 /// it stays in the place of `principal_changed`.
 #[test]
 fn under_unsaved_settings_the_waiting_binding_is_not_written() {
-    let mut host = awaiting(Confirmation::UnsavedSettings);
+    let mut host = awaiting(Some(Confirmation::UnsavedSettings));
     let change = IdentityChange::Principal;
     host.identity_changed("a", change, Some(created(9, "bob")));
     let (changes, _) = confirmed(&mut host);
@@ -270,7 +322,7 @@ fn under_unsaved_settings_the_waiting_binding_is_not_written() {
 /// S1.13: a principal already awaited is not written again.
 #[test]
 fn an_awaited_principal_is_not_awaited_again() {
-    let mut host = awaiting(Confirmation::PrincipalChanged);
+    let mut host = awaiting(Some(Confirmation::PrincipalChanged));
     let change = IdentityChange::Principal;
     host.identity_changed("a", change, Some(created(9, "bob")));
     let (changes, _) = confirmed(&mut host);

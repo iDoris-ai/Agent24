@@ -27,8 +27,9 @@ impl<I: Ids> Host<I> {
     /// principal also awaits the user's confirmation (S1.13), and its new
     /// binding waits unconfirmed. `created` is the new binding for another
     /// instance or principal; without it the placeholder retries with
-    /// `dependency`. Without a binding, an attempt in flight no longer
-    /// counts and nothing is written.
+    /// `dependency`. Without a binding nothing is written: an attempt or a
+    /// creation in flight is dropped as [`crate::provider::profile::Profile::change_identity`]
+    /// says.
     pub fn identity_changed(
         &mut self,
         id: I::Profile,

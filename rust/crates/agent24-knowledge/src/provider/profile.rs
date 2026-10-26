@@ -120,7 +120,7 @@ impl<K: Ord + Clone> Profile<K> {
             Slot::Bound(binding) => binding.leave(event),
             Slot::Placeholder(placeholder) => {
                 if event == Leave::Logout {
-                    placeholder.cancel();
+                    placeholder.cancel(false);
                 }
                 WithRule {
                     value: Effects::default(),
@@ -154,12 +154,13 @@ impl<K: Ord + Clone> Profile<K> {
 
     /// S3.5: the binding is retired (invalidated if in the connection phase,
     /// placeholders in any state) and the profile is a placeholder again.
-    /// `None` without a binding; a placeholder's attempt in flight no longer
-    /// counts.
+    /// `None` without a binding: the placeholder's attempt in flight, or the
+    /// binding it was creating, is dropped and, but for another endpoint,
+    /// retried by backoff (S3.5).
     pub fn change_identity(&mut self, change: IdentityChange) -> Option<Retired<K>> {
         match &mut self.slot {
             Slot::Placeholder(placeholder) => {
-                placeholder.cancel();
+                placeholder.cancel(change != IdentityChange::Endpoint);
                 return None;
             }
             // Removed: it takes no event, and nothing follows it.

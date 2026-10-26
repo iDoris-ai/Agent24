@@ -115,7 +115,7 @@ impl<I: Ids> Member<I> {
     /// S3.5: the binding is retired for `change`, with its placeholder rule
     /// and the generation it invalidated to (S5.6, S4.5), and the attempt
     /// that creates the new binding, if one follows. `None` without a
-    /// binding: a placeholder's attempt in flight no longer counts.
+    /// binding, as [`Profile::change_identity`].
     pub fn change_identity(
         &mut self,
         change: IdentityChange,
