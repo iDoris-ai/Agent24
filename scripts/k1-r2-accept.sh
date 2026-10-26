@@ -32,9 +32,9 @@ done
 # before anything is created.
 resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
-WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/k1r2-accept.XXXX")}
-case "$(resolve "$WORK")/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
-mkdir -p "$WORK" && WORK=$(cd "$WORK" && pwd -P)
+WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/k1r2-accept.$$}")
+case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
+mkdir -p "$WORK" || exit 2
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
 # Only what each case sets reaches a daemon or the CLI.
@@ -202,10 +202,12 @@ def call(i, method, params):
         if json.loads(line).get("id") == i:
             return json.loads(line), seen
     sys.exit("acp closed")
-call(1, "initialize", {"protocolVersion": 1})
-sid = call(2, "session/new", {"cwd": "/", "mcpServers": []})[0]["result"]["sessionId"]
-print("\n".join(call(3, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "ACP-MARKER"}]})[1]))
-p.stdin.close(); p.wait(timeout=10)
+try:
+    call(1, "initialize", {"protocolVersion": 1})
+    sid = call(2, "session/new", {"cwd": "/", "mcpServers": []})[0]["result"]["sessionId"]
+    print("\n".join(call(3, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "ACP-MARKER"}]})[1]))
+finally:
+    p.kill(); p.wait()
 EOF
 AGENT24_DATA_DIR="$DATA" python3 -I "$WORK/acp.py" "$NEW/agent24" > "$WORK/acp.out" 2>&1
 ACP=$( (grep -qF "$NOTICE" "$WORK/acp.out" && ! grep -qE 'ACP-MARKER|provider' "$WORK/acp.out") && echo ok || echo fail)
