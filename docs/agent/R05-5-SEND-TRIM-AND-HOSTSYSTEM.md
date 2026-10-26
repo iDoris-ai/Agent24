@@ -1,14 +1,14 @@
 # R05-5：发送副本按来源 kind 整形，与 HostSystem 来源
 
-基线是 `origin/ab/memory-p1` 的 tip `b9e4eb5f059e1d406e562cfbd4ec368ef5b5fc1e`，即 PR #1205 的 merge。本稿是契约，不写代码。评审对象是分支 `ab/memory-p1-49-r05-5-send-trim` 的精确 head。clestons 对该 head 的 APPROVE 只接受本稿条目。本稿不勾 PLAN，不改 R05-1 到 R05-4 的原文。
+基线是 `origin/ab/memory-p1` 的 tip `b9e4eb5f059e1d406e562cfbd4ec368ef5b5fc1e`，即 PR #1205 的 merge。本稿是契约，不写代码。评审对象是分支 `ab/memory-p1-49-r05-5-send-trim` 的精确 head。clestons 对该 head 的 APPROVE 只接受本稿条目。本稿不勾 PLAN，不改 R05-1 到 R05-4 的原文。R05-4 尚未合入 `ab/memory-p1`：它在 PR #1245，分支 `ab/memory-p1-47-h03-closeout`，head `968d2db3`。本稿凡引用 R05-4，都指该 PR 的该 head。
 
 本稿改动两个文件：新增本稿，修订 `docs/adr/ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md`。不改 Rust、migrations、OpenAPI、协议。
 
 ## 1. 现状（已核对事实）
 
-`rust/crates/agent24-agent/src/lib.rs::request_messages_for` 仍只按位置 0 的消息判定宿主 recall。判据是该消息 role 为 user，正文以 `RECALL_PREFIX` 开头，且以 `RECALL_END_MARKER` 结尾。它不读 `run_message_origins` 的 kind。命中后，它用 `memory.active_ids()` 的结果交给同文件的 `prune_stale_recall_message`，按行裁掉已失效的 id；全部失效则从发送副本移除整条；`active_ids()` 失败则移除整条并记 warn。
+`rust/crates/agent24-agent/src/lib.rs::request_messages_for` 仍只按位置 0 的消息判定宿主 recall。判据是该消息 role 为 user，正文以 `RECALL_PREFIX` 开头，且以 `RECALL_END_MARKER` 结尾。它不读 `run_message_origins` 的 kind。`self.memory` 为 None 时，它在判定之前就返回 `normalize_for_provider(messages)`，不裁任何东西。`rust/apps/agent24d/src/server.rs::open_memory_base` 打开记忆库失败时返回 None，所以重启后的冷恢复可以走到这条分支，带合法来源的旧 recall 也能通过来源门。memory 存在时，命中后，它用 `memory.active_ids()` 的结果交给同文件的 `prune_stale_recall_message`，按行裁掉已失效的 id；全部失效则从发送副本移除整条；`active_ids()` 失败则移除整条并记 warn。
 
-因此用户自己输入的、恰好同形的整段文字，仍会被当成 recall 裁剪或丢弃。这是 P02 探针报告里的原始缺陷。#1197 和 #1205 没有修它。#1197 只加了拒发门 `persisted_origins_allow_send`。#1205 只加了 provider 返回 role 的门。这两道门不改变放行之后的整形。R05-4 第 2 节已写明这一点。
+因此用户自己输入的、恰好同形的整段文字，仍会被当成 recall 裁剪或丢弃。这是 P02 探针报告里的原始缺陷。#1197 和 #1205 没有修它。#1197 只加了拒发门 `persisted_origins_allow_send`。#1205 只加了 provider 返回 role 的门。这两道门不改变放行之后的整形。R05-4（PR #1245，head `968d2db3`，未合并）第 2 节已写明这一点。
 
 另有三条已核对的事实，本稿后文要用：
 
@@ -25,13 +25,14 @@
 1. 是否宿主 recall，只看该 seq 已落盘来源的 kind 是否为 HostRecall。不再看文本标记。
 2. `RECALL_PREFIX` 与 `RECALL_END_MARKER` 只用于在已证明的 HostRecall 正文里定位要裁的行。
 3. HostRecall 不限位置 0，按 seq 逐条处理。
-4. 其余 kind（UserPrompt、SessionHistory、Assistant、ToolResult，以及第 3 节的 HostSystem）逐字发送，不裁剪，不移除。
-5. 裁剪只作用于发送副本。库里的消息正文、来源行、snapshot 都不改。
-6. 整形完成后才调用 `normalize_for_provider`（与 ADR 第 3 节第 6 条一致）。
+4. `self.memory` 为 None（`open_memory_base` 失败）时，同样移除全部 Present 的 HostRecall，因为无法证明其中的 id 仍有效，失败关闭。此时记 warn。UserPrompt、SessionHistory、Assistant、ToolResult、HostSystem 照常逐字发送。
+5. 其余 kind（UserPrompt、SessionHistory、Assistant、ToolResult，以及第 3 节的 HostSystem）逐字发送，不裁剪，不移除。
+6. 裁剪只作用于发送副本。库里的消息正文、来源行、snapshot 都不改。
+7. 整形完成后才调用 `normalize_for_provider`（与 ADR 第 3 节第 6 条一致）。
 
 | 行 | provider 可以收到什么 | 必须裁掉什么 | snapshot 是否保持 |
 | --- | --- | --- | --- |
-| HostRecall（Present，recall_ref 非 NULL） | 正文中 id 仍在当前有效集合内的行，连同头和结束标记。 | 沿用 `prune_stale_recall_message` 的逐行规则，裁掉 id 已失效的行。全部失效则整条从发送副本移除。读取有效 id 集合失败则整条移除并记 warn（失败关闭）。 | 保持。库里正文与来源行不变。 |
+| HostRecall（Present，recall_ref 非 NULL） | 正文中 id 仍在当前有效集合内的行，连同头和结束标记。 | 沿用 `prune_stale_recall_message` 的逐行规则，裁掉 id 已失效的行。全部失效则整条从发送副本移除。读取有效 id 集合失败，或 memory 为 None，则整条移除并记 warn（失败关闭）。 | 保持。库里正文与来源行不变。 |
 | UserPrompt | 逐字发送。 | 无。永不裁剪，永不移除，即使正文与 recall 块完全同形。 | 保持。 |
 | SessionHistory | 逐字发送，role 为 user、assistant、tool、system 都一样。 | 无。永不裁剪，永不移除，即使正文与 recall 块完全同形。 | 保持。 |
 | 同文三来源 | 同一段正文分成 HostRecall、UserPrompt、SessionHistory 三行时，三行各按自己的 kind 处理：HostRecall 行按上面规则裁，另两行逐字到达。digest 相同不影响处理。 | 只有 HostRecall 那一行可能被裁。 | 保持，三行都不变。 |
@@ -57,20 +58,26 @@
 | `send_copy_drops_host_recall_when_active_ids_unreadable` | `active_ids()` 失败：HostRecall 整条消失，同一请求里的 UserPrompt 仍在，且有 warn。 |
 | `send_copy_three_same_text_origins_each_by_kind` | 同文三行：只有 HostRecall 行被裁，另两行逐字到达。 |
 | `send_copy_trim_leaves_snapshot_bytes_unchanged` | 裁剪前后读 `list_run_messages` 与 `read_run_message_origin`：正文、kind、digest、recall_ref 逐字节不变。 |
-| `resume_after_restart_sends_same_copy_as_live` | 新建一个 manager 模拟 daemon 重启，走 `resume_run`。provider spy 收到的发送副本与同进程审批唤醒路径逐条相等。 |
+| `resume_after_restart_drops_revoked_recall_line` | 不比较两条路径是否相等，因为两边都发出撤回内容也能相等。步骤：run 挂起等审批；撤回 recall 块中的一个 id；丢弃 manager；用同一个数据文件重新打开持久库；新建 manager 走 `resume_run`。独立断言：被撤回 id 的行不在 provider spy 收到的副本里；其余有效行、普通 history、UserPrompt 与库里正文逐字相等。 |
+| `resume_after_append_binds_kind_by_store_seq` | 本轮已追加 assistant 与 tool 消息之后再次发送（审批后第二次迭代）。断言 HostRecall 仍被裁，UserPrompt 与 SessionHistory 逐字，且 kind 来自库里的 seq。构造一个内存下标与 seq 不对齐的夹具（例如 HostRecall 同形正文出现在非位置 0 的 UserPrompt 上），证明不是按下标推断。 |
+| `send_copy_drops_host_recall_when_memory_is_none` | 记忆库打不开（`self.memory` 为 None）时恢复，Present 的 HostRecall 不出现在发送副本里；UserPrompt、SessionHistory 照常逐字到达；有 warn。 |
 | `send_copy_handles_host_recall_not_at_position_zero` | 位置非 0 的 HostRecall 也被处理。当前写点只在位置 0 写 HostRecall，测试用直接构造的来源行覆盖（经 `append_originated_run_messages` 写入）。 |
 
 ## 3. HostSystem 来源
 
 产品负责人 jason 于 2026-10-26 拍板。
 
-1. 推翻 R05-2 D7d 中「暂停通知没有现成 kind，保持无来源行，读取继续是 Missing」这一条，以及 R05-4 第 1 节表里「暂停通知是有类型的无来源行」的说法。D7d 其余文字不再适用于暂停通知；R05-2 原文不改。
+1. 推翻 R05-2 D7d 中「暂停通知没有现成 kind，保持无来源行，读取继续是 Missing」这一条，以及 R05-4（PR #1245，head `968d2db3`，未合并）第 1 节表里「暂停通知是有类型的无来源行」的说法。D7d 其余文字不再适用于暂停通知；R05-2 原文不改。
 2. 新增来源 kind `HostSystem`，用于宿主生成的系统性通知。首个且唯一的写点是记忆暂停时 `execute` 写入的暂停通知。`recall_ref` 为 SQL NULL。非 NULL 在读取时不得变成 Present。digest 规则不变，仍绑定 schema_version、role、content、tool_calls、tool_call_id。
 3. 发送语义：Present 的 HostSystem 逐字发送，不裁剪，不是 HostRecall。
 4. 存储：需要一个新迁移。编号是下一个，即 `0023`（`rust/crates/agent24-store/migrations/` 现有最大编号是 `0022_run_message_origin_kinds.sql`）。做法照 0022：建 `run_message_origins_next`，CHECK 加入 `HostSystem`，复制旧行，删旧表，改名。不改 0021、0022。不回填既有无来源的暂停通知行。
 5. 旧 run 没有来源行：继续停发，不回填。这是 jason 2026-10-26 的确认。已存在的无来源暂停通知行仍读成 Missing，相关旧 run 仍按 #1197 以 `source_unproven` 拒发。
 6. 写点变化（属 4a）：暂停通知改走 `Originated`，带 `MessageOrigin::HostSystem`。`SnapshotRunMessage::PauseNotice` 变体在 4a 里是删除还是保留，由 4a 决定，但生产路径不得再写出无来源的暂停通知。`chat_memory_prelude` 的那一处不落库，不在本节范围。
-7. 用户可见效果：记忆暂停后，用户说「记住 X」，新 run 不再以 `source_unproven` 失败。暂停通知照常进入发送副本。
+7. 用户可见效果：记忆暂停后，用户说「记住 X」，新 run 不再以 `source_unproven` 失败，状态为 Completed。暂停通知照常进入发送副本。
+8. 被取代的结论：除 R05-2 D7d 外，R05-3 的 D7f4（暂停通知不是 `persist_message` 的行，仍按 D7d 保持无来源，读取继续是 Missing）里「暂停通知无来源」的结论也一并被本节取代。D7f4 说暂停通知不经 `persist_message` 这一事实不变。
+9. 4a 必须同步修改的既有测试期望：
+   - `rust/apps/agent24d/src/memory_routes.rs::rest_pause_blocks_the_write_and_tells_the_model_review_h1`。现在期望 Failed、`source_unproven`、provider 零调用。改为：新 run 状态为 Completed，provider 收到暂停通知。该测试里「不写记忆、发 `memory.write_skipped{reason:"paused"}`」的断言保留，恢复开启后的对照段也保留。
+   - `rust/crates/agent24-agent/src/source_send_gate_tests.rs::pause_notice_fails_the_run_and_keeps_snapshot_rows`。现在期望 Failed、`source_unproven`、provider 未被调用，且通知读成 Missing。改为：新 run 为 Completed，provider 收到暂停通知，通知读成 Present 的 HostSystem。快照行数与顺序（通知、历史、历史、prompt）的断言保留。该测试仍需另有一个手工插入无来源暂停通知行的反例，由第 3 节的 `legacy_unsourced_pause_notice_still_refused` 承担。
 
 不变的边界：模型、tool、客户端 body 不得指定 HostSystem。REST 的 role=system 或自报 source 不是宿主构造证明。HostSystem 不授予工具权限，也不扩大 K1 路由。
 
@@ -89,7 +96,7 @@
 
 | 片 | 内容 |
 | --- | --- |
-| 4a | HostSystem：迁移 `0023`，`MessageOrigin::HostSystem` 的读写，暂停通知写点切换，第 3 节的测试。 |
+| 4a | HostSystem：迁移 `0023`，`MessageOrigin::HostSystem` 的读写，暂停通知写点切换，第 3 节的测试，以及第 3 节第 9 条列出的两个既有测试的期望修改。 |
 | 4b | H03-b：`request_messages_for` 按 kind 整形，第 2 节的测试。 |
 
 4a 与 4b 谁先都行，各自独立。4b 不依赖 4a：HostSystem 之前，暂停通知行仍是 Missing，被拒发门挡在整形之前；4b 对 kind 的 match 里，HostSystem 在 4a 合并后才有该变体，4b 先合时不引用它。
@@ -98,7 +105,7 @@
 
 - 只新增本稿，并按需修订 ADR（状态行、基线、已落地边界、决策记录）。
 - 不勾 PLAN 的 R02、R05 或 H03。
-- 不改 R05-1、R05-2、R05-3、R05-4 原文。
+- 不改 R05-1、R05-2、R05-3 原文，不改 R05-4（PR #1245，head `968d2db3`，未合并）原文。
 - 不改 Rust、migrations、OpenAPI、协议。
 - 不实现 G1、G2、G4、G5、K1 或冷恢复矩阵。
 - 不启动 purge，不做 P1-02c，不改 #794，不开 H04，不开 release。
