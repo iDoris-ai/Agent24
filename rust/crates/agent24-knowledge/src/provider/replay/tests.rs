@@ -1,6 +1,9 @@
 #![allow(clippy::unwrap_used)]
 
+use std::collections::BTreeSet;
+
 use super::*;
+use crate::provider::evidence::{Kbs, Pending, Rule, Saved};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct T;
@@ -11,6 +14,7 @@ impl Ids for T {
     type Run = u32;
     type Principal = &'static str;
     type Identity = &'static str;
+    type Kb = &'static str;
 }
 
 type C = Change<T>;
@@ -416,7 +420,213 @@ fn a_binding_bound_twice_or_below_its_profile_s_values_is_damage() {
         bind("a", 2, 9),
     ];
     assert_eq!(damaged(below), Err(Damaged));
-    // Past it, or another profile's first value: sound.
+    // No first value at all (S4.4: it starts at 1).
+    assert_eq!(damaged(vec![bind("a", 1, 0)]), Err(Damaged));
     let sound = vec![bind("a", 1, 9), bind("a", 2, 10), bind("b", 3, 1)];
     assert_eq!(damaged(sound).unwrap().bindings.len(), 3);
+}
+
+fn kbs(all: &[&'static str]) -> BTreeSet<&'static str> {
+    all.iter().copied().collect()
+}
+
+fn placed(binding: u32, epoch: u64, kbs: Kbs<&'static str>) -> C {
+    C::Placed {
+        of: of("a", binding),
+        rule: Rule { epoch, kbs },
+    }
+}
+
+#[test]
+fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
+    let a = || of("a", 1);
+    let changes = vec![
+        bind("a", 1, 1),
+        placed(1, 1, Kbs::All),
+        C::Seen {
+            of: a(),
+            kbs: kbs(&["k", "l", "m"]),
+        },
+        // Questioned twice, then released at the first version only.
+        C::Questioned {
+            of: a(),
+            kbs: kbs(&["k"]),
+            version: 1,
+            timeouts: Some(0),
+        },
+        C::Questioned {
+            of: a(),
+            kbs: kbs(&["l"]),
+            version: 2,
+            timeouts: Some(0),
+        },
+        C::Released {
+            of: a(),
+            kbs: kbs(&["k"]),
+            version: 1,
+        },
+        C::TimedOut { of: a(), count: 2 },
+        // A tombstone takes its KB out of the set; a deletion ends it.
+        C::Tombstone { of: a(), kb: "l" },
+        C::Tombstone { of: a(), kb: "n" },
+        placed(1, 2, Kbs::One("n")),
+        C::Tombstone { of: a(), kb: "o" },
+        C::TombstoneWithdrawn { of: a(), kb: "o" },
+        C::Unseen {
+            of: a(),
+            kbs: kbs(&["m"]),
+        },
+        // Not bound: nothing changes.
+        C::Seen {
+            of: of("a", 9),
+            kbs: kbs(&["z"]),
+        },
+    ];
+    let state = replay(1, log(changes)).unwrap();
+    let expected = Saved {
+        epoch: 2,
+        rules: vec![
+            Rule {
+                epoch: 1,
+                kbs: Kbs::All,
+            },
+            Rule {
+                epoch: 2,
+                kbs: Kbs::One("n"),
+            },
+        ],
+        version: 2,
+        pending: Some(Pending {
+            kbs: kbs(&["k", "l"]),
+            timeouts: 2,
+        }),
+        tombstones: kbs(&["l"]),
+        visible: kbs(&["k"]),
+    };
+    assert_eq!(state.bindings[0].evidence, expected);
+    // Released at the current version, and the count cleared.
+    let more = |tail: Vec<C>| {
+        let head = vec![
+            bind("a", 1, 1),
+            C::Questioned {
+                of: a(),
+                kbs: kbs(&["k"]),
+                version: 3,
+                timeouts: Some(0),
+            },
+            C::TimedOut { of: a(), count: 2 },
+        ];
+        replay(1, log([head, tail].concat())).unwrap().bindings[0]
+            .evidence
+            .clone()
+    };
+    let cleared = more(vec![C::TimeoutsCleared { of: a(), from: 2 }]);
+    assert_eq!(cleared.pending.map(|p| p.timeouts), Some(0));
+    let released = more(vec![C::Released {
+        of: a(),
+        kbs: kbs(&["k"]),
+        version: 3,
+    }]);
+    assert_eq!(released.pending, None);
+    // An offset re-registering an older version does not take it back.
+    let older = more(vec![C::Questioned {
+        of: a(),
+        kbs: kbs(&["k"]),
+        version: 2,
+        timeouts: Some(0),
+    }]);
+    assert_eq!(older.version, 3);
+    // A count with nothing pending is not kept.
+    let idle = replay(
+        1,
+        log(vec![bind("a", 1, 1), C::TimedOut { of: a(), count: 1 }]),
+    );
+    assert_eq!(idle.unwrap().bindings[0].evidence.pending, None);
+}
+
+#[test]
+fn an_epoch_that_does_not_advance_is_damage() {
+    let changes = vec![
+        bind("a", 1, 1),
+        placed(1, 2, Kbs::All),
+        placed(1, 2, Kbs::One("k")),
+    ];
+    assert_eq!(replay(1, log(changes)), Err(Damaged));
+    // On a number given up the rule stands; a release does not.
+    let a = || of("a", 1);
+    let records = vec![
+        Record {
+            seq: 1,
+            entry: Entry::Changes(vec![bind("a", 1, 1)]),
+        },
+        Record {
+            seq: 2,
+            entry: Entry::Changes(vec![C::Questioned {
+                of: a(),
+                kbs: kbs(&["k"]),
+                version: 1,
+                timeouts: Some(0),
+            }]),
+        },
+        Record {
+            seq: 3,
+            entry: Entry::Changes(vec![
+                placed(1, 1, Kbs::One("k")),
+                C::Released {
+                    of: a(),
+                    kbs: kbs(&["k"]),
+                    version: 1,
+                },
+            ]),
+        },
+        Record {
+            seq: 3,
+            entry: Entry::Void,
+        },
+    ];
+    let evidence = &replay(1, records).unwrap().bindings[0].evidence;
+    assert_eq!(evidence.epoch, 1);
+    assert!(evidence.pending.is_some());
+}
+
+#[test]
+fn a_release_that_landed_though_abandoned_keeps_the_count() {
+    // ST-26g: two timeouts in a row persisted, then a release written and
+    // abandoned (I1) that lands all the same.
+    let a = || of("a", 1);
+    let questioned = |version, timeouts| C::Questioned {
+        of: a(),
+        kbs: kbs(&["k"]),
+        version,
+        timeouts,
+    };
+    let released = C::Released {
+        of: a(),
+        kbs: kbs(&["k"]),
+        version: 1,
+    };
+    let count = |between: Vec<C>, after: C| {
+        let head = vec![
+            bind("a", 1, 1),
+            questioned(1, Some(0)),
+            C::TimedOut { of: a(), count: 2 },
+            released.clone(),
+        ];
+        let state = replay(1, log([head, between, vec![after]].concat())).unwrap();
+        let evidence = &state.bindings[0].evidence;
+        assert_eq!(evidence.version, 2);
+        evidence.pending.as_ref().map(|p| p.timeouts)
+    };
+    let offset = || released.offset().unwrap();
+    // Its offset brings the count back, or a registration meanwhile does.
+    assert_eq!(count(vec![], offset()), Some(2));
+    assert_eq!(count(vec![], questioned(2, Some(2))), Some(2));
+    // Cleared by a retry, or timed out again, while the release pended: the
+    // offset brings back the count as it then stood.
+    let cleared = C::TimeoutsCleared { of: a(), from: 2 };
+    assert_eq!(count(vec![cleared], offset()), Some(0));
+    let again = C::TimedOut { of: a(), count: 3 };
+    assert_eq!(count(vec![again], offset()), Some(3));
+    // Released for good: a later registration starts from its own count.
+    assert_eq!(count(vec![], questioned(2, Some(0))), Some(0));
 }
