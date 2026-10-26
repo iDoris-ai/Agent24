@@ -279,11 +279,21 @@ pub trait AssertionStore: Send + Sync {
 #[derive(Clone)]
 pub struct AssertionLedger {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl AssertionLedger {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Insert one assertion row on a caller-owned connection — no transaction of
@@ -364,6 +374,7 @@ impl AssertionLedger {
 #[async_trait]
 impl AssertionStore for AssertionLedger {
     async fn assert(&self, a: &Assertion) -> Result<AssertionId> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         // Serialize the whole correction so a superseded row cannot be left open
         // by a crash between the two writes.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -390,6 +401,7 @@ impl AssertionStore for AssertionLedger {
     async fn retract(&self, id: &AssertionId, owner: &str, at: &str) -> Result<()> {
         // Owner-scoped like the assert/supersede path: a foreign id cannot close
         // this owner's belief, and this owner's id cannot reach across tenants.
+        self.gate.check(crate::disk_gate::WriteClass::Retract)?;
         sqlx::query(
             "UPDATE mem_assertions SET recorded_to = ?
              WHERE id = ? AND scope_owner = ? AND recorded_to IS NULL",

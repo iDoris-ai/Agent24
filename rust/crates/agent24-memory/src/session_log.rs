@@ -12,6 +12,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 #[derive(Clone)]
 pub struct SessionLog {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
     #[cfg(test)]
     probe: Option<std::sync::Arc<regression_tests::Probe>>,
 }
@@ -62,9 +63,16 @@ impl SessionLog {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
             #[cfg(test)]
             probe: None,
         }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// The caller's stable turn number distinguishes repeated identical user
@@ -82,6 +90,7 @@ impl SessionLog {
         assistant: &Msg,
         assistant_origin: Origin,
     ) -> Result<TurnIds> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope = Scope::owner(owner).with_session(session);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ids = TurnIds {
@@ -163,6 +172,7 @@ impl SessionLog {
         owner: &str,
         legacy: &CanonicalSession,
     ) -> Result<ImportOutcome> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope = Scope::owner(owner).with_session(&legacy.session_id);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists: bool = sqlx::query_scalar(
@@ -225,6 +235,7 @@ impl SessionLog {
         summary: &str,
         covered_through_seq: i64,
     ) -> Result<i64> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope = Scope::owner(owner).with_session(session);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let nonce: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM mem_events")

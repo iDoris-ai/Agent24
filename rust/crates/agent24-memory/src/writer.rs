@@ -165,11 +165,21 @@ pub trait MemoryWriter: Send + Sync {
 #[derive(Clone)]
 pub struct WriteGate {
     pool: sqlx::SqlitePool,
+    disk: crate::disk_gate::DiskGate,
 }
 
 impl WriteGate {
     pub(crate) fn new(pool: sqlx::SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            disk: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.disk = gate;
+        self
     }
 
     /// The DETERMINISTIC policy: same candidate → same outcome, no I/O.
@@ -727,6 +737,11 @@ impl WriteGate {
 #[async_trait]
 impl MemoryWriter for WriteGate {
     async fn propose(&self, candidates: Vec<Candidate>) -> Result<Vec<WriteDecision>> {
+        // Every outcome of a proposal (commit, hold, reject) writes an audit
+        // event, so the whole batch is one content write for the disk check.
+        if !candidates.is_empty() {
+            self.disk.check(crate::disk_gate::WriteClass::Content)?;
+        }
         let mut out = Vec::with_capacity(candidates.len());
         for c in &candidates {
             let decision = match Self::policy(c) {
