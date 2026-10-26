@@ -944,6 +944,54 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /peer/runs:
+    get:
+      operationId: listPeerRuns
+      x-milestone: K1-6b
+      tags: [runs]
+      summary: List runs as a peer bridge may relay them
+      description: |
+        K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
+        runs here instead of /runs. A run's prompt, output and error appear
+        only when every source tagged on it is ordinary, it has ended, and —
+        while tool results carry no source tags — it cannot have taken one in:
+        it called no tool, recalled no memory, was not started by a
+        kernel-created schedule, and has no session context (no session, or it
+        ran, and the daemon runs, without session memory). Any other run
+        carries only its id,
+        status and a fixed notice.
+      responses:
+        "200":
+          description: Peer run list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PeerRun"
+
+  /peer/runs/{id}:
+    get:
+      operationId: getPeerRun
+      x-milestone: K1-6b
+      tags: [runs]
+      summary: Get one run as a peer bridge may relay it
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Peer run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PeerRun"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /approvals:
     get:
       operationId: listApprovals
@@ -3044,6 +3092,43 @@ components:
         ended_at:
           type: [string, "null"]
           format: date-time
+
+    PeerRun:
+      type: object
+      description: |
+        K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
+        filtered Run, so a field added to Run later is not relayed by default.
+      required: [id, status, withheld, prompt, output, error, notice]
+      properties:
+        id:
+          type: string
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        withheld:
+          type: boolean
+          description: |
+            True unless every source tagged on the run so far is ordinary and
+            the run called no tool, recalled no memory, was not started by a
+            kernel-created schedule and has no session context. Sources are
+            tagged before the first model call, so afterwards the value only
+            changes when the run starts a tool or the daemon restarts with
+            session memory turned on or off.
+        prompt:
+          type: [string, "null"]
+          description: Present only for an ended run that is not withheld
+        output:
+          oneOf:
+            - $ref: "#/components/schemas/RunOutput"
+            - type: "null"
+          description: Present only for a completed run that is not withheld
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorBody"
+            - type: "null"
+          description: Present only for a failed run that is not withheld
+        notice:
+          type: [string, "null"]
+          description: Fixed explanation, present exactly when withheld is true
 
     RunCreate:
       type: object
