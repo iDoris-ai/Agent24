@@ -571,6 +571,17 @@ fn a_revocation_on_a_discarded_credential_registers_what_it_asked() {
     assert_eq!(recheck.rule, None);
     assert!(binding.facts().reverify_pending);
     assert_eq!(binding.evidence().epoch(), 0);
+    // An empty Q fails closed: every KB's evidence becomes placeholders.
+    let (mut binding, old) = discarded();
+    let empty = binding.response(old, Signal::Revoked, [], now);
+    assert_eq!(empty.value, Outcome::Recheck);
+    assert_eq!(
+        empty.rule,
+        Some(Rule {
+            epoch: 1,
+            kbs: Kbs::All
+        })
+    );
 }
 
 #[test]

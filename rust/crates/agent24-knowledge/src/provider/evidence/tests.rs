@@ -425,6 +425,12 @@ fn evidence_of_several_kbs_shows_by_the_strictest_of_them() {
     assert_eq!(evidence.shown(false, &pack(1)), Shown::Withheld);
     assert!(evidence.release(1));
     assert_eq!(evidence.shown(false, &pack(1)), Shown::Body);
+    // Evidence naming no KB is held back (#1305 note 4).
+    let none = Delivered {
+        kbs: BTreeSet::new(),
+        epoch: 1,
+    };
+    assert_eq!(evidence.shown(false, &none), Shown::Withheld);
     // Each of its KBs counts as delivered, and only those.
     let mut evidence = E::default();
     evidence.delivered(["a"], 0);

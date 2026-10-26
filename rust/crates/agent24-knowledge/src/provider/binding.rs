@@ -195,7 +195,8 @@ impl<K: Ord + Clone> BindingState<K> {
     /// [`Credentials::response`]. `asked` is the request's KBs, or for one
     /// without KBs (an issuance) its credential's granted scope, never empty
     /// (S3.1): a revocation signal on a discarded credential registers them
-    /// for re-verification, admitting nothing until it is released (§6).
+    /// for re-verification, admitting nothing until it is released (§6). An
+    /// empty one fails closed: a rule over every KB (#1305 note 3).
     pub fn response(
         &mut self,
         credential: CredentialId,
@@ -206,9 +207,12 @@ impl<K: Ord + Clone> BindingState<K> {
         let outcome = self
             .credentials
             .response(&mut self.connection, credential, signal, now);
-        if outcome == Outcome::Recheck {
-            let registered = self.evidence.register(asked);
-            debug_assert!(registered, "S3.1: Q is never empty");
+        if outcome == Outcome::Recheck && !self.evidence.register(asked) {
+            let rule = Some(self.evidence.place(Kbs::All));
+            return WithRule {
+                value: outcome,
+                rule,
+            };
         }
         self.ruled_outcome(outcome)
     }
