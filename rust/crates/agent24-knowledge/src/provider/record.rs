@@ -2,12 +2,13 @@
 //! A.1, A.4, A.5 as reference): the class of each, the tightening that offsets
 //! an abandoned loosening, and whether a record landing late on a sequence
 //! number given up still counts. Pure data: the host numbers and writes them
-//! (KB-C1-04 slice 6); `replay` reads them back. Evidence epochs, placeholder
-//! rules, tombstones, revalidation and the visible set join with slice 5.
+//! (KB-C1-04 slice 6); `replay` reads them back.
 
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+use super::evidence::Rule;
 use super::ledger::Scope;
 use super::profile::Confirmation;
 use super::state::{PlaceholderFailure, UnavailableCause};
@@ -44,6 +45,8 @@ pub trait Ids: Clone + Debug + Eq {
     type Principal: Clone + Debug + Eq;
     /// An identity tuple: a binding's, or a run's candidate (S4.7).
     type Identity: Clone + Debug + Eq;
+    /// A KB of the binding's server (S5.6, S5.10).
+    type Kb: Clone + Debug + Ord;
 }
 
 /// A binding with the profile its changes count for (S4.9, I1).
@@ -155,6 +158,56 @@ pub enum Change<I: Ids> {
         run: I::Run,
         of: Of<I>,
     },
+    /// A placeholder rule, at the epoch it advanced to (S5.6). A deletion's
+    /// also ends its tombstone (S5.10).
+    Placed {
+        of: Of<I>,
+        rule: Rule<I::Kb>,
+    },
+    /// Pending re-verification registered: the KBs merge in, `version` is
+    /// the one it advanced to (S3.1).
+    Questioned {
+        of: Of<I>,
+        kbs: BTreeSet<I::Kb>,
+        version: u64,
+    },
+    /// Released at `version`, over the KBs then pending.
+    Released {
+        of: Of<I>,
+        kbs: BTreeSet<I::Kb>,
+        version: u64,
+    },
+    /// A recheck timed out: the count in a row now.
+    TimedOut {
+        of: Of<I>,
+        count: u8,
+    },
+    /// The count cleared, from `from`.
+    TimeoutsCleared {
+        of: Of<I>,
+        from: u8,
+    },
+    /// Before the host deletes `kb` (S5.10).
+    Tombstone {
+        of: Of<I>,
+        kb: I::Kb,
+    },
+    /// The deletion failed.
+    TombstoneWithdrawn {
+        of: Of<I>,
+        kb: I::Kb,
+    },
+    /// KBs that joined the last visible set (S5.10). Not listed in S1.10's
+    /// classes; a tightening, as losing one lets a narrowing of it go unseen.
+    Seen {
+        of: Of<I>,
+        kbs: BTreeSet<I::Kb>,
+    },
+    /// KBs a narrowing removed from it, written with the narrowing's rule.
+    Unseen {
+        of: Of<I>,
+        kbs: BTreeSet<I::Kb>,
+    },
     Started,
     Shutdown,
 }
@@ -173,7 +226,13 @@ impl<I: Ids> Change<I> {
             | Self::Logout(_)
             | Self::Revoked(_)
             | Self::Stuck { .. }
-            | Self::RunUnbound { .. } => Class::Tightening,
+            | Self::RunUnbound { .. }
+            | Self::Placed { .. }
+            | Self::Questioned { .. }
+            | Self::TimedOut { .. }
+            | Self::Tombstone { .. }
+            | Self::Seen { .. }
+            | Self::Unseen { .. } => Class::Tightening,
             Self::On
             | Self::PromptConfirmed
             | Self::Enable(_)
@@ -185,7 +244,10 @@ impl<I: Ids> Change<I> {
             | Self::Relogin(_)
             | Self::Unstuck { .. }
             | Self::RunBound { .. }
-            | Self::RunBackfilled { .. } => Class::Loosening,
+            | Self::RunBackfilled { .. }
+            | Self::Released { .. }
+            | Self::TimeoutsCleared { .. }
+            | Self::TombstoneWithdrawn { .. } => Class::Loosening,
             Self::Generation { .. } => Class::Generation,
             Self::Started | Self::Shutdown => Class::Lifecycle,
         }
@@ -216,7 +278,16 @@ impl<I: Ids> Change<I> {
             | Self::Bind { of, .. }
             | Self::Stuck { of, .. }
             | Self::Unstuck { of, .. }
-            | Self::RunBackfilled { of, .. } => vec![of.profile.clone()],
+            | Self::RunBackfilled { of, .. }
+            | Self::Placed { of, .. }
+            | Self::Questioned { of, .. }
+            | Self::Released { of, .. }
+            | Self::TimedOut { of, .. }
+            | Self::TimeoutsCleared { of, .. }
+            | Self::Tombstone { of, .. }
+            | Self::TombstoneWithdrawn { of, .. }
+            | Self::Seen { of, .. }
+            | Self::Unseen { of, .. } => vec![of.profile.clone()],
             Self::RunUnbound { profiles, .. } => profiles.clone(),
             Self::RunBound {
                 bindings,
@@ -271,6 +342,19 @@ impl<I: Ids> Change<I> {
                 run: run.clone(),
                 profiles: vec![of.profile.clone()],
             },
+            Self::Released { of, kbs, version } => Self::Questioned {
+                of: of.clone(),
+                kbs: kbs.clone(),
+                version: version.saturating_add(1),
+            },
+            Self::TimeoutsCleared { of, from } => Self::TimedOut {
+                of: of.clone(),
+                count: *from,
+            },
+            Self::TombstoneWithdrawn { of, kb } => Self::Tombstone {
+                of: of.clone(),
+                kb: kb.clone(),
+            },
             // Listed, not `_`: a new loosening must say what offsets it.
             Self::Servable(_)
             | Self::Off
@@ -286,6 +370,12 @@ impl<I: Ids> Change<I> {
             | Self::Revoked(_)
             | Self::Stuck { .. }
             | Self::RunUnbound { .. }
+            | Self::Placed { .. }
+            | Self::Questioned { .. }
+            | Self::TimedOut { .. }
+            | Self::Tombstone { .. }
+            | Self::Seen { .. }
+            | Self::Unseen { .. }
             | Self::Started
             | Self::Shutdown => return None,
         })

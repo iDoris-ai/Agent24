@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use crate::provider::evidence::Kbs;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct T;
@@ -11,12 +12,17 @@ impl Ids for T {
     type Run = u32;
     type Principal = &'static str;
     type Identity = &'static str;
+    type Kb = &'static str;
 }
 
 type C = Change<T>;
 
 fn of(profile: &'static str, binding: u32) -> Of<T> {
     Of { profile, binding }
+}
+
+fn kbs(all: &[&'static str]) -> BTreeSet<&'static str> {
+    all.iter().copied().collect()
 }
 
 /// One of every change, each with the class S1.10 (or the record's own
@@ -116,7 +122,81 @@ fn every() -> Vec<(C, Class)> {
             },
             Loosening,
         ),
-        (C::RunBackfilled { run: 7, of: a }, Loosening),
+        (
+            C::RunBackfilled {
+                run: 7,
+                of: a.clone(),
+            },
+            Loosening,
+        ),
+        (
+            C::Placed {
+                of: a.clone(),
+                rule: Rule {
+                    epoch: 1,
+                    kbs: Kbs::All,
+                },
+            },
+            Tightening,
+        ),
+        (
+            C::Questioned {
+                of: a.clone(),
+                kbs: kbs(&["k"]),
+                version: 1,
+            },
+            Tightening,
+        ),
+        (
+            C::Released {
+                of: a.clone(),
+                kbs: kbs(&["k"]),
+                version: 1,
+            },
+            Loosening,
+        ),
+        (
+            C::TimedOut {
+                of: a.clone(),
+                count: 1,
+            },
+            Tightening,
+        ),
+        (
+            C::TimeoutsCleared {
+                of: a.clone(),
+                from: 1,
+            },
+            Loosening,
+        ),
+        (
+            C::Tombstone {
+                of: a.clone(),
+                kb: "k",
+            },
+            Tightening,
+        ),
+        (
+            C::TombstoneWithdrawn {
+                of: a.clone(),
+                kb: "k",
+            },
+            Loosening,
+        ),
+        (
+            C::Seen {
+                of: a.clone(),
+                kbs: kbs(&["k"]),
+            },
+            Tightening,
+        ),
+        (
+            C::Unseen {
+                of: a,
+                kbs: kbs(&["k"]),
+            },
+            Tightening,
+        ),
         (C::Started, Lifecycle),
         (C::Shutdown, Lifecycle),
     ]
@@ -193,11 +273,45 @@ fn an_abandoned_loosening_is_offset_by_its_counterpart() {
             },
         ),
         (
-            C::RunBackfilled { run: 7, of: a },
+            C::RunBackfilled {
+                run: 7,
+                of: a.clone(),
+            },
             C::RunUnbound {
                 run: 7,
                 profiles: vec!["a"],
             },
+        ),
+        // Registered again over the KBs released, past their version.
+        (
+            C::Released {
+                of: a.clone(),
+                kbs: kbs(&["k", "l"]),
+                version: 4,
+            },
+            C::Questioned {
+                of: a.clone(),
+                kbs: kbs(&["k", "l"]),
+                version: 5,
+            },
+        ),
+        // The count as it was before it was cleared.
+        (
+            C::TimeoutsCleared {
+                of: a.clone(),
+                from: 2,
+            },
+            C::TimedOut {
+                of: a.clone(),
+                count: 2,
+            },
+        ),
+        (
+            C::TombstoneWithdrawn {
+                of: a.clone(),
+                kb: "k",
+            },
+            C::Tombstone { of: a, kb: "k" },
         ),
     ];
     for (loosening, offset) in pairs {
@@ -251,6 +365,24 @@ fn a_change_counts_for_its_profile_or_the_host() {
     };
     assert_eq!(empty.scope(), Some(Scope::Host));
     assert_eq!(empty.offset().unwrap().scope(), Some(Scope::Host));
+    // Evidence records count for their binding's profile.
+    for (change, _) in every() {
+        let evidence = matches!(
+            change,
+            C::Placed { .. }
+                | C::Questioned { .. }
+                | C::Released { .. }
+                | C::TimedOut { .. }
+                | C::TimeoutsCleared { .. }
+                | C::Tombstone { .. }
+                | C::TombstoneWithdrawn { .. }
+                | C::Seen { .. }
+                | C::Unseen { .. }
+        );
+        if evidence {
+            assert_eq!(change.scope(), Some(Scope::profile("a")), "{change:?}");
+        }
+    }
     // Generation and lifecycle records are outside I1.
     assert_eq!(
         C::Generation {

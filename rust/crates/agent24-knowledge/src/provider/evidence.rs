@@ -101,7 +101,7 @@ pub struct Observed<K> {
 }
 
 /// The state as persisted, to restore at restart.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Saved<K> {
     pub epoch: u64,
     pub rules: Vec<Rule<K>>,
@@ -109,6 +109,19 @@ pub struct Saved<K> {
     pub pending: Option<Pending<K>>,
     pub tombstones: BTreeSet<K>,
     pub visible: BTreeSet<K>,
+}
+
+impl<K> Default for Saved<K> {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            rules: Vec::new(),
+            version: 0,
+            pending: None,
+            tombstones: BTreeSet::new(),
+            visible: BTreeSet::new(),
+        }
+    }
 }
 
 /// S3.1: after the third recheck in a row that timed out, no recheck is sent

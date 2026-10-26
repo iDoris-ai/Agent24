@@ -13,6 +13,7 @@ impl Ids for T {
     type Run = u32;
     type Principal = &'static str;
     type Identity = &'static str;
+    type Kb = &'static str;
 }
 
 type C = Change<T>;
@@ -227,6 +228,15 @@ fn a_binding_no_longer_configured_as_it_was_is_retired_at_restart() {
     // Logged out, or the same principal: it stands (FI-6g).
     let out = recover(read(vec![bind("a", 1)]), SEALED, false, &["a"], same);
     assert!(matches!(out, Recovery::Normal { retire, .. } if retire.is_empty()));
+    // Only `principal_changed` defers the check: under `unsaved_settings`
+    // another principal's login retires it.
+    let changes = vec![bind("h", 8), unsaved("h")];
+    let other = |_: &Bound<T>| Found::OtherPrincipal;
+    let out = recover(read(changes), SEALED, false, &["h"], other);
+    let Recovery::Normal { retire, .. } = out else {
+        panic!("not normal");
+    };
+    assert_eq!(retire, vec![C::Retire(of("h", 8))]);
 }
 
 #[test]

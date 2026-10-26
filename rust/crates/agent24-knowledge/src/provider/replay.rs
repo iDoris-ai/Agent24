@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use super::evidence::{Kbs, Pending, Saved};
 use super::profile::Confirmation;
 use super::record::{Change, Ids, Of, StuckCause};
 use super::state::PlaceholderFailure;
@@ -49,6 +50,8 @@ pub struct Bound<I: Ids> {
     pub logged_out: bool,
     pub revoked: bool,
     pub stuck: Option<StuckCause>,
+    /// To restore its [`Evidence`](super::evidence::Evidence) from.
+    pub evidence: Saved<I::Kb>,
 }
 
 /// A run's binding set and candidates (S4.7); `None` once unbound.
@@ -209,10 +212,10 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
             generation,
             confirmed,
         } => {
-            // Bound twice, or a first value not past one its profile used: no
-            // sound host wrote this (S2.6, S4.4, S1.8).
+            // Bound twice, a first value not past one its profile used, or
+            // none at all: no sound host wrote this (S2.6, S4.4, S1.8).
             let used = |b: &Bound<I>| b.of.profile == of.profile && b.generation >= generation;
-            if out.bindings.iter().any(|b| b.of == of || used(b)) {
+            if generation == 0 || out.bindings.iter().any(|b| b.of == of || used(b)) {
                 return Err(Damaged);
             }
             out.highest = out.highest.max(generation);
@@ -228,6 +231,7 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
                 logged_out: false,
                 revoked: false,
                 stuck: None,
+                evidence: Saved::default(),
             });
         }
         Change::Generation { of, value } => {
@@ -246,6 +250,53 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
             if b.stuck == Some(cause) {
                 b.stuck = None;
             }
+        }),
+        Change::Placed { of, rule } => {
+            if let Some(e) = bound(out, &of).map(|b| &mut b.evidence) {
+                // Epochs only advance (S5.6, S1.8).
+                if rule.epoch <= e.epoch {
+                    return Err(Damaged);
+                }
+                e.epoch = rule.epoch;
+                if let Kbs::One(kb) = &rule.kbs {
+                    e.tombstones.remove(kb);
+                }
+                e.rules.push(rule);
+            }
+        }
+        Change::Questioned { of, kbs, version } => evidence(out, &of, |e| {
+            let pending = e.pending.get_or_insert_with(|| Pending {
+                kbs: Default::default(),
+                timeouts: 0,
+            });
+            pending.kbs.extend(kbs);
+            e.version = e.version.max(version);
+        }),
+        Change::Released { of, version, .. } => evidence(out, &of, |e| {
+            if e.version == version {
+                e.pending = None;
+            }
+        }),
+        Change::TimedOut { of, count } => evidence(out, &of, |e| {
+            if let Some(p) = &mut e.pending {
+                p.timeouts = count;
+            }
+        }),
+        Change::TimeoutsCleared { of, .. } => evidence(out, &of, |e| {
+            if let Some(p) = &mut e.pending {
+                p.timeouts = 0;
+            }
+        }),
+        Change::Tombstone { of, kb } => evidence(out, &of, |e| {
+            e.visible.remove(&kb);
+            e.tombstones.insert(kb);
+        }),
+        Change::TombstoneWithdrawn { of, kb } => evidence(out, &of, |e| {
+            e.tombstones.remove(&kb);
+        }),
+        Change::Seen { of, kbs } => evidence(out, &of, |e| e.visible.extend(kbs)),
+        Change::Unseen { of, kbs } => evidence(out, &of, |e| {
+            e.visible.retain(|kb| !kbs.contains(kb));
         }),
         Change::RunBound {
             run,
@@ -282,6 +333,10 @@ fn on<I: Ids>(out: &mut Replayed<I>, of: &Of<I>, f: impl FnOnce(&mut Bound<I>)) 
     if let Some(b) = bound(out, of) {
         f(b);
     }
+}
+
+fn evidence<I: Ids>(out: &mut Replayed<I>, of: &Of<I>, f: impl FnOnce(&mut Saved<I::Kb>)) {
+    on(out, of, |b| f(&mut b.evidence));
 }
 
 fn run_set<I: Ids>(out: &mut Replayed<I>, run: I::Run) -> &mut RunSet<I> {
