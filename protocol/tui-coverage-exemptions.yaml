@@ -2,9 +2,8 @@
 # CI (scripts/tui-coverage.mjs) 语义是「不降」：protocol/openapi.yaml 的每个 operation 必须
 # 被 CLI (rust/apps/agent24-cli) 覆盖，或在此登记。补上 CLI 命令后必须同步删除对应条目
 # （脚本会把「已覆盖却仍在豁免」判为失败）。
-# category: visual | desktop-internal | planned-tui-2 | planned-tui-3
+# category: visual | planned-tui-2 | planned-tui-3（ADR-037 §4：豁免只限纯视觉能力）
 #   visual           视觉类功能，终端不做
-#   desktop-internal 仅桌面壳内部使用的流程
 #   planned-tui-2    计划在 TUI-2 补（管理/观测类命令）
 #   planned-tui-3    计划在 TUI-3 补（Sin90 / documents 领域命令）
 # fallback: CLI 补齐前的兜底方式。raw-http = 对 daemon 直接发 HTTP（Bearer token，端口/token 见 daemon ready 行）。
@@ -22,11 +21,11 @@ exemptions:
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: getDecideProfile
-    category: desktop-internal
-    fallback: "仅桌面壳（模型下载授权/模块命令面板）使用；无头场景 raw-http"
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令（桌面壳目前使用）"
   - operationId: invokeAttachedModuleCommand
-    category: desktop-internal
-    fallback: "仅桌面壳（模型下载授权/模块命令面板）使用；无头场景 raw-http"
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令（桌面壳目前使用）"
   - operationId: updateAttachedModule
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
