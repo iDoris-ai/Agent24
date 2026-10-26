@@ -18,58 +18,72 @@ impl Ids for T {
 type J = Journal<T, &'static str>;
 type C = Change<T>;
 
-fn changes(record: Option<Record<T>>) -> (u64, Vec<C>) {
-    match record {
-        Some(Record {
-            seq,
-            entry: Entry::Changes(changes),
-        }) => (seq, changes),
+fn take(journal: &mut J) -> (Attempt, u64, Vec<C>) {
+    match journal.take() {
+        Some((
+            attempt,
+            Record {
+                seq,
+                entry: Entry::Changes(changes),
+            },
+        )) => (attempt, seq, changes),
         other => panic!("{other:?}"),
     }
 }
 
-/// One write at a time, by number; a report of another write moves nothing.
+/// One write at a time, by number; a report of anything but the attempt in
+/// flight moves nothing.
 #[test]
 fn writes_run_one_at_a_time_in_order() {
     let mut journal = J::new(10);
     journal.push(vec![C::Off], "off");
     journal.push(vec![C::Disable("a")], "disable");
-    assert_eq!(changes(journal.take()), (10, vec![C::Off]));
+    let (off, seq, changes) = take(&mut journal);
+    assert_eq!((seq, changes), (10, vec![C::Off]));
     assert_eq!(journal.take(), None, "one is running");
-    assert_eq!(journal.written(11, Written::Durable), Report::Ignored);
-    assert_eq!(journal.take(), None, "still running");
     assert_eq!(
-        journal.written(10, Written::Durable),
+        journal.written(off, Written::Durable),
         Report::Durable("off")
     );
-    assert_eq!(journal.written(10, Written::Durable), Report::Ignored);
-    assert_eq!(changes(journal.take()), (11, vec![C::Disable("a")]));
+    assert_eq!(journal.written(off, Written::Durable), Report::Ignored);
+    let (disable, seq, changes) = take(&mut journal);
+    assert_eq!((seq, changes), (11, vec![C::Disable("a")]));
+    assert_eq!(journal.written(off, Written::Failed), Report::Ignored);
+    assert_eq!(journal.take(), None, "still running");
     assert_eq!(
-        journal.written(11, Written::Durable),
+        journal.written(disable, Written::Durable),
         Report::Durable("disable")
     );
     assert_eq!(journal.take(), None);
     journal.push(vec![C::On], "on");
-    assert_eq!(changes(journal.take()).0, 12);
+    assert_eq!(take(&mut journal).1, 12);
 }
 
 /// A.1: a failed write is taken again as it was, under its number, before
-/// any later one.
+/// any later one; a late report of the failed attempt moves nothing.
 #[test]
 fn a_failed_write_is_taken_again_under_its_number() {
     let mut journal = J::new(1);
     journal.push(vec![C::Off], "off");
     journal.push(vec![C::On], "on");
-    let first = changes(journal.take());
-    assert_eq!(journal.written(1, Written::Failed), Report::Failed(&"off"));
+    let (first, seq, changes) = take(&mut journal);
     assert_eq!(
-        journal.written(1, Written::Failed),
-        Report::Ignored,
-        "not running"
+        journal.written(first, Written::Failed),
+        Report::Failed(&"off")
     );
-    assert_eq!(changes(journal.take()), first);
-    assert_eq!(journal.written(1, Written::Durable), Report::Durable("off"));
-    assert_eq!(changes(journal.take()).0, 2);
+    assert_eq!(journal.written(first, Written::Failed), Report::Ignored);
+    let (retry, again, same) = take(&mut journal);
+    assert_eq!((again, &same), (seq, &changes));
+    assert_ne!(retry, first);
+    for late in [Written::Failed, Written::Durable] {
+        assert_eq!(journal.written(first, late), Report::Ignored);
+    }
+    assert_eq!(journal.take(), None, "the retry still runs");
+    assert_eq!(
+        journal.written(retry, Written::Durable),
+        Report::Durable("off")
+    );
+    assert_eq!(take(&mut journal).1, 2);
 }
 
 /// The ledger's seal through its writes: a deletion is tried again while a

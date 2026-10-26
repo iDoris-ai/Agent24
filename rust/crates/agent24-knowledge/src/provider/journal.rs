@@ -1,8 +1,9 @@
 //! The order the Provider's writes run in (KB-C1-04 6c), pure: the log's
 //! records one at a time, by number, each reported back. A failed one is
 //! taken again as it was, under its number (A.1: a retry under the same number
-//! is idempotent), so the log never has a gap (A.3). The seal's writes follow
-//! the ledger, which keeps one at a time in flight.
+//! is idempotent), so the log never has a gap (A.3). Each taking is its own
+//! attempt, so a late report of an earlier one never moves the journal. The
+//! seal's writes follow the ledger, which keeps one at a time in flight.
 
 use std::collections::VecDeque;
 
@@ -24,10 +25,14 @@ pub enum SealWrite {
     Rebuild(SealOp),
 }
 
+/// One taking of a write: only its report counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attempt(u64);
+
 /// What a report of the write in flight gives back: what it was written for.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Report<'a, T> {
-    /// Not the write in flight: nothing moves.
+    /// Not the attempt in flight: nothing moves.
     Ignored,
     /// Still the next to take.
     Failed(&'a T),
@@ -44,7 +49,8 @@ struct Queued<I: Ids, T> {
 #[derive(Debug)]
 pub struct Journal<I: Ids, T> {
     queue: VecDeque<Queued<I, T>>,
-    in_flight: bool,
+    in_flight: Option<Attempt>,
+    attempts: u64,
     next_seq: u64,
 }
 
@@ -53,7 +59,8 @@ impl<I: Ids, T> Journal<I, T> {
     pub fn new(next_seq: u64) -> Self {
         Self {
             queue: VecDeque::new(),
-            in_flight: false,
+            in_flight: None,
+            attempts: 0,
             next_seq,
         }
     }
@@ -66,23 +73,26 @@ impl<I: Ids, T> Journal<I, T> {
     }
 
     /// The next write to run, unless one is running.
-    pub fn take(&mut self) -> Option<Record<I>> {
-        if self.in_flight {
+    pub fn take(&mut self) -> Option<(Attempt, Record<I>)> {
+        if self.in_flight.is_some() {
             return None;
         }
         let head = self.queue.front()?;
-        self.in_flight = true;
-        Some(Record {
+        self.attempts += 1;
+        let attempt = Attempt(self.attempts);
+        self.in_flight = Some(attempt);
+        let record = Record {
             seq: head.seq,
             entry: Entry::Changes(head.changes.clone()),
-        })
+        };
+        Some((attempt, record))
     }
 
-    pub fn written(&mut self, seq: u64, outcome: Written) -> Report<'_, T> {
-        if !self.in_flight || self.queue.front().is_none_or(|q| q.seq != seq) {
+    pub fn written(&mut self, attempt: Attempt, outcome: Written) -> Report<'_, T> {
+        if self.in_flight != Some(attempt) {
             return Report::Ignored;
         }
-        self.in_flight = false;
+        self.in_flight = None;
         match outcome {
             Written::Failed => self
                 .queue
