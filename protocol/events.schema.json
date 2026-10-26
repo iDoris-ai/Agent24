@@ -863,7 +863,7 @@
       "type": "object",
       "properties": {
         "memory_persisted": {
-          "description": "P1-02c, THREE-state. `Some(false)`: this run's exchange (or its\nexplicit-remember assertion) FAILED to persist; the answer above is still\nreal, but nothing in the model's text can be taken as \"remembered\".\n`Some(true)`: no memory write this run attempted failed (including when\nthere was nothing to write, or memory is paused — a user choice reported\nby `memory.write_skipped`). `None` (field absent): UNKNOWN — the producer\npredates this field, and a daemon from before it could well have failed to\nwrite. Never read absence as `true`. Current daemons always send it.",
+          "description": "P1-02c, THREE-state. `Some(false)`: this run's exchange (or its\nexplicit-remember assertion) FAILED to persist; the answer above is still\nreal, but nothing in the model's text can be taken as \"remembered\".\n`Some(true)`: no memory write this run attempted failed (including when\nthere was nothing to write, or memory is paused — a user choice reported\nby `memory.write_skipped`). `None` (field absent): UNKNOWN — the producer\npredates this field, and a daemon from before it could well have failed to\nwrite. Never read absence as `true`. Current daemons always send it.\n\nScope: this reflects ONLY this run's own writes. A failure to write the\ncompaction summary is reported separately via the `session.summary`\nevent and does NOT flip this flag.",
           "type": [
             "boolean",
             "null"

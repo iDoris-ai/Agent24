@@ -1734,7 +1734,7 @@ impl RunManager {
                 self.finish_failed(
                     &run_id,
                     failure.wire_code_str(),
-                    "this session's earlier history could not be imported; nothing was changed, retry the run",
+                    "this session's earlier history could not be imported; nothing was changed; if retrying still fails, the session's old records may be corrupted",
                 )
                 .await;
                 return;

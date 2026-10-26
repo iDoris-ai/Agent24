@@ -220,6 +220,10 @@ pub struct RunCompletedPayload {
     /// by `memory.write_skipped`). `None` (field absent): UNKNOWN — the producer
     /// predates this field, and a daemon from before it could well have failed to
     /// write. Never read absence as `true`. Current daemons always send it.
+    ///
+    /// Scope: this reflects ONLY this run's own writes. A failure to write the
+    /// compaction summary is reported separately via the `session.summary`
+    /// event and does NOT flip this flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_persisted: Option<bool>,
 }
