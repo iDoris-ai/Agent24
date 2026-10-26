@@ -35,18 +35,6 @@ exemptions:
   - operationId: summarizeTimings
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: getUsage
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listSessions
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: getSession
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: getRun
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: listModuleApprovals
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
@@ -57,12 +45,6 @@ exemptions:
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: createSchedule
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listSchedules
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: getSchedule
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: updateSchedule
@@ -98,13 +80,7 @@ exemptions:
   - operationId: deleteToolOverride
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listMemoryAssertions
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: forgetMemoryAssertion
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: getMemorySettings
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: putMemorySettings
