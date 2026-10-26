@@ -69,6 +69,7 @@ const PROVIDER_ROLE_MESSAGE: &str = "模型返回的角色不是 assistant，已
 fn origin_allows_send(lookup: &MessageOriginLookup) -> bool {
     match lookup {
         // A stored HostRecall with a SQL NULL recall_ref is still unproven.
+        // Present HostSystem is sent verbatim (R05-5 section 3).
         MessageOriginLookup::Present(stored) => !matches!(
             stored.origin,
             MessageOrigin::HostRecall { recall_ref: None }
