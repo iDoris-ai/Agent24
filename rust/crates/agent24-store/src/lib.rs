@@ -127,6 +127,12 @@ pub enum StoreError {
     /// its closed-set/bounded-identifier validation.
     #[error("invalid audit metadata: {0}")]
     InvalidAuditMetadata(String),
+    /// Offline open refused to migrate. `current` is 0 when the file or the
+    /// `_sqlx_migrations` table is absent.
+    #[error("请先启动 daemon 完成升级 (applied {current}, binary {latest})")]
+    SchemaBehind { current: i64, latest: i64 },
+    #[error("database schema {current} is newer than this binary ({latest})")]
+    SchemaAhead { current: i64, latest: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -172,6 +178,44 @@ impl Store {
         })
     }
 
+    /// Open an existing file and do not migrate it.
+    ///
+    /// A separate function, not a flag on [`Store::open`]: the daemon keeps
+    /// migrating, and an offline caller cannot forget the flag. A missing
+    /// file is schema 0 and is not created. Any other `_sqlx_migrations`
+    /// version closes the pool and returns; no migration runs.
+    pub async fn open_without_migration(path: &Path) -> Result<Self> {
+        let latest = embedded_schema_version();
+        if !path.exists() {
+            return Err(StoreError::SchemaBehind { current: 0, latest });
+        }
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(sqlite_file_options(path, false)?)
+            .await?;
+        let current = match applied_schema_version(&pool).await {
+            Ok(version) => version,
+            Err(err) => {
+                pool.close().await;
+                return Err(err);
+            }
+        };
+        if current != latest {
+            pool.close().await;
+            return Err(if current < latest {
+                StoreError::SchemaBehind { current, latest }
+            } else {
+                StoreError::SchemaAhead { current, latest }
+            });
+        }
+        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        Ok(Self {
+            pool,
+            module_consent_revocations,
+            terminal_commit_ack_gate: std::sync::Arc::default(),
+        })
+    }
+
     /// In-memory database for tests.
     pub async fn open_memory() -> Result<Self> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?
@@ -194,6 +238,41 @@ impl Store {
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+fn sqlite_file_options(path: &Path, create_if_missing: bool) -> Result<SqliteConnectOptions> {
+    Ok(
+        SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+            .create_if_missing(create_if_missing)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true),
+    )
+}
+
+fn embedded_schema_version() -> i64 {
+    sqlx::migrate!("./migrations")
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(0)
+}
+
+async fn applied_schema_version(pool: &SqlitePool) -> Result<i64> {
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if tables == 0 {
+        return Ok(0);
+    }
+    let version: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(pool)
+            .await?;
+    Ok(version.unwrap_or(0))
 }
 
 /// Test-only escape hatch (integration tests need raw SQL to simulate
@@ -247,6 +326,64 @@ pub mod test_hooks {
             module_consent_revocations,
             terminal_commit_ack_gate: std::sync::Arc::default(),
         }
+    }
+
+    /// Create `path` with only migrations whose version is `< stop_before`.
+    pub async fn prepare_db_stopped_before(
+        path: &std::path::Path,
+        stop_before: i64,
+    ) -> super::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| super::StoreError::Conflict(e.to_string()))?;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(super::sqlite_file_options(path, true)?)
+            .await?;
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = migrator
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < stop_before)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        migrator.run(&pool).await?;
+        pool.close().await;
+        Ok(())
+    }
+
+    pub async fn applied_schema_version(path: &std::path::Path) -> super::Result<i64> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(super::sqlite_file_options(path, false)?)
+            .await?;
+        let version = super::applied_schema_version(&pool).await?;
+        pool.close().await;
+        Ok(version)
+    }
+
+    pub fn embedded_schema_version() -> i64 {
+        super::embedded_schema_version()
+    }
+
+    /// Truncate the WAL and close this pool so a later open sees one file.
+    pub async fn checkpoint(store: &super::Store) -> super::Result<()> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(store.pool())
+            .await?;
+        store.pool().close().await;
+        Ok(())
+    }
+
+    pub async fn revocation_count(store: &super::Store, module: &str) -> super::Result<i64> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM module_consent_revocations WHERE module = ?")
+                .bind(module)
+                .fetch_one(store.pool())
+                .await?;
+        Ok(count)
     }
 
     /// Insert a schedule row with arbitrary (possibly invalid) JSON columns —
