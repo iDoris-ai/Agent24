@@ -233,9 +233,8 @@ fn outside_the_connection_phase_nothing_is_invalidated() {
     assert!(bound(&host));
 }
 
-/// "a" bound to binding 7 and loading, awaiting the host's confirmation of
-/// unsaved settings.
-fn unsaved() -> H {
+/// "a" bound to binding 7 and loading, awaiting `confirmation`.
+fn awaiting(confirmation: Confirmation) -> H {
     let mut binding = BindingState::new(
         Connection::new(Gate::new(1), true),
         Credentials::new(false),
@@ -247,7 +246,7 @@ fn unsaved() -> H {
     };
     binding.connect(clear);
     let slot = Slot::Bound(Box::new(binding));
-    let profile = Profile::new(slot, true, Some(Confirmation::UnsavedSettings));
+    let profile = Profile::new(slot, true, Some(confirmation));
     let mut host = H::new(false, true, 10, 1);
     host.insert(Member::new("a", profile, Some(7), false));
     host
@@ -257,7 +256,7 @@ fn unsaved() -> H {
 /// it stays in the place of `principal_changed`.
 #[test]
 fn under_unsaved_settings_the_waiting_binding_is_not_written() {
-    let mut host = unsaved();
+    let mut host = awaiting(Confirmation::UnsavedSettings);
     let change = IdentityChange::Principal;
     host.identity_changed("a", change, Some(created(9, "bob")));
     let (changes, _) = confirmed(&mut host);
@@ -266,4 +265,30 @@ fn under_unsaved_settings_the_waiting_binding_is_not_written() {
     assert_eq!(failure(&host), Some(PlaceholderFailure::Dependency));
     let awaiting = Some(Confirmation::UnsavedSettings);
     assert_eq!(host.profile(&"a").unwrap().confirmation(), awaiting);
+}
+
+/// S1.13: a principal already awaited is not written again.
+#[test]
+fn an_awaited_principal_is_not_awaited_again() {
+    let mut host = awaiting(Confirmation::PrincipalChanged);
+    let change = IdentityChange::Principal;
+    host.identity_changed("a", change, Some(created(9, "bob")));
+    let (changes, _) = confirmed(&mut host);
+    assert_eq!(changes[0], C::Retire(of("a", 7)));
+    assert!(!awaits(&changes));
+    assert_eq!(confirmed(&mut host).0, vec![bind(9, 3, None)]);
+}
+
+/// I1: another tightening confirmed first leaves the new binding waiting for
+/// its own retirement.
+#[test]
+fn another_write_does_not_release_the_waiting_binding() {
+    let mut host = host();
+    host.unselect("b");
+    let change = IdentityChange::Instance;
+    host.identity_changed("a", change, Some(created(9, "alice")));
+    assert_eq!(confirmed(&mut host).0, vec![C::Unselect("b")]);
+    assert_eq!(confirmed(&mut host).0[0], C::Retire(of("a", 7)));
+    assert_eq!(confirmed(&mut host).0, vec![bind(9, 3, Some("alice"))]);
+    assert!(bound(&host));
 }
