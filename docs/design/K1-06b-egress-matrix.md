@@ -57,8 +57,9 @@
 
 | 消费方 | (a) | (b) | (c) | (d) |
 |---|---|---|---|---|
-| **http_fetch** | **缺**：LocalOnly 资源 → 拒绝、DNS 零次 | `net.rs` `denied_fetch_does_not_invoke_dns_resolver`；**缺**：`with_egress_policy_unavailable()` | 只有部分正例：`net.rs` `fetches_a_fixture_body` 用的 gate 无条件放行，不看三元组；`lib.rs` `model_fetches_a_url_through_http_fetch` 的 `FixtureEgressGate` 精确比对资源、用途和代次，但目的地只比前缀 `http://127.0.0.1:`（任何端口都放行）。**缺**：精确目的地的正例，以及逐项不匹配的负例 | 部分：`net.rs` `ordinary_fetch_does_not_require_egress_policy_before_dns`（只测域名主机的 DNS 前一步）；`tools/src/lib.rs` `ordinary_http_fetch_is_advertised_without_egress_policy`（只测通告）。**缺**：IP 字面量主机分支在 Ordinary、无 gate 时放行；Ordinary 下端到端取回成功 |
-| **MCP client 工具** | **缺** | **缺** | **缺**（见下方注） | **缺** |
+| **http_fetch** | `net.rs` `a_local_only_source_is_refused_before_any_request`（IPv4、IPv6 `[::1]`、域名三种主机都经 `call()`，零请求、零 DNS）、`every_resource_of_the_run_is_checked_not_only_the_first`；`domain/egress.rs` `the_local_only_flag_alone_refuses_an_otherwise_granted_resource`（6b.5c-1，#1220） | `net.rs` `denied_fetch_does_not_invoke_dns_resolver`、`a_fetch_whose_source_policy_is_unavailable_is_refused_before_any_request`、`a_granted_run_whose_policy_then_became_unavailable_is_refused`、`a_restricted_run_without_an_egress_gate_is_refused_before_any_request`（6b.5c-1） | `net.rs` `an_exact_grant_fetches_only_what_it_names`（精确目的地正例，以及资料、修订、授权引用、政策版本、代次、目的地、用途逐项不匹配的负例）、`an_incompletely_granted_resource_is_refused_even_by_a_permissive_gate`（6b.5c-1）。**缺**（Low）：HTTPS 主机、HTTPS 请求用 HTTP 来源的授权（本机桩没有 TLS） | `net.rs` `ordinary_fetch_does_not_require_egress_policy_before_dns`、`an_ordinary_fetch_of_an_ip_literal_needs_no_egress_policy`（6b.5c-1，IP 字面量、无 gate、端到端取回）；`tools/src/lib.rs` `ordinary_http_fetch_is_advertised_without_egress_policy` |
+| **MCP client 工具** | `agent24-mcp/src/lib.rs` `a_restricted_or_unknown_source_never_reaches_the_mcp_server`（放行 gate 加 LocalOnly 资源，6b.5c-1） | 同一条测试的「政策不可用」「没装 gate」两种情况（6b.5c-1） | `an_exact_grant_reaches_only_the_mcp_tool_it_names`（测试 gate，见下方注；6b.5c-1）。**缺**（Low）：目的地常量和桩的真实名字相同，区分不出写死 | `an_ordinary_run_calls_an_mcp_tool_without_egress_policy`（6b.5c-1） |
+| **MCP server、ACP 桥（peer 视图）** | `agent24d/src/peer_runs.rs` `a_run_with_any_source_that_is_not_ordinary_is_withheld_from_peers`、`a_run_that_called_a_tool_is_withheld_until_tool_results_are_tagged`、`a_run_that_recalled_a_memory_is_withheld`、`a_run_started_by_a_kernel_created_schedule_is_withheld`、`a_session_run_is_withheld_while_the_daemon_keeps_session_memory`（6b.5c-2a）；两座桥只读 peer 视图的测试在 6b.5c-2b | `a_run_whose_sources_cannot_be_read_is_withheld_from_peers`、`a_run_that_has_not_ended_carries_no_content_and_tightens_when_a_source_lands`（6b.5c-2a） | 不适用：peer 视图不接受云授权，非 Ordinary 一律扣下 | `an_ordinary_run_that_has_ended_is_relayed_in_full`（6b.5c-2a） |
 
 另有 SSRF 测试：`net.rs` 里的 `public_ip_classification`、`private_targets_are_denied`、`redirects_are_returned_not_followed`。
 
@@ -108,7 +109,7 @@
    - `agent24_list_runs` 返回所有 run 的 prompt 和输出；
    - 不按来源分类过滤。
    对端可能把内容转发给它自己的云模型。§2.4 第 2 条点名了「MCP client/server 工具」。
-   **David 2026-10-25 定：视为出口，按分类过滤**（Claude、Codex、Fable 三方都选这一项）。在 6b.5c 实现，要求如下：
+   **David 2026-10-25 定：视为出口，按分类过滤**（Claude、Codex、Fable 三方都选这一项）。在 6b.5c-2 实现，要求如下。其中「Ordinary」怎么算，以第 4 条的现行规则（只放行自成一体的 run）为准：
    - 内核权威分类为 Ordinary 的 run，照常返回文本。
    - Restricted、Unknown 或分类读不出来时，只返回状态和固定提示；`agent24_list_runs` 不给这些 run 的 prompt 和输出。
    - 错误消息同样过滤。
@@ -125,9 +126,12 @@
    - **David 的决定**（2026-10-25 至 10-26，三次）：
      - 第一次：peer 视图里，本 run 调过工具就扣下。Claude、Codex、Fable 都选这一项。
      - 第二次：第 2 轮评审发现跨 run 传播，改成按会话算。Claude、Fable 选这一项；Codex 选在源头打 Unknown 标签，并自认那会改变目标。
-     - 第三次（现行）：第 3 轮评审又找到 `/chat`、无会话的 self-wake、同会话并发三条路径，按路径推断补不完。改成**只放行自成一体的 run**：标签全是 Ordinary、没调过工具、没召回过记忆、不是内核建的 schedule 触发、没有会话上下文（不带会话，或内核没开会话记忆）。其余一律扣下（6b.5c-2）。三方都选这一项，Codex、Fable 都指出它扩大了代价，David 确认接受。ACP 桥每次 prompt 都建会话，所以开了会话记忆时，ACP 上的 run 全部只发固定提示。
+     - 第三次（现行）：第 3 轮评审又找到 `/chat`、无会话的 self-wake、同会话并发三条路径，按路径推断补不完。改成**只放行自成一体的 run**：标签全是 Ordinary、没调过工具、没召回过记忆、不是内核建的 schedule 触发、没有会话上下文（不带会话，或内核没开会话记忆）。其余一律扣下。6b.5c-2a 实现内核的 peer 视图（`/api/v1/peer/runs`），6b.5c-2b 把 MCP server 和 ACP 桥接上它。三方都选这一项，Codex、Fable 都指出它扩大了代价，David 确认接受。ACP 桥每次 prompt 都建会话，所以开了会话记忆时，ACP 上的 run 全部只发固定提示。
      - 会话下限、记忆分类和工具出口门这次都不改：在源头打 Unknown，会让调过任何工具的 run 及其会话后续轮的 shell_exec、http_fetch 等全被拒。
-     - 给工具结果打标签另开一片（§7 的 6b.5f），同时修工具出口门、会话下限、记忆分类和 self-wake 的来源分类；那一片落地后再放宽 peer 视图的规则。已经记成 Ordinary 的旧断言和 schedule 不会自动更正，6b.5f 要说明怎么处理。
+     - 给工具结果打标签另开一片（§7 的 6b.5f），同时修工具出口门、会话下限、记忆分类和 self-wake 的来源分类；那一片落地后再放宽 peer 视图的规则。已经记成 Ordinary 的旧断言和 schedule 不做兼容：David 已定不做兼容、清库。
+   - **David 2026-10-26 对 6b.5f 的两项决定**：
+     - 分类按工具定：fs_read、explorer 的输出记 Ordinary，因为来源能追溯到工作区根目录里的具体路径；http_fetch 取回的公网内容记 Ordinary；shell_exec、MCP、模块工具的输出记 Unknown，因为来源追溯不到；fs_write、self_wake 返回回执，不含读到的资料。Claude、Fable 选这一项；Codex 选「本地结果都算普通」，那要修订 ADR §2.1。David 接受的代价：跑过 shell_exec 以后，本 run 和同会话后面的轮次不能再用 shell_exec、http_fetch、MCP、模块工具；工作区文件经 fs_read→http_fetch 外发这条链仍开着，和现在一样。
+     - 同源回送不拦：模块工具的输出记 Unknown，标签上由内核记下来源模块。发往模块 X 的调用不计来自 X 自己的 Unknown，因为 X 本来就持有这些内容（ADR §2.1.1 第 3、5 条：按动作实际携带的数据判定，可信宿主可用不可伪造的绑定收窄）。其他来源的 Unknown 和 Restricted 照拦；External 操作不享受这条例外；读不到来源时照拒。同源靠注册表里的绑定来认，不看模块自报的 `output_privacy`。来源模块要带着身份传到同会话后面的轮次。三方都选这一项。这样 Documenting 的对话入口可以在同一个模块内连续调用。
 5. **Hyphae `/comm/send`**：只能由用户经 REST 直接调用，没有 Tool 包装，也不带 run 资料。视为用户直接操作，不在 agent 出口矩阵内。
 
 ## 7. 后续切片
@@ -135,7 +139,7 @@
 | 片 | 补什么 |
 |---|---|
 | 6b.5b 模型类 | **已补**（见上表标 6b.5b 的测试）。没有补的：模块模型回调的 (b)，要等 §6 第 2 条接上来源继承以后才有可测的政策读取 |
-| 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用、精确目的地正例和逐项不匹配负例，以及 Ordinary 下 IP 字面量分支和端到端取回；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3 条，可能要拆成单独一片） |
+| 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用、精确目的地正例和逐项不匹配负例，以及 Ordinary 下 IP 字面量分支和端到端取回；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3、4 条）。6b.5c-1（#1220）已补 http_fetch 与 MCP client 的四列；peer 视图拆成 6b.5c-2a（内核视图）、6b.5c-2b（两座桥） |
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
-| 6b.5f 工具结果打标签 | §6 第 4 条：每类工具结果（fs_read、http_fetch、MCP、模块工具、子 agent）的分类先定方案；结果进上下文时打标签，工具出口门、会话下限、记忆分类、self-wake 来源分类和 peer 视图都按它判定；处理已记成 Ordinary 的旧断言和 schedule；然后放宽 6b.5c-2 的临时规则 |
+| 6b.5f 工具结果打标签 | 按 §6 第 4 条 David 10-26 的两项决定。5f-1：run 内打标签（结果进模型之前，写失败就结束 run）和模块的同源回送。5f-2：来源模块跨轮次传到会话后面的轮次。5f-3：放宽 6b.5c-2 的 peer 视图规则，改成按标签判定 |
 | 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已接、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
