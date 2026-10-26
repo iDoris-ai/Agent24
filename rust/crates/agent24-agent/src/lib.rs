@@ -487,6 +487,24 @@ enum ParkedCallStop {
     RecoveryStopped,
 }
 
+/// What one tool call hands back to the model, with the source tag that must
+/// be durable before the model sees it (K1-6b.5f, ADR-K1-02 §2.1). `source`
+/// is `None` only for fixed text the tool never produced: a refusal, a
+/// cancellation, a timeout, unparseable arguments.
+struct ToolAnswer {
+    content: String,
+    source: Option<agent24_store::SourceRef>,
+}
+
+impl ToolAnswer {
+    fn fixed(content: String) -> Self {
+        Self {
+            content,
+            source: None,
+        }
+    }
+}
+
 impl RunManager {
     // Keep the invalid version case explicit: mapping it to zero makes the
     // source fail `EgressRequest::authorize` instead of widening access.
@@ -928,6 +946,47 @@ impl RunManager {
                 .into_iter()
                 .map(|source| (source.source_id, source.classification)),
         )
+    }
+
+    /// The source tag for what `tool` returned on call `tool_call_id`.
+    fn tool_result_tag(&self, tool: &str, tool_call_id: &str) -> agent24_store::SourceRef {
+        let source = self.tools.tool_result_source(tool);
+        agent24_store::SourceRef::tool_result(
+            &source.origin,
+            tool_call_id,
+            source.classification,
+            now_iso8601(),
+        )
+    }
+
+    /// Persist `answer`'s source tag, then hand its content to the model as
+    /// the result of `call`. A tag that cannot be written ends the run before
+    /// the content reaches the model; returns false then.
+    async fn answer_tool_call(
+        &self,
+        run_id: &str,
+        messages: &mut Vec<Msg>,
+        call: &ToolCallRequest,
+        answer: ToolAnswer,
+    ) -> bool {
+        if let Some(tag) = &answer.source
+            && let Err(err) = self
+                .store
+                .tag_run_source(run_id, messages.len() as i64, tag, &now_iso8601())
+                .await
+        {
+            self.finish_failed(
+                run_id,
+                "source_policy_unavailable",
+                &format!("failed to persist a tool result's source: {err}"),
+            )
+            .await;
+            return false;
+        }
+        let result = Msg::tool_result(call.id.clone(), answer.content);
+        let _ = self.persist_message(run_id, &result).await;
+        messages.push(result);
+        true
     }
 
     /// Append one message to the run's durable thread (H3/G1 foundation).
@@ -1398,7 +1457,7 @@ impl RunManager {
                 self.finish_cancelled(&run_id).await;
                 return;
             }
-            let content = if call.id == tool_call_id {
+            let answer = if call.id == tool_call_id {
                 if call.name.trim() == PROPOSE_PLAN {
                     // H8: the parked call is a plan approval (the only thing a
                     // plan-mode run can park on — read tools never gate, and no
@@ -1414,14 +1473,16 @@ impl RunManager {
                             .await;
                         return;
                     }
-                    "Plan approved. The full tool set is now available — carry out the plan."
-                        .to_owned()
+                    ToolAnswer::fixed(
+                        "Plan approved. The full tool set is now available — carry out the plan."
+                            .to_owned(),
+                    )
                 } else {
                     match self
                         .settle_parked_call(&run, &approval, &call, &cancel)
                         .await
                     {
-                        Ok(content) => content,
+                        Ok(answer) => answer,
                         Err(ParkedCallStop::CancelRun) => {
                             self.finish_cancelled(&run_id).await;
                             return;
@@ -1431,7 +1492,7 @@ impl RunManager {
                 }
             } else {
                 match self.run_tool_call(&run, &call, &cancel, true).await {
-                    Ok(content) => content,
+                    Ok(answer) => answer,
                     Err(ParkedCallStop::CancelRun) => {
                         self.finish_cancelled(&run_id).await;
                         return;
@@ -1439,9 +1500,12 @@ impl RunManager {
                     Err(ParkedCallStop::RecoveryStopped) => return,
                 }
             };
-            let result = Msg::tool_result(call.id.clone(), content);
-            let _ = self.persist_message(&run_id, &result).await;
-            messages.push(result);
+            if !self
+                .answer_tool_call(&run_id, &mut messages, &call, answer)
+                .await
+            {
+                return;
+            }
         }
 
         // 5. Continue the shared loop for subsequent model iterations. Always
@@ -1462,7 +1526,7 @@ impl RunManager {
         approval: &Approval,
         call: &ToolCallRequest,
         cancel: &CancellationToken,
-    ) -> Result<String, ParkedCallStop> {
+    ) -> Result<ToolAnswer, ParkedCallStop> {
         let decision = approval.decision.clone().unwrap_or_else(|| Decision {
             kind: "deny".to_owned(),
             reason: Some("no decision was recorded".to_owned()),
@@ -1488,9 +1552,9 @@ impl RunManager {
                             self.cancel_workspace_resume_recovery(&run.id).await;
                             return Err(ParkedCallStop::RecoveryStopped);
                         }
-                        return Ok(format!(
+                        return Ok(ToolAnswer::fixed(format!(
                             "tool error: workspace authority unavailable: {err}"
-                        ));
+                        )));
                     }
                 };
                 self.tools
@@ -1521,19 +1585,29 @@ impl RunManager {
                     }
                     outcome => outcome,
                 };
+                // As in `run_tool_call`: only `Ok` and `Failed` carry what the
+                // tool produced.
+                let tag = || Some(self.tool_result_tag(&call.name, &approval.tool_call_id));
                 match outcome {
-                    Ok(out) => Ok(out),
+                    Ok(content) => Ok(ToolAnswer {
+                        content,
+                        source: tag(),
+                    }),
                     // The whole-run abort choice is honoured even on resume.
                     Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled) => {
                         Err(ParkedCallStop::CancelRun)
                     }
-                    Err(err) => Ok(format!("tool error: {err}")),
+                    Err(err @ ToolError::Failed(_)) => Ok(ToolAnswer {
+                        content: format!("tool error: {err}"),
+                        source: tag(),
+                    }),
+                    Err(err) => Ok(ToolAnswer::fixed(format!("tool error: {err}"))),
                 }
             }
-            "deny" => Ok(format!(
+            "deny" => Ok(ToolAnswer::fixed(format!(
                 "denied by user: {}",
                 decision.reason.as_deref().unwrap_or("no reason given")
-            )),
+            ))),
             // "abort" or anything unexpected → cancel the run (fail-closed).
             _ => Err(ParkedCallStop::CancelRun),
         }
@@ -2227,10 +2301,13 @@ impl RunManager {
                     continue;
                 }
                 match self.run_tool_call(&run, call, &cancel, false).await {
-                    Ok(content) => {
-                        let result = Msg::tool_result(call.id.clone(), content);
-                        let _ = self.persist_message(&run_id, &result).await;
-                        messages.push(result);
+                    Ok(answer) => {
+                        if !self
+                            .answer_tool_call(&run_id, &mut messages, call, answer)
+                            .await
+                        {
+                            return;
+                        }
                     }
                     Err(ParkedCallStop::CancelRun) => {
                         // Cancelled mid-tool, or the user chose abort on an
@@ -2261,7 +2338,7 @@ impl RunManager {
         call: &agent24_models::ToolCallRequest,
         cancel: &CancellationToken,
         recovery_resume: bool,
-    ) -> Result<String, ParkedCallStop> {
+    ) -> Result<ToolAnswer, ParkedCallStop> {
         let run_id = run.id.as_str();
         let (input, parse_error) = if call.arguments.trim().is_empty() {
             (serde_json::Map::new(), None)
@@ -2312,7 +2389,9 @@ impl RunManager {
         };
         if let Err(err) = self.store.insert_tool_call(&tc).await {
             tracing::error!("tool call persist failed: {err}");
-            return Ok("tool error: internal persistence failure".to_owned());
+            return Ok(ToolAnswer::fixed(
+                "tool error: internal persistence failure".to_owned(),
+            ));
         }
         self.sink.emit(EventBody::ToolStarted(ToolStartedPayload {
             run_id: run_id.to_owned(),
@@ -2335,6 +2414,8 @@ impl RunManager {
             tracing::error!("run {run_id}: awaiting_approval transition failed: {err}");
         }
 
+        // Only content the tool itself produced carries a source tag.
+        let dispatched = parse_error.is_none();
         let outcome = match parse_error {
             Some(msg) => Err(ToolError::Invalid(msg)),
             None => match recovery_ctx {
@@ -2363,6 +2444,10 @@ impl RunManager {
             tracing::error!("run {run_id}: back-to-running transition failed: {err}");
         }
 
+        // `Invalid` is the host's own argument check or an unknown name;
+        // what an MCP server or a module sends back arrives as `Ok` or
+        // `Failed`.
+        let produced = dispatched && matches!(outcome, Ok(_) | Err(ToolError::Failed(_)));
         let (status, summary, content, cancelled) = match outcome {
             Ok(output) => {
                 let summary = truncate(&output, SUMMARY_MAX_BYTES);
@@ -2428,7 +2513,10 @@ impl RunManager {
         if cancelled {
             return Err(ParkedCallStop::CancelRun);
         }
-        Ok(content)
+        Ok(ToolAnswer {
+            content,
+            source: produced.then(|| self.tool_result_tag(&call.name, &tc.id)),
+        })
     }
 
     /// The tool specs advertised this turn: the full advert set normally, or the
@@ -3586,6 +3674,258 @@ pub(crate) mod tests {
         assert!(
             !process_egress_allowed_when(vec![user], true).await,
             "unreadable tags must restrict"
+        );
+    }
+
+    const TOOL_SECRET: &str = "TOOL-SECRET-91c2";
+
+    /// Returns [`TOOL_SECRET`]; the host classifies it as `source` says.
+    struct ReadingTool(agent24_tools::ToolResultSource);
+
+    #[async_trait]
+    impl agent24_tools::Tool for ReadingTool {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new("reader", "builtin", "reads", RiskClass::Read)
+        }
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn result_source(&self) -> agent24_tools::ToolResultSource {
+            self.0.clone()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            Ok(TOOL_SECRET.to_owned())
+        }
+    }
+
+    /// Fails with [`TOOL_SECRET`], as an MCP `is_error` result or a module's
+    /// error body hands back what the other side sent; the host's default
+    /// classification applies.
+    struct FailingReader;
+
+    #[async_trait]
+    impl agent24_tools::Tool for FailingReader {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new("reader", "builtin", "reads", RiskClass::Read)
+        }
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            Err(ToolError::Failed(TOOL_SECRET.to_owned()))
+        }
+    }
+
+    /// Answers whether its call could leave the device, as `shell_exec` asks.
+    struct EgressProbe;
+
+    #[async_trait]
+    impl agent24_tools::Tool for EgressProbe {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new("probe", "builtin", "probes", RiskClass::Read)
+        }
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            ctx: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            ctx.authorize_egress_if_restricted(
+                agent24_domain::EgressPurpose::ProcessExecution,
+                agent24_domain::EgressDestination::unknown(),
+            )
+            .await?;
+            Ok("egress allowed".to_owned())
+        }
+    }
+
+    fn calls(name: &str, id: &str) -> Msg {
+        Msg::assistant(
+            None,
+            vec![agent24_models::ToolCallRequest {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        )
+    }
+
+    /// Runs `reader` then `probe`, and returns the probe's answer (the final
+    /// output) and the run's tags.
+    async fn read_then_probe(
+        source: agent24_tools::ToolResultSource,
+    ) -> (Run, Vec<agent24_store::StoredSourceTag>) {
+        run_then_probe(Arc::new(ReadingTool(source))).await
+    }
+
+    /// [`read_then_probe`] with `reader` as the tool called first.
+    async fn run_then_probe(
+        reader: Arc<dyn agent24_tools::Tool>,
+    ) -> (Run, Vec<agent24_store::StoredSourceTag>) {
+        let tools = ToolRegistry::new().with(reader).with(Arc::new(EgressProbe));
+        let provider = ScriptedProvider::new(vec![calls("probe", "c2"), calls("reader", "c1")]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let run = wait_terminal(&store, &run.id).await;
+        let tags = store.list_run_source_tags(&run.id).await.unwrap();
+        (run, tags)
+    }
+
+    /// K1-6b.5f: a tool's result is tagged as the host classifies that tool,
+    /// and the tag restricts the run's next egress. An Ordinary result does
+    /// not.
+    #[tokio::test]
+    async fn a_tool_result_is_tagged_and_an_unknown_one_restricts_later_egress() {
+        use agent24_store::{SourceClassification, SourceKind};
+        let (run, tags) = read_then_probe(agent24_tools::ToolResultSource::unknown("reader")).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        let output = run.output.unwrap().text;
+        assert_eq!(
+            output,
+            "tool said: denied by policy: outbound policy unavailable"
+        );
+        let results: Vec<_> = tags
+            .iter()
+            .filter(|tag| tag.source.kind == SourceKind::ToolResult)
+            .collect();
+        // The refused probe returned fixed text, so only the reader's
+        // result carries a tag.
+        let [reader] = results.as_slice() else {
+            panic!("only the reader produced content: {results:?}");
+        };
+        assert!(
+            reader
+                .source
+                .source_id
+                .starts_with("tool_result:tool:reader:tc_"),
+            "the reader's result is tagged under its origin and call"
+        );
+        assert_eq!(reader.source.classification, SourceClassification::Unknown);
+
+        let (run, tags) =
+            read_then_probe(agent24_tools::ToolResultSource::ordinary("reader")).await;
+        assert_eq!(run.output.unwrap().text, "tool said: egress allowed");
+        assert!(
+            tags.iter()
+                .filter(|tag| tag.source.kind == SourceKind::ToolResult)
+                .all(
+                    |tag| tag.source.classification == SourceClassification::Ordinary
+                        || tag.source.source_id.starts_with("tool_result:tool:probe:")
+                ),
+        );
+    }
+
+    /// K1-6b.5f (PR-Daemon #1282 N1): a call that failed hands the model
+    /// whatever the other side sent, so its error is tagged like a result
+    /// and restricts the run's next egress.
+    #[tokio::test]
+    async fn a_failed_tool_call_is_tagged_and_restricts_later_egress() {
+        let (run, tags) = run_then_probe(Arc::new(FailingReader)).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(
+            run.output.unwrap().text,
+            "tool said: denied by policy: outbound policy unavailable"
+        );
+        let failed = tags
+            .iter()
+            .find(|tag| {
+                tag.source
+                    .source_id
+                    .starts_with("tool_result:tool:reader:tc_")
+            })
+            .expect("the failed call's error is tagged");
+        assert_eq!(
+            failed.source.classification,
+            agent24_store::SourceClassification::Unknown
+        );
+    }
+
+    /// Answers from a script and remembers whether any request it was sent
+    /// carried [`TOOL_SECRET`].
+    struct WatchingProvider {
+        script: ScriptedProvider,
+        saw_secret: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WatchingProvider {
+        fn name(&self) -> &str {
+            "watching"
+        }
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            if req.messages.iter().any(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(TOOL_SECRET))
+            }) {
+                self.saw_secret
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.script.complete(req, cancel).await
+        }
+        async fn models(
+            &self,
+            _: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    /// K1-6b.5f: a result whose tag cannot be written never reaches the
+    /// model; the run ends failed instead.
+    #[tokio::test]
+    async fn a_tool_result_whose_tag_cannot_be_written_never_reaches_the_model() {
+        let provider = Arc::new(WatchingProvider {
+            script: ScriptedProvider::new(vec![calls("reader", "c1")]),
+            saw_secret: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+            agent24_tools::ToolResultSource::unknown("reader"),
+        )));
+        let (manager, _sink, store) = manager_with_tools(provider.clone(), tools).await;
+        sqlx::query(
+            "CREATE TRIGGER no_tool_result_tags BEFORE INSERT ON run_source_tags \
+             WHEN NEW.source_id LIKE 'tool_result:%' \
+             BEGIN SELECT RAISE(ABORT, 'tag write refused'); END",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = manager.start_run(create()).await.unwrap();
+        let run = wait_terminal(&store, &run.id).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error.unwrap().code, "source_policy_unavailable");
+        assert!(
+            !provider
+                .saw_secret
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the untagged result reached the model"
         );
     }
 
@@ -5825,105 +6165,131 @@ mod approval_tests {
     /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
-    /// thread.
+    /// thread. A parked call that fails once it runs is settled the same way,
+    /// its error tagged like any result (K1-6b.5f, PR-Daemon #1282 N1).
     #[tokio::test]
     async fn a_parked_run_resumes_after_its_approval_is_answered() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = resume_harness(dir.path().to_path_buf()).await;
+        for (argv, answer) in [
+            (vec!["/bin/echo", "resumed-output"], "resumed-output"),
+            (vec!["/nonexistent/agent24-resume-test"], "spawn"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = resume_harness(dir.path().to_path_buf()).await;
 
-        // Seed the crash state directly: an awaiting_approval run with NO live
-        // task, its thread persisted (user + assistant turn whose trailing
-        // tool_call is unanswered), and a matching pending approval. The
-        // assistant call's arguments MUST equal the approval payload, or
-        // staleness re-validation would (correctly) refuse to run B for A.
-        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
-        let run = Run {
-            id: "run_1".to_owned(),
-            session_id: None,
-            workspace_id: None,
-            status: RunStatus::AwaitingApproval,
-            input: RunInput {
-                prompt: "run echo".to_owned(),
+            // Seed the crash state directly: an awaiting_approval run with NO live
+            // task, its thread persisted (user + assistant turn whose trailing
+            // tool_call is unanswered), and a matching pending approval. The
+            // assistant call's arguments MUST equal the approval payload, or
+            // staleness re-validation would (correctly) refuse to run B for A.
+            let args = serde_json::json!({ "argv": argv });
+            let run = Run {
+                id: "run_1".to_owned(),
+                session_id: None,
                 workspace_id: None,
-                model_override: None,
-                mode: agent24_protocol::RunMode::Normal,
-            },
-            output: None,
-            error: None,
-            usage: zero_usage(),
-            schedule_id: None,
-            created_at: now_iso8601(),
-            started_at: Some(now_iso8601()),
-            ended_at: None,
-        };
-        h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
-        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
-        h.store
-            .tag_run_source("run_1", 0, &source, &now_iso8601())
-            .await
-            .unwrap();
-        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
-        let approval = Approval {
-            id: "apr_1".to_owned(),
-            run_id: "run_1".to_owned(),
-            tool_call_id: "tc_internal_1".to_owned(),
-            kind: "exec".to_owned(),
-            summary: "shell_exec".to_owned(),
-            payload: args.as_object().unwrap().clone(),
-            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
-            standing_target: None,
-            status: ApprovalStatus::Pending,
-            decision: None,
-            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
-            created_at: now_iso8601(),
-            decided_at: None,
-        };
-        h.store.insert_approval(&approval).await.unwrap();
+                status: RunStatus::AwaitingApproval,
+                input: RunInput {
+                    prompt: "run echo".to_owned(),
+                    workspace_id: None,
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: now_iso8601(),
+                started_at: Some(now_iso8601()),
+                ended_at: None,
+            };
+            h.store.insert_run(&run).await.unwrap();
+            h.store
+                .append_run_message(
+                    "run_1",
+                    "user",
+                    Some("run echo"),
+                    &serde_json::json!([]),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+            h.store
+                .tag_run_source("run_1", 0, &source, &now_iso8601())
+                .await
+                .unwrap();
+            let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+            h.store
+                .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+                .await
+                .unwrap();
+            let approval = Approval {
+                id: "apr_1".to_owned(),
+                run_id: "run_1".to_owned(),
+                tool_call_id: "tc_internal_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "shell_exec".to_owned(),
+                payload: args.as_object().unwrap().clone(),
+                available_decisions: vec![
+                    "approve".to_owned(),
+                    "deny".to_owned(),
+                    "abort".to_owned(),
+                ],
+                standing_target: None,
+                status: ApprovalStatus::Pending,
+                decision: None,
+                expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
+                created_at: now_iso8601(),
+                decided_at: None,
+            };
+            h.store.insert_approval(&approval).await.unwrap();
 
-        // The human answers — no in-memory waiter is woken (the task is gone).
-        h.broker
-            .resolve("apr_1", decision("approve", None))
-            .await
-            .unwrap();
-        // The daemon resumes the run off the persisted thread.
-        h.manager
-            .resume_run("run_1".to_owned(), "apr_1".to_owned())
-            .await
-            .unwrap();
+            // The human answers — no in-memory waiter is woken (the task is gone).
+            h.broker
+                .resolve("apr_1", decision("approve", None))
+                .await
+                .unwrap();
+            // The daemon resumes the run off the persisted thread.
+            h.manager
+                .resume_run("run_1".to_owned(), "apr_1".to_owned())
+                .await
+                .unwrap();
 
-        let done = wait_terminal(&h.store, "run_1").await;
-        assert_eq!(done.status, RunStatus::Completed);
-        // The parked shell_exec actually ran on resume; its output flowed into
-        // the final answer.
-        assert!(
-            done.output.unwrap().text.contains("resumed-output"),
-            "the parked tool did not run on resume"
-        );
-        // The reconstructed thread gained the tool result for the parked call,
-        // keyed on the THREAD's provider id (call_provider_1) — NOT the
-        // approval's tc_internal_1. Resume works across the two id namespaces.
-        let thread = h.store.list_run_messages("run_1").await.unwrap();
-        assert!(
-            thread
+            let done = wait_terminal(&h.store, "run_1").await;
+            assert_eq!(done.status, RunStatus::Completed);
+            // The parked shell_exec actually ran on resume; its output flowed into
+            // the final answer.
+            assert!(
+                done.output.unwrap().text.contains(answer),
+                "the parked tool did not run on resume"
+            );
+            // The reconstructed thread gained the tool result for the parked call,
+            // keyed on the THREAD's provider id (call_provider_1) — NOT the
+            // approval's tc_internal_1. Resume works across the two id namespaces.
+            let thread = h.store.list_run_messages("run_1").await.unwrap();
+            assert!(
+                thread
+                    .iter()
+                    .any(|m| m.role == "tool"
+                        && m.tool_call_id.as_deref() == Some("call_provider_1")),
+                "no tool result was recorded for the resumed call"
+            );
+            // K1-6b.5f: the settled call's result is tagged like any other, under
+            // the approval's call id.
+            let tags = h.store.list_run_source_tags("run_1").await.unwrap();
+            let result = tags
                 .iter()
-                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
-            "no tool result was recorded for the resumed call"
-        );
+                .find(|tag| tag.source.kind == agent24_store::SourceKind::ToolResult)
+                .expect("the resumed shell_exec's result is tagged");
+            assert_eq!(
+                result.source.source_id,
+                "tool_result:tool:shell_exec:tc_internal_1"
+            );
+            assert_eq!(
+                result.source.classification,
+                agent24_store::SourceClassification::Unknown
+            );
+        }
     }
 
     /// K1-6b.5d: a run parked on a shell_exec approval when the daemon

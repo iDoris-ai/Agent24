@@ -1662,19 +1662,13 @@ pub async fn serve(
         else {
             continue;
         };
-        match agent24_tools::ModuleTool::new(
+        match crate::module_tool_runtime::assemble_module_tool(
             module,
-            declaration.operation(),
-            declaration.description(),
-            declaration.input_schema().clone(),
-            Duration::from_millis(declaration.timeout_ms()),
-            Duration::from_millis(declaration.inline_wait_ms()),
-            agent24_protocol::RiskClass::External,
+            declaration,
             StdArc::clone(&advert_view_dyn),
             StdArc::clone(authorization),
             StdArc::clone(&module_tool_runtime_dyn),
             store.clone(),
-            "agent24d",
         ) {
             Ok(tool) => {
                 if let Err(error) = tools.register_module_tool(StdArc::new(tool)) {

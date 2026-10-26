@@ -238,6 +238,12 @@ impl FsReadTool {
 
 #[async_trait]
 impl Tool for FsReadTool {
+    /// Traceable: only files under the configured roots can be read, so the
+    /// host knows the path each result came from (David 2026-10-26).
+    fn result_source(&self) -> crate::ToolResultSource {
+        crate::ToolResultSource::ordinary("fs_read")
+    }
+
     fn requires_outbound_policy(&self) -> bool {
         false
     }
@@ -322,6 +328,11 @@ impl FsWriteTool {
 
 #[async_trait]
 impl Tool for FsWriteTool {
+    /// A receipt: it returns no content it read.
+    fn result_source(&self) -> crate::ToolResultSource {
+        crate::ToolResultSource::ordinary("fs_write")
+    }
+
     fn requires_outbound_policy(&self) -> bool {
         false
     }
