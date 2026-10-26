@@ -80,9 +80,24 @@ pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<Arc<crate::P
 pub(crate) fn pin_outside_dir(
     parent: PathBuf,
 ) -> Result<Arc<crate::PinnedOutsideDir>, std::io::Error> {
+    // `parent` was canonical when it was resolved, but opening it resolves it
+    // again: a component swapped for a symlink in between would leave the
+    // handle on another directory under the approved name. Opened without
+    // following a symlink at any level, the handle is the directory that is
+    // at this very name, or the open fails.
     // Directory open fails immediately on a FIFO or regular file. `File::open`
     // would block on a FIFO and stall the caller before any approval exists.
-    let dir = cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())?;
+    if !parent.is_absolute()
+        || parent
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a canonical absolute path",
+        ));
+    }
+    let dir = open_dir_through_no_symlink(&parent)?;
     let meta = dir.dir_metadata()?;
     Ok(Arc::new(crate::PinnedOutsideDir {
         path: parent,
@@ -90,6 +105,63 @@ pub(crate) fn pin_outside_dir(
         dev: cap_fs_ext::MetadataExt::dev(&meta),
         ino: cap_fs_ext::MetadataExt::ino(&meta),
     }))
+}
+
+/// macOS 11 (Darwin 20) and later: one open of the whole path that fails on
+/// a symlink at any level (`O_NOFOLLOW_ANY`). Like a plain open, ancestors
+/// need only search permission. Older kernels ignore the flag without an
+/// error, so there the path is walked as elsewhere (each level then needs
+/// read permission: an approved write under an unreadable ancestor fails).
+#[cfg(target_os = "macos")]
+fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !nofollow_any_is_honoured() {
+        return walk_without_following(path);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
+        .open(path)?;
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+/// Whether this kernel is Darwin 20 (macOS 11) or later, read once. An
+/// unreadable release counts as older: the walk is the closed direction.
+#[cfg(target_os = "macos")]
+fn nofollow_any_is_honoured() -> bool {
+    static HONOURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HONOURED.get_or_init(|| darwin_major().is_some_and(|major| major >= 20))
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_major() -> Option<u32> {
+    let name = rustix::system::uname();
+    name.release()
+        .to_str()
+        .ok()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Elsewhere: walked from the root, no level followed. cap-std opens each
+/// with `O_PATH` where there is one (Linux), so ancestors need only search
+/// permission there too.
+#[cfg(not(target_os = "macos"))]
+fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    walk_without_following(path)
+}
+
+/// The canonical path opened level by level from the root, following none.
+fn walk_without_following(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    let mut dir = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            dir = cap_fs_ext::DirExt::open_dir_nofollow(&dir, name)?;
+        }
+    }
+    Ok(dir)
 }
 
 /// Lexically fold `.` / `..` (no filesystem access). `None` when `..` would
@@ -273,6 +345,32 @@ impl Tool for FsWriteTool {
             "required": ["path", "content"],
             "additionalProperties": false
         })
+    }
+
+    /// An outside write's approval is for the directory captured before the
+    /// gate (L-APPR-8). The durable-resume path captured none, and which one
+    /// the human saw is not recorded, so the call is asked again
+    /// (`ApprovalStale`, as for a module call), not refused by the whitelist.
+    async fn call_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        invocation: &crate::ToolInvocation,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let outside_unpinned = || {
+            str_arg(input, "path").is_some_and(|raw| {
+                Path::new(raw).is_absolute() && resolve_in_roots(raw, &self.roots).is_err()
+            })
+        };
+        if matches!(invocation.approval, crate::ApprovalBinding::Unbound)
+            && ctx.workspace_authority().is_none()
+            && ctx.pinned_outside_directory().is_none()
+            && outside_unpinned()
+        {
+            return Err(ToolError::ApprovalStale);
+        }
+        self.call(ctx, input, cancel).await
     }
 
     async fn call(
@@ -656,6 +754,103 @@ mod tests {
             .unwrap_err();
         assert!(matches!(wrong, ToolError::Denied(_)), "{wrong:?}");
         assert!(!other.exists());
+    }
+
+    /// The name `approved_parent` resolved is opened again without following
+    /// any symlink: a level swapped for one after it was resolved, last or
+    /// in between, is not pinned (#1254 Codex C1); a real directory is.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_now_goes_through_a_symlink_is_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (safe, secret) = (root.join("safe"), root.join("secret"));
+        std::fs::create_dir_all(safe.join("sub")).unwrap();
+        std::fs::create_dir_all(secret.join("sub")).unwrap();
+        let pinned = pin_outside_dir(safe.clone()).unwrap();
+        let meta = std::fs::metadata(&safe).unwrap();
+        assert_eq!(
+            (pinned.dev(), pinned.ino()),
+            (
+                std::os::unix::fs::MetadataExt::dev(&meta),
+                std::os::unix::fs::MetadataExt::ino(&meta)
+            )
+        );
+        // `safe` resolved, then swapped for a symlink to `secret`.
+        std::fs::rename(&safe, root.join("safe-moved")).unwrap();
+        std::os::unix::fs::symlink(&secret, &safe).unwrap();
+        assert!(pin_outside_dir(safe.clone()).is_err(), "the last level");
+        assert!(
+            pin_outside_dir(safe.join("sub")).is_err(),
+            "a level in between"
+        );
+        assert!(pin_outside_dir(PathBuf::from("relative")).is_err());
+    }
+
+    /// The walk used where `O_NOFOLLOW_ANY` is not honoured refuses a
+    /// symlink at any level as well (#1254 Codex round 3).
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_refuses_a_symlink_at_any_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (real, link) = (root.join("real"), root.join("link"));
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(walk_without_following(&real.join("sub")).is_ok());
+        assert!(walk_without_following(&link).is_err(), "the last level");
+        assert!(
+            walk_without_following(&link.join("sub")).is_err(),
+            "a level in between"
+        );
+    }
+
+    /// An ancestor the user may search but not read does not stop the pin,
+    /// as it did not stop the plain open before (#1254 Codex round 2) —
+    /// except where macOS ignores `O_NOFOLLOW_ANY` (Darwin < 20) and the
+    /// walk needs read permission: there it fails, closed.
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_that_can_only_be_searched_still_pins() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (shared, target) = (root.join("shared"), root.join("shared/target"));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let pinned = pin_outside_dir(target.clone());
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(target_os = "macos")]
+        let pins = nofollow_any_is_honoured();
+        #[cfg(not(target_os = "macos"))]
+        let pins = true;
+        assert_eq!(pinned.is_ok(), pins, "{:?}", pinned.err());
+    }
+
+    /// The durable-resume path captured no outside directory: the call is
+    /// asked again, not run and not refused (#1254 Codex C2). Inside the
+    /// workspace it runs as approved.
+    #[tokio::test]
+    async fn a_resumed_outside_write_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let reg = ToolRegistry::builtin(ws.clone());
+        let file = outside.join("a.txt");
+        let input = sinput(&[("path", file.to_str().unwrap()), ("content", "x")]);
+        let err = reg
+            .execute_preapproved("fs_write", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ApprovalStale), "{err:?}");
+        assert!(!file.exists());
+        let inside = ws.join("b.txt");
+        let input = sinput(&[("path", inside.to_str().unwrap()), ("content", "y")]);
+        reg.execute_preapproved("fs_write", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "y");
     }
 
     struct SwapGate {
