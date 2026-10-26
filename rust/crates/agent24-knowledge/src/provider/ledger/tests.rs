@@ -307,3 +307,9 @@ fn a_confirmed_loosening_can_no_longer_be_abandoned() {
 fn an_empty_scope_is_a_caller_bug() {
     fresh(true).tighten(Scope::Profiles(Vec::new()));
 }
+
+#[test]
+#[should_panic]
+fn an_empty_loosening_scope_is_a_caller_bug() {
+    let _ = fresh(true).loosen(Scope::Profiles(Vec::new()), None, true);
+}

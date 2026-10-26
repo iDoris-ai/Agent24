@@ -35,6 +35,23 @@ impl From<StuckCause> for UnavailableCause {
     }
 }
 
+/// The causes that persist; `dependency`, `not_ready` and `local_storage`
+/// do not (#1267), so a host writing a record cannot keep them by mistake.
+impl TryFrom<UnavailableCause> for StuckCause {
+    type Error = UnavailableCause;
+    fn try_from(cause: UnavailableCause) -> Result<Self, UnavailableCause> {
+        match cause {
+            UnavailableCause::Incompatible => Ok(Self::Incompatible),
+            UnavailableCause::InstanceUnidentified => Ok(Self::InstanceUnidentified),
+            UnavailableCause::CredentialRejected => Ok(Self::CredentialRejected),
+            UnavailableCause::AccessRevoked => Ok(Self::AccessRevoked),
+            UnavailableCause::Dependency
+            | UnavailableCause::NotReady
+            | UnavailableCause::LocalStorage => Err(cause),
+        }
+    }
+}
+
 /// The host's identifiers and values: the crate only compares them. The
 /// implementing marker derives what the records do.
 pub trait Ids: Clone + Debug + Eq {

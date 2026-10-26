@@ -172,7 +172,15 @@ impl BindingState {
     }
 
     /// A probe goes out only with a current credential, so no probe moves
-    /// the binding to a servable phase without one (#1228 note 1).
+    /// the binding to a servable phase without one (#1228 note 1). This, on
+    /// the aggregate, is the only way to a probe ticket; the connection's own
+    /// is not reachable from outside the module:
+    ///
+    /// ```compile_fail,E0624
+    /// fn bypass(connection: &mut agent24_knowledge::provider::connection::Connection) {
+    ///     let _ = connection.probe();
+    /// }
+    /// ```
     pub fn probe(&mut self) -> Option<ProbeTicket> {
         self.credentials.current()?;
         self.connection.probe()
