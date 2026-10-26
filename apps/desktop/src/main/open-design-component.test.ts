@@ -397,6 +397,29 @@ describe('OpenDesignComponentInstaller', () => {
     expect(fs.readdirSync(componentsRoot)).toEqual([])
   })
 
+  it('L1: install() with a custom componentsRoot does not need HOME / AGENT24_DATA_DIR', async () => {
+    const stage = seedTreeFor('a24-od-stage-nohome-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+    const componentsRoot = tmpDir('a24-od-root-nohome-')
+    const savedHome = process.env['HOME']
+    const savedDir = process.env['AGENT24_DATA_DIR']
+    delete process.env['HOME']
+    delete process.env['AGENT24_DATA_DIR']
+    try {
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result).toEqual({ state: 'installed', dir: openDesignComponentInstallDir(componentsRoot, manifest) })
+    } finally {
+      if (savedHome === undefined) delete process.env['HOME']
+      else process.env['HOME'] = savedHome
+      if (savedDir === undefined) delete process.env['AGENT24_DATA_DIR']
+      else process.env['AGENT24_DATA_DIR'] = savedDir
+    }
+  })
+
   it('downloads, verifies, and installs a good tarball', async () => {
     const stage = seedTreeFor('a24-od-stage-good-')
     const tarPath = buildTarball(stage)
