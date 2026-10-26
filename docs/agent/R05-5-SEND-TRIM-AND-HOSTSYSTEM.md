@@ -23,16 +23,16 @@
 规则：
 
 1. 是否宿主 recall，只看该 seq 已落盘来源的 kind 是否为 HostRecall。不再看文本标记。
-2. `RECALL_PREFIX` 与 `RECALL_END_MARKER` 只用于在已证明的 HostRecall 正文里定位要裁的行。
+2. `RECALL_PREFIX` 与 `RECALL_END_MARKER` 只用于在已证明的 HostRecall 正文里定位要裁的行。已证明是 HostRecall、但不满足「role 为 user、有头、有结束标记、能解析出至少一个 id」的行，整条从发送副本移除并记 warn（失败关闭），不得走原样保留分支。`prune_stale_recall_message` 对不合形消息（content 为 None、role 非 user、不以 `RECALL_PREFIX` 开头、不以 `RECALL_END_MARKER` 结尾）会 `return Some(msg)` 原样放行，`prune_stale_recall_message_preserves_rather_than_drops_a_malformed_lookalike` 断言的就是这个放行。该放行语义只适用于旧的按文本判定，不适用于按 kind 判定。4b 不得直接复用这些分支返回 `Some(msg)` 的结果：要么在调用前自行校验形状，要么在调用后区分「已裁剪」与「原样放行」。
 3. HostRecall 不限位置 0，按 seq 逐条处理。
 4. `self.memory` 为 None（`open_memory_base` 失败）时，同样移除全部 Present 的 HostRecall，因为无法证明其中的 id 仍有效，失败关闭。此时记 warn。UserPrompt、SessionHistory、Assistant、ToolResult、HostSystem 照常逐字发送。
 5. 其余 kind（UserPrompt、SessionHistory、Assistant、ToolResult，以及第 3 节的 HostSystem）逐字发送，不裁剪，不移除。
 6. 裁剪只作用于发送副本。库里的消息正文、来源行、snapshot 都不改。
-7. 整形完成后才调用 `normalize_for_provider`（与 ADR 第 3 节第 6 条一致）。
+7. 整形完成后才调用 `normalize_for_provider`（与 ADR 第 3 节第 6 条一致）。4b 实现时先按 kind 整形，再 normalize：`normalize_for_provider` 会合并相邻 user，合并之后来源就分不开了。
 
 | 行 | provider 可以收到什么 | 必须裁掉什么 | snapshot 是否保持 |
 | --- | --- | --- | --- |
-| HostRecall（Present，recall_ref 非 NULL） | 正文中 id 仍在当前有效集合内的行，连同头和结束标记。 | 沿用 `prune_stale_recall_message` 的逐行规则，裁掉 id 已失效的行。全部失效则整条从发送副本移除。读取有效 id 集合失败，或 memory 为 None，则整条移除并记 warn（失败关闭）。 | 保持。库里正文与来源行不变。 |
+| HostRecall（Present，recall_ref 非 NULL） | 正文中 id 仍在当前有效集合内的行，连同头和结束标记。 | 沿用 `prune_stale_recall_message` 的逐行规则，裁掉 id 已失效的行。全部失效则整条从发送副本移除。读取有效 id 集合失败，或 memory 为 None，则整条移除并记 warn（失败关闭）。正文不合形（role 非 user、content 为 NULL、缺头、缺结束标记、解析不出 id）同样整条移除并记 warn，不原样保留。 | 保持。库里正文与来源行不变。 |
 | UserPrompt | 逐字发送。 | 无。永不裁剪，永不移除，即使正文与 recall 块完全同形。 | 保持。 |
 | SessionHistory | 逐字发送，role 为 user、assistant、tool、system 都一样。 | 无。永不裁剪，永不移除，即使正文与 recall 块完全同形。 | 保持。 |
 | 同文三来源 | 同一段正文分成 HostRecall、UserPrompt、SessionHistory 三行时，三行各按自己的 kind 处理：HostRecall 行按上面规则裁，另两行逐字到达。digest 相同不影响处理。 | 只有 HostRecall 那一行可能被裁。 | 保持，三行都不变。 |
@@ -57,6 +57,7 @@
 | `send_copy_drops_host_recall_when_all_ids_revoked` | 全部撤回后该条不在 provider 请求里。 |
 | `send_copy_drops_host_recall_when_active_ids_unreadable` | `active_ids()` 失败：HostRecall 整条消失，同一请求里的 UserPrompt 仍在，且有 warn。 |
 | `send_copy_three_same_text_origins_each_by_kind` | 同文三行：只有 HostRecall 行被裁，另两行逐字到达。 |
+| `send_copy_drops_malformed_host_recall` | 构造 kind 为 HostRecall、recall_ref 非 NULL 的行，分三种正文：缺结束标记；role 非 user；content 为 NULL。每种 provider spy 都看不到这条，同一请求里的 UserPrompt 仍在，有 warn。反向对照：同样缺结束标记的正文落在 UserPrompt 上，必须逐字到达。 |
 | `send_copy_trim_leaves_snapshot_bytes_unchanged` | 裁剪前后读 `list_run_messages` 与 `read_run_message_origin`：正文、kind、digest、recall_ref 逐字节不变。 |
 | `resume_after_restart_drops_revoked_recall_line` | 不比较两条路径是否相等，因为两边都发出撤回内容也能相等。步骤：run 挂起等审批；撤回 recall 块中的一个 id；丢弃 manager；用同一个数据文件重新打开持久库；新建 manager 走 `resume_run`。独立断言：被撤回 id 的行不在 provider spy 收到的副本里；其余有效行、普通 history、UserPrompt 与库里正文逐字相等。 |
 | `resume_after_append_binds_kind_by_store_seq` | 本轮已追加 assistant 与 tool 消息之后再次发送（审批后第二次迭代）。断言 HostRecall 仍被裁，UserPrompt 与 SessionHistory 逐字，且 kind 来自库里的 seq。构造一个内存下标与 seq 不对齐的夹具（例如 HostRecall 同形正文出现在非位置 0 的 UserPrompt 上），证明不是按下标推断。 |
