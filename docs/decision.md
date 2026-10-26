@@ -1504,7 +1504,7 @@ argv 会暴露给 process listing；env 容易被继承/诊断 dump；0600 普�
 
 **日期**：2026-10-26
 **状态**：🟡 提议（产品方向由 jason 2026-10-26 拍板；本文待 Codex 挑战与 clestons 评审，批准前不派生产实现）
-**事实基线**：main `3a433bb0` 只读调查，逐条证据见 [`docs/tracking/2026-10-26/SOURCE-ADR-037-facts.md`](tracking/2026-10-26/SOURCE-ADR-037-facts.md)。这份清单随 2026-10-26 三份跟踪文档的 PR 一起入库；在那之前它标「待入库」。
+**事实基线**：main `3a433bb0` 只读调查，逐条证据见 [`docs/tracking/2026-10-26/SOURCE-ADR-037-facts.md`](tracking/2026-10-26/SOURCE-ADR-037-facts.md)。这份清单随本 PR 入库。
 
 ### 背景
 
@@ -1550,7 +1550,8 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
           - 进程不以非 0 退出，避免 LaunchAgent 的 `KeepAlive{SuccessfulExit:false}` 每 10 秒拉起一次，反复做整库快照（`agent24-cli/src/service.rs`）；
           - 外壳看到 `migration_failed` 后给出明确提示。
           
-          标记只有两种方式清除：安装器换回旧二进制后清除；或者用户执行 `agent24 daemon repair --retry-migration`，这个命令属于提升级操作。启动时如果发现标记仍在，且二进制版本没变，就直接进入停靠状态，不再尝试迁移。
+          标记只有两种方式清除：安装器换回旧二进制后清除；或者用户执行 `agent24 daemon repair --retry-migration`。后者属于提升级操作，必须走停靠态 daemon 的诊断端点，由 daemon 校验在场证明后才清除标记；不允许 CLI 离线直接改标记，否则同 UID 进程也能做，提升级就没有意义。
+          - 停靠态下 `/health.status=migration_failed`，`tryReuseExternal` 和其他外壳都必须把它识别为「不可复用、需要处理」，不能当作健康。Linux 的 systemd 单元（`Restart=on-failure`）按同一语义落地：停靠时进程不退出，不触发重启。启动时如果发现标记仍在，且二进制版本没变，就直接进入停靠状态，不再尝试迁移。
        
        不可回退的迁移（例如 0015–0017）必须先过这道门。
 
@@ -1566,6 +1567,7 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
          1. **FIDO2 / WebAuthn 安全密钥**：触碰即构成物理在场，挑战由 daemon 生成，经 SSH 转发或在本机读卡器上完成。
          2. **已配对移动设备**：经决策 6 的独立授权入口确认，确认内容绑定确切的操作和 payload 版本。
          
+         安全密钥、配对设备的**首次登记**本身也是提升级操作，同样要在场证明：在有桌面的机器上用桌面确认；在 headless 机器上，只能在本机控制台或已登记的外壳里，用一次性配对码完成，并在审计里留记录。FIDO2 挑战经 SSH 怎么做（CTAP 转发，还是本机读卡器），由实现设计定，`REMOTE-CONTROL-HYPHAE.md` 的「配对」一题一并回答。
          TOTP、口令这类秘密存在本机磁盘上，同 UID 进程能读到并离线伪造，所以**不作为**提升级证明。headless 机器上两者都没配置时，只能用日常级，在 TUI 里明确提示「需要配置安全密钥或配对设备才能审批」。这条写进对 ADR-026 #11 的修订。
        - **边界声明**：
          - 恶意的同 UID 程序仍然可以伪造界面输入，防它需要 OS 隔离，不在本文范围（ADR-031 威胁模型）。本条挡的是合作但不受信的插件和 sidecar 自动提权。
