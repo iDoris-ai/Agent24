@@ -948,9 +948,6 @@ impl RunManager {
         )
     }
 
-    /// Append one message to the run's durable thread (H3/G1 foundation).
-    /// Most callers treat this as best-effort bookkeeping; callers that require
-    /// a complete replay prefix must check the result and fail closed.
     /// The source tag for what `tool` returned on call `tool_call_id`.
     fn tool_result_tag(&self, tool: &str, tool_call_id: &str) -> agent24_store::SourceRef {
         let source = self.tools.tool_result_source(tool);
@@ -992,6 +989,9 @@ impl RunManager {
         true
     }
 
+    /// Append one message to the run's durable thread (H3/G1 foundation).
+    /// Most callers treat this as best-effort bookkeeping; callers that require
+    /// a complete replay prefix must check the result and fail closed.
     async fn persist_message(&self, run_id: &str, msg: &Msg) -> Result<(), StoreError> {
         let tool_calls =
             serde_json::to_value(&msg.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
@@ -3706,6 +3706,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// Fails with [`TOOL_SECRET`], as an MCP `is_error` result or a module's
+    /// error body hands back what the other side sent; the host's default
+    /// classification applies.
+    struct FailingReader;
+
+    #[async_trait]
+    impl agent24_tools::Tool for FailingReader {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new("reader", "builtin", "reads", RiskClass::Read)
+        }
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            Err(ToolError::Failed(TOOL_SECRET.to_owned()))
+        }
+    }
+
     /// Answers whether its call could leave the device, as `shell_exec` asks.
     struct EgressProbe;
 
@@ -3751,9 +3777,14 @@ pub(crate) mod tests {
     async fn read_then_probe(
         source: agent24_tools::ToolResultSource,
     ) -> (Run, Vec<agent24_store::StoredSourceTag>) {
-        let tools = ToolRegistry::new()
-            .with(Arc::new(ReadingTool(source)))
-            .with(Arc::new(EgressProbe));
+        run_then_probe(Arc::new(ReadingTool(source))).await
+    }
+
+    /// [`read_then_probe`] with `reader` as the tool called first.
+    async fn run_then_probe(
+        reader: Arc<dyn agent24_tools::Tool>,
+    ) -> (Run, Vec<agent24_store::StoredSourceTag>) {
+        let tools = ToolRegistry::new().with(reader).with(Arc::new(EgressProbe));
         let provider = ScriptedProvider::new(vec![calls("probe", "c2"), calls("reader", "c1")]);
         let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
         let run = manager.start_run(create()).await.unwrap();
@@ -3803,6 +3834,31 @@ pub(crate) mod tests {
                     |tag| tag.source.classification == SourceClassification::Ordinary
                         || tag.source.source_id.starts_with("tool_result:tool:probe:")
                 ),
+        );
+    }
+
+    /// K1-6b.5f (PR-Daemon #1282 N1): a call that failed hands the model
+    /// whatever the other side sent, so its error is tagged like a result
+    /// and restricts the run's next egress.
+    #[tokio::test]
+    async fn a_failed_tool_call_is_tagged_and_restricts_later_egress() {
+        let (run, tags) = run_then_probe(Arc::new(FailingReader)).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(
+            run.output.unwrap().text,
+            "tool said: denied by policy: outbound policy unavailable"
+        );
+        let failed = tags
+            .iter()
+            .find(|tag| {
+                tag.source
+                    .source_id
+                    .starts_with("tool_result:tool:reader:tc_")
+            })
+            .expect("the failed call's error is tagged");
+        assert_eq!(
+            failed.source.classification,
+            agent24_store::SourceClassification::Unknown
         );
     }
 
@@ -6109,120 +6165,131 @@ mod approval_tests {
     /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
-    /// thread.
+    /// thread. A parked call that fails once it runs is settled the same way,
+    /// its error tagged like any result (K1-6b.5f, PR-Daemon #1282 N1).
     #[tokio::test]
     async fn a_parked_run_resumes_after_its_approval_is_answered() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = resume_harness(dir.path().to_path_buf()).await;
+        for (argv, answer) in [
+            (vec!["/bin/echo", "resumed-output"], "resumed-output"),
+            (vec!["/nonexistent/agent24-resume-test"], "spawn"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = resume_harness(dir.path().to_path_buf()).await;
 
-        // Seed the crash state directly: an awaiting_approval run with NO live
-        // task, its thread persisted (user + assistant turn whose trailing
-        // tool_call is unanswered), and a matching pending approval. The
-        // assistant call's arguments MUST equal the approval payload, or
-        // staleness re-validation would (correctly) refuse to run B for A.
-        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
-        let run = Run {
-            id: "run_1".to_owned(),
-            session_id: None,
-            workspace_id: None,
-            status: RunStatus::AwaitingApproval,
-            input: RunInput {
-                prompt: "run echo".to_owned(),
+            // Seed the crash state directly: an awaiting_approval run with NO live
+            // task, its thread persisted (user + assistant turn whose trailing
+            // tool_call is unanswered), and a matching pending approval. The
+            // assistant call's arguments MUST equal the approval payload, or
+            // staleness re-validation would (correctly) refuse to run B for A.
+            let args = serde_json::json!({ "argv": argv });
+            let run = Run {
+                id: "run_1".to_owned(),
+                session_id: None,
                 workspace_id: None,
-                model_override: None,
-                mode: agent24_protocol::RunMode::Normal,
-            },
-            output: None,
-            error: None,
-            usage: zero_usage(),
-            schedule_id: None,
-            created_at: now_iso8601(),
-            started_at: Some(now_iso8601()),
-            ended_at: None,
-        };
-        h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
-        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
-        h.store
-            .tag_run_source("run_1", 0, &source, &now_iso8601())
-            .await
-            .unwrap();
-        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
-        let approval = Approval {
-            id: "apr_1".to_owned(),
-            run_id: "run_1".to_owned(),
-            tool_call_id: "tc_internal_1".to_owned(),
-            kind: "exec".to_owned(),
-            summary: "shell_exec".to_owned(),
-            payload: args.as_object().unwrap().clone(),
-            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
-            standing_target: None,
-            status: ApprovalStatus::Pending,
-            decision: None,
-            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
-            created_at: now_iso8601(),
-            decided_at: None,
-        };
-        h.store.insert_approval(&approval).await.unwrap();
+                status: RunStatus::AwaitingApproval,
+                input: RunInput {
+                    prompt: "run echo".to_owned(),
+                    workspace_id: None,
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: now_iso8601(),
+                started_at: Some(now_iso8601()),
+                ended_at: None,
+            };
+            h.store.insert_run(&run).await.unwrap();
+            h.store
+                .append_run_message(
+                    "run_1",
+                    "user",
+                    Some("run echo"),
+                    &serde_json::json!([]),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+            h.store
+                .tag_run_source("run_1", 0, &source, &now_iso8601())
+                .await
+                .unwrap();
+            let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+            h.store
+                .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+                .await
+                .unwrap();
+            let approval = Approval {
+                id: "apr_1".to_owned(),
+                run_id: "run_1".to_owned(),
+                tool_call_id: "tc_internal_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "shell_exec".to_owned(),
+                payload: args.as_object().unwrap().clone(),
+                available_decisions: vec![
+                    "approve".to_owned(),
+                    "deny".to_owned(),
+                    "abort".to_owned(),
+                ],
+                standing_target: None,
+                status: ApprovalStatus::Pending,
+                decision: None,
+                expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
+                created_at: now_iso8601(),
+                decided_at: None,
+            };
+            h.store.insert_approval(&approval).await.unwrap();
 
-        // The human answers — no in-memory waiter is woken (the task is gone).
-        h.broker
-            .resolve("apr_1", decision("approve", None))
-            .await
-            .unwrap();
-        // The daemon resumes the run off the persisted thread.
-        h.manager
-            .resume_run("run_1".to_owned(), "apr_1".to_owned())
-            .await
-            .unwrap();
+            // The human answers — no in-memory waiter is woken (the task is gone).
+            h.broker
+                .resolve("apr_1", decision("approve", None))
+                .await
+                .unwrap();
+            // The daemon resumes the run off the persisted thread.
+            h.manager
+                .resume_run("run_1".to_owned(), "apr_1".to_owned())
+                .await
+                .unwrap();
 
-        let done = wait_terminal(&h.store, "run_1").await;
-        assert_eq!(done.status, RunStatus::Completed);
-        // The parked shell_exec actually ran on resume; its output flowed into
-        // the final answer.
-        assert!(
-            done.output.unwrap().text.contains("resumed-output"),
-            "the parked tool did not run on resume"
-        );
-        // The reconstructed thread gained the tool result for the parked call,
-        // keyed on the THREAD's provider id (call_provider_1) — NOT the
-        // approval's tc_internal_1. Resume works across the two id namespaces.
-        let thread = h.store.list_run_messages("run_1").await.unwrap();
-        assert!(
-            thread
+            let done = wait_terminal(&h.store, "run_1").await;
+            assert_eq!(done.status, RunStatus::Completed);
+            // The parked shell_exec actually ran on resume; its output flowed into
+            // the final answer.
+            assert!(
+                done.output.unwrap().text.contains(answer),
+                "the parked tool did not run on resume"
+            );
+            // The reconstructed thread gained the tool result for the parked call,
+            // keyed on the THREAD's provider id (call_provider_1) — NOT the
+            // approval's tc_internal_1. Resume works across the two id namespaces.
+            let thread = h.store.list_run_messages("run_1").await.unwrap();
+            assert!(
+                thread
+                    .iter()
+                    .any(|m| m.role == "tool"
+                        && m.tool_call_id.as_deref() == Some("call_provider_1")),
+                "no tool result was recorded for the resumed call"
+            );
+            // K1-6b.5f: the settled call's result is tagged like any other, under
+            // the approval's call id.
+            let tags = h.store.list_run_source_tags("run_1").await.unwrap();
+            let result = tags
                 .iter()
-                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
-            "no tool result was recorded for the resumed call"
-        );
-        // K1-6b.5f: the settled call's result is tagged like any other, under
-        // the approval's call id.
-        let tags = h.store.list_run_source_tags("run_1").await.unwrap();
-        let result = tags
-            .iter()
-            .find(|tag| tag.source.kind == agent24_store::SourceKind::ToolResult)
-            .expect("the resumed shell_exec's result is tagged");
-        assert_eq!(
-            result.source.source_id,
-            "tool_result:tool:shell_exec:tc_internal_1"
-        );
-        assert_eq!(
-            result.source.classification,
-            agent24_store::SourceClassification::Unknown
-        );
+                .find(|tag| tag.source.kind == agent24_store::SourceKind::ToolResult)
+                .expect("the resumed shell_exec's result is tagged");
+            assert_eq!(
+                result.source.source_id,
+                "tool_result:tool:shell_exec:tc_internal_1"
+            );
+            assert_eq!(
+                result.source.classification,
+                agent24_store::SourceClassification::Unknown
+            );
+        }
     }
 
     /// K1-6b.5d: a run parked on a shell_exec approval when the daemon

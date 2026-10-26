@@ -580,7 +580,6 @@ impl ApprovalGate for DenyAllGate {
     }
 }
 
-/// One callable tool. `parameters` is the JSON Schema advertised to the model;
 /// Where a tool's result came from and how the host classifies it
 /// (K1-6b.5f, ADR-K1-02 §2.1). Decided by the host's code for each kind of
 /// tool, so an MCP server or a module process cannot change it.
@@ -609,6 +608,7 @@ impl ToolResultSource {
     }
 }
 
+/// One callable tool. `parameters` is the JSON Schema advertised to the model;
 /// `call` returns the string handed back as the tool result message.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -1139,6 +1139,13 @@ impl ModuleTool {
     pub fn with_declared_outbound(mut self, outbound: bool) -> Self {
         self.declared_outbound = outbound;
         self
+    }
+
+    /// What [`Self::with_declared_outbound`] recorded; `true` unless the host
+    /// said otherwise.
+    #[must_use]
+    pub fn declared_outbound(&self) -> bool {
+        self.declared_outbound
     }
 }
 

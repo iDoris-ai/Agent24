@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::domain::Supervisors;
 use agent24_domain::tool::{
     ModuleToolAdvertView, ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult,
+    ToolDeclaration,
 };
 use agent24_os_proto::drain::{DrainState, Generation};
 use agent24_os_proto::kernel_call::{
@@ -426,6 +427,37 @@ pub(crate) fn store_authorization(
     .with_artifact_source(artifact)
 }
 
+/// The tool the host registers for `module`'s `declaration`. Every module
+/// operation is `External` to the host's approval gate whatever the manifest
+/// says; what the manifest declares only ever withholds the same-source
+/// exception (K1-6b.5f, ADR-K1-02 §2.1.1 item 6).
+pub(crate) fn assemble_module_tool(
+    module: &str,
+    declaration: &ToolDeclaration,
+    advert_view: Arc<dyn ModuleToolAdvertView>,
+    authorization: Arc<dyn ModuleToolAuthorization>,
+    runtime: Arc<dyn ModuleToolRuntime>,
+    store: agent24_store::Store,
+) -> Result<agent24_tools::ModuleTool, &'static str> {
+    agent24_tools::ModuleTool::new(
+        module,
+        declaration.operation(),
+        declaration.description(),
+        declaration.input_schema().clone(),
+        Duration::from_millis(declaration.timeout_ms()),
+        Duration::from_millis(declaration.inline_wait_ms()),
+        agent24_protocol::RiskClass::External,
+        advert_view,
+        authorization,
+        runtime,
+        store,
+        "agent24d",
+    )
+    .map(|tool| {
+        tool.with_declared_outbound(agent24_policy::tool_summary::declares_outbound(declaration))
+    })
+}
+
 /// A module tool's authorization, or none for a module not on the grants
 /// protocol (K1-6a-G §2.6, #1202 G6): a grant it holds from before the
 /// protocol it needs moved (an older daemon's) does not hold, so its tool is
@@ -829,6 +861,26 @@ mod tests {
         )
     }
 
+    fn fake_module(running: bool) -> Arc<FakeModule> {
+        Arc::new(FakeModule {
+            running: AtomicBool::new(running),
+            calls: AtomicUsize::new(0),
+            failure: std::sync::Mutex::new(None),
+            pending: AtomicBool::new(false),
+            wait_for_cancel: AtomicBool::new(false),
+            slow_check: AtomicBool::new(false),
+            unresponsive_check: AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            remote_tier: AtomicBool::new(false),
+            check_entered: tokio::sync::Notify::new(),
+            on_check: Hook::default(),
+            on_invoke: Hook::default(),
+            dispatched: std::sync::Mutex::default(),
+            contexts: std::sync::Mutex::default(),
+            run: std::sync::Mutex::default(),
+        })
+    }
+
     async fn fixture(
         risk: RiskClass,
         granted: bool,
@@ -871,12 +923,13 @@ mod tests {
             outbound_ready,
             supplied_store,
             supplied_authorization,
-            true,
+            None,
         )
         .await
     }
 
-    /// [`fixture_using`] whose tool's manifest declares `declared_outbound`.
+    /// [`fixture_using`] whose tool's manifest declares `declared_outbound`;
+    /// `None` leaves the tool's default.
     async fn fixture_declaring(
         risk: RiskClass,
         granted: bool,
@@ -884,7 +937,7 @@ mod tests {
         outbound_ready: bool,
         supplied_store: Option<Store>,
         supplied_authorization: Option<Arc<dyn ModuleToolAuthorization>>,
-        declared_outbound: bool,
+        declared_outbound: Option<bool>,
     ) -> (
         ToolRegistry,
         Arc<FakeModule>,
@@ -928,47 +981,32 @@ mod tests {
                 fixture_package(),
             ));
         let authorization = supplied_authorization.unwrap_or(default_authorization);
-        let runtime = Arc::new(FakeModule {
-            running: AtomicBool::new(running),
-            calls: AtomicUsize::new(0),
-            failure: std::sync::Mutex::new(None),
-            pending: AtomicBool::new(false),
-            wait_for_cancel: AtomicBool::new(false),
-            slow_check: AtomicBool::new(false),
-            unresponsive_check: AtomicBool::new(false),
-            entered: tokio::sync::Notify::new(),
-            remote_tier: AtomicBool::new(false),
-            check_entered: tokio::sync::Notify::new(),
-            on_check: Hook::default(),
-            on_invoke: Hook::default(),
-            dispatched: std::sync::Mutex::default(),
-            contexts: std::sync::Mutex::default(),
-            run: std::sync::Mutex::default(),
-        });
+        let runtime = fake_module(running);
         let test_view = Arc::new(TestAdvertView {
             authorization: Arc::clone(&authorization),
             running: Arc::clone(&runtime),
             outbound_ready: AtomicBool::new(outbound_ready),
         });
         let view: Arc<dyn ModuleToolAdvertView> = test_view;
-        let tool = Arc::new(
-            ModuleTool::new(
-                "fake_module",
-                "write_local",
-                "fake module tool",
-                serde_json::json!({"type":"object"}),
-                Duration::from_secs(2),
-                Duration::from_secs(1),
-                risk,
-                view,
-                authorization,
-                runtime.clone(),
-                store.clone(),
-                "agent24d",
-            )
-            .unwrap()
-            .with_declared_outbound(declared_outbound),
-        );
+        let tool = ModuleTool::new(
+            "fake_module",
+            "write_local",
+            "fake module tool",
+            serde_json::json!({"type":"object"}),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            risk,
+            view,
+            authorization,
+            runtime.clone(),
+            store.clone(),
+            "agent24d",
+        )
+        .unwrap();
+        let tool = Arc::new(match declared_outbound {
+            Some(declared) => tool.with_declared_outbound(declared),
+            None => tool,
+        });
         let approvals = Arc::new(CountingApproval {
             calls: AtomicUsize::new(0),
             deny: AtomicBool::new(false),
@@ -2841,7 +2879,7 @@ mod tests {
     #[tokio::test]
     async fn a_module_may_receive_back_only_what_it_returned_itself() {
         let (registry, runtime, _, _, _) =
-            fixture_declaring(RiskClass::Read, true, true, true, None, None, false).await;
+            fixture_declaring(RiskClass::Read, true, true, true, None, None, Some(false)).await;
         let call = |resources: Vec<EgressResource>| {
             let registry = &registry;
             async move {
@@ -2914,23 +2952,75 @@ mod tests {
     }
 
     /// An operation whose manifest says it may act outside the device gets
-    /// no same-source exception; that is also the default.
+    /// no same-source exception; neither does one the host said nothing
+    /// about (PR-Daemon #1282 N3).
     #[tokio::test]
     async fn an_outbound_operation_is_not_sent_back_its_own_results() {
-        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
-        let Err(error) = registry
-            .dispatch(
-                "fake_module.write_local",
-                &context().with_egress_resources(vec![result_of("fake_module", "tc_1")]),
-                &Map::new(),
-                &CancellationToken::new(),
+        for declared in [None, Some(true)] {
+            let (registry, runtime, _, _, _) =
+                fixture_declaring(RiskClass::Read, true, true, true, None, None, declared).await;
+            let Err(error) = registry
+                .dispatch(
+                    "fake_module.write_local",
+                    &context().with_egress_resources(vec![result_of("fake_module", "tc_1")]),
+                    &Map::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+            else {
+                panic!("an outbound operation must be refused ({declared:?})");
+            };
+            assert!(
+                matches!(error, ToolError::Denied(_)),
+                "{declared:?}: {error}"
+            );
+            assert_eq!(runtime.calls.load(Ordering::SeqCst), 0, "{declared:?}");
+        }
+    }
+
+    /// The host builds every module tool it registers here (PR-Daemon #1282
+    /// N2): only a declaration that keeps its output on the device and is not
+    /// `external` gets the same-source exception, and every tool is
+    /// `External` to the approval gate whatever it declares.
+    #[tokio::test]
+    async fn the_host_builds_a_module_tool_from_what_its_manifest_declares() {
+        let store = Store::open_memory().await.unwrap();
+        let authorization: Arc<dyn ModuleToolAuthorization> = Arc::new(PausingAuthorization {
+            entered: tokio::sync::Notify::new(),
+        });
+        let runtime = fake_module(true);
+        let view: Arc<dyn ModuleToolAdvertView> = Arc::new(TestAdvertView {
+            authorization: Arc::clone(&authorization),
+            running: Arc::clone(&runtime),
+            outbound_ready: AtomicBool::new(true),
+        });
+        for (risk, privacy, outbound) in [
+            ("read", "local_only", false),
+            ("write_local", "local_only", false),
+            ("external", "local_only", true),
+            ("read", "remote_allowed", true),
+        ] {
+            let yaml = format!(
+                "name: documents\nversion: 1.0.0\nroute_namespace: /api/v1/documents\nevent_module: documents\ndata_dir: ~/.agent24/os/documents/\nimpl_kind: in_process_crate\nmin_daemon_protocol: {}\ntools:\n  - operation: get\n    description: Read the document\n    input_schema: {{ type: object }}\n    risk: {risk}\n    output_privacy: {privacy}\n    timeout_ms: 2000\n    inline_wait_ms: 1000\n",
+                agent24_domain::RESOURCE_KINDS_PROTOCOL
+            );
+            let manifest = agent24_domain::DomainOsManifest::from_yaml(&yaml).unwrap();
+            let tool = super::assemble_module_tool(
+                "documents",
+                &manifest.tools()[0],
+                Arc::clone(&view),
+                Arc::clone(&authorization),
+                runtime.clone(),
+                store.clone(),
             )
-            .await
-        else {
-            panic!("an outbound operation must be refused");
-        };
-        assert!(matches!(error, ToolError::Denied(_)), "{error}");
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+            .unwrap();
+            assert_eq!(tool.declared_outbound(), outbound, "{risk}/{privacy}");
+            assert_eq!(
+                tool.info().risk_class,
+                RiskClass::External,
+                "{risk}/{privacy}"
+            );
+        }
     }
 
     /// The host names a module tool's results after the module, so the
