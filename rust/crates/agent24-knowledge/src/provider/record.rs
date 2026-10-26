@@ -84,7 +84,8 @@ pub enum Change<I: Ids> {
         profile: I::Profile,
         awaited: Confirmation,
     },
-    /// The user's confirmation, with what it answered.
+    /// The user's confirmation, with what it answered. Only an answer to
+    /// `principal_changed` confirms `principal` (S1.13).
     Confirm {
         profile: I::Profile,
         principal: I::Principal,

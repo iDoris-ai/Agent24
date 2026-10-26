@@ -114,7 +114,7 @@ pub fn replay<I: Ids>(
                     return Err(Damaged);
                 }
                 if let Some(done) = slot.take() {
-                    settle(&mut out, done);
+                    settle(&mut out, done)?;
                 }
                 let (write, void) = match entry {
                     Entry::Changes(c) => (Some(c), false),
@@ -126,7 +126,7 @@ pub fn replay<I: Ids>(
     }
     if let Some(done) = slot {
         out.next = done.seq.checked_add(1).ok_or(Damaged)?;
-        settle(&mut out, done);
+        settle(&mut out, done)?;
     }
     Ok(out)
 }
@@ -138,20 +138,21 @@ struct Slot<I: Ids> {
     void: bool,
 }
 
-fn settle<I: Ids>(out: &mut Replayed<I>, Slot { write, void, .. }: Slot<I>) {
+fn settle<I: Ids>(out: &mut Replayed<I>, Slot { write, void, .. }: Slot<I>) -> Result<(), Damaged> {
     out.shut_down = false;
     for change in write.into_iter().flatten() {
         if !void || change.outlives_void() {
-            apply(out, change);
+            apply(out, change)?;
         } else if let Change::Bind { generation, .. } = change {
             // The binding is not there, but its first value may have been
             // used: new values still go past it (S4.4).
             out.highest = out.highest.max(generation);
         }
     }
+    Ok(())
 }
 
-fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) {
+fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged> {
     match change {
         Change::Off => out.off = true,
         Change::On => out.off = false,
@@ -180,7 +181,11 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) {
             let state = profile(out, p.clone());
             if state.awaiting == Some(awaited) {
                 state.awaiting = None;
-                out.confirmed.insert(p, principal);
+                // `unsaved_settings` only clears: a new principal awaits its
+                // own confirmation (S1.13).
+                if awaited == Confirmation::PrincipalChanged {
+                    out.confirmed.insert(p, principal);
+                }
             }
         }
         Change::PlaceholderFailed {
@@ -204,6 +209,12 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) {
             generation,
             confirmed,
         } => {
+            // Bound twice, or a first value not past one its profile used: no
+            // sound host wrote this (S2.6, S4.4, S1.8).
+            let used = |b: &Bound<I>| b.of.profile == of.profile && b.generation >= generation;
+            if out.bindings.iter().any(|b| b.of == of || used(b)) {
+                return Err(Damaged);
+            }
             out.highest = out.highest.max(generation);
             if let Some(principal) = confirmed {
                 out.confirmed.insert(of.profile.clone(), principal);
@@ -254,6 +265,7 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) {
         Change::Started => {}
         Change::Shutdown => out.shut_down = true,
     }
+    Ok(())
 }
 
 fn profile<I: Ids>(out: &mut Replayed<I>, p: I::Profile) -> &mut ProfileState {
