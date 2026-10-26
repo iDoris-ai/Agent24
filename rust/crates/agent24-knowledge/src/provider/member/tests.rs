@@ -7,7 +7,7 @@ use crate::provider::credential::Credentials;
 use crate::provider::evidence::{Kbs, Rule};
 use crate::provider::gate::Gate;
 use crate::provider::placeholder::Placeholder;
-use crate::provider::state::ConnectionPhase;
+use crate::provider::state::{ConnectionPhase, UnavailableCause};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct T;
@@ -29,17 +29,26 @@ const OF: Of<T> = Of {
     binding: 7,
 };
 
-/// "a", selected, bound to binding 7 at generation 1 and `loading`.
-fn loading() -> M {
+/// `of`, selected, bound at `generation` and `loading`.
+fn bound(of: &Of<T>, generation: u64) -> M {
     let binding = BindingState::new(
-        Connection::new(Gate::new(1), true),
+        Connection::new(Gate::new(generation), true),
         Credentials::new(false),
         true,
     );
     let profile = Profile::new(Slot::Bound(Box::new(binding)), true, None);
-    let mut member = M::new("a", profile, Some(7), false);
+    let mut member = M::new(of.profile, profile, Some(of.binding), false);
     assert!(member.connect(false).is_some());
     member
+}
+
+/// "a", bound to binding 7 at generation 1 and `loading`.
+fn loading() -> M {
+    bound(&OF, 1)
+}
+
+fn call(member: &mut M) -> CallId {
+    binding(member).connection_mut().open_call().unwrap().0
 }
 
 fn binding(member: &mut M) -> &mut BindingState<&'static str> {
@@ -58,12 +67,12 @@ fn generation(member: &mut M) -> u64 {
 #[test]
 fn off_aborts_the_calls_and_writes_the_generation_without_a_rule() {
     let mut member = loading();
-    let (call, _) = binding(&mut member).connection_mut().open_call().unwrap();
+    let call = call(&mut member);
     let mut left = Left::new(C::Off);
     member.leave(Leave::Off, &mut left);
     assert_eq!(left.changes, [C::Off, C::Generation { of: OF, value: 2 }]);
     assert_eq!(left.generations, [(OF, 2)]);
-    assert_eq!(left.aborted, [call]);
+    assert_eq!(left.aborted, [(OF, call)]);
     assert_eq!(binding(&mut member).connection().phase(), None);
 }
 
@@ -92,6 +101,7 @@ fn a_placeholder_writes_only_the_event() {
     let mut left = Left::new(C::Unselect("b"));
     member.leave(Leave::Unselect, &mut left);
     assert_eq!(left, Left::new(C::Unselect("b")));
+    assert!(!member.profile().selected(), "remembered all the same");
     assert_eq!(member.connect(false), None);
 }
 
@@ -113,7 +123,7 @@ fn it_connects_with_neither_switch_on() {
 }
 
 /// S4.4: the generation takes effect once confirmed, and only for the
-/// binding it was written for.
+/// binding and the value it was written for.
 #[test]
 fn a_generation_takes_effect_for_its_own_binding_only() {
     let mut member = loading();
@@ -122,6 +132,96 @@ fn a_generation_takes_effect_for_its_own_binding_only() {
         member.confirm_generation(&other, 2);
         assert_eq!(generation(&mut member), 1, "{other:?}");
     }
+    assert_eq!(member.confirm_generation(&OF, 3), None);
+    assert_eq!(generation(&mut member), 1, "not the value written");
     member.confirm_generation(&OF, 2);
     assert_eq!(generation(&mut member), 2);
+}
+
+/// Every event but Off in the connection phase: the rule and the generation
+/// go into the same write, and the calls in flight are aborted (S3.3).
+#[test]
+fn an_event_in_the_connection_phase_writes_its_rule_and_its_generation() {
+    for event in [
+        Leave::Disable,
+        Leave::Unselect,
+        Leave::Logout,
+        Leave::Remove,
+        Leave::Retire,
+    ] {
+        let mut member = loading();
+        let call = call(&mut member);
+        let mut left = Left::new(C::Disable("a"));
+        member.leave(event, &mut left);
+        let rule = Rule {
+            epoch: 1,
+            kbs: Kbs::All,
+        };
+        let changes = [
+            C::Disable("a"),
+            C::Placed { of: OF, rule },
+            C::Generation { of: OF, value: 2 },
+        ];
+        assert_eq!(left.changes, changes, "{event:?}");
+        assert_eq!(left.aborted, [(OF, call)], "{event:?}");
+    }
+}
+
+/// S4.5: an invalidation takes effect even with no greater value left; the
+/// calls are aborted all the same, and no value is written.
+#[test]
+fn an_exhausted_generation_still_aborts_the_calls() {
+    let mut member = bound(&OF, u64::MAX);
+    let call = call(&mut member);
+    let mut left = Left::new(C::Off);
+    member.leave(Leave::Off, &mut left);
+    assert_eq!(left.changes, [C::Off]);
+    assert!(left.generations.is_empty());
+    assert_eq!(left.aborted, [(OF, call)]);
+}
+
+/// Call ids are each binding's own: two bindings' first calls share one, and
+/// the binding tells them apart.
+#[test]
+fn the_calls_of_two_bindings_stay_apart() {
+    let b = Of {
+        profile: "b",
+        binding: 8,
+    };
+    let (mut a, mut other) = (loading(), bound(&b, 1));
+    let (first, second) = (call(&mut a), call(&mut other));
+    assert_eq!(first, second);
+    let mut left = Left::new(C::Off);
+    a.leave(Leave::Off, &mut left);
+    other.leave(Leave::Off, &mut left);
+    assert_eq!(left.aborted, [(OF, first), (b, second)]);
+}
+
+/// S1.4: connecting while the generation is pending holds the binding in
+/// `local_storage`; the confirmation brings it back to `loading`, once.
+#[test]
+fn a_confirmed_generation_brings_local_storage_back_to_loading() {
+    let mut member = loading();
+    member.leave(Leave::Off, &mut Left::new(C::Off));
+    assert_eq!(member.connect(false), None);
+    let local = ConnectionPhase::Unavailable(UnavailableCause::LocalStorage);
+    assert_eq!(binding(&mut member).connection().phase(), Some(local));
+    assert!(member.confirm_generation(&OF, 2).is_some());
+    let phase = binding(&mut member).connection().phase();
+    assert_eq!(phase, Some(ConnectionPhase::Loading));
+    assert_eq!(member.confirm_generation(&OF, 2), None, "once");
+}
+
+#[test]
+#[should_panic]
+fn a_bound_slot_needs_its_binding_id() {
+    let profile = loading().profile;
+    let _ = M::new("a", profile, None, false);
+}
+
+#[test]
+#[should_panic]
+fn a_placeholder_has_no_binding_id() {
+    let placeholder = Slot::Placeholder(Placeholder::new(None));
+    let _ = M::new("b", Profile::new(placeholder, true, None), Some(8), false);
 }

@@ -27,8 +27,9 @@ pub struct Left<I: Ids> {
     /// The generation values among `changes`: each takes effect once they
     /// are confirmed persisted (S4.4).
     pub generations: Vec<(Of<I>, u64)>,
-    /// Abort these calls and answer them `cancelled` (S4.5).
-    pub aborted: Vec<CallId>,
+    /// Abort these calls and answer them `cancelled` (S4.5). A call's id is
+    /// its binding's own, so it goes with the binding.
+    pub aborted: Vec<(Of<I>, CallId)>,
 }
 
 impl<I: Ids> Left<I> {
@@ -98,7 +99,8 @@ impl<I: Ids> Member<I> {
             left.changes.push(Change::Placed { of, rule });
         }
         if let Some(invalidation) = effects.invalidation {
-            left.aborted.extend(invalidation.aborted);
+            let calls = invalidation.aborted.into_iter();
+            left.aborted.extend(calls.map(|call| (of.clone(), call)));
             if let Some(value) = invalidation.to_persist {
                 let generation = Change::Generation {
                     of: of.clone(),
