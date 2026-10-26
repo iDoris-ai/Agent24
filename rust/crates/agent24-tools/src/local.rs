@@ -82,24 +82,22 @@ pub(crate) fn pin_outside_dir(
 ) -> Result<Arc<crate::PinnedOutsideDir>, std::io::Error> {
     // `parent` was canonical when it was resolved, but opening it resolves it
     // again: a component swapped for a symlink in between would leave the
-    // handle on another directory under the approved name. Walked from the
-    // root without following any symlink, the handle is the directory that
-    // is at this very name, or the open fails.
+    // handle on another directory under the approved name. Opened without
+    // following a symlink at any level, the handle is the directory that is
+    // at this very name, or the open fails.
     // Directory open fails immediately on a FIFO or regular file. `File::open`
     // would block on a FIFO and stall the caller before any approval exists.
-    let mut dir = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
-    for component in parent.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => dir = cap_fs_ext::DirExt::open_dir_nofollow(&dir, name)?,
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "not a canonical absolute path",
-                ));
-            }
-        }
+    if !parent.is_absolute()
+        || parent
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a canonical absolute path",
+        ));
     }
+    let dir = open_dir_through_no_symlink(&parent)?;
     let meta = dir.dir_metadata()?;
     Ok(Arc::new(crate::PinnedOutsideDir {
         path: parent,
@@ -107,6 +105,33 @@ pub(crate) fn pin_outside_dir(
         dev: cap_fs_ext::MetadataExt::dev(&meta),
         ino: cap_fs_ext::MetadataExt::ino(&meta),
     }))
+}
+
+/// macOS: one open of the whole path that fails on a symlink at any level
+/// (`O_NOFOLLOW_ANY`). Like a plain open, ancestors need only search
+/// permission; opening them one by one would need read permission on each.
+#[cfg(target_os = "macos")]
+fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
+        .open(path)?;
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+/// Elsewhere: walked from the root, no level followed. cap-std opens each
+/// with `O_PATH` where there is one (Linux), so ancestors need only search
+/// permission there too.
+#[cfg(not(target_os = "macos"))]
+fn open_dir_through_no_symlink(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    let mut dir = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            dir = cap_fs_ext::DirExt::open_dir_nofollow(&dir, name)?;
+        }
+    }
+    Ok(dir)
 }
 
 /// Lexically fold `.` / `..` (no filesystem access). `None` when `..` would
@@ -708,6 +733,22 @@ mod tests {
             "a level in between"
         );
         assert!(pin_outside_dir(PathBuf::from("relative")).is_err());
+    }
+
+    /// An ancestor the user may search but not read does not stop the pin,
+    /// as it did not stop the plain open before (#1254 Codex round 2).
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_that_can_only_be_searched_still_pins() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (shared, target) = (root.join("shared"), root.join("shared/target"));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let pinned = pin_outside_dir(target.clone());
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pinned.unwrap();
     }
 
     /// The durable-resume path captured no outside directory: the call is

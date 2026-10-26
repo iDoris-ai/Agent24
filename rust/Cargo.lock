@@ -379,6 +379,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "chrono",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
