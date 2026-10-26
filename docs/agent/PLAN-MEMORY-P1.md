@@ -13,14 +13,14 @@
 
 ## 2. P1 前余项核销（证据与未完成分开）
 
-> 协调者补充：本设计完成后，又补得 P02 同进程/冷恢复 marker history 红证，P03 真实 HTTP 撤回/pause/fallback/qualification/no-session 共 5 项通过，协调者独立复跑亦通过。P03 结论是已构造请求按现行边界继续发送，不据此新增 H04 bug。下表与 Todo 中涉及这些已列场景的“补测”应转为维护回归与设计输入；同秒固定时钟已在后续独立接缝取得审计 ID 碰撞红证，修复未完成；完整来源矩阵与新发送屏障设计仍未完成。最新证据见探针报告 §8.1/§8.5/§9，不能只读前轮快照。
+> 协调者补充：本设计完成后，又补得 P02 同进程/冷恢复 marker history 红证，P03 真实 HTTP 撤回/pause/fallback/qualification/no-session 共 5 项通过，协调者独立复跑亦通过。P03 结论是已构造请求按现行边界继续发送，不据此新增 H04 bug。下表与 Todo 中涉及这些已列场景的“补测”应转为维护回归与设计输入；同秒固定时钟审计 ID 碰撞已由 #1152（`7dd6f08f`，2026-10-23 合并）修复；H03-b 发送副本按来源 kind 整形已由 #1250（`727fad28`）合入；冷恢复矩阵与新发送屏障设计仍未完成。最新证据见探针报告 §8.1/§8.5/§9，不能只读前轮快照。
 
 | 项目 | 当前结论 / 证据级别 | 下一动作与关闭条件 |
 |---|---|---|
 | M1/P0 #720 | 已验收发布：jason 2026-10-06 在 `c503bf1` 真机链；#720 入 main | 保持关闭，空白验收模板不能推翻事实；T12–T14 聊天记忆/回执已有，只做差量 |
 | M2 #767 / H01 #1024 | M2 已发布；H01 重复撤回事件 ID 修复已交付 | 不重做；F7 是移交 P1 的新阶段工作，H01 现有测试作回归 |
-| H02 / R01（当前红证） | 真 WriteGate 新 evidence 重申后重试 Conflict；真实 `chat_remember_turn` 再次 remember 返回 Failed；尚非 HTTP E2E | 优先最小修复当前审计匹配，保留缺失/伪造 audit、跨 owner 拒绝；固定时钟同秒同 evidence 的第二重申已确定 SQLite 2067 ID 碰撞，独立修复且保留故障注入回滚控制 |
-| P02/H03 / R02（当前红证） | 完整 marker prompt、普通历史在 provider 收到的副本中丢失；持久原文未删；已有 UserInput tag 未阻止误裁 | 优先来源契约重审与修复；补 host/prompt/history 完全同文、同进程/冷恢复、旧/坏标签和读取失败；不能关闭撤回校验来保输入 |
+| H02 / R01（当前红证） | 真 WriteGate 新 evidence 重申后重试 Conflict；真实 `chat_remember_turn` 再次 remember 返回 Failed；尚非 HTTP E2E | 优先最小修复当前审计匹配，保留缺失/伪造 audit、跨 owner 拒绝；固定时钟同秒同 evidence 的第二重申 SQLite 2067 ID 碰撞已由 #1152（`7dd6f08f`）修复，故障注入回滚控制保留；新 evidence 重申与存量重申已由 #1153（`4b3ace00`）、#1154（`a09561c2`）修复，红证已转常规回归 |
+| P02/H03 / R02（当前红证） | 完整 marker prompt、普通历史在 provider 收到的副本中丢失；持久原文未删；已有 UserInput tag 未阻止误裁 | 优先来源契约重审与修复；补 host/prompt/history 完全同文、同进程/冷恢复、旧/坏标签和读取失败；不能关闭撤回校验来保输入。进展：来源表 #1168/#1181/#1195/#1251，拒发门 #1197，按 kind 整形 #1250；冷恢复矩阵尚缺，见第 4 节 |
 | P01 / R03（限定绿） | 新 run pause、同进程审批、独立进程退出后的冷恢复符合 OpenAPI；撤回裁请求副本而不改 snapshot | 已运行场景核销为契约回归通过；daemon HTTP/启动 orphan sweep、并发 pause 另列补测，不要求改变暂停契约 |
 | P03/H04 / R04（HTTP 观察已补） | 真实 Router 撤回/pause/fallback/qualification/no-session 共 5 项通过，协调者独立复跑 exit 0；首 provider barrier 发生在收到请求后 | 已列场景转为回归；尚未证明首次发送前的线性化屏障。先冻结旧承诺与新要求界线，确有旧契约 red 才建 H04；已发送不可追回，网络 await 不持 SQLite 写锁 |
 | R4 Held/System | 未证进入当前个人产品链 | 记录消费者核查；自动抽取接线时再设计，不改全库信任政策 |
@@ -41,15 +41,17 @@ P02 优先检查复用/扩展 `agent24-store/migrations/0016_run_source_tags.sql
 
 以下 ID 延续 10/22 跟踪别名；子片是建议拆分，**全部未派生产**。每个子片独立验证、不得以整项数千行实现一次交付。`P1-01` 本轮为“草稿已产出，外审待办”，不是完成批准。
 
+> 2026-10-26 按合并证据核销。勾 `[x]` 须同时满足：有合并提交实现，且退出测试门已由合并测试覆盖；证据写作「#PR merge短SHA」。部分完成的保留 `[ ]` 并写明已做/未做。推迟的门不勾，触发条件见 [R05-4](R05-4-H03-CLOSEOUT.md) §3。「设计已接受」不等于「实现已完成」。
+
 | ID / 顺序 | Todo 与最小分片 | 依赖 / 退出测试门 |
 |---|---|---|
-| L01 | [x] 模块/研究入库 #1146/#1147；[ ] 报告 #1148 与全部探针分片入库 | 固定 SHA/hash、完整命令/退出码；文档合并不等于修复，未覆盖不关闭 |
+| L01 | [x] 模块/研究入库 #1146/#1147；[ ] 报告 #1148 与全部探针分片入库。已入库：报告 #1148 `146dae39`，H02/容量夹具 #1151 `91158847`，时钟接缝 #1152 `7dd6f08f`，容量探针 #1164 `09771b6d`。未核到入库：#1148 所述 897 行 agent 夹具与 354 行 HTTP 夹具；P02 场景已由 #1250、#1197 的回归测试覆盖，但原夹具文件本身不勾 | 固定 SHA/hash、完整命令/退出码；文档合并不等于修复，未覆盖不关闭 |
 | L02 | [x] #1145 merge commit 吸收固定 main，核所有权与精确 ruleset；[ ] 每片开工重核 | 同步 merge `8535154f`，已保留 main 祖先，未改 ruleset；477/0 是同步前测量，不永久沿用 |
-| R01/R06-H02 | [ ] a 固定当前红测与控制；b 最小审计幂等修复；c 同秒风险独立核销 | L01/L02；当前 chat 红→绿且 audit 伪造/缺失、owner 反例仍红；H01 三轮撤回回归；同秒须可控时钟，不靠运行速度；数据写入语义需外审 |
-| R02/R05 | [ ] a 新来源设计；b fresh/history/审批冷恢复矩阵；c 旧/坏/缺来源策略 | L01、K1 当前表/调用点；同文三来源各自正确，用户输入逐字到 provider、真 host 撤回被裁、snapshot 不改；新契约精确版本 APPROVE 才派 H03 |
-| R06-H03 | [ ] a 持久来源绑定；b fresh 发送副本；c 同进程/冷恢复及诊断消费者 | R05 批准、L02；每片可用或受控不启用，迁移/wire 分片独立门；provider spy 与真实审批路径 red→green，旧 run 不被错误继续执行 |
+| R01/R06-H02 | [x] a 固定当前红测与控制（#1151 `91158847`）；[x] b 最小审计幂等修复（#1153 `4b3ace00` 新重申，#1154 `a09561c2` 存量重申）；[x] c 同秒风险独立核销（#1152 `7dd6f08f`，原「未修复」已过期，五项 `h02_` 常规测试与回滚控制） | L01/L02；当前 chat 红→绿且 audit 伪造/缺失、owner 反例仍红；H01 三轮撤回回归；同秒须可控时钟，不靠运行速度；数据写入语义需外审 |
+| R02/R05 | [x] a 新来源设计（设计已接受，不是实现完成：R05-1 #1170 `4fbc3728`、R05-2 #1173 `9ba7d5ee`、R05-3 #1185 `2207cdc6`、R05-5 #1248 `4d2d2100`，R05 ADR 修订作为接受记录）；[ ] b fresh/history/审批冷恢复矩阵（部分。已做：fresh 与同进程审批恢复，#1250 `727fad28` 的 `send_trim_tests.rs` 契约测试，含同文三来源、同形 UserPrompt/SessionHistory 逐字、真 HostRecall 撤回被裁、snapshot 字节不变；冷恢复仅 `resume_after_restart_drops_revoked_recall_line` 一例，重开文件库后撤回行被裁、其余逐字、库内 recall 正文保留。未做：冷恢复下 `memory=None`、`active_ids` 读失败、同文三来源，以及恢复后来源行与 digest 不变的断言；`send_copy_drops_host_recall_when_memory_is_none` 与 `resume_after_append_binds_kind_by_store_seq` 用内存库，不算冷恢复）；[x] c 旧/坏/缺来源策略（整次拒发 `source_unproven`、不回填：#1197 `9df7d670`，测试 `null_host_recall_does_not_call_the_provider`、`unreadable_assistant_recall_ref_fails_before_the_next_send`、`origin_read_failure_does_not_call_the_provider`、`legacy_resume_approve_does_not_run_shell_or_call_the_provider`、`legacy_resume_deny_does_not_run_shell_or_call_the_provider`；坏 digest 读成 Unreadable 见 `tampered_instance_digest_is_unreadable_and_not_no_recall`；无来源旧暂停通知 `legacy_unsourced_pause_notice_still_refused`，#1251 `3ec207ec`） | L01、K1 当前表/调用点；同文三来源各自正确，用户输入逐字到 provider、真 host 撤回被裁、snapshot 不改；新契约精确版本 APPROVE 才派 H03。该前置门已满足：R05-1 #1170 于 2026-10-24T09:52Z APPROVE、10:08Z 合并，H03 首片 #1197 于 21:04Z 合并；R05-5 #1248 于 2026-10-26T05:19Z APPROVE 并合并。推迟，不勾：G1、G2、G4、G5、K1 同事务，触发条件见 R05-4 §3；冷恢复矩阵见同节 |
+| R06-H03 | [x] a 持久来源绑定（#1168 `c9a19532` 迁移 0021、#1181 `631ff507` 快照与来源同事务、#1195 `b680cb0a` 迁移 0022、#1251 `3ec207ec` 迁移 0023 HostSystem；K1 标签仍是 `append_snapshot_run_messages` 之后独立 `tag_run_source`，K1 同事务推迟，不在此勾内）；[x] b fresh 发送副本（#1197 `9df7d670` 拒发门、#1250 `727fad28` 按 kind 整形、#1205 `b9e4eb5f` G3 角色门；provider spy 先红后绿见 #1250 PR 正文）；[ ] c 同进程/冷恢复及诊断消费者（部分。已做：同进程审批恢复，#1197 的 `drive_resume` 恢复门，#1250 的 `resume_after_restart_drops_revoked_recall_line`。未做：冷恢复缺口同 R02/R05 b；诊断消费者无合并提交；G2 推迟） | R05 批准（已于 2026-10-26 满足，#1248）、L02；每片可用或受控不启用，迁移/wire 分片独立门；provider spy 与真实审批路径 red→green，旧 run 不被错误继续执行 |
 | R03/R04 | [ ] P01 剩余 daemon 入口回归；[x] P03 已列 HTTP/资格/no-session 观察；[ ] 新发送屏障契约表，仅确有违约再开 H04 | 不阻塞 ADR 起草；阻塞对应 readiness 声明/发送保证。fixture 控制顺序、首 provider/fallback 收包分别记录，不将 pause 既有恢复例外判 bug |
-| P1-01 | [ ] 外审本文与生命周期 ADR，冻结 no-loss/purge 例外、scope/身份/恢复控制与审计 | L01；逐项处置 §3 数据落点、失败恢复/取消/幂等/副本承诺；外审意见有接受/修订记录才完成设计门 |
+| P1-01 | [ ] 外审本文与生命周期 ADR，冻结 no-loss/purge 例外、scope/身份/恢复控制与审计。状态：生命周期 ADR 第 9 节五项拍板的外审接受记录已形成（#1247 `59d2130d`，clestons 2026-10-26T04:54Z APPROVE，即 adr-s9 的接受记录，只接受设计与首版范围，不批准迁移或生产实现）；R05 ADR 修订的接受记录见 #1248 `4d2d2100`。本计划文档本身仍是 DRAFT、未经外审接受，故不勾 | L01；逐项处置 §3 数据落点、失败恢复/取消/幂等/副本承诺；外审意见有接受/修订记录才完成设计门 |
 | P1-02 / F7 | [ ] a 合成数据容量探针；b 行数/payload/磁盘/附件口径；c 保留/压实与配额失败设计 | a/b 只读源码和隔离合成库测量可与 ADR 并行；c 及生产行为按相关 ADR 批准门；核 per-owner override、personal 全路径、满额后聊天/原文/回执、审计空间与恢复。默认 200000/256 MiB 仅为 migration 0014 静态配置，不是磁盘占用或机器测量 |
 | P1-03 | [ ] a 受权用量 API；b 记忆页占用/会话排行与告警；c 满额回执与恢复入口 | P1-02；阈值用量纲/测量选定，触发与解除可测；配额/磁盘满不能报“已记住”，原文未保存必须显式显示；聊天继续不等于持久化成功 |
 | P1-04a | [ ] 大输出 owner 内附件格式/引用；[ ] 原子写入与校验；[ ] 回放/回收 | P1-02 + 格式外审；原文逐字可还原、摘要不代替原文；写 blob/提交引用/回收各点 crash，不产生悬挂引用或误删其他引用 |
