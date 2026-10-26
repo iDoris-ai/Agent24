@@ -5,7 +5,7 @@
 //! configuration events (`binding`), the unbound placeholder (`placeholder`),
 //! the profile with its identity changes (`profile`), and what is persisted
 //! when, with the seal that tells a restart whether it can trust that
-//! (`ledger`).
+//! (`ledger`), and the records it is persisted as (`record`).
 
 pub mod binding;
 pub mod connection;
@@ -14,4 +14,5 @@ pub mod gate;
 pub mod ledger;
 pub mod placeholder;
 pub mod profile;
+pub mod record;
 pub mod state;
