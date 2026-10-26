@@ -1,0 +1,22 @@
+{"fields":[
+ {"key":"notice_reference","description":"这份通知的通知编号","type":"identifier"},
+ {"key":"work_order","description":"这份通知对应的工单号","type":"identifier"},
+ {"key":"notice_date","description":"这份通知的发出日期","type":"date"},
+ {"key":"shutoff_date","description":"哪一天停水","type":"date"},
+ {"key":"shutoff_start_time","description":"停水从几点开始","type":"text"},
+ {"key":"shutoff_end_time","description":"停水到几点结束","type":"text"},
+ {"key":"affected_units","description":"停水影响哪些单元","type":"text"},
+ {"key":"shutoff_registration_not_needed","description":"停水这件事本身需不需要提前登记","type":"text"},
+ {"key":"drinking_water_registration_deadline","description":"想领临时饮用水，最晚什么时候登记","type":"datetime"},
+ {"key":"drinking_water_registration_location","description":"临时饮用水在哪里登记","type":"text"},
+ {"key":"drinking_water_limit","description":"每户最多可以领多少临时饮用水","type":"text"},
+ {"key":"store_water_in_advance","description":"停水前住户要做什么准备","type":"text"},
+ {"key":"lobby_restroom_closure","description":"停水期间大堂一层的公共卫生间还能不能用","type":"text"},
+ {"key":"lifts_under_maintenance","description":"哪几部电梯要维保","type":"text"},
+ {"key":"lift_in_service","description":"维保期间哪一部电梯还能用","type":"text"},
+ {"key":"lift_maintenance_date","description":"电梯维保在哪一天","type":"date"},
+ {"key":"lift_maintenance_duration","description":"电梯维保持续多长时间","type":"text"},
+ {"key":"flush_after_restoration","description":"恢复供水后，用水之前要做什么","type":"text"},
+ {"key":"contact_party","description":"有问题该找谁","type":"text"},
+ {"key":"contact_phone","description":"联系电话是多少","type":"identifier"}
+]}

@@ -88,7 +88,7 @@
   - `authorization_refs`：这次事件结束的授予引用（`ga1:…`），在一条通知里去重。撤销还会再带上范围内没确认停下的旧引用（下文 B1），所以个数可能多于授权表的行数，同一引用也可能出现在多条通知里；模块按引用幂等处理，不得按行数截断（#1202 第 3 轮 C2）。
   - `reason`：`revoked`（撤销）、`expired`（到期）、`replaced`（被重新授予或改为拒绝的旧授予）、`epoch`（启用纪元推进，旧授予变成 `Stale`）。
   - `revoked_at`：撤销取撤销时刻，到期取 `expires_at`，替换取新决定的 `decided_at`。
-  - 两个字段都是新增的。`revoked`、`expired` 通知，不认识它们的模块照旧按操作名停，不会出错。`replaced`、`epoch` 不一样：不认识引用的模块会按操作名停掉新授予下刚接受的工作，`epoch` 的 `*` 会停掉整个模块（#1202 G6）。所以这两种只发给声明了协议 3（`GRANT_END_REFS_PROTOCOL`，见 §2.6）的模块。能拿到授予的模块都声明了 3；换包后协议号降到 3 以下的，通知任务不发这两种行，记为 `unconfirmed`，不记为已停（A5c-2b）。在不在协议上，按守护进程启动时读到的 manifest 判断：启动之后换包、升级的模块，要到下次启动才按新的协议号算。方向是保守的，只会少发，少发的行记 `unconfirmed`（#1231 PR-Daemon L4）。
+  - 两个字段都是新增的。`revoked`、`expired` 通知，不认识它们的模块照旧按操作名停，不会出错。`replaced`、`epoch` 不一样：不认识引用的模块会按操作名停掉新授予下刚接受的工作，`epoch` 的 `*` 会停掉整个模块（#1202 G6）。所以这两种只发给声明了协议 4（`GRANT_END_REFS_PROTOCOL`，见 §2.6；同步 main 之前是 3）的模块。能拿到授予的模块都声明了 4；换包后协议号降到 4 以下的，通知任务不发这两种行，记为 `unconfirmed`，不记为已停（A5c-2b）。在不在协议上，按守护进程启动时读到的 manifest 判断：启动之后换包、升级的模块，要到下次启动才按新的协议号算。方向是保守的，只会少发，少发的行记 `unconfirmed`（#1231 PR-Daemon L4）。
   - 带 `authorization_refs` 的模块必须区分「空数组」和「没带这个字段」（#1202 G2）：空数组表示这次事件没有要停的引用：带引用的工作一个也不停，不兜底按操作名停；没带才把全部工作按操作名停。没带引用的工作不在此列，见「模块侧」（David 2026-10-26 定）。解析时不得把两者合成一种（例如缺省值取空数组）。
 - **哪些事件结束哪些引用**（在写入这次事件的同一事务里读出，按写入这次事件**之前**的状态取：这次撤销自己不算覆盖它要结束的授予，否则它的目标全被判成已告知，正文成了空数组，#1202 第 3 轮 C1）。「为授予」指决定是授予，不论是否已到期、是否 `Stale`、是否被更早的撤销覆盖（#1202 G1）；「已告知」见发件箱一段：
   - 撤销一个工具：该 `(module, op)` 为授予、还没告知的那一行的引用。
@@ -123,7 +123,7 @@
 
 - `RawToolDeclaration` 加可选字段 `resource_kinds`（资源契约 §2.3）。
 - `DAEMON_PROTOCOL_VERSION` 在 A2 合入时目标分支的值上加 1（`ab/kernel` 现在是 1，main 已是 2，同步 main 之后应为 3），带 `resource_kinds` 或实现了撤销通知端点的模块，其 manifest 的 `min_daemon_protocol` 取这个新号。低一号的内核加载这样的 manifest 时，在版本检查处明确拒绝，而不是在 `deny_unknown_fields` 处报未知字段。
-- 授予只对声明了协议 3（`GRANT_END_REFS_PROTOCOL`）的模块开放（#1202 G6，David 定）：协议 3 表示模块实现了撤销通知端点和 §2.5.1 的按引用停。manifest 的 `min_daemon_protocol` 低于 3 的模块，卡片不生成、`POST` 返回 409，避免出现永远「停止未确认」的授予，也避免 `replaced`、`epoch` 通知让不认识引用的模块多停。`DAEMON_PROTOCOL_VERSION` 随之升到 3；`resource_kinds` 仍只要求 2。同步 main 时（main 的 2 是别的改动），这三个号一起往后挪：`resource_kinds` 3，按引用停 4。Documenting 在 A5c-3 实现按引用停时，把 manifest 改成 3，在那之前拿不到授予。
+- 授予只对声明了协议 4（`GRANT_END_REFS_PROTOCOL`）的模块开放（#1202 G6，David 定）：协议 4 表示模块实现了撤销通知端点和 §2.5.1 的按引用停。manifest 的 `min_daemon_protocol` 低于 4 的模块，卡片不生成、`POST` 返回 409，避免出现永远「停止未确认」的授予，也避免 `replaced`、`epoch` 通知让不认识引用的模块多停。ab/kernel 上原来是：`DAEMON_PROTOCOL_VERSION` 3，`resource_kinds` 要求 2，按引用停要求 3。2026-10-26 同步 main 时（main 的 2 是 ME4-S2b 的 `temperature`），这三个号一起往后挪：`DAEMON_PROTOCOL_VERSION` 4，`resource_kinds` 3，按引用停 4。Documenting 实现了按引用停（A5c-3），manifest 要改成 4，在那之前拿不到授予。
 
 ### 2.7 模型可见的函数名
 

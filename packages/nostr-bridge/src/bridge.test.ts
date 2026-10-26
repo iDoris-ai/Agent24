@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { NostrBridge } from './bridge.js'
+import { GroupJoint, groupMember, NostrBridge } from './bridge.js'
 import { SpeakerClient } from './speaker.js'
 import { FakeSpeaker } from './testing/fake-speaker.js'
 import { loadAgent24Profile, toAgentSpeakerProfile } from './profile.js'
@@ -138,5 +138,236 @@ describe('NostrBridge outbound (real bridge + SpeakerClient vs fake agent-speake
     expect(call.args).toEqual(expect.arrayContaining(['--capability', '触达纺织业客户群', '--json']))
     expect(hits).toHaveLength(1)
     expect(hits[0]!.npub).toBe('npub1bob')
+  })
+})
+
+describe('three-identity group joint', () => {
+  const groupId = '00112233445566778899aabbccddeeff'
+  const logicalId = 'ff'.repeat(16)
+  const bobEvent = 'bb'.repeat(32)
+  const carolEvent = 'cc'.repeat(32)
+  const body = 'fixture group hello'
+
+  function historyRow(identity: string, plaintext: string): Record<string, unknown> {
+    if (identity === 'alice') {
+      return {
+        id: logicalId,
+        event_id: '',
+        sender: 'npub1alice',
+        plaintext,
+        created_at: 1_700_000_000,
+      }
+    }
+    return {
+      id: logicalId,
+      event_id: identity === 'bob' ? bobEvent : carolEvent,
+      sender: 'npub1alice',
+      plaintext,
+      created_at: 1_700_000_000,
+    }
+  }
+
+  function localFixture() {
+    const calls: { identity: string; args: string[] }[] = []
+    let stored: string | undefined
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        calls.push({ identity, args })
+        if (args[0] === 'groupchat' && args[1] === 'send') {
+          const bodyAt = args.indexOf('--body')
+          stored = args[bodyAt + 1]
+          return JSON.stringify({
+            ok: true,
+            data: {
+              logical_id: logicalId,
+              recipients: [
+                { recipient_npub: 'npub1bob', event_id: bobEvent },
+                { recipient_npub: 'npub1carol', event_id: carolEvent },
+              ],
+            },
+          })
+        }
+        if (args[0] === 'groupchat' && args[1] === 'history') {
+          if (!stored) return JSON.stringify({ ok: true, data: { messages: [] } })
+          const messages = [historyRow(identity, stored)]
+          if (identity === 'alice') {
+            messages.push({ id: '', event_id: 'ee'.repeat(32), sender: 'npub1alice', plaintext: 'skip', created_at: 1 })
+          }
+          return JSON.stringify({ ok: true, data: { messages } })
+        }
+        throw new Error(`unexpected argv ${args.join(' ')}`)
+      }),
+    )
+    return { calls, members }
+  }
+
+  it('reports the sender row with an empty event id and distinct recipient event ids', async () => {
+    const { calls, members } = localFixture()
+    const joint = new GroupJoint(members)
+    const sent = await joint.send(groupId, body)
+    const first = await joint.receiveNew(groupId)
+    const second = await joint.receiveNew(groupId)
+
+    expect(sent.logical_id).toBe(logicalId)
+    expect(sent.event_id).toBe(bobEvent)
+    expect(first).toEqual([
+      { identity: 'alice', logical_id: logicalId, event_id: undefined, plaintext: body },
+      { identity: 'bob', logical_id: logicalId, event_id: bobEvent, plaintext: body },
+      { identity: 'carol', logical_id: logicalId, event_id: carolEvent, plaintext: body },
+    ])
+    expect(second).toEqual([])
+
+    const sends = calls.filter((call) => call.args[1] === 'send')
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.identity).toBe('alice')
+    expect(sends[0]?.args).toEqual([
+      'groupchat',
+      'send',
+      '--group-id',
+      groupId,
+      '--body',
+      body,
+      '--identity',
+      'alice',
+      '--json',
+    ])
+    const history = calls.filter((call) => call.args[1] === 'history')
+    expect(history.map((call) => call.identity)).toEqual([
+      'alice',
+      'bob',
+      'carol',
+      'alice',
+      'bob',
+      'carol',
+    ])
+    for (const call of calls) {
+      expect(call.args.join(' ')).not.toContain('wss://')
+      expect(call.args.join(' ')).not.toContain('ws://')
+      expect(call.args.join(' ')).not.toContain('relay.aastar')
+    }
+  })
+
+  it('does not keep a partial read when a later history call throws', async () => {
+    let bobFailed = false
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        if (args[1] === 'history' && identity === 'bob' && !bobFailed) {
+          bobFailed = true
+          throw new Error('bob history down')
+        }
+        if (args[1] === 'history') {
+          return JSON.stringify({
+            ok: true,
+            data: { messages: [historyRow(identity, body)] },
+          })
+        }
+        throw new Error(`unexpected argv ${args.join(' ')}`)
+      }),
+    )
+    const joint = new GroupJoint(members)
+    await expect(joint.receiveNew(groupId)).rejects.toThrow(/bob history down/)
+    await expect(joint.receiveNew(groupId)).resolves.toEqual([
+      { identity: 'alice', logical_id: logicalId, event_id: undefined, plaintext: body },
+      { identity: 'bob', logical_id: logicalId, event_id: bobEvent, plaintext: body },
+      { identity: 'carol', logical_id: logicalId, event_id: carolEvent, plaintext: body },
+    ])
+  })
+
+  it('fails the send when hyphae returns a non-zero envelope', async () => {
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async () => JSON.stringify({ ok: false, message: 'group is not active' })),
+    )
+    const joint = new GroupJoint(members)
+    await expect(joint.send(groupId, body)).rejects.toThrow(/group is not active/)
+  })
+
+  it('rejects a joint without three identities', () => {
+    expect(() => new GroupJoint([])).toThrow(/three identities/)
+    const one = groupMember('alice', async () => '{}')
+    const two = groupMember('bob', async () => '{}')
+    const three = groupMember('carol', async () => '{}')
+    const four = groupMember('dave', async () => '{}')
+    expect(() => new GroupJoint([one, two])).toThrow(/three identities/)
+    expect(() => new GroupJoint([one, two, three, four])).toThrow(/three identities/)
+  })
+
+  it('reports a later message when the sender event id is empty on both', async () => {
+    const firstLogical = '11'.repeat(16)
+    const secondLogical = '22'.repeat(16)
+    const sent: string[] = []
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        if (args[1] === 'send') {
+          const bodyAt = args.indexOf('--body')
+          sent.push(args[bodyAt + 1] ?? '')
+          const logical = sent.length === 1 ? firstLogical : secondLogical
+          return JSON.stringify({
+            ok: true,
+            data: {
+              logical_id: logical,
+              recipients: [
+                { recipient_npub: 'npub1bob', event_id: `${sent.length}b`.padEnd(64, 'b') },
+                { recipient_npub: 'npub1carol', event_id: `${sent.length}c`.padEnd(64, 'c') },
+              ],
+            },
+          })
+        }
+        if (args[1] === 'history') {
+          const messages = sent.map((plaintext, index) => ({
+            id: index === 0 ? firstLogical : secondLogical,
+            event_id: identity === 'alice' ? '' : `${index + 1}${identity === 'bob' ? 'b' : 'c'}`.padEnd(64, identity === 'bob' ? 'b' : 'c'),
+            sender: 'npub1alice',
+            plaintext,
+            created_at: 1_700_000_000 + index,
+          }))
+          return JSON.stringify({ ok: true, data: { messages } })
+        }
+        throw new Error(`unexpected argv ${args.join(' ')}`)
+      }),
+    )
+    const joint = new GroupJoint(members)
+    await joint.send(groupId, 'one')
+    expect(await joint.receiveNew(groupId)).toEqual([
+      { identity: 'alice', logical_id: firstLogical, event_id: undefined, plaintext: 'one' },
+      { identity: 'bob', logical_id: firstLogical, event_id: '1b'.padEnd(64, 'b'), plaintext: 'one' },
+      { identity: 'carol', logical_id: firstLogical, event_id: '1c'.padEnd(64, 'c'), plaintext: 'one' },
+    ])
+    await joint.send(groupId, 'two')
+    expect(await joint.receiveNew(groupId)).toEqual([
+      { identity: 'alice', logical_id: secondLogical, event_id: undefined, plaintext: 'two' },
+      { identity: 'bob', logical_id: secondLogical, event_id: '2b'.padEnd(64, 'b'), plaintext: 'two' },
+      { identity: 'carol', logical_id: secondLogical, event_id: '2c'.padEnd(64, 'c'), plaintext: 'two' },
+    ])
+  })
+
+  it('reports the same logical id from a second group', async () => {
+    const otherGroup = 'aabbccddeeff00112233445566778899'
+    const members = ['alice', 'bob', 'carol'].map((identity) =>
+      groupMember(identity, async (args) => {
+        if (args[1] !== 'history') throw new Error(`unexpected argv ${args.join(' ')}`)
+        const asked = args[args.indexOf('--group-id') + 1]
+        return JSON.stringify({
+          ok: true,
+          data: {
+            messages: [
+              {
+                id: logicalId,
+                event_id: identity === 'alice' ? '' : identity === 'bob' ? bobEvent : carolEvent,
+                sender: 'npub1alice',
+                plaintext: asked,
+                created_at: 1_700_000_000,
+              },
+            ],
+          },
+        })
+      }),
+    )
+    const joint = new GroupJoint(members)
+    const first = await joint.receiveNew(groupId)
+    const second = await joint.receiveNew(otherGroup)
+    expect(first.map((row) => row.logical_id)).toEqual([logicalId, logicalId, logicalId])
+    expect(second.map((row) => row.identity)).toEqual(['alice', 'bob', 'carol'])
+    expect(second.map((row) => row.logical_id)).toEqual([logicalId, logicalId, logicalId])
+    expect(second.map((row) => row.plaintext)).toEqual([otherGroup, otherGroup, otherGroup])
   })
 })

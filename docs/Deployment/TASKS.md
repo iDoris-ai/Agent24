@@ -79,16 +79,16 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 <a id="hyphae-delivery"></a>
 ### Hyphae 网络交付：DEP-HN（2026-10-10 新增，尚未实现）
 
-规范见 [HYPHAE-NETWORK-DELIVERY.md](HYPHAE-NETWORK-DELIVERY.md)。这是 M1 之后的有界交付里程碑，不是 Hyphae M2；现在只允许文档/契约冻结，所有实现必须等待 Hyphae 当前 M1 发布门关闭。范围仅标准 client、可选本机 relay、离线包、服务器发行与三入口引导；远程执行、移动端、Windows、自动公网配置不在本轮。
+规范见 [HYPHAE-NETWORK-DELIVERY.md](HYPHAE-NETWORK-DELIVERY.md) 及 [健康/回滚冻结契约](HYPHAE-HEALTH-ROLLBACK-CONTRACT.md)（真实存储观察、目标清单/准入矩阵、时限和逐 task 负例）。这是 M1 之后的有界交付里程碑，不是 Hyphae M2；现在只允许文档/契约冻结，所有实现必须等待 Hyphae 当前 M1 发布门关闭。范围仅标准 client、可选本机 relay、离线包、服务器发行与三入口引导；远程执行、移动端、Windows、自动公网配置不在本轮。
 
 **C8/C9 对账**：原编号、BACKLOG 与来源保留，原始 S 规模因四平台/双锁验收扩大为 M；不另建“升级 client lock”或“标准包内置 client”的重复任务。基线生产锁已是 `671c584f…`，不能沿用设计文档“仍为 a4aa606”的历史描述，也不能仅凭 SHA 变化认定 C8 完成；须证明候选包含 #104 能力并通过实际占用/导入反例。A3/A8 等 DONE 记录保持历史原样，C9 负责把未来包布局从两程序更新为三程序。
 
-下表 HN 编号均为本交付台账 ID；Hyphae 行由上游建立对应 issue/PR 并双向映射，不替代其原生里程碑编号。可按 ≤300 行 task PR 再细分，依赖和出口不变。当前仅 HN0 为 READY，其余均 BACKLOG 且受 M1 门阻塞。#881 与 Hyphae 配套契约 PR 合并只建立基线；HN0 仍保持 READY，直到互链 follow-up PR 冻结健康阈值和 schema/回滚矩阵，才可标 DONE 并解锁 HN1。
+下表 HN 编号均为本交付台账 ID；Hyphae 行由上游建立对应 issue/PR 并双向映射，不替代其原生里程碑编号。可按 ≤300 行 task PR 再细分，依赖和出口不变。当前 HN0 为 **待跨仓配套 follow-up 评审（非 DONE）**，其余均 BACKLOG 且受 M1 门阻塞。#881 与 Hyphae #172/#173 合并只建立基线；健康/回滚策略补充已成文，须双方互链 follow-up 最终 head 评审并合并后才可标 HN0 DONE，HN1 仍须等待 M1 发布门。精确候选版本兼容/迁移证据归 HN1/C8 晋升门，不能据缺少候选证据推迟冻结决策规则。
 
 | ID | 归属仓库 / 负责人 | 依赖 | 交付及可观察验收 | 估算人日 |
 |---|---|---|---|---|
-| DEP-HN0 | Agent24 + Hyphae / 双方维护者 | —（只写文档） | 两仓互链契约 PR 合并；冻结 SKU、pin/签名根策略、健康探测时限、schema/回滚矩阵与责任；没有根不能声称验签 | 0.5–1 |
-| DEP-HN1 | Hyphae / 上游发布负责人 | HN0、M1 发布门 | tag 发布及四平台 client/relay 分包、两类 manifest/lock；固定版本安全安装器；Linux 双架构容器/持久卷指南；实际下载验证来源、完整 hash 与真实 relay smoke，坏资产拒绝 | 4–6 |
+| DEP-HN0 | Agent24 + Hyphae / 双方维护者 | —（只写文档） | 待跨仓配套 follow-up 评审；[冻结契约](HYPHAE-HEALTH-ROLLBACK-CONTRACT.md) 已给出 SKU 依据、pin/签名根策略、健康时限、真实存储/回滚矩阵与责任，双方互链合并才完成；没有根不能声称验签 | 0.5–1 |
+| DEP-HN1 | Hyphae / 上游发布负责人 | HN0、M1 发布门 | tag 发布及四平台 client/relay 分包、两类 manifest/lock；固定版本安全安装器；Linux 双架构容器/持久卷指南；结构化 client/relay readiness、受影响本地存储停写/维护隔离及可确认停机能力，按健康契约证明 15/20/10s 界限与故障负例；实际下载验证来源、完整 hash 与真实 relay smoke，坏资产拒绝；上述能力/证据缺任一项则不解锁 C8 | 4–6 |
 | DEP-C8 | Agent24 / comm 维护者 | HN1 | lock-promotion PR 固定双方 SHA；四平台按配方重建匹配下载资产；client/relay 组合、daemon.lock 占用、身份/联系人/收发/离线/重启/zero-run 通过；不兼容附 Hyphae issue/PR | 1–2 |
 | DEP-HN2 | Agent24 / 安装器维护者 | C8 | client 与 relay 共用安全安装语义；staging/fsync/不覆盖原子提交、现有副本重验；断电模拟、满盘、篡改/并发/归档逃逸均不执行半成品、不覆盖异常目标 | 2–3 |
 | DEP-C9 | Agent24 / 发布负责人 | C8、HN2 | CLI 与桌面包内 client 匹配锁，relay 不在标准包；四平台 Release 下载 smoke；无源码/Go/PATH 外部 hyphae 的干净环境能使用通信 | 1–2 |

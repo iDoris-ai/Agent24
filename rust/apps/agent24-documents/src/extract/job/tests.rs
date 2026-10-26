@@ -229,7 +229,11 @@ async fn a_job_writes_its_extraction_with_its_success() {
             &body["schema_sha256"],
             &body["extractor_version"]
         ),
-        (&json!("qwen3-8b"), &input()["schema_sha256"], &json!("2"))
+        (
+            &json!("qwen3-8b"),
+            &input()["schema_sha256"],
+            &json!(crate::extract::EXTRACTOR_VERSION)
+        )
     );
     let v = &body["values"][0];
     assert_eq!(
@@ -283,16 +287,17 @@ async fn each_way_a_job_cannot_finish_ends_it_with_its_code() {
             Some("engine_unavailable"),
         ),
         (
-            Some(script(vec![
-                answer("x").map(|mut r| {
-                    r.text = "{}".into();
-                    r
-                }),
-                answer("x").map(|mut r| {
-                    r.text = "{}".into();
-                    r
-                }),
-            ])),
+            // Malformed free, then held twice (ME4-S2c).
+            Some(script(
+                (0..3)
+                    .map(|_| {
+                        answer("x").map(|mut r| {
+                            r.text = "{}".into();
+                            r
+                        })
+                    })
+                    .collect(),
+            )),
             input(),
             "failed",
             Some("parse_failed"),

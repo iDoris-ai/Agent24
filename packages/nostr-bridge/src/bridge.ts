@@ -7,7 +7,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { makeContent, type ContentInput } from './protocol.js'
-import { SpeakerClient, type DiscoverEntry, type PublishResult, type SendResult } from './speaker.js'
+import {
+  SpeakerClient,
+  type DiscoverEntry,
+  type GroupSendResult,
+  type PublishResult,
+  type SendResult,
+  type SpeakerRunner,
+} from './speaker.js'
 import {
   toAgentSpeakerProfile,
   type Agent24Profile,
@@ -64,5 +71,63 @@ export class NostrBridge {
   /** search: locate agents by business capability. */
   async search(capability: string): Promise<DiscoverEntry[]> {
     return this.speaker.discover(capability)
+  }
+}
+
+export interface GroupMember {
+  identity: string
+  client: SpeakerClient
+}
+
+export function groupMember(identity: string, run: SpeakerRunner): GroupMember {
+  return { identity, client: new SpeakerClient(run, { identity }) }
+}
+
+export interface GroupReceiveReport {
+  identity: string
+  logical_id: string
+  event_id?: string
+  plaintext: string
+}
+
+/** Three members. `members[0]` calls `groupchat send`. `receiveNew` records identity, group id, and logical id after every history read has returned. */
+export class GroupJoint {
+  private readonly delivered = new Set<string>()
+
+  constructor(private readonly members: readonly GroupMember[]) {
+    if (members.length !== 3) {
+      throw new Error('group joint requires three identities')
+    }
+  }
+
+  async send(groupId: string, body: string): Promise<GroupSendResult> {
+    const sender = this.members[0]
+    if (!sender) {
+      throw new Error('group joint requires three identities')
+    }
+    return sender.client.groupSend(groupId, body)
+  }
+
+  async receiveNew(groupId: string): Promise<GroupReceiveReport[]> {
+    const read: { identity: string; rows: Awaited<ReturnType<SpeakerClient['groupHistory']>> }[] = []
+    for (const member of this.members) {
+      read.push({ identity: member.identity, rows: await member.client.groupHistory(groupId) })
+    }
+    const fresh: GroupReceiveReport[] = []
+    for (const member of read) {
+      for (const row of member.rows) {
+        if (!row.id) continue
+        const key = `${member.identity}\0${groupId}\0${row.id}`
+        if (this.delivered.has(key)) continue
+        this.delivered.add(key)
+        fresh.push({
+          identity: member.identity,
+          logical_id: row.id,
+          event_id: row.event_id,
+          plaintext: row.plaintext,
+        })
+      }
+    }
+    return fresh
   }
 }

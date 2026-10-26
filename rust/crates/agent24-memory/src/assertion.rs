@@ -67,9 +67,32 @@ pub async fn forget(pool: &SqlitePool, owner: &str, id: &str, at: &str) -> Resul
     }
 
     // Preserve field boundaries so distinct owner/id pairs cannot alias.
-    let event_key = serde_json::to_string(&["retract", owner, id])?;
+    let base_key = serde_json::to_string(&["retract", owner, id])?;
+    let base_id = crate::artifact::checksum(&base_key);
+    let existing_ids: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT id FROM mem_events WHERE id = ? OR id LIKE ?")
+            .bind(&base_id)
+            .bind(format!("{base_id}-%"))
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
+
+    let event_id = if !existing_ids.contains(&base_id) {
+        base_id
+    } else {
+        let mut suffix = 1;
+        loop {
+            let candidate = format!("{base_id}-{suffix}");
+            if !existing_ids.contains(&candidate) {
+                break candidate;
+            }
+            suffix += 1;
+        }
+    };
+
     let mut event = MemEvent::new(
-        crate::artifact::checksum(&event_key),
+        event_id,
         Scope::owner(owner),
         "assertion.retracted",
         serde_json::json!({ "assertion_id": id }),

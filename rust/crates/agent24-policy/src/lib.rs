@@ -14,8 +14,10 @@ pub mod consent_gate;
 pub mod guardian;
 pub mod overrides;
 pub mod tool_summary;
+pub mod write_scope;
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +55,11 @@ pub const AVAILABLE_DECISIONS: [&str; 4] = ["approve", "approve_for_session", "d
 ///
 /// 3. A module call with `per_call_approval=true` gets neither standing option.
 ///    The broker also skips matching existing grants before it creates the
-///    approval. Builtin behavior intentionally remains as-is.
+///    approval.
+/// 4. Builtin `exec` and `write_local` also get no `approve_for_session`.
+///    A session-wide tool grant is not an exact target (L-APPR-5 / L-APPR-8).
+///    An outside `fs_write` may still offer `approve_for_target` for one
+///    canonical directory. A confirmed workspace root is not wired yet.
 pub fn decisions_for(
     risk: RiskClass,
     standing_target: Option<&str>,
@@ -67,7 +73,7 @@ pub fn decisions_for(
         if standing_target.is_some() {
             out.push("approve_for_target".to_owned());
         }
-    } else {
+    } else if session_wide_grant_allowed(risk) {
         out.push("approve_for_session".to_owned());
     }
     out.push("deny".to_owned());
@@ -124,6 +130,11 @@ pub struct ApprovalRequest<'a> {
     pub standing_target: Option<&'a str>,
     pub summary: String,
     pub payload: Map<String, Value>,
+    /// Builtin workspace root for L-APPR-8. Absent means no confirmed root.
+    pub workspace_root: Option<&'a Path>,
+    /// Parent directory captured before the gate. When set, this is the only
+    /// directory the grant may name. The raw path is not resolved again.
+    pub captured_write_directory: Option<&'a Path>,
 }
 
 /// What an approved decision needs in order to mint the right kind of grant.
@@ -137,6 +148,58 @@ struct GrantCtx {
     scope_id: Option<String>,
     /// The exact target this call named, when it is eligible for a grant.
     target: Option<String>,
+}
+
+/// A `(session, tool)` grant is only still offered for `Read`.
+///
+/// `Exec` is asked on every call when the default always-review list includes
+/// exec. `WriteLocal` may later hold a path-scoped grant; a grant of the tool
+/// itself is not that. A Guardian can still auto-approve WriteLocal, and can
+/// auto-approve Exec if always-review is explicitly emptied. That is existing
+/// behavior, not a session grant.
+fn session_wide_grant_allowed(risk: RiskClass) -> bool {
+    matches!(risk, RiskClass::Read)
+}
+
+fn write_decisions(
+    mut offered: Vec<String>,
+    risk: RiskClass,
+    tool: &str,
+    directory: Option<&str>,
+) -> Vec<String> {
+    if risk == RiskClass::WriteLocal && tool == "fs_write" && directory.is_some() {
+        let target = "approve_for_target".to_owned();
+        if !offered.contains(&target) {
+            offered.insert(1, target);
+        }
+    }
+    offered
+}
+
+fn classify_write(
+    source: &str,
+    tool: &str,
+    risk: RiskClass,
+    workspace_root: Option<&Path>,
+    payload: &Map<String, Value>,
+    captured_write_directory: Option<&Path>,
+) -> Option<write_scope::WriteLocation> {
+    if source != "builtin" || tool != "fs_write" || risk != RiskClass::WriteLocal {
+        return None;
+    }
+    if let Some(path) = captured_write_directory {
+        let Some(directory) = path.to_str() else {
+            return Some(write_scope::WriteLocation::AskWithoutDirectoryGrant);
+        };
+        if write_scope::directory_grant_forbidden(path) {
+            return Some(write_scope::WriteLocation::AskWithoutDirectoryGrant);
+        }
+        return Some(write_scope::WriteLocation::Outside {
+            directory: directory.to_owned(),
+        });
+    }
+    let raw = payload.get("path").and_then(Value::as_str)?;
+    Some(write_scope::classify_builtin_write(workspace_root, raw))
 }
 
 /// Where a standing grant would live: the schedule if one fired this run, else
@@ -270,13 +333,15 @@ impl ApprovalBroker {
             standing_target,
             summary,
             payload,
+            workspace_root,
+            captured_write_directory,
         } = req;
         let module_per_call = source == "module" && per_call_approval;
         // A target-scoped grant is only offerable when there is something
         // durable to hang it on. A transient run's id never recurs, so a grant
         // scoped to it could never match again — offering it would be a button
         // that silently does nothing.
-        let grant_ctx = grant_ctx(
+        let mut grant_ctx = grant_ctx(
             run_id,
             session_id,
             schedule_id,
@@ -290,6 +355,35 @@ impl ApprovalBroker {
         );
         let scope = grant_ctx.scope.clone();
         let grant_scope = grant_scope(session_id, schedule_id);
+        let write_location = classify_write(
+            source,
+            tool,
+            risk,
+            workspace_root,
+            &payload,
+            captured_write_directory,
+        );
+        if matches!(
+            write_location,
+            Some(write_scope::WriteLocation::InsideConfirmedRoot)
+        ) {
+            let detail = serde_json::json!({
+                "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
+                "kind": kind, "reason": "confirmed_workspace_root"
+            });
+            if self
+                .try_audit("approval.workspace_write_allowed", &detail)
+                .await
+                .is_ok()
+            {
+                return Verdict::Approved;
+            }
+        }
+        if let Some(write_scope::WriteLocation::Outside { directory }) = &write_location
+            && grant_ctx.scope_kind.is_some()
+        {
+            grant_ctx.target = Some(directory.clone());
+        }
         let offer_target = grant_ctx.target.as_deref();
 
         // Standing grant (H4): persistent, and matched on the EXACT target.
@@ -323,7 +417,8 @@ impl ApprovalBroker {
         // Broad session grant. Deliberately NOT consulted for external tools:
         // they can no longer mint one (see `decisions_for`), and a grant minted
         // before H4 must not keep authorising every address afterwards.
-        let granted = !module_per_call
+        let granted = session_wide_grant_allowed(risk)
+            && !module_per_call
             && !risk.standing_grant_eligible()
             && self
                 .grants
@@ -347,7 +442,9 @@ impl ApprovalBroker {
         // fast path above. A prior `approve_for_session` is an EXPLICIT human
         // pre-authorisation and outranks the model's per-call opinion, so a
         // granted (session, tool) never re-consults the guardian — by design.
-        if let Some(guardian) = &self.guardian {
+        if write_location.is_none()
+            && let Some(guardian) = &self.guardian
+        {
             let assess = AssessInput {
                 tool,
                 kind,
@@ -444,7 +541,12 @@ impl ApprovalBroker {
             kind: kind.to_owned(),
             summary,
             payload,
-            available_decisions: decisions_for(risk, offer_target, source, per_call_approval),
+            available_decisions: write_decisions(
+                decisions_for(risk, offer_target, source, per_call_approval),
+                risk,
+                tool,
+                offer_target,
+            ),
             standing_target: offer_target.map(str::to_owned),
             status: ApprovalStatus::Pending,
             decision: None,
@@ -893,7 +995,7 @@ impl ApprovalGate for BrokerGate {
             return;
         }
         let eligible = match decision.kind.as_str() {
-            "approve_for_session" => !info.risk_class.standing_grant_eligible(),
+            "approve_for_session" => session_wide_grant_allowed(info.risk_class),
             "approve_for_target" => {
                 info.risk_class.standing_grant_eligible() && standing_target.is_some()
             }
@@ -970,6 +1072,8 @@ impl ApprovalGate for BrokerGate {
                     standing_target,
                     summary,
                     payload: input.clone(),
+                    workspace_root: ctx.confirmed_write_root(),
+                    captured_write_directory: ctx.approved_outside_directory(),
                 },
                 cancel,
             )
@@ -1020,7 +1124,28 @@ mod tests {
             standing_target: None,
             summary,
             payload,
+            workspace_root: None,
+            captured_write_directory: None,
         }
+    }
+
+    fn req_read<'a>(
+        run_id: &'a str,
+        session_id: Option<&'a str>,
+        tool_call_id: &'a str,
+        tool: &'a str,
+    ) -> ApprovalRequest<'a> {
+        let mut request = req(
+            run_id,
+            session_id,
+            tool_call_id,
+            tool,
+            "read",
+            "s".to_owned(),
+            Map::new(),
+        );
+        request.risk = RiskClass::Read;
+        request
     }
 
     struct Recorded(Arc<StdMutex<Vec<String>>>);
@@ -1506,10 +1631,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_for_session_grants_skip_the_next_ask() {
+    async fn exec_session_grant_does_not_skip_the_next_ask() {
         let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
         seed_run(&store, "run_1").await;
+        broker.grant("sess_1", "shell_exec");
         let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
         let waiter = tokio::spawn(async move {
             b.request(
                 req(
@@ -1521,6 +1649,314 @@ mod tests {
                     "s".to_owned(),
                     Map::new(),
                 ),
+                &request_cancel,
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        let pending = store.get_approval(&id).await.unwrap().unwrap();
+        assert!(
+            !pending
+                .available_decisions
+                .iter()
+                .any(|d| d == "approve_for_session")
+        );
+        cancel.cancel();
+        assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
+    }
+
+    fn write_req<'a>(
+        run_id: &'a str,
+        session_id: Option<&'a str>,
+        tool_call_id: &'a str,
+        path: &'a str,
+        root: Option<&'a Path>,
+    ) -> ApprovalRequest<'a> {
+        let mut payload = Map::new();
+        payload.insert("path".to_owned(), Value::String(path.to_owned()));
+        let mut request = req(
+            run_id,
+            session_id,
+            tool_call_id,
+            "fs_write",
+            "fs_write",
+            "write".to_owned(),
+            payload,
+        );
+        request.workspace_root = root;
+        request
+    }
+
+    #[tokio::test]
+    async fn a_standing_grant_matches_the_captured_directory_not_a_second_parse() {
+        let dir = std::env::temp_dir().join(format!("a24-cap-{}", std::process::id()));
+        let safe = dir.join("safe");
+        let secret = dir.join("secret");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let safe_owned = safe.clone();
+        let waiter = tokio::spawn(async move {
+            let mut request = write_req("run_1", Some("sess_1"), "tc_1", "/tmp/ignored", None);
+            request.captured_write_directory = Some(&safe_owned);
+            b.request(request, &CancellationToken::new()).await
+        });
+        let id = wait_for_pending(&store).await;
+        broker
+            .resolve(&id, decision("approve_for_target", None))
+            .await
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+
+        seed_run(&store, "run_2").await;
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let secret_owned = secret.clone();
+        let second = tokio::spawn(async move {
+            let mut request = write_req("run_2", Some("sess_1"), "tc_2", "/tmp/ignored", None);
+            request.captured_write_directory = Some(&secret_owned);
+            b.request(request, &request_cancel).await
+        });
+        let id2 = wait_for_pending(&store).await;
+        let pending = store.get_approval(&id2).await.unwrap().unwrap();
+        assert_eq!(pending.standing_target.as_deref(), secret.to_str());
+        cancel.cancel();
+        assert!(matches!(second.await.unwrap(), Verdict::Aborted(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct SwapAroundBroker {
+        inner: BrokerGate,
+        link: std::path::PathBuf,
+        safe: std::path::PathBuf,
+        secret: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl ApprovalGate for SwapAroundBroker {
+        async fn check(
+            &self,
+            info: &agent24_protocol::ToolInfo,
+            ctx: &ToolContext,
+            input: &Map<String, Value>,
+            standing_target: Option<&str>,
+            cancel: &CancellationToken,
+        ) -> GateDecision {
+            let _ = std::fs::remove_file(&self.link);
+            std::os::unix::fs::symlink(&self.safe, &self.link).unwrap();
+            let decision = self
+                .inner
+                .check(info, ctx, input, standing_target, cancel)
+                .await;
+            let _ = std::fs::remove_file(&self.link);
+            std::os::unix::fs::symlink(&self.secret, &self.link).unwrap();
+            decision
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_directory_not_the_grant_is_denied_through_the_real_gate() {
+        let dir = std::env::temp_dir().join(format!("a24-wire-{}", std::process::id()));
+        let ws = dir.join("ws");
+        let safe = dir.join("safe");
+        let secret = dir.join("secret");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let (broker, _events, store) = broker_with_timeout(Duration::from_millis(200)).await;
+        seed_run(&store, "run_1").await;
+        store
+            .insert_standing_grant(&agent24_store::StandingGrant {
+                id: "sg_safe".to_owned(),
+                scope_kind: "session".to_owned(),
+                scope_id: "sess_1".to_owned(),
+                tool: "fs_write".to_owned(),
+                target: safe.canonicalize().unwrap().to_str().unwrap().to_owned(),
+                created_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        let gate = SwapAroundBroker {
+            inner: BrokerGate::new(Arc::clone(&broker)),
+            link: link.clone(),
+            safe: safe.clone(),
+            secret: secret.clone(),
+        };
+        let reg = agent24_tools::ToolRegistry::builtin(ws).with_gate(Arc::new(gate));
+        let file = link.join("a.txt");
+        let mut input = Map::new();
+        input.insert(
+            "path".to_owned(),
+            Value::String(file.to_str().unwrap().to_owned()),
+        );
+        input.insert("content".to_owned(), Value::String("no".to_owned()));
+        let err = reg
+            .dispatch(
+                "fs_write",
+                &ToolContext::legacy("run_1", Some("sess_1".to_owned()), None, "tc_1"),
+                &input,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, agent24_tools::ToolError::Denied(_)),
+            "{err:?}"
+        );
+        assert!(!secret.join("a.txt").exists());
+        assert!(!safe.join("a.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_write_inside_the_confirmed_root_does_not_ask() {
+        let dir = std::env::temp_dir().join(format!("a24-ws-in-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let verdict = broker
+            .request(
+                write_req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    file.to_str().unwrap(),
+                    Some(&dir),
+                ),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+        assert!(store.list_approvals(None).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_outside_directory_grant_does_not_cover_a_sibling() {
+        let dir = std::env::temp_dir().join(format!("a24-ws-out-{}", std::process::id()));
+        let root = dir.join("proj");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let outside = other.join("a.txt");
+        let sibling = dir.join("third").join("b.txt");
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let path = outside.to_str().unwrap().to_owned();
+        let root_owned = root.clone();
+        let waiter = tokio::spawn(async move {
+            b.request(
+                write_req("run_1", Some("sess_1"), "tc_1", &path, Some(&root_owned)),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        let pending = store.get_approval(&id).await.unwrap().unwrap();
+        assert!(
+            pending
+                .available_decisions
+                .iter()
+                .any(|d| d == "approve_for_target")
+        );
+        broker
+            .resolve(&id, decision("approve_for_target", None))
+            .await
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+
+        seed_run(&store, "run_2").await;
+        let again = outside.to_str().unwrap().to_owned();
+        let root_owned = root.clone();
+        let verdict = broker
+            .request(
+                write_req("run_2", Some("sess_1"), "tc_2", &again, Some(&root_owned)),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+
+        seed_run(&store, "run_3").await;
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let sibling_path = sibling.to_str().unwrap().to_owned();
+        let root_owned = root.clone();
+        let third = tokio::spawn(async move {
+            b.request(
+                write_req(
+                    "run_3",
+                    Some("sess_1"),
+                    "tc_3",
+                    &sibling_path,
+                    Some(&root_owned),
+                ),
+                &request_cancel,
+            )
+            .await
+        });
+        let id3 = wait_for_pending(&store).await;
+        assert_ne!(id3, id);
+        cancel.cancel();
+        assert!(matches!(third.await.unwrap(), Verdict::Aborted(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_local_session_grant_does_not_skip_the_next_ask() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        broker.grant("sess_1", "fs_write");
+        let b = Arc::clone(&broker);
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            b.request(
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "fs_write",
+                    "fs_write",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
+                &request_cancel,
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        assert!(
+            !store
+                .get_approval(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .available_decisions
+                .iter()
+                .any(|d| d == "approve_for_session")
+        );
+        cancel.cancel();
+        assert!(matches!(waiter.await.unwrap(), Verdict::Aborted(_)));
+    }
+
+    #[tokio::test]
+    async fn approve_for_session_grants_skip_the_next_ask() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let waiter = tokio::spawn(async move {
+            b.request(
+                req_read("run_1", Some("sess_1"), "tc_1", "fs_read"),
                 &CancellationToken::new(),
             )
             .await
@@ -1532,19 +1968,13 @@ mod tests {
             .unwrap();
         assert_eq!(waiter.await.unwrap(), Verdict::Approved);
 
-        // Second ask in the same session: instant approve, NO new row
+        // Second ask in the same session: instant approve, NO new row.
+        // This remains only for Read. Exec is covered by
+        // exec_session_grant_does_not_skip_the_next_ask.
         seed_run(&store, "run_2").await;
         let verdict = broker
             .request(
-                req(
-                    "run_2",
-                    Some("sess_1"),
-                    "tc_2",
-                    "shell_exec",
-                    "exec",
-                    "s".to_owned(),
-                    Map::new(),
-                ),
+                req_read("run_2", Some("sess_1"), "tc_2", "fs_read"),
                 &CancellationToken::new(),
             )
             .await;
@@ -1563,15 +1993,7 @@ mod tests {
         let b = Arc::clone(&broker);
         let first = tokio::spawn(async move {
             b.request(
-                req(
-                    "run_1",
-                    Some("sess_1"),
-                    "tc_1",
-                    "shared-name",
-                    "exec",
-                    "builtin call".to_owned(),
-                    Map::new(),
-                ),
+                req_read("run_1", Some("sess_1"), "tc_1", "shared-name"),
                 &CancellationToken::new(),
             )
             .await
@@ -1668,72 +2090,114 @@ mod tests {
     async fn grants_are_scoped_to_session_and_tool() {
         // An approve_for_session grant must NOT leak across sessions or tools:
         // a different session, or a different tool in the same session, still
-        // creates a fresh pending approval (review C4 grant-scoping).
-        let (broker, _events, store) = broker_with_timeout(Duration::from_millis(80)).await;
+        // creates a fresh pending approval that must be explicitly asked and
+        // explicitly denied, never silently auto-granted (review C4
+        // grant-scoping). Use a 30s arrangement for this non-timeout test;
+        // the grant-scope assertions must not rely on the timeout firing.
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
         seed_run(&store, "run_1").await;
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
             b.request(
-                req(
-                    "run_1",
-                    Some("sess_1"),
-                    "tc_1",
-                    "shell_exec",
-                    "exec",
-                    "s".to_owned(),
-                    Map::new(),
-                ),
+                req_read("run_1", Some("sess_1"), "tc_1", "fs_read"),
                 &CancellationToken::new(),
             )
             .await
         });
-        let id = wait_for_pending(&store).await;
+        let id1 = wait_for_pending(&store).await;
         broker
-            .resolve(&id, decision("approve_for_session", None))
+            .resolve(&id1, decision("approve_for_session", None))
             .await
             .unwrap();
         assert_eq!(waiter.await.unwrap(), Verdict::Approved);
 
-        // Different SESSION, same tool → not granted → asks (times out closed)
+        // Different SESSION, same tool → the grant does not apply: a fresh
+        // pending row is created (never the already-resolved id1) and must be
+        // explicitly denied.
         seed_run(&store, "run_2").await;
-        let other_session = broker
-            .request(
-                req(
-                    "run_2",
-                    Some("sess_2"),
-                    "tc_2",
-                    "shell_exec",
-                    "exec",
-                    "s".to_owned(),
-                    Map::new(),
-                ),
+        let b2 = Arc::clone(&broker);
+        let waiter_2 = tokio::spawn(async move {
+            b2.request(
+                req_read("run_2", Some("sess_2"), "tc_2", "fs_read"),
                 &CancellationToken::new(),
             )
-            .await;
-        assert!(
-            matches!(other_session, Verdict::Denied(_)),
+            .await
+        });
+        let id2 = wait_for_pending(&store).await;
+        assert_ne!(
+            id2, id1,
+            "a different session must get a fresh row, not the resolved one"
+        );
+        let row2 = store.get_approval(&id2).await.unwrap().unwrap();
+        assert_eq!(row2.run_id, "run_2");
+        assert_eq!(row2.tool_call_id, "tc_2");
+        assert_eq!(row2.status, ApprovalStatus::Pending);
+        broker
+            .resolve(
+                &id2,
+                decision("deny", Some("different session must re-ask")),
+            )
+            .await
+            .unwrap();
+        let other_session = waiter_2.await.unwrap();
+        assert_eq!(
+            other_session,
+            Verdict::Denied("denied by user: different session must re-ask".to_owned()),
             "a different session must still be asked: {other_session:?}"
         );
+        assert_eq!(
+            store.get_approval(&id2).await.unwrap().unwrap().status,
+            ApprovalStatus::Denied
+        );
+        assert!(
+            store.list_audit().await.unwrap().iter().all(|entry| {
+                !(entry.action == "approval.auto_granted"
+                    && entry.detail.get("run_id").and_then(Value::as_str) == Some("run_2"))
+            }),
+            "a different session must never be audited as auto-granted"
+        );
 
-        // Same session, different TOOL → not granted → asks (times out closed)
+        // Same session, different TOOL → the grant does not apply either: a
+        // fresh pending row is created and must be explicitly denied too.
         seed_run(&store, "run_3").await;
-        let other_tool = broker
-            .request(
-                req(
-                    "run_3",
-                    Some("sess_1"),
-                    "tc_3",
-                    "fs_write",
-                    "fs_write",
-                    "s".to_owned(),
-                    Map::new(),
-                ),
+        let b3 = Arc::clone(&broker);
+        let waiter_3 = tokio::spawn(async move {
+            b3.request(
+                req_read("run_3", Some("sess_1"), "tc_3", "fs_read_other"),
                 &CancellationToken::new(),
             )
-            .await;
-        assert!(
-            matches!(other_tool, Verdict::Denied(_)),
+            .await
+        });
+        let id3 = wait_for_pending(&store).await;
+        assert_ne!(
+            id3, id1,
+            "a different tool must get a fresh row, not the resolved one"
+        );
+        assert_ne!(id3, id2, "run_3's row must not be run_2's leftover row");
+        let row3 = store.get_approval(&id3).await.unwrap().unwrap();
+        assert_eq!(row3.run_id, "run_3");
+        assert_eq!(row3.tool_call_id, "tc_3");
+        assert_eq!(row3.status, ApprovalStatus::Pending);
+        broker
+            .resolve(&id3, decision("deny", Some("different tool must re-ask")))
+            .await
+            .unwrap();
+        let other_tool = waiter_3.await.unwrap();
+        assert_eq!(
+            other_tool,
+            Verdict::Denied("denied by user: different tool must re-ask".to_owned()),
             "a different tool must still be asked: {other_tool:?}"
+        );
+        assert_eq!(
+            store.get_approval(&id3).await.unwrap().unwrap().status,
+            ApprovalStatus::Denied
+        );
+        assert!(
+            store.list_audit().await.unwrap().iter().all(|entry| {
+                !(entry.action == "approval.auto_granted"
+                    && entry.detail.get("run_id").and_then(Value::as_str) == Some("run_3"))
+            }),
+            "a different tool must never be audited as auto-granted"
         );
     }
 
@@ -1753,7 +2217,7 @@ mod tests {
                     "run_1",
                     Some("sess_1"),
                     "tc_1",
-                    "fs_write",
+                    "notes_write",
                     "fs_write",
                     "fs_write: /tmp/x".to_owned(),
                     payload,
@@ -1874,15 +2338,7 @@ mod tests {
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
             b.request(
-                req(
-                    "run_1",
-                    Some("sess_1"),
-                    "tc_1",
-                    "shell_exec",
-                    "exec",
-                    "s".to_owned(),
-                    Map::new(),
-                ),
+                req_read("run_1", Some("sess_1"), "tc_1", "fs_read"),
                 &CancellationToken::new(),
             )
             .await
@@ -1895,19 +2351,12 @@ mod tests {
         assert_eq!(waiter.await.unwrap(), Verdict::Approved);
 
         // Second call, same session+tool: granted → Approved with NO new row,
-        // even though the guardian would have rated it high.
+        // even though the guardian would have rated it high. Exec does not
+        // take this path; see exec_session_grant_does_not_skip_the_next_ask.
         seed_run(&store, "run_2").await;
         let verdict = broker
             .request(
-                req(
-                    "run_2",
-                    Some("sess_1"),
-                    "tc_2",
-                    "shell_exec",
-                    "exec",
-                    "s".to_owned(),
-                    Map::new(),
-                ),
+                req_read("run_2", Some("sess_1"), "tc_2", "fs_read"),
                 &CancellationToken::new(),
             )
             .await;
@@ -1946,6 +2395,8 @@ mod tests {
             standing_target: target,
             summary: "post a message".to_owned(),
             payload: Map::new(),
+            workspace_root: None,
+            captured_write_directory: None,
         }
     }
 
@@ -1981,27 +2432,35 @@ mod tests {
                 "{risk:?} module calls must ask for this invocation only"
             );
         }
-        // A source with the same risk and the existing builtin contract keeps
-        // its current session option; this PR does not change builtin policy.
-        assert!(
-            decisions_for(RiskClass::Exec, None, "builtin", true)
-                .contains(&"approve_for_session".to_owned())
-        );
+        for risk in [RiskClass::Exec, RiskClass::WriteLocal] {
+            assert!(
+                !decisions_for(risk, None, "builtin", false)
+                    .contains(&"approve_for_session".to_owned()),
+                "{risk:?} must not offer a session-wide tool grant"
+            );
+        }
     }
 
-    /// Non-external tools are untouched by H4: shell/fs keep the session grant
-    /// they always had, and never gain a target-scoped one.
+    /// Read may still offer a session grant. Exec and write_local must not, and
+    /// none of them gain an external-style target grant from H4.
     #[test]
-    fn non_external_tools_keep_the_session_grant_and_gain_nothing() {
+    fn exec_and_write_do_not_offer_a_session_wide_grant() {
         for risk in [RiskClass::Exec, RiskClass::WriteLocal, RiskClass::Read] {
             let offered = decisions_for(risk, Some("#ops"), "builtin", false);
             assert!(
-                offered.contains(&"approve_for_session".to_owned()),
-                "{risk:?}"
-            );
-            assert!(
                 !offered.contains(&"approve_for_target".to_owned()),
-                "{risk:?} must never be eligible for a target grant"
+                "{risk:?} must never be eligible for an external target grant"
+            );
+        }
+        assert!(
+            decisions_for(RiskClass::Read, None, "builtin", false)
+                .contains(&"approve_for_session".to_owned())
+        );
+        for risk in [RiskClass::Exec, RiskClass::WriteLocal] {
+            assert_eq!(
+                decisions_for(risk, Some("#ops"), "builtin", false),
+                vec!["approve", "deny", "abort"],
+                "{risk:?}"
             );
         }
     }

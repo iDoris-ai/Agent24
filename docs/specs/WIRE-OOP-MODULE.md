@@ -251,7 +251,9 @@ doc 明确引用"用户裁决 D1"。）
 | `auth_token` | string | ✅ | 必须等于 `A24_HANDSHAKE_TOKEN`；不符 → `auth_failed` |
 | `capabilities` | `[string]` | 否（缺省 `[]`） | 模块请求的能力；内核只会**给交集**（manifest 请求 ∩ 内核愿意给），见 §5 开头的 offer 语义 |
 
-**今天的协议版本区间只有 `1..=1`**——`protocol_versions: {"min": 1, "max": 1}` 是唯一能协商成功的值。
+**内核今天讲 `1..=2`**（ME4-S2b 起；之前只有 1）。协商结果是 `min(模块的 max, 2)`，所以只声明 `{"min": 1, "max": 1}` 的模块照样得到 1。
+v2 与 v1 的区别只有一条：`_a24/model/complete` 收 `temperature`（§5.5）。内核不按连接区分两者，v1 模块只是不发这个字段；
+用了它的模块在 manifest 里写 `min_daemon_protocol: 2`，老内核在安装和挂载时就拒绝这个包。
 
 成功响应（`InitializeResult`，`initialize.rs:150-157`）：
 
@@ -334,8 +336,8 @@ digest 是不是自己给的那份，这一步不泄露秘密，可以放在 tok
 ### 4.4 超时
 
 - 连接级默认：**`CALL_TIMEOUT = 30s`**（`rpc.rs:75-82`）。
-- 方法可声明自己的上限（不得超过 `MAX_METHOD_CALL_TIMEOUT = 300s`）；今天唯一声明了非默认超时的方法
-  是 `_a24/model/complete = 120s`（§5.5）。
+- 方法可声明自己的上限（不得超过 `MAX_METHOD_CALL_TIMEOUT`）；今天唯一声明了非默认超时的方法
+  是 `_a24/model/complete`，它的兜底值 4456s 就是这个上限（§5.5，ME4-S2a）。
 - 到点 → `-32000` + `data.kind: "timeout"`，**不重试**（回调可能已有副作用）。
 - 另有一条**写响应超时** `WRITE_TIMEOUT = 10s`——对端（模块）如果不读走内核写回来的响应，整条连接
   会被内核判定为对端不读、直接断开，防止模块拖死内核的写循环。这条是内核→模块方向的自我保护，
@@ -661,7 +663,8 @@ cron 规则：恰好 5 段（无秒段，即便 REST 路径接受 6 段这里也
 | `messages` | `[{role: "system"\|"user"\|"assistant", content: string}]` | ✅ | 1..=64 条 |
 | `response_format` | `{"type":"json_schema","json_schema":{name,schema,strict?}}` | 否 | — |
 | `max_tokens` | u32 | 否 | 1..=4096，缺省 1024 |
-| `complexity` | `"simple"\|"complex"` | 否 | 仅是偏好，最终选哪个 provider 由内核决定 |
+| `complexity` | `"simple"\|"complex"` | 否 | 选路的偏好，缺省按 `simple`，最终选哪个 provider 由内核决定。**显式**写 `"simple"` 还会让内核请本地后端关掉思考模型的思考（oMLX 发 `chat_template_kwargs`，Ollama 发 `reasoning_effort: "none"`，ME4-S2c §4）；后端不认这个字段、回 400 时，内核去掉它重发一次，模型照常思考；时间不够再答一次时（剩余不足一个 stall）不重发，照常报拒绝。不写不关 |
+| `temperature` | number | 否 | 0..=2（ME4-S2b，协议 v2）；越界 `-32602`；写 `null` 等同不写。不写时请求里不带，后端用它自己的缺省（Ollama 的 OpenAI 兼容层是 1.0）。其余采样参数（`seed`、`top_p`、惩罚参数）都是 unknown field |
 | `request_id` | string | 否 | — |
 
 **没有任何字段能改隐私、选具体模型或开 tools**——`privacy`/`model`/`tools`/`provider` 都不是这个
@@ -689,7 +692,7 @@ cron 规则：恰好 5 段（无秒段，即便 REST 路径接受 6 段这里也
 ```
 只有 `no_provider` 的 `retryable` 为 `true`；其余三个恒为 `false`。
 
-**方法专属超时**：120 秒（比连接级默认的 30 秒长，`Handler::call_timeout()` 声明值）。
+**时限**（ME4-S2a）：一次调用受它自己的截止时间约束：300 秒 + `max_tokens` × 1 秒（没写 `max_tokens` 按 1024 算），准入后设一次。内核流式读模型的回答，对每个 provider 各自计时：300 秒内没有收到第一个非空 `data:` 事件，或者此后 60 秒没有新事件（只带 `role`、内容为空的事件也算一个），就判定这个 provider 卡住、放弃它；截止时间还剩至少 60 秒时换下一个 provider（各 provider 共用同一个截止时间）。所有 provider 都失败、或到了截止时间，模块收到 `unavailable`（`no_provider`，`retryable: true`）。一直有输出、但到了截止时间还没写完，回的也是这个；这时用同样的 `max_tokens` 重试多半还会超时，应调低 `max_tokens` 或拆小请求。`Handler::call_timeout()` 声明的方法超时是兜底值 4456 秒，只防内核自身卡住；SDK 的 `MODEL_RESPONSE_TIMEOUT` 是 4461 秒。
 
 **并发/限流**：每模块同时在途 ≤2，全 daemon 所有模块合计 ≤4——超出当场 `busy`，不排队。token
 bucket 容量 30、每秒回填 0.5（约每分钟 30 次）。

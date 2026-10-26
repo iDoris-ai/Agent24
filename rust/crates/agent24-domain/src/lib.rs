@@ -403,24 +403,26 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// The kernel↔module PROTOCOL version this build speaks. Separate from the schema
 /// version: a manifest can be v1 while the protocol moves, and vice versa.
 ///
-/// 2 (K1-6a-G §2.6): tools may declare `resource_kinds`. 3 (§2.5.1, A5c):
+/// 2 (ME4-S2b): `_a24/model/complete` takes `temperature`. Nothing else
+/// differs, so a v2 kernel still speaks 1 to a module that only knows 1 (see
+/// `agent24_os_proto::version::kernel_range`); a module that sends
+/// `temperature` asks for 2 in its manifest (`min_daemon_protocol: 2`).
+/// 3 (K1-6a-G §2.6): tools may declare `resource_kinds`. 4 (§2.5.1, A5c):
 /// the module stops by reference, so it may hold tool grants. `ab/kernel`
-/// moved from 1; `main` is already at 2 for another change, so merging
-/// `main` into `ab/kernel` must move this and [`GRANT_END_REFS_PROTOCOL`] to
-/// 4, and [`RESOURCE_KINDS_PROTOCOL`] to 3.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
+/// had these as 2 and 3 until `main`'s 2 was merged into it.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 4;
 
 /// The first protocol whose kernels read `tools[].resource_kinds`. A manifest
 /// that declares the field must require at least this, so an older kernel
 /// refuses it at the version check rather than at `deny_unknown_fields`.
-pub const RESOURCE_KINDS_PROTOCOL: u32 = 2;
+pub const RESOURCE_KINDS_PROTOCOL: u32 = 3;
 const _: () = assert!(RESOURCE_KINDS_PROTOCOL <= DAEMON_PROTOCOL_VERSION);
 
 /// The first protocol whose modules stop by reference (K1-6a-G §2.5.1): told
 /// the grants that ended, a module stops exactly their work and refuses late
 /// calls carrying them. Only such a module takes grants, so a `replaced` or
 /// `epoch` notice never stops work a newer grant let in (#1202 G6).
-pub const GRANT_END_REFS_PROTOCOL: u32 = 3;
+pub const GRANT_END_REFS_PROTOCOL: u32 = 4;
 const _: () = assert!(GRANT_END_REFS_PROTOCOL <= DAEMON_PROTOCOL_VERSION);
 
 /// The wire shape of `domain-os.yml`. PRIVATE, and the only MANIFEST type that

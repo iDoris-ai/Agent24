@@ -7,6 +7,30 @@ separate from the Agent24 product version (`agent24d`/`agent24-cli`) — see
 `agent24-os-sdk-v<version>` and pushed on the `main` merge commit that
 contains the corresponding change (J-S14).
 
+## [Unreleased]
+
+### 新增
+
+- `clients::MODEL_NO_PROVIDER_WAIT`（也从 `agent24_os_sdk::MODEL_NO_PROVIDER_WAIT` 导出）= 60s，
+  即内核路由器冷却 provider 的最长时间（ME4-S2a §2.6）。模块收到 `unavailable` / `no_provider` 后等这么久再试，
+  被冷却的 provider 就都会被再试一次。内核测试断言它与路由器的 `DEFAULT_MAX_COOLDOWN` 相等。
+- `CompleteRequest.temperature: Option<f64>`（ME4-S2b）：采样温度，内核接受 0–2；`None` 时 params 里不写，请求与以前相同。
+  NaN、无穷大在本地报 `ClientError::InvalidParams`，不发出。**需要协议版本 2 的内核**，老内核会以 unknown field 拒绝带温度的调用。
+  公开结构体加字段，直接写结构体字面量的调用方（如 Sin90）要补上这个字段，源码不兼容（同 ME4-S2 R7）。
+
+### 变更
+
+- `PROTOCOL_MAX` 由 1 改为 2（ME4-S2b）：握手声明 `{min: 1, max: 2}`。v2 内核与 v1 的区别只是 `_a24/model/complete` 收 `temperature`；
+  v1 内核照样协商到 1。用了 `temperature` 的模块要在 manifest 里写 `min_daemon_protocol: 2`，老内核在安装和挂载时就会拒绝它。
+- `clients::MODEL_RESPONSE_TIMEOUT`（也从 `agent24_os_sdk::MODEL_RESPONSE_TIMEOUT` 导出，两个路径都保留）
+  由 125s 改为 4461s，改为从 `agent24_os_proto::model_budget` 导入，与内核同一个数（ME4-S2a，
+  `docs/design/ME4-S2a-model-call-progress-timeout.md`）。内核对一次模型调用改为按进展计时：
+  截止时间 300s + `max_tokens` × 1s，首段 300s、间隔 60s 判定卡住；方法超时只是 4456s 的兜底。
+  - 行为上只是 SDK 等得更久，不是不兼容。配老内核时，内核仍在 120s 回 `timeout`，SDK 照常收到。
+  - 反过来，仍用 SDK 0.1.0（或自己写死 125s）的模块配新内核，会照旧在 125s 放弃并发出 `$/cancelRequest`，
+    内核随之取消这次调用；要按进展计时，升级 SDK。
+  - 直接断言这个常量等于 125s 的测试要跟着改（ME4-S3 §5.2 第 4 条提到的 Sin90 单测）。
+
 ## [0.1.0] — 2026-09-28
 
 **最低内核版本 = agent24 0.4.0.** 这是 SDK 与 `agent24-os-fd` 的首个原型版本，
