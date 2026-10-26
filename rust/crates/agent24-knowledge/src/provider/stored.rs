@@ -3,9 +3,9 @@
 //! changes what a stored record means. Serde derives the two-way mapping
 //! from the declarations below (`remote`), each of which must match the type
 //! it mirrors or the build fails; the stored names are the ones written here.
-//! A record reads only as this build writes it: another version, a kind, a
-//! value or a field it does not know, or any other spelling is refused, and
-//! the log reads as damaged (S1.8). Pure: the host stores the text.
+//! A record reads only as the JSON this build writes it: another version, a
+//! kind, a value or a field it does not know, or another shape is refused,
+//! and the log reads as damaged (S1.8). Pure: the host stores the text.
 
 use std::collections::BTreeSet;
 
@@ -22,7 +22,9 @@ use super::state::PlaceholderFailure;
 /// The stored shape's version. A record of any other is refused.
 pub const VERSION: u32 = 1;
 
-/// The host's values, each stored as it serializes.
+/// The host's values, each stored as it serializes. Each must be exactly
+/// the JSON it writes, read back: a string, an integer, or a struct of them;
+/// never a map, whose doubled key serde would take, or a float, rounded.
 pub trait StoredIds:
     Ids<
         Profile: Serialize + DeserializeOwned,
