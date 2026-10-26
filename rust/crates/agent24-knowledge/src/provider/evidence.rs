@@ -307,8 +307,10 @@ impl<K: Ord + Clone> Evidence<K> {
     /// lists joins the set; a KB asked for that it leaves out, and that was
     /// visible, was removed. Only a request sent with the current credential
     /// tells a removal (S3.1 ownership). A KB with a tombstone neither joins
-    /// nor is removed, nor does one a rule placed since the request was
-    /// admitted join: a deletion that succeeded meanwhile (ST-28g).
+    /// nor is removed, nor does one deleted since the request was admitted
+    /// join (ST-28g). A rule over every KB does not keep a KB out: a renewal
+    /// that fails too places one without invalidating, so what comes back
+    /// after it is still accepted.
     pub fn observe(
         &mut self,
         asked: &BTreeSet<K>,
@@ -329,7 +331,9 @@ impl<K: Ord + Clone> Evidence<K> {
             .collect();
         let added: BTreeSet<K> = listed
             .iter()
-            .filter(|kb| live(kb) && !self.visible.contains(*kb) && !self.placed(kb, admitted))
+            .filter(|kb| {
+                live(kb) && !self.visible.contains(*kb) && !self.deleted_since(kb, admitted)
+            })
             .cloned()
             .collect();
         self.visible.retain(|kb| !removed.contains(kb));
@@ -341,6 +345,11 @@ impl<K: Ord + Clone> Evidence<K> {
     fn visible(&self, kb: &K) -> bool {
         let uncovered = self.delivered.get(kb).is_some_and(|e| !self.placed(kb, *e));
         self.visible.contains(kb) || uncovered
+    }
+
+    fn deleted_since(&self, kb: &K, epoch: u64) -> bool {
+        let one = |r: &Rule<K>| matches!(&r.kbs, Kbs::One(one) if one == kb);
+        self.rules.iter().any(|r| epoch < r.epoch && one(r))
     }
 
     fn placed(&self, kb: &K, epoch: u64) -> bool {

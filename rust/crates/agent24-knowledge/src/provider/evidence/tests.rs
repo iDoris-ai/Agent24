@@ -363,15 +363,23 @@ fn a_kb_being_deleted_neither_joins_nor_narrows() {
     evidence.deleted("b");
     // A search admitted before the deletion comes back listing b: it does
     // not join, so no later omission narrows (ST-28g).
-    let late = evidence.observe(&kbs(&["b"]), &listed(&["b"]), 0, true);
-    assert_eq!(late, Observed::default());
-    // Admitted since, it is listed anew.
-    let fresh = evidence.observe(&kbs(&["b"]), &listed(&["b"]), evidence.epoch(), true);
-    assert_eq!(fresh.added, kbs(&["b"]));
+    let late = evidence.observe(&kbs(&["b", "c"]), &listed(&["b", "c"]), 0, true);
+    assert_eq!(late.added, kbs(&["c"]));
     assert_eq!(
         evidence.observe(&kbs(&["b"]), &Scope::Empty, evidence.epoch(), true),
         Observed::default()
     );
+    // Admitted since, it is listed anew, and its omission narrows again.
+    let fresh = evidence.observe(&kbs(&["b"]), &listed(&["b"]), evidence.epoch(), true);
+    assert_eq!(fresh.added, kbs(&["b"]));
+    let out = evidence.observe(&kbs(&["b"]), &Scope::Empty, evidence.epoch(), true);
+    assert_eq!(out.removed, removed(&["b"]));
+    // A rule over every KB placed without invalidating (a renewal that fails
+    // too): a response admitted before it still adds.
+    let mut evidence = E::default();
+    evidence.place(Kbs::All);
+    let late = evidence.observe(&kbs(&["c"]), &listed(&["c"]), 0, true);
+    assert_eq!(late.added, kbs(&["c"]));
     // Read back unresolved: the same.
     let saved = Saved {
         tombstones: kbs(&["b"]),
