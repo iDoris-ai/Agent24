@@ -64,10 +64,16 @@ export function parseAdminPort(raw: string | undefined): number | null {
   return Number.isInteger(port) && port >= 1 && port <= 65_535 ? port : null
 }
 
+function isLowerHexByte(byte: number): boolean {
+  return (byte >= 0x30 && byte <= 0x39) || (byte >= 0x61 && byte <= 0x66)
+}
+
 export function parseTokenFrame(frame: Buffer): string | null {
   if (frame.length !== TOKEN_FRAME_BYTES || frame[64] !== 0x0a) return null
-  const token = frame.subarray(0, 64).toString('ascii')
-  return /^[0-9a-f]{64}$/.test(token) ? token : null
+  for (let index = 0; index < 64; index += 1) {
+    if (!isLowerHexByte(frame[index])) return null
+  }
+  return frame.subarray(0, 64).toString('ascii')
 }
 
 export function readAdminTokenFromFd(fd: number, timeoutMs = TOKEN_READ_TIMEOUT_MS): Promise<string | null> {
@@ -127,7 +133,7 @@ export function parseStatusResponse(value: unknown): IdorisStatusResponse | null
       if (typeof entry.id !== 'string' || typeof entry.capability !== 'string' || typeof entry.resident !== 'boolean') return null
       if (typeof entry.estimated_memory_gb !== 'number' || !Number.isFinite(entry.estimated_memory_gb) || entry.estimated_memory_gb < 0) return null
       if (!Number.isInteger(entry.ctx_limit) || (entry.ctx_limit as number) < 0 || !Number.isInteger(entry.queue_depth) || (entry.queue_depth as number) < 0) return null
-      if (!['ready', 'requires_eviction', 'blocked'].includes(String(entry.admission_status))) return null
+      if (typeof entry.admission_status !== 'string' || !['ready', 'requires_eviction', 'blocked'].includes(entry.admission_status)) return null
     }
   } else return null
 
