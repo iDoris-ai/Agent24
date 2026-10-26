@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod runs;
 mod service;
 mod tui;
 
@@ -89,6 +90,11 @@ enum Command {
     Hw {
         #[command(subcommand)]
         action: HwAction,
+    },
+    /// List, inspect and cancel runs (the desktop's Runs page)
+    Runs {
+        #[command(subcommand)]
+        action: runs::RunsAction,
     },
 }
 
@@ -2263,6 +2269,7 @@ async fn main() -> std::process::ExitCode {
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
         Command::Hw { action } => cmd_hw(action),
+        Command::Runs { action } => runs::cmd_runs(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
