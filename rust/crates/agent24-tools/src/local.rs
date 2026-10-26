@@ -805,6 +805,19 @@ mod tests {
         );
     }
 
+    /// A name with `..` is refused before any open: the walk skips it, so
+    /// `safe/../secret` would pin `safe/secret` (#1270 PR-Daemon N1). Both
+    /// directories exist, so only that check refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_with_a_parent_level_is_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("safe/secret")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        assert!(pin_outside_dir(root.join("safe/../secret")).is_err());
+    }
+
     /// An ancestor the user may search but not read does not stop the pin,
     /// as it did not stop the plain open before (#1254 Codex round 2) —
     /// except where macOS ignores `O_NOFOLLOW_ANY` (Darwin < 20) and the
