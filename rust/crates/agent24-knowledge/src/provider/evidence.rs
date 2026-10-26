@@ -56,7 +56,8 @@ pub enum Passed<K> {
     /// The version is still current: persist the release, then
     /// [`Evidence::release`] (a loosening, I1).
     Release,
-    /// Registered again since: recheck the merged KBs.
+    /// Registered again since: recheck the merged KBs. The recheck came
+    /// back, so timeouts are no longer in a row ([`Evidence::retry`]).
     Again(Recheck<K>),
     /// Nothing is pending.
     Ignored,
@@ -231,8 +232,10 @@ impl<K: Ord + Clone> Evidence<K> {
         }
     }
 
-    /// A manual retry or logging in again: rechecks go on. A loosening, once
-    /// persisted.
+    /// Timeouts are no longer in a row: a manual retry, logging in again, or
+    /// a recheck that came back without timing out yet left it pending
+    /// ([`Passed::Again`], an invalid-class answer). Rechecks go on. A
+    /// loosening, once persisted.
     pub fn retry(&mut self) {
         if let Some(p) = &mut self.pending {
             p.timeouts = 0;
@@ -247,9 +250,11 @@ impl<K: Ord + Clone> Evidence<K> {
         self.place(Kbs::All)
     }
 
-    /// Before the host deletes `kb` (S5.10). A tightening.
+    /// Before the host deletes `kb` (S5.10). A tightening. One read back
+    /// unresolved stays so while the host deletes again: the earlier delete
+    /// may have gone through.
     pub fn tombstone(&mut self, kb: K) {
-        self.tombstones.insert(kb, Tombstone::Pending);
+        self.tombstones.entry(kb).or_insert(Tombstone::Pending);
     }
 
     /// The deletion succeeded: its evidence becomes placeholders, without

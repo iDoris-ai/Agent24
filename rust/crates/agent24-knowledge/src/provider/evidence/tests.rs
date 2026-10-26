@@ -94,6 +94,15 @@ fn the_third_timeout_in_a_row_stops_rechecks_until_a_retry() {
     assert_eq!(evidence.shown(false, &at("a", 0)), Shown::Withheld);
     evidence.retry();
     assert!(evidence.recheck().is_some());
+    // Timed out twice, then an older version passed: not three in a row
+    // once the caller persists the reset.
+    evidence.timed_out();
+    evidence.timed_out();
+    evidence.register(["b"]);
+    assert!(matches!(evidence.passed(1), Passed::Again(_)));
+    evidence.retry();
+    evidence.timed_out();
+    assert!(evidence.recheck().is_some());
     // ST-26g: two in a row persisted, then a restart; one more stops them.
     evidence.timed_out();
     evidence.timed_out();
@@ -150,6 +159,10 @@ fn a_tombstone_withholds_only_once_read_back_unresolved() {
     assert_eq!(restored.tombstone_of(&"b"), Some(Tombstone::Unresolved));
     assert_eq!(restored.shown(false, &at("b", 0)), Shown::Withheld);
     assert_eq!(restored.shown(false, &at("a", 0)), Shown::Body);
+    // Deleting again does not bring the evidence back meanwhile.
+    restored.tombstone("b");
+    assert_eq!(restored.tombstone_of(&"b"), Some(Tombstone::Unresolved));
+    assert_eq!(restored.shown(false, &at("b", 0)), Shown::Withheld);
     restored.deleted("b");
     assert_eq!(restored.shown(false, &at("b", 0)), Shown::Placeholder);
     assert_eq!(restored.tombstone_of(&"b"), None);
