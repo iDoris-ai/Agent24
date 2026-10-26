@@ -46,9 +46,10 @@ enum Command {
         /// Model id override
         #[arg(long)]
         model: Option<String>,
-        /// Chat within this conversation, as the desktop's chat page does with
-        /// each of its conversations: the run is the session's, and personal
-        /// memory is recalled and kept for it
+        /// Turn on personal memory under this conversation id, as the desktop's
+        /// chat page does for each conversation: an explicit "记住…" is kept and
+        /// its outcome shown, and what you remember is recalled for the reply.
+        /// Only this one message is sent, not the turns before it
         #[arg(long)]
         session: Option<String>,
     },
@@ -745,6 +746,16 @@ fn chat_request(message: String, model: Option<String>, session: Option<String>)
     }
 }
 
+fn receipt_line(receipt: agent24_protocol::MemoryReceipt) -> &'static str {
+    match receipt {
+        agent24_protocol::MemoryReceipt::Saved => "remembered",
+        agent24_protocol::MemoryReceipt::PausedNotSaved => {
+            "not remembered: personal memory is paused"
+        }
+        agent24_protocol::MemoryReceipt::Failed => "not remembered: saving it failed",
+    }
+}
+
 async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
     let ep = connect().await?;
     let result = bearer(&ep, client().post(format!("{}/api/v1/chat", ep.base)))
@@ -757,6 +768,11 @@ async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
+            // What the daemon did with an explicit "记住…", never what the
+            // reply claims (the desktop shows the same receipt).
+            if let Some(receipt) = body.memory_receipt {
+                println!("· {}", receipt_line(receipt));
+            }
             Ok(())
         }
         Ok(res) => {
@@ -2523,7 +2539,15 @@ mod tests {
         assert_eq!(body["session_id"], "chat_1", "{body}");
         assert_eq!(body["messages"][0]["content"], "hi", "{body}");
         let body = request(&["agent24", "chat", "hi"]);
-        assert!(body["session_id"].is_null(), "{body}");
+        assert_eq!(body.get("session_id"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn a_remember_receipt_says_what_the_daemon_did() {
+        use agent24_protocol::MemoryReceipt::{Failed, PausedNotSaved, Saved};
+        assert_eq!(receipt_line(Saved), "remembered");
+        assert!(receipt_line(PausedNotSaved).contains("paused"));
+        assert!(receipt_line(Failed).contains("failed"));
     }
 
     #[test]
