@@ -14,7 +14,6 @@ use std::time::Duration;
 use agent24_protocol::state_file::{self, DaemonState};
 use agent24_protocol::{
     AttachedAddRequest, AttachedAddResponse, AttachedList, ChatMessage, ChatRequest, ChatResponse,
-    Health,
 };
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -661,6 +660,20 @@ struct HealthAdvertisement {
     protocol_version: Option<u32>,
 }
 
+/// What `daemon status` reads from `GET /api/v1/health`. Unlike the strict
+/// `Health` resource, a missing `protocol_version` is an old daemon, not a
+/// parse error. Other fields added after that daemon shipped are skipped
+/// the same way.
+#[derive(serde::Deserialize)]
+struct StatusHealth {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    protocol_version: Option<u32>,
+}
+
 /// `Ok(None)` is a live daemon that did not advertise a protocol version
 /// (an old `/health`). `Err` means the probe itself failed.
 async fn fetch_protocol_version(base: &str, token: &str) -> Result<Option<u32>, ()> {
@@ -767,17 +780,28 @@ async fn finish(mut ep: Endpoint) {
 /// `connect`, which falls back to `spawn_daemon` when none is found) — for a
 /// best-effort step (FU-61's `uninstall` hot-disable) that must not bring up
 /// a fresh ephemeral daemon, which could run the very package being removed.
-/// `None` if no live daemon is discoverable or healthy.
-async fn attach_only() -> Option<Endpoint> {
-    let state = state_file::read_live()?;
-    if state.auth_mode.is_capabilities() {
-        return None;
+///
+/// `Ok(None)` if no live daemon is discoverable or healthy. `Err` is a daemon
+/// that is up but must not be used; callers keep that error and do not send.
+async fn attach_only() -> Result<Option<Endpoint>, String> {
+    match state_file::read_live() {
+        Some(state) => attach_only_from(&state).await,
+        None => Ok(None),
     }
-    let base = format!("http://127.0.0.1:{}", state.port);
-    health_ok(&base, discovery_health_token(&state))
-        .await
-        .then(|| endpoint_from_state(state).ok())
-        .flatten()
+}
+
+async fn attach_only_from(state: &DaemonState) -> Result<Option<Endpoint>, String> {
+    // Same checks as `connect`: discovery version, then the live `/health`
+    // advertisement. `Ok(None)` only when there is nothing to attach to.
+    match attach_discovered(state).await {
+        DiscoveredAttach::Ready(endpoint) => Ok(Some(endpoint)),
+        DiscoveredAttach::Unreachable => Ok(None),
+        // Capability discovery has no host bearer. Callers already treat that
+        // as "nothing to attach to". A protocol mismatch must stay an error
+        // so os enable/disable and the uninstall hot-stop do not send.
+        DiscoveredAttach::Incompatible(err) if err == HOST_AUTHORITY_UNAVAILABLE => Ok(None),
+        DiscoveredAttach::Incompatible(err) => Err(err),
+    }
 }
 
 /// Serve agent24d as an MCP server over stdio (E4). Attaches to the running
@@ -1059,12 +1083,20 @@ fn daemon_error_line(body: &serde_json::Value) -> String {
 /// `cmd_uninstall`'s result is decided by the removal and the consent
 /// revocation, not by this.
 async fn hot_disable_best_effort(name: &str) {
-    let Some(ep) = attach_only().await else {
-        println!(
-            "  no reachable daemon right now; a module of it running elsewhere will report \
-             `package_changed` after its own next restart"
-        );
-        return;
+    let ep = match attach_only().await {
+        Ok(Some(ep)) => ep,
+        Ok(None) => {
+            println!(
+                "  no reachable daemon right now; a module of it running elsewhere will report \
+                 `package_changed` after its own next restart"
+            );
+            return;
+        }
+        // Version mismatch must stay visible. Do not POST /stop to that daemon.
+        Err(err) => {
+            println!("  {err}");
+            return;
+        }
     };
     // POST .../stop, NOT the PATCH `agent24 os disable` uses — that one
     // persists `enabled:false` into `os.json`, which is actively wrong for a
@@ -1134,11 +1166,14 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         return done;
     }
     let ep = match attach_only().await {
-        Some(ep) => ep,
+        Ok(Some(ep)) => ep,
+        // A daemon that answered on the wrong protocol is not "not running".
+        // Enable/disable must fail with that error and must not PATCH it.
+        Err(err) => return Err(err),
         // `connect` would start an ephemeral daemon with an isolated package
         // root. Its empty catalogue would report false facts about the user's
         // installed OS packages, so these commands only use a resident daemon.
-        None => {
+        Ok(None) => {
             let path = agent24_protocol::state_file::state_dir()
                 .map(|d| d.join("os.json").display().to_string())
                 .unwrap_or_else(|| "~/.agent24/os.json".to_owned());
@@ -2145,6 +2180,20 @@ async fn wait_for_stop(state: &DaemonState) -> Result<(), String> {
     }
 }
 
+/// `daemon status`'s reading of `GET /api/v1/health`.
+fn daemon_status_summary(pid: u32, port: u16, body: &str) -> Result<String, String> {
+    let health: StatusHealth = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let backend = &health.backend;
+    let version = &health.version;
+    let mut lines = vec![format!(
+        "running · pid {pid} · port {port} · backend {backend} · v{version}"
+    )];
+    if health.protocol_version.is_none() {
+        lines.push("daemon 版本过旧，请升级".to_owned());
+    }
+    Ok(lines.join("\n"))
+}
+
 async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
     match action {
         DaemonAction::Start => {
@@ -2197,11 +2246,9 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         .send()
                         .await
                         .map_err(|e| e.to_string())?;
-                    let health: Health = res.json().await.map_err(|e| e.to_string())?;
-                    println!(
-                        "running · pid {} · port {} · backend {} · v{}",
-                        state.pid, state.port, health.backend, health.version
-                    );
+                    let body = res.text().await.map_err(|e| e.to_string())?;
+                    let summary = daemon_status_summary(state.pid, state.port, &body)?;
+                    println!("{summary}");
                     // SHUT-1c. Only a daemon from before it (405) is skipped
                     // quietly; any other failure is said, since the report is
                     // how a budget that is too tight gets noticed (review of
@@ -2876,6 +2923,68 @@ mod tests {
         assert_eq!(endpoint.base, format!("http://127.0.0.1:{port}"));
         assert_eq!(endpoint.token, "tok");
         assert!(endpoint.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_only_refuses_an_incompatible_daemon_and_keeps_the_error() {
+        let body = r#"{"status":"ok","version":"9.9.9","backend":"rust","protocol_version":2,"migrations":{"store":1,"memory":1}}"#;
+        let (port, _) = thread_stub(json_reply(body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "9.9.9", "gen").unwrap();
+        match attach_only_from(&state).await {
+            Err(err) => {
+                assert!(err.contains("协议版本不兼容"), "{err}");
+                assert!(err.contains("daemon 协议版本 2"), "{err}");
+                assert!(err.contains("升级"), "{err}");
+            }
+            Ok(Some(_)) => panic!(
+                "attach_only handed back an endpoint; os enable/disable and uninstall hot-stop would send to this daemon"
+            ),
+            Ok(None) => {
+                panic!("attach_only swallowed the incompatible daemon as if none were running")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_only_still_attaches_when_the_protocol_matches() {
+        let body = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let (port, _) = thread_stub(json_reply(&body));
+        let state =
+            DaemonState::new_legacy(port, "tok", std::process::id(), "0.5.1", "gen").unwrap();
+        let endpoint = attach_only_from(&state)
+            .await
+            .expect("a matching daemon is not an error")
+            .expect("a matching daemon is attached");
+        assert_eq!(endpoint.base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(endpoint.token, "tok");
+    }
+
+    #[test]
+    fn daemon_status_of_an_old_health_body_says_the_daemon_is_too_old() {
+        let current = format!(
+            r#"{{"status":"ok","version":"0.5.1","backend":"rust","protocol_version":{},"migrations":{{"store":1,"memory":1}}}}"#,
+            agent24_protocol::PROTOCOL_VERSION
+        );
+        let current_report = daemon_status_summary(7, 4321, &current).unwrap();
+        assert!(
+            current_report.contains("running · pid 7 · port 4321 · backend rust · v0.5.1"),
+            "{current_report}"
+        );
+        assert!(!current_report.contains("版本过旧"), "{current_report}");
+
+        let old = r#"{"status":"ok","version":"0.4.0","backend":"rust","migrations":{"store":1,"memory":1}}"#;
+        let report = daemon_status_summary(7, 4321, old)
+            .unwrap_or_else(|err| panic!("old daemon must not surface a parse error: {err}"));
+        assert!(report.contains("daemon 版本过旧"), "{report}");
+        assert!(
+            report.contains("running · pid 7 · port 4321 · backend rust · v0.4.0"),
+            "{report}"
+        );
+        assert!(!report.contains("missing field"), "{report}");
     }
 
     fn target_port() -> u16 {

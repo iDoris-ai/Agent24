@@ -284,9 +284,10 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       expect(fetchMock).toHaveBeenCalled()
       expect(manager.isExternalDaemon()).toBe(false)
       expect(getBackendEndpoint()).toBeNull()
-      expect(spawnProcess).toHaveBeenCalledTimes(1)
-      const spawned = spawnProcess.mock.results[0]?.value as { kill: ReturnType<typeof vi.fn> }
-      expect(spawned.kill).not.toHaveBeenCalled()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.status()).toBe('error')
+      expect(manager.statusDetail()).toContain('请升级较旧的一方')
+      expect(manager.statusDetail()).toContain('4242')
       const logged = warn.mock.calls.map((args) => args.join(' ')).join('\n')
       expect(logged).toContain('不复用外部 daemon')
       expect(logged).toContain(`daemon 协议版本 ${CLIENT_PROTOCOL_VERSION + 1}`)
@@ -316,9 +317,10 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
 
       expect(fetchHealth).not.toHaveBeenCalled()
       expect(manager.isExternalDaemon()).toBe(false)
-      expect(spawnProcess).toHaveBeenCalledTimes(1)
-      const spawned = spawnProcess.mock.results[0]?.value as { kill: ReturnType<typeof vi.fn> }
-      expect(spawned.kill).not.toHaveBeenCalled()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.status()).toBe('error')
+      expect(manager.statusDetail()).toContain('请升级较旧的一方')
+      expect(manager.statusDetail()).toContain('4242')
       const logged = warn.mock.calls.map((args) => args.join(' ')).join('\n')
       expect(logged).toContain('daemon 版本过旧，请升级')
 
@@ -416,6 +418,57 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
     expect(children[1].kill).toHaveBeenCalledWith('SIGTERM')
 
     manager.stop()
+  })
+
+  it('does not spawn over an incompatible external daemon, and the health loop does not retry', async () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth: vi.fn().mockResolvedValue({
+        ok: true,
+        protocolVersion: CLIENT_PROTOCOL_VERSION + 1,
+      }),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+
+      // The external daemon holds the singleton lock. Spawning (now, or on a
+      // later health tick) fails and retries forever.
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(getBackendEndpoint()).toBeNull()
+      expect(manager.status()).toBe('error')
+      const detail = manager.statusDetail()
+      expect(detail).toContain('请升级较旧的一方')
+      expect(detail).toContain('4242')
+      expect(detail).toContain(`daemon 协议版本 ${CLIENT_PROTOCOL_VERSION + 1}`)
+      expect(detail).toContain(`客户端协议版本 ${CLIENT_PROTOCOL_VERSION}`)
+
+      const warnsAfterStart = warn.mock.calls.length
+      expect(warnsAfterStart).toBeGreaterThan(0)
+
+      for (let i = 0; i < MAX_HEALTH_FAILURES + 2; i++) {
+        await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+      }
+
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(warn.mock.calls.length).toBe(warnsAfterStart)
+      expect(manager.status()).toBe('error')
+      expect(external.checkHealth).not.toHaveBeenCalled()
+
+      manager.restart()
+      manager.startDaemon()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(getBackendEndpoint()).toBeNull()
+    } finally {
+      manager.stop()
+      warn.mockRestore()
+    }
   })
 })
 

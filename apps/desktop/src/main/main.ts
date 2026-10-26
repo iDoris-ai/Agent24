@@ -332,6 +332,7 @@ const STATUS_META: Record<BackendStatus, { title: string; label: string }> = {
   running: { title: '⚡A24', label: '● daemon：运行中' },
   starting: { title: '…A24', label: '○ daemon：启动中…' },
   stopped: { title: '⚠️A24', label: '✕ daemon：已停止' },
+  error: { title: '⚠️A24', label: '✕ daemon：协议不兼容' },
 }
 
 // Rebuild the tray title, tooltip, and context menu from the live daemon status.
@@ -341,10 +342,17 @@ function refreshTray(): void {
   const status = backendManager.status()
   const external = backendManager.isExternalDaemon()
   const meta = STATUS_META[status]
+  const detail = backendManager.statusDetail()
   // DEP-A5: an external daemon (reused from `agent24 daemon start`, not
   // spawned by this app) gets a visibly different label — the whole point of
   // requirement #2 is that the user can tell them apart before hitting stop.
-  const label = external ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）` : meta.label
+  // An incompatible one is not reused and must not be killed; the tray shows
+  // the upgrade hint and offers no start/stop that would spawn or signal it.
+  const label = status === 'error' && detail
+    ? `${meta.label}：${detail}`
+    : external
+      ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）`
+      : meta.label
   if (process.platform === 'darwin') tray.setTitle(meta.title)
   tray.setToolTip(`Agent24 — ${label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
 
@@ -354,14 +362,16 @@ function refreshTray(): void {
   // but the external case also gets its own menu wording here — "断开" instead
   // of "停止/重启" — so the tray itself never implies a kill that won't happen.
   const daemonItems: MenuItemConstructorOptions[] =
-    status === 'stopped'
-      ? [{ label: '启动 daemon', click: () => { backendManager.startDaemon(); refreshTray() } }]
-      : external
-        ? [{ label: '断开外部 daemon（不会终止它）', click: () => { backendManager.stopDaemon(); refreshTray() } }]
-        : [
-            { label: '重启 daemon', click: () => { backendManager.restart(); refreshTray() } },
-            { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
-          ]
+    status === 'error'
+      ? []
+      : status === 'stopped'
+        ? [{ label: '启动 daemon', click: () => { backendManager.startDaemon(); refreshTray() } }]
+        : external
+          ? [{ label: '断开外部 daemon（不会终止它）', click: () => { backendManager.stopDaemon(); refreshTray() } }]
+          : [
+              { label: '重启 daemon', click: () => { backendManager.restart(); refreshTray() } },
+              { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
+            ]
 
   tray.setContextMenu(Menu.buildFromTemplate([
     { label, enabled: false },

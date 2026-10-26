@@ -76,10 +76,11 @@ export function selectedBackend(
 }
 
 /** Daemon lifecycle status surfaced to the tray (F1b). */
-export type BackendStatus = 'running' | 'starting' | 'stopped'
+export type BackendStatus = 'running' | 'starting' | 'stopped' | 'error'
 
 /** Pure derivation of the tray status from the manager's observable state.
  * Exported so the state machine is unit-testable without spawning a process:
+ * - an incompatible external daemon pins `error` (no spawn, no retry);
  * - a user-initiated stop pins `stopped` (the health loop won't auto-respawn);
  * - a healthy endpoint is `running`;
  * - anything else (spawned but not yet ready, or briefly between respawns) is
@@ -88,7 +89,9 @@ export function deriveStatus(s: {
   userStopped: boolean
   hasEndpoint: boolean
   healthy: boolean
+  incompatible?: boolean
 }): BackendStatus {
+  if (s.incompatible) return 'error'
   if (s.userStopped) return 'stopped'
   if (s.hasEndpoint && s.healthy) return 'running'
   return 'starting'
@@ -278,6 +281,11 @@ export class BackendManager {
   // lifecycle action that would otherwise kill a process we don't own.
   private isExternal = false
   private externalPid: number | null = null
+  // Set when a discoverable daemon is up but on another protocol. That process
+  // holds the singleton lock, so spawning would fail and the health loop would
+  // retry forever. While set, start/tick/restart do not spawn and do not signal
+  // the external pid. Cleared only by a later successful reuse.
+  private blockedReason: string | null = null
   // Reentrancy guard for tick(): setInterval doesn't wait for a previous
   // callback to resolve before scheduling the next one, and the failure-
   // threshold branch below now awaits a second health probe (tryReuseExternal)
@@ -295,32 +303,43 @@ export class BackendManager {
   }
 
   async start(): Promise<void> {
-    const reused = await this.tryReuseExternal()
-    if (!reused) this.spawnChild()
+    // Only "nothing to reuse" may spawn. An incompatible daemon already holds
+    // the singleton lock; spawning fails and the health loop would retry forever.
+    const outcome = await this.tryReuseExternal()
+    if (outcome === 'absent') this.spawnChild()
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
   }
 
   /** DEP-A5 step 1: before spawning anything, check whether a daemon started
    * outside this app (typically `agent24 daemon start`) is already up and
-   * healthy — if so, point at it instead of racing it for the singleton lock. */
-  private async tryReuseExternal(): Promise<boolean> {
+   * healthy — if so, point at it instead of racing it for the singleton lock.
+   * `incompatible` is a live daemon this app must not attach to and must not
+   * spawn over. `absent` is the only outcome that may spawn. */
+  private async tryReuseExternal(): Promise<'reused' | 'absent' | 'incompatible'> {
     const state = this.external.read()
-    if (!state) return false
+    if (!state) return 'absent'
     const endpoint: BackendEndpoint = { port: state.port, token: state.token }
-    const refuse = (reason: string): boolean => {
-      // Visible, and nothing else: do not attach, and do not signal the
-      // external process. A later spawn is this app's own child.
+    const refuse = (reason: string): 'incompatible' => {
+      const message =
+        `${reason}。请升级较旧的一方，使两边协议版本一致，然后重新打开本应用。` +
+        `外部 daemon（pid ${state.pid}）仍在运行，本应用不会终止它，也不会再启动另一个。`
+      this.blockedReason = message
+      this.isExternal = false
+      this.externalPid = null
+      this.lastHealthy = false
+      currentEndpoint = null
       console.warn(
-        `[backend:${this.kind}] 不复用外部 daemon（pid ${state.pid}，port ${state.port}）：${reason}`,
+        `[backend:${this.kind}] 不复用外部 daemon（pid ${state.pid}，port ${state.port}）：${message}`,
       )
-      return false
+      return 'incompatible'
     }
     const recorded = protocolCompatibility(state.protocolVersion ?? null, CLIENT_PROTOCOL_VERSION)
     if (!recorded.compatible) return refuse(recorded.reason)
     const health = await this.external.fetchHealth(endpoint)
-    if (!health.ok) return false
+    if (!health.ok) return 'absent'
     const live = protocolCompatibility(health.protocolVersion, CLIENT_PROTOCOL_VERSION)
     if (!live.compatible) return refuse(live.reason)
+    this.blockedReason = null
     this.isExternal = true
     this.externalPid = state.pid
     currentEndpoint = endpoint
@@ -328,7 +347,7 @@ export class BackendManager {
     console.log(
       `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
     )
-    return true
+    return 'reused'
   }
 
   /** True while the current endpoint is a daemon this manager discovered
@@ -348,7 +367,13 @@ export class BackendManager {
       userStopped: this.userStopped,
       hasEndpoint: currentEndpoint !== null,
       healthy: this.lastHealthy,
+      incompatible: this.blockedReason !== null,
     })
+  }
+
+  /** Upgrade hint while an incompatible external daemon blocks spawn. */
+  statusDetail(): string | null {
+    return this.blockedReason
   }
 
   /** Which backend implementation is running (shown in the tray tooltip). */
@@ -358,6 +383,8 @@ export class BackendManager {
 
   /** Tray "启动 daemon": clear a prior manual stop and (re)spawn if needed. */
   startDaemon(): void {
+    // Spawning against the lock just restarts the failure loop.
+    if (this.blockedReason !== null) return
     this.userStopped = false
     this.failureCount = 0
     if (!this.child && !this.isExternal) this.spawnChild()
@@ -385,6 +412,7 @@ export class BackendManager {
    * reason as stopDaemon() above — "restart" here means "stop reusing it and
    * bring up a desktop-managed one instead". */
   restart(): void {
+    if (this.blockedReason !== null) return
     this.userStopped = false
     this.failureCount = 0
     this.lastHealthy = false
@@ -478,6 +506,12 @@ export class BackendManager {
         this.lastHealthy = false
         return
       }
+      // Stop the failure/respawn loop. The external pid is not ours to kill,
+      // and another spawn cannot take the singleton lock it still holds.
+      if (this.blockedReason !== null) {
+        this.lastHealthy = false
+        return
+      }
 
       const alive = await this.external.checkHealth(currentEndpoint)
       this.lastHealthy = alive
@@ -521,8 +555,8 @@ export class BackendManager {
         // re-spawned forever every MAX_HEALTH_FAILURES ticks, even once the
         // real (CLI-owned) daemon is up and healthy. Only fall back to
         // spawning our own when the external daemon is still not reachable.
-        const reused = await this.tryReuseExternal()
-        if (!reused) {
+        const outcome = await this.tryReuseExternal()
+        if (outcome === 'absent') {
           this.spawnChild()
         }
       }
