@@ -7,7 +7,7 @@ use crate::provider::credential::Credentials;
 use crate::provider::evidence::{Kbs, Rule};
 use crate::provider::gate::Gate;
 use crate::provider::placeholder::Placeholder;
-use crate::provider::profile::Slot;
+use crate::provider::profile::{Confirmation, Slot};
 use crate::provider::replay::Entry;
 use crate::provider::state::{ConnectionPhase, Switches};
 
@@ -434,4 +434,39 @@ fn a_selection_is_blocked_by_its_own_profile_only() {
     assert_eq!(host.select("a"), Ok(()));
     tightening_alone(&mut host, C::Unselect("b"));
     assert_eq!(write(&mut host).2, [C::Select("a")]);
+}
+
+/// S1.13: with a confirmation awaited, selecting only sets the flag; the
+/// binding stays deactivated until the confirmation.
+#[test]
+fn a_selection_awaiting_confirmation_does_not_activate() {
+    let binding = BindingState::new(
+        Connection::new(Gate::new(1), true),
+        Credentials::new(false),
+        false,
+    );
+    let awaited = Some(Confirmation::PrincipalChanged);
+    let profile = Profile::new(Slot::Bound(Box::new(binding)), false, awaited);
+    let mut host = H::new(false, true, 1);
+    host.insert(Member::new("a", profile, Some(7), false));
+    host.select("a").unwrap();
+    assert!(durable(&mut host).loading.is_empty());
+    let profile = host.profile(&"a").unwrap();
+    assert!(profile.selected());
+    assert_eq!(profile.confirmation(), awaited);
+    assert_eq!(phase(&host, "a"), None);
+}
+
+/// A placeholder's selection is remembered once confirmed; nothing connects.
+#[test]
+fn a_placeholder_selection_is_remembered() {
+    let mut host = host();
+    host.unselect("b");
+    tightening_alone(&mut host, C::Unselect("b"));
+    host.select("b").unwrap();
+    assert!(!host.profile(&"b").unwrap().selected());
+    assert!(durable(&mut host).loading.is_empty());
+    let b = host.profile(&"b").unwrap();
+    assert!(b.selected());
+    assert!(matches!(b.slot(), Slot::Placeholder(_)));
 }
