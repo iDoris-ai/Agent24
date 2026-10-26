@@ -1,13 +1,20 @@
 //! P03 HTTP observation fixtures (MEMORY-P1-READINESS-PROBES-20261023 §8.5).
 //!
 //! These are OBSERVATION tests: they pin what the production Axum router does
-//! today to a `/api/v1/chat` request that has already captured its memory
-//! prelude when memory is withdrawn / paused / re-qualified. OpenAPI promises
-//! DELETE blocks NEW session recalls and pause affects NEWLY started runs; it
-//! does not promise to rewrite an already-built request, and the report does
-//! not judge that a H04 bug ("pause" keeps its existing recovery exception).
-//! If the sending contract is later tightened, these tests are the ones that
-//! must be revisited deliberately, not silently flipped.
+//! today to a `/api/v1/chat` request when memory is withdrawn / paused /
+//! re-qualified WHILE THE PROVIDER HOLDS THE REQUEST. The barrier sits inside
+//! `provider.complete()`, so the window pinned is "after the provider has
+//! received the request". The window between "prelude built" and "provider
+//! called" is NOT covered here (no hook exists there; that is the H04 send
+//! barrier question). OpenAPI promises DELETE blocks NEW session recalls and
+//! pause affects NEWLY started runs; it does not promise to rewrite a request
+//! the provider already holds, and the report does not judge that an H04 bug
+//! ("pause" keeps its existing recovery exception). Each withdrawal test pairs
+//! the captured-request observation with readbacks proving the withdrawal
+//! really took effect (list/settings GET plus a fresh-session chat), so
+//! "withdrawn but the in-flight request kept its recall" is distinguishable
+//! from "withdrawal never happened". If the sending contract is later
+//! tightened, revisit these deliberately, never flip them silently.
 
 use super::*;
 use agent24_memory::assertion::{Assertion, AssertionStore};
@@ -264,6 +271,79 @@ async fn set_unqualified(h: &Harness) {
     conn.close().await.unwrap();
 }
 
+/// GET the assertion ids the memory API lists for the daemon's owner.
+async fn listed_assertion_ids(h: &Harness) -> Vec<String> {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/memory/assertions")
+        .header("authorization", "Bearer p03-token")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(h.app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    body["assertions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// GET /memory/settings -> `enabled`.
+async fn settings_enabled(h: &Harness) -> bool {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/memory/settings")
+        .header("authorization", "Bearer p03-token")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(h.app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    body["enabled"].as_bool().unwrap()
+}
+
+/// Run a brand-new session's chat to completion after the first one finished
+/// and return the messages of the single request any provider received for it
+/// (after a fallback the router may skip the failed first provider, so both
+/// recorders are checked). The release permit is stored beforehand so the
+/// barrier does not block it.
+async fn fresh_session_chat_messages(h: &Harness, session: &str) -> Vec<Msg> {
+    let count = |h: &Harness| {
+        (
+            h.first_messages.lock().unwrap().len(),
+            h.fallback_messages.lock().unwrap().len(),
+        )
+    };
+    let (f0, b0) = count(h);
+    h.first_release.notify_one();
+    let (status, _) = call(h.app.clone(), chat_request(Some(session))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (f1, b1) = count(h);
+    assert_eq!(
+        (f1 - f0) + (b1 - b0),
+        1,
+        "the fresh-session chat must reach a provider exactly once"
+    );
+    if f1 > f0 {
+        h.first_messages.lock().unwrap()[f0].clone()
+    } else {
+        h.fallback_messages.lock().unwrap()[b0].clone()
+    }
+}
+
+/// The recall messages (role + full content) in a provider request.
+fn recall_messages(messages: &[Msg]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .filter(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains(RECALL_TEXT))
+        })
+        .map(|m| (m.role.clone(), m.content.clone().unwrap()))
+        .collect()
+}
+
 fn has_recall(messages: &[Msg]) -> bool {
     messages.iter().any(|m| {
         m.content
@@ -296,6 +376,15 @@ async fn post_chat_http_delete_after_prelude_observes_captured_recall() {
         StatusCode::OK
     );
     assert!(has_recall(&h.first_messages.lock().unwrap()[0]));
+    // Readbacks: the DELETE really took effect, and a NEW session gets no recall.
+    assert!(
+        !listed_assertion_ids(&h)
+            .await
+            .contains(&ASSERTION_ID.to_owned())
+    );
+    assert!(!has_recall(
+        &fresh_session_chat_messages(&h, "s-delete-new").await
+    ));
 }
 
 #[tokio::test]
@@ -322,6 +411,11 @@ async fn post_chat_http_pause_after_prelude_observes_captured_recall() {
         StatusCode::OK
     );
     assert!(has_recall(&h.first_messages.lock().unwrap()[0]));
+    // Readbacks: the pause really took effect, and a NEW session gets no recall.
+    assert!(!settings_enabled(&h).await);
+    assert!(!has_recall(
+        &fresh_session_chat_messages(&h, "s-pause-new").await
+    ));
 }
 
 #[tokio::test]
@@ -349,8 +443,22 @@ async fn post_chat_http_unavailable_fallback_spy_observes_captured_recall_after_
     );
     assert_eq!(h.first_messages.lock().unwrap().len(), 1);
     assert_eq!(h.fallback_messages.lock().unwrap().len(), 1);
-    assert!(has_recall(&h.first_messages.lock().unwrap()[0]));
-    assert!(has_recall(&h.fallback_messages.lock().unwrap()[0]));
+    let first = recall_messages(&h.first_messages.lock().unwrap()[0]);
+    let fallback = recall_messages(&h.fallback_messages.lock().unwrap()[0]);
+    assert_eq!(first.len(), 1, "exactly one recall message: {first:?}");
+    assert_eq!(
+        first, fallback,
+        "fallback receives the identical recall message (role + full content)"
+    );
+    // Readbacks: the DELETE really took effect, and a NEW session gets no recall.
+    assert!(
+        !listed_assertion_ids(&h)
+            .await
+            .contains(&ASSERTION_ID.to_owned())
+    );
+    assert!(!has_recall(
+        &fresh_session_chat_messages(&h, "s-fallback-new").await
+    ));
 }
 
 #[tokio::test]
