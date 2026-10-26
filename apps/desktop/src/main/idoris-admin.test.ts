@@ -44,6 +44,14 @@ describe('iDoris Admin launch handoff', () => {
     expect(parseTokenFrame(Buffer.from(`${TOKEN}\nextra`))).toBeNull()
   })
 
+  it('rejects a high-bit 0xe1 token frame that ascii decoding would mask', () => {
+    expect(parseTokenFrame(Buffer.concat([Buffer.alloc(64, 0xe1), Buffer.from('\n')]))).toBeNull()
+  })
+
+  it('rejects a high-bit 0xb0 token frame that ascii decoding would mask', () => {
+    expect(parseTokenFrame(Buffer.concat([Buffer.alloc(64, 0xb0), Buffer.from('\n')]))).toBeNull()
+  })
+
   it('reads once and closes the inherited fd before returning', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-idoris-token-'))
     const file = path.join(dir, 'frame')
@@ -87,6 +95,7 @@ describe('iDoris Admin status transport', () => {
     expect(parseStatusResponse(VALID_STATUS)).toEqual(VALID_STATUS)
     expect(parseStatusResponse({ ...VALID_STATUS, token: TOKEN })).toBeNull()
     expect(parseStatusResponse({ ...VALID_STATUS, capacity: { state: 'observed', entries: [{ ...VALID_STATUS.capacity.entries[0], estimated_memory_gb: -1 }] } })).toBeNull()
+    expect(parseStatusResponse({ ...VALID_STATUS, capacity: { state: 'observed', entries: [{ ...VALID_STATUS.capacity.entries[0], admission_status: ['ready'] }] } })).toBeNull()
   })
 
   it('projects only the frozen backends/models contracts', () => {
