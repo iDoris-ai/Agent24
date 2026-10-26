@@ -181,8 +181,12 @@ impl Connection {
     /// A probe may go out from `loading`, a servable phase, or an
     /// `unavailable` that retries by itself (S1.5). A single request that
     /// came back `unavailable` or `timeout` asks for one, and only that
-    /// probe's result moves the binding (S1.3).
-    pub fn probe(&mut self) -> Option<ProbeTicket> {
+    /// probe's result moves the binding (S1.3). Only the binding asks for
+    /// one: callers go through [`BindingState::probe`], which also needs a
+    /// credential (#1238 note 1).
+    ///
+    /// [`BindingState::probe`]: super::binding::BindingState::probe
+    pub(super) fn probe(&mut self) -> Option<ProbeTicket> {
         let probing = match self.phase? {
             ConnectionPhase::Unavailable(cause) => cause.retries_automatically(),
             ConnectionPhase::Loading
