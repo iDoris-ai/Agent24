@@ -75,7 +75,7 @@ pub(crate) struct When {
     /// A 5- or 6-field cron expression
     #[arg(long, conflicts_with = "at")]
     cron: Option<String>,
-    /// IANA timezone for --cron (default UTC)
+    /// IANA timezone for --cron (default UTC; an update keeps the one it had)
     #[arg(long)]
     tz: Option<String>,
     /// Once, at this RFC 3339 time
@@ -107,8 +107,7 @@ impl New {
             session_id: self.session,
             model_override: self.model,
         };
-        let enabled = !self.disabled;
-        let (name, delivery) = (self.name, Vec::new());
+        let (name, enabled, delivery) = (self.name, !self.disabled, Vec::new());
         Ok(ScheduleCreate {
             name,
             enabled,
@@ -124,10 +123,18 @@ impl Change {
         self.prompt.is_some() || self.session.is_some() || self.model.is_some()
     }
 
-    /// The patch. `current` is the schedule's action now, read only when the
-    /// action changes: the daemon replaces it as a whole, so a new prompt
-    /// alone keeps the session and model it had.
-    fn patch(self, current: Option<ScheduleAction>) -> Result<ScheduleUpdate, String> {
+    /// Whether `patch` needs the schedule as it is now.
+    fn needs_current(&self) -> bool {
+        self.touches_action() || (self.when.cron.is_some() && self.when.tz.is_none())
+    }
+
+    /// The daemon replaces action and spec whole, so `current` fills in what was
+    /// not given (session, model, timezone). A write in between is lost: no revision.
+    fn patch(mut self, current: Option<Schedule>) -> Result<ScheduleUpdate, String> {
+        let (current, spec) = current.map_or((None, None), |s| (s.action, Some(s.spec)));
+        if let (true, Some(ScheduleSpec::Cron { tz, .. })) = (self.when.tz.is_none(), spec) {
+            self.when.tz = tz.filter(|_| self.when.cron.is_some());
+        }
         let action = if self.touches_action() {
             let Some(ScheduleAction::AgentRun {
                 prompt,
@@ -135,9 +142,7 @@ impl Change {
                 model_override,
             }) = current
             else {
-                return Err(
-                    "this schedule has no agent run to change (a module's schedule)".into(),
-                );
+                return Err("a module's schedule has no prompt to change".into());
             };
             Some(ScheduleAction::AgentRun {
                 prompt: self.prompt.unwrap_or(prompt),
@@ -157,11 +162,7 @@ impl Change {
             delivery,
         };
         if patch == ScheduleUpdate::default() {
-            return Err(
-                "nothing to change: give --name, --every/--cron/--at, --prompt, \
-                        --session, --model, --enable or --disable"
-                    .to_owned(),
-            );
+            return Err("nothing to change; see `agent24 schedules update --help`".into());
         }
         Ok(patch)
     }
@@ -231,8 +232,8 @@ async fn schedules(ep: &Endpoint, action: SchedulesAction) -> Result<String, Str
         }
         SchedulesAction::Update { id, change } => {
             let url = one(&id)?;
-            let current = match change.touches_action() {
-                true => decode::<Schedule>(send(bearer(ep, client().get(&url))).await?)?.action,
+            let current = match change.needs_current() {
+                true => Some(decode(send(bearer(ep, client().get(&url))).await?)?),
                 false => None,
             };
             let patch = change.patch(current)?;
@@ -280,7 +281,7 @@ mod tests {
         }
     }
 
-    fn update(args: &[&str], current: Option<ScheduleAction>) -> Result<ScheduleUpdate, String> {
+    fn update(args: &[&str], current: Option<Schedule>) -> Result<ScheduleUpdate, String> {
         let mut all = vec!["schedules", "update", "sch_1"];
         all.extend_from_slice(args);
         match parse(&all).map_err(|e| e.to_string())? {
@@ -407,7 +408,7 @@ mod tests {
 
     #[test]
     fn a_new_prompt_keeps_the_session_and_model() {
-        let now = agent_run("old", Some("sess_1"), Some("m"));
+        let now = schedule(agent_run("old", Some("sess_1"), Some("m")), every());
         let patch = update(&["--prompt", "new"], Some(now.clone())).unwrap();
         assert_eq!(
             patch.action,
@@ -422,10 +423,39 @@ mod tests {
         assert!(module_row.contains("module"), "{module_row}");
     }
 
-    fn schedule_json(action: ScheduleAction) -> String {
+    fn cron(expr: &str, tz: Option<&str>) -> ScheduleSpec {
+        let (expr, tz) = (expr.to_owned(), tz.map(str::to_owned));
+        ScheduleSpec::Cron { expr, tz }
+    }
+
+    #[test]
+    fn a_new_cron_expression_keeps_the_timezone() {
+        let shanghai = cron("0 9 * * *", Some("Asia/Shanghai"));
+        let now = schedule(agent_run("p", None, None), shanghai);
+        let patch = update(&["--cron", "0 10 * * *"], Some(now.clone())).unwrap();
+        assert_eq!(patch.spec, Some(cron("0 10 * * *", Some("Asia/Shanghai"))));
+        let patch = update(&["--cron", "0 10 * * *", "--tz", "UTC"], Some(now.clone())).unwrap();
+        assert_eq!(patch.spec, Some(cron("0 10 * * *", Some("UTC"))));
+        // A new prompt alone leaves the spec, timezone and all, untouched.
+        assert_eq!(update(&["--prompt", "q"], Some(now)).unwrap().spec, None);
+        // Only a cron schedule has a timezone to keep.
+        let was_every = schedule(agent_run("p", None, None), every());
+        let patch = update(&["--cron", "0 10 * * *"], Some(was_every)).unwrap();
+        assert_eq!(patch.spec, Some(cron("0 10 * * *", None)));
+    }
+
+    fn every() -> ScheduleSpec {
+        ScheduleSpec::Every { secs: 3600 }
+    }
+
+    fn schedule(action: ScheduleAction, spec: ScheduleSpec) -> Schedule {
+        serde_json::from_str(&schedule_json(action, spec)).unwrap()
+    }
+
+    fn schedule_json(action: ScheduleAction, spec: ScheduleSpec) -> String {
         serde_json::json!({
             "id": "sch_1", "name": "daily", "enabled": true,
-            "spec": {"type": "every", "secs": 3600}, "action": action, "delivery": [],
+            "spec": spec, "action": action, "delivery": [],
             "last_run_at": null, "next_run_at": "2026-10-27T00:00:00Z", "consecutive_failures": 0,
             "owner": null, "user_suspended": false, "system_disabled_reason": null,
             "effective_enabled": true, "disabled_by": null
@@ -444,8 +474,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_prompt_is_read_then_patched_with_the_session_kept() {
-        let now = schedule_json(agent_run("old", Some("sess_1"), None));
-        let after = schedule_json(agent_run("new", Some("sess_1"), None));
+        let now = schedule_json(agent_run("old", Some("sess_1"), None), every());
+        let after = schedule_json(agent_run("new", Some("sess_1"), None), every());
         let (ep, seen) = answer_each(vec![("200 OK", now), ("200 OK", after)]);
         let out = run(&["update", "sch_1", "--prompt", "new"], &ep)
             .await
@@ -466,6 +496,22 @@ mod tests {
         let patch: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(patch["action"]["session_id"], "sess_1", "{patch}");
         assert_eq!(patch["action"]["prompt"], "new", "{patch}");
+    }
+
+    #[tokio::test]
+    async fn a_new_cron_expression_alone_reads_the_timezone_first() {
+        let shanghai = cron("0 9 * * *", Some("Asia/Shanghai"));
+        let now = schedule_json(agent_run("p", None, None), shanghai);
+        let (ep, seen) = answer_each(vec![("200 OK", now.clone()), ("200 OK", now)]);
+        run(&["update", "sch_1", "--cron", "0 10 * * *"], &ep)
+            .await
+            .unwrap();
+        let seen = seen.join().unwrap();
+        assert!(seen[0].starts_with("GET "), "{}", seen[0]);
+        let body = seen[1].split("\r\n\r\n").nth(1).unwrap();
+        let patch: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(patch["spec"]["tz"], "Asia/Shanghai", "{patch}");
+        assert!(patch["action"].is_null(), "{patch}");
     }
 
     #[tokio::test]
@@ -507,7 +553,7 @@ mod tests {
     async fn list_reads_the_envelope_and_a_bad_id_sends_nothing() {
         let list = format!(
             r#"{{"schedules":[{}]}}"#,
-            schedule_json(agent_run("p", None, None))
+            schedule_json(agent_run("p", None, None), every())
         );
         let (ep, _seen) = answer_each(vec![("200 OK", list)]);
         let out = run(&["list"], &ep).await.unwrap();

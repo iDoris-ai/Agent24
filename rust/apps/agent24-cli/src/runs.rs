@@ -227,11 +227,14 @@ pub(crate) mod tests {
         replies: Vec<(&'static str, String)>,
     ) -> (Endpoint, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = std::thread::spawn(move || {
             let mut seen = Vec::new();
             for (status, body) in replies {
-                let (mut sock, _) = listener.accept().unwrap();
+                let Some(mut sock) = accept(&listener) else {
+                    break;
+                };
                 seen.push(read_request(&mut sock));
                 let reply = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -247,6 +250,27 @@ pub(crate) mod tests {
             child: None,
         };
         (ep, seen)
+    }
+
+    /// The next connection, or none after 5 s: a client that sends fewer
+    /// requests than there are replies fails its test instead of hanging it.
+    fn accept(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((sock, _)) => {
+                    sock.set_nonblocking(false).unwrap();
+                    return Some(sock);
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => return None,
+            }
+        }
     }
 
     /// The head, then as many body bytes as its content-length says.
