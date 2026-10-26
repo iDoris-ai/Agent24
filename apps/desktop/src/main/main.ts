@@ -21,7 +21,7 @@ import { OpenDesignComponentInstaller } from './open-design-component'
 import { createIdorisStatusProvider } from './idoris-admin'
 
 const isDev = process.env.NODE_ENV === 'development'
-const backendManager = new BackendManager()
+const backendManager = new BackendManager({ isPackaged: app.isPackaged })
 // Start the one-shot inherited-FD read immediately. The promise is awaited
 // before any managed child is spawned, so the secret-bearing FD is closed first.
 const idorisStatusProviderPromise = createIdorisStatusProvider()

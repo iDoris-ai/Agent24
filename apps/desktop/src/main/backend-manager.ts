@@ -35,17 +35,36 @@ export function getBackendEndpoint(): BackendEndpoint | null {
   return currentEndpoint
 }
 
-export function selectedBackend(packaged: boolean = !isDev): BackendKind {
-  // Default rust (v0.1.0); only an explicit `node` opts into the reference
-  // implementation — and only in dev. ADR-037 decision 1 (CORE-8): the Node
-  // daemon is no longer shipped in installers, so a packaged build ignores
-  // AGENT24_BACKEND=node with a warning and falls back to Rust (rather than
-  // throwing: a stray env var must not brick an installed app, and there is no
-  // server.js to launch anyway).
+/** Dev-only: workspace dep @agent24/node-daemon main → packages/node-daemon/dist/server.js */
+function resolveNodeEntry(): string {
+  return require.resolve('@agent24/node-daemon')
+}
+
+/** `packaged` MUST come from Electron's `app.isPackaged` (injected by main.ts).
+ * It is deliberately NOT derived from NODE_ENV: an installed app can inherit
+ * NODE_ENV=development from its launching shell, and that must not unlock the
+ * node backend. Default `true` = fail closed (never node unless told dev).
+ *
+ * ADR-037 decision 1 (CORE-8): node-daemon is not shipped in installers, so:
+ * - packaged + AGENT24_BACKEND=node → warn, use rust;
+ * - dev + node but the dependency cannot be resolved → warn, use rust (never
+ *   throw: a stray env var must not brick the app). */
+export function selectedBackend(
+  packaged: boolean = true,
+  resolveNode: () => string = resolveNodeEntry,
+): BackendKind {
   if (process.env['AGENT24_BACKEND'] !== 'node') return 'rust'
   if (packaged) {
     console.warn(
       '[backend] AGENT24_BACKEND=node ignored in packaged builds (ADR-037: node-daemon is a dev/contract-test reference only); using rust',
+    )
+    return 'rust'
+  }
+  try {
+    resolveNode()
+  } catch (err) {
+    console.warn(
+      `[backend] AGENT24_BACKEND=node requested but @agent24/node-daemon is not resolvable (${String(err)}); using rust`,
     )
     return 'rust'
   }
@@ -74,16 +93,6 @@ export function deriveStatus(s: {
 function repoRootDev(): string {
   // __dirname = apps/desktop/dist/main → repo root is four levels up
   return path.join(__dirname, '..', '..', '..', '..')
-}
-
-function resolveNodeEntry(): string {
-  if (isDev) {
-    // Workspace dep: @agent24/node-daemon main → packages/node-daemon/dist/server.js
-    return require.resolve('@agent24/node-daemon')
-  }
-  // ADR-037: no node-daemon in installers; selectedBackend() never yields
-  // 'node' when packaged, so reaching here is a bug.
-  throw new Error('node backend is not available in packaged builds (ADR-037)')
 }
 
 function resolveRustBinary(): string {
@@ -158,6 +167,11 @@ export interface BackendManagerDeps {
    * spawn/fork call below; tests inject a fake so `spawnChild()` never
    * touches a real binary. */
   spawnProcess?: (kind: BackendKind) => ChildProcess
+  /** Electron `app.isPackaged`, injected by main.ts. Omitted → treated as
+   * packaged (fail closed). */
+  isPackaged?: boolean
+  /** Test seam for the dev-time node-daemon resolution. */
+  resolveNode?: () => string
 }
 
 function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
@@ -208,7 +222,7 @@ export class BackendManager {
   private child: ChildProcess | null = null
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
-  private readonly kind: BackendKind = selectedBackend()
+  private readonly kind: BackendKind
   private readonly external: ExternalDaemonSource
   private readonly spawnProcess: (kind: BackendKind) => ChildProcess
   // F1b: last observed health (drives the tray status), and whether the user
@@ -231,6 +245,7 @@ export class BackendManager {
   private tickInFlight = false
 
   constructor(deps: BackendManagerDeps = {}) {
+    this.kind = selectedBackend(deps.isPackaged ?? true, deps.resolveNode)
     this.external = deps.external ?? defaultExternalDaemonSource
     this.spawnProcess = deps.spawnProcess ?? defaultSpawnProcess
   }
