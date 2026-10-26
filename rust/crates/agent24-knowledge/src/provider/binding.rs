@@ -207,31 +207,44 @@ impl<K: Ord + Clone> BindingState<K> {
         let outcome = self
             .credentials
             .response(&mut self.connection, credential, signal, now);
-        if outcome == Outcome::Recheck && !self.evidence.register(asked) {
-            let rule = Some(self.evidence.place(Kbs::All));
-            return WithRule {
-                value: outcome,
-                rule,
-            };
+        if outcome == Outcome::Recheck {
+            return self.questioned(asked);
         }
         self.ruled_outcome(outcome)
     }
 
     /// The recheck, sent with `credential`, came back with a revocation
     /// signal: a revocation as any (S3.1), and what was held back becomes
-    /// placeholders. If the credential was discarded meanwhile, it asks for
-    /// another recheck instead.
+    /// placeholders. If the credential was discarded meanwhile (a renewal
+    /// does so without invalidating), the recheck's KBs `asked` are
+    /// registered again as by [`BindingState::response`].
     pub fn recheck_revoked(
         &mut self,
         credential: CredentialId,
+        asked: impl IntoIterator<Item = K>,
         now: Instant,
     ) -> WithRule<Outcome, K> {
         let outcome =
             self.credentials
                 .response(&mut self.connection, credential, Signal::Revoked, now);
-        let rule = (outcome != Outcome::Recheck).then(|| self.evidence.revoked());
+        if outcome == Outcome::Recheck {
+            return self.questioned(asked);
+        }
+        let rule = Some(self.evidence.revoked());
         WithRule {
             value: outcome,
+            rule,
+        }
+    }
+
+    /// S3.1: a revocation signal on a discarded credential registers `asked`
+    /// for re-verification; an empty Q fails closed with a rule over every
+    /// KB (#1305 note 3).
+    fn questioned(&mut self, asked: impl IntoIterator<Item = K>) -> WithRule<Outcome, K> {
+        let registered = self.evidence.register(asked);
+        let rule = (!registered).then(|| self.evidence.place(Kbs::All));
+        WithRule {
+            value: Outcome::Recheck,
             rule,
         }
     }

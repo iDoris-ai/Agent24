@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::provider::credential::{Issued, Outcome, Signal};
+use crate::provider::evidence::Passed;
 use crate::provider::gate::Gate;
 use crate::provider::state::{Probe, ServiceState, Target, derive};
 use ConnectionPhase::{Loading, Ready, Unavailable};
@@ -546,6 +547,45 @@ fn a_credential_event_places_a_rule_exactly_when_it_calls_for_a_placeholder() {
         })
     );
     assert_eq!(binding.evidence().epoch(), 2);
+    // A renewal granted narrowed, then an issuance refused once revoked.
+    let mut binding = ready();
+    let current = binding.credentials().current().unwrap();
+    let expired = binding.response(current, Signal::Expired, ["a"], now).value;
+    let Outcome::Done(Effects {
+        renew: Some(renew), ..
+    }) = expired
+    else {
+        panic!("{expired:?}")
+    };
+    let narrowed = binding.issued(renew, Issued::Granted { narrowed: true }, now);
+    assert_eq!(
+        narrowed.rule,
+        Some(Rule {
+            epoch: 1,
+            kbs: Kbs::All
+        })
+    );
+    let Outcome::Done(narrowed) = narrowed.value else {
+        unreachable!()
+    };
+    persisted(&mut binding, &narrowed);
+    let ticket = binding.issue().unwrap();
+    let refused = binding.issued(ticket, Issued::Refused, now);
+    assert!(matches!(
+        refused.value,
+        Outcome::Done(Effects {
+            placeholder: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        refused.rule,
+        Some(Rule {
+            epoch: 2,
+            kbs: Kbs::All
+        })
+    );
+    assert_eq!(binding.evidence().epoch(), 2);
 }
 
 /// A `ready` binding left Off and back in `loading`, with the credential
@@ -590,7 +630,7 @@ fn a_recheck_that_came_back_revoked_places_once_and_ends_the_hold() {
     let (mut binding, old) = discarded();
     let _ = binding.response(old, Signal::Revoked, ["a"], now);
     // Sent with a credential discarded since: another recheck.
-    let again = binding.recheck_revoked(old, now);
+    let again = binding.recheck_revoked(old, ["a"], now);
     assert_eq!(again.value, Outcome::Recheck);
     assert_eq!(again.rule, None);
     assert!(binding.facts().reverify_pending);
@@ -598,7 +638,7 @@ fn a_recheck_that_came_back_revoked_places_once_and_ends_the_hold() {
     let granted = Issued::Granted { narrowed: false };
     let _ = binding.issued(ticket, granted, now);
     let current = binding.credentials().current().unwrap();
-    let revoked = binding.recheck_revoked(current, now);
+    let revoked = binding.recheck_revoked(current, ["a"], now);
     assert!(matches!(
         revoked.value,
         Outcome::Done(Effects {
@@ -651,4 +691,55 @@ fn a_removal_is_handled_as_a_narrowing_in_the_same_step() {
     assert!(late.value.0.removed.is_empty());
     assert_eq!((late.value.1, late.rule), (None, None));
     assert_eq!(binding.evidence().epoch(), 1);
+}
+
+/// Pending on `a`, a recheck R1 sent with c1, then a renewal that does not
+/// invalidate, and a recheck R2 sent with c2: the binding, c1, R1's version
+/// and R2's.
+fn renewed_meanwhile() -> (B, CredentialId, u64, u64) {
+    let now = Instant::now();
+    let (mut binding, old) = discarded();
+    let _ = binding.response(old, Signal::Revoked, ["a"], now);
+    let ticket = binding.issue().unwrap();
+    let _ = binding.issued(ticket, Issued::Granted { narrowed: false }, now);
+    let c1 = binding.credentials().current().unwrap();
+    let r1 = binding.evidence().recheck().unwrap();
+    let expired = binding.response(c1, Signal::Expired, ["a"], now).value;
+    let Outcome::Done(Effects {
+        renew: Some(renew), ..
+    }) = expired
+    else {
+        panic!("{expired:?}")
+    };
+    let _ = binding.issued(renew, Issued::Granted { narrowed: false }, now);
+    assert_ne!(binding.credentials().current(), Some(c1));
+    let r2 = binding.evidence().recheck().unwrap();
+    (binding, c1, r1.version, r2.version)
+}
+
+#[test]
+fn a_recheck_revoked_on_a_credential_renewed_since_registers_again() {
+    // Codex on 5e, C1: R2 passed and was released, then R1 came back.
+    let now = Instant::now();
+    let (mut binding, c1, _, r2) = renewed_meanwhile();
+    assert_eq!(binding.evidence().passed(r2), Passed::Release);
+    assert!(binding.evidence_mut().release(r2));
+    let late = binding.recheck_revoked(c1, ["a"], now);
+    assert_eq!((late.value, late.rule), (Outcome::Recheck, None));
+    assert!(binding.facts().reverify_pending);
+    // R1 back first: R2 passing no longer releases.
+    let (mut binding, c1, r1, r2) = renewed_meanwhile();
+    assert_eq!(r1, r2);
+    let _ = binding.recheck_revoked(c1, ["a"], now);
+    assert!(matches!(binding.evidence().passed(r2), Passed::Again(_)));
+    // An empty Q fails closed here too.
+    let (mut binding, c1, _, _) = renewed_meanwhile();
+    let empty = binding.recheck_revoked(c1, [], now);
+    assert_eq!(
+        empty.rule,
+        Some(Rule {
+            epoch: 1,
+            kbs: Kbs::All
+        })
+    );
 }
