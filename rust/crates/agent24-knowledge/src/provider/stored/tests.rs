@@ -226,6 +226,53 @@ const V1: &str = r#"{"version":1,"changes":[
 "started","shutdown"
 ]}"#;
 
+/// The values [`every_change`] leaves out, each in a change.
+fn other_values() -> Vec<C> {
+    vec![
+        C::PlaceholderFailed {
+            profile: "p".into(),
+            failure: PlaceholderFailure::InstanceUnidentified,
+        },
+        C::Bind {
+            of: of("p", 2),
+            identity: "id".into(),
+            generation: 0,
+            confirmed: None,
+        },
+        C::Stuck {
+            of: of("p", 2),
+            cause: StuckCause::InstanceUnidentified,
+        },
+        C::Stuck {
+            of: of("p", 2),
+            cause: StuckCause::CredentialRejected,
+        },
+        C::Placed {
+            of: of("p", 2),
+            rule: Rule {
+                epoch: 1,
+                kbs: Kbs::All,
+            },
+        },
+        C::Questioned {
+            of: of("p", 2),
+            kbs: BTreeSet::new(),
+            version: 1,
+            timeouts: None,
+        },
+    ]
+}
+
+/// What version 1 wrote for [`other_values`]. Never edit, as [`V1`].
+const V1_OTHER: &str = r#"{"version":1,"changes":[
+{"placeholder_failed":{"profile":"p","failure":"instance_unidentified"}},
+{"bind":{"of":{"profile":"p","binding":2},"identity":"id","generation":0,"confirmed":null}},
+{"stuck":{"of":{"profile":"p","binding":2},"cause":"instance_unidentified"}},
+{"stuck":{"of":{"profile":"p","binding":2},"cause":"credential_rejected"}},
+{"placed":{"of":{"profile":"p","binding":2},"rule":{"epoch":1,"kbs":"all"}}},
+{"questioned":{"of":{"profile":"p","binding":2},"kbs":[],"version":1,"timeouts":null}}
+]}"#;
+
 /// A version 1 write holding `changes`, spelled as given.
 fn write(changes: &str) -> String {
     format!(r#"{{"version":1,"changes":[{changes}]}}"#)
@@ -248,39 +295,18 @@ fn the_sample_holds_every_kind_once() {
 
 #[test]
 fn a_version_1_record_reads_back_and_is_written_the_same() {
-    assert_eq!(decode::<T>(V1).unwrap(), every_change());
-    assert_eq!(json(&encode(&every_change()).unwrap()), json(V1));
+    for (text, changes) in [(V1, every_change()), (V1_OTHER, other_values())] {
+        assert_eq!(decode::<T>(text).unwrap(), changes);
+        assert_eq!(json(&encode(&changes).unwrap()), json(text));
+    }
 }
 
 #[test]
 fn what_is_written_reads_back() {
-    for change in every_change() {
+    for change in every_change().into_iter().chain(other_values()) {
         let text = encode(std::slice::from_ref(&change)).unwrap();
         assert_eq!(decode::<T>(&text).unwrap(), vec![change]);
     }
-    let none = vec![
-        C::Bind {
-            of: of("p", 2),
-            identity: "id".into(),
-            generation: 0,
-            confirmed: None,
-        },
-        C::Placed {
-            of: of("p", 2),
-            rule: Rule {
-                epoch: 1,
-                kbs: Kbs::All,
-            },
-        },
-        C::Questioned {
-            of: of("p", 2),
-            kbs: BTreeSet::new(),
-            version: 1,
-            timeouts: None,
-        },
-    ];
-    let text = encode(&none).unwrap();
-    assert_eq!(decode::<T>(&text).unwrap(), none);
     assert_eq!(decode::<T>(&write("")).unwrap(), vec![]);
 }
 
@@ -327,6 +353,38 @@ fn a_field_unknown_missing_or_doubled_is_damaged() {
         assert!(damaged(&write(change)), "{change}");
     }
     assert!(damaged(r#"{"version":1,"changes":[],"extra":1}"#));
+}
+
+/// serde would read a struct from an array by position, a set from a list
+/// in any order, and a missing field of an `Option` type as none.
+#[test]
+fn only_the_shape_written_reads() {
+    for text in [
+        r#"[1,["on"]]"#,
+        r#"{"version":1,"changes":[{"retire":["p",1]}]}"#,
+        r#"{"version":1,"changes":[{"generation":[{"profile":"p","binding":2},4]}]}"#,
+        r#"{"version":1,"changes":[{"confirm":["p","alice","unsaved_settings"]}]}"#,
+        &write(r#"{"placed":{"of":{"profile":"p","binding":2},"rule":[9,"all"]}}"#),
+        &write(r#"{"seen":{"of":{"profile":"p","binding":2},"kbs":["kb2","kb1"]}}"#),
+        &write(r#"{"seen":{"of":{"profile":"p","binding":2},"kbs":["kb1","kb1"]}}"#),
+    ] {
+        assert!(damaged(text), "{text}");
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Optional;
+    impl Ids for Optional {
+        type Profile = Option<String>;
+        type Binding = u32;
+        type Run = u32;
+        type Principal = String;
+        type Identity = String;
+        type Kb = String;
+    }
+    let missing = write(r#"{"retire":{"binding":1}}"#);
+    assert_eq!(decode::<Optional>(&missing), Err(Damaged));
+    let null = write(r#"{"retire":{"profile":null,"binding":1}}"#);
+    assert!(decode::<Optional>(&null).is_ok());
 }
 
 #[test]

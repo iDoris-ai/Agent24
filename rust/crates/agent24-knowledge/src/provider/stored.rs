@@ -3,13 +3,15 @@
 //! changes what a stored record means. Serde derives the two-way mapping
 //! from the declarations below (`remote`), each of which must match the type
 //! it mirrors or the build fails; the stored names are the ones written here.
-//! A version, a kind or a field this build does not know is refused, and the
-//! log reads as damaged (S1.8). Pure: the host stores the text.
+//! A record reads only as this build writes it: another version, a kind, a
+//! value or a field it does not know, or any other spelling is refused, and
+//! the log reads as damaged (S1.8). Pure: the host stores the text.
 
 use std::collections::BTreeSet;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 use super::evidence::{Kbs, Rule};
 use super::profile::Confirmation;
@@ -55,17 +57,24 @@ pub fn encode<I: StoredIds>(changes: &[Change<I>]) -> serde_json::Result<String>
 }
 
 /// The changes of one write, or `Damaged` for anything this build does not
-/// read exactly.
+/// read exactly: read, then written again, it must give the same JSON. Serde
+/// alone would take an unknown field, a struct as an array by position, a
+/// set in any order, or a missing field of an `Option` type as none.
 pub fn decode<I: StoredIds>(text: &str) -> Result<Vec<Change<I>>, Damaged> {
     let body: Body<I> = serde_json::from_str(text).map_err(|_| Damaged)?;
-    if body.version != VERSION {
-        return Err(Damaged);
+    let read: Value = serde_json::from_str(text).map_err(|_| Damaged)?;
+    let changes: Vec<_> = body.changes.into_iter().map(|Item(c)| c).collect();
+    let again = encode(&changes)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    match again {
+        Some(again) if again == read => Ok(changes),
+        _ => Err(Damaged),
     }
-    Ok(body.changes.into_iter().map(|Item(c)| c).collect())
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields, bound = "I: StoredIds")]
+#[serde(bound = "I: StoredIds")]
 struct Body<I: StoredIds> {
     version: u32,
     changes: Vec<Item<I>>,
@@ -76,16 +85,10 @@ struct Body<I: StoredIds> {
 struct Item<I: StoredIds>(#[serde(with = "ChangeDef")] Change<I>);
 
 #[derive(Serialize, Deserialize)]
-#[serde(remote = "Of", deny_unknown_fields, bound = "I: StoredIds")]
+#[serde(remote = "Of", bound = "I: StoredIds")]
 struct OfDef<I: StoredIds> {
     profile: I::Profile,
     binding: I::Binding,
-}
-
-/// An `Option` the record spells out, `null` for none: serde would read a
-/// missing one as none.
-fn required<'de, T: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<Option<T>, D::Error> {
-    Option::deserialize(d)
 }
 
 /// `Vec<Of<I>>`, each as [`OfDef`].
@@ -140,7 +143,7 @@ enum KbsDef<K> {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(remote = "Rule", deny_unknown_fields)]
+#[serde(remote = "Rule")]
 #[serde(bound = "K: Serialize + DeserializeOwned")]
 struct RuleDef<K> {
     epoch: u64,
@@ -150,7 +153,7 @@ struct RuleDef<K> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Change")]
-#[serde(rename_all = "snake_case", deny_unknown_fields, bound = "I: StoredIds")]
+#[serde(rename_all = "snake_case", bound = "I: StoredIds")]
 enum ChangeDef<I: StoredIds> {
     Off,
     On,
@@ -188,7 +191,6 @@ enum ChangeDef<I: StoredIds> {
         of: Of<I>,
         identity: I::Identity,
         generation: u64,
-        #[serde(deserialize_with = "required")]
         confirmed: Option<I::Principal>,
     },
     Generation {
@@ -238,7 +240,6 @@ enum ChangeDef<I: StoredIds> {
         of: Of<I>,
         kbs: BTreeSet<I::Kb>,
         version: u64,
-        #[serde(deserialize_with = "required")]
         timeouts: Option<u8>,
     },
     Released {
