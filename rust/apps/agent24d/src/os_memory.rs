@@ -149,6 +149,23 @@ const RECALL_PAGE: i64 = 500;
 /// two independently maintained copies.
 pub(crate) const MAX_KIND_BYTES: usize = 128;
 
+/// Why [`OsScopedMemory::build_remember_event`] refused a request. Kept apart
+/// from a plain message so the reserved-kind refusal stays typed on both paths.
+#[derive(Debug)]
+enum RememberRefusal {
+    Invalid(String),
+    ReservedKind,
+}
+
+/// P1-02c: kinds the kernel writes itself. Compared case-insensitively on the
+/// trimmed kind, so `" Assertion.retracted"` cannot slip past the check.
+fn is_reserved_kind(kind: &str) -> bool {
+    let k = kind.trim().to_ascii_lowercase();
+    ["assertion.", "mem.", "session."]
+        .iter()
+        .any(|p| k.starts_with(p))
+}
+
 /// The largest serialized body a module may remember in one call.
 ///
 /// Well under the 1 MiB HTTP body cap, because this is one memory rather than
@@ -770,24 +787,33 @@ impl OsScopedMemory {
     /// `Remember` differently. Returns a human-readable message on failure;
     /// each caller maps it into its own error type (`DomainError` for the
     /// trait path, `MemoryRpcError` for the wire path).
-    fn build_remember_event(&self, what: Remember) -> Result<MemEvent, String> {
+    fn build_remember_event(&self, what: Remember) -> Result<MemEvent, RememberRefusal> {
         // Bounded BEFORE anything is written. See `MAX_KIND_BYTES`: the partition
         // stops A from reading B, and these stop A from crowding B out of the
         // database they share.
         if what.kind.trim().is_empty() {
-            return Err("kind must not be empty".into());
+            return Err(RememberRefusal::Invalid("kind must not be empty".into()));
         }
         if what.kind.len() > MAX_KIND_BYTES {
-            return Err(format!("kind exceeds {MAX_KIND_BYTES} bytes"));
+            return Err(RememberRefusal::Invalid(format!(
+                "kind exceeds {MAX_KIND_BYTES} bytes"
+            )));
+        }
+        // P1-02c: the kernel's own event kinds are not the module's to write.
+        // The quota trigger exempts `assertion.retracted` for PERSONAL owners
+        // only, but a module must not be able to forge a control or audit row
+        // under any owner either.
+        if is_reserved_kind(&what.kind) {
+            return Err(RememberRefusal::ReservedKind);
         }
         let body = serde_json::Value::Object(what.body);
-        let encoded =
-            serde_json::to_string(&body).map_err(|e| format!("body is not serialisable: {e}"))?;
+        let encoded = serde_json::to_string(&body)
+            .map_err(|e| RememberRefusal::Invalid(format!("body is not serialisable: {e}")))?;
         if encoded.len() > MAX_BODY_BYTES {
-            return Err(format!(
+            return Err(RememberRefusal::Invalid(format!(
                 "body is {} bytes, over the {MAX_BODY_BYTES}-byte limit for one memory",
                 encoded.len()
-            ));
+            )));
         }
         Ok(MemEvent::new(
             self.mint_id(),
@@ -830,9 +856,10 @@ impl OsScopedMemory {
 #[async_trait::async_trait]
 impl ScopedMemory for OsScopedMemory {
     async fn remember(&self, what: Remember) -> agent24_domain::Result<Remembered> {
-        let ev = self
-            .build_remember_event(what)
-            .map_err(DomainError::Memory)?;
+        let ev = self.build_remember_event(what).map_err(|r| match r {
+            RememberRefusal::Invalid(m) => DomainError::Memory(m),
+            RememberRefusal::ReservedKind => DomainError::MemoryReservedKind,
+        })?;
         let at = ev.at.clone();
         let id = ev.id.clone();
         self.events
@@ -940,9 +967,10 @@ impl OsScopedMemory {
         admission: Arc<Semaphore>,
         what: Remember,
     ) -> Result<Remembered, MemoryRpcError> {
-        let ev = self
-            .build_remember_event(what)
-            .map_err(MemoryRpcError::Invalid)?;
+        let ev = self.build_remember_event(what).map_err(|r| match r {
+            RememberRefusal::Invalid(m) => MemoryRpcError::Invalid(m),
+            RememberRefusal::ReservedKind => MemoryRpcError::ReservedKind,
+        })?;
         let Some(mut reservation) = Reservation::reserve(limiter, MEMORY_COST_REMEMBER) else {
             return Err(MemoryRpcError::application(
                 ErrorKind::RateLimited,
@@ -1346,6 +1374,194 @@ mod tests {
             .map(|r| r.body.get("n").and_then(|v| v.as_i64()).unwrap())
             .collect();
         assert_eq!(got, vec![19, 18, 17], "newest first — NOT the oldest three");
+    }
+
+    // ---- P1-02c c1 (T9, T10): reserved kinds and partition isolation ----
+
+    fn retraction_shaped(id: &str, owner: &str) -> MemEvent {
+        MemEvent::new(
+            id,
+            Scope::owner(owner),
+            "assertion.retracted",
+            serde_json::json!({ "assertion_id": "x" }),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+    }
+
+    async fn file_store() -> (tempfile::TempDir, agent24_memory::KvStore, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite");
+        let kv = agent24_memory::KvStore::open(&path).await.unwrap();
+        let admin = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, kv, admin)
+    }
+
+    async fn pin_quota(admin: &sqlx::SqlitePool, owner: &str, rows: i64) {
+        sqlx::query(
+            "INSERT INTO mem_owner_quota(owner, max_rows, max_bytes) VALUES(?, ?, 268435456)
+             ON CONFLICT(owner) DO UPDATE SET max_rows=excluded.max_rows",
+        )
+        .bind(owner)
+        .bind(rows)
+        .execute(admin)
+        .await
+        .unwrap();
+    }
+
+    const RESERVED_KINDS: [&str; 7] = [
+        "assertion.retracted",
+        "assertion.reasserted",
+        "mem.write_decision",
+        "session.summary",
+        "session.anything",
+        " Assertion.Retracted",
+        "MEM.x",
+    ];
+
+    #[tokio::test]
+    async fn t9_in_process_entry_refuses_reserved_kinds_with_a_typed_error() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        for kind in RESERVED_KINDS {
+            let err = m
+                .remember(Remember::new(kind, serde_json::Map::new()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, DomainError::MemoryReservedKind),
+                "{kind}: {err}"
+            );
+        }
+        assert!(
+            m.recent(10).await.unwrap().is_empty(),
+            "nothing was written"
+        );
+        // Near misses are ordinary kinds.
+        for kind in ["assertions", "memory", "sessions.x", "note.assertion.x"] {
+            m.remember(Remember::new(kind, serde_json::Map::new()))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn t9_oop_entry_refuses_reserved_kinds_and_maps_to_a_wire_code() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        for kind in RESERVED_KINDS {
+            let err = m
+                .remember_checked(
+                    None,
+                    generous_limiter(),
+                    admission(4),
+                    Remember::new(kind, serde_json::Map::new()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err, MemoryRpcError::ReservedKind, "{kind}");
+        }
+        let wire = MemoryRpcError::ReservedKind.into_rpc_error();
+        assert_eq!(wire.code, agent24_os_proto::rpc::code::INVALID_PARAMS);
+        assert_eq!(
+            wire.data.as_ref().and_then(|d| d.get("code")),
+            Some(&serde_json::json!("memory_reserved_kind"))
+        );
+        assert!(
+            m.recent(10).await.unwrap().is_empty(),
+            "nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn t9_a_module_owner_gets_no_retraction_exemption() {
+        let (_dir, kv, admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        m.remember(Remember::new("note", serde_json::Map::new()))
+            .await
+            .unwrap();
+        // Exactly full: one row used, one allowed.
+        pin_quota(&admin, &m.key, 1).await;
+        let err = agent24_memory::event::EventStore::append(
+            &kv.events(),
+            &retraction_shaped("forged", &m.key),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, agent24_memory::MemoryError::QuotaExceeded { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t10_a_full_module_partition_does_not_touch_personal_writes_or_retraction() {
+        use agent24_memory::assertion::{AssertionStore, BeliefQuery, Forget};
+        use agent24_memory::writer::{Candidate, MemoryWriter};
+        let (_dir, kv, admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let org = org_of(&kv, "alice").await;
+        let personal = OsMemoryCatalog::default()
+            .ensure_personal_recorded(&org, "alice", &kv)
+            .await
+            .unwrap();
+        m.remember(Remember::new("note", serde_json::Map::new()))
+            .await
+            .unwrap();
+        pin_quota(&admin, &m.key, 1).await;
+        // The module is now full: its next write is refused.
+        let err = m
+            .remember(Remember::new("note", serde_json::Map::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Store(_)), "{err}");
+
+        // The personal partition is unaffected: write, retract.
+        let id = "assertion-t10";
+        kv.write_gate()
+            .propose(vec![
+                Candidate::new(
+                    id,
+                    Scope::owner(&personal),
+                    "user",
+                    "prefers",
+                    serde_json::json!("tea"),
+                    Origin {
+                        source: "user".into(),
+                        trust: Trust::UserSaid,
+                    },
+                )
+                .with_evidence(vec!["e".into()])
+                .remember(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.assertions()
+                .beliefs_as_of(&BeliefQuery::owner(&personal))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Fill the personal partition too: retraction still works, the module's
+        // fullness never mattered.
+        let used: i64 = sqlx::query_scalar("SELECT row_count FROM mem_owner_usage WHERE owner=?")
+            .bind(&personal)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        pin_quota(&admin, &personal, used).await;
+        assert_eq!(
+            kv.forget(&personal, id, &agent24_core::util::now_iso8601())
+                .await
+                .unwrap(),
+            Forget::Forgotten
+        );
     }
 
     #[tokio::test]

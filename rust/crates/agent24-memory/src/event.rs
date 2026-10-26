@@ -451,7 +451,7 @@ impl EventLog {
         let scope_json = serde_json::to_string(&e.scope)?;
         let payload = serde_json::to_string(&e.body)?;
         let causal = serde_json::to_string(&e.causal)?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO mem_events
                  (id, scope_owner, scope_session, scope, kind, payload,
                   origin_source, origin_trust, causal, at)
@@ -470,6 +470,16 @@ impl EventLog {
         .execute(&mut *conn)
         .await
         .map_err(map_quota_error(&e.scope.owner))?;
+        // Migration 0018's `mem_events_bi_no_replace` ignores (RAISE(IGNORE))
+        // an insert whose id already exists instead of letting SQLite raise a
+        // UNIQUE error, so a collision now shows up as zero affected rows. It
+        // must stay the error it always was: the caller's transaction rolls back.
+        if inserted.rows_affected() == 0 {
+            return Err(crate::MemoryError::Conflict(format!(
+                "event id {:?} already exists",
+                e.id
+            )));
+        }
         Ok(())
     }
 
@@ -1241,6 +1251,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_tx_with_an_existing_id_is_still_an_error_that_rolls_back() {
+        // Since 0018 the SQL layer ignores a same-id insert; append_tx must keep
+        // reporting the collision, or a pre-occupied audit id would silently
+        // commit a belief its audit does not describe.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        let first = ev("dup", "u1", None, "msg");
+        log.append(&first).await.unwrap();
+        let mut tx = kv.pool.begin().await.unwrap();
+        let err = EventLog::append_tx(&mut tx, &ev("dup", "u1", None, "other"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::MemoryError::Conflict(_)), "{err:?}");
+        drop(tx);
+        assert_eq!(usage_of(&kv.pool, "u1").await, (1, payload_bytes(&first)));
+    }
+
+    #[tokio::test]
     async fn t85b_append_and_append_tx_both_authoritatively_update_usage() {
         // Judgement 1: EventLog::append (the &pool path) and EventLog::append_tx
         // (the caller's own transaction — writer.rs::commit_with_audit's only
@@ -1676,7 +1704,9 @@ mod tests {
                 "mem_events_ad_usage".to_owned(),
                 "mem_events_ai_usage".to_owned(),
                 "mem_events_au_owner_usage".to_owned(),
+                "mem_events_bi_no_replace".to_owned(),
                 "mem_events_bi_quota".to_owned(),
+                "mem_events_bu_id_immutable".to_owned(),
                 "mem_events_bu_payload_immutable".to_owned(),
             ]
         );

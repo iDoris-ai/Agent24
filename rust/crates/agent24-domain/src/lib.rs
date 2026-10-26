@@ -122,6 +122,11 @@ pub enum DomainError {
     /// base failing rather than the request being unacceptable.
     #[error("memory: {0}")]
     Memory(String),
+    /// P1-02c: a module tried to write a kind the kernel reserves for itself
+    /// (`assertion.*`, `mem.*`, `session.*`). Typed, with a stable code
+    /// (`memory_reserved_kind`), so it is never confused with a size refusal.
+    #[error("memory_reserved_kind: the kernel reserves this kind")]
+    MemoryReservedKind,
 }
 
 pub type Result<T> = std::result::Result<T, DomainError>;
