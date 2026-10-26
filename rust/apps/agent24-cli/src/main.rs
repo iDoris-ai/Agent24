@@ -49,8 +49,9 @@ enum Command {
         /// Chat with personal memory on, as the desktop's chat page does for each
         /// conversation: an explicit "记住…" is kept and its outcome shown, and
         /// what you remember is recalled for the reply. Memory is shared by all
-        /// your conversations; this id only files the turn under one of them.
-        /// Only this one message is sent, not the turns before it
+        /// your conversations; this id files the turn under one of them, whose
+        /// source floor (the strictest source it has recalled) a new memory
+        /// takes. Only this one message is sent, not the turns before it
         #[arg(long)]
         session: Option<String>,
     },
