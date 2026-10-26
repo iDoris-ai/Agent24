@@ -37,17 +37,21 @@ REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
 WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/k1r2-accept.$$}")
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
-# inside DIR TOP: DIR is TOP or below it. The names are compared without case
-# (a case-insensitive volume takes ~/.Agent24 for ~/.agent24) and every existing
-# ancestor of DIR by inode.
+# inside DIR TOP: DIR is TOP or below it, both absolute. TOP is cut to its
+# nearest existing ancestor and the missing rest; an existing ancestor of DIR
+# that is that same directory by inode (a firmlink or bind mount names it
+# otherwise) is followed by DIR's rest, compared without case (a
+# case-insensitive volume takes ~/.Agent24 for ~/.agent24).
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 inside() {
-  local a=$1
-  case "$(lower "$a")/" in "$(lower "$2")"/*) return 0 ;; esac
+  local top=$2 missing="" a=$1 rest=""
+  while [ ! -e "$top" ]; do missing="/$(basename "$top")$missing"; top=$(dirname "$top"); done
   while :; do
-    [ -e "$a" ] && [ "$a" -ef "$2" ] && return 0
+    if [ -e "$a" ] && [ "$a" -ef "$top" ]; then
+      case "$(lower "$rest")/" in "$(lower "$missing")"/*) return 0 ;; esac
+    fi
     [ "$a" = / ] && return 1
-    a=$(dirname "$a")
+    rest="/$(basename "$a")$rest"; a=$(dirname "$a")
   done
 }
 inside "$WORK" "$REAL" && { echo "--work must not be inside $REAL" >&2; exit 2; }

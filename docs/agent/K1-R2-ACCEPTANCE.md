@@ -6,7 +6,7 @@
   - 造旧数据：main 没有写授予、写 self-wake 的产品入口，旧授予和旧 self-wake 只能写进库里；
   - 读迁移结果：`_sqlx_migrations` 和 `schedule_source_origin` 没有对外接口。
 - **不碰用户数据**：每个 daemon 都用工作目录下自己的 `AGENT24_DATA_DIR` 和 `A24_OS_PACKAGES`。Z1 检查 `~/.agent24` 在运行期间没有变化。
-- **前提**：先停掉自己的 daemon（`agent24 daemon stop`），不然 Z1 会把它正常的写入当成被碰过；脚本发现 daemon 在跑会直接拒绝运行，这一步在创建任何东西之前。`--work` 不能在 `~/.agent24` 下面：两边都先解析到最终路径（包括悬空的链接和还不存在的子路径），再不分大小写比较路径（大小写不敏感的卷上 `~/.Agent24` 就是 `~/.agent24`），并对 `--work` 每个已存在的上级目录按 inode 比较；这些都在创建任何东西之前做。`--work` 要么不存在，要么为空，免得上一次的残留混进结果。
+- **前提**：先停掉自己的 daemon（`agent24 daemon stop`），不然 Z1 会把它正常的写入当成被碰过；脚本发现 daemon 在跑会直接拒绝运行，这一步在创建任何东西之前。`--work` 不能在 `~/.agent24` 下面：两边都先解析到最终路径（包括悬空的链接和还不存在的子路径），再从 `~/.agent24` 最近一个已存在的上级目录（它本身存在时就是它）比起：`--work` 的已存在上级目录中，凡与它是同一个 inode 的（firmlink、bind mount 会给同一个目录另起名字），就把余下的路径和 `~/.agent24` 缺的那几段不分大小写比较（大小写不敏感的卷上 `~/.Agent24` 就是 `~/.agent24`）。这些都在创建任何东西之前做。`--work` 要么不存在，要么为空，免得上一次的残留混进结果。
 - **环境变量**：调用者 shell 里的 `A24_*`、`AGENT24_*` 全部清掉，daemon 和 CLI 只拿到各条用例自己设的值。
 - **不需要模型**：没有模型时 run 以 `provider_unavailable` 结束，来源标签在调模型之前就写好了，所以 peer 视图的判定照样成立。
 - **依赖**：curl、jq、sqlite3、python3、perl（给 MCP 的交互限时）、node（P1 要起示例模块 `examples/node-module`）。脚本开头设 `LC_ALL=C`：系统里没装调用者 shell 设的 locale 时，perl 每次启动都会打警告；`tr`、`grep` 也按字节处理。
