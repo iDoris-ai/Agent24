@@ -80,9 +80,26 @@ pub(crate) fn approved_parent(input: &Map<String, Value>) -> Option<Arc<crate::P
 pub(crate) fn pin_outside_dir(
     parent: PathBuf,
 ) -> Result<Arc<crate::PinnedOutsideDir>, std::io::Error> {
+    // `parent` was canonical when it was resolved, but opening it resolves it
+    // again: a component swapped for a symlink in between would leave the
+    // handle on another directory under the approved name. Walked from the
+    // root without following any symlink, the handle is the directory that
+    // is at this very name, or the open fails.
     // Directory open fails immediately on a FIFO or regular file. `File::open`
     // would block on a FIFO and stall the caller before any approval exists.
-    let dir = cap_std::fs::Dir::open_ambient_dir(&parent, cap_std::ambient_authority())?;
+    let mut dir = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => dir = cap_fs_ext::DirExt::open_dir_nofollow(&dir, name)?,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a canonical absolute path",
+                ));
+            }
+        }
+    }
     let meta = dir.dir_metadata()?;
     Ok(Arc::new(crate::PinnedOutsideDir {
         path: parent,
@@ -273,6 +290,32 @@ impl Tool for FsWriteTool {
             "required": ["path", "content"],
             "additionalProperties": false
         })
+    }
+
+    /// An outside write's approval is for the directory captured before the
+    /// gate (L-APPR-8). The durable-resume path captured none, and which one
+    /// the human saw is not recorded, so the call is asked again
+    /// (`ApprovalStale`, as for a module call), not refused by the whitelist.
+    async fn call_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        invocation: &crate::ToolInvocation,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let outside_unpinned = || {
+            str_arg(input, "path").is_some_and(|raw| {
+                Path::new(raw).is_absolute() && resolve_in_roots(raw, &self.roots).is_err()
+            })
+        };
+        if matches!(invocation.approval, crate::ApprovalBinding::Unbound)
+            && ctx.workspace_authority().is_none()
+            && ctx.pinned_outside_directory().is_none()
+            && outside_unpinned()
+        {
+            return Err(ToolError::ApprovalStale);
+        }
+        self.call(ctx, input, cancel).await
     }
 
     async fn call(
@@ -634,6 +677,63 @@ mod tests {
             .unwrap_err();
         assert!(matches!(wrong, ToolError::Denied(_)), "{wrong:?}");
         assert!(!other.exists());
+    }
+
+    /// The name `approved_parent` resolved is opened again without following
+    /// any symlink: a level swapped for one after it was resolved, last or
+    /// in between, is not pinned (#1254 Codex C1); a real directory is.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_now_goes_through_a_symlink_is_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (safe, secret) = (root.join("safe"), root.join("secret"));
+        std::fs::create_dir_all(safe.join("sub")).unwrap();
+        std::fs::create_dir_all(secret.join("sub")).unwrap();
+        let pinned = pin_outside_dir(safe.clone()).unwrap();
+        let meta = std::fs::metadata(&safe).unwrap();
+        assert_eq!(
+            (pinned.dev(), pinned.ino()),
+            (
+                std::os::unix::fs::MetadataExt::dev(&meta),
+                std::os::unix::fs::MetadataExt::ino(&meta)
+            )
+        );
+        // `safe` resolved, then swapped for a symlink to `secret`.
+        std::fs::rename(&safe, root.join("safe-moved")).unwrap();
+        std::os::unix::fs::symlink(&secret, &safe).unwrap();
+        assert!(pin_outside_dir(safe.clone()).is_err(), "the last level");
+        assert!(
+            pin_outside_dir(safe.join("sub")).is_err(),
+            "a level in between"
+        );
+        assert!(pin_outside_dir(PathBuf::from("relative")).is_err());
+    }
+
+    /// The durable-resume path captured no outside directory: the call is
+    /// asked again, not run and not refused (#1254 Codex C2). Inside the
+    /// workspace it runs as approved.
+    #[tokio::test]
+    async fn a_resumed_outside_write_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let reg = ToolRegistry::builtin(ws.clone());
+        let file = outside.join("a.txt");
+        let input = sinput(&[("path", file.to_str().unwrap()), ("content", "x")]);
+        let err = reg
+            .execute_preapproved("fs_write", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ApprovalStale), "{err:?}");
+        assert!(!file.exists());
+        let inside = ws.join("b.txt");
+        let input = sinput(&[("path", inside.to_str().unwrap()), ("content", "y")]);
+        reg.execute_preapproved("fs_write", &ctx(), &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "y");
     }
 
     struct SwapGate {
