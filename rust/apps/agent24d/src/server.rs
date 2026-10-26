@@ -1334,6 +1334,24 @@ fn spawn_approval_recovery_scan_every(
     })
 }
 
+/// Set once the ready line has gone out (SPEC-002 §4): from then on stdout
+/// carries nothing, not even a `failed` line.
+pub static READY_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Another daemon holds the singleton lock: the start that loses a
+/// concurrent-start race. Its `failed` line says `already_running`, so a
+/// launcher knows to look for the winner instead of reporting an error.
+#[derive(Debug)]
+pub struct AlreadyRunning;
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another agent24d is already running (singleton lock held)")
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
 pub async fn serve(
     port: u16,
     ephemeral: bool,
@@ -1457,11 +1475,7 @@ pub async fn serve(
     } else {
         match agent24_protocol::state_file::try_acquire_singleton()? {
             Some(guard) => Some(guard),
-            None => {
-                return Err(std::io::Error::other(
-                    "another agent24d is already running (singleton lock held)",
-                ));
-            }
+            None => return Err(std::io::Error::other(AlreadyRunning)),
         }
     };
     // SHUT-1b: what the previous daemon left, then this one's marker — right
@@ -2494,7 +2508,8 @@ pub async fn serve(
 
     // SPEC-002 §4 ready line: legacy parsers scan stdout; capability mode first
     // proves stdin/stdout are parent-owned pipes and binds lifetime to stdin.
-    // stdout carries nothing else in either mode (logs go to stderr).
+    // stdout carries nothing else in either mode (logs go to stderr), except
+    // a `failed` line in place of the ready line when the start fails first.
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
@@ -2577,6 +2592,7 @@ pub async fn serve(
             host_ready.send(&ready).await?;
         }
     }
+    READY_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
     // In capability mode `ready` is the only temporary owner of the raw host
     // bearer after the private write completes. Do not retain it for daemon
     // lifetime; the authority store keeps only its digest.

@@ -164,7 +164,9 @@ fn run_serve(
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {
-            tracing::error!("failed to start tokio runtime: {err}");
+            let error = format!("failed to start tokio runtime: {err}");
+            tracing::error!("{error}");
+            say_start_failed("start_failed", &error);
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -186,7 +188,31 @@ fn run_serve(
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("serve failed: {err}");
+            let already_running = err
+                .get_ref()
+                .is_some_and(|inner| inner.is::<server::AlreadyRunning>());
+            let code = if already_running {
+                "already_running"
+            } else {
+                "start_failed"
+            };
+            say_start_failed(code, &err.to_string());
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// SPEC-002 §4: a start that fails before its ready line says why on stdout
+/// too, `{"type":"failed","code":…,"error":…}`, so a launcher that does not
+/// keep stderr can still tell the user. Never after the ready line; a write
+/// error is ignored, since the reader may be gone.
+fn say_start_failed(code: &str, error: &str) {
+    use std::io::Write;
+    if server::READY_SENT.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let line = serde_json::json!({ "type": "failed", "code": code, "error": error });
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }

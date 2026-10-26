@@ -621,7 +621,41 @@ fn agent24d_binary() -> String {
         .unwrap_or_else(|| "agent24d".to_owned())
 }
 
-async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), String> {
+/// Why `spawn_daemon` got no ready line.
+#[derive(Debug)]
+struct SpawnError {
+    message: String,
+    /// The start may have lost a concurrent-start race, so a winner may be
+    /// coming up: the daemon said `already_running`, or it gave no reason.
+    /// A daemon that said why it failed otherwise had no winner to wait for.
+    maybe_raced: bool,
+}
+
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            maybe_raced: true,
+        }
+    }
+}
+
+impl From<&str> for SpawnError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+/// A SPEC-002 §4 `failed` line: what the daemon said before exiting.
+fn start_failure(line: &serde_json::Value) -> SpawnError {
+    let error = line["error"].as_str().unwrap_or("it gave no reason");
+    SpawnError {
+        message: format!("agent24d did not start: {error}"),
+        maybe_raced: line["code"] == "already_running",
+    }
+}
+
+async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), SpawnError> {
     let bin = agent24d_binary();
     let mut cmd = tokio::process::Command::new(&bin);
     let mut args = vec!["serve", "--port", "0"];
@@ -646,16 +680,20 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
         let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
         let line = match next {
             Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => return Err("agent24d exited before ready line".to_owned()),
-            Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}")),
-            Err(_) => return Err("agent24d did not become ready within 15s".to_owned()),
+            Ok(Ok(None)) => return Err("agent24d exited before ready line".into()),
+            Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}").into()),
+            Err(_) => return Err("agent24d did not become ready within 15s".into()),
         };
-        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&line)
-            && state["type"] == "ready"
-        {
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if state["type"] == "ready" {
             let pid = child.id().unwrap_or(0);
             let parsed = parse_ready_state(&state, pid)?;
             return Ok((parsed, child));
+        }
+        if state["type"] == "failed" {
+            return Err(start_failure(&state));
         }
     }
 }
@@ -674,7 +712,7 @@ async fn connect() -> Result<Endpoint, String> {
             return endpoint_from_state(state);
         }
     }
-    let (state, child) = spawn_daemon(true).await?;
+    let (state, child) = spawn_daemon(true).await.map_err(|err| err.message)?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
@@ -2102,6 +2140,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
             }
             let (state, child) = match spawn_daemon(false).await {
                 Ok(v) => v,
+                Err(err) if !err.maybe_raced => return Err(err.message),
                 Err(err) => {
                     // Lost a concurrent-start race? The winner holds the
                     // singleton lock and our child exited before ready. The
@@ -2120,7 +2159,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                    return Err(err);
+                    return Err(err.message);
                 }
             };
             // Detach: without kill_on_drop, dropping the handle leaves the
