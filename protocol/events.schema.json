@@ -518,6 +518,27 @@
         "message"
       ]
     },
+    "MemoryFailureCode": {
+      "description": "P1-02c: the closed set of memory-failure codes. Mirrors\n`agent24_memory::MemoryErrorCode` one for one (the protocol crate does not\ndepend on the memory crate; `agent24-agent` maps between them with an\nexhaustive `match` and a test pins the strings equal).",
+      "type": "string",
+      "enum": [
+        "memory_quota_rows",
+        "memory_quota_bytes",
+        "memory_disk_low",
+        "memory_disk_full",
+        "memory_reserved_kind",
+        "memory_retract_id_too_long",
+        "memory_internal"
+      ]
+    },
+    "MemoryOwnerKind": {
+      "description": "Whose partition a memory failure concerns. Never the partition key itself.",
+      "type": "string",
+      "enum": [
+        "personal",
+        "module"
+      ]
+    },
     "MemoryRecalledPayload": {
       "description": "Assertion ids that were actually included in a run's recalled context.",
       "type": "object",
@@ -538,11 +559,32 @@
       ]
     },
     "MemoryWriteFailedPayload": {
-      "description": "The answer completed, but its session exchange could not be recorded.",
+      "description": "A memory write failed. Typed on purpose (P1-02c T6): a stable `code`, the\nquota `dimension` when there is one, and the owner CLASS — never the storage\nerror's text, the partition key, or any of the content that was being written.",
       "type": "object",
       "properties": {
-        "reason": {
-          "type": "string"
+        "code": {
+          "$ref": "#/$defs/MemoryFailureCode"
+        },
+        "dimension": {
+          "description": "`\"rows\"` or `\"bytes\"` for a quota code; absent otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "What kind of write failed, when it is not the ordinary turn/assertion\nwrite: `\"session.summary\"` (compaction summary) or `\"session.import\"`\n(legacy session import). Absent for the turn itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_kind": {
+          "$ref": "#/$defs/MemoryOwnerKind"
+        },
+        "partial": {
+          "description": "True when the conversation turn WAS saved but its explicit-remember\nassertion was not.",
+          "type": "boolean"
         },
         "session_id": {
           "type": "string"
@@ -550,7 +592,8 @@
       },
       "required": [
         "session_id",
-        "reason"
+        "code",
+        "owner_kind"
       ]
     },
     "MemoryWriteSkippedPayload": {
@@ -798,6 +841,11 @@
     "RunCompletedPayload": {
       "type": "object",
       "properties": {
+        "memory_persisted": {
+          "description": "P1-02c: `false` when this run's exchange (or its explicit-remember\nassertion) FAILED to persist to memory; the answer above is still real,\nbut nothing in the model's text can be taken as \"remembered\". `true`\notherwise, including when there was nothing to write or memory is paused\n(a user choice, reported by `memory.write_skipped`, not a failure).\nAbsent on the wire means `true`.",
+          "type": "boolean",
+          "default": true
+        },
         "output": {
           "$ref": "#/$defs/RunOutputPayload"
         },

@@ -89,6 +89,15 @@ pub enum MemoryError {
     /// bytes are exempt). Carries no owner key and no id on purpose.
     #[error("assertion id is too long to retract while the partition is full")]
     RetractIdTooLong,
+    /// P1-02c (c2b, W3): importing a session's legacy KV blob into the event log
+    /// failed. The import is one transaction, so nothing was written and the
+    /// session still has no events: the next call retries it from scratch (that
+    /// absence IS the "import incomplete" mark — no extra state is needed).
+    /// Wraps the cause so [`MemoryError::code`] still classifies it (the import
+    /// writes N+2 rows and can hit the quota), while callers can tell "history
+    /// could not be loaded" from "the history is empty".
+    #[error("session import incomplete: {0}")]
+    SessionImportIncomplete(Box<MemoryError>),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -167,6 +176,7 @@ impl MemoryError {
             }
             Self::QuotaExceeded { .. } => MemoryErrorCode::QuotaBytes,
             Self::RetractIdTooLong => MemoryErrorCode::RetractIdTooLong,
+            Self::SessionImportIncomplete(cause) => cause.code(),
             Self::Sqlx(sqlx::Error::Database(db))
                 if db.code().as_deref() == Some(SQLITE_FULL)
                     || db.message().contains("database or disk is full") =>

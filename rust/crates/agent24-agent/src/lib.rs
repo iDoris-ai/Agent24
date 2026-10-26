@@ -132,12 +132,94 @@ pub enum MemoryWriteOutcome {
     /// Personal memory was paused at the moment of commit; nothing was
     /// persisted for this turn's explicit remember.
     SkippedPaused,
-    /// The write-gate (or the session append it depends on) reported an
-    /// error.
-    Failed,
+    /// The session append (the conversation turn) reported an error; NOTHING of
+    /// this turn was written. Carries the typed cause, never its text.
+    Failed(MemoryFailure),
+    /// P1-02c: the conversation turn WAS saved, but the explicit-remember
+    /// assertion was not. Distinct from [`Self::Failed`] so a receipt never
+    /// says "nothing saved" about a turn that is in the history, nor "saved"
+    /// about an assertion that is not.
+    Partial(MemoryFailure),
     /// There was nothing to write: no configured memory, no session, the
     /// prompt was not an explicit remember, or the origin was untrusted.
     NotApplicable,
+}
+
+/// P1-02c: the typed cause of a failed memory write — a closed code and, for a
+/// quota code, its dimension. Carries no owner key and no storage text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFailure {
+    pub code: agent24_memory::MemoryErrorCode,
+}
+
+impl MemoryFailure {
+    pub fn from_error(err: &agent24_memory::MemoryError) -> Self {
+        Self { code: err.code() }
+    }
+
+    /// The wire form of the code. Exhaustive on purpose: a new
+    /// `MemoryErrorCode` is a compile error here until the protocol knows it.
+    pub fn wire_code(self) -> agent24_protocol::MemoryFailureCode {
+        use agent24_memory::MemoryErrorCode as M;
+        use agent24_protocol::MemoryFailureCode as W;
+        match self.code {
+            M::QuotaRows => W::QuotaRows,
+            M::QuotaBytes => W::QuotaBytes,
+            M::DiskLow => W::DiskLow,
+            M::DiskFull => W::DiskFull,
+            M::ReservedKind => W::ReservedKind,
+            M::RetractIdTooLong => W::RetractIdTooLong,
+            M::Internal => W::Internal,
+        }
+    }
+
+    fn wire_code_str(self) -> &'static str {
+        self.code.as_str()
+    }
+
+    fn event(
+        self,
+        session_id: &str,
+        kind: Option<&str>,
+        partial: bool,
+    ) -> agent24_protocol::MemoryWriteFailedPayload {
+        agent24_protocol::MemoryWriteFailedPayload {
+            session_id: session_id.to_owned(),
+            code: self.wire_code(),
+            dimension: self.code.dimension().map(str::to_owned),
+            owner_kind: agent24_protocol::MemoryOwnerKind::Personal,
+            kind: kind.map(str::to_owned),
+            partial,
+        }
+    }
+}
+
+/// What loading a session's prior context came to (see
+/// [`RunManager::session_context`]).
+enum SessionContext {
+    Ready(Vec<Msg>),
+    Cancelled,
+    ImportIncomplete(MemoryFailure),
+}
+
+#[cfg(test)]
+impl SessionContext {
+    /// Test convenience: the loaded messages, panicking on any other outcome.
+    fn unwrap(self) -> Vec<Msg> {
+        match self {
+            Self::Ready(context) => context,
+            Self::Cancelled => panic!("session context load was cancelled"),
+            Self::ImportIncomplete(f) => panic!("session import incomplete: {}", f.code),
+        }
+    }
+}
+
+impl MemoryWriteOutcome {
+    /// P1-02c: `false` iff a memory write this run attempted failed (wholly or
+    /// partly). Paused and not-applicable are not failures.
+    pub fn persisted(self) -> bool {
+        !matches!(self, Self::Failed(_) | Self::Partial(_))
+    }
 }
 
 /// H8: the reserved tool name the model calls to submit a plan for approval.
@@ -695,20 +777,36 @@ impl RunManager {
         &self,
         session_id: Option<&str>,
         cancel: &CancellationToken,
-    ) -> Option<Vec<Msg>> {
+    ) -> SessionContext {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
-            return Some(Vec::new());
+            return SessionContext::Ready(Vec::new());
         };
         let load = memory.context(sid);
         let loaded = tokio::select! {
             result = load => result,
-            () = cancel.cancelled() => return None,
+            () = cancel.cancelled() => return SessionContext::Cancelled,
         };
         match loaded {
-            Ok(context) => Some(context),
+            Ok(context) => SessionContext::Ready(context),
+            // W3: the legacy import failed, so this session's history exists but
+            // could not be brought in. Running on as if the session were empty
+            // would answer without context the user believes is there, and the
+            // exchange would then be appended to a history missing its past.
+            // Nothing was written (the import is one transaction), so a retry
+            // starts clean.
+            Err(err @ agent24_memory::MemoryError::SessionImportIncomplete(_)) => {
+                let failure = MemoryFailure::from_error(&err);
+                tracing::error!(session_id = sid, code = %failure.code, error = %err, "session import failed");
+                self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+                    sid,
+                    Some("session.import"),
+                    false,
+                )));
+                SessionContext::ImportIncomplete(failure)
+            }
             Err(err) => {
                 tracing::warn!("session {sid} memory load failed: {err}");
-                Some(Vec::new())
+                SessionContext::Ready(Vec::new())
             }
         }
     }
@@ -731,19 +829,43 @@ impl RunManager {
             return MemoryWriteOutcome::NotApplicable;
         };
         match memory.remember(sid, prompt, answer, prompt_origin).await {
-            Ok(retain::RetainOutcome::Saved) => MemoryWriteOutcome::Saved,
-            Ok(retain::RetainOutcome::SkippedPaused) => MemoryWriteOutcome::SkippedPaused,
-            Ok(retain::RetainOutcome::NotApplicable) => MemoryWriteOutcome::NotApplicable,
-            Err(err) => {
-                let reason = err.to_string();
-                tracing::error!(session_id = sid, %reason, "session memory write failed");
-                self.sink.emit(EventBody::MemoryWriteFailed(
-                    agent24_protocol::MemoryWriteFailedPayload {
-                        session_id: sid.to_owned(),
-                        reason,
-                    },
-                ));
-                MemoryWriteOutcome::Failed
+            Ok(report) => {
+                // W2: the turn is durable, but its compaction summary could not
+                // be written. Observable, with the typed cause only.
+                if let Some(err) = &report.compaction_failure {
+                    let failure = MemoryFailure::from_error(err);
+                    tracing::error!(session_id = sid, code = %failure.code, error = %err, "session summary write failed");
+                    self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+                        sid,
+                        Some("session.summary"),
+                        false,
+                    )));
+                }
+                match report.retain {
+                    retain::RetainOutcome::Saved => MemoryWriteOutcome::Saved,
+                    retain::RetainOutcome::SkippedPaused => MemoryWriteOutcome::SkippedPaused,
+                    retain::RetainOutcome::NotApplicable => MemoryWriteOutcome::NotApplicable,
+                }
+            }
+            Err(failure_of) => {
+                let failure = MemoryFailure::from_error(&failure_of.error);
+                // W3: the legacy import is its own kind of failed write.
+                let kind = matches!(
+                    failure_of.error,
+                    agent24_memory::MemoryError::SessionImportIncomplete(_)
+                )
+                .then_some("session.import");
+                tracing::error!(session_id = sid, code = %failure.code, error = %failure_of.error, "session memory write failed");
+                self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+                    sid,
+                    kind,
+                    failure_of.turn_saved,
+                )));
+                if failure_of.turn_saved {
+                    MemoryWriteOutcome::Partial(failure)
+                } else {
+                    MemoryWriteOutcome::Failed(failure)
+                }
             }
         }
     }
@@ -1591,12 +1713,24 @@ impl RunManager {
         // session actually remembers. Empty when memory is off or session-less.
         // A cancel while waiting on a concurrent run's session lock ends the run
         // here rather than proceeding without its own context.
-        let Some(prior_context) = self
+        let prior_context = match self
             .session_context(run.session_id.as_deref(), &cancel)
             .await
-        else {
-            self.finish_cancelled(&run_id).await;
-            return;
+        {
+            SessionContext::Ready(context) => context,
+            SessionContext::Cancelled => {
+                self.finish_cancelled(&run_id).await;
+                return;
+            }
+            SessionContext::ImportIncomplete(failure) => {
+                self.finish_failed(
+                    &run_id,
+                    failure.wire_code_str(),
+                    "this session's earlier history could not be imported; nothing was changed, retry the run",
+                )
+                .await;
+                return;
+            }
         };
         // M1-T07.1: the FULL first-call input — recall block, then the
         // session's prior (compacted) context, then this run's prompt — is the
@@ -2019,18 +2153,18 @@ impl RunManager {
                 // state` is the C2 contract. If cancellation drops this waiter
                 // after append starts, SessionMemory's detached transaction task
                 // keeps the session lock until SQLx confirms the append outcome.
-                tokio::select! {
-                    _ = self.remember_exchange(
+                let memory_persisted = tokio::select! {
+                    outcome = self.remember_exchange(
                         run.session_id.as_deref(),
                         &run.input.prompt,
                         &text,
                         run_prompt_origin(&run),
-                    ) => {},
+                    ) => outcome.persisted(),
                     () = cancel.cancelled() => {
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
-                }
+                };
                 // Re-check: a cancel that landed just as the write finished must
                 // still win rather than be overwritten by Completed.
                 //
@@ -2065,6 +2199,7 @@ impl RunManager {
                             run_id,
                             output: RunOutputPayload { text },
                             usage: usage_total,
+                            memory_persisted,
                         }));
                     }
                     Err(err) => tracing::error!("run completion persist failed: {err}"),
@@ -2558,6 +2693,8 @@ impl RunManager {
                     text: text.to_owned(),
                 },
                 usage,
+                // This path never attempts a memory write, so none failed.
+                memory_persisted: true,
             })),
             Err(err) => tracing::error!("run completion persist failed: {err}"),
         }
@@ -2645,6 +2782,9 @@ pub(crate) mod tests {
     }
     mod session_failure_tests {
         include!("session_failure_tests.rs");
+    }
+    mod memory_receipt_tests {
+        include!("memory_receipt_tests.rs");
     }
     mod snapshot_origin_tests {
         include!("snapshot_origin_tests.rs");

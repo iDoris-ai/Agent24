@@ -212,6 +212,18 @@ pub struct RunCompletedPayload {
     pub run_id: String,
     pub output: RunOutputPayload,
     pub usage: Usage,
+    /// P1-02c: `false` when this run's exchange (or its explicit-remember
+    /// assertion) FAILED to persist to memory; the answer above is still real,
+    /// but nothing in the model's text can be taken as "remembered". `true`
+    /// otherwise, including when there was nothing to write or memory is paused
+    /// (a user choice, reported by `memory.write_skipped`, not a failure).
+    /// Absent on the wire means `true`.
+    #[serde(default = "default_memory_persisted")]
+    pub memory_persisted: bool,
+}
+
+fn default_memory_persisted() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -219,11 +231,61 @@ pub struct RunOutputPayload {
     pub text: String,
 }
 
-/// The answer completed, but its session exchange could not be recorded.
+/// P1-02c: the closed set of memory-failure codes. Mirrors
+/// `agent24_memory::MemoryErrorCode` one for one (the protocol crate does not
+/// depend on the memory crate; `agent24-agent` maps between them with an
+/// exhaustive `match` and a test pins the strings equal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum MemoryFailureCode {
+    #[serde(rename = "memory_quota_rows")]
+    QuotaRows,
+    #[serde(rename = "memory_quota_bytes")]
+    QuotaBytes,
+    // Reserved for the pre-write disk check; nothing emits it yet.
+    #[serde(rename = "memory_disk_low")]
+    DiskLow,
+    #[serde(rename = "memory_disk_full")]
+    DiskFull,
+    #[serde(rename = "memory_reserved_kind")]
+    ReservedKind,
+    #[serde(rename = "memory_retract_id_too_long")]
+    RetractIdTooLong,
+    #[serde(rename = "memory_internal")]
+    Internal,
+}
+
+/// Whose partition a memory failure concerns. Never the partition key itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryOwnerKind {
+    Personal,
+    Module,
+}
+
+/// A memory write failed. Typed on purpose (P1-02c T6): a stable `code`, the
+/// quota `dimension` when there is one, and the owner CLASS — never the storage
+/// error's text, the partition key, or any of the content that was being written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryWriteFailedPayload {
     pub session_id: String,
-    pub reason: String,
+    pub code: MemoryFailureCode,
+    /// `"rows"` or `"bytes"` for a quota code; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<String>,
+    pub owner_kind: MemoryOwnerKind,
+    /// What kind of write failed, when it is not the ordinary turn/assertion
+    /// write: `"session.summary"` (compaction summary) or `"session.import"`
+    /// (legacy session import). Absent for the turn itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// True when the conversation turn WAS saved but its explicit-remember
+    /// assertion was not.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// M1-T10 review H1: `reason` is an open enum (today only `"paused"`).

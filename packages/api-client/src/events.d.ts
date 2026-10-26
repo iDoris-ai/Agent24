@@ -118,6 +118,24 @@ export type Agent24V1WebSocketEventProtocol = {
     }
 );
 /**
+ * P1-02c: the closed set of memory-failure codes. Mirrors
+ * `agent24_memory::MemoryErrorCode` one for one (the protocol crate does not
+ * depend on the memory crate; `agent24-agent` maps between them with an
+ * exhaustive `match` and a test pins the strings equal).
+ */
+export type MemoryFailureCode =
+  | "memory_quota_rows"
+  | "memory_quota_bytes"
+  | "memory_disk_low"
+  | "memory_disk_full"
+  | "memory_reserved_kind"
+  | "memory_retract_id_too_long"
+  | "memory_internal";
+/**
+ * Whose partition a memory failure concerns. Never the partition key itself.
+ */
+export type MemoryOwnerKind = "personal" | "module";
+/**
  * Closed set per protocol/events.schema.json (a running tool never emits
  * tool.completed)
  */
@@ -202,6 +220,15 @@ export interface ModelCallPayload {
   [k: string]: unknown;
 }
 export interface RunCompletedPayload {
+  /**
+   * P1-02c: `false` when this run's exchange (or its explicit-remember
+   * assertion) FAILED to persist to memory; the answer above is still real,
+   * but nothing in the model's text can be taken as "remembered". `true`
+   * otherwise, including when there was nothing to write or memory is paused
+   * (a user choice, reported by `memory.write_skipped`, not a failure).
+   * Absent on the wire means `true`.
+   */
+  memory_persisted?: boolean;
   output: RunOutputPayload;
   run_id: string;
   usage: Usage;
@@ -219,10 +246,28 @@ export interface Usage {
   [k: string]: unknown;
 }
 /**
- * The answer completed, but its session exchange could not be recorded.
+ * A memory write failed. Typed on purpose (P1-02c T6): a stable `code`, the
+ * quota `dimension` when there is one, and the owner CLASS — never the storage
+ * error's text, the partition key, or any of the content that was being written.
  */
 export interface MemoryWriteFailedPayload {
-  reason: string;
+  code: MemoryFailureCode;
+  /**
+   * `"rows"` or `"bytes"` for a quota code; absent otherwise.
+   */
+  dimension?: string | null;
+  /**
+   * What kind of write failed, when it is not the ordinary turn/assertion
+   * write: `"session.summary"` (compaction summary) or `"session.import"`
+   * (legacy session import). Absent for the turn itself.
+   */
+  kind?: string | null;
+  owner_kind: MemoryOwnerKind;
+  /**
+   * True when the conversation turn WAS saved but its explicit-remember
+   * assertion was not.
+   */
+  partial?: boolean;
   session_id: string;
   [k: string]: unknown;
 }

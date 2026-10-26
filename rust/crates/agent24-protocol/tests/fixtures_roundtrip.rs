@@ -164,3 +164,46 @@ fn approval_fixture_decodes_decision_open_set() {
         other => panic!("wrong variant: {}", other.wire_type()),
     }
 }
+
+/// P1-02c: `memory.write_failed` is typed (code/dimension/owner_kind/kind/partial),
+/// carries no free-text reason, and omits its optional fields when absent. (No
+/// fixture file: the fixture gate requires wire names without `_`, and this
+/// event's established name has one.)
+#[test]
+fn memory_write_failed_is_typed_and_omits_absent_fields() {
+    let raw = serde_json::json!({
+        "v": 1, "seq": 3, "ts": "2026-07-23T12:00:01Z", "type": "memory.write_failed",
+        "payload": {
+            "session_id": "ses_x", "code": "memory_quota_rows",
+            "dimension": "rows", "owner_kind": "personal"
+        }
+    });
+    let event: Event = serde_json::from_value(raw.clone()).unwrap();
+    assert!(matches!(event.body, EventBody::MemoryWriteFailed(_)));
+    assert_eq!(serde_json::to_value(&event).unwrap(), raw);
+
+    // The old free-text shape no longer decodes: a producer still sending
+    // `reason` without a `code` is a bug, not something to accept silently.
+    let old = serde_json::json!({
+        "v": 1, "seq": 3, "ts": "2026-07-23T12:00:01Z", "type": "memory.write_failed",
+        "payload": { "session_id": "ses_x", "reason": "quota exceeded for owner ..." }
+    });
+    assert!(serde_json::from_value::<Event>(old).is_err());
+}
+
+/// P1-02c: `run.completed` without `memory_persisted` (an older producer, or the
+/// TS daemon) means "nothing failed to persist".
+#[test]
+fn run_completed_without_memory_persisted_defaults_to_true() {
+    let raw = fs::read_to_string(fixtures_dir("events").join("run.completed.json")).unwrap();
+    let mut value: Value = serde_json::from_str(&raw).unwrap();
+    value["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("memory_persisted");
+    let event: Event = serde_json::from_value(value).unwrap();
+    let EventBody::RunCompleted(p) = event.body else {
+        panic!("not run.completed")
+    };
+    assert!(p.memory_persisted);
+}
