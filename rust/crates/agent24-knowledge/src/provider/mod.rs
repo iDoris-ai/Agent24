@@ -9,7 +9,8 @@
 //! (`ledger`), the records it is persisted as (`record`), how they are read
 //! back (`replay`) and what a restart makes of them (`recover`), with the
 //! order its writes run in (`journal`); the budgets calls run under
-//! (`budget`); and one profile as the host holds it (`member`).
+//! (`budget`); one profile as the host holds it (`member`), and the
+//! orchestration over them all (`host`).
 
 pub mod binding;
 pub mod budget;
@@ -17,6 +18,7 @@ pub mod connection;
 pub mod credential;
 pub mod evidence;
 pub mod gate;
+pub mod host;
 pub mod journal;
 pub mod ledger;
 pub mod member;
