@@ -6,8 +6,9 @@
 //! yet).
 //!
 //! Scope (per task spec): host-generated per-tool permission summary
-//! (readable/writable/external scope text, host risk level, source,
-//! module version, and a derived permission-scope fingerprint) plus
+//! (readable/writable/external scope text, whether that scope is a reversible
+//! draft, host risk level, source, module version, and a derived
+//! permission-scope fingerprint) plus
 //! `grant`/`deny`/`lookup` storage and durable 6a.3 revocation state. No call
 //! gate (6a.2), no UI/export (6a.4) — those are separate slices.
 //!
@@ -93,9 +94,11 @@ pub struct ToolPermissionSummary {
     pub readable: Option<String>,
     pub writable: Option<String>,
     pub external: Option<String>,
-    /// Whether the tool declares reversible-draft semantics. This remains a
-    /// declaration only; it is included in the consent fingerprint so
-    /// changing this exemption-relevant property invalidates prior consent.
+    /// Whether this permission summary includes reversible-draft semantics.
+    /// Persisted on the consent row and hashed into the fingerprint. `new`
+    /// leaves it false; a caller sets it only when the host's current tool
+    /// summary actually carries the attribute. Changing it changes the
+    /// fingerprint, so an older grant no longer matches.
     pub reversible_draft: bool,
     /// Already clamped by [`Self::new`] — ADR §4/jason's ruling: a
     /// `ManualInstall` source can never carry a risk below `High`, regardless
@@ -219,6 +222,10 @@ pub struct ModuleConsentRecord {
     pub readable: Option<String>,
     pub writable: Option<String>,
     pub external: Option<String>,
+    /// The reversible-draft bit of the summary this row recorded. False on
+    /// rows written before the column existed. The draft exemption may treat
+    /// a grant as authorization for that attribute only when this is true.
+    pub reversible_draft: bool,
     pub decision: ConsentDecision,
     pub decided_at: String,
     pub expires_at: String,
@@ -539,6 +546,7 @@ fn row_to_record(row: &SqliteRow) -> Result<ModuleConsentRecord> {
         readable: row.get("readable"),
         writable: row.get("writable"),
         external: row.get("external"),
+        reversible_draft: row.get("reversible_draft"),
         decision: parse_decision(&row.get::<String, _>("decision"))?,
         decided_at: row.get("decided_at"),
         expires_at: row.get("expires_at"),
@@ -841,9 +849,10 @@ impl Store {
         Ok(state.flatten())
     }
 
-    /// Lifecycle invalidation for disable/uninstall/package replacement. The
-    /// operation is deliberately best-effort at call sites that already have
-    /// an established lifecycle result; failures are returned for logging.
+    /// Lifecycle invalidation for disable/uninstall/package replacement.
+    /// Callers must treat an `Err` as fail-closed (ADR-K1-03 §3): the
+    /// lifecycle step may still go ahead, but it must not be reported as a
+    /// success while the consent is still live.
     pub async fn invalidate_module_consents(&self, module: &str) -> Result<()> {
         self.revoke_module_consent(module, None, &Utc::now().to_rfc3339())
             .await
@@ -955,9 +964,9 @@ impl Store {
         let row = sqlx::query(
             "INSERT INTO module_consents
                 (module, op, module_version, scope_fingerprint, source, risk,
-                 readable, writable, external, decision, decided_at, expires_at,
-                 resources, artifact, generation, enable_epoch)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 readable, writable, external, reversible_draft, decision,
+                 decided_at, expires_at, resources, artifact, generation, enable_epoch)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (module, op) DO UPDATE SET
                 module_version = excluded.module_version,
                 scope_fingerprint = excluded.scope_fingerprint,
@@ -966,6 +975,7 @@ impl Store {
                 readable = excluded.readable,
                 writable = excluded.writable,
                 external = excluded.external,
+                reversible_draft = excluded.reversible_draft,
                 decision = excluded.decision,
                 decided_at = excluded.decided_at,
                 expires_at = excluded.expires_at,
@@ -985,6 +995,7 @@ impl Store {
         .bind(&summary.readable)
         .bind(&summary.writable)
         .bind(&summary.external)
+        .bind(summary.reversible_draft)
         .bind(decision_str(decision))
         .bind(&decided_at)
         .bind(expires_at)
@@ -1514,6 +1525,104 @@ mod tests {
             .unwrap();
 
         assert!(matches!(lookup, ConsentLookup::Stale(_)));
+    }
+
+    #[tokio::test]
+    async fn grant_and_lookup_roundtrip_the_consented_reversible_draft_attribute() {
+        let store = store().await;
+        let plain = summary("doc body");
+        assert!(!plain.reversible_draft);
+
+        let granted = store
+            .grant_module_consent(&plain, "2026-10-08T00:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(!granted.reversible_draft);
+
+        let listed = store.list_module_consents().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].reversible_draft);
+
+        let mut draft = plain.clone();
+        draft.reversible_draft = true;
+        let upgraded = store
+            .grant_module_consent(&draft, "2026-10-08T01:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(upgraded.reversible_draft);
+        match store
+            .lookup_module_consent(
+                &draft.module,
+                &draft.op,
+                &draft.module_version,
+                &draft.scope_fingerprint(),
+                "2026-10-08T01:00:01Z",
+            )
+            .await
+            .unwrap()
+        {
+            ConsentLookup::Granted(record) => assert!(record.reversible_draft),
+            other => panic!("draft regrant must be authorized, got {other:?}"),
+        }
+
+        let cleared = store
+            .grant_module_consent(&plain, "2026-10-08T02:00:00Z", "2026-11-08T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(!cleared.reversible_draft);
+        match store
+            .lookup_module_consent(
+                &plain.module,
+                &plain.op,
+                &plain.module_version,
+                &plain.scope_fingerprint(),
+                "2026-10-08T02:00:01Z",
+            )
+            .await
+            .unwrap()
+        {
+            ConsentLookup::Granted(record) => assert!(!record.reversible_draft),
+            other => panic!("clearing the draft attribute must replace the row, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_that_omits_reversible_draft_reads_back_as_not_a_draft() {
+        // Rows written before 0018, or inserted without the column, must not
+        // become draft consents. DEFAULT 0 is that backfill.
+        let store = store().await;
+        let s = summary("doc body");
+        let fp = s.scope_fingerprint();
+        sqlx::query(
+            "INSERT INTO module_consents
+                (module, op, module_version, scope_fingerprint, source, risk,
+                 readable, writable, external, decision, decided_at, expires_at)
+             VALUES (?, ?, ?, ?, 'first_party', 'low', ?, NULL, NULL, 'granted',
+                     '2026-10-08T00:00:00.000Z', '2026-11-08T00:00:00.000Z')",
+        )
+        .bind(&s.module)
+        .bind(&s.op)
+        .bind(&s.module_version)
+        .bind(&fp)
+        .bind(&s.readable)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        match store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &fp,
+                "2026-10-08T00:00:01Z",
+            )
+            .await
+            .unwrap()
+        {
+            ConsentLookup::Granted(record) => assert!(!record.reversible_draft),
+            other => panic!("legacy row must still be a grant, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2708,6 +2817,7 @@ mod tests {
             readable: None,
             writable: None,
             external: None,
+            reversible_draft: false,
             decision: ConsentDecision::Granted,
             decided_at: "2026-10-08T00:00:00.000Z".to_owned(),
             expires_at: "2026-11-08T00:00:00.000Z".to_owned(),

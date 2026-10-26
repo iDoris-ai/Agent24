@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use sysinfo::{Disks, System};
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
 use crate::disks::{free_bytes_for_path, is_user_visible_volume};
 use crate::parse;
@@ -56,6 +56,14 @@ impl SystemProbe {
     }
 }
 
+/// Sysinfo refresh specification: refreshes only CPU and memory metrics.
+/// Explicitly excludes any process inspection (command line, environment, cwd, etc.).
+pub fn hardware_refresh_kind() -> RefreshKind {
+    RefreshKind::nothing()
+        .with_cpu(CpuRefreshKind::nothing())
+        .with_memory(MemoryRefreshKind::everything())
+}
+
 impl Default for SystemProbe {
     fn default() -> Self {
         Self::new()
@@ -64,7 +72,7 @@ impl Default for SystemProbe {
 
 impl HardwareProbe for SystemProbe {
     fn probe(&self) -> HardwareProfile {
-        let sys = System::new_all();
+        let sys = System::new_with_specifics(hardware_refresh_kind());
         let disks = Disks::new_with_refreshed_list();
 
         let all: Vec<DiskInfo> = disks
@@ -310,5 +318,33 @@ mod tests {
     fn models_dir_on_this_machine_has_free_bytes() {
         let p = SystemProbe::with_models_dir("/tmp/a24-hw-nonexistent/models").probe();
         assert!(p.models_dir_free_bytes.is_some());
+    }
+
+    #[test]
+    fn probe_production_code_must_not_use_new_all_or_refresh_processes() {
+        let src = include_str!("probe.rs");
+        let prod_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !prod_src.contains("System::new_all()"),
+            "System::new_all() refreshes all processes including command line and environment"
+        );
+        assert!(
+            !prod_src.contains("ProcessRefreshKind"),
+            "probe.rs must not refresh processes"
+        );
+    }
+
+    #[test]
+    fn hardware_refresh_kind_only_refreshes_cpu_and_memory() {
+        let kind = hardware_refresh_kind();
+        assert!(kind.processes().is_none(), "processes refresh must be None");
+        assert!(kind.cpu().is_some(), "cpu refresh must be Some");
+        assert!(kind.memory().is_some(), "memory refresh must be Some");
+
+        let sys = System::new_with_specifics(kind);
+        assert!(
+            sys.processes().is_empty(),
+            "sysinfo System must not have any processes loaded"
+        );
     }
 }

@@ -136,15 +136,15 @@ fn every_quote_must_hold_or_the_value_has_no_anchors() {
     for (what, value, evidence, why) in [
         ("none given", "10月12日", vec![], unsourced::NO_EVIDENCE),
         (
-            "no such block",
-            "10月12日",
-            vec![ev("p9/b9", "10月12日")],
+            "no such block, nor the quote anywhere shown",
+            "10月13日",
+            vec![ev("p9/b9", "10月13日")],
             unsourced::NOT_SHOWN,
         ),
         (
-            "not in the block it names",
-            "10月12日",
-            vec![ev("p1/b2", "10月12日")],
+            "in no block shown",
+            "10月13日",
+            vec![ev("p1/b2", "10月13日")],
             unsourced::NOT_FOUND,
         ),
         (
@@ -158,6 +158,12 @@ fn every_quote_must_hold_or_the_value_has_no_anchors() {
             "10月12日",
             vec![ev("p1/b1", "  ")],
             unsourced::NOT_FOUND,
+        ),
+        (
+            "only spaces, naming a block not shown",
+            "10月12日",
+            vec![ev("p9/b9", "  ")],
+            unsourced::NOT_SHOWN,
         ),
         // One good quote does not carry a bad one: the condition may be the bad one.
         (
@@ -175,10 +181,100 @@ fn every_quote_must_hold_or_the_value_has_no_anchors() {
     ] {
         assert_eq!(src.ground(&all, value, &evidence), Err(why), "{what}");
     }
-    // A block that exists but the model was not shown is not evidence either.
+    // A block that exists but the model was not shown is not evidence either,
+    // whichever block the quote names.
     assert_eq!(
         src.ground(&Window(vec![1, 2]), "10月12日", &[date]),
         Err(unsourced::NOT_SHOWN)
+    );
+    assert_eq!(
+        src.ground(
+            &Window(vec![1, 2]),
+            "10月12日",
+            &[ev("p1/b2", "10月12日全天停水")]
+        ),
+        Err(unsourced::NOT_FOUND)
+    );
+}
+
+#[test]
+fn a_quote_in_another_block_shown_is_anchored_where_it_is() {
+    let l = layer();
+    let src = source(&l);
+    let all = Window(vec![0, 1, 2]);
+    // The model named the wrong block, or one that does not exist: the quote is where the OS finds it.
+    for named in ["p1/b2", "p2/b1", "p9/b9"] {
+        let a = src
+            .ground(&all, "10月12日", &[ev(named, "10月12日全天停水")])
+            .unwrap();
+        assert_eq!(
+            (a[0].block_id.as_str(), a[0].page),
+            ("p1/b1", Some(1)),
+            "{named}"
+        );
+        assert_eq!(
+            a[0].block_text_sha256,
+            sha256_address(l.blocks[0].text.as_bytes()),
+            "{named}"
+        );
+    }
+    // Only among the blocks shown: the same quote, with its block not shown, is no anchor.
+    assert_eq!(
+        src.ground(
+            &Window(vec![1, 2]),
+            "10月12日",
+            &[ev("p1/b2", "10月12日全天停水")]
+        ),
+        Err(unsourced::NOT_FOUND)
+    );
+    // A block that exists but was not shown, named for a quote that is once in a block that was.
+    let a = src
+        .ground(&Window(vec![1, 2]), "40", &[ev("p1/b1", "Fee: 40 yuan")])
+        .unwrap();
+    assert_eq!(
+        (a[0].block_id.as_str(), a[0].quote.as_str()),
+        ("p2/b1", "Fee: 40 yuan")
+    );
+    assert_eq!((a[0].text_range.start, a[0].text_range.end), (0, 12));
+    // Every quote of a value is located so, and all must hold.
+    let a = src
+        .ground(
+            &all,
+            "10月12日",
+            &[ev("p2/b1", "因管道检修"), ev("p1/b2", "10月12日全天停水")],
+        )
+        .unwrap();
+    assert_eq!(
+        a.iter().map(|x| x.block_id.as_str()).collect::<Vec<_>>(),
+        ["p1/b1", "p1/b1"]
+    );
+}
+
+#[test]
+fn a_quote_in_two_blocks_shown_is_ambiguous_and_the_block_named_is_not_left_for_another() {
+    let mut l = layer();
+    l.blocks[2].text = "因管道检修\nfor late renewal only.".into();
+    let src = source(&l);
+    let all = Window(vec![0, 1, 2]);
+    // Named rightly, it is found once there: the other block does not matter.
+    let a = src
+        .ground(&all, "检修", &[ev("p1/b1", "因管道检修")])
+        .unwrap();
+    assert_eq!(a[0].block_id, "p1/b1");
+    // Named wrongly, it is in two blocks: no telling which.
+    assert_eq!(
+        src.ground(&all, "检修", &[ev("p1/b2", "因管道检修")]),
+        Err(unsourced::AMBIGUOUS)
+    );
+    // Twice in the block it names is ambiguous there, though it is once nowhere else.
+    assert_eq!(
+        src.ground(&all, "40元", &[ev("p1/b2", "补领40元/证")]),
+        Err(unsourced::AMBIGUOUS)
+    );
+    // Twice in one other block is ambiguous too.
+    assert_eq!(
+        src.ground(&all, "40元", &[ev("p1/b1", "补领40元/证")]),
+        Err(unsourced::AMBIGUOUS)
     );
 }
 
@@ -224,5 +320,23 @@ fn a_longer_quote_settles_what_a_short_one_cannot() {
         a[0].geometry.as_ref().unwrap().rects,
         vec![[72.0, 100.0, 300.0, 112.0]],
         "one line"
+    );
+}
+
+#[test]
+fn a_quote_once_in_another_block_is_anchored_there_even_if_the_row_meant_reads_otherwise() {
+    // The residual risk ADR-DOC-02 §3.2 states: the row the model meant has
+    // full-width digits, which `find` does not fold; another row has the quote
+    // once. The anchor goes where the quote is; the OS cannot tell which row was
+    // meant, and the reader sees the anchor.
+    let mut l = layer();
+    l.blocks[0].text = "临时身份证 ４０元/证\n仅限本人".into();
+    let src = source(&l);
+    let a = src
+        .ground(&Window(vec![0, 1, 2]), "40元", &[ev("p1/b1", "40元/证，")])
+        .unwrap();
+    assert_eq!(
+        (a[0].block_id.as_str(), a[0].quote.as_str()),
+        ("p1/b2", "40元/证，")
     );
 }

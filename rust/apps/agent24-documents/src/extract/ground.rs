@@ -1,8 +1,11 @@
 //! Turning the model's evidence into anchors (§3.2). The model names a
 //! block and quotes it; the OS looks for the quote, by `find`'s rules
-//! (§3.1, Q14), only in that block and only among the blocks the model was
-//! shown. A quote found exactly once is an anchor; found nowhere, or more
-//! than once, it is not. A value's evidence counts whole or not at all: a
+//! (§3.1, Q14), only among the blocks the model was shown. The block named
+//! is where it looks first; when the quote is not there, it looks in all of
+//! them, for the model may name the wrong one. A quote found exactly once
+//! in the block named, or else exactly once among the blocks shown, is an
+//! anchor; found nowhere, or more than once, it is not. A value's
+//! evidence counts whole or not at all: a
 //! value keeps no partial evidence, which could drop the condition or the
 //! negation that decides its meaning. And the value itself must be in one
 //! of its quotes. What the OS cannot check is whether the quotes support
@@ -29,9 +32,10 @@ pub struct Source<'a> {
 /// Why a value has no anchors: its `unsourced_reason`.
 pub mod unsourced {
     pub const NO_EVIDENCE: &str = "the model gave no evidence";
-    pub const NOT_SHOWN: &str = "a quote names a block the model was not shown";
-    pub const NOT_FOUND: &str = "a quote is not in the block it names";
-    pub const AMBIGUOUS: &str = "a quote occurs more than once in its block";
+    pub const NOT_SHOWN: &str =
+        "a quote names a block the model was not shown, and is in none it was";
+    pub const NOT_FOUND: &str = "a quote is in no block the model was shown";
+    pub const AMBIGUOUS: &str = "a quote occurs more than once in the blocks the model was shown";
     pub const VALUE_NOT_QUOTED: &str = "the value is in none of its quotes";
 }
 
@@ -94,6 +98,45 @@ impl Source<'_> {
         }
     }
 
+    /// Where a quote is: in the block it names, if the model was shown that
+    /// block and the quote is there once; else, if it is nowhere there, in
+    /// the one block of `window` that has it, once. Twice in the block named
+    /// is ambiguous there, and a longer quote is what settles it, not another
+    /// block. Found nowhere, the reason says whether the block named was shown.
+    fn locate(
+        &self,
+        window: &Window,
+        shown: &HashSet<&str>,
+        e: &Evidence,
+    ) -> Result<(&Block, (usize, usize)), &'static str> {
+        let named = shown
+            .contains(e.block_id.as_str())
+            .then(|| self.layer.blocks.iter().find(|b| b.block_id == e.block_id))
+            .flatten();
+        // Twice in the block named is ambiguous below as well: that block is one of those shown.
+        if let Some(b) = named
+            && let Ok(at) = once(&e.quote, &b.text)
+        {
+            return Ok((b, at));
+        }
+        let nowhere = if named.is_some() {
+            unsourced::NOT_FOUND
+        } else {
+            unsourced::NOT_SHOWN
+        };
+        let q = Query::new(&e.quote).ok_or(nowhere)?;
+        let mut found = window
+            .0
+            .iter()
+            .map(|&i| &self.layer.blocks[i])
+            .filter(|b| !q.find(&e.quote, &b.text).is_empty());
+        match (found.next(), found.next()) {
+            (Some(b), None) => Ok((b, once(&e.quote, &b.text)?)),
+            (Some(_), Some(_)) => Err(unsourced::AMBIGUOUS),
+            (None, _) => Err(nowhere),
+        }
+    }
+
     /// The anchors of `value`'s `evidence`, read in `window`: all of them,
     /// or why there are none.
     ///
@@ -115,13 +158,8 @@ impl Source<'_> {
             .collect();
         let mut anchors = Vec::with_capacity(evidence.len());
         for e in evidence {
-            if !shown.contains(e.block_id.as_str()) {
-                return Err(unsourced::NOT_SHOWN);
-            }
-            let Some(b) = self.layer.blocks.iter().find(|b| b.block_id == e.block_id) else {
-                return Err(unsourced::NOT_SHOWN);
-            };
-            anchors.push(self.anchor(b, once(&e.quote, &b.text)?));
+            let (b, at) = self.locate(window, &shown, e)?;
+            anchors.push(self.anchor(b, at));
         }
         let quoted = Query::new(value)
             .is_some_and(|q| anchors.iter().any(|a| !q.find(value, &a.quote).is_empty()));

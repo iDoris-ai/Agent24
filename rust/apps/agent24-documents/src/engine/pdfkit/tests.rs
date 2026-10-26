@@ -210,6 +210,30 @@ async fn the_real_helper_reads_the_s01_samples() {
     assert_eq!(unsupported.err(), Some(EngineError::Unsupported));
 }
 
+/// The real helper is built for macOS 13 and later, whichever macOS builds
+/// it: the OS package is built on one machine and run on others. This reads
+/// what the build says; it does not run the helper on macOS 13 (macOS only).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_real_helper_is_built_for_macos_13_on_any_machine() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = tempfile::tempdir().unwrap();
+    let built = Command::new(root.join("engines/pdfkit/build.sh"))
+        .arg(out.path())
+        .status()
+        .unwrap();
+    assert!(built.success(), "the helper did not build");
+    let shown = Command::new("xcrun")
+        .args(["vtool", "-show-build"])
+        .arg(out.path().join(HELPER))
+        .output()
+        .unwrap();
+    let build = String::from_utf8_lossy(&shown.stdout);
+    let oldest = |l: &str| l.split_whitespace().eq(["minos", "13.0"]);
+    let said = String::from_utf8_lossy(&shown.stderr);
+    assert!(build.lines().any(oldest), "{build}{said}");
+}
+
 const PNG_BYTES: &str = r"\211PNG\r\n\032\n";
 
 fn ask(region: Option<[f64; 4]>) -> RenderAsk {

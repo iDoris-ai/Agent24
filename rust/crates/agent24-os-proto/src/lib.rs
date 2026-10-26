@@ -29,6 +29,7 @@ pub mod initialize;
 pub mod kernel_call;
 pub mod launch;
 pub mod manifest;
+pub mod model_budget;
 pub mod module;
 pub mod proxy;
 pub mod rpc;

@@ -877,7 +877,10 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
 /// itself (unchanged contract: works with the daemon down); hot-disable
 /// (FU-61) is a best-effort step tried ONLY after a real removal, whose
 /// outcome can only add an informational line, never flip the `Result` this
-/// function already decided. This split (rather than folding into
+/// function already decided. The one thing that CAN turn a real removal
+/// into an `Err` is a failed consent revocation (ADR-K1-03 §3, fail-closed):
+/// the removal still stands and the hot stop is still tried, but the command
+/// must not report success while the consent may still be live. This split (rather than folding into
 /// `os_local`) exists because the daemon call needs the REAL `bool`
 /// `install::uninstall` returns (was something actually removed just now?)
 /// — `os_local`'s shared `Option<Result<(), String>>` shape has nowhere to
@@ -914,7 +917,14 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
 /// reached (a daemon does not start without one either): the command
 /// stands, and says the grants, if any, were not revoked.
 async fn revoke_module_consents(name: &str) -> Result<(), String> {
-    let Some(dir) = state_file::state_dir() else {
+    revoke_module_consents_in(state_file::state_dir().as_deref(), name).await
+}
+
+async fn revoke_module_consents_in(
+    state_dir: Option<&std::path::Path>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(dir) = state_dir else {
         eprintln!(
             "  HOME is not set: cannot reach a consent store, so any grants of {name} were not revoked"
         );
@@ -949,8 +959,9 @@ fn daemon_error_line(body: &serde_json::Value) -> String {
 /// happens to restart (which the daemon's own re-check then reports as
 /// `package_changed` — but only for a module that DOES eventually restart;
 /// for a long-healthy one that could be indefinite). Never starts a daemon
-/// (`attach_only`, not `connect`) and never turns into an `Err` — by the
-/// time this runs, `cmd_uninstall`'s `Ok(())` is already final.
+/// (`attach_only`, not `connect`) and never turns into an `Err` of its own —
+/// `cmd_uninstall`'s result is decided by the removal and the consent
+/// revocation, not by this.
 async fn hot_disable_best_effort(name: &str) {
     let Some(ep) = attach_only().await else {
         println!(
@@ -2264,10 +2275,38 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// No HOME, no store to reach: the command stands (review G3; the
+    /// `A24_OS_PACKAGES` install the CLI documents for containers), and
+    /// says the grants, if any, were not revoked.
+    #[tokio::test]
+    async fn consent_revocation_without_state_dir_stands() {
+        revoke_module_consents_in(None, "consent-mod")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn consent_revocation_store_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the database file should be: opening it fails.
+        std::fs::create_dir(dir.path().join("agent24.db")).unwrap();
+        let err = revoke_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap_err();
+        assert!(err.contains("consent-mod"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn consent_revocation_succeeds_with_a_writable_store() {
+        let dir = tempfile::tempdir().unwrap();
+        revoke_module_consents_in(Some(dir.path()), "consent-mod")
+            .await
+            .unwrap();
+    }
 
     // ── D0-2 `agent24 decide` guards (pre-pr-check T2) ──────────────────────
 

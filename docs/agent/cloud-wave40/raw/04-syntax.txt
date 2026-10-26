@@ -1,0 +1,7 @@
+# argv: /bin/bash -c cd /home/user/agent24 && bash -n tools/qa/rustdoc-repro/*.sh && python3 -I -B -m py_compile tools/qa/rustdoc-repro/artifact_observer.py && echo syntax-ok
+# cwd: /home/user/agent24
+# env: PATH=/usr/bin:/bin:/opt/node22/bin HOME=<0700 fake> TMPDIR=<fake> CFFIXED_USER_HOME=<fake> XDG_*=<fake> LC_ALL=C
+# exit: 0
+## stdout
+syntax-ok
+## stderr

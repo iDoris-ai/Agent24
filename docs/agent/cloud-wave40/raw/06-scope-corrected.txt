@@ -1,0 +1,17 @@
+# 修正后的范围与库存校验（取代 05-scope.txt 中失败的 ls-tree 段；原文件保留）
+## 相对 base（工作树，含待提交的 pyc 删除）改动文件
+M	baton-result.json
+A	docs/agent/cloud-wave40/raw/01-red-base.txt
+A	docs/agent/cloud-wave40/raw/02-green-final.txt
+M	tools/qa/rustdoc-repro/README.md
+M	tools/qa/rustdoc-repro/artifact_observer.py
+A	tools/qa/rustdoc-repro/tests/test_r3_hardening.py
+## 范围外 tracked 文件 ls-tree 清单 sha256: base vs 当前 index(ls-files --stage 对应 blob)
+5711697846a412e56e0db2c61c24c2afc6b033954ae6ac5087cafc0391c4f1a3  -
+65926b712fe3edf4f1b54d47b08139bd52d6657dc029e967515efeb06fb1b8de  -
+## 范围外 diff 行数
+0
+## 旧历史/legacy/原测试 diff 行数
+0
+## pycache 文件数
+0

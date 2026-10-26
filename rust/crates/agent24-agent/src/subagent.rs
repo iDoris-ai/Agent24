@@ -215,6 +215,8 @@ impl ExplorerSubagent {
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
+                temperature: None,
+                progress: None,
             };
             let mode = match &store {
                 Some(store) => match store.run_policy_snapshot(ctx.run_id()).await {

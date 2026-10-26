@@ -283,6 +283,10 @@ app.whenReady().then(async () => {
     ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' })
   ipcMain.handle(IpcChannels.OpenDesignComponentInstall, () => openDesignComponent?.install()
     ?? Promise.resolve({ state: 'unavailable', reason: 'Open Design component installer is unavailable' }))
+  ipcMain.handle(IpcChannels.OpenDesignComponentPause, () => {
+    openDesignComponent?.pause()
+    return openDesignComponent?.status() ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }
+  })
   openDesignComponent?.onProgress((status) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)

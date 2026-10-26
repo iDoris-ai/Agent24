@@ -189,14 +189,17 @@ pub fn negotiate(
 }
 
 /// The oldest protocol version this kernel still speaks. Version 2 only added
-/// a manifest field (K1-6a-G §2.6, `tools[].resource_kinds`), so a v2 kernel
-/// serves a v1 module exactly as before and need not tell the two apart on a
-/// connection: the gate is the manifest's `min_daemon_protocol`. (`main`
-/// made the same move for its own version 2, ME4-S2b.) Version 3 (K1-6a-G
-/// §2.5.1) only changed what a module that takes grants must do when told
-/// they ended, and a kernel offers grants by the manifest alone, so it too
-/// needs no telling apart on a connection.
+/// a field a module may send (ME4-S2b's `temperature`), and version 3 a
+/// manifest field (K1-6a-G §2.6, `tools[].resource_kinds`), so a newer kernel
+/// serves a v1 module exactly as before and need not tell them apart on a
+/// connection: the gate is the manifest's `min_daemon_protocol`. Version 4
+/// (K1-6a-G §2.5.1) only changed what a module that takes grants must do when
+/// told they ended, and a kernel offers grants by the manifest alone, so it
+/// too needs no telling apart on a connection.
 pub const KERNEL_PROTOCOL_MIN: u32 = 1;
+/// The newest: `agent24_domain::DAEMON_PROTOCOL_VERSION`, said here for a
+/// module's SDK, which does not depend on the domain crate.
+pub const KERNEL_PROTOCOL_MAX: u32 = agent24_domain::DAEMON_PROTOCOL_VERSION;
 
 /// What this kernel build speaks: [`KERNEL_PROTOCOL_MIN`] up to
 /// `agent24_domain::DAEMON_PROTOCOL_VERSION`, which remains the definition of
@@ -415,16 +418,17 @@ mod tests {
         );
     }
 
-    /// K1-6a-G §2.6, §2.5.1: a v3 kernel still speaks 1 to a module that
-    /// only knows 1, 2 to one that knows up to 2, and 3 to one that knows 3.
+    /// ME4-S2b §4 (B), K1-6a-G §2.6, §2.5.1: a v4 kernel still speaks 1 to a
+    /// module that only knows 1, and up to 4 to one that knows more.
     #[test]
-    fn a_v1_module_still_connects_and_a_v3_one_gets_3() {
+    fn a_v1_module_still_connects_and_a_v4_one_gets_4() {
         let k = kernel_range();
-        assert_eq!((k.min(), k.max()), (1, 3));
+        assert_eq!((k.min(), k.max()), (1, 4));
         assert_eq!(negotiate(Some(r(1, 1)), k), Ok(1));
         assert_eq!(negotiate(Some(r(1, 2)), k), Ok(2));
-        assert_eq!(negotiate(Some(r(2, 9)), k), Ok(3));
-        assert!(negotiate(Some(r(4, 9)), k).is_err());
+        assert_eq!(negotiate(Some(r(1, 3)), k), Ok(3));
+        assert_eq!(negotiate(Some(r(2, 9)), k), Ok(4));
+        assert!(negotiate(Some(r(5, 9)), k).is_err());
     }
 }
 
