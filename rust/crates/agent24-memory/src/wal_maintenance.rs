@@ -101,6 +101,9 @@ pub struct WalMaintainer {
     ok_total: u64,
     partial_total: u64,
     truncate_attempts: u64,
+    /// Test hook: runs between the PASSIVE pass and the pre-TRUNCATE re-check.
+    #[cfg(test)]
+    after_passive: Option<futures::future::BoxFuture<'static, ()>>,
 }
 
 impl KvStore {
@@ -143,6 +146,8 @@ impl KvStore {
             ok_total: 0,
             partial_total: 0,
             truncate_attempts: 0,
+            #[cfg(test)]
+            after_passive: None,
         }))
     }
 }
@@ -237,6 +242,25 @@ impl WalMaintainer {
         // Step 2: only a fully backfilled WAL is worth truncating — then the
         // TRUNCATE holds the writer lock for next to no backfill work.
         if log != done {
+            return Ok(self.back_off(now, wal_before, false));
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.after_passive.take() {
+            hook.await;
+        }
+        // Step 3: a commit since this round's idle verdict means fresh frames
+        // that TRUNCATE would have to backfill under the writer lock — skip.
+        //
+        // Residual window (stated, not closed): a transaction may still commit
+        // between this re-read and the TRUNCATE below; TRUNCATE then holds the
+        // writer lock while it backfills those frames. This is best-effort
+        // "do not block writers", not a guarantee. It is accepted because the
+        // task only runs after `idle_after` (60s default) without any write and
+        // the backfill left at that point is normally tiny.
+        let now_version = data_version(&mut self.conn).await?;
+        if now_version != version {
+            self.last_version = now_version;
+            self.last_write = now;
             return Ok(self.back_off(now, wal_before, false));
         }
         self.truncate_attempts += 1;
@@ -559,10 +583,43 @@ mod tests {
         });
         let out = m.tick(t0 + Duration::from_secs(70)).await.unwrap();
         let worst = w.await.unwrap();
-        assert!(matches!(out, TickOutcome::Done { .. }), "got {out:?}");
+        // Concurrent commits may (correctly) make the round Partial; what
+        // matters is that no writer was stalled either way.
+        assert!(
+            matches!(out, TickOutcome::Done { .. } | TickOutcome::Partial { .. }),
+            "got {out:?}"
+        );
         assert!(
             worst < Duration::from_secs(1),
             "a write stalled for {worst:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_commit_after_passive_skips_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = store(&dir).await;
+        let t0 = Instant::now();
+        let mut m = kv.wal_maintainer(cfg(), t0).await.unwrap().unwrap();
+        write_batch(&kv, "a", 50).await;
+        m.tick(t0 + Duration::from_secs(1)).await.unwrap();
+
+        let writer = kv.clone();
+        m.after_passive = Some(Box::pin(async move {
+            write_batch(&writer, "late", 1).await;
+        }));
+        let out = m.tick(t0 + Duration::from_secs(70)).await.unwrap();
+        assert!(matches!(out, TickOutcome::Partial { .. }), "got {out:?}");
+        assert_eq!(
+            m.truncate_attempts(),
+            0,
+            "TRUNCATE issued after a late commit"
+        );
+        assert_eq!(m.ok_total(), 0);
+
+        // The late commit counts as a write: a fresh idle window later, it works.
+        m.tick(t0 + Duration::from_secs(80)).await.unwrap();
+        let out = m.tick(t0 + Duration::from_secs(200)).await.unwrap();
+        assert!(matches!(out, TickOutcome::Done { .. }), "got {out:?}");
     }
 }
