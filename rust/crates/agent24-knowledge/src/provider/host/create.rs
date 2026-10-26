@@ -164,7 +164,8 @@ impl<I: Ids> Host<I> {
     /// attempt superseded or its profile removed meanwhile, it is retired at
     /// once (A.5). The rest of the write stands as a restart reads it: its
     /// principal is confirmed (S1.13), and the reason it cleared is written
-    /// back unless a newer one took its place.
+    /// back unless a newer one took its place or a later creation, written
+    /// after it, clears it again and settles it in turn.
     pub(super) fn created(&mut self, ticket: Loosening, out: &mut Output<I>) {
         let Some(i) = self.creations.iter().position(|c| c.ticket == ticket) else {
             return;
@@ -184,10 +185,13 @@ impl<I: Ids> Host<I> {
             return;
         }
         let profile = c.of.profile.clone();
+        // Confirmed in the order written: any left are later.
+        let later = self.creations.iter().any(|l| l.of.profile == profile);
         let mut left = Left::new(Change::Retire(c.of));
         if let Some(m) = self.member(&profile) {
             m.confirm_principal(c.confirmed);
-            if let Some(failure) = c.cleared.filter(|f| m.failure() == Some(*f)) {
+            let held = |f: &PlaceholderFailure| !later && m.failure() == Some(*f);
+            if let Some(failure) = c.cleared.filter(held) {
                 let profile = profile.clone();
                 left.changes
                     .push(Change::PlaceholderFailed { profile, failure });

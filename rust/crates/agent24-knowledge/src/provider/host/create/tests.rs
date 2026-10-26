@@ -352,3 +352,67 @@ fn a_superseded_binding_writes_back_the_reason_it_cleared() {
         Some(unidentified)
     );
 }
+
+/// A later creation written after the retired one clears the reason again
+/// and settles it itself: nothing is written back over it, and a failed
+/// write taken again changes nothing.
+#[test]
+fn a_later_creation_settles_the_reason_itself() {
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    step(&mut host, &mut log);
+    let first = host.attempt(&"b").unwrap();
+    host.identified("b", first, created(8, "alice"));
+    let second = host.attempt(&"b").unwrap();
+    host.identified("b", second, created(9, "alice"));
+    let (attempt, _) = host.take_write().unwrap();
+    host.written(attempt, Written::Failed);
+    step(&mut host, &mut log);
+    step(&mut host, &mut log);
+    assert_eq!(step(&mut host, &mut log), vec![C::Retire(of("b", 8))]);
+    assert!(host.take_write().is_none());
+    assert!(bound(&host, "b"));
+
+    let replayed = replay(10, log).unwrap();
+    assert_eq!(replayed.profiles.get("b").unwrap().failure, None);
+    let live: Vec<_> = replayed.bindings.iter().filter(|b| !b.retired).collect();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].of, of("b", 9));
+    assert_eq!(replayed.confirmed.get("b"), Some(&"alice"));
+    assert_eq!(confirmed_principal(&host, "b"), Some("alice"));
+}
+
+/// Only a later creation of the same profile settles the reason: another
+/// profile's changes nothing.
+#[test]
+fn another_profiles_creation_does_not_hold_the_reason_back() {
+    let rejected = PlaceholderFailure::CredentialRejected;
+    let mut log = Vec::new();
+    let mut host = host_after(Attempted::Rejected);
+    let slot = Slot::Placeholder(Placeholder::new(None));
+    host.insert(Member::new(
+        "c",
+        Profile::new(slot, true, None),
+        None,
+        false,
+    ));
+    step(&mut host, &mut log);
+    let attempt = host.attempt(&"b").unwrap();
+    host.identified("b", attempt, created(8, "alice"));
+    host.attempt(&"b").unwrap();
+    let attempt = host.attempt(&"c").unwrap();
+    host.identified("c", attempt, created(9, "carol"));
+    step(&mut host, &mut log);
+    let failed = C::PlaceholderFailed {
+        profile: "b",
+        failure: rejected,
+    };
+    step(&mut host, &mut log);
+    assert_eq!(
+        step(&mut host, &mut log),
+        vec![C::Retire(of("b", 8)), failed]
+    );
+    let replayed = replay(10, log).unwrap();
+    assert_eq!(replayed.profiles.get("b").unwrap().failure, Some(rejected));
+    assert_eq!(failure(&host, "b"), Some(rejected));
+}
