@@ -44,7 +44,7 @@ fn at(seq: u64, entry: Entry<T>) -> Record<T> {
 }
 
 fn replayed(changes: Vec<C>) -> Replayed<T> {
-    replay(log(changes)).unwrap()
+    replay(1, log(changes)).unwrap()
 }
 
 fn binding(out: &Replayed<T>, id: u32) -> &Bound<T> {
@@ -53,7 +53,7 @@ fn binding(out: &Replayed<T>, id: u32) -> &Bound<T> {
 
 #[test]
 fn an_empty_log_is_off_with_nothing_else() {
-    let out = replay(Vec::<Record<T>>::new()).unwrap();
+    let out = replay(1, Vec::<Record<T>>::new()).unwrap();
     assert!(out.off && !out.prompt && !out.shut_down);
     assert!(out.profiles.is_empty() && out.bindings.is_empty() && out.runs.is_empty());
     assert_eq!(out.highest, 0);
@@ -162,10 +162,12 @@ fn a_write_found_with_its_void_keeps_only_what_outlives_it() {
     for pair in [[Entry::Void, write()], [write(), Entry::Void]] {
         let mut records = log(vec![bind("a", 1, 1)]);
         records.extend(pair.into_iter().map(|e| at(2, e)));
-        let out = replay(records).unwrap();
+        let out = replay(1, records).unwrap();
         assert!(binding(&out, 1).retired);
         assert_eq!(out.bindings.len(), 1);
         assert!(!out.shut_down);
+        // The new binding's first value may have been used all the same.
+        assert_eq!(out.highest, 9);
     }
     // A generation value outlives it.
     let raised = C::Generation {
@@ -174,11 +176,11 @@ fn a_write_found_with_its_void_keeps_only_what_outlives_it() {
     };
     let mut records = log(vec![bind("a", 1, 1)]);
     records.extend([at(2, Entry::Void), at(2, Entry::Changes(vec![raised]))]);
-    assert_eq!(binding(&replay(records).unwrap(), 1).generation, 6);
+    assert_eq!(binding(&replay(1, records).unwrap(), 1).generation, 6);
     // Without its void the whole write counts.
     let mut records = log(vec![bind("a", 1, 1)]);
     records.push(at(2, write()));
-    let out = replay(records).unwrap();
+    let out = replay(1, records).unwrap();
     assert_eq!(out.bindings.len(), 2);
     assert!(out.shut_down);
 }
@@ -187,20 +189,28 @@ fn a_write_found_with_its_void_keeps_only_what_outlives_it() {
 fn numbers_that_skip_go_back_or_disagree_are_damage() {
     let on = || Entry::Changes(vec![C::On]);
     let off = || Entry::Changes(vec![C::Off]);
-    assert_eq!(replay(vec![at(1, on()), at(3, off())]), Err(Damaged));
-    assert_eq!(replay(vec![at(2, on()), at(1, off())]), Err(Damaged));
-    assert_eq!(replay(vec![at(1, on()), at(1, off())]), Err(Damaged));
+    assert_eq!(replay(1, vec![at(1, on()), at(3, off())]), Err(Damaged));
+    assert_eq!(replay(1, vec![at(2, on()), at(1, off())]), Err(Damaged));
+    assert_eq!(replay(1, vec![at(1, on()), at(1, off())]), Err(Damaged));
     assert_eq!(
-        replay(vec![at(1, Entry::Void), at(1, on()), at(1, off())]),
+        replay(1, vec![at(1, Entry::Void), at(1, on()), at(1, off())]),
         Err(Damaged)
     );
+    // A log missing its head, or numbers running past the last one.
+    assert_eq!(replay(1, vec![at(2, on())]), Err(Damaged));
+    assert_eq!(replay(4, vec![at(1, on())]), Err(Damaged));
+    let last = vec![at(u64::MAX, off()), at(0, on())];
+    assert_eq!(replay(u64::MAX, last), Err(Damaged));
     // The same write or void again is a retry.
-    let out = replay(vec![
-        at(4, on()),
-        at(4, on()),
-        at(5, Entry::Void),
-        at(5, Entry::Void),
-    ]);
+    let out = replay(
+        4,
+        vec![
+            at(4, on()),
+            at(4, on()),
+            at(5, Entry::Void),
+            at(5, Entry::Void),
+        ],
+    );
     assert!(!out.unwrap().off);
 }
 
@@ -354,5 +364,5 @@ fn only_a_shutdown_last_of_all_is_clean() {
     assert!(!replayed(vec![C::Shutdown, C::Started]).shut_down);
     let mut records = log(vec![C::Shutdown]);
     records.push(at(2, Entry::Void));
-    assert!(!replay(records).unwrap().shut_down);
+    assert!(!replay(1, records).unwrap().shut_down);
 }

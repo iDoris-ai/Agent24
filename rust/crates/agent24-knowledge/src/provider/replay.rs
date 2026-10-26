@@ -77,19 +77,22 @@ pub struct Replayed<I: Ids> {
     pub profiles: HashMap<I::Profile, ProfileState<I>>,
     pub bindings: Vec<Bound<I>>,
     pub runs: Vec<(I::Run, RunSet<I>)>,
-    /// The highest generation persisted for any binding, retired ones
-    /// included: new values go past it (S4.4).
+    /// The highest generation in the log, for any binding: retired ones, and
+    /// new ones whose write was given up. New values go past it (S4.4).
     pub highest: u64,
     /// The last record is a clean shutdown (A.4).
     pub shut_down: bool,
 }
 
-/// Replays `records` in the order read. Each number follows the one before;
-/// a number may hold a write and its void, in either order, each possibly
-/// twice (a retry). Of a write found with its void only the changes
-/// that outlive it count ([`Change::outlives_void`]): an atomic write is
-/// split, the stricter part kept.
+/// Replays `records` in the order read. The first number is `start`, the
+/// one the log's header or baseline gives (A.3), so a log missing its head
+/// is damage; each number follows the one before. A number may hold a write
+/// and its void, in either order, each possibly twice (a retry). Of a write
+/// found with its void only the changes that outlive it count
+/// ([`Change::outlives_void`]): an atomic write is split, the stricter part
+/// kept.
 pub fn replay<I: Ids>(
+    start: u64,
     records: impl IntoIterator<Item = Record<I>>,
 ) -> Result<Replayed<I>, Damaged> {
     let mut out = Replayed {
@@ -110,8 +113,14 @@ pub fn replay<I: Ids>(
                 Entry::Changes(c) if s.write.as_ref() == Some(&c) => {}
                 Entry::Changes(_) => return Err(Damaged),
             },
-            Some(s) if seq != s.seq + 1 => return Err(Damaged),
             _ => {
+                let expected = match &slot {
+                    Some(s) => s.seq.checked_add(1).ok_or(Damaged)?,
+                    None => start,
+                };
+                if seq != expected {
+                    return Err(Damaged);
+                }
                 if let Some(done) = slot.take() {
                     settle(&mut out, done);
                 }
@@ -141,6 +150,10 @@ fn settle<I: Ids>(out: &mut Replayed<I>, Slot { write, void, .. }: Slot<I>) {
     for change in write.into_iter().flatten() {
         if !void || change.outlives_void() {
             apply(out, change);
+        } else if let Change::Bind { generation, .. } = change {
+            // The binding is not there, but its first value may have been
+            // used: new values still go past it (S4.4).
+            out.highest = out.highest.max(generation);
         }
     }
 }
