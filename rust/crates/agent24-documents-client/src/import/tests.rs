@@ -1286,15 +1286,42 @@ async fn every_request_has_its_method_and_content_type() {
     );
 }
 
-/// Every code in `RETRY` is sent again, at most three sends per step; any
-/// other error is returned after one send.
+/// The codes sent again, as `documents-import.ts` lists them (ADR-DOC-02
+/// §6): written out here, not read from `RETRY`, so a code dropped or added
+/// there turns this red.
+const RETRY_CONTRACT: [&str; 16] = [
+    "backend_not_ready",
+    "backend_unreachable",
+    "backend_timeout",
+    "module_overloaded",
+    "module_stopping",
+    "module_not_ready",
+    "module_draining",
+    "request_abandoned",
+    "upstream_timeout",
+    "upstream_connection_closed",
+    "upstream_unavailable",
+    "upstream_response_too_large",
+    "duplicate_request_id",
+    "module_panicked",
+    "module_killed",
+    "stop_failed",
+];
+
+/// Every code in the contract is sent again, at most three sends per step;
+/// any other error is returned after one send.
 #[tokio::test]
 async fn each_retry_code_is_sent_again_up_to_three_times() {
     let _guard = begin().await;
+    let mut ours = RETRY.to_vec();
+    let mut want = RETRY_CONTRACT.to_vec();
+    ours.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(ours, want);
     let dir = WorkDir::new();
     let (path, _) = dir.file(10, "a.pdf").await;
     for fails in [2u64, 3] {
-        for code in RETRY.iter().copied().chain(["conflict"]) {
+        for code in RETRY_CONTRACT.iter().copied().chain(["conflict"]) {
             let sends = Arc::new(AtomicU64::new(0));
             let n = Arc::clone(&sends);
             let os = FnSend::new(move |req: Request| {
@@ -1402,13 +1429,14 @@ async fn one_run_walks_at_most_64_expired_uploads() {
 #[tokio::test]
 async fn the_chain_memory_keeps_the_newest_1024_files() {
     let _guard = begin().await;
-    for i in 0..=MAX_TAILS {
+    // 1024 written out, not `MAX_TAILS`, so the bound itself is pinned.
+    for i in 0..=1024 {
         chain_remember(&format!("k{i}"), "r", "a");
     }
     assert_eq!(chain_hint("k0"), None);
     assert_eq!(chain_hint("k1"), Some(("r".to_owned(), "a".to_owned())));
-    assert!(chain_hint(&format!("k{MAX_TAILS}")).is_some());
-    assert_eq!(with_tails(|t| t.len()), MAX_TAILS);
+    assert!(chain_hint("k1024").is_some());
+    assert_eq!(with_tails(|t| t.len()), 1024);
     chain_remember("k1", "r", "b");
     chain_remember("extra", "r", "a");
     assert_eq!(chain_hint("k2"), None);
