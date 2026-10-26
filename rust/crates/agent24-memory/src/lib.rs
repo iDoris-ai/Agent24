@@ -24,6 +24,7 @@ pub mod session;
 pub mod session_log;
 pub mod trace;
 pub mod vector;
+pub mod wal_maintenance;
 pub mod writer;
 
 use std::path::Path;
