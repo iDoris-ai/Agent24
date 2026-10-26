@@ -588,6 +588,28 @@ mod tests {
             .collect()
     }
 
+    /// shell_exec input whose only effect is creating `marker`, so a refused
+    /// call can be shown to have spawned nothing.
+    fn touch(marker: &std::path::Path) -> Map<String, Value> {
+        let mut input = Map::new();
+        input.insert(
+            "argv".to_owned(),
+            serde_json::json!(["/usr/bin/touch", marker]),
+        );
+        input
+    }
+
+    struct AllowEgress;
+    #[async_trait]
+    impl agent24_domain::EgressGate for AllowEgress {
+        async fn check(
+            &self,
+            _request: &agent24_domain::EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn an_approved_outside_directory_can_be_written_and_a_sibling_cannot() {
         let dir = tempfile::tempdir().unwrap();
@@ -850,9 +872,9 @@ mod tests {
     #[tokio::test]
     async fn shell_exec_fails_closed_when_child_network_use_cannot_be_bounded() {
         let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
         let tool = ShellExecTool::new(dir.path().to_path_buf());
-        let mut input = Map::new();
-        input.insert("argv".to_owned(), serde_json::json!(["/bin/echo", "safe"]));
+        let input = touch(&marker);
         let restricted = ctx().with_egress_policy(
             <dyn agent24_domain::EgressGate>::deny_all(),
             vec![agent24_domain::EgressResource::local_only(
@@ -866,6 +888,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
     }
 
     #[tokio::test]
@@ -1056,24 +1079,10 @@ mod tests {
 
     #[tokio::test]
     async fn local_only_shell_exec_is_denied_even_by_permissive_egress_gate() {
-        struct AllowEgress;
-        #[async_trait]
-        impl agent24_domain::EgressGate for AllowEgress {
-            async fn check(
-                &self,
-                _request: &agent24_domain::EgressRequest,
-            ) -> Result<(), agent24_domain::EgressDecision> {
-                Ok(())
-            }
-        }
-
         let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
         let tool = ShellExecTool::new(dir.path().to_path_buf());
-        let mut input = Map::new();
-        input.insert(
-            "argv".to_owned(),
-            serde_json::json!(["/bin/echo", "sensitive"]),
-        );
+        let input = touch(&marker);
         let restricted = ctx().with_egress_policy(
             Arc::new(AllowEgress),
             vec![agent24_domain::EgressResource::local_only(
@@ -1087,22 +1096,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
+    }
+
+    /// K1-6b.5d: a fully granted CloudAuthorized source and a gate that allows
+    /// everything still cannot run a child. Where a child process sends data
+    /// is unknown, and an unknown destination is refused before any gate.
+    #[tokio::test]
+    async fn cloud_authorized_shell_exec_is_denied_because_its_destination_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let granted = ctx().with_egress_policy(
+            Arc::new(AllowEgress),
+            vec![
+                agent24_domain::EgressResource::cloud_authorized("doc-1", "rev-1", 3)
+                    .with_authorization_ref("grant-1"),
+            ],
+            7,
+        );
+        let err = tool
+            .call(&granted, &touch(&marker), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
     }
 
     #[tokio::test]
     async fn shell_exec_is_denied_when_source_policy_lookup_failed() {
         let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-ran");
         let tool = ShellExecTool::new(dir.path().to_path_buf());
-        let mut input = Map::new();
-        input.insert(
-            "argv".to_owned(),
-            serde_json::json!(["/bin/echo", "unknown"]),
-        );
         let unavailable = ctx().with_egress_policy_unavailable();
         let err = tool
-            .call(&unavailable, &input, &CancellationToken::new())
+            .call(&unavailable, &touch(&marker), &CancellationToken::new())
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!marker.exists(), "a refused shell_exec must not spawn");
     }
 }

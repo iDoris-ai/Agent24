@@ -294,6 +294,47 @@ mod tests {
         assert!(request(true).authorize(&grant).await.is_err());
     }
 
+    /// K1-6b.5d: the invariants `authorize` checks before it asks any gate.
+    /// A gate that allows everything still refuses a request that is not
+    /// remote, names an empty destination or carries no resources; the same
+    /// request with all three in place passes.
+    #[tokio::test]
+    async fn a_permissive_gate_cannot_allow_what_the_invariants_refuse() {
+        struct AllowAll;
+        #[async_trait]
+        impl EgressGate for AllowAll {
+            async fn check(&self, _request: &EgressRequest) -> Result<(), EgressDecision> {
+                Ok(())
+            }
+        }
+        let granted = || {
+            EgressRequest::remote(
+                vec![
+                    EgressResource::cloud_authorized("selected_material:report", "rev-1", 2)
+                        .with_authorization_ref("grant"),
+                ],
+                EgressPurpose::ModelInference,
+                EgressDestination::exact("provider:acme"),
+                7,
+            )
+        };
+        assert!(granted().authorize(&AllowAll).await.is_ok());
+
+        let mut not_remote = granted();
+        not_remote.remote = false;
+        let mut empty_destination = granted();
+        empty_destination.destination = EgressDestination::exact("");
+        let mut no_resources = granted();
+        no_resources.resources.clear();
+        for (what, request) in [
+            ("not remote", not_remote),
+            ("empty destination", empty_destination),
+            ("no resources", no_resources),
+        ] {
+            assert!(request.authorize(&AllowAll).await.is_err(), "{what}");
+        }
+    }
+
     struct RevocableGrant(AtomicBool);
 
     #[async_trait]

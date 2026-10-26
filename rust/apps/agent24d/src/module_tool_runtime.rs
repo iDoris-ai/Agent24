@@ -2657,6 +2657,144 @@ mod tests {
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
     }
 
+    /// K1-6b.5d (b): a run whose source policy could not be read, and a
+    /// restricted run with no gate installed (how production builds it), are
+    /// refused before the module is called.
+    #[tokio::test]
+    async fn a_module_tool_is_refused_when_the_source_policy_is_unavailable() {
+        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
+        let cases = [
+            (
+                "policy unavailable",
+                context().with_egress_policy_unavailable(),
+            ),
+            (
+                "no gate",
+                context().with_egress_resources(vec![granted_resource()]),
+            ),
+        ];
+        for (what, ctx) in cases {
+            let error = registry
+                .dispatch(
+                    "fake_module.write_local",
+                    &ctx,
+                    &Map::new(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::Denied(_)), "{what}: {error}");
+        }
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A gate that allows exactly one request and nothing else.
+    struct ExactGate(agent24_domain::EgressRequest);
+    #[async_trait]
+    impl EgressGate for ExactGate {
+        async fn check(
+            &self,
+            request: &agent24_domain::EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            if *request == self.0 {
+                Ok(())
+            } else {
+                Err(agent24_domain::EgressDecision)
+            }
+        }
+    }
+
+    fn granted_resource() -> EgressResource {
+        EgressResource::cloud_authorized("doc-1", "rev-1", 3).with_authorization_ref("grant-1")
+    }
+
+    fn grant(purpose: agent24_domain::EgressPurpose, destination: &str) -> Arc<dyn EgressGate> {
+        Arc::new(ExactGate(agent24_domain::EgressRequest::remote(
+            vec![granted_resource()],
+            purpose,
+            agent24_domain::EgressDestination::exact(destination),
+            7,
+        )))
+    }
+
+    /// K1-6b.5d (c), on a test gate. The destination is the label
+    /// `{module}.{operation}`: it says which tool may receive the material,
+    /// not where the module process itself sends it (ADR-K1-02 §2.4 item 3).
+    #[tokio::test]
+    async fn an_exact_grant_reaches_only_the_module_tool_it_names() {
+        use agent24_domain::EgressPurpose;
+        let (registry, runtime, _, _) = fixture(RiskClass::Read, true, true).await;
+        let named = "fake_module.write_local";
+        let call = |ctx: ToolContext| {
+            let registry = &registry;
+            async move {
+                registry
+                    .dispatch(named, &ctx, &Map::new(), &CancellationToken::new())
+                    .await
+            }
+        };
+        let exact = grant(EgressPurpose::ModuleTool, named);
+        call(context().with_egress_policy(exact.clone(), vec![granted_resource()], 7))
+            .await
+            .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+
+        let other = |f: fn(&mut EgressResource)| {
+            let mut resource = granted_resource();
+            f(&mut resource);
+            vec![resource]
+        };
+        let scoped = |gate: &Arc<dyn EgressGate>, resources, generation| {
+            context().with_egress_policy(Arc::clone(gate), resources, generation)
+        };
+        let mismatches = [
+            (
+                "resource",
+                scoped(&exact, other(|r| r.resource_id = "doc-2".into()), 7),
+            ),
+            (
+                "revision",
+                scoped(&exact, other(|r| r.revision = Some("rev-2".into())), 7),
+            ),
+            (
+                "authorization",
+                scoped(
+                    &exact,
+                    other(|r| r.authorization_ref = Some("grant-2".into())),
+                    7,
+                ),
+            ),
+            (
+                "policy version",
+                scoped(&exact, other(|r| r.policy_version = 4), 7),
+            ),
+            ("generation", scoped(&exact, vec![granted_resource()], 8)),
+            (
+                "destination",
+                scoped(
+                    &grant(EgressPurpose::ModuleTool, "fake_module.other"),
+                    vec![granted_resource()],
+                    7,
+                ),
+            ),
+            (
+                "purpose",
+                scoped(
+                    &grant(EgressPurpose::McpTool, named),
+                    vec![granted_resource()],
+                    7,
+                ),
+            ),
+        ];
+        for (what, ctx) in mismatches {
+            let Err(error) = call(ctx).await else {
+                panic!("a grant mismatched in {what} must be refused");
+            };
+            assert!(matches!(error, ToolError::Denied(_)), "{what}: {error}");
+        }
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    }
+
     /// K1-6a-G §4 case 1: a withheld tool called by name, on either
     /// dispatch path, is refused before the module and audited as denied.
     #[tokio::test]

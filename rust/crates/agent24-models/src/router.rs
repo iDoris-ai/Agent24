@@ -943,6 +943,50 @@ mod tests {
         assert_eq!(local.calls(), 0);
     }
 
+    /// K1-6b.5d: a run's model override is a model id, never a tier. `route`
+    /// reads only the profile and provider health, so an override naming
+    /// either provider leaves the routed tier as the profile chose it, and a
+    /// LocalOnly run never reaches the remote one.
+    #[tokio::test]
+    async fn a_model_override_never_changes_the_routed_tier() {
+        let cases = [
+            (Privacy::Any, Complexity::Simple, "local"),
+            (Privacy::Any, Complexity::Complex, "remote"),
+            (Privacy::LocalOnly, Complexity::Complex, "local"),
+        ];
+        for (privacy, complexity, expected) in cases {
+            for model in ["local", "remote"] {
+                let local = StubProvider::ok("local");
+                let remote = StubProvider::ok("remote");
+                let r = router(vec![
+                    (local.clone(), Tier::Local),
+                    (remote.clone(), Tier::Remote),
+                ]);
+                let (gate, resources) = authorized_test_scope();
+                let mut request = req();
+                request.model = Some(model.to_owned());
+                let (name, _) = r
+                    .complete_with_egress(
+                        TaskProfile {
+                            privacy,
+                            complexity,
+                        },
+                        &request,
+                        &CancellationToken::new(),
+                        gate,
+                        resources,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                let case = format!("{privacy:?}/{complexity:?}, override {model}");
+                assert_eq!(name, expected, "{case}");
+                let unused = if expected == "local" { &remote } else { &local };
+                assert_eq!(unused.calls(), 0, "{case}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn remote_provider_is_not_called_without_a_host_egress_gate() {
         let remote = StubProvider::ok("remote");

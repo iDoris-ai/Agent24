@@ -68,8 +68,8 @@
 
 | 消费方 | (a) | (b) | (c) | (d) |
 |---|---|---|---|---|
-| **模块工具** | `module_tool_runtime.rs` `restricted_module_tool_is_denied_when_egress_gate_denies` | **缺**：政策不可用 → 拒绝，运行时零调用 | **缺** | `module_tool_runtime.rs` `granted_fake_module_is_advertised_and_callable` |
-| **shell_exec** | `local.rs` `shell_exec_fails_closed_when_child_network_use_cannot_be_bounded`、`local_only_shell_exec_is_denied_even_by_permissive_egress_gate`；**缺**：零副作用断言（两条都用 `/bin/echo`） | `local.rs` `shell_exec_is_denied_when_source_policy_lookup_failed`；`lib.rs` `restricted_or_unknown_sources_of_any_kind_restrict_tool_egress`；**缺**：经 `tool_context_for` 的快照为空、读失败两个分支 | **缺**：CloudAuthorized 加放行 gate 仍被拒（目的地未知） | `local.rs` `shell_exec_runs_for_ordinary_run_without_egress_policy`、`ordinary_shell_exec_runs_after_approval_without_egress_gate`；`lib.rs` `approved_shell_exec_actually_executes` |
+| **模块工具** | `module_tool_runtime.rs` `restricted_module_tool_is_denied_when_egress_gate_denies` | `a_module_tool_is_refused_when_the_source_policy_is_unavailable`（政策不可用、没装 gate 两种情况，运行时零调用；6b.5d） | `an_exact_grant_reaches_only_the_module_tool_it_names`（测试 gate，目的地是 `模块.操作` 这个标签，同 §3 的注；正例，以及资料、修订、授权引用、政策版本、代次、目的地、用途逐项不匹配的负例；6b.5d） | `module_tool_runtime.rs` `granted_fake_module_is_advertised_and_callable` |
+| **shell_exec** | `local.rs` `shell_exec_fails_closed_when_child_network_use_cannot_be_bounded`、`local_only_shell_exec_is_denied_even_by_permissive_egress_gate`（6b.5d 起改用 `touch`，断言子进程没跑） | `local.rs` `shell_exec_is_denied_when_source_policy_lookup_failed`（同样断言零副作用）；`lib.rs` `restricted_or_unknown_sources_of_any_kind_restrict_tool_egress`、`a_run_with_no_readable_sources_restricts_tool_egress`（经 `tool_context_for`：没有标签、标签读失败；6b.5d） | `local.rs` `cloud_authorized_shell_exec_is_denied_because_its_destination_is_unknown`（授权齐全的 CloudAuthorized 加放行 gate 仍被拒，子进程没跑；6b.5d）；`domain/egress.rs` `a_permissive_gate_cannot_allow_what_the_invariants_refuse`（非远端、空目的地、没有资源） | `local.rs` `shell_exec_runs_for_ordinary_run_without_egress_policy`、`ordinary_shell_exec_runs_after_approval_without_egress_gate`；`lib.rs` `approved_shell_exec_actually_executes` |
 | **模块进程自身出网** | 没有网络沙箱。**已知限制**：只靠调用前的出口门（受限 run 一律拒） | — | — | — |
 
 `has_remote` 过渡门（`module_tool_runtime.rs` 的 `blocked_by_remote_tier_guard`）现有测试：
@@ -90,8 +90,8 @@
 | 模块投递 | 走模块的本机代次通道，载荷不带会话内容 |
 | 续轮（会话下限，6b.4c） | (a)：`lib.rs` `a_restricted_earlier_turn_restricts_the_later_turns_of_its_session`、`prior_session_context_without_a_recorded_floor_is_unknown`（都断言工具出口被拒）<br>分类传播（不算 (a)，只断言分类）：`the_chat_prelude_classifies_client_history_by_the_session_floor`<br>(b)：见 run_loop 一行<br>(d)：`an_ordinary_session_stays_ordinary_across_turns`<br>残余风险：会话已有下限时，客户端搬来的历史按这条下限计（#1203 G1，David 接受） |
 | self-wake（6b.4d） | (a)：`lib.rs` `a_self_wake_run_carries_the_classification_recorded_at_creation`（断言工具出口被拒）<br>分类传播（不算 (a)）：`lib.rs` `a_restricted_self_wake_raises_its_session_floor_for_later_turns`（只断言写入记忆的分类）；`self_wake.rs` `a_wake_records_the_strictest_source_of_the_run_that_created_it`（只断言记下的分类）<br>(b)：`a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model`、`a_wake_whose_sources_cannot_be_recorded_is_not_created`<br>(d)：`a_user_schedule_run_has_no_schedule_origin` |
-| 恢复停放的 run | (a) 只有直接调 `run_loop` 的那一条。**缺**：带受限来源的 run 经 `drive_resume`/`restore_pending_approvals` 恢复后，shell_exec 被拒、零 spawn。恢复时不重新合并下限（#1204 G4，David 定） |
-| 模型 override | 只换 model id：`ModelRouter::route` 只看 tier 顺序和健康状况，不读 `req.model`。**缺**：钉住「override 不改路由 tier」的测试 |
+| 恢复停放的 run | (a)：直接调 `run_loop` 的那一条；`lib.rs` `a_restricted_run_resumed_after_a_restart_still_cannot_spawn`（带 Restricted 来源、停在 shell_exec 审批上的 run，经 `restore_pending_approvals`、批准、`resume_run` 恢复后子进程没跑；只有 Ordinary 来源的对照会跑；6b.5d）。恢复时不重新合并下限（#1204 G4，David 定） |
+| 模型 override | 只换 model id：`ModelRouter::route` 只看 tier 顺序和健康状况，不读 `req.model`。`router.rs` `a_model_override_never_changes_the_routed_tier`（override 指向哪个 provider 都不改 profile 选的 tier；LocalOnly 不会到远端；6b.5d） |
 
 ## 6. 不在矩阵内、或计划与代码不一致的
 
