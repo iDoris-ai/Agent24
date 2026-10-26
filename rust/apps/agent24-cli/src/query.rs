@@ -78,11 +78,9 @@ pub enum ConsentAction {
         #[arg(long, help = JSON_HELP)]
         json: bool,
     },
-    /// 导出模块工具授权
-    Export {
-        #[arg(long, help = JSON_HELP)]
-        json: bool,
-    },
+    /// 原样导出模块工具授权（始终输出完整 JSON，含作用域/版本/有效期；
+    /// 用于备份或迁移，可直接 `> backup.json`，没有表格视图）
+    Export,
 }
 
 #[derive(clap::Subcommand)]
@@ -246,7 +244,7 @@ pub async fn timings(
 pub async fn consent(action: ConsentAction) -> Result<(), String> {
     let (read, json) = match action {
         ConsentAction::List { json } => (Read::Consents, json),
-        ConsentAction::Export { json } => (Read::ConsentExport, json),
+        ConsentAction::Export => (Read::ConsentExport, true),
     };
     run(read, json).await
 }
@@ -486,7 +484,13 @@ async fn execute(ep: &crate::Endpoint, read: &Read, json: bool) -> Result<String
     }
     let body: Value = serde_json::from_str(&text)
         .map_err(|e| format!("daemon returned {status} but the body is not JSON: {e}"))?;
-    if json { Ok(text) } else { render(&body, view) }
+    // `consent export` is a backup/migration artifact: always the daemon's
+    // JSON, byte for byte, never a lossy table.
+    if json || matches!(read, Read::ConsentExport) {
+        Ok(text)
+    } else {
+        render(&body, view)
+    }
 }
 
 fn render(body: &Value, view: View) -> Result<String, String> {
@@ -932,16 +936,52 @@ mod tests {
         ]
     }
 
-    /// The `operationId`'s 200 response references `schema`.
-    fn op_refs(operation_id: &str, schema: &str) -> bool {
-        const YAML: &str = include_str!("../../../../protocol/openapi.yaml");
+    const OPENAPI: &str = include_str!("../../../../protocol/openapi.yaml");
+
+    /// Schema name of the first `$ref` in `text`.
+    fn first_ref(text: &str) -> Option<String> {
+        let rest = text.split_once("#/components/schemas/")?.1;
+        Some(
+            rest.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect(),
+        )
+    }
+
+    fn op_segment<'a>(yaml: &'a str, operation_id: &str) -> &'a str {
         let tag = format!("operationId: {operation_id}");
-        let Some(start) = YAML.find(&tag) else {
-            return false;
-        };
-        let rest = &YAML[start + tag.len()..];
-        let end = rest.find("operationId:").unwrap_or(rest.len());
-        rest[..end].contains(&format!("#/components/schemas/{schema}\""))
+        let rest = &yaml[yaml.find(&tag).expect("operationId") + tag.len()..];
+        &rest[..rest.find("operationId:").unwrap_or(rest.len())]
+    }
+
+    /// What the operation's 200 response `$ref`s directly (named list schema).
+    fn op_200_ref(yaml: &str, operation_id: &str) -> Option<String> {
+        first_ref(op_segment(yaml, operation_id).split_once("\"200\":")?.1)
+    }
+
+    /// Item schema of `key` in an inline wrapper under the operation's 200.
+    fn inline_items_ref(yaml: &str, operation_id: &str, key: &str) -> Option<String> {
+        let seg = op_segment(yaml, operation_id).split_once("properties:")?.1;
+        first_ref(seg.split_once(&format!("{key}:"))?.1)
+    }
+
+    /// Item schema of `key` in the named list schema `list`.
+    fn named_items_ref(yaml: &str, list: &str, key: &str) -> Option<String> {
+        let head = format!("    {list}:");
+        let block: String = yaml
+            .lines()
+            .skip_while(|l| *l != head)
+            .skip(1)
+            .take_while(|l| l.trim().is_empty() || l.starts_with("     "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        first_ref(
+            block
+                .split_once("properties:")?
+                .1
+                .split_once(&format!("{key}:"))?
+                .1,
+        )
     }
 
     /// The table must cover every `Read` variant (so a new command cannot
@@ -994,18 +1034,88 @@ mod tests {
             }
             match (view.list_key, wrap) {
                 (Some(key), Wrap::Inline(op)) => {
-                    assert!(wrapper_requires(op, key), "{op} does not wrap in `{key}`")
+                    assert!(wrapper_requires(op, key), "{op} does not wrap in `{key}`");
+                    assert_eq!(
+                        inline_items_ref(OPENAPI, op, key).as_deref(),
+                        Some(schema),
+                        "{op}.{key} items point at the wrong schema"
+                    );
                 }
                 (Some(key), Wrap::Named(list, op)) => {
                     assert!(
                         schema_fields(list).0.iter().any(|r| r == key),
                         "{list} does not require `{key}`"
                     );
-                    assert!(op_refs(op, list), "{op} does not return {list}");
+                    assert_eq!(
+                        op_200_ref(OPENAPI, op).as_deref(),
+                        Some(list),
+                        "{op} does not return {list}"
+                    );
+                    assert_eq!(
+                        named_items_ref(OPENAPI, list, key).as_deref(),
+                        Some(schema),
+                        "{list}.{key} items point at the wrong schema"
+                    );
                 }
                 (None, Wrap::None) => {}
                 _ => panic!("list/wrapper mismatch for {schema}"),
             }
+        }
+    }
+
+    /// Counter-examples: a wrong `$ref` in the contract must be visible to
+    /// the resolvers (so the check above cannot pass vacuously).
+    #[test]
+    fn ref_resolvers_catch_a_wrong_reference() {
+        assert_eq!(
+            named_items_ref(OPENAPI, "ModuleAuthorizationList", "authorizations").as_deref(),
+            Some("ModuleAuthorization")
+        );
+        let wrong = OPENAPI.replace(
+            r##"items: { $ref: "#/components/schemas/ModuleAuthorization" }"##,
+            r##"items: { $ref: "#/components/schemas/Timing" }"##,
+        );
+        assert_ne!(wrong, OPENAPI, "mutation did not apply");
+        assert_eq!(
+            named_items_ref(&wrong, "ModuleAuthorizationList", "authorizations").as_deref(),
+            Some("Timing")
+        );
+        let wrong_op = OPENAPI.replacen(
+            r##"$ref: "#/components/schemas/ModuleAuthorizationList""##,
+            r##"$ref: "#/components/schemas/Timing""##,
+            1,
+        );
+        assert_eq!(
+            op_200_ref(&wrong_op, "listModuleConsents").as_deref(),
+            Some("Timing")
+        );
+        assert_eq!(
+            inline_items_ref(OPENAPI, "listTimings", "timings").as_deref(),
+            Some("Timing")
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_export_is_always_the_raw_json_backup() {
+        let body = r#"{"authorizations":[{"module":"sin90","tool":"fs","module_version":"1.0.0","scope_summary":{"readable":"a","writable":null,"external":"c"},"host_risk":"high","source":"manual_install","decided_at":"2026-10-26T01:00:00Z","expires_at":"2026-11-26T01:00:00Z","status":"revoked"}]}"#;
+        let (port, _) = stub("200 OK", body);
+        // json=false: the default must still be the raw JSON.
+        let out = execute(&endpoint(port), &Read::ConsentExport, false)
+            .await
+            .unwrap();
+        assert_eq!(out, body);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed, serde_json::from_str::<Value>(body).unwrap());
+        let (required, _) = schema_fields("ModuleAuthorization");
+        let item = &parsed["authorizations"][0];
+        for f in &required {
+            assert!(item.get(f).is_some(), "export lost `{f}`");
+        }
+        for f in schema_fields("ModuleAuthorization").1 {
+            assert!(item.get(&f).is_some(), "export lost `{f}`");
+        }
+        for f in ["readable", "writable", "external"] {
+            assert!(item["scope_summary"].get(f).is_some(), "lost scope `{f}`");
         }
     }
 
