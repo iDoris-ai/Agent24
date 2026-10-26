@@ -85,12 +85,16 @@ export function importFile(
     child.on('error', unstartable)
     child.stdout?.setEncoding('utf8')
     child.stdout?.on('data', (chunk: string) => {
+      if (settled) return
       pending += chunk
       for (let nl = pending.indexOf('\n'); nl >= 0; nl = pending.indexOf('\n')) {
+        if (nl > MAX_LINE_CHARS) break
         take(pending.slice(0, nl))
         pending = pending.slice(nl + 1)
       }
-      if (pending.length > MAX_LINE_CHARS) {
+      // A whole line, or the start of one, past the bound: stop.
+      const nl = pending.indexOf('\n')
+      if ((nl < 0 ? pending.length : nl) > MAX_LINE_CHARS) {
         pending = ''
         child.kill()
         settle(fail(502, 'invalid_response', 'the import tool wrote a line too long'))

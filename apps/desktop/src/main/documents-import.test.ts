@@ -70,8 +70,10 @@ describe('importFile through agent24 documents import', () => {
 
   it('reads lines split across chunks, a last line without a newline, and skips what is not its JSON', async () => {
     const line = result({ ok: true, status: 200, data: JOB })
+    const seen: unknown[] = []
     const cli = fakeCli(['not json\n', '{"type":"progress","sent":"x","total":1}\n', line.slice(0, 9), line.slice(9).trimEnd()])
-    expect(await importFile('/a.pdf', () => EP, () => {}, cli.spawn, 'agent24')).toEqual({ ok: true, status: 200, data: JOB })
+    expect(await importFile('/a.pdf', () => EP, (p) => seen.push(p), cli.spawn, 'agent24')).toEqual({ ok: true, status: 200, data: JOB })
+    expect(seen).toEqual([])
   })
 
   it('no daemon yet is backend_not_ready, and the CLI is not run', async () => {
@@ -100,10 +102,13 @@ describe('importFile through agent24 documents import', () => {
     }
   })
 
-  it('a line past the bound stops the CLI and answers invalid_response', async () => {
-    const cli = fakeCli(['x'.repeat(4 * 1024 * 1024 + 1)])
-    const res = await importFile('/a.pdf', () => EP, () => {}, cli.spawn, 'agent24')
-    expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the import tool wrote a line too long' } })
-    expect(cli.killed()).toBe(true)
+  it('a line past the bound stops the CLI and answers invalid_response, ended or not', async () => {
+    const long = result({ ok: true, status: 200, data: { ...JOB, pad: 'x'.repeat(4 * 1024 * 1024) } })
+    for (const lines of [['x'.repeat(4 * 1024 * 1024 + 1)], [long], ['x'.repeat(4 * 1024 * 1024 - 1), 'xx\n' + result({ ok: true, status: 200, data: JOB })]]) {
+      const cli = fakeCli(lines)
+      const res = await importFile('/a.pdf', () => EP, () => {}, cli.spawn, 'agent24')
+      expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the import tool wrote a line too long' } })
+      expect(cli.killed()).toBe(true)
+    }
   })
 })
