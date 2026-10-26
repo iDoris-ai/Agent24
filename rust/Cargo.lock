@@ -436,6 +436,7 @@ dependencies = [
  "agent24-decide",
  "agent24-domain",
  "agent24-hw",
+ "agent24-knowledge",
  "agent24-mcp",
  "agent24-memory",
  "agent24-models",
