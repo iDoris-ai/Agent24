@@ -38,7 +38,7 @@ fn seq_of(thread: &[RunMessage], text: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn paused_snapshot_notice_is_missing_and_neighbors_are_present() {
+async fn paused_snapshot_notice_is_host_system_and_neighbors_are_present() {
     let (manager, store, kv) =
         manager_with_memory(Arc::new(HangingProvider), Arc::new(UnusedSummarizer)).await;
     seed_session(&store, "snap-pause").await;
@@ -87,7 +87,10 @@ async fn paused_snapshot_notice_is_missing_and_neighbors_are_present() {
         .seq;
     assert_eq!(summary, notice + 1);
     let notice_origin = store.read_run_message_origin(&run.id, notice).await.unwrap();
-    assert!(matches!(notice_origin, MessageOriginLookup::Missing));
+    assert!(matches!(
+        &notice_origin,
+        MessageOriginLookup::Present(stored) if stored.origin == MessageOrigin::HostSystem
+    ));
     assert!(!format!("{notice_origin:?}").contains("NoRecall"));
     assert_eq!(
         present(&store, &run.id, summary).await,
