@@ -62,7 +62,7 @@ fn an_empty_log_is_off_with_nothing_else() {
 #[test]
 fn the_records_give_back_the_state_in_their_order() {
     let a = of("a", 1);
-    let cause = UnavailableCause::Incompatible;
+    let cause = StuckCause::Incompatible;
     let out = replayed(vec![
         C::Started,
         C::On,
@@ -156,14 +156,23 @@ fn the_records_give_back_the_state_in_their_order() {
 fn a_write_found_with_its_void_keeps_only_what_outlives_it() {
     let new = bind("a", 2, 9);
     let retire = C::Retire(of("a", 1));
-    let write = || Entry::Changes(vec![retire.clone(), new.clone(), C::Shutdown]);
-    // The void before the write or after it: the retirement stands, the new
-    // binding and the clean shutdown do not.
+    let servable = C::Servable(of("a", 1));
+    let write = || {
+        Entry::Changes(vec![
+            servable.clone(),
+            retire.clone(),
+            new.clone(),
+            C::Shutdown,
+        ])
+    };
+    // The void before the write or after it: the retirement stands, and so
+    // does "once servable" (S3.1's exception stays closed); the new binding
+    // and the clean shutdown do not.
     for pair in [[Entry::Void, write()], [write(), Entry::Void]] {
         let mut records = log(vec![bind("a", 1, 1)]);
         records.extend(pair.into_iter().map(|e| at(2, e)));
         let out = replay(1, records).unwrap();
-        assert!(binding(&out, 1).retired);
+        assert!(binding(&out, 1).retired && binding(&out, 1).servable);
         assert_eq!(out.bindings.len(), 1);
         assert!(!out.shut_down);
         // The new binding's first value may have been used all the same.
@@ -282,7 +291,7 @@ fn a_clearing_clears_only_what_it_names() {
     assert_eq!(out.profiles["a"].failure, None);
 
     let a = of("a", 1);
-    let revoked = UnavailableCause::AccessRevoked;
+    let revoked = StuckCause::AccessRevoked;
     let out = replayed(vec![
         bind("a", 1, 1),
         C::Stuck {
@@ -291,7 +300,7 @@ fn a_clearing_clears_only_what_it_names() {
         },
         C::Unstuck {
             of: a,
-            cause: UnavailableCause::Incompatible,
+            cause: StuckCause::Incompatible,
         },
     ]);
     assert_eq!(binding(&out, 1).stuck, Some(revoked));

@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use super::profile::Confirmation;
-use super::record::{Change, Ids, Of};
-use super::state::{PlaceholderFailure, UnavailableCause};
+use super::record::{Change, Ids, Of, StuckCause};
+use super::state::PlaceholderFailure;
 
 /// What one sequence number holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +62,7 @@ pub struct Bound<I: Ids> {
     pub servable: bool,
     pub logged_out: bool,
     pub revoked: bool,
-    pub stuck: Option<UnavailableCause>,
+    pub stuck: Option<StuckCause>,
 }
 
 /// A run's binding set and candidates (S4.7); `None` once unbound.
