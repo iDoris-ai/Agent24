@@ -208,11 +208,35 @@ fn run_serve(
 /// error is ignored, since the reader may be gone.
 fn say_start_failed(code: &str, error: &str) {
     use std::io::Write;
-    if server::READY_SENT.load(std::sync::atomic::Ordering::SeqCst) {
+    let ready_sent = server::READY_SENT.load(std::sync::atomic::Ordering::SeqCst);
+    let Some(line) = start_failed_line(ready_sent, code, error) else {
         return;
-    }
-    let line = serde_json::json!({ "type": "failed", "code": code, "error": error });
+    };
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// The `failed` line, or none once the ready line has gone out.
+fn start_failed_line(ready_sent: bool, code: &str, error: &str) -> Option<String> {
+    (!ready_sent)
+        .then(|| serde_json::json!({ "type": "failed", "code": code, "error": error }).to_string())
+}
+
+#[cfg(test)]
+mod start_failed_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::start_failed_line;
+
+    #[test]
+    fn nothing_follows_the_ready_line() {
+        assert_eq!(start_failed_line(true, "start_failed", "x"), None);
+        let line = start_failed_line(false, "already_running", "held").unwrap();
+        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({ "type": "failed", "code": "already_running", "error": "held" })
+        );
+    }
 }
