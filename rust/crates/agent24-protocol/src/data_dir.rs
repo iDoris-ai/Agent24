@@ -97,7 +97,9 @@ pub fn data_dir_from(
         }
         Platform::Macos | Platform::Linux => {
             let home = text(home).ok_or(DataDirError::HomeUnset)?;
-            Ok(PathBuf::from(home).join(".agent24"))
+            // Literal concatenation: no `..`/`.` folding, host-independent.
+            let home = home.trim_end_matches('/');
+            Ok(PathBuf::from(format!("{home}/.agent24")))
         }
     }
 }

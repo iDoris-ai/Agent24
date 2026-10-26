@@ -9,7 +9,6 @@
 //
 // Reads env vars directly (not os.homedir()) so it stays in lockstep with the
 // daemon, and so tests can point it at an isolated dir.
-import * as path from 'node:path'
 
 export type DataDirPlatform = 'macos' | 'linux' | 'windows'
 export type DataDirErrorCode = 'home_unset' | 'localappdata_unset'
@@ -53,7 +52,8 @@ export function resolveDataDir(platform: DataDirPlatform, env: DataDirEnv): stri
   }
   const home = env.HOME
   if (!home) throw new DataDirError('home_unset')
-  return path.posix.join(home, '.agent24')
+  // Literal concatenation: no `..`/`.` folding (must match the Rust side).
+  return `${home.replace(/\/+$/, '')}/.agent24`
 }
 
 /** The data root for this process. Throws DataDirError. */

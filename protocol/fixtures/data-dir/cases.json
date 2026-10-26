@@ -24,6 +24,10 @@
     { "name": "drive path is not absolute on posix", "platform": "linux", "env": { "AGENT24_DATA_DIR": "C:\\x", "HOME": "/home/u" }, "expect": { "path": "/home/u/.agent24" } },
     { "name": "linux missing HOME errors", "platform": "linux", "env": {}, "expect": { "error": "home_unset" } },
     { "name": "mac empty HOME errors", "platform": "macos", "env": { "HOME": "" }, "expect": { "error": "home_unset" } },
+    { "name": "HOME with .. is kept literally", "platform": "linux", "env": { "HOME": "/a/link/.." }, "expect": { "path": "/a/link/../.agent24" } },
+    { "name": "HOME with . is kept literally", "platform": "macos", "env": { "HOME": "/Users/./u" }, "expect": { "path": "/Users/./u/.agent24" } },
+    { "name": "env override with .. is kept literally", "platform": "linux", "env": { "AGENT24_DATA_DIR": "/a/link/../x", "HOME": "/h" }, "expect": { "path": "/a/link/../x" } },
+    { "name": "windows LOCALAPPDATA with .. is kept literally", "platform": "windows", "env": { "LOCALAPPDATA": "C:\\a\\link\\.." }, "expect": { "path": "C:\\a\\link\\..\\Agent24" } },
     { "name": "HOME trailing slash normalised", "platform": "macos", "env": { "HOME": "/Users/u/" }, "expect": { "path": "/Users/u/.agent24" } }
   ]
 }

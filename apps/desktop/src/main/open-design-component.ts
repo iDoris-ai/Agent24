@@ -184,7 +184,7 @@ export function loadOpenDesignComponentManifest(resourcesPath?: string): OpenDes
  * frozen module-level constant — resolves the data dir fresh every call,
  * matching the constructor's own (pre-existing) behavior of resolving it at
  * construction time rather than at module load. */
-function defaultComponentsRoot(): string {
+export function defaultComponentsRoot(): string {
   return path.join(dataDir(), 'components', 'open-design')
 }
 
