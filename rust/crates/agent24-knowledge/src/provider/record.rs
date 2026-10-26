@@ -190,6 +190,13 @@ pub enum Change<I: Ids> {
         of: Of<I>,
         from: u8,
     },
+    /// A clearing's offset: the count is at least `count` again. Not a
+    /// plain `TimedOut`, which may lower it: a timeout written while the
+    /// clearing pended, then the clearing confirmed and counting anew.
+    TimeoutsRestored {
+        of: Of<I>,
+        count: u8,
+    },
     /// Before the host deletes `kb` (S5.10).
     Tombstone {
         of: Of<I>,
@@ -233,6 +240,7 @@ impl<I: Ids> Change<I> {
             | Self::Placed { .. }
             | Self::Questioned { .. }
             | Self::TimedOut { .. }
+            | Self::TimeoutsRestored { .. }
             | Self::Tombstone { .. }
             | Self::Seen { .. }
             | Self::Unseen { .. } => Class::Tightening,
@@ -287,6 +295,7 @@ impl<I: Ids> Change<I> {
             | Self::Released { of, .. }
             | Self::TimedOut { of, .. }
             | Self::TimeoutsCleared { of, .. }
+            | Self::TimeoutsRestored { of, .. }
             | Self::Tombstone { of, .. }
             | Self::TombstoneWithdrawn { of, .. }
             | Self::Seen { of, .. }
@@ -351,7 +360,7 @@ impl<I: Ids> Change<I> {
                 version: version.saturating_add(1),
                 timeouts: None,
             },
-            Self::TimeoutsCleared { of, from } => Self::TimedOut {
+            Self::TimeoutsCleared { of, from } => Self::TimeoutsRestored {
                 of: of.clone(),
                 count: *from,
             },
@@ -377,6 +386,7 @@ impl<I: Ids> Change<I> {
             | Self::Placed { .. }
             | Self::Questioned { .. }
             | Self::TimedOut { .. }
+            | Self::TimeoutsRestored { .. }
             | Self::Tombstone { .. }
             | Self::Seen { .. }
             | Self::Unseen { .. }

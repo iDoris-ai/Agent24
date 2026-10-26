@@ -652,16 +652,18 @@ fn an_offset_or_a_repeat_takes_no_count_back() {
         evidence.pending.as_ref().map(|p| p.timeouts)
     };
     // A clearing written, a timeout meanwhile (the count still 2 in memory,
-    // so 3), then the clearing abandoned though it landed: still 3.
+    // so 3), then the clearing abandoned though it landed: its offset keeps
+    // 3.
     let cleared = C::TimeoutsCleared { of: a(), from: 2 };
     let offset = cleared.offset().unwrap();
     let again = C::TimedOut { of: a(), count: 3 };
     assert_eq!(count(vec![cleared.clone(), again, offset]), Some(3));
-    // A clearing that stood: counted afresh from 0.
-    assert_eq!(
-        count(vec![cleared, C::TimedOut { of: a(), count: 1 }]),
-        Some(1)
-    );
+    // A clearing that stood: counted afresh from 0, even past a timeout
+    // written while it pended.
+    let again = C::TimedOut { of: a(), count: 3 };
+    let anew = C::TimedOut { of: a(), count: 1 };
+    assert_eq!(count(vec![cleared.clone(), again, anew.clone()]), Some(1));
+    assert_eq!(count(vec![cleared, anew]), Some(1));
     // A release written twice keeps what the first set aside for its offset.
     let released = C::Released {
         of: a(),

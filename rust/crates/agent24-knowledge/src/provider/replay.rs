@@ -290,10 +290,15 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
                 b.released = b.evidence.pending.take();
             }
         }),
-        // Only a clearing lowers the count. An offset of a clearing that
-        // landed though abandoned may follow a timeout written meanwhile,
-        // whose count already counted from the uncleared one.
         Change::TimedOut { of, count } => on(out, &of, |b| {
+            if let Some(p) = counted(b) {
+                p.timeouts = count;
+            }
+        }),
+        // A clearing that landed though abandoned may be followed by a
+        // timeout written meanwhile, counted from the uncleared value: its
+        // offset never lowers the count.
+        Change::TimeoutsRestored { of, count } => on(out, &of, |b| {
             if let Some(p) = counted(b) {
                 p.timeouts = p.timeouts.max(count);
             }
