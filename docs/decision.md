@@ -1526,22 +1526,49 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
    - 桌面端首次运行时，征得同意后安装并启动常驻服务；用户拒绝则退回现在的子进程模式，此时单例锁仍保证同一数据目录只有一个 daemon。
    - 桌面退出默认不停 daemon，日程和后台 run 继续执行；托盘提供「完全退出（停止后台服务）」。
    - 外壳统一按 `daemon.json` 发现并接入。TUI 和 CLI 发现不到 daemon 时，提示并启动常驻实例（`agent24 daemon start` 或 `agent24 service install`），不再默认起 `--ephemeral`。`--ephemeral` 只留给测试和显式的恢复诊断，并在界面上标明「临时实例，数据不保存」。
+   - **服务模式的启动与存活**：现在 capability 模式强制要求 `--host-bootstrap-stdio`（`server.rs:validate_auth_startup`），父管道 EOF 后 daemon 关机。新增服务模式：`serve --auth-mode capabilities --enroll-endpoint`。这个模式不需要父管道，存活只受服务管理器和 `POST /shutdown` 控制，宿主权限一律经决策 3 的登记握手获得。这条修订 open-design ADR-005 中「capability daemon 由桌面拉起并绑定父进程」的约束：父进程绑定只在子进程模式下成立。ab/weknora 的 KB-HOST-01 PR-A2（#1184）和 OD-M11 F11.1 让桌面经 stdin 管道拥有 daemon，按本条改为「子进程模式退路」，不作为产品默认。
+   - **外壳与 daemon 退出时的生命周期归属**：
 
-3. **客户端分级与令牌交付。** 信任边界写明为「同一 OS 用户的本机进程」：同一用户的进程本来就能读数据库，对它们做隔离只是表演。分权的真正目的是第三方开发者应用、浏览器渲染进程和远程设备。客户端分三级：
-   - **一方本机外壳**（桌面主进程、TUI、CLI）：读 owner-only 的本机凭据获得宿主级令牌。凭据放 `~/.agent24/`：Unix 下 0600；Windows 下写入后设 ACL，只允许当前用户 SID；macOS 可改放钥匙串。这条交付路径与 `--host-bootstrap-stdio` 并存，替代「只有父进程能拿到宿主令牌」的限制。
-   - **开发者应用**（第三方本机程序）：必须持有具名、分权、可吊销的令牌。令牌通过 `agent24 token create --name --scope ...` 或桌面「开发者令牌」页签发；作用域取 `Operation` 子集，可选限定 workspace；默认带 TTL。库里只存 hash；列表、吊销和最后使用时间可见。创建高权限作用域（审批决定、grant 管理、shutdown、模块管理）必须由宿主级客户端确认。
+     | 对象 | 外壳退出 | daemon 停止或重启 | 依据 |
+     |---|---|---|---|
+     | Creative / Open Design sidecar（桌面拉起的界面服务） | 随桌面停止（属于外壳） | 断开；桌面重连后重新附着 | `main.ts:will-quit` |
+     | 附着模块（AgentEar） | 不受影响 | 断开；按 A3 §5.6 由模块自行重连，期间回到独立模式 | A3-ATTACHED-MODULE |
+     | 进程外领域 OS 与模块进程 | 不受影响（归 daemon 监管） | 随 daemon 排空并停止；重启后按启用状态恢复 | ADR-029/031 |
+     | 本地模型加载 lease | 加载者是外壳时随外壳回收 | 全部回收；重启后按需重新准入 | HW-TIERS §准入 |
+     | 进行中的 run / 审批 | 不受影响 | 按现有的停机排空与持久审批恢复处理 | SHUT、H3 恢复 |
+
+   - **版本协商与升级**：
+     - `GET /health` 返回 daemon 版本、协议版本、迁移水位。外壳接入时比对版本：协议不兼容就拒绝接入并提示升级，不做静默降级。`tryReuseExternal` 也要补这项校验，现在它只看 health。
+     - 服务二进制由桌面安装器负责更新：替换二进制，排空旧 daemon，再启动新 daemon。
+     - 跑数据库迁移前自动备份 `agent24.db`。迁移失败就回滚到备份并拒绝启动新版本，界面上给出明确提示。不可回退的迁移（如 0015–0017）必须先过这道备份门。
+
+3. **客户端分级与令牌交付：不设共享宿主秘密。** 对恶意的同 UID 本机二进制，没有 OS 隔离就防不住（ADR-031 威胁模型），本文不声称能防。但分权必须挡住两类合作进程：同用户的 Creative sidecar 和第三方插件。所以本文不采用「owner-only 文件里放一枚宿主令牌、谁读到谁是宿主」的方案，open-design ADR-005 已否决过它。客户端分三级：
+   - **一方本机外壳**（桌面主进程、TUI、CLI）：经**本机登记握手**拿到**只属于本进程的短期令牌**。
+     - **通道**：daemon 开一个 owner-only 的本机登记端点（Unix 用 UDS 0600 并取对端凭据；Windows 用命名管道 DACL 加对端 PID→SID）。
+     - **身份**：daemon 按对端 PID 解析可执行文件并校验身份。macOS 上要求代码签名的 Team ID 和 bundle 与 Agent24 一致，Windows 校验 Authenticode，Linux 校验安装路径归属。
+     - **用户感知**：签名的一方外壳自动登记，用户无感。开发构建等无法识别身份的情况，要用户在已登记的外壳里确认一次（例如桌面弹窗，或在 TUI 里输入一次性配对码）。
+     - **令牌性质**：带 TTL，按进程续期，进程退出即失效，不落普通文件。
+     - **保持不变**：ADR-035 的 iDoris Admin token 仍然只经匿名 FD/HANDLE 交付；`--host-bootstrap-stdio` 保留，作为子进程模式下的同一级通道。
+   - **开发者应用**（第三方本机程序）：只能持有具名、分权、可吊销的令牌。
+     - **签发**：在已登记的一方外壳里签发（`agent24 token create --name --scope ...`，或桌面的「开发者令牌」页）。
+     - **作用域**：取 `Operation` 子集，可限定到 workspace，默认带 TTL。
+     - **存储与可见性**：库里只存 hash；令牌列表、吊销操作、最后使用时间都可见。
+     - **高权限作用域**：包括审批决定、grant 管理、shutdown、模块管理，签发时要用户在一方外壳里单独确认。
    - **远程设备**（移动端）：不直连 HTTP，见决策 6。
-   - 渲染进程不再经 `backendProxy` 借全权 token：主进程按路径白名单转发；或者给渲染进程签发一枚只覆盖其页面所需操作的短期令牌。
-   - 开发者 API 对外宣传前必须先满足以下门（G-API）：
-     - G-API-1：每条路由都在 `required_operation` 里有映射，并能从请求中提取 workspace、session、run 资源。补齐 ARCHITECTURE-LAYERS 标 📐 的「路由级资源授权」。
+   - **渲染进程与 sidecar**：不再经 `backendProxy` 借用宿主令牌。主进程按路径白名单转发，或为页面签发只覆盖所需操作的短期令牌。Creative 和第三方插件一律按开发者应用级对待。
+   - **开发者 API 对外宣传前必须先过的门（G-API）**：
+     - G-API-1：每条路由都在 `required_operation` 里有映射，并能从请求中提取 workspace、session、run 资源，补齐 ARCHITECTURE-LAYERS 标 📐 的「路由级资源授权」。
      - G-API-2：REST 校验 Host 头（防 DNS rebinding），拒绝浏览器 Origin（桌面渲染进程的固定来源除外）。
      - G-API-3：OpenAPI 覆盖全部对外路由，CI 检查代码路由与 OpenAPI 一致。
+     - G-API-4：**事件流授权**。WS `/events` 现在向所有连接广播全部事件（`events.rs:client_loop`）。要改成按令牌主体和资源过滤，每次发送前复验，令牌吊销或过期时断开连接；配负向测试：低权限令牌收不到越权事件。
+     - G-API-5：令牌治理。只存 hash、强制 TTL、吊销即时生效；按令牌限流和配额；审计按令牌记录，正文脱敏。
    - 监听地址继续写死回环地址，不提供 bind-address 配置。
+   - **平台数据目录契约**：外壳和 daemon 共用同一个解析函数，环境变量 `AGENT24_DATA_DIR` 优先。macOS 默认仍是 `~/.agent24`，Linux 用 `$XDG_STATE_HOME/agent24`（未设时退回 `~/.local/state/agent24`），Windows 用 `%LOCALAPPDATA%\Agent24`（与 `design/WINDOWS-PORT.md` 一致）。发现文件、登记端点、日志都放在这个目录下。
 
 4. **TUI 的「全功能」定义为能力对齐，视觉类功能给兜底。** OpenAPI 的每个对外操作，必须在 CLI 子命令或 TUI 视图中有入口，或者在豁免表里写明理由。豁免限于纯视觉能力，例如 Open Design 画布、富文件预览，TUI 给出「在桌面或浏览器打开」的链接。CI 增加覆盖检查（覆盖不降，豁免表变化需评审）。TUI 仍是客户端，不是第二个运行时（ADR-026 #11 不变），但不再只是「运维面」：要有聊天输入、日程、记忆、模块、文档、审批这些视图。恢复测试场景下，TUI 在桌面不可用时要能独立拉起并诊断 daemon。
 
 5. **平台顺序：先 Mac，再 Linux，后 Windows；靠可替换部件推进，不分叉核心。**
-   - **Mac**（当前）：arm64 先行；按 10-05 裁决，未签名也照常发布，开发者账号到位后再补签名与公证；默认运行时 oMLX。
+   - **Mac**（当前）：arm64 先行，签名加公证的流程已经跑通（预发布 `v0.5.1-preview.20261016.2`）。正式版沿用这套流程，CLI 和模块包的签名（DEP-B3）一并补上。Intel 包要不要出另行决定。默认运行时 oMLX。
    - **Linux**：服务化用 systemd `--user`；运行时用 Ollama 或 llama.cpp 后端（目前只有 Ollama）；密钥存储用 Secret Service；`agent24-hw` 补齐 Linux 探测。
    - **Windows**：按 `docs/design/WINDOWS-PORT.md`（v2）用命名管道替代 UDS 和 fd 继承，`os-fd`、`os-cwd`、`workspace` 中的 Unix 路径都要按该文处置表改写；服务化用登录计划任务；凭据文件用 ACL；钥匙串开启 Windows feature；运行时同 Linux。CI 发布矩阵加入 Windows。
    - 默认运行时按平台和硬件档位选择，ADR-022 的「默认 MLX」收窄为「Apple Silicon 上默认 MLX」，选型归 iDoris（ADR-036）。
@@ -1551,6 +1578,16 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
    - 传输走 Hyphae（Nostr NIP-44）。手机与 daemon 用 Hyphae 身份配对，daemon 把配对的公钥映射为一组受限作用域，作用域与决策 3 的开发者令牌同一套模型，并可吊销。
    - daemon 不对公网或局域网开放 HTTP。
    - 遥控命令格式另写设计文档 `docs/design/REMOTE-CONTROL-HYPHAE.md`，替代 Deployment 计划中的 `REMOTE-ACCESS.md`（PWA 加 tailscale），批准后才实施。
+   - 遥控是**独立的授权入口**，不改变通信层的约束：COMM-HYPHAE §7 规定入站消息默认不触发 run（F4b 冻结，zero-run）。遥控命令只有经过配对设备的独立授权入口才能生效，普通 Hyphae 消息仍然不触发任何动作。
+   - 遥控设计文档必须回答以下问题，才算可评审：
+     - 配对：本机确认配对，并把配对绑定到目标 daemon 的身份。
+     - 授权：权限按设备和资源分别授予。
+     - 密钥：设备密钥怎么轮换、怎么吊销。
+     - 命令：每条命令有唯一 ID 和有效期，跨重启去重并保证幂等。
+     - 离线：离线期间的积压怎么处理，回执语义是什么。
+     - 审批：遥控审批绑定到确切的操作和 payload 版本，并原子地检查「仍在 pending 且未过期」；断线超时一律按拒绝处理。
+     - 审计：按设备记录。
+     - 副本：移动端不持有记忆副本，与记忆 P1 的 purge、无痕设计一致。
 
 ### 对既有 ADR 的修订
 
@@ -1558,14 +1595,18 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
 - **ADR-022**：「默认 MLX」收窄为 Apple Silicon 上的默认值；其他平台的默认运行时由 iDoris 按档位选择。
 - **ADR-026 #11**：TUI 仍不是第二个运行时，但对齐范围从运维面扩大为全部对外能力（决策 4）。
 - **ADR-027**：移动瘦壳「经 HTTP/WS 直连 daemon」和其遗留项（bind-address、远程认证）被决策 6 取代；双壳技术选型（Tauri / Expo）留待遥控设计时再定。
-- **ADR-035 / open-design ADR-004、ADR-005**：capability 模型和一次性 FD 交付保持不变。宿主令牌新增「owner-only 本机凭据」交付路径，ADR-004 中「Electron main 是唯一宿主」改为「Electron main 是宿主级客户端之一」。
+- **ADR-035**：不变。iDoris Admin token 仍只经匿名 FD/HANDLE 交付，不落普通文件。
+- **open-design ADR-004、ADR-005**：capability 模型、「不设共享宿主秘密」的结论保持不变。修订两点：一是宿主权限除了父进程管道，新增一条获取通道，即决策 3 的本机登记握手（经身份校验，只属于本进程，有 TTL）；二是 daemon 不再必须由桌面拉起并绑定父进程（决策 2 服务模式）。ADR-004 的「Electron main 是唯一宿主」改为「Electron main 是一方宿主级客户端之一」。
+- **SPEC-002 §4**：stdout ready 行每次启动交付 token 的握手，只适用于子进程模式。服务模式改走登记端点，需要同步修订。
+- **KB-HOST-01（#1184，ab/weknora）、OD-M11 F11.1**：桌面经 stdin 管道拥有 daemon 降为「子进程模式退路」。
 - **Deployment README、TASKS**：移动端条目改为指向决策 6；「v0.5.1 不发 dmg」与 10-05 裁决对齐。
 
 ### 备选与取舍
 
 - **各外壳各自带 daemon（维持现状）**：桌面、TUI 和开发者看到的不是同一份记忆和 run，桌面一退出日程就停。否决。
 - **系统级服务（root / LocalSystem）**：权限过大，多用户机器上还会跨用户共享数据，与「个人数字主权」相悖。否决。
-- **所有本机客户端都必须走 capability 握手**：同一 OS 用户的进程能直接读 SQLite 和凭据，强行隔离只增加复杂度、不增加安全。只对第三方、渲染进程和远程设备分权。
+- **在 owner-only 文件里放共享宿主令牌，一方外壳都去读**：用户无感，实现也最简单，但同用户的 Creative sidecar 和第三方插件同样能读到这个文件，分权等于没做。open-design ADR-005 已经否决过这种做法（Codex 挑战，2026-10-26）。否决，改用经身份校验的登记握手。
+- **一方外壳也逐个让用户手动配对**：安全上没有比身份校验更多的收益，却打扰用户。只对无法识别身份的开发构建要求确认。
 - **移动端直连 HTTP（ADR-027）、PWA 加 tailscale**：要把 daemon 暴露到回环之外，并新建配对、TLS、Origin 防护整套体系；Hyphae 已有加密身份和 relay。否决。
 - **TUI 完全复刻桌面视觉**：成本高、收益低。改为能力对齐加视觉兜底。
 
@@ -1573,9 +1614,11 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
 
 - 要新增的工作（具体任务进入 2026-10-26 里程碑文档）：
   - 常驻服务化：桌面安装 LaunchAgent、systemd `--user`、Windows 计划任务；
-  - 一方本机凭据交付；
+  - 服务模式启动（`--enroll-endpoint`），以及本机登记握手与身份校验（三个平台各一份实现）；
+  - 版本协商；迁移前自动备份与失败回滚；
   - 开发者令牌签发、管理和 UI；
-  - G-API-1/2/3：路由级授权、Host/Origin 校验、OpenAPI 一致性 CI；
+  - G-API-1 至 5：路由级授权、Host/Origin 校验、OpenAPI 一致性 CI、事件流授权、令牌治理；
+  - 统一的平台数据目录解析；
   - 渲染进程隔离；
   - TUI 视图补齐与覆盖 CI；
   - node-daemon 移出安装包；
