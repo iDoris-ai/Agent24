@@ -10,6 +10,7 @@ import {
   readExternalDaemonState,
   BackendManager,
   selectedBackend,
+  resolveRustBinary,
   getBackendEndpoint,
   type ExternalDaemonSource,
 } from './backend-manager'
@@ -384,5 +385,34 @@ describe('selectedBackend (ADR-037 / CORE-8: node-daemon not shipped)', () => {
     process.env['AGENT24_BACKEND'] = 'node'
     noWarnSpy()
     expect(new BackendManager({ resolveNode: ok }).backendKind()).toBe('rust')
+  })
+})
+
+describe('resolveRustBinary (ADR-037: packaged decided by injected isPackaged)', () => {
+  const prevN = process.env['NODE_ENV']
+  const prevBin = process.env['AGENT24D_BIN']
+  const prevRes = (process as { resourcesPath?: string }).resourcesPath
+  afterEach(() => {
+    if (prevN === undefined) delete process.env['NODE_ENV']
+    else process.env['NODE_ENV'] = prevN
+    if (prevBin === undefined) delete process.env['AGENT24D_BIN']
+    else process.env['AGENT24D_BIN'] = prevBin
+    ;(process as { resourcesPath?: string }).resourcesPath = prevRes
+  })
+  const exe = process.platform === 'win32' ? 'agent24d.exe' : 'agent24d'
+
+  it('isPackaged=true + inherited NODE_ENV=development → resourcesPath/backend binary', () => {
+    delete process.env['AGENT24D_BIN']
+    process.env['NODE_ENV'] = 'development'
+    ;(process as { resourcesPath?: string }).resourcesPath = '/app/Resources'
+    expect(resolveRustBinary(true)).toBe(path.join('/app/Resources', 'backend', exe))
+  })
+
+  it('isPackaged=false + NODE_ENV=production → rust/target/debug', () => {
+    delete process.env['AGENT24D_BIN']
+    process.env['NODE_ENV'] = 'production'
+    expect(resolveRustBinary(false)).toBe(
+      path.join(path.resolve(__dirname, '..', '..', '..', '..'), 'rust', 'target', 'debug', exe),
+    )
   })
 })

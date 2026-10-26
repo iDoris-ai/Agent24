@@ -17,7 +17,6 @@ const HEALTH_INTERVAL_MS = 5_000
 const HEALTH_TIMEOUT_MS = 3_000
 const MAX_HEALTH_FAILURES = 3
 
-const isDev = process.env['NODE_ENV'] === 'development'
 
 export type BackendKind = 'node' | 'rust'
 
@@ -95,11 +94,13 @@ function repoRootDev(): string {
   return path.join(__dirname, '..', '..', '..', '..')
 }
 
-function resolveRustBinary(): string {
+/** `packaged` = Electron `app.isPackaged` (injected), NOT NODE_ENV: an installed
+ * app may inherit NODE_ENV=development and must still use its bundled binary. */
+export function resolveRustBinary(packaged: boolean): string {
   const override = process.env['AGENT24D_BIN']
   if (override) return override
   const exe = process.platform === 'win32' ? 'agent24d.exe' : 'agent24d'
-  if (isDev) {
+  if (!packaged) {
     return path.join(repoRootDev(), 'rust', 'target', 'debug', exe)
   }
   // Packaged: electron-builder copies the platform-native release binary into
@@ -197,9 +198,9 @@ function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
   })
 }
 
-function defaultSpawnProcess(kind: BackendKind): ChildProcess {
+function defaultSpawnProcess(kind: BackendKind, packaged: boolean): ChildProcess {
   if (kind === 'rust') {
-    const bin = resolveRustBinary()
+    const bin = resolveRustBinary(packaged)
     return spawn(bin, ['serve', '--port', '0'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env },
@@ -247,7 +248,8 @@ export class BackendManager {
   constructor(deps: BackendManagerDeps = {}) {
     this.kind = selectedBackend(deps.isPackaged ?? true, deps.resolveNode)
     this.external = deps.external ?? defaultExternalDaemonSource
-    this.spawnProcess = deps.spawnProcess ?? defaultSpawnProcess
+    const packaged = deps.isPackaged ?? true
+    this.spawnProcess = deps.spawnProcess ?? ((kind) => defaultSpawnProcess(kind, packaged))
   }
 
   async start(): Promise<void> {
