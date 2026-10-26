@@ -1088,10 +1088,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        schedule("sch_user", "self-wake")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Not self-wakes: the prefix is `wake_` exactly (#1278 PR-Daemon F1).
+        for id in ["sch_user", "wakeful", "WAKE_up"] {
+            schedule(id, "self-wake").execute(&pool).await.unwrap();
+        }
         // A self-wake that fired and was then deleted: only its run is left.
         sqlx::query(
             "INSERT INTO runs (id, status, input, usage, created_at, schedule_id) \
@@ -1123,7 +1123,9 @@ mod tests {
             origin("wake_gone").await.unwrap(),
             Some(SourceClassification::Unknown)
         );
-        assert_eq!(origin("sch_user").await.unwrap(), None);
+        for id in ["sch_user", "wakeful", "WAKE_up"] {
+            assert_eq!(origin(id).await.unwrap(), None, "{id}");
+        }
         assert_eq!(
             origin("wake_new").await.unwrap(),
             Some(SourceClassification::Restricted)
