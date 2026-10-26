@@ -23,6 +23,15 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
+/// Every wait that could hang if the chat fails early gets a bound and a name.
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn within<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(STEP_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {STEP_TIMEOUT:?} waiting for: {step}"))
+}
+
 const OWNER: &str = "p03-http-owner";
 const ASSERTION_ID: &str = "p03-http-assertion";
 const RECALL_TEXT: &str = "The secret project codename is Cedar.";
@@ -54,7 +63,11 @@ impl ModelProvider for BarrierProvider {
     ) -> Result<CompletionResponse, ModelError> {
         self.messages.lock().unwrap().push(req.messages.clone());
         self.entered.notify_one();
-        self.release.notified().await;
+        within(
+            "test releasing the held first provider",
+            self.release.notified(),
+        )
+        .await;
         if matches!(self.result, FirstResult::Unavailable) {
             return Err(ModelError::Unavailable("probe fallback".into()));
         }
@@ -201,7 +214,7 @@ fn chat_request(session: Option<&str>) -> Request<Body> {
 }
 
 async fn call(app: axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
-    let res = app.oneshot(req).await.unwrap();
+    let res = within("router response", app.oneshot(req)).await.unwrap();
     let status = res.status();
     let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
     let value = if bytes.is_empty() {
@@ -223,11 +236,18 @@ async fn mutate(app: axum::Router, method: &str, uri: &str, body: Option<&str>) 
     let req = builder
         .body(Body::from(body.unwrap_or("").to_owned()))
         .unwrap();
-    app.oneshot(req).await.unwrap().status()
+    within("mutation request response", app.oneshot(req))
+        .await
+        .unwrap()
+        .status()
 }
 
 async fn wait_for_first(h: &Harness) {
-    h.first_entered.notified().await;
+    within(
+        "first provider to receive the chat request (chat failed before sending?)",
+        h.first_entered.notified(),
+    )
+    .await;
 }
 
 async fn set_unqualified(h: &Harness) {
@@ -271,7 +291,10 @@ async fn post_chat_http_delete_after_prelude_observes_captured_recall() {
         StatusCode::NO_CONTENT
     );
     h.first_release.notify_one();
-    assert_eq!(chat.await.unwrap().0, StatusCode::OK);
+    assert_eq!(
+        within("chat task to finish", chat).await.unwrap().0,
+        StatusCode::OK
+    );
     assert!(has_recall(&h.first_messages.lock().unwrap()[0]));
 }
 
@@ -294,7 +317,10 @@ async fn post_chat_http_pause_after_prelude_observes_captured_recall() {
         StatusCode::OK
     );
     h.first_release.notify_one();
-    assert_eq!(chat.await.unwrap().0, StatusCode::OK);
+    assert_eq!(
+        within("chat task to finish", chat).await.unwrap().0,
+        StatusCode::OK
+    );
     assert!(has_recall(&h.first_messages.lock().unwrap()[0]));
 }
 
@@ -317,7 +343,10 @@ async fn post_chat_http_unavailable_fallback_spy_observes_captured_recall_after_
         StatusCode::NO_CONTENT
     );
     h.first_release.notify_one();
-    assert_eq!(chat.await.unwrap().0, StatusCode::OK);
+    assert_eq!(
+        within("chat task to finish", chat).await.unwrap().0,
+        StatusCode::OK
+    );
     assert_eq!(h.first_messages.lock().unwrap().len(), 1);
     assert_eq!(h.fallback_messages.lock().unwrap().len(), 1);
     assert!(has_recall(&h.first_messages.lock().unwrap()[0]));
@@ -334,7 +363,10 @@ async fn post_chat_http_qualification_change_after_prelude_does_not_rewrite_capt
     wait_for_first(&h).await;
     set_unqualified(&h).await;
     h.first_release.notify_one();
-    assert_eq!(chat.await.unwrap().0, StatusCode::OK);
+    assert_eq!(
+        within("chat task to finish", chat).await.unwrap().0,
+        StatusCode::OK
+    );
     assert!(has_recall(&h.first_messages.lock().unwrap()[0]));
     let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", h.db_path.display()))
         .await
@@ -356,7 +388,10 @@ async fn post_chat_http_without_session_sends_only_client_messages() {
     let chat = tokio::spawn(async move { call(app, chat_request(None)).await });
     wait_for_first(&h).await;
     h.first_release.notify_one();
-    assert_eq!(chat.await.unwrap().0, StatusCode::OK);
+    assert_eq!(
+        within("chat task to finish", chat).await.unwrap().0,
+        StatusCode::OK
+    );
     let received = h.first_messages.lock().unwrap();
     assert_eq!(received.len(), 1);
     assert_eq!(
