@@ -46,6 +46,11 @@ enum Command {
         /// Model id override
         #[arg(long)]
         model: Option<String>,
+        /// Chat within this conversation, as the desktop's chat page does with
+        /// each of its conversations: the run is the session's, and personal
+        /// memory is recalled and kept for it
+        #[arg(long)]
+        session: Option<String>,
     },
     /// List models known to the daemon
     Models,
@@ -729,16 +734,19 @@ fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder
     }
 }
 
-async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> {
-    let ep = connect().await?;
-    let req = ChatRequest {
+fn chat_request(message: String, model: Option<String>, session: Option<String>) -> ChatRequest {
+    ChatRequest {
         messages: vec![ChatMessage {
             role: "user".to_owned(),
             content: message,
         }],
         model,
-        session_id: None,
-    };
+        session_id: session,
+    }
+}
+
+async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
+    let ep = connect().await?;
     let result = bearer(&ep, client().post(format!("{}/api/v1/chat", ep.base)))
         .timeout(Duration::from_secs(180))
         .json(&req)
@@ -2264,7 +2272,11 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Chat { message, model } => cmd_chat(message, model).await,
+        Command::Chat {
+            message,
+            model,
+            session,
+        } => cmd_chat(chat_request(message, model, session)).await,
         Command::Models => cmd_models().await,
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),
@@ -2489,6 +2501,29 @@ mod tests {
                 action: CommAction::Unlock { remember: true }
             }
         ));
+    }
+
+    /// `--session` reaches the request as the desktop's chat page sends it;
+    /// without it the chat stays session-less.
+    #[test]
+    fn chat_sends_the_session_it_was_given() {
+        let request = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Chat {
+                message,
+                model,
+                session,
+            } = cli.command
+            else {
+                panic!("not a chat");
+            };
+            serde_json::to_value(chat_request(message, model, session)).unwrap()
+        };
+        let body = request(&["agent24", "chat", "hi", "--session", "chat_1"]);
+        assert_eq!(body["session_id"], "chat_1", "{body}");
+        assert_eq!(body["messages"][0]["content"], "hi", "{body}");
+        let body = request(&["agent24", "chat", "hi"]);
+        assert!(body["session_id"].is_null(), "{body}");
     }
 
     #[test]
