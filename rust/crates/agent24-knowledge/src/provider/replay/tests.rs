@@ -630,3 +630,44 @@ fn a_release_that_landed_though_abandoned_keeps_the_count() {
     // Released for good: a later registration starts from its own count.
     assert_eq!(count(vec![], questioned(2, Some(0))), Some(0));
 }
+
+#[test]
+fn an_offset_or_a_repeat_takes_no_count_back() {
+    let a = || of("a", 1);
+    let head = || {
+        vec![
+            bind("a", 1, 1),
+            C::Questioned {
+                of: a(),
+                kbs: kbs(&["k"]),
+                version: 1,
+                timeouts: Some(0),
+            },
+            C::TimedOut { of: a(), count: 2 },
+        ]
+    };
+    let count = |tail: Vec<C>| {
+        let state = replay(1, log([head(), tail].concat())).unwrap();
+        let evidence = &state.bindings[0].evidence;
+        evidence.pending.as_ref().map(|p| p.timeouts)
+    };
+    // A clearing written, a timeout meanwhile (the count still 2 in memory,
+    // so 3), then the clearing abandoned though it landed: still 3.
+    let cleared = C::TimeoutsCleared { of: a(), from: 2 };
+    let offset = cleared.offset().unwrap();
+    let again = C::TimedOut { of: a(), count: 3 };
+    assert_eq!(count(vec![cleared.clone(), again, offset]), Some(3));
+    // A clearing that stood: counted afresh from 0.
+    assert_eq!(
+        count(vec![cleared, C::TimedOut { of: a(), count: 1 }]),
+        Some(1)
+    );
+    // A release written twice keeps what the first set aside for its offset.
+    let released = C::Released {
+        of: a(),
+        kbs: kbs(&["k"]),
+        version: 1,
+    };
+    let back = released.offset().unwrap();
+    assert_eq!(count(vec![released.clone(), released, back]), Some(2));
+}
