@@ -784,7 +784,9 @@ mod tests {
     }
 
     /// An ancestor the user may search but not read does not stop the pin,
-    /// as it did not stop the plain open before (#1254 Codex round 2).
+    /// as it did not stop the plain open before (#1254 Codex round 2) —
+    /// except where macOS ignores `O_NOFOLLOW_ANY` (Darwin < 20) and the
+    /// walk needs read permission: there it fails, closed.
     #[cfg(unix)]
     #[test]
     fn an_ancestor_that_can_only_be_searched_still_pins() {
@@ -796,7 +798,11 @@ mod tests {
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o311)).unwrap();
         let pinned = pin_outside_dir(target.clone());
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
-        pinned.unwrap();
+        #[cfg(target_os = "macos")]
+        let pins = nofollow_any_is_honoured();
+        #[cfg(not(target_os = "macos"))]
+        let pins = true;
+        assert_eq!(pinned.is_ok(), pins, "{:?}", pinned.err());
     }
 
     /// The durable-resume path captured no outside directory: the call is
