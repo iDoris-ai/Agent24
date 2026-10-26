@@ -3107,10 +3107,17 @@ raise SystemExit(3)
         );
         let closed = host.supervisors.close();
         assert!(closed.running.is_empty(), "the shutdown got it too");
-        assert_eq!(
-            closed.disabling.len(),
-            1,
-            "the disable's stop, not waited for"
+        // `never()` only stands for the shutdown's cut-off; it does not hold
+        // the module up. With nothing in flight the drain is immediate and the
+        // module stops within milliseconds, so the disable's task may already
+        // have finished by the time `close` runs, and `close` then leaves it
+        // out (it only hands over stops that are still running). Both are
+        // right: still stopping (waited for here) or already stopped (history).
+        // What must never happen is the shutdown taking the module itself as
+        // well (`running` above) or the disable's stop being handed over twice.
+        assert!(
+            closed.disabling.len() <= 1,
+            "the disable's stop is handed over at most once"
         );
         for stop in closed.disabling {
             stop.task.await.unwrap();
