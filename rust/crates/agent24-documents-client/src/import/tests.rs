@@ -1234,3 +1234,228 @@ async fn an_expired_upload_gets_no_chunks() {
         "{chunked:?}"
     );
 }
+
+/// A valid upload id per number, for scripted OSes that hand out many.
+fn upl(n: usize) -> String {
+    const B32: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut tail = String::new();
+    let mut v = n;
+    for _ in 0..5 {
+        tail.insert(0, B32[v % 32] as char);
+        v /= 32;
+    }
+    format!("upl_01K74Z3QJ8V5N2W9RTX6Y{tail}")
+}
+
+/// Each request goes out with its method and content type: the OS parses
+/// the JSON bodies only under `application/json`.
+#[tokio::test]
+async fn every_request_has_its_method_and_content_type() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let (path, _) = dir.file(10, "a.pdf").await;
+    let seen = Arc::new(Mutex::new(Vec::<(Method, String, String)>::new()));
+    let log = Arc::clone(&seen);
+    let os = FnSend::new(move |req: Request| {
+        let kind = req.path.rsplit('/').next().unwrap_or("").to_owned();
+        let ctype = header(&req.headers, "Content-Type").to_owned();
+        log.lock().unwrap().push((req.method, kind.clone(), ctype));
+        match kind.as_str() {
+            "uploads" => {
+                let mut body = good_upload();
+                body["sha256"] = body_sha(&req);
+                reply(201, body)
+            }
+            "chunks" => reply(200, json!({"received": 10})),
+            _ => reply(202, json!({"job_id": "job_01K74Z3QJ8V5N2W9RTX6YB4MCD"})),
+        }
+    });
+    assert!(run(&path, &os).await.is_ok());
+    let json_type = "application/json".to_owned();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (Method::Post, "uploads".to_owned(), json_type.clone()),
+            (
+                Method::Post,
+                "chunks".to_owned(),
+                "application/octet-stream".to_owned()
+            ),
+            (Method::Post, "imports".to_owned(), json_type),
+        ]
+    );
+}
+
+/// Every code in `RETRY` is sent again, at most three sends per step; any
+/// other error is returned after one send.
+#[tokio::test]
+async fn each_retry_code_is_sent_again_up_to_three_times() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let (path, _) = dir.file(10, "a.pdf").await;
+    for fails in [2u64, 3] {
+        for code in RETRY.iter().copied().chain(["conflict"]) {
+            let sends = Arc::new(AtomicU64::new(0));
+            let n = Arc::clone(&sends);
+            let os = FnSend::new(move |req: Request| {
+                if req.path.ends_with("/uploads") {
+                    if n.fetch_add(1, Ordering::SeqCst) < fails {
+                        return reply(503, json!({"error": {"code": code, "message": "x"}}));
+                    }
+                    let mut body = good_upload();
+                    body["sha256"] = body_sha(&req);
+                    reply(201, body)
+                } else if req.path.ends_with("/chunks") {
+                    reply(200, json!({"received": 10}))
+                } else {
+                    reply(202, json!({"job_id": "job_01K74Z3QJ8V5N2W9RTX6YB4MCD"}))
+                }
+            });
+            let res = run(&path, &os).await;
+            let creates = sends.load(Ordering::SeqCst);
+            if code == "conflict" {
+                assert_eq!((res.code(), creates), (Some("conflict"), 1), "{code}");
+            } else if fails == 2 {
+                assert!(
+                    res.is_ok() && creates == 3,
+                    "{code}: {creates} sends, {res:?}"
+                );
+            } else {
+                assert_eq!((res.code(), creates), (Some(code), 3), "{code}");
+            }
+        }
+    }
+}
+
+/// An OS that keeps moving the offset gets 8 resumes, then its reply: 9
+/// chunk sends in all.
+#[tokio::test]
+async fn resumes_stop_after_eight() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let (path, _) = dir.file(10, "a.pdf").await;
+    let chunks = Arc::new(AtomicU64::new(0));
+    let n = Arc::clone(&chunks);
+    let os = FnSend::new(move |req: Request| {
+        if req.path.ends_with("/uploads") {
+            let mut body = good_upload();
+            body["sha256"] = body_sha(&req);
+            return reply(201, body);
+        }
+        let at = if n.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+            5
+        } else {
+            0
+        };
+        reply(
+            409,
+            json!({"error": {"code": "upload_offset_mismatch", "message": "x",
+                "details": {"received_offset": at}}}),
+        )
+    });
+    assert_eq!(run(&path, &os).await.code(), Some("upload_offset_mismatch"));
+    assert_eq!(chunks.load(Ordering::SeqCst), 9);
+}
+
+/// One run walks at most 64 expired uploads, then says so.
+#[tokio::test]
+async fn one_run_walks_at_most_64_expired_uploads() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let (path, _) = dir.file(10, "a.pdf").await;
+    let ids = Arc::new(Mutex::new(
+        std::collections::HashMap::<String, String>::new(),
+    ));
+    let imports = Arc::new(AtomicU64::new(0));
+    let n = Arc::clone(&imports);
+    let os = FnSend::new(move |req: Request| {
+        if req.path.ends_with("/uploads") {
+            let key = header(&req.headers, "Idempotency-Key").to_owned();
+            let mut ids = ids.lock().unwrap();
+            let next = upl(ids.len());
+            let id = ids.entry(key).or_insert(next).clone();
+            let mut body = good_upload();
+            body["sha256"] = body_sha(&req);
+            body["upload_id"] = json!(id);
+            body["status"] = json!("expired");
+            reply(200, body)
+        } else if req.path.ends_with("/imports") {
+            n.fetch_add(1, Ordering::SeqCst);
+            reply(404, json!({"error": {"code": "not_found", "message": "x"}}))
+        } else {
+            reply(
+                500,
+                json!({"error": {"code": "internal", "message": "no chunks expected"}}),
+            )
+        }
+    });
+    let res = run(&path, &os).await;
+    assert_eq!(
+        res,
+        Response::fail(404, "not_found", "the upload keeps expiring")
+    );
+    assert_eq!(imports.load(Ordering::SeqCst), 64);
+}
+
+/// The chain memory keeps the newest 1024 files; remembering a file again
+/// makes it the newest.
+#[tokio::test]
+async fn the_chain_memory_keeps_the_newest_1024_files() {
+    let _guard = begin().await;
+    for i in 0..=MAX_TAILS {
+        chain_remember(&format!("k{i}"), "r", "a");
+    }
+    assert_eq!(chain_hint("k0"), None);
+    assert_eq!(chain_hint("k1"), Some(("r".to_owned(), "a".to_owned())));
+    assert!(chain_hint(&format!("k{MAX_TAILS}")).is_some());
+    assert_eq!(with_tails(|t| t.len()), MAX_TAILS);
+    chain_remember("k1", "r", "b");
+    chain_remember("extra", "r", "a");
+    assert_eq!(chain_hint("k2"), None);
+    assert_eq!(chain_hint("k1"), Some(("r".to_owned(), "b".to_owned())));
+    forget_chains();
+}
+
+/// A file that cannot be read, wherever that is found out, answers only
+/// that: never the path, never the I/O error's text.
+#[tokio::test]
+async fn an_unreadable_file_says_only_that() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let want = Response::fail(400, "file_unreadable", "the file could not be read");
+    let missing = dir.path().join("gone.pdf");
+    assert_eq!(run(&missing, &FakeOs::plain()).await, want);
+    assert_eq!(run(dir.path(), &FakeOs::plain()).await, want);
+    let mut nop = |_: Progress| {};
+    let reopened = upload(&missing, 10, HELLO_SHA, &FakeOs::plain(), &mut nop).await;
+    assert_eq!(reopened, want);
+}
+
+/// A chunk reply that claims more than the file holds is refused, and no
+/// import starts on it.
+#[tokio::test]
+async fn a_chunk_reply_past_the_size_is_refused() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let (path, _) = dir.file(10, "a.pdf").await;
+    let imports = Arc::new(AtomicU64::new(0));
+    let n = Arc::clone(&imports);
+    let os = FnSend::new(move |req: Request| {
+        if req.path.ends_with("/uploads") {
+            let mut body = good_upload();
+            body["sha256"] = body_sha(&req);
+            reply(201, body)
+        } else if req.path.ends_with("/chunks") {
+            reply(200, json!({"received": 11}))
+        } else {
+            n.fetch_add(1, Ordering::SeqCst);
+            reply(202, json!({"job_id": "job_01K74Z3QJ8V5N2W9RTX6YB4MCD"}))
+        }
+    });
+    let res = run(&path, &os).await;
+    assert_eq!(
+        res,
+        Response::fail(502, "invalid_response", "the upload did not move forward")
+    );
+    assert_eq!(imports.load(Ordering::SeqCst), 0);
+}
