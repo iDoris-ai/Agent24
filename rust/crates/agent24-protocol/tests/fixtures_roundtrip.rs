@@ -165,45 +165,90 @@ fn approval_fixture_decodes_decision_open_set() {
     }
 }
 
-/// P1-02c: `memory.write_failed` is typed (code/dimension/owner_kind/kind/partial),
-/// carries no free-text reason, and omits its optional fields when absent. (No
-/// fixture file: the fixture gate requires wire names without `_`, and this
-/// event's established name has one.)
+/// P1-02c transition, NEW reads OLD: a `memory.write_failed` from a daemon that
+/// predates the typed fields (`{session_id, reason}` only) still decodes, with the
+/// cause UNKNOWN (`None`) rather than a made-up code.
 #[test]
-fn memory_write_failed_is_typed_and_omits_absent_fields() {
-    let raw = serde_json::json!({
-        "v": 1, "seq": 3, "ts": "2026-07-23T12:00:01Z", "type": "memory.write_failed",
-        "payload": {
-            "session_id": "ses_x", "code": "memory_quota_rows",
-            "dimension": "rows", "owner_kind": "personal"
-        }
-    });
-    let event: Event = serde_json::from_value(raw.clone()).unwrap();
-    assert!(matches!(event.body, EventBody::MemoryWriteFailed(_)));
-    assert_eq!(serde_json::to_value(&event).unwrap(), raw);
-
-    // The old free-text shape no longer decodes: a producer still sending
-    // `reason` without a `code` is a bug, not something to accept silently.
+fn memory_write_failed_from_an_older_daemon_decodes_with_unknown_cause() {
     let old = serde_json::json!({
         "v": 1, "seq": 3, "ts": "2026-07-23T12:00:01Z", "type": "memory.write_failed",
         "payload": { "session_id": "ses_x", "reason": "quota exceeded for owner ..." }
     });
-    assert!(serde_json::from_value::<Event>(old).is_err());
+    let event: Event = serde_json::from_value(old).unwrap();
+    let EventBody::MemoryWriteFailed(p) = event.body else {
+        panic!("not memory.write_failed")
+    };
+    assert_eq!(p.session_id, "ses_x");
+    assert!(p.code.is_none() && p.owner_kind.is_none());
 }
 
-/// P1-02c: `run.completed` without `memory_persisted` (an older producer, or the
-/// TS daemon) means "nothing failed to persist".
+/// P1-02c transition, OLD reads NEW: what a current daemon emits is still valid
+/// for a decoder that knows only the old `{session_id, reason}` shape, and its
+/// `reason` is the sanitized code string, never free text.
 #[test]
-fn run_completed_without_memory_persisted_defaults_to_true() {
+fn memory_write_failed_from_a_current_daemon_is_valid_for_an_old_decoder() {
+    #[derive(serde::Deserialize)]
+    struct OldPayload {
+        session_id: String,
+        reason: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct OldEvent {
+        #[serde(rename = "type")]
+        ty: String,
+        payload: OldPayload,
+    }
+    let new = EventBody::MemoryWriteFailed(agent24_protocol::MemoryWriteFailedPayload {
+        session_id: "ses_x".into(),
+        reason: Some("memory_quota_rows".into()),
+        code: Some(agent24_protocol::MemoryFailureCode::QuotaRows),
+        dimension: Some("rows".into()),
+        owner_kind: Some(agent24_protocol::MemoryOwnerKind::Personal),
+        kind: None,
+        partial: false,
+    });
+    let event = Event {
+        v: 1,
+        seq: 3,
+        ts: "2026-07-23T12:00:01Z".into(),
+        body: new,
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    let old: OldEvent = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(old.ty, "memory.write_failed");
+    assert_eq!(old.payload.session_id, "ses_x");
+    assert_eq!(old.payload.reason, "memory_quota_rows");
+    // And the new decoder round-trips its own output exactly.
+    let again: Event = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&again).unwrap(), json);
+}
+
+/// P1-02c: `run.completed` WITHOUT `memory_persisted` (a daemon from before the
+/// field, which may well have failed to write) is UNKNOWN, never `true`.
+#[test]
+fn run_completed_without_memory_persisted_is_unknown_not_true() {
     let raw = fs::read_to_string(fixtures_dir("events").join("run.completed.json")).unwrap();
     let mut value: Value = serde_json::from_str(&raw).unwrap();
     value["payload"]
         .as_object_mut()
         .unwrap()
         .remove("memory_persisted");
-    let event: Event = serde_json::from_value(value).unwrap();
+    let event: Event = serde_json::from_value(value.clone()).unwrap();
+    let EventBody::RunCompleted(p) = &event.body else {
+        panic!("not run.completed")
+    };
+    assert_eq!(p.memory_persisted, None);
+    // Unknown stays unknown on the way back out.
+    assert!(
+        serde_json::to_value(&event).unwrap()["payload"]
+            .get("memory_persisted")
+            .is_none()
+    );
+    // The fixture itself (a current daemon) carries the explicit value.
+    let raw = fs::read_to_string(fixtures_dir("events").join("run.completed.json")).unwrap();
+    let event: Event = serde_json::from_str(&raw).unwrap();
     let EventBody::RunCompleted(p) = event.body else {
         panic!("not run.completed")
     };
-    assert!(p.memory_persisted);
+    assert_eq!(p.memory_persisted, Some(true));
 }

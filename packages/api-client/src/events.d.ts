@@ -221,14 +221,16 @@ export interface ModelCallPayload {
 }
 export interface RunCompletedPayload {
   /**
-   * P1-02c: `false` when this run's exchange (or its explicit-remember
-   * assertion) FAILED to persist to memory; the answer above is still real,
-   * but nothing in the model's text can be taken as "remembered". `true`
-   * otherwise, including when there was nothing to write or memory is paused
-   * (a user choice, reported by `memory.write_skipped`, not a failure).
-   * Absent on the wire means `true`.
+   * P1-02c, THREE-state. `Some(false)`: this run's exchange (or its
+   * explicit-remember assertion) FAILED to persist; the answer above is still
+   * real, but nothing in the model's text can be taken as "remembered".
+   * `Some(true)`: no memory write this run attempted failed (including when
+   * there was nothing to write, or memory is paused — a user choice reported
+   * by `memory.write_skipped`). `None` (field absent): UNKNOWN — the producer
+   * predates this field, and a daemon from before it could well have failed to
+   * write. Never read absence as `true`. Current daemons always send it.
    */
-  memory_persisted?: boolean;
+  memory_persisted?: boolean | null;
   output: RunOutputPayload;
   run_id: string;
   usage: Usage;
@@ -249,9 +251,22 @@ export interface Usage {
  * A memory write failed. Typed on purpose (P1-02c T6): a stable `code`, the
  * quota `dimension` when there is one, and the owner CLASS — never the storage
  * error's text, the partition key, or any of the content that was being written.
+ *
+ * TRANSITION (v1 compatibility, both directions). Older daemons sent only
+ * `{session_id, reason}`, and older clients require exactly those two fields.
+ * So: `code` and `owner_kind` are `Option` on decode (an old producer's event
+ * decodes with `None` — "unknown", NOT a made-up `memory_internal`/`personal`,
+ * which would assert a cause nobody established), and current daemons emit the
+ * typed fields AND a sanitized `reason`. `reason` is only ever the code string
+ * itself (e.g. `"memory_quota_rows"`) — never a Display, never an owner. It is
+ * deprecated and is to be removed in the release after the one that ships this,
+ * once no supported client reads it.
  */
 export interface MemoryWriteFailedPayload {
-  code: MemoryFailureCode;
+  /**
+   * Absent from an older producer: unknown cause.
+   */
+  code?: MemoryFailureCode | null;
   /**
    * `"rows"` or `"bytes"` for a quota code; absent otherwise.
    */
@@ -262,12 +277,20 @@ export interface MemoryWriteFailedPayload {
    * (legacy session import). Absent for the turn itself.
    */
   kind?: string | null;
-  owner_kind: MemoryOwnerKind;
+  /**
+   * Absent from an older producer: unknown.
+   */
+  owner_kind?: MemoryOwnerKind | null;
   /**
    * True when the conversation turn WAS saved but its explicit-remember
    * assertion was not.
    */
   partial?: boolean;
+  /**
+   * Deprecated, transitional: the code string itself when sent by a current
+   * daemon; free text from an older one (do not display or parse it).
+   */
+  reason?: string | null;
   session_id: string;
   [k: string]: unknown;
 }

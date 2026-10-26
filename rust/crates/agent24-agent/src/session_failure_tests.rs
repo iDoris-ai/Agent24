@@ -124,7 +124,7 @@ async fn assert_quota_rejection(rows: i64) {
     // P1-02c: typed, no free-text reason (which spelled out the partition key).
     assert_eq!(failure["code"], "memory_quota_rows", "quota={rows}");
     assert_eq!(failure["dimension"], "rows");
-    assert!(failure.get("reason").is_none(), "{failure}");
+    assert_eq!(failure["reason"], failure["code"], "{failure}");
 
     let view = kv
         .session_log()
@@ -248,7 +248,7 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
     // A preparation timeout is not a quota or disk failure: the closed code is
     // `memory_internal`, and the free-text "timed out" reason is gone (P1-02c).
     assert_eq!(failures[0]["payload"]["code"], "memory_internal");
-    assert!(failures[0]["payload"].get("reason").is_none());
+    assert_eq!(failures[0]["payload"]["reason"], "memory_internal");
     drop(guard);
 }
 

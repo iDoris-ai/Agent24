@@ -185,9 +185,11 @@ impl MemoryFailure {
     ) -> agent24_protocol::MemoryWriteFailedPayload {
         agent24_protocol::MemoryWriteFailedPayload {
             session_id: session_id.to_owned(),
-            code: self.wire_code(),
+            // Sanitized transitional `reason`: the code string, nothing else.
+            reason: Some(self.code.as_str().to_owned()),
+            code: Some(self.wire_code()),
             dimension: self.code.dimension().map(str::to_owned),
-            owner_kind: agent24_protocol::MemoryOwnerKind::Personal,
+            owner_kind: Some(agent24_protocol::MemoryOwnerKind::Personal),
             kind: kind.map(str::to_owned),
             partial,
         }
@@ -830,17 +832,7 @@ impl RunManager {
         };
         match memory.remember(sid, prompt, answer, prompt_origin).await {
             Ok(report) => {
-                // W2: the turn is durable, but its compaction summary could not
-                // be written. Observable, with the typed cause only.
-                if let Some(err) = &report.compaction_failure {
-                    let failure = MemoryFailure::from_error(err);
-                    tracing::error!(session_id = sid, code = %failure.code, error = %err, "session summary write failed");
-                    self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
-                        sid,
-                        Some("session.summary"),
-                        false,
-                    )));
-                }
+                self.report_summary_failure(sid, report.compaction_failure.as_ref());
                 match report.retain {
                     retain::RetainOutcome::Saved => MemoryWriteOutcome::Saved,
                     retain::RetainOutcome::SkippedPaused => MemoryWriteOutcome::SkippedPaused,
@@ -861,6 +853,9 @@ impl RunManager {
                     kind,
                     failure_of.turn_saved,
                 )));
+                // W2 on top of a failed retain: independent events, so a
+                // double failure never loses the summary one.
+                self.report_summary_failure(sid, failure_of.compaction_failure.as_ref());
                 if failure_of.turn_saved {
                     MemoryWriteOutcome::Partial(failure)
                 } else {
@@ -868,6 +863,19 @@ impl RunManager {
                 }
             }
         }
+    }
+
+    /// W2: the turn is durable, but its compaction summary could not be written.
+    /// Observable, with the typed cause only.
+    fn report_summary_failure(&self, sid: &str, err: Option<&agent24_memory::MemoryError>) {
+        let Some(err) = err else { return };
+        let failure = MemoryFailure::from_error(err);
+        tracing::error!(session_id = sid, code = %failure.code, error = %err, "session summary write failed");
+        self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+            sid,
+            Some("session.summary"),
+            false,
+        )));
     }
 
     /// M1-T12: the SAME recall + pause-notice decision `drive_new` makes at
@@ -2159,7 +2167,7 @@ impl RunManager {
                         &run.input.prompt,
                         &text,
                         run_prompt_origin(&run),
-                    ) => outcome.persisted(),
+                    ) => Some(outcome.persisted()),
                     () = cancel.cancelled() => {
                         self.finish_cancelled(&run_id).await;
                         return;
@@ -2694,7 +2702,7 @@ impl RunManager {
                 },
                 usage,
                 // This path never attempts a memory write, so none failed.
-                memory_persisted: true,
+                memory_persisted: Some(true),
             })),
             Err(err) => tracing::error!("run completion persist failed: {err}"),
         }

@@ -667,10 +667,10 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     (
                         receipt,
                         failure.map(agent24_agent::MemoryFailure::wire_code),
-                        outcome.persisted(),
+                        Some(outcome.persisted()),
                     )
                 } else {
-                    (None, None, true)
+                    (None, None, Some(true))
                 };
             state
                 .events

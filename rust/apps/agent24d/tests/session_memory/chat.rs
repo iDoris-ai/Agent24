@@ -404,7 +404,11 @@ async fn ordinary_chat_turn_on_a_full_partition_is_not_saved_with_a_typed_code()
         EventBody::RunCompleted(p) => Some(p.memory_persisted),
         _ => None,
     });
-    assert_eq!(persisted, Some(false), "run.completed must say so too");
+    assert_eq!(
+        persisted,
+        Some(Some(false)),
+        "run.completed must say so too"
+    );
 }
 
 #[tokio::test]

@@ -559,11 +559,19 @@
       ]
     },
     "MemoryWriteFailedPayload": {
-      "description": "A memory write failed. Typed on purpose (P1-02c T6): a stable `code`, the\nquota `dimension` when there is one, and the owner CLASS — never the storage\nerror's text, the partition key, or any of the content that was being written.",
+      "description": "A memory write failed. Typed on purpose (P1-02c T6): a stable `code`, the\nquota `dimension` when there is one, and the owner CLASS — never the storage\nerror's text, the partition key, or any of the content that was being written.\n\nTRANSITION (v1 compatibility, both directions). Older daemons sent only\n`{session_id, reason}`, and older clients require exactly those two fields.\nSo: `code` and `owner_kind` are `Option` on decode (an old producer's event\ndecodes with `None` — \"unknown\", NOT a made-up `memory_internal`/`personal`,\nwhich would assert a cause nobody established), and current daemons emit the\ntyped fields AND a sanitized `reason`. `reason` is only ever the code string\nitself (e.g. `\"memory_quota_rows\"`) — never a Display, never an owner. It is\ndeprecated and is to be removed in the release after the one that ships this,\nonce no supported client reads it.",
       "type": "object",
       "properties": {
         "code": {
-          "$ref": "#/$defs/MemoryFailureCode"
+          "description": "Absent from an older producer: unknown cause.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryFailureCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "dimension": {
           "description": "`\"rows\"` or `\"bytes\"` for a quota code; absent otherwise.",
@@ -580,20 +588,33 @@
           ]
         },
         "owner_kind": {
-          "$ref": "#/$defs/MemoryOwnerKind"
+          "description": "Absent from an older producer: unknown.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryOwnerKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "partial": {
           "description": "True when the conversation turn WAS saved but its explicit-remember\nassertion was not.",
           "type": "boolean"
+        },
+        "reason": {
+          "description": "Deprecated, transitional: the code string itself when sent by a current\ndaemon; free text from an older one (do not display or parse it).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "session_id": {
           "type": "string"
         }
       },
       "required": [
-        "session_id",
-        "code",
-        "owner_kind"
+        "session_id"
       ]
     },
     "MemoryWriteSkippedPayload": {
@@ -842,9 +863,11 @@
       "type": "object",
       "properties": {
         "memory_persisted": {
-          "description": "P1-02c: `false` when this run's exchange (or its explicit-remember\nassertion) FAILED to persist to memory; the answer above is still real,\nbut nothing in the model's text can be taken as \"remembered\". `true`\notherwise, including when there was nothing to write or memory is paused\n(a user choice, reported by `memory.write_skipped`, not a failure).\nAbsent on the wire means `true`.",
-          "type": "boolean",
-          "default": true
+          "description": "P1-02c, THREE-state. `Some(false)`: this run's exchange (or its\nexplicit-remember assertion) FAILED to persist; the answer above is still\nreal, but nothing in the model's text can be taken as \"remembered\".\n`Some(true)`: no memory write this run attempted failed (including when\nthere was nothing to write, or memory is paused — a user choice reported\nby `memory.write_skipped`). `None` (field absent): UNKNOWN — the producer\npredates this field, and a daemon from before it could well have failed to\nwrite. Never read absence as `true`. Current daemons always send it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "output": {
           "$ref": "#/$defs/RunOutputPayload"

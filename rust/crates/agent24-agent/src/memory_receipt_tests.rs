@@ -160,9 +160,10 @@ fn assert_events_are_clean(rig: &Rig) {
             "driver text leaked: {raw}"
         );
         if event["type"] == "memory.write_failed" {
-            assert!(
-                event["payload"].get("reason").is_none(),
-                "the free-text reason is gone: {raw}"
+            // Transitional `reason` is the sanitized code string and nothing else.
+            assert_eq!(
+                event["payload"]["reason"], event["payload"]["code"],
+                "reason must be exactly the code: {raw}"
             );
             assert!(!raw.contains("saved"), "{raw}");
             assert!(!raw.contains("已记住"), "{raw}");
@@ -276,6 +277,37 @@ async fn a_summary_that_cannot_be_written_emits_a_typed_session_summary_failure(
     assert_eq!(failed[0]["kind"], "session.summary");
     assert_eq!(failed[0]["code"], "memory_quota_rows");
     assert!(failed[0].get("partial").is_none());
+    assert_events_are_clean(&r);
+}
+
+/// W2 + W4 at once: the assertion AND the summary both fail to write. Each is
+/// reported on its own; the summary event must not be lost behind the partial.
+#[tokio::test]
+async fn a_double_failure_reports_both_the_partial_and_the_summary() {
+    let policy = CompactionPolicy {
+        max_recent: 1,
+        keep_recent: 0,
+        max_summary_chars: 500,
+    };
+    let r = rig(Arc::new(FixedSummarizer), policy).await;
+    // The turn's two rows fit; the assertion's audit row and the summary do not.
+    set_rows(&r.path, 2).await;
+    let outcome = r
+        .manager
+        .chat_remember_turn("s-double", "记住我喜欢茶", "好的")
+        .await;
+    assert!(matches!(outcome, MemoryWriteOutcome::Partial(_)), "{outcome:?}");
+
+    let failed = r.sink.of_type("memory.write_failed");
+    assert_eq!(failed.len(), 2, "{failed:?}");
+    assert!(
+        failed.iter().any(|f| f["partial"] == true && f.get("kind").is_none()),
+        "{failed:?}"
+    );
+    assert!(
+        failed.iter().any(|f| f["kind"] == "session.summary"),
+        "the summary failure must not be dropped: {failed:?}"
+    );
     assert_events_are_clean(&r);
 }
 

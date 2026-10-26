@@ -424,6 +424,8 @@ impl SessionMemory {
             Err(error) => Err(RememberFailure {
                 error,
                 turn_saved: true,
+                // Independent of the assertion failure: both get reported.
+                compaction_failure,
             }),
         };
         // append_turn is the durable boundary. Any compaction error or timeout
@@ -550,6 +552,9 @@ pub(crate) struct RememberReport {
 pub(crate) struct RememberFailure {
     pub(crate) error: MemoryError,
     pub(crate) turn_saved: bool,
+    /// A compaction summary that also failed to WRITE in the same call (the
+    /// assertion and the summary can fail independently; each is reported).
+    pub(crate) compaction_failure: Option<MemoryError>,
 }
 
 impl From<MemoryError> for RememberFailure {
@@ -557,6 +562,7 @@ impl From<MemoryError> for RememberFailure {
         Self {
             error,
             turn_saved: false,
+            compaction_failure: None,
         }
     }
 }
