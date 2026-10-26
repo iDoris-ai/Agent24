@@ -131,6 +131,20 @@ fn a_tightening_during_a_rebuild_deletes_the_seal_again_after_it() {
 }
 
 #[test]
+fn a_rebuild_with_no_tightening_meanwhile_leaves_the_seal_standing() {
+    // The first rebuild had a tightening come in; the next one does not.
+    let mut ledger = fresh(false);
+    let first = ledger.reseal().unwrap();
+    let t = ledger.tighten(p("a"));
+    let delete = ledger.resealed(first).unwrap();
+    ledger.seal_deleted(delete);
+    ledger.record_durable(t.ticket);
+    let second = ledger.reseal().unwrap();
+    assert_eq!(ledger.resealed(second), None);
+    assert!(ledger.tighten(p("a")).unseal.is_some());
+}
+
+#[test]
 fn a_stray_report_never_moves_the_seal() {
     let mut ledger = fresh(true);
     let t = ledger.tighten(Scope::Host);
