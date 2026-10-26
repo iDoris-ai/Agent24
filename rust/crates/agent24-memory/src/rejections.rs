@@ -65,7 +65,7 @@ struct Owned {
 /// blocked audit table cannot delay or replace the original error.
 pub struct QueuedRejections {
     tx: tokio::sync::mpsc::Sender<Owned>,
-    dropped: std::sync::atomic::AtomicU64,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl QueuedRejections {
@@ -131,11 +131,37 @@ impl Rejections {
 
     /// Start the background drain. Outside a tokio runtime no worker exists and
     /// every enqueue is counted as dropped.
-    pub fn spawn_queue(self, capacity: usize) -> QueuedRejections {
+    ///
+    /// `admission` is the SAME semaphore that gates out-of-process memory writes
+    /// (`KvStore::oop_admission`). The worker takes a permit with `try_acquire`
+    /// before each audit write and DROPS the row (counted) if none is free, so the
+    /// audit trail can never occupy a connection the business path needs.
+    pub fn spawn_queue(
+        self,
+        capacity: usize,
+        admission: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    ) -> QueuedRejections {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Owned>(capacity);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let dropped = dropped.clone();
             handle.spawn(async move {
                 while let Some(o) = rx.recv().await {
+                    let _permit = match &admission {
+                        Some(sem) => match sem.clone().try_acquire_owned() {
+                            Ok(p) => Some(p),
+                            Err(_) => {
+                                let n =
+                                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                tracing::warn!(
+                                    dropped_total = n,
+                                    "write-rejection audit dropped: no admission permit"
+                                );
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
                     self.note(&Rejection {
                         owner_kind: o.owner_kind,
                         owner_key: &o.owner_key,
@@ -147,10 +173,7 @@ impl Rejections {
                 }
             });
         }
-        QueuedRejections {
-            tx,
-            dropped: Default::default(),
-        }
+        QueuedRejections { tx, dropped }
     }
 
     /// Best-effort record: a failure here is logged and swallowed so it can never

@@ -539,6 +539,13 @@ impl Reservation {
         self.committed = true;
     }
 
+    /// Keep the whole reservation spent: no refund at all. For a request that is
+    /// refused but must still cost a token (e.g. an audited reserved-kind probe),
+    /// so refusing cannot be repeated for free.
+    pub(crate) fn spend_in_full(mut self) {
+        self.committed = true;
+    }
+
     #[cfg(test)]
     pub(crate) fn scanned_for_test(&self) -> u32 {
         self.scanned

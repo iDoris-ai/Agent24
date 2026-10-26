@@ -1031,6 +1031,9 @@ impl OsScopedMemory {
             let Some(ev) = ev else {
                 debug_assert!(refused);
                 audit(agent24_memory::MemoryErrorCode::ReservedKind, &refused_kind);
+                // A refused probe still costs its token: repeating it cannot be
+                // free, so it cannot be used to flood the audit queue.
+                reservation.spend_in_full();
                 return Err(MemoryRpcError::ReservedKind);
             };
             // About to touch the shared pool — see `Reservation::mark_touched`
@@ -1606,6 +1609,82 @@ mod tests {
             .unwrap_err();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(kv.rejections().list(&m.key).await.unwrap().is_empty());
+    }
+
+    /// A refused reserved-kind probe still costs its token: with one token and no
+    /// refill the second probe is rate limited and never reaches the audit queue.
+    #[tokio::test]
+    async fn c3_refused_reserved_kind_probes_consume_rate_limit_tokens() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let limiter = Arc::new(RateLimiter::new(1.0, 0.0));
+        let first = m
+            .remember_checked(
+                None,
+                limiter.clone(),
+                admission(4),
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(first, MemoryRpcError::ReservedKind);
+        for _ in 0..20 {
+            let again = m
+                .remember_checked(
+                    None,
+                    limiter.clone(),
+                    admission(4),
+                    Remember::new("mem.x", serde_json::Map::new()),
+                )
+                .await
+                .unwrap_err();
+            assert_ne!(again, MemoryRpcError::ReservedKind, "must be rate limited");
+        }
+        let rows = audit_rows(&kv, &m.key, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rows2 = kv.rejections().list(&m.key).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows2[0].suppressed_count, 0,
+            "a rate-limited probe enqueued: {rows2:?}"
+        );
+    }
+
+    /// The audit worker needs an OOP admission permit and only try-acquires one:
+    /// with every permit taken the audit is dropped and counted, business reads
+    /// are untouched, and it resumes once a permit is free.
+    #[tokio::test]
+    async fn c3_audit_is_dropped_not_waited_when_admission_is_exhausted() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let sem = kv.oop_admission().unwrap();
+        let held = sem
+            .clone()
+            .acquire_many_owned(sem.available_permits() as u32)
+            .await
+            .unwrap();
+        let err = m
+            .remember(Remember::new("mem.x", serde_json::Map::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::MemoryReservedKind));
+        let q = kv.queued_rejections();
+        for _ in 0..200 {
+            if q.dropped_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(q.dropped_count(), 1);
+        let t = std::time::Instant::now();
+        assert!(m.recent(10).await.unwrap().is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(kv.rejections().list(&m.key).await.unwrap().is_empty());
+        drop(held);
+        let _ = m
+            .remember(Remember::new("mem.y", serde_json::Map::new()))
+            .await;
+        assert_eq!(audit_rows(&kv, &m.key, 1).await.len(), 1);
     }
 
     #[tokio::test]

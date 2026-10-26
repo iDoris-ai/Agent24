@@ -482,10 +482,18 @@ impl KvStore {
         if tokio::runtime::Handle::try_current().is_err() {
             // No runtime to host the worker: hand back an inert queue (every
             // enqueue is counted as dropped) and do not cache it.
-            return Arc::new(self.rejections().spawn_queue(rejections::QUEUE_CAPACITY));
+            return Arc::new(
+                self.rejections()
+                    .spawn_queue(rejections::QUEUE_CAPACITY, self.oop_admission.clone()),
+            );
         }
         self.rejection_queue
-            .get_or_init(|| Arc::new(self.rejections().spawn_queue(rejections::QUEUE_CAPACITY)))
+            .get_or_init(|| {
+                Arc::new(
+                    self.rejections()
+                        .spawn_queue(rejections::QUEUE_CAPACITY, self.oop_admission.clone()),
+                )
+            })
             .clone()
     }
 
