@@ -2,7 +2,7 @@
 //! A.1, A.4, A.5 as reference): the class of each, the tightening that offsets
 //! an abandoned loosening, and whether a record landing late on a sequence
 //! number given up still counts. Pure data: the host numbers and writes them
-//! (KB-C1-04 slice 6); replay is the next slice. Evidence epochs, placeholder
+//! (KB-C1-04 slice 6); `replay` reads them back. Evidence epochs, placeholder
 //! rules, tombstones, revalidation and the visible set join with slice 5.
 
 use std::fmt::Debug;
@@ -40,7 +40,7 @@ pub trait Ids: Clone + Debug + Eq {
     type Profile: Clone + Debug + Eq + Hash;
     type Binding: Clone + Debug + Eq;
     type Run: Clone + Debug + Eq;
-    /// A principal the user confirmed (S1.13).
+    /// A principal recorded as confirmed (S1.13).
     type Principal: Clone + Debug + Eq;
     /// An identity tuple: a binding's, or a run's candidate (S4.7).
     type Identity: Clone + Debug + Eq;
@@ -102,11 +102,14 @@ pub enum Change<I: Ids> {
     /// The profile removed; its binding's retirement is its own record.
     Remove(I::Profile),
     Retire(Of<I>),
-    /// A new binding with its identity and first value (S4.4).
+    /// A new binding with its identity and first value (S4.4). `confirmed`
+    /// is its principal when none was awaited: recorded as confirmed too
+    /// (S1.13).
     Bind {
         of: Of<I>,
         identity: I::Identity,
         generation: u64,
+        confirmed: Option<I::Principal>,
     },
     Generation {
         of: Of<I>,
