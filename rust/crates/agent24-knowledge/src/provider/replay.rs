@@ -52,6 +52,9 @@ pub struct Bound<I: Ids> {
     pub stuck: Option<StuckCause>,
     /// To restore its [`Evidence`](super::evidence::Evidence) from.
     pub evidence: Saved<I::Kb>,
+    /// What the last release ended, kept up to date by later counts, in
+    /// case its offset follows: a release written but abandoned may land.
+    released: Option<Pending<I::Kb>>,
 }
 
 /// A run's binding set and candidates (S4.7); `None` once unbound.
@@ -232,6 +235,7 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
                 revoked: false,
                 stuck: None,
                 evidence: Saved::default(),
+                released: None,
             });
         }
         Change::Generation { of, value } => {
@@ -269,28 +273,28 @@ fn apply<I: Ids>(out: &mut Replayed<I>, change: Change<I>) -> Result<(), Damaged
             kbs,
             version,
             timeouts,
-        } => evidence(out, &of, |e| {
-            // Pending anew after a release that landed though abandoned: the
-            // count comes back with it.
+        } => on(out, &of, |b| {
+            let released = b.released.take().map(|p| p.timeouts);
+            let e = &mut b.evidence;
             let pending = e.pending.get_or_insert_with(|| Pending {
                 kbs: Default::default(),
-                timeouts,
+                timeouts: timeouts.or(released).unwrap_or(0),
             });
             pending.kbs.extend(kbs);
             e.version = e.version.max(version);
         }),
-        Change::Released { of, version, .. } => evidence(out, &of, |e| {
-            if e.version == version {
-                e.pending = None;
+        Change::Released { of, version, .. } => on(out, &of, |b| {
+            if b.evidence.version == version {
+                b.released = b.evidence.pending.take();
             }
         }),
-        Change::TimedOut { of, count } => evidence(out, &of, |e| {
-            if let Some(p) = &mut e.pending {
+        Change::TimedOut { of, count } => on(out, &of, |b| {
+            if let Some(p) = counted(b) {
                 p.timeouts = count;
             }
         }),
-        Change::TimeoutsCleared { of, .. } => evidence(out, &of, |e| {
-            if let Some(p) = &mut e.pending {
+        Change::TimeoutsCleared { of, .. } => on(out, &of, |b| {
+            if let Some(p) = counted(b) {
                 p.timeouts = 0;
             }
         }),
@@ -340,6 +344,12 @@ fn on<I: Ids>(out: &mut Replayed<I>, of: &Of<I>, f: impl FnOnce(&mut Bound<I>)) 
     if let Some(b) = bound(out, of) {
         f(b);
     }
+}
+
+/// The count a timeout or a clearing changes: the pending one's, or after a
+/// release the one its offset would bring back.
+fn counted<I: Ids>(b: &mut Bound<I>) -> Option<&mut Pending<I::Kb>> {
+    b.evidence.pending.as_mut().or(b.released.as_mut())
 }
 
 fn evidence<I: Ids>(out: &mut Replayed<I>, of: &Of<I>, f: impl FnOnce(&mut Saved<I::Kb>)) {

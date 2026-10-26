@@ -452,19 +452,18 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
             of: a(),
             kbs: kbs(&["k"]),
             version: 1,
-            timeouts: 0,
+            timeouts: Some(0),
         },
         C::Questioned {
             of: a(),
             kbs: kbs(&["l"]),
             version: 2,
-            timeouts: 0,
+            timeouts: Some(0),
         },
         C::Released {
             of: a(),
             kbs: kbs(&["k"]),
             version: 1,
-            timeouts: 0,
         },
         C::TimedOut { of: a(), count: 2 },
         // A tombstone takes its KB out of the set; a deletion ends it.
@@ -513,7 +512,7 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
                 of: a(),
                 kbs: kbs(&["k"]),
                 version: 3,
-                timeouts: 0,
+                timeouts: Some(0),
             },
             C::TimedOut { of: a(), count: 2 },
         ];
@@ -527,7 +526,6 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
         of: a(),
         kbs: kbs(&["k"]),
         version: 3,
-        timeouts: 0,
     }]);
     assert_eq!(released.pending, None);
     // An offset re-registering an older version does not take it back.
@@ -535,7 +533,7 @@ fn a_binding_s_evidence_comes_back_as_its_records_left_it() {
         of: a(),
         kbs: kbs(&["k"]),
         version: 2,
-        timeouts: 0,
+        timeouts: Some(0),
     }]);
     assert_eq!(older.version, 3);
     // A count with nothing pending is not kept.
@@ -567,7 +565,7 @@ fn an_epoch_that_does_not_advance_is_damage() {
                 of: a(),
                 kbs: kbs(&["k"]),
                 version: 1,
-                timeouts: 0,
+                timeouts: Some(0),
             }]),
         },
         Record {
@@ -578,7 +576,6 @@ fn an_epoch_that_does_not_advance_is_damage() {
                     of: a(),
                     kbs: kbs(&["k"]),
                     version: 1,
-                    timeouts: 0,
                 },
             ]),
         },
@@ -594,8 +591,8 @@ fn an_epoch_that_does_not_advance_is_damage() {
 
 #[test]
 fn a_release_that_landed_though_abandoned_keeps_the_count() {
-    // ST-26g: two timeouts in a row persisted; the release is written, then
-    // abandoned for a registration that came meanwhile (I1), yet it lands.
+    // ST-26g: two timeouts in a row persisted, then a release written and
+    // abandoned (I1) that lands all the same.
     let a = || of("a", 1);
     let questioned = |version, timeouts| C::Questioned {
         of: a(),
@@ -603,28 +600,33 @@ fn a_release_that_landed_though_abandoned_keeps_the_count() {
         version,
         timeouts,
     };
-    let changes = vec![
-        bind("a", 1, 1),
-        questioned(1, 0),
-        C::TimedOut { of: a(), count: 2 },
-        C::Released {
-            of: a(),
-            kbs: kbs(&["k"]),
-            version: 1,
-            timeouts: 2,
-        },
-    ];
-    // The offset, or the new registration, carries the count back.
     let released = C::Released {
         of: a(),
         kbs: kbs(&["k"]),
         version: 1,
-        timeouts: 2,
     };
-    for after in [released.offset().unwrap(), questioned(2, 2)] {
-        let state = replay(1, log([changes.clone(), vec![after]].concat())).unwrap();
-        let pending = state.bindings[0].evidence.pending.clone().unwrap();
-        assert_eq!(pending.timeouts, 2);
-        assert_eq!(state.bindings[0].evidence.version, 2);
-    }
+    let count = |between: Vec<C>, after: C| {
+        let head = vec![
+            bind("a", 1, 1),
+            questioned(1, Some(0)),
+            C::TimedOut { of: a(), count: 2 },
+            released.clone(),
+        ];
+        let state = replay(1, log([head, between, vec![after]].concat())).unwrap();
+        let evidence = &state.bindings[0].evidence;
+        assert_eq!(evidence.version, 2);
+        evidence.pending.as_ref().map(|p| p.timeouts)
+    };
+    let offset = || released.offset().unwrap();
+    // Its offset brings the count back, or a registration meanwhile does.
+    assert_eq!(count(vec![], offset()), Some(2));
+    assert_eq!(count(vec![], questioned(2, Some(2))), Some(2));
+    // Cleared by a retry, or timed out again, while the release pended: the
+    // offset brings back the count as it then stood.
+    let cleared = C::TimeoutsCleared { of: a(), from: 2 };
+    assert_eq!(count(vec![cleared], offset()), Some(0));
+    let again = C::TimedOut { of: a(), count: 3 };
+    assert_eq!(count(vec![again], offset()), Some(3));
+    // Released for good: a later registration starts from its own count.
+    assert_eq!(count(vec![], questioned(2, Some(0))), Some(0));
 }

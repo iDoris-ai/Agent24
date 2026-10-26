@@ -144,7 +144,7 @@ fn every() -> Vec<(C, Class)> {
                 of: a.clone(),
                 kbs: kbs(&["k"]),
                 version: 1,
-                timeouts: 0,
+                timeouts: Some(0),
             },
             Tightening,
         ),
@@ -153,7 +153,6 @@ fn every() -> Vec<(C, Class)> {
                 of: a.clone(),
                 kbs: kbs(&["k"]),
                 version: 1,
-                timeouts: 0,
             },
             Loosening,
         ),
@@ -284,20 +283,19 @@ fn an_abandoned_loosening_is_offset_by_its_counterpart() {
                 profiles: vec!["a"],
             },
         ),
-        // Registered again over the KBs and the count released, past their
-        // version.
+        // Registered again over the KBs released, past their version, with
+        // the count as it stood.
         (
             C::Released {
                 of: a.clone(),
                 kbs: kbs(&["k", "l"]),
                 version: 4,
-                timeouts: 2,
             },
             C::Questioned {
                 of: a.clone(),
                 kbs: kbs(&["k", "l"]),
                 version: 5,
-                timeouts: 2,
+                timeouts: None,
             },
         ),
         // The count as it was before it was cleared.
