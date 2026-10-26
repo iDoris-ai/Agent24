@@ -84,9 +84,11 @@ pub enum MemoryError {
         dimension: &'static str,
     },
     /// P1-02c (c2): a retraction was refused on a full partition because the
-    /// assertion id is so long that `{"assertion_id":"…"}` exceeds the 256-byte
-    /// cap of the retraction quota exemption (migration 0018, ids up to 237
-    /// bytes are exempt). Carries no owner key and no id on purpose.
+    /// serialized retraction payload `{"assertion_id":…}` exceeds the 256-byte
+    /// cap of the retraction quota exemption (migration 0018). The test is on the
+    /// SERIALIZED bytes, not the id length: a plain id is exempt up to 237 bytes,
+    /// but an id with characters JSON escapes (`"`, `\`, control characters)
+    /// crosses the cap sooner. Carries no owner key and no id on purpose.
     #[error("assertion id is too long to retract while the partition is full")]
     RetractIdTooLong,
 }
@@ -107,8 +109,8 @@ pub enum MemoryErrorCode {
     DiskLow,
     DiskFull,
     ReservedKind,
-    /// A retraction whose assertion id makes the `assertion.retracted` payload
-    /// exceed the 256-byte quota-exemption cap (migration 0018), so on a full
+    /// A retraction whose serialized `assertion.retracted` payload exceeds the
+    /// 256-byte quota-exemption cap (migration 0018), so on a full
     /// partition it is charged as ordinary content and refused.
     RetractIdTooLong,
     Internal,

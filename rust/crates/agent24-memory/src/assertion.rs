@@ -38,7 +38,8 @@ pub enum Forget {
 }
 
 /// Mirror of migration 0018's cap on an exempt `assertion.retracted` payload
-/// (`LENGTH(CAST(payload AS BLOB)) <= 256`). Keep the two in step.
+/// (`LENGTH(CAST(payload AS BLOB)) <= 256`) — a limit on the SERIALIZED payload,
+/// so JSON-escaped characters in an id count double. Keep the two in step.
 pub const RETRACT_EXEMPT_MAX_PAYLOAD_BYTES: usize = 256;
 
 /// Close a belief and append its retraction event atomically. Repeated calls
