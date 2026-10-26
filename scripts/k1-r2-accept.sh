@@ -36,6 +36,7 @@ done
 # before anything is created.
 resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
+NEW=$(resolve "$NEW")
 WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/k1r2-accept.$$}")
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
@@ -66,6 +67,14 @@ REPORT="$WORK/report.md"
 FAILS=0
 : > "$WORK/results"
 touch "$WORK/.start"
+# release_daemons: the pids of `$NEW/agent24d serve` processes (the command
+# line `agent24 daemon start` gives the daemon next to it), less those that were
+# there before this run
+release_daemons() {
+  ps -axo pid=,command= | awk -v c="$NEW/agent24d serve" '{ pid = $1; sub(/^ *[0-9]+ /, ""); if (index($0, c) == 1) print pid }' \
+    | grep -vxF -f "$WORK/.before"
+}
+: > "$WORK/.before"; release_daemons > "$WORK/.before.tmp"; mv "$WORK/.before.tmp" "$WORK/.before"
 [ -e "$REAL" ] && REAL_BEFORE=present || REAL_BEFORE=absent
 
 # check ID "what" ok|fail "evidence" ["known limitation"]: a failing check
@@ -102,15 +111,16 @@ start_daemon() {
   done
   stop_daemon; return 1
 }
-# reap DATA_DIR: kill a daemon the state file names there, if alive. A start
-# that gave up waiting leaves its daemon running (kill_on_drop is off for a
-# resident one), and it may write the file later.
+# reap: kill every release daemon this run left behind. A start that gave up
+# waiting leaves its daemon running (kill_on_drop is off for a resident one),
+# with or without a state file; no pid is taken from a state file, which may
+# be stale.
 reap() {
   local pid
-  pid=$(jq -r '.pid // empty' "$1/daemon.json" 2>/dev/null) || return 0
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
-  echo "a daemon on $1 outlived its start (pid $pid); killing it" >&2
-  kill -KILL "$pid"
+  for pid in $(release_daemons); do
+    echo "a release daemon outlived its case (pid $pid); killing it" >&2
+    kill -KILL "$pid" 2>/dev/null
+  done
 }
 # start_cli BIN_DIR DATA_DIR [VAR=value ...]: `agent24 daemon start`, as a user
 # starts it; 0 once it started, 1 otherwise, its words in DATA_DIR.start.out
@@ -118,7 +128,7 @@ start_cli() {
   local bin=$1; DATA=$2; shift 2
   mkdir -p "$DATA"; rm -f "$DATA/daemon.json"
   env AGENT24_DATA_DIR="$DATA" A24_OS_PACKAGES="$DATA.pk" "$@" perl -e 'alarm shift; exec @ARGV' 60 \
-    "$bin/agent24" daemon start > "$DATA.start.out" 2>&1 || { reap "$DATA"; return 1; }
+    "$bin/agent24" daemon start > "$DATA.start.out" 2>&1 || { reap; return 1; }
   PID=$(jq -r .pid "$DATA/daemon.json"); PORT=$(jq -r .port "$DATA/daemon.json")
   TOKEN=$(jq -r .token "$DATA/daemon.json"); BY_CLI=$bin
 }
@@ -145,7 +155,7 @@ stop_daemon() {
   fi
   PID="" BY_CLI=""
 }
-trap 'stop_daemon; reap "$WORK/up"; reap "$WORK/down"' EXIT
+trap 'stop_daemon; reap' EXIT
 # cli ARGS...: the release's agent24 on the current library, time-limited
 cli() { env AGENT24_DATA_DIR="$DATA" A24_OS_PACKAGES="$DATA.pk" perl -e 'alarm shift; exec @ARGV' 60 "$NEW/agent24" "$@"; }
 
@@ -295,9 +305,11 @@ NEW_RUN=$(run_with NEW-ORDINARY-MARKER); ACP_RUN=$(run_with ACP-MARKER); wait_ru
 N=$(peer "$NEW_RUN"); S=$(withheld "$ACP_RUN")
 # The MCP answer is that run's own end, as agent24_run gives a shared run back:
 # its output, or its error as `code: message`; any other error text is not
-EXPECT=$(cli runs show "$NEW_RUN" --json 2>/dev/null | jq -r 'if .status == "completed" then (.output.text // "") else "\(.error.code): \(.error.message)" end' 2>/dev/null)
+cli runs show "$NEW_RUN" --json > "$WORK/v3.run" 2>/dev/null
+END=$(jq -r .status "$WORK/v3.run" 2>/dev/null)
+EXPECT=$(jq -r 'if .status == "completed" then (.output.text // "") else "\(.error.code): \(.error.message)" end' "$WORK/v3.run" 2>/dev/null)
 GOT=$(jq -r '.result.content[0].text // empty' "$WORK/v3.mcp" 2>/dev/null)
-M=$( [ -n "$EXPECT" ] && [ "$GOT" = "$EXPECT" ] && echo ok || echo fail)
+M=$(case "$END" in (completed|failed) [ "$GOT" = "$EXPECT" ] && echo ok || echo fail ;; (*) echo fail ;; esac)
 check V3 "a run started over MCP (no session) is shared, an ACP run (a session) is withheld" "$(is "$N/$M/$S" false/ok/ok)" "MCP run $NEW_RUN $N, answer $(jq -c '.result.content[0].text' "$WORK/v3.mcp" 2>/dev/null | cut -c1-80); ACP run $ACP_RUN $S"
 api GET /api/v1/peer/runs; cp "$WORK/r.json" "$WORK/peer.json"
 LEAK=$( [ "$CODE" = 200 ] && peer_list "$WORK/peer.json" || echo fail)
