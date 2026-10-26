@@ -1,56 +1,43 @@
-# P1-02c：配额失败、保留空间与压实边界（设计说明）
+# P1-02c：配额失败、撤回豁免与压实边界（设计说明）
 
-> 2026-10-26。基线：`origin/ab/memory-p1` `812204be`。
+> 2026-10-26。基线：`origin/ab/memory-p1` `812204be`。第 2 版，回应 Mac mini Codex 第一轮挑战（3 High、3 Medium、1 Low），修订记录见文末。
 >
-> **这是设计说明，不写代码。** 评审对象是本分支的精确 head；APPROVE 只接受本稿的语义与分片，不批准任何迁移或实现。各实现片各自开 PR，各自评审。
+> **这是设计说明，不写代码。** 评审对象是本分支的精确 head；APPROVE 只接受本稿的语义和分片，不批准迁移或实现。各实现片单独开 PR、单独评审。
 >
 > 上游约束：
-> - 生命周期 ADR（`docs/adr/ADR-MEMORY-P1-LIFECYCLE-AND-PURGE.md`，§9 已于 #1247 接受）：正常生命周期 no-loss；压缩、归档、配额都不能偷删原文；配额满不能报「已记住」；purge 控制记录需要独立的保留空间。
+> - 生命周期 ADR（`docs/adr/ADR-MEMORY-P1-LIFECYCLE-AND-PURGE.md`，§9 已于 #1247 接受）：正常生命周期不丢数据；配额不得偷删原文；配额满时不能报「已记住」；purge 控制记录需要独立保留空间（ADR:46、ADR:62）。
 > - ADR-037 的两级权限（#1249）。
+> - R05-5 的来源契约（#1248）。
 >
-> 代码事实见 [`docs/research/P1-02C-FACTS-20261026.md`](../research/P1-02C-FACTS-20261026.md)，每条附 文件:行。口径见 `P1-02B-CAPACITY-CALIBER-20261024.md`。
+> 代码事实见 [`docs/research/P1-02C-FACTS-20261026.md`](../research/P1-02C-FACTS-20261026.md)，每条附 文件:行。
 
 ## 1. 现状中违反 ADR 的地方
 
 | # | 现状 | 违反 | 证据 |
 |---|---|---|---|
-| V1 | 配额满时，撤回（`assertion.retracted`）也被同一个触发器拒绝，整笔回滚，断言仍然有效。`DELETE /memory/assertions/{id}` 返回 500 `internal`。用户满额后无法忘记任何东西 | 「撤回始终可用」；配额不得阻断用户控制 | facts §2；`memory_routes.rs:212`；`agent24-memory/src/lib.rs:2544` 测试 |
-| V2 | `mem_events` 没有任何不受配额约束的空间。审计、撤回、将来的 purge 控制记录都与内容争同一份额度 | ADR「purge 控制记录须有独立保留空间」 | facts §2 |
-| V3 | run 路径写入失败时，只发 `memory.write_failed` WS 事件，没有任何消费方；run 照常 `completed`；普通聊天轮次写入失败时，`memory_receipt` 为空，界面零提示 | 「配额满不能报已记住；原文未保存必须显式显示」 | facts §1；`agent24-agent/src/lib.rs:2023` |
-| V4 | 写入失败不留任何持久记录，事后无从查证 | 审计可查 | facts §2 |
-| V5 | `memory.write_failed.reason` 直接用 `MemoryError::Display`，含带 NUL 的分区键；进程内模块路径把错误转成字符串，丢失了类型 | 错误应可分类、不泄露内部键 | facts §1、§5 |
-| V6 | 没有磁盘满映射，没有写前剩余空间检查；SQLITE_FULL 会变成通用 internal | 失败应可解释、可恢复 | facts §4 |
-| V7 | 满额后没有任何回收路径（不 VACUUM、不 checkpoint、`mem_events` 无删除），会话压实只追加摘要 | ADR 允许的回收只有 purge（P1-08）和归档切换（P1-04b），这里不算违反，但必须写明满额的出路 | facts §5 |
+| V1 | 配额满时，撤回（`assertion.retracted`）也被同一个触发器拒绝，整笔回滚，断言仍然有效。`DELETE /memory/assertions/{id}` 返回 500 `internal`。用户在满额后无法让任何记忆失效 | 「撤回始终可用」；配额不得阻断用户控制 | facts W5；`memory_routes.rs:212`；`agent24-memory/src/lib.rs:2544` 的测试 |
+| V2 | `mem_events` 没有任何不受配额约束的空间；将来的 purge 控制记录也没有落点 | ADR「purge 控制记录需要独立保留空间」 | facts §2 |
+| V3 | run 路径写入失败只发一个 `memory.write_failed` WS 事件，没有任何消费方，run 照常 `completed`；普通 chat 轮次写入失败时 `memory_receipt` 为空，界面没有任何提示；压实摘要（W2）写入失败只打 `tracing::error!` | 「配额满不能报已记住；原文没保存必须显式显示」 | facts W1–W3；`agent24-agent/src/lib.rs:2023` |
+| V4 | 写入失败不留任何持久记录 | 审计可查 | facts §2 |
+| V5 | `memory.write_failed.reason` 用的是 `MemoryError::Display`，其中以 `{owner:?}` 形式带出分区键（NUL 以转义文本出现）；进程内模块路径把错误转成字符串，丢掉了类型 | 错误要能分类，不泄露内部键 | facts §1；`agent24-memory/src/lib.rs:81`；`os_memory.rs:841` |
+| V6 | 没有磁盘满的映射，写入前也不检查剩余空间；SQLITE_FULL 最终变成通用 internal | 失败要能解释、能恢复 | facts §4 |
+| V7 | 满额后没有任何回收路径 | 不算违反（ADR 只允许 purge 和归档回收空间），但必须写明满额后的出路 | facts §5 |
 
 ## 2. 决定
 
-### D1 配额只约束「新增内容」，用户控制与审计走保留空间
+### D1 撤回豁免配额：靠结构上界，不靠共享保留池
 
-`mem_events` 的 kind 分成两类，由迁移中的封闭清单决定（新增 kind 默认属于 A，进入 B 必须改迁移并评审）：
+第 1 版提出「B 类 kind 共享一个保留池」。挑战指出这个方案有三个问题：模块可以自选 kind 冒充控制事件；`mem.write_decision` 审计含正文，新增断言可以借它绕过配额；保留池在正常使用下也会耗尽，还会挤占内容额度。第 2 版改为：
 
-- **A 内容类**（受基础配额约束）：消息、断言、重申、会话摘要、trace，以及其他新增内容。
-- **B 控制与审计类**（只受保留空间约束）：
-  - `assertion.retracted`、`mem.write_decision`；
-  - 本稿新增的 `mem.write_rejected`、`session.gap`；
-  - 将来的 purge 控制与审计 kind；
-  - 设置变更类。
-
-触发器改为：
-- A 类：`row_count + 1 ≤ max_rows`，且 `byte_count + len ≤ max_bytes`（现状不变）。
-- B 类：`row_count + 1 ≤ max_rows + reserve_rows`，且 `byte_count + len ≤ max_bytes + reserve_bytes`。
-
-默认 `reserve_rows = 10000`、`reserve_bytes = 16 MiB`。这是推测值，P1-02c-0 实测后才复核，写进迁移注释。
-
-用量统计不分类，A、B 合计进 `row_count`/`byte_count`，告警（D6）按合计计算。
-
-**防滥用**：
-- B 类单行 payload 有上限（例如 4 KiB），只允许元数据，不得携带正文。
-- `mem.write_rejected` 按 owner 限频（见 D3）。
-- 撤回数量的上界是已有断言数，不会无限增长。
-
-**reassert 归 A 类**：它会让失效内容重新生效，等同于新增内容。
-
-**重申「满额后能撤回」**：只要 B 类保留空间还有余量，撤回一定成功。保留空间本身耗尽，只可能发生在异常滥用时；这时返回类型化错误 `memory_reserve_exhausted`，不再回落为 internal。
+1. **内容和成功审计照旧受配额约束（A 类）。** 包括消息、断言、重申、会话摘要、trace、导入，以及 `mem.write_decision`（含正文，与内容在同一事务，R05/H02 现状不变）。新增 kind 默认都是 A 类。
+2. **只有撤回豁免配额。** 触发器对 `kind = 'assertion.retracted'` 的行跳过配额比较，但必须同时满足以下三条，否则仍按 A 类处理：
+   - **写入者**：只有宿主撤回路径会写这个 kind（`assertion.rs` 的 `forget`）。
+   - **owner 类别**：`scope_owner` 是 personal owner（不是 `os:` 前缀）。模块 owner 不享受豁免，它们没有 ADR 要求的「用户撤回」语义。
+   - **payload**：只有 `{"assertion_id": …}`（现状已经如此），长度上限 256 字节，在触发器里检查。
+3. **豁免有结构上界，不会无限增长。** 一次撤回只能作用于一条当前有效的断言（`forget` 已经要求断言有效，撤回后即失效）。要让同一条断言再次被撤回，必须先重申它，而重申属于 A 类、受配额约束。因此在任一时刻，豁免撤回的累计行数不超过「曾经有效的断言数」，而后者本身受 A 类配额约束。结论：豁免撤回的总行数 ≤ 基础 `max_rows`，字节数 ≤ 256 × `max_rows`（默认约 49 MiB）。这是证明，不是估计值；需要 T2 测试来固定。
+4. **用量计数分开。** `mem_owner_usage` 新增 `exempt_row_count` 和 `exempt_byte_count` 两列；A 类门只比较 A 类计数，豁免行不会挤占内容额度。告警（D6）同时报两组计数。
+5. **模块不能写保留 kind。** 进程内和进程外两个模块写入入口都拒绝以下 kind：`assertion.*`、`mem.*`、`session.*`，以及将来的 purge 控制类 kind。返回类型化错误 `reserved_kind`。需要补两条伪造测试（T9）。
+6. **purge 控制记录不进 `mem_events`。** ADR §5 已经要求「独立恢复控制存储」，所以 purge 的意图、fence 和世代记录存在独立的控制表或控制库，不受 `mem_owner_quota` 约束，空间由 P1-08 设计。本稿只确认一点：purge 不会因为记忆满额而写不下控制记录。
 
 ### D2 统一的类型化失败与各路径回执
 
@@ -58,108 +45,125 @@
 
 | 码 | 含义 |
 |---|---|
-| `memory_quota_rows` | 行数配额已满 |
+| `memory_quota_rows` | 行配额已满 |
 | `memory_quota_bytes` | 字节配额已满 |
-| `memory_reserve_exhausted` | 保留空间耗尽 |
-| `memory_disk_low` | 写前检查发现磁盘剩余不足 |
-| `memory_disk_full` | 写入时遇到 SQLITE_FULL |
+| `memory_disk_low` | 写前检查发现剩余空间不足 |
+| `memory_disk_full` | SQLITE_FULL |
+| `memory_reserved_kind` | 模块试图写保留 kind |
 | `memory_internal` | 其他内部错误 |
 
-错误对外只带码、维度和 owner 类别（`personal` / `module`），不带分区键或 Display 原文（修 V5）。
+对外只给出错误码、维度和 owner 类别（personal / module），不带分区键，也不带 Display 原文（修 V5）。
 
-各路径的回执：
-
-| 路径 | 失败时用户必须看到 |
+| 路径（facts 编号） | 失败时用户必须看到 |
 |---|---|
-| chat 显式「记住」 | 维持 `memory_receipt: "failed"`，新增 `memory_error_code` 字段 |
-| chat 普通轮次 | `memory_receipt: "not_saved"` 加错误码；桌面在该轮显示「本轮未保存到记忆」 |
-| run 路径 | `memory.write_failed{code, dimension, owner_kind}`（类型化，不含原文）；run 结束事件携带 `memory_persisted: false`；桌面和 TUI 必须消费并显示，属 P1-03 的验收项 |
-| `DELETE /memory/assertions/{id}` | 按 D1 不应再因配额失败。保留空间耗尽时返回 507 `memory_reserve_exhausted`，其他错误保持 500 |
-| 模块 `os_memory` | 进程外路径保持现有的 `quota_exceeded`，改为带维度；进程内路径改为类型化，不再转字符串 |
+| W1 chat 普通轮次 | `memory_receipt: "not_saved"` 加错误码；桌面在该轮显示「本轮未保存到记忆」 |
+| W1 + W4 chat 显式「记住」 | 保持 `memory_receipt: "failed"`，新增 `memory_error_code`；如果 `append_turn` 成功、断言失败，回执为 `partial`，并写明「对话已保存，记忆未写入」 |
+| W1 run 路径 | `memory.write_failed{code, dimension, owner_kind}`（类型化，不含原文）；run 结束事件带 `memory_persisted: false`；桌面和 TUI 必须消费并显示（P1-03 验收项） |
+| W2 会话压实摘要 | 写入失败时发 `memory.write_failed{kind:"session.summary"}`，不只打日志；之后的上下文仍用完整原文，不依赖摘要 |
+| W3 旧会话导入 | 导入失败时 `ensure_imported` 返回类型化错误；该会话标记「导入未完成」并可重试，不能当成空会话继续 |
+| W5 撤回 `DELETE /memory/assertions/{id}` | 按 D1 不再因配额失败。磁盘满时返回 507 `memory_disk_full`，磁盘偏低时返回 507 `memory_disk_low`，其他错误保持 500 |
+| W6 / W7 模块 | OOP 保持 `quota_exceeded`，加上维度；进程内改为类型化；保留 kind 返回 `memory_reserved_kind` |
 
-**模型口头说「记住了」不算回执**（与 P1-10 一致）。界面以结构化回执为准，并把两者冲突的情况标出来。
+模型口头说「记住了」不算回执（与 P1-10 一致）。界面以结构化回执为准，两者冲突时标出来。
 
-### D3 失败留痕：`mem.write_rejected`
+### D3 失败留痕
 
-每次 A 类写入被拒，都在保留空间写一行 `mem.write_rejected`。payload 只含元数据：错误码、维度、被拒 kind、拒绝时的计数、时间。不含正文。
+第 1 版设计的 `mem.write_rejected` 是 `mem_events` 里的保留行，会和 D1 的计数问题纠缠在一起。第 2 版改成**独立表** `mem_write_rejections`：
 
-**限频**：同一 owner、同一错误码，每 60 秒最多写一行；被合并的次数累加进下一行的 `suppressed_count`。
+- 字段：owner 类别、不透明 owner id、错误码、维度、被拒 kind、拒绝时的计数、时间、`suppressed_count`。不含正文。
+- 不受 `mem_owner_quota` 约束。
+- 自身容量有上限：每个 owner 最多 1000 行，满了就环形覆盖最旧的行。审计的完整性以可见窗口为准，这一点要写明。
+- 限频：同一 owner、同一错误码，每 60 秒最多新增一行，被合并的次数累加到 `suppressed_count`。
+- 它是审计，不是重试队列；系统不会自动重写被拒的内容。
 
-这是审计，不是重试队列：系统不会自动重写被拒的内容。
+### D4 会话缺口：只记录、对用户显式，暂不注入模型上下文
 
-### D4 会话历史的缺口要显式化
+第 1 版提出用 HostSystem 来源把缺口说明注入后续上下文。这与 R05-5:72 冲突（HostSystem 当前唯一的写点是暂停通知），会动到来源契约，所以第 2 版不注入：
 
-某一轮写入失败后，后续上下文不含这一轮（facts §1，`SessionLog`），这本身符合「不伪造」。但必须让用户和后续轮次知道这里有缺口：
-
-- 在保留空间写一行 `session.gap`，记录 session、轮次号、错误码，不含正文。
-- 构造后续上下文时，遇到 `gap` 就插入一条宿主系统说明：「此处有 N 轮未能保存」。这条说明的来源 kind 记为 HostSystem，与 R05-5 一致。
-- 会话压实摘要写入失败时，同样记 `session.gap`，并发出事件，不能只打 `tracing::error!`。
-- `append_turn` 与 `persist` 是两个事务，可能出现「消息已存、断言未存」。这时回执写成「对话已保存、记忆未写入」，不能笼统说「已保存」。
+- 一轮写入失败后，在 `mem_write_rejections` 里记 `kind=session.turn`、`session_id`、轮次号。
+- 用户可见：该轮的回执（D2）是 `not_saved`；会话页在缺口处显示「此处 N 轮未保存」，数据来自 `mem_write_rejections`。
+- 模型可见：**不处理**。后续上下文照现状不含失败轮次，也不插入说明。如果以后要让模型知道缺口，另开一份 R05 契约修订（R05-6）：定义唯一写点，来源与 digest 同一事务，并经过发送门和冷恢复测试。本稿不批准这件事。
 
 ### D5 磁盘
 
-- **写前检查**：在 `memory.db` 所在卷（不是 cwd）检查剩余空间，低于 `max(512 MiB, 2 × 当前 WAL 大小)` 时，A 类写入返回 `memory_disk_low`；B 类写入在剩余空间高于 64 MiB 时仍然允许，保证撤回可用。检查做缓存，每 5 秒最多读一次，避免逐写 statfs。
-- **SQLITE_FULL（code 13）**：映射为 `memory_disk_full`，可借鉴 `agent24-documents/src/state.rs` 的现有映射。
-- 平台差异：Windows 的卷剩余空间读法留给 PLT-WIN。
+- **写前检查**：针对 `memory.db` 所在的卷（不是 cwd）。剩余空间低于 `max(512 MiB, 2 × 当前 WAL 大小)` 时，内容写入（A 类）返回 `memory_disk_low`。
+- **撤回**：只是**尽力保证**，不做硬保证。撤回只写一行（≤256 B）加 WAL 增量，所以剩余空间不低于 16 MiB 时放行；低于 16 MiB 时返回 `memory_disk_low`，并提示用户先释放磁盘。同一卷上可能有并发写入（其他进程或其他库）在检查之后耗尽空间，这种情况会遇到 SQLITE_FULL，映射为 `memory_disk_full`。本稿不承诺在磁盘完全写满时还能撤回。
+- **缓存**：检查结果最多缓存 5 秒，A 类写入在缓存过期时重新读取。缓存只用于减少 statfs 调用，不作为安全依据；安全依据是 SQLITE_FULL 的映射。
+- **SQLITE_FULL（code 13）**：映射为 `memory_disk_full`，可以参照 `agent24-documents/src/state.rs` 的现有映射。
+- Windows 卷剩余空间的读取方法交给 PLT-WIN。
 
 ### D6 告警阈值（供 P1-03 实现）
 
-- **按 owner 告警**：行数或字节用量超过基础配额的 80% 发 `warning`，超过 95% 发 `critical`；分别回落到 75% 和 90% 以下时解除（滞回）。
-- **磁盘告警**：剩余低于 2 GiB 发 `warning`，低于 D5 的门槛发 `critical`。
-- **告警通道**：用量 API（P1-03a）和事件 `memory.usage_level_changed`，后者只在跨档时发出。
-- **阈值要可测**：阈值本身写在配置里，测试用小配额 owner 覆盖跨档与解除。
+- **按 owner 告警**：A 类用量（行或字节）达到 80% 为 `warning`，达到 95% 为 `critical`；回落到 75% / 90% 以下时解除（滞回）。豁免撤回计数单独展示，不触发配额告警。
+- **磁盘告警**：剩余空间低于 2 GiB 为 `warning`，低于 D5 门槛为 `critical`。
+- **通道**：用量 API（P1-03a），以及 `memory.usage_level_changed` 事件（只在跨档时发出）。
+- **阈值放在配置里**：测试用小配额 owner 覆盖跨档和解除。
 
-### D7 不自动回收；满额的出路
+### D7 不自动回收；满额后的出路
 
-- **不做自动删除**：到限不删、不压缩原文、不自动扩大限额。
-- **用户可用的出路**，按交付顺序：
-  1. 撤回（D1 保证可用）；撤回不释放空间，但让内容不再被召回。
-  2. 管理员调整 owner 限额（D8）。
-  3. 冷归档（P1-04b）：归档包经校验、回放等价后，才切换引用并回收热副本。
-  4. purge（P1-08）。
-- **WAL**：允许定期执行 `wal_checkpoint(TRUNCATE)` 限制 WAL 长度。它不删除任何逻辑数据，只在空闲时执行，单独成片（c5）。
+- 到限后不删数据、不压缩原文、不自动扩大限额。
+- 用户可用的出路（按交付顺序）：
+  1. **撤回**（D1 保证可用）：撤回不释放空间，但让内容不再被召回。
+  2. **管理员调整限额**（D8）。
+  3. **冷归档**（P1-04b）：校验并回放等价之后，才切换引用、回收热副本。
+  4. **purge**（P1-08）。
+- **WAL**：允许在空闲时执行 `wal_checkpoint(TRUNCATE)`，限制 WAL 长度，不删除逻辑数据（c5）。
 - **VACUUM / incremental_vacuum**：只在 purge 或归档回收之后由对应流程触发，本稿不新增。
 
 ### D8 owner 限额调整
 
-- 新增 owner 级配额覆盖的写入口（API / CLI），属于 ADR-037 的**提升级**操作，需要用户在场证明。
-- 只允许设定绝对值，不允许设成「无限」；把限额调到低于当前用量时，不删数据，只让后续 A 类写入被拒。
-- 每次调整写 B 类审计行（`mem.quota_changed`，记录旧值、新值和操作者的不透明 id）。
+- 新增 owner 级配额覆盖的写入口（API / CLI），属于 ADR-037 的提升级操作，需要用户在场证明。
+- 只能设为绝对值，不能设为「无限」。调低到当前用量以下时不删数据，只让后续 A 类写入被拒。
+- 每次调整都写入 `mem_write_rejections` 的同类审计表 `mem_quota_changes`（旧值、新值、不透明操作者 id、时间），不受配额约束。
 
-### D9 测量先于调参
+### D9 先测量再调参
 
-`P1-02c-0`：在隔离的合成库上运行现有的 `p1_capacity` 探针，扩展到真实的 personal 写入路径（chat 和 retain），记录 `page_count × page_size`、WAL 峰值、`mem_events` 平均 payload、每千轮对话的行数与字节。结果写入 `docs/research/`，只作为 D1 保留空间和 D6 阈值的复核依据。**默认限额不因测量自动改变**；要改，另开一份决定。
+`P1-02c-0`：在隔离的合成库上运行现有 `p1_capacity` 探针，并扩展到真实的 personal 写入路径（chat、retain）。记录 `page_count × page_size`、WAL 峰值、`mem_events` 平均 payload、每千轮对话的行数和字节。结果写入 `docs/research/`，用来复核 D6 阈值和 D5 门槛。**默认限额不因测量结果自动改变。**
 
 ## 3. 测试门（每片 red → green，并做变异验证）
 
-| 门 | 断言 |
-|---|---|
-| T1 满额撤回 | 把 owner 配额设为当前用量，撤回成功，断言失效；去掉 B 类分支后测试变红 |
-| T2 保留空间上界 | B 类超出 `max + reserve` 时返回 `memory_reserve_exhausted`（507），不是 500 |
-| T3 A 类仍然拒绝 | 满额后新增消息或断言被拒，`mem_events` 无新增内容行，`mem.write_rejected` 有且只有一行（限频窗口内） |
-| T4 回执 | chat 显式记住、普通轮次、run 三条路径在满额时都给出类型化失败回执；run 结束事件 `memory_persisted:false`；任何回执都不出现「已记住」 |
-| T5 不泄露 | 失败事件与 HTTP 错误体中不含分区键、NUL 或 Display 原文 |
-| T6 会话缺口 | 某轮写入失败后，下一轮上下文含 HostSystem 缺口说明，且来源行可证明 |
-| T7 磁盘 | 模拟卷剩余不足：A 类返回 `memory_disk_low`，B 类撤回仍成功；注入 SQLITE_FULL 映射为 `memory_disk_full` |
-| T8 限额调整 | 没有在场证明时拒绝；有证明时写入审计行；下调到低于用量后不删数据 |
-| T9 分区隔离 | 模块 owner 写满，不影响 personal owner 的写入与撤回 |
+| 门 | 断言 | 片 |
+|---|---|---|
+| T1 满额撤回 | 把 personal owner 的配额设为当前用量，撤回成功、断言失效；去掉豁免分支后测试变红 | c1 |
+| T2 豁免上界 | 反复「重申 → 撤回」直到 A 类配额满：重申先被拒，此后再无可撤回的有效断言；豁免行数不超过曾经有效的断言数；payload 超过 256 B 的伪撤回走 A 类门 | c1 |
+| T3 内容仍拒 | 满额后新增消息、断言或重申被拒，`mem_events` 没有新增内容行；`mem.write_decision` 与断言一起回滚 | c1 |
+| T4 计数分离 | 豁免撤回不增加 A 类计数，A 类门不受影响 | c1 |
+| T5 回执 | W1–W7 各路径在满额时都给出类型化失败回执；run 结束事件 `memory_persisted:false`；`partial` 组合（轮次已存、断言未存）有专门用例；任何回执都不出现「已记住」 | c2 |
+| T6 不泄露 | 失败事件和 HTTP 错误体里不含分区键、`{owner:?}` 转义文本或 Display 原文 | c2 |
+| T7 失败留痕 | 拒绝时 `mem_write_rejections` 有一行；60 秒内重复拒绝只累加 `suppressed_count`；超过 1000 行时环形覆盖 | c3 |
+| T8 磁盘 | 模拟卷剩余不足：A 类返回 `memory_disk_low`，剩余 ≥16 MiB 时撤回成功、<16 MiB 时返回 507；注入 SQLITE_FULL 映射为 `memory_disk_full`（A 类和撤回都测）；缓存过期后重新读取 | c4 |
+| T9 模块伪造 | 进程内、进程外模块入口都无法写 `assertion.retracted` / `mem.*` / `session.*`（返回 `memory_reserved_kind`）；模块 owner 的撤回不享受豁免 | c1 |
+| T10 分区隔离 | 模块 owner 写满不影响 personal 的写入和撤回 | c1 |
+| T11 限额调整 | 没有在场证明时拒绝；有证明时写入审计；调低到用量以下时不删数据 | c6 |
 
 ## 4. 实现分片（批准后再派，各自独立 PR）
 
 | 片 | 内容 | 依赖 |
 |---|---|---|
 | c0 | D9 测量报告（只读、合成库） | — |
-| c1 | 迁移 0024：kind 分类封闭清单、B 类保留空间、新 kind；T1、T2、T3、T9 | — |
-| c2 | 类型化错误码与各路径回执、`memory_persisted`；T4、T5 | c1 |
-| c3 | `mem.write_rejected` 限频与 `session.gap` 及上下文缺口说明；T3、T6 | c1 |
-| c4 | 磁盘写前检查与 SQLITE_FULL 映射；T7 | c2 |
-| c5 | 空闲时 WAL checkpoint(TRUNCATE) | — |
-| c6 | owner 限额调整入口（提升级）；T8 | c1，ADR-037 提升级机制（CORE-2） |
+| c1 | 迁移 0024：撤回豁免（personal、宿主写点、payload 上限）、豁免计数列、模块保留 kind 拒绝；T1–T4、T9、T10 | — |
+| c2 | 类型化错误码与 W1–W7 回执、`memory_persisted`、`partial`；T5、T6 | c1 |
+| c3 | `mem_write_rejections` 表、限频与环形上限、会话缺口展示数据；T7 | c1 |
+| c4 | 磁盘写前检查与 SQLITE_FULL 映射；T8 | c2 |
+| c5 | 空闲时 `wal_checkpoint(TRUNCATE)` | — |
+| c6 | owner 限额调整入口（提升级）与 `mem_quota_changes`；T11 | c1；ADR-037 在场证明（CORE-2） |
 
-c6 依赖 CORE 线的在场证明。在那之前，限额只能离线改，并在文档中注明。告警与用量 API 属于 P1-03，不在本稿。
+告警与用量 API 属于 P1-03。会话缺口注入模型上下文属于另行开的 R05-6。
 
 ## 5. 不在本稿
 
-- 用量 API 与记忆页 UI（P1-03）；附件外置（P1-04a）；冷归档（P1-04b）；purge（P1-08）。
-- 改动默认的 200000 行 / 256 MiB。
-- 跨 owner 的全局上限：模块数增长时总量会叠加，这条记为风险，留给 P1-03 告警之后再决定。
+- 用量 API 与记忆页 UI（P1-03）；附件外置（P1-04a）；冷归档（P1-04b）；purge 控制存储的具体设计（P1-08）。
+- 修改默认的 200000 行 / 256 MiB。
+- 跨 owner 的全局上限：模块数量增长时，总量会叠加。这一条记为风险，等 P1-03 告警上线后再决定。
+
+## 6. 修订记录
+
+**第 2 版**，回应 Mac mini Codex 第一轮挑战：
+
+- **H1**（模块可冒充控制 kind）：只豁免宿主撤回、只对 personal owner 豁免，模块入口拒绝保留 kind（D1.2、D1.5，T9）。
+- **H2**（`mem.write_decision` 含正文，可绕过配额门）：成功审计保持 A 类，与内容同一事务（D1.1，T3）。
+- **H3**（共享保留池在正常使用下会耗尽，挤占内容额度，也证明不了 purge 有空间）：取消保留池，改为撤回豁免加结构上界的证明（D1.3），计数分离（D1.4），purge 控制记录放到 `mem_events` 之外（D1.6），失败留痕改用独立表并设环形上限（D3）。
+- **M1**（HostSystem 唯一写点冲突）：会话缺口不注入模型上下文，留给 R05-6（D4）。
+- **M2**（回执遗漏 W2/W3、撤回磁盘满仍返回 500、门禁顺序）：补齐回执表；撤回的磁盘错误改为 507；T3 不再依赖 c3。
+- **M3**（64 MiB 加 5 秒缓存保证不了撤回）：撤回改为尽力保证，写明低于门槛时的行为，并补并发和 SQLITE_FULL 测试（D5，T8）。
+- **L1**：V5 的措辞改为「`{owner:?}` 以转义文本出现」。
