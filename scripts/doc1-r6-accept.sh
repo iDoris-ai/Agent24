@@ -294,8 +294,10 @@ check C5 "list: the two retried imports are documents now" "$(is "$rc/$(last "$W
 doc_of() { a24 documents job "$1" --json 2>/dev/null | tail -n 1 | jq -r '.data.document_id // empty'; }
 # readtext DOC OUT: page 1's text. An image's text layer is built (OCR) on its
 # first read, which answers engine_unavailable until it is there; any other
-# answer is final. Up to 60 s in all: each read itself may wait 8 s for the
-# layer before it answers, so the bound is the clock, not a count.
+# answer is final. No new read starts after 60 s: each read itself may wait
+# 8 s for the layer before it answers, so the bound is the clock, not a
+# count, and the last read may end that much later. The case judges the
+# words, not the time.
 readtext() {
   local t0
   t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
