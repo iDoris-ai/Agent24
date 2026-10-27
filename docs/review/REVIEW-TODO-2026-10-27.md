@@ -36,6 +36,7 @@
 | P1 | REV-04 | 聊天只送本轮文本，上下文由 daemon 已压缩视图提供；压缩移后台不占会话锁；`next_turn` 持久计数器；`/chat` 打开流式 Progress 经 WS 推 delta | R6 / P-01–03、P-10 | 新「性能」线，与 TUI-2 共用 | M |
 | P1 | REV-02 | CORE-5 范围补 documents.db；memory 打开失败改 `/health` 可见 degraded | R5 / A-06 | CORE-5f | M |
 | P1 | CORE-2b | ProductHost 1 小时 TTL + 父管道续期；事件按主体过滤、吊销断连 | S-05 / C-03 / C-13 | ab/core | L |
+| P1 | ID-ERR-1 | iDoris v0.3.2 的 `502` + `error.type=upstream_auth_failed` 映射为终态 `Rejected`（不重试、不换 provider），提示检查 `IDORIS_OMLX_API_KEY`；现 `idoris.rs` 把 5xx 一律当 `Unavailable` | iDoris#583/#582 | ab/idoris（等 v0.3.2） | S |
 | P2 | G-API-3b | `ApiErrorCode` 枚举统一 Rust/OpenAPI/桌面三处错误码清单 | C-07 | ab/core | M |
 | P2 | REV-05 | 记忆性能：FTS 重建离开 ready 路径、`content=''` 外部内容表、撤回删 FTS 行、`active_ids` 部分索引、`run_messages` 不再复制会话尾部、进程内走准入信号量 | R7 / P-04–07、P-12 | ab/memory-p1（c3b 之后） | L |
 | P2 | REV-06 | `serve()` 按启动阶段拆分，结构性测试改为阶段函数单测；MCP 与模块并行挂载 | R8 / A-01 / C-10 / P-09 | 随 CORE-5f/2e | L |
