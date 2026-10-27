@@ -64,6 +64,11 @@ mod lifecycle;
 mod mcp;
 mod memory_callback;
 mod memory_routes;
+#[allow(
+    dead_code,
+    reason = "CORE-5b coordinator stays unwired; production startup still uses Store::open"
+)]
+mod migration_coordinator;
 mod model_callback;
 mod module_approval_broker;
 mod module_approvals;
@@ -79,6 +84,8 @@ mod scheduler_callback;
 mod scheduler_deliver;
 mod schedules;
 mod server;
+
+const _: () = assert!(!migration_coordinator::ENABLED);
 mod timing_recorder;
 mod usage_recorder;
 

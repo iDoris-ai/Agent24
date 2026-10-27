@@ -23,6 +23,7 @@ mod allocation_retention_plan;
 mod allocation_retention_writer;
 mod allocation_types;
 mod audit;
+mod conn_phase;
 mod decision_log;
 mod legacy_recovery;
 mod model_call_timings;
@@ -37,6 +38,8 @@ mod run_workspace_authority;
 mod run_workspace_orphan;
 mod run_workspace_terminal;
 pub mod source_policy;
+#[doc(hidden)]
+pub mod sqlite_phase;
 mod terminal_core;
 mod terminal_helpers;
 pub(crate) mod terminal_mutations;
@@ -137,6 +140,8 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+pub use conn_phase::{OBSERVE_UNCLOSED, PhaseError, PhaseFault, StoreConn, embedded_version};
+
 /// Persistence boundary for trusted, internally authorized workflow code.
 ///
 /// `Store` validates and journals persistence data; it does not establish
@@ -157,25 +162,10 @@ pub struct Store {
 impl Store {
     /// Open (creating if needed) a database file and run migrations.
     pub async fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| StoreError::Conflict(e.to_string()))?;
-        }
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
-        Ok(Self {
-            pool,
-            module_consent_revocations,
-            terminal_commit_ack_gate: std::sync::Arc::default(),
-        })
+        StoreConn::migrate(path, PhaseFault::none())
+            .await
+            .map(StoreConn::into_store)
+            .map_err(|err| err.source)
     }
 
     /// Open an existing file and do not migrate it.
