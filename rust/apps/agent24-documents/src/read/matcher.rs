@@ -42,6 +42,13 @@ fn get(bits: &[u64], k: usize) -> bool {
     bits[k / 64] & (1 << (k % 64)) != 0
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Steps taken on this thread. A step costs the same whatever the text,
+    /// so a test judges `find`'s time by these, not by a clock.
+    static STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Query {
     /// `None` for a query that is only whitespace (or empty).
     #[must_use]
@@ -96,6 +103,8 @@ impl Query {
 
     /// One step on `c`: `d` (the live states) becomes its successors.
     fn step(&self, d: &mut [u64], c: char) {
+        #[cfg(test)]
+        STEPS.with(|s| s.set(s.get() + 1));
         let ws = c.is_whitespace();
         let takes = self.takes.get(&fold(c));
         let mut carry = 0;
