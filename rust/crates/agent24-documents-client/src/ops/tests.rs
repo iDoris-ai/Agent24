@@ -576,6 +576,7 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
         );
         async move { call(&req, &Answers(reply)).await }
     };
+    let whole = json!(base64::engine::general_purpose::STANDARD.encode(&body));
     for (asked, used) in [
         (Some(0.25), "0.25"),
         (Some(4.0), "4"),
@@ -588,12 +589,19 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
             panic!("{asked:?} {used}: refused");
         };
         assert_eq!(
-            (status, &data["media_type"], &data["scale"], &data["bytes"]),
+            (
+                status,
+                &data["media_type"],
+                &data["scale"],
+                &data["bytes"],
+                &data["png"]
+            ),
             (
                 200,
                 &json!("image/png"),
                 &json!(used.parse::<f64>().unwrap()),
-                &json!(body.len())
+                &json!(body.len()),
+                &whole
             ),
             "{asked:?} {used}"
         );
