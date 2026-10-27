@@ -207,6 +207,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "memory",
     // T7b/ME-3e: `/api/v1/module-approvals`.
     "module-approvals",
+    // K1-6a.4: `/api/v1/module-consents` management endpoints.
+    "module-consents",
     "models",
     // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
     // — and the set-equality test below is what forced this entry the moment the
@@ -2985,8 +2987,13 @@ raise SystemExit(3)
 
     /// A host with one package, `remote`, started and Running.
     pub(crate) async fn running_package(tmp: &Path) -> ProcessHost {
+        running_package_with(tmp, PACKAGE_MODULE).await
+    }
+
+    /// [`running_package`] with a caller-chosen module script.
+    async fn running_package_with(tmp: &Path, script: &str) -> ProcessHost {
         let packages = tmp.join("packages");
-        write_package(&packages, "remote");
+        write_package_with(&packages, "remote", "[]", script);
         let host = test_host(tmp);
         let hub = crate::events::EventsHub::default();
         let _ = mount_all(
@@ -3012,10 +3019,55 @@ raise SystemExit(3)
         host
     }
 
+    /// `PACKAGE_MODULE` that appends one line to `exits` each time its process
+    /// ends (SIGTERM is turned into a normal exit so `atexit` runs). The file's
+    /// line count is how many times the module was actually stopped: a module
+    /// stopped by both the disable and the shutdown would not show up in any
+    /// list length, but a process only ends once, and the stop of an already
+    /// stopped one would be a second `SIGTERM` to nothing — so exactly one
+    /// line, together with the stop record, pins "stopped once, by one side".
+    fn counting_module(exits: &Path) -> String {
+        format!(
+            "import atexit, signal, sys\n\
+             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n\
+             def _mark():\n    with open({exits:?}, 'a') as f:\n        f.write('exit\\n')\n\
+             atexit.register(_mark)\n{PACKAGE_MODULE}"
+        )
+    }
+
+    /// How many times the counting module's process has ended.
+    fn exits(exits: &Path) -> usize {
+        std::fs::read_to_string(exits).map_or(0, |t| t.lines().count())
+    }
+
+    /// A request held in flight on `remote`'s current generation until the
+    /// returned guard is dropped. A drain waits for in-flight requests, so
+    /// while this is held a `disable` is *still disabling* — the handover
+    /// to the shutdown no longer depends on how fast the module stops.
+    fn hold_in_flight(host: &ProcessHost) -> agent24_os_proto::drain::InFlight {
+        host.supervisors
+            .running_slot("remote")
+            .expect("the running module")
+            .get()
+            .admit_request(
+                "held".to_owned(),
+                [0; 32],
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(120),
+            )
+            .expect("a Running generation admits the request")
+    }
+
     /// A disable and the shutdown racing for the same module, on two threads
     /// at once: whichever wins, the module is handed to the shutdown exactly
     /// once — as a module to stop, or as a disable's stop to wait for — never
     /// both and never neither (SUP-5).
+    ///
+    /// A request is held in flight, so a disable that wins is *still stopping*
+    /// when `close` runs (its drain waits for the request) and is handed over.
+    /// Without it the module could stop before `close` and be filtered out,
+    /// leaving both lists empty. The process's own exit count then proves it
+    /// was stopped once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_disable_racing_the_shutdown_hands_the_module_over_exactly_once() {
         for _ in 0..5 {
@@ -3023,7 +3075,9 @@ raise SystemExit(3)
                 .prefix("a24")
                 .tempdir_in("/tmp")
                 .unwrap();
-            let host = Arc::new(running_package(tmp.path()).await);
+            let marks = tmp.path().join("exits");
+            let host = Arc::new(running_package_with(tmp.path(), &counting_module(&marks)).await);
+            let held = hold_in_flight(&host);
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let disable = {
                 let (host, barrier) = (host.clone(), barrier.clone());
@@ -3034,7 +3088,7 @@ raise SystemExit(3)
                     host.supervisors
                         .disable(
                             "remote",
-                            std::time::Duration::from_secs(10),
+                            std::time::Duration::from_secs(60),
                             std::future::pending(),
                         )
                         .is_some()
@@ -3055,12 +3109,15 @@ raise SystemExit(3)
                 "handed over twice or not at all"
             );
             assert_eq!(disabled, closed.disabling.len() == 1);
+            assert_eq!(exits(&marks), 0, "nothing has stopped it yet");
+            drop(held);
             for s in closed.running {
                 s.handle.stop().await.expect("a clean stop");
             }
             for stop in closed.disabling {
                 stop.task.await.unwrap();
             }
+            assert_eq!(exits(&marks), 1, "stopped once, not by both sides");
         }
     }
 
@@ -3073,23 +3130,15 @@ raise SystemExit(3)
             .prefix("a24")
             .tempdir_in("/tmp")
             .unwrap();
-        let packages = tmp.path().join("packages");
-        write_package(&packages, "remote");
-        let host = test_host(tmp.path());
-        let hub = crate::events::EventsHub::default();
-        let _ = mount_all(
-            &discovered(&packages),
-            &tmp.path().join("os"),
-            &hub,
-            Ok(&all_enabled()),
-            &no_models(),
-            None,
-            Ok(&host),
-            &test_approval_broker(&hub).await,
-            test_callback_deps().await,
-        )
-        .await;
-        let drain = std::time::Duration::from_secs(10);
+        let marks = tmp.path().join("exits");
+        let host = running_package_with(tmp.path(), &counting_module(&marks)).await;
+        // Held in flight: the disable's drain waits for it, so the module is
+        // still being stopped when `close` runs, however fast the machine is.
+        // (`never()` is only the shutdown's cut-off; it does not hold the
+        // module up, and without this the stop could finish before `close`
+        // and be filtered out of `disabling`.)
+        let held = hold_in_flight(&host);
+        let drain = std::time::Duration::from_secs(60);
         let never = std::future::pending::<()>;
         assert!(host.supervisors.disable("nope", drain, never()).is_none());
         assert!(!host.supervisors.is_disabled("remote"));
@@ -3110,6 +3159,14 @@ raise SystemExit(3)
             1,
             "the disable's stop, not waited for"
         );
+        assert!(
+            closed.disabling.iter().all(|d| !d.task.is_finished()),
+            "still stopping: its request is in flight"
+        );
+        assert_eq!(exits(&marks), 0, "not stopped before the request ends");
+        // Let the request go: the drain ends idle, then the module is stopped.
+        drop(held);
+        let records: Vec<_> = closed.disabling.iter().map(|d| d.record.clone()).collect();
         for stop in closed.disabling {
             stop.task.await.unwrap();
         }
@@ -3117,6 +3174,16 @@ raise SystemExit(3)
             current.get().state(),
             agent24_os_proto::drain::DrainState::Revoked
         );
+        let record = records[0].snapshot();
+        assert_eq!(
+            record.drain.map(|d| d.ended_by),
+            Some(agent24_os_proto::stop_record::DrainEndedBy::Idle)
+        );
+        assert_eq!(
+            record.supervisor,
+            Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped)
+        );
+        assert_eq!(exits(&marks), 1, "stopped exactly once, by the disable");
         assert!(
             host.supervisors.disable("remote", drain, never()).is_none(),
             "a disable after the shutdown began"
@@ -5641,7 +5708,19 @@ while f.readline():
                 .await
                 .unwrap_or_else(|e| panic!("call {i} must succeed: {e:?}"));
         }
-        let err = call_list(&methods1, 300).await.unwrap_err();
+        // Drain until the bucket actually refuses a call. The bucket refills one
+        // token per *real* second (it has no injected clock), so a loaded runner
+        // can hand back a token or two while these 300 awaits are in flight; the
+        // old "call 301 must fail" assertion was really asserting wall-clock luck.
+        // The bound stays far below the 300-token capacity, so a bucket that had
+        // reset would still be caught.
+        let mut err = call_list(&methods1, 300).await;
+        let mut next_id = 301;
+        while err.is_ok() && next_id < 350 {
+            err = call_list(&methods1, next_id).await;
+            next_id += 1;
+        }
+        let err = err.unwrap_err();
         assert_eq!(
             err.kind,
             Some(agent24_os_proto::rpc::ErrorKind::RateLimited)
@@ -5654,7 +5733,15 @@ while f.readline():
             agent24_os_proto::drain::Generation::serving_at("/tmp/does-not-need-to-exist".into());
         assert!(gen2.ready());
         let methods2 = methods_for(&gen2);
-        let err2 = call_list(&methods2, 0).await.unwrap_err();
+        // Still exhausted after the "restart" — bounded the same way, and far
+        // below the capacity, so a bucket that reset inside the closure fails here.
+        let mut err2 = call_list(&methods2, 0).await;
+        let mut id2 = 1;
+        while err2.is_ok() && id2 < 10 {
+            err2 = call_list(&methods2, id2).await;
+            id2 += 1;
+        }
+        let err2 = err2.unwrap_err();
         assert_eq!(
             err2.kind,
             Some(agent24_os_proto::rpc::ErrorKind::RateLimited),

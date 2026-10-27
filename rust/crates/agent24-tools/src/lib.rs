@@ -19,13 +19,44 @@ pub use net::HttpFetchTool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult};
 use agent24_protocol::{Decision, RiskClass, ToolInfo};
+use agent24_store::{
+    ActorRef, AttemptId, AuditTimestamp, AuthorizationRef, DurationMs, ModuleId,
+    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, RunId,
+    SessionRef, Store, ToolCallId,
+};
 use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
+
+/// Directory opened before the approval gate. Writes use this handle, not a
+/// later lookup of the same path name.
+#[derive(Clone)]
+pub struct PinnedOutsideDir {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) dir: std::sync::Arc<cap_std::fs::Dir>,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl PinnedOutsideDir {
+    pub(crate) fn dir(&self) -> &cap_std::fs::Dir {
+        &self.dir
+    }
+
+    pub(crate) fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+}
 
 /// Per-call execution context.
 #[derive(Clone)]
@@ -41,6 +72,8 @@ pub struct ToolContext {
     /// The persisted tool-call row this execution belongs to
     tool_call_id: String,
     workspace: WorkspaceAuthority,
+    confirmed_write_root: Option<std::path::PathBuf>,
+    approved_outside_directory: Option<std::sync::Arc<PinnedOutsideDir>>,
 }
 
 #[derive(Clone)]
@@ -63,6 +96,8 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Legacy,
+            confirmed_write_root: None,
+            approved_outside_directory: None,
         }
     }
 
@@ -81,7 +116,40 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Bound(authority),
+            confirmed_write_root: None,
+            approved_outside_directory: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_confirmed_write_root(mut self, root: std::path::PathBuf) -> Self {
+        self.confirmed_write_root = Some(root);
+        self
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_approved_outside_directory(
+        mut self,
+        directory: std::sync::Arc<PinnedOutsideDir>,
+    ) -> Self {
+        self.approved_outside_directory = Some(directory);
+        self
+    }
+
+    #[must_use]
+    pub fn approved_outside_directory(&self) -> Option<&std::path::Path> {
+        self.approved_outside_directory
+            .as_ref()
+            .map(|pin| pin.path.as_path())
+    }
+
+    pub(crate) fn pinned_outside_directory(&self) -> Option<&std::sync::Arc<PinnedOutsideDir>> {
+        self.approved_outside_directory.as_ref()
     }
 
     #[must_use]
@@ -127,7 +195,125 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: self.workspace.clone(),
+            confirmed_write_root: self.confirmed_write_root.clone(),
+            approved_outside_directory: self.approved_outside_directory.clone(),
         }
+    }
+}
+
+fn fresh_attempt_id() -> Result<AttemptId, ToolError> {
+    static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ToolError::Failed("could not create invocation identity".into()))?
+        .as_nanos();
+    AttemptId::new(format!(
+        "attempt-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+    ))
+    .map_err(|_| ToolError::Failed("could not create invocation identity".into()))
+}
+
+#[derive(Clone)]
+struct ModuleToolOwnerToken(Arc<()>);
+
+impl ModuleToolOwnerToken {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationLifecycle {
+    Fresh,
+    Active,
+    Interrupted,
+    Completed,
+    Settled,
+}
+
+struct InvocationState {
+    lifecycle: InvocationLifecycle,
+    relation: Option<ModuleToolAuditRelation>,
+}
+
+struct ModuleInvocationCapability {
+    owner_token: ModuleToolOwnerToken,
+    attempt_id: AttemptId,
+    state: std::sync::Mutex<InvocationState>,
+}
+
+struct InvocationExecutionGuard {
+    capability: Arc<ModuleInvocationCapability>,
+    completed: bool,
+}
+
+impl InvocationExecutionGuard {
+    fn mark_completed(&mut self) {
+        self.completed = true;
+        if let Ok(mut state) = self.capability.state.lock() {
+            state.lifecycle = InvocationLifecycle::Completed;
+        }
+    }
+}
+
+impl Drop for InvocationExecutionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            match self.capability.state.lock() {
+                Ok(mut state) if state.lifecycle == InvocationLifecycle::Active => {
+                    state.lifecycle = InvocationLifecycle::Interrupted;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl ModuleInvocationCapability {
+    fn claim_for_execution(self: &Arc<Self>) -> Result<InvocationExecutionGuard, ToolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unknown_module_outcome("result_unknown"))?;
+        if state.lifecycle != InvocationLifecycle::Fresh {
+            return Err(unknown_module_outcome("result_unknown"));
+        }
+        state.lifecycle = InvocationLifecycle::Active;
+        Ok(InvocationExecutionGuard {
+            capability: Arc::clone(self),
+            completed: false,
+        })
+    }
+}
+
+/// Opaque invocation-only settlement authority. Authorization adapters receive
+/// only `ToolContext`, so cloning it cannot copy this capability.
+pub struct ToolInvocation {
+    module: Option<Arc<ModuleInvocationCapability>>,
+}
+
+impl ToolInvocation {
+    fn unbound() -> Self {
+        Self { module: None }
+    }
+
+    fn module(owner_token: ModuleToolOwnerToken) -> Result<Self, ToolError> {
+        Ok(Self {
+            module: Some(Arc::new(ModuleInvocationCapability {
+                owner_token,
+                attempt_id: fresh_attempt_id()?,
+                state: std::sync::Mutex::new(InvocationState {
+                    lifecycle: InvocationLifecycle::Fresh,
+                    relation: None,
+                }),
+            })),
+        })
     }
 }
 
@@ -233,8 +419,8 @@ pub trait ApprovalGate: Send + Sync {
 /// the person who owns the machine decides how far to trust them. If an
 /// installer could write here, a marketplace entry would ship its own
 /// exemption, and the conservative default for third-party code would be
-/// worth nothing. Any future install path that touches this is a bug, not a
-/// feature.
+/// worth nothing. Module tool risk is also host-computed and may be tightened,
+/// but never relaxed below its configured class, so L-APPR-5 cannot be skipped.
 pub trait RiskOverrides: Send + Sync {
     /// The user's class for `tool_name`, or `None` to keep the declared one.
     fn resolve(&self, tool_name: &str) -> Option<RiskClass>;
@@ -266,6 +452,10 @@ impl ApprovalGate for DenyAllGate {
 pub trait Tool: Send + Sync {
     fn info(&self) -> ToolInfo;
 
+    async fn advertisable(&self) -> bool {
+        true
+    }
+
     /// JSON Schema for the input object
     fn parameters(&self) -> Value;
 
@@ -285,12 +475,643 @@ pub trait Tool: Send + Sync {
         Duration::from_secs(30)
     }
 
+    fn isolates_cancellation(&self) -> bool {
+        false
+    }
+
     async fn call(
         &self,
         ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError>;
+
+    /// Prepare invocation-only state. Defaults preserve custom Tool source
+    /// compatibility and carry no module settlement authority.
+    #[doc(hidden)]
+    fn prepare_invocation(&self, _ctx: &ToolContext) -> Result<ToolInvocation, ToolError> {
+        Ok(ToolInvocation::unbound())
+    }
+
+    /// Registry call path for tools that need settlement state kept separate
+    /// from the reusable context visible to external adapters.
+    #[doc(hidden)]
+    async fn call_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        _invocation: &ToolInvocation,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        self.call(ctx, input, cancel).await
+    }
+
+    /// Record a kernel-side refusal that happens before `call` (for example,
+    /// a capability or approval-gate denial). Ordinary tools have no module
+    /// audit stream, so their default is a no-op.
+    async fn audit_denied(&self, _ctx: &ToolContext) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    /// Preserve a typed terminal if a cancellation grace period expires and
+    /// the call future must finally be dropped.
+    async fn audit_interrupted(
+        &self,
+        _ctx: &ToolContext,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        Ok(None)
+    }
+
+    #[doc(hidden)]
+    async fn audit_interrupted_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        _invocation: &ToolInvocation,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        self.audit_interrupted(ctx).await
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ModuleToolContext {
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub tool_call_id: String,
+    pub module_id: String,
+    pub operation: String,
+    pub authorized_resources: Vec<String>,
+    pub authorization_ref: String,
+}
+
+#[async_trait]
+pub trait ModuleToolAuthorization: Send + Sync {
+    async fn authorize(
+        &self,
+        module: &str,
+        operation: &str,
+        ctx: &ToolContext,
+    ) -> Result<ModuleToolGrantContext, ModuleToolCallError>;
+
+    async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleToolGrantContext {
+    pub authorized_resources: Vec<String>,
+    pub authorization_ref: String,
+    pub per_call_approval: bool,
+}
+pub struct DenyModuleToolAuthorization;
+
+fn permission_denied() -> ModuleToolCallError {
+    ModuleToolCallError::Module {
+        code: ModuleToolErrorCode::PermissionDenied,
+        retryable: false,
+        details: None,
+        unknown_code: None,
+    }
+}
+
+#[async_trait]
+impl ModuleToolAuthorization for DenyModuleToolAuthorization {
+    async fn authorize(
+        &self,
+        _: &str,
+        _: &str,
+        _: &ToolContext,
+    ) -> Result<ModuleToolGrantContext, ModuleToolCallError> {
+        Err(permission_denied())
+    }
+
+    async fn has_current_consent(&self, _: &str, _: &str) -> bool {
+        false
+    }
+}
+
+#[async_trait]
+pub trait ModuleToolRuntime: Send + Sync {
+    async fn check_available(
+        &self,
+        module: &str,
+        operation: &str,
+    ) -> Result<(), ModuleToolCallError>;
+    async fn invoke(
+        &self,
+        context: ModuleToolContext,
+        arguments: Map<String, Value>,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ModuleToolResult, ModuleToolCallError>;
+}
+
+pub struct ModuleTool {
+    owner_token: ModuleToolOwnerToken,
+    module: String,
+    operation: String,
+    name: String,
+    description: String,
+    schema: Value,
+    timeout: Duration,
+    inline_wait: Duration,
+    risk: RiskClass,
+    advert_view: Arc<dyn agent24_domain::tool::ModuleToolAdvertView>,
+    authorization: Arc<dyn ModuleToolAuthorization>,
+    runtime: Arc<dyn ModuleToolRuntime>,
+    audit_store: Store,
+    audit_actor: String,
+}
+
+impl ModuleTool {
+    fn audit_relation(
+        &self,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+        attempt_id: &AttemptId,
+    ) -> Result<ModuleToolAuditRelation, ToolError> {
+        Ok(ModuleToolAuditRelation {
+            attempt_id: Some(attempt_id.clone()),
+            actor: ActorRef::new(self.audit_actor.clone()).map_err(|_| audit_unavailable())?,
+            run_id: RunId::new(ctx.run_id()).map_err(|_| audit_unavailable())?,
+            session_ref: ctx
+                .session_id()
+                .map(SessionRef::new)
+                .transpose()
+                .map_err(|_| audit_unavailable())?,
+            tool_call_id: ToolCallId::new(ctx.tool_call_id()).map_err(|_| audit_unavailable())?,
+            module_id: ModuleId::new(self.module.clone()).map_err(|_| audit_unavailable())?,
+            operation_id: OperationId::new(self.operation.clone())
+                .map_err(|_| audit_unavailable())?,
+            authorization_ref: AuthorizationRef::new(authorization_ref)
+                .map_err(|_| audit_unavailable())?,
+            resource_ref: None,
+        })
+    }
+
+    async fn audit_refusal(&self, ctx: &ToolContext) -> Result<(), ToolError> {
+        let invocation = ToolInvocation::module(self.owner_token.clone())?;
+        let capability = invocation.module.as_ref().ok_or_else(audit_unavailable)?;
+        let authorization_ref = self
+            .authorization
+            .authorize(&self.module, &self.operation, ctx)
+            .await
+            .as_ref()
+            .map_or_else(denied_authorization_ref, |grant| {
+                grant.authorization_ref.clone()
+            });
+        let relation = self.audit_relation(ctx, &authorization_ref, &capability.attempt_id)?;
+        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
+            .await?;
+        self.finish_audit(
+            &relation,
+            ModuleToolResultCode::Denied,
+            std::time::Instant::now(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the module advert plus the two host adapters.
+    pub fn new(
+        module: impl Into<String>,
+        operation: impl Into<String>,
+        description: impl Into<String>,
+        schema: Value,
+        timeout: Duration,
+        inline_wait: Duration,
+        risk: RiskClass,
+        advert_view: Arc<dyn agent24_domain::tool::ModuleToolAdvertView>,
+        authorization: Arc<dyn ModuleToolAuthorization>,
+        runtime: Arc<dyn ModuleToolRuntime>,
+        audit_store: Store,
+        audit_actor: impl Into<String>,
+    ) -> Result<Self, &'static str> {
+        if inline_wait >= timeout {
+            return Err("inline_wait must be shorter than timeout");
+        }
+        let module = module.into();
+        let operation = operation.into();
+        Ok(Self {
+            owner_token: ModuleToolOwnerToken::new(),
+            name: format!("{module}.{operation}"),
+            module,
+            operation,
+            description: description.into(),
+            schema,
+            timeout,
+            inline_wait,
+            risk,
+            advert_view,
+            authorization,
+            runtime,
+            audit_store,
+            audit_actor: audit_actor.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ModuleTool {
+    async fn advertisable(&self) -> bool {
+        self.advert_view.module_ready(&self.module).await
+            && self
+                .advert_view
+                .operation_available(&self.module, &self.operation)
+                .await
+            && self
+                .advert_view
+                .has_current_consent(&self.module, &self.operation)
+                .await
+            && !self
+                .advert_view
+                .blocked_by_remote_tier_guard(&self.module, &self.operation)
+                .await
+    }
+
+    fn info(&self) -> ToolInfo {
+        ToolInfo::new(
+            self.name.clone(),
+            "module",
+            self.description.clone(),
+            self.risk,
+        )
+    }
+    fn parameters(&self) -> Value {
+        self.schema.clone()
+    }
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+    fn isolates_cancellation(&self) -> bool {
+        true
+    }
+
+    async fn audit_denied(&self, ctx: &ToolContext) -> Result<(), ToolError> {
+        self.audit_refusal(ctx).await
+    }
+
+    async fn audit_interrupted(
+        &self,
+        _ctx: &ToolContext,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        // Settlement without the exact registry-owned capability is never
+        // allowed to query prior attempts.
+        Ok(Some(Err(unknown_module_outcome("result_unknown"))))
+    }
+
+    fn prepare_invocation(&self, _ctx: &ToolContext) -> Result<ToolInvocation, ToolError> {
+        ToolInvocation::module(self.owner_token.clone())
+    }
+
+    async fn audit_interrupted_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        invocation: &ToolInvocation,
+    ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+        let Some(capability) = invocation.module.as_ref() else {
+            return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+        };
+        if !self.owner_token.matches(&capability.owner_token) {
+            return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+        }
+        let relation = {
+            let mut state = capability
+                .state
+                .lock()
+                .map_err(|_| unknown_module_outcome("module_tool_audit_degraded_result_unknown"))?;
+            if state.lifecycle != InvocationLifecycle::Interrupted {
+                return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+            }
+            let Some(relation) = state.relation.clone() else {
+                state.lifecycle = InvocationLifecycle::Settled;
+                return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+            };
+            state.lifecycle = InvocationLifecycle::Settled;
+            relation
+        };
+        if relation.run_id.as_str() != ctx.run_id()
+            || relation.tool_call_id.as_str() != ctx.tool_call_id()
+            || relation
+                .session_ref
+                .as_ref()
+                .map(|session| session.as_str())
+                != ctx.session_id()
+            || relation.module_id.as_str() != self.module
+            || relation.operation_id.as_str() != self.operation
+            || relation.actor.as_str() != self.audit_actor
+        {
+            return Ok(Some(Err(unknown_module_outcome("result_unknown"))));
+        }
+        let timestamp = AuditTimestamp::new(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .map_err(|_| unknown_module_outcome("module_tool_audit_degraded_result_unknown"))?;
+        self.audit_store
+            .append_interrupted_module_tool_terminal_for_relation(&timestamp, &relation)
+            .await
+            .map(|outcome| match outcome {
+                agent24_store::InterruptedTerminalOutcome::NotFound => {
+                    Some(Err(unknown_module_outcome("result_unknown")))
+                }
+                agent24_store::InterruptedTerminalOutcome::AppendedUnknown => {
+                    Some(Err(unknown_module_outcome("result_unknown")))
+                }
+                agent24_store::InterruptedTerminalOutcome::Existing(
+                    agent24_store::ModuleToolResultCode::Success,
+                ) => Some(Ok(serde_json::json!({
+                    "completed": true,
+                    "response_available": false,
+                })
+                .to_string())),
+                agent24_store::InterruptedTerminalOutcome::Existing(result) => {
+                    Some(Err(persisted_terminal_error(result)))
+                }
+            })
+            .map_err(|_| unknown_module_outcome("module_tool_audit_degraded_result_unknown"))
+    }
+
+    async fn call(
+        &self,
+        ctx: &ToolContext,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let invocation = ToolInvocation::module(self.owner_token.clone())?;
+        self.call_with_invocation(ctx, &invocation, input, cancel)
+            .await
+    }
+
+    async fn call_with_invocation(
+        &self,
+        ctx: &ToolContext,
+        invocation: &ToolInvocation,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let Some(capability) = invocation.module.as_ref() else {
+            return Err(unknown_module_outcome("result_unknown"));
+        };
+        if !self.owner_token.matches(&capability.owner_token) {
+            return Err(unknown_module_outcome("result_unknown"));
+        }
+        let mut execution_guard = capability.claim_for_execution()?;
+
+        let authorized = self
+            .authorization
+            .authorize(&self.module, &self.operation, ctx)
+            .await;
+        let authorization_ref = authorized
+            .as_ref()
+            .map_or_else(denied_authorization_ref, |grant| {
+                grant.authorization_ref.clone()
+            });
+        let relation = self.audit_relation(ctx, &authorization_ref, &capability.attempt_id)?;
+        {
+            let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
+            state.relation = Some(relation.clone());
+        }
+        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
+            .await?;
+        if cancel.is_cancelled() {
+            self.finish_audit(
+                &relation,
+                ModuleToolResultCode::Cancelled,
+                std::time::Instant::now(),
+            )
+            .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(
+                ModuleToolCallError::Cancelled,
+            )));
+        }
+        let started = std::time::Instant::now();
+        let grant = match authorized {
+            Ok(grant) => grant,
+            Err(error) => {
+                self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
+                    .await?;
+                execution_guard.mark_completed();
+                return Err(ToolError::Failed(module_error_json(error)));
+            }
+        };
+        if grant.per_call_approval && !self.risk.requires_approval() {
+            self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
+        if let Err(error) = self
+            .runtime
+            .check_available(&self.module, &self.operation)
+            .await
+        {
+            self.finish_audit(&relation, result_code(&error), started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(error)));
+        }
+        if cancel.is_cancelled() {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(
+                ModuleToolCallError::Cancelled,
+            )));
+        }
+        let context = ModuleToolContext {
+            run_id: ctx.run_id().to_owned(),
+            session_id: ctx.session_id().map(str::to_owned),
+            tool_call_id: ctx.tool_call_id().to_owned(),
+            module_id: self.module.clone(),
+            operation: self.operation.clone(),
+            authorized_resources: grant.authorized_resources,
+            authorization_ref: grant.authorization_ref,
+        };
+        let call_cancel = cancel.child_token();
+        let result = match tokio::time::timeout(
+            self.inline_wait,
+            self.runtime
+                .invoke(context, input.clone(), self.timeout, call_cancel.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                call_cancel.cancel();
+                self.finish_audit(&relation, ModuleToolResultCode::ResultUnknown, started)
+                    .await?;
+                execution_guard.mark_completed();
+                return Err(ToolError::Failed(module_error_json(
+                    ModuleToolCallError::ResultUnknown,
+                )));
+            }
+        };
+        let code = match &result {
+            Ok(ModuleToolResult::Completed { .. }) => ModuleToolResultCode::Success,
+            Ok(ModuleToolResult::Pending { .. }) => ModuleToolResultCode::ResultUnknown,
+            Err(error) => result_code(error),
+        };
+        self.finish_audit(&relation, code, started).await?;
+        execution_guard.mark_completed();
+        match result {
+            Ok(ModuleToolResult::Completed { payload, replayed }) => Ok(serde_json::json!({
+                "kind":"completed", "payload":payload, "replayed":replayed
+            })
+            .to_string()),
+            Ok(ModuleToolResult::Pending { .. }) => Err(ToolError::Failed(module_error_json(
+                ModuleToolCallError::ResultUnknown,
+            ))),
+            Err(failure) => Err(ToolError::Failed(module_error_json(failure))),
+        }
+    }
+}
+
+fn persisted_terminal_error(result: agent24_store::ModuleToolResultCode) -> ToolError {
+    use agent24_store::ModuleToolResultCode as Terminal;
+    let failure = match result {
+        Terminal::Failed => ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::ModuleError,
+            retryable: false,
+            details: None,
+            unknown_code: None,
+        },
+        Terminal::Denied => ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::PermissionDenied,
+            retryable: false,
+            details: None,
+            unknown_code: None,
+        },
+        Terminal::Timeout => ModuleToolCallError::Timeout,
+        Terminal::Cancelled => ModuleToolCallError::Cancelled,
+        Terminal::ResultUnknown => ModuleToolCallError::ResultUnknown,
+        Terminal::Success => unreachable!("success has a recovered response"),
+    };
+    ToolError::Failed(module_error_json(failure))
+}
+
+fn audit_unavailable() -> ToolError {
+    ToolError::Failed("module_tool_audit_unavailable".to_owned())
+}
+
+fn denied_authorization_ref(error: &ModuleToolCallError) -> String {
+    match error {
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::PermissionDenied,
+            details: Some(details),
+            ..
+        } if details.get("reason").and_then(Value::as_str) == Some("revoked") => {
+            "denied:revoked".to_owned()
+        }
+        _ => "denied:no_grant".to_owned(),
+    }
+}
+
+fn result_code(error: &ModuleToolCallError) -> ModuleToolResultCode {
+    match error {
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::PermissionDenied,
+            ..
+        } => ModuleToolResultCode::Failed,
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::Cancelled,
+            ..
+        }
+        | ModuleToolCallError::Cancelled => ModuleToolResultCode::Cancelled,
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::Timeout,
+            ..
+        }
+        | ModuleToolCallError::Timeout => ModuleToolResultCode::Timeout,
+        ModuleToolCallError::ResultUnknown
+        | ModuleToolCallError::ResponseTooLarge
+        | ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::ResponseTooLarge,
+            ..
+        } => ModuleToolResultCode::ResultUnknown,
+        ModuleToolCallError::Module {
+            code: ModuleToolErrorCode::ResultUnknown,
+            ..
+        } => ModuleToolResultCode::ResultUnknown,
+        ModuleToolCallError::InvalidResult
+        | ModuleToolCallError::ModuleUnavailable
+        | ModuleToolCallError::Module { .. } => ModuleToolResultCode::Failed,
+    }
+}
+
+impl ModuleTool {
+    async fn append_audit(&self, event: &ModuleToolAuditEvent) -> Result<(), ToolError> {
+        let timestamp = AuditTimestamp::new(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .map_err(|_| audit_unavailable())?;
+        self.audit_store
+            .append_module_tool_audit_event(&timestamp, event)
+            .await
+            .map(|_| ())
+            .map_err(|_| audit_unavailable())
+    }
+
+    async fn finish_audit(
+        &self,
+        relation: &ModuleToolAuditRelation,
+        result: ModuleToolResultCode,
+        started: std::time::Instant,
+    ) -> Result<(), ToolError> {
+        let duration = started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(DurationMs::MAX)) as u64;
+        let event = ModuleToolAuditEvent::Terminal {
+            relation: relation.clone(),
+            result,
+            duration_ms: Some(DurationMs::new(duration).map_err(|_| audit_unavailable())?),
+            size_bytes: None,
+        };
+        self.append_audit(&event).await.map_err(|error| {
+            if result == ModuleToolResultCode::Denied {
+                error
+            } else {
+                unknown_module_outcome("module_tool_audit_degraded_result_unknown")
+            }
+        })
+    }
+}
+
+fn module_error_json(failure: ModuleToolCallError) -> String {
+    let result_unknown = result_code(&failure) == ModuleToolResultCode::ResultUnknown;
+    let (code, retryable, unknown) = match failure {
+        ModuleToolCallError::Module {
+            code,
+            retryable,
+            unknown_code,
+            ..
+        } => (code, retryable, unknown_code),
+        ModuleToolCallError::InvalidResult => (ModuleToolErrorCode::InvalidResult, false, None),
+        ModuleToolCallError::ResultUnknown => (ModuleToolErrorCode::ResultUnknown, false, None),
+        ModuleToolCallError::ResponseTooLarge => {
+            (ModuleToolErrorCode::ResponseTooLarge, false, None)
+        }
+        ModuleToolCallError::Cancelled => (ModuleToolErrorCode::Cancelled, false, None),
+        ModuleToolCallError::Timeout => (ModuleToolErrorCode::Timeout, false, None),
+        ModuleToolCallError::ModuleUnavailable => {
+            (ModuleToolErrorCode::ModuleUnavailable, false, None)
+        }
+    };
+    let retryable = retryable && !result_unknown;
+    let module_code = unknown.map(|raw| {
+        raw.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            .take(64)
+            .collect::<String>()
+    });
+    serde_json::json!({"error":{"code":code,"retryable":retryable,"module_code":module_code,"result_unknown":result_unknown}}).to_string()
+}
+
+fn unknown_module_outcome(code: &str) -> ToolError {
+    ToolError::Failed(
+        serde_json::json!({"error":{"code":code,"retryable":false,"result_unknown":true}})
+            .to_string(),
+    )
 }
 
 /// What the agent loop advertises to the model (provider-neutral; the models
@@ -313,6 +1134,7 @@ pub struct ToolRegistry {
     interactive_gate: bool,
     /// User-local risk adjustments (H2). None → declared classes stand.
     overrides: Option<Arc<dyn RiskOverrides>>,
+    confirmed_write_root: Option<std::path::PathBuf>,
 }
 
 impl ToolRegistry {
@@ -323,7 +1145,13 @@ impl ToolRegistry {
             gate: Arc::new(DenyAllGate),
             interactive_gate: false,
             overrides: None,
+            confirmed_write_root: None,
         }
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
     }
 
     /// Install the user's local risk overrides (H2).
@@ -347,6 +1175,10 @@ impl ToolRegistry {
     #[must_use]
     pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
         let name = tool.info().name;
+        if self.tools.contains_key(&name) {
+            tracing::warn!("refusing to register duplicate tool name {name}");
+            return self;
+        }
         self.allowed.insert(name.clone());
         self.tools.insert(name, tool);
         self
@@ -356,8 +1188,24 @@ impl ToolRegistry {
     /// later, by policy-managed module tools).
     #[must_use]
     pub fn with_unlisted(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.tools.insert(tool.info().name, tool);
+        let name = tool.info().name;
+        if self.tools.contains_key(&name) {
+            tracing::warn!("refusing to register duplicate tool name {name}");
+            return self;
+        }
+        self.tools.insert(name, tool);
         self
+    }
+
+    #[must_use]
+    pub fn register_module_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        let name = tool.info().name;
+        if self.tools.contains_key(&name) {
+            return Err(format!("refusing to register duplicate tool name {name}"));
+        }
+        self.allowed.insert(name.clone());
+        self.tools.insert(name, tool);
+        Ok(())
     }
 
     /// The default builtin set rooted at `workspace` (fs whitelist + shell cwd).
@@ -406,7 +1254,8 @@ impl ToolRegistry {
     /// and the person who owns the machine has standing to correct it. A
     /// builtin's class is not a guess: we wrote `shell_exec` and know it runs
     /// commands. So an override may always TIGHTEN, and may relax anything
-    /// third-party, but may not relax a builtin along [`RiskClass::escape_rank`].
+    /// third-party, but may not relax a builtin or module tool along
+    /// [`RiskClass::escape_rank`].
     ///
     /// That single rule is what stops `shell_exec → read` ("stop asking me
     /// about shell") and `shell_exec → external` (which would quietly make it
@@ -422,10 +1271,13 @@ impl ToolRegistry {
         else {
             return declared;
         };
-        if info.source == "builtin" && over.escape_rank() > declared.escape_rank() {
+        if matches!(info.source.as_str(), "builtin" | "module")
+            && over.escape_rank() > declared.escape_rank()
+        {
             tracing::warn!(
-                "ignoring override {declared:?} → {over:?} for builtin {}: a builtin's class \
+                "ignoring override {declared:?} → {over:?} for {} {}: this source's class \
                  may be tightened but not relaxed",
+                info.source,
                 info.name
             );
             return declared;
@@ -486,6 +1338,32 @@ impl ToolRegistry {
             .collect()
     }
 
+    pub async fn live_adverts(&self) -> Vec<ToolAdvert> {
+        let mut adverts = Vec::new();
+        for tool in self.tools.values() {
+            let info = tool.info();
+            if self.allowed.contains(&info.name)
+                && (self.interactive_gate || !self.effective_risk(&info).requires_approval())
+                && tool.advertisable().await
+            {
+                adverts.push(ToolAdvert {
+                    name: info.name,
+                    description: info.description,
+                    parameters: tool.parameters(),
+                });
+            }
+        }
+        adverts
+    }
+
+    pub async fn live_plan_adverts(&self) -> Vec<ToolAdvert> {
+        self.live_adverts()
+            .await
+            .into_iter()
+            .filter(|a| self.tool_risk_class(&a.name) == Some(RiskClass::Read))
+            .collect()
+    }
+
     /// Tools advertised to the model while a run is in plan mode (H8): the
     /// read-only subset only. Write/exec/external tools are structurally absent
     /// from the model's options — there is nothing to bypass because they were
@@ -534,6 +1412,7 @@ impl ToolRegistry {
 
         // 2. capability whitelist
         if !self.allowed.contains(name) {
+            tool.audit_denied(ctx).await?;
             return Err(ToolError::Denied(format!(
                 "tool {name} is not in the capability whitelist"
             )));
@@ -570,20 +1449,43 @@ impl ToolRegistry {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_owned);
+        // Capture the outside directory before the gate. A later symlink swap
+        // must not make the write follow a different parent than this one.
+        // Exec-tightened fs_write does not get the exception: Guardian can
+        // Allow that class without a human, and the whitelist must still hold.
+        let approved_before_gate = if name == "fs_write" && effective == RiskClass::WriteLocal {
+            let input = input.clone();
+            tokio::task::spawn_blocking(move || crate::local::approved_parent(&input))
+                .await
+                .unwrap_or_default()
+        } else {
+            None
+        };
+        let owned;
+        let exec_ctx = if let Some(directory) = approved_before_gate {
+            owned = ctx.clone().with_approved_outside_directory(directory);
+            &owned
+        } else {
+            ctx
+        };
         if effective.requires_approval() {
             match self
                 .gate
-                .check(&info, ctx, input, standing_target.as_deref(), cancel)
+                .check(&info, exec_ctx, input, standing_target.as_deref(), cancel)
                 .await
             {
                 GateDecision::Allow => {}
-                GateDecision::Deny(reason) => return Err(ToolError::Denied(reason)),
-                GateDecision::AbortRun(reason) => return Err(ToolError::AbortRun(reason)),
+                GateDecision::Deny(reason) => {
+                    tool.audit_denied(ctx).await?;
+                    return Err(ToolError::Denied(reason));
+                }
+                GateDecision::AbortRun(reason) => {
+                    tool.audit_denied(ctx).await?;
+                    return Err(ToolError::AbortRun(reason));
+                }
             }
         }
-
-        // 4. execute under the tool's budget, cancellable at any point
-        Self::run_budgeted(tool, ctx, input, cancel).await
+        Self::run_budgeted(tool, exec_ctx, input, cancel).await
     }
 
     /// Execute a tool whose approval was ALREADY granted out of band — the
@@ -674,12 +1576,55 @@ impl ToolRegistry {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        // Mint opaque settlement authority before constructing the call future.
+        // Authorization receives only the reusable ToolContext.
+        let invocation = tool.prepare_invocation(ctx)?;
         let budget = tool.timeout();
-        tokio::select! {
-            r = tokio::time::timeout(budget, tool.call(ctx, input, cancel)) => {
-                r.map_err(|_| ToolError::Timeout(budget))?
+        const CANCELLATION_SETTLE_GRACE: Duration = Duration::from_secs(5);
+        const INTERRUPTED_AUDIT_BUDGET: Duration = Duration::from_secs(5);
+        let call_cancel = if tool.isolates_cancellation() {
+            cancel.child_token()
+        } else {
+            cancel.clone()
+        };
+        let abandoned_reason = {
+            let call = tool.call_with_invocation(ctx, &invocation, input, &call_cancel);
+            tokio::pin!(call);
+            let reason = tokio::select! {
+                result = &mut call => return result,
+                () = tokio::time::sleep(budget) => {
+                    if !tool.isolates_cancellation() {
+                        return Err(ToolError::Timeout(budget));
+                    }
+                    call_cancel.cancel();
+                    "timeout"
+                }
+                () = cancel.cancelled() => {
+                    if !tool.isolates_cancellation() {
+                        return Err(ToolError::Cancelled);
+                    }
+                    call_cancel.cancel();
+                    "cancelled"
+                }
+            };
+            match tokio::time::timeout(CANCELLATION_SETTLE_GRACE, &mut call).await {
+                Ok(result) => return result,
+                Err(_) => reason,
             }
-            () = cancel.cancelled() => Err(ToolError::Cancelled),
+        };
+        // The call future is dropped before this hook runs. It recovers the
+        // persisted PreDispatch relation and writes one ResultUnknown terminal.
+        match tokio::time::timeout(
+            INTERRUPTED_AUDIT_BUDGET,
+            tool.audit_interrupted_with_invocation(ctx, &invocation),
+        )
+        .await
+        {
+            Ok(Ok(Some(result))) => result,
+            Ok(Ok(None)) => Err(unknown_module_outcome(abandoned_reason)),
+            Ok(Err(_)) | Err(_) => Err(unknown_module_outcome(
+                "module_tool_audit_degraded_result_unknown",
+            )),
         }
     }
 }
@@ -716,6 +1661,15 @@ mod tests {
 
     use super::*;
 
+    struct DenyAdvertView;
+
+    #[async_trait]
+    impl agent24_domain::tool::ModuleToolAdvertView for DenyAdvertView {
+        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
     struct SlowTool;
 
     #[async_trait]
@@ -740,6 +1694,66 @@ mod tests {
                 () = cancel.cancelled() => Err(ToolError::Cancelled),
             }
         }
+    }
+
+    struct StalledInterruptedAudit;
+
+    #[async_trait]
+    impl Tool for StalledInterruptedAudit {
+        fn info(&self) -> ToolInfo {
+            ToolInfo::new("stalled_audit", "module", "stalled audit", RiskClass::Read)
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn timeout(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+        fn isolates_cancellation(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &Map<String, Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            std::future::pending().await
+        }
+        async fn audit_interrupted(
+            &self,
+            _: &ToolContext,
+        ) -> std::result::Result<Option<Result<String, ToolError>>, ToolError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_interrupted_audit_is_bounded_and_non_retryable() {
+        let registry = ToolRegistry::new().with(Arc::new(StalledInterruptedAudit));
+        let result = tokio::time::timeout(
+            Duration::from_secs(11),
+            registry.dispatch(
+                "stalled_audit",
+                &ctx(),
+                &Map::new(),
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+        let ToolError::Failed(message) = result
+            .expect("interrupted audit fallback hung")
+            .unwrap_err()
+        else {
+            panic!("expected explicit degraded result_unknown");
+        };
+        let json: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(
+            json["error"]["code"],
+            "module_tool_audit_degraded_result_unknown"
+        );
+        assert_eq!(json["error"]["retryable"], false);
+        assert_eq!(json["error"]["result_unknown"], true);
     }
 
     fn ctx() -> ToolContext {
@@ -862,6 +1876,100 @@ mod tests {
             }
         }
         Arc::new(Remote)
+    }
+
+    struct ModuleFixtureRuntime;
+    #[async_trait]
+    impl ModuleToolRuntime for ModuleFixtureRuntime {
+        async fn check_available(&self, _: &str, _: &str) -> Result<(), ModuleToolCallError> {
+            Ok(())
+        }
+        async fn invoke(
+            &self,
+            _: ModuleToolContext,
+            _: Map<String, Value>,
+            _: Duration,
+            _: CancellationToken,
+        ) -> Result<ModuleToolResult, ModuleToolCallError> {
+            Err(ModuleToolCallError::ModuleUnavailable)
+        }
+    }
+
+    async fn module_fixture(name: &str, operation: &str, risk: RiskClass) -> Arc<dyn Tool> {
+        let store = Store::open_memory().await.unwrap();
+        Arc::new(
+            ModuleTool::new(
+                name,
+                operation,
+                "module fixture",
+                serde_json::json!({"type":"object"}),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                risk,
+                Arc::new(DenyAdvertView),
+                Arc::new(DenyModuleToolAuthorization),
+                Arc::new(ModuleFixtureRuntime),
+                store,
+                "agent24-tools-test",
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn module_tool_risk_override_cannot_relax_declared_risk() {
+        let reg = ToolRegistry::new()
+            .with(module_fixture("sample", "write", RiskClass::WriteLocal).await)
+            .with_risk_overrides(Arc::new(FixedOverride("sample.write", RiskClass::Read)));
+
+        assert_eq!(
+            reg.tool_risk_class("sample.write"),
+            Some(RiskClass::WriteLocal)
+        );
+        assert!(reg.tool_requires_approval("sample.write"));
+    }
+
+    #[tokio::test]
+    async fn module_tool_registration_reports_duplicate_names_without_replacing_existing_tool() {
+        let registry =
+            ToolRegistry::new().with(module_fixture("sample", "write", RiskClass::Read).await);
+        let mut registry = registry;
+        assert!(matches!(
+            registry.register_module_tool(
+                module_fixture("sample", "write", RiskClass::External).await
+            ),
+            Err(error) if error.contains("duplicate tool name sample.write")
+        ));
+    }
+
+    #[tokio::test]
+    async fn registering_a_module_name_collision_keeps_the_existing_tool() {
+        struct Existing;
+        #[async_trait]
+        impl Tool for Existing {
+            fn info(&self) -> ToolInfo {
+                ToolInfo::new("sample.read", "builtin", "existing", RiskClass::Read)
+            }
+            fn parameters(&self) -> Value {
+                serde_json::json!({"type":"object"})
+            }
+            async fn call(
+                &self,
+                _: &ToolContext,
+                _: &Map<String, Value>,
+                _: &CancellationToken,
+            ) -> Result<String, ToolError> {
+                Ok("existing".to_owned())
+            }
+        }
+
+        let reg = ToolRegistry::new()
+            .with(Arc::new(Existing))
+            .with(module_fixture("sample", "read", RiskClass::WriteLocal).await);
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "builtin");
+        assert_eq!(listed[0].risk_class, RiskClass::Read);
     }
 
     fn targeted_external_tool() -> Arc<dyn Tool> {
@@ -1114,6 +2222,48 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::Cancelled), "{err}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn module_tool_authorization_defaults_to_denial_before_dispatch() {
+        struct Runtime;
+        #[async_trait]
+        impl ModuleToolRuntime for Runtime {
+            async fn check_available(&self, _: &str, _: &str) -> Result<(), ModuleToolCallError> {
+                Ok(())
+            }
+            async fn invoke(
+                &self,
+                _: ModuleToolContext,
+                _: Map<String, Value>,
+                _: Duration,
+                _: CancellationToken,
+            ) -> Result<ModuleToolResult, ModuleToolCallError> {
+                Err(ModuleToolCallError::ModuleUnavailable)
+            }
+        }
+        assert!(
+            ModuleTool::new(
+                "m",
+                "op",
+                "description",
+                serde_json::json!({"type":"object"}),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                RiskClass::External,
+                Arc::new(DenyAdvertView),
+                Arc::new(DenyModuleToolAuthorization),
+                Arc::new(Runtime),
+                agent24_store::Store::open_memory().await.unwrap(),
+                "agent24d",
+            )
+            .unwrap()
+            .call(&ctx(), &Map::new(), &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("permission_denied")
+        );
     }
 
     #[test]

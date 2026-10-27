@@ -34,10 +34,10 @@ pub use clients::{
     ApprovalAnswer, ApprovalClient, ApprovalDecision, ApprovalKind, ApprovalSubmit,
     CompleteRequest, CompleteResult, Complexity, DEDUP_KEY_FIELD, DeleteOutcome, DeleteResult,
     EventSink, EventSinkConfig, EventsClient, JsonSchemaFormat, LastFire, LastFires, ListResult,
-    MODEL_RESPONSE_TIMEOUT, MemoryClient, ModelClient, ModelMessage, ModelRole,
-    RECALL_PRECHECK_MAX_PAGES, RECALL_PRECHECK_PAGE_SIZE, RecallPage, Recollection, RememberOnce,
-    Remembered, ScheduleSpec, ScheduleState, SchedulerClient, ServedTier, UpsertOutcome,
-    UpsertRequest, UpsertResult, Usage,
+    MODEL_NO_PROVIDER_WAIT, MODEL_RESPONSE_TIMEOUT, MemoryClient, ModelClient, ModelMessage,
+    ModelRole, RECALL_PRECHECK_MAX_PAGES, RECALL_PRECHECK_PAGE_SIZE, RecallPage, Recollection,
+    RememberOnce, Remembered, ScheduleSpec, ScheduleState, SchedulerClient, ServedTier,
+    UpsertOutcome, UpsertRequest, UpsertResult, Usage,
 };
 pub use context::{ApprovalToken, RequestContext, RequestId};
 pub use error::{ClientError, UnavailableCause};

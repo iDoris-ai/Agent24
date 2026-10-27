@@ -4,6 +4,91 @@
  */
 
 export interface paths {
+    "/module-consents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List module tool authorizations
+         * @description Host identity is injected by agent24d. The response is limited to permission metadata and excludes tool input, output, message bodies, and credentials.
+         */
+        get: operations["listModuleConsents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export module tool authorizations as JSON
+         * @description Exports module, tool, scope, risk, source, validity, and status metadata. Audit history is exposed by the later audit export endpoint.
+         */
+        get: operations["exportModuleConsents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/modules/{module}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke every tool authorization for a module
+         * @description Persists revocation and broadcasts the 6a.3 revocation notice.
+         */
+        delete: operations["revokeModuleConsents"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-consents/modules/{module}/tools/{tool}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one module tool authorization
+         * @description Persists revocation and broadcasts the 6a.3 revocation notice.
+         */
+        delete: operations["revokeModuleToolConsent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -1689,8 +1774,13 @@ export interface components {
                 removable: boolean;
                 read_only: boolean;
             }[];
-            /** @description Free bytes on the disk holding the models directory; null when it cannot be determined (replaces the removed free_disk_bytes, which was the cwd disk) */
+            /** @description Free bytes on the disk holding the models directory; null when it cannot be determined */
             models_dir_free_bytes?: number | null;
+            /**
+             * @deprecated
+             * @description v1 compatibility only. Historical daemon-cwd disk free bytes: the disk whose mount point is the longest prefix of the daemon process's current working directory, falling back to the disk with the most available space when none matches (including a failed cwd read), or 0 when no disks are enumerated at all; 0 is also a legitimate "disk full" value, not a distinct unknown marker. Not the models directory's disk — use models_dir_free_bytes for that — and never used to gate model downloads.
+             */
+            free_disk_bytes: number;
             /** @description Reserved; not probed yet (HW-1) */
             runtimes?: {
                 name: string;
@@ -2308,6 +2398,35 @@ export interface components {
             task_id: string;
             to_week: string;
         };
+        ModuleAuthorizationList: {
+            authorizations: components["schemas"]["ModuleAuthorization"][];
+        };
+        ModuleAuthorization: {
+            module: string;
+            tool: string;
+            module_version: string;
+            scope_summary: {
+                readable: string | null;
+                writable: string | null;
+                external: string | null;
+            };
+            /** @enum {string} */
+            host_risk: "low" | "medium" | "high";
+            /** @enum {string} */
+            source: "first_party" | "manual_install";
+            /** Format: date-time */
+            decided_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** @enum {string} */
+            status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";
+        };
+        ModuleAuthorizationRevocation: {
+            module: string;
+            tool: string | null;
+            /** @constant */
+            status: "revoked";
+        };
         /**
          * @description A batch of atomic ops. `status` MUST be `pending` on submit — the server
          *     stores it as pending regardless (only pending is meaningful here).
@@ -2521,6 +2640,146 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listModuleConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Persisted per-tool decisions, including revoked or expired entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationList"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    exportModuleConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Downloadable JSON export */
+            200: {
+                headers: {
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationList"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeModuleConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Module authorizations revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationRevocation"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeModuleToolConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tool authorization revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationRevocation"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getHealth: {
         parameters: {
             query?: never;

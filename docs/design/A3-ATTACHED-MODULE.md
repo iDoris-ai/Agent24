@@ -200,12 +200,12 @@ Q2=b 让 AgentEar 代跑 CLI 配对；这不能变成「模块自己给自己放
 | 方向 | 方法 | params → result | 限制（来源） |
 |---|---|---|---|
 | 模块→内核 | `_a24/events/emit` | `{kind, payload}` → `{}` | `kind` 为点分小写 ASCII `[a-z0-9_-]+(\.[a-z0-9_-]+)+`、≤96 字节；`payload` 对象 ≤256 节点且字符串（含键）≤8 KiB；令牌桶 20 突发 / 5 每秒（`events_emit.rs`），超限 `rate_limited` |
-| 模块→内核 | `_a24/model/complete` | `{messages:[{role:system\|user\|assistant, content}], complexity?: simple\|complex, max_tokens?: 1..=4096（缺省 1024）, response_format?, _meta?}` → `{text, model_id, tier: local\|remote, usage:{prompt_tokens, completion_tokens}}` | messages ≤64；内核超时 120 s；每模块并发 2、全局 4；令牌桶 30 突发 / 0.5 每秒（`model_callback.rs:35-49`） |
+| 模块→内核 | `_a24/model/complete` | `{messages:[{role:system\|user\|assistant, content}], complexity?: simple\|complex, max_tokens?: 1..=4096（缺省 1024）, temperature?: 0..=2（ME4-S2b，协议 v2）, response_format?, _meta?}` → `{text, model_id, tier: local\|remote, usage:{prompt_tokens, completion_tokens}}` | messages ≤64；内核超时原为固定 120 s，ME4-S2a 改为按进展计时（首段 300 s、间隔 60 s，截止时间 300 s + `max_tokens` × 1 s，方法超时为兜底值 4456 s）；每模块并发 2、全局 4；令牌桶 30 突发 / 0.5 每秒（`model_callback.rs:35-49`） |
 | 内核→模块 | `_a24/command/invoke` | `{name, body}` → JSON **对象** | 见 §6；内核等待 5 s |
 
 **`request_id` 在 A3 下无意义，模块应省略**（M1）：附着代没有入站代理请求，也就没有在途的 `request_id`。带了的后果：`model/complete` 得 `-32000 timeout`（`retryable: false`，「request_id is not in flight」，`model_callback.rs:641-649`）；`events/emit` 被接受但该字段只是原样透传到 WS，没有任何生命周期语义。
 
-**超时与取消（AgentEar 对齐 3，按代码核查）**：模块若要比内核的 120 s 更早放弃（AgentEar 语音超时默认 60 s），**应发 `$/cancelRequest`**，而不是单方面丢弃等待。内核的实际行为（`main@f504ae0`）：
+**超时与取消（AgentEar 对齐 3，按代码核查）**：模块若要比内核更早放弃（内核原为 120 s，ME4-S2a 起一次调用可以长达 300 s + `max_tokens` × 1 s）（AgentEar 语音超时默认 60 s），**应发 `$/cancelRequest`**，而不是单方面丢弃等待。内核的实际行为（`main@f504ae0`）：
 
 1. `rpc.rs:1279-1285`：对该 id 的处理任务 `abort()`；任务结束后 `rpc.rs:1326-1333` 回一帧 `{"id":<原 id>,"error":{"code":-32000,"message":"cancelled by $/cancelRequest; …","data":{"kind":"cancelled"}}}`（无 `retryable`）。若处理已先完成，模块收到的是正常结果——**模块应把「发出取消后收到的那一帧」一律当作该调用的终态**，结果照常丢弃即可。
 2. 处理 future 被丢弃 → `_cancel_on_drop`（`model_callback.rs:669`）取消 provider 的 `CancellationToken`，本机推理被中止；并发名额（`admission`）随之释放；`UsageTicket` 未 finish 即被丢弃 → 记一条 `UsageOutcome::Cancelled`（`model_callback.rs:263-289`），`GET /api/v1/usage` 可见。

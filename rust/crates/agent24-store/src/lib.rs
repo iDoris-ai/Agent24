@@ -27,6 +27,8 @@ mod decision_log;
 mod legacy_recovery;
 mod model_call_timings;
 mod module_approvals;
+mod module_audit_event;
+mod module_consents;
 mod module_model_usage;
 mod module_schedules;
 mod repo;
@@ -34,6 +36,7 @@ mod run_workspace_admission;
 mod run_workspace_authority;
 mod run_workspace_orphan;
 mod run_workspace_terminal;
+pub mod source_policy;
 mod terminal_core;
 mod terminal_helpers;
 pub(crate) mod terminal_mutations;
@@ -73,6 +76,16 @@ pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
 };
 pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
+pub use module_audit_event::{
+    ActorRef, AttemptId, AuditRef, AuditTimestamp, AuthorizationRef, DurationMs,
+    InterruptedTerminalOutcome, MODULE_TOOL_AUDIT_RETENTION_DAYS, ModuleId, ModuleToolAuditEvent,
+    ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef, RunId, SessionRef,
+    SizeBytes, ToolCallId,
+};
+pub use module_consents::{
+    ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentRecord,
+    ModuleConsentRevocation, ToolPermissionSummary,
+};
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
 pub use repo::*;
@@ -80,6 +93,9 @@ pub use run_workspace_admission::{RunAdmission, RunAdmissionDenial};
 pub use run_workspace_authority::RunWorkspaceAuthoritySnapshot;
 pub use run_workspace_orphan::WorkspaceOrphanSweep;
 pub use run_workspace_terminal::RunTerminalTransition;
+pub use source_policy::{
+    PolicySnapshot, SOURCE_TAG_SCHEMA_VERSION, SourceKind, SourceMode, SourceRef, StoredSourceTag,
+};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -107,6 +123,10 @@ pub enum StoreError {
     /// the line.
     #[error("module schedule quota reached")]
     QuotaExceeded,
+    /// K1-7.1 (ADR-K1-04 §2.1): a typed K1 module-tool audit field failed
+    /// its closed-set/bounded-identifier validation.
+    #[error("invalid audit metadata: {0}")]
+    InvalidAuditMetadata(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -123,6 +143,9 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    module_consent_revocations: tokio::sync::broadcast::Sender<ModuleConsentRevocation>,
+    terminal_commit_ack_gate:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>>,
 }
 
 impl Store {
@@ -141,7 +164,12 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        Ok(Self {
+            pool,
+            module_consent_revocations,
+            terminal_commit_ack_gate: std::sync::Arc::default(),
+        })
     }
 
     /// In-memory database for tests.
@@ -155,7 +183,12 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        Ok(Self {
+            pool,
+            module_consent_revocations,
+            terminal_commit_ack_gate: std::sync::Arc::default(),
+        })
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
@@ -167,8 +200,35 @@ impl Store {
 /// tampering). Not part of the supported API.
 #[doc(hidden)]
 pub mod test_hooks {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
     pub fn pool(store: &super::Store) -> &sqlx::SqlitePool {
         store.pool()
+    }
+
+    /// Pause the next typed terminal append after SQLite has committed but
+    /// before the append future acknowledges completion to its caller.
+    pub fn pause_next_terminal_commit_ack(store: &super::Store) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        let mut configured_gate = store
+            .terminal_commit_ack_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) async fn terminal_commit_ack_boundary(store: &super::Store) {
+        let gate = store
+            .terminal_commit_ack_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.notify_one();
+            gate.notified().await;
+        }
     }
 
     /// Build a `Store` around an already-migrated pool a test built by hand
@@ -181,7 +241,12 @@ pub mod test_hooks {
     /// build.
     #[must_use]
     pub fn from_pool(pool: sqlx::SqlitePool) -> super::Store {
-        super::Store { pool }
+        let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        super::Store {
+            pool,
+            module_consent_revocations,
+            terminal_commit_ack_gate: std::sync::Arc::default(),
+        }
     }
 
     /// Insert a schedule row with arbitrary (possibly invalid) JSON columns —

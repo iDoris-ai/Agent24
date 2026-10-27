@@ -9,6 +9,7 @@ rust/apps/agent24-documents/engines/pdfkit/build.sh <dir>     # writes <dir>/age
                                                               # one JSON line, then a PNG
 ```
 
+- `build.sh` builds it for macOS 13 and later, whichever macOS the build machine runs.
 - It reads one file per run and writes the pages' lines, in reading order, as text plus a rectangle in CropBox points, origin top left of the page as displayed. It also lists the regions it could not read. It writes no files and uses no network. Its output counts only on exit 0.
 - Vision OCR reads every page that has no text, or that draws an image anywhere (including inside form XObjects, and inline images). Mixed pages are put back in reading order. A page it cannot render or recognise is listed as unparsed, not treated as empty. Renders stay within 40 megapixels. JPEG orientation (EXIF) is applied. An image over 100 megapixels is not decoded (exit 3): a small file can hold a huge image.
 - Text is kept as read, except for these clean-ups:

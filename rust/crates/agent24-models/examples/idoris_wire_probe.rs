@@ -32,6 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         max_tokens: std::num::NonZeroU32::new(512),
         disable_thinking: true,
+        progress: None,
+        temperature: None,
     };
     let served = ModelRouter::from_env()
         .complete_served(

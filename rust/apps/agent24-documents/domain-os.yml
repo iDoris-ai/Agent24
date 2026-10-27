@@ -12,3 +12,6 @@ model_access: local_only
 impl_kind: out_of_process_provider
 spawn:
   command: bin/agent24-documents
+# Extraction sends `temperature` (ADR-DOC-02 §3.2), which only a v2 kernel takes
+# (ME4-S2b): an older one refuses this package when it is installed or mounted.
+min_daemon_protocol: 2
