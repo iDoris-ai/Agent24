@@ -22,6 +22,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
 mod runs;
+mod schedules;
 mod service;
 mod tui;
 
@@ -95,6 +96,11 @@ enum Command {
     Runs {
         #[command(subcommand)]
         action: runs::RunsAction,
+    },
+    /// List, create, change, delete and fire schedules (the desktop's Schedules page)
+    Schedules {
+        #[command(subcommand)]
+        action: schedules::SchedulesAction,
     },
 }
 
@@ -2270,6 +2276,7 @@ async fn main() -> std::process::ExitCode {
         Command::Decide { action } => cmd_decide(action).await,
         Command::Hw { action } => cmd_hw(action),
         Command::Runs { action } => runs::cmd_runs(action).await,
+        Command::Schedules { action } => schedules::cmd_schedules(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

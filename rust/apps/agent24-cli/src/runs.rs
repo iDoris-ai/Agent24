@@ -37,7 +37,7 @@ fn wire_name<T: serde::Serialize>(value: &T) -> String {
 }
 
 /// The first line of `text`, cut to `max` characters.
-fn short(text: &str, max: usize) -> String {
+pub(super) fn short(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or("");
     if line.chars().count() > max || text.lines().nth(1).is_some() {
         format!("{}…", line.chars().take(max).collect::<String>())
@@ -97,7 +97,7 @@ fn cancel_line(run: &Run) -> String {
     }
 }
 
-async fn resident() -> Result<Endpoint, String> {
+pub(super) async fn resident() -> Result<Endpoint, String> {
     if let Some(ep) = attach_only().await {
         return Ok(ep);
     }
@@ -114,7 +114,7 @@ async fn resident() -> Result<Endpoint, String> {
 /// `id` as one path segment. The daemon's ids are a prefix and a ULID
 /// (`run_…`, `sch_…`); anything else could step out of the route (`..`, `/`,
 /// `?`, `#`) and is refused before a request is sent.
-fn segment(id: &str) -> Result<&str, String> {
+pub(super) fn segment(id: &str) -> Result<&str, String> {
     let ok = !id.is_empty()
         && id
             .bytes()
@@ -123,13 +123,16 @@ fn segment(id: &str) -> Result<&str, String> {
 }
 
 /// Sends `req`; the body as JSON on success, the daemon's own message otherwise.
-async fn send(req: reqwest::RequestBuilder) -> Result<serde_json::Value, String> {
+pub(super) async fn send(req: reqwest::RequestBuilder) -> Result<serde_json::Value, String> {
     let res = req
         .timeout(Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| e.to_string())?;
     let status = res.status();
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Ok(serde_json::Value::Null);
+    }
     if status.is_success() {
         return res
             .json()
@@ -147,11 +150,13 @@ async fn send(req: reqwest::RequestBuilder) -> Result<serde_json::Value, String>
     }
 }
 
-fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, String> {
+pub(super) fn decode<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, String> {
     serde_json::from_value(value).map_err(|e| format!("unexpected answer from the daemon: {e}"))
 }
 
-fn pretty(value: &serde_json::Value) -> String {
+pub(super) fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
@@ -197,7 +202,7 @@ async fn runs(ep: &Endpoint, action: RunsAction) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::io::{Read, Write};
@@ -216,27 +221,28 @@ mod tests {
         })
     }
 
-    /// A daemon that gives one canned answer; the request it got comes back
-    /// through the handle.
-    fn answer_once(status: &str, body: String) -> (Endpoint, std::thread::JoinHandle<String>) {
+    /// A daemon that answers each request in turn with the next canned
+    /// answer; the requests it got (head and body) come back through the handle.
+    pub(crate) fn answer_each(
+        replies: Vec<(&'static str, String)>,
+    ) -> (Endpoint, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let reply = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
         let seen = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            // Until the end of the head: the requests here carry no body.
-            let mut got = Vec::new();
-            let mut buf = [0u8; 1024];
-            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = sock.read(&mut buf).unwrap();
-                assert!(n > 0, "the client closed before its request ended");
-                got.extend_from_slice(&buf[..n]);
+            let mut seen = Vec::new();
+            for (status, body) in replies {
+                let Some(mut sock) = accept(&listener) else {
+                    break;
+                };
+                seen.push(read_request(&mut sock));
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(reply.as_bytes()).unwrap();
             }
-            sock.write_all(reply.as_bytes()).unwrap();
-            String::from_utf8_lossy(&got).into_owned()
+            seen
         });
         let ep = Endpoint {
             base,
@@ -244,6 +250,61 @@ mod tests {
             child: None,
         };
         (ep, seen)
+    }
+
+    /// The next connection, or none after 5 s: a client that sends fewer
+    /// requests than there are replies fails its test instead of hanging it.
+    fn accept(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((sock, _)) => {
+                    sock.set_nonblocking(false).unwrap();
+                    return Some(sock);
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// The head, then as many body bytes as its content-length says.
+    fn read_request(sock: &mut std::net::TcpStream) -> String {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        let head_end = loop {
+            if let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            let n = sock.read(&mut buf).unwrap();
+            assert!(n > 0, "the client closed before its request ended");
+            got.extend_from_slice(&buf[..n]);
+        };
+        let head = String::from_utf8_lossy(&got[..head_end]).to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map_or(0, |v| v.trim().parse().unwrap());
+        while got.len() < head_end + length {
+            let n = sock.read(&mut buf).unwrap();
+            assert!(n > 0, "the client closed before its body ended");
+            got.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    }
+
+    fn answer_once(
+        status: &'static str,
+        body: String,
+    ) -> (Endpoint, std::thread::JoinHandle<String>) {
+        let (ep, seen) = answer_each(vec![(status, body)]);
+        let one = std::thread::spawn(move || seen.join().unwrap().remove(0));
+        (ep, one)
     }
 
     #[tokio::test]
