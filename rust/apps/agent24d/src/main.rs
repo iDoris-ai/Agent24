@@ -23,6 +23,7 @@ mod comm_routes;
 mod consent_routes;
 mod decide_routes;
 mod domain;
+mod enroll_endpoint;
 mod events;
 mod events_emit;
 mod hardware;
@@ -125,6 +126,11 @@ enum Command {
         /// Required for capability mode and hidden from ordinary CLI help.
         #[arg(long, hide = true, default_value_t = false)]
         host_bootstrap_stdio: bool,
+        /// Service mode: capability daemon with no parent pipes that opens
+        /// the enrolment endpoint `<data_dir>/enroll.sock`. Exclusive with
+        /// --host-bootstrap-stdio (which opens the endpoint by itself).
+        #[arg(long, default_value_t = false)]
+        enroll_endpoint: bool,
     },
 }
 
@@ -149,7 +155,14 @@ fn main() -> std::process::ExitCode {
             ephemeral,
             auth_mode,
             host_bootstrap_stdio,
-        } => run_serve(port, ephemeral, auth_mode.into(), host_bootstrap_stdio),
+            enroll_endpoint,
+        } => run_serve(
+            port,
+            ephemeral,
+            auth_mode.into(),
+            host_bootstrap_stdio,
+            enroll_endpoint,
+        ),
     }
 }
 
@@ -158,6 +171,7 @@ fn run_serve(
     ephemeral: bool,
     auth_mode: agent24_protocol::state_file::AuthMode,
     host_bootstrap_stdio: bool,
+    enroll_endpoint: bool,
 ) -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -173,6 +187,7 @@ fn run_serve(
         ephemeral,
         auth_mode,
         host_bootstrap_stdio,
+        enroll_endpoint,
         cancel,
     ));
     // Bounded, not the default `Drop`, which waits for every blocking task:

@@ -1405,27 +1405,17 @@ pub async fn serve(
     ephemeral: bool,
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
+    enroll_endpoint: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
-    let (mut host_ready, parent_liveness) = match (auth_mode, host_bootstrap_stdio) {
-        (AuthMode::Capabilities, true) => {
-            let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
-            (Some(writer), Some(liveness))
-        }
-        (AuthMode::Capabilities, false) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "capability mode requires trusted host bootstrap stdio",
-            ));
-        }
-        (AuthMode::LegacySingleToken, false) => (None, None),
-        (AuthMode::LegacySingleToken, true) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "host bootstrap stdio is valid only in capability mode",
-            ));
-        }
+    let mode = validate_auth_startup(auth_mode, host_bootstrap_stdio, enroll_endpoint, ephemeral)?;
+    // Only the host-child mode owns the trusted pipes (and so the parent-EOF
+    // lease). Service mode has neither: it is not a child of anything.
+    let (mut host_ready, parent_liveness) = if mode == StartupMode::HostChild {
+        let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
+        (Some(writer), Some(liveness))
+    } else {
+        (None, None)
     };
     // The shutdown controller, and the signals that request it, before
     // anything else: a SIGTERM during startup — which can take seconds (the
@@ -1566,15 +1556,22 @@ pub async fn serve(
         AuthMode::LegacySingleToken => (generate_token(), None, None),
         AuthMode::Capabilities => {
             let store = crate::capabilities::CapabilityStore::new(daemon_generation.clone());
-            let minted = store
-                .mint_product_host(
-                    generate_token(),
-                    Duration::from_secs(u64::MAX),
-                    crate::capabilities::unix_now(),
-                )
-                .map_err(std::io::Error::other)?;
-            let (bearer, _, _) = minted.into_bearer_parts();
-            (String::new(), Some(store), Some(bearer))
+            // CORE-2 R5: a service has no trusted parent pipe to hand a host
+            // credential to, so it mints none (and nothing secret is ever
+            // published for it).
+            let bearer = if !mints_product_host(mode) {
+                None
+            } else {
+                let minted = store
+                    .mint_product_host(
+                        generate_token(),
+                        Duration::from_secs(u64::MAX),
+                        crate::capabilities::unix_now(),
+                    )
+                    .map_err(std::io::Error::other)?;
+                Some(minted.into_bearer_parts().0)
+            };
+            (String::new(), Some(store), bearer)
         }
     };
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
@@ -2543,7 +2540,27 @@ pub async fn serve(
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
+    // CORE-2e (D5): lock -> migration -> bind the enrolment endpoint -> only
+    // then publish daemon.json and the ready line. A bind or (service mode)
+    // publish failure ends this start; nothing half-ready is advertised.
+    let mut enroll = None;
+    let mut publish_error = None;
     if !ephemeral {
+        let bound = if mode == StartupMode::Legacy {
+            Ok(None)
+        } else {
+            crate::enroll_endpoint::bind(&state_dir).map(Some)
+        };
+        match bound {
+            Ok(endpoint) => enroll = endpoint,
+            Err(err) => {
+                publish_error = Some(std::io::Error::other(format!(
+                    "cannot bind the enrolment endpoint: {err}"
+                )))
+            }
+        }
+    }
+    if publish_error.is_none() && !ephemeral {
         let discovery = match auth_mode {
             AuthMode::LegacySingleToken => agent24_protocol::state_file::DaemonState::new_legacy(
                 local.port(),
@@ -2560,9 +2577,40 @@ pub async fn serve(
             ),
         }
         .map_err(std::io::Error::other)?;
+        let discovery = match &enroll {
+            Some(endpoint) => {
+                discovery.with_enroll_endpoint(endpoint.path().to_string_lossy().into_owned())
+            }
+            None => discovery,
+        };
         if let Err(err) = agent24_protocol::state_file::write(&discovery) {
-            tracing::warn!("could not write daemon state file: {err}");
+            if mode == StartupMode::Service {
+                // Revises facts §8.3 for the service path only: a service
+                // nobody can discover is a failed start.
+                publish_error = Some(err);
+            } else {
+                tracing::warn!("could not write daemon state file: {err}");
+            }
         }
+    }
+    if let Some(err) = publish_error {
+        tracing::error!("daemon start failed before ready: {err}");
+        shutdown.request();
+        tracing::info!("stopping modules after a failed start");
+        let _ = stopping.await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
+        if !ephemeral {
+            agent24_protocol::state_file::remove_if_owner(daemon_pid);
+        }
+        return Err(err);
+    }
+    if let Some(endpoint) = enroll.as_mut() {
+        endpoint.serve(cancel.clone());
     }
 
     // The state file is written; now readiness and a shutdown request race
@@ -2591,6 +2639,14 @@ pub async fn serve(
             "generation": daemon_generation,
             "version": env!("CARGO_PKG_VERSION"),
         }),
+        AuthMode::Capabilities if mode == StartupMode::Service => serde_json::json!({
+            "type": "ready",
+            "port": local.port(),
+            "auth_mode": "capabilities",
+            "generation": daemon_generation,
+            "version": env!("CARGO_PKG_VERSION"),
+            "enroll_endpoint": enroll.as_ref().map(|e| e.path().to_string_lossy().into_owned()),
+        }),
         AuthMode::Capabilities => {
             let product_host_token = product_host_token.ok_or_else(|| {
                 std::io::Error::new(
@@ -2612,6 +2668,7 @@ pub async fn serve(
     };
     match auth_mode {
         AuthMode::LegacySingleToken => println!("{ready}"),
+        AuthMode::Capabilities if mode == StartupMode::Service => println!("{ready}"),
         AuthMode::Capabilities => {
             let host_ready = host_ready.as_mut().ok_or_else(|| {
                 std::io::Error::new(
@@ -2670,23 +2727,60 @@ pub async fn serve(
     result
 }
 
-/// Capability mode requires the trusted host-bootstrap transport; the route
-/// middleware maps every request before accepting its bearer.
+/// How this process is started (CORE-2 D8). The single source of the
+/// bootstrap / enroll matrix; `serve` acts on the returned mode only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupMode {
+    /// Single-token daemon, unchanged.
+    Legacy,
+    /// Capability daemon owned by a trusted parent over stdio pipes: the
+    /// parent-EOF lease applies and the enrolment endpoint opens by itself.
+    HostChild,
+    /// Capability daemon run by a service manager: no pipes, no parent lease,
+    /// no host credential; the enrolment endpoint is the only way in.
+    Service,
+}
+
+/// Only a host-child daemon has a trusted pipe to hand a `ProductHost`
+/// credential to; a service never mints one (CORE-2 R5, T17).
+fn mints_product_host(mode: StartupMode) -> bool {
+    mode == StartupMode::HostChild
+}
+
+/// Validate the auth / bootstrap / enroll combination. Mutually exclusive by
+/// construction, not by argument order; bootstrap together with enroll is
+/// refused as ambiguous (§9 Q5).
 fn validate_auth_startup(
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
-) -> Result<(), std::io::Error> {
-    match (auth_mode, host_bootstrap_stdio) {
-        (AuthMode::Capabilities, true) => Ok(()),
-        (AuthMode::Capabilities, false) => Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "capability mode requires trusted host bootstrap stdio",
-        )),
-        (AuthMode::LegacySingleToken, true) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+    enroll_endpoint: bool,
+    ephemeral: bool,
+) -> Result<StartupMode, std::io::Error> {
+    use std::io::{Error, ErrorKind};
+    match (auth_mode, host_bootstrap_stdio, enroll_endpoint) {
+        (AuthMode::LegacySingleToken, false, false) => Ok(StartupMode::Legacy),
+        (AuthMode::LegacySingleToken, true, _) => Err(Error::new(
+            ErrorKind::InvalidInput,
             "host bootstrap stdio is valid only in capability mode",
         )),
-        (AuthMode::LegacySingleToken, false) => Ok(()),
+        (AuthMode::LegacySingleToken, false, true) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "--enroll-endpoint is valid only in capability mode",
+        )),
+        (AuthMode::Capabilities, true, false) => Ok(StartupMode::HostChild),
+        (AuthMode::Capabilities, false, false) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "capability mode requires trusted host bootstrap stdio or --enroll-endpoint",
+        )),
+        (AuthMode::Capabilities, true, true) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "host bootstrap stdio and --enroll-endpoint are mutually exclusive",
+        )),
+        (AuthMode::Capabilities, false, true) if ephemeral => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "--enroll-endpoint needs a discoverable daemon and cannot be ephemeral",
+        )),
+        (AuthMode::Capabilities, false, true) => Ok(StartupMode::Service),
     }
 }
 
@@ -3803,10 +3897,37 @@ pub(crate) mod tests {
 
     #[test]
     fn capability_startup_requires_the_trusted_host_bootstrap_transport() {
-        assert!(validate_auth_startup(AuthMode::Capabilities, true).is_ok());
-        let err = validate_auth_startup(AuthMode::Capabilities, false)
+        assert_eq!(
+            validate_auth_startup(AuthMode::Capabilities, true, false, false).unwrap(),
+            StartupMode::HostChild
+        );
+        let err = validate_auth_startup(AuthMode::Capabilities, false, false, false)
             .expect_err("capability startup without private host pipes");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn only_the_host_child_mints_a_product_host() {
+        assert!(mints_product_host(StartupMode::HostChild));
+        assert!(!mints_product_host(StartupMode::Service));
+        assert!(!mints_product_host(StartupMode::Legacy));
+    }
+
+    /// CORE-2e T4: every row of the D8 matrix (+ Q5, + ephemeral service).
+    #[test]
+    fn startup_matrix_matches_d8() {
+        use AuthMode::{Capabilities as C, LegacySingleToken as L};
+        let m = |a, b, e, eph| validate_auth_startup(a, b, e, eph).ok();
+        assert_eq!(m(L, false, false, false), Some(StartupMode::Legacy));
+        assert_eq!(m(L, true, false, false), None);
+        assert_eq!(m(L, true, true, false), None);
+        assert_eq!(m(L, false, true, false), None);
+        assert_eq!(m(C, true, false, false), Some(StartupMode::HostChild));
+        assert_eq!(m(C, true, false, true), Some(StartupMode::HostChild));
+        assert_eq!(m(C, false, true, false), Some(StartupMode::Service));
+        assert_eq!(m(C, false, false, false), None);
+        assert_eq!(m(C, true, true, false), None);
+        assert_eq!(m(C, false, true, true), None);
     }
 
     #[tokio::test]
