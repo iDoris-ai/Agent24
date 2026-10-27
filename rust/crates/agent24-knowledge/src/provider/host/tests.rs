@@ -7,7 +7,7 @@ use crate::provider::credential::Credentials;
 use crate::provider::evidence::{Kbs, Rule};
 use crate::provider::gate::Gate;
 use crate::provider::placeholder::Placeholder;
-use crate::provider::profile::Slot;
+use crate::provider::profile::{Confirmation, Slot};
 use crate::provider::replay::Entry;
 use crate::provider::state::{ConnectionPhase, Switches};
 
@@ -358,4 +358,115 @@ fn a_binding_connects_only_once_neither_switch_holds_it() {
     assert_eq!(phase(&host, "a"), None);
     host.enable("a").unwrap();
     assert_eq!(durable(&mut host).loading.len(), 1);
+}
+
+/// S5.6: unselecting a bound profile advances the evidence epoch with a
+/// placeholder rule over every KB; selecting it again activates the same
+/// binding once confirmed (S3.3), Off permitting.
+#[test]
+fn unselect_places_a_rule_and_select_activates_the_same_binding() {
+    let mut host = host();
+    host.unselect("a");
+    assert!(!host.profile(&"a").unwrap().selected());
+    let (unselect, _, changes) = write(&mut host);
+    let rule = Rule {
+        epoch: 1,
+        kbs: Kbs::All,
+    };
+    let generation = C::Generation {
+        of: of("a", 7),
+        value: 2,
+    };
+    let placed = C::Placed {
+        of: of("a", 7),
+        rule,
+    };
+    assert_eq!(changes, [C::Unselect("a"), placed, generation]);
+    assert!(host.written(unselect, Written::Durable).loading.is_empty());
+    host.select("a").unwrap();
+    assert!(
+        !host.profile(&"a").unwrap().selected(),
+        "not before confirmed"
+    );
+    assert_eq!(durable(&mut host).loading.len(), 1);
+    assert!(host.profile(&"a").unwrap().selected());
+
+    let mut off = host_off();
+    off.unselect("a");
+    durable(&mut off);
+    off.select("a").unwrap();
+    assert!(durable(&mut off).loading.is_empty(), "Off still holds it");
+    assert!(off.profile(&"a").unwrap().selected());
+}
+
+/// I1 for selection: refused while its profile's tightening is unconfirmed;
+/// the opposite action gives a pending one up, and a selection already in
+/// place writes nothing.
+#[test]
+fn selection_follows_the_same_rules_as_the_other_switches() {
+    let mut host = host();
+    host.unselect("b");
+    host.unselect("b");
+    assert_eq!(host.select("b"), Err(Refused::LocalStorage));
+    tightening_alone(&mut host, C::Unselect("b"));
+    assert!(host.take_write().is_none(), "one write");
+    host.select("a").unwrap();
+    assert!(host.take_write().is_none(), "selected already");
+
+    host.select("b").unwrap();
+    host.select("b").unwrap();
+    let (select, _, changes) = write(&mut host);
+    assert_eq!(changes, [C::Select("b")]);
+    host.unselect("b");
+    assert_eq!(host.written(select, Written::Durable), Output::default());
+    assert!(!host.profile(&"b").unwrap().selected());
+    assert_eq!(write(&mut host).2, [C::Unselect("b")]);
+}
+
+/// I1 blocks by profile: another profile's unconfirmed tightening does not
+/// refuse a selection.
+#[test]
+fn a_selection_is_blocked_by_its_own_profile_only() {
+    let mut host = host();
+    host.unselect("a");
+    durable(&mut host);
+    host.unselect("b");
+    assert_eq!(host.select("a"), Ok(()));
+    tightening_alone(&mut host, C::Unselect("b"));
+    assert_eq!(write(&mut host).2, [C::Select("a")]);
+}
+
+/// S1.13: with a confirmation awaited, selecting only sets the flag; the
+/// binding stays deactivated until the confirmation.
+#[test]
+fn a_selection_awaiting_confirmation_does_not_activate() {
+    let binding = BindingState::new(
+        Connection::new(Gate::new(1), true),
+        Credentials::new(false),
+        false,
+    );
+    let awaited = Some(Confirmation::PrincipalChanged);
+    let profile = Profile::new(Slot::Bound(Box::new(binding)), false, awaited);
+    let mut host = H::new(false, true, 1);
+    host.insert(Member::new("a", profile, Some(7), false));
+    host.select("a").unwrap();
+    assert!(durable(&mut host).loading.is_empty());
+    let profile = host.profile(&"a").unwrap();
+    assert!(profile.selected());
+    assert_eq!(profile.confirmation(), awaited);
+    assert_eq!(phase(&host, "a"), None);
+}
+
+/// A placeholder's selection is remembered once confirmed; nothing connects.
+#[test]
+fn a_placeholder_selection_is_remembered() {
+    let mut host = host();
+    host.unselect("b");
+    tightening_alone(&mut host, C::Unselect("b"));
+    host.select("b").unwrap();
+    assert!(!host.profile(&"b").unwrap().selected());
+    assert!(durable(&mut host).loading.is_empty());
+    let b = host.profile(&"b").unwrap();
+    assert!(b.selected());
+    assert!(matches!(b.slot(), Slot::Placeholder(_)));
 }
