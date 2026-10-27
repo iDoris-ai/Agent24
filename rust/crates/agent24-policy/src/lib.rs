@@ -13,6 +13,7 @@
 pub mod consent_gate;
 pub mod guardian;
 pub mod overrides;
+pub mod tool_summary;
 pub mod write_scope;
 
 use std::collections::{HashMap, HashSet};

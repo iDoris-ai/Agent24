@@ -113,6 +113,10 @@ impl ExplorerSubagent {
 
 #[async_trait]
 impl Tool for ExplorerSubagent {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+
     fn info(&self) -> ToolInfo {
         // Read: spawning an explorer has only read side effects, because the
         // sub-run can only read. So it is not gated — advertised and runs like
@@ -339,6 +343,9 @@ mod tests {
 
     #[async_trait]
     impl Tool for KnowledgeOnlyTool {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
         fn info(&self) -> ToolInfo {
             ToolInfo::new("kb_read", "builtin", "reads Knowledge", RiskClass::Read)
         }
@@ -362,6 +369,8 @@ mod tests {
     async fn a_sub_run_is_not_offered_a_tool_that_needs_a_knowledge_binding() {
         let tools = ToolRegistry::new().with(Arc::new(KnowledgeOnlyTool));
         assert!(ExplorerSubagent::specs_of(&tools).await.is_empty());
+        // Hidden for the binding alone: a bound run is offered it.
+        assert_eq!(tools.live_adverts(true).await.len(), 1);
     }
 
     /// A provider whose turns are scripted; when the script runs out it answers
@@ -461,6 +470,48 @@ mod tests {
             .await;
         assert!(matches!(result, Err(ToolError::Failed(_))));
         assert_eq!(remote.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// K1-6b.5b (ADR-K1-02 §2.4 (b)): a remote-only router, and the parent
+    /// run's policy cannot be read, or there is no store to read it from. The
+    /// call is routed local-only (no local provider, so it fails) rather than
+    /// reaching the remote provider's gate.
+    async fn delegate_with_a_remote_only_router(store: Option<agent24_store::Store>) -> String {
+        let remote = Scripted::new(vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let router = Arc::new(ModelRouter::with_defaults(vec![(
+            remote.clone(),
+            Tier::Remote,
+        )]));
+        let tools = Arc::new(ToolRegistry::read_only(dir.path().to_path_buf()));
+        let explorer = match store {
+            Some(store) => ExplorerSubagent::new_with_store(router, tools, store),
+            None => ExplorerSubagent::new(router, tools),
+        };
+        let mut input = Map::new();
+        input.insert("task".to_owned(), Value::String("inspect".to_owned()));
+        let result = explorer
+            .call(&ctx(), &input, &CancellationToken::new())
+            .await;
+        assert_eq!(remote.calls.load(Ordering::SeqCst), 0);
+        match result {
+            Err(ToolError::Failed(message)) => message,
+            other => panic!("expected a failed call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegated_call_whose_parent_policy_cannot_be_read_stays_local_only() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        agent24_store::test_hooks::fail_source_tag_reads(&store);
+        let message = delegate_with_a_remote_only_router(Some(store)).await;
+        assert!(message.contains("local-only"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_delegated_call_without_a_policy_store_stays_local_only() {
+        let message = delegate_with_a_remote_only_router(None).await;
+        assert!(message.contains("local-only"), "{message}");
     }
 
     /// The registry the explorer runs against contains ONLY fs_read — the

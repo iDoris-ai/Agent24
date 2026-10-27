@@ -290,7 +290,7 @@ impl FtsRetriever {
         let rows = sqlx::query(
             "SELECT a.id, a.scope, a.subject, a.predicate, a.object,
                     a.valid_from, a.valid_to, a.recorded_from, a.recorded_to,
-                    a.evidence, a.confidence, a.modality, a.speaker, a.writer_version,
+                    a.evidence, a.source_ref, a.confidence, a.modality, a.speaker, a.writer_version,
                     a.supersedes, a.qualified,
                     -bm25(mem_assertions_fts) AS score
              FROM mem_assertions_fts f

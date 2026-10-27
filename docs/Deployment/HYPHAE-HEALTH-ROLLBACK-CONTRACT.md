@@ -23,7 +23,7 @@ Agent24 实查 `ab125de262827bd0f1c6680b427d9c241ccff785`。Hyphae 在 `/Users/j
 | 同一 SQLite 的其他表；`internal/group/db.go`、`internal/profile/db.go`、`internal/audit/audit.go` | 旧 groups/group_members/group_messages（含 role 增列）、agent_profiles、audit_log 也可能存在；不能只备份 messages 或只数聊天条数。保留完整 DB、审计链和未知对象。 |
 | relay `<data-dir>/events.db`；`internal/relay/server.go`、`go.mod/go.sum` | Khatru + `fiatjaf.com/nostr/eventstore/boltdb`，不是 SQLite。固定依赖 `v0.0.0-20260928115942-58e4c715304e` 的本地模块源码 `boltdb/lib.go,migration.go` 有 settingsStore/rawEventStore/索引桶，内部 migration target=1，settingsStore 的 version 可缺省，注释无 rollback。**这是依赖内部标记，不是 Hyphae relay schema v1 或兼容保证**；必须绑定依赖和实际桶/编码证据。 |
 
-上述是静态源码观察；未运行候选迁移或兼容测试，未读取用户真实私钥/消息库。该观察时 Agent24 生产 lock 的 Hyphae source 为 `671c584f9e9eb807a15968e2aa42fd7507e178b8`（历史值），与实查上游不同；二者兼容性为 **unknown**。2026-10-24 生产 lock 已升到 Hyphae v0.26.3 `144555ca6b043be77225786ddbf4e6bce5ad3228`，见 [LOCK-UPGRADE-20261024](../comm/LOCK-UPGRADE-20261024.md)；上述静态观察没有对新 source 重做，兼容性结论仍为 **unknown**。
+上述是静态源码观察；未运行候选迁移或兼容测试，未读取用户真实私钥/消息库。该观察时 Agent24 生产 lock 的 Hyphae source 为 `671c584f9e9eb807a15968e2aa42fd7507e178b8`（历史值），与实查上游不同；二者兼容性为 **unknown**。2026-10-24 生产 lock 已升到 Hyphae v0.27.0 `9126147e8eb5e497e3055f9eda27473fefbb91b2`，见 [LOCK-UPGRADE-20261024](../comm/LOCK-UPGRADE-20261024.md)；上述静态观察没有对新 source 重做，兼容性结论仍为 **unknown**。
 
 ## 2. 健康分层与固定时限
 
@@ -60,7 +60,7 @@ tuple 精确绑定 Agent24 build、平台、client binary/lock、relay binary/lo
   "platform": "darwin-arm64",
   "trust": {"mode": "embedded_independent_pins", "signing_root": null},
   "pins": {
-    "client_current": {"source_sha": "144555ca6b043be77225786ddbf4e6bce5ad3228", "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
+    "client_current": {"source_sha": "9126147e8eb5e497e3055f9eda27473fefbb91b2", "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
     "client_candidate": {"source_sha": "1df9c6707c4df956bfc8868509bf33c1925bac2d", "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
     "client_previous": {"source_sha": null, "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},
     "relay_current": {"source_sha": null, "lock_sha256": null, "archive_sha256": null, "binary_sha256": null},

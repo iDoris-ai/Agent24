@@ -37,6 +37,7 @@
 //! silent omissions.
 
 use agent24_core::util::now_iso8601;
+use agent24_store::{AssertionSourceRef, strictest_classification};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -58,6 +59,7 @@ pub struct Candidate {
     predicate: String,
     object: Value,
     evidence: Vec<String>,
+    source_ref: Option<Value>,
     origin: Origin,
     explicit_remember: bool,
 }
@@ -79,6 +81,7 @@ impl Candidate {
             predicate: predicate.into(),
             object,
             evidence: Vec::new(),
+            source_ref: None,
             origin,
             explicit_remember: false,
         }
@@ -87,6 +90,14 @@ impl Candidate {
     /// requires at least one.
     pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
         self.evidence = evidence;
+        self
+    }
+    /// Attach the host-authored provenance persisted atomically with this
+    /// assertion. Callers must not derive it from the assertion id. An
+    /// identical re-assert keeps whichever of the stored and this
+    /// provenance has the stricter classification.
+    pub fn with_source_ref(mut self, source_ref: Value) -> Self {
+        self.source_ref = Some(source_ref);
         self
     }
     /// The user explicitly asked to remember this. Only meaningful for `UserSaid`;
@@ -206,6 +217,7 @@ impl WriteGate {
             c.evidence.clone(),
         );
         a.qualified = qualified;
+        a.source_ref = c.source_ref.clone();
         a.writer_version = "md4".to_owned();
         a.modality = match c.origin.trust {
             Trust::ToolOutput => Modality::Observed,
@@ -296,7 +308,7 @@ impl WriteGate {
 
             let existing = sqlx::query(
                 "SELECT scope_owner, scope, subject, predicate, object, qualified,
-                        valid_from, valid_to, recorded_from, recorded_to, evidence
+                        valid_from, valid_to, recorded_from, recorded_to, evidence, source_ref
                  FROM mem_assertions WHERE id = ?",
             )
             .bind(&c.id)
@@ -368,6 +380,37 @@ impl WriteGate {
                                 && audit_row.get::<String, _>("origin_trust") == "system"
                                 && body_matches;
                             if audit_matches {
+                                // K1-6b.4b: an identical re-assert keeps the
+                                // stricter classification of the stored and the
+                                // proposed provenance. Merging here, inside this
+                                // `BEGIN IMMEDIATE` transaction, means concurrent
+                                // re-asserts can never lower it.
+                                let stored_source_ref = row
+                                    .get::<Option<String>, _>("source_ref")
+                                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+                                let stored_class = AssertionSourceRef::classification_of(
+                                    stored_source_ref.as_ref(),
+                                );
+                                let tightens = c.source_ref.as_ref().is_some_and(|proposed| {
+                                    let proposed_class =
+                                        AssertionSourceRef::classification_of(Some(proposed));
+                                    strictest_classification([stored_class, proposed_class])
+                                        != stored_class
+                                });
+                                if tightens {
+                                    sqlx::query(
+                                        "UPDATE mem_assertions SET source_ref = ? WHERE id = ?",
+                                    )
+                                    .bind(
+                                        c.source_ref
+                                            .as_ref()
+                                            .map(serde_json::to_string)
+                                            .transpose()?,
+                                    )
+                                    .bind(&c.id)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                }
                                 tx.commit().await?;
                                 return Ok(CommitStatus::Committed);
                             }
@@ -390,10 +433,11 @@ impl WriteGate {
                 let recorded_to: Option<String> = row.get("recorded_to");
                 if content_matches && recorded_to.is_some() {
                     sqlx::query(
-                        "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, qualified = 1
+                        "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, source_ref = ?, qualified = 1
                          WHERE id = ?",
                     )
                     .bind(serde_json::to_string(&c.evidence)?)
+                    .bind(c.source_ref.as_ref().map(serde_json::to_string).transpose()?)
                     .bind(&c.id)
                     .execute(&mut *tx)
                     .await?;
@@ -490,7 +534,12 @@ mod tests {
     use crate::KvStore;
     use crate::assertion::{AssertionStore, BeliefQuery};
     use crate::event::{EventQuery, EventStore};
+    use agent24_store::SourceClassification;
     use serde_json::json;
+
+    fn source_ref(classification: SourceClassification) -> Value {
+        AssertionSourceRef::from_sources([("user_input:r1".to_owned(), classification)]).to_value()
+    }
 
     async fn gate() -> (KvStore, WriteGate) {
         let kv = KvStore::open_memory().await.unwrap();
@@ -540,6 +589,78 @@ mod tests {
             .unwrap();
         assert_eq!(d, vec![WriteDecision::Committed("c1".into())]);
         assert_eq!(recall(&kv, "u1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_identical_reassert_records_a_stricter_source_reference() {
+        let (kv, gate) = gate().await;
+        let first = source_ref(SourceClassification::Ordinary);
+        let second = source_ref(SourceClassification::Restricted);
+        for source in [&first, &second] {
+            gate.propose(vec![
+                cand("c_again", "u1", "fact", Trust::UserSaid)
+                    .with_source_ref(source.clone())
+                    .remember(),
+            ])
+            .await
+            .unwrap();
+        }
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&second));
+        // Still one commit audit: the re-assert is the idempotent path.
+        assert_eq!(audits(&kv, "u1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_identical_reassert_never_lowers_the_stored_classification() {
+        // Reverse: replacing the stored provenance whenever it differed let a
+        // later ordinary re-assert (e.g. a concurrent session) overwrite a
+        // restricted one.
+        let (kv, gate) = gate().await;
+        let restricted = source_ref(SourceClassification::Restricted);
+        let unreadable = json!({"classification": "ordinary"});
+        let proposals = [
+            restricted.clone(),
+            source_ref(SourceClassification::Ordinary),
+            source_ref(SourceClassification::Unknown),
+            unreadable,
+        ];
+        for source in proposals {
+            gate.propose(vec![
+                cand("c_keep", "u1", "fact", Trust::UserSaid)
+                    .with_source_ref(source)
+                    .remember(),
+            ])
+            .await
+            .unwrap();
+        }
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&restricted));
+    }
+
+    #[tokio::test]
+    async fn assertion_source_reference_commits_with_content_and_audit() {
+        let (kv, gate) = gate().await;
+        let source = json!({
+            "source_id": "user_input:event-1",
+            "revision_digest": "sha256:abc",
+            "classification": "ordinary",
+            "kind": "user_input",
+            "mode": "local_only"
+        });
+        gate.propose(vec![
+            cand("c_source", "u1", "fact", Trust::UserSaid)
+                .with_source_ref(source.clone())
+                .remember(),
+        ])
+        .await
+        .unwrap();
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&source));
+        let audit = audits(&kv, "u1").await;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].event.body["verdict"], "commit");
     }
 
     #[tokio::test]
@@ -626,7 +747,9 @@ mod tests {
         // collides. The whole transaction must roll back — the belief must NOT
         // land without its governance record.
         let (kv, g) = gate().await;
-        let c = cand("X", "u1", "trusted-subject", Trust::UserSaid).remember();
+        let c = cand("X", "u1", "trusted-subject", Trust::UserSaid)
+            .with_source_ref(json!({"classification":"ordinary"}))
+            .remember();
         let audit = WriteGate::audit_event(&c, "commit", None);
         let clash = MemEvent::new(
             audit.id.clone(),
