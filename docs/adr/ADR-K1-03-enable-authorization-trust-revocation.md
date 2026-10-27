@@ -45,6 +45,8 @@
 
 撤销、禁用或过期时，应使关联能力/执行代次失效并通知正在运行的调用；进程内缓存不得成为绕过。若无法可靠取消或复验，执行必须 fail closed。对于已经越过远端接收/不可逆提交点的操作，系统说明结果不可保证撤回，但禁止继续产生后续副作用。
 
+包安装、卸载时的撤销同样 fail closed：授权存储打不开或写不进，命令失败，安装撤回、卸载可重跑。唯一例外是没有 HOME：CLI 找不到任何授权存储（守护进程没有 HOME 也不会启动），命令照常完成，并明确说授予（如果有）没有撤销，不说成没有授予。这样文档写明的容器安装方式（`A24_OS_PACKAGES`）不会因此失败；授予另外绑定了包标识和启用纪元，换掉的包本来就对不上旧授予（K1-6a-G §2.1、§2.2；review G3，David 2026-10-26 定，#1254 PR-Daemon N1）。
+
 ### 4. 第一方、第三方、升级与来源信任
 
 - 第一方模块（如 Documenting）在随产品安装后默认处于“已安装并可启用”状态。首次使用前仍须由宿主展示逐工具权限并取得一次明确确认；默认安装不是权限授予，也不降低宿主风险等级。
@@ -72,14 +74,14 @@ K1-6a 可消费宿主授权决定，按最小操作/资源/有效期签发或更
 
 ## 代码现状与差距
 
-以下行号对应本 ADR 编写时的 `ab/kernel` 工作树。
+以下行号对应本 ADR 编写时的 `ab/kernel` 工作树，代码链接固定到当时的提交 `9131bc7c`；「现状」一栏描述的是那时的代码，不随之后的改动更新。
 
 | 现状 | 证据 | 与本 ADR 的差距 |
 | --- | --- | --- |
-| `agent24-policy` 的 `ApprovalRequest` 由宿主调用路径携带有效 `RiskClass`，Broker 管理一次调用的待审批项；approve_for_session grant 是内存中的 `(scope, tool)`，target grant 另有约束。 | [`lib.rs`](../../rust/crates/agent24-policy/src/lib.rs#L95)（请求字段）；[`lib.rs`](../../rust/crates/agent24-policy/src/lib.rs#L163)（Broker/grants）；[`lib.rs`](../../rust/crates/agent24-policy/src/lib.rs#L241)（单次 request）；[`lib.rs`](../../rust/crates/agent24-policy/src/lib.rs#L393)（每次请求建立 approval/timeout） | 还没有模块启用授权记录，也没有权限面板数据模型、资料×用途×目的地范围、持久期限或启用授权撤销与在途调用联动。现有 grant 不可充当本 ADR 的授权。 |
-| `RiskClass` 有 `Read`、`WriteLocal`、`Exec`、`External`；`Read` 注释也指出网络读取的风险可能是外传而非副作用类别。策略使用有效等级。 | [`types.rs`](../../rust/crates/agent24-protocol/src/types.rs#L1031)（分类说明）；[`types.rs`](../../rust/crates/agent24-protocol/src/types.rs#L1036)（枚举） | 这是通用调用风险分类，不足以表示逐工具数据、用途、目的地、资源边界或来源 taint。不能把 `Read` 当作无外传风险，也不能采信模块自报风险。 |
-| `os_routes` 的启用开关写入 `os.json`；禁用时交给 supervisor 停止模块。当前注释明确启用需 daemon restart；启用前的 admission gate 只处理 refused/degraded mount 状态。 | [`os_routes.rs`](../../rust/apps/agent24d/src/os_routes.rs#L29)（启停生效现状）；[`os_routes.rs`](../../rust/apps/agent24d/src/os_routes.rs#L440)（配置写入/停止交接）；[`os_routes.rs`](../../rust/apps/agent24d/src/os_routes.rs#L822)（启用 admission gate） | `enabled` 是生命周期配置，不是用户逐工具授权；没有首次权限确认、来源差异、权限变化重同意或撤销后中止 tool call 的语义。 |
-| `capabilities` 保存 scoped claims，含 audience/resource/generation/expiry/operations；validate 检查撤销、代次、到期和允许操作；revoke 会更新状态 epoch 并通知 watch。 | [`types.rs`](../../rust/apps/agent24d/src/capabilities/types.rs#L13)（audience/resource）；[`mint.rs`](../../rust/apps/agent24d/src/capabilities/mint.rs#L89)（Creative claims mint）；[`validate.rs`](../../rust/apps/agent24d/src/capabilities/validate.rs#L7)（validate）；[`revoke.rs`](../../rust/apps/agent24d/src/capabilities/revoke.rs#L12)（revoke/epoch） | 它隔离 API 操作和资源，不记录用户对模块工具数据范围的同意；当前代码也不等于撤销模块工具在途调用或其外发边界。须由 K1 把宿主授权与能力执行接起来。 |
+| `agent24-policy` 的 `ApprovalRequest` 由宿主调用路径携带有效 `RiskClass`，Broker 管理一次调用的待审批项；approve_for_session grant 是内存中的 `(scope, tool)`，target grant 另有约束。 | [`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L95)（请求字段）；[`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L163)（Broker/grants）；[`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L241)（单次 request）；[`lib.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-policy/src/lib.rs#L393)（每次请求建立 approval/timeout） | 还没有模块启用授权记录，也没有权限面板数据模型、资料×用途×目的地范围、持久期限或启用授权撤销与在途调用联动。现有 grant 不可充当本 ADR 的授权。 |
+| `RiskClass` 有 `Read`、`WriteLocal`、`Exec`、`External`；`Read` 注释也指出网络读取的风险可能是外传而非副作用类别。策略使用有效等级。 | [`types.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-protocol/src/types.rs#L1031)（分类说明）；[`types.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/crates/agent24-protocol/src/types.rs#L1036)（枚举） | 这是通用调用风险分类，不足以表示逐工具数据、用途、目的地、资源边界或来源 taint。不能把 `Read` 当作无外传风险，也不能采信模块自报风险。 |
+| `os_routes` 的启用开关写入 `os.json`；禁用时交给 supervisor 停止模块。当前注释明确启用需 daemon restart；启用前的 admission gate 只处理 refused/degraded mount 状态。 | [`os_routes.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/os_routes.rs#L29)（启停生效现状）；[`os_routes.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/os_routes.rs#L440)（配置写入/停止交接）；[`os_routes.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/os_routes.rs#L822)（启用 admission gate） | `enabled` 是生命周期配置，不是用户逐工具授权；没有首次权限确认、来源差异、权限变化重同意或撤销后中止 tool call 的语义。 |
+| `capabilities` 保存 scoped claims，含 audience/resource/generation/expiry/operations；validate 检查撤销、代次、到期和允许操作；revoke 会更新状态 epoch 并通知 watch。 | [`types.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/types.rs#L13)（audience/resource）；[`mint.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/mint.rs#L89)（Creative claims mint）；[`validate.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/validate.rs#L7)（validate）；[`revoke.rs`](https://github.com/iDoris-ai/Agent24/blob/9131bc7cd1c3fdd1ebd056dd55d19345c939f16a/rust/apps/agent24d/src/capabilities/revoke.rs#L12)（revoke/epoch） | 它隔离 API 操作和资源，不记录用户对模块工具数据范围的同意；当前代码也不等于撤销模块工具在途调用或其外发边界。须由 K1 把宿主授权与能力执行接起来。 |
 
 ## 状态、迁移与否决路径
 
