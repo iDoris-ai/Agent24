@@ -2,7 +2,8 @@
 //!
 //! [`StoreConn::open_maintenance`] does not migrate and does not create a
 //! missing file. [`StoreConn::migrate`] is the migrate half of [`Store::open`].
-//! [`StoreConn::close`] awaits every connection in the pool.
+//! [`StoreConn::close`] awaits every connection, then waits until the file
+//! can be locked exclusively.
 
 use std::path::Path;
 
@@ -110,13 +111,24 @@ impl StoreConn {
             .unwrap_or_else(|| store_from_pool(self.inner.pool().clone()))
     }
 
-    pub async fn close(self) {
-        self.inner.close().await;
+    pub async fn close(mut self) -> Result<(), StoreError> {
+        // `Store` keeps a pool clone. Drop it first so `Guard::close` drops
+        // the last `Arc` and can see the worker release the file.
+        drop(self.store.take());
+        self.inner.close().await.map_err(close_error)
     }
 
     async fn fail(self, err: PhaseError) -> PhaseError {
-        self.close().await;
+        let _ = self.close().await;
         err
+    }
+}
+
+fn close_error(err: StepError) -> StoreError {
+    match err {
+        StepError::Sqlx { source, .. } => source.into(),
+        StepError::Migrate { source, .. } => source.into(),
+        StepError::Msg { message, .. } => StoreError::Conflict(message),
     }
 }
 
@@ -239,7 +251,7 @@ mod tests {
         assert_eq!(conn.applied_version().await.unwrap(), before);
         let (busy, _, _) = conn.checkpoint_truncate().await.unwrap();
         assert_eq!(busy, 0);
-        conn.close().await;
+        conn.close().await.unwrap();
         assert_eq!(
             crate::test_hooks::applied_schema_version(&path)
                 .await
@@ -282,7 +294,8 @@ mod tests {
             .await
             .unwrap()
             .close()
-            .await;
+            .await
+            .unwrap();
         let err = StoreConn::open_maintenance(&path, fault(0, true))
             .await
             .unwrap_err();
@@ -308,7 +321,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let version = conn.applied_version().await.unwrap();
-            conn.close().await;
+            conn.close().await.unwrap();
             assert_eq!(version, i64::from(nth - 1));
         }
     }
@@ -326,7 +339,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, embedded_version());
-        conn.close().await;
+        conn.close().await.unwrap();
 
         let opened = crate::Store::open(&dir.path().join("via-open.db"))
             .await

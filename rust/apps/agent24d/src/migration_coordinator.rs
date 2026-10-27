@@ -47,9 +47,13 @@ impl MigratedPair {
         self.memory.kv()
     }
 
-    pub async fn close(self) {
-        self.store.close().await;
-        self.memory.close().await;
+    pub async fn close(self) -> Result<(), MigrationFailure> {
+        let MigratedPair { store, memory } = self;
+        let store_result = store.close().await;
+        let memory_result = memory.close().await;
+        store_result.map_err(|err| close_failure("agent24.db", err))?;
+        memory_result.map_err(|err| close_failure("memory.db", err))?;
+        Ok(())
     }
 }
 
@@ -71,16 +75,20 @@ pub async fn run(
         Ok(conn) => conn,
         Err(err) => {
             if let Some(conn) = store_maint {
-                conn.close().await;
+                let _ = conn.close().await;
             }
             return Err(from_memory(err));
         }
     };
     if let Some(conn) = store_maint {
-        conn.close().await;
+        conn.close()
+            .await
+            .map_err(|err| close_failure("agent24.db", err))?;
     }
     if let Some(conn) = memory_maint {
-        conn.close().await;
+        conn.close()
+            .await
+            .map_err(|err| close_failure("memory.db", err))?;
     }
 
     let store = match StoreConn::migrate(store_path, store_fault).await {
@@ -90,11 +98,20 @@ pub async fn run(
     let memory = match MemoryConn::migrate(memory_path, memory_fault).await {
         Ok(conn) => conn,
         Err(err) => {
-            store.close().await;
+            let _ = store.close().await;
             return Err(from_memory(err));
         }
     };
     Ok(MigratedPair { store, memory })
+}
+
+fn close_failure(database: &'static str, err: impl std::fmt::Display) -> MigrationFailure {
+    MigrationFailure {
+        database,
+        migration: None,
+        phase: "close",
+        summary: err.to_string(),
+    }
 }
 
 fn from_store(err: agent24_store::PhaseError) -> MigrationFailure {
@@ -196,7 +213,7 @@ mod tests {
         );
         assert!(!can_take_exclusive(&store_path).await);
         assert!(!can_take_exclusive(&memory_path).await);
-        opened.close().await;
+        opened.close().await.unwrap();
         assert!(can_take_exclusive(&store_path).await);
         assert!(can_take_exclusive(&memory_path).await);
 
@@ -212,7 +229,7 @@ mod tests {
         .unwrap();
         assert!(!can_take_exclusive(&store_path).await);
         assert!(!can_take_exclusive(&memory_path).await);
-        again.close().await;
+        again.close().await.unwrap();
         assert!(can_take_exclusive(&store_path).await);
         assert!(can_take_exclusive(&memory_path).await);
     }
@@ -283,12 +300,14 @@ mod tests {
             .await
             .unwrap()
             .close()
-            .await;
+            .await
+            .unwrap();
         agent24_memory::MemoryConn::migrate(&memory_path, MemoryFault::none())
             .await
             .unwrap()
             .close()
-            .await;
+            .await
+            .unwrap();
 
         let err = run(
             &store_path,

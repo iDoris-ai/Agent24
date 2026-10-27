@@ -2,7 +2,8 @@
 //!
 //! [`MemoryConn::open_maintenance`] does not migrate and does not create a
 //! missing file. [`MemoryConn::migrate`] migrates and rebuilds FTS.
-//! [`MemoryConn::close`] awaits every connection in the pool.
+//! [`MemoryConn::close`] awaits every connection, then waits until the file
+//! can be locked exclusively.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -172,8 +173,11 @@ impl MemoryConn {
             .unwrap_or_else(|| kv_from_pool(self.inner.pool().clone()))
     }
 
-    pub async fn close(self) {
-        self.inner.close().await;
+    pub async fn close(mut self) -> Result<(), MemoryError> {
+        // `KvStore` keeps a pool clone. Drop it first so `Guard::close` drops
+        // the last `Arc` and can see the worker release the file.
+        drop(self.kv.take());
+        self.inner.close().await.map_err(close_error)
     }
 
     #[cfg(test)]
@@ -182,8 +186,16 @@ impl MemoryConn {
     }
 
     async fn fail(self, err: PhaseError) -> PhaseError {
-        self.close().await;
+        let _ = self.close().await;
         err
+    }
+}
+
+fn close_error(err: StepError) -> MemoryError {
+    match err {
+        StepError::Sqlx { source, .. } => source.into(),
+        StepError::Migrate { source, .. } => source.into(),
+        StepError::Msg { message, .. } => MemoryError::Conflict(message),
     }
 }
 
@@ -299,7 +311,7 @@ mod tests {
                 .fetch_optional(conn.pool())
                 .await
                 .unwrap();
-        conn.close().await;
+        conn.close().await.unwrap();
         marker
     }
 
@@ -321,7 +333,7 @@ mod tests {
             .await
             .unwrap();
         let version = migrated.applied_version().await.unwrap();
-        migrated.close().await;
+        migrated.close().await.unwrap();
         let maint = MemoryConn::open_maintenance(&path, PhaseFault::none())
             .await
             .unwrap()
@@ -329,7 +341,7 @@ mod tests {
         assert_eq!(maint.applied_version().await.unwrap(), version);
         let (busy, _, _) = maint.checkpoint_truncate().await.unwrap();
         assert_eq!(busy, 0);
-        maint.close().await;
+        maint.close().await.unwrap();
         assert_eq!(version, embedded_version());
         assert!(can_take_exclusive(&path).await);
     }
@@ -368,7 +380,8 @@ mod tests {
             .await
             .unwrap()
             .close()
-            .await;
+            .await
+            .unwrap();
         let err = MemoryConn::open_maintenance(&path, fault(0, true, false))
             .await
             .unwrap_err();
@@ -389,7 +402,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let version = conn.applied_version().await.unwrap();
-            conn.close().await;
+            conn.close().await.unwrap();
             assert_eq!(version, i64::from(nth - 1));
         }
     }
@@ -410,7 +423,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(conn.applied_version().await.unwrap(), embedded_version());
-        conn.close().await;
+        conn.close().await.unwrap();
         assert_eq!(fts_marker(&path).await.as_deref(), Some("1"));
     }
 
