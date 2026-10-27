@@ -113,8 +113,10 @@ r6 给 documents 库加了迁移 0007、0008（`job_acceptances`、`job_revocati
 | M3 | 读 r5 导入的作业、文档和文字 | 作业 `succeeded`，`head_revision` 1，文字块数与 r5 读到的相同 |
 | M4 | 读迁移记录 | 最高到 8，每一步都成功（和 M1 的 6 合起来，证明确实从 6 迁到了 8） |
 | M5 | 在升级后的库上再导入一个 | 成功，列表里两个文档 |
-| M6 | 停掉 r6，装回 r5 的包再启动，`documents list` | 回退前库在 `8/1`；r5 不认这个库，返回 `storage_unavailable`（提示语是 corrupt）；库的 `.dump` 前后一样，r5 什么都没写（读不出库时这条失败，不会把两次读失败当成「没变」） |
+| M6 | 停掉 r6，装回 r5 的包再启动，`documents list` | 回退前库在 `8/1`；r5 不认这个库，`documents list` 退出 1，返回 `storage_unavailable`（提示语是 corrupt）；库的 `.dump` 前后一样，r5 什么都没写（读不出库时这条失败，不会把两次读失败当成「没变」） |
 | M7 | 再装回 r6 | 两个文档都在 |
+
+M1 把 r5 的库版本钉在 6。r6 合进 main 之后，main 的 documents 库就在 8 了；以后的发布要用 `--old` 指向上一次发布（r6）的二进制，并把 M1 和 M4 的版本号改成那一版的。
 
 M6 是退回旧版的已知行为，不是缺陷：r5 打不开 r6 迁移过的库，只是提示语写的是 corrupt，容易让人以为库坏了。数据没有动，装回 r6 就恢复（M7）。release 说明里写明：升级后不要退回 r5。
 

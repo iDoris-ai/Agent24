@@ -8,7 +8,7 @@
 #
 # The bin dir holds `agent24`, `agent24d` and `agent24-documents`
 # (`cargo build -p agent24-cli -p agent24d -p agent24-documents`); --old the
-# same three built from main (r5), for the upgrade cases M1-M6. Run it from
+# same three built from main (r5), for the upgrade cases M1-M7. Run it from
 # the release checkout: the package is assembled from the domain-os.yml, the
 # pdfkit engine sources and the samples found here. macOS only (the engine).
 # The daemon runs on its own AGENT24_DATA_DIR under --work; Z1 checks the
@@ -21,6 +21,11 @@ export LC_ALL=C
 abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
 BIN="" OLD="" WORK=""
 while [ $# -gt 0 ]; do
+  case "$1" in
+    # Each takes a value: without one, `$(abs "$2")` fails in its subshell
+    # only and `shift 2` shifts nothing, so the loop would never end.
+    --bin|--old|--work) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
+  esac
   case "$1" in
     --bin) BIN=$(abs "$2"); shift 2 ;;
     --old) OLD=$(abs "$2"); shift 2 ;;
@@ -394,7 +399,7 @@ if [ -n "$OLD" ]; then
   PATH="$OLD:$PATH" limit 60 "$OLD/agent24" daemon start >> "$WORK/m6.out" 2>&1; r1=$?
   st=""
   for _ in $(seq 1 150); do
-    a24 documents list --json > "$WORK/m6l.out" 2>/dev/null
+    a24 documents list --json > "$WORK/m6l.out" 2>/dev/null; rl=$?
     st=$(last "$WORK/m6l.out" '.error.code // "listed"')
     [ "$st" = module_not_ready ] || break
     sleep 0.2
@@ -403,7 +408,7 @@ if [ -n "$OLD" ]; then
   for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
   h2=$(dump)
   check M6 "back to r5: the library refused (storage_unavailable), not changed" \
-    "$(is "$vb/$r1/$st/$h2" "8/1/0/storage_unavailable/$h1")" "library $vb; rc=$r1; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2"
+    "$(is "$vb/$r1/$rl/$st/$h2" "8/1/0/1/storage_unavailable/$h1")" "library $vb; rc=$r1, list rc=$rl; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2"
 
   a24 os uninstall documents > "$WORK/m7.out" 2>&1
   a24 os install "$PKG" >> "$WORK/m7.out" 2>&1
