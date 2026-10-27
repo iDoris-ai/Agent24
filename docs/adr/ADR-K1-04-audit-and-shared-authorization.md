@@ -104,7 +104,7 @@ K1-7 实现依赖 C1 K-2 字段约束落地或有可验证的等价白名单门�
 
 | 法律 | 本 ADR 的约束 |
 |---|---|
-| [APPROVAL.md L-APPR-1..7](../laws/APPROVAL.md) | 用户/组织权限优先于风险便利；批准仍走宿主门；模块身份、日志或 UI 点击不扩大许可；actor/资源/动作由宿主注入和验证。 |
+| [APPROVAL.md L-APPR-1..8](../laws/APPROVAL.md) | 用户/组织权限优先于风险便利；批准仍走宿主门；模块身份、日志或 UI 点击不扩大许可；actor/资源/动作由宿主注入和验证。 |
 | [MEMORY.md L-MEM-1..7](../laws/MEMORY.md) | 模块不得取得 raw store 或自报 owner/scope；审计只通过受限宿主入口写入，不开放任意审计表句柄。 |
 | [CONTEXT.md L-CTX-1..4](../laws/CONTEXT.md) | 来源、调用主体及工具结果须可点名和关联；运行/审计记录不是任务完成证据，也不能将不可信工具内容提升为可信指令。 |
 | [`docs/laws/README.md`](../laws/README.md) | 本 ADR 不直接修改法律；若 180 天保留、审计删除或共用主体形成新的长期隐私不变量，按法律流程另案闭环。 |

@@ -1774,8 +1774,13 @@ export interface components {
                 removable: boolean;
                 read_only: boolean;
             }[];
-            /** @description Free bytes on the disk holding the models directory; null when it cannot be determined (replaces the removed free_disk_bytes, which was the cwd disk) */
+            /** @description Free bytes on the disk holding the models directory; null when it cannot be determined */
             models_dir_free_bytes?: number | null;
+            /**
+             * @deprecated
+             * @description v1 compatibility only. Historical daemon-cwd disk free bytes: the disk whose mount point is the longest prefix of the daemon process's current working directory, falling back to the disk with the most available space when none matches (including a failed cwd read), or 0 when no disks are enumerated at all; 0 is also a legitimate "disk full" value, not a distinct unknown marker. Not the models directory's disk — use models_dir_free_bytes for that — and never used to gate model downloads.
+             */
+            free_disk_bytes: number;
             /** @description Reserved; not probed yet (HW-1) */
             runtimes?: {
                 name: string;
