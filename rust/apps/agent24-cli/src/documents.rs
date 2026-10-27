@@ -63,9 +63,10 @@ pub(crate) enum DocumentsAction {
         /// The revision (1 is the imported file)
         revision: u64,
         /// The `next_cursor` of the page before
-        #[arg(long, conflicts_with = "block")]
+        #[arg(long)]
         cursor: Option<String>,
-        /// Start at this block (`p<page>/b<n>`, a block's `block_id`)
+        /// Start at this block (`p<page>/b<n>`, a block's `block_id`); not
+        /// with --cursor, which already holds the position
         #[arg(long)]
         block: Option<String>,
         /// Blocks per page (1–200)
@@ -112,10 +113,10 @@ pub(crate) enum DocumentsAction {
         #[arg(long)]
         schema: PathBuf,
         /// Extract again although this schema was extracted before; needs --key
-        #[arg(long, requires = "key")]
+        #[arg(long)]
         rerun: bool,
-        /// Names this rerun: the same key again replays it, a new one runs again
-        #[arg(long, requires = "rerun")]
+        /// Names a rerun: the same key again replays it, a new one runs again
+        #[arg(long)]
         key: Option<String>,
         /// Print the result as one JSON line
         #[arg(long)]
@@ -411,6 +412,9 @@ async fn render(req: Value, out: Option<PathBuf>, json: bool) -> Result<(), Stri
     report(&res, json)
 }
 
+/// Writes the page's PNG to `path` whole or not at all: into a new file
+/// beside it first, renamed over `path` once written, so a failure midway
+/// (a full disk) leaves a file already there as it was.
 fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
     use base64::Engine as _;
     let png = data
@@ -418,8 +422,19 @@ fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
         .and_then(Value::as_str)
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
         .ok_or_else(|| Response::fail(502, "invalid_response", "the page is not base64"))?;
-    std::fs::write(path, png)
-        .map_err(|_| Response::fail(400, "file_unwritable", "the page could not be written"))
+    let unwritable = || Response::fail(400, "file_unwritable", "the page could not be written");
+    let name = path.file_name().ok_or_else(unwritable)?.to_string_lossy();
+    let part = path.with_file_name(format!(".{name}.{}.part", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .and_then(|mut f| f.write_all(&png).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&part, path));
+    written.map_err(|_| {
+        let _ = std::fs::remove_file(&part);
+        unwritable()
+    })
 }
 
 fn invalid(message: String) -> Response {
@@ -730,10 +745,28 @@ mod tests {
                 .code(),
             Some("invalid_response")
         );
+        // A failure leaves the file there as it was, and no part file.
+        let taken = dir.path().join("taken");
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("x"), b"x").unwrap();
+        assert_eq!(
+            write_page(&page, &taken).unwrap_err().code(),
+            Some("file_unwritable")
+        );
+        assert!(taken.join("x").exists());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        // Over an existing file: replaced whole.
+        std::fs::write(&out, b"old page").unwrap();
+        write_page(&page, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"\x89PNG");
     }
 
     #[test]
-    fn a_rerun_names_its_key_and_a_text_page_starts_at_a_block_or_a_cursor() {
+    fn the_os_not_clap_judges_a_rerun_without_its_key_and_a_block_with_a_cursor() {
         use clap::Parser;
         #[derive(Parser)]
         struct Cli {
@@ -748,11 +781,13 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--rerun"]).is_err());
-        assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--key", "k"]).is_err());
+        // Refused by clap there is no result line for --json (exit 2): these
+        // go to the OS, which answers 400 with one.
+        assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--rerun"]).is_ok());
+        assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--key", "k"]).is_ok());
+        assert!(parse(&["text", "doc_x", "1", "--block", "p1/b1", "--cursor", "ab"]).is_ok());
         assert!(parse(&["extract", "doc_x", "1"]).is_err());
         assert!(parse(&["text", "doc_x", "1", "--block", "p1/b1", "--limit", "5"]).is_ok());
-        assert!(parse(&["text", "doc_x", "1", "--block", "p1/b1", "--cursor", "ab"]).is_err());
         assert!(
             parse(&[
                 "render", "doc_x", "1", "2", "--scale", "0.5", "--out", "p.png"
