@@ -402,6 +402,16 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
         ],
         PNG,
     ));
+    // Spaces and tabs around a value are padding.
+    let padded = Answers(page_reply(
+        200,
+        &[
+            ("content-type", " image/png; charset=x"),
+            ("documents-render-scale", "\t0.5 "),
+        ],
+        PNG,
+    ));
+    assert!(call(&render, &padded).await.is_ok());
     assert_eq!(
         call(&render, &ok).await,
         Response::Ok {
@@ -420,6 +430,23 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
             br#"{"a":1}"#.as_slice(),
         ),
         (200, vec![("content-type", "image/png")], PNG),
+        // Padding other than spaces and tabs is part of the value.
+        (
+            200,
+            vec![
+                ("content-type", "\u{a0}image/png"),
+                ("documents-render-scale", "1"),
+            ],
+            PNG,
+        ),
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("documents-render-scale", "\u{a0}1"),
+            ],
+            PNG,
+        ),
         // Two scales, or two types: which one is meant is not known.
         (
             200,

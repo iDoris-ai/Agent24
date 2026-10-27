@@ -275,7 +275,8 @@ fn to_page(reply: Reply) -> Response {
     if !(200..300).contains(status) {
         return to_response(reply);
     }
-    // Exactly one of each: a repeated header could say two things.
+    // Exactly one of each: a repeated header could say two things. Only
+    // spaces and tabs are padding (RFC 9110 OWS), not every Unicode space.
     let header = |name: &str| {
         let mut values = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name));
         match (values.next(), values.next()) {
@@ -285,10 +286,13 @@ fn to_page(reply: Reply) -> Response {
     };
     let png = header("content-type")
         .and_then(|t| t.split(';').next())
-        .is_some_and(|t| t.trim().eq_ignore_ascii_case("image/png"))
+        .is_some_and(|t| {
+            t.trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("image/png")
+        })
         && body.starts_with(b"\x89PNG\r\n\x1a\n");
     let scale = header("documents-render-scale")
-        .and_then(|s| s.trim().parse::<f64>().ok())
+        .and_then(|s| s.trim_matches([' ', '\t']).parse::<f64>().ok())
         .filter(|s| (0.25..=4.0).contains(s));
     match (*status, png, scale) {
         (200, true, Some(scale)) => Response::Ok {
