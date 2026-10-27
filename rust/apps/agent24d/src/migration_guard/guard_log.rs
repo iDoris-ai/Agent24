@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::atomic::FileOps;
-use super::manifest::{BinaryIdentity, FORMAT_VERSION, StateError, read_json, write_json};
+use super::manifest::{
+    BinaryIdentity, FORMAT_VERSION, StateError, parse_json, read_optional, write_json,
+};
 
 pub const GUARD_FILE: &str = "migration-guard.json";
 
@@ -116,6 +118,13 @@ impl GuardLog {
                 self.phase
             )));
         }
+        if self.phase == Phase::Restored
+            && (self.store_restore != DbRestore::Done || self.memory_restore != DbRestore::Done)
+        {
+            return Err(GuardError::Invalid(
+                "Restored requires both store_restore and memory_restore Done".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -162,13 +171,14 @@ pub fn advance(
     Ok(())
 }
 
-/// `Ok(None)` only when the file does not exist.
+/// `Ok(None)` only when the file genuinely does not exist; unreadable or
+/// corrupt state is a dock-class error.
 pub fn read(data_dir: &Path) -> Result<Option<GuardLog>, GuardError> {
     let p = guard_path(data_dir);
-    if !p.exists() {
+    let Some(bytes) = read_optional(&p)? else {
         return Ok(None);
-    }
-    let log: GuardLog = read_json(&p)?;
+    };
+    let log: GuardLog = parse_json(&bytes)?;
     log.validate()?;
     Ok(Some(log))
 }
@@ -208,6 +218,10 @@ mod tests {
             Phase::Restoring,
             Phase::Restored,
         ] {
+            if to == Phase::Restored {
+                g.store_restore = DbRestore::Done;
+                g.memory_restore = DbRestore::Done;
+            }
             advance(&RealOps, td.path(), &mut g, to).unwrap();
         }
     }
@@ -297,5 +311,67 @@ mod tests {
             let err = read(td.path()).unwrap_err();
             assert!(err.must_dock(), "{err:?}");
         }
+    }
+
+    /// Unreadable-but-present guard state must dock, never read as absent.
+    fn unreadable_cases(check: impl Fn(&std::path::Path, &str) -> bool, file: &str) {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        // dangling symlink
+        let td = tempfile::tempdir().unwrap();
+        symlink(td.path().join("nowhere"), td.path().join(file)).unwrap();
+        assert!(check(td.path(), "dangling symlink"));
+        // path is a directory (EISDIR)
+        let td = tempfile::tempdir().unwrap();
+        fs::create_dir(td.path().join(file)).unwrap();
+        assert!(check(td.path(), "directory"));
+        // parent unreadable (EACCES); root bypasses permissions
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join(file), b"{trunc").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores mode bits: skip this case rather than test nothing
+        if fs::read_dir(&dir).is_err() {
+            let ok = check(&dir, "unreadable parent");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(ok);
+        } else {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn unreadable_guard_file_is_dock_class() {
+        unreadable_cases(
+            |d, what| {
+                let r = read(d);
+                println!("{what}: {r:?}");
+                matches!(&r, Err(e) if e.must_dock())
+            },
+            GUARD_FILE,
+        );
+    }
+
+    #[test]
+    fn restored_requires_both_restores_done() {
+        let td = tempfile::tempdir().unwrap();
+        let mut g = fresh();
+        g.snapshot_id = Some("s".into());
+        for to in [Phase::Snapshotted, Phase::Migrating, Phase::Restoring] {
+            advance(&RealOps, td.path(), &mut g, to).unwrap();
+        }
+        let err = advance(&RealOps, td.path(), &mut g, Phase::Restored).unwrap_err();
+        assert!(err.must_dock(), "{err:?}");
+        assert_eq!(g.phase, Phase::Restoring);
+        g.store_restore = DbRestore::Done;
+        assert!(advance(&RealOps, td.path(), &mut g, Phase::Restored).is_err());
+        g.memory_restore = DbRestore::Done;
+        advance(&RealOps, td.path(), &mut g, Phase::Restored).unwrap();
+        assert_eq!(read(td.path()).unwrap().unwrap().phase, Phase::Restored);
+        // hand-written Restored/Pending/Pending on disk is corrupt
+        let mut bad = g.clone();
+        bad.store_restore = DbRestore::Pending;
+        fs::write(guard_path(td.path()), serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(read(td.path()).unwrap_err().must_dock());
     }
 }

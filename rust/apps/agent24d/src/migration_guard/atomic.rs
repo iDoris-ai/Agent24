@@ -2,9 +2,11 @@
 //!
 //! Sequence: exclusive 0600 temp file in the target directory, write, fsync,
 //! rename, then fsync the parent directory and every ancestor up to and
-//! including `data_dir`. Any failure leaves the target untouched (or absent)
-//! and removes the temp file. File operations go through [`FileOps`] so tests
-//! can record the call order and inject failures.
+//! including `data_dir`. A failure before the rename leaves the target
+//! untouched (or absent) and removes the temp file. A failure of the directory
+//! fsync chain is reported as an error but the rename has already taken
+//! effect: the new content may be visible (durability is unconfirmed). File
+//! operations go through [`FileOps`] so tests can record the call order and inject failures.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -56,6 +58,9 @@ pub fn atomic_write(
     target: &Path,
     data: &[u8],
 ) -> io::Result<()> {
+    if data_dir.as_os_str().is_empty() {
+        return Err(invalid("data_dir is empty"));
+    }
     let parent = target
         .parent()
         .ok_or_else(|| invalid("target has no parent"))?;
@@ -278,5 +283,35 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let err = atomic_write(&RealOps, td.path(), &other.path().join("x"), b"n").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Touches nothing; counts calls.
+    #[derive(Default)]
+    struct NoFs(std::cell::Cell<u32>);
+    impl FileOps for NoFs {
+        fn write_new_synced(&self, _: &Path, _: &[u8]) -> io::Result<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+        fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+        fn fsync_dir(&self, _: &Path) -> io::Result<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+        fn remove_file(&self, _: &Path) -> io::Result<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn empty_data_dir_is_rejected_before_any_io() {
+        let ops = NoFs::default();
+        let r = atomic_write(&ops, Path::new(""), Path::new("g.json"), b"x");
+        assert!(r.is_err());
+        assert_eq!(ops.0.get(), 0, "no file operation may run");
     }
 }
