@@ -487,6 +487,32 @@ fn an_unreachable_retry_clears_the_written_reason_first() {
     assert_eq!(replay(10, log).unwrap().profiles["b"].failure, None);
 }
 
+/// #1337 F1: a written reason, then an unreachable retry, then a binding:
+/// the reason is gone as a restart reads it, the clearing confirmed before
+/// the binding or not.
+#[test]
+fn a_binding_after_an_unreachable_retry_leaves_no_written_reason() {
+    for settled in [true, false] {
+        let mut log = Vec::new();
+        let mut host = host_after(Attempted::Rejected);
+        step(&mut host, &mut log);
+        let attempt = host.attempt(&"b").unwrap();
+        host.attempt_failed("b", attempt, Attempted::Unreachable);
+        if settled {
+            step(&mut host, &mut log);
+        }
+        let attempt = host.attempt(&"b").unwrap();
+        host.identified("b", attempt, created(8, "alice"));
+        while let Some((attempt, record)) = host.take_write() {
+            log.push(record);
+            host.written(attempt, Written::Durable);
+        }
+        assert!(bound(&host, "b"), "{settled}");
+        let replayed = replay(10, log).unwrap();
+        assert_eq!(replayed.profiles["b"].failure, None, "{settled}");
+    }
+}
+
 /// "b" alone, a selected placeholder with `credential_rejected` written and
 /// `confirmation` awaited; the log holds values up to `highest`.
 fn rejected(highest: u64, confirmation: Option<Confirmation>) -> H {
