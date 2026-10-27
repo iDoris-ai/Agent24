@@ -18,7 +18,7 @@
   - T1 读 `GET /api/v1/tools`，这是 agent 能看到的工具列表，CLI 没有对应入口；
   - T2 从外部访问模块内部的工具路由。
 - **只有 C1 动数据目录**：把 `blobs/tmp` 暂时设成不可写，造出一个存储失败的导入，然后马上改回去。这个失败是真实的，用户遇到磁盘或权限问题时就会这样失败；而运行中的导入只有约 0.1 秒，靠抢时机取消没法复现。
-- **不碰用户数据**：daemon 和 CLI 都用工作目录下的 `AGENT24_DATA_DIR`，调用者 shell 里的 `A24_*`、`AGENT24_*` 全部清掉。Z1 检查 `~/.agent24` 没有变化；脚本发现自己的 daemon 在跑时，会在创建任何东西之前直接拒绝运行。`--work` 不能在 `~/.agent24` 下面，必须不存在或为空。
+- **不碰用户数据**：daemon 和 CLI 都用工作目录下的 `AGENT24_DATA_DIR`，调用者 shell 里的 `A24_*`、`AGENT24_*` 以及 `AGENT24D_BIN` 这类变量全部清掉，不然 CLI 会起 `AGENT24D_BIN` 指的那个 daemon，而不是 `--bin` 里的。Z1 比较 `~/.agent24` 下每一项的路径、大小和修改时间，运行前后必须完全一样；脚本发现自己的 daemon 在跑时，会在创建任何东西之前直接拒绝运行。`--work` 不能在 `~/.agent24` 下面，必须不存在或为空。
 - **不留进程**：脚本无论怎样退出，都会 `agent24 daemon stop` 停掉自己起的 daemon。停不掉时，按状态文件里的 pid 强杀。
 - **不需要模型**：抽取要用模型，但它只能由 agent 工具触发，不在本次发布的对外范围内（见 T1）。
 - **依赖**：macOS（pdfkit 引擎）、swiftc、jq、curl、perl（给 CLI 限时、计时）、python3（解析路径）。
@@ -60,18 +60,18 @@
 |---|---|---|
 | P1 | `agent24 os install <包>` | 退出 0，说 installed |
 | P2 | `agent24 daemon start`（全新数据目录） | 退出 0，说 daemon started |
-| P3 | 反复 `agent24 documents capabilities`，直到成功 | 30 秒内成功；记下用了多少毫秒 |
+| P3 | 反复 `agent24 documents capabilities`，直到成功 | 从 `daemon start` 返回算起 30 秒内成功（按实测的毫秒数判定） |
 | U1 | `documents import <PDF>` | 退出 0，打出 `import job job_… (状态)` |
-| U2 | 再导入同一个文件 | 同一个 job |
-| U3 | `import --json`，文件超过一个分块（768 KiB） | 至少 2 行 progress，最后一行是 `ok: true` 的 result |
+| U2 | 再导入同一个文件 | 与 U1 同一个 job（U1 没拿到 job 时这条也失败） |
+| U3 | `import --json`，文件超过一个分块（768 KiB） | 有一行 progress 在 786432 字节处（第二块开始发送），一共至少 3 行；最后一行是 `ok: true` 的 result |
 | U4 | 导入不存在的文件 | 退出 1，`error: file_unreadable: the file could not be read`，输出里不带路径 |
 | U5 | `import --json` 一个文本文件 | 退出 1，422 `unsupported_format`，`retryable: false` |
 | U6 | `import --host-stdin --json`（桌面端的传法） | 退出 0，与 U1 同一个 job |
 | U7 | `--host-stdin` 带错的 token | 退出 1，`error: unauthorized: …` |
 | O1 | `documents capabilities` | 存储 `ready`，pdfkit 解析引擎 `ready` |
 | O2 | `documents job <U1 的 job>`，等它结束 | 一行 `import job … (succeeded)`；U3 的 job 也成功 |
-| O3 | `documents list --json` | 两个文档，最早导入的排在最后 |
-| O4 | `list --limit 1`，再用 `--cursor` 翻下一页 | 每页一个，第二页是另一个文档 |
+| O3 | `documents list --json` | 两个文档，U1 的排在最后（U3 之前先等 U1 的作业结束，所以它一定更早） |
+| O4 | `list --limit 1`，再用 `--cursor` 翻下一页 | 两页各一个文档：第一页不是 U1 的文档，第二页是 |
 | O5 | `documents get <doc>` | 缩进的 JSON，`document_id` 对得上，`head_revision` 为 1 |
 | O6 | `documents text <doc> 1 --json` | 文字块里有样本 PDF 自己的字（「boil」） |
 | O7 | `documents cancel` 一个已成功的作业 | 退出 0，作业不变（`succeeded`，attempt 1） |
@@ -87,14 +87,14 @@
 | C3 | `documents cancel` 第二个作业（失败的） | 退出 0，变成 `cancelled` |
 | C4 | `documents retry` 这个取消了的作业 | 退出 0，重新跑并成功 |
 | C5 | `documents list` | 4 个文档（重试的两个也在） |
-| T1 | `GET /api/v1/tools` | 期望里面有 documents 工具；现在没有，记 KNOWN（#705：`domain-os.yml` 还没有声明 `tools:`）。补上声明后这条会变成 PASS |
+| T1 | `GET /api/v1/tools` | 期望里面有 documents 工具。现在列表正常返回（200，非空）但其中没有，记 KNOWN（#705：`domain-os.yml` 还没有声明 `tools:`）；补上声明后这条会变成 PASS。列表本身出错（非 200、没有列表）记 FAIL |
 | T2 | 从外部 `POST /api/v1/documents/_a24/tools/find` | 404 `not_found`：模块内部的工具路由不对外 |
 | N1 | `agent24 daemon stop`，再 `documents list` | 退出 1，说没有在跑的 daemon，并提示 `agent24 daemon start`；不会顺手起一个 |
 | N2 | 没有 daemon 时 `job --json` | 退出 1，只有一行 result，`backend_not_ready` |
 | N3 | 没有 daemon 时 `import --json` | 同上 |
 | N4 | 没有 daemon 时 `list --limit 0 --json` | `invalid_request`，不是 `backend_not_ready`（请求本身不对，先说这个） |
 | N5 | `import --host-stdin --json`，stdin 不是 JSON | 退出 1，一行 result，`invalid_request` |
-| Z1 | 比较 `~/.agent24` 运行前后 | 没有变化 |
+| Z1 | 比较 `~/.agent24` 运行前后每一项的路径、大小、修改时间 | 完全一样 |
 
 ## 反面对照
 

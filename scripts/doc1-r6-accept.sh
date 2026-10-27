@@ -43,9 +43,12 @@ case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;
 [ -z "$(ls -A "$WORK" 2>/dev/null)" ] || { echo "--work must be new or empty: $WORK" >&2; exit 2; }
 mkdir -p "$WORK" || exit 2
 # Only what this script sets reaches the daemon or the CLI.
-for v in $(env | grep -oE '^(A24|AGENT24)_[A-Z0-9_]+'); do unset "$v"; done
+# AGENT24D_BIN too: the CLI would start that daemon instead of the one in --bin.
+for v in $(env | grep -oE '^(A24|AGENT24)[A-Z0-9]*_[A-Z0-9_]+'); do unset "$v"; done
 export AGENT24_DATA_DIR="$WORK/data"
-REAL_BEFORE=$(ls -A "$REAL" 2>/dev/null | wc -l | tr -d ' ')
+# Z1: every entry under ~/.agent24 with its size and modification time.
+snapshot() { [ -e "$REAL" ] && find "$REAL" -exec stat -f '%N %z %m' {} + 2>/dev/null | sort; }
+snapshot > "$WORK/.real-before"
 
 FAILS=0
 : > "$WORK/results"
@@ -114,6 +117,7 @@ for _ in $(seq 1 150); do
   sleep 0.2
 done
 t1=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
+[ $((t1 - t0)) -le 30000 ] || ready=fail
 check P3 "the documents module answers within 30 s of daemon start" "$ready" "after $((t1 - t0)) ms; storage $(jq -r .storage.state "$WORK/p3.out" 2>/dev/null)"
 
 # --- U: import ------------------------------------------------------------------
@@ -122,14 +126,19 @@ JOB1=$(job_of "$WORK/u1.out")
 check U1 "import a PDF: prints its job" "$(is "$rc/$(grep -cE '^import job job_[0-9A-Z]{26} \((queued|running|succeeded)\)$' "$WORK/u1.out")" 0/1)" "rc=$rc; $(one "$WORK/u1.out")"
 
 a24 documents import "$SMALL" > "$WORK/u2.out" 2>/dev/null; rc=$?
-check U2 "the same file again: the same job" "$(is "$rc/$(job_of "$WORK/u2.out")" "0/$JOB1")" "rc=$rc; $(one "$WORK/u2.out")"
+check U2 "the same file again: the same job" "$(is "$rc/$(job_of "$WORK/u2.out")" "0/${JOB1:-no job from U1}")" "rc=$rc; $(one "$WORK/u2.out")"
 
+# U1's import settles first, so its document is the older one in O3 and O4.
+st1=$(settle "$JOB1")
 a24 documents import --json "$BIG" > "$WORK/u3.out" 2>/dev/null; rc=$?
 n=$(grep -c '"type":"progress"' "$WORK/u3.out")
+# Progress comes before each chunk and once at the end: a second chunk shows
+# as a line at the first chunk's end (786432 bytes).
+second=$(grep -c '"sent":786432,' "$WORK/u3.out")
 JOB3=$(last "$WORK/u3.out" '.data.job_id // empty')
-[ "$n" -ge 2 ] && ok=ok || ok=fail
+[ "$n" -ge 3 ] && [ "$second" = 1 ] && ok=ok || ok=fail
 [ "$ok" = ok ] && ok=$(is "$rc/$(last "$WORK/u3.out" '"\(.type)/\(.ok)"')" "0/result/true")
-check U3 "--json, a file of two chunks: progress lines, then the result" "$ok" "rc=$rc; progress=$n; job=$JOB3"
+check U3 "--json, a file of two chunks: progress lines, then the result" "$ok" "rc=$rc; progress=$n, at 786432: $second; job=$JOB3"
 
 a24 documents import "$WORK/secret-name-missing.pdf" > "$WORK/u4.out" 2> "$WORK/u4.err"; rc=$?
 ok=$(is "$rc/$(cat "$WORK/u4.err")" "1/error: file_unreadable: the file could not be read")
@@ -156,7 +165,7 @@ check O1 "capabilities: storage ready, the pdfkit engine there" \
   "$(is "$rc/$(jq -r '"\(.storage.state)/\([.engines[] | select(.id == "apple-pdfkit" and .kind == "parse") | .state] | first)"' "$WORK/o1.out" 2>/dev/null)" 0/ready/ready)" \
   "rc=$rc; $(jq -c '{os_version, storage, engines: [.engines[] | {id, kind, state}]}' "$WORK/o1.out" 2>/dev/null | cut -c1-140)"
 
-st1=$(settle "$JOB1"); st3=$(settle "$JOB3")
+st3=$(settle "$JOB3")
 a24 documents job "$JOB1" > "$WORK/o2.out" 2>&1; rc=$?
 check O2 "job: the import, one line, once it succeeds" "$(is "$rc/$st3/$(cat "$WORK/o2.out")" "0/succeeded/import job $JOB1 (succeeded)")" "rc=$rc; $(one "$WORK/o2.out"); two-chunk job $st3"
 DOC1=$(a24 documents job "$JOB1" --json 2>/dev/null | tail -n 1 | jq -r '.data.document_id // empty')
@@ -170,7 +179,7 @@ a24 documents list --limit 1 --json > "$WORK/o4.out" 2>/dev/null; rc=$?
 CUR=$(last "$WORK/o4.out" '.data.next_cursor // empty')
 a24 documents list --limit 1 --cursor "$CUR" --json > "$WORK/o4b.out" 2>/dev/null; rc2=$?
 check O4 "list --limit 1, then --cursor: one document a page, the second page the other" \
-  "$(is "$rc/$rc2/$(last "$WORK/o4.out" '.data.documents | length')/$(last "$WORK/o4b.out" '.data.documents[0].document_id')" "0/0/1/$DOC1")" \
+  "$(is "$rc/$rc2/$(last "$WORK/o4.out" '"\(.data.documents | length)/\(.data.documents[0].document_id != "'"$DOC1"'")"')/$(last "$WORK/o4b.out" '"\(.data.documents | length)/\(.data.documents[0].document_id)"')" "0/0/1/true/1/$DOC1")" \
   "rc=$rc/$rc2; cursor=${CUR:0:16}"
 
 a24 documents get "$DOC1" > "$WORK/o5.out" 2>&1; rc=$?
@@ -246,11 +255,17 @@ a24 documents list --json > "$WORK/c5.out" 2>/dev/null; rc=$?
 check C5 "list: the two retried imports are documents now" "$(is "$rc/$(last "$WORK/c5.out" '.data.documents | length')" 0/4)" "rc=$rc; documents=$(last "$WORK/c5.out" '.data.documents | length')"
 
 # --- T: the agent-facing tools (not in this release) -----------------------------
-curl -s -m 30 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/tools" > "$WORK/t1.out"
+code=$(curl -s -m 30 -o "$WORK/t1.out" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/tools")
+listed=$(jq -r 'if (.tools | type) == "array" and (.tools | length) > 0 then "listed" else "no list" end' "$WORK/t1.out" 2>/dev/null)
 dt=$(jq -r '[.tools[] | (.name // "") | select(test("^documents"))] | length' "$WORK/t1.out" 2>/dev/null)
-check T1 "the agent is offered the documents tools" "$([ "${dt:-0}" -ge 1 ] && echo ok || echo fail)" \
-  "tools=$(jq -r '.tools | length' "$WORK/t1.out" 2>/dev/null), documents=${dt:-?}" \
-  "domain-os.yml declares no tools: (#705); the tools exist in the module but no chat can call them"
+# KNOWN only for the gap itself: a list that came back without them.
+if [ "$code/$listed" != 200/listed ]; then
+  check T1 "the agent is offered the documents tools" fail "the tool list itself failed: $code $listed; $(cut -c1-80 "$WORK/t1.out")"
+else
+  check T1 "the agent is offered the documents tools" "$([ "${dt:-0}" -ge 1 ] && echo ok || echo fail)" \
+    "tools=$(jq -r '.tools | length' "$WORK/t1.out"), documents=$dt" \
+    "domain-os.yml declares no tools: (#705); the tools exist in the module but no chat can call them"
+fi
 code=$(curl -s -m 30 -o "$WORK/t2.out" -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"context":{},"arguments":{}}' \
   "http://127.0.0.1:$PORT/api/v1/documents/_a24/tools/find")
@@ -276,8 +291,9 @@ check N4 "a malformed request with no daemon: invalid_request, not backend_not_r
 printf 'not json' | limit 60 "$BIN/agent24" documents import --host-stdin --json > "$WORK/n5.out" 2>/dev/null; rc=$?
 check N5 "--host-stdin --json with bad input: a result line, invalid_request" "$(is "$rc/$(last "$WORK/n5.out" '"\(.type)/\(.error.code)"')" 1/result/invalid_request)" "rc=$rc; $(cut -c1-100 "$WORK/n5.out")"
 
-REAL_AFTER=$(ls -A "$REAL" 2>/dev/null | wc -l | tr -d ' ')
-check Z1 "the user's ~/.agent24 was not touched" "$(is "$REAL_BEFORE" "$REAL_AFTER")" "entries before=$REAL_BEFORE after=$REAL_AFTER"
+snapshot > "$WORK/.real-after"
+check Z1 "the user's ~/.agent24 was not touched" "$(cmp -s "$WORK/.real-before" "$WORK/.real-after" && echo ok || echo fail)" \
+  "entries before=$(wc -l < "$WORK/.real-before" | tr -d ' ') after=$(wc -l < "$WORK/.real-after" | tr -d ' '); $(diff "$WORK/.real-before" "$WORK/.real-after" | grep -c '^[<>]') changed"
 
 {
   echo "| ID | case | result | evidence |"
