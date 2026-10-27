@@ -2237,6 +2237,12 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             println!("loaded:    {}", if loaded { "yes" } else { "no" });
             if let Some(p) = plist {
                 println!("plist:     {}", p.display());
+                if installed && !service::plist_has_ready_omit_token(&p) {
+                    println!(
+                        "note:      this LaunchAgent predates --ready-omit-token and still \
+                         logs the daemon bearer token; run `agent24 service install` to update it"
+                    );
+                }
             }
             match state_file::read_live() {
                 Some(st) => println!("daemon:    running (pid {}, port {})", st.pid, st.port),

@@ -108,7 +108,14 @@ jobs:
         # dev-dependency edges (the self-dev-dependencies that turn them on for
         # `cargo test` only); a hit here means a normal dependency enabled one.
         run: |
-          if cargo tree -e normal,build,features -p agent24d -p agent24-cli | grep -E 'test-lock-override|test-util'; then
+          set -euo pipefail
+          # Capture first: a failing `cargo tree` (bad -p, resolver error) must
+          # fail the step, not read as "no match".
+          out=$(cargo tree -e normal,build,features -p agent24d -p agent24-cli) || {
+            echo "::error::cargo tree failed"
+            exit 1
+          }
+          if printf '%s\n' "$out" | grep -E 'test-lock-override|test-util'; then
             echo "::error::test-only feature reachable from the release build"
             exit 1
           fi

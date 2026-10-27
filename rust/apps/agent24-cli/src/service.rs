@@ -246,6 +246,43 @@ fn prepare_log_files(dir: &Path, files: &[&Path]) -> Result<(), String> {
     Ok(())
 }
 
+/// Everything `install` puts on disk, idempotently: logs dir 0700 and log files
+/// 0600 (tightening ones an older install left loose), then the plist rewritten
+/// from the current template (so an old install gains `--ready-omit-token`) and
+/// kept owner-only because the captured env can include `OMLX_API_KEY`.
+fn write_install_files(
+    exec: &Path,
+    plist: &Path,
+    out_log: &Path,
+    err_log: &Path,
+    env: &[(String, String)],
+) -> Result<(), String> {
+    if let Some(dir) = out_log.parent() {
+        prepare_log_files(dir, &[out_log, err_log])?;
+    }
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    let body = render_plist(exec, out_log, err_log, env);
+    std::fs::write(plist, body).map_err(|e| format!("writing {}: {e}", plist.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(plist, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("securing {}: {e}", plist.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether the installed plist already passes `--ready-omit-token`. An install
+/// made before that flag existed keeps printing the bearer into its log until
+/// `agent24 service install` is run again; `service status` uses this to say so.
+/// A missing/unreadable plist is "not stale" (nothing installed to warn about).
+pub fn plist_has_ready_omit_token(plist: &Path) -> bool {
+    std::fs::read_to_string(plist).is_ok_and(|b| b.contains("<string>--ready-omit-token</string>"))
+}
+
 /// Install (or reinstall) the LaunchAgent and start it.
 pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     if !exec.exists() {
@@ -259,25 +296,12 @@ pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     let logs = log_dir().ok_or("HOME not set")?;
     let out_log = logs.join("agent24d.out.log");
     let err_log = logs.join("agent24d.err.log");
-    prepare_log_files(&logs, &[&out_log, &err_log])?;
-    if let Some(parent) = plist.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
-    }
     // Reinstall must unload the old job first, or launchd keeps running the
     // previous ProgramArguments and the new plist looks like it did nothing.
     bootout_if_loaded();
 
     let env = capture_env();
-    let body = render_plist(exec, &out_log, &err_log, &env);
-    std::fs::write(&plist, body).map_err(|e| format!("writing {}: {e}", plist.display()))?;
-    // The captured env can include OMLX_API_KEY, so keep the plist owner-only.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("securing {}: {e}", plist.display()))?;
-    }
+    write_install_files(exec, &plist, &out_log, &err_log, &env)?;
 
     let target = format!("gui/{}", uid());
     let out = launchctl(&["bootstrap", &target, &plist.to_string_lossy()])?;
@@ -370,6 +394,44 @@ mod tests {
         assert_eq!(mode(&err), 0o600);
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_over_an_old_plist_adds_the_flag_and_tightens_the_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("a24-reinstall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let logs = root.join("logs");
+        let plist = root.join("LaunchAgents/ai.auraai.agent24.plist");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        let (out, err) = (logs.join("o.log"), logs.join("e.log"));
+        // An install from before this change: no flag, loose permissions.
+        let old = render_plist(Path::new("/old/agent24d"), &out, &err, &[])
+            .replace("        <string>--ready-omit-token</string>\n", "");
+        std::fs::write(&plist, &old).unwrap();
+        std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&out, "x").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!plist_has_ready_omit_token(&plist), "control: old plist lacks the flag");
+
+        write_install_files(Path::new("/new/agent24d"), &plist, &out, &err, &[]).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert!(plist_has_ready_omit_token(&plist));
+        assert!(std::fs::read_to_string(&plist).unwrap().contains("/new/agent24d"));
+        assert_eq!(mode(&plist), 0o600);
+        assert_eq!(mode(&logs), 0o700);
+        assert_eq!(mode(&out), 0o600);
+        assert_eq!(mode(&err), 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_plist_is_not_reported_as_stale() {
+        assert!(!plist_has_ready_omit_token(Path::new("/nonexistent/x.plist")));
     }
 
     #[test]
