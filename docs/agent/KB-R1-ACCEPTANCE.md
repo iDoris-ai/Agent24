@@ -29,9 +29,9 @@
 - **不留进程**：
   - 宿主 daemon 靠关闭 stdin 来停：父进程租约结束，daemon 自己退出。legacy 方式拉起的发 SIGTERM。15 秒内没有退出就杀掉。
   - CLI 起的 daemon 用 `agent24 daemon stop` 停。
-  - 兜底：`agent24 daemon start` 等不到 ready 就放弃时，daemon 不会随 CLI 退出，而且可能还没写出状态文件。所以运行开始时先记下已有的 `<--old 或 --new>/agent24d serve` 进程；每条用例结束后，以及脚本退出时，把之后新出现的都杀掉。不按状态文件里的 pid 杀，免得误杀。
+  - 兜底：`agent24 daemon start` 等不到 ready 就放弃时，daemon 不会随 CLI 退出，而且可能还没写出状态文件。所以运行开始时先记下已有的 `<--old 或 --new>/agent24d serve` 进程；每条用例结束后，以及脚本退出时，查之后新出现的这类进程，只杀工作目录落在 `--work` 下的。脚本让每个 daemon 和每次 CLI 调用都在各自的数据目录里启动，daemon 和 CLI 都不切换目录，所以这次运行起的 daemon 都在 `--work` 下面。别的运行或用户自己从同一个目录起的 daemon 不碰，读不到工作目录的也不碰，只打一行提示。工作目录在 Linux 上读 `/proc/<pid>/cwd`，在 macOS 上用 `lsof -d cwd`（macOS 的 `ps -E` 读不到别的进程的环境变量）。不按状态文件里的 pid 杀，免得误杀。
   - 每个 daemon 都在 `try` 里构造，构造中途出错也会被清理。
-- **依赖**：python3，只用标准库，以 `-I` 运行。
+- **依赖**：python3，只用标准库，以 `-I` 运行；macOS 上还要 `lsof`（系统自带）。
 
 ## 用例
 
@@ -54,7 +54,7 @@
 | W4a | CLI 与桌面托管的 daemon | 按 W1 的方式拉起 daemon，在同一个数据目录上跑 `agent24 daemon status` | 退出 0，说出这个 daemon 的 pid，并说 `shutdown report unavailable: host authority unavailable` |
 | W4b | 同上 | `agent24 models` | 非 0 退出，说 `host authority unavailable`；daemon 还在 |
 | W4c | 同上 | `agent24 daemon stop` | 非 0 退出，说 `host authority unavailable`；daemon 还在，宿主仍能调它 |
-| W4r | 反面对照 | 按 main 上桌面的方式拉起 main 的 `agent24d`，再跑 main 的 `daemon status`、`models`、`daemon stop` | 都退出 0，`status` 说出这个 pid，`stop` 之后 daemon 退出。说明 W4 的变化是这次带来的 |
+| W4r | 反面对照 | 按 main 上桌面的方式拉起 main 的 `agent24d`，再跑 main 的 `daemon status`、`models`、`daemon stop`。跑 `models` 时把 `AGENT24D_BIN` 指向一个不存在的文件：附着失败时 CLI 会另起一个临时 daemon，这样能堵住这条退路 | 都退出 0，`status` 说出这个 pid，`stop` 之后 daemon 退出。说明 W4 的变化是这次带来的 |
 | W5a | 保留路径段 `host` | 用 W3 的 daemon，`POST /api/v1/attached` 注册名为 `host` 的 attached 模块；再注册一个叫 `kbacceptmod` 的作对照 | `host` 得 400 `invalid_manifest`，消息里有 `reserved`；`kbacceptmod` 得 201 |
 | W5r | 反面对照 | 用 W3r 的 main daemon 注册 `host` | 201（main 不保留这个名字） |
 | Z1 | 不碰用户数据 | 对比运行前后的 `~/.agent24` | 没有变化 |

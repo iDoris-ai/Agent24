@@ -97,11 +97,35 @@ def daemons():
 BEFORE = daemons()
 
 
+def cwd_of(pid):
+    """A process's working directory, or None if it cannot be read. Every
+    daemon this run starts runs in its own data dir under --work: the script
+    starts it there, or starts the CLI that spawns it there (neither chdirs)."""
+    try:
+        if sys.platform.startswith("linux"):
+            return os.readlink(f"/proc/{pid}/cwd")
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+    except OSError:
+        pass
+    return None
+
+
 def reap():
     """Kill every daemon this run started and left behind. A CLI start that
     gave up waiting leaves its daemon running, maybe with no state file yet,
-    so no pid is taken from a state file."""
+    so no pid is taken from a state file. Only a daemon that runs in a
+    directory under --work is this run's: one another run or the user started from the
+    same bin dir is left alone, as is one whose directory cannot be read."""
     for pid in daemons() - BEFORE:
+        cwd = cwd_of(pid)
+        if cwd is None or not os.path.realpath(cwd).startswith(WORK + os.sep):
+            print(f"a daemon from the same bin dir is not this run's (pid {pid}, cwd {cwd!r}); "
+                  "leaving it", file=sys.stderr)
+            continue
         print(f"a daemon outlived its case (pid {pid}); killing it", file=sys.stderr)
         try:
             os.kill(pid, signal.SIGKILL)
@@ -147,10 +171,13 @@ def code_of(parsed):
     return None
 
 
-def cli(bin_dir, data, *args):
+def cli(bin_dir, data, *args, extra_env=None):
     """`agent24 ARGS` on DATA: (exit code, what it said)."""
+    env = env_for(data)
+    env.update(extra_env or {})
+    os.makedirs(data, exist_ok=True)
     try:
-        out = subprocess.run([os.path.join(bin_dir, "agent24"), *args], env=env_for(data),
+        out = subprocess.run([os.path.join(bin_dir, "agent24"), *args], env=env, cwd=data,
                              capture_output=True, timeout=90)
     except subprocess.TimeoutExpired:
         return None, "timed out"
@@ -193,7 +220,7 @@ class SpawnedDaemon:
             args += ["--auth-mode", "capabilities", "--host-bootstrap-stdio"]
         self.proc = subprocess.Popen(
             args, stdin=subprocess.PIPE if capabilities else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=self.log, env=env_for(data))
+            stdout=subprocess.PIPE, stderr=self.log, env=env_for(data), cwd=data)
         self.ready = read_line(self.proc, READY_TIMEOUT)
         r = self.ready if isinstance(self.ready, dict) else {}
         self.port = r.get("port")
@@ -432,7 +459,10 @@ def case_w4():
             check("W4r", "反面对照：main 桌面方式起的 daemon 就绪", False, "没有 ready 行")
             return
         c1, s1 = cli(OLD, data, "daemon", "status")
-        c2, _ = cli(OLD, data, "models")
+        # An attach that fails falls back to spawning an ephemeral daemon; a
+        # daemon binary that does not exist shuts that door, so 0 here can
+        # only come from using the desktop's daemon.
+        c2, _ = cli(OLD, data, "models", extra_env={"AGENT24D_BIN": os.path.join(WORK, "no-such-agent24d")})
         c3, _ = cli(OLD, data, "daemon", "stop")
         try:
             old.proc.wait(timeout=15)
