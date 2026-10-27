@@ -148,6 +148,18 @@ pub fn plan_resume(status: RunStatus, thread: &[RunMessage]) -> ResumePlan {
     }
 }
 
+/// What a parked approval says about the call it was asked for.
+pub struct ApprovedCall<'a> {
+    /// The payload the human approved.
+    pub payload: &'a Map<String, Value>,
+    /// The approval's `tool_call_id`: the internal id of the call's
+    /// `tool_calls` row, or, for an approval asked again while a resume
+    /// settled the call, that call's provider id.
+    pub tool_call_id: &'a str,
+    /// The tool that `tool_calls` row names; `None` when there is no row.
+    pub tool: Option<&'a str>,
+}
+
 /// The verdict of [`assess_restore`]: whether a parked approval survives the
 /// restart re-validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,13 +206,15 @@ fn find_requested_call<'a>(
 ///
 /// ## The suspension point comes from the THREAD, not the approval's id
 ///
-/// `Approval.tool_call_id` is an INTERNAL persistence id (`tc_{ulid}`, minted for
-/// the ToolCall audit row), while the thread's `tool_calls[].id` is the MODEL
-/// PROVIDER's id (`call_...`). These are two different namespaces and never
-/// equal, so they must NOT be compared. The suspension point is derived purely
-/// from the thread ([`plan_resume`]), and the approval's correspondence to that
-/// call is established by PAYLOAD equality (below) — the integrity property for
-/// data the daemon's single-writer store owns end to end. The returned
+/// `Approval.tool_call_id` is normally an INTERNAL persistence id (`tc_{ulid}`,
+/// minted for the ToolCall audit row), while the thread's `tool_calls[].id` is
+/// the MODEL PROVIDER's id (`call_...`): two namespaces that never meet, so the
+/// suspension point is derived purely from the thread ([`plan_resume`]), never
+/// from the approval's id. Only an approval asked again while a resume settled
+/// the call carries that call's provider id instead (the settle runs under it).
+/// The approval's correspondence to the call is established by PAYLOAD equality
+/// (below) — the integrity property for data the daemon's single-writer store
+/// owns end to end — plus the call identity of check 3. The returned
 /// `tool_call_id` is the thread/provider id, the one the tool-result message
 /// will be keyed on.
 ///
@@ -211,18 +225,18 @@ fn find_requested_call<'a>(
 /// 3. the input rebuilt from the thread still equals what was approved — the
 ///    payload-integrity property ("refuse to run B for an approval of A"), and
 ///    ALSO what ties this approval to this parked call across the id namespaces;
-///    and the call names the tool the approval was asked for (`approved_tool`,
-///    from the approval's own `tool_calls` row): an earlier call whose answer
-///    was never written can share the parked call's arguments, and would
-///    otherwise be settled with its approval (#1379 review);
+///    and the approval is the parked call's own: either it was asked again on
+///    resume, bound to that call's provider id, or its `tool_calls` row names
+///    the call's tool. An earlier call whose answer was never written can
+///    share the parked call's arguments, and would otherwise be settled with
+///    its approval (#1379 review);
 /// 4. the approval is not older than the resume TTL (`created_at >= ttl_cutoff`;
 ///    both fixed-width UTC, so the lexical compare is chronological).
 ///
 /// Pure over its inputs: the caller derives `tool_exists` from the registry and
 /// `ttl_cutoff` from the clock ([`agent24_core::util::iso8601_before`]).
 pub fn assess_restore(
-    approved_payload: &Map<String, Value>,
-    approved_tool: &str,
+    approved: &ApprovedCall<'_>,
     created_at: &str,
     run_status: RunStatus,
     thread: &[RunMessage],
@@ -246,11 +260,12 @@ pub fn assess_restore(
             reason: format!("tool `{name}` is no longer registered — cannot resume its call"),
         };
     }
-    if name != approved_tool {
+    if approved.tool_call_id != tool_call_id && approved.tool != Some(name) {
         return RestoreDecision::Abort {
             reason: format!(
                 "tool_call {tool_call_id} is a `{name}` call, but the approval was asked for \
-                 `{approved_tool}`"
+                 {:?}",
+                approved.tool
             ),
         };
     }
@@ -272,7 +287,7 @@ pub fn assess_restore(
             }
         }
     };
-    if &rebuilt != approved_payload {
+    if &rebuilt != approved.payload {
         return RestoreDecision::Abort {
             reason: format!(
                 "tool_call {tool_call_id} input changed since it was approved \
@@ -605,8 +620,11 @@ mod tests {
         ];
         assert_eq!(
             assess_restore(
-                &Map::new(),
-                "shell_exec",
+                &ApprovedCall {
+                    payload: &Map::new(),
+                    tool_call_id: "tc_internal_1",
+                    tool: Some("shell_exec"),
+                },
                 FRESH,
                 RunStatus::AwaitingApproval,
                 &thread,
@@ -634,8 +652,11 @@ mod tests {
         ];
         assert_eq!(
             assess_restore(
-                &obj(json!({ "argv": ["x"] })),
-                "shell_exec",
+                &ApprovedCall {
+                    payload: &obj(json!({ "argv": ["x"] })),
+                    tool_call_id: "tc_internal_1",
+                    tool: Some("shell_exec"),
+                },
                 FRESH,
                 RunStatus::AwaitingApproval,
                 &thread,
@@ -656,8 +677,11 @@ mod tests {
         ];
         assert_eq!(
             assess_restore(
-                &Map::new(),
-                "fs_write",
+                &ApprovedCall {
+                    payload: &Map::new(),
+                    tool_call_id: "tc_internal_1",
+                    tool: Some("fs_write"),
+                },
                 FRESH,
                 RunStatus::AwaitingApproval,
                 &thread,
@@ -678,8 +702,11 @@ mod tests {
         ];
         // Registry no longer has this tool (e.g. its MCP server went offline).
         let decision = assess_restore(
-            &Map::new(),
-            "mcp_slack_post",
+            &ApprovedCall {
+                payload: &Map::new(),
+                tool_call_id: "tc_internal_1",
+                tool: Some("mcp_slack_post"),
+            },
             FRESH,
             RunStatus::AwaitingApproval,
             &thread,
@@ -695,9 +722,10 @@ mod tests {
     /// #1379 review: `fs_read` ran under `call_r` but its answer was never
     /// written; `fs_write` under `call_w`, with the same arguments, is the
     /// call the approval was asked for. The thread points at `call_r`, so
-    /// the approval must not settle it.
+    /// the approval must not settle it: neither its `tool_calls` row nor, for
+    /// an approval asked again on resume, its provider id is `call_r`'s.
     #[test]
-    fn an_approval_for_another_tool_aborts() {
+    fn an_approval_for_another_call_aborts() {
         let args = r#"{"path":"/tmp/x"}"#;
         let call = |id: &str, name: &str| json!({ "id": id, "name": name, "arguments": args });
         let thread = [
@@ -707,10 +735,14 @@ mod tests {
                 ..assistant_calls(1, &[])
             },
         ];
-        let assess = |tool: &str| {
+        let payload = obj(json!({ "path": "/tmp/x" }));
+        let assess = |tool_call_id: &str, tool: Option<&str>| {
             assess_restore(
-                &obj(json!({ "path": "/tmp/x" })),
-                tool,
+                &ApprovedCall {
+                    payload: &payload,
+                    tool_call_id,
+                    tool,
+                },
                 FRESH,
                 RunStatus::AwaitingApproval,
                 &thread,
@@ -718,17 +750,22 @@ mod tests {
                 CUTOFF,
             )
         };
-        assert_eq!(
-            assess("fs_read"),
-            RestoreDecision::Restore {
-                tool_call_id: "call_r".to_owned()
-            }
-        );
-        let decision = assess("fs_write");
-        assert!(
-            matches!(&decision, RestoreDecision::Abort { reason } if reason.contains("fs_write")),
-            "{decision:?}"
-        );
+        let restores = RestoreDecision::Restore {
+            tool_call_id: "call_r".to_owned(),
+        };
+        assert_eq!(assess("tc_internal_1", Some("fs_read")), restores);
+        assert_eq!(assess("call_r", None), restores);
+        for (tool_call_id, tool) in [
+            ("tc_internal_1", Some("fs_write")),
+            ("tc_internal_1", None),
+            ("call_w", None),
+        ] {
+            let decision = assess(tool_call_id, tool);
+            assert!(
+                matches!(&decision, RestoreDecision::Abort { .. }),
+                "{tool_call_id} {tool:?}: {decision:?}"
+            );
+        }
     }
 
     #[test]
@@ -741,8 +778,11 @@ mod tests {
             assistant_call_full(1, "call_a", "shell_exec", r#"{"a":1}"#),
         ];
         let decision = assess_restore(
-            &obj(json!({ "a": 2 })),
-            "shell_exec",
+            &ApprovedCall {
+                payload: &obj(json!({ "a": 2 })),
+                tool_call_id: "tc_internal_1",
+                tool: Some("shell_exec"),
+            },
             FRESH,
             RunStatus::AwaitingApproval,
             &thread,
@@ -762,8 +802,11 @@ mod tests {
             assistant_call_full(1, "call_a", "shell_exec", "{}"),
         ];
         let decision = assess_restore(
-            &Map::new(),
-            "shell_exec",
+            &ApprovedCall {
+                payload: &Map::new(),
+                tool_call_id: "tc_internal_1",
+                tool: Some("shell_exec"),
+            },
             STALE,
             RunStatus::AwaitingApproval,
             &thread,
@@ -784,8 +827,11 @@ mod tests {
         ];
         assert!(matches!(
             assess_restore(
-                &Map::new(),
-                "shell_exec",
+                &ApprovedCall {
+                    payload: &Map::new(),
+                    tool_call_id: "tc_internal_1",
+                    tool: Some("shell_exec"),
+                },
                 FRESH,
                 RunStatus::Cancelled,
                 &thread,

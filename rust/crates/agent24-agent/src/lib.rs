@@ -1268,14 +1268,17 @@ impl RunManager {
                     continue;
                 }
             };
-            // NB: the approval's `tool_call_id` (an internal `tc_` id) is
-            // deliberately NOT passed — the suspension point is derived from the
-            // thread's provider ids, and the approval is matched by payload and
-            // by the tool its own `tool_calls` row names.
+            // NB: the suspension point is derived from the thread's provider
+            // ids, never from the approval's `tool_call_id`; that id and the
+            // tool its `tool_calls` row names only confirm the approval is the
+            // parked call's own (with the payload).
             let approved_tool = self.approved_tool(&approval).await?;
             match crate::resume::assess_restore(
-                &approval.payload,
-                &approved_tool,
+                &crate::resume::ApprovedCall {
+                    payload: &approval.payload,
+                    tool_call_id: &approval.tool_call_id,
+                    tool: approved_tool.as_deref(),
+                },
                 &approval.created_at,
                 run.status,
                 &thread,
@@ -1408,17 +1411,16 @@ impl RunManager {
     }
 
     /// The tool `approval` was asked for: the one its `tool_calls` row names,
-    /// written before the call parked. Empty when that row is missing, which
-    /// matches no call, so the restore aborts.
-    async fn approved_tool(&self, approval: &Approval) -> Result<String, AgentError> {
+    /// written before the call parked. `None` when there is no such row, as
+    /// for an approval asked again while a resume settled the call.
+    async fn approved_tool(&self, approval: &Approval) -> Result<Option<String>, AgentError> {
         Ok(self
             .store
             .list_tool_calls(&approval.run_id)
             .await?
             .into_iter()
             .find(|call| call.id == approval.tool_call_id)
-            .map(|call| call.tool)
-            .unwrap_or_default())
+            .map(|call| call.tool))
     }
 
     /// Body of a resume: re-validate, reconstruct, settle the parked turn's
@@ -1434,9 +1436,9 @@ impl RunManager {
 
         // 1+2. Re-validate off the persisted thread and locate the suspension
         // point. The point is a PROVIDER id derived from the thread (NOT the
-        // approval's internal `tc_` id — a different namespace that never
-        // matches); the approval is tied to that call by payload equality inside
-        // assess_restore. Done BEFORE any state change, so an unrestorable run
+        // approval's `tool_call_id`); the approval is tied to that call by
+        // payload equality and call identity inside assess_restore. Done
+        // BEFORE any state change, so an unrestorable run
         // never emits a spurious RunStarted→Cancelled pair.
         let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
         let approved_tool = match self.approved_tool(&approval).await {
@@ -1448,8 +1450,11 @@ impl RunManager {
             }
         };
         let tool_call_id = match crate::resume::assess_restore(
-            &approval.payload,
-            &approved_tool,
+            &crate::resume::ApprovedCall {
+                payload: &approval.payload,
+                tool_call_id: &approval.tool_call_id,
+                tool: approved_tool.as_deref(),
+            },
             &approval.created_at,
             run.status,
             &thread,
@@ -6797,6 +6802,28 @@ mod approval_tests {
         .expect("the resumed call is asked about again");
         let waiting = h.store.get_run("run_1").await.unwrap().unwrap();
         assert_eq!(waiting.status, RunStatus::AwaitingApproval);
+        // #1379 review: had the daemon restarted here, the approval asked
+        // again would still restore. It has no `tool_calls` row of its own;
+        // it is bound to the parked call's provider id.
+        let approved_tool = h.manager.approved_tool(&asked_again).await.unwrap();
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert_eq!(
+            crate::resume::assess_restore(
+                &crate::resume::ApprovedCall {
+                    payload: &asked_again.payload,
+                    tool_call_id: &asked_again.tool_call_id,
+                    tool: approved_tool.as_deref(),
+                },
+                &asked_again.created_at,
+                waiting.status,
+                &thread,
+                |_| true,
+                "",
+            ),
+            crate::resume::RestoreDecision::Restore {
+                tool_call_id: "call_provider_1".to_owned()
+            }
+        );
         h.broker
             .resolve(&asked_again.id, decision("approve", None))
             .await
@@ -6872,7 +6899,7 @@ mod approval_tests {
             "tc_internal_1",
             args.as_object().unwrap().clone(),
         );
-        h.store.insert_approval(&approval).await.unwrap();
+        insert_parked(&h.store, &approval, "shell_exec").await;
         h.broker
             .resolve("apr_1", decision("approve", None))
             .await
@@ -7561,15 +7588,17 @@ mod approval_tests {
             .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
             .await
             .unwrap();
-        h.store
-            .insert_approval(&seed_approval(
+        insert_parked(
+            &h.store,
+            &seed_approval(
                 "apr_1",
                 "run_1",
                 "tc_internal_1",
                 args.as_object().unwrap().clone(),
-            ))
-            .await
-            .unwrap();
+            ),
+            "shell_exec",
+        )
+        .await;
 
         assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (0, 1));
         assert_eq!(
