@@ -2515,7 +2515,10 @@ export interface components {
             decided_at: string;
             /** Format: date-time */
             expires_at: string;
-            /** @enum {string} */
+            /**
+             * @description What the dispatch gate would make of a call now: judged against the tool as it is mounted now and the identity of the package running now. A grant for another package, for none, for a module not running, not on the grants protocol or a tool no longer mounted, or for an earlier version or scope of the tool is `stale`.
+             * @enum {string}
+             */
             status: "granted" | "denied" | "revoked" | "expired" | "stale" | "not_granted";
             /**
              * @description Only for a revoked one, or an expired grant: whether the module said it stopped the work the grant started when told it ended (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded, as for a revocation made outside this daemon or an expiry not yet told.
