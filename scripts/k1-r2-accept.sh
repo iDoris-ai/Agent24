@@ -9,6 +9,8 @@
 # user's ~/.agent24, so stop your own daemon first). No model is needed.
 # Needs curl, jq, sqlite3, python3, perl and node.
 set -uo pipefail
+# perl (the time limits) warns on a locale it cannot load; tr and grep stay byte-wise.
+export LC_ALL=C
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 
@@ -33,11 +35,28 @@ done
 resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
 WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/k1r2-accept.$$}")
-case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
-[ -z "$(ls -A "$WORK" 2>/dev/null)" ] || { echo "--work must be new or empty: $WORK" >&2; exit 2; }
-mkdir -p "$WORK" || exit 2
 [ -s "$REAL/daemon.json" ] && kill -0 "$(jq -r .pid "$REAL/daemon.json")" 2>/dev/null \
   && { echo "a daemon is running on $REAL: stop it first (agent24 daemon stop)" >&2; exit 2; }
+# inside DIR TOP: DIR is TOP or below it, both absolute. TOP is cut to its
+# nearest existing ancestor and the missing rest; an existing ancestor of DIR
+# that is that same directory by inode (a firmlink or bind mount names it
+# otherwise) is followed by DIR's rest, compared without case (a
+# case-insensitive volume takes ~/.Agent24 for ~/.agent24).
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+inside() {
+  local top=$2 missing="" a=$1 rest=""
+  while [ ! -e "$top" ]; do missing="/$(basename "$top")$missing"; top=$(dirname "$top"); done
+  while :; do
+    if [ -e "$a" ] && [ "$a" -ef "$top" ]; then
+      case "$(lower "$rest")/" in "$(lower "$missing")"/*) return 0 ;; esac
+    fi
+    [ "$a" = / ] && return 1
+    rest="/$(basename "$a")$rest"; a=$(dirname "$a")
+  done
+}
+inside "$WORK" "$REAL" && { echo "--work must not be inside $REAL" >&2; exit 2; }
+[ -z "$(ls -A "$WORK" 2>/dev/null)" ] || { echo "--work must be new or empty: $WORK" >&2; exit 2; }
+mkdir -p "$WORK" || exit 2
 # Only what each case sets reaches a daemon or the CLI.
 for v in $(env | grep -oE '^(A24|AGENT24)_[A-Z0-9_]+'); do unset "$v"; done
 
@@ -89,8 +108,10 @@ stop_daemon() {
 }
 trap 'stop_daemon' EXIT
 
-# api METHOD PATH [BODY] -> body in $WORK/r.json, status in $CODE
+# api METHOD PATH [BODY] -> body in $WORK/r.json, status in $CODE; no answer
+# leaves no r.json, so an earlier body is never read as this one's
 api() {
+  rm -f "$WORK/r.json"
   CODE=$(curl -s -m 20 -o "$WORK/r.json" -w '%{http_code}' -X "$1" \
     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
     ${3:+-d "$3"} "http://127.0.0.1:$PORT$2")
@@ -107,10 +128,19 @@ wait_run() {
 peer() { api GET "/api/v1/peer/runs/$1"; jq -r .withheld "$WORK/r.json"; }
 NOTICE="this run used sources that are not ordinary, so its content is not shared with connected tools; open it in Agent24 to see it"
 # withheld ID: ok when a peer gets the run withheld, with the notice and nothing else
+WITHHELD='.withheld == true and .notice == $n and .prompt == null and .output == null and .error == null'
 withheld() {
   api GET "/api/v1/peer/runs/$1"
-  jq -e --arg n "$NOTICE" '.withheld == true and .notice == $n and .prompt == null and .output == null and .error == null' \
-    "$WORK/r.json" > /dev/null && echo ok || echo fail
+  [ "$CODE" = 200 ] && jq -e --arg n "$NOTICE" "$WITHHELD" "$WORK/r.json" > /dev/null && echo ok || echo fail
+}
+# peer_list FILE: ok when the list holds at least 6 runs, the run with
+# NEW-ORDINARY-MARKER shared among them, and at least 4 others, each withheld
+# as `withheld` checks it
+peer_list() {
+  jq -e --arg n "$NOTICE" "(.runs | length) >= 6
+    and any(.runs[]; .withheld == false and .prompt == \"NEW-ORDINARY-MARKER\")
+    and ([.runs[] | select(.withheld != false)] | length >= 4 and all($WITHHELD))" "$1" > /dev/null \
+    && echo ok || echo fail
 }
 db() { sqlite3 "$DATA/agent24.db" "$1"; }
 iso() { python3 -c "import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"; }
@@ -176,17 +206,18 @@ api POST /api/v1/runs "{\"prompt\":\"SESSION-MARKER\",\"session_id\":\"$SESS\"}"
 N=$(peer "$NEW_RUN"); S=$(withheld "$SESS_RUN")
 check V3 "a new run with no session is shared, a session run is withheld" "$(is "$N/$S" false/ok)" "$NEW_RUN $N; $SESS_RUN $S"
 api GET /api/v1/peer/runs; cp "$WORK/r.json" "$WORK/peer.json"
-LEAK=$( [ "$CODE" = 200 ] && [ "$(jq '.runs | length' "$WORK/peer.json")" -ge 6 ] && echo ok || echo fail)
+LEAK=$( [ "$CODE" = 200 ] && peer_list "$WORK/peer.json" || echo fail)
 for m in OLD-RUN-MARKER WAKE-MARKER SESSION-MARKER; do [ "$(lacks "$WORK/peer.json" "$m")" = ok ] || LEAK=fail; done
 check V4 "the peer list carries no withheld content" "$LEAK" "$WORK/peer.json"
 
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"accept","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agent24_list_runs","arguments":{}}}' \
-  | (cat; sleep 5) | AGENT24_DATA_DIR="$DATA" limit 30 "$NEW/agent24" mcp 2> "$WORK/mcp.err" | grep '"id":2' > "$WORK/mcp.out"
+  | (cat; sleep 5) | AGENT24_DATA_DIR="$DATA" limit 30 "$NEW/agent24" mcp 2> "$WORK/mcp.err" | grep -E '"id": ?2[,}]' > "$WORK/mcp.out"
+# The tool's text is the daemon's peer list as it came
 jq -r '.result.content[0].text' "$WORK/mcp.out" > "$WORK/mcp.runs" 2>/dev/null
-MCP=$( (grep -q NEW-ORDINARY-MARKER "$WORK/mcp.runs" && grep -qF "$NOTICE" "$WORK/mcp.runs" \
-  && ! grep -qE 'OLD-RUN-MARKER|WAKE-MARKER|SESSION-MARKER' "$WORK/mcp.runs") && echo ok || echo fail)
+MCP=$( [ "$(peer_list "$WORK/mcp.runs")" = ok ] \
+  && ! grep -qE 'OLD-RUN-MARKER|WAKE-MARKER|SESSION-MARKER' "$WORK/mcp.runs" && echo ok || echo fail)
 check V5 "MCP agent24_list_runs shows the shared run and hides the rest" "$MCP" "$WORK/mcp.out"
 
 cat > "$WORK/acp.py" <<'EOF'
@@ -221,7 +252,7 @@ api POST /api/v1/module-consents/modules/node-ref/tools/echo '{}'
 check G3 "A24_MODULE_TOOL_GRANTS=1 opens it (max 90 days accepted)" "$(is "$CODE/$(jq -r .error.code "$WORK/r.json")" 404/not_found)" "$CODE $(jq -c .error.code "$WORK/r.json") — past the switch; node-ref is not installed yet"
 stop_daemon
 for bad in A24_MODULE_TOOL_GRANTS=yes A24_MODULE_GRANT_MAX_DAYS=91; do
-  if start_daemon "$NEW" "$WORK/up" "$bad"; then R=fail; stop_daemon; else R=$(has "$WORK/up.serve.log" "${bad%%=*}"); fi
+  if start_daemon "$NEW" "$WORK/up" "$bad"; then R=fail; stop_daemon; else R=$(has "$WORK/up.serve.log" "serve failed: ${bad%%=*}"); fi
   check G4 "the daemon refuses to start with $bad" "$R" "$(grep -m1 -o "serve failed: ${bad%%=*}.*" "$WORK/up.serve.log" | cut -c1-120)"
 done
 
