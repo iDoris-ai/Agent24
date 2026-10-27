@@ -1,0 +1,18 @@
+{
+  "name": "@agent24/data-dir",
+  "version": "0.5.1",
+  "private": true,
+  "description": "ADR-037 platform data-directory resolver shared by the desktop shell and TS packages. Mirror of agent24-protocol data_dir.rs.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.5"
+  }
+}

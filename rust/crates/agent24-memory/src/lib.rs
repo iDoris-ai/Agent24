@@ -258,6 +258,15 @@ pub struct MemorySettings {
     pub enabled: bool,
 }
 
+/// Test-only pool access so `/health` can be checked against the migration
+/// table without making the pool part of the supported API.
+#[doc(hidden)]
+pub mod test_hooks {
+    pub fn pool(store: &super::KvStore) -> &sqlx::SqlitePool {
+        &store.pool
+    }
+}
+
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
 #[derive(Clone)]
 pub struct KvStore {
@@ -341,6 +350,16 @@ impl KvStore {
             pool,
             oop_admission: None,
         })
+    }
+
+    /// Latest successful migration in `_sqlx_migrations`, or 0 when none
+    /// has been applied. This is the memory-database watermark `/health` reports.
+    pub async fn latest_applied_migration(&self) -> Result<i64> {
+        let version: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(version.unwrap_or(0))
     }
 
     async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
