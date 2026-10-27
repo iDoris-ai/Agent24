@@ -3322,9 +3322,37 @@ pub(crate) mod tests {
         "/documents/extractions/{extraction_id}",
     ];
 
-    // COMM routes are mounted by server::serve, outside the scanned builder;
-    // `/api/v1/comm/*` remains a known blind spot owned by the COMM workstream.
-    const EXTRA_RESERVED_NOT_IN_BUILD_ROUTER: &[&str] = &["/comm/*"];
+    // COMM routes are mounted by server::serve, outside the scanned builder, so
+    // their literals are scanned from the agent24-comm sources instead
+    // (`comm_route_literals`); they are covered by the same gate, no exemption.
+    const COMM_ROUTE_SOURCES: [(&str, &str); 2] = [
+        (
+            include_str!("../../../crates/agent24-comm/src/router.rs"),
+            "pub fn router(",
+        ),
+        (
+            include_str!("../../../crates/agent24-comm/src/groupchat.rs"),
+            "pub(crate) fn routes(",
+        ),
+    ];
+
+    /// `.route("<path>"` literals inside the function starting at `anchor`.
+    fn route_literals(source: &str, anchor: &str) -> Vec<String> {
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} must exist"));
+        let body = &source[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("function must be brace-terminated")];
+        body.match_indices(".route(")
+            .filter_map(|(offset, _)| {
+                let rest = &body[offset + ".route(".len()..];
+                let rest = &rest[rest.find('"')? + 1..];
+                Some(rest[..rest.find('"')?].to_owned())
+            })
+            .collect()
+    }
 
     fn route_openapi_mismatches(
         server_source: &str,
@@ -3332,26 +3360,8 @@ pub(crate) mod tests {
     ) -> (Vec<String>, Vec<String>) {
         use std::collections::BTreeSet;
 
-        let start = server_source
-            .find("pub fn build_router_with_modules")
-            .expect("build_router_with_modules must exist");
-        let body = &server_source[start..];
-        let end = body
-            .find("\n}\n")
-            .expect("build_router_with_modules must be brace-terminated");
-        let body = &body[..end];
-
         let mut routes = BTreeSet::new();
-        for (offset, _) in body.match_indices(".route(") {
-            let registration = &body[offset + ".route(".len()..];
-            let Some(quote_start) = registration.find('"') else {
-                continue;
-            };
-            let path_and_rest = &registration[quote_start + 1..];
-            let Some(quote_end) = path_and_rest.find('"') else {
-                continue;
-            };
-            let path = &path_and_rest[..quote_end];
+        for path in route_literals(server_source, "pub fn build_router_with_modules") {
             if let Some(path) = path.strip_prefix("/api/v1") {
                 routes.insert(path.to_owned());
             }
@@ -3376,7 +3386,14 @@ pub(crate) mod tests {
 
         let undocumented: BTreeSet<&str> = UNDOCUMENTED_KERNEL_ROUTES.iter().copied().collect();
         let module_paths: BTreeSet<&str> = MODULE_SURFACE_PATHS.iter().copied().collect();
-        let _known_external_blind_spot = EXTRA_RESERVED_NOT_IN_BUILD_ROUTER;
+        let mut comm = 0;
+        for (source, anchor) in COMM_ROUTE_SOURCES {
+            for path in route_literals(source, anchor) {
+                routes.insert(format!("/comm{path}"));
+                comm += 1;
+            }
+        }
+        assert!(comm >= 20, "comm route scan found only {comm} paths");
         let expected_openapi: BTreeSet<String> = routes
             .iter()
             .filter(|path| !undocumented.contains(path.as_str()))
@@ -3429,6 +3446,16 @@ pub(crate) mod tests {
         let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(&routes, openapi);
         assert_eq!(missing_from_openapi, ["/not-in-openapi"]);
         assert!(extra_in_openapi.is_empty());
+    }
+
+    #[test]
+    fn route_openapi_gate_covers_comm_routes() {
+        let routes = include_str!("server.rs");
+        let openapi = include_str!("../../../../protocol/openapi.yaml")
+            .replace("  /comm/groupchat:\n", "  /comm/groupchat-gone:\n");
+        let (missing_from_openapi, extra_in_openapi) = route_openapi_mismatches(routes, &openapi);
+        assert_eq!(missing_from_openapi, ["/comm/groupchat"]);
+        assert_eq!(extra_in_openapi, ["/comm/groupchat-gone"]);
     }
 
     #[test]

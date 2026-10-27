@@ -125,7 +125,9 @@ impl CommState {
         }
     }
 
-    fn require_ready(&self) -> Result<(&HyphaeRunner, &dyn PasswordStore, &Path), CommError> {
+    pub(crate) fn require_ready(
+        &self,
+    ) -> Result<(&HyphaeRunner, &dyn PasswordStore, &Path), CommError> {
         match &self.backend {
             Backend::Ready {
                 runner,
@@ -173,6 +175,7 @@ pub fn router(state: CommState) -> Router {
         .route("/outbox", get(list_outbox))
         .route("/outbox/{event_id}/retry", post(retry_outbox))
         .route("/outbox/clear", post(clear_outbox))
+        .merge(crate::groupchat::routes())
         .with_state(state)
 }
 
