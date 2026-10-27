@@ -623,7 +623,7 @@ fn desktop_key(key: &str) -> bool {
     rest.len() == 64 && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn declares_the_file_sends_chunks_then_starts_the_import() {
     // it('declares the file, sends it in chunks of at most 768 KiB, then starts the import')
     let _guard = begin().await;
@@ -679,7 +679,7 @@ async fn declares_the_file_sends_chunks_then_starts_the_import() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_lost_chunk_reply_is_replayed_and_a_kernel_timeout_is_retried() {
     // it('a chunk whose reply was lost is replayed as 200, and a kernel timeout is retried')
     let _guard = begin().await;
@@ -699,7 +699,7 @@ async fn a_lost_chunk_reply_is_replayed_and_a_kernel_timeout_is_retried() {
     assert_eq!(os.job_count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_lost_import_is_continued_by_importing_again() {
     // it('an import whose replies were all lost is continued, not repeated, by importing the file again')
     let _guard = begin().await;
@@ -717,7 +717,7 @@ async fn a_lost_import_is_continued_by_importing_again() {
     assert_eq!((os.upload_count(), os.job_count()), (1, 1));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_upload_cut_off_midway_resumes() {
     // it('an upload cut off midway resumes from what the OS already holds')
     let _guard = begin().await;
@@ -738,7 +738,7 @@ async fn an_upload_cut_off_midway_resumes() {
     assert_eq!(os.upload_count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_file_that_shrinks_stops_with_file_changed() {
     // it('a file that shrinks while it is sent stops with file_changed, never loops')
     let _guard = begin().await;
@@ -757,7 +757,7 @@ async fn a_file_that_shrinks_stops_with_file_changed() {
     assert!(os.chunks().len() <= 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn refuses_replies_that_do_not_fit_the_file() {
     // it('refuses replies that do not fit the file, and stops resuming after a bound')
     let _guard = begin().await;
@@ -850,7 +850,7 @@ async fn refuses_replies_that_do_not_fit_the_file() {
     assert!(flip.load(Ordering::SeqCst) <= 10);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_file_it_cannot_read_is_file_unreadable() {
     // it('a file it cannot read is file_unreadable, without its path')
     let _guard = begin().await;
@@ -862,7 +862,7 @@ async fn a_file_it_cannot_read_is_file_unreadable() {
     assert!(!res.to_json().to_string().contains("secret-name"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_forbidden_name_is_not_sent_and_an_os_error_is_returned() {
     // it('a name the contract forbids is not sent; an OS error is returned as it is')
     let _guard = begin().await;
@@ -878,7 +878,7 @@ async fn a_forbidden_name_is_not_sent_and_an_os_error_is_returned() {
     assert_eq!(res.code(), Some("invalid_request"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_retry_a_second_import_or_two_at_once_reach_one_job() {
     // it('a retry, a second import or two at once reach one upload and one job')
     let _guard = begin().await;
@@ -902,7 +902,7 @@ async fn a_retry_a_second_import_or_two_at_once_reach_one_job() {
     assert_eq!(ok_data(&a).get("job_id"), ok_data(&b).get("job_id"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_renamed_copy_is_a_new_import() {
     // it('a renamed copy is a new import, never a reused key with another request')
     let _guard = begin().await;
@@ -916,7 +916,7 @@ async fn a_renamed_copy_is_a_new_import() {
     assert_eq!((os.upload_count(), os.job_count()), (2, 2));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_upload_that_expired_before_its_import_is_replaced() {
     // it('an upload that expired before its import is replaced by a new one')
     let _guard = begin().await;
@@ -941,7 +941,7 @@ async fn an_upload_that_expired_before_its_import_is_replaced() {
     assert_eq!(keys.len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unknown_or_undispatched_reply_is_sent_again() {
     // it('a reply whose outcome is unknown, or that was never dispatched, is sent again (ADR-DOC-02 §6)')
     let _guard = begin().await;
@@ -966,7 +966,7 @@ async fn an_unknown_or_undispatched_reply_is_sent_again() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_import_that_started_before_expiry_is_found_again() {
     // it('an import that started before its upload expired is found again, never repeated')
     let _guard = begin().await;
@@ -984,7 +984,7 @@ async fn an_import_that_started_before_expiry_is_found_again() {
     assert_eq!((os.upload_count(), os.job_count()), (1, 1));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn more_expired_uploads_than_a_small_bound_still_import() {
     // it('more expired uploads than any small bound still lead to an import')
     let _guard = begin().await;
@@ -1005,7 +1005,7 @@ async fn more_expired_uploads_than_a_small_bound_still_import() {
     assert!(os.upload_count() > 5);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_upload_that_expires_midway_is_replaced_in_the_same_run() {
     // it('an upload that expires midway is replaced in the same run, from its chunk request 404')
     let _guard = begin().await;
@@ -1024,7 +1024,7 @@ async fn an_upload_that_expires_midway_is_replaced_in_the_same_run() {
     assert_eq!(snaps[1].bytes, bytes);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn past_64_expired_uploads_a_run_reaches_a_live_one() {
     // it('past 64 expired uploads a run still reaches a live one, starting where the last run stopped')
     let _guard = begin().await;
@@ -1048,7 +1048,7 @@ async fn past_64_expired_uploads_a_run_reaches_a_live_one() {
     assert!(later - creates < 8);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_expired_upload_whose_import_started_answers_with_that_job() {
     // it('an expired upload whose import started answers with that job, not a new upload')
     let _guard = begin().await;
@@ -1062,7 +1062,7 @@ async fn an_expired_upload_whose_import_started_answers_with_that_job() {
     assert_eq!((os.upload_count(), os.job_count()), (1, 1));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn after_the_os_loses_its_data_every_run_takes_the_same_upload() {
     // it('after the OS loses its data, the remembered place is dropped and every run takes the same upload')
     let _guard = begin().await;
@@ -1081,7 +1081,7 @@ async fn after_the_os_loses_its_data_every_run_takes_the_same_upload() {
     assert_eq!(os.job_count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn losing_data_between_create_and_chunks_does_not_fork() {
     // it('the OS losing its data between creating an upload and its chunks does not fork the chain')
     let _guard = begin().await;
@@ -1096,7 +1096,7 @@ async fn losing_data_between_create_and_chunks_does_not_fork() {
     assert_eq!(send.job_count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn losing_data_just_before_the_next_upload_does_not_fork() {
     // it('the OS losing its data just before the next upload in the chain does not fork it')
     let _guard = begin().await;
@@ -1160,7 +1160,7 @@ fn the_error_envelope_keeps_its_hint_and_details() {
 
 /// A 409 `upload_offset_mismatch` (a chunk that landed before its reply was
 /// lost) carries on from the OS's `received_offset`, not from the start.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_offset_mismatch_carries_on_from_what_the_os_holds() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1199,7 +1199,7 @@ async fn an_offset_mismatch_carries_on_from_what_the_os_holds() {
 
 /// An upload the OS answers as `expired` gets no chunks: the run goes
 /// straight to its import, then to the next upload in the chain.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_expired_upload_gets_no_chunks() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1253,7 +1253,7 @@ fn upl(n: usize) -> String {
 
 /// Each request goes out with its method and content type: the OS parses
 /// the JSON bodies only under `application/json`.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn every_request_has_its_method_and_content_type() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1314,7 +1314,7 @@ const RETRY_CONTRACT: [&str; 16] = [
 
 /// Every code in the contract is sent again, at most three sends per step;
 /// any other error is returned after one send.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn each_retry_code_is_sent_again_up_to_three_times() {
     let _guard = begin().await;
     let mut ours = RETRY.to_vec();
@@ -1358,9 +1358,57 @@ async fn each_retry_code_is_sent_again_up_to_three_times() {
     }
 }
 
+/// A send that is to be repeated waits first, 0.5 s and then 1.5 s: a
+/// module still starting (`module_not_ready`, about 1.3 s after `daemon
+/// start` returns) is not asked three times inside that window. An answer
+/// that is final is not waited on.
+#[tokio::test(start_paused = true)]
+async fn a_send_again_waits_half_a_second_then_one_and_a_half() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let (path, _) = dir.file(10, "a.pdf").await;
+    for (code, sends) in [("module_not_ready", 3), ("conflict", 1)] {
+        let at = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&at);
+        let os = FnSend::new(move |req: Request| {
+            if req.path.ends_with("/uploads") {
+                let mut seen = log.lock().unwrap();
+                seen.push(tokio::time::Instant::now());
+                if seen.len() < 3 {
+                    return reply(503, json!({"error": {"code": code, "message": "x"}}));
+                }
+                let mut body = good_upload();
+                body["sha256"] = body_sha(&req);
+                reply(201, body)
+            } else if req.path.ends_with("/chunks") {
+                reply(200, json!({"received": 10}))
+            } else {
+                reply(202, json!({"job_id": "job_01K74Z3QJ8V5N2W9RTX6YB4MCD"}))
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let res = run(&path, &os).await;
+        let gaps: Vec<_> = at
+            .lock()
+            .unwrap()
+            .iter()
+            .scan(started, |last, t| {
+                Some(t.duration_since(std::mem::replace(last, *t)))
+            })
+            .collect();
+        let ms = |n: u64| std::time::Duration::from_millis(n);
+        if sends == 3 {
+            assert!(res.is_ok(), "{res:?}");
+            assert_eq!(gaps, [ms(0), ms(500), ms(1500)]);
+        } else {
+            assert_eq!((res.code(), gaps), (Some(code), vec![ms(0)]));
+        }
+    }
+}
+
 /// An OS that keeps moving the offset gets 8 resumes, then its reply: 9
 /// chunk sends in all.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn resumes_stop_after_eight() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1389,7 +1437,7 @@ async fn resumes_stop_after_eight() {
 }
 
 /// One run walks at most 64 expired uploads, then says so.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn one_run_walks_at_most_64_expired_uploads() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1430,7 +1478,7 @@ async fn one_run_walks_at_most_64_expired_uploads() {
 
 /// The chain memory keeps the newest 1024 files; remembering a file again
 /// makes it the newest.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_chain_memory_keeps_the_newest_1024_files() {
     let _guard = begin().await;
     // 1024 written out, not `MAX_TAILS`, so the bound itself is pinned.
@@ -1450,7 +1498,7 @@ async fn the_chain_memory_keeps_the_newest_1024_files() {
 
 /// A file that cannot be read, wherever that is found out, answers only
 /// that: never the path, never the I/O error's text.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unreadable_file_says_only_that() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1465,7 +1513,7 @@ async fn an_unreadable_file_says_only_that() {
 
 /// A chunk reply that claims more than the file holds is refused, and no
 /// import starts on it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_chunk_reply_past_the_size_is_refused() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1592,7 +1640,7 @@ fn an_envelope_needs_its_code_and_message_and_a_null_details_is_none() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn progress_is_reported_before_each_chunk_and_at_the_end() {
     let _guard = begin().await;
     let dir = WorkDir::new();
@@ -1610,7 +1658,7 @@ async fn progress_is_reported_before_each_chunk_and_at_the_end() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_mismatch_that_names_the_same_offset_is_not_sent_again() {
     let _guard = begin().await;
     let dir = WorkDir::new();

@@ -46,6 +46,14 @@ const RETRY: &[&str] = &[
 /// Sends per step. Every step is idempotent (the key, a chunk replay, the
 /// upload id), so a retry never doubles anything.
 const ATTEMPTS: usize = 3;
+/// The waits before the second and the third send. A module still starting
+/// answers `module_not_ready` for about 1.3 s after `daemon start` returns (a
+/// debug build hashing its package, R6-RELEASE-USECASES.md); three sends back
+/// to back all land in that window, these 2 s outlast it.
+const PAUSES: [std::time::Duration; ATTEMPTS - 1] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_millis(1500),
+];
 /// 409 resumes allowed in one run, so a confused server cannot loop us.
 const MAX_RESUMES: usize = 8;
 /// Uploads tried in one run: the first, then one more for each that the OS
@@ -248,7 +256,10 @@ async fn sha256_of(path: &Path) -> std::io::Result<String> {
 
 async fn step<T: Transport + Sync>(transport: &T, request: Request) -> Response {
     let mut res = Response::fail(503, "backend_unreachable", "not sent");
-    for _ in 0..ATTEMPTS {
+    for attempt in 0..ATTEMPTS {
+        if let Some(pause) = attempt.checked_sub(1).and_then(|i| PAUSES.get(i)) {
+            tokio::time::sleep(*pause).await;
+        }
         res = to_response(transport.send(request.clone()).await);
         if !retryable(&res) {
             return res;
