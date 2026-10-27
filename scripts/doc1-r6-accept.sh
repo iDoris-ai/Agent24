@@ -361,8 +361,9 @@ check T2 "the module's tool route is not reachable from outside" "$(is "$code/$(
 # what a page holds is judged against that read, not against fixed ids.
 if [ -n "$NEXT" ]; then
   ids() { last "$1" '[.data.blocks[].block_id] | join(",")'; }
-  # lines OUT: how many lines a --json run printed (its result is the only one).
-  lines() { wc -l < "$1" | tr -d ' '; }
+  # lines OUT: how many lines a --json run printed (its result is the only
+  # one), a last line with no newline counted too.
+  lines() { awk 'END { print NR }' "$1"; }
   # dims PNG: its pixel size as WxH ("" for a file that is no image).
   dims() { sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null | awk '/pixel/ { print $2 }' | paste -sd x -; }
   png() { [ "$(head -c 8 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 89504e470d0a1a0a ] && echo y; }
