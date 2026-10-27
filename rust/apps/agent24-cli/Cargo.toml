@@ -11,6 +11,11 @@ name = "agent24"
 path = "src/main.rs"
 
 [dependencies]
+# `documents render --out`: the page comes as base64 in the JSON result.
+base64 = "0.22"
+# `documents render --out`: the page goes into a file of its own beside the
+# target first and is renamed over it, so a failure leaves the target as it was.
+tempfile = "3"
 agent24-documents-client = { path = "../../crates/agent24-documents-client" }
 agent24-hw = { path = "../../crates/agent24-hw" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
@@ -40,7 +45,6 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
-tempfile = "3"
 # os_uninstall_consents: a store that opens but refuses the revocation.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
