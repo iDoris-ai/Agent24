@@ -2,12 +2,15 @@
 
 use super::super::tests::{C, H, T, durable, host, of, phase, write};
 use super::*;
+use crate::provider::connection::ProbeApplied;
+use crate::provider::credential::{Effects, Issued, Outcome};
 use crate::provider::journal::{SealWrite, Written};
 use crate::provider::member::Member;
 use crate::provider::placeholder::Placeholder;
 use crate::provider::profile::{IdentityChange, Profile, Slot};
 use crate::provider::replay::{Record, replay};
-use crate::provider::state::ConnectionPhase;
+use crate::provider::state::{ConnectionPhase, Probe, UnavailableCause};
+use std::time::Instant;
 
 fn created(binding: u32, principal: &'static str) -> Created<T> {
     Created {
@@ -103,6 +106,40 @@ fn a_new_binding_binds_once_its_first_value_is_confirmed() {
         value: 3,
     };
     assert!(write(&mut host).2.contains(&generation));
+}
+
+/// A new binding was never servable nor revoked: its first servable probe
+/// waits for that to be persisted (S1.12), and a refused issuance before it
+/// falls under S3.1's exception, without a revocation.
+#[test]
+fn a_new_binding_was_never_servable_nor_revoked() {
+    for answer in [Issued::Granted { narrowed: false }, Issued::Refused] {
+        let mut host = host_with_creation();
+        durable(&mut host);
+        let member = host.member(&"b").unwrap();
+        let Slot::Bound(state) = member.profile_mut().slot_mut() else {
+            panic!("b is not bound");
+        };
+        let ticket = state.issue().unwrap();
+        let out = state.issued(ticket, answer, Instant::now()).value;
+        assert_eq!(out, Outcome::Done(Effects::default()), "{answer:?}");
+        if answer == Issued::Refused {
+            let rejected = UnavailableCause::CredentialRejected;
+            assert_eq!(
+                phase(&host, "b"),
+                Some(ConnectionPhase::Unavailable(rejected))
+            );
+            continue;
+        }
+        let probe = state.probe().unwrap();
+        let servable = Probe::Answered {
+            live: true,
+            search_ready: true,
+            read_ready: true,
+        };
+        let applied = state.connection_mut().apply_probe(probe, servable);
+        assert_eq!(applied, ProbeApplied::PersistOnceServable);
+    }
 }
 
 fn host_with_creation() -> H {
@@ -448,6 +485,32 @@ fn an_unreachable_retry_clears_the_written_reason_first() {
     step(&mut host, &mut log);
     assert_eq!(failure(&host, "b"), Some(PlaceholderFailure::Dependency));
     assert_eq!(replay(10, log).unwrap().profiles["b"].failure, None);
+}
+
+/// #1337 F1: a written reason, then an unreachable retry, then a binding:
+/// the reason is gone as a restart reads it, the clearing confirmed before
+/// the binding or not.
+#[test]
+fn a_binding_after_an_unreachable_retry_leaves_no_written_reason() {
+    for settled in [true, false] {
+        let mut log = Vec::new();
+        let mut host = host_after(Attempted::Rejected);
+        step(&mut host, &mut log);
+        let attempt = host.attempt(&"b").unwrap();
+        host.attempt_failed("b", attempt, Attempted::Unreachable);
+        if settled {
+            step(&mut host, &mut log);
+        }
+        let attempt = host.attempt(&"b").unwrap();
+        host.identified("b", attempt, created(8, "alice"));
+        while let Some((attempt, record)) = host.take_write() {
+            log.push(record);
+            host.written(attempt, Written::Durable);
+        }
+        assert!(bound(&host, "b"), "{settled}");
+        let replayed = replay(10, log).unwrap();
+        assert_eq!(replayed.profiles["b"].failure, None, "{settled}");
+    }
 }
 
 /// "b" alone, a selected placeholder with `credential_rejected` written and

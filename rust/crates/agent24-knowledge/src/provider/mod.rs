@@ -28,3 +28,4 @@ pub mod record;
 pub mod recover;
 pub mod replay;
 pub mod state;
+pub mod stored;
