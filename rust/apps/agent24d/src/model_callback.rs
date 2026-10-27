@@ -517,16 +517,19 @@ impl ModelGrant {
 
     fn build(
         module: String,
-        access: ModelAccess,
+        _access: ModelAccess,
         deps: ModelCallbackDeps,
         limiter: RateLimiter,
     ) -> Self {
         Self {
             module,
-            privacy: match access {
-                ModelAccess::RemoteAllowed => Privacy::Any,
-                ModelAccess::LocalOnly => Privacy::LocalOnly,
-            },
+            // K1-6b.5g (David 2026-10-27, option C): every callback is routed
+            // LocalOnly, whatever `model_access` says. A callback carries no
+            // record of the sources its payload came from, and no cloud
+            // processing is wired (ADR-K1-02 §1), so it takes the strictest
+            // bound (§2.1.1 item 5). `remote_allowed` takes effect again only
+            // once an action-level source binding exists.
+            privacy: Privacy::LocalOnly,
             router: Arc::new(deps.router.with_separate_health()),
             limiter: Arc::new(limiter),
             deps,
@@ -1392,16 +1395,19 @@ mod tests {
         );
     }
 
-    // ---- ModelGrant::new / with_clock: privacy comes from ModelAccess, not the caller ----
+    // ---- ModelGrant::new / with_clock: privacy is the host's, not the manifest's or the caller's ----
 
+    /// K1-6b.5g: a `remote_allowed` manifest no longer widens routing, so the
+    /// router's LocalOnly exclusion, and not only its `deny_all` gate, keeps
+    /// every callback off remote tiers.
     #[test]
-    fn grant_privacy_comes_from_model_access() {
+    fn every_grant_routes_local_only_whatever_its_manifest_declares() {
         let kernel = Arc::new(ModelRouter::with_defaults(vec![]));
         let deps = kernel_deps(kernel);
         let local = ModelGrant::new("m".into(), ModelAccess::LocalOnly, deps.clone());
         assert_eq!(local.privacy, Privacy::LocalOnly);
         let remote = ModelGrant::new("m".into(), ModelAccess::RemoteAllowed, deps.clone());
-        assert_eq!(remote.privacy, Privacy::Any);
+        assert_eq!(remote.privacy, Privacy::LocalOnly);
 
         struct Frozen(std::time::Instant);
         impl Clock for Frozen {
@@ -1864,8 +1870,8 @@ mod handler_tests {
         let e = h.call(ok_params()).await.unwrap_err();
         assert_eq!(e.kind, Some(ErrorKind::Unavailable));
         assert_eq!(remote.calls.load(Ordering::SeqCst), 0);
-        // The remote grant affects routing eligibility but cannot replace the
-        // live host egress decision at the provider boundary.
+        // A `remote_allowed` manifest routes LocalOnly like any other
+        // (K1-6b.5g), so the remote-only router has nothing to offer it.
         let recs = sink.take();
         assert_eq!(recs.len(), 3);
         assert!(
