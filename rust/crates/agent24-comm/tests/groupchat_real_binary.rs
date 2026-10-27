@@ -418,3 +418,55 @@ async fn partial_fanout_is_502_partial_with_per_recipient_detail_and_retry_recov
         (Some(0), Some(2))
     );
 }
+
+/// 挑战 #1：以 `-` 开头的消息正文/群名/游标必须原样当作 flag 的值，
+/// 不能被 Hyphae 的 flag 解析当成另一个 flag。
+#[tokio::test]
+async fn dash_leading_text_is_a_value_not_a_flag() {
+    let fx = fx!("dash-leading");
+    let g = fx.active_group().await;
+    for (n, text) in [
+        (2u8, "--help"),
+        (3, "-x"),
+        (4, "--password-stdin"),
+        (5, "-"),
+    ] {
+        let logical = lid(n);
+        let (s, b) = fx.send(&g, text, &logical).await;
+        assert_eq!(s, StatusCode::OK, "{text}: {b}");
+        let (s, b) = call(
+            &fx.app,
+            "GET",
+            &format!("/groupchat/{g}/messages?identity=alice&limit=50"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(
+            b["data"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["plaintext"] == text),
+            "{text} not stored verbatim: {b}"
+        );
+    }
+    let (s, b) = call(
+        &fx.app,
+        "POST",
+        "/groupchat",
+        Some(json!({"name": "--name", "invitees": [fx.bob, fx.carol], "identity": "alice"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let made = b["data"]["group_id"].as_str().unwrap().to_owned();
+    let (s, b) = call(&fx.app, "GET", "/groupchat?identity=alice", None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(
+        b["data"]["groups"].as_array().unwrap().iter().any(|g| {
+            let id = g["group_id"].as_str().or_else(|| g["id"].as_str());
+            id == Some(made.as_str()) && g["name"] == "--name"
+        }),
+        "{b}"
+    );
+}

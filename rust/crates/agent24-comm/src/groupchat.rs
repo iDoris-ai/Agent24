@@ -151,6 +151,11 @@ struct CreateReq {
 
 fn create_argv(req: &CreateReq) -> Result<Vec<OsString>, CommError> {
     text("name", &req.name, 256)?;
+    if req.invitees.is_empty() {
+        return Err(CommError::Invalid(
+            "invitees must name at least one npub".to_owned(),
+        ));
+    }
     if req.invitees.len() > MAX_INVITEES {
         return Err(CommError::Invalid(format!(
             "at most {MAX_INVITEES} invitees"
@@ -552,6 +557,22 @@ mod tests {
             identity: None,
         };
         assert!(retry_argv(G, G, &r).is_err());
+    }
+
+    #[test]
+    fn create_requires_at_least_one_invitee() {
+        // Hyphae answers an empty invitee list with `Required flag "invitee"
+        // not set`; reject it here with a message that names the JSON field.
+        let c = CreateReq {
+            name: "g".into(),
+            invitees: vec![],
+            identity: None,
+        };
+        let err = create_argv(&c).unwrap_err();
+        assert!(
+            matches!(&err, CommError::Invalid(m) if m.contains("invitees")),
+            "{err}"
+        );
     }
 
     #[test]

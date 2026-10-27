@@ -3448,6 +3448,50 @@ pub(crate) mod tests {
         assert!(extra_in_openapi.is_empty());
     }
 
+    /// The comm scan reads `.route(` literals out of two functions. A route
+    /// added through `.merge(`/`.nest(` of another module (or a second
+    /// `routes()`) would be invisible to it AND absent from OpenAPI, i.e. the
+    /// gate would pass an unregistered route. Pin the composition instead.
+    fn comm_composition_is_scanned(router_source: &str) -> Result<(), String> {
+        let start = router_source
+            .find("pub fn router(")
+            .ok_or("pub fn router( must exist")?;
+        let body = &router_source[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .ok_or("router must be brace-terminated")?];
+        let composed: Vec<&str> = body
+            .match_indices(".merge(")
+            .chain(body.match_indices(".nest("))
+            .chain(body.match_indices(".fallback"))
+            .chain(body.match_indices(".route_service("))
+            .map(|(i, _)| body[i..].lines().next().unwrap_or("").trim())
+            .collect();
+        if composed == [".merge(crate::groupchat::routes())"] {
+            Ok(())
+        } else {
+            Err(format!(
+                "comm router composes unscanned routes; extend COMM_ROUTE_SOURCES: {composed:?}"
+            ))
+        }
+    }
+
+    #[test]
+    fn comm_route_scan_covers_every_composed_module() {
+        let real = COMM_ROUTE_SOURCES[0].0;
+        comm_composition_is_scanned(real).unwrap();
+        let sneaky = real.replace(
+            ".merge(crate::groupchat::routes())",
+            ".merge(crate::groupchat::routes())\n        .merge(crate::other::routes())",
+        );
+        assert!(comm_composition_is_scanned(&sneaky).is_err());
+        let nested = real.replace(
+            ".merge(crate::groupchat::routes())",
+            ".merge(crate::groupchat::routes())\n        .nest(\"/x\", y())",
+        );
+        assert!(comm_composition_is_scanned(&nested).is_err());
+    }
+
     #[test]
     fn route_openapi_gate_covers_comm_routes() {
         let routes = include_str!("server.rs");
