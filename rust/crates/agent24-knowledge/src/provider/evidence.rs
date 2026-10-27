@@ -196,8 +196,8 @@ impl<K: Ord + Clone> Evidence<K> {
     }
 
     /// For the history sent to the model, by any of the evidence's KBs: a
-    /// placeholder if a rule covers one, else held back if one is. Evidence
-    /// of a retired binding is a placeholder, held back or not (S3.1);
+    /// placeholder if a rule covers one, else held back if one is, or if it
+    /// names no KB (#1305 note 4: fail closed). Evidence of a retired binding is a placeholder, held back or not (S3.1);
     /// evidence whose binding is not in the state after a restart is the
     /// caller's to replace (I5).
     pub fn shown(&self, retired: bool, delivered: &Delivered<K>) -> Shown {
@@ -208,7 +208,7 @@ impl<K: Ord + Clone> Evidence<K> {
         // Evidence delivered after the registration is held back too.
         let questioned = |kb: &K| self.pending.as_ref().is_some_and(|p| p.kbs.contains(kb));
         let unresolved = |kb: &K| self.tombstones.get(kb) == Some(&Tombstone::Unresolved);
-        if kbs.iter().any(|kb| questioned(kb) || unresolved(kb)) {
+        if kbs.is_empty() || kbs.iter().any(|kb| questioned(kb) || unresolved(kb)) {
             Shown::Withheld
         } else {
             Shown::Body
