@@ -467,9 +467,9 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
   # 1) 删掉 role 卡里 daily 那一行，重启 iDoris；没有绑定的 role 不进选路
   N0=$(wc -l < $WORK/fb.log); ic "$KEY" idoris/daily; N1=$(wc -l < $WORK/fb.log)
   # 2) 停掉假后端（本地没有模型）再请求 idoris/fast
-  # 3) IDORIS_REMOTE_KILL_SWITCH=1 重启 iDoris 再各请求一次
+  # 3) IDORIS_REMOTE_KILL_SWITCH=1 重启 iDoris：3a 已绑定的 daily 仍 200/loopback（熔断只切远程，正对照）；3b 熔断 + 停掉假后端，再请求 → 503
   ```
-- 期望：fail-closed，503（`local_only_unavailable` 或 `no_eligible_candidate`），不退到别的 role，也不自动选第一个模型；**假后端（直连后端）请求计数不变**（`N1 = N0`）。Agent24 侧提示「本地没有可用模型」。402 是终态（不重试、不换 provider），由 iDoris 侧用例覆盖，Agent24 侧只确认 402 不触发重试。
+- 期望：第 1、2、3b 步 fail-closed，503，`reason_code` 一律是 `local_only_unavailable`（iDoris v0.3.1 不区分原因，见 #1370 issuecomment-6443049445），响应**不带** `X-iDoris-Served-Locality` 头；不退到别的 role，也不自动选第一个模型；**假后端（直连后端）请求计数不变**（`N1 = N0`）。第 3a 步：`IDORIS_REMOTE_KILL_SWITCH=1` 只切远程，本地已绑定的 daily 照常 200、locality=`loopback`（设计行为，不是缺陷）。Agent24 侧提示「本地没有可用模型」。402 是终态（不重试、不换 provider），由 iDoris 侧用例覆盖（v0.3.1 tag 上 18 个用例，断言不碰上游、不扣账；纯本地链路无法复现，见 #1370），Agent24 侧只确认 402 不触发重试。
 - 判定：`ic` 返回 503；`[ "$N1" = "$N0" ]`。
 - PR/issue：#1370（ID-2）。执行方式：脚本（`--idoris`，只覆盖第 1 步；2、3 步手工）。
 
