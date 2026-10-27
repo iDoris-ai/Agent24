@@ -108,9 +108,12 @@ async fn a_read_needs_its_revision_an_engine_and_a_format_the_engine_reads() {
         media_type: "application/msword".into(),
         ..rev(DOC, 1)
     };
-    let err = current_layer(&state, &storage, &docx).await.err().unwrap();
+    let err = current_layer(&state, &storage, &docx, Requester::Page)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(err.code(), "unsupported_format");
-    let err = current_layer(&state, &storage, &rev(DOC, 1))
+    let err = current_layer(&state, &storage, &rev(DOC, 1), Requester::Page)
         .await
         .err()
         .unwrap();

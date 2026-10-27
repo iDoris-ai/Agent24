@@ -364,7 +364,7 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 | M2-06 | 审批回调绑定请求生命周期（FU-70 / FU-54） | — | 是（权限 + 数据写入） | `DONE` | #746 |
 | M2-07 | 记账收口（SPEC / followups / ADR，按 D1–D3 落文） | M2-02…06、D1–D3 | 否 | `DONE` | 本 PR |
 | M2-08 | 模块目录 `openat` 逐级打开（F6，**仅当 D2 = B**） | D2 | 是（安全） | `CANCELLED` | D2 接受检查级处理；不做 |
-| **M2 release** | `ab/m2` → main（PR-Daemon APPROVE + jason 真机验收） | 全部 | — | `BACKLOG` |  |
+| **M2 release** | `ab/m2` → main（PR-Daemon APPROVE + 完整用例验收，见 AGENTS.md） | 全部 | — | `BACKLOG` |  |
 
 ## M1 v2 台账（2026-10-01 冻结；本表是 M1 唯一的状态来源）—— ✅ 2026-10-07 已全部合入 main（#720）
 

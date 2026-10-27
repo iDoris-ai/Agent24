@@ -12,11 +12,12 @@ if (backend === 'node') {
   process.exit(0)
 }
 
-console.log('[dev] building the Rust debug agent24d…')
+// agent24 too: the document import runs `agent24 documents import`.
+console.log('[dev] building the Rust debug agent24d and agent24…')
 try {
   execFileSync(
     'cargo',
-    ['build', '-p', 'agent24d', '--manifest-path', '../../rust/Cargo.toml'],
+    ['build', '-p', 'agent24d', '-p', 'agent24-cli', '--manifest-path', '../../rust/Cargo.toml'],
     { stdio: 'inherit' },
   )
 } catch {

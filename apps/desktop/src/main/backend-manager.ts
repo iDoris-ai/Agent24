@@ -58,6 +58,21 @@ export function daemonConnection(): DaemonConnection | null {
   return { port, authHeaders: { Authorization: `Bearer ${auth.token}` } }
 }
 
+/** The daemon's port and main's credential, for the `agent24` CLI that main
+ * runs and hands them to on stdin (documents-cli.ts). Null in the same cases
+ * as `daemonConnection`; the node mock takes no credential, so it is empty. */
+export interface CliEndpoint {
+  port: number
+  token: string
+}
+
+export function daemonCliEndpoint(): CliEndpoint | null {
+  if (!current) return null
+  const { port, auth } = current
+  if (auth.kind === 'none') return { port, token: '' }
+  return auth.token ? { port, token: auth.token } : null
+}
+
 /** How the desktop asks agent24d to authenticate. Capability mode needs the
  * daemon to verify that stdin/stdout are private pipes, which it can do only
  * on Unix; Windows and the node mock keep the single legacy token. */
@@ -109,9 +124,13 @@ function resolveNodeEntry(): string {
 }
 
 function resolveRustBinary(): string {
-  const override = process.env['AGENT24D_BIN']
-  if (override) return override
-  const exe = process.platform === 'win32' ? 'agent24d.exe' : 'agent24d'
+  return process.env['AGENT24D_BIN'] || resolveBundledRustBinary('agent24d')
+}
+
+/** A Rust binary the app ships: `agent24d`, or the `agent24` CLI whose
+ * commands main runs (documents-import.ts). */
+export function resolveBundledRustBinary(name: string): string {
+  const exe = process.platform === 'win32' ? `${name}.exe` : name
   if (isDev) {
     return path.join(repoRootDev(), 'rust', 'target', 'debug', exe)
   }
