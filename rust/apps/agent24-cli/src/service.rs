@@ -419,13 +419,20 @@ mod tests {
         std::fs::write(&out, "x").unwrap();
         std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(!plist_has_ready_omit_token(&plist), "control: old plist lacks the flag");
+        assert!(
+            !plist_has_ready_omit_token(&plist),
+            "control: old plist lacks the flag"
+        );
 
         write_install_files(Path::new("/new/agent24d"), &plist, &out, &err, &[]).unwrap();
 
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert!(plist_has_ready_omit_token(&plist));
-        assert!(std::fs::read_to_string(&plist).unwrap().contains("/new/agent24d"));
+        assert!(
+            std::fs::read_to_string(&plist)
+                .unwrap()
+                .contains("/new/agent24d")
+        );
         assert_eq!(mode(&plist), 0o600);
         assert_eq!(mode(&logs), 0o700);
         assert_eq!(mode(&out), 0o600);
@@ -435,7 +442,9 @@ mod tests {
 
     #[test]
     fn a_missing_plist_is_not_reported_as_stale() {
-        assert!(!plist_has_ready_omit_token(Path::new("/nonexistent/x.plist")));
+        assert!(!plist_has_ready_omit_token(Path::new(
+            "/nonexistent/x.plist"
+        )));
     }
 
     #[test]
