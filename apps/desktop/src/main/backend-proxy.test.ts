@@ -38,6 +38,13 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('POST', '/api/v1/approvals?status=pending')).toBe(false)
     expect(isAllowedProxyRoute('get', '/api/v1/models')).toBe(false)
   })
+  it('rejects control characters anywhere in path or query (header/request-line smuggling)', () => {
+    for (const bad of ['\n', '\r', '\0', '\t', '\u001f', '\u007f']) {
+      expect(isAllowedProxyRoute('GET', `/api/v1/runs?x=1${bad}Host: evil`), JSON.stringify(bad)).toBe(false)
+      expect(isAllowedProxyRoute('GET', `/api/v1/runs/a${bad}b`), JSON.stringify(bad)).toBe(false)
+    }
+    expect(isAllowedProxyRoute('GET', '/api/v1/runs?x=1&y=%0d%0a')).toBe(true)
+  })
   it('rejects fragments and non-absolute paths', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/models#x')).toBe(false)
     expect(isAllowedProxyRoute('GET', 'api/v1/models')).toBe(false)
@@ -175,6 +182,23 @@ describe('A2 proxyRequest', () => {
     const out = await proxyRequest({ port, token: '' }, { method: 'GET', path: '/x' })
     expect(out.ok).toBe(false)
     expect((out.data as { error: { code: string; message: string } }).error.code).toBe('proxy_failed')
+  })
+
+  it('a synchronous http.request throw becomes proxy_failed, with no stray timer error', async () => {
+    const ep = await serve((_q, res) => res.end('{}'))
+    // A space in the path makes node throw ERR_UNESCAPED_CHARACTERS synchronously.
+    const out = await proxyRequest(ep, { method: 'GET', path: '/bad path' }, { timeoutMs: 50 })
+    expect(out.ok).toBe(false)
+    expect((out.data as { error: { code: string } }).error.code).toBe('proxy_failed')
+    // Outlive the (cleared) deadline: a leftover timer would throw here.
+    await new Promise((r) => setTimeout(r, 120))
+  })
+
+  it('an invalid method also stays inside the unified error shape', async () => {
+    const ep = await serve((_q, res) => res.end('{}'))
+    const out = await proxyRequest(ep, { method: 'BAD METHOD' as never, path: '/x' }, { timeoutMs: 50 })
+    expect((out.data as { error: { code: string } }).error.code).toBe('proxy_failed')
+    await new Promise((r) => setTimeout(r, 120))
   })
 
   it('sends the bearer token and JSON body', async () => {

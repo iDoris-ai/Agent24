@@ -115,17 +115,28 @@ export function matchTemplate(template: string, pathname: string): boolean {
 
 /** The matching allowlist entry, or null. The query string is not matched. */
 export function findAllowedRoute(method: string, requestPath: string): ProxyRoute | null {
-  if (!requestPath.startsWith('/') || requestPath.includes('#')) return null
+  // eslint-disable-next-line no-control-regex -- control characters (CR/LF/NUL...) must never reach the request line
+  if (
+    !requestPath.startsWith('/') ||
+    requestPath.includes('#') ||
+    /[\u0000-\u001f\u007f]/.test(requestPath)
+  )
+    return null
   const q = requestPath.indexOf('?')
   const pathname = q === -1 ? requestPath : requestPath.slice(0, q)
-  return ALLOWED_PROXY_ROUTES.find((rt) => rt.method === method && matchTemplate(rt.template, pathname)) ?? null
+  return (
+    ALLOWED_PROXY_ROUTES.find(
+      (rt) => rt.method === method && matchTemplate(rt.template, pathname),
+    ) ?? null
+  )
 }
 
 export function isAllowedProxyRoute(method: string, requestPath: string): boolean {
   return findAllowedRoute(method, requestPath) !== null
 }
 
-export type ProxyErrorCode = 'forbidden' | 'timeout' | 'payload_too_large' | 'proxy_failed' | 'backend_not_ready'
+export type ProxyErrorCode =
+  'forbidden' | 'timeout' | 'payload_too_large' | 'proxy_failed' | 'backend_not_ready'
 
 const ERROR_STATUS: Record<ProxyErrorCode, number> = {
   forbidden: 403,
@@ -172,59 +183,66 @@ export function proxyRequest(
       resolve(value)
     }
 
-    const outReq = http.request(
-      {
-        host: opts.host ?? '127.0.0.1',
-        port: endpoint.port,
-        path: req.path,
-        method: req.method,
-        headers: {
-          'Content-Type': 'application/json',
-          ...(endpoint.token ? { Authorization: 'Bearer ' + endpoint.token } : {}),
-          ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
+    let outReq: http.ClientRequest | undefined
+    try {
+      outReq = http.request(
+        {
+          host: opts.host ?? '127.0.0.1',
+          port: endpoint.port,
+          path: req.path,
+          method: req.method,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(endpoint.token ? { Authorization: 'Bearer ' + endpoint.token } : {}),
+            ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
+          },
         },
-      },
-      (res) => {
-        const declared = Number(res.headers['content-length'])
-        if (Number.isFinite(declared) && declared > maxBytes) {
-          finish(proxyError('payload_too_large', `daemon response exceeds ${maxBytes} bytes`))
-          outReq.destroy()
-          return
-        }
-        const chunks: Buffer[] = []
-        let received = 0
-        res.on('data', (chunk: Buffer) => {
-          received += chunk.length
-          if (received > maxBytes) {
+        (res) => {
+          const declared = Number(res.headers['content-length'])
+          if (Number.isFinite(declared) && declared > maxBytes) {
             finish(proxyError('payload_too_large', `daemon response exceeds ${maxBytes} bytes`))
-            outReq.destroy()
+            outReq?.destroy()
             return
           }
-          chunks.push(chunk)
-        })
-        res.on('end', () => {
-          let data: unknown = null
-          try {
-            data = JSON.parse(Buffer.concat(chunks).toString())
-          } catch {
-            data = null
-          }
-          const status = res.statusCode ?? 500
-          finish({ ok: status < 400, status, data })
-        })
-        res.on('error', (err) => finish(proxyError('proxy_failed', err.message)))
-      },
-    )
+          const chunks: Buffer[] = []
+          let received = 0
+          res.on('data', (chunk: Buffer) => {
+            received += chunk.length
+            if (received > maxBytes) {
+              finish(proxyError('payload_too_large', `daemon response exceeds ${maxBytes} bytes`))
+              outReq?.destroy()
+              return
+            }
+            chunks.push(chunk)
+          })
+          res.on('end', () => {
+            let data: unknown = null
+            try {
+              data = JSON.parse(Buffer.concat(chunks).toString())
+            } catch {
+              data = null
+            }
+            const status = res.statusCode ?? 500
+            finish({ ok: status < 400, status, data })
+          })
+          res.on('error', (err) => finish(proxyError('proxy_failed', err.message)))
+        },
+      )
+    } catch (err) {
+      finish(proxyError('proxy_failed', (err as Error).message))
+      return
+    }
 
     function onTimeout(): void {
       finish(proxyError('timeout', `daemon did not answer within ${timeoutMs} ms`))
-      outReq.destroy()
+      outReq?.destroy()
     }
-    outReq.setTimeout(timeoutMs, onTimeout)
+    const sent = outReq
+    sent.setTimeout(timeoutMs, onTimeout)
 
-    outReq.on('error', (err) => finish(proxyError('proxy_failed', err.message)))
-    if (body) outReq.write(body)
-    outReq.end()
+    sent.on('error', (err) => finish(proxyError('proxy_failed', err.message)))
+    if (body) sent.write(body)
+    sent.end()
   })
 }
 

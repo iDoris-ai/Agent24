@@ -159,6 +159,23 @@ async function confirmNative(event: IpcMainInvokeEvent, message: string, detail:
   }
 }
 
+const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max)}…` : text)
+
+// Sensitive IPCs share one in-flight slot: a script that fires them in a loop
+// must not be able to stack native dialogs. Busy => immediate refusal, no queue.
+let sensitiveBusy = false
+async function exclusive(fn: () => Promise<BackendProxyResponse>): Promise<BackendProxyResponse> {
+  if (sensitiveBusy) {
+    return { ok: false, status: 429, data: { error: { code: 'busy', message: '另一项需要确认的操作正在进行' } } }
+  }
+  sensitiveBusy = true
+  try {
+    return await fn()
+  } finally {
+    sensitiveBusy = false
+  }
+}
+
 const cancelled = (): BackendProxyResponse =>
   ({ ok: false, status: 499, data: { error: { code: 'cancelled', message: '操作已取消' } } })
 const invalidRequest = (message: string): BackendProxyResponse =>
@@ -327,38 +344,65 @@ export function registerIpcHandlers(options: {
   })
 
   // A1: POST /api/v1/approvals/{id} — an elevated operation, so it is not on
-  // the generic proxy. The user confirms in a native dialog built here.
-  handle(IpcChannels.ApprovalDecide, async (event, id: unknown, decision: unknown): Promise<BackendProxyResponse> => {
-    const d = decision as { type?: unknown; reason?: unknown } | null
-    if (typeof id !== 'string' || !SAFE_ID.test(id) || id === '.' || id === '..') return invalidRequest('invalid approval id')
-    if (typeof d !== 'object' || d === null || !(APPROVAL_DECISION_TYPES as readonly unknown[]).includes(d.type)) {
-      return invalidRequest('invalid decision')
-    }
-    if (d.reason !== undefined && typeof d.reason !== 'string') return invalidRequest('invalid reason')
-    const label: Record<string, string> = { approve: '批准', approve_for_session: '本会话内一律批准', deny: '拒绝', abort: '中止' }
-    const ok = await confirmNative(
-      event,
-      `确认对审批 ${id} 做出「${label[d.type as string]}」决定？`,
-      typeof d.reason === 'string' && d.reason ? `原因：${d.reason}` : '此决定会立即生效，且可能无法撤销。',
-    )
-    if (!ok) return cancelled()
-    return proxyToBackend({
-      method: 'POST',
-      path: `/api/v1/approvals/${id}`,
-      body: { type: d.type, ...(typeof d.reason === 'string' ? { reason: d.reason } : {}) },
-    })
-  })
+  // the generic proxy. The native dialog shows the daemon's OWN record of the
+  // approval (read here, by id), never text supplied by the page; the page's
+  // reason is shown only as a note. Unreadable record => refuse, no dialog.
+  handle(IpcChannels.ApprovalDecide, (event, id: unknown, decision: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      const d = decision as { type?: unknown; reason?: unknown } | null
+      if (typeof id !== 'string' || !SAFE_ID.test(id) || id === '.' || id === '..') return invalidRequest('invalid approval id')
+      if (typeof d !== 'object' || d === null || !(APPROVAL_DECISION_TYPES as readonly unknown[]).includes(d.type)) {
+        return invalidRequest('invalid decision')
+      }
+      if (d.reason !== undefined && typeof d.reason !== 'string') return invalidRequest('invalid reason')
 
-  // A1: PATCH /api/v1/os/{name} — enables/disables a domain OS module.
-  handle(IpcChannels.OsModuleSetEnabled, async (event, name: unknown, enabled: unknown): Promise<BackendProxyResponse> => {
-    if (typeof name !== 'string' || !SAFE_ID.test(name) || name === '.' || name === '..') return invalidRequest('invalid module name')
-    if (typeof enabled !== 'boolean') return invalidRequest('enabled must be a boolean')
-    const ok = await confirmNative(
-      event,
-      `确认${enabled ? '启用' : '停用'}领域模块「${name}」？`,
-      '变更写入配置，守护进程重启后生效。',
-    )
-    if (!ok) return cancelled()
-    return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })
-  })
+      const rec = await proxyToBackend({ method: 'GET', path: `/api/v1/approvals/${id}` })
+      if (!rec.ok || typeof rec.data !== 'object' || rec.data === null) {
+        return { ok: false, status: rec.status === 404 ? 404 : 502, data: { error: { code: 'approval_unavailable', message: '读不到该审批的真实记录，已拒绝操作' } } }
+      }
+      const a = rec.data as { kind?: unknown; summary?: unknown; payload?: unknown; run_id?: unknown; status?: unknown }
+      if (a.status !== undefined && a.status !== 'pending') {
+        return { ok: false, status: 409, data: { error: { code: 'not_pending', message: `审批已处于 ${String(a.status)} 状态` } } }
+      }
+      const label: Record<string, string> = { approve: '批准', approve_for_session: '本会话内一律批准', deny: '拒绝', abort: '中止' }
+      const payload = clip(JSON.stringify(a.payload ?? {}), 600)
+      const detail = [
+        `类型：${clip(String(a.kind ?? '?'), 40)}`,
+        `摘要：${clip(String(a.summary ?? ''), 300)}`,
+        `运行：${clip(String(a.run_id ?? '?'), 80)}`,
+        `详情：${payload}`,
+        typeof d.reason === 'string' && d.reason ? `页面备注（仅供参考）：${clip(d.reason, 200)}` : '',
+        '此决定会立即生效，且可能无法撤销。',
+      ].filter(Boolean).join('\n')
+      const ok = await confirmNative(event, `确认对审批 ${id} 做出「${label[d.type as string]}」决定？`, detail)
+      if (!ok) return cancelled()
+      return proxyToBackend({
+        method: 'POST',
+        path: `/api/v1/approvals/${id}`,
+        body: { type: d.type, ...(typeof d.reason === 'string' ? { reason: d.reason } : {}) },
+      })
+    }),
+  )
+
+  // A1: PATCH /api/v1/os/{name} — enables/disables a domain OS module. The
+  // dialog names the module as the daemon lists it, and the state it becomes.
+  handle(IpcChannels.OsModuleSetEnabled, (event, name: unknown, enabled: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (typeof name !== 'string' || !SAFE_ID.test(name) || name === '.' || name === '..') return invalidRequest('invalid module name')
+      if (typeof enabled !== 'boolean') return invalidRequest('enabled must be a boolean')
+      const list = await proxyToBackend({ method: 'GET', path: '/api/v1/os' })
+      const mods = (list.data as { modules?: { name?: unknown; enabled?: unknown; version?: unknown }[] } | null)?.modules
+      const mod = list.ok && Array.isArray(mods) ? mods.find((m) => m.name === name) : undefined
+      if (!mod) {
+        return { ok: false, status: 404, data: { error: { code: 'module_unavailable', message: '守护进程没有该领域模块，已拒绝操作' } } }
+      }
+      const ok = await confirmNative(
+        event,
+        `确认将领域模块「${name}」${mod.enabled === true ? '由 启用 改为' : mod.enabled === false ? '由 停用 改为' : '改为'} ${enabled ? '启用' : '停用'}？`,
+        `版本：${clip(String(mod.version ?? '?'), 40)}\n变更写入配置，守护进程重启后生效。`,
+      )
+      if (!ok) return cancelled()
+      return proxyToBackend({ method: 'PATCH', path: `/api/v1/os/${encodeURIComponent(name)}`, body: { enabled } })
+    }),
+  )
 }

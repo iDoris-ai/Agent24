@@ -47,10 +47,22 @@ beforeAll(async () => {
     const chunks: Buffer[] = []
     req.on('data', (c: Buffer) => chunks.push(c))
     req.on('end', () => {
-      seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
+      if (!(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/v1/models') res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
-      else res.end(JSON.stringify({ ok: true, echoed: req.url }))
+      else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_1') {
+        res.end(JSON.stringify({
+          id: 'ap_1', kind: 'exec', summary: 'REAL: rm -rf /tmp/real', run_id: 'run_real',
+          payload: { argv: ['rm', '-rf', '/tmp/real'] }, status: 'pending',
+        }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_done') {
+        res.end(JSON.stringify({ id: 'ap_done', kind: 'exec', summary: 's', status: 'approved' }))
+      } else if (req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/ap_missing')) {
+        res.statusCode = 404
+        res.end(JSON.stringify({ error: { code: 'not_found', message: 'nope' } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/os') {
+        res.end(JSON.stringify({ modules: [{ name: 'sin90', enabled: false, version: '0.5.0' }] }))
+      } else res.end(JSON.stringify({ ok: true, echoed: req.url }))
     })
   })
   await new Promise<void>((r) => daemon.listen(0, '127.0.0.1', r))
@@ -132,6 +144,29 @@ describe('A1 backendProxy allowlist', () => {
       expect(res.data.error.code).toBe('cancelled')
       expect(seen).toHaveLength(0)
     })
+    it('the dialog shows the daemon record, not page-supplied text; page reason is only a note', async () => {
+      showMessageBox.mockResolvedValue({ response: 0 })
+      await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve', reason: 'harmless readme tweak' })
+      const opts = showMessageBox.mock.calls[0]!.at(-1) as { message: string; detail: string }
+      expect(opts.message).toContain('ap_1')
+      expect(opts.detail).toContain('REAL: rm -rf /tmp/real')
+      expect(opts.detail).toContain('run_real')
+      expect(opts.detail).toContain('exec')
+      expect(opts.detail).toContain('/tmp/real')
+      expect(opts.detail).toContain('页面备注（仅供参考）：harmless readme tweak')
+    })
+    it('daemon 404 -> refused without any dialog or POST', async () => {
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_missing', { type: 'approve' })
+      expect(res.ok).toBe(false)
+      expect(res.data.error.code).toBe('approval_unavailable')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(seen).toHaveLength(0)
+    })
+    it('an already-resolved approval is refused without a dialog (409)', async () => {
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_done', { type: 'approve' })
+      expect(res.status).toBe(409)
+      expect(showMessageBox).not.toHaveBeenCalled()
+    })
     it('rejects malformed ids/decisions before even asking', async () => {
       for (const [id, d] of [['../shutdown', { type: 'approve' }], ['ap_1', { type: 'nuke' }], ['ap_1', null], [7, { type: 'approve' }]]) {
         const res = await call(IpcChannels.ApprovalDecide, id, d)
@@ -152,12 +187,49 @@ describe('A1 backendProxy allowlist', () => {
       expect(seen[0]?.url).toBe('/api/v1/os/sin90')
       expect(JSON.parse(seen[0]!.body)).toEqual({ enabled: true })
     })
+    it('the dialog names the module and the state it becomes, from the daemon list', async () => {
+      showMessageBox.mockResolvedValue({ response: 1 })
+      await call(IpcChannels.OsModuleSetEnabled, 'sin90', true)
+      const opts = showMessageBox.mock.calls[0]!.at(-1) as { message: string; detail: string }
+      expect(opts.message).toContain('sin90')
+      expect(opts.message).toContain('停用 改为 启用')
+      expect(opts.detail).toContain('0.5.0')
+    })
+    it('a module the daemon does not list is refused without a dialog', async () => {
+      const res = await call(IpcChannels.OsModuleSetEnabled, 'ghost', true)
+      expect(res.data.error.code).toBe('module_unavailable')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(seen).toHaveLength(0)
+    })
     it('sends nothing when cancelled', async () => {
       showMessageBox.mockResolvedValue({ response: 1 })
       const res = await call(IpcChannels.OsModuleSetEnabled, 'sin90', false)
       expect(res.ok).toBe(false)
       expect(seen).toHaveLength(0)
     })
+  })
+})
+
+describe('sensitive IPCs share one in-flight slot (no dialog stacking)', () => {
+  it('two concurrent calls open one dialog; the second is busy immediately', async () => {
+    let release!: (v: { response: number }) => void
+    showMessageBox.mockReturnValue(new Promise((r) => { release = r }))
+    const first = call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+    const second = call(IpcChannels.OsModuleSetEnabled, 'sin90', true)
+    const third = call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+    expect((await second).data.error.code).toBe('busy')
+    expect((await third).data.error.code).toBe('busy')
+    // Let the first reach its dialog, then confirm it.
+    await vi.waitFor(() => expect(showMessageBox).toHaveBeenCalledTimes(1))
+    release({ response: 1 })
+    expect((await first).data.error.code).toBe('cancelled')
+    expect(showMessageBox).toHaveBeenCalledTimes(1)
+  })
+  it('the slot is released afterwards (also after a refusal)', async () => {
+    await call(IpcChannels.ApprovalDecide, 'ap_missing', { type: 'approve' })
+    showMessageBox.mockResolvedValue({ response: 1 })
+    const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+    expect(res.data.error.code).toBe('cancelled')
   })
 })
 
