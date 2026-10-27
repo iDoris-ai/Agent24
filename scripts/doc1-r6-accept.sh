@@ -13,8 +13,9 @@
 # pdfkit engine sources and the samples found here. macOS only (the engine).
 # The daemon runs on its own AGENT24_DATA_DIR under --work; Z1 checks the
 # user's ~/.agent24, so stop your own daemon first. No model is needed.
-# Needs jq, curl, perl, python3 and swiftc (engines/pdfkit/build.sh); with
-# --old, sqlite3 too (M4 reads the migrations, which have no product entry).
+# Needs jq, curl, perl, python3, sips (U9's PNG) and swiftc
+# (engines/pdfkit/build.sh); with --old, sqlite3 too (M4 reads the
+# migrations, which have no product entry).
 set -uo pipefail
 export LC_ALL=C
 # Relative paths are the caller's: taken from where it ran, before the cd.
@@ -40,7 +41,7 @@ for b in agent24 agent24d agent24-documents; do
   [ -x "$BIN/$b" ] || { echo "missing binary: $BIN/$b" >&2; exit 2; }
   [ -z "$OLD" ] || [ -x "$OLD/$b" ] || { echo "missing binary: $OLD/$b" >&2; exit 2; }
 done
-for t in jq curl perl python3 ${OLD:+sqlite3}; do
+for t in jq curl perl python3 sips ${OLD:+sqlite3}; do
   command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
 done
 resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
@@ -99,11 +100,11 @@ settle() {
 # The daemon this run started is stopped however the run ends.
 # C1 makes blobs/tmp read-only for a while: an interrupted run puts it back,
 # or the work dir cannot be removed.
-# Both data dirs (the M cases use a second one), whichever is current.
+# Every data dir (E and M use their own), whichever is current.
 cleanup() {
   [ -n "${TMPBLOBS:-}" ] && chmod u+w "$TMPBLOBS" 2>/dev/null
   local dir pid
-  for dir in "$WORK/data" "$WORK/up/data"; do
+  for dir in "$WORK/data" "$WORK/bare/data" "$WORK/up/data"; do
     [ -s "$dir/daemon.json" ] || continue
     AGENT24_DATA_DIR=$dir limit 30 "$BIN/agent24" daemon stop > /dev/null 2>&1 && continue
     pid=$(jq -r .pid "$dir/daemon.json" 2>/dev/null)
@@ -248,6 +249,9 @@ check O13 "a wrong token: unauthorized, exit 1" "$(is "$rc/$(grep -c '^error: un
 a24 documents job job_00000000000000000000000000 > /dev/null 2> "$WORK/o14.err"; rc=$?
 check O14 "job that does not exist: not_found" "$(is "$rc/$(cat "$WORK/o14.err")" "1/error: not_found: no such job")" "rc=$rc; $(one "$WORK/o14.err")"
 
+a24 documents get doc_00000000000000000000000000 > /dev/null 2> "$WORK/o15.err"; rc=$?
+check O15 "get a document that does not exist: not_found" "$(is "$rc/$(cat "$WORK/o15.err")" "1/error: not_found: no such document")" "rc=$rc; $(one "$WORK/o15.err")"
+
 # --- C: cancel and retry (#1186) --------------------------------------------------
 # A blob store that cannot be written fails an import at its store stage:
 # storage_unavailable, which the desktop offers to retry.
@@ -286,6 +290,50 @@ done
 check C5 "list: the two retried imports are documents now" "$(is "$rc/$(last "$WORK/c5.out" '.data.documents | length')/$retried" 0/4/2)" \
   "rc=$rc; documents=$(last "$WORK/c5.out" '.data.documents | length'), retried ones listed: $retried"
 
+# --- U, again: images and file names (after C5, which counts the documents) ------
+doc_of() { a24 documents job "$1" --json 2>/dev/null | tail -n 1 | jq -r '.data.document_id // empty'; }
+# readtext DOC OUT: page 1's text. An image's text layer is built (OCR) on its
+# first read, which answers engine_unavailable until it is there; any other
+# answer is final. No new read starts after 60 s: each read itself may wait
+# 8 s for the layer before it answers, so the bound is the clock, not a
+# count, and the last read may end that much later. The case judges the
+# words, not the time.
+readtext() {
+  local t0
+  t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
+  while :; do
+    a24 documents text "$1" 1 --json > "$2" 2>/dev/null && return 0
+    [ "$(last "$2" .error.code)" = engine_unavailable ] || return 1
+    [ $(($(perl -MTime::HiRes=time -e 'printf "%d", time * 1000') - t0)) -lt 60000 ] || return 1
+    sleep 1
+  done
+}
+# image ID WHAT FILE MEDIA: import a scan of the 2026 holiday notice, read its
+# words back. Its page has no text layer: "春节" can only come from the OCR.
+image() {
+  local rc st doc mt words
+  a24 documents import "$3" > "$WORK/$1.out" 2>&1; rc=$?
+  st=$(settle "$(job_of "$WORK/$1.out")"); doc=$(doc_of "$(job_of "$WORK/$1.out")")
+  mt=$(a24 documents get "$doc" 2>/dev/null | jq -r .head.media_type 2>/dev/null)
+  readtext "$doc" "$WORK/$1.text"
+  words=$(last "$WORK/$1.text" '[.data.blocks[].text] | join(" ") | test("春节")')
+  check "$1" "$2" "$(is "$rc/$st/$mt/$words" "0/succeeded/$4/true")" \
+    "rc=$rc; $st; $mt; blocks=$(last "$WORK/$1.text" '.data.blocks | length'), 春节: $words$(last "$WORK/$1.text" '.error.code // empty' | sed 's/^./; &/')"
+}
+SCAN=$REPO/docs/documenting/samples/s01/s01-06-zh-holiday-2026-scan/source.jpg
+image U8 "import a JPG scan: its words read back through OCR" "$SCAN" image/jpeg
+sips -s format png "$SCAN" --out "$WORK/scan.png" > /dev/null 2>&1
+image U9 "import a PNG of the same scan: its words read back" "$WORK/scan.png" image/png
+
+# U1's PDF under another name: the name is part of the import's key, so this
+# is an import of its own, not U1's job again.
+NAMED="$WORK/煮沸 通知.pdf"
+cp "$SMALL" "$NAMED"
+a24 documents import "$NAMED" > "$WORK/u10.out" 2>&1; rc=$?
+JOBN=$(job_of "$WORK/u10.out"); st=$(settle "$JOBN")
+title=$(a24 documents get "$(doc_of "$JOBN")" 2>/dev/null | jq -r .title 2>/dev/null)
+check U10 "a Chinese file name with a space: the document keeps it as its title" "$(is "$rc/$st/$title" "0/succeeded/煮沸 通知.pdf")" "rc=$rc; $st; title=$title"
+
 # --- T: the agent-facing tools (not in this release) -----------------------------
 code=$(curl -s -m 30 -o "$WORK/t1.out" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/tools")
 listed=$(jq -r 'if (.tools | type) == "array" and (.tools | length) > 0 then "listed" else "no list" end' "$WORK/t1.out" 2>/dev/null)
@@ -322,6 +370,36 @@ check N4 "a malformed request with no daemon: invalid_request, not backend_not_r
 
 printf 'not json' | limit 60 "$BIN/agent24" documents import --host-stdin --json > "$WORK/n5.out" 2>/dev/null; rc=$?
 check N5 "--host-stdin --json with bad input: a result line, invalid_request" "$(is "$rc/$(last "$WORK/n5.out" '"\(.type)/\(.error.code)"')" 1/result/invalid_request)" "rc=$rc; $(cut -c1-100 "$WORK/n5.out")"
+
+# --- E: a package without the read engine ---------------------------------------------
+# What a user gets who skipped engines/pdfkit/build.sh (the module README's
+# step), or runs where the engine cannot be: imports work, reading does not.
+export AGENT24_DATA_DIR="$WORK/bare/data"
+BARE=$WORK/bare/pkg; mkdir -p "$BARE/bin"
+cp "$REPO/rust/apps/agent24-documents/domain-os.yml" "$BARE/"
+cp "$BIN/agent24-documents" "$BARE/bin/"
+a24 os install "$BARE" > "$WORK/e1.out" 2>&1; r1=$?
+PATH="$BIN:$PATH" limit 60 "$BIN/agent24" daemon start >> "$WORK/e1.out" 2>&1; r2=$?
+r3=1
+for _ in $(seq 1 150); do
+  a24 documents capabilities > "$WORK/e1.json" 2>/dev/null && { r3=0; break; }
+  sleep 0.2
+done
+check E1 "no engine in the package: the module starts, both pdfkit engines absent" \
+  "$(is "$r1/$r2/$r3/$(jq -r '"\(.storage.state)/" + ([.engines[] | select(.id == "apple-pdfkit") | "\(.kind):\(.state)"] | sort | join(","))' "$WORK/e1.json" 2>/dev/null)" "0/0/0/ready/parse:absent,render:absent")" \
+  "rc=$r1/$r2/$r3; $(jq -c '[.engines[] | {id, kind, state}]' "$WORK/e1.json" 2>/dev/null | cut -c1-120)"
+
+a24 documents import "$SMALL" > "$WORK/e2.out" 2>&1; rc=$?
+JOBE=$(job_of "$WORK/e2.out"); st=$(settle "$JOBE")
+check E2 "no engine: an import still succeeds" "$(is "$rc/$st" 0/succeeded)" "rc=$rc; $JOBE $st"
+
+a24 documents text "$(doc_of "$JOBE")" 1 --json > "$WORK/e3.out" 2>/dev/null; rc=$?
+check E3 "no engine: text answers engine_unavailable (503, retryable), exit 1" \
+  "$(is "$rc/$(last "$WORK/e3.out" '"\(.type)/\(.status)/\(.error.code)/\(.error.details.engine)/\(.error.details.retryable)/\(.error.message)"')" \
+    "1/result/503/engine_unavailable/apple-pdfkit/true/no read engine on this platform")" \
+  "rc=$rc; $(tail -n 1 "$WORK/e3.out" | cut -c1-140)"
+limit 60 "$BIN/agent24" daemon stop > /dev/null 2>&1
+for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
 
 # --- M: upgrading from r5 (main), only with --old ------------------------------------
 # r5's CLI has no `documents`: its side is driven with its own `os` and
@@ -407,8 +485,11 @@ if [ -n "$OLD" ]; then
   limit 60 "$OLD/agent24" daemon stop >> "$WORK/m6.out" 2>&1
   for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
   h2=$(dump)
+  # r5's kernel must start for this to say anything about the documents library:
+  # a kernel store migration newer than r5's stops it first (its error is shown).
   check M6 "back to r5: the library refused (storage_unavailable), not changed" \
-    "$(is "$vb/$r1/$rl/$st/$h2" "8/1/0/1/storage_unavailable/$h1")" "library $vb; rc=$r1, list rc=$rl; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2"
+    "$(is "$vb/$r1/$rl/$st/$h2" "8/1/0/1/storage_unavailable/$h1")" \
+    "library $vb; rc=$r1, list rc=$rl; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2$(grep -m 1 '^error: ' "$WORK/m6.out" | cut -c1-140 | sed 's/^/; r5: /')"
 
   a24 os uninstall documents > "$WORK/m7.out" 2>&1
   a24 os install "$PKG" >> "$WORK/m7.out" 2>&1
