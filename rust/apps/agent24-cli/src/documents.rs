@@ -115,7 +115,8 @@ pub(crate) enum DocumentsAction {
         /// Extract again although this schema was extracted before; needs --key
         #[arg(long)]
         rerun: bool,
-        /// Names a rerun: the same key again replays it, a new one runs again
+        /// Names a rerun: the same key again replays it, a new one runs again.
+        /// Only with --rerun (the OS reads it for nothing else)
         #[arg(long)]
         key: Option<String>,
         /// Print the result as one JSON line
@@ -306,16 +307,10 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             rerun,
             key,
             json,
-        } => {
-            let schema = match read_schema(&schema) {
-                Ok(schema) => schema,
-                Err(res) => return report(&res, json),
-            };
-            let mut req = json!({"op": "extract", "documentId": document_id, "revision": revision, "schema": schema});
-            put(&mut req, "rerun", rerun.then_some(true));
-            put(&mut req, "idempotencyKey", key);
-            operation(req, json).await
-        }
+        } => match extract_request(document_id, revision, &schema, rerun, key) {
+            Ok(req) => operation(req, json).await,
+            Err(res) => report(&res, json),
+        },
         DocumentsAction::Extraction {
             extraction_id,
             cursor,
@@ -396,25 +391,51 @@ fn read_schema(path: &Path) -> Result<Value, Response> {
 /// result (`file_unwritable`). A person is shown the page without its base64.
 async fn render(req: Value, out: Option<PathBuf>, json: bool) -> Result<(), String> {
     let mut res = against_daemon(&req).await;
-    if let (Some(path), Response::Ok { data, .. }) = (&out, &res) {
-        if let Err(failed) = write_page(data, path) {
-            res = failed;
-        }
+    if let (Some(path), Response::Ok { data, .. }) = (&out, &res)
+        && let Err(failed) = write_page(data, path)
+    {
+        res = failed;
     }
-    if let (false, Response::Ok { data, .. }) = (json, &mut res) {
-        if let Some(shown) = data.as_object_mut() {
-            shown.remove("png");
-            if let Some(path) = &out {
-                shown.insert("written_to".to_owned(), json!(path));
-            }
+    if let (false, Response::Ok { data, .. }) = (json, &mut res)
+        && let Some(shown) = data.as_object_mut()
+    {
+        shown.remove("png");
+        if let Some(path) = &out {
+            shown.insert("written_to".to_owned(), json!(path));
         }
     }
     report(&res, json)
 }
 
+/// The `extract` operation. A `--key` without `--rerun` is refused here: the
+/// OS reads the key only for a rerun, so it would otherwise answer with the
+/// earlier extraction as if the key had been used.
+fn extract_request(
+    document_id: String,
+    revision: u64,
+    schema: &Path,
+    rerun: bool,
+    key: Option<String>,
+) -> Result<Value, Response> {
+    if key.is_some() && !rerun {
+        return Err(invalid(
+            "--key names a rerun; give --rerun with it".to_owned(),
+        ));
+    }
+    let schema = read_schema(schema)?;
+    let mut req =
+        json!({"op": "extract", "documentId": document_id, "revision": revision, "schema": schema});
+    put(&mut req, "rerun", rerun.then_some(true));
+    put(&mut req, "idempotencyKey", key);
+    Ok(req)
+}
+
 /// Writes the page's PNG to `path` whole or not at all: into a new file
-/// beside it first, renamed over `path` once written, so a failure midway
-/// (a full disk) leaves a file already there as it was.
+/// beside it first (a name of its own, readable only by its owner while it
+/// is written), renamed over `path` once written, so a failure midway (a full
+/// disk) leaves a file already there as it was. The new file takes the
+/// permissions of the one it replaces, and a link is written through to its
+/// target, as writing in place would.
 fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
     use base64::Engine as _;
     let png = data
@@ -422,20 +443,48 @@ fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
         .and_then(Value::as_str)
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
         .ok_or_else(|| Response::fail(502, "invalid_response", "the page is not base64"))?;
-    let unwritable = || Response::fail(400, "file_unwritable", "the page could not be written");
-    let name = path.file_name().ok_or_else(unwritable)?.to_string_lossy();
-    let part = path.with_file_name(format!(".{name}.{}.part", std::process::id()));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&part)
-        .and_then(|mut f| f.write_all(&png).and_then(|()| f.sync_all()))
-        .and_then(|()| std::fs::rename(&part, path));
-    written.map_err(|_| {
-        let _ = std::fs::remove_file(&part);
-        unwritable()
-    })
+    fn unwritable<E>(_: E) -> Response {
+        Response::fail(400, "file_unwritable", "the page could not be written")
+    }
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(path).map_err(unwritable)?
+        }
+        _ => path.to_path_buf(),
+    };
+    target.file_name().ok_or(()).map_err(unwritable)?;
+    let dir = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let was = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".agent24-page-").suffix(".part");
+    if was.is_none() {
+        as_new(&mut builder);
+    }
+    let mut part = builder.tempfile_in(dir).map_err(unwritable)?;
+    part.write_all(&png)
+        .and_then(|()| match was {
+            Some(was) => part.as_file().set_permissions(was),
+            None => Ok(()),
+        })
+        .and_then(|()| part.as_file().sync_all())
+        .map_err(unwritable)?;
+    // A failure drops the part file, which removes it.
+    part.persist(&target).map(drop).map_err(unwritable)
 }
+
+/// A page with no file before it is made as a file made in place would be,
+/// readable as the umask allows (the part file starts owner-only).
+#[cfg(unix)]
+fn as_new(builder: &mut tempfile::Builder<'_, '_>) {
+    use std::os::unix::fs::PermissionsExt as _;
+    builder.permissions(std::fs::Permissions::from_mode(0o666));
+}
+
+#[cfg(not(unix))]
+fn as_new(_: &mut tempfile::Builder<'_, '_>) {}
 
 fn invalid(message: String) -> Response {
     Response::fail(400, "invalid_request", &message)
@@ -763,6 +812,75 @@ mod tests {
         std::fs::write(&out, b"old page").unwrap();
         write_page(&page, &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"\x89PNG");
+        // The longest name the disk takes is still a name to write to.
+        let long = dir.path().join(format!("{}.png", "p".repeat(251)));
+        write_page(&page, &long).unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), b"\x89PNG");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_page_keeps_the_permissions_and_the_link_of_what_it_replaces() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let page = json!({"png": "iVBORw=="});
+        let private = dir.path().join("private.png");
+        std::fs::write(&private, b"old").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_page(&page, &private).unwrap();
+        assert_eq!(mode(&private), 0o600);
+        let shared = dir.path().join("shared.png");
+        std::fs::write(&shared, b"old").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o664)).unwrap();
+        write_page(&page, &shared).unwrap();
+        assert_eq!(mode(&shared), 0o664);
+        // A new page is as readable as a file made in place.
+        let made = dir.path().join("made");
+        std::fs::write(&made, b"").unwrap();
+        let new = dir.path().join("new.png");
+        write_page(&page, &new).unwrap();
+        assert_eq!(mode(&new), mode(&made));
+        // Through a link: the link stays, its target is the new page.
+        let kept = dir.path().join("archive.png");
+        std::fs::write(&kept, b"old").unwrap();
+        let link = dir.path().join("link.png");
+        std::os::unix::fs::symlink(&kept, &link).unwrap();
+        write_page(&page, &link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&kept).unwrap(), b"\x89PNG");
+    }
+
+    #[test]
+    fn a_key_without_a_rerun_is_refused_unsent() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = dir.path().join("ask.json");
+        std::fs::write(&schema, r#"{"fields":[]}"#).unwrap();
+        let ask = |rerun, key: Option<&str>| {
+            extract_request("doc_x".into(), 1, &schema, rerun, key.map(Into::into))
+        };
+        assert_eq!(
+            ask(false, Some("k")).unwrap_err(),
+            Response::fail(
+                400,
+                "invalid_request",
+                "--key names a rerun; give --rerun with it"
+            )
+        );
+        assert_eq!(
+            ask(true, Some("k")).unwrap(),
+            json!({"op": "extract", "documentId": "doc_x", "revision": 1,
+                "schema": {"fields": []}, "rerun": true, "idempotencyKey": "k"})
+        );
+        assert_eq!(
+            ask(false, None).unwrap(),
+            json!({"op": "extract", "documentId": "doc_x", "revision": 1, "schema": {"fields": []}})
+        );
     }
 
     #[test]
@@ -782,7 +900,7 @@ mod tests {
             .is_ok()
         );
         // Refused by clap there is no result line for --json (exit 2): these
-        // go to the OS, which answers 400 with one.
+        // are refused with one, by the OS or before it (a key with no rerun).
         assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--rerun"]).is_ok());
         assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--key", "k"]).is_ok());
         assert!(parse(&["text", "doc_x", "1", "--block", "p1/b1", "--cursor", "ab"]).is_ok());
