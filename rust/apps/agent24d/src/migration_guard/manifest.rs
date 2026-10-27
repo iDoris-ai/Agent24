@@ -116,7 +116,21 @@ pub fn write_manifest(
     snapshot_dir: &Path,
     m: &Manifest,
 ) -> Result<(), StateError> {
-    write_json(ops, data_dir, &snapshot_dir.join("manifest.json"), m)
+    let path = snapshot_dir.join("manifest.json");
+    let Err(err) = write_json(ops, data_dir, &path, m) else {
+        return Ok(());
+    };
+    // After the rename the manifest is visible even though the call failed
+    // (e.g. directory fsync), and `verify_complete` would accept it. A failed
+    // publish must not leave something that can authorise `migrating`.
+    match ops.remove_file(&path) {
+        Ok(()) => Err(err),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(err), // failed before rename
+        Err(e) => Err(StateError::Invalid(format!(
+            "manifest publish failed ({err}) and could not withdraw {}: {e}",
+            path.display()
+        ))),
+    }
 }
 
 pub fn read_manifest(path: &Path) -> Result<Manifest, StateError> {

@@ -134,6 +134,8 @@ pub(crate) mod test_ops {
     pub struct RecordingOps {
         pub calls: RefCell<Vec<String>>,
         pub fail_on: Option<&'static str>,
+        /// When set, `fail_on` only fires once a call of this name was recorded.
+        pub only_after: Option<&'static str>,
     }
 
     impl RecordingOps {
@@ -141,13 +143,28 @@ pub(crate) mod test_ops {
             Self {
                 calls: RefCell::default(),
                 fail_on: Some(op),
+                only_after: None,
+            }
+        }
+        /// Fail `op`, but only after a call named `after` has happened.
+        pub fn failing_after(op: &'static str, after: &'static str) -> Self {
+            Self {
+                calls: RefCell::default(),
+                fail_on: Some(op),
+                only_after: Some(after),
             }
         }
         fn hit(&self, op: &'static str, arg: &Path) -> io::Result<()> {
+            let armed = self.only_after.is_none_or(|a| {
+                self.calls
+                    .borrow()
+                    .iter()
+                    .any(|c| c.split(':').next() == Some(a))
+            });
             self.calls
                 .borrow_mut()
                 .push(format!("{op}:{}", arg.display()));
-            if self.fail_on == Some(op) {
+            if armed && self.fail_on == Some(op) {
                 return Err(io::Error::other("injected"));
             }
             Ok(())
@@ -171,7 +188,10 @@ pub(crate) mod test_ops {
             self.hit("fsync_dir", dir)
         }
         fn remove_file(&self, path: &Path) -> io::Result<()> {
-            let _ = RealOps.remove_file(path);
+            // A failing remove leaves the file in place (the real failure mode).
+            if self.fail_on != Some("remove") {
+                let _ = RealOps.remove_file(path);
+            }
             self.hit("remove", path)
         }
     }
