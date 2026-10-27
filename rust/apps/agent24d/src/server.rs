@@ -2592,6 +2592,9 @@ pub async fn serve(
             host_ready.send(&ready).await?;
         }
     }
+    // SPEC-002 §4: nothing follows the ready line, so `main` writes no
+    // `failed` line after this. Only review guards this store: no test can
+    // fail a start between the line and here (review of #1332).
     READY_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
     // In capability mode `ready` is the only temporary owner of the raw host
     // bearer after the private write completes. Do not retain it for daemon

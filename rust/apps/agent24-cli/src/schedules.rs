@@ -444,6 +444,22 @@ mod tests {
         assert_eq!(patch.spec, Some(cron("0 10 * * *", None)));
     }
 
+    /// A cron schedule changed to every N with a new prompt: it is read first
+    /// (for the session and model), and its timezone does not follow.
+    #[test]
+    fn a_cron_schedule_can_become_every_n_with_a_new_prompt() {
+        let now = schedule(
+            agent_run("p", Some("sess_1"), Some("m")),
+            cron("0 9 * * *", Some("Asia/Shanghai")),
+        );
+        let patch = update(&["--every", "120", "--prompt", "q"], Some(now)).unwrap();
+        assert_eq!(patch.spec, Some(ScheduleSpec::Every { secs: 120 }));
+        assert_eq!(
+            patch.action,
+            Some(agent_run("q", Some("sess_1"), Some("m")))
+        );
+    }
+
     fn every() -> ScheduleSpec {
         ScheduleSpec::Every { secs: 3600 }
     }

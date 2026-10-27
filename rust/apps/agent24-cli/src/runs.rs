@@ -421,6 +421,8 @@ pub(crate) mod tests {
             "show prints the whole prompt: {detail}"
         );
         assert_eq!(short(&"p".repeat(60), 60), "p".repeat(60));
+        // A short first line still says there is more after it.
+        assert_eq!(short("hi\nmore", 60), "hi…");
     }
 
     #[test]
