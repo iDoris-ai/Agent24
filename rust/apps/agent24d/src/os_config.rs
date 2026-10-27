@@ -115,6 +115,18 @@ impl Drop for ConfigLock {
     }
 }
 
+/// Beside os.json: each module's enable mark (K1-6a-G §2.1 F3), kept out
+/// of os.json so a build that predates it still reads os.json. Written
+/// under [`ConfigLock`]; missing or unreadable reads as no marks.
+const MARKS_FILE: &str = "os-enable-marks.json";
+
+fn load_marks(dir: &Path) -> BTreeMap<String, String> {
+    std::fs::read_to_string(dir.join(MARKS_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
 pub fn config_path() -> Option<PathBuf> {
     agent24_protocol::state_file::state_dir().map(|d| d.join("os.json"))
 }
@@ -167,8 +179,10 @@ impl OsConfig {
     /// means "enable everything": a crash partway through a naive
     /// truncate-and-write would silently turn every disabled module back on.
     ///
-    /// Returns the config as written.
-    pub fn set_enabled(path: &Path, name: &str, enabled: bool) -> Result<Self, String> {
+    /// Returns what a start now sees of `name` ([`Self::observed_entry`]),
+    /// read under the lock, so another process's write after it is not
+    /// taken for this one's (K1-6a-G §2.1 F3).
+    pub fn set_enabled(path: &Path, name: &str, enabled: bool) -> Result<String, String> {
         let parent = path
             .parent()
             .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -178,22 +192,61 @@ impl OsConfig {
 
         let mut cfg = Self::load(path)?;
         cfg.modules.insert(name.to_owned(), ModuleEntry { enabled });
-        cfg.write_atomically(path, parent)?;
-        Ok(cfg)
+        let body = serde_json::to_string_pretty(&cfg)
+            .map_err(|e| format!("cannot serialize os.json: {e}"))?;
+        if enabled {
+            // K1-6a-G §2.1 F3: a new mark on every enable, so a daemon that
+            // starts next sees another entry even when os.json reads the
+            // same. Before os.json: a crash in between costs one extra
+            // epoch, never a missed one.
+            Self::write_new_mark(parent, name)?;
+        }
+        Self::write_atomically(path, parent, &body)?;
+        Ok(cfg.observed_entry(path, name))
     }
 
     /// Caller must hold [`ConfigLock`].
-    fn write_atomically(&self, path: &Path, parent: &Path) -> Result<(), String> {
-        use std::io::Write;
+    fn write_new_mark(parent: &Path, name: &str) -> Result<(), String> {
+        let mut marks = load_marks(parent);
+        let mut mark = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut mark);
+        marks.insert(
+            name.to_owned(),
+            mark.iter().map(|b| format!("{b:02x}")).collect(),
+        );
+        let marks = serde_json::to_string_pretty(&marks)
+            .map_err(|e| format!("cannot serialize {MARKS_FILE}: {e}"))?;
+        Self::write_atomically(&parent.join(MARKS_FILE), parent, &marks)
+    }
 
-        let body = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("cannot serialize os.json: {e}"))?;
+    /// What a start sees of `name` (K1-6a-G §2.1 F3): the digest of the
+    /// default policy, its entry in this config, and its enable mark beside
+    /// `path`. Any change to one of those changes it.
+    pub fn observed_entry(&self, path: &Path, name: &str) -> String {
+        use sha2::Digest as _;
+        let marks = path.parent().map(load_marks).unwrap_or_default();
+        let seen = serde_json::json!({
+            "default": self.default,
+            "entry": self.modules.get(name).map(|e| e.enabled),
+            "mark": marks.get(name),
+        });
+        let digest = sha2::Sha256::digest(seen.to_string().as_bytes());
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Write `body` to `path` (os.json or the marks beside it). Caller must
+    /// hold [`ConfigLock`].
+    fn write_atomically(path: &Path, parent: &Path, body: &str) -> Result<(), String> {
+        use std::io::Write;
 
         // Beside the destination so the rename stays on one filesystem, and
         // `create_new` so a file already at that path — or a symlink planted at a
         // predictable name — is an error rather than something we write THROUGH,
         // truncating whatever it points at.
-        let tmp = parent.join(format!("os.json.writing.{}", std::process::id()));
+        let name = path
+            .file_name()
+            .map_or_else(|| "os.json".into(), |n| n.to_string_lossy().into_owned());
+        let tmp = parent.join(format!("{name}.writing.{}", std::process::id()));
         // Two guards, doing DIFFERENT jobs — worth saying, because a test that
         // conflates them proves neither:
         //
@@ -391,7 +444,8 @@ mod tests {
         let p = tmp.path().join("os.json");
 
         // From nothing at all — the first toggle a user ever makes.
-        let cfg = OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        let cfg = OsConfig::load(&p).unwrap();
         assert!(!cfg.is_enabled("sin90"));
         assert!(!OsConfig::load(&p).unwrap().is_enabled("sin90"));
         // Match what production actually names its temp (`os.json.writing.<pid>`):
@@ -405,7 +459,8 @@ mod tests {
 
         // And back, without disturbing other entries.
         OsConfig::set_enabled(&p, "cos72", false).unwrap();
-        let cfg = OsConfig::set_enabled(&p, "sin90", true).unwrap();
+        OsConfig::set_enabled(&p, "sin90", true).unwrap();
+        let cfg = OsConfig::load(&p).unwrap();
         assert!(cfg.is_enabled("sin90"));
         assert!(!cfg.is_enabled("cos72"), "the other entry survived");
         assert_eq!(
@@ -458,7 +513,8 @@ mod tests {
             .join(format!("os.json.writing.{}", std::process::id()));
         std::fs::write(&stale, b"garbage from a crashed write").unwrap();
 
-        let cfg = OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        let cfg = OsConfig::load(&p).unwrap();
         assert!(!cfg.is_enabled("sin90"));
         assert!(leftover_temps(tmp.path()).is_empty());
     }
@@ -581,5 +637,53 @@ mod tests {
         let p = tmp.path().join("os.json");
         std::fs::create_dir(&p).unwrap();
         assert!(OsConfig::load(&p).is_err());
+    }
+
+    /// K1-6a-G §2.1 F3: every enable writes a new mark beside os.json, so
+    /// a start sees another entry even when os.json reads the same; a
+    /// disable, or another module's enable, leaves this one's mark. A
+    /// marks file that is gone or unreadable is no marks, not an error.
+    #[test]
+    fn every_enable_changes_what_a_start_sees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        let seen = |name: &str| OsConfig::load(&p).unwrap().observed_entry(&p, name);
+        let before = seen("sin90");
+        let first = OsConfig::set_enabled(&p, "sin90", true).unwrap();
+        assert_eq!(seen("sin90"), first, "what a start sees, returned");
+        assert_ne!(before, first);
+        let raw = std::fs::read_to_string(&p).unwrap();
+        OsConfig::set_enabled(&p, "sin90", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), raw);
+        assert!(!raw.contains("mark"), "os.json carries no mark: {raw}");
+        let second = seen("sin90");
+        assert_ne!(first, second);
+        let marks = tmp.path().join(MARKS_FILE);
+        let marked = std::fs::read_to_string(&marks).unwrap();
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&marks).unwrap(), marked);
+        let disabled = seen("sin90");
+        assert_ne!(second, disabled);
+        OsConfig::set_enabled(&p, "cos72", true).unwrap();
+        assert_eq!(seen("sin90"), disabled);
+        std::fs::write(&marks, "not json").unwrap();
+        let unreadable = seen("sin90");
+        std::fs::remove_file(&marks).unwrap();
+        assert_eq!(seen("sin90"), unreadable);
+        assert_ne!(unreadable, disabled);
+    }
+
+    /// The mark is written before os.json: an enable whose mark cannot be
+    /// written is not written at all.
+    #[test]
+    fn an_enable_whose_mark_cannot_be_written_is_not_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        std::fs::create_dir(tmp.path().join(MARKS_FILE)).unwrap();
+        std::fs::write(tmp.path().join(MARKS_FILE).join("x"), "").unwrap();
+        assert!(OsConfig::set_enabled(&p, "sin90", true).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), raw);
     }
 }

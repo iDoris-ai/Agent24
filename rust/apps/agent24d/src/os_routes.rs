@@ -323,6 +323,17 @@ enum HotStop {
     NotRunning,
 }
 
+impl HotStop {
+    /// What this stop's own answer says: `stopped`, or its error code.
+    fn word(self) -> &'static str {
+        match self {
+            HotStop::Stopping | HotStop::Already | HotStop::NotRunning => "stopped",
+            HotStop::Pending => "disable_pending",
+            HotStop::Failed => "stop_failed",
+        }
+    }
+}
+
 /// Hand a running out-of-process module's stop to its supervisor (SUP-5):
 /// it drains and stops in the background, and the shutdown — if it begins
 /// meanwhile — waits for that stop, cutting it off at `cut_off`. Synchronous:
@@ -457,43 +468,36 @@ type Applied = (
 /// a disable whose revocation did not land; a failed authorization-store
 /// write resolves to deny/unavailable):
 ///
-/// - **Enable** of a module os.json does not currently have enabled revokes
-///   its persisted consents BEFORE publishing `enabled=true`. If that
-///   revocation fails, nothing is written and `Err` is returned, so the
+/// - **Enable** advances the module's enable epoch BEFORE publishing
+///   `enabled=true` (K1-6a-G §2.1 F3), which ends every grant from before
+///   it. If that fails, nothing is written and `Err` is returned, so the
 ///   module stays disabled. This is the backstop that keeps a consent which
 ///   survived a failed disable-time revocation from coming back to life on
 ///   re-enable: re-enabling always requires fresh consent.
-/// - **Disable** publishes `enabled=false` and hands the stop off FIRST (so
-///   the module stops serving whatever happens next), then a failed
-///   revocation is returned as the third element and the route answers a
-///   non-2xx `consent_revocation_failed` — it does NOT roll os.json back.
-///   Of the two allowed choices (non-2xx vs. rollback) this one is taken
-///   because rolling back would re-enable a module whose consent is still
-///   live, which is the less closed of the two; leaving it disabled plus
-///   the enable-time revocation above means the stale consent can never be
-///   used again without the operator seeing an error first.
+/// - **Disable** publishes `enabled=false`, revokes the module's consents,
+///   then hands the stop off whatever the revocation did (so the module
+///   stops serving whatever happens next). Revoked first, so the running
+///   module is told its grants ended before it drains (K1-6a-G §2.5.1). A
+///   failed revocation is returned as the third element and the route
+///   answers a non-2xx `consent_revocation_failed` — it does NOT roll
+///   os.json back. Of the two allowed choices (non-2xx vs. rollback) this
+///   one is taken because rolling back would re-enable a module whose
+///   consent is still live, which is the less closed of the two; leaving it
+///   disabled plus the enable-time epoch above means the stale consent can
+///   never be used again without the operator seeing an error first.
 async fn apply(
     state: &AppState,
     path: std::path::PathBuf,
     name: &str,
     enabled: bool,
 ) -> Result<Applied, String> {
-    if enabled {
-        let was_enabled = tokio::task::spawn_blocking({
-            let (path, name) = (path.clone(), name.to_owned());
-            // Unreadable config counts as "not enabled": revoking is the
-            // closed direction.
-            move || crate::os_config::OsConfig::load(&path).is_ok_and(|c| c.is_enabled(&name))
-        })
-        .await
-        .unwrap_or(false);
-        if !was_enabled && let Err(e) = state.store.invalidate_module_consents(name).await {
-            tracing::error!(module = name, error = %e, "failed to invalidate module consents before enable");
-            return Err(format!(
-                "could not revoke earlier module consent for {name:?} before enabling it, so it \
-                 was left disabled and os.json was not changed: {e}"
-            ));
-        }
+    // K1-6a-G §2.1 F3: grants from before an enable end before it is
+    // written; if they cannot, the enable is not.
+    if enabled && let Err(e) = state.store.advance_module_enable_epoch(name).await {
+        tracing::error!(module = name, error = %e, "an enable could not end the module's grants");
+        return Err(format!(
+            "could not end the grants for {name:?} before enabling it"
+        ));
     }
     // Off the async workers: the file lock waits for any other writer, for
     // as long as that takes (review of SUP-5, round 2).
@@ -502,14 +506,14 @@ async fn apply(
         move || crate::os_config::OsConfig::set_enabled(&path, &name, enabled)
     })
     .await;
-    let failed = match written {
-        Ok(Ok(_)) => None,
-        Ok(Err(why)) => Some(why),
-        Err(e) => Some(format!("the config write failed: {e}")),
+    let (seen, failed) = match written {
+        Ok(Ok(seen)) => (Some(seen), None),
+        Ok(Err(why)) => (None, Some(why)),
+        Err(e) => (None, Some(format!("the config write failed: {e}"))),
     };
     if let Some(why) = &failed {
         let published = tokio::task::spawn_blocking({
-            let name = name.to_owned();
+            let (path, name) = (path.clone(), name.to_owned());
             move || {
                 crate::os_config::OsConfig::load(&path)
                     .is_ok_and(|c| c.is_enabled(&name) == enabled)
@@ -521,18 +525,10 @@ async fn apply(
             return Err(why.clone());
         }
     }
-    let handed = if enabled {
-        None
-    } else {
-        hand_off(
-            state.supervisors.as_deref(),
-            state.shutdown.modules_cut_off(),
-            name,
-        )
-    };
-    // After the hand-off, not before: a failed revocation must not also
-    // leave the module serving. See this function's doc comment for why a
-    // failure here is reported as an error rather than rolled back.
+    // Before the hand-off, so the running module is told its grants ended
+    // (K1-6a-G §2.5.1); the stop is handed off below whatever this did. See
+    // this function's doc comment for why a failure is reported as an error
+    // rather than rolled back.
     let revocation_failed = if enabled {
         None
     } else {
@@ -543,6 +539,32 @@ async fn apply(
                 Some(e.to_string())
             }
         }
+    };
+    // What a later start compares with (K1-6a-G §2.1 F3): a disable, so
+    // one that finds the module enabled again advances its epoch whatever
+    // the entry then reads; an enable's new entry, as written under the
+    // config lock, so a restart alone does not end the grants made since.
+    // Recorded without advancing: an enable advanced above. An enable left
+    // unrecorded costs one more epoch at the next start; a disable left
+    // unrecorded is missed only if os.json is then restored byte for byte,
+    // the case §2.1 F3 leaves, and only after its grants were revoked above
+    // (or their revocation failed, which the answer then says).
+    if let Some(seen) = seen
+        && let Err(e) = state
+            .store
+            .record_module_enablement(name, enabled, &seen)
+            .await
+    {
+        tracing::error!(module = name, error = %e, "enablement not recorded for the enable epoch");
+    }
+    let handed = if enabled {
+        None
+    } else {
+        hand_off(
+            state.supervisors.as_deref(),
+            state.shutdown.modules_cut_off(),
+            name,
+        )
     };
     Ok((handed, failed, revocation_failed))
 }
@@ -1039,30 +1061,37 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
             &format!("no domain OS named {name:?}; this daemon provides {known:?}"),
         );
     }
-    // Fail-closed (ADR-K1-03 §3): a failed revocation still lets the stop
-    // go ahead — the module must stop serving either way — but the answer is
-    // a non-2xx `consent_revocation_failed`, never `stopped: true`.
-    let revocation_error = state
-        .store
-        .invalidate_module_consents(&name)
-        .await
-        .err()
-        .map(|e| {
-            tracing::error!(module = name, error = %e, "failed to invalidate module consents before package stop");
-            e.to_string()
-        });
+    // Held to the end: a decision written after the revocation but before
+    // the epoch advances, or while the module still runs, would outlive it.
+    let _control = state.os_control.lock().await;
+    let revoked = state.store.invalidate_module_consents(&name).await;
     let handed = hand_off(
         state.supervisors.as_deref(),
         state.shutdown.modules_cut_off(),
         &name,
     );
     let hot = settled_and_reconciled(handed, ADMISSION_CLOSED_WITHIN).await;
-    if hot != HotStop::Failed
-        && let Some(why) = revocation_error
-    {
+    // K1-6a-G §2.1 F3: a stop ends the epoch, so no grant from before it,
+    // or from while it was stopping, holds once the module runs again. A
+    // store that cannot record that is the answer, whatever the stop did:
+    // nothing else remembers it, so the caller must, and stop again.
+    let ended = match revoked {
+        Ok(()) => state
+            .store
+            .advance_module_enable_epoch(&name)
+            .await
+            .map(|_| ()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = ended {
+        tracing::error!(module = name, error = %e, ?hot, "a stop could not end the module's grants");
+        // Fail-closed (ADR-K1-03 §3): never `stopped: true`.
         return consent_revocation_failed_response(
-            &format!("the stop of {name:?} was handed off"),
-            &why,
+            &format!(
+                "the stop of {name:?} was handed off (the stop: {})",
+                hot.word()
+            ),
+            &format!("{e}; stop it again"),
         );
     }
     match hot {
@@ -1779,6 +1808,35 @@ mod tests {
         assert!(j.get("modules").is_none(), "{j}");
     }
 
+    /// K1-6a-G §2.1 F7: a stop waits for `os_control`, which a module tool
+    /// decision holds from its checks to its write.
+    #[tokio::test]
+    async fn a_stop_waits_for_os_control() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut st = crate::server::tests::state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("sin91", MountOutcome::Mounted)]);
+        let token = st.token.to_string();
+        let held = st.os_control.clone().lock_owned().await;
+        let router = crate::server::build_router_with_modules(st, axum::Router::new());
+        let task = tokio::spawn(
+            router.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/os/sin91/stop")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+        drop(held);
+        assert!(task.await.unwrap().unwrap().status().is_success());
+    }
+
     #[tokio::test]
     async fn stop_now_os_reports_not_running_without_claiming_a_live_stop() {
         use axum::body::Body;
@@ -2106,6 +2164,186 @@ mod tests {
         assert!(!lookup.is_authorized());
     }
 
+    fn consent_summary() -> agent24_store::ToolPermissionSummary {
+        agent24_store::ToolPermissionSummary::new(
+            "consent-mod",
+            "read_doc",
+            "1.0.0",
+            agent24_store::ConsentSource::FirstParty,
+            Some("docs".into()),
+            None,
+            None,
+            agent24_store::HostRiskLevel::Low,
+        )
+    }
+
+    async fn consent_lookup(st: &AppState) -> agent24_store::ConsentLookup {
+        let s = consent_summary();
+        st.store
+            .lookup_module_consent(
+                &s.module,
+                &s.op,
+                &s.module_version,
+                &s.scope_fingerprint(),
+                "2026-10-09T00:00:00Z",
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn break_enable_epochs(st: &AppState) {
+        sqlx::query("DROP TABLE module_enable_epochs")
+            .execute(agent24_store::test_hooks::pool(&st.store))
+            .await
+            .unwrap();
+    }
+
+    /// K1-6a-G §2.1 F3: an enable ends the grants from before it.
+    #[tokio::test]
+    async fn an_enable_ends_the_grants_from_before_it() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        st.store
+            .grant_module_consent(
+                &consent_summary(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert!(consent_lookup(&st).await.is_authorized());
+        let response = t8_patch(&st, "consent-mod", true, Some(path)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            consent_lookup(&st).await,
+            agent24_store::ConsentLookup::Stale(_)
+        ));
+    }
+
+    /// A grant made after an enable holds across the next start, which sees
+    /// the entry the enable wrote (review G1).
+    #[tokio::test]
+    async fn a_grant_after_an_enable_survives_the_next_start() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        let response = t8_patch(&st, "consent-mod", true, Some(path.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        st.store
+            .grant_module_consent(
+                &consent_summary(),
+                "2026-10-08T00:00:00Z",
+                "2026-11-08T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let entry = crate::os_config::OsConfig::load(&path)
+            .unwrap()
+            .observed_entry(&path, "consent-mod");
+        assert!(
+            !st.store
+                .observe_module_enablement("consent-mod", true, &entry)
+                .await
+                .unwrap()
+        );
+        assert!(consent_lookup(&st).await.is_authorized());
+    }
+
+    /// ... and an enable whose grants cannot be ended is not written.
+    #[tokio::test]
+    async fn an_enable_whose_grants_cannot_be_ended_is_not_written() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        crate::os_config::OsConfig::set_enabled(&path, "consent-mod", false).unwrap();
+        break_enable_epochs(&st).await;
+        let response = t8_patch(&st, "consent-mod", true, Some(path.clone())).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let config = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(!config.is_enabled("consent-mod"));
+    }
+
+    /// A disable is recorded, so the next start that finds the module
+    /// enabled advances its epoch, even on an entry seen before.
+    #[tokio::test]
+    async fn a_disable_is_seen_by_the_next_start() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        crate::os_config::OsConfig::set_enabled(&path, "consent-mod", true).unwrap();
+        let entry = crate::os_config::OsConfig::load(&path)
+            .unwrap()
+            .observed_entry(&path, "consent-mod");
+        let observe = || {
+            st.store
+                .observe_module_enablement("consent-mod", true, &entry)
+        };
+        assert!(observe().await.unwrap());
+        assert!(!observe().await.unwrap());
+        let response = t8_patch(&st, "consent-mod", false, Some(path)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(observe().await.unwrap());
+    }
+
+    /// A stop ends the enable epoch; a stop that cannot still stops, and
+    /// says its grants were not ended.
+    #[tokio::test]
+    async fn a_stop_ends_the_enable_epoch() {
+        let (mut st, _dir, _path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        let epoch = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT epoch FROM module_enable_epochs WHERE module = 'consent-mod'",
+            )
+            .fetch_optional(agent24_store::test_hooks::pool(&st.store))
+            .await
+            .unwrap()
+        };
+        assert_eq!(epoch().await, None);
+        let response = stop_now_os(State(st.clone()), Path("consent-mod".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(epoch().await.is_some_and(|epoch| epoch > 0));
+        break_enable_epochs(&st).await;
+        let response = stop_now_os(State(st.clone()), Path("consent-mod".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("stop it again") && m.contains("(the stop: stopped)")),
+            "{body}"
+        );
+    }
+
+    /// The answer a stop whose grants could not be ended gives names what
+    /// the stop did, in the words its own answer would have used.
+    #[test]
+    fn a_stop_is_named_as_its_own_answer_names_it() {
+        assert_eq!(HotStop::Stopping.word(), "stopped");
+        assert_eq!(HotStop::Already.word(), "stopped");
+        assert_eq!(HotStop::NotRunning.word(), "stopped");
+        assert_eq!(HotStop::Pending.word(), "disable_pending");
+        assert_eq!(HotStop::Failed.word(), "stop_failed");
+    }
+
+    /// A stop whose grants cannot be revoked does not advance either, and
+    /// says so: the retry it asks for does both.
+    #[tokio::test]
+    async fn a_stop_that_cannot_revoke_does_not_advance() {
+        let (mut st, _dir, _path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
+        sqlx::query("DROP TABLE module_consent_revocations")
+            .execute(agent24_store::test_hooks::pool(&st.store))
+            .await
+            .unwrap();
+        let response = stop_now_os(State(st.clone()), Path("consent-mod".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let epoch: Option<i64> = sqlx::query_scalar(
+            "SELECT epoch FROM module_enable_epochs WHERE module = 'consent-mod'",
+        )
+        .fetch_optional(agent24_store::test_hooks::pool(&st.store))
+        .await
+        .unwrap();
+        assert_eq!(epoch, None);
+    }
+
     fn consent_fixture_summary() -> agent24_store::ToolPermissionSummary {
         agent24_store::ToolPermissionSummary::new(
             "consent-mod",
@@ -2119,7 +2357,7 @@ mod tests {
         )
     }
 
-    async fn consent_lookup(
+    async fn consent_fixture_lookup(
         st: &AppState,
         summary: &agent24_store::ToolPermissionSummary,
     ) -> agent24_store::ConsentLookup {
@@ -2167,7 +2405,7 @@ mod tests {
             .grant_module_consent(&summary, "2026-10-08T00:00:00Z", "2099-11-08T00:00:00Z")
             .await
             .unwrap();
-        assert!(consent_lookup(&st, &summary).await.is_authorized());
+        assert!(consent_fixture_lookup(&st, &summary).await.is_authorized());
 
         break_revocation_writes(&st).await;
         let disabled = t8_patch(&st, "consent-mod", false, Some(path.clone())).await;
@@ -2198,9 +2436,13 @@ mod tests {
                 .unwrap()
                 .is_enabled("consent-mod")
         );
-        let lookup = consent_lookup(&st, &summary).await;
+        let lookup = consent_fixture_lookup(&st, &summary).await;
+        // Revoked, or ended with the epoch the re-enable advanced.
         assert!(
-            matches!(lookup, agent24_store::ConsentLookup::Revoked(_)),
+            matches!(
+                lookup,
+                agent24_store::ConsentLookup::Revoked(_) | agent24_store::ConsentLookup::Stale(_)
+            ),
             "{lookup:?}"
         );
         assert!(
@@ -2209,10 +2451,11 @@ mod tests {
         );
     }
 
-    /// The enable-time revocation is itself fail-closed: if it cannot be
-    /// written, the enable is refused and os.json is left disabled.
+    /// The enable-time end of the grants is itself fail-closed: if the
+    /// epoch cannot be advanced (K1-6a-G §2.1 F3), the enable is refused and
+    /// os.json is left as it was, byte for byte.
     #[tokio::test]
-    async fn failed_enable_revocation_refuses_enable_and_keeps_module_disabled() {
+    async fn failed_enable_epoch_refuses_enable_and_keeps_module_disabled() {
         let (mut st, _dir, path) = t8_state().await;
         st.os_reports = std::sync::Arc::new(vec![report("consent-mod", MountOutcome::Mounted)]);
         crate::os_config::OsConfig::set_enabled(&path, "consent-mod", false).unwrap();
@@ -2223,7 +2466,7 @@ mod tests {
             .unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        break_revocation_writes(&st).await;
+        break_enable_epochs(&st).await;
         let res = t8_patch(&st, "consent-mod", true, Some(path.clone())).await;
         assert!(!res.status().is_success());
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -2255,7 +2498,7 @@ mod tests {
         restore_revocation_writes(&st).await;
         let res = stop_now_os(State(st.clone()), Path("consent-mod".to_owned())).await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert!(!consent_lookup(&st, &summary).await.is_authorized());
+        assert!(!consent_fixture_lookup(&st, &summary).await.is_authorized());
     }
 
     /// Judgement criterion 4 — the blocked `message` is exactly what `os

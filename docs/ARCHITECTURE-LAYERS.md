@@ -3,7 +3,6 @@
 > 写于 2026-10-03，对应 main `122fff7`（M10 Open Design 集成落地 #660、设计文档补落 #662 之后），已经本地 Codex 对照代码审查。
 > 本文是**导航性总览**：解释各层是什么、彼此什么关系、将来扩展会互相影响到哪里。
 > 每一层的权威细节在文中链接的 ADR / spec / 设计文档里；两者冲突时，以那些文档和**代码**为准，并回来修正本文。
-> 2026-10-26 按当时 main 上的代码订正了：retriever 与 M1 落点、依赖表缺项、Documenting 与 K1 模块工具、数据目录。
 
 **状态标记**（全文统一）：
 
@@ -23,12 +22,12 @@
 │   SidecarManager 🟡（通用 sidecar 规格，产品路径未使用）               │
 │ agent24-cli（含 `agent24 acp` ✅ ACP→REST/WS 映射桥）                  │
 │ packages/：api-client（生成客户端）· contract-tests · nostr/wechat 桥 │
-│            · node-daemon（契约测试参考实现；产品后端是 agent24d）    │
+│            · node-daemon（v1 协议的 mock / 参考实现 daemon）          │
 └──────────────┬───────────────────────────────────────────────────────┘
                │ REST / WS + bearer（默认 legacy 全权 token）
 ┌──────────────▼──────────── L6 扩展面（四类"外挂"）────────────────────┐
 │ ① 进程内 DomainModule 🟡（挂载缝已实现；当前无生产内置模块）           │
-│ ② 进程外领域 OS ✅（ME-3/ME-4：Sin90 / Cos72 / Documenting）           │
+│ ② 进程外领域 OS ✅（ME-3/ME-4：Sin90 / Cos72）                         │
 │ ③ 附着模块 ✅（A3：AgentEar）                                          │
 │ ④ Sidecar 集成（Open Design）：现行 ✅ CreativeServeWeb + ACP 桥；      │
 │    目标形态 🟡 SidecarManager + agent24-sidecar-host + CreativeRuntime │
@@ -49,7 +48,7 @@
 ┌──────────────▼──────── L3 内核能力服务 ────────────────────────────────┐
 │ models（网关 + TaskProfile 路由） tools（工具流水线）                   │
 │ policy（fail-closed 审批 + 可选 Guardian） memory（M-D）                │
-│ scheduler · mcp · comm（Hyphae）· hw · decide · worker 🟡（无消费者）   │
+│ scheduler · mcp · comm（Hyphae） · worker 🟡（ML Worker 契约，无消费者） │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L2 权威与持久化 ────────────────────────────────┐
 │ store：SQLite + 哈希链审计 + workspace 注册表/租约/分配/保留/恢复       │
@@ -74,20 +73,20 @@
 | core、domain、models | protocol |
 | store | core, protocol |
 | workspace | core, protocol, store, os-cwd |
-| tools | protocol, domain, store, workspace |
+| tools | protocol, workspace |
 | memory | core, models |
-| policy | core, domain, models, protocol, store, tools |
+| policy | core, models, protocol, store, tools |
 | scheduler | core, protocol, store |
 | mcp | protocol, tools |
 | agent | core, memory, models, protocol, store, tools, workspace（policy 仅 dev 依赖：审批门由 agent24d 注入） |
 | os-proto | domain, os-fd |
 | os-packages | domain, os-proto |
 | os-sdk | os-proto |
-| **agent24d** | agent, comm, core, decide, domain, hw, mcp, memory, models, os-packages, os-proto, policy, protocol, scheduler, store, tools, workspace（os-sdk 仅 dev 依赖） |
-| agent24-cli | hw, mcp, os-packages, protocol, store（D0-2：`decide export`/`delete` 直接读写 `agent24.db`，不经过 daemon，见 ADR-034） |
+| **agent24d** | agent, comm, core, domain, mcp, memory, models, os-packages, os-proto, policy, protocol, scheduler, store, tools, workspace（os-sdk 仅 dev 依赖） |
+| agent24-cli | mcp, os-packages, protocol, store（D0-2：`decide export`/`delete` 直接读写 `agent24.db`，不经过 daemon，见 ADR-034） |
 | agent24-sidecar-host | sidecar-host-protocol（**没有任何 app 依赖它，Desktop 也不调用**） |
 
-依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`decide` 只被 agent24d 的 `GET /api/v1/decide/profile` 消费（D0-3，`server.rs:1063`，`decide_routes.rs`）；`hw` 被 decide / agent24d / agent24-cli 依赖；`store` 的 dev 依赖含 `decide`，正常依赖不含；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
+依赖方向一律向下，没有向上依赖。`agent24d` 是内核运行时的组合根，`comm` 编译进 agent24d（但不依赖其它内部 crate）；`worker` 当前没有消费者；`decide` 只被 agent24d 的 `GET /api/v1/decide/profile` 消费（D0-1，见下）；`hw` 被 decide / agent24d / agent24-cli 依赖；`agent24-sidecar-host` 是另一个独立的二进制组合根，只依赖自己的协议 crate。
 
 ---
 
@@ -135,13 +134,13 @@
 | `agent24-models` | 模型网关：`ModelProvider` trait + OpenAI 兼容适配 + 有序注册表；`ModelRouter`（`router.rs`，M-D/D2）按 `TaskProfile`（`Privacy::{Any, LocalOnly}` × `Complexity::{Simple, Complex}`）在 `Tier::{Local, Remote, Lora}` 间选 provider，带健康/冷却 | `LocalOnly` 对远端 fail-closed（本地全挂也报错，不外发）。`ModelRouter::from_env` 今天只构造 oMLX 与 Ollama provider。**主对话、子 agent、REST 聊天都传 `TaskProfile::default()`**，只有 Guardian 与模块推理回调会设置 `LocalOnly`，任务画像生成 📐（ID-1）。Agent24 内没有出境脱敏代码（已定由 iDoris 出口网关负责）。**iDoris provider 📐**：ADR-032 已接受，P4 接线未做（无 `IDORIS_URL`） |
 | `agent24-tools` | 工具 trait + 注册表 + 内建工具（`http_fetch`、`fs_read`、`fs_write`、`shell_exec`） | 固定流水线：normalize → 能力白名单 → 审批门 → 超时执行；文件系统权限见 L2 的 workspace-bound / legacy 两条路径 |
 | `agent24-policy` | 审批 broker + 工具门；可选的 **Guardian**（`guardian.rs`，M-D/D3）：在人工审批前用 LocalOnly 本地模型给工具调用评风险 | fail-closed：超时即拒绝，取消即 aborted，store 行为权威，重复决策 409。Guardian **默认关闭**（`A24_GUARDIAN=1` 才开）：只有明确解析出 `low` 才自动批准，其余一律交给人；`exec` 默认始终要人审 |
-| `agent24-memory` | M-D 记忆：D1 的 `KvStore` + `CanonicalSession`，以及 artifact / assertion / condenser / consolidator / event / knowledge / retriever / vector / writer 等高层模块 | agent loop **已消费** D1 的 `KvStore` / `CanonicalSession`；recall 已调用 retriever 的 `search_any`（`agent24-agent/src/session_memory.rs:158-162`）；event 层被领域 OS 的 memory 回调使用。consolidator 仍无 agent loop 消费者。M1 已于 2026-10-07 经 #720 合入 main |
+| `agent24-memory` | M-D 记忆：D1 的 `KvStore` + `CanonicalSession`，以及 artifact / assertion / condenser / consolidator / event / knowledge / retriever / vector / writer 等高层模块 | agent loop **已消费** D1 的 `KvStore` / `CanonicalSession`；event 层被领域 OS 的 memory 回调使用；**retriever / consolidator 等高层尚未被 agent loop 消费**（M1 的工作） |
 | `agent24-scheduler` | cron / every / at 调度 | 先推进 `next_run_at` 再触发；跳过漏掉的 tick；连续失败自动禁用；ME-4 起可把触发投递给模块 |
 | `agent24-mcp` | 外部 MCP server 适配 | 外部工具包装成普通 `Tool`，与内建工具走同一条审批流水线 |
 | `agent24-comm` | Hyphae（Nostr）CLI 调用、keystore 串行化、密码存储、REST 路由与 daemon 状态 | 二进制哈希校验、密码只走 stdin（[COMM-HYPHAE](design/COMM-HYPHAE.md)） |
 | `agent24-worker` 🟡 | Python ML Worker（embedding / whisper）的 Rust 侧 wire 契约 + HTTP 客户端 | workspace 内没有任何 crate 依赖它 |
-| `agent24-hw` 🟡 | 硬件探测与内存账（HW-1，[ADR-036](decision.md)，设计 [HW-TIERS](design/HW-TIERS-capability-hardware-matrix.md)）：`HardwareProfile` v2（芯片、统一内存、GPU wired 上限、独显、**全部挂载卷**含外接盘、模型目录所在盘余量、电池）+ `HardwareProbe`/`SystemProbe`/`FakeHardwareProbe` + `HwLevel::L1..L6` + `usable_bytes` 预算（`A24_HW_BUDGET_CAP_GB` 可压低以模拟小内存机） | 只依赖 serde/serde_json/sysinfo，不依赖任何其它内部 crate；外部命令（sysctl/sw_vers/pmset/nvidia-smi）全带 2s 超时、失败为 `None`；agent24d 启动时把 `hardware.json` 写进数据目录（默认 `$HOME/.agent24`，`hardware.rs`），`agent24 hw probe` 打印；**runtimes 未探测、无 HTTP 路由（HW-3）、能力梯/解析器未做** |
-| `agent24-decide` 🟡 | 决策服务（D0-1，[ADR-033](decision.md)）：`DecisionRequest`/`Question`/`Decision` 等类型 + `DecisionBackend` trait + `RuleBackend` + 级联 `DecisionService`；接口形状照 Jev `/v1/systemone`（choice/noul/score + 校准概率）。D0-2（[ADR-034](decision.md)）追加 `log` 模块：决策日志的 `DecisionLog` trait + DTO（`LogEntry`/`OutcomeEntry`/`ExportFilter`/`DeleteSelector`） | 正常依赖只有 `agent24-hw`。agent24d 用它提供 `GET /api/v1/decide/profile`（`decide_routes.rs`，D0-3）。agent loop 还不消费 `DecisionService`（那是 D1）。`DecisionLog` 仍无生产调用方（ADR-034，预期落在 `agent24d`） |
+| `agent24-hw` 🟡 | 硬件探测与内存账（HW-1，[ADR-036](decision.md)，设计 [HW-TIERS](design/HW-TIERS-capability-hardware-matrix.md)）：`HardwareProfile` v2（芯片、统一内存、GPU wired 上限、独显、**全部挂载卷**含外接盘、模型目录所在盘余量、电池）+ `HardwareProbe`/`SystemProbe`/`FakeHardwareProbe` + `HwLevel::L1..L6` + `usable_bytes` 预算（`A24_HW_BUDGET_CAP_GB` 可压低以模拟小内存机） | 只依赖 serde/serde_json/sysinfo，不依赖任何其它内部 crate；外部命令（sysctl/sw_vers/pmset/nvidia-smi）全带 2s 超时、失败为 `None`；agent24d 启动时写 `~/.agent24/hardware.json`，`agent24 hw probe` 打印；**runtimes 未探测、无 HTTP 路由（HW-3）、能力梯/解析器未做** |
+| `agent24-decide` 🟡 | 决策服务（D0-1，[ADR-033](decision.md)）：`DecisionRequest`/`Question`/`Decision` 等类型 + `DecisionBackend` trait + `RuleBackend` + 级联 `DecisionService`；接口形状照 Jev `/v1/systemone`（choice/noul/score + 校准概率）。D0-2（[ADR-034](decision.md)）追加 `log` 模块：决策日志的 `DecisionLog` trait + DTO（`LogEntry`/`OutcomeEntry`/`ExportFilter`/`DeleteSelector`） | 只依赖 serde/serde_json/async-trait/thiserror；不依赖任何其它内部 crate；**D0-1/D0-2 都不接入 agent24d，不改任何现有调用点**；无消费者，等 D1 接线（记住意图 + 召回门控）时才有人实现 `DecisionLog`（预期落在 `agent24d`，ADR-034） |
 
 ### L4 运行时内核 — `agent24-agent`
 
@@ -155,11 +154,9 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 
 - **对外 API**：v1 REST + WS（runs、sessions、approvals、comm、os、attached…）。workspace 目前**没有**对外 REST 路由（产品构造、host lease、resolve 都未开放），只能经内部 run 准入路径使用。
 - **鉴权模式**：
-  - 默认 `legacy_single_token` ✅：生成一个全权 bearer，写进数据目录的 `daemon.json`。数据目录是 `AGENT24_DATA_DIR`（非空绝对路径）优先，否则 `$HOME/.agent24`（`agent24-protocol/src/state_file.rs:126-148`；桌面 `daemonStatePath` 同一规则）。ADR-037 决策 3 把 Windows 定为 `%LOCALAPPDATA%\Agent24`，`state_dir()` 今天只认上面这条规则。Desktop（`BackendManager` 以 `serve --port 0` 启动）和 CLI 今天都走这条路径。
+  - 默认 `legacy_single_token` ✅：生成一个全权 bearer，写进 `~/.agent24/daemon.json`。Desktop（`BackendManager` 以 `serve --port 0` 启动）和 CLI 今天都走这条路径。
   - `capabilities` 🟡：需要 `--auth-mode capabilities --host-bootstrap-stdio` 启动；`daemon.json` 不含凭据，`ProductHost` 只经私有 ready pipe 交给宿主父进程。已实现：令牌库、`CreativeRuntime` 的 mint / 吊销（claims 含 workspace / attachment / principal）、TTL 与代际、**默认拒绝**的路由策略（`src/capabilities/`、`server.rs` 的 `required_operation`）。**尚未实现**（📐，见 [ADR-005](open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md)）：从请求中提取 workspace / session / run 资源并校验、durable 的 session / run 归属、事件过滤与每次发送前复验、broker / handoff。因此在 capability 模式下，除公开的 `GET /api/v1/health` 外，`CreativeRuntime` 目前唯一能访问的受认证路由是全局模型目录（`GET /api/v1/models`），其余受认证路由一律要求宿主权限。另外，Desktop 的通用 `backendProxy` 目前接受渲染进程给的任意路径并附带 token，ADR-002/005 要求的高权限接口隔离尚未实现（见 [PLAN-OD-NEXT](agent/PLAN-OD-NEXT.md) F11.0）。Desktop 与 `agent24 acp` 都未使用该模式；CLI 遇到 capability 模式的 daemon 会报错 `host authority unavailable`（内部常量 `HOST_AUTHORITY_UNAVAILABLE`）。
 - **领域 OS 挂载**（`src/domain.rs`）：进程内模块的授权上限 `KERNEL_GRANTS` = Events / Memory / Approval；进程外模块 `KERNEL_OOP_GRANTS` 再多 Scheduler / Models。
-- **模块工具与同意**（K1，#1022 已入 main）：`module_tool_runtime.rs` 派发模块工具；`consent_routes.rs` 提供 `/api/v1/module-consents`；`module_approvals.rs` 与 `module_approval_broker.rs` 管模块审批。策略侧有 `agent24-policy/src/consent_gate.rs` 和 `write_scope.rs`。相关迁移是 `0014_decision_log.sql` 到 `0018_module_consent_reversible_draft.sql`。
-- **个人记忆 REST**（M1）：`memory_routes.rs` 提供 `GET /api/v1/memory/assertions`、撤回，以及 `GET/PUT /api/v1/memory/settings`（`server.rs:1114-1125`）。带查询词的列表调用 retriever（`memory_routes.rs:165`）。进程外记忆分页在 `os_memory_page.rs`。
 - **回调面**：审批、调度、推理、记忆回调（ME-4），见 [PLAN-ME4-OS-CAPABILITIES](agent/PLAN-ME4-OS-CAPABILITIES.md)。
 - **附着注册表**：A3 模块的监听 socket、握手、代际簿记、反向命令。
 
@@ -179,11 +176,9 @@ run 管理器与 agent loop。正常依赖：core / memory / models / protocol /
 | 类型 | 例子 | 谁启动进程 | 信任假设 | 通道 | 权威文档 |
 |---|---|---|---|---|---|
 | ① 进程内 DomainModule 🟡 | 当前无（生产 catalogue 为空，没有生产代码构造 `Build::InProcess`；挂载缝已实现并测试） | 编进 daemon | **可信代码**；Rust 可见性不是沙箱 | 进程内 trait | [ADR-029](decision.md) |
-| ② 进程外领域 OS ✅ | Sin90、Cos72、Documenting | daemon 拉起 / 监管 / 停止 | 同 UID、合作但可能有 bug；**不防**敌意本地二进制 | UDS + 一次性回调 socket + 握手 token | [SPEC-ME3](specs/SPEC-ME3-OUT-OF-PROCESS.md)、[ME4-S3 os-sdk](design/ME4-S3-os-sdk.md)、[ADR-DOC-01](documenting/adr/ADR-DOC-01-placement-and-integration.md) |
+| ② 进程外领域 OS ✅ | Sin90、Cos72 | daemon 拉起 / 监管 / 停止 | 同 UID、合作但可能有 bug；**不防**敌意本地二进制 | UDS + 一次性回调 socket + 握手 token | [SPEC-ME3](specs/SPEC-ME3-OUT-OF-PROCESS.md)、[ME4-S3 os-sdk](design/ME4-S3-os-sdk.md) |
 | ③ 附着模块 ✅ | AgentEar | 用户 / launchd / 自己 | 同②，但 token 长期有效、断连不杀 | 常驻 attach socket 上的 JSON-RPC | [A3-ATTACHED-MODULE](design/A3-ATTACHED-MODULE.md)、ADR-032 |
 | ④ Sidecar 集成 | Open Design | 见下表 | 经 pin / hash 校验的 bundled sidecar 属于**本地应用 TCB**；capability 是应用层最小权限，**不是**同 UID 的 OS 沙箱，敌意 sidecar 不在当前威胁模型内（ADR-005） | 见下表 | [ADR-001](open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md)、[ADR-003](open-design-workspace/design/ADR-003-ACP-BRIDGE.md)、[ADR-004](open-design-workspace/design/ADR-004-DESKTOP-HOST.md)、[ADR-005](open-design-workspace/design/ADR-005-CAPABILITY-AUTHORITY.md) |
-
-Documenting 的二进制是 `rust/apps/agent24-documents`，正常依赖 `agent24-os-sdk`。`packages/documents-accept` 是验收夹具，跑真实 daemon 的 documents 路由。桌面页面走 `apps/desktop/src/main/documents.ts` 的类型化 preload（`window.agent24.documents.*`），不经通用 `backendProxy`（`documents.ts:1-4`）。
 
 **④ Open Design 的现行路径与目标形态**
 
@@ -202,14 +197,13 @@ Documenting 的二进制是 `rust/apps/agent24-documents`，正常依赖 `agent2
 
 ### L7 外壳
 
-- **apps/desktop（Electron）**：唯一的桌面 main 进程。`BackendManager` 托管 agent24d（默认 Rust；`AGENT24_BACKEND=node` 才拉起 node-daemon）。`CreativeServeWeb` 托管 Open Design；`SidecarManager` 已实现但产品路径未使用。文档页走 `documents.ts` / `documents-import.ts`。`idoris-admin.ts` 按 ADR-035 从继承的 FD 读取 Admin token（`main.ts` 引用它）。
-- **agent24-cli**：v1 协议客户端；`agent24 acp` 是 ACP-over-stdio 映射桥，不持有执行逻辑。`agent24 chat` 已有子命令；TUI 仍没有聊天输入。
+- **apps/desktop（Electron）**：唯一的桌面 main 进程。`BackendManager` 托管 agent24d；`CreativeServeWeb` 托管 Open Design；`SidecarManager` 已实现但产品路径未使用。
+- **agent24-cli**：v1 协议客户端；`agent24 acp` 是 ACP-over-stdio 映射桥，不持有执行逻辑。
 - **packages/**：
   - `api-client`：由 OpenAPI 生成的 TS 客户端；
   - `contract-tests`：契约测试；
   - `nostr-bridge` / `wechat-bridge`：通信桥；
-  - `documents-accept`：Documenting 验收夹具；
-  - `node-daemon`：v1 协议的契约测试参考实现。产品后端是 agent24d。各平台安装包的 `extraResources` 今天仍打进 `packages/node-daemon/dist`（`apps/desktop/package.json`）。ADR-037 决策 1 要求把它移出安装包。
+  - `node-daemon`：v1 协议的 Node 参考 / mock daemon 实现，**不是客户端**。
 
 ---
 
@@ -262,7 +256,7 @@ Documenting 的二进制是 `rust/apps/agent24-documents`，正常依赖 `agent2
 | 给 `Capability` 加新能力 | 契约层、`KERNEL_*_GRANTS`、os-sdk 客户端、协议版本协商、所有模块类型 | 影响面最大；先写 ADR，再按 ME-4 的切法逐片落地 |
 | 新 workspace 类型 / 支持写回源码 | tools、policy（写回需审批）、store 结构、ADR-001/002 | 先定写回审批与并发策略 |
 | 接第二个 sidecar 工具（例如另一个 Apache-2.0 创作工具） | 复用 L6④ 全套；但 `CreativeRuntime`、`creative_attachment_id`、`CreativeServeWeb` 是 Creative 专名 | 先完成上面第一行，再把专名泛化成按工具区分的 audience / attachment / 托管器 |
-| M1 记忆产品化 | `ScopedMemory`、领域 OS 记忆分区、agent loop、`laws/MEMORY.md` | retriever 已由 agent loop 的 recall 消费（`session_memory.rs:158-162`）。consolidator 仍无 agent loop 消费者。M1 已于 2026-10-07 经 #720 合入 main，`ab/m1-memory` 不在。跨 OS 共享仍在后面 |
+| M1 记忆产品化 | `ScopedMemory`、领域 OS 记忆分区、agent loop、`laws/MEMORY.md` | agent loop 先消费 M-D 高层（retriever / consolidator），再谈跨 OS 共享 |
 | ② 与 ④ 两套扩展模型长期并存 | 生命周期、授权、协议各一套 | 中长期考虑共用一套令牌 + workspace 权限模型 |
 | iDoris provider（ADR-032 P4） | `ModelRouter::from_env`、隐私头 `X-iDoris-Privacy`、落点回报 | 接线时保持 `LocalOnly` 对远端 fail-closed |
 | 领域 OS 签名（ME-6） | os-packages 安装、启动校验 | 当前威胁模型明确不防敌意本地二进制，签名也解决不了这一点 |
@@ -304,7 +298,7 @@ Documenting 的二进制是 `rust/apps/agent24-documents`，正常依赖 `agent2
 - 📐 Web3（AAStar）身份与结算：Agent24 中没有接线。
 - 📐 OpenAPI 由 Rust 生成（B4）。
 - workspace 只有 scratch 一种受信构造；写回、其它类型、并发策略未定。
-- retriever 已被 main 上 agent loop 的 recall 消费（`rust/crates/agent24-agent/src/session_memory.rs:158-162` 调用 `search_any`）。consolidator 仍无 agent loop 消费者。M1 已于 2026-10-07 经 #720 合入 main。
+- M-D 高层（retriever / consolidator 等）尚未被 main 上的 agent loop 消费；M1 已在 `ab/m1-memory` 恢复为当前主干（2026-10-03），完成后合回 main。
 - 📐 领域 OS 签名（ME-6）。
 - `docs/laws/` 目前只有上下文、记忆、审批三部法条。
 - Review 遗留：[#661](https://github.com/iDoris-ai/Agent24/issues/661)（Creative view）、[#663](https://github.com/iDoris-ai/Agent24/issues/663)（M10 叠加 PR 遗留）。

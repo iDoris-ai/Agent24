@@ -159,6 +159,29 @@ pub struct RawToolDeclaration {
     /// Untrusted semantic claim only; the host must verify storage and effects.
     #[serde(default)]
     reversible_draft: bool,
+    /// K1-06a-resource-scope §2.3: the root kinds a grant for this tool may
+    /// carry. Absent or empty: grants carry no resources. The outer `Option`
+    /// is whether the key is there at all, so an explicit `null` counts as
+    /// written (and is then refused): an older kernel refuses the key
+    /// whatever its value.
+    #[serde(default, deserialize_with = "present")]
+    resource_kinds: Option<Option<Vec<String>>>,
+}
+
+/// A key that is present, whatever its value, including `null`.
+fn present<'de, D>(deserializer: D) -> Result<Option<Option<Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer).map(Some)
+}
+
+impl RawToolDeclaration {
+    /// Whether the entry carries `resource_kinds` at all, even empty or
+    /// `null`: an older kernel refuses the key whatever its value.
+    pub(crate) fn declares_resource_kinds(&self) -> bool {
+        self.resource_kinds.is_some()
+    }
 }
 
 /// One module-declared tool operation, VALIDATED.
@@ -178,6 +201,7 @@ pub struct ToolDeclaration {
     timeout_ms: u64,
     inline_wait_ms: u64,
     reversible_draft: bool,
+    resource_kinds: Vec<String>,
 }
 
 impl ToolDeclaration {
@@ -222,6 +246,56 @@ impl ToolDeclaration {
     pub fn reversible_draft(&self) -> bool {
         self.reversible_draft
     }
+
+    /// The grantable root kinds, in declaration order; empty when none
+    /// (K1-06a-resource-scope §2.3). Declared, not granted: the host decides
+    /// which ids a grant carries.
+    pub fn resource_kinds(&self) -> &[String] {
+        &self.resource_kinds
+    }
+}
+
+/// `kind` of K1-06a-resource-scope §2.1: `[a-z][a-z0-9_]{0,31}`, ASCII.
+pub fn is_resource_kind(kind: &str) -> bool {
+    let bytes = kind.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// Each kind valid ([`is_resource_kind`]) and none repeated, else the whole
+/// manifest is refused; absent is empty, and an explicit `null` is refused.
+fn validate_resource_kinds(
+    operation: &str,
+    kinds: Option<Option<Vec<String>>>,
+) -> Result<Vec<String>, DomainError> {
+    let list = match kinds {
+        None => return Ok(Vec::new()),
+        Some(None) => {
+            return Err(DomainError::Manifest(format!(
+                "tools.{operation:?}: resource_kinds must be a list, not null"
+            )));
+        }
+        Some(Some(list)) => list,
+    };
+    let mut seen = BTreeSet::new();
+    for k in &list {
+        if !is_resource_kind(k) {
+            return Err(DomainError::Manifest(format!(
+                "tools.{operation:?}: invalid resource kind {k:?} (expected [a-z][a-z0-9_]{{0,31}})"
+            )));
+        }
+        if !seen.insert(k.clone()) {
+            return Err(DomainError::Manifest(format!(
+                "tools.{operation:?}: resource kind {k:?} is declared more than once"
+            )));
+        }
+    }
+    Ok(list)
 }
 
 /// Validate a manifest's declared tools (ADR-K1-01 §2.1, §2.2, §5(2)).
@@ -286,6 +360,7 @@ pub(crate) fn validate_tools(
                 r.operation, r.inline_wait_ms, r.timeout_ms
             )));
         }
+        let resource_kinds = validate_resource_kinds(&r.operation, r.resource_kinds)?;
         out.push(ToolDeclaration {
             operation: r.operation,
             description: r.description,
@@ -295,6 +370,7 @@ pub(crate) fn validate_tools(
             timeout_ms: r.timeout_ms,
             inline_wait_ms: r.inline_wait_ms,
             reversible_draft: r.reversible_draft,
+            resource_kinds,
         });
     }
     Ok(out)
@@ -462,6 +538,7 @@ impl ModuleToolRegistry {
             if view.module_ready(module).await
                 && view.operation_available(module, operation).await
                 && view.has_current_consent(module, operation).await
+                && view.outbound_gate_ready(module, operation).await
                 && !view.blocked_by_remote_tier_guard(module, operation).await
             {
                 adverts.push(ModuleToolAdvert {
@@ -572,7 +649,8 @@ impl ModuleToolAdvert {
 /// Every gate is awaited fresh for every registered tool. Defaults fail closed;
 /// agent24d supplies live supervisor state, registered manifest operations,
 /// ConsentGate lookups, and the remote-tier/document guard. Gate 5 only narrows
-/// what gates 1-4 allow.
+/// what gates 1-4 allow. Gate 6 also withholds tools until K1-5.3 invokes
+/// through the live egress gate.
 #[async_trait::async_trait]
 pub trait ModuleToolAdvertView: Send + Sync {
     /// Gates 1+2 (ADR-K1-01 §2.2): `module` is registered and its current
@@ -598,6 +676,15 @@ pub trait ModuleToolAdvertView: Send + Sync {
     /// third-party module self-reporting `Read`/`local_only` — never
     /// substitutes for this. Default: unauthorized (fail-closed).
     async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
+        false
+    }
+
+    /// Gate 6 (K1-6b.3): whether this operation's invocation path is wired to
+    /// the host-owned live egress decision API. This is only an advert readiness
+    /// gate; K1-5.3 must pass source policy, purpose, exact destination and
+    /// authorization generation into the checker immediately before invoking.
+    /// Until that call path lands, this defaults false and suppresses adverts.
+    async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
         false
     }
 
@@ -628,6 +715,7 @@ mod tests {
             timeout_ms: 5_000,
             inline_wait_ms: 1_000,
             reversible_draft: false,
+            resource_kinds: None,
         }
     }
 
@@ -871,6 +959,7 @@ mod tests {
         operation_available: bool,
         authorized: bool,
         remote_tier_blocked: bool,
+        outbound_ready: bool,
     }
 
     impl TestView {
@@ -880,6 +969,7 @@ mod tests {
                 operation_available: true,
                 authorized: true,
                 remote_tier_blocked: false,
+                outbound_ready: true,
             }
         }
     }
@@ -896,6 +986,10 @@ mod tests {
 
         async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
             self.authorized
+        }
+
+        async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
+            self.outbound_ready
         }
 
         async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {
@@ -945,6 +1039,14 @@ mod tests {
             adverts[0].input_schema(),
             &serde_json::json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[tokio::test]
+    async fn a_tool_without_a_live_egress_call_path_is_not_advertised() {
+        let reg = registry_with_one_tool();
+        let mut view = TestView::all_pass();
+        view.outbound_ready = false;
+        assert!(reg.adverts(&view).await.is_empty());
     }
 
     // ---- ADR-K1-01 §5(4): disabled/breaker/backoff/draining/crashed or
@@ -1079,6 +1181,9 @@ mod tests {
                 true
             }
             async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
+                true
+            }
+            async fn outbound_gate_ready(&self, _module: &str, _operation: &str) -> bool {
                 true
             }
             async fn blocked_by_remote_tier_guard(&self, _module: &str, _operation: &str) -> bool {

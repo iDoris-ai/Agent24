@@ -152,7 +152,7 @@ fn raw_request_timeout(
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect to the daemon");
     s.set_read_timeout(Some(timeout)).unwrap();
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {token}\r\n\
          connection: close\r\ncontent-length: {}\r\n\r\n",
         body.len()
     )

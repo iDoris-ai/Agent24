@@ -774,11 +774,13 @@ async fn a_backend_that_hangs_up_while_a_large_prompt_is_written_is_unavailable(
         messages: vec![Msg::user("x".repeat(16 << 20))],
         ..req(None)
     };
-    // The timers are not this test's subject (the first chunk's has tests of
-    // its own) and must not race the hang-up: the first chunk's runs from
-    // before the body is serialized (16 MiB, some 350 ms in a debug build)
-    // through its write, so a loaded runner lost a 1 s one to it (#1116).
     let streamed = CompletionRequest {
+        // The write is what is under test, so the timers must not be able to
+        // end the call first. A 16 MiB body is serialized and written inside
+        // the first-chunk timer, which takes longer than a 1s limit in a debug
+        // build (every run failed with `no output within 1s`, #1158). A minute
+        // is out of reach for the hang-up, which is certain: the server has
+        // already closed, so the write is reset.
         progress: Some(progress(60_000, 60_000, 120_000)),
         ..big.clone()
     };

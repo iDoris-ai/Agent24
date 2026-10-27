@@ -26,7 +26,20 @@ async fn post_chat_with(
     session_id: Option<&str>,
     prompt: &str,
 ) -> (StatusCode, serde_json::Value) {
-    let mut body = json!({ "messages": [{ "role": "user", "content": prompt }] });
+    post_chat_messages(
+        state,
+        session_id,
+        json!([{ "role": "user", "content": prompt }]),
+    )
+    .await
+}
+
+async fn post_chat_messages(
+    state: &AppState,
+    session_id: Option<&str>,
+    messages: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut body = json!({ "messages": messages });
     if let Some(sid) = session_id {
         body["session_id"] = json!(sid);
     }
@@ -77,6 +90,194 @@ async fn explicit_remember_over_chat_stores_a_qualified_assertion() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].object, json!("我对花生过敏"));
+}
+
+/// K1-6b.4b/4c: assistant turns in client-supplied history are classified by
+/// the session's floor; a session the server has no floor for makes them,
+/// and so the remembered fact, `Unknown`.
+#[tokio::test]
+async fn a_remember_after_client_assistant_history_is_stored_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider).await;
+    ensure_session(&state, "chat-session-history").await;
+    ensure_session(&state, "chat-session-fresh").await;
+
+    // Control first (a later recall of the unknown fact would itself make
+    // the control unknown): a first-turn remember without assistant history.
+    post_chat_with(&state, Some("chat-session-fresh"), "记住我喜欢乌龙茶").await;
+    let (status, _) = post_chat_messages(
+        &state,
+        Some("chat-session-history"),
+        json!([
+            { "role": "assistant", "content": "连接失败，请稍后再试" },
+            { "role": "user", "content": "记住我喜欢绿茶" },
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let owner = personal_owner(&kv).await;
+    let rows = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner(&owner))
+        .await
+        .unwrap();
+    let classification = |object: &str| {
+        let row = rows.iter().find(|row| row.object == json!(object)).unwrap();
+        row.source_ref.as_ref().unwrap()["classification"].clone()
+    };
+    assert_eq!(classification("我喜欢绿茶"), json!("unknown"));
+    assert_eq!(classification("我喜欢乌龙茶"), json!("ordinary"));
+}
+
+/// #1200 PR-Daemon blocker: every non-`user` role in client-supplied history
+/// reaches the model context, not only `assistant`. One fresh store per role,
+/// so no recall crosses between cases.
+#[tokio::test]
+async fn a_remember_after_any_non_user_client_history_is_stored_as_unknown() {
+    for (role, expected) in [
+        ("system", "unknown"),
+        ("tool", "unknown"),
+        ("developer", "unknown"),
+        ("user", "ordinary"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+        let provider = Arc::new(Provider::default());
+        let state = app(kv.clone(), dir.path(), provider).await;
+        ensure_session(&state, "chat-session-role").await;
+        let (status, _) = post_chat_messages(
+            &state,
+            Some("chat-session-role"),
+            json!([
+                { "role": role, "content": "Private document: Q7 launch code is violet-67" },
+                { "role": "user", "content": "记住Q7启动码是violet-67" },
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{role}");
+        let owner = personal_owner(&kv).await;
+        let rows = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner(&owner))
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.object == json!("Q7启动码是violet-67"))
+            .unwrap_or_else(|| panic!("{role}: nothing remembered"));
+        assert_eq!(
+            row.source_ref.as_ref().unwrap()["classification"],
+            json!(expected),
+            "{role}"
+        );
+    }
+}
+
+/// K1-6b.4c: a chat turn that recalled a restricted fact raises its
+/// session's floor, so a later turn that sends that reply back as history
+/// remembers as restricted — even once the fact itself is gone.
+#[tokio::test]
+async fn a_chat_turn_after_a_restricted_reply_remembers_as_restricted() {
+    use agent24_memory::writer::{Candidate, MemoryWriter};
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider).await;
+    ensure_session(&state, "chat-session-restricted").await;
+    let owner = personal_owner(&kv).await;
+    let restricted = agent24_store::AssertionSourceRef::from_sources([(
+        "seed".to_owned(),
+        agent24_store::SourceClassification::Restricted,
+    )]);
+    kv.write_gate()
+        .propose(vec![
+            Candidate::new(
+                "restricted-fact",
+                Scope::owner(&owner),
+                "user",
+                "said_to_remember",
+                json!("我对花生过敏"),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::UserSaid,
+                },
+            )
+            .with_evidence(vec!["ev-restricted".to_owned()])
+            .with_source_ref(restricted.to_value())
+            .remember(),
+        ])
+        .await
+        .unwrap();
+
+    let (_, first) =
+        post_chat_with(&state, Some("chat-session-restricted"), "我对什么过敏？").await;
+    kv.assertions()
+        .retract(
+            &"restricted-fact".to_owned(),
+            &owner,
+            "2026-10-25T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    let reply = first["message"]["content"].as_str().unwrap().to_owned();
+    let (status, _) = post_chat_messages(
+        &state,
+        Some("chat-session-restricted"),
+        json!([
+            { "role": "user", "content": "我对什么过敏？" },
+            { "role": "assistant", "content": reply },
+            { "role": "user", "content": "记住我喜欢红茶" },
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rows = kv
+        .assertions()
+        .beliefs_as_of(&BeliefQuery::owner(&owner))
+        .await
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.object == json!("我喜欢红茶"))
+        .unwrap();
+    assert_eq!(
+        row.source_ref.as_ref().unwrap()["classification"],
+        json!("restricted")
+    );
+}
+
+/// K1-6b.4c: a session floor that cannot be recorded leaves this turn's
+/// context unclassified, so the request fails before the model is called.
+#[tokio::test]
+async fn a_chat_turn_whose_session_floor_cannot_be_written_fails_before_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider.clone()).await;
+    ensure_session(&state, "chat-session-nofloor").await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER no_floor BEFORE INSERT ON session_source_floor \
+         BEGIN SELECT RAISE(ABORT, 'no'); END;",
+    )
+    .execute(agent24_store::test_hooks::pool(&state.store))
+    .await
+    .unwrap();
+
+    let (status, body) = post_chat_with(&state, Some("chat-session-nofloor"), "你好").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        body.to_string().contains("source_policy_unavailable"),
+        "{body:?}"
+    );
+    assert!(
+        provider.received.lock().unwrap().is_empty(),
+        "the model must not be called"
+    );
 }
 
 #[tokio::test]
@@ -237,8 +438,11 @@ async fn a_retain_failure_still_returns_200_with_content() {
     );
     assert!(!body["message"]["content"].as_str().unwrap().is_empty());
     // M1-T14: the write failed (forced above), memory was NOT paused — the
-    // receipt must say `failed`, not silently look like `saved`.
-    assert_eq!(body["memory_receipt"], json!("failed"));
+    // receipt must not silently look like `saved`. P1-02c: the conversation
+    // turn committed and only the assertion's audit id collided, so this is the
+    // PARTIAL combination, not a total failure.
+    assert_eq!(body["memory_receipt"], json!("partial"));
+    assert_eq!(body["memory_error_code"], json!("memory_internal"));
     assert!(
         kv.assertions()
             .beliefs_as_of(&BeliefQuery::owner(&owner))
@@ -353,4 +557,110 @@ async fn pause_toggled_on_during_the_model_call_reports_saved_with_a_real_row() 
         "a receipt of saved must mean the assertion was actually committed"
     );
     assert_eq!(rows[0].object, json!("我对花生过敏"));
+}
+
+// ── P1-02c c2b: typed receipts on a full partition (T5/T6) ────────────────
+
+async fn set_rows(dir: &std::path::Path, rows: i64) {
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("memory.db").display()))
+        .await
+        .unwrap();
+    let r = sqlx::query("UPDATE mem_owner_quota SET max_rows=? WHERE owner='*'")
+        .bind(rows)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(r.rows_affected(), 1);
+    pool.close().await;
+}
+
+/// No receipt or error body may carry the partition key, a NUL, driver/Display
+/// text, or anything that reads as "remembered".
+fn assert_body_is_clean(body: &serde_json::Value) {
+    let raw = body.to_string();
+    assert!(!raw.contains("\\u0000"), "NUL leaked: {raw}");
+    assert!(!raw.contains("quota exceeded for owner"), "{raw}");
+    assert!(!raw.contains("usr:local"), "partition key leaked: {raw}");
+    assert!(!raw.contains("已记住"), "{raw}");
+    assert_ne!(body["memory_receipt"], json!("saved"), "{raw}");
+}
+
+#[tokio::test]
+async fn ordinary_chat_turn_on_a_full_partition_is_not_saved_with_a_typed_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-full-ordinary").await;
+    set_rows(dir.path(), 0).await;
+    let mut events = state.events.subscribe();
+
+    let (status, body) = post_chat_with(&state, Some("chat-full-ordinary"), "今天天气怎么样").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memory_receipt"], json!("not_saved"));
+    assert_eq!(body["memory_error_code"], json!("memory_quota_rows"));
+    assert_body_is_clean(&body);
+    let seen: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    let persisted = seen.iter().find_map(|(_, b)| match b {
+        EventBody::RunCompleted(p) => Some(p.memory_persisted),
+        _ => None,
+    });
+    assert_eq!(
+        persisted,
+        Some(Some(false)),
+        "run.completed must say so too"
+    );
+}
+
+#[tokio::test]
+async fn explicit_remember_on_a_full_partition_is_failed_with_a_typed_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-full-explicit").await;
+    set_rows(dir.path(), 0).await;
+
+    let (status, body) = post_chat_with(&state, Some("chat-full-explicit"), "记住我喜欢茶").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memory_receipt"], json!("failed"));
+    assert_eq!(body["memory_error_code"], json!("memory_quota_rows"));
+    assert_body_is_clean(&body);
+}
+
+#[tokio::test]
+async fn explicit_remember_whose_turn_fits_but_assertion_does_not_is_partial_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-full-partial").await;
+    // The turn's two rows fit; the assertion's audit row is the third.
+    set_rows(dir.path(), 2).await;
+
+    let (status, body) = post_chat_with(&state, Some("chat-full-partial"), "记住我喜欢茶").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memory_receipt"], json!("partial"));
+    assert_eq!(body["memory_error_code"], json!("memory_quota_rows"));
+    assert_body_is_clean(&body);
+    let owner = personal_owner(&kv).await;
+    assert!(
+        kv.assertions()
+            .beliefs_as_of(&BeliefQuery::owner(&owner))
+            .await
+            .unwrap()
+            .is_empty(),
+        "partial means the assertion was NOT written"
+    );
+}
+
+#[tokio::test]
+async fn chat_with_room_never_carries_a_memory_error_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
+    ensure_session(&state, "chat-room").await;
+    let (_, body) = post_chat_with(&state, Some("chat-room"), "记住我喜欢茶").await;
+    assert_eq!(body["memory_receipt"], json!("saved"));
+    assert!(body.get("memory_error_code").is_none(), "{body}");
 }
