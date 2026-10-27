@@ -26,7 +26,7 @@ Linux、Intel mac 不在本次预发布范围。dmg 文件名以实际构建输�
 - [ ] 四条线都已合入 main，顺序为 kernel #1280 → memory-p1 #1341 → documenting → weknora。
       `gh pr list -R iDoris-ai/Agent24 --state merged --base main --limit 20` 能看到这四个 release PR。
 - [ ] `ab/idoris` 已进 main（第五线，排在最后；截止 2026-10-28 12:00 Asia/Bangkok，见 #1370）。**赶不上则本版不含 iDoris，
-      配对改下一个 preview**，不等；此时第 4 节的 iDoris 用例组（ID-1…ID-8）、第 5.1 节的 iDoris 项和 Release Notes 的 iDoris 项一并划掉。
+      配对改下一个 preview**，不等；此时第 4 节的 iDoris 用例组（ID-1…ID-6、ID-8）、第 5.1 节的 iDoris 项和 Release Notes 的 iDoris 项一并划掉。
 - [ ] 本分支（`chore/release-0.6.0-preview-prep`）已吸收 main，**合并后重新核对版本号**：
       ```bash
       git grep -n '^version = "0.5.1"' -- '*Cargo.toml'; git grep -n '"version": "0.5.1"' -- '*package.json'
@@ -158,7 +158,7 @@ mkdir -p /tmp/a24-pre-verify && gh release download v0.6.0-preview.20261028.1 -R
   旧授予按 Stale 拒绝、已知局限 #1290）。
 - **数据库升级不可回退**：迁移无 `.down.sql`，旧二进制遇到已记录的新迁移会拒开；升级前自行复制
   `agent24.db` / 各记忆库。开发机若跑过 memory-p1 改号前的版本，需要重置本地库。
-- **iDoris：temperature 透传行为变化（见 #1370）**：调用方设置了 `temperature` 时也会发给 iDoris 网关，默认不设就不发。同时写明本期不做项（共同 launcher / Admin token FD 交接、自动安装模型、`idoris-any`、流式），不得宣称。
+- **iDoris 已知限制：iDoris 网关当前忽略 `temperature`**（见 #1370、#1365）：经 iDoris 网关的请求不发 `temperature`，其它 provider 照 main 透传；iDoris 以后支持采样参数时再另行商定。同时写明本期不做项（共同 launcher / Admin token FD 交接、自动安装模型、`idoris-any`、流式），不得宣称。
 - 未验收项：不要把没跑的东西写成已通过。
 
 ### 5.1 发布后的跨仓库动作（联合发布）
