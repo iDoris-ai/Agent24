@@ -81,7 +81,7 @@ impl<I: Ids> Host<I> {
         out
     }
 
-    fn write_creation(&mut self, id: I::Profile, attempt: Attempt, created: Created<I>) {
+    pub(super) fn write_creation(&mut self, id: I::Profile, attempt: Attempt, created: Created<I>) {
         let loosened = self.highest.checked_add(1).and_then(|value| {
             let scope = Scope::profile(id.clone());
             Some((value, self.ledger.loosen(scope, None, self.off).ok()?))

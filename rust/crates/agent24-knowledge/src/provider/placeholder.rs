@@ -66,11 +66,15 @@ impl Placeholder {
         self.next
     }
 
-    /// The identity it was trying changed: the attempt in flight no longer
-    /// counts.
-    pub fn cancel(&mut self) {
-        self.attempt = None;
-        self.creating = None;
+    /// The identity it was trying changed, or a logout: the attempt in
+    /// flight, and any binding it was creating, no longer count. With
+    /// `retry`, one that was dropped is tried again by backoff (`dependency`,
+    /// S3.5, S2.5).
+    pub fn cancel(&mut self, retry: bool) {
+        let dropped = self.attempt.take().is_some() | self.creating.take().is_some();
+        if retry && dropped {
+            self.failure = Some(PlaceholderFailure::Dependency);
+        }
     }
 
     pub fn failure(&self) -> Option<PlaceholderFailure> {

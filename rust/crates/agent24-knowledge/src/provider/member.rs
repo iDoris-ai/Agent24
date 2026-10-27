@@ -6,10 +6,11 @@
 
 use super::binding::{Leave, WithRule};
 use super::connection::{Connection, Round};
-use super::credential::Credentials;
+use super::credential::{Credentials, Effects};
+use super::evidence::Rule;
 use super::gate::{CallId, Gate};
 use super::placeholder::{Attempt, Attempted, Settled};
-use super::profile::{Profile, Slot};
+use super::profile::{IdentityChange, Profile, Slot};
 use super::record::{Change, Ids, Of};
 use super::state::{PlaceholderFailure, Switches};
 
@@ -108,21 +109,33 @@ impl<I: Ids> Member<I> {
             profile: self.id.clone(),
             binding: binding.clone(),
         };
-        if let Some(rule) = rule {
-            let of = of.clone();
-            left.changes.push(Change::Placed { of, rule });
-        }
-        if let Some(invalidation) = effects.invalidation {
-            let calls = invalidation.aborted.into_iter();
-            left.aborted.extend(calls.map(|call| (of.clone(), call)));
-            if let Some(value) = invalidation.to_persist {
-                let generation = Change::Generation {
-                    of: of.clone(),
-                    value,
-                };
-                left.changes.push(generation);
-                left.generations.push((of, value));
-            }
+        record(of, effects, rule, left);
+    }
+
+    /// S3.5: the binding is retired for `change`, with its placeholder rule
+    /// and the generation it invalidated to (S5.6, S4.5), and the attempt
+    /// that creates the new binding, if one follows. `None` without a
+    /// binding, as [`Profile::change_identity`].
+    pub fn change_identity(
+        &mut self,
+        change: IdentityChange,
+    ) -> Option<(Left<I>, Option<Attempt>)> {
+        let retired = self.profile.change_identity(change)?;
+        let binding = self.binding.take()?;
+        let of = Of {
+            profile: self.id.clone(),
+            binding,
+        };
+        let mut left = Left::new(Change::Retire(of.clone()));
+        record(of, retired.effects, retired.rule, &mut left);
+        Some((left, retired.create))
+    }
+
+    /// Whether the placeholder still creates `attempt`'s binding.
+    pub fn creates(&self, attempt: Attempt) -> bool {
+        match self.profile.slot() {
+            Slot::Placeholder(placeholder) => placeholder.creates(attempt),
+            Slot::Bound(_) => false,
         }
     }
 
@@ -205,6 +218,27 @@ impl<I: Ids> Member<I> {
         match self.profile.slot_mut() {
             Slot::Bound(binding) => binding.connection_mut().confirm_generation(value),
             Slot::Placeholder(_) => None,
+        }
+    }
+}
+
+/// What leaving persists and aborts for `of`: its placeholder rule, the
+/// calls it aborted and the generation it invalidated to.
+fn record<I: Ids>(of: Of<I>, effects: Effects, rule: Option<Rule<I::Kb>>, left: &mut Left<I>) {
+    if let Some(rule) = rule {
+        let of = of.clone();
+        left.changes.push(Change::Placed { of, rule });
+    }
+    if let Some(invalidation) = effects.invalidation {
+        let calls = invalidation.aborted.into_iter();
+        left.aborted.extend(calls.map(|call| (of.clone(), call)));
+        if let Some(value) = invalidation.to_persist {
+            let generation = Change::Generation {
+                of: of.clone(),
+                value,
+            };
+            left.changes.push(generation);
+            left.generations.push((of, value));
         }
     }
 }

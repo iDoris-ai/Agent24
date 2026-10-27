@@ -7,8 +7,8 @@
 //! it up, and its offset is written instead.
 //!
 //! The caller runs the writes as [`super::journal`] orders them and reports
-//! each back. New bindings are in `create`; identity changes, calls and the
-//! start follow in later slices.
+//! each back. New bindings are in `create`, identity changes in `identity`;
+//! calls and the start follow in later slices.
 
 use std::collections::HashMap;
 
@@ -23,6 +23,7 @@ use super::record::{Change, Ids, Of};
 use super::replay::Record;
 
 mod create;
+mod identity;
 
 pub use create::Created;
 
@@ -83,6 +84,8 @@ pub struct Host<I: Ids> {
     /// binding's first value goes past it (S4.4, A.4).
     highest: u64,
     creations: Vec<create::Creation<I>>,
+    /// New bindings waiting for a retirement (S3.5).
+    deferred: Vec<identity::Deferred<I>>,
 }
 
 impl<I: Ids> Host<I> {
@@ -97,6 +100,7 @@ impl<I: Ids> Host<I> {
             journal: Journal::new(next_seq),
             highest,
             creations: Vec::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -272,7 +276,9 @@ impl<I: Ids> Host<I> {
             Report::Ignored | Report::Failed(Then::Loose { .. }) => return out,
             Report::Failed(Then::Create { .. }) => return out,
             Report::Failed(Then::Tight { ticket, .. }) => {
-                self.ledger.record_failed(*ticket);
+                let ticket = *ticket;
+                self.ledger.record_failed(ticket);
+                self.retired(ticket, Written::Failed);
                 return out;
             }
             Report::Durable(Then::Tight { ticket, values }) => {
@@ -283,6 +289,7 @@ impl<I: Ids> Host<I> {
                         out.loading.push((of.profile, round));
                     }
                 }
+                self.retired(ticket, Written::Durable);
             }
             Report::Durable(Then::Loose { ticket, switch }) => {
                 if self.pending.get(&switch) == Some(&ticket) {

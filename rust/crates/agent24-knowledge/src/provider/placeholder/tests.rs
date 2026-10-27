@@ -77,7 +77,7 @@ fn a_late_creation_failure_never_overwrites_a_newer_reason() {
     let created = placeholder.creating();
     placeholder.creation_failed(refused);
     assert_eq!(placeholder.failure(), None);
-    placeholder.cancel();
+    placeholder.cancel(false);
     placeholder.creation_failed(created);
     assert_eq!(placeholder.failure(), None);
     let mut placeholder = Placeholder::new(None);
@@ -121,7 +121,24 @@ fn a_following_placeholder_numbers_on_and_a_cancelled_attempt_does_not_count() {
     assert_ne!(fresh, old);
     assert_eq!(later.settle(old, Attempted::Identified), Settled::Ignored);
     assert_eq!(later.next(), earlier.next() + 1);
-    later.cancel();
+    later.cancel(false);
     assert_eq!(later.settle(fresh, Attempted::Identified), Settled::Ignored);
     assert_eq!(later.failure(), None);
+}
+
+/// S3.5: an identity change drops the attempt or the creation in flight and
+/// retries by backoff; with neither in flight, nothing changes.
+#[test]
+fn a_cancel_that_retries_records_dependency_for_what_it_dropped() {
+    let mut placeholder = Placeholder::new(None);
+    placeholder.cancel(true);
+    assert_eq!(placeholder.failure(), None);
+    placeholder.attempt();
+    placeholder.cancel(true);
+    assert_eq!(placeholder.failure(), Some(F::Dependency));
+    let mut placeholder = Placeholder::new(Some(F::CredentialRejected));
+    let created = placeholder.creating();
+    placeholder.cancel(true);
+    assert!(!placeholder.creates(created));
+    assert_eq!(placeholder.failure(), Some(F::Dependency));
 }
