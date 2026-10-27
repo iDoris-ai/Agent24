@@ -25,7 +25,8 @@ impl<I: Ids> Host<I> {
     /// S3.5: `change` retires `id`'s binding: invalidated in the connection
     /// phase, its evidence placeholders in any state (S5.6). Another
     /// principal also awaits the user's confirmation (S1.13), and its new
-    /// binding waits unconfirmed. `created` is the new binding for another
+    /// binding waits unconfirmed; another instance whose `created` brings a
+    /// principal other than the one confirmed is another principal. `created` is the new binding for another
     /// instance or principal; without it the placeholder retries with
     /// `dependency`. Without a binding nothing is written: an attempt or a
     /// creation in flight is dropped as [`crate::provider::profile::Profile::change_identity`]
@@ -39,6 +40,14 @@ impl<I: Ids> Host<I> {
         let mut out = Output::default();
         let Some(m) = self.member(&id) else {
             return out;
+        };
+        // Another principal is one whatever `change` says, as for a login.
+        let other = created
+            .as_ref()
+            .is_some_and(|c| m.confirmed().is_some_and(|p| *p != c.principal));
+        let change = match change {
+            IdentityChange::Instance if other => IdentityChange::Principal,
+            change => change,
         };
         let awaited_before = m.profile().confirmation();
         let Some((mut left, create)) = m.change_identity(change) else {
