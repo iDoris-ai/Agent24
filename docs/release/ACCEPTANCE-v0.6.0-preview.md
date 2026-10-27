@@ -550,7 +550,7 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
   sqlite3 agent24.db "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version)"   # = 1,2,...,30
   sqlite3 memory.db  "SELECT group_concat(version) FROM (SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version)"   # = 1,2,...,20
   ```
-  与 `seq -s, 1 29`、`seq -s, 1 20` 比较。
+  与 `seq -s, 1 30`、`seq -s, 1 20` 比较。
 - PR：#1280、#1341、#1298（改号）。执行方式：脚本。
 
 **X-02 升级后数据不丢，新功能可用**
