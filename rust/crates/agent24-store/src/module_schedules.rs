@@ -1028,24 +1028,83 @@ pub struct ScheduleRecord {
     pub revision: i64,
 }
 
+/// The tick's due-row query (see [`Store::list_schedules_for_tick`]). The
+/// predicate must keep matching the partial index in migration 0030.
+pub(crate) const TICK_DUE_SQL: &str = "\
+SELECT * FROM ( \
+  SELECT * FROM schedules \
+  WHERE enabled = 1 AND next_run_at IS NOT NULL \
+    AND next_run_at GLOB '[0-9][0-9][0-9][0-9]-*' \
+    AND julianday(next_run_at) <= julianday(?1) + 2.0 / 86400.0 \
+  UNION ALL \
+  SELECT * FROM schedules \
+  WHERE enabled = 1 AND next_run_at IS NOT NULL \
+    AND next_run_at GLOB '[0-9][0-9][0-9][0-9]-*' \
+    AND julianday(next_run_at) IS NULL \
+  UNION ALL \
+  SELECT * FROM schedules \
+  WHERE enabled = 1 AND next_run_at IS NOT NULL \
+    AND next_run_at NOT GLOB '[0-9][0-9][0-9][0-9]-*' \
+) ORDER BY name ASC";
+
 impl Store {
-    /// Every schedule row (user AND module), unfiltered, for the tick loop
-    /// (ME4-1.2.2b) — see [`ScheduleRecord`]. Built on the exact same
-    /// `row_to_schedule` the strict `list_schedules`/`get_schedule` paths
-    /// use, so a row whose `spec`/`action` JSON does not deserialize is
-    /// skipped and logged, exactly like [`Store::list_schedules_lenient`] —
-    /// one corrupt row must never wedge the whole tick. The caller decides
-    /// `enabled`/due/suspended/owner-installed, so a change to those rules
-    /// never requires a store-layer change.
+    /// The schedule rows (user AND module) the tick loop (ME4-1.2.2b) may
+    /// fire at `now` — see [`ScheduleRecord`]. P-13: filtered in SQL instead
+    /// of reading the whole table every tick.
+    ///
+    /// Selected: `enabled = 1`, `next_run_at` non-NULL, and either due
+    /// (`julianday(next_run_at) <= julianday(now)`, tolerant of
+    /// milliseconds/offset spellings, +2 s slack (`now` is formatted to whole seconds here while the tick's `now`
+    /// carries sub-seconds; also covers julianday rounding) so rounding can never
+    /// drop a boundary row — the caller re-checks the exact instant) or
+    /// unparsable (`julianday` NULL — kept so the tick still logs it, as it
+    /// always did). Both arms are served by `idx_schedules_tick_due`
+    /// (migration 0030); a third arm reads rows whose `next_run_at` does not start
+    /// with a 4-digit year (served by `idx_schedules_tick_odd_shape`) so they are
+    /// still logged by the tick. A row SQLite can parse but chrono cannot
+    /// (e.g. `2026-10-28`) is treated as not-yet-due and no longer logged.
+    ///
+    /// Not filtered here: `user_suspended`/`system_disabled_reason`. A
+    /// suspended module row has `next_run_at` NULL in practice, and the tick's
+    /// pre-advance CAS (`advance_and_record_fire`) re-checks all three
+    /// switches, so a row the SQL lets through but that is suspended simply
+    /// loses the CAS, exactly as before. Rows with `enabled = 0` also always
+    /// lost that CAS; skipping them here changes no outcome.
+    ///
+    /// Built on the same `row_to_schedule` as the strict
+    /// `list_schedules`/`get_schedule` paths, so a row whose `spec`/`action`
+    /// JSON does not deserialize is skipped and logged — one corrupt row must
+    /// never wedge the whole tick.
     ///
     /// # Errors
     /// Storage.
-    pub async fn list_schedules_for_tick(&self) -> Result<Vec<ScheduleRecord>> {
+    pub async fn list_schedules_for_tick(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ScheduleRecord>> {
+        let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let rows = sqlx::query(TICK_DUE_SQL)
+            .bind(&now_str)
+            .fetch_all(self.pool())
+            .await?;
+        Self::tick_records(&rows)
+    }
+
+    /// Every schedule row, unfiltered (diagnostics and tests that need to see
+    /// rows the tick would not select). NOT used by the tick.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn list_all_schedule_records(&self) -> Result<Vec<ScheduleRecord>> {
         let rows = sqlx::query("SELECT * FROM schedules ORDER BY name ASC")
             .fetch_all(self.pool())
             .await?;
+        Self::tick_records(&rows)
+    }
+
+    fn tick_records(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<ScheduleRecord>> {
         let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for row in rows {
             match Store::row_to_schedule(row) {
                 Ok(schedule) => out.push(ScheduleRecord {
                     schedule,
@@ -3374,6 +3433,187 @@ mod tests {
         assert!(store.update_schedule_runtime(&user_row).await.unwrap());
     }
 
+    // ── P-13: the tick selects only due rows, via the partial index ─────────
+
+    async fn seed_many(store: &Store, total: usize, due_ids: &[usize]) {
+        let mut tx = pool(store).begin().await.unwrap();
+        for i in 0..total {
+            let next = if due_ids.contains(&i) {
+                format!("2026-09-23T09:00:{:02}Z", i % 60)
+            } else {
+                "2026-12-01T00:00:00Z".to_owned()
+            };
+            sqlx::query(
+                "INSERT INTO schedules (id, name, enabled, spec, action, delivery, \
+                 last_run_at, next_run_at, consecutive_failures) \
+                 VALUES (?, ?, 1, '{\"type\":\"every\",\"secs\":60}', \
+                 '{\"type\":\"agent_run\",\"prompt\":\"x\"}', '[]', NULL, ?, 0)",
+            )
+            .bind(format!("bulk_{i}"))
+            .bind(format!("n{i:05}"))
+            .bind(next)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    fn now_t() -> chrono::DateTime<chrono::Utc> {
+        "2026-09-23T09:30:00Z".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn tick_reads_only_the_due_rows_out_of_a_thousand() {
+        let (store, _dir) = fresh(1).await;
+        seed_many(&store, 1000, &[3, 500, 999]).await;
+        let rows = store.list_schedules_for_tick(now_t()).await.unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.schedule.id.as_str()).collect();
+        // `sch_old` (fixture) is long overdue too, so it comes along: 4 rows of 1001.
+        assert_eq!(ids, ["sch_old", "bulk_3", "bulk_500", "bulk_999"]);
+        // unfiltered reader still sees everything (1000 + fixture)
+        assert_eq!(store.list_all_schedule_records().await.unwrap().len(), 1001);
+    }
+
+    #[tokio::test]
+    async fn tick_query_plan_uses_the_partial_index_for_both_arms() {
+        let (store, _dir) = fresh(1).await;
+        seed_many(&store, 1000, &[3]).await;
+        let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {TICK_DUE_SQL}"))
+            .bind("2026-09-23T09:30:00Z")
+            .fetch_all(pool(&store))
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("idx_schedules_tick_due"), "plan: {plan}");
+        // The only scan allowed is a walk of the odd-shape partial index,
+        // which holds just the (normally zero) malformed rows.
+        assert_eq!(
+            plan.matches("SCAN").count(),
+            plan.matches("SCAN schedules USING INDEX idx_schedules_tick_odd_shape")
+                .count(),
+            "table scan in plan: {plan}"
+        );
+        assert_eq!(
+            plan.matches("SEARCH schedules USING INDEX idx_schedules_tick_due")
+                .count(),
+            2,
+            "both parsable arms must range-search the expression index: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_keeps_unparsable_and_offset_spellings_but_drops_disabled_and_null() {
+        let (store, _dir) = fresh(1).await;
+        for (id, enabled, next) in [
+            ("a_millis", 1, Some("2026-09-23T09:00:00.000Z")),
+            ("b_offset", 1, Some("2026-09-23T17:00:00+08:00")),
+            ("c_garbage", 1, Some("nonsense")),
+            ("d_future_offset", 1, Some("2026-09-23T08:00:00-02:00")),
+            ("e_disabled", 0, Some("2026-09-23T09:00:00Z")),
+            ("f_null", 1, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO schedules (id, name, enabled, spec, action, delivery, \
+                 last_run_at, next_run_at, consecutive_failures) \
+                 VALUES (?, ?, ?, '{\"type\":\"every\",\"secs\":60}', \
+                 '{\"type\":\"agent_run\",\"prompt\":\"x\"}', '[]', NULL, ?, 0)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(enabled)
+            .bind(next)
+            .execute(pool(&store))
+            .await
+            .unwrap();
+        }
+        let rows = store.list_schedules_for_tick(now_t()).await.unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.schedule.id.as_str()).collect();
+        // garbage is surfaced (the tick logs+skips it, as before); d_future is 10:00Z.
+        assert_eq!(ids, ["a_millis", "b_offset", "c_garbage", "sch_old"]);
+    }
+
+    #[tokio::test]
+    async fn migration_0030_applies_on_top_of_a_0029_database() {
+        let (_dir, path) = temp_db();
+        let pool = pool_migrated_up_to(&path, 30, 1).await; // through 0029
+        sqlx::query(SEED_SCH_OLD).execute(&pool).await.unwrap();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'idx_schedules_tick_due'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 0);
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'idx_schedules_tick_due'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, 1);
+        let store = crate::test_hooks::from_pool(pool);
+        // sch_old's next_run_at is not due at now_t(); the query runs on the upgraded db.
+        store.list_schedules_for_tick(now_t()).await.unwrap();
+    }
+
+    async fn insert_raw(store_pool: &SqlitePool, id: &str, enabled: i64, next: &str) {
+        sqlx::query(
+            "INSERT INTO schedules (id, name, enabled, spec, action, delivery, \
+             last_run_at, next_run_at, consecutive_failures) \
+             VALUES (?, ?, ?, '{\"type\":\"every\",\"secs\":60}', \
+             '{\"type\":\"agent_run\",\"prompt\":\"x\"}', '[]', NULL, ?, 0)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(enabled)
+        .bind(next)
+        .execute(store_pool)
+        .await
+        .unwrap();
+    }
+
+    /// F1: `julianday('now')` is non-deterministic and a hard error inside an
+    /// index expression. A row like that must neither abort the 0029 -> 0030
+    /// migration nor make later writes fail, and the tick must still read it.
+    #[tokio::test]
+    async fn non_deterministic_next_run_at_neither_breaks_the_migration_nor_later_writes() {
+        let (_dir, path) = temp_db();
+        let pool = pool_migrated_up_to(&path, 30, 1).await; // through 0029
+        insert_raw(&pool, "pre_now", 1, "now").await;
+        insert_raw(&pool, "pre_localtime", 1, "localtime").await;
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        insert_raw(&pool, "post_now", 1, "now").await;
+        let store = crate::test_hooks::from_pool(pool);
+        let rows = store.list_schedules_for_tick(now_t()).await.unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.schedule.id.as_str()).collect();
+        assert_eq!(ids, ["post_now", "pre_localtime", "pre_now"]);
+    }
+
+    /// F2: SQL formats the caller's `now` to whole seconds, the tick's `now`
+    /// carries sub-seconds. A legacy `...05.500Z` slot is due at `...05.800`
+    /// and must be read this tick, not one tick (10 s) later.
+    #[tokio::test]
+    async fn sub_second_now_still_reads_a_sub_second_legacy_slot() {
+        let (store, _dir) = fresh(1).await;
+        insert_raw(pool(&store), "sub", 1, "2030-01-01T00:00:05.500Z").await;
+        insert_raw(pool(&store), "later", 1, "2030-01-01T00:00:09Z").await;
+        let now: chrono::DateTime<chrono::Utc> = "2030-01-01T00:00:05.800Z".parse().unwrap();
+        let rows = store.list_schedules_for_tick(now).await.unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.schedule.id.as_str()).collect();
+        assert!(ids.contains(&"sub"), "{ids:?}");
+        assert!(!ids.contains(&"later"), "{ids:?}");
+        // F3: sub-millisecond neighbours (julianday rounding) are read too.
+        insert_raw(pool(&store), "submilli", 1, "2030-01-01T00:00:03.9995Z").await;
+        let now2: chrono::DateTime<chrono::Utc> = "2030-01-01T00:00:03.9999Z".parse().unwrap();
+        let rows = store.list_schedules_for_tick(now2).await.unwrap();
+        assert!(rows.iter().any(|r| r.schedule.id == "submilli"));
+    }
+
     // ── the tick read-model tells module rows and user rows apart ───────────
 
     #[tokio::test]
@@ -3391,7 +3631,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let rows = store.list_schedules_for_tick().await.unwrap();
+        let rows = store.list_all_schedule_records().await.unwrap();
         let module_row = &rows
             .iter()
             .find(|r| r.schedule.id == "sch_1")
