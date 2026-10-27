@@ -652,7 +652,7 @@ impl Scheduler {
         // Every row (user AND module); a single corrupt row is skipped and
         // logged rather than wedging every future tick (`list_schedules_for_
         // tick`'s own doc comment).
-        let records = self.store.list_schedules_for_tick().await?;
+        let records = self.store.list_schedules_for_tick(now).await?;
         let mut fired = 0;
         for record in records {
             let ScheduleRecord { schedule, revision } = record;
@@ -1529,7 +1529,7 @@ mod tests {
 
         // What a tick would have read a moment before the concurrent PATCH.
         let stale = store
-            .list_schedules_for_tick()
+            .list_all_schedule_records()
             .await
             .unwrap()
             .into_iter()
@@ -1612,7 +1612,7 @@ mod tests {
 
         // The 5th tick's read.
         let stale = store
-            .list_schedules_for_tick()
+            .list_all_schedule_records()
             .await
             .unwrap()
             .into_iter()
@@ -1732,6 +1732,163 @@ mod tests {
 
         assert_eq!(sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap(), 1);
         assert_eq!(trig.count(), 1);
+    }
+
+    // ── P-13: pin the tick's selection semantics (before/after SQL filtering) ──
+
+    fn user_row(id: &str, enabled: bool, next_run_at: Option<&str>) -> Schedule {
+        Schedule {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            enabled,
+            spec: ScheduleSpec::Every { secs: 60 },
+            action: Some(ScheduleAction::AgentRun {
+                prompt: "x".to_owned(),
+                session_id: None,
+                model_override: None,
+            }),
+            delivery: vec![],
+            last_run_at: None,
+            next_run_at: next_run_at.map(str::to_owned),
+            consecutive_failures: 0,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: enabled,
+            disabled_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_selection_semantics_are_pinned() {
+        // now = 10:01:05Z. The tick fires exactly the rows whose `next_run_at`
+        // parses (RFC-3339, any offset/fraction) to an instant <= now. It does
+        // NOT look at `enabled` (disabling clears next_run_at, so the two
+        // agree in practice) and skips NULL / unparsable values.
+        let trig = RecordingTrigger::new();
+        let (sched, _ev, store) = scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        let rows = [
+            ("due_canon", true, Some("2026-07-24T10:01:00Z")),
+            ("future", true, Some("2026-07-24T10:02:00Z")),
+            ("null_next", true, None),
+            ("disabled_due", false, Some("2026-07-24T10:00:00Z")),
+            ("disabled_null", false, None),
+            ("due_millis", true, Some("2026-07-24T10:01:00.000Z")),
+            ("due_offset", true, Some("2026-07-24T12:01:00+02:00")),
+            // string order says "18:.." > "10:01:05Z", but it is 10:00Z: due.
+            ("due_offset_east", true, Some("2026-07-24T18:00:00+08:00")),
+            // string order says "09:.." < "10:..", but it is 11:30Z: not due.
+            ("future_offset", true, Some("2026-07-24T09:30:00-02:00")),
+            ("garbage", true, Some("not-a-timestamp")),
+            ("boundary_eq", true, Some("2026-07-24T10:01:05Z")),
+            ("boundary_after", true, Some("2026-07-24T10:01:06Z")),
+        ];
+        for (id, enabled, next) in rows {
+            store
+                .upsert_schedule(&user_row(id, enabled, next))
+                .await
+                .unwrap();
+        }
+        // module rows: one due, one future (suspended-state rows keep next_run_at
+        // NULL elsewhere; here we pin the plain due/future split).
+        let desired = every_module(60);
+        for (id, key, next) in [
+            ("mod_due", "a", "2026-07-24T10:01:00Z"),
+            ("mod_future", "b", "2026-07-24T10:05:00Z"),
+        ] {
+            store
+                .upsert_module_schedule(
+                    id,
+                    "mod-a",
+                    key,
+                    &desired,
+                    Some(next),
+                    "2026-07-24T10:00:00Z",
+                    256,
+                )
+                .await
+                .unwrap();
+        }
+
+        for (id, key, set) in [
+            ("mod_suspended_due", "c", "user_suspended = 1"),
+            (
+                "mod_sysdisabled_due",
+                "d",
+                "system_disabled_reason = 'boom'",
+            ),
+        ] {
+            store
+                .upsert_module_schedule(
+                    id,
+                    "mod-a",
+                    key,
+                    &desired,
+                    Some("2026-07-24T10:00:30Z"),
+                    "2026-07-24T10:00:00Z",
+                    256,
+                )
+                .await
+                .unwrap();
+            sqlx::query(&format!("UPDATE schedules SET {set} WHERE id = ?"))
+                .bind(id)
+                .execute(agent24_store::test_hooks::pool(&store))
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE schedules SET next_run_at = '2026-07-24T10:00:30Z' WHERE id = 'disabled_due'",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+
+        let fired = sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap();
+        let mut calls = trig.calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(
+            calls,
+            vec![
+                "boundary_eq",
+                "due_canon",
+                "due_millis",
+                "due_offset",
+                "due_offset_east"
+            ]
+        );
+        // + the due module row (advanced, no trigger call). `disabled_due`,
+        // `mod_suspended_due` and `mod_sysdisabled_due` have a due slot but
+        // lose the pre-advance CAS (it requires enabled = 1 AND
+        // user_suspended = 0 AND system_disabled_reason IS NULL): not fired,
+        // not advanced.
+        assert_eq!(fired, 6);
+        for id in ["disabled_due", "mod_suspended_due", "mod_sysdisabled_due"] {
+            let r = store.get_schedule(id).await.unwrap().unwrap();
+            assert_eq!(r.last_run_at, None, "{id} must not have fired");
+            assert_eq!(
+                r.next_run_at.as_deref(),
+                Some("2026-07-24T10:00:30Z"),
+                "{id}"
+            );
+        }
+        let mod_future = store.get_schedule("mod_future").await.unwrap().unwrap();
+        assert_eq!(
+            mod_future.next_run_at.as_deref(),
+            Some("2026-07-24T10:05:00Z")
+        );
+        let mod_due = store.get_schedule("mod_due").await.unwrap().unwrap();
+        assert_ne!(mod_due.next_run_at.as_deref(), Some("2026-07-24T10:01:00Z"));
+        // untouched rows stay untouched
+        for id in ["future", "future_offset", "boundary_after"] {
+            let r = store.get_schedule(id).await.unwrap().unwrap();
+            assert_ne!(
+                r.last_run_at.as_deref(),
+                Some("2026-07-24T10:01:05Z"),
+                "{id}"
+            );
+        }
+        let g = store.get_schedule("garbage").await.unwrap().unwrap();
+        assert_eq!(g.next_run_at.as_deref(), Some("not-a-timestamp"));
     }
 
     // ── ME4-1.2.2b3: module rows (design §3.2/§4.2/§4.7, v2 M5) ─────────────
@@ -1932,7 +2089,7 @@ mod tests {
             .unwrap();
 
         // What a tick would have read.
-        let records = store.list_schedules_for_tick().await.unwrap();
+        let records = store.list_all_schedule_records().await.unwrap();
         let stale = records
             .into_iter()
             .find(|r| r.schedule.id == "sch_mod3")
@@ -1992,7 +2149,7 @@ mod tests {
 
         // positive control: the CURRENT (post-change) record fires cleanly.
         let current = store
-            .list_schedules_for_tick()
+            .list_all_schedule_records()
             .await
             .unwrap()
             .into_iter()
@@ -2041,7 +2198,7 @@ mod tests {
             .await
             .unwrap();
 
-        let records = store.list_schedules_for_tick().await.unwrap();
+        let records = store.list_all_schedule_records().await.unwrap();
         let stale = records
             .into_iter()
             .find(|r| r.schedule.id == "sch_mod4")
