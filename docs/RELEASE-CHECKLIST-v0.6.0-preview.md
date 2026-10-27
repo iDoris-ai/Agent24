@@ -106,6 +106,8 @@ scripts/sign-cli-mac.sh
 scripts/verify-mac-signing.sh <dmg>
 ```
 
+- [ ] 出 DMG 前先 `hdiutil info`，确认没有残留挂载的镜像（10-27 彩排时 electron-builder 的 `hdiutil resize` 报 `Resource temporarily unavailable (35)`；`hdiutil detach -force` 清掉残留镜像后重跑通过）。
+- [ ] 产物位置：DMG 在 `apps/desktop/release/`，CLI 在 `dist/mac-cli/`。`verify-mac-signing.sh` 只接受 dmg 或 .app；CLI 裸二进制用 `spctl -a -vv -t install <bin>`（应输出 accepted 和 `source=Notarized Developer ID`）加上 `codesign --verify --strict`。不带 `-t install` 时会输出 `rejected (… not an app)`，裸 Mach-O 本来就是这样，不算失败。
 - [ ] `verify-mac-signing.sh` 输出 `accepted` 且 `source=Notarized Developer ID`；`codesign -dv` 可见内嵌 `backend/agent24d` 已签且 Hardened Runtime；`lipo -archs` 为 arm64。
 - [ ] dmg 与 CLI 的 submission id、`spctl`/`codesign` 实测输出贴进 Release Notes，不照抄上一版。
 - [ ] 已知限制写进 Release Notes：CLI 裸二进制不能 staple，离线机器首次运行需联网核验；Intel（x64）未实测、本次不发；GitHub Actions 侧签名仍需 DEP-B1 的 Secrets（本次在 jason 本机出包）。
