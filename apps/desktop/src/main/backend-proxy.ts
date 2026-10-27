@@ -115,13 +115,10 @@ export function matchTemplate(template: string, pathname: string): boolean {
 
 /** The matching allowlist entry, or null. The query string is not matched. */
 export function findAllowedRoute(method: string, requestPath: string): ProxyRoute | null {
-  // eslint-disable-next-line no-control-regex -- control characters (CR/LF/NUL...) must never reach the request line
-  if (
-    !requestPath.startsWith('/') ||
-    requestPath.includes('#') ||
-    /[\u0000-\u001f\u007f]/.test(requestPath)
-  )
-    return null
+  // Control characters (CR/LF/NUL...) must never reach the request line.
+  // eslint-disable-next-line no-control-regex
+  const hasControl = /[\u0000-\u001f\u007f]/.test(requestPath)
+  if (!requestPath.startsWith('/') || requestPath.includes('#') || hasControl) return null
   const q = requestPath.indexOf('?')
   const pathname = q === -1 ? requestPath : requestPath.slice(0, q)
   return (
