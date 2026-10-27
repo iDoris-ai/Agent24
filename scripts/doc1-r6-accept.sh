@@ -301,12 +301,13 @@ doc_of() { a24 documents job "$1" --json 2>/dev/null | tail -n 1 | jq -r '.data.
 readtext() {
   local t0
   t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
-  while :; do
+  # The deadline is checked right before each read, after its pause.
+  while [ $(($(perl -MTime::HiRes=time -e 'printf "%d", time * 1000') - t0)) -lt 60000 ]; do
     a24 documents text "$1" 1 --json > "$2" 2>/dev/null && return 0
     [ "$(last "$2" .error.code)" = engine_unavailable ] || return 1
-    [ $(($(perl -MTime::HiRes=time -e 'printf "%d", time * 1000') - t0)) -lt 60000 ] || return 1
     sleep 1
   done
+  return 1
 }
 # image ID WHAT FILE MEDIA: import a scan of the 2026 holiday notice, read its
 # words back. Its page has no text layer: "春节" can only come from the OCR.
