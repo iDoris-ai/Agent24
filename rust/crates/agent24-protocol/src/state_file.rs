@@ -45,6 +45,11 @@ pub struct DaemonState {
     /// Missing means the pre-capability legacy format.
     #[serde(default)]
     pub auth_mode: AuthMode,
+    /// Wire protocol this daemon speaks. Absent on discovery files written
+    /// before version negotiation; readers treat absence as unknown, which
+    /// is incompatible ([`crate::protocol_compatibility`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
 }
 
 impl DaemonState {
@@ -63,6 +68,7 @@ impl DaemonState {
             version: version.into(),
             generation: generation.into(),
             auth_mode: AuthMode::LegacySingleToken,
+            protocol_version: Some(crate::PROTOCOL_VERSION),
         };
         state.validate().map(|()| state)
     }
@@ -82,6 +88,7 @@ impl DaemonState {
             version: version.into(),
             generation: generation.into(),
             auth_mode: AuthMode::Capabilities,
+            protocol_version: Some(crate::PROTOCOL_VERSION),
         };
         state.validate().map(|()| state)
     }
@@ -296,6 +303,7 @@ mod tests {
                 .unwrap();
         assert_eq!(state.auth_mode, AuthMode::LegacySingleToken);
         assert_eq!(state.generation, "");
+        assert_eq!(state.protocol_version, None);
         assert_eq!(state.bearer_token(), Ok("old-token"));
     }
 
@@ -305,6 +313,7 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["auth_mode"], "capabilities");
         assert_eq!(json["generation"], "gen-1");
+        assert_eq!(json["protocol_version"], crate::PROTOCOL_VERSION);
         assert!(json.get("token").is_none());
         assert_eq!(state.bearer_token(), Err("host authority unavailable"));
     }
@@ -318,6 +327,7 @@ mod tests {
             version: "v".into(),
             generation: "gen".into(),
             auth_mode: AuthMode::Capabilities,
+            protocol_version: Some(crate::PROTOCOL_VERSION),
         };
         assert!(with_token.validate().is_err());
         let without_token = DaemonState {
@@ -327,6 +337,7 @@ mod tests {
             version: "v".into(),
             generation: "gen".into(),
             auth_mode: AuthMode::LegacySingleToken,
+            protocol_version: None,
         };
         assert!(without_token.validate().is_err());
     }
