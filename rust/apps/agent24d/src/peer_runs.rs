@@ -10,8 +10,8 @@
 //! that called tools is relayed only when each call has a tag of its own,
 //! and then as strictly as its tags say (David 2026-10-27, option C). A call
 //! without one put text no tag describes into the run: a refusal (it can
-//! carry the user's reason, or an address a lookup resolved), a cancelled or
-//! timed-out call, a plan, or a call made before 6b.5f.
+//! carry the user's reason, or an address a lookup resolved), an invalid,
+//! cancelled or timed-out call, a plan, or a call made before 6b.5f.
 //!
 //! What a tool returned also travels on past its run: through a session's
 //! memory of earlier turns (including `/chat` turns, which are not stored as
