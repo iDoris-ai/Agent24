@@ -1,0 +1,107 @@
+# macOS 签名与公证（DEP-B1/B2/B3）
+
+可复现流水线：桌面端 dmg 和 CLI 裸二进制都用 Developer ID 签名、Hardened Runtime、notarytool 公证。脚本全部在仓库内，不依赖口头步骤。
+
+| 产物 | 脚本 | 公证对象 | staple |
+|---|---|---|---|
+| 桌面端 dmg | `apps/desktop/scripts/release-mac.sh` | dmg | 是（dmg） |
+| `agent24` / `agent24d` 等裸二进制 | `scripts/sign-cli-mac.sh` | zip | 否（裸 Mach-O 不支持，见下） |
+| 验证 | `scripts/verify-mac-signing.sh` | - | - |
+
+## 前置条件（一次性）
+
+1. **签名证书在 login keychain**：
+   ```bash
+   security find-identity -v -p codesigning
+   # 应见：Developer ID Application: Huifeng Jiao (HYAP444FN9)
+   ```
+   证书私钥丢失就无法签名，换机器要导出 p12（含私钥）再导入。
+2. **notarytool keychain profile**（凭据只存在 keychain，不进仓库、不进环境变量）：
+   ```bash
+   xcrun notarytool store-credentials apple-notary-HYAP444FN9 \
+     --apple-id <Apple ID> --team-id HYAP444FN9 --password <app-specific-password>
+   # 或用 App Store Connect API key：--key AuthKey_XXXX.p8 --key-id <ID> --issuer <UUID>
+   xcrun notarytool history --keychain-profile apple-notary-HYAP444FN9   # 能列出历史即可用
+   ```
+3. 工具链：Xcode Command Line Tools（`codesign`、`xcrun notarytool`、`stapler`）、Rust、pnpm（`pnpm install` 已完成）。
+
+> DEP-B1 的"导出 p12 / API key 存仓库 Secrets"只在要把签名搬进 GitHub Actions 时才需要。当前签名在本机 keychain 完成，CI 接入留给后续（见"未自动化的点"）。
+
+## 一条命令发布桌面端
+
+```bash
+bash apps/desktop/scripts/release-mac.sh          # 签名 + 公证 + staple + 验证
+SKIP_NOTARIZE=1 bash apps/desktop/scripts/release-mac.sh   # 只签名，本地快速试
+```
+
+环境变量：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `AGENT24_SIGN_IDENTITY` | `Developer ID Application: Huifeng Jiao (HYAP444FN9)` | 签名身份（脚本会去掉前缀后交给 electron-builder） |
+| `AGENT24_NOTARY_PROFILE` | `apple-notary-HYAP444FN9` | notarytool keychain profile |
+| `SKIP_NOTARIZE` | 空 | `1` = 不公证，验证时不断言 Notarized |
+| `AGENT24_ARCH` | `arm64` | 目标架构（`x64` 需在 Intel 机或对应工具链上） |
+| `CARGO_TARGET_DIR` | `rust/target` | Rust 产物目录；脚本把 `agent24d` 复制到 `rust/target/release/` 供打包引用 |
+
+步骤：前置检查 → `cargo build --release` → node-daemon + vite/tsc → `electron-builder --mac`（签名）→ `notarytool submit --wait` → `stapler staple/validate` → `verify-mac-signing.sh`。任一步失败即退出；公证被拒时自动打印 `notarytool log`。产物在 `apps/desktop/release/`（已被 `.gitignore`，不要提交），含 `SHA256SUMS` 与 `notarize-submit.json`（submission id）。
+
+### 配置选择：为什么公证不用 electron-builder 内置 `notarize`
+
+- electron-builder 25 内置公证只认 `APPLE_ID`+app 专用密码 或 App Store Connect API key 环境变量，**不支持 keychain profile**；用它就得把明文凭据放进环境变量/CI secrets。
+- 公证放在脚本里调 `notarytool --keychain-profile`：凭据留在 keychain，与 10-16 手工流程完全一致，且**公证对象是 dmg 本身**（内含 app 的票据一并登记），再 `staple` 到 dmg，离线机器打开 dmg 也能通过。
+- 因此 `package.json` 里 `mac.notarize=false`，签名由 electron-builder 完成（`hardenedRuntime`、`entitlements`、`entitlementsInherit`、`binaries`、`dmg.sign`）。
+- `mac.binaries` 显式列出 `Contents/Resources/backend/agent24d`（路径相对 `.app`）。桌面包目前不带 `agent24` CLI，如将来打进包，在此追加。
+
+### Entitlements（`apps/desktop/build/entitlements.mac.plist`）
+
+仅 `allow-jit` + `allow-unsigned-executable-memory`（Electron/V8 必需）。**没有** `disable-library-validation`：Electron Framework 和内置原生模块同 Team ID，用不上。`agent24d` 子进程沿用 `entitlementsInherit`，没有额外权限。
+
+## CLI 裸二进制（DEP-B3）
+
+```bash
+CARGO_TARGET_DIR=... cargo build --release -p agent24d -p agent24-cli --manifest-path rust/Cargo.toml
+bash scripts/sign-cli-mac.sh                      # 默认处理 release 下的 agent24、agent24d
+bash scripts/sign-cli-mac.sh bin/sin90 bin/cos72  # 或显式传入路径
+```
+
+`codesign --force --options runtime --timestamp` → 打 zip → `notarytool submit --wait` → 输出 `dist/mac-cli/`（二进制、zip、`notarize-submission.json`、`SHA256SUMS`）。
+
+**裸二进制不能 staple**：票据只能附着在 `.app/.pkg/.dmg`。分发 zip 即可：用户（浏览器下载带 quarantine）首次运行时 Gatekeeper 在线查询票据；完全离线机器首次运行会被拦。要离线可用，请把 CLI 装进 `.pkg` 或 dmg 再公证 staple（未做）。`tar` 解压或 `curl` 下载不带 quarantine，不触发 Gatekeeper，行为与未签名一致。
+
+## 验证
+
+```bash
+bash scripts/verify-mac-signing.sh --expect-notarized --arch arm64 apps/desktop/release/Agent24-*.dmg
+bash scripts/verify-mac-signing.sh /Applications/Agent24.app
+```
+
+dmg 路径：`spctl -t open --context context:primary-signature` + `stapler validate` → 只读挂载 → `ditto` 复制 app 到临时目录 → 卸载 → 对副本 `codesign --verify --deep --strict`、`spctl -a -vv`、逐个检查主程序/`agent24d`/其他 Mach-O 已签且带 `runtime` flag、`lipo -archs` 主程序与 `agent24d` 一致且与 dmg 文件名（arm64/x64）一致。
+
+## 干净机验收（B5）
+
+1. 在**没装过 Agent24、没登录开发者账号**的 Mac 上，用 Safari/Chrome 从 Release 页下载 dmg（带 quarantine 标记，`xattr` 可见 `com.apple.quarantine`）。
+2. `shasum -a 256 -c SHA256SUMS`。
+3. 双击打开 dmg，拖到 Applications，首次打开：不应出现"无法验证开发者"或"已损坏"，仅有"从互联网下载"的常规确认。
+4. 可选断网重复一次（验证 staple）。
+5. 终端：`spctl -a -t open --context context:primary-signature -v <dmg>` 应为 `accepted` + `source=Notarized Developer ID`。
+
+## 常见失败
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| `notarytool` 返回 Invalid，日志含 "The binary is not signed with a valid Developer ID certificate" | 用了 Apple Development/ad-hoc 证书；检查 `AGENT24_SIGN_IDENTITY` 与 keychain |
+| 日志 "not signed with a hardened runtime" / "no secure timestamp" | 某个嵌套二进制漏签；`verify-mac-signing.sh` 会列出 `UNSIGNED`/`NO-RUNTIME`。新增的随包 Mach-O 加进 `mac.binaries` |
+| `Team ID` 不匹配（Electron Framework 与主程序不同 Team） | 混用了不同证书重复签名；清空 `apps/desktop/release/` 重来，确认 `CSC_*` 环境变量未设置（脚本会 unset） |
+| 签名后 app 启动即崩溃（`EXC_BAD_ACCESS`/`JIT`、`V8 ... code range`） | entitlements 缺 `allow-jit` / `allow-unsigned-executable-memory`，或 `entitlementsInherit` 未指向 plist |
+| 加载原生模块报 `code signature ... not valid for use in process: different Team IDs` | 引入了其他 Team 签名的 dylib/.node；确需则在 plist 加 `com.apple.security.cs.disable-library-validation` 并在此记录原因 |
+| `notarytool` 报 keychain profile 不存在 | 重新 `store-credentials`（见前置 2） |
+| electron-builder 报 identity 前缀错误 | `mac.identity` 不能带 `Developer ID Application:` 前缀（脚本已处理） |
+| 校验时 `spctl` 为 `rejected` / `source=Unnotarized Developer ID` | 没公证或公证后又改动了 dmg（改动即作废票据）；公证必须是最后一步，之后只能 staple |
+
+## 未自动化的点
+
+- GitHub Actions 里的签名/公证（需要 DEP-B1 的 p12 + API key 进 Secrets，用临时 keychain 导入）。
+- Intel（x64）dmg：脚本支持 `AGENT24_ARCH=x64`，但需 Intel 机或可用的交叉工具链，尚未实测。
+- 裸 CLI 的离线可用（需 pkg/dmg 封装）。
+- 干净机的浏览器下载验收是人工步骤（B5）。

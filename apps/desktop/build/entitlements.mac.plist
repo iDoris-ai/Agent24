@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Electron/V8 需要 JIT 与可写可执行内存；缺这两项 Hardened Runtime 下渲染进程启动即崩溃。 -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <!-- 不加 disable-library-validation：Electron Framework 与内置原生模块均由同一 Team ID 签名。
+       若将来加载第三方未签名 dylib/.node，再按需打开并在 MACOS-SIGNING.md 记录原因。 -->
+</dict>
+</plist>
