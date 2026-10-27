@@ -1952,6 +1952,8 @@ export interface components {
             workspace_id: string | null;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];
+            /** @description The Knowledge binding copied from the run request; null when the run has none. */
+            knowledge_binding_id: string | null;
         };
         RunOutput: {
             text: string;
@@ -2011,6 +2013,8 @@ export interface components {
             prompt: string;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];
+            /** @description KB-HOST-01: a Knowledge binding the product host activated over its private interface. A selector, not an authority: only the product host may name one, and only one it has active; the run is pinned to that activation. Omit/null for a run without Knowledge. */
+            knowledge_binding_id?: string | null;
         };
         /** @enum {string} */
         ToolCallStatus: "running" | "completed" | "failed" | "denied";
@@ -4366,7 +4370,25 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description host_authority_required: knowledge_binding_id was named by a caller other than the product host */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             404: components["responses"]["NotFound"];
+            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getRun: {

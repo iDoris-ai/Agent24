@@ -26,7 +26,7 @@
 // this bridge is inert until then, and reconnects quietly in the meantime.
 
 import WebSocket from 'ws'
-import { getBackendEndpoint } from './backend-manager'
+import { daemonConnection } from './backend-manager'
 import type { ModelCallEnvelope } from '../shared/ipc-types'
 
 export const AGENTEAR_MODULE_NAME = 'agentear'
@@ -163,14 +163,12 @@ export class AgentEarEventBridge {
 
   private connect(): void {
     if (this.stopped) return
-    const endpoint = getBackendEndpoint()
-    if (!endpoint) {
+    const conn = daemonConnection()
+    if (!conn) {
       this.scheduleReconnect()
       return
     }
-    const headers: Record<string, string> = {}
-    if (endpoint.token) headers['Authorization'] = `Bearer ${endpoint.token}`
-    const socket = new WebSocket(`ws://127.0.0.1:${endpoint.port}/api/v1/events`, { headers })
+    const socket = new WebSocket(`ws://127.0.0.1:${conn.port}/api/v1/events`, { headers: conn.authHeaders })
     this.socket = socket
 
     socket.on('open', () => {

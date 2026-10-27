@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/knowledge/v1/local-cancelled.schema.json",
+  "title": "Agent24 Knowledge v1 — Provider-local cancelled result",
+  "description": "CONTRACT-READONLY-v1 R7.3, §11.4. Never on the wire: the Provider returns it when it drops a response whose request_id is not in flight or whose generation is not current. details.generation echoes the dropped request; current_generation is the client's value.",
+  "type": "object", "required": ["error"], "additionalProperties": false,
+  "properties": {
+    "error": {
+      "type": "object", "required": ["code", "message", "details"], "additionalProperties": false,
+      "properties": {
+        "code": { "const": "cancelled" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "hint": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "details": {
+          "type": "object", "required": ["retryable", "request_id", "generation", "current_generation"], "additionalProperties": false,
+          "properties": {
+            "retryable": { "const": false },
+            "request_id": { "$ref": "common.schema.json#/$defs/request_id" },
+            "generation": { "$ref": "common.schema.json#/$defs/generation" },
+            "current_generation": { "$ref": "common.schema.json#/$defs/generation" }
+          }
+        }
+      }
+    }
+  }
+}

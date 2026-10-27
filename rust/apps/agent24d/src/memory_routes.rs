@@ -786,6 +786,7 @@ mod tests {
     async fn finish_run(state: &AppState, session_id: &str, prompt: &str) -> agent24_protocol::Run {
         let response = crate::runs::create_run(
             State(state.clone()),
+            None,
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/runs")

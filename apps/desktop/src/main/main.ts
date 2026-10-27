@@ -1,6 +1,6 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
@@ -20,6 +20,8 @@ import {
 } from './creative-serve-web'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { createIdorisStatusProvider } from './idoris-admin'
+import { KnowledgeHost } from './knowledge-host'
+import { KnowledgeLoginStore } from './knowledge-logins'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -80,6 +82,8 @@ let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
 let creativeServeWeb: CreativeServeWeb | null = null
+// KB-HOST-01: Knowledge logins and the daemon's private Knowledge interface.
+let knowledgeHost: KnowledgeHost | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
@@ -233,7 +237,20 @@ process.on('unhandledRejection', (reason) => {
   console.error('[main] unhandledRejection', reason)
 })
 
+// One desktop per user. Its daemon runs in capability mode, so a second copy
+// could neither share that daemon nor start its own while the first holds the
+// daemon's singleton lock; a second launch brings the first window forward.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
+// Until whenReady below has created the first window (after the CSP hook and
+// IPC handlers are in place), a second launch has nothing to bring forward and
+// must not create a window of its own.
+app.on('second-instance', () => {
+  if (mainWin) showOrCreateWindow()
+})
+
 app.whenReady().then(async () => {
+  if (!isPrimaryInstance) return
   const idorisStatus = await idorisStatusProviderPromise
   // Owner decision 2026-10-05: Open Design is downloaded on demand (see
   // open-design-component.ts) instead of being bundled in the installer.
@@ -272,6 +289,11 @@ app.whenReady().then(async () => {
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
   void backendManager.start()
+  // safeStorage needs the app ready. The logins load once, here, before
+  // anything can change them; the reason is logged, never the contents.
+  knowledgeHost = new KnowledgeHost(new KnowledgeLoginStore(app.getPath('userData'), safeStorage))
+  const knowledgeLogins = knowledgeHost.start()
+  if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -339,7 +361,12 @@ app.whenReady().then(async () => {
   refreshTray()
   // Poll so the menu-bar title/tooltip and menu track the daemon as it starts,
   // crashes, or is toggled from the menu itself.
-  trayTimer = setInterval(refreshTray, 4_000)
+  trayTimer = setInterval(() => {
+    refreshTray()
+    // Replays the wanted Knowledge bindings on a restarted daemon and retries
+    // changes that did not land.
+    knowledgeHost?.sync()
+  }, 4_000)
   // ─────────────────────────────────────────────────────────────────────────
 
   // macOS: re-open window when dock icon clicked with no windows open
@@ -351,6 +378,7 @@ const STATUS_META: Record<BackendStatus, { title: string; label: string }> = {
   running: { title: '⚡A24', label: '● daemon：运行中' },
   starting: { title: '…A24', label: '○ daemon：启动中…' },
   stopped: { title: '⚠️A24', label: '✕ daemon：已停止' },
+  blocked: { title: '⚠️A24', label: '✕ daemon：被另一个 Agent24 占用' },
 }
 
 // Rebuild the tray title, tooltip, and context menu from the live daemon status.
@@ -363,7 +391,10 @@ function refreshTray(): void {
   // DEP-A5: an external daemon (reused from `agent24 daemon start`, not
   // spawned by this app) gets a visibly different label — the whole point of
   // requirement #2 is that the user can tell them apart before hitting stop.
-  const label = external ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）` : meta.label
+  const foreign = backendManager.foreignDaemonPid()
+  const label = external
+    ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）`
+    : foreign !== null ? `${meta.label}（pid ${foreign}）` : meta.label
   if (process.platform === 'darwin') tray.setTitle(meta.title)
   tray.setToolTip(`Agent24 — ${label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
 

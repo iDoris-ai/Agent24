@@ -421,6 +421,10 @@ pub struct RunInput {
     pub model_override: Option<String>,
     #[serde(default)]
     pub mode: RunMode,
+    /// The Knowledge binding copied from the run request; null when the run
+    /// has none. Absent in runs stored before it existed, which read as null.
+    #[schemars(required)]
+    pub knowledge_binding_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -464,6 +468,10 @@ pub struct RunCreate {
     /// H8: `plan` starts the run read-only until a submitted plan is approved.
     #[serde(default)]
     pub mode: RunMode,
+    /// KB-HOST-01: a Knowledge binding the product host activated over its
+    /// private interface. A selector, not an authority; omit/null for none.
+    #[serde(default)]
+    pub knowledge_binding_id: Option<String>,
 }
 
 /// K1-6b.5c-2 (ADR-K1-02 §2.4): a run as a peer bridge (the MCP server, the
