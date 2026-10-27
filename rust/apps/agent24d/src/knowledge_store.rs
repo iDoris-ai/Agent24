@@ -105,7 +105,8 @@ impl KnowledgeDb {
     /// The log, replayed from its start, and the seal, in one read
     /// transaction. SQLite checks a column's type when writing, not when
     /// reading: a number that is not an integer reads as `NULL` here, the
-    /// seal then missing and the log damaged, never as zero.
+    /// seal then missing and the log damaged, never as zero. Text is read as
+    /// bytes, so text that is not UTF-8 is damaged, not an error.
     pub async fn read<I: StoredIds>(&self) -> Result<Found<I>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let next: Option<i64> =
@@ -122,16 +123,16 @@ impl KnowledgeDb {
         )
         .fetch_optional(&mut *tx)
         .await?;
-        let rows: Vec<(Option<i64>, String, Option<String>)> = sqlx::query_as(
-            "SELECT CASE typeof(seq) WHEN 'integer' THEN seq END, kind, body \
-             FROM records ORDER BY seq, kind",
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT CASE typeof(seq) WHEN 'integer' THEN seq END, \
+             CAST(kind AS BLOB), CAST(body AS BLOB) FROM records ORDER BY seq, kind",
         )
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
         let decoded: Result<Vec<Record<I>>, Damaged> = rows
             .into_iter()
-            .map(|(seq, kind, body)| record_from_row(seq, &kind, body))
+            .map(|(seq, kind, body)| record_from_row(seq, kind.as_deref(), body))
             .collect();
         let start = start.map(|s| s.and_then(|s| u64::try_from(s).ok()).ok_or(Damaged));
         let log = match (start, decoded) {
@@ -242,15 +243,21 @@ fn record_columns<I: StoredIds>(
     }
 }
 
+/// A row of `records` as read: seq, kind and body.
+type Row = (Option<i64>, Option<Vec<u8>>, Option<Vec<u8>>);
+
 fn record_from_row<I: StoredIds>(
     seq: Option<i64>,
-    kind: &str,
-    body: Option<String>,
+    kind: Option<&[u8]>,
+    body: Option<Vec<u8>>,
 ) -> Result<Record<I>, Damaged> {
     let seq = seq.and_then(|seq| u64::try_from(seq).ok()).ok_or(Damaged)?;
     let entry = match (kind, body) {
-        ("changes", Some(body)) => Entry::Changes(stored::decode::<I>(&body)?),
-        ("void", None) => Entry::Void,
+        (Some(b"changes"), Some(body)) => {
+            let body = String::from_utf8(body).map_err(|_| Damaged)?;
+            Entry::Changes(stored::decode::<I>(&body)?)
+        }
+        (Some(b"void"), None) => Entry::Void,
         _ => return Err(Damaged),
     };
     Ok(Record { seq, entry })

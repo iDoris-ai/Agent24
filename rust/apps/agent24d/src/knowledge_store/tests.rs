@@ -229,6 +229,51 @@ async fn a_number_that_is_not_an_integer_reads_as_unreadable() {
     }
 }
 
+/// Without its `CHECK`s, a damaged file may hold any kind with any body:
+/// only `changes` with a body and `void` without one read as records.
+#[tokio::test]
+async fn a_kind_and_body_that_do_not_match_are_damaged() {
+    for row in [
+        "'changes', NULL",
+        "'void', 'x'",
+        "'weird', NULL",
+        "NULL, NULL",
+    ] {
+        let (_dir, db) = open().await;
+        db.begin(1).await.unwrap();
+        exec(&db, "DROP TABLE records").await;
+        exec(&db, "CREATE TABLE records (seq, kind, body)").await;
+        exec(&db, &format!("INSERT INTO records VALUES (1, {row})")).await;
+        assert_eq!(log(&db).await, Some(Err(Damaged)), "{row}");
+    }
+}
+
+/// Text that is not UTF-8 is damaged, not a failure to read, and not read
+/// with the byte replaced: the body would then be a change.
+#[tokio::test]
+async fn text_that_is_not_utf8_is_damaged() {
+    let (_dir, db) = open().await;
+    db.begin(1).await.unwrap();
+    exec(
+        &db,
+        r#"INSERT INTO records VALUES (1, 'changes',
+           '{"version":1,"changes":[{"vanish":"' || CAST(x'ff' AS TEXT) || '"}]}')"#,
+    )
+    .await;
+    assert_eq!(log(&db).await, Some(Err(Damaged)));
+
+    let (_dir, db) = open().await;
+    db.begin(1).await.unwrap();
+    exec(&db, "DROP TABLE records").await;
+    exec(&db, "CREATE TABLE records (seq, kind, body)").await;
+    exec(
+        &db,
+        "INSERT INTO records VALUES (1, CAST(x'ff' AS TEXT), NULL)",
+    )
+    .await;
+    assert_eq!(log(&db).await, Some(Err(Damaged)));
+}
+
 /// A write that fails is reported, never taken as persisted (A.1).
 #[tokio::test]
 async fn a_failed_write_is_reported_and_changes_nothing() {
