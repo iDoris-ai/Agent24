@@ -71,12 +71,9 @@ impl<I: Ids> Host<I> {
         self.persist(self.runs.len() - 1);
     }
 
-    /// A run as the log has it: its set confirmed persisted; one unbound
-    /// (`None`) binds nothing and has no candidate.
+    /// A run as the log has it, once each: its set confirmed persisted; one
+    /// unbound (`None`) binds nothing and has no candidate.
     pub fn restore_run(&mut self, run: I::Run, set: RunSet<I>) {
-        if self.runs.iter().any(|r| r.id == run) {
-            return;
-        }
         let (bindings, candidates) = set.unwrap_or_default();
         self.runs.push(Run {
             id: run,
