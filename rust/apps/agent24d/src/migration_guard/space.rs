@@ -6,7 +6,7 @@
 //! allocated reservation file, never a sparse one.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -243,6 +243,7 @@ fn allocate(f: &mut fs::File, bytes: u64) -> io::Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn allocate(f: &mut fs::File, bytes: u64) -> io::Result<()> {
+    use std::io::Write;
     let chunk = vec![0u8; 1 << 20];
     let mut left = bytes;
     while left > 0 {
