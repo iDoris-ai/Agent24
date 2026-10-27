@@ -46,6 +46,7 @@ dependencies = [
  "agent24-os-packages",
  "agent24-protocol",
  "agent24-store",
+ "base64",
  "clap",
  "crossterm",
  "futures-util",

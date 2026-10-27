@@ -3,7 +3,7 @@
 //! use case passing here passes for the desktop too (AGENTS.md).
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent24_documents_client::http::HttpTransport;
 use agent24_documents_client::{Progress, Response, call, import_file, refused, route};
@@ -63,9 +63,96 @@ pub(crate) enum DocumentsAction {
         /// The revision (1 is the imported file)
         revision: u64,
         /// The `next_cursor` of the page before
+        #[arg(long, conflicts_with = "block")]
+        cursor: Option<String>,
+        /// Start at this block (`p<page>/b<n>`, a block's `block_id`)
+        #[arg(long)]
+        block: Option<String>,
+        /// Blocks per page (1–200)
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Fail with `partial_parse` rather than read a partly parsed file
+        #[arg(long)]
+        require_complete: bool,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find text in a document's revision; every match is an anchor
+    Find {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// The revision (1 is the imported file)
+        revision: u64,
+        /// What to look for (1–500 characters)
+        query: String,
+        /// The `next_cursor` of the page before
         #[arg(long)]
         cursor: Option<String>,
+        /// Matches per page (1–200)
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Fail with `partial_parse` rather than search a partly parsed file
+        #[arg(long)]
+        require_complete: bool,
         /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Extract fields from a document's revision with the local model; prints
+    /// the extraction job (`documents job` follows it, `documents extraction`
+    /// reads its values)
+    Extract {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// The revision (1 is the imported file)
+        revision: u64,
+        /// A JSON file with the fields to extract (`{"fields":[{"key",
+        /// "description","type"},..]}`), or `-` for stdin
+        #[arg(long)]
+        schema: PathBuf,
+        /// Extract again although this schema was extracted before; needs --key
+        #[arg(long, requires = "key")]
+        rerun: bool,
+        /// Names this rerun: the same key again replays it, a new one runs again
+        #[arg(long, requires = "rerun")]
+        key: Option<String>,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show an extraction's values, a page at a time
+    Extraction {
+        /// The extraction's id (`ext_…`)
+        extraction_id: String,
+        /// The `next_cursor` of the page before
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Values per page (1–200)
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render a page of a document's revision as PNG
+    Render {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// The revision (1 is the imported file)
+        revision: u64,
+        /// The page, from 1
+        page: u64,
+        /// Scale (0.25–4, default 1); the OS lowers it until the PNG fits 1 MiB
+        #[arg(long)]
+        scale: Option<f64>,
+        /// Only this area: `x0,y0,x1,y1` in points from the page's top left
+        #[arg(long)]
+        region: Option<String>,
+        /// Write the PNG to this file
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print the result as one JSON line, the PNG in base64 (`png`)
         #[arg(long)]
         json: bool,
     },
@@ -175,14 +262,83 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             document_id,
             revision,
             cursor,
+            block,
+            limit,
+            require_complete,
             json,
         } => {
             let mut req =
                 json!({"op": "readText", "documentId": document_id, "revision": revision});
-            if let Some(cursor) = cursor {
-                req["cursor"] = json!(cursor);
-            }
+            put(&mut req, "cursor", cursor);
+            put(&mut req, "block", block);
+            put(&mut req, "limit", limit);
+            put(
+                &mut req,
+                "requireComplete",
+                require_complete.then_some(true),
+            );
             operation(req, json).await
+        }
+        DocumentsAction::Find {
+            document_id,
+            revision,
+            query,
+            cursor,
+            limit,
+            require_complete,
+            json,
+        } => {
+            let mut req = json!({"op": "find", "documentId": document_id, "revision": revision, "query": query});
+            put(&mut req, "cursor", cursor);
+            put(&mut req, "limit", limit);
+            put(
+                &mut req,
+                "requireComplete",
+                require_complete.then_some(true),
+            );
+            operation(req, json).await
+        }
+        DocumentsAction::Extract {
+            document_id,
+            revision,
+            schema,
+            rerun,
+            key,
+            json,
+        } => {
+            let schema = match read_schema(&schema) {
+                Ok(schema) => schema,
+                Err(res) => return report(&res, json),
+            };
+            let mut req = json!({"op": "extract", "documentId": document_id, "revision": revision, "schema": schema});
+            put(&mut req, "rerun", rerun.then_some(true));
+            put(&mut req, "idempotencyKey", key);
+            operation(req, json).await
+        }
+        DocumentsAction::Extraction {
+            extraction_id,
+            cursor,
+            limit,
+            json,
+        } => {
+            let mut req = json!({"op": "getExtraction", "extractionId": extraction_id});
+            put(&mut req, "cursor", cursor);
+            put(&mut req, "limit", limit);
+            operation(req, json).await
+        }
+        DocumentsAction::Render {
+            document_id,
+            revision,
+            page,
+            scale,
+            region,
+            out,
+            json,
+        } => {
+            let mut req = json!({"op": "renderPage", "documentId": document_id, "revision": revision, "page": page});
+            put(&mut req, "scale", scale);
+            put(&mut req, "region", region);
+            render(req, out, json).await
         }
         DocumentsAction::Job { job_id, json } => {
             operation(json!({"op": "job", "jobId": job_id}), json).await
@@ -199,6 +355,71 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             host_stdin,
         } => request_op(request, json, host_stdin).await,
     }
+}
+
+/// Sets `req[key]` when there is a value.
+fn put<T: serde::Serialize>(req: &mut Value, key: &str, value: Option<T>) {
+    if let Some(value) = value {
+        req[key] = json!(value);
+    }
+}
+
+/// Far above a hundred fields (`DocumentsExtractRequest`); a bound so a
+/// wrong file is not read whole.
+const MAX_SCHEMA: u64 = 1024 * 1024;
+
+/// The fields to extract, from a file or stdin (`-`): any JSON value; the OS
+/// checks its shape. Not read, or not JSON: 400, before the daemon is asked.
+fn read_schema(path: &Path) -> Result<Value, Response> {
+    let mut text = String::new();
+    let read = if path == Path::new("-") {
+        std::io::stdin()
+            .lock()
+            .take(MAX_SCHEMA + 1)
+            .read_to_string(&mut text)
+    } else {
+        std::fs::File::open(path).and_then(|f| f.take(MAX_SCHEMA + 1).read_to_string(&mut text))
+    };
+    if read.is_err() || text.len() as u64 > MAX_SCHEMA {
+        return Err(Response::fail(
+            400,
+            "file_unreadable",
+            "the schema could not be read",
+        ));
+    }
+    serde_json::from_str(&text).map_err(|_| invalid("the schema is not JSON".to_owned()))
+}
+
+/// `render`: the page as the shared operation returns it; with `--out` its
+/// PNG written there first, so a page that could not be written is the
+/// result (`file_unwritable`). A person is shown the page without its base64.
+async fn render(req: Value, out: Option<PathBuf>, json: bool) -> Result<(), String> {
+    let mut res = against_daemon(&req).await;
+    if let (Some(path), Response::Ok { data, .. }) = (&out, &res) {
+        if let Err(failed) = write_page(data, path) {
+            res = failed;
+        }
+    }
+    if let (false, Response::Ok { data, .. }) = (json, &mut res) {
+        if let Some(shown) = data.as_object_mut() {
+            shown.remove("png");
+            if let Some(path) = &out {
+                shown.insert("written_to".to_owned(), json!(path));
+            }
+        }
+    }
+    report(&res, json)
+}
+
+fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
+    use base64::Engine as _;
+    let png = data
+        .get("png")
+        .and_then(Value::as_str)
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .ok_or_else(|| Response::fail(502, "invalid_response", "the page is not base64"))?;
+    std::fs::write(path, png)
+        .map_err(|_| Response::fail(400, "file_unwritable", "the page could not be written"))
 }
 
 fn invalid(message: String) -> Response {
@@ -464,6 +685,79 @@ mod tests {
         assert_eq!(
             res,
             Response::fail(400, "invalid_request", "a file to import is required")
+        );
+    }
+
+    #[test]
+    fn a_schema_is_any_json_from_its_file_and_anything_else_is_refused_unsent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ask.json");
+        std::fs::write(&ok, r#"{"fields":[{"key":"date"}]}"#).unwrap();
+        assert_eq!(
+            read_schema(&ok).unwrap(),
+            json!({"fields": [{"key": "date"}]})
+        );
+        let text = dir.path().join("ask.txt");
+        std::fs::write(&text, "fields: date").unwrap();
+        assert_eq!(
+            read_schema(&text).unwrap_err(),
+            Response::fail(400, "invalid_request", "the schema is not JSON")
+        );
+        let big = dir.path().join("big.json");
+        std::fs::write(&big, format!("\"{}\"", "x".repeat(1024 * 1024))).unwrap();
+        let unreadable = Response::fail(400, "file_unreadable", "the schema could not be read");
+        assert_eq!(read_schema(&big).unwrap_err(), unreadable);
+        assert_eq!(
+            read_schema(&dir.path().join("none.json")).unwrap_err(),
+            unreadable
+        );
+    }
+
+    #[test]
+    fn a_page_is_written_as_its_png_bytes_or_the_failure_is_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = json!({"media_type": "image/png", "bytes": 4, "scale": 1.0, "png": "iVBORw=="});
+        let out = dir.path().join("p1.png");
+        write_page(&page, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"\x89PNG");
+        assert_eq!(
+            write_page(&page, &dir.path().join("no/such/dir/p1.png")).unwrap_err(),
+            Response::fail(400, "file_unwritable", "the page could not be written")
+        );
+        assert_eq!(
+            write_page(&json!({"png": "not base64!"}), &out)
+                .unwrap_err()
+                .code(),
+            Some("invalid_response")
+        );
+    }
+
+    #[test]
+    fn a_rerun_names_its_key_and_a_text_page_starts_at_a_block_or_a_cursor() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            action: DocumentsAction,
+        }
+        let parse =
+            |args: &[&str]| Cli::try_parse_from(["documents"].iter().chain(args)).map(|_| ());
+        assert!(
+            parse(&[
+                "extract", "doc_x", "1", "--schema", "a.json", "--rerun", "--key", "k"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--rerun"]).is_err());
+        assert!(parse(&["extract", "doc_x", "1", "--schema", "a.json", "--key", "k"]).is_err());
+        assert!(parse(&["extract", "doc_x", "1"]).is_err());
+        assert!(parse(&["text", "doc_x", "1", "--block", "p1/b1", "--limit", "5"]).is_ok());
+        assert!(parse(&["text", "doc_x", "1", "--block", "p1/b1", "--cursor", "ab"]).is_err());
+        assert!(
+            parse(&[
+                "render", "doc_x", "1", "2", "--scale", "0.5", "--out", "p.png"
+            ])
+            .is_ok()
         );
     }
 

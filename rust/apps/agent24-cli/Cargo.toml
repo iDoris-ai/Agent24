@@ -11,6 +11,8 @@ name = "agent24"
 path = "src/main.rs"
 
 [dependencies]
+# `documents render --out`: the page comes as base64 in the JSON result.
+base64 = "0.22"
 agent24-documents-client = { path = "../../crates/agent24-documents-client" }
 agent24-hw = { path = "../../crates/agent24-hw" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
