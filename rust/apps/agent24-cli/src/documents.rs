@@ -439,7 +439,8 @@ fn extract_request(
 /// place of a file, the new one is readable only by its owner until it is
 /// written and then takes that file's permissions; with no file there, it is
 /// made as the umask allows from the start, as writing in place would. A
-/// link is written through to its target. Any step that fails is
+/// link is written through to its target. A page that is not base64 is
+/// `invalid_response`; any step of writing it that fails is
 /// `file_unwritable`; among them, the new file cannot be made beside it (a
 /// directory that cannot be written, as `/dev` for `/dev/null`), a link leads
 /// nowhere (it cannot be resolved), or the rename fails (a directory at
