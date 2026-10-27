@@ -73,6 +73,7 @@ fn sha(bytes: &[u8]) -> String {
 fn reply(status: u16, body: Value) -> Reply {
     Reply::Http {
         status,
+        headers: Vec::new(),
         body: serde_json::to_vec(&body).unwrap(),
     }
 }
@@ -1131,6 +1132,7 @@ fn the_error_envelope_keeps_its_hint_and_details() {
     let body = br#"{"error":{"code":"conflict","message":"m","hint":"try again","details":{"received_offset":3}}}"#;
     let res = to_response(Reply::Http {
         status: 409,
+        headers: Vec::new(),
         body: body.to_vec(),
     });
     let Response::Err { status, error } = res else {
@@ -1144,11 +1146,13 @@ fn the_error_envelope_keeps_its_hint_and_details() {
     );
     let bare = to_response(Reply::Http {
         status: 500,
+        headers: Vec::new(),
         body: b"oops".to_vec(),
     });
     assert_eq!(bare.code(), Some("invalid_response"));
     let null = to_response(Reply::Http {
         status: 200,
+        headers: Vec::new(),
         body: b"null".to_vec(),
     });
     assert_eq!(null.code(), Some("invalid_response"));
@@ -1566,6 +1570,7 @@ fn an_envelope_needs_its_code_and_message_and_a_null_details_is_none() {
     use crate::response::to_response;
     let http = |status: u16, body: &str| Reply::Http {
         status,
+        headers: Vec::new(),
         body: body.as_bytes().to_vec(),
     };
     assert_eq!(

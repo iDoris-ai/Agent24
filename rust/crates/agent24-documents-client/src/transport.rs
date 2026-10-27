@@ -26,8 +26,17 @@ pub struct Request {
 /// `invalid_response` (a reply too large).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
-    Http { status: u16, body: Vec<u8> },
-    Failed { status: u16, error: ApiError },
+    /// `headers` are the reply's, names in lower case; only a rendered page
+    /// reads them (its content type and scale).
+    Http {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    Failed {
+        status: u16,
+        error: ApiError,
+    },
 }
 
 /// Sends one request. It never retries: whether a failure may be sent

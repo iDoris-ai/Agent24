@@ -104,7 +104,7 @@ pub fn to_response(reply: Reply) -> Response {
 
     match reply {
         Reply::Failed { status, error } => Response::Err { status, error },
-        Reply::Http { status, body } => {
+        Reply::Http { status, body, .. } => {
             let parsed = serde_json::from_slice::<Value>(&body).ok();
             if (200..300).contains(&status)
                 && let Some(data) = parsed.as_ref().filter(|v| !v.is_null())
