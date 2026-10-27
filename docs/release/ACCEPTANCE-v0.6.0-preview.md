@@ -3,11 +3,12 @@
 - **日期**：2026-10-27 起草。**状态**：草稿，待发布负责人（David）确认。
 - **依据**：#1293（`DOC-1-40`，AGENTS.md「release PR 的合并门槛」由 jason 真机验收改为完整用例验收，**合并前需 jason 同意，见 #1159**）。
 - **范围**：五条线合并后的 `v0.6.0-preview.20261028.1`。合入顺序：kernel → memory-p1 → documenting → weknora → idoris（iDoris 最后；截止 2026-10-28 12:00 Asia/Bangkok，赶不上则整条 iDoris 线移出本版，配对改下一个 preview，见 #1370）：
-  - kernel：release PR #1280（`release/kernel-k1-r2-20261026`，迁移 store 0019–0026 + memory 0018）；
-  - memory-p1：release PR #1341（`ab/memory-p1`，迁移 memory 0019–0020 + store 0027–0029，**待 #1280 先合，再吸收 main**）；
-  - documenting：`ab/documenting`（#1293 的 base；store 无迁移，documents 模块自己的库 0007–0008）；
-  - weknora：`ab/weknora`（KB-C1 / KB-HOST-01）；
-  - idoris（第五线，#1370）：`ab/idoris`（Agent24 经 iDoris 网关调用本地模型；与 iDoris v0.3.1 联合发布，**待吸收 main 第二次并开 release PR**）。
+  - kernel：**已合并 main（`03bf1e17`）**。release PR #1280（`release/kernel-k1-r2-20261026`，迁移 store 0019–0026 + memory 0018）；
+  - memory-p1：**已合并 main（`c98745b0`，在 #1280 之后）**。release PR #1341（`ab/memory-p1`，迁移 memory 0019–0020 + store 0027–0029，**待 #1280 先合，再吸收 main**）；
+  - documenting：**已合并 main（r6，#1386，`8bba633e`）**。`ab/documenting`（#1293 的 base；store 无迁移，documents 模块自己的库 0007–0008）；
+  - weknora：**已合并 main（KB-R1，#1396，`3659317d`）**。`ab/weknora`（KB-C1 / KB-HOST-01）；
+  - 另：P-13（#1381，`bb3fb6d8`）已合并 main（store 0030）。
+  - idoris（第五线，#1370，**尚未合入 main**）：`ab/idoris`（Agent24 经 iDoris 网关调用本地模型；与 iDoris v0.3.1 联合发布，**待吸收 main 第二次并开 release PR**）。
 - **本清单没有实跑过**：起草时只读了各集成分支的代码、协议文件和测试，命令和断言依据代码核对，没有在五线合并后的 head 上执行（那个 head 还不存在）。第一次执行时，凡是 FAIL 先判断是用例写错还是产品错，用例写错就改本文件。「待核实」「缺口」两节列出起草时已经看到的疑点。
 
 ## 0. 规则对照（#1293）

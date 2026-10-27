@@ -107,6 +107,13 @@ kernel（K1 第二次发布）、documenting、weknora（Knowledge）、memory-p
 **破坏性变更**：桌面端不再带 TS 版文档路由；自建脚本如果依赖 `documents-import.ts` 的内部实现，改走
 `agent24 documents ...`。
 
+**本次不对外（#1386）**：上面「文档模块工具」与「授权结束时停下」两条已合入，但 `domain-os.yml` 没声明
+`tools:`（#705 余下部分），内核授予也默认关闭，agent 看不到这些工具；什么时候开放单独走 #705。
+
+**其他变化（#1386）**：mac 包把 `agent24` 也列进 `mac.binaries`，release 脚本与签名校验两个后端二进制
+都处理（#1375）；桌面包多一个 `backend/agent24`。**不要退回 r5**：r5 打不开 r6 迁移过的库（文档请求
+返回 `storage_unavailable`，数据未被改动，装回 r6 即恢复）。
+
 ### weknora —— Knowledge（私有知识库）首次进 main
 
 **新功能**
@@ -128,6 +135,20 @@ kernel（K1 第二次发布）、documenting、weknora（Knowledge）、memory-p
   「数据不是指令」包裹，分块续读拼成整段引用，发送前长度上限。
 - 设计带入与任务方案 v2.1（KB-C0-01，#1171、#1174）；吸收 main（#1032、#1102）；稳定
   `get_timings` 测试（#1211）。
+
+**行为变化（需要知道，#1396）**
+1. **桌面托管的 daemon 改为 capabilities 模式**（macOS、Linux；Windows 仍 legacy）：桌面开着时，CLI 的
+   `models / chat / tui / daemon stop` 报 `host authority unavailable`，`daemon status` 拿不到关停报告。
+   这是对用户可见的退步，是否接受由 David 定。
+2. 桌面崩溃或被强杀时，它托管的 daemon 随之停下（stdin 即父进程租约，EOF 即关机）。
+3. `POST /api/v1/runs` 的 `RunInput` 新增 `knowledge_binding_id`；非宿主调用方指名 binding 返回 403
+   `host_authority_required`，binding 未激活返回 409 `knowledge_binding_inactive`。新增宿主私有接口
+   `/api/v1/host/knowledge/*`（渲染进程代理拒绝转发，403 `host_interface_private`）与 capability
+   `knowledge.host`。
+4. 新保留路径段 `host`：叫 `host` 的 attached 模块注册会被拒（400 `invalid_manifest`），升级前已有的同名模块
+   也不再加载，需改名后重装。
+5. 单实例：数据目录被另一宿主占用时桌面托盘显示「被占用」。
+6. **不能退回旧版本**：本次带着 store 迁移 0030（P-13，#1381），旧内核读不了迁移后的库。
 
 **迁移 / 破坏性变更**：只新增 `knowledge.db`（`0001_log`），不动既有库。新增 crate 与 `agent24-protocol`
 的 Knowledge 类型是增量，不改现有接口。
