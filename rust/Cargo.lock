@@ -176,6 +176,7 @@ dependencies = [
  "agent24-store",
  "async-trait",
  "futures",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "sha2",
