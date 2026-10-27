@@ -1212,13 +1212,6 @@ mod tests {
         assert_eq!(summary[0]["max_ms"], 500);
     }
 
-    /// Relative to now: the recorder prunes rows older than
-    /// `RETENTION_MAX_AGE_DAYS` when the state starts, so a fixed date stops
-    /// passing once it is that old.
-    fn days_ago(days: u64) -> String {
-        agent24_core::util::iso8601_before(std::time::Duration::from_secs(days * 86_400))
-    }
-
     async fn get(router: axum::Router, token: &str, uri: &str) -> (StatusCode, serde_json::Value) {
         let res = router
             .oneshot(
