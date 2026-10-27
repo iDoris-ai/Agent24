@@ -1060,6 +1060,71 @@ mod tests {
         );
     }
 
+    /// K1-6b.5e prerequisite (#1209 PR-Daemon): with a gate that allows every
+    /// request and a valid cloud grant, a LocalOnly task still never reaches a
+    /// remote provider. Nothing but the LocalOnly exclusion in `tier_order`
+    /// stands in the way here — not the production `deny_all` gate, not a
+    /// domain refusal — so this is what proves the exclusion itself.
+    #[tokio::test]
+    async fn local_only_never_reaches_remote_even_when_the_gate_grants_it() {
+        async fn complete(
+            r: &ModelRouter,
+            privacy: Privacy,
+            complexity: Complexity,
+        ) -> Result<(String, CompletionResponse), ModelError> {
+            let (gate, resources) = authorized_test_scope();
+            r.complete_with_egress(
+                TaskProfile {
+                    privacy,
+                    complexity,
+                },
+                &req(),
+                &CancellationToken::new(),
+                gate,
+                resources,
+                1,
+            )
+            .await
+        }
+        for complexity in [Complexity::Simple, Complexity::Complex] {
+            // Control: the same gate and grant let a task with no privacy
+            // label reach the remote provider.
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![(remote.clone(), Tier::Remote)]);
+            let (name, _) = complete(&r, Privacy::Any, complexity).await.unwrap();
+            assert_eq!(name, "remote", "{complexity:?}");
+            assert_eq!(remote.calls(), 1, "{complexity:?}");
+
+            let err = complete(&r, Privacy::LocalOnly, complexity)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Unavailable(_)),
+                "{complexity:?}: {err}"
+            );
+            assert_eq!(remote.calls(), 1, "{complexity:?}: only a remote provider");
+
+            // A local provider that fails, then cools down.
+            let local = StubProvider::down("local");
+            let remote = StubProvider::ok("remote");
+            let r = router(vec![
+                (local.clone(), Tier::Local),
+                (remote.clone(), Tier::Remote),
+            ]);
+            for _ in 0..2 {
+                let err = complete(&r, Privacy::LocalOnly, complexity)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, ModelError::Unavailable(_)),
+                    "{complexity:?}: {err}"
+                );
+            }
+            assert_eq!(local.calls(), 1, "{complexity:?}: tried once, then cooling");
+            assert_eq!(remote.calls(), 0, "{complexity:?}: local down");
+        }
+    }
+
     #[tokio::test]
     async fn local_only_with_cooled_down_local_still_never_uses_remote() {
         // Privacy × health: even when the ONLY local provider is in cooldown, a

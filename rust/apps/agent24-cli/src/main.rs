@@ -21,6 +21,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod runs;
+mod schedules;
 mod service;
 mod tui;
 
@@ -44,6 +46,14 @@ enum Command {
         /// Model id override
         #[arg(long)]
         model: Option<String>,
+        /// Chat with personal memory on, as the desktop's chat page does for each
+        /// conversation: an explicit "记住…" is kept and its outcome shown, and
+        /// what you remember is recalled for the reply. Memory is shared by all
+        /// your conversations; this id files the turn under one of them, whose
+        /// source floor (the strictest source it has recalled) a new memory
+        /// takes. Only this one message is sent, not the turns before it
+        #[arg(long)]
+        session: Option<String>,
     },
     /// List models known to the daemon
     Models,
@@ -89,6 +99,16 @@ enum Command {
     Hw {
         #[command(subcommand)]
         action: HwAction,
+    },
+    /// List, inspect and cancel runs (the desktop's Runs page)
+    Runs {
+        #[command(subcommand)]
+        action: runs::RunsAction,
+    },
+    /// List, create, change, delete and fire schedules (the desktop's Schedules page)
+    Schedules {
+        #[command(subcommand)]
+        action: schedules::SchedulesAction,
     },
 }
 
@@ -601,7 +621,41 @@ fn agent24d_binary() -> String {
         .unwrap_or_else(|| "agent24d".to_owned())
 }
 
-async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), String> {
+/// Why `spawn_daemon` got no ready line.
+#[derive(Debug)]
+struct SpawnError {
+    message: String,
+    /// The start may have lost a concurrent-start race, so a winner may be
+    /// coming up: the daemon said `already_running`, or it gave no reason.
+    /// A daemon that said why it failed otherwise had no winner to wait for.
+    maybe_raced: bool,
+}
+
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            maybe_raced: true,
+        }
+    }
+}
+
+impl From<&str> for SpawnError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+/// A SPEC-002 §4 `failed` line: what the daemon said before exiting.
+fn start_failure(line: &serde_json::Value) -> SpawnError {
+    let error = line["error"].as_str().unwrap_or("it gave no reason");
+    SpawnError {
+        message: format!("agent24d did not start: {error}"),
+        maybe_raced: line["code"] == "already_running",
+    }
+}
+
+async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), SpawnError> {
     let bin = agent24d_binary();
     let mut cmd = tokio::process::Command::new(&bin);
     let mut args = vec!["serve", "--port", "0"];
@@ -626,16 +680,20 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
         let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
         let line = match next {
             Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => return Err("agent24d exited before ready line".to_owned()),
-            Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}")),
-            Err(_) => return Err("agent24d did not become ready within 15s".to_owned()),
+            Ok(Ok(None)) => return Err("agent24d exited before ready line".into()),
+            Ok(Err(e)) => return Err(format!("reading agent24d stdout: {e}").into()),
+            Err(_) => return Err("agent24d did not become ready within 15s".into()),
         };
-        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&line)
-            && state["type"] == "ready"
-        {
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if state["type"] == "ready" {
             let pid = child.id().unwrap_or(0);
             let parsed = parse_ready_state(&state, pid)?;
             return Ok((parsed, child));
+        }
+        if state["type"] == "failed" {
+            return Err(start_failure(&state));
         }
     }
 }
@@ -654,7 +712,7 @@ async fn connect() -> Result<Endpoint, String> {
             return endpoint_from_state(state);
         }
     }
-    let (state, child) = spawn_daemon(true).await?;
+    let (state, child) = spawn_daemon(true).await.map_err(|err| err.message)?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
@@ -717,16 +775,29 @@ fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder
     }
 }
 
-async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> {
-    let ep = connect().await?;
-    let req = ChatRequest {
+fn chat_request(message: String, model: Option<String>, session: Option<String>) -> ChatRequest {
+    ChatRequest {
         messages: vec![ChatMessage {
             role: "user".to_owned(),
             content: message,
         }],
         model,
-        session_id: None,
-    };
+        session_id: session,
+    }
+}
+
+fn receipt_line(receipt: agent24_protocol::MemoryReceipt) -> &'static str {
+    match receipt {
+        agent24_protocol::MemoryReceipt::Saved => "remembered",
+        agent24_protocol::MemoryReceipt::PausedNotSaved => {
+            "not remembered: personal memory is paused"
+        }
+        agent24_protocol::MemoryReceipt::Failed => "not remembered: saving it failed",
+    }
+}
+
+async fn cmd_chat(req: ChatRequest) -> Result<(), String> {
+    let ep = connect().await?;
     let result = bearer(&ep, client().post(format!("{}/api/v1/chat", ep.base)))
         .timeout(Duration::from_secs(180))
         .json(&req)
@@ -737,6 +808,11 @@ async fn cmd_chat(message: String, model: Option<String>) -> Result<(), String> 
             let body: ChatResponse = res.json().await.map_err(|e| e.to_string())?;
             println!("{}", body.message.content);
             println!("· {} tokens", body.usage.total_tokens);
+            // What the daemon did with an explicit "记住…", never what the
+            // reply claims (the desktop shows the same receipt).
+            if let Some(receipt) = body.memory_receipt {
+                println!("· {}", receipt_line(receipt));
+            }
             Ok(())
         }
         Ok(res) => {
@@ -2064,6 +2140,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
             }
             let (state, child) = match spawn_daemon(false).await {
                 Ok(v) => v,
+                Err(err) if !err.maybe_raced => return Err(err.message),
                 Err(err) => {
                     // Lost a concurrent-start race? The winner holds the
                     // singleton lock and our child exited before ready. The
@@ -2082,7 +2159,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                    return Err(err);
+                    return Err(err.message);
                 }
             };
             // Detach: without kill_on_drop, dropping the handle leaves the
@@ -2252,7 +2329,11 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Chat { message, model } => cmd_chat(message, model).await,
+        Command::Chat {
+            message,
+            model,
+            session,
+        } => cmd_chat(chat_request(message, model, session)).await,
         Command::Models => cmd_models().await,
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),
@@ -2263,6 +2344,8 @@ async fn main() -> std::process::ExitCode {
         Command::Acp => cmd_acp().await,
         Command::Decide { action } => cmd_decide(action).await,
         Command::Hw { action } => cmd_hw(action),
+        Command::Runs { action } => runs::cmd_runs(action).await,
+        Command::Schedules { action } => schedules::cmd_schedules(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -2475,6 +2558,37 @@ mod tests {
                 action: CommAction::Unlock { remember: true }
             }
         ));
+    }
+
+    /// `--session` reaches the request as the desktop's chat page sends it;
+    /// without it the chat stays session-less.
+    #[test]
+    fn chat_sends_the_session_it_was_given() {
+        let request = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Chat {
+                message,
+                model,
+                session,
+            } = cli.command
+            else {
+                panic!("not a chat");
+            };
+            serde_json::to_value(chat_request(message, model, session)).unwrap()
+        };
+        let body = request(&["agent24", "chat", "hi", "--session", "chat_1"]);
+        assert_eq!(body["session_id"], "chat_1", "{body}");
+        assert_eq!(body["messages"][0]["content"], "hi", "{body}");
+        let body = request(&["agent24", "chat", "hi"]);
+        assert_eq!(body.get("session_id"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn a_remember_receipt_says_what_the_daemon_did() {
+        use agent24_protocol::MemoryReceipt::{Failed, PausedNotSaved, Saved};
+        assert_eq!(receipt_line(Saved), "remembered");
+        assert!(receipt_line(PausedNotSaved).contains("paused"));
+        assert!(receipt_line(Failed).contains("failed"));
     }
 
     #[test]

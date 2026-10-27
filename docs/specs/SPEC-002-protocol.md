@@ -185,6 +185,16 @@ agent24d stdout 输出一行: {"type":"ready","port":49317,"token":"<32B 随机>
 ```
 解析方约定：**逐行扫描 stdout，取首个 `type=="ready"` 的 JSON 行**——不要求它是绝对首行
 （daemon 初始化日志可能在其之前，如 node mock 的 BoxLite 绑定加载日志）。
+
+启动在 ready 行之前失败时（配置错误、端口或单例锁被占等），daemon 退出前在 stdout 写一行 `failed`，代替 ready 行：
+
+```
+{"type":"failed","code":"start_failed","error":"A24_MODULE_GRANT_MAX_DAYS=\"91\" must be a number of days from 1 to 90"}
+```
+- `code` 是开放集合：`already_running`（另一个 daemon 持有单例锁，启动方可以去找那个赢家），`start_failed`（其他原因）。`error` 是给人看的原因，和 stderr 日志里 `serve failed:` 后面那段相同。
+- ready 行发出之后 stdout 不再有任何输出，也不会再出现 `failed` 行。
+- 不保证每次 ready 前退出都有 `failed` 行（例如 panic，或在 ready 之前就收到关停信号）。读到 EOF 却既没有 ready 也没有 failed 时，启动方照旧报「没等到 ready 行」。
+- 不认识 `failed` 的旧启动方会把它当作非 ready 行跳过，行为和以前一样。
 - 只绑定 `127.0.0.1`；token 每次启动重新生成；拒绝带浏览器 `Origin` 头的 WS 升级（防 CSRF）；**唯一免认证端点：`GET /api/v1/health`**（存活探测）
 - mock（node-daemon）豁免 token 但必须实现同样的 ready 行（token 可为空串），保证 BackendManager 逻辑统一
 
