@@ -49,6 +49,8 @@
 | W3r | 反面对照 | main 的 `agent24 daemon start`，指名 binding 建 run | 202（main 不查）。说明 W3a 的拒绝是这次加的 |
 | Z1 | 不碰用户数据 | 对比运行前后的 `~/.agent24` | 没有变化 |
 
+**整体反面对照**：把 `--new` 也指向 main 的二进制再跑一遍，W2b–W2f、W3a、W3b 应当 FAIL。其余各条照常 PASS：W1 走的 capabilities 模式在 main 上已经有了，这次的变化是桌面改用它；W2a、W3c 是不指名 binding 的普通 run；W2r、W3r 本来就是 main。2026-10-27 在本机跑过，结果与此一致。
+
 ## 只能在桌面端人工确认的（没有 CLI 入口）
 
 这几项是桌面主进程独有的逻辑，CLI 没有对应的入口，由发布负责人在桌面上确认，结果写进 release PR。
