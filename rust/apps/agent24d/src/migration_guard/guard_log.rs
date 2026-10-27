@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::atomic::FileOps;
 use super::manifest::{
-    BinaryIdentity, FORMAT_VERSION, StateError, parse_json, read_optional, write_json,
+    BinaryIdentity, FORMAT_VERSION, StateError, parse_json, read_optional, verify_complete,
+    write_json,
 };
 
 pub const GUARD_FILE: &str = "migration-guard.json";
@@ -153,6 +154,13 @@ pub fn guard_path(data_dir: &Path) -> PathBuf {
 /// Durably write `log` as is (after validation).
 pub fn persist(ops: &dyn FileOps, data_dir: &Path, log: &GuardLog) -> Result<(), GuardError> {
     log.validate()?;
+    if log.phase == Phase::Migrating {
+        // D2/section 4 row 4: no verified snapshot, no migrating.
+        let id = log.snapshot_id.as_deref().unwrap_or_default();
+        verify_complete(data_dir, id, &log.attempt_id).map_err(|_| {
+            GuardError::Precondition("migrating requires a complete, verified snapshot manifest")
+        })?;
+    }
     write_json(ops, data_dir, &guard_path(data_dir), log)?;
     Ok(())
 }
@@ -187,6 +195,7 @@ pub fn read(data_dir: &Path) -> Result<Option<GuardLog>, GuardError> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::super::atomic::{RealOps, test_ops::RecordingOps};
+    use super::super::manifest::test_empty_snapshot;
     use super::*;
     use std::fs;
 
@@ -205,13 +214,13 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let mut g = fresh();
         persist(&RealOps, td.path(), &g).unwrap();
-        g.snapshot_id = Some("s".into());
+        g.snapshot_id = Some(test_empty_snapshot(td.path(), "a1"));
         for to in [Phase::Snapshotted, Phase::Migrating, Phase::Committed] {
             advance(&RealOps, td.path(), &mut g, to).unwrap();
             assert_eq!(read(td.path()).unwrap().unwrap().phase, to);
         }
         let mut g = fresh();
-        g.snapshot_id = Some("s".into());
+        g.snapshot_id = Some(test_empty_snapshot(td.path(), "a1"));
         for to in [
             Phase::Snapshotted,
             Phase::Migrating,
@@ -260,6 +269,32 @@ mod tests {
             !guard_path(td.path()).exists(),
             "rejected step wrote nothing"
         );
+    }
+
+    #[test]
+    fn migrating_requires_a_verified_manifest() {
+        let td = tempfile::tempdir().unwrap();
+        let mut g = fresh();
+        g.snapshot_id = Some("20261027T000000Z-a1".into());
+        advance(&RealOps, td.path(), &mut g, Phase::Snapshotted).unwrap();
+        let refused = |g: &mut GuardLog| {
+            let r = advance(&RealOps, td.path(), g, Phase::Migrating);
+            assert!(matches!(r, Err(GuardError::Precondition(_))), "{r:?}");
+            assert_eq!(g.phase, Phase::Snapshotted);
+            assert_eq!(read(td.path()).unwrap().unwrap().phase, Phase::Snapshotted);
+        };
+        refused(&mut g); // no manifest at all
+        test_empty_snapshot(td.path(), "other"); // manifest of another attempt
+        let snaps = td.path().join("migration-snapshots");
+        fs::rename(
+            snaps.join("20261027T000000Z-other"),
+            snaps.join("20261027T000000Z-a1"),
+        )
+        .unwrap();
+        refused(&mut g);
+        fs::remove_dir_all(snaps.join("20261027T000000Z-a1")).unwrap();
+        test_empty_snapshot(td.path(), "a1"); // the real thing passes
+        advance(&RealOps, td.path(), &mut g, Phase::Migrating).unwrap();
     }
 
     #[test]
@@ -356,7 +391,7 @@ mod tests {
     fn restored_requires_both_restores_done() {
         let td = tempfile::tempdir().unwrap();
         let mut g = fresh();
-        g.snapshot_id = Some("s".into());
+        g.snapshot_id = Some(test_empty_snapshot(td.path(), "a1"));
         for to in [Phase::Snapshotted, Phase::Migrating, Phase::Restoring] {
             advance(&RealOps, td.path(), &mut g, to).unwrap();
         }
