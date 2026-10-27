@@ -94,12 +94,16 @@ settle() {
 # The daemon this run started is stopped however the run ends.
 # C1 makes blobs/tmp read-only for a while: an interrupted run puts it back,
 # or the work dir cannot be removed.
+# Both data dirs (the M cases use a second one), whichever is current.
 cleanup() {
   [ -n "${TMPBLOBS:-}" ] && chmod u+w "$TMPBLOBS" 2>/dev/null
-  [ -s "$AGENT24_DATA_DIR/daemon.json" ] || return 0
-  limit 30 "$BIN/agent24" daemon stop > /dev/null 2>&1 && return 0
-  local pid; pid=$(jq -r .pid "$AGENT24_DATA_DIR/daemon.json" 2>/dev/null)
-  [ -n "$pid" ] && [ "$pid" != null ] && kill -9 "$pid" 2>/dev/null
+  local dir pid
+  for dir in "$WORK/data" "$WORK/up/data"; do
+    [ -s "$dir/daemon.json" ] || continue
+    AGENT24_DATA_DIR=$dir limit 30 "$BIN/agent24" daemon stop > /dev/null 2>&1 && continue
+    pid=$(jq -r .pid "$dir/daemon.json" 2>/dev/null)
+    [ -n "$pid" ] && [ "$pid" != null ] && kill -9 "$pid" 2>/dev/null
+  done
   return 0
 }
 trap cleanup EXIT
@@ -324,13 +328,25 @@ if [ -n "$OLD" ]; then
   OLDPKG=$WORK/oldpkg; mkdir -p "$OLDPKG/bin"
   cp "$REPO/rust/apps/agent24-documents/domain-os.yml" "$OLDPKG/"
   cp "$OLD/agent24-documents" "$PKG/bin/agent24-documents-pdfkit" "$OLDPKG/bin/"
-  # ready: the documents module answers within 30 s (P3).
+  # ready: the documents module answers within 30 s of now (as P3 judges it).
   ready() {
-    for _ in $(seq 1 150); do a24 documents capabilities > /dev/null 2>&1 && return 0; sleep 0.2; done
+    local t0 t1
+    t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
+    for _ in $(seq 1 150); do
+      a24 documents capabilities > /dev/null 2>&1 || { sleep 0.2; continue; }
+      t1=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
+      [ $((t1 - t0)) -le 30000 ]; return
+    done
     return 1
   }
   dbv() { sqlite3 "$DB" 'SELECT max(version) || "/" || min(success) FROM _sqlx_migrations' 2>/dev/null; }
-  dump() { sqlite3 "$DB" .dump 2>/dev/null | shasum | cut -c1-16; }
+  # A library sqlite3 could not read is no evidence: it hashes to a marker, never
+  # to the hash of nothing, so two failed reads cannot compare equal as "unchanged".
+  dump() {
+    local out
+    out=$(sqlite3 "$DB" .dump 2>/dev/null) && [ -n "$out" ] || { echo "unreadable-$RANDOM$RANDOM"; return; }
+    printf '%s' "$out" | shasum | cut -c1-16
+  }
 
   limit 120 "$OLD/agent24" os install "$OLDPKG" > "$WORK/m1.out" 2>&1; r1=$?
   PATH="$OLD:$PATH" limit 60 "$OLD/agent24" daemon start >> "$WORK/m1.out" 2>&1; r2=$?
@@ -372,7 +388,7 @@ if [ -n "$OLD" ]; then
   # Rolling back: r5 cannot read a library r6 migrated, and must not write it.
   limit 60 "$BIN/agent24" daemon stop > "$WORK/m6.out" 2>&1
   for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
-  h1=$(dump)
+  h1=$(dump); vb=$(dbv)
   a24 os uninstall documents >> "$WORK/m6.out" 2>&1
   limit 120 "$OLD/agent24" os install "$OLDPKG" >> "$WORK/m6.out" 2>&1
   PATH="$OLD:$PATH" limit 60 "$OLD/agent24" daemon start >> "$WORK/m6.out" 2>&1; r1=$?
@@ -387,7 +403,7 @@ if [ -n "$OLD" ]; then
   for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
   h2=$(dump)
   check M6 "back to r5: the library refused (storage_unavailable), not changed" \
-    "$(is "$r1/$st/$h2" "0/storage_unavailable/$h1")" "rc=$r1; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2"
+    "$(is "$vb/$r1/$st/$h2" "8/1/0/storage_unavailable/$h1")" "library $vb; rc=$r1; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2"
 
   a24 os uninstall documents > "$WORK/m7.out" 2>&1
   a24 os install "$PKG" >> "$WORK/m7.out" 2>&1
