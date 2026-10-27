@@ -195,6 +195,13 @@ fn restore_one(
     let staging = parent.join(format!("{name}.restore.{attempt}"));
     // A leftover staging file is untrusted (crash mid-copy): always rebuild.
     remove_if_present(ops, &staging)?;
+    // Crash after install but before progress was persisted: the formal db
+    // already is the snapshot. Do not copy again (the recovery budget was
+    // spent once; a second copy can ENOSPC) nor quarantine the good file.
+    // Any read error here just falls through to the strict full path.
+    if check_final(path, rec).is_ok() {
+        return fsync_chain(ops, data_dir, parent).map_err(|x| e("fsync db dir", x));
+    }
     if rec.existed {
         ops.copy_new_synced(snap_file, &staging)
             .map_err(|x| e("stage copy", x))?;
@@ -254,10 +261,20 @@ fn free_name(q: &Path, base: &str) -> R<PathBuf> {
 }
 
 /// After `Restored` is durable the failed WAL/SHM/journal copies are junk.
+/// Returns how many things could not be cleaned (listing, delete, fsync
+/// errors all count); a missing quarantine dir is a genuine zero.
 fn drop_quarantined_sidecars(ops: &dyn FileOps, q: &Path) -> usize {
-    let Ok(rd) = fs::read_dir(q) else { return 0 };
+    let rd = match fs::read_dir(q) {
+        Ok(rd) => rd,
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(_) => return 1,
+    };
     let mut bad = 0;
-    for ent in rd.flatten() {
+    for ent in rd {
+        let Ok(ent) = ent else {
+            bad += 1;
+            continue;
+        };
         let n = ent.file_name().to_string_lossy().into_owned();
         if SIDECARS.iter().any(|s| n.contains(&format!("db{s}")))
             && remove_if_present(ops, &ent.path()).is_err()
@@ -265,8 +282,7 @@ fn drop_quarantined_sidecars(ops: &dyn FileOps, q: &Path) -> usize {
             bad += 1;
         }
     }
-    let _ = ops.fsync_dir(q);
-    bad
+    bad + usize::from(ops.fsync_dir(q).is_err())
 }
 
 #[cfg(test)]
@@ -639,5 +655,64 @@ mod tests {
             fx.go(&RealOps),
             Err(RestoreError::NotRestorable(Phase::Committed))
         ));
+    }
+
+    /// Review High: crash after the store was installed but before its Done
+    /// was persisted. The replay must neither copy it again (ENOSPC under the
+    /// reserved budget) nor quarantine the already-correct file again.
+    #[tokio::test]
+    async fn t9_replay_after_install_does_not_recopy_or_requarantine() {
+        let mut fx = fixture(true).await;
+        let clean = Probe::new(None);
+        fx.go(&clean).unwrap();
+        let calls = clean.calls.borrow().clone();
+        let install = calls
+            .iter()
+            .position(|x| x == &format!("rename:{}", fx.s.display()))
+            .unwrap();
+        let progress = install
+            + calls[install..]
+                .iter()
+                .position(|x| x.starts_with("write:"))
+                .unwrap();
+        let mut fx = fixture(true).await;
+        assert!(fx.go(&Probe::new(Some(progress))).is_err());
+        fx.log = guard_log::read(&fx.root).unwrap().unwrap();
+        assert_eq!(
+            fx.log.store_restore,
+            DbRestore::Pending,
+            "fixture: Done not yet durable"
+        );
+        assert_eq!(
+            fs::read(&fx.s).unwrap(),
+            fs::read(fx.snap.join(STORE_FILE)).unwrap()
+        );
+        let retry = Probe::new(None);
+        fx.go(&retry).unwrap();
+        let rc = retry.calls.borrow();
+        assert!(
+            !rc.iter()
+                .any(|x| x.starts_with("copy:") && x.contains("agent24.db.restore")),
+            "{rc:?}"
+        );
+        let q = fx.root.join(QUARANTINE_DIR).join("a1");
+        assert!(
+            q.join(STORE_FILE).exists() && !q.join("agent24.db.1").exists(),
+            "no extra quarantine copy"
+        );
+        assert_restored(&fx);
+    }
+
+    /// Review Low: an unreadable quarantine dir is reported, not "0 left".
+    #[test]
+    fn cleanup_reports_unreadable_quarantine() {
+        let td = tempfile::tempdir().unwrap();
+        let f = td.path().join("not-a-dir");
+        fs::write(&f, b"x").unwrap();
+        assert_eq!(drop_quarantined_sidecars(&RealOps, &f), 1);
+        assert_eq!(
+            drop_quarantined_sidecars(&RealOps, &td.path().join("absent")),
+            0
+        );
     }
 }
