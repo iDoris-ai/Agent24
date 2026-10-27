@@ -14,7 +14,7 @@
     "dev:vite": "vite",
     "dev:electron": "wait-on http://localhost:5173 && node scripts/dev-prepare-backend.mjs && pnpm --filter @agent24/node-daemon build && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
     "build": "vite build && tsc -p tsconfig.electron.json && node scripts/ensure-open-design-component-dir.mjs",
-    "build:rust:debug": "cargo build -p agent24d --manifest-path ../../rust/Cargo.toml",
+    "build:rust:debug": "cargo build -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
     "stage:open-design": "node scripts/stage-open-design-resources.mjs",
     "rebuild:open-design-native": "node scripts/rebuild-open-design-native.mjs",
@@ -93,6 +93,10 @@
         {
           "from": "../../rust/target/release/agent24d",
           "to": "backend/agent24d"
+        },
+        {
+          "from": "../../rust/target/release/agent24",
+          "to": "backend/agent24"
         }
       ],
       "identity": "Huifeng Jiao (HYAP444FN9)",
@@ -101,7 +105,8 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "binaries": [
-        "Contents/Resources/backend/agent24d"
+        "Contents/Resources/backend/agent24d",
+        "Contents/Resources/backend/agent24"
       ],
       "notarize": false
     },
@@ -113,6 +118,10 @@
         {
           "from": "../../rust/target/release/agent24d.exe",
           "to": "backend/agent24d.exe"
+        },
+        {
+          "from": "../../rust/target/release/agent24.exe",
+          "to": "backend/agent24.exe"
         }
       ]
     },
@@ -128,6 +137,10 @@
         {
           "from": "../../rust/target/release/agent24d",
           "to": "backend/agent24d"
+        },
+        {
+          "from": "../../rust/target/release/agent24",
+          "to": "backend/agent24"
         }
       ]
     },

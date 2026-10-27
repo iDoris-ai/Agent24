@@ -399,12 +399,23 @@ async fn a_restart_interrupts_working_jobs_and_finishes_cancelling_ones() {
             "interrupted",
             "interrupted",
         ),
+        ("job_01K75A0B1C2D3E4F5G6H7J8K95", "cancelling", "cancelled"),
+        ("job_01K75A0B1C2D3E4F5G6H7J8K96", "cancelling", "cancelled"),
     ];
     {
         let state = AppState::open(dir.path()).await;
         for (id, status, _) in ids {
             add_job_as(&state, id, status).await;
         }
+        // K95 was cancelling because its authorization ended; K96's ended
+        // only for an earlier attempt, so this one was the user's.
+        exec(
+            &state,
+            "UPDATE jobs SET attempt = 2 WHERE id = 'job_01K75A0B1C2D3E4F5G6H7J8K96';
+             INSERT INTO job_revocations (job_id, attempt) VALUES
+                 ('job_01K75A0B1C2D3E4F5G6H7J8K95', 1), ('job_01K75A0B1C2D3E4F5G6H7J8K96', 1);",
+        )
+        .await;
     }
     // Reopening in the same process can find the blob store lock still held
     // for a moment (seen ~1 in 20 full-suite runs; e.g. a child another test
@@ -423,6 +434,12 @@ async fn a_restart_interrupts_working_jobs_and_finishes_cancelling_ones() {
         assert_eq!(v["status"], after, "{id}");
         if after == "cancelled" {
             assert_eq!(v["error"]["code"], "cancelled");
+            let why = if id.ends_with("K95") {
+                crate::authorization::ENDED
+            } else {
+                "cancelled before a restart"
+            };
+            assert_eq!(v["error"]["message"], why, "{id}");
         }
     }
 }

@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 use tower::ServiceExt;
 
 use super::media_type;
+use crate::events::Events;
 use crate::events::tests::{JOB, recorder, sent};
 use crate::state::AppState;
 use crate::uploads::chunks::MAX_CHUNK;
@@ -576,6 +577,23 @@ async fn a_cancel_that_ends_a_job_announces_it_once() {
     );
 }
 
+/// A restart of `state`'s module on `dir`, telling WS clients through
+/// `events`: the old instance stops wholly first, as when its process exits.
+/// Dropping the state alone leaves its pool's connections closing on their
+/// own threads, and an instance that opens meanwhile may not get its storage
+/// (#1116); one that does not says why, not just that nothing was announced.
+/// Only for an instance with no job running: a runner holds the storage, and
+/// with it the blob store's lock, past the pool's close.
+async fn restarted(state: AppState, dir: &std::path::Path, events: Events) -> AppState {
+    state.storage().await.unwrap().db.pool().close().await;
+    drop(state);
+    let state = AppState::open_with_events(dir, events).await;
+    if let Err(cause) = state.storage().await {
+        panic!("the restarted instance has no storage: {cause:?}");
+    }
+    state
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jobs_ended_by_a_restart_are_announced() {
     let dir = tempfile::tempdir().unwrap();
@@ -586,9 +604,8 @@ async fn jobs_ended_by_a_restart_are_announced() {
     ] {
         exec(&state, &format!("INSERT INTO jobs (id, kind, status, origin) VALUES ('{id}', 'import', '{status}', '{{\"kind\":\"page\"}}')")).await;
     }
-    drop(state);
     let (events, seen) = recorder(Duration::ZERO, 0);
-    let _state = AppState::open_with_events(dir.path(), events).await;
+    let _state = restarted(state, dir.path(), events).await;
     let sent = sent(&seen, 2).await;
     let ends: Vec<_> = sent
         .iter()
@@ -680,9 +697,8 @@ async fn a_restart_announces_a_bounded_number_of_the_jobs_it_ended() {
         ),
     )
     .await;
-    drop(state);
     let (events, seen) = recorder(Duration::ZERO, 0);
-    let state = AppState::open_with_events(dir.path(), events).await;
+    let state = restarted(state, dir.path(), events).await;
     sent(&seen, crate::jobs::RECOVERED_SHOWN).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(seen.lock().unwrap().len(), crate::jobs::RECOVERED_SHOWN);

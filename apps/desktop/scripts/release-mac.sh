@@ -41,13 +41,16 @@ unset CSC_LINK CSC_KEY_PASSWORD CSC_NAME
 step "1/6 构建 Rust release（agent24d、agent24）"
 ( cd "$REPO_ROOT" && cargo build --release -p agent24d -p agent24-cli --manifest-path rust/Cargo.toml )
 CARGO_OUT="${CARGO_TARGET_DIR:-$REPO_ROOT/rust/target}/release"
-[[ -x "$CARGO_OUT/agent24d" ]] || die "缺少 $CARGO_OUT/agent24d"
-if [[ "$CARGO_OUT" != "$REPO_ROOT/rust/target/release" ]]; then
-  mkdir -p "$REPO_ROOT/rust/target/release"
-  cp -f "$CARGO_OUT/agent24d" "$REPO_ROOT/rust/target/release/agent24d"
-fi
-# 每次都从未签名的干净二进制起步，避免 electron-builder 对已签名文件重复处理
-codesign --remove-signature "$REPO_ROOT/rust/target/release/agent24d" 2>/dev/null || true
+# 两个都进包：extraResources 的 backend/agent24d 和 backend/agent24（文档导入调用 agent24）
+for b in agent24d agent24; do
+  [[ -x "$CARGO_OUT/$b" ]] || die "缺少 $CARGO_OUT/$b"
+  if [[ "$CARGO_OUT" != "$REPO_ROOT/rust/target/release" ]]; then
+    mkdir -p "$REPO_ROOT/rust/target/release"
+    cp -f "$CARGO_OUT/$b" "$REPO_ROOT/rust/target/release/$b"
+  fi
+  # 每次都从未签名的干净二进制起步，避免 electron-builder 对已签名文件重复处理
+  codesign --remove-signature "$REPO_ROOT/rust/target/release/$b" 2>/dev/null || true
+done
 
 step "2/6 构建 node-daemon 与桌面端前端/主进程"
 cd "$DESKTOP_DIR"
