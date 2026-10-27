@@ -353,6 +353,7 @@ fn malformed_read_extract_and_render_requests_are_refused() {
         json!({"op": "getExtraction", "extractionId": EXT, "cursor": "v1#x"}),
         json!({"op": "getExtraction", "extractionId": EXT, "cursor": "V1"}),
         json!({"op": "getExtraction", "extractionId": EXT, "cursor": "v1%26limit=1"}),
+        json!({"op": "getExtraction", "extractionId": EXT, "cursor": "v1%26"}),
         json!({"op": "renderPage", "documentId": DOC, "revision": 1}),
         json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 0}),
         json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 1, "scale": 0.2}),
