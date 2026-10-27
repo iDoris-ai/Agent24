@@ -1487,3 +1487,148 @@ async fn a_chunk_reply_past_the_size_is_refused() {
     );
     assert_eq!(imports.load(Ordering::SeqCst), 0);
 }
+
+// Edges PR-Daemon's mutations on #1313 left unguarded.
+
+#[test]
+fn a_chunk_is_exactly_the_os_limit() {
+    // The OS refuses a chunk past 786432 bytes; written out, not read from
+    // the constant under test.
+    assert_eq!(CHUNK_BYTES, 786_432);
+}
+
+#[test]
+fn an_upload_id_is_upl_and_a_ulid() {
+    for ok in [
+        "upl_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "upl_7ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        "upl_00000000000000000000000000",
+    ] {
+        assert!(upload_id_ok(ok), "{ok}");
+    }
+    for bad in [
+        "upl_81ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "upl_01ARZ3NDEKTSV4RRFFQ69G5FAI",
+        "upl_01ARZ3NDEKTSV4RRFFQ69G5FAL",
+        "upl_01ARZ3NDEKTSV4RRFFQ69G5FAO",
+        "upl_01ARZ3NDEKTSV4RRFFQ69G5FAU",
+        "upl_01arz3ndektsv4rrffq69g5fav",
+        "upl_01ARZ3NDEKTSV4RRFFQ69G5FA",
+        "upl_01ARZ3NDEKTSV4RRFFQ69G5FAVV",
+        "doc_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ] {
+        assert!(!upload_id_ok(bad), "{bad}");
+    }
+}
+
+#[test]
+fn numbers_are_read_as_the_desktop_reads_them() {
+    assert_eq!(
+        safe_u64(&json!(9_007_199_254_740_991_u64)),
+        Some(9_007_199_254_740_991)
+    );
+    assert_eq!(safe_u64(&json!(9_007_199_254_740_992_u64)), None);
+    assert_eq!(safe_u64(&json!(2.0)), Some(2));
+    for bad in [json!(1.5), json!(-1), json!("1"), json!(null)] {
+        assert_eq!(safe_u64(&bad), None, "{bad}");
+    }
+    // Parsed exactly, as JSON.parse does (serde_json's float_roundtrip): not
+    // rounded to an integer, not one off.
+    let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+    assert_eq!(safe_u64(&parse("10.000000000000001")), None);
+    assert_eq!(
+        safe_u64(&parse("9007199254740991.0")),
+        Some(9_007_199_254_740_991)
+    );
+    assert_eq!(is_offset(&json!(10), 10), Some(10));
+    assert_eq!(is_offset(&json!(11), 10), None);
+    assert!(same_u64(&json!(5), 5) && same_u64(&json!(5.0), 5));
+    assert!(!same_u64(&json!(5.5), 5) && !same_u64(&json!(6), 5));
+}
+
+#[test]
+fn only_a_404_not_found_is_gone() {
+    assert!(gone(&Response::fail(404, "not_found", "x")));
+    assert!(!gone(&Response::fail(410, "not_found", "x")));
+    assert!(!gone(&Response::fail(404, "upload_expired", "x")));
+}
+
+#[test]
+fn an_upload_without_a_status_is_not_taken_as_expired() {
+    let data = json!({"upload_id": "upl_01ARZ3NDEKTSV4RRFFQ69G5FAV", "total_size": 5,
+        "sha256": HELLO_SHA, "received": 0});
+    let up = accepted_upload(&data, 5, HELLO_SHA).unwrap();
+    assert_eq!((up.received, up.status.as_str()), (0, ""));
+}
+
+#[test]
+fn an_envelope_needs_its_code_and_message_and_a_null_details_is_none() {
+    use crate::response::to_response;
+    let http = |status: u16, body: &str| Reply::Http {
+        status,
+        body: body.as_bytes().to_vec(),
+    };
+    assert_eq!(
+        to_response(http(
+            409,
+            r#"{"error":{"code":"c","message":"m","details":null}}"#
+        )),
+        Response::Err {
+            status: 409,
+            error: ApiError::new("c", "m"),
+        }
+    );
+    let no_message = to_response(http(409, r#"{"error":{"code":"c"}}"#));
+    assert_eq!(no_message.code(), Some("invalid_response"));
+    assert!(to_response(http(299, r#"{"a":1}"#)).is_ok());
+    assert_eq!(
+        to_response(http(300, r#"{"a":1}"#)).code(),
+        Some("invalid_response")
+    );
+}
+
+#[tokio::test]
+async fn progress_is_reported_before_each_chunk_and_at_the_end() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let (path, bytes) = dir.file(2 * CHUNK_BYTES as usize + 10, "a.pdf").await;
+    let os = FakeOs::plain();
+    let mut progress = Vec::new();
+    assert!(
+        import_file(&path, &os, &mut |p| progress.push(p.sent))
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        progress,
+        vec![0, CHUNK_BYTES, 2 * CHUNK_BYTES, bytes.len() as u64]
+    );
+}
+
+#[tokio::test]
+async fn a_mismatch_that_names_the_same_offset_is_not_sent_again() {
+    let _guard = begin().await;
+    let dir = WorkDir::new();
+    let size = CHUNK_BYTES + 5;
+    let (path, _) = dir.file(size as usize, "a.pdf").await;
+    let chunks = Arc::new(AtomicU64::new(0));
+    let seen = Arc::clone(&chunks);
+    let os = FnSend::new(move |req: Request| {
+        if req.path.ends_with("/uploads") {
+            let mut body = good_upload();
+            body["sha256"] = body_sha(&req);
+            body["total_size"] = json!(size);
+            reply(201, body)
+        } else {
+            seen.fetch_add(1, Ordering::Relaxed);
+            reply(
+                409,
+                json!({"error": {"code": "upload_offset_mismatch", "message": "x",
+                    "details": {"received_offset": 0}}}),
+            )
+        }
+    });
+    let res = run(&path, &os).await;
+    assert_eq!(res.code(), Some("upload_offset_mismatch"));
+    assert_eq!(chunks.load(Ordering::Relaxed), 1);
+}

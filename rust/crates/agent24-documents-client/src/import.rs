@@ -69,7 +69,8 @@ struct ChainTail {
 static CHAIN_TAILS: Mutex<VecDeque<ChainTail>> = Mutex::new(VecDeque::new());
 
 /// For tests: each fake OS starts with no uploads.
-pub fn forget_chains() {
+#[cfg(test)]
+pub(crate) fn forget_chains() {
     if let Ok(mut tails) = CHAIN_TAILS.lock() {
         tails.clear();
     }

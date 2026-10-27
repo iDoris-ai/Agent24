@@ -2,7 +2,7 @@
 //! the same client code the desktop runs (`agent24-documents-client`), so a
 //! use case passing here passes for the desktop too (AGENTS.md).
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use agent24_documents_client::http::HttpTransport;
@@ -279,20 +279,24 @@ async fn import(path: Option<PathBuf>, json: bool, host_stdin: bool) -> Result<(
     let mut shown = false;
     let mut on_progress = |p: Progress| {
         if json {
-            println!(
-                "{}",
-                json!({"type": "progress", "sent": p.sent, "total": p.total})
-            );
+            say(json!({"type": "progress", "sent": p.sent, "total": p.total}));
         } else {
-            eprint!("\rsent {} of {} bytes", p.sent, p.total);
+            let _ = write!(std::io::stderr(), "\rsent {} of {} bytes", p.sent, p.total);
             shown = true;
         }
     };
     let res = import_file(&path, &transport, &mut on_progress).await;
     if shown {
-        eprintln!();
+        let _ = writeln!(std::io::stderr());
     }
     report(&res, json)
+}
+
+/// A line on stdout. A reader that went away (the desktop closing the
+/// pipe, `| head`) is no reason to panic: the exit code still says how it
+/// went, and an import already sent goes on in the daemon.
+fn say(line: impl std::fmt::Display) {
+    let _ = writeln!(std::io::stdout().lock(), "{line}");
 }
 
 /// The result as one JSON line, or for a person (an import job as one
@@ -302,12 +306,12 @@ fn report(res: &Response, json: bool) -> Result<(), String> {
     if json {
         let mut line = res.to_json();
         line["type"] = json!("result");
-        println!("{line}");
+        say(line);
     }
     match res {
         Response::Ok { data, .. } => {
             if !json {
-                println!("{}", for_a_person(data));
+                say(for_a_person(data));
             }
             Ok(())
         }
