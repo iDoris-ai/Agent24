@@ -8,37 +8,16 @@
 #   planned-tui-3    计划在 TUI-3 补（Sin90 / documents 领域命令）
 # fallback: CLI 补齐前的兜底方式。raw-http = 对 daemon 直接发 HTTP（Bearer token，端口/token 见 daemon ready 行）。
 exemptions:
-  - operationId: listModuleConsents
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: exportModuleConsents
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: revokeModuleConsents
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: revokeModuleToolConsent
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: getDecideProfile
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令（桌面壳目前使用）"
   - operationId: invokeAttachedModuleCommand
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令（桌面壳目前使用）"
   - operationId: updateAttachedModule
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listTimings
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: summarizeTimings
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listModuleApprovals
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: getModuleApproval
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: decideModuleApproval
@@ -62,16 +41,7 @@ exemptions:
   - operationId: resumeSchedule
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listTools
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listStandingGrants
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: revokeStandingGrant
-    category: planned-tui-2
-    fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
-  - operationId: listToolOverrides
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
   - operationId: setToolOverride
