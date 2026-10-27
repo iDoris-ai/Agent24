@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use super::*;
 use PlaceholderFailure as F;
 
@@ -164,7 +166,13 @@ fn dependency_takes_the_place_of_a_written_reason_once_it_is_cleared() {
         // Its clearing written, `dependency` takes its place, once.
         assert_eq!(placeholder.take_leaving(), Some(failure));
         assert_eq!(placeholder.take_leaving(), None);
-        placeholder.left(failure);
+        let [ticket, other] = tickets();
+        placeholder.clearing(ticket);
+        assert!(placeholder.clears());
+        placeholder.left(other);
+        assert_eq!(placeholder.failure(), Some(failure));
+        placeholder.left(ticket);
+        assert!(!placeholder.clears());
         assert_eq!(placeholder.failure(), Some(F::Dependency));
         assert!(placeholder.retries_by_itself(CLEAR, true, false));
     }
@@ -173,10 +181,19 @@ fn dependency_takes_the_place_of_a_written_reason_once_it_is_cleared() {
     let attempt = placeholder.attempt();
     placeholder.settle(attempt, Attempted::Unreachable);
     assert_eq!(placeholder.take_leaving(), Some(F::CredentialRejected));
+    let [ticket, _] = tickets();
+    placeholder.clearing(ticket);
     let attempt = placeholder.attempt();
     placeholder.settle(attempt, Attempted::Rejected);
-    placeholder.left(F::CredentialRejected);
+    placeholder.left(ticket);
     assert_eq!(placeholder.failure(), Some(F::CredentialRejected));
     // Nothing waits: nothing to clear.
     assert_eq!(Placeholder::new(None).take_leaving(), None);
+}
+
+/// Two loosenings' tickets, as the ledger hands them out.
+fn tickets() -> [crate::provider::ledger::Loosening; 2] {
+    use crate::provider::ledger::{Ledger, Scope};
+    let mut ledger = Ledger::new(true);
+    [(); 2].map(|()| ledger.loosen(Scope::profile("p"), None, false).unwrap())
 }

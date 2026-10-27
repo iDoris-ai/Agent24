@@ -21,7 +21,6 @@ use super::member::{Left, Member};
 use super::profile::Profile;
 use super::record::{Change, Ids, Of};
 use super::replay::Record;
-use super::state::PlaceholderFailure;
 
 mod create;
 mod identity;
@@ -71,11 +70,7 @@ enum Then<I: Ids> {
     /// A new binding, in [`Host::creations`].
     Create { ticket: Loosening },
     /// The clearing of a written reason, for a `dependency` to take its place.
-    Leave {
-        ticket: Loosening,
-        id: I::Profile,
-        failure: PlaceholderFailure,
-    },
+    Leave { ticket: Loosening, id: I::Profile },
 }
 
 #[derive(Debug)]
@@ -307,14 +302,11 @@ impl<I: Ids> Host<I> {
                 }
             }
             Report::Durable(Then::Create { ticket }) => self.created(ticket, &mut out),
-            Report::Durable(Then::Leave {
-                ticket,
-                id,
-                failure,
-            }) => {
+            Report::Durable(Then::Leave { ticket, id }) => {
                 let applied = self.ledger.loosening_durable(ticket) == Confirmed::Applied;
-                if let Some(m) = self.member(&id).filter(|_| applied) {
-                    m.left(failure);
+                let member = self.member(&id).filter(|_| applied);
+                if let Some(placeholder) = member.and_then(|m| m.placeholder_mut()) {
+                    placeholder.left(ticket);
                 }
             }
         }

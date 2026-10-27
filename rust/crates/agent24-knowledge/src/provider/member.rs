@@ -9,7 +9,7 @@ use super::connection::{Connection, Round};
 use super::credential::{Credentials, Effects};
 use super::evidence::Rule;
 use super::gate::{CallId, Gate};
-use super::placeholder::{Attempt, Attempted, Settled};
+use super::placeholder::{Attempt, Attempted, Placeholder, Settled};
 use super::profile::{IdentityChange, Profile, Slot};
 use super::record::{Change, Ids, Of};
 use super::state::{PlaceholderFailure, Switches};
@@ -163,18 +163,10 @@ impl<I: Ids> Member<I> {
         }
     }
 
-    /// As [`super::placeholder::Placeholder::take_leaving`].
-    pub fn take_leaving(&mut self) -> Option<PlaceholderFailure> {
+    pub fn placeholder_mut(&mut self) -> Option<&mut Placeholder> {
         match self.profile.slot_mut() {
-            Slot::Placeholder(placeholder) => placeholder.take_leaving(),
+            Slot::Placeholder(placeholder) => Some(placeholder),
             Slot::Bound(_) => None,
-        }
-    }
-
-    /// As [`super::placeholder::Placeholder::left`].
-    pub fn left(&mut self, failure: PlaceholderFailure) {
-        if let Slot::Placeholder(placeholder) = self.profile.slot_mut() {
-            placeholder.left(failure);
         }
     }
 

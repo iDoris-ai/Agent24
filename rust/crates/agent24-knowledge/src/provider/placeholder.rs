@@ -3,6 +3,7 @@
 //! (remote) or handshaking (local-managed) happens on it; only the attempt
 //! in flight counts, and a failure is recorded with its reason.
 
+use super::ledger::Loosening;
 use super::state::{PlaceholderFailure, Switches};
 
 /// A login or handshake the caller is about to make.
@@ -42,8 +43,8 @@ pub struct Placeholder {
     next: u64,
     /// A `dependency` waits to take the place of the written reason.
     leaving: bool,
-    /// The written reason whose clearing is being written for it.
-    clearing: Option<PlaceholderFailure>,
+    /// The clearing of the written reason on its way, by its ticket.
+    clearing: Option<Loosening>,
 }
 
 impl Placeholder {
@@ -94,20 +95,30 @@ impl Placeholder {
     }
 
     /// The written reason a `dependency` waits to take the place of, once;
-    /// the caller writes its clearing and reports it with
-    /// [`Placeholder::left`].
+    /// the caller writes its clearing, [`Placeholder::clearing`], or, refused,
+    /// the reason stays.
     pub fn take_leaving(&mut self) -> Option<PlaceholderFailure> {
-        if !std::mem::take(&mut self.leaving) {
-            return None;
+        if std::mem::take(&mut self.leaving) {
+            self.failure
+        } else {
+            None
         }
-        self.clearing = self.failure;
-        self.clearing
     }
 
-    /// The clearing of `failure` is confirmed persisted: `dependency` takes
-    /// its place, unless a reason written since did.
-    pub fn left(&mut self, failure: PlaceholderFailure) {
-        if self.clearing == Some(failure) && self.failure == Some(failure) {
+    /// The clearing of the written reason is written, as `ticket`.
+    pub fn clearing(&mut self, ticket: Loosening) {
+        self.clearing = Some(ticket);
+    }
+
+    /// Whether a clearing of the written reason is on its way.
+    pub fn clears(&self) -> bool {
+        self.clearing.is_some()
+    }
+
+    /// The clearing `ticket` is confirmed persisted: `dependency` takes the
+    /// reason's place, unless a reason written since did.
+    pub fn left(&mut self, ticket: Loosening) {
+        if self.clearing == Some(ticket) {
             self.clearing = None;
             self.failure = Some(PlaceholderFailure::Dependency);
         }
@@ -155,7 +166,6 @@ impl Placeholder {
             Attempted::Unidentified => PlaceholderFailure::InstanceUnidentified,
         };
         self.failure = Some(failure);
-        self.leaving = false;
         self.clearing = None;
         Settled::Failed(failure)
     }
