@@ -34,6 +34,30 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+/// Directory opened before the approval gate. Writes use this handle, not a
+/// later lookup of the same path name.
+#[derive(Clone)]
+pub struct PinnedOutsideDir {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) dir: std::sync::Arc<cap_std::fs::Dir>,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl PinnedOutsideDir {
+    pub(crate) fn dir(&self) -> &cap_std::fs::Dir {
+        &self.dir
+    }
+
+    pub(crate) fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
 /// Per-call execution context.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -48,6 +72,8 @@ pub struct ToolContext {
     /// The persisted tool-call row this execution belongs to
     tool_call_id: String,
     workspace: WorkspaceAuthority,
+    confirmed_write_root: Option<std::path::PathBuf>,
+    approved_outside_directory: Option<std::sync::Arc<PinnedOutsideDir>>,
 }
 
 #[derive(Clone)]
@@ -70,6 +96,8 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Legacy,
+            confirmed_write_root: None,
+            approved_outside_directory: None,
         }
     }
 
@@ -88,7 +116,40 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Bound(authority),
+            confirmed_write_root: None,
+            approved_outside_directory: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_confirmed_write_root(mut self, root: std::path::PathBuf) -> Self {
+        self.confirmed_write_root = Some(root);
+        self
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_approved_outside_directory(
+        mut self,
+        directory: std::sync::Arc<PinnedOutsideDir>,
+    ) -> Self {
+        self.approved_outside_directory = Some(directory);
+        self
+    }
+
+    #[must_use]
+    pub fn approved_outside_directory(&self) -> Option<&std::path::Path> {
+        self.approved_outside_directory
+            .as_ref()
+            .map(|pin| pin.path.as_path())
+    }
+
+    pub(crate) fn pinned_outside_directory(&self) -> Option<&std::sync::Arc<PinnedOutsideDir>> {
+        self.approved_outside_directory.as_ref()
     }
 
     #[must_use]
@@ -134,6 +195,8 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: self.workspace.clone(),
+            confirmed_write_root: self.confirmed_write_root.clone(),
+            approved_outside_directory: self.approved_outside_directory.clone(),
         }
     }
 }
@@ -1080,6 +1143,7 @@ pub struct ToolRegistry {
     interactive_gate: bool,
     /// User-local risk adjustments (H2). None → declared classes stand.
     overrides: Option<Arc<dyn RiskOverrides>>,
+    confirmed_write_root: Option<std::path::PathBuf>,
 }
 
 impl ToolRegistry {
@@ -1090,7 +1154,13 @@ impl ToolRegistry {
             gate: Arc::new(DenyAllGate),
             interactive_gate: false,
             overrides: None,
+            confirmed_write_root: None,
         }
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
     }
 
     /// Install the user's local risk overrides (H2).
@@ -1395,10 +1465,29 @@ impl ToolRegistry {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_owned);
+        // Capture the outside directory before the gate. A later symlink swap
+        // must not make the write follow a different parent than this one.
+        // Exec-tightened fs_write does not get the exception: Guardian can
+        // Allow that class without a human, and the whitelist must still hold.
+        let approved_before_gate = if name == "fs_write" && effective == RiskClass::WriteLocal {
+            let input = input.clone();
+            tokio::task::spawn_blocking(move || crate::local::approved_parent(&input))
+                .await
+                .unwrap_or_default()
+        } else {
+            None
+        };
+        let owned;
+        let exec_ctx = if let Some(directory) = approved_before_gate {
+            owned = ctx.clone().with_approved_outside_directory(directory);
+            &owned
+        } else {
+            ctx
+        };
         if effective.requires_approval() {
             match self
                 .gate
-                .check(&info, ctx, input, standing_target.as_deref(), cancel)
+                .check(&info, exec_ctx, input, standing_target.as_deref(), cancel)
                 .await
             {
                 GateDecision::Allow => {}
@@ -1412,9 +1501,7 @@ impl ToolRegistry {
                 }
             }
         }
-
-        // 4. execute under the tool's budget, cancellable at any point
-        Self::run_budgeted(tool, ctx, input, cancel).await
+        Self::run_budgeted(tool, exec_ctx, input, cancel).await
     }
 
     /// Execute a tool whose approval was ALREADY granted out of band — the

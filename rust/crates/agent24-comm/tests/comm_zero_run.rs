@@ -57,6 +57,14 @@ impl ModelCounter {
                     }
                     Err(_) => break,
                 };
+                // On macOS (BSD sockets) an accepted stream inherits the
+                // listener's O_NONBLOCK. Left that way, `read` below returns
+                // WouldBlock whenever it runs before the client's bytes land,
+                // `unwrap_or(0)` turns that into an empty request, and the
+                // request is silently never counted. Make the stream blocking
+                // (bounded by a timeout so a silent peer cannot hang `Drop`).
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut request = [0_u8; 2048];
                 let read = stream.read(&mut request).unwrap_or(0);
                 let line = String::from_utf8_lossy(&request[..read]);
@@ -234,7 +242,7 @@ async fn six_inbound_shapes_and_read_routes_do_not_dispatch_work() {
         StatusCode::OK,
         "start fake daemon: {start_body}"
     );
-    let running_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let running_deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let (status, body) = get(&app, "/daemon").await;
         assert_eq!(status, StatusCode::OK, "get daemon status: {body}");
@@ -247,7 +255,11 @@ async fn six_inbound_shapes_and_read_routes_do_not_dispatch_work() {
         );
         thread::sleep(Duration::from_millis(20));
     }
-    let health_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    // The fake daemon's health call and the counter's TCP accept are served by
+    // other threads, so on a loaded (CI, macOS) machine they can land well after
+    // this thread gets here. Poll for the condition with a generous ceiling
+    // instead of betting on a fixed short wait; it returns as soon as it holds.
+    let health_deadline = std::time::Instant::now() + Duration::from_secs(15);
     while counter.health_count() == 0 && std::time::Instant::now() < health_deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -304,8 +316,11 @@ async fn six_inbound_shapes_and_read_routes_do_not_dispatch_work() {
             b"POST /v1/chat/completions HTTP/1.1\r\nhost: local\r\ncontent-length: 2\r\n\r\n{}",
         )
         .expect("write positive control");
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while counter.count() == 0 && std::time::Instant::now() < deadline {
+    // Same reasoning as the health poll above: a fixed 2 s was too short on a
+    // slow runner and misread a late counter thread as "positive control not
+    // counted" (seen on #1261). Wait for the increment, ceiling 15 s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while counter.count() <= baseline_inference && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
