@@ -12,7 +12,7 @@
   "scripts": {
     "dev": "concurrently --kill-others-on-fail \"pnpm dev:vite\" \"pnpm dev:electron\"",
     "dev:vite": "vite",
-    "dev:electron": "wait-on http://localhost:5173 && node scripts/dev-prepare-backend.mjs && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
+    "dev:electron": "wait-on http://localhost:5173 && node scripts/dev-prepare-backend.mjs && pnpm --filter @agent24/data-dir build && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
     "build": "pnpm --filter @agent24/data-dir build && vite build && tsc -p tsconfig.electron.json && node scripts/ensure-open-design-component-dir.mjs",
     "build:rust:debug": "cargo build -p agent24d --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",

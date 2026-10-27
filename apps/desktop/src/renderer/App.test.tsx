@@ -150,7 +150,7 @@ describe('App', () => {
     mockBackendProxy.mockImplementation((req: { path: string }) =>
       Promise.resolve(
         req.path === '/api/v1/os'
-          ? { ok: true, status: 200, data: { modules: [{ name: 'a' }, { name: 'b' }, { name: 'c' }] } }
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'mounted' }, { name: 'b', state: 'mounted' }, { name: 'c', state: 'mounted' }, { name: 'd', state: 'disabled' }, { name: 'e', state: 'refused' }] } }
           : { ok: true, status: 200, data: { status: 'ok' } },
       ),
     )
@@ -159,6 +159,22 @@ describe('App', () => {
     await waitFor(() => {
       expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
       expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('3')
+    })
+  })
+
+  it('Home module count is 0 when every OS module is disabled or refused', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'disabled' }, { name: 'b', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('0')
     })
   })
 

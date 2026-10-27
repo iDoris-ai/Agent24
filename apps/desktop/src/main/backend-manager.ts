@@ -46,13 +46,17 @@ export function getBackendEndpoint(): BackendEndpoint | null {
  * workspace path directly and the developer builds it by hand
  * (`pnpm --filter @agent24/node-daemon build`). Throws if absent, which
  * selectedBackend turns into a fall-back to rust. */
-function resolveNodeEntry(): string {
-  // dist/main/backend-manager.js → repo root
-  const entry = path.resolve(__dirname, '../../../../packages/node-daemon/dist/server.js')
-  if (!fs.existsSync(entry)) {
+export function resolveNodeEntryFrom(dir: string, exists: (p: string) => boolean = fs.existsSync): string {
+  // <repo>/apps/desktop/{dist,src}/main → repo root
+  const entry = path.resolve(dir, '../../../../packages/node-daemon/dist/server.js')
+  if (!exists(entry)) {
     throw new Error(`${entry} not found — run: pnpm --filter @agent24/node-daemon build`)
   }
   return entry
+}
+
+function resolveNodeEntry(): string {
+  return resolveNodeEntryFrom(__dirname)
 }
 
 /** `packaged` MUST come from Electron's `app.isPackaged` (injected by main.ts).

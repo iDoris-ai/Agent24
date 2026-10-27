@@ -108,7 +108,7 @@ export function App(): JSX.Element {
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
-  // Domain-OS modules mounted in the daemon (`GET /api/v1/os`) — the Home card.
+  // Domain-OS modules actually mounted (state==='mounted') in the daemon (`GET /api/v1/os`) — the Home card.
   const [osModuleCount, setOsModuleCount] = useState(0)
   // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
   // used when the daemon has no `default_model` to report. The topbar's
@@ -144,7 +144,7 @@ export function App(): JSX.Element {
           setBackendOk(res.ok)
           if (res.ok) {
             void listOsModules()
-              .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.length : 0))
+              .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.filter((m) => m.state === 'mounted').length : 0))
               .catch(() => { /* keep the last count */ })
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
