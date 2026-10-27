@@ -101,22 +101,29 @@ fn run(ops: &dyn FileOps, req: &RestoreRequest<'_>, log: &mut GuardLog) -> R<()>
         (MEMORY_FILE, req.memory_db, &m.memory_db),
     ];
     for (file, path, rec) in dbs {
+        // Restored: the pair is live again and may have been written to, so
+        // it is only checked below, never rebuilt. Restoring: every database,
+        // Done or not, is re-derived from disk (idempotent shortcut), so a
+        // Done database that drifted heals instead of failing the gate forever.
+        if log.phase != Phase::Restoring {
+            continue;
+        }
         let store = file == STORE_FILE;
+        restore_one(
+            ops,
+            req.data_dir,
+            &log.attempt_id,
+            path,
+            rec,
+            &snap.join(file),
+            &q,
+        )?;
         if (if store {
             log.store_restore
         } else {
             log.memory_restore
         }) == DbRestore::Pending
         {
-            restore_one(
-                ops,
-                req.data_dir,
-                &log.attempt_id,
-                path,
-                rec,
-                &snap.join(file),
-                &q,
-            )?;
             let mut next = log.clone();
             *(if store {
                 &mut next.store_restore
@@ -199,7 +206,15 @@ fn restore_one(
     // already is the snapshot. Do not copy again (the recovery budget was
     // spent once; a second copy can ENOSPC) nor quarantine the good file.
     // Any read error here just falls through to the strict full path.
+    // `check_final` also requires no sidecar, so a stray -wal/-shm/-journal
+    // beside the good file sends us down the full path (quarantine) instead.
+    // The accepted file itself is fsynced too: it may match the snapshot
+    // bytes while still being an unflushed in-place rewrite.
     if check_final(path, rec).is_ok() {
+        if rec.existed {
+            ops.fsync_file(path)
+                .map_err(|x| e("fsync accepted db", x))?;
+        }
         return fsync_chain(ops, data_dir, parent).map_err(|x| e("fsync db dir", x));
     }
     if rec.existed {
@@ -260,6 +275,20 @@ fn free_name(q: &Path, base: &str) -> R<PathBuf> {
     Err(format!("no free quarantine name for {base}"))
 }
 
+/// Exactly `<db><-wal|-shm|-journal>` with an optional `.N` suffix (the
+/// `free_name` collision form) for one of the two managed databases.
+fn is_quarantined_sidecar(n: &str) -> bool {
+    [STORE_FILE, MEMORY_FILE].iter().any(|db| {
+        SIDECARS.iter().any(|s| {
+            let base = format!("{db}{s}");
+            n == base
+                || n.strip_prefix(&base)
+                    .and_then(|r| r.strip_prefix('.'))
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
+}
+
 /// After `Restored` is durable the failed WAL/SHM/journal copies are junk.
 /// Returns how many things could not be cleaned (listing, delete, fsync
 /// errors all count); a missing quarantine dir is a genuine zero.
@@ -276,9 +305,7 @@ fn drop_quarantined_sidecars(ops: &dyn FileOps, q: &Path) -> usize {
             continue;
         };
         let n = ent.file_name().to_string_lossy().into_owned();
-        if SIDECARS.iter().any(|s| n.contains(&format!("db{s}")))
-            && remove_if_present(ops, &ent.path()).is_err()
-        {
+        if is_quarantined_sidecar(&n) && remove_if_present(ops, &ent.path()).is_err() {
             bad += 1;
         }
     }
@@ -345,6 +372,10 @@ mod tests {
         fn copy_new_synced(&self, a: &Path, b: &Path) -> io::Result<()> {
             self.hit("copy", b)?;
             RealOps.copy_new_synced(a, b)
+        }
+        fn fsync_file(&self, p: &Path) -> io::Result<()> {
+            self.hit("fsync_file", p)?;
+            RealOps.fsync_file(p)
         }
     }
 
@@ -701,6 +732,168 @@ mod tests {
             "no extra quarantine copy"
         );
         assert_restored(&fx);
+    }
+
+    /// State after "installed, Done not yet durable": the store is already
+    /// the snapshot, its progress flag is still Pending (fresh log from disk).
+    async fn crash_after_install() -> Fx {
+        let mut fx = fixture(true).await;
+        let clean = Probe::new(None);
+        fx.go(&clean).unwrap();
+        let calls = clean.calls.borrow().clone();
+        let install = calls
+            .iter()
+            .position(|x| x == &format!("rename:{}", fx.s.display()))
+            .unwrap();
+        let progress = install
+            + calls[install..]
+                .iter()
+                .position(|x| x.starts_with("write:"))
+                .unwrap();
+        let mut fx = fixture(true).await;
+        assert!(fx.go(&Probe::new(Some(progress))).is_err());
+        fx.log = guard_log::read(&fx.root).unwrap().unwrap();
+        assert_eq!(fx.log.store_restore, DbRestore::Pending);
+        fx
+    }
+
+    /// Review 1 / M14: a stray WAL next to the already-installed db must not
+    /// survive the replay shortcut.
+    #[tokio::test]
+    async fn m14_replay_after_install_removes_stray_wal() {
+        let mut fx = crash_after_install().await;
+        fs::write(with_suffix(&fx.s, "-wal"), b"stray").unwrap();
+        fx.go(&RealOps).unwrap();
+        assert_restored(&fx);
+    }
+
+    /// Review 1 / M11: re-quarantining must never overwrite earlier evidence.
+    #[tokio::test]
+    async fn m11_requarantine_does_not_overwrite_evidence() {
+        let mut fx = fixture(true).await;
+        let q = fx.root.join(QUARANTINE_DIR).join("a1");
+        fs::create_dir_all(&q).unwrap();
+        fs::write(q.join(STORE_FILE), b"old evidence").unwrap();
+        let failed = fs::read(&fx.s).unwrap();
+        fx.go(&RealOps).unwrap();
+        assert_eq!(fs::read(q.join(STORE_FILE)).unwrap(), b"old evidence");
+        assert_eq!(fs::read(q.join("agent24.db.1")).unwrap(), failed);
+        assert_restored(&fx);
+    }
+
+    #[test]
+    fn m11_free_name_skips_taken_names() {
+        let td = tempfile::tempdir().unwrap();
+        let q = td.path();
+        assert_eq!(free_name(q, "x.db").unwrap(), q.join("x.db"));
+        fs::write(q.join("x.db"), b"a").unwrap();
+        assert_eq!(free_name(q, "x.db").unwrap(), q.join("x.db.1"));
+        fs::write(q.join("x.db.1"), b"b").unwrap();
+        assert_eq!(free_name(q, "x.db").unwrap(), q.join("x.db.2"));
+    }
+
+    /// Review 1 / M13 guard: once Restored, a sidecar that drifts in later is
+    /// refused by the final check (never `Ok`), and left untouched.
+    #[tokio::test]
+    async fn m13_restored_log_with_drifted_sidecar_is_not_ok() {
+        let mut fx = fixture(true).await;
+        fx.go(&RealOps).unwrap();
+        assert_eq!(fx.log.phase, Phase::Restored);
+        let shm = with_suffix(&fx.s, "-shm");
+        fs::write(&shm, b"drift").unwrap();
+        // the live db also took a legitimate post-restore write
+        fs::write(&fx.s, b"post-restore write").unwrap();
+        let q = fx.root.join(QUARANTINE_DIR).join("a1");
+        let quarantined = fs::read_dir(&q).unwrap().count();
+        let r = fx.go(&RealOps);
+        assert!(
+            matches!(
+                r,
+                Err(RestoreError::RollbackFailed {
+                    persisted: false,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        assert!(shm.exists(), "Restored state: nothing is touched");
+        assert_eq!(fs::read(&fx.s).unwrap(), b"post-restore write");
+        assert_eq!(fs::read_dir(&q).unwrap().count(), quarantined);
+        assert_eq!(fx.log.phase, Phase::Restored);
+    }
+
+    /// Review 1 (G2) + Low 6: store is Done, the crash hits the memory stage,
+    /// then the store drifts (bytes + -shm). The retry must re-derive the Done
+    /// store from disk and self-heal, not fail the final gate forever.
+    #[tokio::test]
+    async fn low6_done_database_that_drifted_is_rechecked_and_healed() {
+        let mut fx = fixture(true).await;
+        let clean = Probe::new(None);
+        fx.go(&clean).unwrap();
+        let mem_stage = clean
+            .calls
+            .borrow()
+            .iter()
+            .position(|x| x.contains("memory.db.restore"))
+            .unwrap();
+        let mut fx = fixture(true).await;
+        assert!(fx.go(&Probe::new(Some(mem_stage))).is_err());
+        fx.log = guard_log::read(&fx.root).unwrap().unwrap();
+        assert_eq!(
+            (fx.log.store_restore, fx.log.memory_restore),
+            (DbRestore::Done, DbRestore::Pending)
+        );
+        fs::write(&fx.s, b"drifted bytes").unwrap();
+        fs::write(with_suffix(&fx.s, "-shm"), b"drift").unwrap();
+        fx.go(&RealOps).unwrap();
+        assert_restored(&fx);
+        assert_eq!(logical(&fx.s).await, fx.before[0]);
+        assert_eq!(logical(&fx.m).await, fx.before[1]);
+        assert_eq!(fx.log.phase, Phase::Restored);
+    }
+
+    /// Review Low 2: the accepted main file itself is fsynced by the shortcut.
+    #[tokio::test]
+    async fn low2_shortcut_fsyncs_the_accepted_main_file() {
+        let mut fx = crash_after_install().await;
+        let retry = Probe::new(None);
+        fx.go(&retry).unwrap();
+        let want = format!("fsync_file:{}", fx.s.display());
+        assert!(retry.calls.borrow().contains(&want), "{:?}", retry.calls);
+    }
+
+    /// Review Low 3: exact `<db>-wal|-shm|-journal[.N]` only.
+    #[test]
+    fn low3_cleanup_matches_sidecar_names_exactly() {
+        let td = tempfile::tempdir().unwrap();
+        let q = td.path();
+        let junk = [
+            "agent24.db-wal",
+            "agent24.db-shm.1",
+            "agent24.db-journal.12",
+            "memory.db-wal",
+            "memory.db-shm.2",
+        ];
+        let keep = [
+            "agent24.db",
+            "memory.db",
+            "agent24.db.1",
+            "xxx.db-wal.backup",
+            "agent24.db-wal.backup",
+            "agent24.db-wal.",
+            "agent24.db-wal.1x",
+            "other.db-wal",
+        ];
+        for n in junk.iter().chain(keep.iter()) {
+            fs::write(q.join(n), b"x").unwrap();
+        }
+        assert_eq!(drop_quarantined_sidecars(&RealOps, q), 0);
+        for n in junk {
+            assert!(!q.join(n).exists(), "{n} should be removed");
+        }
+        for n in keep {
+            assert!(q.join(n).exists(), "{n} must be kept");
+        }
     }
 
     /// Review Low: an unreadable quarantine dir is reported, not "0 left".
