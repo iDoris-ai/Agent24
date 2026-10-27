@@ -111,6 +111,18 @@ impl KnowledgeDb {
     /// neither ever a record.
     pub async fn read<I: StoredIds>(&self) -> Result<Found<I>, StoreError> {
         let mut tx = self.pool.begin().await?;
+        // Text is compared as bytes in the file's encoding. This build only
+        // creates UTF-8 files; any other was not written by it.
+        let encoding: String = sqlx::query_scalar("PRAGMA encoding")
+            .fetch_one(&mut *tx)
+            .await?;
+        if encoding != "UTF-8" {
+            tx.commit().await?;
+            return Ok(Found {
+                log: Some(Err(Damaged)),
+                seal: Seal::Missing,
+            });
+        }
         let next: Option<i64> =
             sqlx::query_scalar("SELECT next FROM seal WHERE id = 1 AND typeof(next) = 'integer'")
                 .fetch_optional(&mut *tx)

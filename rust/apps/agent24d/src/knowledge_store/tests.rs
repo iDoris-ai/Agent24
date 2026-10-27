@@ -280,6 +280,43 @@ async fn text_that_is_not_utf8_is_damaged() {
     assert_eq!(log(&db).await, Some(Err(Damaged)));
 }
 
+/// A file in another encoding was not written by this build: damaged, its
+/// seal untrusted, even where its bytes would spell a record.
+#[tokio::test]
+async fn a_file_not_in_utf8_is_damaged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(DIR);
+    std::fs::create_dir_all(&path).unwrap();
+    let options = SqliteConnectOptions::new()
+        .filename(path.join(DB_FILE))
+        .create_if_missing(true)
+        .pragma("encoding", "'UTF-16le'");
+    let pool = SqlitePool::connect_with(options).await.unwrap();
+    sqlx::query("CREATE TABLE made (x)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let db = KnowledgeDb::open(dir.path()).await.unwrap();
+    db.begin(1).await.unwrap();
+    db.append(&void(1)).await.unwrap();
+    db.rebuild_seal(2).await.unwrap();
+    let found = db.read::<T>().await.unwrap();
+    assert_eq!(found.log, Some(Err(Damaged)));
+    assert_eq!(found.seal, Seal::Missing);
+
+    // Its bytes are those of "void".
+    exec(&db, "DROP TABLE records").await;
+    exec(&db, "CREATE TABLE records (seq, kind, body)").await;
+    exec(
+        &db,
+        "INSERT INTO records VALUES (1, CAST(x'766f6964' AS TEXT), NULL)",
+    )
+    .await;
+    assert_eq!(log(&db).await, Some(Err(Damaged)));
+}
+
 /// A write that fails is reported, never taken as persisted (A.1).
 #[tokio::test]
 async fn a_failed_write_is_reported_and_changes_nothing() {
