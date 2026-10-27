@@ -44,7 +44,7 @@
 | **REST /api/v1/chat** | `routes.rs` `post_chat_never_reaches_a_remote_only_provider`（6b.5b） | `session_memory/chat.rs` `a_chat_turn_whose_session_floor_cannot_be_written_fails_before_the_model`；`lib.rs` `a_chat_prelude_whose_floor_cannot_be_written_fails` | 不适用 | `routes.rs` `post_chat_records_a_timing_row_on_success`；`chat.rs` `explicit_remember_over_chat_stores_a_qualified_assertion` |
 | **子 agent（explore）** | `subagent.rs` `delegated_call_inherits_persisted_local_only_policy` | `subagent.rs` `a_delegated_call_whose_parent_policy_cannot_be_read_stays_local_only`、`a_delegated_call_without_a_policy_store_stays_local_only`（6b.5b） | 不适用 | `subagent.rs` `a_direct_answer_returns_immediately`、`it_reads_a_file_then_answers` |
 | **会话压缩** | `session_memory_tests.rs` `local_only_run_compaction_never_falls_back_to_remote` | 不适用：写死 LocalOnly，不读政策 | 不适用 | `session_memory/mod.rs` `successful_compaction_replays_every_original_message_after_daemon_restart` |
-| **模块模型回调** `_a24/model/complete` | `model_callback.rs` `remote_provider_stays_closed_without_a_host_egress_policy`；`me4_model_blackbox.rs` `model_complete_blackbox_round_trip`（远端桩零请求） | **计划/代码差异**：回调不读父 run 的来源（见 §6 第 2 条），所以没有可失败的政策读取 | 无接口可表达 | `model_callback.rs` `a_successful_call_broadcasts_exactly_one_model_call_event_with_no_content` |
+| **模块模型回调** `_a24/model/complete` | `model_callback.rs` `every_grant_routes_local_only_whatever_its_manifest_declares`（`remote_allowed` 也是 LocalOnly，6b.5g）、`remote_provider_stays_closed_without_a_host_egress_policy`；`me4_model_blackbox.rs` `model_complete_blackbox_round_trip`（`remote_allowed` 加 Complex 也只到本地，远端桩零请求） | 不适用：回调一律 LocalOnly，不读政策（见 §6 第 2 条） | 无接口可表达 | `model_callback.rs` `a_successful_call_broadcasts_exactly_one_model_call_event_with_no_content` |
 | **Guardian**（默认关闭，`A24_GUARDIAN`） | `guardian.rs` `the_model_assessor_never_sends_a_payload_to_a_remote_model`（6b.5b，接真实 router 和远端桩） | `guardian.rs` `assessor_error_fails_closed_to_escalation`（只测 stub） | 不适用 | `guardian.rs` `low_risk_auto_approves` |
 | **模型发现** | `router.rs` `model_discovery_never_lists_a_remote_provider_through_the_default_gate`（6b.5b，`models()` 计数为 0） | `a_remote_provider_that_cannot_name_its_destination_is_never_called`（6b.5b，同时测 `models_detailed_with_egress`）；gate 拒绝见 (a) | `router.rs` `model_discovery_needs_a_grant_for_the_discovery_purpose`（6b.5b，精确匹配 gate：正例，以及用途、资源、修订、授权引用、政策版本、代次、目的地逐项不匹配的负例） | `routes.rs` `get_models_includes_the_daemons_default_model_field` |
 
@@ -103,7 +103,11 @@
    - 流式请求：`"stream": false` 写死；
    - `SelectedMaterial` 入口（ID-2 未实现）。
    这些不写成「已覆盖」。接入时必须同时补齐本表的四列。
-2. **模块模型回调不继承父 run 的来源集合**（§2.2：「模块 callback … 继承父操作的来源集合」）。`model_callback.rs` 不读 run 的政策，隐私只看 manifest 里的 `ModelAccess`。目前远端被 `deny_all` 拦住，所以没有泄露。但撤 `has_remote` 过渡门、或者接入获准云处理之前，必须先接上来源继承。
+2. **模块模型回调一律 LocalOnly（6b.5g，David 2026-10-27 选 C）**（§2.2：「模块 callback … 继承父操作的来源集合」）。
+   - 回调不带它载荷的来源记录，获准云处理也还没有接入（ADR-K1-02 §1）。所以回调按最严的上界走（ADR §2.1.1 第 5 条）：`model_callback.rs` 的 privacy 不再看 manifest 的 `ModelAccess`，一律 LocalOnly。路由的 LocalOnly 排除和 `deny_all` 两层都挡住远端，served-tier tripwire 覆盖所有回调。
+   - 代价：`remote_allowed` 暂时不起作用（manifest 照常解析，附着模块的放宽确认照常走）。模块侧看到的错误不变，`Unavailable` 一律映射成 `no_provider`。
+   - **接入获准云处理之前，必须先接上动作级的来源继承**，不能把这一条简单回退成「看 manifest」。不能只靠 `request_id` 把父 run 的来源塞进在途表：模块可以借另一个在途请求的 id 送别的载荷（§2.1.1 第 5 条：模块不得声称收窄）。
+   - 证据裁决：裁判多数（Borda C 5、A 4、B 0），记录在本机 `~/.claude/decisions/2026-10-27-module-callback-inheritance/`。被否掉的有两项：A 在途表带父操作的出口上下文、取更严者（生产里父 run 的有效模式恒为 LocalOnly，与 C 等价；它要搬的 `egress_resources` 滤掉了 Ordinary，不是完整来源）；B 只钉测试（manifest 仍决定 privacy，只剩 `deny_all` 一层）。
 3. **agent24d 作为 stdio MCP server，以及 ACP 桥**（`agent24-mcp/src/server.rs`、`agent24-cli/src/acp.rs`）：
    - `agent24_run` 把 run 的最终输出交给外部 MCP 对端；
    - `agent24_list_runs` 返回所有 run 的 prompt 和输出；
@@ -141,8 +145,9 @@
 
 | 片 | 补什么 |
 |---|---|
-| 6b.5b 模型类 | **已补**（见上表标 6b.5b 的测试）。没有补的：模块模型回调的 (b)，要等 §6 第 2 条接上来源继承以后才有可测的政策读取 |
+| 6b.5b 模型类 | **已补**（见上表标 6b.5b 的测试）。模块模型回调的 (b) 不适用：6b.5g 起回调一律 LocalOnly，不读政策 |
 | 6b.5c 网络类 | http_fetch 的 LocalOnly、政策不可用、精确目的地正例和逐项不匹配负例，以及 Ordinary 下 IP 字面量分支和端到端取回；MCP client 的 (a)(b)(d)，以及测试 gate 上的 (c)；MCP server 和 ACP 桥按分类过滤（§6 第 3、4 条）。6b.5c-1（#1220）已补 http_fetch 与 MCP client 的四列；peer 视图拆成 6b.5c-2a（内核视图）、6b.5c-2b（两座桥） |
 | 6b.5d 模块、进程、生命周期 | 模块工具 (b)(c)；shell_exec 零副作用、CloudAuthorized 仍被拒、`tool_context_for` 两个分支；恢复时受限来源的出口测试；模型 override 测试 |
 | 6b.5f 工具结果打标签 | 按 §6 第 4 条 David 10-26 的两项决定。5f-1：run 内打标签（结果进模型之前，写失败就结束 run）和模块的同源回送。5f-2：来源模块跨轮次传到会话后面的轮次。5f-3：放宽 6b.5c-2 的 peer 视图规则，改成按标签逐条对账（§6 第 4 条 10-27 的决定），并用 0028 回填存量缺口 |
-| 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已接、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
+| 6b.5g 模块模型回调 | 回调一律 LocalOnly（§6 第 2 条，David 10-27 选 C）；测试 `every_grant_routes_local_only_whatever_its_manifest_declares`，以及 `me4_model_blackbox.rs` 场景 3 改写说明 |
+| 6b.5e 撤 `has_remote` 过渡门 | 前提：本表全绿、§2 末尾那条 LocalOnly 排除测试已补、§6 第 2 条已落实（6b.5g：回调一律 LocalOnly）、6b.5f 已合入、K1-6a 已验收；附 #708 macOS 证据。**撤门要 David 确认** |
