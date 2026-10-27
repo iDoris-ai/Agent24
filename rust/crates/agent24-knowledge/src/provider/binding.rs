@@ -1,13 +1,19 @@
-//! One binding as a whole (CONTRACT-STATE-v1 S3.3): its connection and
-//! credential parts, whether it is activated, whether it is retired, and the
-//! user and configuration events that take it out of the connection phase or
-//! back in. Pure state, like its parts. Persisting what an event asks for,
+//! One binding as a whole (CONTRACT-STATE-v1 S3.3): its connection,
+//! credential and evidence parts, whether it is activated, whether it is
+//! retired, and the user and configuration events that take it out of the
+//! connection phase or back in. Credential events go through it, so each one
+//! that calls for a placeholder places its rule (S5.6). Pure state, like its
+//! parts. Persisting what an event asks for,
 //! and refusing a loosening while a tightening is not yet persisted (I1), are
 //! the persistence slice's; identity changes and the placeholder are in
 //! `profile`.
 
+use std::collections::BTreeSet;
+use std::time::Instant;
+
 use super::connection::{Connection, ProbeTicket, Round};
-use super::credential::{Credentials, Effects, Issuance};
+use super::credential::{CredentialId, Credentials, Effects, Issuance, Issued, Outcome, Signal};
+use super::evidence::{Evidence, Kbs, Observed, Rule, Scope};
 use super::state::{self, ConnectionPhase, Switches, UnavailableCause};
 
 /// An event that takes the binding out of the connection phase (S3.3).
@@ -58,24 +64,40 @@ pub enum Retry {
     Probe(ProbeTicket),
 }
 
+/// What an event did, with the placeholder rule it placed (S5.6): the
+/// caller persists the rule as part of the event's tightening.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a rule placed is persisted with the event"]
+pub struct WithRule<T, K> {
+    pub value: T,
+    pub rule: Option<Rule<K>>,
+}
+
 #[derive(Debug)]
-pub struct BindingState {
+pub struct BindingState<K> {
     connection: Connection,
     credentials: Credentials,
+    evidence: Evidence<K>,
     /// Selected, principal bound, no confirmation pending; Off and the
     /// disabled flag are [`Switches`], not part of this.
     activated: bool,
     retired: bool,
 }
 
-impl BindingState {
+impl<K: Ord + Clone> BindingState<K> {
     pub fn new(connection: Connection, credentials: Credentials, activated: bool) -> Self {
         Self {
             connection,
             credentials,
+            evidence: Evidence::default(),
             activated,
             retired: false,
         }
+    }
+
+    /// With the evidence state restored at restart (S1.14).
+    pub fn with_evidence(self, evidence: Evidence<K>) -> Self {
+        Self { evidence, ..self }
     }
 
     pub fn connection(&self) -> &Connection {
@@ -86,9 +108,20 @@ impl BindingState {
         &self.credentials
     }
 
-    /// Both parts, for the probe and credential events.
-    pub fn parts_mut(&mut self) -> (&mut Connection, &mut Credentials) {
-        (&mut self.connection, &mut self.credentials)
+    /// For probes; credential events go through the binding.
+    pub fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+
+    pub fn evidence(&self) -> &Evidence<K> {
+        &self.evidence
+    }
+
+    /// For evidence delivered, rechecks and deletions. A response's scope
+    /// goes through [`BindingState::observe`], a registration through
+    /// [`BindingState::response`]: both come with a credential event.
+    pub fn evidence_mut(&mut self) -> &mut Evidence<K> {
+        &mut self.evidence
     }
 
     pub fn retired(&self) -> bool {
@@ -105,16 +138,16 @@ impl BindingState {
             activated: self.activated && phase.is_some(),
             phase: phase.unwrap_or(ConnectionPhase::Loading),
             persist_pending: self.connection.persist_pending(),
-            reverify_pending: false,
+            reverify_pending: self.evidence.reverify_pending(),
         }
     }
 
     /// S3.3: in the connection phase it invalidates; in any state the short
     /// lived credential goes, and every event but Off advances the evidence
     /// epoch (S5.6, decision 3). A retired binding takes no event.
-    pub fn leave(&mut self, event: Leave) -> Effects {
+    pub fn leave(&mut self, event: Leave) -> WithRule<Effects, K> {
         if self.retired {
-            return Effects::default();
+            return self.ruled(Effects::default());
         }
         let invalidation = self
             .connection
@@ -127,10 +160,137 @@ impl BindingState {
             Leave::Remove | Leave::Retire => self.retired = true,
             Leave::Off | Leave::Disable => {}
         }
-        Effects {
+        self.ruled(Effects {
             invalidation,
             placeholder: event != Leave::Off,
             ..Effects::default()
+        })
+    }
+
+    /// A `loading` round's issuance, as [`Credentials::issue`].
+    pub fn issue(&mut self) -> Option<Issuance> {
+        self.credentials.issue(&self.connection)
+    }
+
+    /// The issuer's answer, as [`Credentials::issued`].
+    pub fn issued(
+        &mut self,
+        ticket: Issuance,
+        answer: Issued,
+        now: Instant,
+    ) -> WithRule<Outcome, K> {
+        let outcome = self
+            .credentials
+            .issued(&mut self.connection, ticket, answer, now);
+        self.ruled_outcome(outcome)
+    }
+
+    /// A revocation signal from outside a response, as [`Credentials::revoke`].
+    pub fn revoke(&mut self, now: Instant) -> WithRule<Outcome, K> {
+        let outcome = self.credentials.revoke(&mut self.connection, now);
+        self.ruled_outcome(outcome)
+    }
+
+    /// The credential class of an accepted response, as
+    /// [`Credentials::response`]. `asked` is the request's KBs, or for one
+    /// without KBs (an issuance) its credential's granted scope, never empty
+    /// (S3.1): a revocation signal on a discarded credential registers them
+    /// for re-verification, admitting nothing until it is released (§6). An
+    /// empty one fails closed: a rule over every KB (#1305 note 3).
+    pub fn response(
+        &mut self,
+        credential: CredentialId,
+        signal: Signal,
+        asked: impl IntoIterator<Item = K>,
+        now: Instant,
+    ) -> WithRule<Outcome, K> {
+        let outcome = self
+            .credentials
+            .response(&mut self.connection, credential, signal, now);
+        if outcome == Outcome::Recheck {
+            return self.questioned(asked);
+        }
+        self.ruled_outcome(outcome)
+    }
+
+    /// The recheck, sent with `credential`, came back with a revocation
+    /// signal: a revocation as any (S3.1), and what was held back becomes
+    /// placeholders. If the credential was discarded meanwhile (a renewal
+    /// does so without invalidating), the recheck's KBs `asked` are
+    /// registered again as by [`BindingState::response`].
+    pub fn recheck_revoked(
+        &mut self,
+        credential: CredentialId,
+        asked: impl IntoIterator<Item = K>,
+        now: Instant,
+    ) -> WithRule<Outcome, K> {
+        let outcome =
+            self.credentials
+                .response(&mut self.connection, credential, Signal::Revoked, now);
+        if outcome == Outcome::Recheck {
+            return self.questioned(asked);
+        }
+        let rule = Some(self.evidence.revoked());
+        WithRule {
+            value: outcome,
+            rule,
+        }
+    }
+
+    /// S3.1: a revocation signal on a discarded credential registers `asked`
+    /// for re-verification; an empty Q fails closed with a rule over every
+    /// KB (#1305 note 3).
+    fn questioned(&mut self, asked: impl IntoIterator<Item = K>) -> WithRule<Outcome, K> {
+        let registered = self.evidence.register(asked);
+        let rule = (!registered).then(|| self.evidence.place(Kbs::All));
+        WithRule {
+            value: Outcome::Recheck,
+            rule,
+        }
+    }
+
+    /// An accepted response's scope (S5.10), and if it removed a KB the
+    /// narrowing that is, in one step: no other response may come between
+    /// (#1297 G-B). The caller has already dropped responses invalidated
+    /// meanwhile (S4.6).
+    pub fn observe(
+        &mut self,
+        asked: &BTreeSet<K>,
+        scope: &Scope<K>,
+        admitted: u64,
+        credential: CredentialId,
+        now: Instant,
+    ) -> WithRule<(Observed<K>, Option<Outcome>), K> {
+        let current = self.credentials.current() == Some(credential);
+        let observed = self.evidence.observe(asked, scope, admitted, current);
+        if observed.removed.is_empty() {
+            return WithRule {
+                value: (observed, None),
+                rule: None,
+            };
+        }
+        let narrowed = self.credentials.narrow(&mut self.connection, now);
+        let WithRule { value, rule } = self.ruled_outcome(narrowed);
+        WithRule {
+            value: (observed, Some(value)),
+            rule,
+        }
+    }
+
+    fn ruled(&mut self, effects: Effects) -> WithRule<Effects, K> {
+        let rule = effects.placeholder.then(|| self.evidence.place(Kbs::All));
+        WithRule {
+            value: effects,
+            rule,
+        }
+    }
+
+    fn ruled_outcome(&mut self, outcome: Outcome) -> WithRule<Outcome, K> {
+        let placeholder = matches!(&outcome, Outcome::Done(e) if e.placeholder);
+        let rule = placeholder.then(|| self.evidence.place(Kbs::All));
+        WithRule {
+            value: outcome,
+            rule,
         }
     }
 
@@ -172,7 +332,15 @@ impl BindingState {
     }
 
     /// A probe goes out only with a current credential, so no probe moves
-    /// the binding to a servable phase without one (#1228 note 1).
+    /// the binding to a servable phase without one (#1228 note 1). This, on
+    /// the aggregate, is the only way to a probe ticket; the connection's own
+    /// is not reachable from outside the module:
+    ///
+    /// ```compile_fail,E0624
+    /// fn bypass(connection: &mut agent24_knowledge::provider::connection::Connection) {
+    ///     let _ = connection.probe();
+    /// }
+    /// ```
     pub fn probe(&mut self) -> Option<ProbeTicket> {
         self.credentials.current()?;
         self.connection.probe()
