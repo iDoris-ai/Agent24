@@ -152,7 +152,9 @@ pub(crate) enum DocumentsAction {
         #[arg(long)]
         region: Option<String>,
         /// Write the PNG to this file: into a new file beside it, then renamed
-        /// over it, so not to a device or a pipe (use --json and decode `png`)
+        /// over it. So not to a device or a pipe: in a directory that cannot
+        /// be written (`/dev`) it fails, and a named pipe is replaced by a
+        /// file (use --json and decode `png` instead)
         #[arg(long)]
         out: Option<PathBuf>,
         /// Print the result as one JSON line, the PNG in base64 (`png`)
@@ -437,9 +439,11 @@ fn extract_request(
 /// place of a file, the new one is readable only by its owner until it is
 /// written and then takes that file's permissions; with no file there, it is
 /// made as the umask allows from the start, as writing in place would. A
-/// link is written through to its target. What a rename cannot replace is
-/// `file_unwritable`: a device (`/dev/null`), a dangling link, a file in a
-/// directory that cannot be written; another hard link keeps the old page.
+/// link is written through to its target. `file_unwritable` when the new
+/// file cannot be made beside it (a directory that cannot be written, as
+/// `/dev` for `/dev/null`) or a link leads nowhere (it cannot be resolved);
+/// whatever else is there is replaced, a named pipe too, and another hard
+/// link keeps the old page.
 fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
     use base64::Engine as _;
     let png = data

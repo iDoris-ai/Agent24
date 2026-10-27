@@ -364,7 +364,8 @@ if [ -n "$NEXT" ]; then
   # lines OUT: how many lines a --json run printed (its result is the only
   # one), a last line with no newline counted too.
   lines() { awk 'END { print NR }' "$1"; }
-  # dims PNG: its pixel size as WxH ("" for a file that is no image).
+  # dims PNG: its pixel size as WxH ("" for no file, "<nil>x<nil>" for one
+  # that is no image): only ever compared with a size.
   dims() { sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null | awk '/pixel/ { print $2 }' | paste -sd x -; }
   png() { [ "$(head -c 8 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 89504e470d0a1a0a ] && echo y; }
   full=$(last "$WORK/o6.out" '[.data.blocks[:4][].block_id] | join(",")')
@@ -415,7 +416,7 @@ if [ -n "$NEXT" ]; then
   a24 documents render "$DOC1" 1 1 --scale 0.5 --region 0,0,100,50 --json > "$WORK/r8.out" 2>/dev/null; rc=$?
   last "$WORK/r8.out" '.data.png // empty' | base64 -d > "$WORK/r8.png" 2>/dev/null
   check R8 "render --scale 0.5 --region: that area, at that scale, in base64 with --json" \
-    "$(is "$rc/$(lines "$WORK/r8.out")/$(last "$WORK/r8.out" '"\(.data.media_type)/\(.data.scale == 0.5)/\(.data.bytes)"')/$(png "$WORK/r8.png")/$(dims "$WORK/r8.png")" "0/1/image/png/true/$(wc -c < "$WORK/r8.png" | tr -d ' ')/y/50x25")" \
+    "$(is "$rc/$(lines "$WORK/r8.out")/$(last "$WORK/r8.out" '"\(.type)/\(.data.media_type)/\(.data.scale == 0.5)/\(.data.bytes)"')/$(png "$WORK/r8.png")/$(dims "$WORK/r8.png")" "0/1/result/image/png/true/$(wc -c < "$WORK/r8.png" | tr -d ' ')/y/50x25")" \
     "rc=$rc; $(dims "$WORK/r8.png"), $(wc -c < "$WORK/r8.png" | tr -d ' ') bytes"
 
   a24 documents render "$DOC1" 1 99 --json > "$WORK/r9.out" 2>/dev/null; rc=$?
@@ -442,15 +443,17 @@ if [ -n "$NEXT" ]; then
 
   a24 documents extract "$DOC1" 1 --schema "$WORK/ask.json" --key k1 --json > "$WORK/r13.out" 2>/dev/null; rc=$?
   check R13 "extract --key without --rerun: refused, not ignored" \
-    "$(is "$rc/$(lines "$WORK/r13.out")/$(last "$WORK/r13.out" '"\(.status)/\(.error.code)/\(.error.message)"')" "1/1/400/invalid_request/--key names a rerun; give --rerun with it")" "rc=$rc"
+    "$(is "$rc/$(lines "$WORK/r13.out")/$(last "$WORK/r13.out" '"\(.type)/\(.status)/\(.error.code)/\(.error.message)"')" "1/1/result/400/invalid_request/--key names a rerun; give --rerun with it")" "rc=$rc"
 
   printf 'fields: issued_by\n' > "$WORK/ask.txt"
   a24 documents extract "$DOC1" 1 --schema "$WORK/ask.txt" --json > "$WORK/r14.out" 2>/dev/null; rc=$?
-  check R14 "extract with a schema that is not JSON: refused before sending" \
-    "$(is "$rc/$(lines "$WORK/r14.out")/$(last "$WORK/r14.out" '"\(.status)/\(.error.message)"')" "1/1/400/the schema is not JSON")" "rc=$rc"
+  # That it is not sent is the CLI's unit test's to show
+  # (a_schema_is_any_json_from_its_file_and_anything_else_is_refused_unsent).
+  check R14 "extract with a schema that is not JSON: refused" \
+    "$(is "$rc/$(lines "$WORK/r14.out")/$(last "$WORK/r14.out" '"\(.type)/\(.status)/\(.error.message)"')" "1/1/result/400/the schema is not JSON")" "rc=$rc"
 
   a24 documents extraction ext_00000000000000000000000000 --json > "$WORK/r15.out" 2>/dev/null; rc=$?
-  check R15 "extraction that does not exist: not_found" "$(is "$rc/$(lines "$WORK/r15.out")/$(last "$WORK/r15.out" '"\(.status)/\(.error.message)"')" "1/1/404/no such extraction")" "rc=$rc"
+  check R15 "extraction that does not exist: not_found" "$(is "$rc/$(lines "$WORK/r15.out")/$(last "$WORK/r15.out" '"\(.type)/\(.status)/\(.error.message)"')" "1/1/result/404/no such extraction")" "rc=$rc"
 
   printf '{"base":"http://127.0.0.1:%s","token":"%s","request":{"op":"find","documentId":"%s","revision":1,"query":"boil"}}' "$PORT" "$TOKEN" "$DOC1" \
     | limit 120 "$BIN/agent24" documents request --host-stdin --json > "$WORK/r16.out" 2>/dev/null; rc=$?
