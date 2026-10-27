@@ -4,11 +4,13 @@
 # the daemon's HTTP API only where no product entry exists (T1, T2). Cases and
 # the release scope: docs/documenting/acceptance/R6-RELEASE-USECASES.md.
 #
-#   scripts/doc1-r6-accept.sh --bin <bin dir> [--old <main bin dir>] [--work <dir>]
+#   scripts/doc1-r6-accept.sh --bin <bin dir> [--old <main bin dir>] [--work <dir>] [--next]
 #
 # The bin dir holds `agent24`, `agent24d` and `agent24-documents`
 # (`cargo build -p agent24-cli -p agent24d -p agent24-documents`); --old the
-# same three built from main (r5), for the upgrade cases M1-M7. Run it from
+# same three built from main (r5), for the upgrade cases M1-M7. --next adds
+# the R cases, for CLI entries added after r6 (DOC-1-57): r6's binaries have
+# none of them, so they fail there. Run it from
 # the release checkout: the package is assembled from the domain-os.yml, the
 # pdfkit engine sources and the samples found here. macOS only (the engine).
 # The daemon runs on its own AGENT24_DATA_DIR under --work; Z1 checks the
@@ -20,7 +22,7 @@ set -uo pipefail
 export LC_ALL=C
 # Relative paths are the caller's: taken from where it ran, before the cd.
 abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
-BIN="" OLD="" WORK=""
+BIN="" OLD="" WORK="" NEXT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     # Each takes a value: without one, `$(abs "$2")` fails in its subshell
@@ -31,10 +33,11 @@ while [ $# -gt 0 ]; do
     --bin) BIN=$(abs "$2"); shift 2 ;;
     --old) OLD=$(abs "$2"); shift 2 ;;
     --work) WORK=$(abs "$2"); shift 2 ;;
+    --next) NEXT=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$BIN" ] || { sed -n 2,17p "$0" >&2; exit 2; }
+[ -n "$BIN" ] || { sed -n 2,19p "$0" >&2; exit 2; }
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 for b in agent24 agent24d agent24-documents; do
@@ -351,6 +354,109 @@ code=$(curl -s -m 30 -o "$WORK/t2.out" -w '%{http_code}' -X POST -H "Authorizati
   -H 'Content-Type: application/json' -d '{"context":{},"arguments":{}}' \
   "http://127.0.0.1:$PORT/api/v1/documents/_a24/tools/find")
 check T2 "the module's tool route is not reachable from outside" "$(is "$code/$(jq -r .error.code "$WORK/t2.out" 2>/dev/null)" 404/not_found)" "$code $(cut -c1-80 "$WORK/t2.out")"
+
+# --- R: reading, finding, extracting, rendering (after r6, only with --next) --------
+# DOC-1-57: `text --block/--limit/--require-complete`, `find`, `extract`,
+# `extraction`, `render`. On U1's document (DOC1), whose page 1 O6 read whole:
+# what a page holds is judged against that read, not against fixed ids.
+if [ -n "$NEXT" ]; then
+  ids() { last "$1" '[.data.blocks[].block_id] | join(",")'; }
+  # dims PNG: its pixel size as WxH ("" for a file that is no image).
+  dims() { sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null | awk '/pixel/ { print $2 }' | paste -sd x -; }
+  png() { [ "$(head -c 8 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 89504e470d0a1a0a ] && echo y; }
+  full=$(last "$WORK/o6.out" '[.data.blocks[:4][].block_id] | join(",")')
+
+  a24 documents text "$DOC1" 1 --limit 2 --json > "$WORK/r1.out" 2>/dev/null; rc=$?
+  CUR=$(last "$WORK/r1.out" '.data.next_cursor // empty')
+  a24 documents text "$DOC1" 1 --limit 2 --cursor "$CUR" --json > "$WORK/r1b.out" 2>/dev/null; rc2=$?
+  check R1 "text --limit 2, then --cursor: two blocks a page, the next two after them" \
+    "$(is "$rc/$rc2/$(ids "$WORK/r1.out"),$(ids "$WORK/r1b.out")" "0/0/$full")" \
+    "rc=$rc/$rc2; $(ids "$WORK/r1.out") | $(ids "$WORK/r1b.out"); whole read: $full"
+
+  third=$(last "$WORK/o6.out" '.data.blocks[2].block_id')
+  a24 documents text "$DOC1" 1 --block "$third" --limit 1 --json > "$WORK/r2.out" 2>/dev/null; rc=$?
+  check R2 "text --block: starts at that block" \
+    "$(is "$rc/$(ids "$WORK/r2.out")/$(last "$WORK/r2.out" '.data.blocks[0].text')" "0/$third/$(last "$WORK/o6.out" '.data.blocks[2].text')")" \
+    "rc=$rc; ${third:-no block 3 in O6}: $(ids "$WORK/r2.out")"
+
+  a24 documents text "$DOC1" 1 --block "$third" --cursor "$CUR" --json > "$WORK/r3.out" 2>/dev/null; rc=$?
+  check R3 "text --block with --cursor: a result line, invalid_request, exit 1" \
+    "$(is "$rc/$(last "$WORK/r3.out" '"\(.type)/\(.status)/\(.error.code)/\(.error.message | test("give block or cursor, not both"))"')" 1/result/400/invalid_request/true)" \
+    "rc=$rc; $(last "$WORK/r3.out" .error.message)"
+
+  a24 documents find "$DOC1" 1 boil --json > "$WORK/r4.out" 2>/dev/null; rc=$?
+  n=$(last "$WORK/r4.out" '.data.matches | length')
+  each=$(last "$WORK/r4.out" '[.data.matches[] | .document_id == "'"$DOC1"'" and .page == 1 and (.quote | test("boil"; "i"))] | all')
+  check R4 "find: every match is an anchor on page 1 quoting the word" \
+    "$(is "$rc/$([ "${n:-0}" -ge 2 ] && echo y)/$each" 0/y/true)" "rc=$rc; matches=$n; first $(last "$WORK/r4.out" '.data.matches[0] | "\(.block_id) \(.quote)"')"
+
+  at() { last "$1" ".data.matches[$2] | \"\(.block_id)@\(.text_range.start)\""; }
+  a24 documents find "$DOC1" 1 boil --limit 1 --json > "$WORK/r5.out" 2>/dev/null; rc=$?
+  FCUR=$(last "$WORK/r5.out" '.data.next_cursor // empty')
+  a24 documents find "$DOC1" 1 boil --limit 1 --cursor "$FCUR" --json > "$WORK/r5b.out" 2>/dev/null; rc2=$?
+  check R5 "find --limit 1, then --cursor: the first match, then the second" \
+    "$(is "$rc/$rc2/$(at "$WORK/r5.out" 0)/$(at "$WORK/r5b.out" 0)" "0/0/$(at "$WORK/r4.out" 0)/$(at "$WORK/r4.out" 1)")" \
+    "rc=$rc/$rc2; $(at "$WORK/r5.out" 0) then $(at "$WORK/r5b.out" 0)"
+
+  a24 documents find "$DOC1" 1 zzqqxxjj --json > "$WORK/r6.out" 2>/dev/null; rc=$?
+  check R6 "find what is not there: no matches, no cursor" "$(is "$rc/$(last "$WORK/r6.out" '"\(.data.matches | length)/\(.data.next_cursor)"')" 0/0/null)" "rc=$rc"
+
+  a24 documents render "$DOC1" 1 1 --out "$WORK/r7.png" > "$WORK/r7.out" 2>&1; rc=$?
+  check R7 "render --out: the page as a PNG at scale 1, the file named in the output" \
+    "$(is "$rc/$(png "$WORK/r7.png")/$(dims "$WORK/r7.png")/$(jq -r '"\(.scale)/\(.written_to)"' "$WORK/r7.out" 2>/dev/null)" "0/y/612x792/1.0/$WORK/r7.png")" \
+    "rc=$rc; $(dims "$WORK/r7.png"); $(tr -d '\n ' < "$WORK/r7.out" | cut -c1-100)"
+
+  a24 documents render "$DOC1" 1 1 --scale 0.5 --region 0,0,100,50 --json > "$WORK/r8.out" 2>/dev/null; rc=$?
+  last "$WORK/r8.out" '.data.png // empty' | base64 -d > "$WORK/r8.png" 2>/dev/null
+  check R8 "render --scale 0.5 --region: that area, at that scale, in base64 with --json" \
+    "$(is "$rc/$(last "$WORK/r8.out" '"\(.data.media_type)/\(.data.scale)/\(.data.bytes)"')/$(png "$WORK/r8.png")/$(dims "$WORK/r8.png")" "0/image/png/0.5/$(wc -c < "$WORK/r8.png" | tr -d ' ')/y/50x25")" \
+    "rc=$rc; $(dims "$WORK/r8.png"), $(wc -c < "$WORK/r8.png" | tr -d ' ') bytes"
+
+  a24 documents render "$DOC1" 1 99 --json > "$WORK/r9.out" 2>/dev/null; rc=$?
+  check R9 "render a page that is not there: not_found, exit 1" "$(is "$rc/$(last "$WORK/r9.out" '"\(.status)/\(.error.code)"')" 1/404/not_found)" "rc=$rc; $(last "$WORK/r9.out" .error.message)"
+
+  a24 documents render "$DOC1" 1 1 --out "$WORK/no/such/dir/p.png" --json > "$WORK/r10.out" 2>/dev/null; rc=$?
+  check R10 "render --out where no file can be made: file_unwritable, exit 1, nothing written" \
+    "$(is "$rc/$(last "$WORK/r10.out" '"\(.status)/\(.error.code)"')/$([ -e "$WORK/no" ] && echo made)" 1/400/file_unwritable/)" "rc=$rc"
+
+  printf '{"fields":[{"key":"issued_by","description":"who issued the notice","type":"text"}]}' > "$WORK/ask.json"
+  # No model is needed: the job is made, then cancelled before it could ask one.
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.json" > "$WORK/r11.out" 2>&1; rc=$?
+  JOBX=$(job_of "$WORK/r11.out")
+  kind=$(a24 documents job "$JOBX" --json 2>/dev/null | tail -n 1 | jq -r .data.kind 2>/dev/null)
+  a24 documents cancel "$JOBX" > /dev/null 2>&1; rc2=$?
+  check R11 "extract: an extract job, which cancel then ends" \
+    "$(is "$rc/$(grep -cE '^extract job job_[0-9A-Z]{26} \((queued|running)\)$' "$WORK/r11.out")/$kind/$rc2/$(settle "$JOBX")" 0/1/extract/0/cancelled)" \
+    "rc=$rc/$rc2; $(one "$WORK/r11.out")"
+
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.json" --rerun --json > "$WORK/r12.out" 2>/dev/null; rc=$?
+  check R12 "extract --rerun without --key: a result line, the key is required, exit 1" \
+    "$(is "$rc/$(last "$WORK/r12.out" '"\(.type)/\(.status)/\(.error.message)"')" "1/result/400/the Idempotency-Key header is required")" "rc=$rc"
+
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.json" --key k1 --json > "$WORK/r13.out" 2>/dev/null; rc=$?
+  check R13 "extract --key without --rerun: refused, not ignored" \
+    "$(is "$rc/$(last "$WORK/r13.out" '"\(.status)/\(.error.code)/\(.error.message)"')" "1/400/invalid_request/--key names a rerun; give --rerun with it")" "rc=$rc"
+
+  printf 'fields: issued_by\n' > "$WORK/ask.txt"
+  a24 documents extract "$DOC1" 1 --schema "$WORK/ask.txt" --json > "$WORK/r14.out" 2>/dev/null; rc=$?
+  check R14 "extract with a schema that is not JSON: refused before sending" \
+    "$(is "$rc/$(last "$WORK/r14.out" '"\(.status)/\(.error.message)"')" "1/400/the schema is not JSON")" "rc=$rc"
+
+  a24 documents extraction ext_00000000000000000000000000 --json > "$WORK/r15.out" 2>/dev/null; rc=$?
+  check R15 "extraction that does not exist: not_found" "$(is "$rc/$(last "$WORK/r15.out" '"\(.status)/\(.error.message)"')" "1/404/no such extraction")" "rc=$rc"
+
+  printf '{"base":"http://127.0.0.1:%s","token":"%s","request":{"op":"find","documentId":"%s","revision":1,"query":"boil"}}' "$PORT" "$TOKEN" "$DOC1" \
+    | limit 120 "$BIN/agent24" documents request --host-stdin --json > "$WORK/r16.out" 2>/dev/null; rc=$?
+  check R16 "find through request --host-stdin (the desktop's way): the same matches" \
+    "$(is "$rc/$(last "$WORK/r16.out" '"\(.type)/\(.data.matches | length)"')" "0/result/$n")" "rc=$rc"
+
+  printf '{"base":"http://127.0.0.1:%s","token":"%s","request":{"op":"renderPage","documentId":"%s","revision":1,"page":1,"scale":0.25}}' "$PORT" "$TOKEN" "$DOC1" \
+    | limit 120 "$BIN/agent24" documents request --host-stdin --json > "$WORK/r17.out" 2>/dev/null; rc=$?
+  last "$WORK/r17.out" '.data.png // empty' | base64 -d > "$WORK/r17.png" 2>/dev/null
+  check R17 "renderPage through request --host-stdin: the PNG in the result line" \
+    "$(is "$rc/$(last "$WORK/r17.out" '"\(.type)/\(.data.media_type)/\(.data.scale)"')/$(png "$WORK/r17.png")/$(dims "$WORK/r17.png")" "0/result/image/png/0.25/y/153x198")" \
+    "rc=$rc; $(dims "$WORK/r17.png")"
+fi
 
 # --- N: no daemon -------------------------------------------------------------------
 limit 60 "$BIN/agent24" daemon stop > "$WORK/n0.out" 2>&1

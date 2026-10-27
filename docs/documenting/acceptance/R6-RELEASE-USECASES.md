@@ -5,11 +5,12 @@
 - **怎么跑**：在发布 head 的 checkout 里运行下面的命令。脚本从这个 checkout 取 `domain-os.yml`、pdfkit 引擎源码和 S01 样本来组装 documents 包。
 
   ```
-  scripts/doc1-r6-accept.sh --bin <二进制目录> [--old <main 的二进制目录>] [--work <目录>]
+  scripts/doc1-r6-accept.sh --bin <二进制目录> [--old <main 的二进制目录>] [--work <目录>] [--next]
   ```
 
   - 二进制目录里要有 `agent24`、`agent24d`、`agent24-documents`（`cargo build -p agent24-cli -p agent24d -p agent24-documents`）。
   - `--old` 指向用 main（r5）编出的同样三个二进制。给了它，才跑升级用例 M1–M7（见「从 r5 升级」一节），这时还需要 sqlite3。发布验收要带上它。
+  - `--next` 加跑 R 组：r6 之后给 CLI 补的入口（DOC-1-57，见「r6 之后的 CLI 入口」一节）。r6 的二进制没有这些入口，所以验收 r6 时不带它；**下一次发布的验收必须带上它**。
   - 脚本逐条打出 PASS、KNOWN 或 FAIL，并在工作目录写 `report.md`。有一条 FAIL 就以非 0 退出；KNOWN 不算失败。
 - **按用户的操作走**：
   - 包按模块 README 的方式组装：`domain-os.yml`、模块二进制，再加上 `engines/pdfkit/build.sh` 编出的读取引擎。
@@ -115,7 +116,35 @@ O15、U8–U10、E1–E3 是 r6 合进 main（#1386）之后补的。合并前�
 | 取消正在运行的导入 | 运行中的导入只有约 0.1 秒，靠抢时机取消没法稳定复现（见上文 C1 的说明） | C3、C4 覆盖取消失败的作业再重试；运行中取消由模块测试 `imports/tests.rs` 的 `an_import_cancelled_before_or_after_its_bytes_are_stored_commits_nothing` 覆盖（用闸门把作业停在运行中再取消） |
 | 被打断的作业再跑一次（daemon 在作业运行中退出） | 同上，作业只跑约 0.1 秒，杀 daemon 的时机抢不准 | C2 覆盖重试成功；被打断的作业由 `imports/handler_test.rs` 的 `an_interrupted_import_runs_again_and_a_cancelled_one_stays_cancelled` 覆盖（再导入时第 2 次尝试成功） |
 | 上传中断后续传 | 本机分块上传每块只要几毫秒，在两块之间掐断 CLI 抢不准时机 | 重新导入同一个文件会续传：客户端用同一个幂等键拿回原来的上传，从服务端已收到的位置接着传。由客户端测试 `import/tests.rs` 的 `an_upload_cut_off_midway_resumes`、`a_lost_import_is_continued_by_importing_again` 覆盖 |
-| 文字分页（`next_cursor`） | CLI 的 `text` 没有 `--limit`；实测 3000 行的 PDF 第 1 页是 49 个块，一页就返回完，造不出第二页 | O4 覆盖 `list` 的分页；`text` 的分页由 `read/text/tests.rs` 的 `cursors_page_through_every_block_once` 覆盖 |
+| 文字分页（`next_cursor`） | r6 的 CLI `text` 没有 `--limit`；实测 3000 行的 PDF 第 1 页是 49 个块，一页就返回完，造不出第二页 | O4 覆盖 `list` 的分页；`text` 的分页由 `read/text/tests.rs` 的 `cursors_page_through_every_block_once` 覆盖。DOC-1-57 给 `text` 加了 `--limit`，分页现在由 R1 覆盖（带 `--next`） |
+
+## r6 之后的 CLI 入口（R1–R17，带 `--next` 时跑）
+
+DOC-1-57 给 CLI 补齐了桌面页面要用的读取操作（#1398 共享路由、#1399 CLI 子命令）：`text` 的 `--block`、`--limit`、`--require-complete`，以及 `find`、`extract`、`extraction`、`render`。这些入口在 r6 发布之后才有，用例放在这一组，只在给了 `--next` 时跑（放置方式见决策记录 `2026-10-27-doc1-57c-case-placement`：R0 三方一致）。下一次发布的验收带上它；到那时再决定脚本改名，或者把这组改成默认跑。
+
+R 组用 U1 导入的文档（EPA 煮沸通知，第 1 页 17 个块，「boil」出现 7 次），在 N 组停掉 daemon 之前跑。期望值尽量取自同一次运行：R1、R2 对照 O6 整页读出的块，R5、R16 对照 R4 的匹配。
+
+| ID | 做什么 | 期望 |
+|---|---|---|
+| R1 | `text <doc> 1 --limit 2`，再用它的 `next_cursor` 读下一页 | 每页两个块，两页合起来正是 O6 整页读取的前 4 个块（这就是文字分页） |
+| R2 | `text <doc> 1 --block <O6 的第 3 个块> --limit 1` | 正好是那个块，文字也相同 |
+| R3 | `text --block … --cursor … --json` | 退出 1，一行 result，400 `invalid_request`，提示 `give block or cursor, not both` |
+| R4 | `find <doc> 1 boil --json` | 至少 2 个匹配；每个都是本文档第 1 页的锚点，`quote` 含这个词（不分大小写） |
+| R5 | `find --limit 1`，再用 `--cursor` 取下一页 | 第一页是 R4 的第 1 个匹配，第二页是第 2 个（按 `block_id` 和起点比较） |
+| R6 | `find` 一个不存在的词 | 退出 0，没有匹配，`next_cursor` 为 null |
+| R7 | `render <doc> 1 1 --out <文件>` | 退出 0；文件是 PNG（签名对），612×792（scale 1 的 US Letter）；输出里的 `scale` 是 1.0，`written_to` 是这个文件 |
+| R8 | `render --scale 0.5 --region 0,0,100,50 --json` | `media_type` 是 `image/png`，`scale` 0.5，`bytes` 等于解码后的大小；解出的 PNG 是 50×25 |
+| R9 | `render` 第 99 页 | 退出 1，404 `not_found` |
+| R10 | `render --out` 到一个不存在的目录 | 退出 1，400 `file_unwritable`，什么都没建 |
+| R11 | `extract <doc> 1 --schema ask.json`，再 `cancel` 这个作业 | 打出 `extract job job_… (queued 或 running)`；作业的 `kind` 是 `extract`；取消后作业停在 `cancelled`。不需要模型：作业在问模型之前就被取消 |
+| R12 | `extract --rerun`，不带 `--key` | 退出 1，一行 result，400，`the Idempotency-Key header is required` |
+| R13 | `extract --key k1`，不带 `--rerun` | 退出 1，400 `invalid_request`，`--key names a rerun; give --rerun with it`（不会被静默忽略） |
+| R14 | `extract --schema` 一个不是 JSON 的文件 | 退出 1，400 `the schema is not JSON`，请求没有发出 |
+| R15 | `extraction ext_000…` | 退出 1，404 `no such extraction` |
+| R16 | 按桌面端的传法 `request --host-stdin --json` 发 `find` | 一行 result，匹配数与 R4 相同 |
+| R17 | 按桌面端的传法发 `renderPage`（scale 0.25） | 一行 result，`image/png`，`scale` 0.25；`png` 解码后是 153×198 的 PNG |
+
+`extract` 跑完要用本地模型，本脚本声明不需要模型，所以 R 组只验到作业建出来和取消为止。抽取结果的值由模块测试和 S01 harness（`packages/documents-accept`）覆盖。
 
 ## 从 r5 升级（M1–M7，带 `--old` 时跑）
 
@@ -146,5 +175,6 @@ M6 是退回旧版的已知行为，不是缺陷：r5 打不开 r6 迁移过的�
 
 - 拿上一次发布的二进制（main）当 `--bin` 跑同一个脚本，确认用例真会失败。main 的 `agent24` 没有 `documents` 子命令，所以除了不依赖它的 P1、P2、T2、Z1 和 T1（列表正常返回、其中没有 documents 工具，仍是 KNOWN），其余用例都应该是 FAIL。
 - 升级用例另做一次：`--old` 也指向 r6 的二进制。这时 M1（库已经在 8）和 M6（不会被拒）应该是 FAIL。
+- R 组另做一次：`--bin` 用 r6 的发布二进制（8bba633e），带 `--next`。r6 的 CLI 没有这些入口，R1–R17 应该全部 FAIL，其余用例照常 PASS。
 
 结果写在发布 PR 里。
