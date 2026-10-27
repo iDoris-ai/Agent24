@@ -80,16 +80,18 @@ pub async fn run(
             return Err(from_memory(err));
         }
     };
-    if let Some(conn) = store_maint {
-        conn.close()
-            .await
-            .map_err(|err| close_failure("agent24.db", err))?;
-    }
-    if let Some(conn) = memory_maint {
-        conn.close()
-            .await
-            .map_err(|err| close_failure("memory.db", err))?;
-    }
+    // Close both before reporting: a store close failure must not leave the
+    // memory maintenance connection open.
+    let store_closed = match store_maint {
+        Some(conn) => conn.close().await,
+        None => Ok(()),
+    };
+    let memory_closed = match memory_maint {
+        Some(conn) => conn.close().await,
+        None => Ok(()),
+    };
+    store_closed.map_err(|err| close_failure("agent24.db", err))?;
+    memory_closed.map_err(|err| close_failure("memory.db", err))?;
 
     let store = match StoreConn::migrate(store_path, store_fault).await {
         Ok(conn) => conn,

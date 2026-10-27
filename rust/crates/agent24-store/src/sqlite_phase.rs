@@ -407,6 +407,53 @@ mod tests {
 
     use super::Guard;
 
+    /// Deterministic counterpart of the race test below: a foreign connection
+    /// holds `BEGIN EXCLUSIVE` for 400 ms. `close` must not return before it
+    /// lets go, and must then succeed. Removing the bounded wait makes
+    /// `close` return at once and this test fail every time.
+    #[tokio::test]
+    async fn close_blocks_until_a_foreign_holder_releases_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hold.db");
+        let opts = |create| {
+            SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .create_if_missing(create)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_millis(0))
+        };
+        let mut holder = sqlx::SqliteConnection::connect_with(&opts(true))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            sqlx::query("ROLLBACK").execute(&mut holder).await.unwrap();
+            holder.close().await.unwrap();
+        });
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(opts(false))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        Guard { pool, armed: true }.close().await.unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "close returned after {:?} while a holder still had the file",
+            started.elapsed()
+        );
+        release.await.unwrap();
+    }
+
     /// SQLx 0.8.6 `Pool::close` can return while the connection that passed
     /// the `is_closed` check is released back to the idle queue still holding
     /// `BEGIN EXCLUSIVE`. Dropping the pool only signals that worker.
