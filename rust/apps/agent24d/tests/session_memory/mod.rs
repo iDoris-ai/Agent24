@@ -135,7 +135,8 @@ async fn app_with_recall_budget(
         workspace_service: None,
         token: "test".into(),
         router,
-        tools: agent24_tools::ToolRegistry::new(),
+        tools: agent24_tools::ToolRegistry::new()
+            .with_egress_gate(<dyn agent24_domain::EgressGate>::deny_all()),
         store,
         shutdown: Shutdown::new(cancel),
         guardian: None,
@@ -332,6 +333,12 @@ mod retain;
 
 #[path = "chat.rs"]
 mod chat;
+
+#[path = "pause_http_snapshot.rs"]
+mod pause_http_snapshot;
+
+#[path = "p03_http_observation.rs"]
+mod p03_http_observation;
 
 #[tokio::test]
 async fn successful_compaction_replays_every_original_message_after_daemon_restart() {

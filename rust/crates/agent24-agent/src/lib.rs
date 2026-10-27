@@ -37,8 +37,9 @@ use agent24_protocol::{
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{
-    RunAdmission, RunAdmissionDenial, RunMessage, RunPatch, RunTerminalTransition, Store,
-    StoreError, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
+    MessageOrigin, MessageOriginLookup, OriginatedRunMessage, RunAdmission, RunAdmissionDenial,
+    RunMessage, RunPatch, RunTerminalTransition, SnapshotRunMessage, Store, StoreError,
+    WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
 };
 use agent24_tools::{
     GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
@@ -59,6 +60,37 @@ pub fn merge_source_policy(
 /// Completion→tools round trips per run before the run is failed. A model
 /// stuck asking for tools forever must terminate deterministically.
 pub const MAX_ITERATIONS: usize = 10;
+
+const SOURCE_UNPROVEN_CODE: &str = "source_unproven";
+const SOURCE_UNPROVEN_MESSAGE: &str =
+    "无法证明本线程已落盘消息的来源，已停止发送。请新建会话。不要自动复制旧 recall 或待执行工具。";
+const PROVIDER_ROLE_MESSAGE: &str = "模型返回的角色不是 assistant，已停止。不会执行这一轮的工具。";
+
+fn origin_allows_send(lookup: &MessageOriginLookup) -> bool {
+    match lookup {
+        // A stored HostRecall with a SQL NULL recall_ref is still unproven.
+        // Present HostSystem is sent verbatim (R05-5 section 3).
+        MessageOriginLookup::Present(stored) => !matches!(
+            stored.origin,
+            MessageOrigin::HostRecall { recall_ref: None }
+        ),
+        MessageOriginLookup::Missing | MessageOriginLookup::Unreadable { .. } => false,
+    }
+}
+
+/// Compact JSON array of every assertion id, sorted lexicographically.
+/// One id is `["id"]`. `serde_json::to_string` emits no spaces.
+fn canonical_recall_ref(ids: &[String]) -> Result<String, serde_json::Error> {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    serde_json::to_string(&sorted)
+}
+
+fn unproven_source_failure(run: &Run) -> bool {
+    run.error
+        .as_ref()
+        .is_some_and(|error| error.code == SOURCE_UNPROVEN_CODE)
+}
 
 /// Cap for the externally-visible `output_summary` (full output goes back to
 /// the model; full input is audit-only in the store row).
@@ -100,12 +132,96 @@ pub enum MemoryWriteOutcome {
     /// Personal memory was paused at the moment of commit; nothing was
     /// persisted for this turn's explicit remember.
     SkippedPaused,
-    /// The write-gate (or the session append it depends on) reported an
-    /// error.
-    Failed,
+    /// The session append (the conversation turn) reported an error; NOTHING of
+    /// this turn was written. Carries the typed cause, never its text.
+    Failed(MemoryFailure),
+    /// P1-02c: the conversation turn WAS saved, but the explicit-remember
+    /// assertion was not. Distinct from [`Self::Failed`] so a receipt never
+    /// says "nothing saved" about a turn that is in the history, nor "saved"
+    /// about an assertion that is not.
+    Partial(MemoryFailure),
     /// There was nothing to write: no configured memory, no session, the
     /// prompt was not an explicit remember, or the origin was untrusted.
     NotApplicable,
+}
+
+/// P1-02c: the typed cause of a failed memory write — a closed code and, for a
+/// quota code, its dimension. Carries no owner key and no storage text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFailure {
+    pub code: agent24_memory::MemoryErrorCode,
+}
+
+impl MemoryFailure {
+    pub fn from_error(err: &agent24_memory::MemoryError) -> Self {
+        Self { code: err.code() }
+    }
+
+    /// The wire form of the code. Exhaustive on purpose: a new
+    /// `MemoryErrorCode` is a compile error here until the protocol knows it.
+    pub fn wire_code(self) -> agent24_protocol::MemoryFailureCode {
+        use agent24_memory::MemoryErrorCode as M;
+        use agent24_protocol::MemoryFailureCode as W;
+        match self.code {
+            M::QuotaRows => W::QuotaRows,
+            M::QuotaBytes => W::QuotaBytes,
+            M::DiskLow => W::DiskLow,
+            M::DiskFull => W::DiskFull,
+            M::ReservedKind => W::ReservedKind,
+            M::RetractIdTooLong => W::RetractIdTooLong,
+            M::Internal => W::Internal,
+        }
+    }
+
+    fn wire_code_str(self) -> &'static str {
+        self.code.as_str()
+    }
+
+    fn event(
+        self,
+        session_id: &str,
+        kind: Option<&str>,
+        partial: bool,
+    ) -> agent24_protocol::MemoryWriteFailedPayload {
+        agent24_protocol::MemoryWriteFailedPayload {
+            session_id: session_id.to_owned(),
+            // Sanitized transitional `reason`: the code string, nothing else.
+            reason: Some(self.code.as_str().to_owned()),
+            code: Some(self.wire_code()),
+            dimension: self.code.dimension().map(str::to_owned),
+            owner_kind: Some(agent24_protocol::MemoryOwnerKind::Personal),
+            kind: kind.map(str::to_owned),
+            partial,
+        }
+    }
+}
+
+/// What loading a session's prior context came to (see
+/// [`RunManager::session_context`]).
+enum SessionContext {
+    Ready(Vec<Msg>),
+    Cancelled,
+    ImportIncomplete(MemoryFailure),
+}
+
+#[cfg(test)]
+impl SessionContext {
+    /// Test convenience: the loaded messages, panicking on any other outcome.
+    fn unwrap(self) -> Vec<Msg> {
+        match self {
+            Self::Ready(context) => context,
+            Self::Cancelled => panic!("session context load was cancelled"),
+            Self::ImportIncomplete(f) => panic!("session import incomplete: {}", f.code),
+        }
+    }
+}
+
+impl MemoryWriteOutcome {
+    /// P1-02c: `false` iff a memory write this run attempted failed (wholly or
+    /// partly). Paused and not-applicable are not failures.
+    pub fn persisted(self) -> bool {
+        !matches!(self, Self::Failed(_) | Self::Partial(_))
+    }
 }
 
 /// H8: the reserved tool name the model calls to submit a plan for approval.
@@ -431,6 +547,27 @@ fn prune_stale_recall_message(msg: Msg, active: &std::collections::HashSet<Strin
     }
 }
 
+/// Shape one message that is PROVEN (by its persisted origin) to be a
+/// `HostRecall`. Unlike [`prune_stale_recall_message`], which deliberately
+/// passes a malformed lookalike through for the old text-based decision, a
+/// proven HostRecall that is not a well-formed recall block is dropped: it
+/// cannot be re-validated, so it must not reach the provider.
+fn shape_host_recall(msg: Msg, active: &std::collections::HashSet<String>) -> Option<Msg> {
+    let content = msg.content.as_deref()?;
+    if msg.role != "user" || !content.starts_with(RECALL_PREFIX) {
+        return None;
+    }
+    let body = content.strip_suffix(RECALL_END_MARKER)?;
+    let has_id = body
+        .split("\n- [id=")
+        .skip(1)
+        .any(|entry| entry.find(' ').is_some_and(|space| space > 0));
+    if !has_id {
+        return None;
+    }
+    prune_stale_recall_message(msg, active)
+}
+
 /// The still-unanswered tool calls of the reconstructed thread's LAST
 /// tool-calling assistant turn, in request order. `None` when there is no such
 /// turn (an inconsistent resume — the caller aborts). Returns the full ordered
@@ -465,6 +602,15 @@ pub struct RunManager {
     /// Optional per-session conversation memory (D1). `None` = runs start from
     /// the bare prompt, exactly as before.
     memory: Option<SessionMemory>,
+    /// Test harness injection for calls whose fixture models an explicitly
+    /// authorized cloud source. Production keeps this absent unless a host
+    /// policy service is wired in.
+    #[cfg(test)]
+    test_egress_policy: Option<(
+        Arc<dyn agent24_domain::EgressGate>,
+        Vec<agent24_domain::EgressResource>,
+        u64,
+    )>,
     /// Daemon-wide shutdown token; every run token is a child of it
     shutdown: CancellationToken,
     /// Live run cancellation tokens; entries removed when a run reaches a
@@ -479,6 +625,16 @@ enum ParkedCallStop {
 }
 
 impl RunManager {
+    // Keep the invalid version case explicit: mapping it to zero makes the
+    // source fail `EgressRequest::authorize` instead of widening access.
+    #[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
+    fn egress_policy_version(policy_version: i64) -> u64 {
+        match u64::try_from(policy_version) {
+            Ok(version) => version,
+            Err(_) => 0,
+        }
+    }
+
     pub async fn task_profile_for_run(&self, run_id: &str, base: TaskProfile) -> TaskProfile {
         let mode = match self.store.run_policy_snapshot(run_id).await {
             Ok(snapshot) => snapshot.effective_mode,
@@ -555,6 +711,8 @@ impl RunManager {
             workspace,
             sink,
             memory,
+            #[cfg(test)]
+            test_egress_policy: None,
             shutdown,
             cancels: Mutex::new(HashMap::new()),
         })
@@ -567,7 +725,7 @@ impl RunManager {
     ) -> Result<ToolContext, AgentError> {
         let tool_call_id = tool_call_id.into();
         let lease_id = self.store.active_workspace_run_lease_id(&run.id).await?;
-        let Some(_) = run.workspace_id.as_ref() else {
+        let context = if run.workspace_id.is_none() {
             if lease_id.is_some() {
                 return Err(WorkspaceStoreError::CorruptRow {
                     table: "runs",
@@ -575,29 +733,79 @@ impl RunManager {
                 }
                 .into());
             }
-            return Ok(ToolContext::legacy(
+            ToolContext::legacy(
                 run.id.clone(),
                 run.session_id.clone(),
                 run.schedule_id.clone(),
                 tool_call_id,
-            ));
+            )
+        } else {
+            let lease_id = lease_id.ok_or(WorkspaceStoreError::CorruptRow {
+                table: "workspace_leases",
+                field: "row",
+            })?;
+            let service = self
+                .workspace
+                .as_ref()
+                .ok_or(AgentError::WorkspaceServiceUnavailable)?;
+            let authority = service.bind_run_authority(&run.id, &lease_id).await?;
+            ToolContext::workspace_bound(
+                run.id.clone(),
+                run.session_id.clone(),
+                run.schedule_id.clone(),
+                tool_call_id,
+                authority,
+            )
         };
-        let lease_id = lease_id.ok_or(WorkspaceStoreError::CorruptRow {
-            table: "workspace_leases",
-            field: "row",
-        })?;
-        let service = self
-            .workspace
-            .as_ref()
-            .ok_or(AgentError::WorkspaceServiceUnavailable)?;
-        let authority = service.bind_run_authority(&run.id, &lease_id).await?;
-        Ok(ToolContext::workspace_bound(
-            run.id.clone(),
-            run.session_id.clone(),
-            run.schedule_id.clone(),
-            tool_call_id,
-            authority,
-        ))
+        let context = match self.store.run_policy_snapshot(&run.id).await {
+            Ok(snapshot) if snapshot.sources.is_empty() => context.with_egress_policy_unavailable(),
+            Ok(snapshot) => {
+                let resources = snapshot
+                    .sources
+                    .into_iter()
+                    // ADR-K1-02 §2.1.1: only the host-assigned classification
+                    // decides whether a source is tool egress material, never
+                    // its kind. `Ordinary` sources (user input today, ordinary
+                    // recalled memory later) do not restrict tools; Restricted
+                    // and Unknown sources, of any kind, keep the strict policy.
+                    .filter(|source| {
+                        source.classification != agent24_store::SourceClassification::Ordinary
+                    })
+                    .map(|source| agent24_domain::EgressResource {
+                        resource_id: source.source_id,
+                        revision: source.revision_digest,
+                        local_only: source.mode == agent24_store::SourceMode::LocalOnly,
+                        authorization_ref: source.authorization_ref,
+                        policy_version: Self::egress_policy_version(source.policy_version),
+                    })
+                    .collect();
+                context.with_egress_resources(resources)
+            }
+            Err(err) => {
+                tracing::warn!(run_id = %run.id, error = %err, "run source policy lookup failed; restricting tool egress");
+                context.with_egress_policy_unavailable()
+            }
+        };
+        #[cfg(test)]
+        let context = if let Some((gate, resources, generation)) = &self.test_egress_policy {
+            context.with_egress_policy(Arc::clone(gate), resources.clone(), *generation)
+        } else {
+            context
+        };
+        Ok(context)
+    }
+
+    #[cfg(test)]
+    fn with_test_egress_policy(
+        mut self: Arc<Self>,
+        gate: Arc<dyn agent24_domain::EgressGate>,
+        resources: Vec<agent24_domain::EgressResource>,
+        generation: u64,
+    ) -> Arc<Self> {
+        if let Some(manager) = Arc::get_mut(&mut self) {
+            manager.test_egress_policy = Some((gate, resources, generation));
+        }
+        self
     }
 
     async fn cancel_workspace_resume_recovery(&self, run_id: &str) {
@@ -642,20 +850,36 @@ impl RunManager {
         &self,
         session_id: Option<&str>,
         cancel: &CancellationToken,
-    ) -> Option<Vec<Msg>> {
+    ) -> SessionContext {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
-            return Some(Vec::new());
+            return SessionContext::Ready(Vec::new());
         };
         let load = memory.context(sid);
         let loaded = tokio::select! {
             result = load => result,
-            () = cancel.cancelled() => return None,
+            () = cancel.cancelled() => return SessionContext::Cancelled,
         };
         match loaded {
-            Ok(context) => Some(context),
+            Ok(context) => SessionContext::Ready(context),
+            // W3: the legacy import failed, so this session's history exists but
+            // could not be brought in. Running on as if the session were empty
+            // would answer without context the user believes is there, and the
+            // exchange would then be appended to a history missing its past.
+            // Nothing was written (the import is one transaction), so a retry
+            // starts clean.
+            Err(err @ agent24_memory::MemoryError::SessionImportIncomplete(_)) => {
+                let failure = MemoryFailure::from_error(&err);
+                tracing::error!(session_id = sid, code = %failure.code, error = %err, "session import failed");
+                self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+                    sid,
+                    Some("session.import"),
+                    false,
+                )));
+                SessionContext::ImportIncomplete(failure)
+            }
             Err(err) => {
                 tracing::warn!("session {sid} memory load failed: {err}");
-                Some(Vec::new())
+                SessionContext::Ready(Vec::new())
             }
         }
     }
@@ -673,26 +897,60 @@ impl RunManager {
         prompt: &str,
         answer: &str,
         prompt_origin: Origin,
+        source_ref: agent24_store::AssertionSourceRef,
     ) -> MemoryWriteOutcome {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
             return MemoryWriteOutcome::NotApplicable;
         };
-        match memory.remember(sid, prompt, answer, prompt_origin).await {
-            Ok(retain::RetainOutcome::Saved) => MemoryWriteOutcome::Saved,
-            Ok(retain::RetainOutcome::SkippedPaused) => MemoryWriteOutcome::SkippedPaused,
-            Ok(retain::RetainOutcome::NotApplicable) => MemoryWriteOutcome::NotApplicable,
-            Err(err) => {
-                let reason = err.to_string();
-                tracing::error!(session_id = sid, %reason, "session memory write failed");
-                self.sink.emit(EventBody::MemoryWriteFailed(
-                    agent24_protocol::MemoryWriteFailedPayload {
-                        session_id: sid.to_owned(),
-                        reason,
-                    },
-                ));
-                MemoryWriteOutcome::Failed
+        match memory
+            .remember(sid, prompt, answer, prompt_origin, source_ref)
+            .await
+        {
+            Ok(report) => {
+                self.report_summary_failure(sid, report.compaction_failure.as_ref());
+                match report.retain {
+                    retain::RetainOutcome::Saved => MemoryWriteOutcome::Saved,
+                    retain::RetainOutcome::SkippedPaused => MemoryWriteOutcome::SkippedPaused,
+                    retain::RetainOutcome::NotApplicable => MemoryWriteOutcome::NotApplicable,
+                }
+            }
+            Err(failure_of) => {
+                let failure = MemoryFailure::from_error(&failure_of.error);
+                // W3: the legacy import is its own kind of failed write.
+                let kind = matches!(
+                    failure_of.error,
+                    agent24_memory::MemoryError::SessionImportIncomplete(_)
+                )
+                .then_some("session.import");
+                tracing::error!(session_id = sid, code = %failure.code, error = %failure_of.error, "session memory write failed");
+                self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+                    sid,
+                    kind,
+                    failure_of.turn_saved,
+                )));
+                // W2 on top of a failed retain: independent events, so a
+                // double failure never loses the summary one.
+                self.report_summary_failure(sid, failure_of.compaction_failure.as_ref());
+                if failure_of.turn_saved {
+                    MemoryWriteOutcome::Partial(failure)
+                } else {
+                    MemoryWriteOutcome::Failed(failure)
+                }
             }
         }
+    }
+
+    /// W2: the turn is durable, but its compaction summary could not be written.
+    /// Observable, with the typed cause only.
+    fn report_summary_failure(&self, sid: &str, err: Option<&agent24_memory::MemoryError>) {
+        let Some(err) = err else { return };
+        let failure = MemoryFailure::from_error(err);
+        tracing::error!(session_id = sid, code = %failure.code, error = %err, "session summary write failed");
+        self.sink.emit(EventBody::MemoryWriteFailed(failure.event(
+            sid,
+            Some("session.summary"),
+            false,
+        )));
     }
 
     /// M1-T12: the SAME recall + pause-notice decision `drive_new` makes at
@@ -710,23 +968,48 @@ impl RunManager {
     /// [`ExplicitRememberState`] (`None` when it is not an explicit
     /// remember at all) — the caller needs it, independent of the model's
     /// own reply, to build a deterministic `memory_receipt` once the turn is
-    /// committed.
+    /// committed. K1-6b.4c: an error means the session floor could not be
+    /// recorded; the caller must not call the model.
     pub async fn chat_memory_prelude(
         &self,
         run_id: &str,
         session_id: Option<&str>,
         prompt: &str,
-    ) -> (Vec<Msg>, Option<ExplicitRememberState>) {
+        has_non_user_history: bool,
+    ) -> Result<
+        (
+            Vec<Msg>,
+            Option<ExplicitRememberState>,
+            agent24_store::AssertionSourceRef,
+        ),
+        StoreError,
+    > {
+        // K1-6b.4b: this stateless surface persists no run tags, so the
+        // sources of its model context are folded here: the caller's own
+        // messages (user input, Ordinary) plus every recalled fact.
+        let mut sources = vec![(
+            format!("user_input:{run_id}"),
+            agent24_store::SourceClassification::Ordinary,
+        )];
         let Some(memory) = self.memory.as_ref() else {
-            return (Vec::new(), None);
+            return Ok((
+                Vec::new(),
+                None,
+                agent24_store::AssertionSourceRef::from_sources(sources),
+            ));
         };
         let mut prelude = Vec::new();
         match memory.recall(prompt).await {
-            Ok(Some((msg, ids))) => {
+            Ok(Some((msg, recalled))) => {
+                sources.extend(
+                    recalled
+                        .iter()
+                        .map(|hit| (format!("memory_assertion:{}", hit.id), hit.classification)),
+                );
                 self.sink
                     .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
                         run_id: run_id.to_owned(),
-                        ids,
+                        ids: recalled.into_iter().map(|hit| hit.id).collect(),
                     }));
                 prelude.push(msg);
             }
@@ -758,7 +1041,28 @@ impl RunManager {
         } else {
             None
         };
-        (prelude, explicit_state)
+        // K1-6b.4c (ADR-K1-02 §2.2): assistant turns the client sends back
+        // are this session's earlier replies, classified by its floor (no
+        // stored floor: Unknown). The merge happens before the model call;
+        // a failure fails the request.
+        if let Some(sid) = session_id {
+            let own = agent24_store::AssertionSourceRef::from_sources(sources.clone());
+            let floor = self
+                .store
+                .merge_session_floor(
+                    sid,
+                    own.classification,
+                    has_non_user_history,
+                    &now_iso8601(),
+                )
+                .await?;
+            sources.push((format!("session_floor:{sid}"), floor));
+        }
+        Ok((
+            prelude,
+            explicit_state,
+            agent24_store::AssertionSourceRef::from_sources(sources),
+        ))
     }
 
     /// M1-T12: the SAME post-answer commit `drive_new`'s run loop performs
@@ -776,6 +1080,7 @@ impl RunManager {
         session_id: &str,
         prompt: &str,
         answer: &str,
+        source_ref: agent24_store::AssertionSourceRef,
     ) -> MemoryWriteOutcome {
         self.remember_exchange(
             Some(session_id),
@@ -785,32 +1090,99 @@ impl RunManager {
                 source: "chat".into(),
                 trust: Trust::UserSaid,
             },
+            source_ref,
         )
         .await
     }
 
+    /// K1-6b.4b (ADR-K1-02 §2.1.1 item 4): the classification a memory
+    /// written from this run carries — the strictest of every source
+    /// persisted for the run. A failed read is no evidence, so `Unknown`.
+    async fn run_assertion_source_ref(&self, run_id: &str) -> agent24_store::AssertionSourceRef {
+        let sources = match self.store.run_policy_snapshot(run_id).await {
+            Ok(snapshot) => snapshot.sources,
+            Err(err) => {
+                tracing::warn!(run_id, error = %err, "run source policy lookup failed; memory written as unknown");
+                Vec::new()
+            }
+        };
+        agent24_store::AssertionSourceRef::from_sources(
+            sources
+                .into_iter()
+                .map(|source| (source.source_id, source.classification)),
+        )
+    }
+
     /// Append one message to the run's durable thread (H3/G1 foundation).
-    /// Most callers treat this as best-effort bookkeeping; callers that require
-    /// a complete replay prefix must check the result and fail closed.
+    /// A caller that then pushes the message into the next provider request
+    /// must use [`Self::persist_for_next_send`] instead of ignoring this error.
     async fn persist_message(&self, run_id: &str, msg: &Msg) -> Result<(), StoreError> {
         let tool_calls =
             serde_json::to_value(&msg.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
-        if let Err(err) = self
-            .store
-            .append_run_message(
-                run_id,
-                &msg.role,
-                msg.content.as_deref(),
-                &tool_calls,
-                msg.tool_call_id.as_deref(),
-                &now_iso8601(),
-            )
-            .await
-        {
+        let message = agent24_store::PendingRunMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls,
+            tool_call_id: msg.tool_call_id.clone(),
+        };
+        let appended = match msg.role.as_str() {
+            "assistant" => {
+                self.store
+                    .append_originated_run_messages(
+                        run_id,
+                        &[OriginatedRunMessage {
+                            message,
+                            origin: MessageOrigin::Assistant,
+                        }],
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+            "tool" => {
+                self.store
+                    .append_originated_run_messages(
+                        run_id,
+                        &[OriginatedRunMessage {
+                            message,
+                            origin: MessageOrigin::ToolResult,
+                        }],
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+            _ => {
+                self.store
+                    .append_run_message(
+                        run_id,
+                        &message.role,
+                        message.content.as_deref(),
+                        &message.tool_calls,
+                        message.tool_call_id.as_deref(),
+                        &now_iso8601(),
+                    )
+                    .await
+            }
+        };
+        if let Err(err) = appended {
             tracing::warn!("run {run_id}: message thread append failed: {err}");
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Persist a message the next provider request would include.
+    /// A failed write ends the run so the caller must not push it.
+    async fn persist_for_next_send(&self, run_id: &str, msg: &Msg) -> bool {
+        if let Err(err) = self.persist_message(run_id, msg).await {
+            self.finish_failed(
+                run_id,
+                "internal",
+                &format!("failed to persist run message: {err}"),
+            )
+            .await;
+            return false;
+        }
+        true
     }
 
     pub async fn start_run(self: &Arc<Self>, create: RunCreate) -> Result<Run, AgentError> {
@@ -1219,6 +1591,25 @@ impl RunManager {
             return;
         }
 
+        // Missing or unreadable origins must not settle a parked tool or
+        // dispatch a sibling such as explore. Failed is legal only from
+        // Running, so the refusal enters Running without RunStarted.
+        if !self.persisted_origins_allow_send(&run_id).await {
+            if let Err(err) = self
+                .store
+                .transition_run(&run_id, RunStatus::Running, RunPatch::default())
+                .await
+            {
+                tracing::error!(
+                    "run {run_id}: resume source refusal could not enter running: {err}"
+                );
+                return;
+            }
+            self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                .await;
+            return;
+        }
+
         // 3. Reconstruct the conversation and return the run to Running.
         // M1-T07.1 M4 (review #674 round 2 ③): re-validating the recall
         // block used to happen ONLY here, which misses the common case of
@@ -1299,7 +1690,9 @@ impl RunManager {
                 }
             };
             let result = Msg::tool_result(call.id.clone(), content);
-            let _ = self.persist_message(&run_id, &result).await;
+            if !self.persist_for_next_send(&run_id, &result).await {
+                return;
+            }
             messages.push(result);
         }
 
@@ -1366,11 +1759,21 @@ impl RunManager {
                 // off (assess_restore already proved it equals the thread's
                 // rebuilt input), so using it directly makes "run A, not B"
                 // structural rather than a re-parse we must trust.
-                match self
+                let outcome = match self
                     .tools
                     .execute_preapproved(&call.name, &ctx, &approval.payload, cancel)
                     .await
                 {
+                    // The approval names no grant (K1-6a-G §2.3): ask again,
+                    // with the run shown as awaiting that answer, as a fresh
+                    // call would be.
+                    Err(ToolError::ApprovalStale) => {
+                        self.reask_parked_call(&run.id, call, &ctx, &approval.payload, cancel)
+                            .await
+                    }
+                    outcome => outcome,
+                };
+                match outcome {
                     Ok(out) => Ok(out),
                     // The whole-run abort choice is honoured even on resume.
                     Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled) => {
@@ -1386,6 +1789,35 @@ impl RunManager {
             // "abort" or anything unexpected → cancel the run (fail-closed).
             _ => Err(ParkedCallStop::CancelRun),
         }
+    }
+
+    async fn reask_parked_call(
+        &self,
+        run_id: &str,
+        call: &ToolCallRequest,
+        ctx: &ToolContext,
+        input: &serde_json::Map<String, serde_json::Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        if let Err(err) = self
+            .store
+            .transition_run(run_id, RunStatus::AwaitingApproval, RunPatch::default())
+            .await
+        {
+            tracing::error!("run {run_id}: awaiting_approval transition failed: {err}");
+        }
+        let outcome = self.tools.dispatch(&call.name, ctx, input, cancel).await;
+        if !matches!(
+            outcome,
+            Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled)
+        ) && let Err(err) = self
+            .store
+            .transition_run(run_id, RunStatus::Running, RunPatch::default())
+            .await
+        {
+            tracing::error!("run {run_id}: back-to-running transition failed: {err}");
+        }
+        outcome
     }
 
     async fn execute(&self, run_id: String, cancel: CancellationToken) {
@@ -1469,12 +1901,24 @@ impl RunManager {
         // session actually remembers. Empty when memory is off or session-less.
         // A cancel while waiting on a concurrent run's session lock ends the run
         // here rather than proceeding without its own context.
-        let Some(prior_context) = self
+        let prior_context = match self
             .session_context(run.session_id.as_deref(), &cancel)
             .await
-        else {
-            self.finish_cancelled(&run_id).await;
-            return;
+        {
+            SessionContext::Ready(context) => context,
+            SessionContext::Cancelled => {
+                self.finish_cancelled(&run_id).await;
+                return;
+            }
+            SessionContext::ImportIncomplete(failure) => {
+                self.finish_failed(
+                    &run_id,
+                    failure.wire_code_str(),
+                    "this session's earlier history could not be imported; nothing was changed; if retrying still fails, the session's old records may be corrupted",
+                )
+                .await;
+                return;
+            }
         };
         // M1-T07.1: the FULL first-call input — recall block, then the
         // session's prior (compacted) context, then this run's prompt — is the
@@ -1485,15 +1929,63 @@ impl RunManager {
         // `thread_to_messages(&thread)` to rebuild from — a partially
         // persisted snapshot would silently resume with less context than the
         // first call saw. M3: the write itself is now ONE transaction
-        // (`append_run_messages_tx`), not N independent single-row appends —
+        // (`append_snapshot_run_messages`), not N independent single-row appends —
         // a mid-batch failure must leave NOTHING behind, not an unpredictable
         // prefix, which is what fail-closed actually requires.
+        let pending_of = |msg: &Msg| agent24_store::PendingRunMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls: serde_json::to_value(&msg.tool_calls)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            tool_call_id: msg.tool_call_id.clone(),
+        };
+        let originated = |msg: &Msg, origin: MessageOrigin| {
+            SnapshotRunMessage::Originated(OriginatedRunMessage {
+                message: pending_of(msg),
+                origin,
+            })
+        };
         let prior_context_len = prior_context.len();
         let mut snapshot = Vec::with_capacity(prior_context_len + 3);
+        let mut rows = Vec::with_capacity(prior_context_len + 3);
         let mut recalled_ids = None;
-        if let Some((recalled, ids)) = recall {
-            recalled_ids = Some(ids);
+        let mut recalled_tags = Vec::new();
+        if let Some((recalled, hits)) = recall {
+            let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
+            let recall_seq = snapshot.len() as i64;
+            recalled_tags = hits
+                .iter()
+                .map(|hit| {
+                    (
+                        recall_seq,
+                        agent24_store::SourceRef::recalled_memory(
+                            &hit.id,
+                            hit.classification,
+                            now_iso8601(),
+                        ),
+                    )
+                })
+                .collect();
+            let encoded = match canonical_recall_ref(&ids) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "internal",
+                        &format!("failed to encode recall ref: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            rows.push(originated(
+                &recalled,
+                MessageOrigin::HostRecall {
+                    recall_ref: Some(encoded),
+                },
+            ));
             snapshot.push(recalled);
+            recalled_ids = Some(ids);
         }
         if write_skipped {
             // M1-T10 review H1/M2: part of the SAME atomic snapshot as the
@@ -1501,7 +1993,9 @@ impl RunManager {
             // resume (M2) must replay exactly what THIS run's first call
             // saw, not re-decide anything against whatever the pause switch
             // says by the time it resumes.
-            snapshot.push(Msg::system(retain::PAUSED_WRITE_NOTICE));
+            let notice = Msg::system(retain::PAUSED_WRITE_NOTICE);
+            rows.push(SnapshotRunMessage::PauseNotice(pending_of(&notice)));
+            snapshot.push(notice);
         }
         // M3 growth control: the seq range `prior_context` will occupy in
         // THIS run's own `run_messages`, so it can be reclaimed once the run
@@ -1512,28 +2006,23 @@ impl RunManager {
             let start = snapshot.len() as i64;
             (start, start + prior_context_len as i64 - 1)
         });
-        snapshot.extend(prior_context);
-        snapshot.push(Msg::user(run.input.prompt.clone()));
+        for msg in prior_context {
+            rows.push(originated(&msg, MessageOrigin::SessionHistory));
+            snapshot.push(msg);
+        }
+        let prompt = Msg::user(run.input.prompt.clone());
+        rows.push(originated(&prompt, MessageOrigin::UserPrompt));
+        snapshot.push(prompt);
         // K1-6b.1 (ADR-K1-02 §6): the seq this run's own user-input message
         // will be assigned by the batch append below. Valid because THIS
-        // call is always the run's first `append_run_messages_tx` (a fresh
+        // call is always the run's first `append_snapshot_run_messages` (a fresh
         // run's `MAX(seq)` starts at -1), so each row's assigned seq equals
-        // its index in `snapshot`/`pending` — the user message is pushed
+        // its index in `snapshot`/`rows` — the user message is pushed
         // last, so its seq is `snapshot.len() - 1`.
         let user_msg_seq = (snapshot.len() - 1) as i64;
-        let pending: Vec<agent24_store::PendingRunMessage> = snapshot
-            .iter()
-            .map(|msg| agent24_store::PendingRunMessage {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-                tool_calls: serde_json::to_value(&msg.tool_calls)
-                    .unwrap_or_else(|_| serde_json::json!([])),
-                tool_call_id: msg.tool_call_id.clone(),
-            })
-            .collect();
         if let Err(err) = self
             .store
-            .append_run_messages_tx(&run_id, &pending, &now_iso8601())
+            .append_snapshot_run_messages(&run_id, &rows, &now_iso8601())
             .await
         {
             self.finish_failed(
@@ -1558,6 +2047,119 @@ impl RunManager {
             )
             .await;
             return;
+        }
+        // K1-6b.4b (ADR-K1-02 §2.1.1 item 2): each recalled fact is a source
+        // of this run with the classification stored with it, so a
+        // non-Ordinary recall restricts the run and anything it remembers.
+        for (seq, tag) in &recalled_tags {
+            if let Err(err) = self
+                .store
+                .tag_run_source(&run_id, *seq, tag, &now_iso8601())
+                .await
+            {
+                self.finish_failed(
+                    &run_id,
+                    "source_policy_unavailable",
+                    &format!("failed to persist recalled memory source policy: {err}"),
+                )
+                .await;
+                return;
+            }
+        }
+        // K1-6b.4d (ADR-K1-02 §2.2): a run started by a kernel-created
+        // schedule (a self-wake) carries the classification recorded when it
+        // was created, re-read on every firing. A schedule the user created
+        // has none. A failed lookup is not safe to re-validate: fail before
+        // the model call.
+        if let Some(schedule_id) = run.schedule_id.as_deref() {
+            let origin = match self.store.schedule_origin_classification(schedule_id).await {
+                Ok(origin) => origin,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to read schedule source origin: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Some(classification) = origin {
+                let tag = agent24_store::SourceRef::schedule_origin(
+                    schedule_id,
+                    classification,
+                    now_iso8601(),
+                );
+                if let Err(err) = self
+                    .store
+                    .tag_run_source(&run_id, user_msg_seq, &tag, &now_iso8601())
+                    .await
+                {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to persist schedule source policy: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        // K1-6b.4c (ADR-K1-02 §2.2): earlier turns of the session are a
+        // source of this run. Merge this run's own classification into the
+        // session floor before the model call and tag the run with the
+        // result, so what the run remembers and which tools it may use both
+        // follow the strictest turn of its session. Without configured memory
+        // the floor is not kept: `session_context` loads nothing and nothing
+        // is recalled or remembered, so no earlier turn reaches the model.
+        if let (Some(_), Some(sid)) = (self.memory.as_ref(), run.session_id.as_deref()) {
+            // This run's own classification, read back from the tags just
+            // written. A failed read must fail the run rather than fold to
+            // `Unknown`: a restricted recall would otherwise enter the floor
+            // one step looser than it is.
+            let floor = match self.store.run_policy_snapshot(&run_id).await {
+                Ok(snapshot) => {
+                    let own = agent24_store::strictest_classification(
+                        snapshot.sources.iter().map(|source| source.classification),
+                    );
+                    self.store
+                        .merge_session_floor(
+                            sid,
+                            own,
+                            prior_context_range.is_some(),
+                            &now_iso8601(),
+                        )
+                        .await
+                }
+                Err(err) => Err(err),
+            };
+            let floor = match floor {
+                Ok(floor) => floor,
+                Err(err) => {
+                    self.finish_failed(
+                        &run_id,
+                        "source_policy_unavailable",
+                        &format!("failed to read or persist session source floor: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let seq = prior_context_range.map_or(user_msg_seq, |(start, _)| start);
+            let tag = agent24_store::SourceRef::session_floor(sid, floor, now_iso8601());
+            if let Err(err) = self
+                .store
+                .tag_run_source(&run_id, seq, &tag, &now_iso8601())
+                .await
+            {
+                self.finish_failed(
+                    &run_id,
+                    "source_policy_unavailable",
+                    &format!("failed to persist session source policy: {err}"),
+                )
+                .await;
+                return;
+            }
         }
         // The audit event names exactly the ids that made it into the
         // now-durable snapshot — emitted only once the snapshot is safely on
@@ -1617,6 +2219,9 @@ impl RunManager {
                 final_run.status,
                 RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
             )
+            // Refusing the send keeps the snapshot. Reclaiming prior-context
+            // rows here would delete bytes this failure promised to leave.
+            && !unproven_source_failure(&final_run)
             && let Err(err) = self
                 .store
                 .delete_run_message_range(&run_id, start, end)
@@ -1628,64 +2233,130 @@ impl RunManager {
         }
     }
 
-    /// M1-T07.1 M4 (review #674 round 2 ③): builds the SAME shape
-    /// `normalize_for_provider` always built, but first re-validates the
-    /// recall block — if any — against the CURRENT ledger. Called fresh on
-    /// EVERY iteration of [`Self::run_loop`], so this is the ONE place that
-    /// covers all three ways a recall block can go stale before the model
-    /// sees it again: a cold-restart resume (`drive_resume` rebuilding from
-    /// `thread_to_messages`), an approval answered while the run is still
-    /// parked in the SAME process (the in-memory broker wakes the task
-    /// directly — no `drive_resume` involved at all), and — in principle —
-    /// a very slow approval wait spanning multiple loop iterations. Never
-    /// mutates `messages` itself, only the copy returned for this request.
+    /// R05-5 4b: the request-only send copy. Each message is shaped by the
+    /// origin kind PERSISTED for its stored seq (`list_run_messages` plus
+    /// `read_run_message_origin`), never by its text or its in-memory index:
     ///
-    /// Round 2 ②: only `messages[0]` is ever treated as a candidate recall
-    /// block — a POSITION check, not a content-prefix scan over the whole
-    /// thread. The snapshot (`execute`) always puts the recall message (if
-    /// any) first, so this is exactly where it would be; scanning every
-    /// message for a `RECALL_PREFIX` match would also treat a bound run's
-    /// own prompt as a recall block if an adversarial user typed text that
-    /// happened to start with that exact prefix.
-    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Vec<Msg> {
-        let Some(memory) = self.memory.as_ref() else {
-            return normalize_for_provider(messages);
-        };
-        let Some(first) = messages.first() else {
-            return normalize_for_provider(messages);
-        };
-        // Round 2 ②: require BOTH the header AND the end marker, not just
-        // the prefix — a real recall block always has this exact shape, so
-        // this is still unambiguous, but it closes the (already-vanishing,
-        // position-0-only) case of a context-free run's very first turn
-        // happening to be the user's OWN prompt and that prompt merely
-        // STARTING WITH the same prefix text without the matching suffix:
-        // such a message is left alone rather than risk getting dropped by
-        // `prune_stale_recall_message` failing to parse it as a real block.
-        if first.role != "user"
-            || !first
-                .content
-                .as_deref()
-                .is_some_and(|c| c.starts_with(RECALL_PREFIX) && c.ends_with(RECALL_END_MARKER))
-        {
-            return normalize_for_provider(messages);
-        }
-        let mut rebuilt = messages.to_vec();
-        match memory.active_ids().await {
-            Ok(active) => match prune_stale_recall_message(first.clone(), &active) {
-                Some(pruned) => rebuilt[0] = pruned,
-                None => {
-                    rebuilt.remove(0);
-                }
-            },
+    /// - `HostRecall` is re-validated against the CURRENT ledger line by line
+    ///   (a retracted id must not reach the model again). A HostRecall that is
+    ///   fully stale, malformed (role not user, no content, no header / end
+    ///   marker, no parsable id), or cannot be re-validated (`active_ids()`
+    ///   failed, or there is no memory) is dropped from the copy with a warn.
+    /// - every other kind (user prompt, session history, assistant, tool
+    ///   result, and any future kind) is sent verbatim, even when its text is
+    ///   shaped exactly like a recall block.
+    ///
+    /// `messages` is the run loop's in-memory thread; it must be provably the
+    /// stored thread (same length, same bytes per seq) or the send is refused
+    /// (`None`) — position is never trusted. Called fresh on EVERY iteration so
+    /// a cold resume, an approval answered in-process, and a long approval wait
+    /// all see the current ledger. Never mutates the store or `messages`; the
+    /// shaping (before `normalize_for_provider`, which merges adjacent user
+    /// turns and would erase the kind boundaries) only affects this copy.
+    async fn request_messages_for(&self, messages: &[Msg], run_id: &str) -> Option<Vec<Msg>> {
+        let stored = match self.store.list_run_messages(run_id).await {
+            Ok(stored) => stored,
             Err(err) => {
-                tracing::warn!(
-                    "run {run_id}: could not re-validate recalled memory; dropping the recall block for this request: {err}"
-                );
-                rebuilt.remove(0);
+                tracing::warn!(run_id, error = %err, "send copy: could not read the stored thread");
+                return None;
+            }
+        };
+        if stored.len() != messages.len()
+            || thread_to_messages(&stored)
+                .iter()
+                .zip(messages)
+                .any(|(a, b)| a != b)
+        {
+            tracing::warn!(
+                run_id,
+                "send copy: the in-memory thread does not match the stored thread; refusing to send"
+            );
+            return None;
+        }
+        // Resolved lazily, once, and only if a HostRecall is actually present.
+        let mut active: Option<Option<std::collections::HashSet<String>>> = None;
+        let mut shaped = Vec::with_capacity(messages.len());
+        for (row, msg) in stored.iter().zip(messages) {
+            let origin = match self.store.read_run_message_origin(run_id, row.seq).await {
+                Ok(MessageOriginLookup::Present(stored_origin)) => stored_origin.origin,
+                Ok(_) => return None,
+                Err(err) => {
+                    tracing::warn!(run_id, seq = row.seq, error = %err, "message origin read failed");
+                    return None;
+                }
+            };
+            match origin {
+                MessageOrigin::HostRecall { recall_ref: None } => return None,
+                MessageOrigin::HostRecall {
+                    recall_ref: Some(_),
+                } => {
+                    if active.is_none() {
+                        active = Some(match self.memory.as_ref() {
+                            None => {
+                                tracing::warn!(
+                                    run_id,
+                                    "run {run_id}: no memory to re-validate HostRecall; dropping it from the send copy"
+                                );
+                                None
+                            }
+                            Some(memory) => match memory.active_ids().await {
+                                Ok(ids) => Some(ids),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        run_id,
+                                        "run {run_id}: could not re-validate HostRecall; dropping it from the send copy: {err}"
+                                    );
+                                    None
+                                }
+                            },
+                        });
+                    }
+                    let kept = match active.as_ref().and_then(Option::as_ref) {
+                        Some(ids) => shape_host_recall(msg.clone(), ids),
+                        None => None,
+                    };
+                    match kept {
+                        Some(kept) => shaped.push(kept),
+                        None => {
+                            tracing::warn!(
+                                run_id,
+                                seq = row.seq,
+                                "dropping a HostRecall row from the send copy (stale, malformed or unverifiable)"
+                            );
+                        }
+                    }
+                }
+                _ => shaped.push(msg.clone()),
             }
         }
-        normalize_for_provider(&rebuilt)
+        Some(normalize_for_provider(&shaped))
+    }
+
+    /// Stored seq order, not message text. A read error is the same refusal
+    /// as a missing or unreadable row: the provider is not called.
+    async fn persisted_origins_allow_send(&self, run_id: &str) -> bool {
+        let messages = match self.store.list_run_messages(run_id).await {
+            Ok(messages) => messages,
+            Err(err) => {
+                tracing::warn!(run_id, error = %err, "message origin read failed");
+                return false;
+            }
+        };
+        for message in messages {
+            match self
+                .store
+                .read_run_message_origin(run_id, message.seq)
+                .await
+            {
+                Ok(lookup) if origin_allows_send(&lookup) => {}
+                Ok(_) => return false,
+                Err(err) => {
+                    tracing::warn!(run_id, seq = message.seq, error = %err, "message origin read failed");
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
@@ -1704,6 +2375,11 @@ impl RunManager {
         let mut usage_total = zero_usage();
 
         for _ in 0..MAX_ITERATIONS {
+            if !self.persisted_origins_allow_send(&run_id).await {
+                self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                    .await;
+                return;
+            }
             // Recomputed each turn: in plan mode only the read-only subset plus
             // `propose_plan` is offered; the instant a plan is approved
             // `plan_mode` flips false and the full set is advertised (H8).
@@ -1711,8 +2387,13 @@ impl RunManager {
             // re-validated against the CURRENT ledger and reshaped fresh
             // every iteration via `request_messages_for` — request-only,
             // never applied back to `messages` itself.
+            let Some(send_messages) = self.request_messages_for(&messages, &run_id).await else {
+                self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                    .await;
+                return;
+            };
             let request = CompletionRequest {
-                messages: self.request_messages_for(&messages, &run_id).await,
+                messages: send_messages,
                 model: run.input.model_override.clone(),
                 tools: self.tool_specs_for(plan_mode).await,
                 response_format: None,
@@ -1761,6 +2442,12 @@ impl RunManager {
             };
             usage_total = add_usage(usage_total, &res.usage);
 
+            if res.message.role != "assistant" {
+                self.finish_failed(&run_id, "provider_error", PROVIDER_ROLE_MESSAGE)
+                    .await;
+                return;
+            }
+
             if res.message.tool_calls.is_empty() {
                 // Final answer
                 let text = res.message.content.clone().unwrap_or_default();
@@ -1783,18 +2470,23 @@ impl RunManager {
                 // state` is the C2 contract. If cancellation drops this waiter
                 // after append starts, SessionMemory's detached transaction task
                 // keeps the session lock until SQLx confirms the append outcome.
-                tokio::select! {
-                    _ = self.remember_exchange(
-                        run.session_id.as_deref(),
-                        &run.input.prompt,
-                        &text,
-                        run_prompt_origin(&run),
-                    ) => {},
+                let memory_persisted = tokio::select! {
+                    outcome = async {
+                        let source_ref = self.run_assertion_source_ref(&run_id).await;
+                        self.remember_exchange(
+                            run.session_id.as_deref(),
+                            &run.input.prompt,
+                            &text,
+                            run_prompt_origin(&run),
+                            source_ref,
+                        )
+                        .await
+                    } => Some(outcome.persisted()),
                     () = cancel.cancelled() => {
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
-                }
+                };
                 // Re-check: a cancel that landed just as the write finished must
                 // still win rather than be overwritten by Completed.
                 //
@@ -1829,6 +2521,7 @@ impl RunManager {
                             run_id,
                             output: RunOutputPayload { text },
                             usage: usage_total,
+                            memory_persisted,
                         }));
                     }
                     Err(err) => tracing::error!("run completion persist failed: {err}"),
@@ -1845,7 +2538,9 @@ impl RunManager {
             // call. This is the row H3 keys resume off: an assistant turn on disk
             // whose trailing tool_call has no answering `tool` row is exactly a
             // run that died awaiting approval.
-            let _ = self.persist_message(&run_id, &res.message).await;
+            if !self.persist_for_next_send(&run_id, &res.message).await {
+                return;
+            }
             messages.push(res.message);
             for (idx, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -1859,7 +2554,9 @@ impl RunManager {
                             "skipped: per-turn tool call limit ({MAX_TOOL_CALLS_PER_TURN}) exceeded"
                         ),
                     );
-                    let _ = self.persist_message(&run_id, &skipped).await;
+                    if !self.persist_for_next_send(&run_id, &skipped).await {
+                        return;
+                    }
                     messages.push(skipped);
                     continue;
                 }
@@ -1874,7 +2571,9 @@ impl RunManager {
                         PlanOutcome::Approved(content) => {
                             plan_mode = false; // full tool set from the next turn
                             let result = Msg::tool_result(call.id.clone(), content);
-                            let _ = self.persist_message(&run_id, &result).await;
+                            if !self.persist_for_next_send(&run_id, &result).await {
+                                return;
+                            }
                             messages.push(result);
                         }
                         PlanOutcome::Rejected(content) => {
@@ -1909,14 +2608,18 @@ impl RunManager {
                          approved before using this tool"
                             .to_owned(),
                     );
-                    let _ = self.persist_message(&run_id, &denied).await;
+                    if !self.persist_for_next_send(&run_id, &denied).await {
+                        return;
+                    }
                     messages.push(denied);
                     continue;
                 }
                 match self.run_tool_call(&run, call, &cancel, false).await {
                     Ok(content) => {
                         let result = Msg::tool_result(call.id.clone(), content);
-                        let _ = self.persist_message(&run_id, &result).await;
+                        if !self.persist_for_next_send(&run_id, &result).await {
+                            return;
+                        }
                         messages.push(result);
                     }
                     Err(ParkedCallStop::CancelRun) => {
@@ -2312,6 +3015,8 @@ impl RunManager {
                     text: text.to_owned(),
                 },
                 usage,
+                // This path never attempts a memory write, so none failed.
+                memory_persisted: Some(true),
             })),
             Err(err) => tracing::error!("run completion persist failed: {err}"),
         }
@@ -2400,6 +3105,18 @@ pub(crate) mod tests {
     mod session_failure_tests {
         include!("session_failure_tests.rs");
     }
+    mod memory_receipt_tests {
+        include!("memory_receipt_tests.rs");
+    }
+    mod snapshot_origin_tests {
+        include!("snapshot_origin_tests.rs");
+    }
+    mod source_send_gate_tests {
+        include!("source_send_gate_tests.rs");
+    }
+    mod send_trim_tests {
+        include!("send_trim_tests.rs");
+    }
 
     use super::*;
     use agent24_memory::{KvStore, session::CompactionPolicy};
@@ -2433,14 +3150,59 @@ pub(crate) mod tests {
             .await
             .unwrap();
         run.status = RunStatus::Running;
+        // Replay the stored thread so the send-copy consistency check passes
+        // and the refusal below can only come from the permission check.
+        let thread = store.list_run_messages(&run.id).await.unwrap();
+        remote.seen.lock().unwrap().clear();
         manager
             .run_loop(
-                run,
-                vec![Msg::user("thread text cannot authorize cloud")],
+                run.clone(),
+                thread_to_messages(&thread),
                 false,
                 CancellationToken::new(),
             )
             .await;
+        assert!(remote.seen.lock().unwrap().is_empty());
+        let ended = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(ended.status, RunStatus::Failed);
+        assert_ne!(
+            ended.error.as_ref().map(|e| e.code.as_str()),
+            Some(SOURCE_UNPROVEN_CODE),
+            "must reach the permission check, not the source gate"
+        );
+    }
+
+    /// K1-6b.5b (ADR-K1-02 §2.4 (b)): a run whose source tags cannot be read
+    /// is routed local-only, not with the caller's base profile, so a
+    /// remote-only router has nothing to serve it with.
+    #[tokio::test]
+    async fn a_run_whose_sources_cannot_be_read_is_routed_local_only() {
+        use agent24_models::router::Privacy;
+        let remote = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let store = Store::open_memory().await.unwrap();
+        let manager = RunManager::new(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                remote.clone(),
+                Tier::Remote,
+            )])),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(RecordingSink(StdMutex::new(vec![]))),
+            CancellationToken::new(),
+        );
+        agent24_store::test_hooks::fail_source_tag_reads(&store);
+        let profile = manager
+            .task_profile_for_run("run_unreadable", TaskProfile::default())
+            .await;
+        assert_eq!(profile.privacy, Privacy::LocalOnly);
+
+        let run = manager.start_run(create()).await.unwrap();
+        let run = wait_terminal(&store, &run.id).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let error = run.error.expect("a failed run carries its error");
+        assert!(error.message.contains("local-only"), "{error:?}");
         assert!(remote.seen.lock().unwrap().is_empty());
     }
 
@@ -2650,8 +3412,8 @@ pub(crate) mod tests {
 
     /// Answers "pong" and records the messages it was handed, so a test can
     /// assert what context the loop actually built.
-    struct RecordingProvider {
-        seen: StdMutex<Vec<Vec<Msg>>>,
+    pub(super) struct RecordingProvider {
+        pub(super) seen: StdMutex<Vec<Vec<Msg>>>,
     }
 
     #[async_trait]
@@ -2784,6 +3546,70 @@ pub(crate) mod tests {
             CancellationToken::new(),
         );
         (manager, sink, store)
+    }
+
+    struct FixtureEgressGate;
+
+    #[async_trait]
+    impl agent24_domain::EgressGate for FixtureEgressGate {
+        async fn check(
+            &self,
+            request: &agent24_domain::EgressRequest,
+        ) -> Result<(), agent24_domain::EgressDecision> {
+            let fixture_resource = request.resources.len() == 1
+                && request.resources[0].resource_id == "agent-test-fixture"
+                && request.resources[0].revision.as_deref() == Some("fixture-rev-1")
+                && request.resources[0].authorization_ref.as_deref()
+                    == Some("agent-test-fixture-grant")
+                && request.resources[0].policy_version == 1
+                && !request.resources[0].local_only;
+            let fixture_destination = request
+                .destination
+                .id()
+                .is_some_and(|id| id.starts_with("http://127.0.0.1:"));
+            if request.purpose == agent24_domain::EgressPurpose::HttpFetch
+                && request.remote
+                && request.authorization_generation == 1
+                && fixture_resource
+                && fixture_destination
+            {
+                Ok(())
+            } else {
+                Err(agent24_domain::EgressDecision)
+            }
+        }
+    }
+
+    pub(crate) fn fixture_egress_policy() -> (
+        Arc<dyn agent24_domain::EgressGate>,
+        Vec<agent24_domain::EgressResource>,
+        u64,
+    ) {
+        (
+            Arc::new(FixtureEgressGate),
+            vec![
+                agent24_domain::EgressResource::cloud_authorized(
+                    "agent-test-fixture",
+                    "fixture-rev-1",
+                    1,
+                )
+                .with_authorization_ref("agent-test-fixture-grant"),
+            ],
+            1,
+        )
+    }
+
+    async fn manager_with_fixture_egress(
+        provider: Arc<dyn ModelProvider>,
+        tools: ToolRegistry,
+    ) -> (Arc<RunManager>, Arc<RecordingSink>, Store) {
+        let (manager, sink, store) = manager_with_tools(provider, tools).await;
+        let (gate, resources, generation) = fixture_egress_policy();
+        (
+            manager.with_test_egress_policy(gate, resources, generation),
+            sink,
+            store,
+        )
     }
 
     async fn manager_with(
@@ -3053,6 +3879,128 @@ pub(crate) mod tests {
             agent24_tools::Tool::call(&shell, &ctx, &shell_input, &CancellationToken::new(),)
                 .await
                 .is_err()
+        );
+    }
+
+    /// K1-6b.4a (ADR-K1-02 §2.1.1, §5 item 9): tool egress is restricted by a
+    /// source's classification, not its kind. Returns whether a process
+    /// egress check passes for a run tagged with exactly `sources`.
+    async fn process_egress_allowed_for(sources: Vec<agent24_store::SourceRef>) -> bool {
+        process_egress_allowed_when(sources, false).await
+    }
+
+    async fn process_egress_allowed_when(
+        sources: Vec<agent24_store::SourceRef>,
+        source_reads_fail: bool,
+    ) -> bool {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let now = now_iso8601();
+        let run = Run {
+            id: format!("run_{}", ulid()),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::Running,
+            input: RunInput {
+                prompt: "classified".into(),
+                workspace_id: None,
+                model_override: None,
+                mode: RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now.clone(),
+            started_at: Some(now.clone()),
+            ended_at: None,
+        };
+        store.insert_run(&run).await.unwrap();
+        for source in &sources {
+            store
+                .tag_run_source(&run.id, 0, source, &now)
+                .await
+                .unwrap();
+        }
+        if source_reads_fail {
+            agent24_store::test_hooks::fail_source_tag_reads(&store);
+        }
+        let ctx = manager.tool_context_for(&run, "tc").await.unwrap();
+        ctx.authorize_egress_if_restricted(
+            agent24_domain::EgressPurpose::ProcessExecution,
+            agent24_domain::EgressDestination::unknown(),
+        )
+        .await
+        .is_ok()
+    }
+
+    fn classified(
+        mut source: agent24_store::SourceRef,
+        classification: agent24_store::SourceClassification,
+    ) -> agent24_store::SourceRef {
+        source.classification = classification;
+        source
+    }
+
+    #[tokio::test]
+    async fn ordinary_sources_of_any_kind_do_not_restrict_tool_egress() {
+        use agent24_store::{SourceClassification, SourceRef};
+        let now = now_iso8601();
+        let user = SourceRef::user_input("run_x", now.clone());
+        assert_eq!(user.classification, SourceClassification::Ordinary);
+        assert!(process_egress_allowed_for(vec![user.clone()]).await);
+        // A non-user-input source the host has classified Ordinary (the shape
+        // ordinary recalled memory takes in 6b.4c) is not egress material.
+        let ordinary_recall = classified(
+            SourceRef::unknown_memory(now),
+            SourceClassification::Ordinary,
+        );
+        assert!(process_egress_allowed_for(vec![user, ordinary_recall]).await);
+    }
+
+    #[tokio::test]
+    async fn restricted_or_unknown_sources_of_any_kind_restrict_tool_egress() {
+        use agent24_store::{SourceClassification, SourceRef};
+        let now = now_iso8601();
+        let user = SourceRef::user_input("run_x", now.clone());
+        for source in [
+            SourceRef::unknown_memory(now.clone()),
+            classified(
+                SourceRef::selected_material("doc-1", None, now.clone()),
+                SourceClassification::Restricted,
+            ),
+            // Kind alone must not exempt a source: user input the host has
+            // not classified Ordinary keeps the strict policy.
+            classified(
+                SourceRef::user_input("run_y", now.clone()),
+                SourceClassification::Restricted,
+            ),
+            classified(
+                SourceRef::user_input("run_y", now.clone()),
+                SourceClassification::Unknown,
+            ),
+        ] {
+            assert!(
+                !process_egress_allowed_for(vec![user.clone(), source.clone()]).await,
+                "{source:?} must restrict process egress"
+            );
+        }
+    }
+
+    /// K1-6b.5d: `tool_context_for` restricts tool egress when a run has no
+    /// source tags at all (ADR-K1-02 §2.1.1 item 4: missing evidence is not
+    /// permission) and when its tags cannot be read. The same Ordinary run,
+    /// readable, is allowed.
+    #[tokio::test]
+    async fn a_run_with_no_readable_sources_restricts_tool_egress() {
+        let user = agent24_store::SourceRef::user_input("run_x", now_iso8601());
+        assert!(process_egress_allowed_for(vec![user.clone()]).await);
+        assert!(
+            !process_egress_allowed_for(vec![]).await,
+            "no tags must restrict"
+        );
+        assert!(
+            !process_egress_allowed_when(vec![user], true).await,
+            "unreadable tags must restrict"
         );
     }
 
@@ -3511,7 +4459,7 @@ pub(crate) mod tests {
         store: &Store,
         session_id: &str,
         prompt: &str,
-    ) {
+    ) -> Run {
         let run = manager
             .start_run(RunCreate {
                 session_id: Some(session_id.to_owned()),
@@ -3525,11 +4473,586 @@ pub(crate) mod tests {
         for _ in 0..200 {
             let current = store.get_run(&run.id).await.unwrap().unwrap();
             if current.status != RunStatus::Running && current.status != RunStatus::Queued {
-                return;
+                return current;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("run did not finish");
+    }
+
+    // ── K1-6b.4b: memory write/recall classification (ADR-K1-02 §2.1.1) ──
+
+    const TEAL: &str = "my favourite colour is teal";
+
+    /// Seed one explicit-remember assertion for the test owner, optionally
+    /// with a stored classification (`None` = a legacy NULL `source_ref`).
+    async fn seed_memory(
+        kv: &KvStore,
+        id: &str,
+        classification: Option<agent24_store::SourceClassification>,
+    ) {
+        use agent24_memory::event::Scope;
+        use agent24_memory::writer::{Candidate, MemoryWriter};
+        let mut candidate = Candidate::new(
+            id,
+            Scope::owner("test-owner"),
+            "user",
+            "said_to_remember",
+            serde_json::json!(TEAL),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+        .with_evidence(vec![format!("ev-{id}")]);
+        if let Some(classification) = classification {
+            candidate = candidate.with_source_ref(
+                agent24_store::AssertionSourceRef::from_sources([(
+                    "seed".to_owned(),
+                    classification,
+                )])
+                .to_value(),
+            );
+        }
+        kv.write_gate()
+            .propose(vec![candidate.remember()])
+            .await
+            .unwrap();
+    }
+
+    /// The stored classification of the owner's current assertion whose
+    /// object is `text`.
+    async fn stored_classification(
+        kv: &KvStore,
+        text: &str,
+    ) -> agent24_store::SourceClassification {
+        use agent24_memory::assertion::{AssertionStore, BeliefQuery};
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner("test-owner"))
+            .await
+            .unwrap();
+        let belief = beliefs
+            .iter()
+            .find(|belief| belief.object == serde_json::json!(text))
+            .unwrap_or_else(|| panic!("no assertion {text:?} in {beliefs:?}"));
+        agent24_store::AssertionSourceRef::classification_of(belief.source_ref.as_ref())
+    }
+
+    #[tokio::test]
+    async fn a_recalled_fact_tags_the_run_with_its_stored_classification() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        // (stored classification, tag classification, process egress allowed)
+        for (stored, expected, egress_allowed) in [
+            (Some(Ordinary), Ordinary, true),
+            (Some(Restricted), Restricted, false),
+            (None, Unknown, false),
+        ] {
+            let provider = Arc::new(RecordingProvider {
+                seen: StdMutex::new(vec![]),
+            });
+            let (manager, store, kv) =
+                manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+            seed_session(&store, "sess_recall").await;
+            seed_memory(&kv, "a-teal", stored).await;
+
+            let run = run_in_session(&manager, &store, "sess_recall", "what colour is teal").await;
+            let seen = provider.seen.lock().unwrap().clone();
+            assert!(
+                seen.iter()
+                    .flatten()
+                    .any(|msg| msg.content.as_deref().is_some_and(|c| c.contains(TEAL))),
+                "the fact must actually be recalled for this case to mean anything"
+            );
+            let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+            let tag = snapshot
+                .sources
+                .iter()
+                .find(|source| source.source_id == "memory_assertion:a-teal")
+                .unwrap_or_else(|| panic!("no recall tag in {:?}", snapshot.sources));
+            assert_eq!(tag.classification, expected, "{stored:?}");
+            assert_eq!(tag.kind, agent24_store::SourceKind::MemoryRecall);
+
+            let ctx = manager.tool_context_for(&run, "tc").await.unwrap();
+            let allowed = ctx
+                .authorize_egress_if_restricted(
+                    agent24_domain::EgressPurpose::ProcessExecution,
+                    agent24_domain::EgressDestination::unknown(),
+                )
+                .await
+                .is_ok();
+            assert_eq!(allowed, egress_allowed, "{stored:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remembered_fact_carries_the_strictest_source_of_its_run() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        let remembered = "my favourite colour is teal and blue";
+        let prompt = format!("记住 {remembered}");
+        // (seeded memory recalled by the same prompt, classification written)
+        for (seeded, expected) in [
+            (None, Ordinary),
+            (Some(Some(Restricted)), Restricted),
+            (Some(None), Unknown),
+            (Some(Some(Ordinary)), Ordinary),
+        ] {
+            let provider = Arc::new(RecordingProvider {
+                seen: StdMutex::new(vec![]),
+            });
+            let (manager, store, kv) =
+                manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+            seed_session(&store, "sess_write").await;
+            if let Some(stored) = seeded {
+                seed_memory(&kv, "a-teal", stored).await;
+            }
+            run_in_session(&manager, &store, "sess_write", &prompt).await;
+            assert_eq!(
+                stored_classification(&kv, remembered).await,
+                expected,
+                "{seeded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remembering_identical_text_again_never_loosens_its_classification() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted};
+        let remembered = "my favourite colour is teal and blue";
+        let prompt = format!("记住 {remembered}");
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_again").await;
+        run_in_session(&manager, &store, "sess_again", &prompt).await;
+        assert_eq!(stored_classification(&kv, remembered).await, Ordinary);
+        // The same text again, from a run that also recalls a restricted fact.
+        seed_memory(&kv, "a-teal", Some(Restricted)).await;
+        run_in_session(&manager, &store, "sess_again", &prompt).await;
+        assert_eq!(stored_classification(&kv, remembered).await, Restricted);
+        // And once restricted, a later ordinary-only run does not lower it.
+        use agent24_memory::assertion::AssertionStore;
+        kv.assertions()
+            .retract(&"a-teal".to_owned(), "test-owner", &now_iso8601())
+            .await
+            .unwrap();
+        run_in_session(&manager, &store, "sess_again", &prompt).await;
+        assert_eq!(stored_classification(&kv, remembered).await, Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_recall_tag_that_cannot_be_written_stops_the_run_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_fail").await;
+        seed_memory(
+            &kv,
+            "a-teal",
+            Some(agent24_store::SourceClassification::Ordinary),
+        )
+        .await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_recall_tags BEFORE INSERT ON run_source_tags \
+             WHEN NEW.source_id LIKE 'memory_assertion:%' BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = run_in_session(&manager, &store, "sess_fail", "what colour is teal").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chat_surface_writes_the_folded_classification() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_chat_write").await;
+        seed_memory(
+            &kv,
+            "a-teal",
+            Some(agent24_store::SourceClassification::Restricted),
+        )
+        .await;
+        let remembered = "my favourite colour is teal and blue";
+        let prompt = format!("记住 {remembered}");
+        let (_, _, source_ref) = manager
+            .chat_memory_prelude("run_chat", Some("sess_chat_write"), &prompt, false)
+            .await
+            .unwrap();
+        let outcome = manager
+            .chat_remember_turn("sess_chat_write", &prompt, "ok", source_ref)
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::Saved);
+        assert_eq!(
+            stored_classification(&kv, remembered).await,
+            agent24_store::SourceClassification::Restricted
+        );
+    }
+
+    async fn process_egress_allowed_in(manager: &Arc<RunManager>, run: &Run) -> bool {
+        manager
+            .tool_context_for(run, "tc")
+            .await
+            .unwrap()
+            .authorize_egress_if_restricted(
+                agent24_domain::EgressPurpose::ProcessExecution,
+                agent24_domain::EgressDestination::unknown(),
+            )
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_session_stays_ordinary_across_turns() {
+        use agent24_store::SourceClassification::Ordinary;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_turns").await;
+        run_in_session(&manager, &store, "sess_turns", "记住 alpha is first").await;
+        assert_eq!(stored_classification(&kv, "alpha is first").await, Ordinary);
+        // The second run carries the first turn as session context.
+        let run = run_in_session(&manager, &store, "sess_turns", "记住 beta is second").await;
+        assert_eq!(stored_classification(&kv, "beta is second").await, Ordinary);
+        assert!(process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_earlier_turn_restricts_the_later_turns_of_its_session() {
+        use agent24_memory::assertion::AssertionStore;
+        use agent24_store::SourceClassification::Restricted;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_floor").await;
+        seed_memory(&kv, "a-teal", Some(Restricted)).await;
+        run_in_session(&manager, &store, "sess_floor", "what colour is teal").await;
+        // The fact itself is gone; the later turn sees it only as session
+        // context, which the session floor still classifies.
+        kv.assertions()
+            .retract(&"a-teal".to_owned(), "test-owner", &now_iso8601())
+            .await
+            .unwrap();
+        let run = run_in_session(&manager, &store, "sess_floor", "记住 beta is second").await;
+        assert_eq!(
+            stored_classification(&kv, "beta is second").await,
+            Restricted
+        );
+        let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+        let floor = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_id == "session_floor:sess_floor")
+            .unwrap_or_else(|| panic!("no session floor tag in {:?}", snapshot.sources));
+        assert_eq!(floor.classification, Restricted);
+        assert_eq!(floor.kind, agent24_store::SourceKind::SessionContext);
+        assert!(!process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
+    async fn prior_session_context_without_a_recorded_floor_is_unknown() {
+        use agent24_store::SourceClassification::Unknown;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_lost").await;
+        run_in_session(&manager, &store, "sess_lost", "记住 alpha is first").await;
+        // The earlier turn is in the session, but its floor is not.
+        sqlx::raw_sql("DELETE FROM session_source_floor")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let run = run_in_session(&manager, &store, "sess_lost", "记住 beta is second").await;
+        assert_eq!(stored_classification(&kv, "beta is second").await, Unknown);
+        assert!(!process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
+    async fn a_session_floor_that_cannot_be_written_stops_the_run_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_nofloor").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_floor BEFORE INSERT ON session_source_floor \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let run = run_in_session(&manager, &store, "sess_nofloor", "hello").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    // ── K1-6b.4d: runs started by kernel-created schedules (ADR-K1-02 §2.2) ──
+
+    async fn run_scheduled(
+        manager: &Arc<RunManager>,
+        store: &Store,
+        session_id: Option<&str>,
+        schedule_id: &str,
+        prompt: &str,
+    ) -> Run {
+        let run = manager
+            .start_run_with_schedule(
+                RunCreate {
+                    session_id: session_id.map(str::to_owned),
+                    workspace_id: None,
+                    prompt: prompt.to_owned(),
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                },
+                Some(schedule_id.to_owned()),
+            )
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            let current = store.get_run(&run.id).await.unwrap().unwrap();
+            if current.status != RunStatus::Running && current.status != RunStatus::Queued {
+                return current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run did not finish");
+    }
+
+    #[tokio::test]
+    async fn a_self_wake_run_carries_the_classification_recorded_at_creation() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        // No session and no memory: nothing else could restrict this run.
+        for (origin, egress_allowed) in [(Ordinary, true), (Restricted, false), (Unknown, false)] {
+            let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+            store
+                .record_schedule_origin("wake_x", "run_creator", origin, &now_iso8601())
+                .await
+                .unwrap();
+            let run = run_scheduled(&manager, &store, None, "wake_x", "check the build").await;
+            let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+            let tag = snapshot
+                .sources
+                .iter()
+                .find(|source| source.source_id == "schedule_origin:wake_x")
+                .unwrap_or_else(|| panic!("no schedule origin tag in {:?}", snapshot.sources));
+            assert_eq!(tag.classification, origin);
+            assert_eq!(tag.kind, agent24_store::SourceKind::ScheduleOrigin);
+            assert_eq!(
+                process_egress_allowed_in(&manager, &run).await,
+                egress_allowed,
+                "{origin:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restricted_self_wake_raises_its_session_floor_for_later_turns() {
+        use agent24_store::SourceClassification::Restricted;
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_wake").await;
+        store
+            .record_schedule_origin("wake_r", "run_creator", Restricted, &now_iso8601())
+            .await
+            .unwrap();
+        // A scheduled prompt cannot itself write a qualified memory, but the
+        // woken turn joins the session, so a later user turn inherits it.
+        run_scheduled(
+            &manager,
+            &store,
+            Some("sess_wake"),
+            "wake_r",
+            "check the build",
+        )
+        .await;
+        run_in_session(&manager, &store, "sess_wake", "记住 gamma is third").await;
+        assert_eq!(
+            stored_classification(&kv, "gamma is third").await,
+            Restricted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_schedule_run_has_no_schedule_origin() {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let run = run_scheduled(&manager, &store, None, "user_sched", "check the build").await;
+        let snapshot = store.run_policy_snapshot(&run.id).await.unwrap();
+        assert!(
+            snapshot
+                .sources
+                .iter()
+                .all(|source| source.kind != agent24_store::SourceKind::ScheduleOrigin),
+            "{:?}",
+            snapshot.sources
+        );
+        assert!(process_egress_allowed_in(&manager, &run).await);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_origin_that_cannot_be_read_stops_the_run_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        sqlx::raw_sql("DROP TABLE schedule_source_origin")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let run = run_scheduled(&manager, &store, None, "wake_gone", "check the build").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_own_sources_cannot_be_read_stops_before_the_model() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_noread").await;
+        agent24_store::test_hooks::fail_source_tag_reads(&store);
+        let run = run_in_session(&manager, &store, "sess_noread", "hello").await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let error = run.error.expect("a failed run carries its error");
+        assert_eq!(error.code, "source_policy_unavailable");
+        assert!(error.message.contains("session source floor"), "{error:?}");
+        assert!(
+            provider.seen.lock().unwrap().is_empty(),
+            "the model must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chat_prelude_classifies_client_history_by_the_session_floor() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        store
+            .merge_session_floor("chat_restricted", Restricted, false, &now_iso8601())
+            .await
+            .unwrap();
+        // (session, client history has non-user turns, classification)
+        for (sid, has_non_user_history, expected) in [
+            ("chat_a", false, Ordinary),
+            // chat_a's floor now exists: its own earlier replies are Ordinary.
+            ("chat_a", true, Ordinary),
+            // No floor: replies the server has no record of are Unknown.
+            ("chat_b", true, Unknown),
+            ("chat_restricted", true, Restricted),
+            ("chat_restricted", false, Restricted),
+        ] {
+            let (_, _, source_ref) = manager
+                .chat_memory_prelude("run_hist", Some(sid), "hello", has_non_user_history)
+                .await
+                .unwrap();
+            assert_eq!(
+                source_ref.classification, expected,
+                "{sid} {has_non_user_history}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chat_prelude_whose_floor_cannot_be_written_fails() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, _kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER no_floor BEFORE INSERT ON session_source_floor \
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert!(
+            manager
+                .chat_memory_prelude("run_x", Some("chat_x"), "hello", false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_sources_cannot_be_read_writes_unknown_memory() {
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        // No tags at all is no evidence either.
+        assert_eq!(
+            manager
+                .run_assertion_source_ref("run_untagged")
+                .await
+                .classification,
+            agent24_store::SourceClassification::Unknown
+        );
+        sqlx::query("DROP TABLE run_source_tags")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .run_assertion_source_ref("run_untagged")
+                .await
+                .classification,
+            agent24_store::SourceClassification::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chat_prelude_folds_the_caller_input_and_every_recalled_fact() {
+        use agent24_store::SourceClassification::{Ordinary, Restricted, Unknown};
+        for (seeded, expected) in [
+            (None, Ordinary),
+            (Some(Some(Ordinary)), Ordinary),
+            (Some(Some(Restricted)), Restricted),
+            (Some(None), Unknown),
+        ] {
+            let provider = Arc::new(RecordingProvider {
+                seen: StdMutex::new(vec![]),
+            });
+            let (manager, store, kv) =
+                manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+            seed_session(&store, "sess_chat").await;
+            if let Some(stored) = seeded {
+                seed_memory(&kv, "a-teal", stored).await;
+            }
+            let (prelude, _, source_ref) = manager
+                .chat_memory_prelude("run_chat", Some("sess_chat"), "what colour is teal", false)
+                .await
+                .unwrap();
+            assert_eq!(prelude.is_empty(), seeded.is_none(), "{seeded:?}");
+            assert_eq!(source_ref.classification, expected, "{seeded:?}");
+            assert!(
+                source_ref
+                    .source_ids
+                    .contains(&"user_input:run_chat".to_owned())
+            );
+        }
     }
 
     #[tokio::test]
@@ -3709,6 +5232,7 @@ pub(crate) mod tests {
                         source: "agent_loop".into(),
                         trust: Trust::UserSaid,
                     },
+                    agent24_store::AssertionSourceRef::from_sources([]),
                 )
                 .await;
             }));
@@ -4128,12 +5652,15 @@ pub(crate) mod tests {
     async fn model_fetches_a_url_through_http_fetch() {
         let url = http_fixture("fixture payload 42").await;
         // allow_local: the fixture lives on loopback
-        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let (egress_gate, _, _) = fixture_egress_policy();
+        let tools = ToolRegistry::new()
+            .with(Arc::new(agent24_tools::HttpFetchTool::new(true)))
+            .with_egress_gate(egress_gate);
         let provider = ScriptedProvider::new(vec![tool_call_turn(
             "http_fetch",
             serde_json::json!({ "url": url }).to_string(),
         )]);
-        let (manager, sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let (manager, sink, store) = manager_with_fixture_egress(Arc::new(provider), tools).await;
         let run = manager.start_run(create()).await.unwrap();
         let done = wait_terminal(&store, &run.id).await;
         assert_eq!(done.status, RunStatus::Completed);
@@ -4167,12 +5694,15 @@ pub(crate) mod tests {
         // the tool_call → the tool result answering it → closing assistant answer.
         // This is what a restarted daemon reconstructs a suspended run from.
         let url = http_fixture("fixture payload 42").await;
-        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let (egress_gate, _, _) = fixture_egress_policy();
+        let tools = ToolRegistry::new()
+            .with(Arc::new(agent24_tools::HttpFetchTool::new(true)))
+            .with_egress_gate(egress_gate);
         let provider = ScriptedProvider::new(vec![tool_call_turn(
             "http_fetch",
             serde_json::json!({ "url": url }).to_string(),
         )]);
-        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let (manager, _sink, store) = manager_with_fixture_egress(Arc::new(provider), tools).await;
         let run = manager.start_run(create()).await.unwrap();
         let done = wait_terminal(&store, &run.id).await;
         assert_eq!(done.status, RunStatus::Completed);
@@ -4303,6 +5833,7 @@ pub(crate) mod tests {
 mod approval_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use super::tests::fixture_egress_policy;
     use super::tests::*;
     use super::*;
     use agent24_models::router::Tier;
@@ -4331,8 +5862,10 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let (egress_gate, _resources, generation) = fixture_egress_policy();
         let tools = ToolRegistry::builtin(workdir)
-            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
+            .with_egress_gate(Arc::clone(&egress_gate));
         struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
         impl EventSink for FnSink {
             fn emit(&self, body: EventBody) {
@@ -4357,7 +5890,8 @@ mod approval_tests {
             Arc::new(tools),
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
-        );
+        )
+        .with_test_egress_policy(egress_gate, Vec::new(), generation);
         Harness {
             manager,
             broker,
@@ -4458,8 +5992,10 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let (egress_gate, resources, generation) = fixture_egress_policy();
         let tools = ToolRegistry::builtin(workdir)
-            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))))
+            .with_egress_gate(Arc::clone(&egress_gate));
         struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
         impl EventSink for FnSink {
             fn emit(&self, body: EventBody) {
@@ -4476,7 +6012,8 @@ mod approval_tests {
             Arc::new(tools),
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
-        );
+        )
+        .with_test_egress_policy(egress_gate, resources, generation);
         Harness {
             manager,
             broker,
@@ -4633,6 +6170,24 @@ mod approval_tests {
     /// resume answers from the last tool result, so the run finishes as soon as
     /// the parked call has been settled and executed.
     async fn resume_harness(workdir: std::path::PathBuf) -> Harness {
+        resume_harness_with(workdir, None).await
+    }
+
+    async fn resume_harness_with(
+        workdir: std::path::PathBuf,
+        extra: Option<Arc<dyn agent24_tools::Tool>>,
+    ) -> Harness {
+        resume_harness_using(workdir, extra, true).await
+    }
+
+    /// `fixture_egress: false` builds tool egress as production does: no
+    /// gate on the registry and no test policy, so a run's own source tags
+    /// alone decide what its tools may do.
+    async fn resume_harness_using(
+        workdir: std::path::PathBuf,
+        extra: Option<Arc<dyn agent24_tools::Tool>>,
+        fixture_egress: bool,
+    ) -> Harness {
         let store = Store::open_memory().await.unwrap();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = Arc::clone(&events);
@@ -4642,8 +6197,15 @@ mod approval_tests {
             }
         });
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
-        let tools = ToolRegistry::builtin(workdir)
+        let (egress_gate, _resources, generation) = fixture_egress_policy();
+        let mut tools = ToolRegistry::builtin(workdir)
             .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        if fixture_egress {
+            tools = tools.with_egress_gate(Arc::clone(&egress_gate));
+        }
+        if let Some(tool) = extra {
+            tools.register_module_tool(tool).unwrap();
+        }
         struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
         impl EventSink for FnSink {
             fn emit(&self, body: EventBody) {
@@ -4660,12 +6222,430 @@ mod approval_tests {
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
         );
+        let manager = if fixture_egress {
+            manager.with_test_egress_policy(egress_gate, Vec::new(), generation)
+        } else {
+            manager
+        };
         Harness {
             manager,
             broker,
             store,
             events,
         }
+    }
+
+    /// [`resume_harness`] plus `explore`, sharing the recording router so a
+    /// test can see a provider call made from the sub-agent.
+    async fn resume_harness_with_explorer(
+        workdir: std::path::PathBuf,
+    ) -> (Harness, Arc<RecordingProvider>) {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let router = Arc::new(ModelRouter::with_defaults(vec![(
+            provider.clone() as Arc<dyn agent24_models::ModelProvider>,
+            Tier::Local,
+        )]));
+        let explorer = crate::subagent::ExplorerSubagent::new(
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::read_only(workdir.clone())),
+        );
+        let tools = ToolRegistry::builtin(workdir)
+            .with(Arc::new(explorer))
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let manager = RunManager::new(
+            store.clone(),
+            router,
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        (
+            Harness {
+                manager,
+                broker,
+                store,
+                events,
+            },
+            provider,
+        )
+    }
+
+    /// Park shell_exec (approval target) and explore on one assistant turn.
+    /// `sourced` writes UserPrompt and Assistant origins. Otherwise the rows
+    /// are legacy `append_run_message` calls with no origin rows.
+    async fn resume_shell_and_explore(
+        sourced: bool,
+        decision_kind: &str,
+        reason: Option<&str>,
+        shell_token: &str,
+    ) -> (Harness, Arc<RecordingProvider>, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, provider) = resume_harness_with_explorer(dir.path().to_path_buf()).await;
+        let shell_args = serde_json::json!({ "argv": ["/bin/echo", shell_token] });
+        let explore_args = serde_json::json!({ "task": "SECRET-TASK-1197" });
+        let calls = serde_json::json!([
+            {
+                "id": "call_shell",
+                "name": "shell_exec",
+                "arguments": shell_args.to_string()
+            },
+            {
+                "id": "call_explore",
+                "name": "explore",
+                "arguments": explore_args.to_string()
+            }
+        ]);
+        let run = run_in("run_1", RunStatus::AwaitingApproval);
+        h.store.insert_run(&run).await.unwrap();
+        if sourced {
+            seed_proven_parked_thread(&h.store, "run_1", "run echo", calls).await;
+            let user_source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+            h.store
+                .tag_run_source("run_1", 0, &user_source, &now_iso8601())
+                .await
+                .unwrap();
+        } else {
+            h.store
+                .append_run_message(
+                    "run_1",
+                    "user",
+                    Some("run echo"),
+                    &serde_json::json!([]),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            h.store
+                .append_run_message("run_1", "assistant", None, &calls, None, &now_iso8601())
+                .await
+                .unwrap();
+        }
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            shell_args.as_object().unwrap().clone(),
+        );
+        h.store.insert_approval(&approval).await.unwrap();
+        h.broker
+            .resolve("apr_1", decision(decision_kind, reason))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        (h, provider, done)
+    }
+
+    fn assert_resume_refused_before_tools(h: &Harness, provider: &RecordingProvider, done: &Run) {
+        let error = done.error.clone().unwrap();
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(error.code, SOURCE_UNPROVEN_CODE);
+        assert_eq!(error.message, SOURCE_UNPROVEN_MESSAGE);
+        assert!(provider.seen.lock().unwrap().is_empty());
+        assert!(
+            !h.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.started")
+        );
+    }
+
+    async fn assert_shell_did_not_run(h: &Harness) {
+        assert!(h.store.list_tool_calls("run_1").await.unwrap().is_empty());
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert_eq!(thread.len(), 2);
+        assert!(thread.iter().all(|message| message.role != "tool"));
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_approve_does_not_run_shell_or_call_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(false, "approve", None, "must-not-run").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_deny_does_not_run_shell_or_call_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(false, "deny", Some("not this time"), "must-not-run").await;
+        assert_resume_refused_before_tools(&h, &provider, &done);
+        assert_shell_did_not_run(&h).await;
+    }
+
+    #[tokio::test]
+    async fn sourced_resume_with_explore_still_completes_and_calls_the_provider() {
+        let (h, provider, done) =
+            resume_shell_and_explore(true, "approve", None, "sourced-ok").await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.output.unwrap().text, "pong");
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().any(|messages| {
+            messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some("SECRET-TASK-1197"))
+        }));
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert!(thread.iter().any(|message| {
+            message.role == "tool"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("sourced-ok"))
+        }));
+        assert!(
+            h.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.started")
+        );
+    }
+
+    const ROLE_TURN_TASK: &str = "SECRET-TASK-G3";
+
+    struct ScriptedRecordingProvider {
+        recorder: Arc<RecordingProvider>,
+        turn: StdMutex<Option<Msg>>,
+    }
+
+    #[async_trait::async_trait]
+    impl agent24_models::ModelProvider for ScriptedRecordingProvider {
+        fn name(&self) -> &str {
+            "scripted-recording"
+        }
+
+        async fn complete(
+            &self,
+            req: &agent24_models::CompletionRequest,
+            cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, agent24_models::ModelError> {
+            if let Some(turn) = self.turn.lock().unwrap().take() {
+                self.recorder
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .push(req.messages.clone());
+                return Ok(agent24_models::CompletionResponse {
+                    message: turn,
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                        cost_usd: 0.0,
+                    },
+                    model_id: None,
+                });
+            }
+            agent24_models::ModelProvider::complete(self.recorder.as_ref(), req, cancel).await
+        }
+
+        async fn models(
+            &self,
+            cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, agent24_models::ModelError> {
+            agent24_models::ModelProvider::models(self.recorder.as_ref(), cancel).await
+        }
+    }
+
+    fn role_tool_turn(role: &str, marker: &std::path::Path) -> Msg {
+        let mut turn = Msg::assistant(
+            None,
+            vec![
+                agent24_models::ToolCallRequest {
+                    id: "call_shell".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: serde_json::json!({
+                        "argv": ["/usr/bin/touch", marker]
+                    })
+                    .to_string(),
+                },
+                agent24_models::ToolCallRequest {
+                    id: "call_explore".to_owned(),
+                    name: "explore".to_owned(),
+                    arguments: serde_json::json!({ "task": ROLE_TURN_TASK }).to_string(),
+                },
+            ],
+        );
+        turn.role = role.to_owned();
+        turn
+    }
+
+    async fn role_turn_harness(
+        workdir: std::path::PathBuf,
+        turn: Msg,
+    ) -> (Harness, Arc<RecordingProvider>) {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let recorder = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let router = Arc::new(ModelRouter::with_defaults(vec![(
+            Arc::new(ScriptedRecordingProvider {
+                recorder: Arc::clone(&recorder),
+                turn: StdMutex::new(Some(turn)),
+            }) as Arc<dyn agent24_models::ModelProvider>,
+            Tier::Local,
+        )]));
+        let explorer = crate::subagent::ExplorerSubagent::new(
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::read_only(workdir.clone())),
+        );
+        let tools = ToolRegistry::builtin(workdir)
+            .with(Arc::new(explorer))
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let manager = RunManager::new(
+            store.clone(),
+            router,
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        (
+            Harness {
+                manager,
+                broker,
+                store,
+                events,
+            },
+            recorder,
+        )
+    }
+
+    fn saw_task(provider: &RecordingProvider) -> bool {
+        provider.seen.lock().unwrap().iter().any(|messages| {
+            messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some(ROLE_TURN_TASK))
+        })
+    }
+
+    async fn finish_role_turn(h: &Harness, run_id: &str) -> Run {
+        for _ in 0..200 {
+            let run = h.store.get_run(run_id).await.unwrap().unwrap();
+            if agent24_core::run_is_terminal(run.status) {
+                return run;
+            }
+            let pending = h
+                .store
+                .list_approvals(Some(ApprovalStatus::Pending))
+                .await
+                .unwrap();
+            if let Some(approval) = pending.first() {
+                h.broker
+                    .resolve(&approval.id, decision("approve", None))
+                    .await
+                    .unwrap();
+                return wait_terminal(&h.store, run_id).await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run {run_id} neither finished nor parked for approval");
+    }
+
+    async fn drive_role_turn(
+        role: &str,
+    ) -> (Harness, Arc<RecordingProvider>, tempfile::TempDir, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("g3-marker");
+        let (h, provider) =
+            role_turn_harness(dir.path().to_path_buf(), role_tool_turn(role, &marker)).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let done = finish_role_turn(&h, &run.id).await;
+        (h, provider, dir, done)
+    }
+
+    #[tokio::test]
+    async fn user_role_with_tools_stops_before_shell_and_explore() {
+        let (h, provider, dir, done) = drive_role_turn("user").await;
+        let marker = dir.path().join("g3-marker");
+        assert_eq!(done.status, RunStatus::Failed);
+        let error = done.error.unwrap();
+        assert_eq!(error.code, "provider_error");
+        assert_eq!(error.message, PROVIDER_ROLE_MESSAGE);
+        assert!(!marker.exists(), "shell_exec must not touch the marker");
+        assert!(!saw_task(&provider), "explore must not call the provider");
+        assert!(h.store.list_tool_calls(&done.id).await.unwrap().is_empty());
+        let thread = h.store.list_run_messages(&done.id).await.unwrap();
+        assert_eq!(
+            thread
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user"]
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_role_with_the_same_tools_runs_the_shell() {
+        let (h, provider, dir, done) = drive_role_turn("assistant").await;
+        let marker = dir.path().join("g3-marker");
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(
+            marker.exists(),
+            "approved shell_exec did not touch the marker"
+        );
+        assert!(saw_task(&provider), "explore should call the provider");
+        assert!(
+            h.store
+                .list_tool_calls(&done.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|call| call.tool == "shell_exec" && call.status == ToolCallStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn user_role_final_answer_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _) = role_turn_harness(dir.path().to_path_buf(), Msg::user("not-an-answer")).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let done = finish_role_turn(&h, &run.id).await;
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(done.error.unwrap().code, "provider_error");
+        let thread = h.store.list_run_messages(&done.id).await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .all(|message| message.content.as_deref() != Some("not-an-answer"))
+        );
     }
 
     #[rustfmt::skip]
@@ -4705,20 +6685,11 @@ mod approval_tests {
             ended_at: None,
         };
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
+        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
         h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .tag_run_source("run_1", 0, &source, &now_iso8601())
             .await
             .unwrap();
         let approval = Approval {
@@ -4767,6 +6738,212 @@ mod approval_tests {
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
             "no tool result was recorded for the resumed call"
         );
+    }
+
+    /// K1-6b.5d: a run parked on a shell_exec approval when the daemon
+    /// stopped is restored, approved and resumed. Resume rebuilds the tool
+    /// context from the run's persisted tags (the session floor is not merged
+    /// again, #1204 G4), so a Restricted source still refuses the child: it
+    /// never spawns. The same run with only Ordinary sources spawns, so the
+    /// fixture would show a leak.
+    #[tokio::test]
+    async fn a_restricted_run_resumed_after_a_restart_still_cannot_spawn() {
+        for restricted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("child-ran");
+            let h = resume_harness_using(dir.path().to_path_buf(), None, false).await;
+            let run = Run {
+                id: "run_1".to_owned(),
+                session_id: None,
+                workspace_id: None,
+                status: RunStatus::AwaitingApproval,
+                input: RunInput {
+                    prompt: "touch it".to_owned(),
+                    workspace_id: None,
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: now_iso8601(),
+                started_at: Some(now_iso8601()),
+                ended_at: None,
+            };
+            h.store.insert_run(&run).await.unwrap();
+            let args = serde_json::json!({ "argv": ["/usr/bin/touch", marker] });
+            let call = serde_json::json!([{
+                "id": "call_provider_1",
+                "name": "shell_exec",
+                "arguments": args.to_string()
+            }]);
+            seed_proven_parked_thread(&h.store, "run_1", "touch it", call).await;
+            let user = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+            h.store
+                .tag_run_source("run_1", 0, &user, &now_iso8601())
+                .await
+                .unwrap();
+            if restricted {
+                let mut material =
+                    agent24_store::SourceRef::selected_material("doc-1", None, now_iso8601());
+                material.classification = agent24_store::SourceClassification::Restricted;
+                h.store
+                    .tag_run_source("run_1", 0, &material, &now_iso8601())
+                    .await
+                    .unwrap();
+            }
+            let approval = seed_approval(
+                "apr_1",
+                "run_1",
+                "tc_internal_1",
+                args.as_object().unwrap().clone(),
+            );
+            h.store.insert_approval(&approval).await.unwrap();
+
+            assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (1, 0));
+            h.broker
+                .resolve("apr_1", decision("approve", None))
+                .await
+                .unwrap();
+            h.manager
+                .resume_run("run_1".to_owned(), "apr_1".to_owned())
+                .await
+                .unwrap();
+            wait_terminal(&h.store, "run_1").await;
+
+            assert_eq!(marker.exists(), !restricted, "restricted: {restricted}");
+            if restricted {
+                let thread = h.store.list_run_messages("run_1").await.unwrap();
+                let result = thread
+                    .iter()
+                    .find(|m| m.role == "tool")
+                    .and_then(|m| m.content.clone())
+                    .expect("the refused call still gets a tool result");
+                assert!(result.contains("outbound"), "{result}");
+            }
+        }
+    }
+
+    /// Says its approval names no grant the first time, as a module tool
+    /// resumed after a restart does (K1-6a-G §2.3), then runs.
+    struct StaleOnceTool {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl agent24_tools::Tool for StaleOnceTool {
+        fn info(&self) -> agent24_protocol::ToolInfo {
+            agent24_protocol::ToolInfo::new(
+                "doc.write",
+                "module",
+                "writes a document",
+                RiskClass::WriteLocal,
+            )
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _: &ToolContext,
+            _: &serde_json::Map<String, serde_json::Value>,
+            _: &CancellationToken,
+        ) -> Result<String, ToolError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(ToolError::ApprovalStale)
+            } else {
+                Ok("rewritten".to_owned())
+            }
+        }
+    }
+
+    /// A resumed approval that names no grant is asked again, with the run
+    /// shown (and restorable) as awaiting that answer; then the call runs.
+    #[tokio::test]
+    async fn a_resumed_approval_naming_no_grant_is_asked_again_while_awaiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = Arc::new(StaleOnceTool {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let h = resume_harness_with(dir.path().to_path_buf(), Some(tool.clone())).await;
+        let run = Run {
+            id: "run_1".to_owned(),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::AwaitingApproval,
+            input: RunInput {
+                prompt: "write it".to_owned(),
+                workspace_id: None,
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now_iso8601(),
+            started_at: Some(now_iso8601()),
+            ended_at: None,
+        };
+        h.store.insert_run(&run).await.unwrap();
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "doc.write", "arguments": "{}" }]);
+        seed_proven_parked_thread(&h.store, "run_1", "write it", call).await;
+        let source = agent24_store::SourceRef::user_input("run_1", now_iso8601());
+        h.store
+            .tag_run_source("run_1", 0, &source, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = Approval {
+            id: "apr_1".to_owned(),
+            run_id: "run_1".to_owned(),
+            tool_call_id: "tc_internal_1".to_owned(),
+            kind: "module".to_owned(),
+            summary: "doc.write".to_owned(),
+            payload: serde_json::Map::new(),
+            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
+            standing_target: None,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
+            created_at: now_iso8601(),
+            decided_at: None,
+        };
+        h.store.insert_approval(&approval).await.unwrap();
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+
+        let asked_again = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pending = h
+                    .store
+                    .list_approvals(Some(ApprovalStatus::Pending))
+                    .await
+                    .unwrap();
+                if let Some(again) = pending.into_iter().find(|a| a.id != "apr_1") {
+                    return again;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the resumed call is asked about again");
+        let waiting = h.store.get_run("run_1").await.unwrap().unwrap();
+        assert_eq!(waiting.status, RunStatus::AwaitingApproval);
+        h.broker
+            .resolve(&asked_again.id, decision("approve", None))
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, "run_1").await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(tool.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(done.output.unwrap().text.contains("rewritten"));
     }
 
     #[tokio::test]
@@ -4887,7 +7064,7 @@ mod approval_tests {
         sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)").bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)").bind(WS).bind(&locator).bind(pm.dev().to_le_bytes().to_vec()).bind(pm.ino().to_le_bytes().to_vec()).bind(rm.dev().to_le_bytes().to_vec()).bind(rm.ino().to_le_bytes().to_vec()).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
         let wid=agent24_protocol::WorkspaceId::parse(WS).unwrap(); h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"s".into(),channel:"desktop".into(),workspace_id:Some(wid.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap(); let input=RunInput{prompt:"two".into(),workspace_id:Some(wid),model_override:None,mode:RunMode::Normal}; sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        h.store.append_run_message("run_1","user",Some("two"),&serde_json::json!([]),None,&now_iso8601()).await.unwrap(); let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); h.store.append_run_message("run_1","assistant",None,&calls,None,&now_iso8601()).await.unwrap(); let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
+        let a1=serde_json::json!({"argv":["/bin/echo","first"]}); let a2=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let calls=serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":a1.to_string()},{"id":"call_provider_2","name":"shell_exec","arguments":a2.to_string()}]); seed_proven_parked_thread(&h.store,"run_1","two",calls).await; let approval=seed_approval("apr_1","run_1","tc_internal_1",a1.as_object().unwrap().clone()); h.store.insert_approval(&approval).await.unwrap(); h.broker.resolve("apr_1",decision("approve",None)).await.unwrap();
         let run=h.store.get_run("run_1").await.unwrap().unwrap(); assert!(h.manager.tool_context_for(&run,"preflight").await.is_ok()); sqlx::raw_sql(&format!("CREATE TRIGGER lose_resume_authority AFTER INSERT ON run_messages WHEN NEW.run_id='run_1' AND NEW.role='tool' AND NEW.tool_call_id='call_provider_1' BEGIN UPDATE workspace_leases SET released_at='{now}' WHERE lease_id='{LEASE}'; END;")).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); h.manager.resume_run("run_1".into(),"apr_1".into()).await.unwrap(); assert_eq!(wait_terminal(&h.store,"run_1").await.status,RunStatus::Cancelled);
         assert_eq!(h.store.list_tool_calls("run_1").await.unwrap().len(),0); let thread=h.store.list_run_messages("run_1").await.unwrap(); assert!(thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_1"))); assert!(!thread.iter().any(|m|m.role=="tool"&&m.tool_call_id.as_deref()==Some("call_provider_2"))); assert_eq!(h.events.lock().unwrap().iter().filter(|e|e.as_str()=="run.cancelled").count(),1);
     }
@@ -4912,22 +7089,8 @@ mod approval_tests {
         let mut run = run_in("run_1", RunStatus::AwaitingApproval);
         run.session_id = Some("sess_1".to_owned());
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
         let mut approval = seed_approval(
             "apr_1",
             "run_1",
@@ -5034,22 +7197,8 @@ mod approval_tests {
             ended_at: None,
         };
         h.store.insert_run(&run).await.unwrap();
-        h.store
-            .append_run_message(
-                "run_1",
-                "user",
-                Some("run echo"),
-                &serde_json::json!([]),
-                None,
-                &now_iso8601(),
-            )
-            .await
-            .unwrap();
         let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
-        h.store
-            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
-            .await
-            .unwrap();
+        seed_proven_parked_thread(&h.store, "run_1", "run echo", call).await;
         let approval = Approval {
             id: "apr_1".to_owned(),
             run_id: "run_1".to_owned(),
@@ -5089,6 +7238,43 @@ mod approval_tests {
             !text.contains("should-not-run"),
             "denied tool ran anyway: {text}"
         );
+    }
+
+    /// The parked thread a current run would have stored: user prompt and the
+    /// assistant tool call, each with a present origin and no recall ref.
+    async fn seed_proven_parked_thread(
+        store: &Store,
+        run_id: &str,
+        prompt: &str,
+        call: serde_json::Value,
+    ) {
+        store
+            .append_originated_run_messages(
+                run_id,
+                &[
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "user".into(),
+                            content: Some(prompt.into()),
+                            tool_calls: serde_json::json!([]),
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::UserPrompt,
+                    },
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "assistant".into(),
+                            content: None,
+                            tool_calls: call,
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::Assistant,
+                    },
+                ],
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
     }
 
     /// A run row in a given status, for seeding crash/parked state directly.

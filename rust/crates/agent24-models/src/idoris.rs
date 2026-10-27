@@ -173,7 +173,7 @@ impl IdorisClient {
             Complexity::Complex => ("complex", "idoris/deep"),
         };
         // This first consumer supports local-only execution; Any may tighten to local.
-        let body = completion_body(req, role, true, false);
+        let body = gateway_body(req, role);
         // Request-Id is iDoris's idempotency key: the same id with a different
         // payload is 409 `request_id_conflict`. One admitted kernel id may bind
         // many calls, so it travels on Trace-Id and every call mints its own key.
@@ -280,6 +280,18 @@ impl IdorisClient {
     }
 }
 
+/// Request body for the iDoris gateway. The lifecycle path whitelists request
+/// fields (`model, messages, stream, max_tokens, tools, response_format, ...`)
+/// and answers 400 `unsupported_parameter` to anything else, so `temperature`
+/// is never forwarded here even when the caller set it (other providers send it).
+fn gateway_body(req: &CompletionRequest, role: &str) -> serde_json::Value {
+    let mut body = completion_body(req, role, true, false);
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("temperature");
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -369,6 +381,26 @@ mod tests {
                 None,
             )
             .await
+    }
+
+    #[test]
+    fn gateway_body_never_carries_temperature_while_other_providers_do() {
+        let request = CompletionRequest {
+            messages: vec![Msg::user("fixture")],
+            model: None,
+            tools: vec![],
+            response_format: None,
+            max_tokens: None,
+            disable_thinking: false,
+            progress: None,
+            temperature: Some(0.7),
+        };
+        let gateway = gateway_body(&request, "idoris/daily");
+        assert!(gateway.get("temperature").is_none(), "{gateway}");
+        assert_eq!(gateway["model"], "idoris/daily");
+        // Control: the shared builder (used by every other provider) still sends it.
+        let other = completion_body(&request, "m", false, false);
+        assert_eq!(other["temperature"].as_f64(), Some(0.7));
     }
 
     #[test]
