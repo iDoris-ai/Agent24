@@ -132,6 +132,8 @@ async fn configured_gateway_is_the_only_http_target() {
             }),
             max_tokens: std::num::NonZeroU32::new(512),
             disable_thinking: true,
+            progress: None,
+            temperature: None,
         };
         let cancel = CancellationToken::new();
         let case = std::env::var("A24_IDORIS_CASE").unwrap_or_default();

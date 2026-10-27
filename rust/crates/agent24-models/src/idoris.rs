@@ -173,7 +173,7 @@ impl IdorisClient {
             Complexity::Complex => ("complex", "idoris/deep"),
         };
         // This first consumer supports local-only execution; Any may tighten to local.
-        let body = completion_body(req, role, true);
+        let body = completion_body(req, role, true, false);
         // Request-Id is iDoris's idempotency key: the same id with a different
         // payload is 409 `request_id_conflict`. One admitted kernel id may bind
         // many calls, so it travels on Trace-Id and every call mints its own key.
@@ -355,6 +355,8 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            progress: None,
+            temperature: None,
         };
         gateway
             .complete(

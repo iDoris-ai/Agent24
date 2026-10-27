@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult};
 use axum::body::Bytes;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
@@ -91,6 +92,57 @@ pub struct KernelLimits {
 #[derive(Debug)]
 pub struct KernelResponse {
     pub status: StatusCode,
+}
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModuleToolEnvelope {
+    Completed {
+        payload: serde_json::Value,
+        #[serde(default)]
+        replayed: bool,
+    },
+    Pending {
+        job: serde_json::Value,
+    },
+    Error {
+        code: String,
+        #[serde(default)]
+        retryable: bool,
+        #[serde(default)]
+        details: Option<serde_json::Value>,
+    },
+}
+
+pub fn parse_module_tool_envelope(body: &[u8]) -> Result<ModuleToolResult, ModuleToolCallError> {
+    let envelope: ModuleToolEnvelope =
+        serde_json::from_slice(body).map_err(|_| ModuleToolCallError::InvalidResult)?;
+    match envelope {
+        ModuleToolEnvelope::Completed { payload, replayed } => {
+            if payload.is_null() {
+                return Err(ModuleToolCallError::InvalidResult);
+            }
+            Ok(ModuleToolResult::Completed { payload, replayed })
+        }
+        ModuleToolEnvelope::Pending { job } => {
+            if job.is_null() {
+                return Err(ModuleToolCallError::InvalidResult);
+            }
+            Ok(ModuleToolResult::Pending { job })
+        }
+        ModuleToolEnvelope::Error {
+            code,
+            retryable,
+            details,
+        } => {
+            let (code, unknown_code) = ModuleToolErrorCode::parse(&code);
+            Err(ModuleToolCallError::Module {
+                code,
+                retryable,
+                details,
+                unknown_code,
+            })
+        }
+    }
 }
 
 /// ME4-S3 §2.5/§4.4 (M7): the body of `POST /api/v1/<ns>/_a24/scheduler/
@@ -149,6 +201,7 @@ pub enum KernelCallError {
     /// The module may have received this attempt.
     MaybeSent(String),
     Timeout,
+    Cancelled,
     ResponseTooLarge,
     /// Review round 1, L3: a NON-2xx response's body failed to read for a
     /// reason OTHER than exceeding `limits.max_response_bytes` (a length
@@ -239,6 +292,58 @@ pub async fn send_kernel_request(
     limits: KernelLimits,
     before_guard: Option<&(dyn Fn() + Sync)>,
 ) -> Result<KernelResponse, KernelCallError> {
+    send_kernel_request_inner(generation, ids, request, limits, before_guard, None, false)
+        .await
+        .map(|response| KernelResponse {
+            status: response.status,
+        })
+}
+
+pub async fn send_module_tool_request(
+    generation: &Arc<Generation>,
+    ids: &KernelRequestIds,
+    request: KernelRequest,
+    limits: KernelLimits,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(StatusCode, ModuleToolResult), ModuleToolCallError> {
+    let response =
+        send_kernel_request_inner(generation, ids, request, limits, None, Some(cancel), true)
+            .await
+            .map_err(|error| match error {
+                KernelCallError::ResponseTooLarge => ModuleToolCallError::ResponseTooLarge,
+                KernelCallError::Timeout => ModuleToolCallError::Timeout,
+                KernelCallError::Abandoned(Abandoned { dispatched: true })
+                | KernelCallError::MaybeSent(_)
+                | KernelCallError::ResponseBodyError(_) => ModuleToolCallError::ResultUnknown,
+                KernelCallError::Abandoned(_) => ModuleToolCallError::ModuleUnavailable,
+                KernelCallError::Cancelled => ModuleToolCallError::Cancelled,
+                KernelCallError::NotDispatched
+                | KernelCallError::NotSent(_)
+                | KernelCallError::NoUpstream
+                | KernelCallError::Refused(_) => ModuleToolCallError::ModuleUnavailable,
+                KernelCallError::EntropyUnavailable => ModuleToolCallError::ModuleUnavailable,
+            })?;
+    let parsed = parse_module_tool_envelope(&response.body)?;
+    if !response.status.is_success() {
+        return Err(ModuleToolCallError::InvalidResult);
+    }
+    Ok((response.status, parsed))
+}
+
+struct KernelResponseData {
+    status: StatusCode,
+    body: Vec<u8>,
+}
+
+async fn send_kernel_request_inner(
+    generation: &Arc<Generation>,
+    ids: &KernelRequestIds,
+    request: KernelRequest,
+    limits: KernelLimits,
+    before_guard: Option<&(dyn Fn() + Sync)>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    strict_body: bool,
+) -> Result<KernelResponseData, KernelCallError> {
     let id = ids.mint();
     let token = proxy::mint_approval_token().ok_or(KernelCallError::EntropyUnavailable)?;
     let in_flight = generation
@@ -255,22 +360,32 @@ pub async fn send_kernel_request(
     let outcome = tokio::select! {
         r = tokio::time::timeout(
             limits.total,
-            exchange_once(&in_flight, &id, &token, request, limits, &may_have_left, &head, before_guard),
+            exchange_once(&in_flight, &id, &token, request, limits, &may_have_left, &head, before_guard, strict_body),
         ) => Some(r.unwrap_or(Err(KernelCallError::Timeout))),
+        () = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending().await } } => Some(Err(KernelCallError::Cancelled)),
         () = in_flight.revoked() => None,
     };
     // The commit point: read BEFORE trusting `outcome` (design §5.2 step 8).
     let finished = in_flight.finish();
     // v2 (L2): a 2xx head is the acknowledgement — body overflow, timeout, or
     // a revocation racing `finish()` after this point change nothing.
-    if let Some(status) = head.get().filter(|s| s.is_success()) {
-        return Ok(KernelResponse { status: *status });
+    if !strict_body && let Some(status) = head.get().filter(|s| s.is_success()) {
+        return Ok(KernelResponseData {
+            status: *status,
+            body: Vec::new(),
+        });
     }
     let left = may_have_left.load(Ordering::SeqCst);
     match (finished, outcome) {
         (Err(_), _) | (Ok(()), None) => {
             Err(KernelCallError::Abandoned(Abandoned { dispatched: left }))
         }
+        (Ok(()), Some(Err(KernelCallError::Cancelled))) if strict_body && left => Err(
+            KernelCallError::MaybeSent("call cancelled after dispatch".to_owned()),
+        ),
+        (Ok(()), Some(Err(KernelCallError::Timeout))) if strict_body && left => Err(
+            KernelCallError::MaybeSent("timed out after dispatch".to_owned()),
+        ),
         (Ok(()), Some(r)) => r,
     }
 }
@@ -285,7 +400,8 @@ async fn exchange_once(
     may_have_left: &AtomicBool,
     head: &std::sync::OnceLock<StatusCode>,
     before_guard: Option<&(dyn Fn() + Sync)>,
-) -> Result<KernelResponse, KernelCallError> {
+    strict_body: bool,
+) -> Result<KernelResponseData, KernelCallError> {
     let upstream = in_flight.upstream().ok_or(KernelCallError::NoUpstream)?;
     let uri: Uri = request
         .path
@@ -372,19 +488,18 @@ async fn exchange_once(
     // size limit that was never reached. A 2xx head is unaffected either way
     // (design v2, L2): `send_kernel_request`'s own head-check treats it as
     // `Ok` regardless of what this function returns.
-    if let Err(err) = Limited::new(body, limits.max_response_bytes)
+    let collected = Limited::new(body, limits.max_response_bytes)
         .collect()
-        .await
-        && !parts.status.is_success()
-    {
-        return if proxy::is_length_limit(&*err) {
-            Err(KernelCallError::ResponseTooLarge)
-        } else {
-            Err(KernelCallError::ResponseBodyError(err.to_string()))
-        };
-    }
-    Ok(KernelResponse {
+        .await;
+    let body = match collected {
+        Ok(body) => body.to_bytes().to_vec(),
+        Err(_err) if !strict_body && parts.status.is_success() => Vec::new(),
+        Err(err) if proxy::is_length_limit(&*err) => return Err(KernelCallError::ResponseTooLarge),
+        Err(err) => return Err(KernelCallError::ResponseBodyError(err.to_string())),
+    };
+    Ok(KernelResponseData {
         status: parts.status,
+        body,
     })
 }
 
@@ -425,6 +540,40 @@ mod tests {
             total: Duration::from_secs(5),
             max_response_bytes: 64 * 1024,
         }
+    }
+
+    #[test]
+    fn module_tool_envelopes_are_typed_closed_and_normalize_unknown_codes() {
+        assert!(parse_module_tool_envelope(br#"{"kind":"ok","payload":{}}"#).is_err());
+        assert!(
+            parse_module_tool_envelope(br#"{"kind":"completed","payload":{},"extra":true}"#)
+                .is_err()
+        );
+        let parsed = parse_module_tool_envelope(
+            br#"{"kind":"error","code":"future_code","retryable":true}"#,
+        )
+        .unwrap_err();
+        match parsed {
+            ModuleToolCallError::Module {
+                code, unknown_code, ..
+            } => {
+                assert_eq!(code, ModuleToolErrorCode::ModuleError);
+                assert_eq!(unknown_code.as_deref(), Some("future_code"));
+            }
+            other => panic!("expected normalized structured error, got {other:?}"),
+        }
+        let parsed = parse_module_tool_envelope(
+            br#"{"kind":"completed","payload":{"answer":42},"replayed":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ModuleToolResult::Completed {
+                payload: serde_json::json!({"answer":42}),
+                replayed: true,
+            }
+        );
+        assert!(parse_module_tool_envelope(b"{truncated").is_err());
     }
 
     fn short_limits(total: Duration) -> KernelLimits {
@@ -531,6 +680,55 @@ mod tests {
         assert_eq!(body, b"{\"key\":\"k\"}");
     }
 
+    #[tokio::test]
+    async fn module_tool_call_requires_a_complete_typed_2xx_envelope() {
+        let (path, _) = raw_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 59\r\n\r\n{\"kind\":\"completed\",\"payload\":{\"ok\":true},\"replayed\":false}",
+        ).await;
+        let generation = running_generation(path);
+        let result = send_module_tool_request(
+            &generation,
+            &ids(),
+            fired_request(),
+            limits(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok((status, ModuleToolResult::Completed { .. })) if status.is_success()),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_2xx_body_is_result_unknown_not_success() {
+        let path = unique_sock("tool-truncated");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0; 4096];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"kind\":\"completed\"")
+                .await;
+        });
+        let generation = running_generation(path);
+        let result = send_module_tool_request(
+            &generation,
+            &ids(),
+            fired_request(),
+            limits(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ModuleToolCallError::ResultUnknown)),
+            "{result:?}"
+        );
+    }
+
     /// Review round 1, M2: this used to be named as if it exercised C4.7a's
     /// own window — it does not. `send_kernel_request` calls its OWN internal
     /// `admit_request` first; a generation already revoked before that call
@@ -635,12 +833,10 @@ mod tests {
             &flag,
             &head,
             None,
+            false,
         )
         .await;
-        assert!(
-            matches!(result, Err(KernelCallError::NotDispatched)),
-            "{result:?}"
-        );
+        assert!(matches!(result, Err(KernelCallError::NotDispatched)));
         assert!(
             tokio::time::timeout(Duration::from_millis(200), rx)
                 .await

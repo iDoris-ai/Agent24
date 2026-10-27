@@ -1,0 +1,11 @@
+$ git diff --stat c57e17e -- . ":!tools/qa/rustdoc-repro" ":!docs/agent/cloud-wave38" ":!baton-result.json" ":!baton-decisions.tsv"
+lines=0
+$ git status --porcelain
+ M tools/qa/rustdoc-repro/make-fixture.sh
+ M tools/qa/rustdoc-repro/run-experiments.sh
+ M tools/qa/rustdoc-repro/target-window-watch.sh
+?? docs/agent/cloud-wave38/
+?? tools/qa/rustdoc-repro/artifact_observer.py
+?? tools/qa/rustdoc-repro/observe-artifacts.sh
+?? tools/qa/rustdoc-repro/tests/
+$ git diff --stat c57e17e -- docs/agent/cloud-wave37 (旧证据应为空)

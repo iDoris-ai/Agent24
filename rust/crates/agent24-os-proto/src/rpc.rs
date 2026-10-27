@@ -81,11 +81,17 @@ pub const MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
 /// `admit_callback`, wired in by the first business method).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// ME4-S2 decision M2: the ceiling on a PER-METHOD timeout
-/// ([`Handler::call_timeout`]). A handler may ask for more than
-/// [`CALL_TIMEOUT`] (a local model can take minutes), never for more than
-/// this — so no method can make a call effectively unbounded.
-pub const MAX_METHOD_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// ME4-S2 decision M2, ME4-S2a §2.4 (A): the ceiling on a PER-METHOD timeout
+/// ([`Handler::call_timeout`]): the most a method that declares one may get.
+/// Only `_a24/model/complete` declares one, and its backstop is this value: a
+/// model call is bounded by its own deadline, derived from the tokens it may
+/// write ([`crate::model_budget`]), and this only stops a kernel that hangs.
+/// No method can make a call effectively unbounded.
+pub const MAX_METHOD_CALL_TIMEOUT: Duration = crate::model_budget::MODEL_CALL_BACKSTOP;
+// J13 (A): the clamp never cuts the model backstop below a call's deadline.
+const _: () = assert!(
+    MAX_METHOD_CALL_TIMEOUT.as_nanos() >= crate::model_budget::MODEL_CALL_BACKSTOP.as_nanos()
+);
 
 /// How long one response may take to be written before the connection is given
 /// up on. A module that stops reading must not be able to stall the kernel's
@@ -1252,7 +1258,7 @@ type HandlerOutcome = Result<Result<Value, RpcError>, tokio::time::error::Elapse
 /// ME4-S2 decision M2: the budget one call gets — the method's own if it
 /// declared one (never above [`MAX_METHOD_CALL_TIMEOUT`]), else the
 /// connection-level default. Pure, so the clamp is unit-testable without
-/// waiting 300s.
+/// waiting for it.
 fn effective_call_timeout(declared: Option<Duration>, default: Duration) -> Duration {
     declared.map_or(default, |t| t.min(MAX_METHOD_CALL_TIMEOUT))
 }
@@ -1719,8 +1725,13 @@ mod tests {
             effective_call_timeout(Some(Duration::from_secs(120)), d),
             Duration::from_secs(120)
         );
+        // The model backstop is not clamped; anything longer is.
         assert_eq!(
-            effective_call_timeout(Some(Duration::from_secs(3600)), d),
+            effective_call_timeout(Some(crate::model_budget::MODEL_CALL_BACKSTOP), d),
+            crate::model_budget::MODEL_CALL_BACKSTOP
+        );
+        assert_eq!(
+            effective_call_timeout(Some(Duration::from_secs(5 * 3600)), d),
             MAX_METHOD_CALL_TIMEOUT
         );
         assert_eq!(

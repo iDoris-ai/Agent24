@@ -9,6 +9,8 @@ description = "Agent24 model gateway — minimal ModelProvider trait, OpenAI-com
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
 async-trait = "0.1"
+# Only to tell a backend that hung up from one that answered garbage (`classify`).
+hyper = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,6 +22,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [lints]
 workspace = true

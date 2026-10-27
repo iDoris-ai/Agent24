@@ -828,7 +828,13 @@ describe('OpenDesignComponentInstaller', () => {
     const result = await installer.install()
     expect(result.state).toBe('failed')
     expect(result.error).toContain('idle-timed-out')
-    expect(fs.readdirSync(componentsRoot)).toEqual([])
+    // SD-01: an idle-timeout is a network interruption, not corruption — the
+    // 1 already-flushed byte and its resume sidecar are kept on disk (not
+    // wiped, as before this change) so a later install() can Range-resume
+    // instead of restarting the whole download.
+    const partPath = path.join(componentsRoot, `.download-${manifest.sha256}.part`)
+    expect(fs.statSync(partPath).size).toBe(1)
+    expect(fs.existsSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`))).toBe(true)
 
     // Retryable: a fresh install() against a server that now responds fully succeeds.
     hangRequest = false
@@ -859,12 +865,18 @@ describe('OpenDesignComponentInstaller', () => {
       localFetch,
     )
     const pending = installer.install()
-    await vi.waitFor(() => expect(installer.status().state).toBe('downloading'))
+    // Wait for the first chunk to actually land (not just the `downloading`
+    // status set synchronously at the very start) so the preserved-prefix
+    // assertion below is deterministic rather than racing the fetch.
+    await vi.waitFor(() => expect(installer.status().received).toBe(1))
     installer.abort('test aborted it')
     const result = await pending
     expect(result.state).toBe('failed')
     expect(result.error).toContain('test aborted it')
-    expect(fs.readdirSync(componentsRoot)).toEqual([])
+    // SD-01: abort() (the quit path) also preserves the on-disk prefix now —
+    // only pause()-driven aborts report `paused`, but every abort reason
+    // keeps the bytes so a restart can still resume them.
+    expect(fs.statSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`)).size).toBe(1)
   })
 
   it('H2: a write-stream error during backpressure fails promptly (does not hang forever) and is retryable', async () => {
@@ -897,11 +909,790 @@ describe('OpenDesignComponentInstaller', () => {
     const result = await pending
     expect(result.state).toBe('failed')
     expect(result.error).toContain('simulated disk write failure')
-    expect(fs.readdirSync(componentsRoot)).toEqual([])
+    // R1 (independent review, 2026-10-15): the download destination is now
+    // opened with O_NOFOLLOW + an fd regular-file check *before* the write
+    // stream this test fakes ever runs — so a real, empty `.part`
+    // placeholder exists on disk (created by that open) alongside the
+    // resume sidecar, even though the fake stream itself never touches the
+    // filesystem.
+    expect(fs.readdirSync(componentsRoot).sort()).toEqual(
+      [`.download-${manifest.sha256}.meta.json`, `.download-${manifest.sha256}.part`].sort(),
+    )
 
     // Retryable: a fresh install() with the real fs restored succeeds.
     createWriteStreamSpy.mockRestore()
     const retried = await installer.install()
     expect(retried.state).toBe('installed')
+  })
+
+  it('R3 (independent review, 2026-10-15): a write-open rejection does not leave an orphaned idle-push timer that revives a failed download', async () => {
+    // A symlink/FIFO planted at the `.part` destination gets cleaned up by
+    // installOnce's own pre-download discard (it isn't a resumable regular
+    // file either), so it never reaches download()'s write-open. Inject the
+    // rejection precisely where the brief asks — the write-open itself —
+    // by rejecting only the exact O_CREAT call download() makes against
+    // this download's `.part` path; every other fs.openSync call (temp
+    // meta file, the real server, etc.) passes straight through.
+    const stage = seedTreeFor('a24-od-stage-timer-finally-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const { url } = await startServer(tarPath)
+    manifest.url = httpsManifestUrl(url)
+    const componentsRoot = tmpDir('a24-od-root-timer-finally-')
+    const partPath = path.join(componentsRoot, `.download-${manifest.sha256}.part`)
+
+    const realOpenSync = fs.openSync.bind(fs)
+    const openSyncSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+      if (filePath === partPath && typeof flags === 'number' && (flags & fs.constants.O_CREAT) !== 0) {
+        const error = new Error('EPERM: simulated write-open rejection (R3 regression test)') as NodeJS.ErrnoException
+        error.code = 'EPERM'
+        throw error
+      }
+      return realOpenSync(filePath as fs.PathLike, flags as number, mode as number)
+    })
+
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    const result = await installer.install()
+    openSyncSpy.mockRestore()
+    expect(result.state).toBe('failed')
+    expect(result.error).toContain('non-regular file')
+
+    // Before the fix: the idle-push timer was created before this
+    // write-open throws, and that throw happens outside the try/finally
+    // that clears it — the orphaned 1s interval survives install()'s
+    // rejection and, more than one tick later, calls
+    // setStatus({ state: 'downloading', ... }), silently reviving a job
+    // that has already failed with no way to retry.
+    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    expect(installer.status().state).toBe('failed')
+  })
+
+  describe('F1 (external review #967, 2026-10-15): a metadata-write ENOSPC resolves `failed` instead of rejecting install()', () => {
+    function metaFileContentsFor(manifest: OpenDesignComponentManifest): string {
+      return JSON.stringify({ version: manifest.version, url: manifest.url, sha256: manifest.sha256, total: manifest.size })
+    }
+
+    function mockWriteSyncEnospc(): ReturnType<typeof vi.spyOn> {
+      return vi.spyOn(fs, 'writeSync').mockImplementation(() => {
+        const error = new Error('ENOSPC: simulated disk-full writing download metadata (F1 regression test)') as NodeJS.ErrnoException
+        error.code = 'ENOSPC'
+        throw error
+      })
+    }
+
+    it('not-installed: fails before any byte is fetched, leaves no .download-meta-*.tmp, and is retryable', async () => {
+      const stage = seedTreeFor('a24-od-stage-f1-fresh-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-f1-fresh-')
+
+      const writeSyncSpy = mockWriteSyncEnospc()
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install() // must RESOLVE, never reject the promise
+      writeSyncSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(result.error).toContain('ENOSPC')
+      expect(requestCount()).toBe(0) // never reached the network
+      expect(fs.existsSync(componentsRoot) ? fs.readdirSync(componentsRoot).filter((n) => n.endsWith('.tmp')) : []).toEqual([])
+
+      const retried = await installer.install()
+      expect(retried.state).toBe('installed')
+    })
+
+    it('paused: resuming a valid on-disk prefix also fails cleanly (not reject), and keeps the prefix + its original sidecar untouched', async () => {
+      const stage = seedTreeFor('a24-od-stage-f1-paused-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+
+      const componentsRoot = tmpDir('a24-od-root-f1-paused-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      const partPath = path.join(componentsRoot, `.download-${manifest.sha256}.part`)
+      const metaPath = path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`)
+      fs.writeFileSync(partPath, bytes.subarray(0, 3))
+      fs.writeFileSync(metaPath, metaFileContentsFor(manifest))
+      const metaBefore = fs.readFileSync(metaPath, 'utf8')
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      expect(installer.status().state).toBe('paused')
+
+      const writeSyncSpy = mockWriteSyncEnospc()
+      const result = await installer.install()
+      writeSyncSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(result.error).toContain('ENOSPC')
+      expect(requestCount()).toBe(0) // the resume Range request never went out
+      expect(fs.readdirSync(componentsRoot).filter((n) => n.endsWith('.tmp'))).toEqual([])
+      // F1: writeDownloadMeta's own temp cleanup must never touch the original sidecar or the resumable prefix.
+      expect(fs.readFileSync(partPath).equals(bytes.subarray(0, 3))).toBe(true)
+      expect(fs.readFileSync(metaPath, 'utf8')).toBe(metaBefore)
+
+      const retried = await installer.install()
+      expect(retried.state).toBe('installed')
+    })
+  })
+
+  describe('R2 (external review #967 round 2, 2026-10-15): writeDownloadMeta write/rename/open boundary and its own-temp ownership', () => {
+    // writeDownloadMeta's random suffix is crypto.randomBytes(6).toString('hex');
+    // pinning randomBytes to an all-zero buffer makes the generated temp path
+    // deterministic so the open-EEXIST collision tests below can pre-plant a
+    // file/symlink at exactly that path.
+    const fixedTempSuffix = '0'.repeat(12)
+
+    function metaTempPathFor(componentsRoot: string): string {
+      return path.join(componentsRoot, `.download-meta-${fixedTempSuffix}.tmp`)
+    }
+
+    it('R3: a genuine partial write (correct bytes, honest short return value, no exception) still publishes the complete JSON — fs.writeFileSync resubmits the remainder itself', async () => {
+      const stage = seedTreeFor('a24-od-stage-r3-short-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r3-short-')
+
+      const realOpenSync = fs.openSync.bind(fs)
+      const realWriteSync = fs.writeSync.bind(fs)
+      const metaFds = new Set<number>()
+      let shortWriteHookCalls = 0
+      const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+        const fd = realOpenSync(filePath as fs.PathLike, flags as number, mode as number)
+        if (String(filePath).includes('.download-meta-')) metaFds.add(fd)
+        return fd
+      })
+      const writeSpy = vi.spyOn(fs, 'writeSync').mockImplementation((fd, data, ...rest) => {
+        // fs.writeFileSync's own JS-slow-path loop calls fs.writeSync with the
+        // payload already converted to a Buffer plus (offset, length[, position]),
+        // never with the original string — a buffer-shaped fault hook is what
+        // actually sits on the real code path, not a string-shaped one.
+        if (!metaFds.has(fd) || !Buffer.isBuffer(data)) return realWriteSync(fd, data as Buffer, ...(rest as [number, number]))
+        shortWriteHookCalls++
+        const offset = typeof rest[0] === 'number' ? rest[0] : 0
+        // a REAL short write: the correct leading byte lands on disk, honestly
+        // reported as fewer bytes than requested — no exception, no corruption.
+        // writeFileSync's loop sees the short count and calls us again with the
+        // advanced offset until the whole payload is on disk.
+        return realWriteSync(fd, data, offset, 1)
+      })
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      // writeDownloadMeta runs synchronously inside installOnce before its
+      // first `await` (the network fetch) — by the time install() returns a
+      // pending promise, the temp write/rename above has already happened,
+      // so the meta file can be inspected here, before this same install()
+      // later discards it as part of a normal successful completion.
+      const pending = installer.install()
+      openSpy.mockRestore()
+      writeSpy.mockRestore()
+      // positive control: the hook actually sat on the real write path (if the
+      // options object ever gained an `encoding`, writeFileSync would take the
+      // C++ fast path and this counter would silently stay 0 — a false green).
+      expect(shortWriteHookCalls).toBeGreaterThan(1)
+      const metaPath = path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`)
+      expect(fs.statSync(metaPath).mode & 0o777).toBe(0o600)
+      expect(JSON.parse(fs.readFileSync(metaPath, 'utf8'))).toEqual({
+        version: manifest.version,
+        url: manifest.url,
+        sha256: manifest.sha256,
+        total: manifest.size,
+      })
+      expect(fs.readdirSync(componentsRoot).filter((n) => n.endsWith('.tmp'))).toEqual([])
+
+      const result = await pending
+      expect(result.state).toBe('installed')
+      expect(requestCount()).toBe(1)
+    })
+
+    it('write ENOSPC followed by a close() that itself throws EIO: the own temp file is still removed, not leaked', async () => {
+      const stage = seedTreeFor('a24-od-stage-r2-closeio-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r2-closeio-')
+
+      const realOpenSync = fs.openSync.bind(fs)
+      const realCloseSync = fs.closeSync.bind(fs)
+      const metaFds = new Set<number>()
+      const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+        const fd = realOpenSync(filePath as fs.PathLike, flags as number, mode as number)
+        if (String(filePath).includes('.download-meta-')) metaFds.add(fd)
+        return fd
+      })
+      const writeSpy = vi.spyOn(fs, 'writeSync').mockImplementation((fd) => {
+        if (!metaFds.has(fd)) throw new Error('unexpected fs.writeSync call outside the metadata temp fd in this test')
+        const error = new Error('ENOSPC: simulated disk-full writing download metadata (R2 regression test)') as NodeJS.ErrnoException
+        error.code = 'ENOSPC'
+        throw error
+      })
+      const closeSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+        const wasMetaFd = metaFds.delete(fd)
+        realCloseSync(fd) // the real fd IS released here, same as a real close() that then reports EIO below.
+        if (wasMetaFd) {
+          const error = new Error('EIO: simulated close failure after the fd was already released (R2 regression test)') as NodeJS.ErrnoException
+          error.code = 'EIO'
+          throw error
+        }
+      })
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      openSpy.mockRestore()
+      writeSpy.mockRestore()
+      closeSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(result.error).toContain('EIO')
+      expect(requestCount()).toBe(0)
+      expect(fs.existsSync(componentsRoot) ? fs.readdirSync(componentsRoot).filter((n) => n.endsWith('.tmp')) : []).toEqual([])
+
+      const retried = await installer.install()
+      expect(retried.state).toBe('installed')
+    })
+
+    it('write ENOSPC followed by a cleanup rmSync that itself throws ENOSPC: the fd is still closed, not leaked', async () => {
+      const stage = seedTreeFor('a24-od-stage-r2-rmio-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r2-rmio-')
+
+      const realOpenSync = fs.openSync.bind(fs)
+      const realCloseSync = fs.closeSync.bind(fs)
+      const realRmSync = fs.rmSync.bind(fs)
+      const metaFds = new Set<number>()
+      const closedFds = new Set<number>()
+      const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+        const fd = realOpenSync(filePath as fs.PathLike, flags as number, mode as number)
+        if (String(filePath).includes('.download-meta-')) metaFds.add(fd)
+        return fd
+      })
+      const writeSpy = vi.spyOn(fs, 'writeSync').mockImplementation((fd) => {
+        if (!metaFds.has(fd)) throw new Error('unexpected fs.writeSync call outside the metadata temp fd in this test')
+        const error = new Error('ENOSPC: simulated disk-full writing download metadata (R2 regression test)') as NodeJS.ErrnoException
+        error.code = 'ENOSPC'
+        throw error
+      })
+      const closeSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+        if (metaFds.has(fd)) closedFds.add(fd)
+        return realCloseSync(fd) // the real fd IS released here, regardless of the cleanup rmSync failure below.
+      })
+      const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
+        if (!String(target).includes('.download-meta-')) return realRmSync(target, options as fs.RmOptions)
+        const error = new Error('ENOSPC: simulated cleanup failure removing the metadata temp file (R2 regression test)') as NodeJS.ErrnoException
+        error.code = 'ENOSPC'
+        throw error
+      })
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      openSpy.mockRestore()
+      writeSpy.mockRestore()
+      closeSpy.mockRestore()
+      rmSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(requestCount()).toBe(0)
+      expect(metaFds.size).toBeGreaterThan(0)
+      // every fd opened for the metadata temp was actually closed, even though
+      // the cleanup rmSync that ran right after it failed with its own ENOSPC.
+      expect(closedFds).toEqual(metaFds)
+    })
+
+    it('open EEXIST against a pre-existing file at the random temp path: foreign content is preserved, not deleted', async () => {
+      const stage = seedTreeFor('a24-od-stage-r2-collide-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r2-collide-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+
+      const randomBytesSpy = vi.spyOn(crypto, 'randomBytes').mockReturnValue(Buffer.alloc(6) as unknown as Buffer<ArrayBuffer>)
+      const collidingTempPath = metaTempPathFor(componentsRoot)
+      fs.writeFileSync(collidingTempPath, 'FOREIGN-CONTENT-MUST-SURVIVE')
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      randomBytesSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(result.error).toContain('EEXIST')
+      expect(requestCount()).toBe(0)
+      expect(fs.readFileSync(collidingTempPath, 'utf8')).toBe('FOREIGN-CONTENT-MUST-SURVIVE')
+    })
+
+    it('open EEXIST against a pre-existing SYMLINK at the random temp path: the symlink and its target both survive', async () => {
+      const stage = seedTreeFor('a24-od-stage-r2-symlink-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r2-symlink-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      const outsideTarget = path.join(tmpDir('a24-od-outside-r2-symlink-'), 'sentinel.txt')
+      fs.writeFileSync(outsideTarget, 'OUTSIDE-TARGET-MUST-SURVIVE')
+
+      const randomBytesSpy = vi.spyOn(crypto, 'randomBytes').mockReturnValue(Buffer.alloc(6) as unknown as Buffer<ArrayBuffer>)
+      const collidingTempPath = metaTempPathFor(componentsRoot)
+      fs.symlinkSync(outsideTarget, collidingTempPath)
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      randomBytesSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(requestCount()).toBe(0)
+      expect(fs.lstatSync(collidingTempPath).isSymbolicLink()).toBe(true)
+      expect(fs.readlinkSync(collidingTempPath)).toBe(outsideTarget)
+      expect(fs.readFileSync(outsideTarget, 'utf8')).toBe('OUTSIDE-TARGET-MUST-SURVIVE')
+    })
+
+    it('a normal write publishes complete, valid JSON at mode 0600', async () => {
+      const stage = seedTreeFor('a24-od-stage-r2-normal-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      expect(bytes.length).toBeGreaterThan(4)
+
+      let hangFreshRequests = true
+      const server = http.createServer((req, res) => {
+        if (req.headers.range) {
+          const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range)![1])
+          res.writeHead(206, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+            'Content-Length': String(bytes.length - start),
+          })
+          res.end(bytes.subarray(start))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+        if (hangFreshRequests) { res.write(bytes.subarray(0, 2)); return }
+        res.end(bytes)
+      })
+      servers.push(server)
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const { port } = server.address() as AddressInfo
+      manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+      const componentsRoot = tmpDir('a24-od-root-r2-normal-')
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const pending = installer.install()
+      await vi.waitFor(() => expect(installer.status().received).toBe(2))
+      installer.pause()
+      const result = await pending
+      expect(result.state).toBe('paused')
+
+      const metaPath = path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`)
+      const stat = fs.statSync(metaPath)
+      expect(stat.mode & 0o777).toBe(0o600)
+      expect(JSON.parse(fs.readFileSync(metaPath, 'utf8'))).toEqual({
+        version: manifest.version,
+        url: manifest.url,
+        sha256: manifest.sha256,
+        total: manifest.size,
+      })
+
+      hangFreshRequests = false
+      const resumed = await installer.install()
+      expect(resumed.state).toBe('installed')
+    })
+  })
+
+  describe('R3 (external review #967 round 3, 2026-10-15): writeDownloadMeta rebuilt on fs.writeFileSync — close-only failure, rename failure, and ownership-by-syscall beyond EEXIST', () => {
+    it('close() alone throwing EIO after a full, successful write still publishes nothing and leaves the temp cleaned up', async () => {
+      const stage = seedTreeFor('a24-od-stage-r3-closeonly-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r3-closeonly-')
+
+      const realOpenSync = fs.openSync.bind(fs)
+      const realCloseSync = fs.closeSync.bind(fs)
+      const metaFds = new Set<number>()
+      const closedFds = new Set<number>()
+      const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+        const fd = realOpenSync(filePath as fs.PathLike, flags as number, mode as number)
+        if (String(filePath).includes('.download-meta-')) metaFds.add(fd)
+        return fd
+      })
+      const closeSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+        if (metaFds.has(fd)) closedFds.add(fd)
+        realCloseSync(fd) // the real fd IS released here — only the reported close() outcome is faked.
+        if (metaFds.has(fd)) {
+          const error = new Error('EIO: simulated close failure after a full, successful write (R3 regression test)') as NodeJS.ErrnoException
+          error.code = 'EIO'
+          error.syscall = 'close'
+          throw error
+        }
+      })
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      openSpy.mockRestore()
+      closeSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(result.error).toContain('EIO')
+      expect(requestCount()).toBe(0)
+      expect(metaFds.size).toBeGreaterThan(0)
+      expect(closedFds).toEqual(metaFds) // the fd was really released, not leaked, despite the reported close() failure
+      expect(fs.existsSync(componentsRoot) ? fs.readdirSync(componentsRoot).filter((n) => n.endsWith('.tmp')) : []).toEqual([])
+      expect(fs.existsSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`))).toBe(false)
+
+      const retried = await installer.install()
+      expect(retried.state).toBe('installed')
+    })
+
+    it('a rename failure (metaPath is a pre-existing directory) leaves the temp cleaned up and the directory untouched', async () => {
+      const stage = seedTreeFor('a24-od-stage-r3-renamefail-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r3-renamefail-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      const metaPath = path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`)
+      fs.mkdirSync(metaPath) // rename(tempFile, existingDir) is EISDIR on macOS/Linux — a real fault, not mocked.
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+
+      expect(result.state).toBe('failed')
+      expect(result.error).toContain('EISDIR')
+      expect(requestCount()).toBe(0)
+      expect(fs.readdirSync(componentsRoot).filter((n) => n.endsWith('.tmp'))).toEqual([])
+      expect(fs.statSync(metaPath).isDirectory()).toBe(true) // the failed rename never touched the destination
+    })
+
+    it('a synthetic EMFILE at open (not EEXIST) still leaves a pre-existing foreign temp untouched — ownership follows error.syscall, not error.code', async () => {
+      const stage = seedTreeFor('a24-od-stage-r3-emfile-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r3-emfile-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+
+      const randomBytesSpy = vi.spyOn(crypto, 'randomBytes').mockReturnValue(Buffer.alloc(6) as unknown as Buffer<ArrayBuffer>)
+      const collidingTempPath = path.join(componentsRoot, `.download-meta-${'0'.repeat(12)}.tmp`)
+      fs.writeFileSync(collidingTempPath, 'FOREIGN-CONTENT-MUST-SURVIVE')
+
+      const realOpenSync = fs.openSync.bind(fs)
+      const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+        if (filePath === collidingTempPath) {
+          // a REAL open() fault carries syscall:'open' (verified against Node
+          // 20.19.1/24.21 above) — a test error missing that field would
+          // falsely exercise the "owned" branch and isn't a valid probe.
+          const error = new Error('EMFILE: simulated too-many-open-files on the metadata temp open (R3 regression test)') as NodeJS.ErrnoException
+          error.code = 'EMFILE'
+          error.syscall = 'open'
+          throw error
+        }
+        return realOpenSync(filePath as fs.PathLike, flags as number, mode as number)
+      })
+      const rmSpy = vi.spyOn(fs, 'rmSync')
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      randomBytesSpy.mockRestore()
+      openSpy.mockRestore()
+      rmSpy.mockRestore()
+
+      expect(result.state).toBe('failed')
+      expect(result.error).toContain('EMFILE')
+      expect(requestCount()).toBe(0)
+      expect(rmSpy.mock.calls.some(([target]) => target === collidingTempPath)).toBe(false)
+      expect(fs.readFileSync(collidingTempPath, 'utf8')).toBe('FOREIGN-CONTENT-MUST-SURVIVE')
+    })
+
+    it('metaPath itself is a symlink — the rename replaces the link with a regular 0600 file, and the outside target survives', async () => {
+      const stage = seedTreeFor('a24-od-stage-r3-metalink-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-r3-metalink-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      const outsideTarget = path.join(tmpDir('a24-od-outside-r3-metalink-'), 'sentinel.txt')
+      fs.writeFileSync(outsideTarget, 'OUTSIDE-META-TARGET-MUST-SURVIVE')
+      const metaPath = path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`)
+      fs.symlinkSync(outsideTarget, metaPath)
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      // Both the symlink's removal (readMatchingDownloadMeta's O_NOFOLLOW open
+      // fails ELOOP -> not resumable -> discardDownloadFile unlinks it) and
+      // writeDownloadMeta's own rename-over-that-name run synchronously before
+      // installOnce's first `await`, so metaPath is already a plain file by
+      // the time install() returns — well before this same install() later
+      // discards it again as part of a normal successful completion.
+      const pending = installer.install()
+      expect(fs.lstatSync(metaPath).isSymbolicLink()).toBe(false)
+      expect(fs.statSync(metaPath).mode & 0o777).toBe(0o600)
+      expect(JSON.parse(fs.readFileSync(metaPath, 'utf8'))).toEqual({
+        version: manifest.version,
+        url: manifest.url,
+        sha256: manifest.sha256,
+        total: manifest.size,
+      })
+      expect(fs.readFileSync(outsideTarget, 'utf8')).toBe('OUTSIDE-META-TARGET-MUST-SURVIVE')
+
+      const result = await pending
+      expect(result.state).toBe('installed')
+      expect(requestCount()).toBe(1)
+    })
+  })
+
+  it('F6 (external review #967, mutation M6): two speed samples landing in the same millisecond never report Infinity bytes/sec', async () => {
+    const stage = seedTreeFor('a24-od-stage-f6-')
+    const tarPath = buildTarball(stage)
+    const { manifest } = manifestFor(tarPath)
+    const bytes = fs.readFileSync(tarPath)
+    expect(bytes.length).toBeGreaterThan(4)
+    const split = 2
+
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+      res.write(bytes.subarray(0, split))
+      setImmediate(() => res.end(bytes.subarray(split)))
+    })
+    servers.push(server)
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as AddressInfo
+    manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+    const componentsRoot = tmpDir('a24-od-root-f6-')
+    // Freezes both chunk samples onto the exact same `Date.now()` reading —
+    // the only way SpeedEstimator.sample's `elapsedMs` can be 0 while bytes
+    // still grew between them (see the elapsedMs > 0 guard it depends on).
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    const seen: Array<{ received?: number; bytesPerSecond?: number }> = []
+    const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+    installer.onProgress((status) => {
+      if (status.state === 'downloading') seen.push({ received: status.received, bytesPerSecond: status.bytesPerSecond })
+    })
+    const result = await installer.install()
+    nowSpy.mockRestore()
+
+    expect(result.state).toBe('installed')
+    const finalChunkSample = seen.find((s) => s.received === bytes.length)
+    expect(finalChunkSample).toBeDefined()
+    expect(Number.isFinite(finalChunkSample!.bytesPerSecond)).toBe(true)
+    for (const s of seen) if (s.bytesPerSecond !== undefined) expect(Number.isFinite(s.bytesPerSecond)).toBe(true)
+  })
+
+  describe('SD-01: pause/resume via HTTP Range', () => {
+    function metaFileContents(manifest: OpenDesignComponentManifest, overrides: Partial<OpenDesignComponentManifest> = {}): string {
+      const m = { ...manifest, ...overrides }
+      return JSON.stringify({ version: m.version, url: m.url, sha256: m.sha256, total: m.size })
+    }
+
+    it('pause() preserves the on-disk prefix (not `failed`), and a BRAND NEW installer instance resumes it with a byte-exact Range request', async () => {
+      const stage = seedTreeFor('a24-od-stage-pause-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      expect(bytes.length).toBeGreaterThan(4)
+
+      let hangFreshRequests = true
+      const rangeHeaders: Array<string | undefined> = []
+      const server = http.createServer((req, res) => {
+        rangeHeaders.push(req.headers.range)
+        if (req.headers.range) {
+          const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range)![1])
+          res.writeHead(206, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+            'Content-Length': String(bytes.length - start),
+          })
+          res.end(bytes.subarray(start))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+        if (hangFreshRequests) { res.write(bytes.subarray(0, 2)); return }
+        res.end(bytes)
+      })
+      servers.push(server)
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const { port } = server.address() as AddressInfo
+      manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+      const componentsRoot = tmpDir('a24-od-root-pause-')
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const pending = installer.install()
+      await vi.waitFor(() => expect(installer.status().received).toBe(2))
+      installer.pause()
+      const result = await pending
+      expect(result.state).toBe('paused')
+      expect(result.received).toBe(2)
+      expect(fs.statSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`)).size).toBe(2)
+      // No final marker / installed dir — a paused download is never mistaken for installed.
+      expect(fs.existsSync(openDesignComponentInstallDir(componentsRoot, manifest))).toBe(false)
+
+      hangFreshRequests = false
+      const restarted = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      expect(restarted.status().state).toBe('paused')
+      expect(restarted.status().received).toBe(2)
+      const resumed = await restarted.install()
+      expect(resumed.state).toBe('installed')
+      expect(rangeHeaders[rangeHeaders.length - 1]).toBe('bytes=2-')
+    })
+
+    it('a prefix already at full size with matching metadata skips the network entirely and verifies by hash alone', async () => {
+      const stage = seedTreeFor('a24-od-stage-skipnet-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+
+      const componentsRoot = tmpDir('a24-od-root-skipnet-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes)
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+      expect(requestCount()).toBe(0)
+    })
+
+    it('416 while the saved prefix is still short forces a controlled reset (retries once from byte 0, does not loop)', async () => {
+      const stage = seedTreeFor('a24-od-stage-416-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+
+      let requests = 0
+      const server = http.createServer((req, res) => {
+        requests += 1
+        if (req.headers.range) {
+          res.writeHead(416, { 'Content-Range': `bytes */${bytes.length}` })
+          res.end()
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+        res.end(bytes)
+      })
+      servers.push(server)
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const { port } = server.address() as AddressInfo
+      manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+      const componentsRoot = tmpDir('a24-od-root-416-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+      expect(requests).toBe(2) // the rejected Range attempt, then exactly one full retry — never more.
+    })
+
+    it('206 with a Content-Range that disagrees with the requested start forces a controlled reset', async () => {
+      const stage = seedTreeFor('a24-od-stage-mismatch206-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+
+      const server = http.createServer((req, res) => {
+        if (req.headers.range) {
+          // Lies about where this response actually starts.
+          res.writeHead(206, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Range': `bytes 0-${bytes.length - 1}/${bytes.length}`,
+            'Content-Length': String(bytes.length),
+          })
+          res.end(bytes)
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length) })
+        res.end(bytes)
+      })
+      servers.push(server)
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const { port } = server.address() as AddressInfo
+      manifest.url = httpsManifestUrl(`http://127.0.0.1:${port}/asset.tar.gz`)
+
+      const componentsRoot = tmpDir('a24-od-root-mismatch206-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+    })
+
+    it('a 200 response to a Range request (server ignoring Range) resets the local file from byte 0 instead of corrupting it', async () => {
+      const stage = seedTreeFor('a24-od-stage-200fallback-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      const { url } = await startServer(tarPath) // always replies 200 + full body, ignoring any Range header
+
+      manifest.url = httpsManifestUrl(url)
+      const componentsRoot = tmpDir('a24-od-root-200fallback-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`), metaFileContents(manifest))
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      // A passing install here proves the file was truncated-and-rewritten
+      // rather than appended-onto — an append would fail the final size/hash
+      // check instead of reaching `installed`.
+      expect(result.state).toBe('installed')
+    })
+
+    it('an on-disk prefix whose sidecar metadata does not match the current manifest (e.g. a different url) is never reused', async () => {
+      const stage = seedTreeFor('a24-od-stage-wrongmeta-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      const bytes = fs.readFileSync(tarPath)
+      const { url, requestCount } = await startServer(tarPath)
+      manifest.url = httpsManifestUrl(url)
+
+      const componentsRoot = tmpDir('a24-od-root-wrongmeta-')
+      fs.mkdirSync(componentsRoot, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(path.join(componentsRoot, `.download-${manifest.sha256}.part`), bytes.subarray(0, 3))
+      fs.writeFileSync(
+        path.join(componentsRoot, `.download-${manifest.sha256}.meta.json`),
+        metaFileContents(manifest, { url: 'https://example.invalid/other.tar.gz' }),
+      )
+
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const result = await installer.install()
+      expect(result.state).toBe('installed')
+      expect(requestCount()).toBe(1) // one full fresh request — the 3-byte "match" was never trusted or Range-resumed.
+    })
+
+    it('a pre-existing INSTALLED component is left untouched when a later install() call runs (same manifest, nothing to do)', async () => {
+      const stage = seedTreeFor('a24-od-stage-installed-noop-')
+      const tarPath = buildTarball(stage)
+      const { manifest } = manifestFor(tarPath)
+      manifest.url = httpsManifestUrl((await startServer(tarPath)).url)
+      const componentsRoot = tmpDir('a24-od-root-installed-noop-')
+      const installer = new OpenDesignComponentInstaller({ manifest, componentsRoot, allowedHosts: ['127.0.0.1'] }, localFetch)
+      const first = await installer.install()
+      expect(first.state).toBe('installed')
+      const finalDir = first.dir!
+      const markerBefore = fs.readFileSync(path.join(finalDir, '.agent24-component.json'), 'utf8')
+
+      const second = await installer.install()
+      expect(second.state).toBe('installed')
+      expect(second.dir).toBe(finalDir)
+      expect(fs.readFileSync(path.join(finalDir, '.agent24-component.json'), 'utf8')).toBe(markerBefore)
+    })
   })
 })

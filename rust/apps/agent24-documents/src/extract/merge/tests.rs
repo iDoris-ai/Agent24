@@ -86,7 +86,7 @@ fn one_value_is_present_with_its_evidence_or_why_it_has_none() {
         &[one(claim(
             "全天",
             "",
-            Err("a quote is not in the block it names"),
+            Err("a quote is in no block the model was shown"),
         ))],
         false,
     );
@@ -95,7 +95,7 @@ fn one_value_is_present_with_its_evidence_or_why_it_has_none() {
         (
             None,
             Some(vec![]),
-            Some("a quote is not in the block it names")
+            Some("a quote is in no block the model was shown")
         )
     );
 }
@@ -139,7 +139,7 @@ fn windows_that_differ_are_a_conflict_never_resolved() {
                 claim(
                     "10月13日",
                     "2026-10-13",
-                    Err("a quote occurs more than once in its block"),
+                    Err("a quote occurs more than once in the blocks the model was shown"),
                 ),
                 claim("10月12日", "2026-10-12", Ok(vec![anchor(3, 0)])),
             ]),
@@ -156,7 +156,10 @@ fn windows_that_differ_are_a_conflict_never_resolved() {
     // Kept without evidence, not dropped: dropping it would choose the other.
     assert_eq!(
         (c[1].anchors.len(), c[1].unsourced_reason.as_deref()),
-        (0, Some("a quote occurs more than once in its block"))
+        (
+            0,
+            Some("a quote occurs more than once in the blocks the model was shown")
+        )
     );
     // Without a normal form, the wording is one, and the comparison.
     let v = merged(

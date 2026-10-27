@@ -538,6 +538,8 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         response_format: None,
         max_tokens: None,
         disable_thinking: false,
+        temperature: None,
+        progress: None,
     };
     state
         .events
@@ -556,13 +558,19 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // response body — see chat-latency.ts), but the DB row exists regardless
     // of whether any client asks.
     let call_start = std::time::Instant::now();
-    // Default profile: shareable + simple → local-first tier order, so everyday
-    // chat prefers the on-device model and only falls back outward (D2).
+    // An untagged transient chat run resolves to LocalOnly; message text cannot widen it.
     // `complete_served` (not the plain `complete`) so the timing row below can
     // report WHICH TIER actually served this call, not just the provider name.
     match state
         .router
-        .complete_served(TaskProfile::default(), &request, &cancel)
+        .complete_served(
+            state
+                .runs
+                .task_profile_for_run(&run_id, TaskProfile::default())
+                .await,
+            &request,
+            &cancel,
+        )
         .await
     {
         Ok(served) => {
@@ -1168,6 +1176,13 @@ mod tests {
         assert!(rows[0].tier.is_none());
     }
 
+    /// A row's `ts` `days` before now: the recorder `state_with_stub` spawns
+    /// prunes rows older than `RETENTION_MAX_AGE_DAYS` as it starts, so a
+    /// fixed date stops being returned once it is that old.
+    fn days_ago(days: u64) -> String {
+        agent24_core::util::iso8601_before(std::time::Duration::from_secs(days * 86_400))
+    }
+
     #[tokio::test]
     async fn get_timings_returns_recorded_rows_filtered_by_source_and_since() {
         let state = state_with_stub().await;
@@ -1175,7 +1190,7 @@ mod tests {
         state
             .store
             .record_call_timing(&agent24_store::NewCallTiming {
-                ts: "2026-09-25T00:00:00Z".to_owned(),
+                ts: days_ago(2),
                 source: "chat".to_owned(),
                 total_ms: 100,
                 ok: true,
@@ -1186,7 +1201,7 @@ mod tests {
         state
             .store
             .record_call_timing(&agent24_store::NewCallTiming {
-                ts: "2026-09-27T00:00:00Z".to_owned(),
+                ts: days_ago(1),
                 source: "module:agentear".to_owned(),
                 model_id: Some("Qwen3.6-35B-A3B-MLX-8bit".to_owned()),
                 tier: Some("local".to_owned()),
@@ -1245,7 +1260,7 @@ mod tests {
             state
                 .store
                 .record_call_timing(&agent24_store::NewCallTiming {
-                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    ts: days_ago(1),
                     source: source.to_owned(),
                     total_ms: ms,
                     ok: true,
@@ -1269,7 +1284,7 @@ mod tests {
             state
                 .store
                 .record_call_timing(&agent24_store::NewCallTiming {
-                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    ts: days_ago(1),
                     source: "chat".to_owned(),
                     model_id: Some("m1".to_owned()),
                     total_ms: ms,

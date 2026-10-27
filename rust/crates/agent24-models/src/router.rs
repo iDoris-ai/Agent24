@@ -21,6 +21,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{CompletionRequest, CompletionResponse, ModelError, ModelProvider};
 
+/// The longest a provider stays cooled by default. A module waits as long
+/// before it asks again after `no_provider` (ME4-S2a §2.6); the kernel's
+/// tests hold the two equal.
+pub const DEFAULT_MAX_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Routing tier. `Lora` is a locally-served fine-tune, so it counts as local
 /// for privacy purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +193,34 @@ fn env_local_tier(url: &str) -> Tier {
     }
 }
 
+/// How a `from_env` provider may be asked to skip a reasoning model's
+/// thinking (`CompletionRequest::disable_thinking`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingSwitch {
+    /// Never: the request body stays as it was before the switches existed.
+    None,
+    /// oMLX / mlx-lm-server's `chat_template_kwargs` extension.
+    ChatTemplateKwargs,
+    /// `reasoning_effort: "none"`, which Ollama's OpenAI layer maps to
+    /// thinking off.
+    ReasoningEffort,
+}
+
+/// Review H2: `chat_template_kwargs` is oMLX's own extension, so only oMLX
+/// gets it — being local does not make a backend oMLX. ME4-S2c §4: Ollama gets
+/// `reasoning_effort` by the same rule. Either only when judged local: behind
+/// a remote URL may be any OpenAI-compatible service, which may refuse it.
+/// A function of its own so a test can read it; `from_env` hands back
+/// `dyn ModelProvider`s, which do not say.
+fn thinking_switch(backend: &str, tier: Tier) -> ThinkingSwitch {
+    match backend {
+        _ if !tier.is_local() => ThinkingSwitch::None,
+        "omlx" => ThinkingSwitch::ChatTemplateKwargs,
+        "ollama" => ThinkingSwitch::ReasoningEffort,
+        _ => ThinkingSwitch::None,
+    }
+}
+
 /// The open-enum tier string reported on `/models` for a judged tier.
 fn tier_label(t: Tier) -> &'static str {
     match t {
@@ -198,6 +231,13 @@ fn tier_label(t: Tier) -> &'static str {
 }
 
 impl ModelRouter {
+    #[must_use]
+    pub fn has_remote_tier(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|routed| routed.tier == Tier::Remote)
+    }
+
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
     /// `base_cooldown`, capped at `max_cooldown`.
     ///
@@ -270,9 +310,11 @@ impl ModelRouter {
     }
 
     /// Convenience default: 2s base, 60s cap. Same PRIVACY CONTRACT as
-    /// [`Self::new`]: Local providers must be `loopback_only()`.
+    /// [`Self::new`]: Local providers must be `loopback_only()`. The cap is a
+    /// contract with modules too (ME4-S2a §2.6): they wait it out after
+    /// `no_provider`, so the daemon's router must keep [`DEFAULT_MAX_COOLDOWN`].
     pub fn with_defaults(providers: Vec<(Arc<dyn ModelProvider>, Tier)>) -> Self {
-        Self::new(providers, Duration::from_secs(2), Duration::from_secs(60))
+        Self::new(providers, Duration::from_secs(2), DEFAULT_MAX_COOLDOWN)
     }
 
     /// The default local chain as tiered providers: oMLX (8088) and Ollama
@@ -303,50 +345,31 @@ impl ModelRouter {
         // v3 N1: a provider labeled Local talks ONLY to its loopback address —
         // no proxy, no redirect. v3 L-e: its reported tier string is the
         // judged tier, not a hard-coded "local".
-        // Review H2: `chat_template_kwargs` (the `enable_thinking: false`
-        // convention) is an oMLX/mlx-lm-server-specific extension — NOT part
-        // of the OpenAI-compatible contract every provider here claims to
-        // speak. Sending it to a hosted/managed OpenAI-compatible endpoint
-        // (a remote provider, or even a local one that isn't actually oMLX)
-        // risks a hard 400 from a strict server. So this is opt-in per
-        // PROVIDER INSTANCE (`allow_ctk`), not derived from `tier` — a
-        // future non-oMLX local provider must NOT inherit it just for being
-        // local.
-        let build = |name: &str,
-                     url: String,
-                     key: Option<String>,
-                     tier: Tier,
-                     allow_ctk: bool|
-         -> Arc<dyn ModelProvider> {
-            let p = crate::OpenAiCompatProvider::new(
-                name,
-                url,
-                key,
-                tier_label(tier),
-                default_model.clone(),
-            );
-            let p = if tier.is_local() {
-                p.loopback_only()
-            } else {
-                p
+        // Review H2, ME4-S2c §4: which thinking switch each one may be sent
+        // is decided per PROVIDER INSTANCE by `thinking_switch`, not by tier.
+        let build =
+            |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
+                let p = crate::OpenAiCompatProvider::new(
+                    name,
+                    url,
+                    key,
+                    tier_label(tier),
+                    default_model.clone(),
+                );
+                let p = if tier.is_local() {
+                    p.loopback_only()
+                } else {
+                    p
+                };
+                let p = match thinking_switch(name, tier) {
+                    ThinkingSwitch::ChatTemplateKwargs => p.supports_chat_template_kwargs(),
+                    ThinkingSwitch::ReasoningEffort => p.supports_reasoning_effort(),
+                    ThinkingSwitch::None => p,
+                };
+                Arc::new(p)
             };
-            let p = if allow_ctk {
-                p.supports_chat_template_kwargs()
-            } else {
-                p
-            };
-            Arc::new(p)
-        };
-        // oMLX only, and only when it actually judged as local (loopback) —
-        // a remote-pointed OMLX_URL never gets it either.
-        let omlx = build(
-            "omlx",
-            omlx_url,
-            Some(omlx_key),
-            omlx_tier,
-            omlx_tier.is_local(),
-        );
-        let ollama = build("ollama", ollama_url, None, ollama_tier, false);
+        let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
+        let ollama = build("ollama", ollama_url, None, ollama_tier);
         let mut router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
         router.default_model = Some(default_model);
         router
@@ -456,7 +479,16 @@ impl ModelRouter {
         // Accumulate per-provider reasons so an all-unavailable error names
         // which providers were tried and why (review D2 minor).
         let mut tried: Vec<String> = Vec::new();
-        for idx in route {
+        for (n, idx) in route.into_iter().enumerate() {
+            // ME4-S2a: the providers share the call's deadline. With less of it
+            // left than one stall, the next would load its model only to be cut.
+            if let Some(p) = &req.progress
+                && n > 0
+                && crate::stream::left(p, Instant::now()) < p.stall
+            {
+                tried.push("no time left for another provider".to_owned());
+                break;
+            }
             let r = &self.providers[idx];
             match r.provider.complete(req, cancel).await {
                 Ok(response) => {
@@ -470,7 +502,13 @@ impl ModelRouter {
                 }
                 Err(ModelError::Unavailable(msg)) => {
                     tracing::debug!("provider {} unavailable: {msg}", r.provider.name());
-                    self.record_failure(r.provider.name(), Instant::now());
+                    // Cut at the call's shared deadline is no fault of the provider: no cooldown.
+                    let cut = req
+                        .progress
+                        .is_some_and(|p| crate::stream::left(&p, Instant::now()).is_zero());
+                    if !cut {
+                        self.record_failure(r.provider.name(), Instant::now());
+                    }
                     tried.push(format!("{}: {msg}", r.provider.name()));
                 }
                 // A reachable-but-failed call or a cancellation is terminal —
@@ -635,11 +673,113 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
+            progress: None,
         }
     }
 
     fn router(providers: Vec<(Arc<dyn ModelProvider>, Tier)>) -> ModelRouter {
         ModelRouter::new(providers, Duration::from_secs(10), Duration::from_secs(60))
+    }
+
+    /// A local backend that takes requests and never answers; how many it took.
+    async fn silent_backend() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = taken.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _held = s;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (url, taken)
+    }
+
+    fn progressing(first_ms: u64, stall_ms: u64, deadline_ms: u64) -> CompletionRequest {
+        CompletionRequest {
+            temperature: None,
+            progress: Some(crate::Progress {
+                deadline: Instant::now() + Duration::from_millis(deadline_ms),
+                first_chunk: Duration::from_millis(first_ms),
+                stall: Duration::from_millis(stall_ms),
+            }),
+            ..req()
+        }
+    }
+
+    async fn two_silent(
+        r: &CompletionRequest,
+    ) -> (Duration, Result<Served, ModelError>, usize, Vec<usize>) {
+        let ((a, _), (b, taken_b)) = (silent_backend().await, silent_backend().await);
+        let providers: Vec<(Arc<dyn ModelProvider>, Tier)> = vec![
+            (
+                Arc::new(crate::OpenAiCompatProvider::new(
+                    "omlx", a, None, "local", "m",
+                )),
+                Tier::Local,
+            ),
+            (
+                Arc::new(crate::OpenAiCompatProvider::new(
+                    "ollama", b, None, "local", "m",
+                )),
+                Tier::Local,
+            ),
+        ];
+        let started = Instant::now();
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            complexity: Complexity::Simple,
+        };
+        let rt = router(providers);
+        let out = rt
+            .complete_served(profile, r, &CancellationToken::new())
+            .await;
+        (
+            started.elapsed(),
+            out,
+            taken_b.load(std::sync::atomic::Ordering::SeqCst),
+            rt.route(profile, Instant::now()),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_providers_share_the_calls_deadline() {
+        // The first stalls at its 400ms first chunk; the second has only what is left of 800ms.
+        let (took, out, second, _) = two_silent(&progressing(400, 50, 800)).await;
+        assert!(matches!(out, Err(ModelError::Unavailable(_))));
+        assert_eq!(second, 1, "the second was tried");
+        assert!(
+            took >= Duration::from_millis(750) && took < Duration::from_millis(1100),
+            "{took:?}"
+        );
+        // The first failed on its own (no first chunk) and cools down; the second
+        // was cut at the shared deadline, which is no fault of its own.
+        let (_, _, _, after) = two_silent(&progressing(400, 50, 800)).await;
+        assert_eq!(
+            after,
+            vec![1],
+            "only the one cut at the deadline is routed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_provider_is_tried_with_less_left_than_one_stall() {
+        // 50ms left after the first's 400ms: less than the 100ms stall.
+        let (took, out, second, _) = two_silent(&progressing(400, 100, 450)).await;
+        match out {
+            Err(ModelError::Unavailable(m)) => assert!(m.contains("no time left"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(second, 0, "the second was not tried");
+        assert!(took < Duration::from_millis(600), "{took:?}");
+        // Positive control: with time left, it is.
+        let (_, _, second, _) = two_silent(&progressing(400, 100, 700)).await;
+        assert_eq!(second, 1);
     }
 
     #[test]
@@ -894,6 +1034,25 @@ mod tests {
         assert_eq!(r.route(profile, t0 + Duration::from_secs(61)).len(), 1);
     }
 
+    /// ME4-S2a §2.6 (PR-Daemon on #969): the daemon's router, built by
+    /// `with_defaults`, cools a provider for at most `DEFAULT_MAX_COOLDOWN`, the
+    /// number modules wait after `no_provider`; waiting exactly that is enough.
+    #[test]
+    fn the_default_router_cools_for_at_most_the_shared_cap() {
+        let r = ModelRouter::with_defaults(vec![(
+            StubProvider::down("p") as Arc<dyn ModelProvider>,
+            Tier::Local,
+        )]);
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            r.record_failure("p", t0);
+        }
+        let profile = TaskProfile::default();
+        let just_before = DEFAULT_MAX_COOLDOWN - Duration::from_millis(1);
+        assert!(r.route(profile, t0 + just_before).is_empty());
+        assert_eq!(r.route(profile, t0 + DEFAULT_MAX_COOLDOWN).len(), 1);
+    }
+
     #[test]
     fn env_local_tier_uses_the_http_clients_own_parser() {
         // Positive controls.
@@ -972,6 +1131,8 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
+            progress: None,
         }
     }
 
@@ -1047,6 +1208,79 @@ mod tests {
         assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// Child: `from_env`'s providers, each asked once with thinking off.
+    #[tokio::test]
+    #[ignore = "child process of from_env_sends_each_backend_its_own_thinking_switch"]
+    async fn switch_child_from_env() {
+        let r = ModelRouter::from_env();
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..Default::default()
+        };
+        let req = CompletionRequest {
+            disable_thinking: true,
+            ..secret_request()
+        };
+        let _ = r.complete(profile, &req, &CancellationToken::new()).await;
+    }
+
+    #[test]
+    fn from_env_sends_each_backend_its_own_thinking_switch() {
+        // J3's wiring: oMLX refuses for now (503), so the router goes on to
+        // Ollama; each body is read as it came.
+        use std::io::{Read, Write};
+        fn stub(reply: String) -> (u16, std::sync::mpsc::Receiver<String>) {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    let Ok(mut s) = s else { continue };
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 65536];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                    }
+                    let text = String::from_utf8_lossy(&got).to_string();
+                    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_owned());
+                    let _ = tx.send(body.unwrap_or_default());
+                    let _ = s.write_all(reply.as_bytes());
+                }
+            });
+            (port, rx)
+        }
+        let busy =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let (omlx_port, omlx) = stub(busy.to_owned());
+        let (ollama_port, ollama) = stub(http_ok());
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "router::tests::switch_child_from_env",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))
+            .env("OLLAMA_URL", format!("http://127.0.0.1:{ollama_port}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let wait = Duration::from_secs(5);
+        let omlx: serde_json::Value =
+            serde_json::from_str(&omlx.recv_timeout(wait).unwrap()).unwrap();
+        let ollama: serde_json::Value =
+            serde_json::from_str(&ollama.recv_timeout(wait).unwrap()).unwrap();
+        assert!(omlx.get("chat_template_kwargs").is_some(), "{omlx}");
+        assert!(omlx.get("reasoning_effort").is_none(), "{omlx}");
+        assert_eq!(ollama["reasoning_effort"], "none", "{ollama}");
+        assert!(ollama.get("chat_template_kwargs").is_none(), "{ollama}");
+    }
+
     #[tokio::test]
     async fn a_loopback_only_provider_does_not_follow_redirects() {
         let (rp, redirected) = thread_stub(http_ok());
@@ -1060,6 +1294,8 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
+            progress: None,
         };
         let c = CancellationToken::new();
         let (tp, _) = thread_stub(redirect.clone());
@@ -1091,6 +1327,25 @@ mod tests {
     fn from_env_reports_the_judged_tier() {
         assert_eq!(tier_label(env_local_tier("http://0.0.0.0:1")), "remote");
         assert_eq!(tier_label(env_local_tier("http://127.0.0.1:1")), "local");
+    }
+
+    #[test]
+    fn only_a_local_ollama_is_sent_reasoning_effort() {
+        // J3 (ME4-S2c): a local Ollama gets `reasoning_effort`; Ollama
+        // judged remote and oMLX never do.
+        let local = env_local_tier("http://127.0.0.1:11434");
+        let remote = env_local_tier("http://10.0.0.5:11434");
+        assert_eq!(
+            thinking_switch("ollama", local),
+            ThinkingSwitch::ReasoningEffort
+        );
+        assert_eq!(thinking_switch("ollama", remote), ThinkingSwitch::None);
+        assert_eq!(
+            thinking_switch("omlx", local),
+            ThinkingSwitch::ChatTemplateKwargs
+        );
+        assert_eq!(thinking_switch("omlx", remote), ThinkingSwitch::None);
+        assert_eq!(thinking_switch("lmstudio", local), ThinkingSwitch::None);
     }
 
     /// `from_env()`'s own env-var manipulation is exercised only via the

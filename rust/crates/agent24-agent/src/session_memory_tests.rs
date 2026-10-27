@@ -5,7 +5,10 @@ use agent24_memory::event::{EventQuery, EventStore, MemEvent, Origin, Scope, Tru
 use agent24_memory::session::CanonicalSession;
 use agent24_models::router::Tier;
 use async_trait::async_trait;
-use std::sync::Mutex as StdMutex;
+use std::sync::{
+    Mutex as StdMutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 const OWNER: &str = "m1-test-owner";
 
@@ -87,6 +90,76 @@ async fn run_completed(manager: &Arc<RunManager>, store: &Store, session: &str, 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("run did not finish");
+}
+
+struct UnavailableProvider;
+
+#[async_trait]
+impl ModelProvider for UnavailableProvider {
+    fn name(&self) -> &str {
+        "unavailable-local"
+    }
+
+    async fn complete(
+        &self,
+        _: &CompletionRequest,
+        _: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        Err(ModelError::Unavailable("local provider is down".into()))
+    }
+
+    async fn models(&self, _: &CancellationToken) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+        Ok(vec![])
+    }
+}
+
+struct CountingRemoteProvider(AtomicUsize);
+
+#[async_trait]
+impl ModelProvider for CountingRemoteProvider {
+    fn name(&self) -> &str {
+        "remote-stub"
+    }
+
+    async fn complete(
+        &self,
+        _: &CompletionRequest,
+        _: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(CompletionResponse {
+            message: Msg::assistant(Some("remote summary".into()), vec![]),
+            usage: Default::default(),
+            model_id: Some("remote-stub".into()),
+        })
+    }
+
+    async fn models(&self, _: &CancellationToken) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+        Ok(vec![])
+    }
+}
+
+#[tokio::test]
+async fn local_only_run_compaction_never_falls_back_to_remote() {
+    let remote = Arc::new(CountingRemoteProvider(AtomicUsize::new(0)));
+    let summarizer_router = Arc::new(ModelRouter::with_defaults(vec![
+        (Arc::new(UnavailableProvider) as Arc<dyn ModelProvider>, Tier::Local),
+        (remote.clone() as Arc<dyn ModelProvider>, Tier::Remote),
+    ]));
+    let summarizer: Arc<dyn Summarizer> = Arc::new(RouterSummarizer::new(
+        summarizer_router,
+        CancellationToken::new(),
+    ));
+    let kv = KvStore::open_memory().await.unwrap();
+    let manager = memory_manager(kv, summarizer, policy(1)).await;
+    let store = manager.store.clone();
+    seed_session(&store, "local-only-compaction").await;
+
+    // max_recent=1 causes this completed run's user/assistant messages to be
+    // compacted through the production RouterSummarizer path.
+    run_completed(&manager, &store, "local-only-compaction", "private conversation").await;
+
+    assert_eq!(remote.0.load(Ordering::SeqCst), 0);
 }
 
 async fn message_events(kv: &KvStore, session: &str) -> Vec<Msg> {

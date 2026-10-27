@@ -1,0 +1,17 @@
+{"fields":[
+ {"key":"doc_number","description":"这份通知的发文字号","type":"identifier"},
+ {"key":"holiday_year","description":"这份通知安排的是哪一年的节假日","type":"text"},
+ {"key":"new_year_holiday","description":"元旦放假是哪几天，一共几天","type":"date"},
+ {"key":"new_year_makeup_workday","description":"元旦假期前后哪一天要调休上班","type":"date"},
+ {"key":"spring_festival_holiday","description":"春节放假是哪几天，一共几天","type":"date"},
+ {"key":"spring_festival_makeup_workdays","description":"春节假期前后哪几天要调休上班","type":"date"},
+ {"key":"qingming_holiday","description":"清明节放假是哪几天，一共几天","type":"date"},
+ {"key":"labour_day_holiday","description":"劳动节放假是哪几天，一共几天","type":"date"},
+ {"key":"labour_day_makeup_workday","description":"劳动节假期前后哪一天要调休上班","type":"date"},
+ {"key":"dragon_boat_holiday","description":"端午节放假是哪几天，一共几天","type":"date"},
+ {"key":"mid_autumn_holiday","description":"中秋节放假是哪几天，一共几天","type":"date"},
+ {"key":"national_day_holiday","description":"国庆节放假是哪几天，一共几天","type":"date"},
+ {"key":"national_day_makeup_workdays","description":"国庆节假期前后哪几天要调休上班","type":"date"},
+ {"key":"paid_leave_encouragement","description":"通知对带薪年休假有什么建议","type":"text"},
+ {"key":"issue_date","description":"这份通知的发文日期","type":"date"}
+]}

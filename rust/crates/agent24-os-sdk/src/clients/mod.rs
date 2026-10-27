@@ -18,8 +18,8 @@ pub use memory::{
     RecallPage, Recollection, RememberOnce, Remembered,
 };
 pub use model::{
-    CompleteRequest, CompleteResult, Complexity, JsonSchemaFormat, MODEL_RESPONSE_TIMEOUT,
-    ModelClient, ModelMessage, ModelRole, ServedTier, Usage,
+    CompleteRequest, CompleteResult, Complexity, JsonSchemaFormat, MODEL_NO_PROVIDER_WAIT,
+    MODEL_RESPONSE_TIMEOUT, ModelClient, ModelMessage, ModelRole, ServedTier, Usage,
 };
 pub use scheduler::{
     DeleteOutcome, DeleteResult, LastFire, LastFires, ListResult, ScheduleSpec, ScheduleState,

@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use agent24_domain::{Capability, Grants, ModelAccess};
 use agent24_models::router::{Complexity, ModelRouter, Privacy, TaskProfile, Tier};
-use agent24_models::{CompletionRequest, ModelError, Msg, ResponseFormat};
+use agent24_models::{CompletionRequest, ModelError, Msg, Progress, ResponseFormat};
 use agent24_os_proto::drain::{Generation, LifecycleTimeout, bind_to_lifecycle};
+use agent24_os_proto::model_budget;
 use agent24_os_proto::rpc::{CallFuture, ErrorKind, Handler, RpcError};
 use agent24_protocol::{EventBody, ModelCallPayload};
 use serde::{Deserialize, Serialize};
@@ -30,10 +31,10 @@ use crate::events_emit::{RateLimiter, refused_error};
 
 // ---- §5.2 numbers (⚖️ = chosen, not derived) ----
 
-/// §3 decision M2: this method's own budget (== the provider's own
-/// `chat_timeout`, `agent24-models/src/lib.rs:206`). Consumed by
-/// `Handler::call_timeout` in 4.2.2b1b.
-pub const MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// §3 decision M2, ME4-S2a §2.4: this method's own budget, the backstop. A
+/// call is bounded by its own deadline (set at admission, from its
+/// `max_tokens`), which the provider keeps; this only stops a kernel that hangs.
+pub const MODEL_CALL_TIMEOUT: Duration = model_budget::MODEL_CALL_BACKSTOP;
 /// ⚖️ §5: per-module in-flight ceiling (PLAN S2-5 suggests 2).
 pub const MODEL_MAX_IN_FLIGHT_PER_MODULE: usize = 2;
 /// ⚖️ §5: daemon-wide ceiling across ALL modules' model calls.
@@ -43,7 +44,7 @@ pub const MODEL_RATE_CAPACITY: f64 = 30.0;
 pub const MODEL_RATE_REFILL_PER_SEC: f64 = 0.5;
 /// ⚖️ §4.2: `max_tokens` bounds for a module call. Consumed by
 /// `ModelCompleteParams::validate` in 4.2.2b1b.
-pub const MODEL_MAX_TOKENS_CEILING: u32 = 4096;
+pub const MODEL_MAX_TOKENS_CEILING: u32 = model_budget::MODEL_MAX_TOKENS_CEILING;
 pub const MODEL_DEFAULT_MAX_TOKENS: u32 = 1024;
 /// ⚖️ §4.2: message count bound (string bytes are already bounded by
 /// `dispatch()`'s 256 KiB params budget). Consumed by 4.2.2b1b.
@@ -74,6 +75,9 @@ pub(crate) struct ModelCompleteParams {
     max_tokens: Option<u32>,
     #[serde(default)]
     complexity: Option<WireComplexity>,
+    /// ME4-S2b: the only sampling parameter a module may set, 0..=2.
+    #[serde(default)]
+    temperature: Option<f64>,
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
@@ -136,6 +140,12 @@ impl ModelCompleteParams {
         {
             return Err("response_format.json_schema.name must not be empty".to_owned());
         }
+        // JSON holds no NaN or infinity, so only the range can be wrong here.
+        if let Some(t) = self.temperature
+            && !(0.0..=2.0).contains(&t)
+        {
+            return Err("temperature must be between 0 and 2".to_owned());
+        }
         Ok(())
     }
 
@@ -187,9 +197,28 @@ impl ModelCompleteParams {
             // that (see `disable_thinking` above), never on which module is
             // calling, and never on an absent/defaulted complexity.
             disable_thinking,
+            temperature: self.temperature,
+            progress: None,
         };
         (request, complexity, self.request_id)
     }
+}
+
+/// ME4-S2a §2.2: the call's one deadline, set once it is admitted and before
+/// it is routed, from the tokens it may write. Every provider the router
+/// tries reads the answer as it is written under it.
+fn with_progress(mut request: CompletionRequest, now: std::time::Instant) -> CompletionRequest {
+    // `into_request` always sets `max_tokens`; the default here only keeps a
+    // request built some other way from getting no deadline.
+    let max = request
+        .max_tokens
+        .map_or(MODEL_DEFAULT_MAX_TOKENS, NonZeroU32::get);
+    request.progress = Some(Progress {
+        deadline: now + model_budget::model_call_budget(max),
+        first_chunk: model_budget::MODEL_FIRST_CHUNK_TIMEOUT,
+        stall: model_budget::MODEL_STALL_TIMEOUT,
+    });
+    request
 }
 
 // ---- §4.3 result ----
@@ -773,6 +802,9 @@ impl Handler for ModelCompleteHandler {
                 ));
             }
 
+            // ME4-S2a §2.2: no `.await` from here until the router has the
+            // request. A wait here would eat into the first-chunk window.
+            let request = with_progress(request, std::time::Instant::now());
             let profile = TaskProfile {
                 privacy: grant.privacy,
                 complexity,
@@ -1012,7 +1044,13 @@ mod tests {
     /// which does not exist yet in this increment.
     #[test]
     fn design_constants_match_the_frozen_numbers_table() {
-        assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(4456));
+        // J14 (ME4-S2a §2.6): what a module waits after `no_provider` is the
+        // router's longest cooldown, so one wait outlasts any one cooldown.
+        assert_eq!(
+            agent24_models::router::DEFAULT_MAX_COOLDOWN,
+            model_budget::MODEL_ROUTER_MAX_COOLDOWN
+        );
         assert_eq!(MODEL_MAX_TOKENS_CEILING, 4096);
         assert_eq!(MODEL_DEFAULT_MAX_TOKENS, 1024);
         assert_eq!(MODEL_MAX_MESSAGES, 64);
@@ -1294,6 +1332,8 @@ mod tests {
             response_format: None,
             max_tokens: None,
             disable_thinking: false,
+            temperature: None,
+            progress: None,
         }
     }
 
@@ -1501,6 +1541,48 @@ mod handler_tests {
         assert!(ModelCompleteParams::parse(p).is_err());
     }
 
+    /// ME4-S2b J2, J3: `temperature` is taken in 0..=2 and carried as given;
+    /// no other sampling parameter is.
+    #[test]
+    fn temperature_is_taken_in_its_range_and_no_other_sampling_parameter_is() {
+        let with = |t: Value| {
+            let mut p = ok_params();
+            p["temperature"] = t;
+            ModelCompleteParams::parse(p)
+        };
+        for t in [json!(-0.1), json!(2.1)] {
+            assert_eq!(with(t).unwrap_err(), "temperature must be between 0 and 2");
+        }
+        assert!(with(json!("0")).unwrap_err().contains("invalid type"));
+        // Too large for an f64: the frame itself does not parse (-32700),
+        // before any handler sees it.
+        assert!(serde_json::from_str::<Value>(r#"{"temperature":1e309}"#).is_err());
+        for (t, want) in [
+            (json!(0), 0.0),
+            (json!(-0.0), 0.0),
+            (json!(0.7), 0.7),
+            (json!(2), 2.0),
+            (json!(1), 1.0),
+        ] {
+            let (req, _, _) = with(t).unwrap().into_request();
+            assert_eq!(req.temperature, Some(want));
+        }
+        let (req, _, _) = ModelCompleteParams::parse(ok_params())
+            .unwrap()
+            .into_request();
+        assert_eq!(req.temperature, None, "absent → not set");
+        for k in ["seed", "top_p", "frequency_penalty"] {
+            let mut p = ok_params();
+            p[k] = json!(0);
+            assert!(
+                ModelCompleteParams::parse(p)
+                    .unwrap_err()
+                    .contains("unknown field"),
+                "{k}"
+            );
+        }
+    }
+
     // ---- review M1: disable_thinking requires an EXPLICIT complexity: "simple" ----
 
     #[test]
@@ -1542,7 +1624,8 @@ mod handler_tests {
         );
     }
 
-    /// `Handler::call_timeout` reports the literal 120s (§5.2). The
+    /// `Handler::call_timeout` reports the RPC backstop, `MODEL_CALL_BACKSTOP`
+    /// (ME4-S2a §3): strictly after any call's own deadline. The
     /// end-to-end proof that this OVERRIDES a real connection's 30s default
     /// (J6, `... sleeps 31s → success`) needs a real `serve()`/`Conn` on a
     /// duplex socket, which nothing in this crate's unit tests builds yet;
@@ -1551,7 +1634,7 @@ mod handler_tests {
     /// (declared vs. connection-level vs. `MAX_METHOD_CALL_TIMEOUT`) is
     /// already pinned by J5 in `agent24-os-proto` (ME4-4.2.2-0).
     #[test]
-    fn call_timeout_is_the_frozen_120s() {
+    fn call_timeout_is_the_backstop() {
         let h = ModelCompleteHandler {
             generation: running(),
             grant: None,
@@ -1580,6 +1663,10 @@ mod handler_tests {
         calls: AtomicUsize,
         behave: Mutex<Behave>,
         saw_cancel: Arc<AtomicBool>,
+        /// ME4-S2a: the timers of the last request it was handed.
+        progress: Mutex<Option<agent24_models::Progress>>,
+        /// ME4-S2b: the temperature of the last request it was handed.
+        temperature: Mutex<Option<f64>>,
     }
 
     #[async_trait::async_trait]
@@ -1590,10 +1677,12 @@ mod handler_tests {
 
         async fn complete(
             &self,
-            _r: &CompletionRequest,
+            r: &CompletionRequest,
             cancel: &CancellationToken,
         ) -> Result<CompletionResponse, ModelError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.progress.lock().unwrap() = r.progress;
+            *self.temperature.lock().unwrap() = r.temperature;
             let b = *self.behave.lock().unwrap();
             let text = match b {
                 Behave::Hang => {
@@ -1638,7 +1727,37 @@ mod handler_tests {
             calls: AtomicUsize::new(0),
             behave: Mutex::new(b),
             saw_cancel: Arc::default(),
+            progress: Mutex::new(None),
+            temperature: Mutex::new(None),
         })
+    }
+
+    /// J12 (ME4-S2a): a module's call reaches the router with one deadline,
+    /// from its own `max_tokens`, and the shared first-chunk and stall timers.
+    #[tokio::test]
+    async fn a_module_call_is_timed_by_its_progress_from_its_own_tokens() {
+        let local = stub("local", Behave::Ok);
+        let (d, _sink) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
+        for (asked, budget) in [(Some(100), 400), (None, 1324)] {
+            let mut p = ok_params();
+            if let Some(n) = asked {
+                p["max_tokens"] = json!(n);
+            }
+            let before = std::time::Instant::now();
+            h.call(p).await.unwrap();
+            let after = std::time::Instant::now();
+            let got = local.progress.lock().unwrap().expect("progress set");
+            let budget = Duration::from_secs(budget);
+            assert!(
+                got.deadline >= before + budget && got.deadline <= after + budget,
+                "{asked:?}"
+            );
+            assert_eq!(
+                (got.first_chunk, got.stall),
+                (Duration::from_secs(300), Duration::from_secs(60))
+            );
+        }
     }
 
     fn deps(router: Arc<ModelRouter>) -> (ModelCallbackDeps, Arc<MemoryUsageSink>) {
@@ -2436,7 +2555,7 @@ mod handler_tests {
     #[tokio::test]
     async fn sdk_wire_parity_model_complete() {
         let local = stub("l", Behave::Ok);
-        let (d, _sink) = deps(router(vec![(local, Tier::Local)]));
+        let (d, _sink) = deps(router(vec![(local.clone(), Tier::Local)]));
         let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
 
         let (conn, mut peer) =
@@ -2450,6 +2569,8 @@ mod handler_tests {
             response_format: None,
             max_tokens: None,
             complexity: None,
+            // ME4-S2b J10: the SDK's number reaches the provider as that number.
+            temperature: Some(0.7),
         };
 
         let (result, ()) = tokio::join!(client.complete(&req, None), async {
@@ -2460,5 +2581,6 @@ mod handler_tests {
         let result = result.expect("SDK complete must succeed against the real handler");
         assert_eq!(result.text, "ok");
         assert_eq!(result.tier, agent24_os_sdk::ServedTier::Local);
+        assert_eq!(*local.temperature.lock().unwrap(), Some(0.7));
     }
 }

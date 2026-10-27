@@ -13,7 +13,35 @@ function formatMb(bytes: number | undefined): string {
   return Math.max(1, Math.round(bytes / (1024 * 1024))).toString()
 }
 
-const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'verifying', 'failed'])
+/** SD-01: user-visible transfer rate — waiting-for-network (not a bogus "0 KiB/s")
+ * whenever the rolling-window estimator has no recent progress to measure. */
+function formatSpeed(bytesPerSecond: number | undefined): string {
+  if (!bytesPerSecond || bytesPerSecond <= 0) {
+    return translate(creativeMessages, 'download.waitingNetwork')
+  }
+  if (bytesPerSecond >= 1024 * 1024) {
+    return translate(creativeMessages, 'download.speedMib', {
+      value: (bytesPerSecond / (1024 * 1024)).toFixed(1),
+    })
+  }
+  return translate(creativeMessages, 'download.speedKib', {
+    value: Math.max(1, Math.round(bytesPerSecond / 1024)),
+  })
+}
+
+/** SD-01: '' (not a misleading ETA) whenever the rate is unknown/zero — the
+ * speed text alone already says waiting-for-network in that case. */
+function formatEta(etaSeconds: number | null | undefined): string {
+  if (etaSeconds == null || !Number.isFinite(etaSeconds) || etaSeconds <= 0) return ''
+  const totalSeconds = Math.round(etaSeconds)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return minutes > 0
+    ? translate(creativeMessages, 'download.etaMinutesSeconds', { minutes, seconds })
+    : translate(creativeMessages, 'download.etaSecondsOnly', { seconds })
+}
+
+const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'paused', 'verifying', 'failed'])
 
 /** The on-demand iDoris Design component card — shown instead of the Creative
  * WebContentsView whenever the component isn't installed yet. User-facing
@@ -28,20 +56,41 @@ const DOWNLOAD_FLOW_STATES = new Set(['not-installed', 'downloading', 'verifying
 function ComponentCard({
   status,
   onInstall,
+  onPause,
 }: {
   status: OpenDesignComponentStatusResult
   onInstall: () => void
+  onPause: () => void
 }): JSX.Element {
   const t = useT(creativeMessages)
   if (status.state === 'downloading') {
     const total = status.total ?? 0
     const received = status.received ?? 0
     const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0
+    const etaText = formatEta(status.etaSeconds)
     return (
       <div className="creative-download">
         <div>{t('download.progress')}</div>
         <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%` }} /></div>
-        <div className="creative-download-hint">{t('download.size', { received: formatMb(received), total: formatMb(total), percent: pct })}</div>
+        <div className="creative-download-hint">
+          {t('download.size', { received: formatMb(received), total: formatMb(total), percent: pct })}
+          {` · ${formatSpeed(status.bytesPerSecond)}`}
+          {etaText ? ` · ${etaText}` : ''}
+        </div>
+        <button className="btn" type="button" onClick={onPause}>{t('action.pause')}</button>
+      </div>
+    )
+  }
+
+  if (status.state === 'paused') {
+    const total = status.total ?? 0
+    const received = status.received ?? 0
+    return (
+      <div className="creative-download">
+        <div>
+          {t('download.paused', { received: formatMb(received), total: formatMb(total) })}
+        </div>
+        <button className="btn btn-primary" type="button" onClick={onInstall}>{t('action.resume')}</button>
       </div>
     )
   }
@@ -92,6 +141,10 @@ export default function CreativePage(): JSX.Element {
 
   const installComponent = (): void => {
     void window.agent24.openDesignComponentInstall().then(applyComponentStatus)
+  }
+
+  const pauseComponent = (): void => {
+    void window.agent24.openDesignComponentPause().then(applyComponentStatus)
   }
 
   useEffect(() => {
@@ -169,7 +222,7 @@ export default function CreativePage(): JSX.Element {
 
   return (
     <div ref={hostRef} className="creative-host">
-      {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} />}
+      {showDownloadCard && <ComponentCard status={cardStatus} onInstall={installComponent} onPause={pauseComponent} />}
       {tryCreative && error && (
         <div className="creative-error">
           <div>{t('error.unavailable', { error })}</div>

@@ -54,7 +54,7 @@
   - 不做流式代理，不跨机。
 - **推理回调**（#505 已合入 main）：
   - 隐私只由 manifest 字段 `model_access` 决定，缺省 `local_only`；
-  - 每个模块并发 2，令牌桶 30 次/分钟，超时 120s；
+  - 每个模块并发 2，令牌桶 30 次/分钟；超时原为固定 120s，ME4-S2a 改为按进展计时（首段 300s、间隔 60s，截止时间 300s + `max_tokens` × 1s）；
   - 不流式，也不支持 tools（ME4-S2 §0、§5.2）。
 - **`agent24-models`**：`from_env()` 只接了 oMLX 和 Ollama 两个槽（`router.rs:258-298`）。`LocalOnly` 只走 `Local`/`Lora` 两层，`Local` 必须是回环地址、不走代理、不跟随重定向（`loopback_only`）。**`IDORIS_URL` 没有接线。**
 - **REST `/api/v1/chat`**：写死 `TaskProfile::default()`，也就是 `Privacy::Any`，而且不流式（`agent24d/src/routes.rs:111`）。
