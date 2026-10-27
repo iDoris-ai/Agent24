@@ -294,14 +294,17 @@ check C5 "list: the two retried imports are documents now" "$(is "$rc/$(last "$W
 doc_of() { a24 documents job "$1" --json 2>/dev/null | tail -n 1 | jq -r '.data.document_id // empty'; }
 # readtext DOC OUT: page 1's text. An image's text layer is built (OCR) on its
 # first read, which answers engine_unavailable until it is there; any other
-# answer is final.
+# answer is final. Up to 60 s in all: each read itself may wait 8 s for the
+# layer before it answers, so the bound is the clock, not a count.
 readtext() {
-  for _ in $(seq 1 60); do
+  local t0
+  t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
+  while :; do
     a24 documents text "$1" 1 --json > "$2" 2>/dev/null && return 0
     [ "$(last "$2" .error.code)" = engine_unavailable ] || return 1
+    [ $(($(perl -MTime::HiRes=time -e 'printf "%d", time * 1000') - t0)) -lt 60000 ] || return 1
     sleep 1
   done
-  return 1
 }
 # image ID WHAT FILE MEDIA: import a scan of the 2026 holiday notice, read its
 # words back. Its page has no text layer: "春节" can only come from the OCR.
@@ -320,9 +323,10 @@ image U8 "import a JPG scan: its words read back through OCR" "$SCAN" image/jpeg
 sips -s format png "$SCAN" --out "$WORK/scan.png" > /dev/null 2>&1
 image U9 "import a PNG of the same scan: its words read back" "$WORK/scan.png" image/png
 
-# Another file than U1's (two bytes more), or it would be U1's job again (U2).
+# U1's PDF under another name: the name is part of the import's key, so this
+# is an import of its own, not U1's job again.
 NAMED="$WORK/煮沸 通知.pdf"
-cp "$SMALL" "$NAMED"; printf '  ' >> "$NAMED"
+cp "$SMALL" "$NAMED"
 a24 documents import "$NAMED" > "$WORK/u10.out" 2>&1; rc=$?
 JOBN=$(job_of "$WORK/u10.out"); st=$(settle "$JOBN")
 title=$(a24 documents get "$(doc_of "$JOBN")" 2>/dev/null | jq -r .title 2>/dev/null)

@@ -89,9 +89,9 @@
 | C3 | `documents cancel` 第二个作业（失败的） | 退出 0，变成 `cancelled` |
 | C4 | `documents retry` 这个取消了的作业 | 退出 0，重新跑并成功 |
 | C5 | `documents list` | 4 个文档，重试成功的两个作业各自的文档都在其中 |
-| U8 | 导入一张 JPG 扫描件（S01 的 2026 年节假日通知），读第 1 页文字 | 作业成功，`media_type` 为 `image/jpeg`；文字里有「春节」。图片没有文本层，这两个字只能来自 OCR。首次读取时文字层还在生成，会先得到 `engine_unavailable`，脚本对这个码最多重试 60 秒，其他错误码立即判失败 |
+| U8 | 导入一张 JPG 扫描件（S01 的 2026 年节假日通知），读第 1 页文字 | 作业成功，`media_type` 为 `image/jpeg`；文字里有「春节」。图片没有文本层，这两个字只能来自 OCR。首次读取时文字层还在生成，会先得到 `engine_unavailable`，脚本对这个码重试，按实际经过的时间最多 60 秒（每次读取在服务端最多要等 8 秒，所以按时间算，不按次数），其他错误码立即判失败 |
 | U9 | 同一张扫描件转成 PNG（`sips`）再导入 | 同上，`media_type` 为 `image/png` |
-| U10 | 导入文件名带中文和空格的 PDF（`煮沸 通知.pdf`，内容比 U1 的多两个字节，否则会得到 U1 的作业） | 作业成功，文档标题就是 `煮沸 通知.pdf` |
+| U10 | 把 U1 的 PDF 复制一份，改名为 `煮沸 通知.pdf`（中文加空格）再导入。文件名是导入幂等键的一部分，所以这是一次新的导入，不会拿回 U1 的作业 | 作业成功，文档标题就是 `煮沸 通知.pdf` |
 | T1 | `GET /api/v1/tools` | 期望里面有 documents 工具。现在列表正常返回（200，非空）但其中没有，记 KNOWN（#705：`domain-os.yml` 还没有声明 `tools:`）；补上声明后这条会变成 PASS。列表本身出错（非 200、没有列表）记 FAIL |
 | T2 | 从外部 `POST /api/v1/documents/_a24/tools/find` | 404 `not_found`：模块内部的工具路由不对外 |
 | N1 | `agent24 daemon stop`，再 `documents list` | 退出 1，说没有在跑的 daemon，并提示 `agent24 daemon start`；不会顺手起一个 |
