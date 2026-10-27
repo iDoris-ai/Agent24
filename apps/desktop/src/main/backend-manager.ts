@@ -142,7 +142,7 @@ export interface DaemonHealthProbe {
 
 /** Mirrors `agent24_protocol::state_file::state_path()` (Rust), i.e.
  * `data_dir()/daemon.json`, with the data root from the one shared resolver
- * (`./data-dir`, ADR-037); unresolvable root → null. */
+ * (`@agent24/data-dir`, re-exported from `./data-dir`, ADR-037); unresolvable root → null. */
 export function daemonStatePath(): string | null {
   const dir = tryDataDir()
   return dir === null ? null : joinLiteral(dir, 'daemon.json')
