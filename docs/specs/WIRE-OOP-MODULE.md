@@ -653,7 +653,8 @@ cron 规则：恰好 5 段（无秒段，即便 REST 路径接受 6 段这里也
 ### 5.5 `_a24/model/complete`
 
 进程内无对应物（`KernelCtx` 没有模型句柄；ME-4b 新增）。所需能力：`models`。manifest 字段
-`model_access` 决定隐私路由（§1.2）——由**调用方在 manifest 里静态声明**，不是每次调用可选的字段。
+`model_access` 由**调用方在 manifest 里静态声明**，不是每次调用可选的字段（§1.2）。K1-6b.5g 起它不再影响路由：
+回调一律按 LocalOnly 路由，见[出口矩阵](../design/K1-06b-egress-matrix.md) §6 第 2 条。
 
 **params**（`ModelCompleteParams`，`rust/apps/agent24d/src/model_callback.rs:67-81`，
 `deny_unknown_fields`）：
