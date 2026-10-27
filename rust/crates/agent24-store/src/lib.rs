@@ -88,8 +88,10 @@ pub use module_audit_event::{
     SizeBytes, ToolCallId,
 };
 pub use module_consents::{
-    ConsentDecision, ConsentLookup, ConsentSource, HostRiskLevel, ModuleConsentRecord,
-    ModuleConsentRevocation, ToolPermissionSummary,
+    ConsentDecision, ConsentLookup, ConsentSource, GrantEndNotice, GrantEndReason, GrantEndStop,
+    GrantScope, HostRiskLevel, MAX_GRANT_RESOURCES, ModuleConsentChange, ModuleConsentRecord,
+    ModuleConsentRevocation, ToolPermissionSummary, consent_instant_millis, is_resource_element,
+    resource_set_digest, resource_set_ref,
 };
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
@@ -99,7 +101,9 @@ pub use run_workspace_authority::RunWorkspaceAuthoritySnapshot;
 pub use run_workspace_orphan::WorkspaceOrphanSweep;
 pub use run_workspace_terminal::RunTerminalTransition;
 pub use source_policy::{
-    PolicySnapshot, SOURCE_TAG_SCHEMA_VERSION, SourceKind, SourceMode, SourceRef, StoredSourceTag,
+    ASSERTION_SOURCE_REF_SCHEMA_VERSION, AssertionSourceRef, PolicySnapshot,
+    SOURCE_TAG_SCHEMA_VERSION, SourceClassification, SourceKind, SourceMode, SourceRef,
+    StoredSourceTag, strictest_classification,
 };
 
 use sqlx::SqlitePool;
@@ -149,8 +153,10 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     pool: SqlitePool,
     module_consent_revocations: tokio::sync::broadcast::Sender<ModuleConsentRevocation>,
+    module_consent_changes: tokio::sync::broadcast::Sender<ModuleConsentChange>,
     terminal_commit_ack_gate:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>>,
+    fail_source_tag_reads: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Store {
@@ -170,10 +176,13 @@ impl Store {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
         Ok(Self {
             pool,
             module_consent_revocations,
+            module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
+            fail_source_tag_reads: std::sync::Arc::default(),
         })
     }
 
@@ -189,10 +198,13 @@ impl Store {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
         Ok(Self {
             pool,
             module_consent_revocations,
+            module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
+            fail_source_tag_reads: std::sync::Arc::default(),
         })
     }
 
@@ -224,6 +236,22 @@ pub mod test_hooks {
         gate
     }
 
+    /// K1-6b.4c: make every later read of run source tags on this store
+    /// (and its clones) fail as if SQLite had returned an error. Tag rows
+    /// that do not decode are already fail-closed, and a trigger cannot stop
+    /// a `SELECT`, so only this hook reaches the read-error branches.
+    pub fn fail_source_tag_reads(store: &super::Store) {
+        store
+            .fail_source_tag_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn source_tag_reads_fail(store: &super::Store) -> bool {
+        store
+            .fail_source_tag_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) async fn terminal_commit_ack_boundary(store: &super::Store) {
         let gate = store
             .terminal_commit_ack_gate
@@ -247,10 +275,13 @@ pub mod test_hooks {
     #[must_use]
     pub fn from_pool(pool: sqlx::SqlitePool) -> super::Store {
         let (module_consent_revocations, _) = tokio::sync::broadcast::channel(128);
+        let (module_consent_changes, _) = tokio::sync::broadcast::channel(128);
         super::Store {
             pool,
             module_consent_revocations,
+            module_consent_changes,
             terminal_commit_ack_gate: std::sync::Arc::default(),
+            fail_source_tag_reads: std::sync::Arc::default(),
         }
     }
 

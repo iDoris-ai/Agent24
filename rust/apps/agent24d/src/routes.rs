@@ -516,13 +516,34 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // response built below can report a deterministic `memory_receipt` —
     // never inferred from the model's own reply text.
     let mut explicit_remember_state: Option<agent24_agent::ExplicitRememberState> = None;
+    let mut memory_source_ref = agent24_store::AssertionSourceRef::from_sources([]);
     let messages = match (chat.session_id.as_deref(), latest_user_message.as_deref()) {
         (Some(sid), Some(prompt)) => {
-            let (prelude, remember_state) = state
+            let prelude = state
                 .runs
-                .chat_memory_prelude(&run_id, Some(sid), prompt)
+                .chat_memory_prelude(
+                    &run_id,
+                    Some(sid),
+                    prompt,
+                    chat.messages.iter().any(|m| m.role != "user"),
+                )
                 .await;
+            // K1-6b.4c: the session floor could not be recorded, so this
+            // turn's sources are unknown; fail before the model call. The
+            // store error stays in the daemon log, not the response.
+            let (prelude, remember_state, source_ref) = match prelude {
+                Ok(prelude) => prelude,
+                Err(err) => {
+                    tracing::error!(run_id = %run_id, error = %err, "chat session source floor not recorded");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "source_policy_unavailable",
+                        "failed to persist session source policy",
+                    );
+                }
+            };
             explicit_remember_state = remember_state;
+            memory_source_ref = source_ref;
             let combined: Vec<agent24_models::Msg> =
                 prelude.into_iter().chain(base_messages.clone()).collect();
             agent24_agent::normalize_for_provider(&combined)
@@ -633,7 +654,10 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 if let (Some(sid), Some(prompt)) =
                     (chat.session_id.as_deref(), latest_user_message.as_deref())
                 {
-                    let outcome = state.runs.chat_remember_turn(sid, prompt, &text).await;
+                    let outcome = state
+                        .runs
+                        .chat_remember_turn(sid, prompt, &text, memory_source_ref)
+                        .await;
                     let explicit = explicit_remember_state.is_some();
                     let (receipt, failure) = match outcome {
                         agent24_agent::MemoryWriteOutcome::Saved => {
@@ -913,6 +937,89 @@ mod tests {
                 tempfile::tempdir().expect("tempdir").path().to_path_buf(),
             ),
         })
+    }
+
+    /// K1-6b.5b: a remote provider that counts every call, and the only one
+    /// the daemon has.
+    struct CountingRemote(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CountingRemote {
+        fn name(&self) -> &str {
+            "counting-remote"
+        }
+        fn outbound_destination(&self) -> Option<String> {
+            Some("https://models.example/v1".to_owned())
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, ModelError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ModelError::Unavailable("must not be called".into()))
+        }
+        async fn models(&self, _cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    async fn state_with_remote_only(remote: std::sync::Arc<CountingRemote>) -> AppState {
+        crate::server::AppState::new(crate::server::AppDeps {
+            token: "testtoken".to_owned(),
+            router: std::sync::Arc::new(ModelRouter::with_defaults(vec![(remote, Tier::Remote)])),
+            tools: agent24_tools::ToolRegistry::new(),
+            store: agent24_store::Store::open_memory().await.unwrap(),
+            shutdown: crate::server::Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            workspace_service: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: std::sync::Arc::new(
+                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+            ),
+            packages_root: std::sync::Arc::new(
+                tempfile::tempdir().expect("tempdir").path().to_path_buf(),
+            ),
+        })
+    }
+
+    /// K1-6b.5b (ADR-K1-02 §2.4 (a)): `/api/v1/chat` routes local-only, so a
+    /// daemon whose only provider is remote answers 503 and the remote
+    /// provider is never called.
+    #[tokio::test]
+    async fn post_chat_never_reaches_a_remote_only_provider() {
+        let remote = std::sync::Arc::new(CountingRemote(std::sync::atomic::AtomicUsize::new(0)));
+        let state = state_with_remote_only(remote.clone()).await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"my private note"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "provider_unavailable", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("local-only")),
+            "{body}"
+        );
+        assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// Review M3: a provider that DOES report a `model_id` — `Stub` above

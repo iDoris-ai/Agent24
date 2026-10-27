@@ -6,6 +6,13 @@ use agent24_memory::event::{Origin, Trust};
 use agent24_policy::{ApprovalBroker, BrokerGate};
 use agent24_store::{MessageOrigin, OriginatedRunMessage, PendingRunMessage};
 
+fn test_source_ref() -> agent24_store::AssertionSourceRef {
+    agent24_store::AssertionSourceRef::from_sources([(
+        "test".to_owned(),
+        agent24_store::SourceClassification::Ordinary,
+    )])
+}
+
 const OWNER: &str = "test-owner";
 
 // ---- warn capture (no tracing-subscriber dev-dependency in this crate) ----
@@ -99,6 +106,7 @@ async fn live_assertions(kv: &KvStore, texts: &[&str]) -> Vec<(String, String)> 
                 source: "test".into(),
                 trust: Trust::UserSaid,
             },
+            &test_source_ref(),
         )
         .await
         .unwrap();

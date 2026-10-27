@@ -25,6 +25,7 @@ mod decide_routes;
 mod domain;
 mod events;
 mod events_emit;
+mod grant_expiry;
 mod hardware;
 #[cfg(unix)]
 mod host_bootstrap;
@@ -74,6 +75,7 @@ mod os_memory;
 mod os_memory_page;
 mod os_routes;
 mod overrides;
+mod peer_runs;
 mod routes;
 mod runs;
 mod scheduler_callback;

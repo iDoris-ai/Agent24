@@ -20,6 +20,13 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+fn test_source_ref() -> agent24_store::AssertionSourceRef {
+    agent24_store::AssertionSourceRef::from_sources([(
+        "test".to_owned(),
+        agent24_store::SourceClassification::Ordinary,
+    )])
+}
+
 const OWNER: &str = "p1-02c0-owner";
 const TURNS: usize = 3000;
 const SESSION_TURNS: usize = 100;
@@ -112,7 +119,9 @@ async fn run_tier(tier: Tier) {
             prompt = format!("记住 {prompt}");
         }
         let answer = synth(&mut rng, alen);
-        let outcome = m.chat_remember_turn(&sid, &prompt, &answer).await;
+        let outcome = m
+            .chat_remember_turn(&sid, &prompt, &answer, test_source_ref())
+            .await;
         let want = if remembers {
             MemoryWriteOutcome::Saved
         } else {
