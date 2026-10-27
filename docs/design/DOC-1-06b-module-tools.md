@@ -9,6 +9,11 @@
 - 片 1 交付后的状态是**「已登记、不通告、调不到」**：文档模块声明七个工具（`risk: read`；其中 `extract` 会在本机提交抽取任务，其余六个只读）并实现 `_a24/tools` 入口，但内核没有授予入口、远端档位守卫仍在，产品行为不变。
 - 对话入口用 agent 页的 `POST /api/v1/runs`；聊天页 `/api/v1/chat` 不带工具，不改（David，2026-10-18）。
 - **「K1-6a 与 K1-6b 都完成并验收前，文档工具不授予」是本设计的前提**：验收按 ADR-K1-02:71，含反例测试和 #708 产品验收；只是合入，或只完成 6a，都不够（K1-6b 是工具结果有自己的敏感分类和出口门，#870/#874）。在此之前文档工具一律不授予，任何片都不撤远端档位守卫（David，2026-10-18）。前提落在「不授予」而不是「不通告」，理由是：有了授予以后，不通告不等于调不到。`register_module_tool` 把模块工具放进 `allowed`（`agent24-tools/src/lib.rs:1131-1139`）；`dispatch`（`:1329-1400`）只查工具存在、白名单和审批门，不调 `advertisable()`；`ModuleTool` 的调用路径只查授予（`:796`）和 `check_available`（`:840` → `agent24d/src/module_tool_runtime.rs:66-76`），不查 `blocked_by_remote_tier_guard`。模型按名字直接调用即可绕过通告。ADR-K1-02:71 也写明不能依赖这道旧门保护。
+  - **现状（2026-10-28）：前提已满足。**
+    - K1-6a 已合入 main（#1280）；K1-6b 的 6b.5a–5g 都已合入（工具结果打来源标签、run 之后的模型调用按来源 LocalOnly、模块的模型回调一律 LocalOnly）。
+    - #708 产品验收的证据见 #1419 正文，David 于 2026-10-28 确认足够。
+    - 远端档位守卫已由 #1419 在 ab/kernel 撤除（be5b3020），随下一次内核发布进 main，再合回 ab/documenting。本段引用的 `blocked_by_remote_tier_guard` 及其行号是撤门前的代码。
+    - 前提满足不等于已授予：documents 的 manifest 至今没有声明 `tools`。正式声明会改变对外行为，走 #705，由 David 定。manifest 是编进模块二进制的（`agent24-documents/src/lib.rs:42` 的 `include_str!`），握手时内核核对它的 digest（`agent24-os-proto/src/supervisor.rs:50`，对不上即 `manifest_mismatch`），所以声明时 manifest 和二进制要一起发布。
 
 ## 1. 现状（main @ 1ef85127）
 
@@ -127,6 +132,7 @@ E 放最后：manifest 只要有一个工具不合法，整个模块就挂不上
 ## 5. 验收（#705 剩余部分）
 
 - 片 1：片 E 加一个 agent24d 测试，只加测试，不改内核行为。装入 documents 的 manifest 后，`GET /api/v1/tools`（`agent24d/src/routes.rs:722-723`，列出 `state.tools.list()`，实现见 `agent24-tools/src/lib.rs:1237`）含七个全名。通告要能证明守卫在起作用：`advertisable`（`agent24-tools/src/lib.rs:652-665`）同时要求模块就绪、操作已登记、`has_current_consent`、远端档位守卫为假。生产没有授予（`agent24d/src/server.rs:1081-1092` 只有列出、导出、撤销），generation 不是 `Running` 时 `module_ready` 也为假（`module_tool_runtime.rs:152-154`；`generation` 在 `:48-49` 要求 `DrainState::Running`）。测试在模块已运行、且注入了有效授予（`ModuleToolAuthorization`）的前提下，对比有无远端档位：无远端档位时七个工具可通告，有远端档位时不可通告；或直接断言 `blocked_by_remote_tier_guard`（`module_tool_runtime.rs:172-174`）。`live_adverts`（`agent24-tools/src/lib.rs:1271`）只收录 `advertisable` 的工具。REST 契约测试全过。
+  - 这是片 1 时、撤门前的验收。#1419 撤掉远端档位守卫时，这几条门测试随门一起删除（ab/kernel be5b3020）；之后通告不再看远端档位，远端由逐 run 的出口门挡住（见 §0 的现状）。
 - 对话入口（内核授予路径，以及 K1-6a 与 K1-6b 都完成并验收之后；含反例测试和 #708 产品验收，只是合入或只完成 6a 都不够，ADR-K1-02:71。**「K1-6a 与 K1-6b 都完成并验收前，文档工具不授予」是本设计的前提**，见 §0）：在 agent 页（`/api/v1/runs`）里，用户确认启用后，agent 能 list / get / read_range / find / extract / job_get / extraction_get 已导入的文档，每次调用记审计。这一项不属于本轮片 1 的验收。
 
 ## 6. 记录在案的缺口
