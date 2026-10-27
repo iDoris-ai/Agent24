@@ -93,11 +93,21 @@ pub trait TaskTrace: Send + Sync {
 #[derive(Clone)]
 pub struct SymbolicTrace {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
 }
 
 impl SymbolicTrace {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            gate: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     fn row_to_node(row: &sqlx::sqlite::SqliteRow) -> TraceNode {
@@ -138,6 +148,7 @@ impl TaskTrace for SymbolicTrace {
         );
         let now = agent24_core::util::now_iso8601();
 
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO mem_trace_refs (scope_owner, ref_id, body, bytes, at)

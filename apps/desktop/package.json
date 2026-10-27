@@ -26,7 +26,8 @@
     "build:linux": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --linux",
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "release:mac": "bash scripts/release-mac.sh"
   },
   "dependencies": {
     "@agent24/api-client": "workspace:*",
@@ -97,7 +98,16 @@
           "from": "../../rust/target/release/agent24",
           "to": "backend/agent24"
         }
-      ]
+      ],
+      "identity": "Huifeng Jiao (HYAP444FN9)",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "binaries": [
+        "Contents/Resources/backend/agent24d"
+      ],
+      "notarize": false
     },
     "win": {
       "target": [
@@ -135,6 +145,9 @@
     },
     "deb": {
       "artifactName": "agent24-desktop_${version}_${arch}.${ext}"
+    },
+    "dmg": {
+      "sign": true
     }
   }
 }
