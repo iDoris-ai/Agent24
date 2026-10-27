@@ -6,7 +6,8 @@ import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
-import { importFile, type Spawner } from './documents-import'
+import { importFile } from './documents-import'
+import { RESULT_GRACE_MS, type Spawner } from './documents-cli'
 
 const EP = { port: 4321, token: 'tok-secret' }
 const JOB = { job_id: 'job_01K74Z3QJ8V5N2W9RTX6YB4MCD', status: 'queued' }
@@ -18,8 +19,9 @@ interface Fake {
   killed: () => boolean
 }
 
-/** A CLI that writes `lines` (raw) to stdout, then exits; or emits `error`. */
-function fakeCli(lines: string[], opts: { error?: boolean; stderr?: string } = {}): Fake {
+/** A CLI that writes `lines` (raw) to stdout, then exits (or, with `hang`,
+ * never does); or emits `error`. */
+function fakeCli(lines: string[], opts: { error?: boolean; stderr?: string; hang?: boolean } = {}): Fake {
   const calls: Fake['calls'] = []
   let input = ''
   let killed = false
@@ -39,6 +41,7 @@ function fakeCli(lines: string[], opts: { error?: boolean; stderr?: string } = {
       }
       if (opts.stderr) stderr.write(opts.stderr)
       for (const line of lines) stdout.write(line)
+      if (opts.hang) return
       stdout.end()
       stdout.on('end', () => setImmediate(() => child.emit('close', 0)))
     })
@@ -135,6 +138,22 @@ describe('importFile through agent24 documents import', () => {
       for (const spy of spies) expect(spy).not.toHaveBeenCalled()
     } finally {
       for (const spy of spies) spy.mockRestore()
+    }
+  })
+
+  it('a CLI that does not exit after its result is stopped, and the result stands', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const cli = fakeCli([result({ ok: true, status: 202, data: JOB })], { hang: true })
+      let settled: unknown = 'pending'
+      void importFile('/a.pdf', () => EP, () => {}, cli.spawn, 'agent24').then((r) => (settled = r))
+      await vi.advanceTimersByTimeAsync(RESULT_GRACE_MS - 1)
+      expect([settled, cli.killed()]).toEqual(['pending', false])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(settled).toEqual({ ok: true, status: 202, data: JOB })
+      expect(cli.killed()).toBe(true)
+    } finally {
+      vi.useRealTimers()
     }
   })
 

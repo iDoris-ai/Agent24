@@ -15,6 +15,9 @@ export type Spawner = (bin: string, args: string[]) => ChildProcess
 /** Far above any line the CLI writes (a reply is at most 2 MiB, the
  * transport's cap): past it, stop. */
 const MAX_LINE_CHARS = 4 * 1024 * 1024
+/** How long a CLI that printed its result may take to exit; past it, it is
+ * stopped and the result stands. */
+export const RESULT_GRACE_MS = 5_000
 
 export function fail(status: number, code: string, message: string): DocumentsResponse<never> {
   return { ok: false, status, error: { code, message } }
@@ -50,10 +53,21 @@ export function runDocumentsCli(
     let settled = false
     let result: DocumentsResponse | null = null
     let pending = ''
+    let grace: ReturnType<typeof setTimeout> | undefined
     const settle = (answer: DocumentsResponse): void => {
       if (settled) return
       settled = true
+      clearTimeout(grace)
       resolve(answer)
+    }
+    // The result is in: a CLI that does not then exit is stopped, so the
+    // renderer's request never hangs on it.
+    const answered = (answer: DocumentsResponse): void => {
+      result = answer
+      grace ??= setTimeout(() => {
+        child.kill()
+        settle(answer)
+      }, RESULT_GRACE_MS)
     }
     const unstartable = (): void => settle(fail(503, 'backend_unreachable', 'the documents tool could not be started'))
     // One line of the CLI's `--json` output; anything else is ignored.
@@ -79,9 +93,9 @@ export function runDocumentsCli(
         // status: a reply that broke the protocol is `invalid_response` with
         // the status the daemon gave (a 302, a 200 that is not JSON).
         if (ok && code >= 200 && code < 300 && typeof data === 'object' && data !== null) {
-          result = { ok: true, status: code, data: data as never }
-        } else if (!ok && isError(error)) result = { ok: false, status: code, error }
-        else result = fail(502, 'invalid_response', 'the documents tool gave a result that does not fit')
+          answered({ ok: true, status: code, data: data as never })
+        } else if (!ok && isError(error)) answered({ ok: false, status: code, error })
+        else answered(fail(502, 'invalid_response', 'the documents tool gave a result that does not fit'))
       }
     }
     let child: ChildProcess
