@@ -143,8 +143,9 @@ fn send(d: &Daemon, method: &str, path: &str, body: &str) -> (u16, serde_json::V
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n\
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nauthorization: Bearer {}\r\n\
          content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        d.port,
         d.token,
         body.len()
     )

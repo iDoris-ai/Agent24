@@ -63,7 +63,7 @@ fn protected_status(port: u16, bearer: &str) -> u16 {
         .expect("response timeout");
     write!(
         stream,
-        "GET /api/v1/models HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {bearer}\r\nconnection: close\r\n\r\n"
+        "GET /api/v1/models HTTP/1.1\r\nhost: localhost:{port}\r\nauthorization: Bearer {bearer}\r\nconnection: close\r\n\r\n"
     )
     .expect("capability request");
     let mut response = String::new();

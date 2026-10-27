@@ -2,7 +2,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { App, pickChatModel, extractDaemonDefaultModel } from './App'
-import type { ModuleManifest } from '../shared/ipc-types'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
 
 const mockBackendProxy = vi.fn()
@@ -12,16 +11,6 @@ const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
 const mockOmlxModels = vi.fn()
 const mockBackendEndpoint = vi.fn()
-
-const helloManifest: ModuleManifest = {
-  id: '@auraaihq/example-hello',
-  version: '0.1.0',
-  name: 'Hello',
-  description: 'Test module',
-  type: 'ui',
-  permissions: ['llm'],
-  navItem: { icon: '👋', label: 'Hello', route: '/modules/hello' },
-}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -160,14 +149,13 @@ describe('App', () => {
     })
   })
 
-  it('shows module nav items when modules with navItem are returned', async () => {
-    mockModulesList.mockResolvedValue([helloManifest])
-
+  // A5: node-daemon-era module entries are gone from the navigation.
+  it('has no module-manager / codebox / service-box / hello entries (A5)', async () => {
     await act(async () => { render(<App />) })
-    await waitFor(() => {
-      const helloNavBtns = screen.getAllByText('Hello')
-      expect(helloNavBtns.length).toBeGreaterThan(0)
-    })
+    expect(screen.queryByText('模块管理')).not.toBeInTheDocument()
+    expect(screen.queryByText('安装模块')).not.toBeInTheDocument()
+    expect(screen.queryByText('能力模块')).not.toBeInTheDocument()
+    expect(mockModulesList).not.toHaveBeenCalled()
   })
 
   it('navigates to settings page on click', async () => {
@@ -227,24 +215,6 @@ describe('App', () => {
     await act(async () => { render(<App />) })
     await waitFor(() => {
       expect(mockOmlxStart).toHaveBeenCalled()
-    })
-  })
-
-  it('renders module page when module nav item clicked', async () => {
-    mockModulesList.mockResolvedValue([helloManifest])
-    mockBackendProxy
-      .mockResolvedValueOnce({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } }) // health
-      .mockResolvedValue({ ok: true, status: 200, data: { moduleId: 'hello', description: 'test' } }) // info
-
-    await act(async () => { render(<App />) })
-    await waitFor(() => screen.getAllByText('Hello'))
-
-    await act(async () => {
-      const helloBtns = screen.getAllByText('Hello')
-      fireEvent.click(helloBtns[0])
-    })
-    await waitFor(() => {
-      expect(screen.getByText('Hello Module')).toBeInTheDocument()
     })
   })
 

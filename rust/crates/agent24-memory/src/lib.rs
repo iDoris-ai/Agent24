@@ -12,18 +12,21 @@ pub mod artifact;
 pub mod assertion;
 pub mod condenser;
 pub mod consolidator;
+pub mod disk_gate;
 pub mod eval;
 #[cfg(test)]
 mod eval_m1;
 pub mod event;
 pub mod knowledge;
 pub mod reconcile;
+pub mod rejections;
 pub mod replay;
 pub mod retriever;
 pub mod session;
 pub mod session_log;
 pub mod trace;
 pub mod vector;
+pub mod wal_maintenance;
 pub mod writer;
 
 use std::path::Path;
@@ -83,9 +86,117 @@ pub enum MemoryError {
         owner: String,
         dimension: &'static str,
     },
+    /// P1-02c (c2): a retraction was refused on a full partition because the
+    /// serialized retraction payload `{"assertion_id":…}` exceeds the 256-byte
+    /// cap of the retraction quota exemption (migration 0019). The test is on the
+    /// SERIALIZED bytes, not the id length: a plain id is exempt up to 237 bytes,
+    /// but an id with characters JSON escapes (`"`, `\`, control characters)
+    /// crosses the cap sooner. Carries no owner key and no id on purpose.
+    #[error("assertion id is too long to retract while the partition is full")]
+    RetractIdTooLong,
+    /// P1-02c (c4): the pre-write disk check refused the write — free space on
+    /// the memory database's volume is under the floor for this write class
+    /// (see [`disk_gate`]). Nothing was written.
+    #[error("not enough free disk space on the memory volume")]
+    DiskLow,
+    /// P1-02c (c2b, W3): importing a session's legacy KV blob into the event log
+    /// failed. The import is one transaction, so nothing was written and the
+    /// session still has no events: the next call retries it from scratch (that
+    /// absence IS the "import incomplete" mark — no extra state is needed).
+    /// Wraps the cause so [`MemoryError::code`] still classifies it (the import
+    /// writes N+2 rows and can hit the quota), while callers can tell "history
+    /// could not be loaded" from "the history is empty".
+    #[error("session import incomplete: {0}")]
+    SessionImportIncomplete(Box<MemoryError>),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+/// P1-02c (c2): the closed set of externally visible memory-failure codes.
+///
+/// This is the ONLY thing a failed write may reveal to an event stream, an HTTP
+/// body or a module: a stable code, never the partition key and never
+/// `MemoryError`'s `Display` (which spells the owner key out with `{owner:?}`).
+/// `memory_disk_low` is produced by the pre-write disk check ([`disk_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryErrorCode {
+    QuotaRows,
+    QuotaBytes,
+    DiskLow,
+    DiskFull,
+    ReservedKind,
+    /// A retraction whose serialized `assertion.retracted` payload exceeds the
+    /// 256-byte quota-exemption cap (migration 0019), so on a full
+    /// partition it is charged as ordinary content and refused.
+    RetractIdTooLong,
+    Internal,
+}
+
+impl MemoryErrorCode {
+    pub const ALL: [Self; 7] = [
+        Self::QuotaRows,
+        Self::QuotaBytes,
+        Self::DiskLow,
+        Self::DiskFull,
+        Self::ReservedKind,
+        Self::RetractIdTooLong,
+        Self::Internal,
+    ];
+
+    /// The wire string. Stable: clients match on it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QuotaRows => "memory_quota_rows",
+            Self::QuotaBytes => "memory_quota_bytes",
+            Self::DiskLow => "memory_disk_low",
+            Self::DiskFull => "memory_disk_full",
+            Self::ReservedKind => "memory_reserved_kind",
+            Self::RetractIdTooLong => "memory_retract_id_too_long",
+            Self::Internal => "memory_internal",
+        }
+    }
+
+    /// The quota dimension (`"rows"` / `"bytes"`) when this is a quota code.
+    pub fn dimension(self) -> Option<&'static str> {
+        match self {
+            Self::QuotaRows => Some("rows"),
+            Self::QuotaBytes => Some("bytes"),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// SQLite primary result code `SQLITE_FULL`: the disk (or `max_page_count`) is full.
+const SQLITE_FULL: &str = "13";
+
+impl MemoryError {
+    /// Classify into the closed [`MemoryErrorCode`] set. Total: anything that is
+    /// not a recognised quota / disk / reserved-kind failure is `Internal`.
+    pub fn code(&self) -> MemoryErrorCode {
+        match self {
+            Self::QuotaExceeded { dimension, .. } if *dimension == "rows" => {
+                MemoryErrorCode::QuotaRows
+            }
+            Self::QuotaExceeded { .. } => MemoryErrorCode::QuotaBytes,
+            Self::RetractIdTooLong => MemoryErrorCode::RetractIdTooLong,
+            Self::DiskLow => MemoryErrorCode::DiskLow,
+            Self::SessionImportIncomplete(cause) => cause.code(),
+            Self::Sqlx(sqlx::Error::Database(db))
+                if db.code().as_deref() == Some(SQLITE_FULL)
+                    || db.message().contains("database or disk is full") =>
+            {
+                MemoryErrorCode::DiskFull
+            }
+            _ => MemoryErrorCode::Internal,
+        }
+    }
+}
 
 /// T8.5c-P (design §3.2, v2 "sqlx 预取 High", v4 "常量口径 Medium" M1): the
 /// SQLite connection option `SqliteConnectOptions::row_buffer_size` — the
@@ -278,6 +389,11 @@ pub struct KvStore {
     /// wrong one with the wrong pool). The ephemeral/file-backed split is now
     /// guaranteed by the two constructors below, not by caller convention.
     oop_admission: Option<Arc<tokio::sync::Semaphore>>,
+    /// P1-02c c3: lazily started bounded audit queue (shared by every clone).
+    rejection_queue: Arc<std::sync::OnceLock<Arc<rejections::QueuedRejections>>>,
+    /// P1-02c c4: pre-write disk check, bound to this database's volume.
+    /// Disabled for [`KvStore::open_memory`].
+    disk: disk_gate::DiskGate,
 }
 
 impl KvStore {
@@ -311,6 +427,8 @@ impl KvStore {
             oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
                 (KVSTORE_MAX_CONNECTIONS - 1) as usize,
             ))),
+            rejection_queue: Default::default(),
+            disk: disk_gate::DiskGate::for_path(path),
         })
     }
 
@@ -340,7 +458,15 @@ impl KvStore {
         Ok(Self {
             pool,
             oop_admission: None,
+            rejection_queue: Default::default(),
+            disk: disk_gate::DiskGate::disabled(),
         })
+    }
+
+    /// Replace the disk gate (tests inject a fake probe and clock here).
+    pub fn with_disk_gate(mut self, gate: disk_gate::DiskGate) -> Self {
+        self.disk = gate;
+        self
     }
 
     async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
@@ -369,28 +495,56 @@ impl KvStore {
     /// cannot yet atomically commit a KV write and an append together — that
     /// cross-store transaction seam is MD-2b work.)
     pub fn events(&self) -> event::EventLog {
-        event::EventLog::new(self.pool.clone())
+        event::EventLog::new(self.pool.clone()).with_gate(self.disk.clone())
+    }
+
+    /// P1-02c c3: the failed-write audit trail and session-gap ranges.
+    pub fn rejections(&self) -> rejections::Rejections {
+        rejections::Rejections::new(self.pool.clone())
+    }
+
+    /// The bounded, asynchronous audit queue: callers `enqueue` and never wait
+    /// on the audit write. Must first be called from inside a tokio runtime.
+    pub fn queued_rejections(&self) -> Arc<rejections::QueuedRejections> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime to host the worker: hand back an inert queue (every
+            // enqueue is counted as dropped) and do not cache it.
+            return Arc::new(
+                self.rejections()
+                    .spawn_queue(rejections::QUEUE_CAPACITY, self.oop_admission.clone()),
+            );
+        }
+        self.rejection_queue
+            .get_or_init(|| {
+                Arc::new(
+                    self.rejections()
+                        .spawn_queue(rejections::QUEUE_CAPACITY, self.oop_admission.clone()),
+                )
+            })
+            .clone()
     }
 
     /// A session event-log writer over this store's database.
     pub fn session_log(&self) -> session_log::SessionLog {
-        session_log::SessionLog::new(self.pool.clone())
+        session_log::SessionLog::new(self.pool.clone(), self.disk.clone())
     }
 
     /// An [`artifact::ArtifactCas`] over the SAME database file — MD-2b's
     /// CAS-versioned editable-content authority shares the KV store's pool.
     pub fn artifacts(&self) -> artifact::ArtifactCas {
-        artifact::ArtifactCas::new(self.pool.clone())
+        artifact::ArtifactCas::new(self.pool.clone()).with_gate(self.disk.clone())
     }
 
     /// An [`assertion::AssertionLedger`] over the SAME database file — MD-3a's
     /// bi-temporal semantic authority shares the KV store's pool.
     pub fn assertions(&self) -> assertion::AssertionLedger {
-        assertion::AssertionLedger::new(self.pool.clone())
+        assertion::AssertionLedger::new(self.pool.clone()).with_gate(self.disk.clone())
     }
 
     /// Retract an assertion and append its event in the same transaction.
     pub async fn forget(&self, owner: &str, id: &str, at: &str) -> Result<assertion::Forget> {
+        // Retraction has its own, lower floor (16 MiB) — see `disk_gate`.
+        self.disk.check(disk_gate::WriteClass::Retract)?;
         assertion::forget(&self.pool, owner, id, at).await
     }
 
@@ -431,25 +585,26 @@ impl KvStore {
     /// A [`writer::WriteGate`] over the SAME database file — MD-4's governance
     /// write-gate, committing an assertion and its audit event atomically.
     pub fn write_gate(&self) -> writer::WriteGate {
-        writer::WriteGate::new(self.pool.clone())
+        writer::WriteGate::new(self.pool.clone()).with_gate(self.disk.clone())
     }
 
     /// An [`consolidator::EventConsolidator`] over the SAME database file — MD-5's
     /// consolidation loop, with the default deterministic [`consolidator::CountSynth`].
     pub fn consolidator(&self) -> consolidator::EventConsolidator<consolidator::CountSynth> {
         consolidator::EventConsolidator::new(self.pool.clone(), consolidator::CountSynth)
+            .with_gate(self.disk.clone())
     }
 
     /// An [`knowledge::InstructionStore`] over the SAME database file — MD-7's
     /// layered instruction/knowledge layer with a review-gated auto-memory inbox.
     pub fn knowledge(&self) -> knowledge::InstructionStore {
-        knowledge::InstructionStore::new(self.pool.clone())
+        knowledge::InstructionStore::new(self.pool.clone()).with_gate(self.disk.clone())
     }
 
     /// A [`trace::SymbolicTrace`] over the SAME database file — MD-8's symbolic
     /// task trace (full bodies spilled to refs, prompt keeps symbols + drill-down).
     pub fn trace(&self) -> trace::SymbolicTrace {
-        trace::SymbolicTrace::new(self.pool.clone())
+        trace::SymbolicTrace::new(self.pool.clone()).with_gate(self.disk.clone())
     }
 
     /// A [`vector::VectorRetriever`] over the SAME database file with a chosen
@@ -1321,6 +1476,8 @@ mod tests {
         let kv = KvStore {
             pool: pool_migrated_up_to(&dir.path().join("m.db"), 16).await,
             oop_admission: None,
+            rejection_queue: Default::default(),
+            disk: disk_gate::DiskGate::disabled(),
         };
 
         let columns = sqlx::query("PRAGMA table_info(mem_os_partitions)")
@@ -1758,7 +1915,13 @@ mod tests {
                 .fetch_one(&upgraded.pool)
                 .await
                 .unwrap();
-        assert_eq!(version, 18);
+        let latest = sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap();
+        assert_eq!(version, latest);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);
