@@ -1159,7 +1159,7 @@ mod tests {
             .unwrap();
         let (registry, runtime, _, store, _) =
             fixture_using(RiskClass::Read, false, true, true, Some(store), None).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
         let error = registry
             .dispatch(
                 "fake_module.write_local",
@@ -2630,7 +2630,7 @@ mod tests {
     #[tokio::test]
     async fn unready_outbound_gate_is_not_advertised() {
         let (registry, _, _, _) = fixture_with_outbound(RiskClass::Read, true, true, false).await;
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
     }
 
     #[tokio::test]
@@ -2801,7 +2801,7 @@ mod tests {
     async fn a_withheld_tool_called_by_name_is_refused_and_audited() {
         let (registry, runtime, _, store) = fixture(RiskClass::Read, true, true).await;
         runtime.remote_tier.store(true, Ordering::SeqCst);
-        assert!(registry.live_adverts().await.is_empty());
+        assert!(registry.live_adverts(false).await.is_empty());
         let by_dispatch = registry
             .dispatch(
                 "fake_module.write_local",
