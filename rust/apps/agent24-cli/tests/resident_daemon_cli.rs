@@ -10,7 +10,6 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 fn tmp_home() -> tempfile::TempDir {
     let home = tempfile::Builder::new()
@@ -60,18 +59,14 @@ struct FakeDaemon {
 impl FakeDaemon {
     fn start(chat_reply: serde_json::Value) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let chats = Arc::new(Mutex::new(Vec::new()));
         let seen = chats.clone();
+        // Serves for as long as the test process lives: no deadline for a
+        // first CLI start that a malware scan slows down.
         std::thread::spawn(move || {
-            let by = Instant::now() + Duration::from_secs(20);
-            while Instant::now() < by {
-                let Ok((stream, _)) = listener.accept() else {
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
-                };
-                stream.set_nonblocking(false).unwrap();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
                 let mut reader = BufReader::new(stream);
                 let (head, body) = read_request(&mut reader);
                 let reply = if head.starts_with("POST /api/v1/chat ") {
