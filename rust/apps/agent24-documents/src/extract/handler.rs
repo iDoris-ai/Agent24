@@ -3,7 +3,8 @@
 //! document, revision, schema hash and extractor version, or for a rerun
 //! the document and its `Idempotency-Key` — and writes the job under one write lock,
 //! starts its worker, and answers 202. A key already claimed replays its
-//! job, as an import does.
+//! job, as an import does. The `documents.extract` tool shares the checks
+//! and the claim ([`prepare`], [`claim`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -17,12 +18,14 @@ use serde_json::{Value, json};
 
 use super::job::{Input, schema_sha256, spawn};
 use super::{EXTRACTOR_VERSION, Field};
+use crate::authorization::{self, Accepted};
 use crate::engine::pdfkit;
 use crate::error::ApiError;
 use crate::extractions::is_field_key;
 use crate::id::{IdKind, is_id, new_id};
-use crate::idem::request_sha256;
+use crate::idem::{UnsupportedNumber, request_sha256};
 use crate::jobs::{Job, load};
+use crate::oplog::{self, Origin};
 use crate::state::{AppState, Storage};
 use crate::uploads::idempotency_key;
 
@@ -36,11 +39,11 @@ const KINDS: [&str; 7] = [
     "boolean",
 ];
 
-/// `DocumentsExtractRequest`, as sent.
+/// `DocumentsExtractRequest`'s `schema`, as sent.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Schema {
-    fields: Vec<Field>,
+pub(crate) struct Schema {
+    pub(crate) fields: Vec<Field>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +53,21 @@ pub struct ExtractRequest {
     schema: Schema,
     #[serde(default)]
     rerun: bool,
+}
+
+/// What a reused key is compared on (§5.4): the body as sent, less
+/// `"rerun": false`, which says what leaving it out says. Without `rerun`
+/// the hash is the one a body has always had, so stored jobs still replay;
+/// a key once stored from an explicit `"rerun": false` is 422 from now on
+/// (DOC-1-06b §2.3 accepts it: there are none).
+fn request_hash(body: &Value) -> Result<String, UnsupportedNumber> {
+    let mut body = body.clone();
+    if let Some(map) = body.as_object_mut()
+        && map.get("rerun") == Some(&Value::Bool(false))
+    {
+        map.remove("rerun");
+    }
+    request_sha256(&body)
 }
 
 /// What is wrong with `fields`, if anything (`DocumentsExtractField`).
@@ -87,21 +105,70 @@ pub async fn extract(
     let Json(body) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let req: ExtractRequest = serde_json::from_value(body.clone())
         .map_err(|e| ApiError::invalid_request(e.to_string()))?;
-    if !is_id(IdKind::Document, &document_id) || req.revision < 1 {
+    let rerun = req.rerun.then_some(&headers);
+    let (revision, fields) = (req.revision, req.schema.fields);
+    let Prepared {
+        storage,
+        key,
+        request,
+        input,
+    } = prepare(&state, document_id, revision, fields, &body, rerun).await?;
+    // In a task of its own: a client that goes away must not stop a commit
+    // halfway from the worker start that belongs with it.
+    let task = tokio::spawn(claim(
+        state,
+        storage.clone(),
+        key,
+        request,
+        input,
+        Origin::Page,
+        None,
+    ));
+    match task.await {
+        Ok(Ok((job, _))) => {
+            let status = match job.status.as_str() {
+                "succeeded" | "cancelled" => StatusCode::OK,
+                _ => StatusCode::ACCEPTED,
+            };
+            Ok((status, Json(job)))
+        }
+        Ok(Err(Fail::Api(e))) => Err(e),
+        Ok(Err(Fail::Db(e))) => Err(storage.db_failure(e).await),
+        // A spawned task is only cancelled when the runtime shuts down.
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+/// What a checked request claims, and the storage it claims it in.
+pub(crate) struct Prepared {
+    pub(crate) storage: Arc<Storage>,
+    pub(crate) key: String,
+    pub(crate) request: String,
+    pub(crate) input: Input,
+}
+
+/// Checks an extract request and works out its key, in REST's order, for
+/// REST and the tool alike. `body` is what the hash is taken of: REST's
+/// body as sent, the tool's `{revision, schema}`. `rerun` carries the
+/// headers of a rerun, which only REST sends.
+pub(crate) async fn prepare(
+    state: &AppState,
+    document_id: String,
+    revision: i64,
+    fields: Vec<Field>,
+    body: &Value,
+    rerun: Option<&HeaderMap>,
+) -> Result<Prepared, ApiError> {
+    if !is_id(IdKind::Document, &document_id) || revision < 1 {
         return Err(ApiError::invalid_request("not a document id or revision"));
     }
-    if let Some(why) = bad_fields(&req.schema.fields) {
+    if let Some(why) = bad_fields(&fields) {
         return Err(ApiError::invalid_request(why));
     }
     // A rerun names itself: it is keyed by its Idempotency-Key (§5.4).
-    let rerun = if req.rerun {
-        Some(idempotency_key(&headers)?)
-    } else {
-        None
-    };
-    // The whole body, as sent, is what a reused key is compared on (§5.4).
-    let request = request_sha256(&body).map_err(|e| ApiError::invalid_request(e.to_string()))?;
-    let schema = schema_sha256(&req.schema.fields).map_err(ApiError::invalid_request)?;
+    let rerun = rerun.map(idempotency_key).transpose()?;
+    let request = request_hash(body).map_err(|e| ApiError::invalid_request(e.to_string()))?;
+    let schema = schema_sha256(&fields).map_err(ApiError::invalid_request)?;
     if state.model().is_none() {
         return Err(ApiError::engine_unavailable(
             "local-model",
@@ -124,7 +191,7 @@ pub async fn extract(
         "SELECT media_type FROM revisions WHERE document_id = ? AND revision = ?",
     )
     .bind(&document_id)
-    .bind(req.revision)
+    .bind(revision)
     .fetch_optional(storage.db.pool())
     .await;
     let media = match row {
@@ -142,31 +209,24 @@ pub async fn extract(
     // its Idempotency-Key within the document: resending it replays it, and
     // the same key with another body is 422 (David, 2026-10-10).
     let key = match &rerun {
-        None => format!(
-            "{document_id}/{}/{schema}/{EXTRACTOR_VERSION}",
-            req.revision
-        ),
+        None => format!("{document_id}/{revision}/{schema}/{EXTRACTOR_VERSION}"),
         Some(rerun) => format!("{document_id}/rerun/{rerun}"),
     };
     let input = Input {
         document_id,
-        revision: req.revision,
+        revision,
         schema_sha256: schema,
-        fields: req.schema.fields,
+        fields,
     };
-    // In a task of its own: a client that goes away must not stop a commit
-    // halfway from the worker start that belongs with it.
-    let task = tokio::spawn(claim(state, storage.clone(), key, request, input));
-    match task.await {
-        Ok(Ok(answer)) => Ok(answer),
-        Ok(Err(Fail::Api(e))) => Err(e),
-        Ok(Err(Fail::Db(e))) => Err(storage.db_failure(e).await),
-        // A spawned task is only cancelled when the runtime shuts down.
-        Err(e) => std::panic::resume_unwind(e.into_panic()),
-    }
+    Ok(Prepared {
+        storage,
+        key,
+        request,
+        input,
+    })
 }
 
-enum Fail {
+pub(crate) enum Fail {
     Api(ApiError),
     Db(sqlx::Error),
 }
@@ -177,17 +237,26 @@ impl From<sqlx::Error> for Fail {
     }
 }
 
-/// Claims `key` and writes the job under the write lock, then starts its
-/// worker; a key already claimed replays its job instead (§7): the same
-/// request returns it, 202 while it works and 200 once it succeeded or was
-/// cancelled; a failed or interrupted one is queued again, attempt + 1.
-async fn claim(
+/// Claims `key` and writes the job, from `origin`, under the write lock,
+/// then starts its worker; a key already claimed replays its job instead
+/// (§7), whose origin stays the first request's: the same request returns
+/// it as it is; a failed or interrupted one is queued again, attempt + 1.
+/// A claim from a run, new or replayed, appends its `oplog` row in the same
+/// transaction, so the row and the job commit or roll back together; the
+/// page's writes none, its job records it (ADR-DOC-01 D9). A tool call
+/// `accepted` for a job still working records the attempt it relies on, so
+/// the end of its authorization stops it (K1-06a-grant-path §2.5). A request
+/// whose hash differs is 422 before anything is written.
+/// Answers the job as this claim leaves it, and whether a worker started.
+pub(crate) async fn claim(
     state: AppState,
     storage: Arc<Storage>,
     key: String,
     request: String,
     input: Input,
-) -> Result<(StatusCode, Json<Job>), Fail> {
+    origin: Origin,
+    accepted: Option<Accepted>,
+) -> Result<(Job, bool), Fail> {
     let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
     let hit: Option<(String, String)> = sqlx::query_as(
         "SELECT request_sha256, target_ref FROM idempotency WHERE kind = 'extract' AND key = ?",
@@ -225,11 +294,12 @@ async fn claim(
             })?;
             sqlx::query(
                 "INSERT INTO jobs (id, kind, document_id, revision, status, origin, input)
-                 VALUES (?, 'extract', ?, ?, 'queued', '{\"kind\":\"page\"}', ?)",
+                 VALUES (?, 'extract', ?, ?, 'queued', ?, ?)",
             )
             .bind(&job_id)
             .bind(&input.document_id)
             .bind(input.revision)
+            .bind(origin.job_json())
             .bind(json!(input).to_string())
             .execute(&mut *tx)
             .await?;
@@ -245,19 +315,23 @@ async fn claim(
             (job_id, Some(1))
         }
     };
+    if let Origin::Run(run) = &origin {
+        oplog::extract_submitted(&mut tx, run, &input.document_id, input.revision, &job_id).await?;
+    }
     // The answer is the job as this transaction leaves it.
     let job = load(&mut *tx, &job_id)
         .await?
         .ok_or_else(|| Fail::Api(ApiError::internal("the job vanished")))?;
+    if let (Origin::Run(run), Some(accepted)) = (&origin, &accepted)
+        && matches!(job.status.as_str(), "queued" | "running" | "cancelling")
+    {
+        authorization::record(&mut tx, &job.job_id, job.attempt, run, accepted).await?;
+    }
     tx.commit().await?;
     if let Some(attempt) = attempt {
         spawn(state, storage, job_id, attempt);
     }
-    let status = match job.status.as_str() {
-        "succeeded" | "cancelled" => StatusCode::OK,
-        _ => StatusCode::ACCEPTED,
-    };
-    Ok((status, Json(job)))
+    Ok((job, attempt.is_some()))
 }
 
 #[cfg(test)]

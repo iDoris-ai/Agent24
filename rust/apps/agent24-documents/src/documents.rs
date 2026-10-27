@@ -1,6 +1,8 @@
 //! Documents (ADR-DOC-02 §3, §4): `GET /documents`, newest first, and
 //! `GET /documents/{document_id}` with its head revision.
 
+use std::collections::BTreeSet;
+
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path as UrlPath, Query};
@@ -8,14 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::id::{IdKind, is_id};
-use crate::state::Ready;
+use crate::state::{Ready, Storage};
 use crate::timestamp::is_timestamp;
 use crate::uploads::is_sha256_address;
 
-const DEFAULT_LIMIT: i64 = 50;
-const MAX_LIMIT: i64 = 200;
-/// A page's serialized JSON stays under this (ADR-DOC-02 §4).
-const PAGE_BYTES: usize = 512 * 1024;
+pub(crate) const DEFAULT_LIMIT: i64 = 50;
+pub(crate) const MAX_LIMIT: i64 = 200;
+/// A REST page's serialized JSON stays under this (ADR-DOC-02 §4); a tool
+/// page has its own, smaller budget (DOC-1-06b §2).
+pub(crate) const PAGE_BYTES: usize = 512 * 1024;
 /// A title the OS writes is 1 to 500 characters (import, §5.6).
 const MAX_TITLE_CHARS: usize = 500;
 /// Every cursor the OS issues: hex of a 24-byte timestamp, a space and a
@@ -122,26 +125,66 @@ pub async fn list_documents(
     let Query(params) = params.map_err(|e| ApiError::invalid_request(e.body_text()))?;
     let limit = match params.limit.as_deref() {
         None => DEFAULT_LIMIT,
-        Some(l) => l
-            .parse::<i64>()
-            .ok()
-            .filter(|l| (1..=MAX_LIMIT).contains(l))
-            .ok_or_else(|| ApiError::invalid_request("limit must be 1 to 200"))?,
+        // Its range is [`list`]'s to check.
+        Some(l) => l.parse::<i64>().map_err(|_| bad_limit())?,
     };
-    let after = match params.cursor.as_deref() {
+    list(&storage, None, params.cursor.as_deref(), limit, PAGE_BYTES)
+        .await
+        .map(Json)
+}
+
+fn bad_limit() -> ApiError {
+    ApiError::invalid_request("limit must be 1 to 200")
+}
+
+/// The page after `cursor`: at most `limit` (1 to 200) documents and
+/// `budget` bytes of JSON, newest first. `GET /documents` and
+/// `documents.list` both read here.
+///
+/// `only`: when `Some`, just the documents whose id it holds, in the same
+/// order, with `next_cursor` set only when another of them follows (a tool
+/// call's scope, K1-06a §2.4); an empty set reads as an empty page without
+/// a query. REST passes `None`: every document.
+pub(crate) async fn list(
+    storage: &Storage,
+    only: Option<&BTreeSet<String>>,
+    cursor: Option<&str>,
+    limit: i64,
+    budget: usize,
+) -> Result<DocumentList, ApiError> {
+    if !(1..=MAX_LIMIT).contains(&limit) {
+        return Err(bad_limit());
+    }
+    let after = match cursor {
         None => None,
         Some(c) => Some(decode_cursor(c).ok_or_else(|| ApiError::invalid_request("bad cursor"))?),
     };
     let (after_at, after_id) = after.unzip();
+    let only_json = match only {
+        Some(set) if set.is_empty() => {
+            return Ok(DocumentList {
+                documents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        None => None,
+        Some(set) => Some(
+            serde_json::to_string(set)
+                .map_err(|_| ApiError::internal("cannot serialize the scope"))?,
+        ),
+    };
     // One more row than the page, to know whether another page follows.
+    // `?4` is NULL for REST (`only` absent); a tool scope binds its ids.
     let rows: Vec<Document> = match sqlx::query_as(
         "SELECT id, title, media_type, head_revision, created_at, updated_at FROM documents
-         WHERE ?1 IS NULL OR (created_at, id) < (?1, ?2)
+         WHERE (?1 IS NULL OR (created_at, id) < (?1, ?2))
+           AND (?4 IS NULL OR id IN (SELECT value FROM json_each(?4)))
          ORDER BY created_at DESC, id DESC LIMIT ?3",
     )
     .bind(after_at)
     .bind(after_id)
     .bind(limit + 1)
+    .bind(only_json)
     .fetch_all(storage.db.pool())
     .await
     {
@@ -151,31 +194,28 @@ pub async fn list_documents(
     if let Some(why) = rows.iter().find_map(|d| checked(d).err()) {
         return Err(storage.db_failure(sqlx::Error::Decode(why.into())).await);
     }
-    let page = fit_page(rows, usize::try_from(limit).unwrap_or(usize::MAX));
-    if let Some(page) = page {
-        return Ok(Json(page));
-    }
-    // A row the contract allows is a few KiB at most (the title check above).
-    let why = "a document too large for a page".into();
-    Err(storage.db_failure(sqlx::Error::Decode(why)).await)
+    // A row the contract allows is a few KiB at most (the title check above),
+    // so only a budget far under REST's can refuse the first row.
+    fit_page(rows, usize::try_from(limit).unwrap_or(usize::MAX), budget)
+        .ok_or_else(|| ApiError::over_budget(budget))
 }
 
-/// The page: at most `limit` rows and at most `PAGE_BYTES` of JSON, with a
+/// The page: at most `limit` rows and at most `budget` bytes of JSON, with a
 /// cursor after the last row it holds when more follow. `None` if not even
 /// one row fits.
-fn fit_page(rows: Vec<Document>, limit: usize) -> Option<DocumentList> {
+fn fit_page(rows: Vec<Document>, limit: usize, budget: usize) -> Option<DocumentList> {
     let envelope = |documents: Vec<Document>, next_cursor: Option<String>| DocumentList {
         documents,
         next_cursor,
     };
     // The envelope with a full-length cursor, and one comma per row.
     let mut used = serde_json::to_vec(&envelope(Vec::new(), Some("0".repeat(CURSOR_LEN))))
-        .map_or(PAGE_BYTES, |v| v.len());
+        .map_or(budget, |v| v.len());
     let total = rows.len();
     let mut documents = Vec::new();
     for d in rows.into_iter().take(limit) {
-        let size = serde_json::to_vec(&d).map_or(PAGE_BYTES, |v| v.len()) + 1;
-        if used + size > PAGE_BYTES {
+        let size = serde_json::to_vec(&d).map_or(budget, |v| v.len()) + 1;
+        if used + size > budget {
             break;
         }
         used += size;
@@ -236,7 +276,13 @@ pub async fn get_document(
     Ready(storage): Ready,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<DocumentDetail>, ApiError> {
-    if !is_id(IdKind::Document, &id) {
+    get(&storage, &id).await.map(Json)
+}
+
+/// One document with its head revision. `GET /documents/{document_id}` and
+/// `documents.get` both read here.
+pub(crate) async fn get(storage: &Storage, id: &str) -> Result<DocumentDetail, ApiError> {
+    if !is_id(IdKind::Document, id) {
         return Err(ApiError::invalid_request("not a document id"));
     }
     // One statement, so the document and its head are read together.
@@ -247,12 +293,12 @@ pub async fn get_document(
          LEFT JOIN revisions r ON r.document_id = d.id AND r.revision = d.head_revision
          WHERE d.id = ?",
     )
-    .bind(&id)
+    .bind(id)
     .fetch_optional(storage.db.pool())
     .await;
     let found = row.and_then(|row| row.map(HeadRow::checked).transpose());
     match found {
-        Ok(Some(detail)) => Ok(Json(detail)),
+        Ok(Some(detail)) => Ok(detail),
         Ok(None) => Err(ApiError::not_found("no such document")),
         Err(e) => Err(storage.db_failure(e).await),
     }

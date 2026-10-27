@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use super::Field;
 use super::ground::Source;
 use super::run::{Extracted, Failure, Job, run};
-use crate::engine::LayerFailure;
+use crate::engine::{LayerFailure, Requester};
 use crate::extractions::{MAX_VALUE_BYTES, NewExtraction, insert};
 use crate::id::{IdKind, new_id};
 use crate::idem::request_sha256;
@@ -144,7 +144,13 @@ async fn extract(
     };
     // The layer may take minutes to build; a cancel is seen within a second.
     // A build already started goes on: it is shared, and pinned for later reads.
-    let layer = state.layers().layer(storage, &content, &media, LAYER_WAIT);
+    let by = Requester::Job {
+        id: claim.job_id().to_owned(),
+        attempt: claim.attempt(),
+    };
+    let layer = state
+        .layers()
+        .layer(storage, &content, &media, LAYER_WAIT, by);
     tokio::pin!(layer);
     let address = loop {
         tokio::select! {
@@ -203,7 +209,10 @@ async fn extract(
 /// `engine_unavailable` and the like for a layer that could not be had.
 fn layer_failure(f: &LayerFailure) -> (&'static str, String) {
     let code = match f {
-        LayerFailure::NoEngine | LayerFailure::Busy | LayerFailure::Pending => "engine_unavailable",
+        LayerFailure::NoEngine
+        | LayerFailure::Busy
+        | LayerFailure::Pending
+        | LayerFailure::Stopped => "engine_unavailable",
         LayerFailure::Engine(crate::engine::EngineError::Unsupported) => "unsupported_format",
         LayerFailure::Engine(_) => "parse_failed",
         LayerFailure::Storage(..) => "storage_unavailable",

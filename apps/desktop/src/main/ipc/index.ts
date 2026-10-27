@@ -9,7 +9,7 @@ import { getBackendEndpoint } from '../backend-manager'
 import { findAllowedRoute, proxyError, proxyRequest, timeoutFor } from '../backend-proxy'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import type { IpcGuard } from './guard'
-import { documentsCall, httpSender } from '../documents'
+import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
@@ -320,9 +320,8 @@ export function registerIpcHandlers(options: {
     const endpoint = getBackendEndpoint()
     return endpoint ? { port: endpoint.port } : null
   })
-  const sendToDocuments = httpSender(getBackendEndpoint, BACKEND_HOST)
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
-    documentsCall(req, sendToDocuments),
+    documentsCall(req, getBackendEndpoint),
   )
   handle(IpcChannels.DocumentsImportFile, async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender)
@@ -338,7 +337,7 @@ export function registerIpcHandlers(options: {
     }
     const path = picked.filePaths[0]
     if (picked.canceled || !path) return null
-    return importFile(path, sendToDocuments, (p) => {
+    return importFile(path, getBackendEndpoint, (p) => {
       if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.DocumentsImportProgress, p)
     })
   })

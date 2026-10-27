@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::engine::{LayerFailure, WAIT, pdfkit};
+use crate::engine::{LayerFailure, Requester, WAIT, pdfkit};
 use crate::error::ApiError;
 use crate::id::{IdKind, is_id};
 use crate::state::{AppState, Storage, blob_cause};
@@ -18,7 +18,8 @@ pub mod matcher;
 pub mod render;
 pub mod text;
 
-/// A response's serialized JSON stays under this (§4).
+/// A REST response's serialized JSON stays under this (§4); a tool's has
+/// its own, smaller budget (DOC-1-06b §2), passed in the same way.
 pub const PAGE_BYTES: usize = 512 * 1024;
 /// Pages one response covers, at most (§3.1).
 pub const PAGES: u32 = 100;
@@ -56,11 +57,12 @@ pub async fn revision(storage: &Storage, id: &str, rev: i64) -> Result<Revision,
     })
 }
 
-/// The current engine's layer of `r`, built if need be.
+/// The current engine's layer of `r`, built if need be, asked for `by`.
 pub async fn current_layer(
     state: &AppState,
     storage: &Arc<Storage>,
     r: &Revision,
+    by: Requester,
 ) -> Result<(String, TextLayer), ApiError> {
     if !pdfkit::FORMATS.contains(&r.media_type.as_str()) {
         return Err(ApiError::unprocessable(
@@ -70,7 +72,7 @@ pub async fn current_layer(
     }
     let address = state
         .layers()
-        .layer(storage, &r.content_sha256, &r.media_type, WAIT)
+        .layer(storage, &r.content_sha256, &r.media_type, WAIT, by)
         .await;
     let address = address.map_err(layer_error)?;
     let layer = load(storage, &address).await?;
@@ -87,6 +89,9 @@ fn layer_error(f: LayerFailure) -> ApiError {
         LayerFailure::Busy => ApiError::engine_unavailable(engine, "the read engine is busy"),
         LayerFailure::Pending => {
             ApiError::engine_unavailable(engine, "the text layer is still being built")
+        }
+        LayerFailure::Stopped => {
+            ApiError::engine_unavailable(engine, "the text layer build was stopped")
         }
         LayerFailure::Engine(crate::engine::EngineError::Unsupported) => ApiError::unprocessable(
             "unsupported_format",
@@ -132,6 +137,16 @@ fn cursor_key() -> Option<&'static [u8; 64]> {
         return None;
     }
     Some(KEY.get_or_init(|| key))
+}
+
+/// A page as it will be sent, if it fits `budget`: a single entry over it,
+/// with what must go with it, is `payload_too_large`, never cut (§4).
+pub fn within<T: serde::Serialize>(page: T, budget: usize) -> Result<T, ApiError> {
+    let size = serde_json::to_vec(&page).map_or(usize::MAX, |v| v.len());
+    if size > budget {
+        return Err(ApiError::over_budget(budget));
+    }
+    Ok(page)
 }
 
 /// HMAC-SHA-256 (RFC 2104) of `payload` under the cursor key, if there is one.
@@ -228,13 +243,35 @@ pub fn geometry(rects: Vec<[f64; 4]>) -> Value {
     json!({ "box": "CropBox", "unit": "pt", "origin": "top-left-rotated", "rects": rects })
 }
 
+fn region_json(r: &Region) -> Value {
+    json!({ "page": r.page, "geometry": geometry(r.rects.clone()), "reason": r.reason })
+}
+
+/// The last page one response from `start` covers: at most [`PAGES`], and
+/// fewer when their regions would take over half of `budget` (never fewer
+/// than `start` itself), so a tool's page still has room for an entry.
+pub fn last_page(layer: &TextLayer, start: u32, budget: usize) -> u32 {
+    let last = layer.pages.min(start.saturating_add(PAGES - 1));
+    let mut used = 0;
+    for r in layer.unparsed_regions.iter() {
+        if !(start..=last).contains(&r.page) {
+            continue;
+        }
+        used += serde_json::to_vec(&region_json(r)).map_or(budget, |v| v.len()) + 1;
+        if used > budget / 2 && r.page > start {
+            return r.page - 1;
+        }
+    }
+    last
+}
+
 /// `parse_status` and `unparsed_regions` for pages `first..=last` (§3.1).
 pub fn coverage(layer: &TextLayer, first: u32, last: u32) -> (ParseStatus, Vec<Value>) {
     let regions: Vec<Value> = layer
         .unparsed_regions
         .iter()
         .filter(|r: &&Region| (first..=last).contains(&r.page))
-        .map(|r| json!({ "page": r.page, "geometry": geometry(r.rects.clone()), "reason": r.reason }))
+        .map(region_json)
         .collect();
     let status = if regions.is_empty() {
         ParseStatus::Complete

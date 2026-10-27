@@ -11,6 +11,7 @@
 | [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀（已收口）的任务定义与验收标准（§五「主链」T1–T14） |
 | [`COMPONENT-ROADMAP.md`](COMPONENT-ROADMAP.md) | ✅ **权威**（配套，2026-10-03 起）。按结构组件（内核、模型、记忆、Workspace、权限、领域 OS、第三方、通信、语音、发布、组织化、Web3）排列的里程碑路线、依赖与跨组件波次 |
 | [`PLAN-OD-NEXT.md`](PLAN-OD-NEXT.md) | ✅ **权威**（配套，2026-10-03 起）。Open Design 下一阶段 / 第三方工具接入 Workflow / OpenCreator 的里程碑定义与验收 |
+| [`PLAN-KNOWLEDGE-CONVERSATION.md`](PLAN-KNOWLEDGE-CONVERSATION.md) | 配套 Knowledge 验收拆分（2026-10-11）；唯一主对话方向已获用户确认，接口/owner/排期待审，不是恢复暂停项或变更当前主线 |
 | [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
 | [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ▶️ **M1 已恢复为当前主干**（2026-10-03）；M2–M6 仍是「未来要做什么」。M1 的任务定义与状态在 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md`（其中的 `[B]` 机器分工已被 2026-10-03 裁决取代：Agent24 全部在笔记本做，分支吸收 main 时一并改掉） |
 | [`../PLAN.md`](../PLAN.md) §六 Roadmap、[`../ROADMAP.md`](../ROADMAP.md) | ⛔ **已作废**。Rust 核心重写（ADR-026）之前的 Electron/Node.js 时代规划，仅供历史考古，**不要照它排期** |
@@ -26,6 +27,20 @@
 
 **历史（2026-09-23 起的 ME-4 执行段，已收口）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
 定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
+
+## Knowledge 一致对话 / 一站式知识库台账（2026-10-11）
+
+产品决策见 [ADR-KB-01](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md)，验收边界见 [KB-C0–C4 计划](PLAN-KNOWLEDGE-CONVERSATION.md)。这里只登记，不启动实现、不改变已有优先级；服务 owner 保留 David，宿主/销售职责待 [#904](https://github.com/iDoris-ai/Agent24/issues/904) 对齐。
+
+| 工作包 | 状态 | 交付边界 |
+|---|---|---|
+| KB-C0 设计与契约 | `REVIEW` | 用户已确认唯一主对话/知识管理分工与 TODO-B；两仓文档/工程契约仍需审查，不等于实现完成 |
+| KB-C1 主对话只读知识 | `BACKLOG` | REST 检索/原文/引用与统一 run、取消、预算及负例 |
+| KB-C2 知识管理页 | `BACKLOG` | 隔离 KnowledgeView，无第二聊天/注册/个人记忆 |
+| KB-C3 深度知识流程 | `BACKLOG` | 可选有界执行器；不能强制限制时只用检索，不阻塞基础问答 |
+| KB-C4 一站式与受审沉淀 | `BACKLOG` | 激活/2–3 问/幂等初始化、小型背景包、经审批 SOP；自动调优后续 |
+
+KB-C ID 不取代 DOC/M1/K1/OD；首轮专用 REST/知识页不等待通用 Workspace，组织/per-run 隐私门继续按能力阻塞对应场景。OD-M11/TPI-W/Line W 保持原暂停状态。
 
 ## Open Design / 第三方工具线台账（2026-10-03 立）
 
@@ -342,7 +357,7 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 | M2-06 | 审批回调绑定请求生命周期（FU-70 / FU-54） | — | 是（权限 + 数据写入） | `DONE` | #746 |
 | M2-07 | 记账收口（SPEC / followups / ADR，按 D1–D3 落文） | M2-02…06、D1–D3 | 否 | `DONE` | 本 PR |
 | M2-08 | 模块目录 `openat` 逐级打开（F6，**仅当 D2 = B**） | D2 | 是（安全） | `CANCELLED` | D2 接受检查级处理；不做 |
-| **M2 release** | `ab/m2` → main（PR-Daemon APPROVE + jason 真机验收） | 全部 | — | `BACKLOG` |  |
+| **M2 release** | `ab/m2` → main（PR-Daemon APPROVE + 完整用例验收，见 AGENTS.md） | 全部 | — | `BACKLOG` |  |
 
 ## M1 v2 台账（2026-10-01 冻结；本表是 M1 唯一的状态来源）—— ✅ 2026-10-07 已全部合入 main（#720）
 

@@ -8,6 +8,10 @@
 //! client that got `engine_unavailable` finds the layer pinned when it tries
 //! again. One build per layer key at a time, at most [`PARALLEL`] engines
 //! running and [`QUEUE`] more builds waiting.
+//!
+//! A build carries on work a call was accepted for (K1-06a-R §3, item 5), so
+//! each build remembers who asked for it, and the builds a revoked operation
+//! asked for can be stopped (K1-06a-grant-path §2.5).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -112,6 +116,10 @@ pub enum LayerFailure {
     /// Still building when the wait ran out; it goes on.
     #[error("the text layer is still being built")]
     Pending,
+    /// The build was stopped before it was pinned: nothing is kept, and a
+    /// later read builds afresh.
+    #[error("the text layer build was stopped")]
+    Stopped,
     #[error(transparent)]
     Engine(EngineError),
     /// Storage failed: with its cause when it is unavailable (§6), none
@@ -122,6 +130,24 @@ pub enum LayerFailure {
 
 type Outcome = Option<Result<String, LayerFailure>>;
 
+/// Who asked for a build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Requester {
+    /// A page of the app, through REST.
+    Page,
+    /// A tool call, accepted as this operation under this grant.
+    Tool(crate::authorization::Accepted),
+    /// An attempt of a job.
+    Job { id: String, attempt: i64 },
+}
+
+/// A build started and not finished.
+struct Build {
+    outcome: watch::Receiver<Outcome>,
+    by: Vec<Requester>,
+    stop: watch::Sender<bool>,
+}
+
 pub struct Layers {
     engine: Option<Arc<dyn Engine>>,
     slots: Arc<Semaphore>,
@@ -129,7 +155,7 @@ pub struct Layers {
     /// Renders waiting for a slot.
     render_queue: AtomicUsize,
     /// Builds started and not finished, by layer key.
-    building: Mutex<HashMap<String, watch::Receiver<Outcome>>>,
+    building: Mutex<HashMap<String, Build>>,
 }
 
 impl Layers {
@@ -174,15 +200,52 @@ impl Layers {
         })
     }
 
+    /// Whether a build not yet finished was asked for `by`.
+    #[cfg(test)]
+    pub(crate) fn requested_by(&self, by: &Requester) -> bool {
+        let building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        building.values().any(|b| b.by.contains(by))
+    }
+
+    /// The job attempts that asked for builds not yet finished.
+    pub fn job_requesters(&self) -> Vec<(String, i64)> {
+        let building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        building
+            .values()
+            .flat_map(|b| &b.by)
+            .filter_map(|by| match by {
+                Requester::Job { id, attempt } => Some((id.clone(), *attempt)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stops the builds any of `which` asked for: one waiting for an engine
+    /// at once, one parsing by dropping its parse (the PDFKit helper is
+    /// killed); one already pinning goes on. Returns their outcomes, which
+    /// come once each build's task has ended.
+    pub fn stop(&self, which: impl Fn(&Requester) -> bool) -> Vec<watch::Receiver<Outcome>> {
+        let building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        building
+            .values()
+            .filter(|b| b.by.iter().any(&which))
+            .map(|b| {
+                b.stop.send_replace(true);
+                b.outcome.clone()
+            })
+            .collect()
+    }
+
     /// The layer the current engine makes of `content_sha256`: the pinned
-    /// one, or one built now. Everything, the first lookup included, ends
-    /// within `wait`.
+    /// one, or one built now, asked for `by`. Everything, the first lookup
+    /// included, ends within `wait`.
     pub async fn layer(
         self: &Arc<Self>,
         storage: &Arc<Storage>,
         content_sha256: &str,
         media_type: &str,
         wait: Duration,
+        by: Requester,
     ) -> Result<String, LayerFailure> {
         let deadline = tokio::time::Instant::now() + wait;
         let engine = self.engine.clone().ok_or(LayerFailure::NoEngine)?;
@@ -197,19 +260,28 @@ impl Layers {
         // (a spawn refused at shutdown drops the guard, which takes the lock).
         let started = {
             let mut building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(started) = building.get(&key.name) {
-                Err(started.clone())
+            if let Some(started) = building.get_mut(&key.name) {
+                if !started.by.contains(&by) {
+                    started.by.push(by);
+                }
+                Err(started.outcome.clone())
             } else if building.len() >= PARALLEL + QUEUE {
                 return Err(LayerFailure::Busy);
             } else {
                 let (tx, rx) = watch::channel(None);
-                building.insert(key.name.clone(), rx.clone());
-                Ok((tx, rx))
+                let (stop, stopped) = watch::channel(false);
+                let build = Build {
+                    outcome: rx.clone(),
+                    by: vec![by],
+                    stop,
+                };
+                building.insert(key.name.clone(), build);
+                Ok((tx, rx, stopped))
             }
         };
         let mut outcome = match started {
             Err(theirs) => theirs,
-            Ok((tx, rx)) => {
+            Ok((tx, rx, mut stopped)) => {
                 // Leaves `building` however the task ends: finished,
                 // panicked or dropped with the runtime.
                 let started = Started {
@@ -220,13 +292,18 @@ impl Layers {
                 let media = media_type.to_owned();
                 // Its own task: a read that stops waiting does not stop it.
                 tokio::spawn(async move {
-                    let result = match slots.acquire().await {
-                        // And the parse in one more, so an engine that panics
-                        // is a failed build, not a stuck one.
-                        Ok(_slot) => tokio::spawn(build(engine, storage, key, media))
-                            .await
-                            .unwrap_or_else(|_| Err(failed("the engine stopped"))),
-                        Err(_) => Err(LayerFailure::Busy),
+                    let result = tokio::select! {
+                        // A stop ready with a slot wins.
+                        biased;
+                        () = told_to_stop(&mut stopped) => Err(LayerFailure::Stopped),
+                        slot = slots.acquire() => match slot {
+                            // And the parse in one more, so an engine that
+                            // panics is a failed build, not a stuck one.
+                            Ok(_slot) => tokio::spawn(build(engine, storage, key, media, stopped))
+                                .await
+                                .unwrap_or_else(|_| Err(failed("the engine stopped"))),
+                            Err(_) => Err(LayerFailure::Busy),
+                        },
                     };
                     // Pinned (or failed) before it stops counting as started,
                     // so a later read finds the layer or starts afresh.
@@ -286,6 +363,13 @@ impl LayerKey {
     }
 }
 
+/// Returns once the build is told to stop; never, if it cannot be.
+async fn told_to_stop(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|stopped| *stopped).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 fn failed(why: &str) -> LayerFailure {
     LayerFailure::Engine(EngineError::Failed(why.to_owned()))
 }
@@ -297,19 +381,33 @@ async fn build(
     storage: Arc<Storage>,
     key: LayerKey,
     media_type: String,
+    mut stop: watch::Receiver<bool>,
 ) -> Result<String, LayerFailure> {
-    // A build that finished between this one's lookup and its start.
-    if let Some(address) = key.pinned(&storage).await? {
+    // A build that finished between this one's lookup and its start: not
+    // given to a build told to stop meanwhile. Stopped wins over a failed
+    // lookup too (#1206 gate 3).
+    let pinned = key.pinned(&storage).await;
+    if *stop.borrow() {
+        return Err(LayerFailure::Stopped);
+    }
+    if let Some(address) = pinned? {
         return Ok(address);
     }
     let path = storage
         .blobs
         .path_of(&key.content)
         .map_err(|e| LayerFailure::Storage(Some(blob_cause(&e)), e.to_string()))?;
-    let layer = engine
-        .parse(&key.content, &media_type, &path)
-        .await
-        .map_err(LayerFailure::Engine)?;
+    let parsed = tokio::select! {
+        biased;
+        () = told_to_stop(&mut stop) => return Err(LayerFailure::Stopped),
+        parsed = engine.parse(&key.content, &media_type, &path) => parsed,
+    };
+    // The last point it stops at, whatever the parse gave: a pin, once
+    // begun, is finished.
+    if *stop.borrow() {
+        return Err(LayerFailure::Stopped);
+    }
+    let layer = parsed.map_err(LayerFailure::Engine)?;
     if layer.engine != key.engine || layer.config != engine.config() {
         return Err(failed("the layer names another engine or config"));
     }

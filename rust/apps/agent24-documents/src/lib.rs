@@ -9,6 +9,7 @@
 //! is now, and every operation without a route yet as
 //! unavailable with a typed reason (ADR-DOC-02 §8).
 
+pub mod authorization;
 pub mod blob;
 pub mod db;
 pub mod documents;
@@ -21,10 +22,13 @@ pub mod id;
 pub mod idem;
 pub mod imports;
 pub mod jobs;
+pub mod oplog;
 pub mod read;
+pub mod scope;
 pub mod state;
 pub mod text_layer;
 pub mod timestamp;
+pub mod tools;
 pub mod uploads;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -195,6 +199,10 @@ pub fn router(state: AppState) -> Router {
             post(uploads::chunks::append_chunk)
                 .layer(DefaultBodyLimit::max(uploads::chunks::MAX_CHUNK)),
         )
+        // Kernel-only: the kernel proxy answers 404 to clients when the first
+        // segment after the namespace canonicalises to `_a24`.
+        .route("/_a24/tools/{op}", post(tools::call_tool))
+        .route("/_a24/authorization/revoked", post(authorization::revoked))
         .with_state(state)
 }
 
