@@ -3,8 +3,9 @@
 
     python3 -I scripts/kb-r1-accept.py --old <main bin dir> --new <release bin dir> [--work <dir>]
 
-Cases: docs/agent/KB-R1-ACCEPTANCE.md. Each bin dir holds `agent24d` and
-`agent24` (`cargo build -p agent24d -p agent24-cli`). Every daemon and CLI call
+Cases: docs/agent/KB-R1-ACCEPTANCE.md. Each bin dir holds `agent24d`,
+`agent24` and `agent24-documents` (`cargo build -p agent24d -p agent24-cli
+-p agent24-documents`). Every daemon and CLI call
 runs with its own AGENT24_DATA_DIR and a HOME under --work; ~/.agent24 must
 stay untouched (Z1). No model is needed. Prints PASS/FAIL per check, writes
 report.md in the work directory and exits non-zero on any FAIL.
@@ -16,6 +17,7 @@ import json
 import os
 import secrets
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -23,7 +25,11 @@ import sys
 import time
 
 READY_TIMEOUT = 30
+# How long the documents module may take to finish its handshake once the
+# daemon is up (docs/documenting/acceptance/R6-RELEASE-USECASES.md, P3).
+MODULE_READY_TIMEOUT = 30
 BINDING = "kb-accept"
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
 def parse_args():
@@ -118,6 +124,18 @@ def daemons():
 BEFORE = daemons()
 
 
+def strays():
+    """Pids of processes run from a binary under --work: the documents
+    module that `os install` put there and its daemon started."""
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    found = set()
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if cmd.startswith(WORK + os.sep):
+            found.add(int(pid))
+    return found
+
+
 def cwd_of(pid):
     """A process's working directory, or None if it cannot be read. Every
     daemon this run starts runs in its own data dir under --work: the script
@@ -148,6 +166,12 @@ def reap():
                   "leaving it", file=sys.stderr)
             continue
         print(f"a daemon outlived its case (pid {pid}); killing it", file=sys.stderr)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    for pid in strays():
+        print(f"a module outlived its daemon (pid {pid}); killing it", file=sys.stderr)
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
@@ -282,6 +306,58 @@ class CliDaemon:
 
     def stop(self):
         cli(self.bin, self.data, "daemon", "stop")
+
+
+def install_documents(bin_dir, data):
+    """The documents package assembled as its README says (domain-os.yml and
+    the module binary; W6 needs no read engine), installed with `agent24 os
+    install` before the daemon starts: (exit code, what it said)."""
+    pkg = data + ".docpkg"
+    os.makedirs(os.path.join(pkg, "bin"))
+    shutil.copy(os.path.join(REPO, "rust", "apps", "agent24-documents", "domain-os.yml"), pkg)
+    shutil.copy(os.path.join(bin_dir, "agent24-documents"), os.path.join(pkg, "bin"))
+    return cli(bin_dir, data, "os", "install", pkg)
+
+
+def documents_request(bin_dir, data, daemon, request, token=None):
+    """`agent24 documents request --host-stdin --json` the desktop's way
+    (apps/desktop/src/main/documents-cli.ts): the daemon's address, the token
+    and the request on stdin, none of them in argv. The token is the
+    daemon's own unless one is given. (exit code, the last stdout line as
+    JSON or None.)"""
+    body = {"base": f"http://127.0.0.1:{daemon.port}",
+            "token": daemon.token if token is None else token, "request": request}
+    try:
+        out = subprocess.run([os.path.join(bin_dir, "agent24"), "documents", "request", "--host-stdin", "--json"],
+                             input=json.dumps(body).encode(), env=env_for(data), cwd=data,
+                             capture_output=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        return None, None
+    lines = out.stdout.decode("utf-8", "replace").strip().splitlines()
+    try:
+        return out.returncode, json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return out.returncode, None
+
+
+def result_of(answer):
+    """(ok, status, error code) of the CLI's `result` line; Nones otherwise."""
+    if not isinstance(answer, dict) or answer.get("type") != "result":
+        return None, None, None
+    return answer.get("ok"), answer.get("status"), code_of(answer)
+
+
+def documents_ready(bin_dir, data, daemon):
+    """Asks for `capabilities` until the module has finished its handshake
+    (`module_not_ready` until then) or MODULE_READY_TIMEOUT has passed.
+    (exit code, answer, seconds waited.)"""
+    start = time.monotonic()
+    while True:
+        code, answer = documents_request(bin_dir, data, daemon, {"op": "capabilities"})
+        waited = time.monotonic() - start
+        if code == 0 or waited > MODULE_READY_TIMEOUT:
+            return code, answer, waited
+        time.sleep(0.3)
 
 
 def start_run(port, token, binding=None):
@@ -523,8 +599,60 @@ def case_w4():
             old.stop()
 
 
+def case_w6():
+    """Documenting's desktop path (the CLI with `--host-stdin`, documenting
+    r6) against the daemon this release's desktop starts, and main's."""
+    host = None
+    try:
+        data = os.path.join(WORK, "w6")
+        code, said = install_documents(NEW, data)
+        if code != 0:
+            check("W6", "装上 documents 包", False, f"os install 退出 {code}：{said[-80:]}")
+            return
+        host = SpawnedDaemon(NEW, data)
+        if not host.port:
+            check("W6", "宿主 daemon 就绪", False, "没有 ready 行")
+            return
+        code, answer, waited = documents_ready(NEW, data, host)
+        ok, status, err = result_of(answer)
+        check("W6a", "桌面的方式（CLI `--host-stdin` 带宿主凭据）问 documents 模块，能答",
+              code == 0 and ok is True and status == 200,
+              f"退出 {code}，{status} {err or ''}，等了 {waited:.1f} 秒")
+        code, answer = documents_request(NEW, data, host, {"op": "list"})
+        ok, status, err = result_of(answer)
+        payload = answer.get("data") if ok is True else None
+        docs = payload.get("documents") if isinstance(payload, dict) else None
+        check("W6b", "列文档：新数据目录里一个也没有", code == 0 and ok is True and status == 200 and docs == [],
+              f"退出 {code}，{status} {err or ''}，documents={docs!r}")
+        code, answer = documents_request(NEW, data, host, {"op": "list"}, token="wrong-" + secrets.token_hex(8))
+        ok, status, err = result_of(answer)
+        check("W6c", "凭据不对被拒，说明 W6a、W6b 的 200 确实经过了鉴权",
+              code == 1 and ok is False and status == 401 and err == "unauthorized", f"退出 {code}，{status} {err}")
+    finally:
+        if host:
+            host.stop()
+    old = None
+    try:
+        data = os.path.join(WORK, "w6-old")
+        code, said = install_documents(OLD, data)
+        if code != 0:
+            check("W6r", "对照：main 装上 documents 包", False, f"os install 退出 {code}：{said[-80:]}")
+            return
+        old = SpawnedDaemon(OLD, data, capabilities=False)
+        if not old.port:
+            check("W6r", "对照：main 桌面方式起的 daemon 就绪", False, "没有 ready 行")
+            return
+        code, answer, waited = documents_ready(OLD, data, old)
+        ok, status, err = result_of(answer)
+        check("W6r", "对照：main 的桌面方式（legacy daemon）同样能答",
+              code == 0 and ok is True and status == 200, f"退出 {code}，{status} {err or ''}，等了 {waited:.1f} 秒")
+    finally:
+        if old:
+            old.stop()
+
+
 try:
-    for case in (case_w1, case_w2, case_w3_w5, case_w4):
+    for case in (case_w1, case_w2, case_w3_w5, case_w4, case_w6):
         try:
             case()
         except Exception as err:  # a case that blows up is a FAIL, the rest still run
