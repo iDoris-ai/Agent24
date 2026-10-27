@@ -30,4 +30,5 @@ pub(super) fn creative(store: &CapabilityStore, host: &MintedCapability) -> Mint
 
 mod authority;
 mod lifecycle;
+mod route_policy;
 mod token;

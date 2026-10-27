@@ -39,6 +39,37 @@ impl CapabilityStore {
         self.validate(&token, operation, resource, now)
     }
 
+    /// Bearer is known, unrevoked, unexpired, and for this daemon.
+    /// Operation and resource are not checked: 404 and 405 must not reveal the
+    /// route table to a missing, unknown, or revoked token.
+    pub fn require_live_bearer(
+        &self,
+        bearer: &str,
+        now: UnixSeconds,
+    ) -> Result<(), CapabilityError> {
+        let token = CapabilityToken::parse_bearer(bearer)?;
+        let digest = digest(&token);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| CapabilityError::Unauthorized)?;
+        let record = state
+            .records
+            .get(&digest)
+            .ok_or(CapabilityError::Unauthorized)?;
+        if record.revoked {
+            return Err(CapabilityError::Revoked);
+        }
+        if record.claims.daemon_generation != *self.daemon_generation {
+            return Err(CapabilityError::StaleGeneration);
+        }
+        if now >= record.claims.expires_at {
+            return Err(CapabilityError::Expired);
+        }
+        Ok(())
+    }
+
     pub fn validate_action(
         &self,
         token: &CapabilityToken,

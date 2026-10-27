@@ -13,7 +13,7 @@
     "dev": "concurrently --kill-others-on-fail \"pnpm dev:vite\" \"pnpm dev:electron\"",
     "dev:vite": "vite",
     "dev:electron": "wait-on http://localhost:5173 && node scripts/dev-prepare-backend.mjs && pnpm --filter @agent24/node-daemon build && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
-    "build": "vite build && tsc -p tsconfig.electron.json && node scripts/ensure-open-design-component-dir.mjs",
+    "build": "pnpm --filter @agent24/data-dir build && vite build && tsc -p tsconfig.electron.json && node scripts/ensure-open-design-component-dir.mjs",
     "build:rust:debug": "cargo build -p agent24d --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
     "stage:open-design": "node scripts/stage-open-design-resources.mjs",
@@ -24,12 +24,13 @@
     "build:mac": "pnpm build:rust && pnpm build && electron-builder --mac",
     "build:win": "pnpm build:rust && pnpm build && electron-builder --win",
     "build:linux": "pnpm build:rust && pnpm build && electron-builder --linux",
-    "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
-    "test": "vitest run",
+    "typecheck": "pnpm --filter @agent24/data-dir build && tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
+    "test": "pnpm --filter @agent24/data-dir build && vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
     "@agent24/api-client": "workspace:*",
+    "@agent24/data-dir": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.21.1"

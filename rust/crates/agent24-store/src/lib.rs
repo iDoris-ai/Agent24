@@ -234,6 +234,16 @@ impl Store {
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Latest successful migration in `_sqlx_migrations`, or 0 when none
+    /// has been applied. This is the run-database watermark `/health` reports.
+    pub async fn latest_applied_migration(&self) -> Result<i64> {
+        let version: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(version.unwrap_or(0))
+    }
 }
 
 fn sqlite_file_options(path: &Path, create_if_missing: bool) -> Result<SqliteConnectOptions> {
