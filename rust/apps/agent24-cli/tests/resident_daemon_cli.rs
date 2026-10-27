@@ -49,11 +49,14 @@ fn cli(home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-/// A daemon on 127.0.0.1 that answers health, and `/api/v1/chat` with
-/// `chat_reply`; the chat bodies it got come back through the handle.
+/// A daemon on 127.0.0.1 that answers health; `/api/v1/chat` with
+/// `chat_reply` and `/api/v1/runs` with no runs, both only with the bearer
+/// `daemon.json` gives (401 otherwise, as the daemon does). The chat bodies
+/// and the request lines it got come back through the handle.
 struct FakeDaemon {
     port: u16,
     chats: Arc<Mutex<Vec<serde_json::Value>>>,
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeDaemon {
@@ -62,6 +65,8 @@ impl FakeDaemon {
         let port = listener.local_addr().unwrap().port();
         let chats = Arc::new(Mutex::new(Vec::new()));
         let seen = chats.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let lines = requests.clone();
         // Serves for as long as the test process lives: no deadline for a
         // first CLI start that a malware scan slows down.
         std::thread::spawn(move || {
@@ -69,22 +74,43 @@ impl FakeDaemon {
                 let Ok(stream) = stream else { continue };
                 let mut reader = BufReader::new(stream);
                 let (head, body) = read_request(&mut reader);
-                let reply = if head.starts_with("POST /api/v1/chat ") {
+                let line = head.lines().next().unwrap_or("").to_owned();
+                lines.lock().unwrap().push(line.clone());
+                let bearer = head
+                    .lines()
+                    .any(|l| l.eq_ignore_ascii_case("authorization: Bearer t"));
+                let (status, reply) = if line.starts_with("GET /api/v1/health ") {
+                    ("200 OK", r#"{"status":"ok"}"#.to_owned())
+                } else if !bearer {
+                    (
+                        "401 Unauthorized",
+                        r#"{"error":{"code":"unauthorized"}}"#.to_owned(),
+                    )
+                } else if line.starts_with("POST /api/v1/chat ") {
                     seen.lock()
                         .unwrap()
                         .push(serde_json::from_slice(&body).unwrap());
-                    chat_reply.to_string()
+                    ("200 OK", chat_reply.to_string())
+                } else if line.starts_with("GET /api/v1/runs ") {
+                    ("200 OK", r#"{"runs":[]}"#.to_owned())
                 } else {
-                    r#"{"status":"ok"}"#.to_owned()
+                    (
+                        "404 Not Found",
+                        r#"{"error":{"code":"not_found"}}"#.to_owned(),
+                    )
                 };
                 let _ = write!(
                     reader.get_mut(),
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
                     reply.len()
                 );
             }
         });
-        Self { port, chats }
+        Self {
+            port,
+            chats,
+            requests,
+        }
     }
 
     /// `daemon.json` naming this daemon, alive as the test process.
@@ -223,6 +249,58 @@ fn runs_on_a_capability_daemon_is_refused_not_started_elsewhere() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("host authority unavailable"), "{stderr}");
+    assert!(
+        !home.path().join("spawned").exists(),
+        "an ephemeral daemon was started"
+    );
+}
+
+#[test]
+fn runs_lists_what_the_resident_daemon_has() {
+    let home = tmp_home();
+    let daemon = FakeDaemon::start(chat_reply(None));
+    daemon.discoverable_in(home.path());
+
+    let out = cli(home.path(), &["runs", "list"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout.trim(), "(no runs)");
+    let requests = daemon.requests.lock().unwrap();
+    assert!(
+        requests.iter().any(|l| l.starts_with("GET /api/v1/runs ")),
+        "{requests:?}"
+    );
+    assert!(
+        !home.path().join("spawned").exists(),
+        "an ephemeral daemon was started"
+    );
+}
+
+/// A state file whose pid is alive but whose port answers nothing is no
+/// resident daemon: `runs` says so and does not start one of its own.
+#[test]
+fn a_state_file_with_nothing_on_its_port_is_no_daemon() {
+    let home = tmp_home();
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    write_state(
+        home.path(),
+        serde_json::json!({
+            "port": closed, "token": "t", "pid": std::process::id(),
+            "version": "0.0.0", "generation": "g",
+        }),
+    );
+    let out = cli(home.path(), &["runs", "list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("daemon not running"), "{stderr}");
     assert!(
         !home.path().join("spawned").exists(),
         "an ephemeral daemon was started"

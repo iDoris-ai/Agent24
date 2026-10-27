@@ -49,8 +49,9 @@ enum Command {
         /// Chat with the daemon's personal memory, as the desktop's chat page
         /// does for each conversation: what you remember is recalled for the
         /// reply, and an explicit "记住…" is kept unless memory is paused, with
-        /// the daemon's receipt printed (none when the message is not an
-        /// explicit remember, or the daemon has no personal memory). Memory is
+        /// the daemon's receipt printed, a failed save included (none when the
+        /// message is not an explicit remember, or the daemon has no personal
+        /// memory). Memory is
         /// shared by all your conversations; this id files the turn under one
         /// of them, whose source floor (the strictest source it has recalled) a
         /// new memory takes. Only this one message is sent, not the turns
