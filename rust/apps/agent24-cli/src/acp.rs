@@ -9,7 +9,8 @@
 //! (`/api/v1/peer/runs/{id}`) says it is not withheld. The view is read at
 //! the first delta, failure or completion — sources are tagged before the
 //! first model call — and read again after each tool the run starts, since
-//! the kernel withholds a run that called a tool (its results are untagged).
+//! a tool's result can withhold the run (K1-6b.5f-3: a call without its own
+//! result tag, or one whose tag is not Ordinary).
 //! Every prompt here runs in a session, so while the daemon keeps session
 //! memory the kernel withholds all of them.
 
@@ -563,8 +564,8 @@ mod tests {
 
     #[tokio::test]
     async fn deltas_after_a_tool_starts_wait_for_a_fresh_check() {
-        // The kernel withholds a run once it has called a tool: the second
-        // check answers withheld.
+        // The tool's result withheld the run: the second check answers
+        // withheld.
         let checks = AtomicUsize::new(0);
         let mut out = Vec::new();
         let result = relay_run(

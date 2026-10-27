@@ -458,6 +458,50 @@ pub(crate) fn assemble_module_tool(
     })
 }
 
+/// Registers a tool for every declaration in `modules` the host holds an
+/// authorization for, each built by [`assemble_module_tool`]; a declaration
+/// without one is not offered (K1-6a-G §2.6).
+pub(crate) fn register_module_tools(
+    tools: &mut agent24_tools::ToolRegistry,
+    modules: &agent24_domain::tool::ModuleToolRegistry,
+    authorizations: &HashMap<(String, String), Arc<dyn ModuleToolAuthorization>>,
+    advert_view: &Arc<dyn ModuleToolAdvertView>,
+    runtime: &Arc<dyn ModuleToolRuntime>,
+    store: &agent24_store::Store,
+) {
+    for (_, registered) in modules.iter() {
+        let module = registered.module();
+        let declaration = registered.declaration();
+        let Some(authorization) =
+            authorizations.get(&(module.to_owned(), declaration.operation().to_owned()))
+        else {
+            continue;
+        };
+        match assemble_module_tool(
+            module,
+            declaration,
+            Arc::clone(advert_view),
+            Arc::clone(authorization),
+            Arc::clone(runtime),
+            store.clone(),
+        ) {
+            Ok(tool) => {
+                if let Err(error) = tools.register_module_tool(Arc::new(tool)) {
+                    tracing::warn!(
+                        module,
+                        operation = declaration.operation(),
+                        %error,
+                        "module tool was not registered"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(module, operation = declaration.operation(), %error, "module tool was not assembled")
+            }
+        }
+    }
+}
+
 /// A module tool's authorization, or none for a module not on the grants
 /// protocol (K1-6a-G §2.6, #1202 G6): a grant it holds from before the
 /// protocol it needs moved (an older daemon's) does not hold, so its tool is
@@ -3054,6 +3098,112 @@ mod tests {
             source.classification,
             agent24_store::SourceClassification::Unknown
         );
+    }
+
+    /// Consents to everything and grants every lookup.
+    struct GrantingAuthorization;
+
+    #[async_trait]
+    impl ModuleToolAuthorization for GrantingAuthorization {
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ToolContext,
+        ) -> Result<agent24_tools::ModuleToolGrantContext, ModuleToolCallError> {
+            Ok(agent24_tools::ModuleToolGrantContext {
+                authorized_resources: vec![],
+                authorization_ref: "grant:test".to_owned(),
+                per_call_approval: false,
+                valid_for: None,
+                artifact: None,
+            })
+        }
+        async fn has_current_consent(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        async fn still_current(&self, _: &str, _: &str, _: &ToolContext, _: &str) -> bool {
+            true
+        }
+    }
+
+    /// What serve registers (#1282 PR-Daemon follow-up): each declaration
+    /// the host holds an authorization for, built from its manifest, so only
+    /// one that keeps its output on the device is sent back the module's own
+    /// results; one without an authorization is not offered.
+    #[tokio::test]
+    async fn the_host_registers_each_authorized_operation_as_its_manifest_declares() {
+        let yaml = format!(
+            "name: documents\nversion: 1.0.0\nroute_namespace: /api/v1/documents\nevent_module: documents\ndata_dir: ~/.agent24/os/documents/\nimpl_kind: in_process_crate\nmin_daemon_protocol: {}\ntools:\n{}",
+            agent24_domain::RESOURCE_KINDS_PROTOCOL,
+            ["find:read", "handoff:external", "draft:read"]
+                .map(|entry| {
+                    let (operation, risk) = entry.split_once(':').unwrap();
+                    format!("  - operation: {operation}\n    description: d\n    input_schema: {{ type: object }}\n    risk: {risk}\n    output_privacy: local_only\n    timeout_ms: 2000\n    inline_wait_ms: 1000\n")
+                })
+                .concat()
+        );
+        let manifest = agent24_domain::DomainOsManifest::from_yaml(&yaml).unwrap();
+        let mut modules = agent24_domain::tool::ModuleToolRegistry::new();
+        modules
+            .register_module("documents", manifest.tools())
+            .unwrap();
+        let authorization: Arc<dyn ModuleToolAuthorization> = Arc::new(GrantingAuthorization);
+        let authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>> =
+            ["find", "handoff"]
+                .map(|operation| {
+                    (
+                        ("documents".to_owned(), operation.to_owned()),
+                        Arc::clone(&authorization),
+                    )
+                })
+                .into_iter()
+                .collect();
+        let runtime = fake_module(true);
+        let view: Arc<dyn ModuleToolAdvertView> = Arc::new(TestAdvertView {
+            authorization: Arc::clone(&authorization),
+            running: Arc::clone(&runtime),
+            outbound_ready: AtomicBool::new(true),
+        });
+        let runtime_dyn: Arc<dyn ModuleToolRuntime> = runtime.clone();
+        // Every module operation is External to the gate; this one allows.
+        let mut tools = ToolRegistry::new().with_gate(Arc::new(CountingApproval {
+            calls: AtomicUsize::new(0),
+            deny: AtomicBool::new(false),
+        }));
+        super::register_module_tools(
+            &mut tools,
+            &modules,
+            &authorizations,
+            &view,
+            &runtime_dyn,
+            &Store::open_memory().await.unwrap(),
+        );
+        let call = |name: &'static str| {
+            let tools = &tools;
+            async move {
+                tools
+                    .dispatch(
+                        name,
+                        &context().with_egress_resources(vec![result_of("documents", "tc_1")]),
+                        &Map::new(),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+
+        call("documents.find").await.unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let Err(error) = call("documents.handoff").await else {
+            panic!("an external operation must be refused");
+        };
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
+        let Err(error) = call("documents.draft").await else {
+            panic!("an operation without an authorization must not be offered");
+        };
+        assert!(matches!(error, ToolError::Invalid(_)), "{error}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
     }
 
     /// K1-6a-G §4 case 1: a withheld tool called by name, on either

@@ -1477,17 +1477,22 @@ impl RunManager {
         // is the one this approval decided (settle from the row, no second ask);
         // any calls after it in the same fan-out were never approved, so they go
         // through the normal gate via run_tool_call (which may itself re-park).
+        // Only one call is settled: a provider can repeat an id within a turn,
+        // and a second call sharing it would otherwise run with no row of its
+        // own, so the peer view could not see it (K1-6b.5f-3, #1349 F1).
         let Some(unanswered) = unanswered_calls_of_last_turn(&messages) else {
             tracing::warn!("run {run_id}: no unanswered parked turn on resume; aborting");
             self.finish_cancelled(&run_id).await;
             return;
         };
+        let mut settled = false;
         for call in unanswered {
             if cancel.is_cancelled() {
                 self.finish_cancelled(&run_id).await;
                 return;
             }
-            let answer = if call.id == tool_call_id {
+            let answer = if !settled && call.id == tool_call_id {
+                settled = true;
                 if call.name.trim() == PROPOSE_PLAN {
                     // H8: the parked call is a plan approval (the only thing a
                     // plan-mode run can park on — read tools never gate, and no
@@ -3381,7 +3386,7 @@ pub(crate) mod tests {
     }
 
     /// Insert a session row so `start_run` accepts it.
-    async fn seed_session(store: &Store, id: &str) {
+    pub(crate) async fn seed_session(store: &Store, id: &str) {
         let now = now_iso8601();
         store
             .insert_session(&agent24_protocol::Session {
@@ -6399,15 +6404,25 @@ mod approval_tests {
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
     /// thread. A parked call that fails once it runs is settled the same way,
-    /// its error tagged like any result (K1-6b.5f, PR-Daemon #1282 N1).
+    /// its error tagged like any result (K1-6b.5f, PR-Daemon #1282 N1). A
+    /// session run's settled result also records its origin for the session's
+    /// later turns (K1-6b.5f-2, PR-Daemon #1309 S2).
     #[tokio::test]
     async fn a_parked_run_resumes_after_its_approval_is_answered() {
-        for (argv, answer) in [
-            (vec!["/bin/echo", "resumed-output"], "resumed-output"),
-            (vec!["/nonexistent/agent24-resume-test"], "spawn"),
+        for (argv, answer, session) in [
+            (vec!["/bin/echo", "resumed-output"], "resumed-output", None),
+            (vec!["/nonexistent/agent24-resume-test"], "spawn", None),
+            (
+                vec!["/bin/echo", "resumed-output"],
+                "resumed-output",
+                Some("sess_1"),
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let h = resume_harness(dir.path().to_path_buf()).await;
+            if let Some(sid) = session {
+                seed_session(&h.store, sid).await;
+            }
 
             // Seed the crash state directly: an awaiting_approval run with NO live
             // task, its thread persisted (user + assistant turn whose trailing
@@ -6417,7 +6432,7 @@ mod approval_tests {
             let args = serde_json::json!({ "argv": argv });
             let run = Run {
                 id: "run_1".to_owned(),
-                session_id: None,
+                session_id: session.map(str::to_owned),
                 workspace_id: None,
                 status: RunStatus::AwaitingApproval,
                 input: RunInput {
@@ -6522,6 +6537,13 @@ mod approval_tests {
                 result.source.classification,
                 agent24_store::SourceClassification::Unknown
             );
+            if let Some(sid) = session {
+                assert_eq!(
+                    h.store.session_tool_result_origins(sid).await.unwrap(),
+                    ["tool:shell_exec"],
+                    "the resumed result's origin is recorded for the session"
+                );
+            }
         }
     }
 
