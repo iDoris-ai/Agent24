@@ -26,6 +26,7 @@
   - 调用者 shell 里以 `A24_`、`AGENT24` 开头的变量全部清掉。`AGENT24D_BIN` 也在其中，否则 CLI 拉起的会是别处的 daemon，反面对照就失真了。
   - Z1 检查 `~/.agent24` 在运行期间没有变化。
   - `--work` 不能在 `~/.agent24` 下面，并且要么不存在、要么为空。
+  - `--work` 解析后的路径必须是可打印 ASCII，否则在创建任何东西之前就拒绝运行。原因是 reap 按 lsof 打出的工作目录认进程，而 lsof 会把其他字节转义（C locale 下连非 ASCII 字符也转义），这样的路径永远匹配不上，残留的 daemon 就会被放过。
 - **不留进程**：
   - 宿主 daemon 靠关闭 stdin 来停：父进程租约结束，daemon 自己退出。legacy 方式拉起的发 SIGTERM。15 秒内没有退出就杀掉。
   - CLI 起的 daemon 用 `agent24 daemon stop` 停。

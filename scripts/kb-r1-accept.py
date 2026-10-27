@@ -44,6 +44,11 @@ REAL = os.path.realpath(os.path.join(os.environ.get("HOME", "/nonexistent"), ".a
 WORK = os.path.realpath(ARGS.work or os.path.join(os.environ.get("TMPDIR", "/tmp"), f"kb-r1-accept.{os.getpid()}"))
 if WORK == REAL or WORK.startswith(REAL + os.sep):
     sys.exit(f"--work must not be inside {REAL}")
+# reap() tells this run's daemons by their working directory as lsof prints
+# it; lsof escapes other bytes (and, under the C locale, any non-ASCII), so
+# such a path would never match and a leftover daemon would be spared.
+if not all(" " <= c <= "~" for c in WORK):
+    sys.exit(f"--work must be a printable ASCII path: {WORK!r}")
 if os.path.exists(WORK) and os.listdir(WORK):
     sys.exit(f"--work must be new or empty: {WORK}")
 os.makedirs(WORK, exist_ok=True)
