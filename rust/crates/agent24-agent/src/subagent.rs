@@ -343,6 +343,9 @@ mod tests {
 
     #[async_trait]
     impl Tool for KnowledgeOnlyTool {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
         fn info(&self) -> ToolInfo {
             ToolInfo::new("kb_read", "builtin", "reads Knowledge", RiskClass::Read)
         }
@@ -366,6 +369,8 @@ mod tests {
     async fn a_sub_run_is_not_offered_a_tool_that_needs_a_knowledge_binding() {
         let tools = ToolRegistry::new().with(Arc::new(KnowledgeOnlyTool));
         assert!(ExplorerSubagent::specs_of(&tools).await.is_empty());
+        // Hidden for the binding alone: a bound run is offered it.
+        assert_eq!(tools.live_adverts(true).await.len(), 1);
     }
 
     /// A provider whose turns are scripted; when the script runs out it answers
