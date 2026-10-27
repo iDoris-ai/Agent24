@@ -1388,6 +1388,7 @@ async fn a_send_again_waits_half_a_second_then_one_and_a_half() {
         });
         let started = tokio::time::Instant::now();
         let res = run(&path, &os).await;
+        let took = started.elapsed();
         let gaps: Vec<_> = at
             .lock()
             .unwrap()
@@ -1399,9 +1400,9 @@ async fn a_send_again_waits_half_a_second_then_one_and_a_half() {
         let ms = |n: u64| std::time::Duration::from_millis(n);
         if sends == 3 {
             assert!(res.is_ok(), "{res:?}");
-            assert_eq!(gaps, [ms(0), ms(500), ms(1500)]);
+            assert_eq!((gaps, took), (vec![ms(0), ms(500), ms(1500)], ms(2000)));
         } else {
-            assert_eq!((res.code(), gaps), (Some(code), vec![ms(0)]));
+            assert_eq!((res.code(), gaps, took), (Some(code), vec![ms(0)], ms(0)));
         }
     }
 }
