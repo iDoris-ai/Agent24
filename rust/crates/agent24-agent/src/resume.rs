@@ -208,7 +208,8 @@ fn find_requested_call<'a>(
 ///
 /// `Approval.tool_call_id` is normally an INTERNAL persistence id (`tc_{ulid}`,
 /// minted for the ToolCall audit row), while the thread's `tool_calls[].id` is
-/// the MODEL PROVIDER's id (`call_...`): two namespaces that never meet, so the
+/// the MODEL PROVIDER's id (`call_...`): two namespaces that do not normally meet
+/// (nothing stops a provider from sending any string, though), so the
 /// suspension point is derived purely from the thread ([`plan_resume`]), never
 /// from the approval's id. Only an approval asked again while a resume settled
 /// the call carries that call's provider id instead (the settle runs under it).
@@ -225,9 +226,9 @@ fn find_requested_call<'a>(
 /// 3. the input rebuilt from the thread still equals what was approved — the
 ///    payload-integrity property ("refuse to run B for an approval of A"), and
 ///    ALSO what ties this approval to this parked call across the id namespaces;
-///    and the approval is the parked call's own: either it was asked again on
-///    resume, bound to that call's provider id, or its `tool_calls` row names
-///    the call's tool. An earlier call whose answer was never written can
+///    and the approval is the parked call's own: its `tool_calls` row names
+///    the call's tool, or, with no row, it was asked again on resume, bound to
+///    that call's provider id. An earlier call whose answer was never written can
 ///    share the parked call's arguments, and would otherwise be settled with
 ///    its approval (#1379 review);
 /// 4. the approval is not older than the resume TTL (`created_at >= ttl_cutoff`;
@@ -260,7 +261,14 @@ pub fn assess_restore(
             reason: format!("tool `{name}` is no longer registered — cannot resume its call"),
         };
     }
-    if approved.tool_call_id != tool_call_id && approved.tool != Some(name) {
+    // The row, when there is one, says which tool was asked about; a
+    // provider id can be any string, so an id that happens to match never
+    // overrides it.
+    let own = match approved.tool {
+        Some(tool) => tool == name,
+        None => approved.tool_call_id == tool_call_id,
+    };
+    if !own {
         return RestoreDecision::Abort {
             reason: format!(
                 "tool_call {tool_call_id} is a `{name}` call, but the approval was asked for \
@@ -759,6 +767,8 @@ mod tests {
             ("tc_internal_1", Some("fs_write")),
             ("tc_internal_1", None),
             ("call_w", None),
+            // A row naming another tool wins over an id that matches.
+            ("call_r", Some("fs_write")),
         ] {
             let decision = assess(tool_call_id, tool);
             assert!(
