@@ -20,9 +20,9 @@
   - T2 从外部访问模块内部的工具路由。
 - **只有 C1 动数据目录**：把 `blobs/tmp` 暂时设成不可写，造出一个存储失败的导入，然后马上改回去。这个失败是真实的，用户遇到磁盘或权限问题时就会这样失败；而运行中的导入只有约 0.1 秒，靠抢时机取消没法复现。
 - **不碰用户数据**：daemon 和 CLI 都用工作目录下的 `AGENT24_DATA_DIR`，调用者 shell 里的 `A24_*`、`AGENT24_*` 以及 `AGENT24D_BIN` 这类变量全部清掉，不然 CLI 会起 `AGENT24D_BIN` 指的那个 daemon，而不是 `--bin` 里的。Z1 比较 `~/.agent24` 下每一项的路径、大小和修改时间，运行前后必须完全一样，有读不了的项也算失败；脚本发现自己的 daemon 在跑时，会在创建任何东西之前直接拒绝运行。`--work` 不能在 `~/.agent24` 下面，必须不存在或为空。
-- **不留进程**：脚本无论怎样退出，都会对两个数据目录（主用例的，和升级用例的 `up/data`）各做一次 `agent24 daemon stop`。停不掉时，按状态文件里的 pid 强杀。
+- **不留进程**：脚本无论怎样退出，都会对三个数据目录（主用例的、E 组的 `bare/data`、升级用例的 `up/data`）各做一次 `agent24 daemon stop`。停不掉时，按状态文件里的 pid 强杀。
 - **不需要模型**：抽取要用模型，但它只能由 agent 工具触发，不在本次发布的对外范围内（见 T1）。
-- **依赖**：macOS（pdfkit 引擎）、swiftc、jq、curl、perl（给 CLI 限时、计时）、python3（解析路径）；带 `--old` 时还要 sqlite3。
+- **依赖**：macOS（pdfkit 引擎）、swiftc、jq、curl、perl（给 CLI 限时、计时）、python3（解析路径）、sips（U9 把样本转成 PNG，macOS 自带）；带 `--old` 时还要 sqlite3。
 
 ## 模块就绪要等一下
 
@@ -43,11 +43,11 @@
 
 | PR | 内容 | 对外？ | 用例 |
 |---|---|---|---|
-| #1313、#1321、#1345 | CLI 与桌面端共用的导入实现，`agent24 documents import` | 是 | P1–P3、U1–U7、N3、N5 |
-| #1334 | 其余操作的 CLI：capabilities、list、get、text、job、cancel、retry、request | 是 | O1–O14、N1、N2、N4 |
+| #1313、#1321、#1345 | CLI 与桌面端共用的导入实现，`agent24 documents import` | 是 | P1–P3、U1–U10、N3、N5 |
+| #1334 | 其余操作的 CLI：capabilities、list、get、text、job、cancel、retry、request | 是 | O1–O15、N1、N2、N4、E1–E3 |
 | #1325、#1343 | 桌面端导入和文档操作改为调用上面的 CLI | 是，与 CLI 共用 | U6、O11（桌面端的传法） |
 | #1186 | 导入的取消与重试 | 是 | C1–C5（主流程），O7、O8（已结束的作业） |
-| #1192、#1218 | 文档详情与文字预览；关闭详情后焦点回到页面标题 | 详情和文字的数据是对外的；焦点属于纯界面 | O5、O6；焦点不跑用例 |
+| #1192、#1218 | 文档详情与文字预览；关闭详情后焦点回到页面标题 | 详情和文字的数据是对外的；焦点属于纯界面 | O5、O6、U8–U10、E3；焦点不跑用例 |
 | #1090、#1097、#1098、#1099、#1104、#1109 | 给 agent 用的文档工具：list、get、job_get、read_range、find、extraction_get、extract | 本次不对外：`domain-os.yml` 没有声明 `tools:`，agent 看不到这些工具 | T1（KNOWN，#705）、T2 |
 | #1126、#1194、#1201、#1206、#1213、#1234、#1240 | 文档工具按 authorized_resources 校验，以及授权结束后停掉在途的调用、作业和构建 | 本次不对外：只有工具调用才会走到 | 同上，不另跑用例 |
 | #1092、#1096 | 存储重开与调用方脱钩 | 用户看不到（内部可靠性） | 不跑用例 |
@@ -83,11 +83,15 @@
 | O12 | `request '{"op":"proxy",…}'` | 退出 1，`invalid_request: not an allowed documents operation` |
 | O13 | `request --host-stdin` 带错的 token | 退出 1，`error: unauthorized: …` |
 | O14 | `documents job` 一个不存在的 id | 退出 1，`error: not_found: no such job` |
+| O15 | `documents get` 一个不存在的文档 | 退出 1，`error: not_found: no such document` |
 | C1 | 把 `blobs/tmp` 设成不可写，导入两个文件 | 两个作业都是 `failed`，都是 `storage_unavailable`，attempt 1；之后把目录改回可写（运行被打断时，退出前也会改回） |
 | C2 | `documents retry` 第一个作业 | 退出 0，第 2 次尝试成功，`error` 清空 |
 | C3 | `documents cancel` 第二个作业（失败的） | 退出 0，变成 `cancelled` |
 | C4 | `documents retry` 这个取消了的作业 | 退出 0，重新跑并成功 |
 | C5 | `documents list` | 4 个文档，重试成功的两个作业各自的文档都在其中 |
+| U8 | 导入一张 JPG 扫描件（S01 的 2026 年节假日通知），读第 1 页文字 | 作业成功，`media_type` 为 `image/jpeg`；文字里有「春节」。图片没有文本层，这两个字只能来自 OCR。首次读取时文字层还在生成，会先得到 `engine_unavailable`，脚本对这个码最多重试 60 秒，其他错误码立即判失败 |
+| U9 | 同一张扫描件转成 PNG（`sips`）再导入 | 同上，`media_type` 为 `image/png` |
+| U10 | 导入文件名带中文和空格的 PDF（`煮沸 通知.pdf`，内容比 U1 的多两个字节，否则会得到 U1 的作业） | 作业成功，文档标题就是 `煮沸 通知.pdf` |
 | T1 | `GET /api/v1/tools` | 期望里面有 documents 工具。现在列表正常返回（200，非空）但其中没有，记 KNOWN（#705：`domain-os.yml` 还没有声明 `tools:`）；补上声明后这条会变成 PASS。列表本身出错（非 200、没有列表）记 FAIL |
 | T2 | 从外部 `POST /api/v1/documents/_a24/tools/find` | 404 `not_found`：模块内部的工具路由不对外 |
 | N1 | `agent24 daemon stop`，再 `documents list` | 退出 1，说没有在跑的 daemon，并提示 `agent24 daemon start`；不会顺手起一个 |
@@ -95,7 +99,23 @@
 | N3 | 没有 daemon 时 `import --json` | 同上 |
 | N4 | 没有 daemon 时 `list --limit 0 --json` | `invalid_request`，不是 `backend_not_ready`（请求本身不对，先说这个） |
 | N5 | `import --host-stdin --json`，stdin 不是 JSON | 退出 1，一行 result，`invalid_request` |
+| E1 | 另一个全新数据目录：包里只放 `domain-os.yml` 和模块二进制，不放读取引擎（漏了 `engines/pdfkit/build.sh` 这一步），安装、启动 | 都退出 0，模块就绪；`capabilities` 里存储 `ready`，`apple-pdfkit` 的 parse、render 都是 `absent` |
+| E2 | 在这个模块上导入 PDF | 作业照样成功：导入不需要引擎 |
+| E3 | `documents text <doc> 1 --json` | 退出 1，503 `engine_unavailable`，`engine: apple-pdfkit`，`retryable: true`，提示 `no read engine on this platform` |
 | Z1 | 比较 `~/.agent24` 运行前后每一项的路径、大小、修改时间 | 完全一样 |
+
+## 发布后追加的用例（DOC-1-55）
+
+O15、U8–U10、E1–E3 是 r6 合进 main（#1386）之后补的。合并前用探针在发布二进制上手动试过，这里把它们写成有精确判定的用例，在合并后的 main 上正式跑。
+
+还有四个缺口，CLI 上造不出确定的场景，不写成用例，记在这里：
+
+| 缺口 | 为什么造不出 | 现在靠什么 |
+|---|---|---|
+| 取消正在运行的导入 | 运行中的导入只有约 0.1 秒，靠抢时机取消没法稳定复现（见上文 C1 的说明） | C3、C4 覆盖取消失败的作业再重试；运行中取消由模块测试 `imports/tests.rs` 的 `an_import_cancelled_before_or_after_its_bytes_are_stored_commits_nothing` 覆盖（用闸门把作业停在运行中再取消） |
+| 被打断的作业再跑一次（daemon 在作业运行中退出） | 同上，作业只跑约 0.1 秒，杀 daemon 的时机抢不准 | C2 覆盖重试成功；被打断的作业由 `imports/handler_test.rs` 的 `an_interrupted_import_runs_again_and_a_cancelled_one_stays_cancelled` 覆盖（再导入时第 2 次尝试成功） |
+| 上传中断后续传 | 本机分块上传每块只要几毫秒，在两块之间掐断 CLI 抢不准时机 | 重新导入同一个文件会续传：客户端用同一个幂等键拿回原来的上传，从服务端已收到的位置接着传。由客户端测试 `import/tests.rs` 的 `an_upload_cut_off_midway_resumes`、`a_lost_import_is_continued_by_importing_again` 覆盖 |
+| 文字分页（`next_cursor`） | CLI 的 `text` 没有 `--limit`；实测 3000 行的 PDF 第 1 页是 49 个块，一页就返回完，造不出第二页 | O4 覆盖 `list` 的分页；`text` 的分页由 `read/text/tests.rs` 的 `cursors_page_through_every_block_once` 覆盖 |
 
 ## 从 r5 升级（M1–M7，带 `--old` 时跑）
 
@@ -117,6 +137,8 @@ r6 给 documents 库加了迁移 0007、0008（`job_acceptances`、`job_revocati
 | M7 | 再装回 r6 | 两个文档都在 |
 
 M1 把 r5 的库版本钉在 6。r6 合进 main 之后，main 的 documents 库就在 8 了；以后的发布要用 `--old` 指向上一次发布（r6）的二进制，并把 M1 和 M4 的版本号改成那一版的。
+
+M6 退回的是整套二进制，r5 的内核要先能起来，这条才测得到 documents 库。`--bin` 的内核要是带了 r5 没有的 store 迁移，r5 的内核会先拒绝打开自己的库（`migration N was previously applied but is missing`），M6 失败在内核这一步；证据里会带上这条错误。r6 发布时的 main（8bba633e）没有新的 store 迁移，但之后的 main 有（#1381 的 0030），所以跑本脚本时 `--bin` 要用发布那一次的提交编，不要用之后的 main。
 
 M6 是退回旧版的已知行为，不是缺陷：r5 打不开 r6 迁移过的库，只是提示语写的是 corrupt，容易让人以为库坏了。数据没有动，装回 r6 就恢复（M7）。release 说明里写明：升级后不要退回 r5。
 
