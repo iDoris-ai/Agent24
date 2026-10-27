@@ -2,39 +2,25 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { App, pickChatModel, extractDaemonDefaultModel } from './App'
-import type { ModuleManifest } from '../shared/ipc-types'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
 
 const mockBackendProxy = vi.fn()
-const mockModulesList = vi.fn()
 const mockGetAppVersion = vi.fn()
 const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
 const mockOmlxModels = vi.fn()
 const mockBackendEndpoint = vi.fn()
 
-const helloManifest: ModuleManifest = {
-  id: '@auraaihq/example-hello',
-  version: '0.1.0',
-  name: 'Hello',
-  description: 'Test module',
-  type: 'ui',
-  permissions: ['llm'],
-  navItem: { icon: '👋', label: 'Hello', route: '/modules/hello' },
-}
-
 beforeEach(() => {
   vi.clearAllMocks()
   mockGetAppVersion.mockResolvedValue('1.0.0')
   mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
-  mockModulesList.mockResolvedValue([])
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
 
   Object.defineProperty(window, 'agent24', {
     value: {
       backendProxy: mockBackendProxy,
-      modulesList: mockModulesList,
       getAppVersion: mockGetAppVersion,
       omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
@@ -160,13 +146,35 @@ describe('App', () => {
     })
   })
 
-  it('shows module nav items when modules with navItem are returned', async () => {
-    mockModulesList.mockResolvedValue([helloManifest])
-
+  it('Home module count reads GET /api/v1/os', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'mounted' }, { name: 'b', state: 'mounted' }, { name: 'c', state: 'mounted' }, { name: 'd', state: 'disabled' }, { name: 'e', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
     await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
     await waitFor(() => {
-      const helloNavBtns = screen.getAllByText('Hello')
-      expect(helloNavBtns.length).toBeGreaterThan(0)
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('3')
+    })
+  })
+
+  it('Home module count is 0 when every OS module is disabled or refused', async () => {
+    mockBackendProxy.mockImplementation((req: { path: string }) =>
+      Promise.resolve(
+        req.path === '/api/v1/os'
+          ? { ok: true, status: 200, data: { modules: [{ name: 'a', state: 'disabled' }, { name: 'b', state: 'refused' }] } }
+          : { ok: true, status: 200, data: { status: 'ok' } },
+      ),
+    )
+    await act(async () => { render(<App />) })
+    fireEvent.click(screen.getAllByText('总览')[0])
+    await waitFor(() => {
+      expect(mockBackendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/os' })
+      expect(screen.getByText('已加载模块').nextElementSibling).toHaveTextContent('0')
     })
   })
 
@@ -227,24 +235,6 @@ describe('App', () => {
     await act(async () => { render(<App />) })
     await waitFor(() => {
       expect(mockOmlxStart).toHaveBeenCalled()
-    })
-  })
-
-  it('renders module page when module nav item clicked', async () => {
-    mockModulesList.mockResolvedValue([helloManifest])
-    mockBackendProxy
-      .mockResolvedValueOnce({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } }) // health
-      .mockResolvedValue({ ok: true, status: 200, data: { moduleId: 'hello', description: 'test' } }) // info
-
-    await act(async () => { render(<App />) })
-    await waitFor(() => screen.getAllByText('Hello'))
-
-    await act(async () => {
-      const helloBtns = screen.getAllByText('Hello')
-      fireEvent.click(helloBtns[0])
-    })
-    await waitFor(() => {
-      expect(screen.getByText('Hello Module')).toBeInTheDocument()
     })
   })
 

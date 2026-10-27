@@ -190,8 +190,8 @@ export const decideApproval = async (id: string, decision: Decision): Promise<vo
 }
 
 // ── FU-90: domain-OS modules (`GET`/`PATCH /api/v1/os`) ─────────────────────
-// These are kernel-mounted out-of-process modules (e.g. Sin90) — a different
-// thing from the npm community modules ModulesManager.tsx otherwise manages.
+// These are kernel-mounted out-of-process modules (e.g. Sin90), managed by
+// ModulesManager.tsx.
 // Mirrors agent24-protocol's DomainOsView/DomainOsList (rust/crates/agent24-protocol/src/types.rs).
 
 /** One domain OS, as `GET /api/v1/os` sees it. */
