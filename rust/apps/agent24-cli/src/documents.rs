@@ -109,8 +109,10 @@ pub(crate) enum DocumentsAction {
 }
 
 const NO_DAEMON: &str = "no running daemon: start one with `agent24 daemon start` (a daemon the desktop started is reachable only from the desktop)";
-/// Far above what the desktop sends; a bound so stdin cannot grow us.
-const MAX_HOST_INPUT: u64 = 64 * 1024;
+/// A request body reaches the OS only up to the kernel's 1 MiB
+/// (`agent24-domain` `MAX_BODY_BYTES`), an extract's schema near that at
+/// most; with room for the base and token, a bound so stdin cannot grow us.
+const MAX_HOST_INPUT: u64 = 1024 * 1024 + 64 * 1024;
 
 /// `--host-stdin` for `import`.
 #[derive(Debug, Deserialize)]
@@ -372,7 +374,7 @@ mod tests {
         }
         let huge = format!(
             r#"{{"base":"{}","token":"t","path":"/a"}}"#,
-            "x".repeat(70_000)
+            "x".repeat(MAX_HOST_INPUT as usize)
         );
         assert_eq!(
             host_input::<HostImport>(huge.as_bytes(), SHAPE).unwrap_err(),
@@ -389,6 +391,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.request, json!({"op": "job", "jobId": "j"}));
+        // An extract with the most fields the OS takes, each described at
+        // length (100 × 500 characters): far past the old 64 KiB.
+        let field = json!({"key": "k", "description": "说明".repeat(250)});
+        let request = json!({"op": "extract", "schema": {"fields": vec![field; 100]}});
+        let big = json!({"base": "http://127.0.0.1:1", "token": "t", "request": request});
+        let big = big.to_string();
+        assert!(big.len() > 150_000);
+        let ok: HostRequest = host_input(big.as_bytes(), SHAPE).unwrap();
+        assert_eq!(ok.request, request);
         for bad in [
             &br#"{"base":"http://127.0.0.1:1","token":"t"}"#[..],
             &br#"{"base":"http://127.0.0.1:1","token":"t","request":{},"path":"/a"}"#[..],

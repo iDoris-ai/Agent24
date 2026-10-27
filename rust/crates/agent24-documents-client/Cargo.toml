@@ -7,6 +7,8 @@ repository.workspace = true
 description = "Client side of the Documenting OS routes, shared by the agent24 CLI and the desktop (ADR-DOC-02 §5.6): one implementation of importing a file"
 
 [dependencies]
+# A rendered page goes out as JSON: its PNG in base64 (ops.rs).
+base64 = "0.22"
 serde = { workspace = true }
 # float_roundtrip: numbers parse exactly, as JSON.parse does (an offset or a
 # limit written as 10.000000000000001 is not 10).
