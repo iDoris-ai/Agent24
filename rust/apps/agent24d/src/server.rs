@@ -1634,6 +1634,18 @@ pub async fn serve(
     // an in-memory one). A failure here degrades to no memory rather than
     // refusing to start — sessions simply don't remember, as before.
     let memory_base = open_memory_base(ephemeral).await;
+    // P1-02c-c5: bound memory.db's WAL — idle-time wal_checkpoint(TRUNCATE),
+    // tracing-only results, stops with the daemon-wide token. In-memory
+    // (ephemeral) bases have no WAL and spawn nothing. Detached on purpose:
+    // it owns its own connection and ends on `cancel`.
+    if let Some(kv) = &memory_base {
+        let _ = crate::memory_maintenance::spawn(
+            kv,
+            agent24_memory::wal_maintenance::WalMaintenanceConfig::default(),
+            cancel.clone(),
+        )
+        .await;
+    }
     let memory = match memory_base.clone() {
         Some(kv) => match session_memory(kv, &router, &cancel).await {
             Ok(memory) => Some(memory),

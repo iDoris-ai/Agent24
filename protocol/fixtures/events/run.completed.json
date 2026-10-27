@@ -13,6 +13,7 @@
       "completion_tokens": 48,
       "total_tokens": 168,
       "cost_usd": 0
-    }
+    },
+    "memory_persisted": true
   }
 }
