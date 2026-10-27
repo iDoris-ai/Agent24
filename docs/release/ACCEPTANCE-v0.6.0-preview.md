@@ -514,9 +514,16 @@ ic() { curl -s -m 20 -o $WORK/ir.json -w '%{http_code}' -H "Authorization: Beare
 - PR/issue：#1370（ID-6）。执行方式：脚本。
 
 **ID-8 真机**
-- 前置：干净的 macOS arm64（无历史 `~/.agent24`）；真实 iDoris v0.3.1 归档（已校验 sha256）；一个已缓存的小模型和对应的本地推理后端（用户按安装指南准备，不是 Agent24 下载）；断网（飞行模式）。
-- 步骤：启动 iDoris（`agent24 hw idoris-env` 算出的额度），桌面端或 CLI 配 `IDORIS_URL` 与 key，Settings 里选这个小模型，发一次 chat；看界面。
-- 期望（人看）：离线下得到一次真实的成功回复（**fixture 不能代替这一项**）；界面显示真实 `response.model`、Record-Id 和 locality=`loopback`；401/403 提示指向 key，503 提示「本地没有可用模型」。
+- 机器：jason 笔记本（M1 Max）。iDoris 侧已用 v0.3.1 候选二进制（main 21b3f74 + #581 release 构建）在此机预演通过（`idoris/daily` → `Qwen3-0.6B-4bit`，200，locality=loopback，越权 `idoris/vision` 403）。本期验收仍要用正式 v0.3.1 归档（已校验 sha256）再跑一遍。
+- 前置（本机与样例不同的三处，照此执行）：
+  1. **隔离 HOME**：不复用本机现有 iDoris/Agent24 状态。每个要跑的终端先 `export HOME=$(mktemp -d)`（或用全新 macOS 用户），再起 iDoris 和 Agent24；数据库、`~/.agent24` 都落在这个临时 HOME 里。
+  2. **oMLX 端口是 8088（不是卡片默认的 8000），且开了认证**。启动 iDoris 前在**当前 shell**设 `IDORIS_OMLX_API_KEY`，值取本机 oMLX 的 API key：oMLX.app 的 Settings 里的 API key，或配置文件 `~/.omlx/settings.json` 的 `auth.api_key`。**注意先于换 HOME 之前读出**（或直接用真实 HOME 的绝对路径读）：
+     `export IDORIS_OMLX_API_KEY="$(python3 -c 'import json,os;print(json.load(open("/Users/jason/.omlx/settings.json"))["auth"]["api_key"])')"`
+     只放当前 shell 环境，**不写进文档、脚本、日志、shell 历史里的明文**，不落盘。
+  3. **角色卡保持默认 `mode: on_demand`，不要改成 `resident`**（resident 对开了认证的 oMLX 不带 key，结果 401，见 iDoris#582，计划 v0.3.2 修）。卡片在打包的 `config/components/omlx.yaml` 基础上只改两处：`endpoint: "http://127.0.0.1:8088"`；追加 `extensions.idoris_role_models.daily: Qwen3-0.6B-4bit`（连同必填的 `_degradation`）。卡片放进 `IDORIS_COMPONENTS_DIR` 指向的目录。
+  - 其余：oMLX 0.6.4 已在运行；已缓存小模型 `Qwen3-0.6B-4bit`（用户按安装指南准备，不是 Agent24 下载）；`IDORIS_ALLOCATED_BUDGET_BYTES=8000000000`（或用 `agent24 hw idoris-env` 算出的额度）；数据面默认 8740、Admin 8741，需空闲（有冲突可用 `IDORIS_PORT=18740 IDORIS_ADMIN_PORT=18741`，Agent24 的 `IDORIS_URL` 随之改）；断网（飞行模式）。
+- 步骤：按上面前置起 iDoris；签发 key；桌面端或 CLI 配 `IDORIS_URL` 与该 key；Settings 里选 `idoris/daily`，发一次 chat；看界面。
+- 期望（人看）：离线下得到一次真实的成功回复（**fixture 不能代替这一项**）；界面显示真实 `response.model`（`Qwen3-0.6B-4bit`）、Record-Id 和 locality=`loopback`；401/403 提示指向 key，503 提示「本地没有可用模型」；日志里不出现上游 oMLX key。
 - PR/issue：#1370（ID-8）。执行方式：真机。
 
 **不跑用例的改动（逐项）**
@@ -1119,7 +1126,7 @@ PY
   check ID-4 "missing / lan / remote locality is an error and the result is not handed to the caller" "$( [ -z "$bad" ] && echo ok || echo fail)" "leaked:${bad:- none}"
   stop_daemon; kill "$STUB" 2> /dev/null
   run_I_real
-  check ID-8 "offline success on a clean macOS arm64" skip "real machine"
+  check ID-8 "offline success on a real machine" skip "real machine (jason laptop M1 Max): isolated HOME, oMLX 127.0.0.1:8088 with IDORIS_OMLX_API_KEY from ~/.omlx/settings.json auth.api_key (shell env only), card stays on_demand (not resident, iDoris#582); see the ID-8 section"
 }
 
 # ID-1/2/3/5 against the real iDoris archive + a deterministic HTTP fake backend (samples from #1370 / iDoris side).
@@ -1328,7 +1335,7 @@ echo "report: $WORK/report.md"
 | G-I2 | idoris | 真实 iDoris v0.3.1 归档的 tag 指向提交、sha256、字节数在 #1370 里仍是「待回填」 | ID-1/2/3/5/8 要先校验 sha256 再用；Release Notes 要引用该 tar 的 sha256 | iDoris 打 tag 后回填 #1370；本文第 2 节的校验命令和 release notes 都按回填值写，**不要用占位值跑** |
 | G-I3 | idoris | 已解决（改写）：`temperature` 只在模块推理回调里可设、没有用户入口，且 iDoris 生命周期路径的请求字段是白名单（`temperature` 会 400 `unsupported_parameter`）。结论：#1365 改为 iDoris 网关路径不发 `temperature`，其它 provider 照 main；ID-7 移出用户路径，改单测/抓上游请求证明，Release Notes 写「已知限制：iDoris 网关当前忽略 temperature」 | 剩余：**#1365 的修复（含单元测试）要先进 `ab/idoris`**，否则带 temperature 的模块调用在 iDoris 路径上会直接失败 | iDoris 侧在 #1365 单独提交修复；本表在它合入后关闭 |
 | G-I4 | idoris | 已解决：key spec、`idoris_role_models` 角色卡、负例构造方法、额度写法已由 iDoris 侧在 #1370 回帖（issuecomment-6436424430）给出，已写进 4.5 节和脚本。剩余：脚本里改卡的做法假定 `config/components/omlx.yaml` 存在 `endpoint:` 行，且 serve 命令、配置目录是否从当前目录读取是依据回帖推断的 | 若与真实 v0.3.1 归档布局不符，ID-1/2/3/5 会先红 | 第一次执行以归档实际布局为准修正脚本（G-I6 同） |
-| G-I5 | idoris | ID-8 需要干净的 macOS arm64、已缓存的小模型和本地推理后端；iDoris 归档不含推理后端与权重 | fixture 不能代替这一项；没有真机就不能算已验 | 指定谁在哪台机器上做；做不了的记 SKIP 并在 release PR 正文交代 |
+| G-I5 | idoris | ID-8 需要隔离 HOME、已缓存的小模型和本地推理后端；iDoris 归档不含推理后端与权重 | fixture 不能代替这一项；没有真机就不能算已验 | 已指定真机：jason 笔记本 M1 Max，iDoris 侧已预演通过（v0.3.1 候选二进制，oMLX 8088 + 认证，on_demand 卡片）；正式 v0.3.1 归档仍需在此机跑一遍，做不了的记 SKIP 并在 release PR 正文交代 |
 | G-I6 | idoris | 一键脚本的 ID-4 用桩网关；ID-1/2/3/5 的 `run_I_real` 假定 iDoris 默认数据面端口 8740、`./idoris serve` 在归档目录里运行、卡里没有别的 `extensions:` 块（脚本会整块替换）；ID-5 的 a/b/c 与 ID-3 的 Settings 部分仍手工；ID-2 的停后端与 `IDORIS_REMOTE_KILL_SWITCH=1` 两步也手工。ID-4 的桩网关模拟的是 `/health` 与 `/v1/chat/completions` 的最小形状（`service`、`contract_version`、两个头），没有对着真实 iDoris 响应核对；daemon 端对 chat 路由到 `idoris-local` 的触发条件（是否需要 role/模型设置）起草时没有跑 | 桩与真实形状有出入时 ID-4a 的正对照会先红，应先修桩 | 第一次执行以 ID-4a 的结果判断桩是否可用；真实形状以 ID-3 抓到的响应为准 |
 
 ## 8. release PR 正文模板
