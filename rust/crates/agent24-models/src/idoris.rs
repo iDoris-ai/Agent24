@@ -188,11 +188,25 @@ impl IdorisClient {
             call = call.header("X-iDoris-Trace-Id", trace_id);
         }
         let response = self.send(call.json(&body), cancel).await?;
-        let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
-        if header("x-idoris-served-locality") != Some("loopback") {
+        // Evidence headers must be unambiguous: absent, or exactly one valid UTF-8
+        // value. Repeated or non-UTF-8 values are contradictory evidence and fail closed.
+        let header = |name: &str| -> Result<Option<&str>, ModelError> {
+            let mut values = response.headers().get_all(name).iter();
+            let Some(first) = values.next() else {
+                return Ok(None);
+            };
+            if values.next().is_some() {
+                return Err(invalid("iDoris sent a duplicated evidence header"));
+            }
+            first
+                .to_str()
+                .map(Some)
+                .map_err(|_| invalid("iDoris evidence header is not valid UTF-8"))
+        };
+        if header("x-idoris-served-locality")? != Some("loopback") {
             return Err(invalid("iDoris did not attest loopback inference"));
         }
-        let record_id = header("x-idoris-record-id")
+        let record_id = header("x-idoris-record-id")?
             .filter(|id| {
                 !id.is_empty()
                     && id.len() <= 128
@@ -202,14 +216,14 @@ impl IdorisClient {
             })
             .ok_or_else(|| invalid("iDoris response has no valid record ID"))?
             .to_owned();
-        let cached = match header("x-idoris-cached") {
+        let cached = match header("x-idoris-cached")? {
             None | Some("false") => false,
             Some("true") => true,
             _ => return Err(invalid("invalid iDoris cache evidence")),
         };
         let origin_record_id = if cached {
             Some(
-                header("x-idoris-origin-record-id")
+                header("x-idoris-origin-record-id")?
                     .filter(|id| {
                         !id.is_empty()
                             && id.len() <= 128

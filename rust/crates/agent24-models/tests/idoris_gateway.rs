@@ -74,14 +74,24 @@ async fn endpoint_with_redirect(
                 } else {
                     "x-idoris-record-id: 00000000-0000-4000-8000-000000000002\r\n"
                 };
+                let record = if content == "dup-record-id" {
+                    format!("{record}x-idoris-record-id: 00000000-0000-4000-8000-000000000003\r\n")
+                } else {
+                    record.to_owned()
+                };
                 let locality = match content {
                     "missing-locality" => "",
                     "remote" => "x-idoris-served-locality: remote\r\n",
                     "lan" => "x-idoris-served-locality: lan\r\n",
+                    "dup-locality" => {
+                        "x-idoris-served-locality: loopback\r\nx-idoris-served-locality: remote\r\n"
+                    }
                     _ => "x-idoris-served-locality: loopback\r\n",
                 };
                 let cache = if content == "invalid-cache" {
                     "x-idoris-cached: maybe\r\n"
+                } else if content == "dup-cached" {
+                    "x-idoris-cached: false\r\nx-idoris-cached: false\r\n"
                 } else if content == "cached-no-origin" {
                     "x-idoris-cached: true\r\n"
                 } else {
@@ -268,6 +278,9 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
         "missing-locality",
         "remote",
         "lan",
+        "dup-locality",
+        "dup-record-id",
+        "dup-cached",
         "missing-record",
         "cached-no-origin",
         "unavailable",
