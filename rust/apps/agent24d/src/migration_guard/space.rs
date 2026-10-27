@@ -6,7 +6,7 @@
 //! allocated reservation file, never a sparse one.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -52,16 +52,85 @@ pub fn declared_g(database: &str, version: i64) -> Option<GDecl> {
         .map(|(_, _, g)| *g)
 }
 
-/// FTS rebuild or whole-table rewrite (SQL comments ignored): must carry an explicit G declaration.
+/// Strip `--` / `/* */` comments with a small SQL scan that skips single-quoted
+/// strings. With `blank_strings` the string contents are dropped (`''`), so
+/// DDL keywords inside literals cannot match; otherwise they are kept.
+fn strip_sql(sql: &str, blank_strings: bool) -> String {
+    let c: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '\'' => {
+                out.push('\'');
+                i += 1;
+                while i < c.len() {
+                    if c[i] == '\'' {
+                        if c.get(i + 1) == Some(&'\'') {
+                            if !blank_strings {
+                                out.push_str("''");
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    if !blank_strings {
+                        out.push(c[i]);
+                    }
+                    i += 1;
+                }
+                out.push('\'');
+                i += 1;
+            }
+            '-' if c.get(i + 1) == Some(&'-') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 2;
+                out.push(' ');
+            }
+            ch => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn normalize(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// FTS rebuild or whole-table rewrite (comments ignored, whitespace
+/// normalized, string literals skipped for DDL keywords): must carry an
+/// explicit G declaration.
 #[must_use]
 pub fn requires_declaration(sql: &str) -> bool {
-    let s: String = sql
-        .lines()
-        .map(|l| l.split("--").next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_ascii_lowercase();
-    s.contains("fts") || s.contains("rebuild") || s.contains("drop table")
+    // fts / rebuild: also look inside literals (`VALUES('rebuild')`); an
+    // over-trigger only demands a declaration.
+    let loose = normalize(&strip_sql(sql, false));
+    if loose.contains("fts") || loose.contains("rebuild") {
+        return true;
+    }
+    let strict = normalize(&strip_sql(sql, true));
+    if strict.contains("drop table") || strict.contains("vacuum") {
+        return true;
+    }
+    strict.split(';').any(|st| {
+        (st.contains("create table") && st.contains(" as select"))
+            || (st.contains("alter table") && st.contains(" rename"))
+    })
 }
 
 /// CI gate: every migration needing a declaration has one. Returns the
@@ -120,6 +189,9 @@ pub fn measure_s(dbs: &[&Path]) -> Result<u64, String> {
     for db in dbs {
         match fs::metadata(db) {
             Ok(m) => {
+                // Std `readonly()` only checks whether any write bit is set; an owner
+                // mode like 0402 that this process cannot actually write is not
+                // detected. The real guard is at the call sites after 5d.
                 if m.permissions().readonly() {
                     return Err(format!("{} is read-only", db.display()));
                 }
@@ -243,6 +315,7 @@ fn allocate(f: &mut fs::File, bytes: u64) -> io::Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn allocate(f: &mut fs::File, bytes: u64) -> io::Result<()> {
+    use std::io::Write;
     let chunk = vec![0u8; 1 << 20];
     let mut left = bytes;
     while left > 0 {
@@ -366,6 +439,30 @@ mod tests {
                 all.iter().any(|m| m.database == *d && m.version == *v),
                 "{d}:{v}"
             );
+        }
+    }
+
+    #[test]
+    fn requires_declaration_is_lexical_not_substring() {
+        for sql in [
+            "DROP\nTABLE old",
+            "SELECT '--'; DROP TABLE old;",
+            "VACUUM;",
+            "CREATE TABLE t2 AS SELECT * FROM t; ALTER TABLE t2 RENAME TO t;",
+            "ALTER   TABLE t2\n RENAME TO t",
+            "CREATE TABLE t2 AS\nSELECT 1",
+            "/* x */ DROP /* y */ TABLE a",
+        ] {
+            assert!(requires_declaration(sql), "{sql:?}");
+        }
+        for sql in [
+            "-- fts rebuild\nSELECT 1",
+            "/* rebuild fts */ SELECT 1",
+            "SELECT '-- drop table'",
+            "ALTER TABLE t ADD COLUMN c TEXT",
+            "CREATE TABLE t (a INT); SELECT 1 AS x",
+        ] {
+            assert!(!requires_declaration(sql), "{sql:?}");
         }
     }
 
