@@ -90,9 +90,26 @@ async fn watermark(c: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
     )
 }
 
+/// `false` only when the path is confirmed absent (NotFound). Any other error
+/// (EACCES, ...) and a dangling symlink are `Io`: a database we cannot see
+/// must never be recorded as "did not exist". Same stance as
+/// `manifest::read_optional`.
+fn exists_strict(path: &Path) -> Result<bool, SnapshotError> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(SnapshotError::Io(e)),
+        Ok(_) => fs::metadata(path).map(|_| true).map_err(|e| {
+            SnapshotError::Io(io::Error::new(
+                e.kind(),
+                format!("{} is unusable (dangling symlink?): {e}", path.display()),
+            ))
+        }),
+    }
+}
+
 /// Open the source (never creating it) and require a complete TRUNCATE checkpoint.
 async fn checkpoint(label: &'static str, path: &Path) -> Result<Option<Src>, SnapshotError> {
-    if !path.exists() {
+    if !exists_strict(path)? {
         return Ok(None); // recorded as missing; never create an empty database
     }
     let mut conn = open(path, false).await?;
@@ -482,6 +499,181 @@ mod tests {
             assert!(
                 verify_complete(root, "20261027T000000Z-a1", "a1").is_err(),
                 "{op}"
+            );
+        }
+    }
+
+    /// F1: a source that cannot be stat'ed must fail the snapshot, never be
+    /// recorded as "did not exist". (Skipped as root: EACCES cannot happen.)
+    #[tokio::test]
+    async fn f1_unreadable_source_is_an_io_error_not_missing() {
+        if running_as_root() {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        let s = locked.join(STORE_FILE);
+        live(&s, &[1]).await.close().await.unwrap();
+        let m = root.join(MEMORY_FILE);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let r = take_snapshot(&RealOps, &req(root, &s, &m)).await;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(r, Err(SnapshotError::Io(_))), "{r:?}");
+        assert!(
+            !root.join("migration-snapshots").exists(),
+            "no trace of a failed snapshot"
+        );
+    }
+
+    /// F1: a dangling symlink is present state, not an absent database.
+    #[tokio::test]
+    async fn f1_dangling_symlink_source_is_an_io_error() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let s = root.join(STORE_FILE);
+        std::os::unix::fs::symlink(root.join("nowhere.db"), &s).unwrap();
+        let m = root.join(MEMORY_FILE);
+        let r = take_snapshot(&RealOps, &req(root, &s, &m)).await;
+        assert!(matches!(r, Err(SnapshotError::Io(_))), "{r:?}");
+    }
+
+    fn running_as_root() -> bool {
+        // No libc dependency: root can read a 0o000 directory, so probe it.
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path().join("p");
+        fs::create_dir(&d).unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&d).is_ok();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+        readable
+    }
+
+    /// F2: manifest renamed into place, then a directory fsync fails. The
+    /// call is Err and the manifest must not remain able to authorise.
+    #[tokio::test]
+    async fn f2_manifest_fsync_failure_withdraws_manifest() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let (s, m) = (root.join(STORE_FILE), root.join(MEMORY_FILE));
+        live(&s, &[1]).await.close().await.unwrap();
+        live(&m, &[2]).await.close().await.unwrap();
+        let ops = RecordingOps::failing_after("fsync_dir", "write");
+        let r = take_snapshot(&ops, &req(root, &s, &m)).await;
+        assert!(r.is_err());
+        let id = "20261027T000000Z-a1";
+        assert!(!snapshot_dir(root, id).join("manifest.json").exists());
+        assert!(verify_complete(root, id, "a1").is_err());
+    }
+
+    /// F2: if withdrawing the manifest also fails, the error says so.
+    #[test]
+    fn f2_withdraw_failure_is_reported() {
+        use super::super::manifest::write_manifest;
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let man = Manifest {
+            format_version: FORMAT_VERSION,
+            attempt_id: "a1".into(),
+            created_at: "t".into(),
+            source: None,
+            target: BinaryIdentity {
+                version: "2".into(),
+                sha256: "y".into(),
+            },
+            store_db: DbRecord {
+                existed: false,
+                len: None,
+                sha256: None,
+            },
+            memory_db: DbRecord {
+                existed: false,
+                len: None,
+                sha256: None,
+            },
+            migrations_digest: "dd".into(),
+            watermark: Watermark {
+                store: 0,
+                memory: 0,
+            },
+        };
+        let ops = RecordingOps::failing_after("fsync_dir", "write");
+        // fail_on is fsync_dir; make remove fail too via a wrapper.
+        struct NoRemove<'a>(&'a RecordingOps);
+        impl FileOps for NoRemove<'_> {
+            fn write_new_synced(&self, p: &Path, d: &[u8]) -> io::Result<()> {
+                self.0.write_new_synced(p, d)
+            }
+            fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
+                self.0.rename(a, b)
+            }
+            fn fsync_dir(&self, d: &Path) -> io::Result<()> {
+                self.0.fsync_dir(d)
+            }
+            fn remove_file(&self, p: &Path) -> io::Result<()> {
+                if p.ends_with("manifest.json") {
+                    return Err(io::Error::other("remove injected"));
+                }
+                self.0.remove_file(p)
+            }
+        }
+        let e = write_manifest(&NoRemove(&ops), root, root, &man).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("could not withdraw"), "{msg}");
+        assert!(
+            root.join("manifest.json").exists(),
+            "left behind, and said so"
+        );
+    }
+
+    /// F3/M2: a reader pinned on the whole WAL leaves log == checkpointed but
+    /// busy=1 (TRUNCATE cannot reset the log). Only the busy bit catches it.
+    #[tokio::test]
+    async fn f3_busy_bit_alone_blocks_snapshot() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let (s, m) = (root.join(STORE_FILE), root.join(MEMORY_FILE));
+        let w = live(&s, &[1, 2]).await;
+        let mut r = SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&s))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut r).await.unwrap();
+        sqlx::query("SELECT x FROM t")
+            .fetch_all(&mut r)
+            .await
+            .unwrap();
+        // Writer idle: every frame is visible to the reader.
+        let err = take_snapshot(&RealOps, &req(root, &s, &m))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SnapshotError::Busy("agent24.db")), "{err:?}");
+        sqlx::query("ROLLBACK").execute(&mut r).await.unwrap();
+        r.close().await.unwrap();
+        w.close().await.unwrap();
+    }
+
+    /// F3/M3: any change to a snapshot database after the fact voids it.
+    #[tokio::test]
+    async fn f3_tampered_snapshot_database_fails_verify() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let (s, m) = (root.join(STORE_FILE), root.join(MEMORY_FILE));
+        live(&s, &[1]).await.close().await.unwrap();
+        live(&m, &[2]).await.close().await.unwrap();
+        let (name, _) = take_snapshot(&RealOps, &req(root, &s, &m)).await.unwrap();
+        assert!(verify_complete(root, &name, "a1").is_ok());
+        for file in [STORE_FILE, MEMORY_FILE] {
+            let p = snapshot_dir(root, &name).join(file);
+            let orig = fs::read(&p).unwrap();
+            let mut bytes = orig.clone();
+            *bytes.last_mut().unwrap() ^= 0xff;
+            fs::write(&p, &bytes).unwrap();
+            assert!(verify_complete(root, &name, "a1").is_err(), "{file}");
+            fs::write(&p, &orig).unwrap();
+            assert!(
+                verify_complete(root, &name, "a1").is_ok(),
+                "{file} restored"
             );
         }
     }
