@@ -364,6 +364,7 @@ export type DocumentsRequest =
   | { op: 'capabilities' }
   | { op: 'list'; cursor?: ListQuery['cursor']; limit?: ListQuery['limit'] }
   | { op: 'get'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'readText'; documentId: DocSchemas['DocumentIdString']; revision: number; cursor?: string }
   | { op: 'job'; jobId: DocSchemas['JobIdString'] }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
@@ -373,6 +374,7 @@ export interface DocumentsResults {
   capabilities: DocSchemas['DocumentsCapabilities']
   list: DocSchemas['DocumentList']
   get: DocSchemas['DocumentDetail']
+  readText: DocSchemas['DocumentsTextPage']
   job: DocSchemas['DocumentsJob']
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
