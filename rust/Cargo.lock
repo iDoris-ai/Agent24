@@ -271,6 +271,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-os-sqlite"
+version = "0.1.0"
+dependencies = [
+ "libsqlite3-sys",
+ "sqlx",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "agent24-policy"
 version = "0.5.1"
 dependencies = [
@@ -431,6 +441,7 @@ dependencies = [
  "agent24-os-packages",
  "agent24-os-proto",
  "agent24-os-sdk",
+ "agent24-os-sqlite",
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",

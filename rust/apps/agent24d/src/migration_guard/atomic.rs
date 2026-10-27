@@ -16,6 +16,9 @@ pub trait FileOps {
     /// Create `path` with `O_EXCL`, mode 0600, write `data`, fsync the file.
     fn write_new_synced(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn fsync_file(&self, path: &Path) -> io::Result<()> {
+        File::open(path)?.sync_all()
+    }
     fn fsync_dir(&self, dir: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
 }
@@ -154,6 +157,10 @@ pub(crate) mod test_ops {
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             self.hit("rename", from)?;
             RealOps.rename(from, to)
+        }
+        fn fsync_file(&self, path: &Path) -> io::Result<()> {
+            FileOps::fsync_file(&RealOps, path)?;
+            self.hit("fsync_file", path)
         }
         fn fsync_dir(&self, dir: &Path) -> io::Result<()> {
             self.hit("fsync_dir", dir)

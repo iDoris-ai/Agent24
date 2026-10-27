@@ -15,6 +15,8 @@ use super::atomic::{FileOps, atomic_write};
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const SNAPSHOTS_DIR: &str = "migration-snapshots";
+pub const STORE_FILE: &str = "agent24.db";
+pub const MEMORY_FILE: &str = "memory.db";
 pub const LAST_SUCCESS_FILE: &str = "migration-last-success.json";
 
 #[derive(Debug)]
@@ -123,6 +125,45 @@ pub fn read_manifest(path: &Path) -> Result<Manifest, StateError> {
     Ok(m)
 }
 
+/// A snapshot authorises migration only when this passes: the manifest is
+/// readable, belongs to `attempt_id`, and each recorded database file matches
+/// its length and SHA-256 (a database recorded as missing must be absent).
+pub fn verify_complete(
+    data_dir: &Path,
+    snapshot_id: &str,
+    attempt_id: &str,
+) -> Result<Manifest, StateError> {
+    if !snapshot_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(StateError::Invalid("unsafe snapshot id".into()));
+    }
+    let dir = snapshot_dir(data_dir, snapshot_id);
+    let m = read_manifest(&dir.join("manifest.json"))?;
+    if m.attempt_id != attempt_id || !snapshot_id.ends_with(&format!("-{attempt_id}")) {
+        return Err(StateError::Invalid("manifest/attempt mismatch".into()));
+    }
+    for (file, rec) in [(STORE_FILE, &m.store_db), (MEMORY_FILE, &m.memory_db)] {
+        let p = dir.join(file);
+        let ok = if rec.existed {
+            sha256_file(&p).map_err(StateError::Io)?
+                == (
+                    rec.len.unwrap_or(u64::MAX),
+                    rec.sha256.clone().unwrap_or_default(),
+                )
+        } else {
+            !p.exists()
+        };
+        if !ok {
+            return Err(StateError::Invalid(format!(
+                "{file} does not match manifest"
+            )));
+        }
+    }
+    Ok(m)
+}
+
 pub fn write_last_success(
     ops: &dyn FileOps,
     data_dir: &Path,
@@ -163,6 +204,39 @@ pub(super) fn write_json<T: Serialize>(
 pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, StateError> {
     let bytes = fs::read(path).map_err(StateError::Io)?;
     serde_json::from_slice(&bytes).map_err(|e| StateError::Invalid(e.to_string()))
+}
+
+/// Test helper: a complete snapshot of two absent databases.
+#[cfg(test)]
+pub(crate) fn test_empty_snapshot(root: &Path, attempt_id: &str) -> String {
+    let id = format!("20261027T000000Z-{attempt_id}");
+    let dir = snapshot_dir(root, &id);
+    fs::create_dir_all(&dir).unwrap_or_default();
+    let none = DbRecord {
+        existed: false,
+        len: None,
+        sha256: None,
+    };
+    let bin = BinaryIdentity {
+        version: "1".into(),
+        sha256: "x".into(),
+    };
+    let m = Manifest {
+        format_version: FORMAT_VERSION,
+        attempt_id: attempt_id.into(),
+        created_at: "2026-10-27T00:00:00Z".into(),
+        source: None,
+        target: bin,
+        store_db: none.clone(),
+        memory_db: none,
+        migrations_digest: String::new(),
+        watermark: Watermark {
+            store: 0,
+            memory: 0,
+        },
+    };
+    write_manifest(&super::atomic::RealOps, root, &dir, &m).unwrap_or_default();
+    id
 }
 
 #[cfg(test)]

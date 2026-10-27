@@ -78,16 +78,18 @@ libc = "0.2"
 # adding a fourth field to that shared reader for one caller.
 serde_yaml = "0.9"
 
+# CORE-5d: snapshot maintenance connections and the raw-handle backup boundary.
+# sqlx is also used by the T7b/ME-3e test that forces a transient `Store` error
+# by dropping `module_approvals` under a live pool.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
+
 [dev-dependencies]
 tempfile = "3"
 # ME4-S3 §6 (J-S7): the SDK's five clients tested against these callback
 # handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
 # kernel (forwarded through the SDK's `test-util` feature, L8).
 agent24-os-sdk = { path = "../../crates/agent24-os-sdk", features = ["test-util"] }
-# T7b/ME-3e: forces a transient `Store` error in the timeout-scan test by
-# dropping `module_approvals` out from under a live pool — there is no
-# fault-injectable `Store` trait to mock instead.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tower = { version = "0.5", features = ["util"] }
 # A paused clock, for deadlines asserted exactly rather than with slack.
 tokio = { version = "1", features = ["test-util"] }
