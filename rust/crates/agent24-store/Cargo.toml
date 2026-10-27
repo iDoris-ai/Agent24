@@ -15,7 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
 thiserror = "2"
 
 [dev-dependencies]

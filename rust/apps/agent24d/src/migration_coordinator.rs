@@ -138,6 +138,7 @@ mod tests {
             fail_open,
             fail_nth_pending: nth,
             retain_exclusive_lock: true,
+            fail_connect_pragma: false,
         }
     }
 
@@ -147,6 +148,7 @@ mod tests {
             fail_nth_pending: nth,
             fail_fts_rebuild: fail_fts,
             retain_exclusive_lock: true,
+            fail_connect_pragma: false,
         }
     }
 

@@ -5,8 +5,11 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use sqlx::SqlitePool;
 use sqlx::migrate::MigrateError;
@@ -27,6 +30,9 @@ pub struct Fault {
     pub fail_nth_pending: u32,
     /// Hold a SQLite reserved lock until [`Guard::close`].
     pub retain_exclusive_lock: bool,
+    /// Run a locking statement inside SQLx's connect PRAGMAs, then fail.
+    /// The worker is still inside `sqlite3_step` when connect returns.
+    pub fail_connect_pragma: bool,
 }
 
 impl Fault {
@@ -35,6 +41,7 @@ impl Fault {
             fail_open: false,
             fail_nth_pending: 0,
             retain_exclusive_lock: false,
+            fail_connect_pragma: false,
         }
     }
 }
@@ -103,15 +110,27 @@ pub async fn open_pool(
     fault: Fault,
 ) -> Result<Guard, StepError> {
     let max = if fault.retain_exclusive_lock { 1 } else { max };
-    let pool = SqlitePoolOptions::new()
+    let path = opts.get_filename().to_owned();
+    let (opts, acquire_timeout) = connect_plan(opts, fault);
+    let mut options = SqlitePoolOptions::new()
         .max_connections(max)
-        .connect_with(opts)
-        .await
-        .map_err(|source| StepError::Sqlx {
-            phase: "open",
-            source,
-        })?;
-    let guard = Guard { pool, armed: true };
+        .min_connections(0);
+    if let Some(timeout) = acquire_timeout {
+        options = options.acquire_timeout(timeout);
+    }
+    // Lazy open: the guard exists before the first connection and its PRAGMAs.
+    // `connect_with` would open that connection before the guard exists.
+    let guard = Guard {
+        pool: options.connect_lazy_with(opts),
+        armed: true,
+    };
+    // Dropping `PoolConnection` only spawns its return. Wait until the
+    // connection is idle, or a second connection can open while
+    // `journal_mode=WAL` still holds the file.
+    match guard.pool().acquire().await {
+        Ok(mut conn) => conn.return_to_pool().await,
+        Err(source) => return Err(close_open_failure(guard, &path, source).await),
+    }
     if fault.retain_exclusive_lock
         && let Err(source) = hold(&guard.pool).await
     {
@@ -130,6 +149,92 @@ pub async fn open_pool(
         });
     }
     Ok(guard)
+}
+
+/// `locking_mode` is emitted before `journal_mode`. The write takes an
+/// exclusive lock; the recursive read holds that lock inside `sqlite3_step`
+/// for longer than the acquire timeout. The missing table makes a fast
+/// machine still fail the open when the timeout does not fire.
+const CONNECT_PRAGMA_FAIL: &str = "\
+EXCLUSIVE; \
+CREATE TABLE IF NOT EXISTS core5b_hold (x INTEGER); \
+INSERT INTO core5b_hold (x) VALUES (1); \
+WITH RECURSIVE c(x) AS ( \
+SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 3000000 \
+) SELECT sum(x) FROM c; \
+SELECT * FROM core5b_pragma_fail";
+
+fn connect_plan(
+    opts: SqliteConnectOptions,
+    fault: Fault,
+) -> (SqliteConnectOptions, Option<Duration>) {
+    if !fault.fail_connect_pragma {
+        return (opts, None);
+    }
+    (
+        opts.pragma("locking_mode", CONNECT_PRAGMA_FAIL),
+        Some(Duration::from_millis(400)),
+    )
+}
+
+/// How long an open failure waits for a worker SQLx dropped inside connect.
+const RELEASE_WAIT: Duration = Duration::from_secs(15);
+
+/// [`Pool::close`] joins workers the pool owns. A PRAGMA error drops the
+/// `SqliteConnection` inside `ConnectOptions::connect` before the pool takes
+/// it, so close returns while that thread can still hold the file. Poll until
+/// another connection can take `BEGIN EXCLUSIVE`, or until [`RELEASE_WAIT`].
+async fn close_open_failure(guard: Guard, path: &Path, source: sqlx::Error) -> StepError {
+    guard.close().await;
+    let deadline = Instant::now() + RELEASE_WAIT;
+    loop {
+        if file_is_free(path).await || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    StepError::Sqlx {
+        phase: "open",
+        source,
+    }
+}
+
+async fn file_is_free(path: &Path) -> bool {
+    if !path.is_file() {
+        return true;
+    }
+    let Ok(options) = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+    else {
+        return true;
+    };
+    let options = options
+        .create_if_missing(false)
+        .busy_timeout(Duration::from_millis(0));
+    let pool = match SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(200))
+        .connect_with(options)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(err) if still_held(&err) => return false,
+        Err(_) => return true,
+    };
+    let free = match pool.begin_with("BEGIN EXCLUSIVE").await {
+        Ok(_) => true,
+        Err(err) if still_held(&err) => false,
+        Err(_) => true,
+    };
+    pool.close().await;
+    free
+}
+
+fn still_held(err: &sqlx::Error) -> bool {
+    if matches!(err, sqlx::Error::PoolTimedOut) {
+        return true;
+    }
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("locked") || text.contains("busy")
 }
 
 async fn hold(pool: &SqlitePool) -> Result<(), sqlx::Error> {

@@ -35,6 +35,8 @@ pub struct PhaseFault {
     pub fail_fts_rebuild: bool,
     /// Hold a SQLite reserved lock until [`MemoryConn::close`].
     pub retain_exclusive_lock: bool,
+    /// Same connect-PRAGMA failure as [`agent24_store::sqlite_phase::Fault`].
+    pub fail_connect_pragma: bool,
 }
 
 impl PhaseFault {
@@ -44,6 +46,7 @@ impl PhaseFault {
             fail_nth_pending: 0,
             fail_fts_rebuild: false,
             retain_exclusive_lock: false,
+            fail_connect_pragma: false,
         }
     }
 
@@ -52,6 +55,7 @@ impl PhaseFault {
             fail_open: self.fail_open,
             fail_nth_pending: self.fail_nth_pending,
             retain_exclusive_lock: self.retain_exclusive_lock,
+            fail_connect_pragma: self.fail_connect_pragma,
         }
     }
 }
@@ -263,6 +267,7 @@ mod tests {
             fail_nth_pending: nth,
             fail_fts_rebuild: fail_fts,
             retain_exclusive_lock: true,
+            fail_connect_pragma: false,
         }
     }
 
@@ -327,6 +332,31 @@ mod tests {
         maint.close().await;
         assert_eq!(version, embedded_version());
         assert!(can_take_exclusive(&path).await);
+    }
+
+    #[tokio::test]
+    async fn connect_pragma_failure_is_open_and_releases_the_file() {
+        guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pragma.db");
+        let err = MemoryConn::migrate(
+            &path,
+            PhaseFault {
+                fail_open: false,
+                fail_nth_pending: 0,
+                fail_fts_rebuild: false,
+                retain_exclusive_lock: false,
+                fail_connect_pragma: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.phase, "open", "{err:?}");
+        assert_eq!(err.migration, None, "{err:?}");
+        assert!(
+            can_take_exclusive(&path).await,
+            "open failure returned while the file was still locked: {err:?}"
+        );
     }
 
     #[tokio::test]

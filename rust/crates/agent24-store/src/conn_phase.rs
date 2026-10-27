@@ -188,6 +188,7 @@ mod tests {
             fail_open,
             fail_nth_pending: nth,
             retain_exclusive_lock: true,
+            fail_connect_pragma: false,
         }
     }
 
@@ -246,6 +247,30 @@ mod tests {
             before
         );
         assert!(can_take_exclusive(&path).await);
+    }
+
+    #[tokio::test]
+    async fn connect_pragma_failure_is_open_and_releases_the_file() {
+        guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pragma.db");
+        let err = StoreConn::migrate(
+            &path,
+            PhaseFault {
+                fail_open: false,
+                fail_nth_pending: 0,
+                retain_exclusive_lock: false,
+                fail_connect_pragma: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.phase, "open", "{err:?}");
+        assert_eq!(err.migration, None, "{err:?}");
+        assert!(
+            can_take_exclusive(&path).await,
+            "open failure returned while the file was still locked: {err:?}"
+        );
     }
 
     #[tokio::test]
