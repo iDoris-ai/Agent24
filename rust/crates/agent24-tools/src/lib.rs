@@ -945,29 +945,6 @@ impl ModuleTool {
         })
     }
 
-    /// Writes the pre-dispatch record and its `Denied` terminal for a call
-    /// gate 5 refused, under [`REMOTE_TIER_REF`], and leaves the relation on
-    /// the invocation as the authorized path does.
-    async fn audit_remote_tier_refusal(
-        &self,
-        ctx: &ToolContext,
-        capability: &ModuleInvocationCapability,
-    ) -> Result<(), ToolError> {
-        let relation = self.audit_relation(ctx, REMOTE_TIER_REF, None, &capability.attempt_id)?;
-        {
-            let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
-            state.relation = Some(relation.clone());
-        }
-        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
-            .await?;
-        self.finish_audit(
-            &relation,
-            ModuleToolResultCode::Denied,
-            std::time::Instant::now(),
-        )
-        .await
-    }
-
     /// Resolves once the grant behind `authorization_ref` has ended: its
     /// deadline passed, or a change to this tool's consent (this operation,
     /// or the whole module) after which
@@ -1178,10 +1155,6 @@ impl Tool for ModuleTool {
                 .advert_view
                 .outbound_gate_ready(&self.module, &self.operation)
                 .await
-            && !self
-                .advert_view
-                .blocked_by_remote_tier_guard(&self.module, &self.operation)
-                .await
     }
 
     fn info(&self) -> ToolInfo {
@@ -1211,34 +1184,19 @@ impl Tool for ModuleTool {
         ctx: &ToolContext,
         cancel: &CancellationToken,
     ) -> Result<Option<String>, ToolError> {
-        // #1130 L3: the gate-5 guard and the grant are settled before any
-        // card, so a call that `call_with_invocation` would refuse is refused
-        // here, with the same audit and the same error. Only the lookup is
-        // cancellable and bounded; a refusal's audit is always written whole.
-        let lookup = async {
-            if self
-                .advert_view
-                .blocked_by_remote_tier_guard(&self.module, &self.operation)
-                .await
-            {
-                return None;
-            }
-            Some(
-                self.authorization
-                    .authorize(&self.module, &self.operation, ctx)
-                    .await,
-            )
-        };
-        let looked_up = tokio::select! {
+        // #1130 L3: the grant is settled before any card, so a call that
+        // `call_with_invocation` would refuse is refused here, with the same
+        // audit and the same error. Only the lookup is cancellable and
+        // bounded; a refusal's audit is always written whole.
+        let lookup = self
+            .authorization
+            .authorize(&self.module, &self.operation, ctx);
+        let authorized = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ToolError::Cancelled),
             looked_up = tokio::time::timeout(self.timeout, lookup) => {
                 looked_up.map_err(|_| ToolError::Timeout(self.timeout))?
             }
-        };
-        let Some(authorized) = looked_up else {
-            self.audit_refusal_as(ctx, REMOTE_TIER_REF).await?;
-            return Err(ToolError::Failed(module_error_json(permission_denied())));
         };
         match authorized {
             // A resource set the dispatch would refuse (§4 case 10) shows no
@@ -1376,19 +1334,6 @@ impl Tool for ModuleTool {
             return Err(unknown_module_outcome("result_unknown"));
         }
         let mut execution_guard = capability.claim_for_execution()?;
-
-        // Gate 5 at dispatch (K1-6a-G §2.4): before the authorization lookup,
-        // so `dispatch` and `execute_preapproved` both pass it, and a call
-        // by name to a withheld tool is refused and audited.
-        if self
-            .advert_view
-            .blocked_by_remote_tier_guard(&self.module, &self.operation)
-            .await
-        {
-            self.audit_remote_tier_refusal(ctx, capability).await?;
-            execution_guard.mark_completed();
-            return Err(ToolError::Failed(module_error_json(permission_denied())));
-        }
 
         let changes = self.authorization.consent_changes();
         let looked_up = tokio::time::Instant::now();
@@ -1649,10 +1594,6 @@ fn persisted_terminal_error(result: agent24_store::ModuleToolResultCode) -> Tool
     };
     ToolError::Failed(module_error_json(failure))
 }
-
-/// The audit `authorization_ref` of a call refused by gate 5: no grant was
-/// looked up for it.
-const REMOTE_TIER_REF: &str = "denied:remote_tier";
 
 fn audit_unavailable() -> ToolError {
     ToolError::Failed("module_tool_audit_unavailable".to_owned())
@@ -2387,25 +2328,11 @@ mod tests {
 
     use super::*;
 
+    /// Every gate at its fail-closed default.
     struct DenyAdvertView;
 
     #[async_trait]
-    impl agent24_domain::tool::ModuleToolAdvertView for DenyAdvertView {
-        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
-            true
-        }
-    }
-
-    /// Gate 5 open, so a call reaches its authorization (K1-6a-G §2.4 puts
-    /// the guard first).
-    struct UnguardedAdvertView;
-
-    #[async_trait]
-    impl agent24_domain::tool::ModuleToolAdvertView for UnguardedAdvertView {
-        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
-            false
-        }
-    }
+    impl agent24_domain::tool::ModuleToolAdvertView for DenyAdvertView {}
 
     struct SlowTool;
 
@@ -3036,7 +2963,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
                 RiskClass::External,
-                Arc::new(UnguardedAdvertView),
+                Arc::new(DenyAdvertView),
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(Runtime),
                 agent24_store::Store::open_memory().await.unwrap(),
