@@ -1034,11 +1034,17 @@ pub(crate) const TICK_DUE_SQL: &str = "\
 SELECT * FROM ( \
   SELECT * FROM schedules \
   WHERE enabled = 1 AND next_run_at IS NOT NULL \
-    AND julianday(next_run_at) <= julianday(?1) + 1.0 / 86400.0 \
+    AND next_run_at GLOB '[0-9][0-9][0-9][0-9]-*' \
+    AND julianday(next_run_at) <= julianday(?1) + 2.0 / 86400.0 \
   UNION ALL \
   SELECT * FROM schedules \
   WHERE enabled = 1 AND next_run_at IS NOT NULL \
+    AND next_run_at GLOB '[0-9][0-9][0-9][0-9]-*' \
     AND julianday(next_run_at) IS NULL \
+  UNION ALL \
+  SELECT * FROM schedules \
+  WHERE enabled = 1 AND next_run_at IS NOT NULL \
+    AND next_run_at NOT GLOB '[0-9][0-9][0-9][0-9]-*' \
 ) ORDER BY name ASC";
 
 impl Store {
@@ -1048,11 +1054,15 @@ impl Store {
     ///
     /// Selected: `enabled = 1`, `next_run_at` non-NULL, and either due
     /// (`julianday(next_run_at) <= julianday(now)`, tolerant of
-    /// milliseconds/offset spellings, +1 s slack so float rounding can never
+    /// milliseconds/offset spellings, +2 s slack (`now` is formatted to whole seconds here while the tick's `now`
+    /// carries sub-seconds; also covers julianday rounding) so rounding can never
     /// drop a boundary row — the caller re-checks the exact instant) or
     /// unparsable (`julianday` NULL — kept so the tick still logs it, as it
     /// always did). Both arms are served by `idx_schedules_tick_due`
-    /// (migration 0030).
+    /// (migration 0030); a third arm reads rows whose `next_run_at` does not start
+    /// with a 4-digit year (served by `idx_schedules_tick_odd_shape`) so they are
+    /// still logged by the tick. A row SQLite can parse but chrono cannot
+    /// (e.g. `2026-10-28`) is treated as not-yet-due and no longer logged.
     ///
     /// Not filtered here: `user_suspended`/`system_disabled_reason`. A
     /// suspended module row has `next_run_at` NULL in practice, and the tick's
@@ -3479,9 +3489,19 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(plan.contains("idx_schedules_tick_due"), "plan: {plan}");
-        assert!(
-            !plan.contains("SCAN schedules"),
-            "full scan in plan: {plan}"
+        // The only scan allowed is a walk of the odd-shape partial index,
+        // which holds just the (normally zero) malformed rows.
+        assert_eq!(
+            plan.matches("SCAN").count(),
+            plan.matches("SCAN schedules USING INDEX idx_schedules_tick_odd_shape")
+                .count(),
+            "table scan in plan: {plan}"
+        );
+        assert_eq!(
+            plan.matches("SEARCH schedules USING INDEX idx_schedules_tick_due")
+                .count(),
+            2,
+            "both parsable arms must range-search the expression index: {plan}"
         );
     }
 
@@ -3539,6 +3559,59 @@ mod tests {
         let store = crate::test_hooks::from_pool(pool);
         // sch_old's next_run_at is not due at now_t(); the query runs on the upgraded db.
         store.list_schedules_for_tick(now_t()).await.unwrap();
+    }
+
+    async fn insert_raw(store_pool: &SqlitePool, id: &str, enabled: i64, next: &str) {
+        sqlx::query(
+            "INSERT INTO schedules (id, name, enabled, spec, action, delivery, \
+             last_run_at, next_run_at, consecutive_failures) \
+             VALUES (?, ?, ?, '{\"type\":\"every\",\"secs\":60}', \
+             '{\"type\":\"agent_run\",\"prompt\":\"x\"}', '[]', NULL, ?, 0)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(enabled)
+        .bind(next)
+        .execute(store_pool)
+        .await
+        .unwrap();
+    }
+
+    /// F1: `julianday('now')` is non-deterministic and a hard error inside an
+    /// index expression. A row like that must neither abort the 0029 -> 0030
+    /// migration nor make later writes fail, and the tick must still read it.
+    #[tokio::test]
+    async fn non_deterministic_next_run_at_neither_breaks_the_migration_nor_later_writes() {
+        let (_dir, path) = temp_db();
+        let pool = pool_migrated_up_to(&path, 30, 1).await; // through 0029
+        insert_raw(&pool, "pre_now", 1, "now").await;
+        insert_raw(&pool, "pre_localtime", 1, "localtime").await;
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        insert_raw(&pool, "post_now", 1, "now").await;
+        let store = crate::test_hooks::from_pool(pool);
+        let rows = store.list_schedules_for_tick(now_t()).await.unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.schedule.id.as_str()).collect();
+        assert_eq!(ids, ["post_now", "pre_localtime", "pre_now"]);
+    }
+
+    /// F2: SQL formats the caller's `now` to whole seconds, the tick's `now`
+    /// carries sub-seconds. A legacy `...05.500Z` slot is due at `...05.800`
+    /// and must be read this tick, not one tick (10 s) later.
+    #[tokio::test]
+    async fn sub_second_now_still_reads_a_sub_second_legacy_slot() {
+        let (store, _dir) = fresh(1).await;
+        insert_raw(pool(&store), "sub", 1, "2030-01-01T00:00:05.500Z").await;
+        insert_raw(pool(&store), "later", 1, "2030-01-01T00:00:09Z").await;
+        let now: chrono::DateTime<chrono::Utc> = "2030-01-01T00:00:05.800Z".parse().unwrap();
+        let rows = store.list_schedules_for_tick(now).await.unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.schedule.id.as_str()).collect();
+        assert!(ids.contains(&"sub"), "{ids:?}");
+        assert!(!ids.contains(&"later"), "{ids:?}");
+        // F3: sub-millisecond neighbours (julianday rounding) are read too.
+        insert_raw(pool(&store), "submilli", 1, "2030-01-01T00:00:03.9995Z").await;
+        let now2: chrono::DateTime<chrono::Utc> = "2030-01-01T00:00:03.9999Z".parse().unwrap();
+        let rows = store.list_schedules_for_tick(now2).await.unwrap();
+        assert!(rows.iter().any(|r| r.schedule.id == "submilli"));
     }
 
     // ── the tick read-model tells module rows and user rows apart ───────────

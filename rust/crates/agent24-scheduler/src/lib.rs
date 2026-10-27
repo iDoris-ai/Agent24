@@ -649,9 +649,10 @@ impl Scheduler {
     /// Free of real time — the caller supplies `now`, so tests drive it
     /// directly.
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<usize, ScheduleError> {
-        // Every row (user AND module); a single corrupt row is skipped and
-        // logged rather than wedging every future tick (`list_schedules_for_
-        // tick`'s own doc comment).
+        // Only enabled rows whose slot may be due (user AND module), selected
+        // in SQL (P-13); the exact `due <= now` check stays below. A single
+        // corrupt row is skipped and logged rather than wedging every future
+        // tick (`list_schedules_for_tick`'s own doc comment).
         let records = self.store.list_schedules_for_tick(now).await?;
         let mut fired = 0;
         for record in records {
