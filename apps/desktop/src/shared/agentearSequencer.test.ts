@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { createHash } from 'node:crypto'
 import {
   AgentEarSequencer,
   DEFAULT_GAP_TIMEOUT_MS,
@@ -117,6 +118,54 @@ describe('AgentEarSequencer — vendored AgentEar fixtures', () => {
     delivered.push(...seq.checkGapTimeouts(1000))
     expect(delivered).toHaveLength(files.length)
     expect(delivered.map((e) => e.seq)).toEqual([1, 2, 3, 5, 6, 7, 8, 9])
+  })
+})
+
+// v0.28.0 re-pin (#1347): the vendored schemas must be byte-identical to the
+// pinned AgentEar blobs, and `turn.timings` (v0.26.0+) must pass through the
+// sequencer untouched — the payload is opaque to the desktop side.
+describe('AgentEar vendored contract — v0.28.0 pin', () => {
+  const gitBlob = (rel: string): string => {
+    const buf = readFileSync(resolve(CONTRACTS, rel))
+    return createHash('sha1')
+      .update(Buffer.concat([Buffer.from(`blob ${buf.length}\0`), buf]))
+      .digest('hex')
+  }
+
+  it('SOURCE pins the full v0.28.0 commit', () => {
+    const source = readFileSync(resolve(FIXTURES_ROOT, 'SOURCE'), 'utf8')
+    expect(source).toMatch(/source_commit:\s*0b6409bafc54ba9904e3c029ebbd8a6652356b06/)
+  })
+
+  it('schema files match the pinned AgentEar blob hashes', () => {
+    expect(gitBlob('schema/agentear.event.v1.schema.json')).toBe('c650c95c632e29ff5db11bcccc3eb6512600be29')
+    expect(gitBlob('schema/agentear.command.v1.schema.json')).toBe('72e01b8e28757443c0bdb0bc9198fd62d8ec2678')
+    expect(gitBlob('schema/agentear.proposal.v1.schema.json')).toBe('da897e1e4b0fc19eb86a9f358d1ffb5dc46dace3')
+  })
+
+  it('event schema declares turn.timings, and the timings fixtures are vendored', () => {
+    const schema = JSON.stringify(readJson('schema/agentear.event.v1.schema.json'))
+    expect(schema).toContain('"timings"')
+    for (const f of [
+      'invalid/turn_timings_negative.json',
+      'invalid/turn_timings_string_ms.json',
+      'invalid/turn_timings_unknown_field.json',
+      'valid/turn_failed_partial_timings.json',
+      'valid/turn_idle_timings.json',
+    ]) {
+      expect(() => readJson(`fixtures/event/${f}`)).not.toThrow()
+    }
+  })
+
+  it('turn.timings payload is delivered through the sequencer unchanged', () => {
+    const ev = readJson('fixtures/event/valid/turn_idle_timings.json') as AgentEarEventEnvelope
+    const r = new AgentEarSequencer().ingest(structuredClone(ev), 0)
+    expect(r.outcome).toBe('accepted')
+    expect(r.delivered).toHaveLength(0) // seq 7 buffers behind the gap
+    const s = new AgentEarSequencer()
+    const first = { ...ev, event_id: 'evt_t1', seq: 1 }
+    const out = s.ingest(first, 0).delivered
+    expect(out[0]!.payload).toEqual(ev.payload)
   })
 })
 

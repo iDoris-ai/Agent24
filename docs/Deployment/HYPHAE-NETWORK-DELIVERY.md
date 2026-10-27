@@ -34,7 +34,7 @@
 
 | 已核对来源 | 当前事实 | 本里程碑补齐 |
 |---|---|---|
-| [生产 client lock](../../rust/crates/agent24-comm/hyphae.lock.json) | source `144555ca6b043be77225786ddbf4e6bce5ad3228`（Hyphae v0.26.3），Go `go1.26.4`；只有 darwin-arm64/linux-x64 hash，darwin-x64/linux-arm64 为 null | 验证新候选及四平台；不能用旧设计文档的 `a4aa606` 代替当前锁 |
+| [生产 client lock](../../rust/crates/agent24-comm/hyphae.lock.json) | source `9126147e8eb5e497e3055f9eda27473fefbb91b2`（Hyphae v0.27.0），Go `go1.26.4`；只有 darwin-arm64/linux-x64 hash，darwin-x64/linux-arm64 为 null | 验证新候选及四平台；不能用旧设计文档的 `a4aa606` 代替当前锁 |
 | [VerifiedBinary](../../rust/crates/agent24-comm/src/binary.rs) | 读取候选并按完整 SHA-256 校验；`O_EXCL`、0500 **直接写最终文件**；已存在副本重新 hash，不一致拒绝；中断可能留下被拒绝的半成品 | 同文件系统 staging、fsync、禁止覆盖目标的原子提交；保留精确 hash 拒绝 |
 | [comm_routes](../../rust/apps/agent24d/src/comm_routes.rs) | `A24_HYPHAE_BIN` → 旧 `A24_SPEAKER_BIN` → agent24d 同目录 hyphae；已有专用 HOME、钥匙串选择、daemon 监管与显式首启后 autostart | relay 组件安装/监管、完整引导与健康回滚尚未交付；外部路径仍须匹配 embedded lock |
 | [Hyphae artifact builder](https://github.com/iDoris-ai/Hyphae/blob/main/scripts/build_release_artifacts.py) | 当前仅 macOS arm64、Linux amd64；tar.gz 混装 client、relay、LICENSE、NOTICE；输出候选，不自动发布 | tag 发布流水线、四平台、client/relay 分包、独立 relay lock、容器与离线交付 |
