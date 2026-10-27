@@ -309,7 +309,7 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
     }
     const path = picked.filePaths[0]
     if (picked.canceled || !path) return null
-    return importFile(path, sendToDocuments, (p) => {
+    return importFile(path, getBackendEndpoint, (p) => {
       if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.DocumentsImportProgress, p)
     })
   })
