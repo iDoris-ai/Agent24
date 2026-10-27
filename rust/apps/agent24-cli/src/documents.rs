@@ -151,7 +151,8 @@ pub(crate) enum DocumentsAction {
         /// Only this area: `x0,y0,x1,y1` in points from the page's top left
         #[arg(long)]
         region: Option<String>,
-        /// Write the PNG to this file
+        /// Write the PNG to this file: into a new file beside it, then renamed
+        /// over it, so not to a device or a pipe (use --json and decode `png`)
         #[arg(long)]
         out: Option<PathBuf>,
         /// Print the result as one JSON line, the PNG in base64 (`png`)
@@ -431,11 +432,14 @@ fn extract_request(
 }
 
 /// Writes the page's PNG to `path` whole or not at all: into a new file
-/// beside it first (a name of its own, readable only by its owner while it
-/// is written), renamed over `path` once written, so a failure midway (a full
-/// disk) leaves a file already there as it was. The new file takes the
-/// permissions of the one it replaces, and a link is written through to its
-/// target, as writing in place would.
+/// beside it first (a name of its own), renamed over `path` once written, so
+/// a failure midway (a full disk) leaves a file already there as it was. In
+/// place of a file, the new one is readable only by its owner until it is
+/// written and then takes that file's permissions; with no file there, it is
+/// made as the umask allows from the start, as writing in place would. A
+/// link is written through to its target. What a rename cannot replace is
+/// `file_unwritable`: a device (`/dev/null`), a dangling link, a file in a
+/// directory that cannot be written; another hard link keeps the old page.
 fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
     use base64::Engine as _;
     let png = data
@@ -475,8 +479,9 @@ fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
     part.persist(&target).map(drop).map_err(unwritable)
 }
 
-/// A page with no file before it is made as a file made in place would be,
-/// readable as the umask allows (the part file starts owner-only).
+/// A page with no file before it: its part file is made as a file made in
+/// place would be, readable as the umask allows (tempfile's own default is
+/// owner-only, which a page replacing a file keeps until it is written).
 #[cfg(unix)]
 fn as_new(builder: &mut tempfile::Builder<'_, '_>) {
     use std::os::unix::fs::PermissionsExt as _;
