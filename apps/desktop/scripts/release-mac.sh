@@ -32,6 +32,9 @@ if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
 fi
 # electron-builder 的 identity 不能带 "Developer ID Application:" 前缀
 BUILDER_IDENTITY="${SIGN_IDENTITY#Developer ID Application: }"
+# S3：cargo 产物路径按 <target>/release 读取，下面两种环境会导致读到陈旧产物或解析错目录
+[[ -z "${CARGO_BUILD_TARGET:-}" ]] || die "请 unset CARGO_BUILD_TARGET：设了它产物在 <target>/<triple>/release，脚本会读到陈旧产物"
+[[ -z "${CARGO_TARGET_DIR:-}" || "${CARGO_TARGET_DIR}" == /* ]] || die "CARGO_TARGET_DIR 必须是绝对路径（当前：${CARGO_TARGET_DIR}）"
 # 防止环境里的 CSC_* 把签名悄悄切到别的证书 / 或让 electron-builder 去找 p12
 unset CSC_LINK CSC_KEY_PASSWORD CSC_NAME
 
@@ -80,7 +83,8 @@ fi
 step "6/6 验证"
 EXPECT=()
 [[ "${SKIP_NOTARIZE:-0}" == "1" ]] || EXPECT=(--expect-notarized)
-bash "$VERIFY" "${EXPECT[@]}" --arch "${ARCH}" "$DMG"
+# bash 3.2 + set -u：空数组直接展开会报 unbound variable，必须用 ${arr[@]+"${arr[@]}"}
+bash "$VERIFY" ${EXPECT[@]+"${EXPECT[@]}"} --arch "${ARCH}" "$DMG"
 
 ( cd "$DESKTOP_DIR/release" && shasum -a 256 "$(basename "$DMG")" > SHA256SUMS && cat SHA256SUMS )
 echo

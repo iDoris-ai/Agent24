@@ -21,6 +21,11 @@ while getopts "o:h" o; do
 done
 shift $((OPTIND - 1))
 
+# S2：-o 转绝对路径（相对路径在 stage/ 子 shell 里会解析错）。必须在 mkdir 前先建目录才能 cd
+mkdir -p "$OUT" || die "无法创建输出目录：$OUT"
+OUT="$(cd "$OUT" && pwd)"
+MARK="$OUT/.agent24-cli-out"   # S1：本脚本创建的标记；内容为上次产物文件名
+
 [[ "$(uname -s)" == "Darwin" ]] || die "只能在 macOS 上运行"
 security find-identity -v -p codesigning | grep -F "$SIGN_IDENTITY" >/dev/null \
   || die "keychain 中找不到签名身份：$SIGN_IDENTITY"
@@ -35,11 +40,28 @@ if [[ ${#BINS[@]} -eq 0 ]]; then
   BINS=("$REL/agent24" "$REL/agent24d")
 fi
 
-rm -rf "$OUT"; mkdir -p "$OUT/stage"
+# S1：不整目录 rm -rf。非空且无标记的目录一律拒绝；有标记则只清理 stage/ 与标记里记录的产物名
+if [[ ! -f "$MARK" && -n "$(ls -A "$OUT")" ]]; then
+  die "输出目录非空且不是本脚本产出的（缺 .agent24-cli-out）：$OUT"
+fi
+# S4：basename 重名会互相覆盖；同时确认输入存在且不在输出目录内（否则会被清理）
+SEEN=$'\n'
+for b in "${BINS[@]}"; do
+  [[ -f "$b" ]] || die "找不到二进制：$b"
+  bd="$(cd "$(dirname "$b")" && pwd)"
+  case "$bd/" in "$OUT"/*) die "输入二进制位于输出目录内：$b" ;; esac
+  bn="$(basename "$b")"
+  case "$SEEN" in *$'\n'"$bn"$'\n'*) die "输入中有同名二进制（basename 冲突）：$bn" ;; esac
+  SEEN="$SEEN$bn"$'\n'
+done
+if [[ -f "$MARK" ]]; then
+  while IFS= read -r f; do [[ -n "$f" && "$f" != */* ]] && rm -rf "${OUT:?}/$f"; done < "$MARK"
+fi
+rm -rf "${OUT:?}/stage"; mkdir -p "$OUT/stage"
+: > "$MARK"
 ARCH=""
 NAMES=()
 for b in "${BINS[@]}"; do
-  [[ -f "$b" ]] || die "找不到二进制：$b"
   file -b "$b" | grep -q "Mach-O" || die "不是 Mach-O：$b"
   n="$(basename "$b")"
   cp -f "$b" "$OUT/stage/$n"
@@ -73,5 +95,7 @@ else
 fi
 
 mv "$OUT/stage/"* "$OUT/"; rmdir "$OUT/stage"
+# 记录本次产物名，下次运行只清理这些
+{ printf '%s\n' "${NAMES[@]}" "$(basename "$ZIP")" SHA256SUMS notarize-submission.json; } > "$MARK"
 ( cd "$OUT" && shasum -a 256 "${NAMES[@]}" "$(basename "$ZIP")" > SHA256SUMS && cat SHA256SUMS )
 echo "产物目录：$OUT"

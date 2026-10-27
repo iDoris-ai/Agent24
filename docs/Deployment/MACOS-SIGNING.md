@@ -40,9 +40,10 @@ SKIP_NOTARIZE=1 bash apps/desktop/scripts/release-mac.sh   # 只签名，本地�
 |---|---|---|
 | `AGENT24_SIGN_IDENTITY` | `Developer ID Application: Huifeng Jiao (HYAP444FN9)` | 签名身份（脚本会去掉前缀后交给 electron-builder） |
 | `AGENT24_NOTARY_PROFILE` | `apple-notary-HYAP444FN9` | notarytool keychain profile |
-| `SKIP_NOTARIZE` | 空 | `1` = 不公证，验证时不断言 Notarized |
+| `SKIP_NOTARIZE` | 空 | `1` = 不公证；验证时不断言 Notarized，且 `spctl` 仅展示不断言（未公证的 Developer ID 被判 `Unnotarized Developer ID` 是预期）。`codesign --verify`、Hardened Runtime、`lipo` 仍为硬断言 |
 | `AGENT24_ARCH` | `arm64` | 目标架构（`x64` 需在 Intel 机或对应工具链上） |
-| `CARGO_TARGET_DIR` | `rust/target` | Rust 产物目录；脚本把 `agent24d` 复制到 `rust/target/release/` 供打包引用 |
+| `CARGO_TARGET_DIR` | `rust/target` | Rust 产物目录，**必须是绝对路径**（相对路径会被脚本拒绝）；脚本把 `agent24d` 复制到 `rust/target/release/` 供打包引用 |
+| `CARGO_BUILD_TARGET` | 必须未设置 | 设了它 cargo 产物在 `<target>/<triple>/release`，脚本只读 `<target>/release`，可能打包陈旧产物，故检测到即报错退出 |
 
 步骤：前置检查 → `cargo build --release` → node-daemon + vite/tsc → `electron-builder --mac`（签名）→ `notarytool submit --wait` → `stapler staple/validate` → `verify-mac-signing.sh`。任一步失败即退出；公证被拒时自动打印 `notarytool log`。产物在 `apps/desktop/release/`（已被 `.gitignore`，不要提交），含 `SHA256SUMS` 与 `notarize-submit.json`（submission id）。
 
@@ -64,6 +65,8 @@ CARGO_TARGET_DIR=... cargo build --release -p agent24d -p agent24-cli --manifest
 bash scripts/sign-cli-mac.sh                      # 默认处理 release 下的 agent24、agent24d
 bash scripts/sign-cli-mac.sh bin/sin90 bin/cos72  # 或显式传入路径
 ```
+
+`-o OUT_DIR` 可为相对或绝对路径（脚本开头转绝对）。OUT_DIR 必须不存在、为空，或含上次本脚本写下的标记文件 `.agent24-cli-out`（复跑时只清理标记里记录的产物与 `stage/`，不会整目录删除）；非空且无标记会拒绝运行。输入二进制 basename 重复（如 `a/tool b/tool`）会拒绝运行。
 
 `codesign --force --options runtime --timestamp` → 打 zip → `notarytool submit --wait` → 输出 `dist/mac-cli/`（二进制、zip、`notarize-submission.json`、`SHA256SUMS`）。
 

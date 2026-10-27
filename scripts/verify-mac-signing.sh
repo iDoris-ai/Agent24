@@ -2,7 +2,7 @@
 # 验证 macOS 签名/公证产物。用法：
 #   scripts/verify-mac-signing.sh [--expect-notarized] [--arch arm64|x86_64|x64] <dmg|.app>
 # dmg：先对 dmg 本身做 spctl（open 上下文）与 stapler 校验，再只读挂载 -> 复制 .app 到临时目录 -> 卸载 -> 对副本验签。
-# 任一断言失败即非 0 退出。
+# 任一断言失败即非 0 退出。未传 --expect-notarized 时 spctl 仅展示不断言（codesign/runtime/lipo 仍为硬断言）。
 set -euo pipefail
 
 EXPECT_NOTARIZED=0
@@ -32,7 +32,13 @@ hr() { printf '\n--- %s ---\n' "$*"; }
 APP=""
 if [[ "$TARGET" == *.dmg ]]; then
   hr "dmg: spctl (open / primary-signature)"
-  SP="$(spctl -a -t open --context context:primary-signature -v "$TARGET" 2>&1)" || { echo "$SP"; fail "dmg 未通过 Gatekeeper"; }
+  # 未传 --expect-notarized（只签名档）时，已签名但未公证的 Developer ID 会被 Gatekeeper 判
+  # "rejected / source=Unnotarized Developer ID"，这是预期现象：spctl 只作展示，不作断言。
+  if [[ "$EXPECT_NOTARIZED" == 1 ]]; then
+    SP="$(spctl -a -t open --context context:primary-signature -v "$TARGET" 2>&1)" || { echo "$SP"; fail "dmg 未通过 Gatekeeper"; }
+  else
+    SP="$(spctl -a -t open --context context:primary-signature -v "$TARGET" 2>&1)" || echo "(informational) spctl 退出码非 0：未公证产物被拒属预期"
+  fi
   echo "$SP"
   if [[ "$EXPECT_NOTARIZED" == 1 ]]; then
     grep -q "source=Notarized Developer ID" <<<"$SP" || fail "dmg 不是 Notarized Developer ID"
@@ -57,7 +63,11 @@ hr "app: codesign --verify --deep --strict"
 codesign --verify --deep --strict --verbose=1 "$APP" 2>&1 || fail "codesign 校验失败"
 
 hr "app: spctl -a -vv (execute)"
-SP2="$(spctl -a -vv "$APP" 2>&1)" || { echo "$SP2"; fail "app 未通过 Gatekeeper"; }
+if [[ "$EXPECT_NOTARIZED" == 1 ]]; then
+  SP2="$(spctl -a -vv "$APP" 2>&1)" || { echo "$SP2"; fail "app 未通过 Gatekeeper"; }
+else
+  SP2="$(spctl -a -vv "$APP" 2>&1)" || echo "(informational) spctl 退出码非 0：未公证产物被拒属预期"
+fi
 echo "$SP2"
 if [[ "$EXPECT_NOTARIZED" == 1 ]]; then
   # 副本无 staple 票据时 Gatekeeper 走在线查询；离线机器需要 dmg 上的 staple
