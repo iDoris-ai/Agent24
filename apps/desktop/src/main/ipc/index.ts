@@ -12,13 +12,8 @@ import type {
   BackendEndpointResult,
   BackendProxyRequest,
   BackendProxyResponse,
-  DiscoverFilter,
-  DiscoveredModule,
   LlmStatusResult,
   IdorisStatusResult,
-  ModuleInfo,
-  ModuleInstallResult,
-  ModuleUninstallResult,
   OmlxDetectResult,
   OmlxModelsResult,
   OmlxStartResult,
@@ -188,74 +183,6 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
     }
     return { ok: true }
   })
-  // modules:list — returns manifests + enabled state of all registered capability modules
-  ipcMain.handle(IpcChannels.ModulesList, async (): Promise<ModuleInfo[]> => {
-    try {
-      const res = await proxyToBackend({ method: 'GET', path: '/api/modules' })
-      if (res.ok) return res.data as ModuleInfo[]
-    } catch { /* daemon may not be ready yet */ }
-    return []
-  })
-
-  // modules:discover — M4 marketplace browse: query installable modules from the
-  // npm registry, tagged with trust tier + installed flag. Filters are optional
-  // and forwarded as query params; the daemon (module-discovery.ts) applies them.
-  ipcMain.handle(IpcChannels.ModulesDiscover, async (_event, filter: unknown): Promise<DiscoveredModule[]> => {
-    const f = (filter ?? {}) as DiscoverFilter
-    const params = new URLSearchParams()
-    if (typeof f.query === 'string' && f.query.trim()) params.set('q', f.query.trim())
-    if (typeof f.trustTier === 'string') params.set('tier', f.trustTier)
-    if (typeof f.installed === 'boolean') params.set('installed', String(f.installed))
-    const qs = params.toString()
-    try {
-      const res = await proxyToBackend({ method: 'GET', path: `/api/modules/discover${qs ? `?${qs}` : ''}` })
-      if (res.ok) return res.data as DiscoveredModule[]
-    } catch { /* daemon may not be ready yet */ }
-    return []
-  })
-
-  // modules:enable / modules:disable — toggle module state via backend
-  ipcMain.handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string') return { ok: false }
-    try {
-      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
-      return { ok: res.ok }
-    } catch { return { ok: false } }
-  })
-
-  ipcMain.handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
-    if (typeof id !== 'string') return { ok: false }
-    try {
-      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
-      return { ok: res.ok }
-    } catch { return { ok: false } }
-  })
-
-  // modules:install — install a community module from npm
-  ipcMain.handle(IpcChannels.ModulesInstall, async (_event, packageName: unknown): Promise<ModuleInstallResult> => {
-    if (typeof packageName !== 'string' || !packageName) return { ok: false, error: 'packageName required' }
-    try {
-      const res = await proxyToBackend({ method: 'POST', path: '/api/modules/install', body: { packageName } })
-      if (res.ok) {
-        const data = res.data as { ok: boolean; id?: string }
-        return { ok: true, id: data.id }
-      }
-      const data = res.data as { error?: string }
-      return { ok: false, error: data?.error ?? 'Install failed' }
-    } catch { return { ok: false, error: 'Backend unreachable' } }
-  })
-
-  // modules:uninstall — remove a community module
-  ipcMain.handle(IpcChannels.ModulesUninstall, async (_event, packageName: unknown, id: unknown): Promise<ModuleUninstallResult> => {
-    if (typeof packageName !== 'string' || !packageName) return { ok: false, error: 'packageName required' }
-    try {
-      const body: Record<string, string> = { packageName }
-      if (typeof id === 'string') body.id = id
-      const res = await proxyToBackend({ method: 'POST', path: '/api/modules/uninstall', body })
-      return { ok: res.ok, error: res.ok ? undefined : (res.data as { error?: string })?.error }
-    } catch { return { ok: false, error: 'Backend unreachable' } }
-  })
-
   // llm:status — current active LLM provider + model
   ipcMain.handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
     // Try oMLX first

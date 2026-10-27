@@ -40,9 +40,19 @@ export function getBackendEndpoint(): BackendEndpoint | null {
   return currentEndpoint
 }
 
-/** Dev-only: workspace dep @agent24/node-daemon main → packages/node-daemon/dist/server.js */
+/** Dev-only, explicit opt-in (`AGENT24_BACKEND=node`): the contract-test
+ * reference daemon at packages/node-daemon/dist/server.js. REV-01: desktop no
+ * longer depends on or builds @agent24/node-daemon, so this resolves the
+ * workspace path directly and the developer builds it by hand
+ * (`pnpm --filter @agent24/node-daemon build`). Throws if absent, which
+ * selectedBackend turns into a fall-back to rust. */
 function resolveNodeEntry(): string {
-  return require.resolve('@agent24/node-daemon')
+  // dist/main/backend-manager.js → repo root
+  const entry = path.resolve(__dirname, '../../../../packages/node-daemon/dist/server.js')
+  if (!fs.existsSync(entry)) {
+    throw new Error(`${entry} not found — run: pnpm --filter @agent24/node-daemon build`)
+  }
+  return entry
 }
 
 /** `packaged` MUST come from Electron's `app.isPackaged` (injected by main.ts).
@@ -69,7 +79,7 @@ export function selectedBackend(
     resolveNode()
   } catch (err) {
     console.warn(
-      `[backend] AGENT24_BACKEND=node requested but @agent24/node-daemon is not resolvable (${String(err)}); using rust`,
+      `[backend] AGENT24_BACKEND=node requested but packages/node-daemon/dist/server.js is not resolvable (${String(err)}); using rust`,
     )
     return 'rust'
   }
