@@ -441,9 +441,9 @@ fn extract_request(
 /// made as the umask allows from the start, as writing in place would. A
 /// link is written through to its target. `file_unwritable` when the new
 /// file cannot be made beside it (a directory that cannot be written, as
-/// `/dev` for `/dev/null`) or a link leads nowhere (it cannot be resolved);
-/// whatever else is there is replaced, a named pipe too, and another hard
-/// link keeps the old page.
+/// `/dev` for `/dev/null`), when a link leads nowhere (it cannot be
+/// resolved), or when the rename fails (a directory at `path`). A file there
+/// is replaced, a named pipe too; another hard link keeps the old page.
 fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
     use base64::Engine as _;
     let png = data
