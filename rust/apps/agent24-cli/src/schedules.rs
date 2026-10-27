@@ -281,15 +281,19 @@ mod tests {
         }
     }
 
-    fn update(args: &[&str], current: Option<Schedule>) -> Result<ScheduleUpdate, String> {
+    fn change(args: &[&str]) -> Result<Change, String> {
         let mut all = vec!["schedules", "update", "sch_1"];
         all.extend_from_slice(args);
         match parse(&all).map_err(|e| e.to_string())? {
             Command::Schedules {
                 action: SchedulesAction::Update { change, .. },
-            } => change.patch(current),
+            } => Ok(change),
             _ => panic!("not an update"),
         }
+    }
+
+    fn update(args: &[&str], current: Option<Schedule>) -> Result<ScheduleUpdate, String> {
+        change(args)?.patch(current)
     }
 
     fn agent_run(prompt: &str, session: Option<&str>, model: Option<&str>) -> ScheduleAction {
@@ -444,8 +448,9 @@ mod tests {
         assert_eq!(patch.spec, Some(cron("0 10 * * *", None)));
     }
 
-    /// A cron schedule changed to every N with a new prompt: it is read first
-    /// (for the session and model), and its timezone does not follow.
+    /// A cron schedule changed to every N with a new prompt keeps its session
+    /// and model, and its timezone does not follow. That it is read first at
+    /// all is `what_needs_the_schedule_as_it_is`.
     #[test]
     fn a_cron_schedule_can_become_every_n_with_a_new_prompt() {
         let now = schedule(
@@ -458,6 +463,21 @@ mod tests {
             patch.action,
             Some(agent_run("q", Some("sess_1"), Some("m")))
         );
+    }
+
+    /// What makes `update` GET the schedule before its PATCH: a new prompt,
+    /// session or model (the daemon replaces the action whole), or a cron with
+    /// no timezone (it keeps the one it had).
+    #[test]
+    fn what_needs_the_schedule_as_it_is() {
+        let needs = |args: &[&str]| change(args).unwrap().needs_current();
+        assert!(needs(&["--every", "120", "--prompt", "q"]));
+        assert!(needs(&["--session", "s"]));
+        assert!(needs(&["--model", "m"]));
+        assert!(needs(&["--cron", "0 9 * * *"]));
+        assert!(!needs(&["--cron", "0 9 * * *", "--tz", "UTC"]));
+        assert!(!needs(&["--every", "120"]));
+        assert!(!needs(&["--name", "n", "--disable"]));
     }
 
     fn every() -> ScheduleSpec {
