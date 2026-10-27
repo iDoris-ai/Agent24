@@ -524,6 +524,14 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
                 ("content-type", "image/png"),
                 ("documents-render-scale", "1"),
             ],
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHXX".as_slice(),
+        ),
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("documents-render-scale", "1"),
+            ],
             b"GIF89a".as_slice(),
         ),
         (
@@ -552,12 +560,12 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
     assert_eq!(call(&render, &missing).await.code(), Some("not_found"));
     // A scale asked for bounds the one the OS answers with, from 0.25 up;
     // none asked is 1. The page is a whole file: more than its header.
+    let body = [PNG, b"\0\0\0\x01rest of the page"].concat();
     let answer = |asked: Option<f64>, used: &str| {
         let mut req = json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 1});
         if let Some(asked) = asked {
             req["scale"] = json!(asked);
         }
-        let body = [PNG, b"\0\0\0\x01rest of the page"].concat();
         let reply = page_reply(
             200,
             &[
@@ -575,8 +583,20 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
         (None, "1"),
         (None, "0.25"),
     ] {
-        let res = answer(asked, used).await;
-        assert!(res.is_ok(), "{asked:?} {used}: {res:?}");
+        // Taken as it came: its own scale, every byte.
+        let Response::Ok { status, data } = answer(asked, used).await else {
+            panic!("{asked:?} {used}: refused");
+        };
+        assert_eq!(
+            (status, &data["media_type"], &data["scale"], &data["bytes"]),
+            (
+                200,
+                &json!("image/png"),
+                &json!(used.parse::<f64>().unwrap()),
+                &json!(body.len())
+            ),
+            "{asked:?} {used}"
+        );
     }
     for (asked, used) in [
         (Some(0.25), "0.5"),
@@ -584,9 +604,18 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
         (Some(0.25), "0.1"),
         (None, "1.5"),
         (None, "0.2"),
+        // Just past either bound, and no number at all.
+        (None, "0.24"),
+        (None, "1.25"),
+        (Some(2.0), "NaN"),
+        (None, "inf"),
     ] {
         let res = answer(asked, used).await;
-        assert_eq!(res.code(), Some("invalid_response"), "{asked:?} {used}");
+        assert_eq!(
+            (res.status(), res.code()),
+            (200, Some("invalid_response")),
+            "{asked:?} {used}"
+        );
     }
     // A JSON operation never takes a PNG for its resource.
     let get = call(&json!({"op": "get", "documentId": DOC}), &ok).await;
