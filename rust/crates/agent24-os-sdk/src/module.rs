@@ -50,9 +50,25 @@ pub enum SdkError {
 /// reconnect (one callback connection per generation, §2.3) — running on
 /// past this point would mean answering HTTP requests over a connection
 /// that will never deliver another kernel call.
+///
+/// `process::exit` skips Rust destructors. That is the Q10 contract: the
+/// supervisor must see status 70, not `serve` returning `Ok` (module `main`
+/// turns that into success). Advisory `flock`s are released by the kernel
+/// when the process terminates, so a lock guard's `Drop` is not what
+/// unlocks them.
 fn default_fatal_hook() -> FatalHook {
     FatalHook::new(|| {
-        tracing::warn!("callback connection lost; exiting so the supervisor restarts this module");
+        // Best-effort log, then exit unconditionally. A fmt subscriber
+        // reports a failed stderr write with `eprintln!`, and Rust's
+        // `print_to` panics on that error (`stdio.rs`). This hook runs on
+        // the callback reader's tokio task, which catches task panics — an
+        // unwind here used to skip `exit` and leave the process holding
+        // the storage lock (issue #1020).
+        let _ = std::panic::catch_unwind(|| {
+            tracing::warn!(
+                "callback connection lost; exiting so the supervisor restarts this module"
+            );
+        });
         std::process::exit(70);
     })
 }
@@ -296,5 +312,136 @@ mod tests {
         let module = module_result.unwrap();
         let err = module.serve(axum::Router::new()).await.unwrap_err();
         assert!(matches!(err, SdkError::NoListener));
+    }
+
+    /// Issue #1020: the default hook's `tracing::warn!` goes through a fmt
+    /// subscriber. On a broken stderr that subscriber's `eprintln!` fallback
+    /// panics (`print_to`), and the reader's tokio task would swallow the
+    /// panic before `process::exit(70)`. The child installs the same
+    /// subscriber shape documents uses, waits until stderr writes fail, and
+    /// fires the real hook from a tokio task.
+    ///
+    /// `--nocapture` is required. libtest's capture buffer absorbs
+    /// `eprintln!`, so a captured child would exit 70 without ever hitting
+    /// the panic this test exists to survive.
+    ///
+    /// The child is selected by **test name**, not by an environment variable:
+    /// `agent24-cli`'s passthrough guard scans for `std::env::var*("...")`
+    /// and fails when a variable the daemon reads is missing from
+    /// `PASSTHROUGH_VARS` (`service::tests::passthrough_list_matches_what_the_
+    /// daemon_actually_reads`). A marker variable here would trip that guard
+    /// for the whole workspace, so the child re-runs this binary with
+    /// `--ignored --exact module::tests::death_hook_child_entrypoint` instead.
+    #[test]
+    fn default_fatal_hook_exits_70_when_stderr_write_fails() {
+        death_hook_parent();
+    }
+
+    /// Child-process entry point for
+    /// [`default_fatal_hook_exits_70_when_stderr_write_fails`]. Ignored so a
+    /// plain `cargo test` does not kill the harness; never returns.
+    #[test]
+    #[ignore = "child process entry point; spawned by default_fatal_hook_exits_70_when_stderr_write_fails"]
+    fn death_hook_child_entrypoint() {
+        death_hook_child();
+    }
+
+    fn death_hook_child() -> ! {
+        wait_until_stderr_write_fails();
+        std::panic::set_hook(Box::new(|info| {
+            let payload = info.payload();
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic");
+            // `writeln!` to the handle returns the error. `eprintln!` would
+            // panic again and abort before the parent can see this line.
+            let mut out = std::io::stdout().lock();
+            let _ = std::io::Write::write_fmt(&mut out, format_args!("PANIC {msg}\n"));
+            let _ = std::io::Write::flush(&mut out);
+        }));
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::stderr)
+            .init();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::spawn(async {
+                default_fatal_hook().fire();
+            });
+            // If the hook's panic escapes, tokio keeps the runtime alive
+            // until this sleep ends. 101 means exit was skipped.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        });
+        std::process::exit(101);
+    }
+
+    fn wait_until_stderr_write_fails() {
+        let start = std::time::Instant::now();
+        loop {
+            // `Write::write_all` returns `Err` on `EPIPE`. The print macros
+            // panic instead, which is the bug; this probe must not.
+            match std::io::Write::write_all(&mut std::io::stderr(), b"x") {
+                Ok(()) => {
+                    if start.elapsed() > std::time::Duration::from_secs(5) {
+                        std::process::exit(102);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn death_hook_parent() {
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "module::tests::death_hook_child_entrypoint",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RUST_TEST_NOCAPTURE", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Close the read end before the child logs. Its next stderr write
+        // is `EPIPE` instead of a buffered success.
+        drop(child.stderr.take());
+        let mut stdout = child.stdout.take().unwrap();
+
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break status,
+                None if start.elapsed() > std::time::Duration::from_secs(8) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let mut out = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
+                    panic!("death hook still running after 8s; stdout={out:?}");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut out).unwrap();
+        assert!(
+            out.contains("failed printing to stderr"),
+            "stderr write did not panic inside the hook; stdout={out:?} status={status:?}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(70),
+            "hook must exit 70 after the log panic; stdout={out:?} status={status:?}"
+        );
     }
 }

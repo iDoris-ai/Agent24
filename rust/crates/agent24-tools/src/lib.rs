@@ -23,16 +23,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent24_domain::tool::{ModuleToolCallError, ModuleToolErrorCode, ModuleToolResult};
+use agent24_domain::{EgressDestination, EgressGate, EgressPurpose, EgressRequest, EgressResource};
 use agent24_protocol::{Decision, RiskClass, ToolInfo};
 use agent24_store::{
     ActorRef, AttemptId, AuditTimestamp, AuthorizationRef, DurationMs, ModuleId,
-    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, RunId,
-    SessionRef, Store, ToolCallId,
+    ModuleToolAuditEvent, ModuleToolAuditRelation, ModuleToolResultCode, OperationId, ResourceRef,
+    RunId, SessionRef, Store, ToolCallId,
 };
 use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
+
+/// Directory opened before the approval gate. Writes use this handle, not a
+/// later lookup of the same path name.
+#[derive(Clone)]
+pub struct PinnedOutsideDir {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) dir: std::sync::Arc<cap_std::fs::Dir>,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl PinnedOutsideDir {
+    pub(crate) fn dir(&self) -> &cap_std::fs::Dir {
+        &self.dir
+    }
+
+    pub(crate) fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+}
 
 /// Per-call execution context.
 #[derive(Clone)]
@@ -48,6 +73,26 @@ pub struct ToolContext {
     /// The persisted tool-call row this execution belongs to
     tool_call_id: String,
     workspace: WorkspaceAuthority,
+    egress: Option<Arc<dyn EgressGate>>,
+    egress_resources: Vec<EgressResource>,
+    egress_policy_unavailable: bool,
+    authorization_generation: u64,
+    confirmed_write_root: Option<std::path::PathBuf>,
+    approved_outside_directory: Option<std::sync::Arc<PinnedOutsideDir>>,
+}
+
+/// What the approval gate bound this call to (K1-6a-G §2.3). It travels on
+/// the [`ToolInvocation`] the registry mints, never on the `ToolContext`, so
+/// a context an adapter kept carries no approval into a later call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ApprovalBinding {
+    /// The gate was not consulted for this call.
+    NotAsked,
+    /// Approved while the tool's grant had this `authorization_ref`.
+    Bound(String),
+    /// Approved out of band (durable resume): which grant the human saw is
+    /// not known, so the approval cannot be held to one.
+    Unbound,
 }
 
 #[derive(Clone)]
@@ -70,7 +115,88 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Legacy,
+            egress: None,
+            egress_resources: Vec::new(),
+            egress_policy_unavailable: false,
+            authorization_generation: 0,
+            confirmed_write_root: None,
+            approved_outside_directory: None,
         }
+    }
+
+    /// Bind the host's current source policy and live authorization checker to this call.
+    #[must_use]
+    pub fn with_egress_policy(
+        mut self,
+        gate: Arc<dyn EgressGate>,
+        resources: Vec<EgressResource>,
+        generation: u64,
+    ) -> Self {
+        self.egress = Some(gate);
+        self.egress_resources = resources;
+        self.authorization_generation = generation;
+        self
+    }
+
+    /// Bind the run's source resources when no live host gate is available.
+    /// Restricted resources are then denied at the tool's egress boundary.
+    #[must_use]
+    pub fn with_egress_resources(mut self, resources: Vec<EgressResource>) -> Self {
+        self.egress_resources = resources;
+        self
+    }
+
+    /// Mark the source-policy lookup as unavailable. Per-run egress consumers
+    /// fail closed when this marker is present, while ordinary runs with no
+    /// restricted resources retain their pre-egress behavior.
+    #[must_use]
+    pub fn with_egress_policy_unavailable(mut self) -> Self {
+        self.egress_policy_unavailable = true;
+        self
+    }
+
+    /// Apply the live egress gate only when this run has restricted or
+    /// explicitly authorized source resources. An empty resource set means
+    /// this run carries no source material governed by ADR-K1-02 §2.4.
+    pub async fn authorize_egress_if_restricted(
+        &self,
+        purpose: EgressPurpose,
+        destination: EgressDestination,
+    ) -> Result<(), ToolError> {
+        if self.egress_policy_unavailable {
+            return Err(ToolError::Denied("outbound policy unavailable".into()));
+        }
+        if self.egress_resources.is_empty() {
+            return Ok(());
+        }
+        self.authorize_egress(purpose, destination).await
+    }
+
+    fn with_egress_gate(mut self, gate: Arc<dyn EgressGate>) -> Self {
+        self.egress = Some(gate);
+        self
+    }
+
+    /// A missing policy service or destination is denied. Call immediately before network I/O.
+    pub async fn authorize_egress(
+        &self,
+        purpose: EgressPurpose,
+        destination: EgressDestination,
+    ) -> Result<(), ToolError> {
+        let gate = self
+            .egress
+            .as_ref()
+            .ok_or_else(|| ToolError::Denied("outbound policy unavailable".into()))?;
+        let request = EgressRequest::remote(
+            self.egress_resources.clone(),
+            purpose,
+            destination,
+            self.authorization_generation,
+        );
+        request
+            .authorize(gate.as_ref())
+            .await
+            .map_err(|_| ToolError::Denied("outbound request denied".into()))
     }
 
     #[doc(hidden)]
@@ -88,7 +214,44 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: WorkspaceAuthority::Bound(authority),
+            egress: None,
+            egress_resources: Vec::new(),
+            egress_policy_unavailable: false,
+            authorization_generation: 0,
+            confirmed_write_root: None,
+            approved_outside_directory: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_confirmed_write_root(mut self, root: std::path::PathBuf) -> Self {
+        self.confirmed_write_root = Some(root);
+        self
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_approved_outside_directory(
+        mut self,
+        directory: std::sync::Arc<PinnedOutsideDir>,
+    ) -> Self {
+        self.approved_outside_directory = Some(directory);
+        self
+    }
+
+    #[must_use]
+    pub fn approved_outside_directory(&self) -> Option<&std::path::Path> {
+        self.approved_outside_directory
+            .as_ref()
+            .map(|pin| pin.path.as_path())
+    }
+
+    pub(crate) fn pinned_outside_directory(&self) -> Option<&std::sync::Arc<PinnedOutsideDir>> {
+        self.approved_outside_directory.as_ref()
     }
 
     #[must_use]
@@ -134,6 +297,12 @@ impl ToolContext {
             schedule_id,
             tool_call_id: tool_call_id.into(),
             workspace: self.workspace.clone(),
+            egress: self.egress.clone(),
+            egress_resources: self.egress_resources.clone(),
+            egress_policy_unavailable: self.egress_policy_unavailable,
+            authorization_generation: self.authorization_generation,
+            confirmed_write_root: self.confirmed_write_root.clone(),
+            approved_outside_directory: self.approved_outside_directory.clone(),
         }
     }
 }
@@ -233,15 +402,20 @@ impl ModuleInvocationCapability {
 /// only `ToolContext`, so cloning it cannot copy this capability.
 pub struct ToolInvocation {
     module: Option<Arc<ModuleInvocationCapability>>,
+    approval: ApprovalBinding,
 }
 
 impl ToolInvocation {
     fn unbound() -> Self {
-        Self { module: None }
+        Self {
+            module: None,
+            approval: ApprovalBinding::NotAsked,
+        }
     }
 
     fn module(owner_token: ModuleToolOwnerToken) -> Result<Self, ToolError> {
         Ok(Self {
+            approval: ApprovalBinding::NotAsked,
             module: Some(Arc::new(ModuleInvocationCapability {
                 owner_token,
                 attempt_id: fresh_attempt_id()?,
@@ -261,6 +435,7 @@ impl fmt::Debug for ToolContext {
             .field("session_id", &self.session_id)
             .field("schedule_id", &self.schedule_id)
             .field("tool_call_id", &self.tool_call_id)
+            .field("egress_bound", &self.egress.is_some())
             .field(
                 "workspace",
                 &match self.workspace {
@@ -290,7 +465,18 @@ pub enum ToolError {
     /// The approval gate decided the whole run must stop (user chose abort)
     #[error("run aborted: {0}")]
     AbortRun(String),
+    /// The approval was given under a grant that is no longer current, or
+    /// names none (K1-6a-G §2.3). `dispatch` asks again; from
+    /// `execute_preapproved` the caller must ask again through `dispatch`.
+    #[error(
+        "the approval no longer matches the current grant; call the tool again to be asked anew"
+    )]
+    ApprovalStale,
 }
+
+/// How many times `dispatch` asks for one call whose grant keeps changing
+/// between approval and dispatch before it gives up.
+const MAX_APPROVAL_ROUNDS: usize = 3;
 
 /// What the approval gate says about one requires-approval dispatch.
 pub enum GateDecision {
@@ -389,6 +575,13 @@ impl ApprovalGate for DenyAllGate {
 pub trait Tool: Send + Sync {
     fn info(&self) -> ToolInfo;
 
+    /// Whether this tool always needs a registry-bound egress gate, regardless
+    /// of per-run source provenance. Source-aware tools enforce the gate at
+    /// their actual boundary using `ToolContext::authorize_egress_if_restricted`.
+    fn requires_outbound_policy(&self) -> bool {
+        true
+    }
+
     async fn advertisable(&self) -> bool {
         true
     }
@@ -452,6 +645,17 @@ pub trait Tool: Send + Sync {
         self.call(ctx, input, cancel).await
     }
 
+    /// Before an approval card is shown: refuse (and audit) a call that could
+    /// never run, rather than ask a human for nothing, and name the grant the
+    /// approval will be bound to. Ordinary tools have none: `Ok(None)`.
+    async fn approval_binding(
+        &self,
+        _ctx: &ToolContext,
+        _cancel: &CancellationToken,
+    ) -> Result<Option<String>, ToolError> {
+        Ok(None)
+    }
+
     /// Record a kernel-side refusal that happens before `call` (for example,
     /// a capability or approval-gate denial). Ordinary tools have no module
     /// audit stream, so their default is a no-op.
@@ -487,6 +691,31 @@ pub struct ModuleToolContext {
     pub operation: String,
     pub authorized_resources: Vec<String>,
     pub authorization_ref: String,
+    /// The package the grant was given for (K1-6a-G §2.2), for the runtime
+    /// to hold the run it sends to against. Never sent to the module.
+    #[serde(skip)]
+    pub expected_artifact: Option<String>,
+    /// The run the grant was last checked under (K1-6a-G §2.5.1), for the
+    /// runtime to send to no other. Never sent to the module.
+    #[serde(skip)]
+    pub run: Option<ModuleRun>,
+}
+
+/// One run of a module, as a runtime knows it: the same run only while it
+/// is the same allocation, which this handle keeps alive.
+#[derive(Clone)]
+pub struct ModuleRun(Arc<dyn std::any::Any + Send + Sync>);
+
+impl ModuleRun {
+    pub fn new<T: std::any::Any + Send + Sync>(run: Arc<T>) -> Self {
+        Self(run)
+    }
+
+    /// Whether this is `run`.
+    #[must_use]
+    pub fn is<T: std::any::Any + Send + Sync>(&self, run: &Arc<T>) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&self.0), Arc::as_ptr(run))
+    }
 }
 
 #[async_trait]
@@ -501,6 +730,31 @@ pub trait ModuleToolAuthorization: Send + Sync {
     async fn has_current_consent(&self, _module: &str, _operation: &str) -> bool {
         false
     }
+
+    /// Every committed grant, refusal and revocation (K1-6a-G §2.5), taken
+    /// BEFORE [`Self::authorize`] so nothing between the two is missed.
+    /// `None`: no feed, and an in-flight call is bounded only by
+    /// [`ModuleToolGrantContext::valid_for`] and the check after it returns.
+    fn consent_changes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>> {
+        None
+    }
+
+    /// Whether `authorization_ref` is still the current grant for this tool:
+    /// a full lookup, not only revocation. Any failure is `false`.
+    async fn still_current(
+        &self,
+        module: &str,
+        operation: &str,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> bool {
+        matches!(
+            self.authorize(module, operation, ctx).await,
+            Ok(grant) if grant.authorization_ref == authorization_ref
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -508,8 +762,53 @@ pub struct ModuleToolGrantContext {
     pub authorized_resources: Vec<String>,
     pub authorization_ref: String,
     pub per_call_approval: bool,
+    /// How long the grant stays valid from the moment it was looked up, by
+    /// the authorization's own clock (K1-6a-G §2.5: a call ends at
+    /// `min(timeout, expires_at)`). `None`: no expiry known.
+    pub valid_for: Option<Duration>,
+    /// The artifact identity the grant was given for (K1-6a-G §2.2): the
+    /// runtime sends the call only to a run of that same package.
+    pub artifact: Option<String>,
+}
+
+/// What can end a grant while a call runs (K1-6a-G §2.5): its expiry, and
+/// any change to this tool's consent that makes its reference no longer
+/// current.
+struct GrantWatch {
+    changes: Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>>,
+    deadline: Option<tokio::time::Instant>,
+    /// A change was taken from `changes` and the grant not yet re-read: set
+    /// before the re-read, cleared only once it says current, so a wait
+    /// dropped midway leaves it for the next.
+    recheck: bool,
+}
+
+impl GrantWatch {
+    fn new(
+        changes: Option<tokio::sync::broadcast::Receiver<agent24_store::ModuleConsentChange>>,
+        valid_for: Option<Duration>,
+        looked_up: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            changes,
+            // Too far off to represent: no deadline, the grant is still
+            // re-checked on every change and after the call returns.
+            deadline: valid_for.and_then(|valid_for| looked_up.checked_add(valid_for)),
+            recheck: false,
+        }
+    }
 }
 pub struct DenyModuleToolAuthorization;
+
+/// Whether a grant's resource set may go to the module as it is (resource
+/// contract §2.1): at most [`agent24_store::MAX_GRANT_RESOURCES`] elements,
+/// each one [`agent24_store::is_resource_element`].
+fn dispatchable_resources(resources: &[String]) -> bool {
+    resources.len() <= agent24_store::MAX_GRANT_RESOURCES
+        && resources
+            .iter()
+            .all(|element| agent24_store::is_resource_element(element))
+}
 
 fn permission_denied() -> ModuleToolCallError {
     ModuleToolCallError::Module {
@@ -538,6 +837,11 @@ impl ModuleToolAuthorization for DenyModuleToolAuthorization {
 
 #[async_trait]
 pub trait ModuleToolRuntime: Send + Sync {
+    /// `module`'s run now, which a call is then bound to (K1-6a-G §2.5.1);
+    /// `None`: no run, or a runtime that binds none.
+    fn current_run(&self, _module: &str) -> Option<ModuleRun> {
+        None
+    }
     async fn check_available(
         &self,
         module: &str,
@@ -574,6 +878,7 @@ impl ModuleTool {
         &self,
         ctx: &ToolContext,
         authorization_ref: &str,
+        resource_ref: Option<&str>,
         attempt_id: &AttemptId,
     ) -> Result<ModuleToolAuditRelation, ToolError> {
         Ok(ModuleToolAuditRelation {
@@ -591,13 +896,132 @@ impl ModuleTool {
                 .map_err(|_| audit_unavailable())?,
             authorization_ref: AuthorizationRef::new(authorization_ref)
                 .map_err(|_| audit_unavailable())?,
-            resource_ref: None,
+            resource_ref: resource_ref
+                .map(ResourceRef::new)
+                .transpose()
+                .map_err(|_| audit_unavailable())?,
         })
     }
 
+    /// Writes the pre-dispatch record and its `Denied` terminal for a call
+    /// gate 5 refused, under [`REMOTE_TIER_REF`], and leaves the relation on
+    /// the invocation as the authorized path does.
+    async fn audit_remote_tier_refusal(
+        &self,
+        ctx: &ToolContext,
+        capability: &ModuleInvocationCapability,
+    ) -> Result<(), ToolError> {
+        let relation = self.audit_relation(ctx, REMOTE_TIER_REF, None, &capability.attempt_id)?;
+        {
+            let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
+            state.relation = Some(relation.clone());
+        }
+        self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
+            .await?;
+        self.finish_audit(
+            &relation,
+            ModuleToolResultCode::Denied,
+            std::time::Instant::now(),
+        )
+        .await
+    }
+
+    /// Resolves once the grant behind `authorization_ref` has ended: its
+    /// deadline passed, or a change to this tool's consent (this operation,
+    /// or the whole module) after which
+    /// [`ModuleToolAuthorization::still_current`] says no. A receiver that
+    /// lagged re-checks as if a change had arrived; a closed one is
+    /// dropped and only the deadline remains. With neither, it never
+    /// resolves. A re-check left unfinished by an earlier wait comes first.
+    async fn grant_ended(
+        &self,
+        watch: &mut GrantWatch,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            if watch.recheck {
+                if !self.recheck(watch, ctx, authorization_ref).await {
+                    return;
+                }
+                continue;
+            }
+            let deadline = watch.deadline;
+            let received = tokio::select! {
+                () = until(deadline) => return,
+                received = async {
+                    match watch.changes.as_mut() {
+                        Some(changes) => changes.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => received,
+            };
+            match received {
+                Ok(change) if !self.concerns(&change) => {}
+                Ok(_) | Err(RecvError::Lagged(_)) => watch.recheck = true,
+                Err(RecvError::Closed) => watch.changes = None,
+            }
+        }
+    }
+
+    /// Right before dispatch: whether the grant still holds, settling every
+    /// change already delivered (K1-6a-G §2.5) without waiting for more.
+    async fn grant_holds(
+        &self,
+        watch: &mut GrantWatch,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> bool {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            if watch
+                .deadline
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+            {
+                return false;
+            }
+            while let Some(changes) = watch.changes.as_mut() {
+                match changes.try_recv() {
+                    Ok(change) if !self.concerns(&change) => {}
+                    Ok(_) | Err(TryRecvError::Lagged(_)) => watch.recheck = true,
+                    Err(TryRecvError::Closed) => watch.changes = None,
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+            // A re-check that says current may have let more arrive meanwhile.
+            if !watch.recheck {
+                return true;
+            }
+            if !self.recheck(watch, ctx, authorization_ref).await {
+                return false;
+            }
+        }
+    }
+
+    /// Re-reads the grant, but no later than its deadline; clears
+    /// `watch.recheck` only when the grant is still current.
+    async fn recheck(
+        &self,
+        watch: &mut GrantWatch,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> bool {
+        let current = tokio::select! {
+            biased;
+            () = until(watch.deadline) => false,
+            current = self.authorization.still_current(&self.module, &self.operation, ctx, authorization_ref) => current,
+        };
+        watch.recheck &= !current;
+        current
+    }
+
+    /// Whether `change` is to this tool: this operation, or the whole module.
+    fn concerns(&self, change: &agent24_store::ModuleConsentChange) -> bool {
+        change.module == self.module && change.op.as_deref().is_none_or(|op| op == self.operation)
+    }
+
     async fn audit_refusal(&self, ctx: &ToolContext) -> Result<(), ToolError> {
-        let invocation = ToolInvocation::module(self.owner_token.clone())?;
-        let capability = invocation.module.as_ref().ok_or_else(audit_unavailable)?;
         let authorization_ref = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
@@ -606,7 +1030,17 @@ impl ModuleTool {
             .map_or_else(denied_authorization_ref, |grant| {
                 grant.authorization_ref.clone()
             });
-        let relation = self.audit_relation(ctx, &authorization_ref, &capability.attempt_id)?;
+        self.audit_refusal_as(ctx, &authorization_ref).await
+    }
+
+    async fn audit_refusal_as(
+        &self,
+        ctx: &ToolContext,
+        authorization_ref: &str,
+    ) -> Result<(), ToolError> {
+        let invocation = ToolInvocation::module(self.owner_token.clone())?;
+        let capability = invocation.module.as_ref().ok_or_else(audit_unavailable)?;
+        let relation = self.audit_relation(ctx, authorization_ref, None, &capability.attempt_id)?;
         self.append_audit(&ModuleToolAuditEvent::PreDispatch(relation.clone()))
             .await?;
         self.finish_audit(
@@ -658,6 +1092,12 @@ impl ModuleTool {
 
 #[async_trait]
 impl Tool for ModuleTool {
+    fn requires_outbound_policy(&self) -> bool {
+        // Enforced dynamically at invocation time via
+        // `ToolContext::authorize_egress_if_restricted`.
+        false
+    }
+
     async fn advertisable(&self) -> bool {
         self.advert_view.module_ready(&self.module).await
             && self
@@ -667,6 +1107,10 @@ impl Tool for ModuleTool {
             && self
                 .advert_view
                 .has_current_consent(&self.module, &self.operation)
+                .await
+            && self
+                .advert_view
+                .outbound_gate_ready(&self.module, &self.operation)
                 .await
             && !self
                 .advert_view
@@ -694,6 +1138,56 @@ impl Tool for ModuleTool {
 
     async fn audit_denied(&self, ctx: &ToolContext) -> Result<(), ToolError> {
         self.audit_refusal(ctx).await
+    }
+
+    async fn approval_binding(
+        &self,
+        ctx: &ToolContext,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, ToolError> {
+        // #1130 L3: the gate-5 guard and the grant are settled before any
+        // card, so a call that `call_with_invocation` would refuse is refused
+        // here, with the same audit and the same error. Only the lookup is
+        // cancellable and bounded; a refusal's audit is always written whole.
+        let lookup = async {
+            if self
+                .advert_view
+                .blocked_by_remote_tier_guard(&self.module, &self.operation)
+                .await
+            {
+                return None;
+            }
+            Some(
+                self.authorization
+                    .authorize(&self.module, &self.operation, ctx)
+                    .await,
+            )
+        };
+        let looked_up = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(ToolError::Cancelled),
+            looked_up = tokio::time::timeout(self.timeout, lookup) => {
+                looked_up.map_err(|_| ToolError::Timeout(self.timeout))?
+            }
+        };
+        let Some(authorized) = looked_up else {
+            self.audit_refusal_as(ctx, REMOTE_TIER_REF).await?;
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        };
+        match authorized {
+            // A resource set the dispatch would refuse (§4 case 10) shows no
+            // card either.
+            Ok(grant) if !dispatchable_resources(&grant.authorized_resources) => {
+                self.audit_refusal_as(ctx, &grant.authorization_ref).await?;
+                Err(ToolError::Failed(module_error_json(permission_denied())))
+            }
+            Ok(grant) => Ok(Some(grant.authorization_ref)),
+            Err(error) => {
+                self.audit_refusal_as(ctx, &denied_authorization_ref(&error))
+                    .await?;
+                Err(ToolError::Failed(module_error_json(error)))
+            }
+        }
     }
 
     async fn audit_interrupted(
@@ -794,6 +1288,11 @@ impl Tool for ModuleTool {
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        ctx.authorize_egress_if_restricted(
+            EgressPurpose::ModuleTool,
+            EgressDestination::exact(&self.name),
+        )
+        .await?;
         let Some(capability) = invocation.module.as_ref() else {
             return Err(unknown_module_outcome("result_unknown"));
         };
@@ -802,6 +1301,21 @@ impl Tool for ModuleTool {
         }
         let mut execution_guard = capability.claim_for_execution()?;
 
+        // Gate 5 at dispatch (K1-6a-G §2.4): before the authorization lookup,
+        // so `dispatch` and `execute_preapproved` both pass it, and a call
+        // by name to a withheld tool is refused and audited.
+        if self
+            .advert_view
+            .blocked_by_remote_tier_guard(&self.module, &self.operation)
+            .await
+        {
+            self.audit_remote_tier_refusal(ctx, capability).await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
+
+        let changes = self.authorization.consent_changes();
+        let looked_up = tokio::time::Instant::now();
         let authorized = self
             .authorization
             .authorize(&self.module, &self.operation, ctx)
@@ -811,7 +1325,19 @@ impl Tool for ModuleTool {
             .map_or_else(denied_authorization_ref, |grant| {
                 grant.authorization_ref.clone()
             });
-        let relation = self.audit_relation(ctx, &authorization_ref, &capability.attempt_id)?;
+        // K1-6a-G §2.2: the audit names the dispatched set by count and
+        // digest, never by ID; a set that will not be dispatched has none.
+        let resource_ref = authorized
+            .as_ref()
+            .ok()
+            .filter(|grant| dispatchable_resources(&grant.authorized_resources))
+            .map(|grant| agent24_store::resource_set_ref(&grant.authorized_resources));
+        let relation = self.audit_relation(
+            ctx,
+            &authorization_ref,
+            resource_ref.as_deref(),
+            &capability.attempt_id,
+        )?;
         {
             let mut state = capability.state.lock().map_err(|_| audit_unavailable())?;
             state.relation = Some(relation.clone());
@@ -840,17 +1366,82 @@ impl Tool for ModuleTool {
                 return Err(ToolError::Failed(module_error_json(error)));
             }
         };
+        // K1-6a-G §2.2, §4 case 10: the module gets the recorded set as it is
+        // or the call is refused; a malformed or oversized set is never
+        // trimmed into one that would pass.
+        if !dispatchable_resources(&grant.authorized_resources) {
+            self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         if grant.per_call_approval && !self.risk.requires_approval() {
             self.finish_audit(&relation, ModuleToolResultCode::Denied, started)
                 .await?;
             execution_guard.mark_completed();
             return Err(ToolError::Failed(module_error_json(permission_denied())));
         }
-        if let Err(error) = self
-            .runtime
-            .check_available(&self.module, &self.operation)
-            .await
-        {
+        // K1-6a-G §2.3: an approval holds only for the grant it was given
+        // under; a call that needs one and has none was never approved.
+        // Nothing has reached the module, so this is `cancelled`.
+        let approved = match &invocation.approval {
+            ApprovalBinding::Bound(bound) => *bound == grant.authorization_ref,
+            ApprovalBinding::Unbound => false,
+            ApprovalBinding::NotAsked => !self.risk.requires_approval(),
+        };
+        if !approved {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::ApprovalStale);
+        }
+        let mut watch = GrantWatch::new(changes, grant.valid_for, looked_up);
+        // Before anything is sent to the module, a grant that ends stops the
+        // call as `cancelled`, and the model sees `permission_denied` — or,
+        // when a human approved this call under that grant, the approval is
+        // void and the registry asks again (§2.3); a grant that is simply
+        // gone is then refused before any card.
+        let ended = || match invocation.approval {
+            ApprovalBinding::Bound(_) => ToolError::ApprovalStale,
+            _ => ToolError::Failed(module_error_json(permission_denied())),
+        };
+        let available = tokio::select! {
+            biased;
+            () = self.grant_ended(&mut watch, ctx, &authorization_ref) => {
+                self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                    .await?;
+                execution_guard.mark_completed();
+                return Err(ended());
+            }
+            available = self.runtime.check_available(&self.module, &self.operation) => available,
+        };
+        // K1-6a-G §2.5.1: the run is taken, then the grant is re-read
+        // whatever the feed holds (`recheck`: is this grant reference still
+        // current): an end is announced only after it commits, an expiry
+        // never. An end told to a run before it was taken had committed, so
+        // the re-read fails; one told later reaches this run, or the call
+        // goes to none.
+        let run = self.runtime.current_run(&self.module);
+        watch.recheck = true;
+        // The wait above may have taken a change and been dropped before it
+        // re-read the grant: settle it here, still before anything is sent
+        // and before the module's own unavailability is reported.
+        // A cancellation still wins while this waits on a re-check.
+        let holds = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            holds = self.grant_holds(&mut watch, ctx, &authorization_ref) => Some(holds),
+        };
+        if holds != Some(true) {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(holds.map_or_else(
+                || ToolError::Failed(module_error_json(ModuleToolCallError::Cancelled)),
+                |_| ended(),
+            ));
+        }
+        if let Err(error) = available {
             self.finish_audit(&relation, result_code(&error), started)
                 .await?;
             execution_guard.mark_completed();
@@ -872,15 +1463,30 @@ impl Tool for ModuleTool {
             operation: self.operation.clone(),
             authorized_resources: grant.authorized_resources,
             authorization_ref: grant.authorization_ref,
+            expected_artifact: grant.artifact,
+            run,
         };
         let call_cancel = cancel.child_token();
-        let result = match tokio::time::timeout(
-            self.inline_wait,
-            self.runtime
-                .invoke(context, input.clone(), self.timeout, call_cancel.clone()),
-        )
-        .await
-        {
+        let invoked = tokio::select! {
+            // A result in hand is never traded for an unknown one.
+            biased;
+            invoked = tokio::time::timeout(
+                self.inline_wait,
+                self.runtime
+                    .invoke(context, input.clone(), self.timeout, call_cancel.clone()),
+            ) => invoked,
+            // Possibly sent: a grant that ends now leaves the outcome unknown.
+            () = self.grant_ended(&mut watch, ctx, &authorization_ref) => {
+                call_cancel.cancel();
+                self.finish_audit(&relation, ModuleToolResultCode::ResultUnknown, started)
+                    .await?;
+                execution_guard.mark_completed();
+                return Err(ToolError::Failed(module_error_json(
+                    ModuleToolCallError::ResultUnknown,
+                )));
+            }
+        };
+        let result = match invoked {
             Ok(result) => result,
             Err(_) => {
                 call_cancel.cancel();
@@ -892,6 +1498,16 @@ impl Tool for ModuleTool {
                 )));
             }
         };
+        // The runtime refused before sending, on its own and not for the
+        // caller (K1-6a-G §2.2: the run is not of the package granted): the
+        // grant as looked up no longer holds, so `cancelled` and
+        // `permission_denied` (§2.5), whatever a later lookup says.
+        if matches!(result, Err(ModuleToolCallError::Cancelled)) && !cancel.is_cancelled() {
+            self.finish_audit(&relation, ModuleToolResultCode::Cancelled, started)
+                .await?;
+            execution_guard.mark_completed();
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         let code = match &result {
             Ok(ModuleToolResult::Completed { .. }) => ModuleToolResultCode::Success,
             Ok(ModuleToolResult::Pending { .. }) => ModuleToolResultCode::ResultUnknown,
@@ -899,6 +1515,21 @@ impl Tool for ModuleTool {
         };
         self.finish_audit(&relation, code, started).await?;
         execution_guard.mark_completed();
+        // What the module said reaches the model only under a grant still
+        // current once the call and its audit are done (K1-6a-G §2.5); the
+        // audit keeps what the module did. A pending job carries nothing of
+        // the module's and is reported as unknown either way.
+        if !matches!(result, Ok(ModuleToolResult::Pending { .. }))
+            && !tokio::select! {
+                // A grant past its deadline is not current, whatever the
+                // lookup would say once it answers.
+                biased;
+                () = until(watch.deadline) => false,
+                current = self.authorization.still_current(&self.module, &self.operation, ctx, &authorization_ref) => current,
+            }
+        {
+            return Err(ToolError::Failed(module_error_json(permission_denied())));
+        }
         match result {
             Ok(ModuleToolResult::Completed { payload, replayed }) => Ok(serde_json::json!({
                 "kind":"completed", "payload":payload, "replayed":replayed
@@ -909,6 +1540,14 @@ impl Tool for ModuleTool {
             ))),
             Err(failure) => Err(ToolError::Failed(module_error_json(failure))),
         }
+    }
+}
+
+/// Resolves at `deadline`; never without one.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -934,6 +1573,10 @@ fn persisted_terminal_error(result: agent24_store::ModuleToolResultCode) -> Tool
     };
     ToolError::Failed(module_error_json(failure))
 }
+
+/// The audit `authorization_ref` of a call refused by gate 5: no grant was
+/// looked up for it.
+const REMOTE_TIER_REF: &str = "denied:remote_tier";
 
 fn audit_unavailable() -> ToolError {
     ToolError::Failed("module_tool_audit_unavailable".to_owned())
@@ -1080,6 +1723,8 @@ pub struct ToolRegistry {
     interactive_gate: bool,
     /// User-local risk adjustments (H2). None → declared classes stand.
     overrides: Option<Arc<dyn RiskOverrides>>,
+    outbound_gate: Option<Arc<dyn EgressGate>>,
+    confirmed_write_root: Option<std::path::PathBuf>,
 }
 
 impl ToolRegistry {
@@ -1090,7 +1735,14 @@ impl ToolRegistry {
             gate: Arc::new(DenyAllGate),
             interactive_gate: false,
             overrides: None,
+            outbound_gate: None,
+            confirmed_write_root: None,
         }
+    }
+
+    #[must_use]
+    pub fn confirmed_write_root(&self) -> Option<&std::path::Path> {
+        self.confirmed_write_root.as_deref()
     }
 
     /// Install the user's local risk overrides (H2).
@@ -1107,6 +1759,13 @@ impl ToolRegistry {
     pub fn with_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
         self.gate = gate;
         self.interactive_gate = true;
+        self
+    }
+
+    /// Install the host-owned live egress checker.
+    #[must_use]
+    pub fn with_egress_gate(mut self, gate: Arc<dyn EgressGate>) -> Self {
+        self.outbound_gate = Some(gate);
         self
     }
 
@@ -1246,6 +1905,7 @@ impl ToolRegistry {
     pub fn list(&self) -> Vec<ToolInfo> {
         self.tools
             .values()
+            .filter(|tool| !tool.requires_outbound_policy() || self.outbound_gate.is_some())
             .map(|t| {
                 let info = t.info();
                 let effective = self.effective_risk(&info);
@@ -1267,6 +1927,7 @@ impl ToolRegistry {
             .filter(|t| {
                 let info = t.info();
                 self.allowed.contains(&info.name)
+                    && (!t.requires_outbound_policy() || self.outbound_gate.is_some())
                     && (self.interactive_gate || !self.effective_risk(&info).requires_approval())
                     && !t.needs_knowledge_binding()
             })
@@ -1288,6 +1949,7 @@ impl ToolRegistry {
         for tool in self.tools.values() {
             let info = tool.info();
             if self.allowed.contains(&info.name)
+                && (!tool.requires_outbound_policy() || self.outbound_gate.is_some())
                 && (self.interactive_gate || !self.effective_risk(&info).requires_approval())
                 && (knowledge_bound || !tool.needs_knowledge_binding())
                 && tool.advertisable().await
@@ -1355,6 +2017,9 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| ToolError::Invalid(format!("unknown tool: {name}")))?;
+        if tool.requires_outbound_policy() && self.outbound_gate.is_none() {
+            return Err(ToolError::Denied("outbound policy unavailable".into()));
+        }
 
         // 2. capability whitelist
         if !self.allowed.contains(name) {
@@ -1395,26 +2060,66 @@ impl ToolRegistry {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_owned);
-        if effective.requires_approval() {
-            match self
-                .gate
-                .check(&info, ctx, input, standing_target.as_deref(), cancel)
+        // Capture the outside directory before the gate. A later symlink swap
+        // must not make the write follow a different parent than this one.
+        // Exec-tightened fs_write does not get the exception: Guardian can
+        // Allow that class without a human, and the whitelist must still hold.
+        let approved_before_gate = if name == "fs_write" && effective == RiskClass::WriteLocal {
+            let input = input.clone();
+            tokio::task::spawn_blocking(move || crate::local::approved_parent(&input))
                 .await
-            {
-                GateDecision::Allow => {}
-                GateDecision::Deny(reason) => {
-                    tool.audit_denied(ctx).await?;
-                    return Err(ToolError::Denied(reason));
+                .unwrap_or_default()
+        } else {
+            None
+        };
+        let owned;
+        let exec_ctx = if let Some(directory) = approved_before_gate {
+            owned = ctx.clone().with_approved_outside_directory(directory);
+            &owned
+        } else {
+            ctx
+        };
+        let call_ctx = self.outbound_gate.as_ref().map_or_else(
+            || exec_ctx.clone(),
+            |gate| exec_ctx.clone().with_egress_gate(Arc::clone(gate)),
+        );
+        // An approval holds only for the grant it was given under (K1-6a-G
+        // §2.3): when that grant changes before the call reaches the module,
+        // the call stops and the human is asked again.
+        for _ in 0..MAX_APPROVAL_ROUNDS {
+            let mut approval = ApprovalBinding::NotAsked;
+            if effective.requires_approval() {
+                let bound = tool.approval_binding(ctx, cancel).await?;
+                match self
+                    .gate
+                    .check(&info, exec_ctx, input, standing_target.as_deref(), cancel)
+                    .await
+                {
+                    GateDecision::Allow => {}
+                    GateDecision::Deny(reason) => {
+                        tool.audit_denied(ctx).await?;
+                        return Err(ToolError::Denied(reason));
+                    }
+                    GateDecision::AbortRun(reason) => {
+                        tool.audit_denied(ctx).await?;
+                        return Err(ToolError::AbortRun(reason));
+                    }
                 }
-                GateDecision::AbortRun(reason) => {
-                    tool.audit_denied(ctx).await?;
-                    return Err(ToolError::AbortRun(reason));
+                approval = bound.map_or(ApprovalBinding::NotAsked, ApprovalBinding::Bound);
+            }
+
+            // 4. execute under the tool's budget, cancellable at any point
+            match Self::run_budgeted(tool, &call_ctx, input, cancel, approval).await {
+                Err(ToolError::ApprovalStale) if effective.requires_approval() => {}
+                Err(ToolError::ApprovalStale) => {
+                    return Err(ToolError::Denied(format!("tool {name} was never approved")));
                 }
+                result => return result,
             }
         }
-
-        // 4. execute under the tool's budget, cancellable at any point
-        Self::run_budgeted(tool, ctx, input, cancel).await
+        Err(ToolError::Denied(format!(
+            "the grant for {name} kept changing while it was being approved"
+        )))
     }
 
     /// Execute a tool whose approval was ALREADY granted out of band — the
@@ -1427,6 +2132,11 @@ impl ToolRegistry {
     /// So this runs the same normalize + whitelist + budgeted-execute path but
     /// deliberately SKIPS the gate. It is the one execution path that does not
     /// ask, and must only be reached with an approval already in hand.
+    ///
+    /// A call whose approval must name the grant it was given under (K1-6a-G
+    /// §2.3) cannot be held to one here, since which grant the human saw is
+    /// not recorded: it stops before the module with `ApprovalStale`, and
+    /// the caller asks again through `dispatch`.
     pub async fn execute_preapproved(
         &self,
         name: &str,
@@ -1446,7 +2156,14 @@ impl ToolRegistry {
                 "tool {name} is not in the capability whitelist"
             )));
         }
-        Self::run_budgeted(tool, ctx, input, cancel).await
+        if tool.requires_outbound_policy() && self.outbound_gate.is_none() {
+            return Err(ToolError::Denied("outbound policy unavailable".into()));
+        }
+        let call_ctx = self.outbound_gate.as_ref().map_or_else(
+            || ctx.clone(),
+            |gate| ctx.clone().with_egress_gate(Arc::clone(gate)),
+        );
+        Self::run_budgeted(tool, &call_ctx, input, cancel, ApprovalBinding::Unbound).await
     }
 
     /// Restore grant side-effects for a durable approval without asking again.
@@ -1504,10 +2221,12 @@ impl ToolRegistry {
         ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
+        approval: ApprovalBinding,
     ) -> Result<String, ToolError> {
         // Mint opaque settlement authority before constructing the call future.
         // Authorization receives only the reusable ToolContext.
-        let invocation = tool.prepare_invocation(ctx)?;
+        let mut invocation = tool.prepare_invocation(ctx)?;
+        invocation.approval = approval;
         let budget = tool.timeout();
         const CANCELLATION_SETTLE_GRACE: Duration = Duration::from_secs(5);
         const INTERRUPTED_AUDIT_BUDGET: Duration = Duration::from_secs(5);
@@ -1599,10 +2318,25 @@ mod tests {
         }
     }
 
+    /// Gate 5 open, so a call reaches its authorization (K1-6a-G §2.4 puts
+    /// the guard first).
+    struct UnguardedAdvertView;
+
+    #[async_trait]
+    impl agent24_domain::tool::ModuleToolAdvertView for UnguardedAdvertView {
+        async fn blocked_by_remote_tier_guard(&self, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
     struct SlowTool;
 
     #[async_trait]
     impl Tool for SlowTool {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+
         fn info(&self) -> ToolInfo {
             ToolInfo::new("slow", "builtin", "sleeps", RiskClass::Read)
         }
@@ -1686,6 +2420,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for StalledInterruptedAudit {
+        fn requires_outbound_policy(&self) -> bool {
+            false
+        }
+
         fn info(&self) -> ToolInfo {
             ToolInfo::new("stalled_audit", "module", "stalled audit", RiskClass::Read)
         }
@@ -1767,6 +2505,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_http_fetch_is_advertised_without_egress_policy() {
+        let registry = ToolRegistry::new().with(Arc::new(HttpFetchTool::new(false)));
+        assert_eq!(registry.adverts().len(), 1);
+        assert!(registry.list().iter().any(|tool| tool.name == "http_fetch"));
+    }
+
+    #[tokio::test]
     async fn approval_stub_auto_denies_shell_exec_and_fs_write() {
         let dir = tempfile::tempdir().unwrap();
         let reg = ToolRegistry::builtin(dir.path().to_path_buf());
@@ -1780,14 +2525,11 @@ mod tests {
         // and they are not advertised to the model
         let advertised: Vec<String> = reg.adverts().into_iter().map(|a| a.name).collect();
         assert_eq!(advertised, vec!["fs_read", "http_fetch"]);
-        // but ARE listed on /tools with the flag visible
+        // Run-scoped egress checks live at actual network/process boundaries;
+        // listing does not blanket-disable ordinary runs with no source resources.
         let listed = reg.list();
-        assert_eq!(listed.len(), 4);
-        assert!(
-            listed
-                .iter()
-                .any(|t| t.name == "shell_exec" && t.requires_approval)
-        );
+        assert!(listed.iter().any(|tool| tool.name == "shell_exec"));
+        assert!(listed.iter().any(|tool| tool.name == "http_fetch"));
     }
 
     /// H1's whole point: `requires_approval` is DERIVED, so it cannot drift
@@ -1841,6 +2583,10 @@ mod tests {
         struct Remote;
         #[async_trait]
         impl Tool for Remote {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 ToolInfo::new(
                     "mcp_fs_read",
@@ -1933,6 +2679,10 @@ mod tests {
         struct Existing;
         #[async_trait]
         impl Tool for Existing {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 ToolInfo::new("sample.read", "builtin", "existing", RiskClass::Read)
             }
@@ -1962,6 +2712,10 @@ mod tests {
         struct Remote;
         #[async_trait]
         impl Tool for Remote {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 ToolInfo::new("mcp_post", "mcp", "post", RiskClass::External)
             }
@@ -2123,7 +2877,7 @@ mod tests {
             .with_risk_overrides(Arc::new(FixedOverride("fs_read", RiskClass::Exec)));
         assert_eq!(reg.tool_risk_class("fs_read"), Some(RiskClass::Exec));
         assert!(reg.tool_requires_approval("fs_read"));
-        // and a tightened tool stops being advertised without an interactive gate
+        // The tightened read tool disappears; ordinary HTTP stays available.
         let advertised: Vec<String> = reg.adverts().into_iter().map(|a| a.name).collect();
         assert_eq!(advertised, vec!["http_fetch"]);
     }
@@ -2178,6 +2932,10 @@ mod tests {
         struct Hanging;
         #[async_trait]
         impl Tool for Hanging {
+            fn requires_outbound_policy(&self) -> bool {
+                false
+            }
+
             fn info(&self) -> ToolInfo {
                 ToolInfo::new("hang", "builtin", "", RiskClass::Read)
             }
@@ -2237,7 +2995,7 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
                 RiskClass::External,
-                Arc::new(DenyAdvertView),
+                Arc::new(UnguardedAdvertView),
                 Arc::new(DenyModuleToolAuthorization),
                 Arc::new(Runtime),
                 agent24_store::Store::open_memory().await.unwrap(),

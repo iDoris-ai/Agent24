@@ -76,11 +76,11 @@ F1 与 F8 加起来二十余轮对抗复审，抓到的几乎全是同一类问�
 - ✅ `docs/agent/architecture.md`「不可动摇的边界」六条 → [`MEMORY.md`](MEMORY.md) `L-MEM-1..6`
 - ✅ `docs/specs/SPEC-ME-FOLLOWUPS.md` F1「不得声称的话」→ [`MEMORY.md`](MEMORY.md) `L-MEM-7`（附「不得声称」对照表）
 - ✅ H2 的 inviolable → [`APPROVAL.md`](APPROVAL.md) `L-APPR-1..3`
-- ✅ H4 → [`APPROVAL.md`](APPROVAL.md) `L-APPR-4..7`
+- ✅ H4 → [`APPROVAL.md`](APPROVAL.md) `L-APPR-4..7`；工作区写入见 `L-APPR-8`
 
 **仍未建**（等对应功能出现再立）：T13/T14 的 SDK 与非 Rust 参考实现会引入进程边界，届时需要一份
 `WIRE.md`；Cos72（T10）会引入项目根与工作区，`CONTEXT.md` 的 L-CTX-1/2 到那时才第一次有真实代码路径。
 
 **迁移不是复制粘贴** —— 每一条都按法律形状重写了「今天靠什么保证」那一栏。
 写的时候确实发现了几条**没有机制、只有纪律**的：`MEMORY.md` L-MEM-7 的第 ④⑤⑥ 项、
-`APPROVAL.md` L-APPR-1 的未来安装路径、L-APPR-7 的「读权限不存储」。**那些正是要找的东西。**
+`APPROVAL.md` L-APPR-1 的未来安装路径、L-APPR-7 的「读权限不存储」及其模块工具授予例外的机械门。**那些正是要找的东西。**

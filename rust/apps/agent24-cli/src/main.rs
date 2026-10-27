@@ -831,31 +831,38 @@ async fn os_local(action: &OsAction) -> Option<Result<(), String>> {
         OsAction::Install { path } => {
             Some(match agent24_os_packages::install::install(path, &root) {
                 Ok(dest) => {
-                    // Package replacement revokes earlier consent. A failure
-                    // is reported (and makes the command fail) only after the
-                    // lines below, which stay true either way: the files ARE
-                    // installed.
+                    // Grants from an earlier install of this name end now,
+                    // or this install does not stand (K1-6a-G §2.1 F1):
+                    // undone, so running it again retries the revocation.
                     let revoked = match dest.file_name().and_then(|n| n.to_str()) {
-                        Some(module) => invalidate_module_consents(module).await,
-                        None => Err(format!(
-                            "could not revoke module consent: {} has no usable module name",
-                            dest.display()
-                        )),
+                        Some(module) => match revoke_module_consents(module).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                let undone = agent24_os_packages::install::uninstall(module, &root);
+                                Err(match undone {
+                                    Ok(_) => format!("{e}; the install was undone"),
+                                    Err(u) => format!("{e}; the install could not be undone: {u}"),
+                                })
+                            }
+                        },
+                        None => Ok(()),
                     };
-                    println!("installed {}", dest.display());
-                    println!(
-                        "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
-                    );
-                    // Said out loud because the isolation is deliberate and
-                    // therefore permanent: an ephemeral daemon (`agent24 chat`
-                    // with nothing running) resolves a different packages root
-                    // and will never see this package. Without this line the two
-                    // lines above are, for that user, a promise that never comes
-                    // true.
-                    println!(
-                        "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
-                    );
-                    revoked.map_err(|e| consent_revocation_failed_message(&e))
+                    if revoked.is_ok() {
+                        println!("installed {}", dest.display());
+                        println!(
+                            "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+                        );
+                        // Said out loud because the isolation is deliberate and
+                        // therefore permanent: an ephemeral daemon (`agent24 chat`
+                        // with nothing running) resolves a different packages root
+                        // and will never see this package. Without this line the two
+                        // lines above are, for that user, a promise that never comes
+                        // true.
+                        println!(
+                            "  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)"
+                        );
+                    }
+                    revoked
                 }
                 Err(e) => Err(e.to_string()),
             })
@@ -886,59 +893,50 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
             // Not an error: the end state the operator asked for is the one
             // they have. Saying so beats a failure they must decide to
             // ignore. Idempotent: nothing NEW was removed, so there is
-            // nothing for a hot-stop to respond to.
+            // nothing for a hot-stop to respond to. Its grants are ended
+            // again all the same: an earlier run may have removed the files
+            // and failed to (K1-6a-G §2.1 F1).
             println!("{name} was not installed; nothing to remove");
-            Ok(())
+            revoke_module_consents(name).await
         }
         Ok(true) => {
             println!("removed {name}");
             println!("  it takes effect at the next daemon start");
-            let revoked = invalidate_module_consents(name).await;
-            // Still tried when the revocation failed: the module must stop
-            // serving either way.
+            let revoked = revoke_module_consents(name).await;
             hot_disable_best_effort(name).await;
-            revoked.map_err(|e| consent_revocation_failed_message(&e))
+            revoked
         }
     }
 }
 
-/// Revoke persisted enablement consent after a package lifecycle change.
-/// Fail-closed (ADR-K1-03 §3): every way this can fail — no state directory
-/// at all, a store that will not open, a write that does not land — is an
-/// `Err` the caller turns into a visible, non-zero result. Never a silent
-/// skip.
-async fn invalidate_module_consents(name: &str) -> Result<(), String> {
-    invalidate_module_consents_in(state_file::state_dir().as_deref(), name).await
+/// End `name`'s module tool grants after a package lifecycle change. A
+/// store that cannot record it fails the command (K1-6a-G §2.1 F1): whether
+/// a grant still holds is what the store says, not what this printed. An
+/// install is undone and an uninstall finds nothing left to remove, so
+/// running either again retries this. Without HOME no store can be
+/// reached (a daemon does not start without one either): the command
+/// stands, and says the grants, if any, were not revoked.
+async fn revoke_module_consents(name: &str) -> Result<(), String> {
+    revoke_module_consents_in(state_file::state_dir().as_deref(), name).await
 }
 
-async fn invalidate_module_consents_in(
+async fn revoke_module_consents_in(
     state_dir: Option<&std::path::Path>,
     name: &str,
 ) -> Result<(), String> {
     let Some(dir) = state_dir else {
-        return Err(format!(
-            "could not revoke {name} module consent: no state directory (set HOME)"
-        ));
+        eprintln!(
+            "  HOME is not set: cannot reach a consent store, so any grants of {name} were not revoked"
+        );
+        return Ok(());
     };
     let store = agent24_store::Store::open(&dir.join("agent24.db"))
         .await
-        .map_err(|e| {
-            format!("could not open the consent store to revoke {name} module consent: {e}")
-        })?;
+        .map_err(|e| format!("could not open the consent store to revoke {name}'s grants: {e}"))?;
     store
         .invalidate_module_consents(name)
         .await
-        .map_err(|e| format!("could not revoke {name} module consent: {e}"))
-}
-
-/// The error a package lifecycle command ends with when its consent
-/// revocation did not land: the file change already happened (and was
-/// printed), but the command must not report success.
-fn consent_revocation_failed_message(why: &str) -> String {
-    format!(
-        "{why}\n  the package change above was made, but an earlier consent for this module may \
-         still be recorded; fix the state store and re-run the command"
-    )
+        .map_err(|e| format!("could not revoke {name}'s module grants: {e}"))
 }
 
 /// Render a daemon error envelope the way every call site here should
@@ -2281,13 +2279,14 @@ mod tests {
 
     use super::*;
 
+    /// No HOME, no store to reach: the command stands (review G3; the
+    /// `A24_OS_PACKAGES` install the CLI documents for containers), and
+    /// says the grants, if any, were not revoked.
     #[tokio::test]
-    async fn consent_revocation_without_state_dir_is_an_error_not_a_silent_skip() {
-        let err = invalidate_module_consents_in(None, "consent-mod")
+    async fn consent_revocation_without_state_dir_stands() {
+        revoke_module_consents_in(None, "consent-mod")
             .await
-            .unwrap_err();
-        assert!(err.contains("no state directory"), "{err}");
-        assert!(consent_revocation_failed_message(&err).contains("may"));
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2295,7 +2294,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the database file should be: opening it fails.
         std::fs::create_dir(dir.path().join("agent24.db")).unwrap();
-        let err = invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+        let err = revoke_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap_err();
         assert!(err.contains("consent-mod"), "{err}");
@@ -2304,7 +2303,7 @@ mod tests {
     #[tokio::test]
     async fn consent_revocation_succeeds_with_a_writable_store() {
         let dir = tempfile::tempdir().unwrap();
-        invalidate_module_consents_in(Some(dir.path()), "consent-mod")
+        revoke_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap();
     }

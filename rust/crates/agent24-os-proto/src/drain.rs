@@ -319,6 +319,9 @@ pub struct Generation {
     /// generation reaches this process and no other — or, since A3, that
     /// there is no such process at all. See [`Upstream`].
     upstream: Upstream,
+    /// The [`crate::artifact`] identity of this run's package (K1-6a-G
+    /// §2.1); `None` if it has none, which grants treat as `Stale`.
+    artifact: Option<String>,
 }
 
 /// A request admitted into a generation. Leaves the in-flight set when dropped,
@@ -348,6 +351,13 @@ impl Generation {
         Self::new(Upstream::Process(upstream))
     }
 
+    /// [`Self::serving_at`], started from a package whose
+    /// [`artifact identity`](crate::artifact) is `artifact`.
+    #[must_use]
+    pub fn serving_package(upstream: std::path::PathBuf, artifact: Option<String>) -> Arc<Self> {
+        Self::with_artifact(Upstream::Process(upstream), artifact)
+    }
+
     /// A3 (`docs/design/A3-ATTACHED-MODULE.md` §5.1, review H1): a
     /// user-started process that just passed the attach handshake. Unlike
     /// [`Self::starting`] this generation DOES become `Running` — see
@@ -361,6 +371,10 @@ impl Generation {
     }
 
     fn new(upstream: Upstream) -> Arc<Self> {
+        Self::with_artifact(upstream, None)
+    }
+
+    fn with_artifact(upstream: Upstream, artifact: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 state: DrainState::Starting,
@@ -370,7 +384,15 @@ impl Generation {
             }),
             revoked: tokio::sync::watch::Sender::new(false),
             upstream,
+            artifact,
         })
+    }
+
+    /// The identity this run was started with (see the field); `None` for
+    /// a placeholder, an attached module, or one that could not be computed.
+    #[must_use]
+    pub fn artifact(&self) -> Option<&str> {
+        self.artifact.as_deref()
     }
 
     /// Where this run's process listens; `None` for a placeholder AND for an

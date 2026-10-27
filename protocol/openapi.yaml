@@ -204,6 +204,166 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+    post:
+      operationId: decideModuleToolConsent
+      x-milestone: K1-6a
+      tags: [tools]
+      summary: Write the user's decision on a module tool's card
+      description: >-
+        The card's `fingerprint`, `module_version` and `artifact` must still
+        be what the tool is checked against when the decision is written,
+        and the module enabled and running (K1-6a-G §2.1). Replaces any
+        earlier decision for the tool.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModuleToolDecision"
+      responses:
+        "200":
+          description: The decision as written
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorization"
+        "400":
+          description: "`invalid_request`: the body is not JSON"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: >-
+            Host authority required; or `grants_closed`: the host has not
+            opened decisions (`A24_MODULE_TOOL_GRANTS=1`), or the daemon is
+            ephemeral
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No such module tool
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `protocol_too_old` or `no_package_identity`, as for the card;
+            `card_changed`: the fingerprint, version or package identity is
+            no longer the current one; `module_disabled`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: >-
+            `invalid_request`: the body is not a decision (`decision`,
+            `fingerprint`, `module_version` or `artifact` missing, a field of
+            another type, or one not defined). `invalid_decision`:
+            `expires_at` missing, null or not an RFC 3339 instant, an expiry
+            already past or past the
+            host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at
+            most 90), more than 256 resources, a resource that is not
+            `<kind>:<id>` of a kind the tool declares, or a denial naming
+            resources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "`invalid_request`: the body is larger than the daemon accepts"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: "`invalid_request`: the body is not sent as `application/json`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Whether the module is enabled could not be read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /module-consents/modules/{module}/tools/{tool}/card:
+    parameters:
+      - name: module
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tool
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getModuleToolCard
+      x-milestone: K1-6a
+      tags: [tools]
+      summary: What a grant of one module tool would cover
+      description: >-
+        Built by the host from the tool's manifest declaration (risk, output
+        privacy, resource kinds, reversible draft); the module's own
+        description text is not shown. `reversible_draft` is what the
+        manifest declares, and the declaration relaxes nothing: a module
+        tool's dispatch is gated with no draft exception.
+        `fingerprint`, `module_version` and `artifact` are what a grant must
+        repeat, and what dispatch compares it with (K1-6a-G §2.1).
+      responses:
+        "200":
+          description: The tool's card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleToolCard"
+        "404":
+          description: No such module tool
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Host authority required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `protocol_too_old`: the module does not require the grants
+            protocol, so it cannot be told its grants were revoked (§2.6).
+            `no_package_identity`: no running package identity to grant
+            against (not running, not yet observed by this daemon start, or
+            an ephemeral daemon).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /health:
     get:
@@ -793,6 +953,54 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /peer/runs:
+    get:
+      operationId: listPeerRuns
+      x-milestone: K1-6b
+      tags: [runs]
+      summary: List runs as a peer bridge may relay them
+      description: |
+        K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
+        runs here instead of /runs. A run's prompt, output and error appear
+        only when every source tagged on it is ordinary, it has ended, and —
+        while tool results carry no source tags — it cannot have taken one in:
+        it called no tool, recalled no memory, was not started by a
+        kernel-created schedule, and has no session context (no session, or it
+        ran, and the daemon runs, without session memory). Any other run
+        carries only its id,
+        status and a fixed notice.
+      responses:
+        "200":
+          description: Peer run list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PeerRun"
+
+  /peer/runs/{id}:
+    get:
+      operationId: getPeerRun
+      x-milestone: K1-6b
+      tags: [runs]
+      summary: Get one run as a peer bridge may relay it
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Peer run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PeerRun"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -2902,6 +3110,43 @@ components:
           type: [string, "null"]
           format: date-time
 
+    PeerRun:
+      type: object
+      description: |
+        K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
+        filtered Run, so a field added to Run later is not relayed by default.
+      required: [id, status, withheld, prompt, output, error, notice]
+      properties:
+        id:
+          type: string
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        withheld:
+          type: boolean
+          description: |
+            True unless every source tagged on the run so far is ordinary and
+            the run called no tool, recalled no memory, was not started by a
+            kernel-created schedule and has no session context. Sources are
+            tagged before the first model call, so afterwards the value only
+            changes when the run starts a tool or the daemon restarts with
+            session memory turned on or off.
+        prompt:
+          type: [string, "null"]
+          description: Present only for an ended run that is not withheld
+        output:
+          oneOf:
+            - $ref: "#/components/schemas/RunOutput"
+            - type: "null"
+          description: Present only for a completed run that is not withheld
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorBody"
+            - type: "null"
+          description: Present only for a failed run that is not withheld
+        notice:
+          type: [string, "null"]
+          description: Fixed explanation, present exactly when withheld is true
+
     RunCreate:
       type: object
       required: [prompt]
@@ -3321,7 +3566,7 @@ components:
     HardwareProfile:
       type: object
       description: D0-3 deterministic hardware probe output (docs/agent/PLAN-DECIDE.md §1.1)
-      required: [total_mem_bytes, avail_mem_bytes, arch, cpu_cores, accelerator, os]
+      required: [total_mem_bytes, avail_mem_bytes, arch, cpu_cores, accelerator, os, free_disk_bytes]
       properties:
         total_mem_bytes:
           type: integer
@@ -3377,7 +3622,20 @@ components:
                 type: boolean
         models_dir_free_bytes:
           type: [integer, "null"]
-          description: Free bytes on the disk holding the models directory; null when it cannot be determined (replaces the removed free_disk_bytes, which was the cwd disk)
+          description: Free bytes on the disk holding the models directory; null when it cannot be determined
+        free_disk_bytes:
+          type: integer
+          deprecated: true
+          description: >-
+            v1 compatibility only. Historical daemon-cwd disk free bytes: the
+            disk whose mount point is the longest prefix of the daemon
+            process's current working directory, falling back to the disk
+            with the most available space when none matches (including a
+            failed cwd read), or 0 when no disks are enumerated at all; 0 is
+            also a legitimate "disk full" value, not a distinct unknown
+            marker. Not the models directory's disk — use
+            models_dir_free_bytes for that — and never used to gate model
+            downloads.
         runtimes:
           type: array
           description: Reserved; not probed yet (HW-1)
@@ -4621,15 +4879,72 @@ components:
         decided_at: { type: string, format: date-time }
         expires_at: { type: string, format: date-time }
         status: { type: string, enum: [granted, denied, revoked, expired, stale, not_granted] }
+        stop:
+          description: >-
+            Only for a revoked one, or an expired grant: whether the module
+            said it stopped the work the grant started when told it ended
+            (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded,
+            as for a revocation made outside this daemon or an expiry not
+            yet told.
+          type: string
+          enum: [confirmed, unconfirmed, not_running]
+
+    ModuleToolCard:
+      type: object
+      required: [module, tool, module_version, scope_summary, host_risk, source, reversible_draft, resource_kinds, fingerprint, artifact]
+      additionalProperties: false
+      properties:
+        module: { type: string }
+        tool: { type: string }
+        module_version: { type: string }
+        scope_summary:
+          type: object
+          required: [readable, writable, external]
+          additionalProperties: false
+          properties:
+            readable: { type: [string, "null"] }
+            writable: { type: [string, "null"] }
+            external: { type: [string, "null"] }
+        host_risk: { type: string, enum: [low, medium, high] }
+        source: { type: string, enum: [first_party, manual_install] }
+        reversible_draft: { type: boolean }
+        resource_kinds:
+          type: array
+          items: { type: string }
+        fingerprint: { type: string }
+        artifact: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+
+    ModuleToolDecision:
+      type: object
+      required: [decision, fingerprint, module_version, artifact, expires_at]
+      additionalProperties: false
+      properties:
+        decision: { type: string, enum: [granted, denied] }
+        fingerprint: { type: string }
+        module_version: { type: string }
+        artifact: { type: string }
+        resources:
+          type: array
+          maxItems: 256
+          items: { type: string }
+        expires_at: { type: string, format: date-time }
 
     ModuleAuthorizationRevocation:
       type: object
-      required: [module, tool, status]
+      required: [module, tool, status, stop]
       additionalProperties: false
       properties:
         module: { type: string }
         tool: { type: [string, "null"] }
         status: { type: string, const: revoked }
+        stop:
+          description: >-
+            What the module answered when told (K1-6a-G §2.5): `confirmed`,
+            it stopped the work the grants started; `unconfirmed`, no 2xx
+            within the bound, so that work may still run; `not_running`, it
+            had no run. The revocation stands in every case.
+          type: string
+          enum: [confirmed, unconfirmed, not_running]
 
     Sin90Proposal:
       type: object

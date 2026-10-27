@@ -72,6 +72,14 @@ export function cliRunner(bin = 'agent-speaker', timeoutMs = CONFIG.SPEAKER_TIME
     })
 }
 
+/** Runner for `hyphae groupchat history`. A non-absolute path throws before execFile. */
+export function groupCliRunner(bin: string, timeoutMs = CONFIG.SPEAKER_TIMEOUT_MS): SpeakerRunner {
+  if (!bin.startsWith('/')) {
+    throw new Error(`hyphae binary path is not pinned: ${bin}`)
+  }
+  return cliRunner(bin, timeoutMs)
+}
+
 /** `agent msg` result (envelope `data`). */
 export interface SendResult {
   event_id?: string
@@ -102,6 +110,15 @@ export interface InboundMessage {
   /** Sender npub — the allowlist / session key. */
   from: string
   content: string
+  event_id?: string
+  created_at?: number
+}
+
+/** One row from `hyphae groupchat history --json` (`data.messages[]`). */
+export interface GroupHistoryEntry {
+  id: string
+  sender: string
+  plaintext: string
   event_id?: string
   created_at?: number
 }
@@ -261,6 +278,93 @@ export class SpeakerClient {
         }
       })
   }
+
+  /** Read `hyphae groupchat history --json` for this identity. */
+  async groupHistory(groupId: string, limit = 20): Promise<GroupHistoryEntry[]> {
+    if (!this.identity) {
+      throw new Error('groupchat history requires an identity')
+    }
+    if (!groupId) {
+      throw new Error('groupchat history requires a group id')
+    }
+    const data = unwrap<unknown>(
+      await this.run([
+        'groupchat',
+        'history',
+        '--group-id',
+        groupId,
+        '--identity',
+        this.identity,
+        '--limit',
+        String(limit),
+        '--json',
+      ]),
+      'groupchat history',
+    )
+    const rows = Array.isArray(data) ? data : ((data as { messages?: unknown[] })?.messages ?? [])
+    return (rows as Record<string, unknown>[]).map((row) => {
+      const eventId =
+        typeof row.event_id === 'string' && row.event_id !== '' ? row.event_id : undefined
+      return {
+        id: String(row.id ?? ''),
+        sender: String(row.sender ?? row.sender_npub ?? ''),
+        plaintext: String(row.plaintext ?? ''),
+        event_id: eventId,
+        created_at: typeof row.created_at === 'number' ? row.created_at : undefined,
+      }
+    })
+  }
+
+  /** Enqueue one group body with `hyphae groupchat send --json`. */
+  async groupSend(groupId: string, body: string): Promise<GroupSendResult> {
+    if (!this.identity) {
+      throw new Error('groupchat send requires an identity')
+    }
+    if (!groupId) {
+      throw new Error('groupchat send requires a group id')
+    }
+    if (!body) {
+      throw new Error('groupchat send requires a body')
+    }
+    const data = unwrap<unknown>(
+      await this.run([
+        'groupchat',
+        'send',
+        '--group-id',
+        groupId,
+        '--body',
+        body,
+        '--identity',
+        this.identity,
+        '--json',
+      ]),
+      'groupchat send',
+    )
+    const row = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>
+    const recipients = Array.isArray(row.recipients) ? row.recipients : []
+    let eventId =
+      typeof row.event_id === 'string' && row.event_id !== '' ? row.event_id : undefined
+    if (!eventId) {
+      for (const item of recipients) {
+        if (!item || typeof item !== 'object') continue
+        const id = (item as Record<string, unknown>).event_id
+        if (typeof id === 'string' && id !== '') {
+          eventId = id
+          break
+        }
+      }
+    }
+    return {
+      logical_id: String(row.logical_id ?? ''),
+      event_id: eventId,
+    }
+  }
+}
+
+/** `groupchat send --json` data. `event_id` is the first recipient event id when the report has no top-level one. */
+export interface GroupSendResult {
+  logical_id: string
+  event_id?: string
 }
 
 interface Envelope {
