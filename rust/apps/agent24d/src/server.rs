@@ -1222,6 +1222,94 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .layer(middleware::from_fn_with_state(state, auth))
 }
 
+/// The legacy-mode `ready` line. With `omit_token` (B3 / S-04: the LaunchAgent
+/// persists stdout to a log file) the bearer is left out — it is still in the
+/// 0600 `daemon.json`, which is where the CLI of a service-run daemon reads it.
+fn legacy_ready_line(
+    port: u16,
+    token: &str,
+    omit_token: bool,
+    generation: &str,
+) -> serde_json::Value {
+    let mut ready = serde_json::json!({
+        "type": "ready",
+        "port": port,
+        "auth_mode": "legacy_single_token",
+        "generation": generation,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    if !omit_token {
+        ready["token"] = serde_json::json!(token);
+    }
+    ready
+}
+
+/// B1 (REVIEW-TODO PR-B, R4 / C-03): DNS-rebinding and browser-CSRF defence for
+/// the REST surface. Layered OUTSIDE [`build_router`] by `serve` (the only
+/// place the real bound port is known), so it runs before `auth` and covers
+/// `/api/v1/health` and the module reverse-proxy routes alike. It only inspects
+/// headers — the request reaching a module is untouched, and the proxy builds
+/// its own fixed upstream `Host` (`agent24-os-proto::proxy`).
+///
+/// - `Host` must be `127.0.0.1:{port}`, `localhost:{port}` or `[::1]:{port}`
+///   (ASCII case-insensitive); any other value is 403 `bad_host`, and no host
+///   at all (an HTTP/1.0 request) is 400 `bad_host`. (HTTP/2 carries the authority in the URI, which is used when there is no
+///   `Host` header.)
+/// - An `Origin` header other than the literal `null` is 403 `forbidden_origin`
+///   (browsers always send it on cross-origin requests; the CLI/desktop main
+///   process/bridges never do). `Origin: null` stays allowed here; the WS
+///   upgrade rejects any `Origin` itself.
+pub fn guard_host_origin(router: Router, port: u16) -> Router {
+    let allowed: StdArc<[String; 3]> = StdArc::new([
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ]);
+    router.layer(middleware::from_fn_with_state(allowed, host_origin_guard))
+}
+
+async fn host_origin_guard(
+    State(allowed): State<StdArc<[String; 3]>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()));
+    match host.as_deref() {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_host",
+                "A Host header is required",
+            );
+        }
+        Some(h) if !allowed.iter().any(|a| a.eq_ignore_ascii_case(h)) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "bad_host",
+                "Host header is not this daemon's loopback address",
+            );
+        }
+        Some(_) => {}
+    }
+    if req
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|o| o.as_bytes() != b"null")
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_origin",
+            "Browser-originated requests are not allowed",
+        );
+    }
+    next.run(req).await
+}
+
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -1318,6 +1406,7 @@ pub async fn serve(
     ephemeral: bool,
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
+    ready_omit_token: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
     validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
@@ -2481,14 +2570,9 @@ pub async fn serve(
         return Ok(());
     }
     let ready = match auth_mode {
-        AuthMode::LegacySingleToken => serde_json::json!({
-            "type": "ready",
-            "port": local.port(),
-            "token": token,
-            "auth_mode": "legacy_single_token",
-            "generation": daemon_generation,
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
+        AuthMode::LegacySingleToken => {
+            legacy_ready_line(local.port(), &token, ready_omit_token, &daemon_generation)
+        }
         AuthMode::Capabilities => {
             let product_host_token = product_host_token.ok_or_else(|| {
                 std::io::Error::new(
@@ -2526,6 +2610,7 @@ pub async fn serve(
     drop(ready);
 
     let graceful_cancel = cancel.clone();
+    let router = guard_host_origin(router, local.port());
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
 
@@ -3964,6 +4049,112 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- B1: Host / Origin guard --------------------------------------
+
+    async fn guarded_status(host: Option<&str>, origin: Option<&str>) -> (StatusCode, String) {
+        let router = guard_host_origin(build_router(state().await), 4242);
+        let mut b = Request::builder().uri("/api/v1/health");
+        if let Some(h) = host {
+            b = b.header(header::HOST, h);
+        }
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        let res = router
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let code = if status == StatusCode::OK {
+            String::new()
+        } else {
+            body_json(res).await["error"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned()
+        };
+        (status, code)
+    }
+
+    #[tokio::test]
+    async fn guard_accepts_the_three_loopback_hosts_case_insensitively() {
+        for h in [
+            "127.0.0.1:4242",
+            "localhost:4242",
+            "[::1]:4242",
+            "LocalHost:4242",
+        ] {
+            assert_eq!(guarded_status(Some(h), None).await.0, StatusCode::OK, "{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_wrong_host_even_on_health() {
+        for h in [
+            "evil.example:4242",
+            "127.0.0.1:4243",
+            "127.0.0.1",
+            "localhost.evil.com:4242",
+            "127.0.0.1:4242.evil.com",
+        ] {
+            let (s, c) = guarded_status(Some(h), None).await;
+            assert_eq!((s, c.as_str()), (StatusCode::FORBIDDEN, "bad_host"), "{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_a_request_with_no_host_as_400() {
+        let (s, c) = guarded_status(None, None).await;
+        assert_eq!((s, c.as_str()), (StatusCode::BAD_REQUEST, "bad_host"));
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_a_browser_origin_but_allows_null_and_none() {
+        let (s, c) = guarded_status(Some("127.0.0.1:4242"), Some("http://evil.example")).await;
+        assert_eq!((s, c.as_str()), (StatusCode::FORBIDDEN, "forbidden_origin"));
+        let (s, _) = guarded_status(Some("127.0.0.1:4242"), Some("null")).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = guarded_status(Some("127.0.0.1:4242"), None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guard_runs_before_auth_and_in_front_of_module_routes() {
+        // Wrong Host on an authenticated route is the guard's answer, not 401.
+        let router = guard_host_origin(build_router(state().await), 4242);
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header(header::HOST, "evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn legacy_ready_line_has_token_unless_told_to_omit_it() {
+        let with = legacy_ready_line(4242, "sekret", false, "g1");
+        assert_eq!(with["token"], "sekret");
+        assert_eq!(with["port"], 4242);
+        let without = legacy_ready_line(4242, "sekret", true, "g1");
+        assert!(without.get("token").is_none());
+        assert!(!without.to_string().contains("sekret"));
+        assert_eq!(without["type"], "ready");
+        assert_eq!(without["port"], 4242);
+        assert_eq!(without["auth_mode"], "legacy_single_token");
+    }
+
+    #[test]
+    fn serve_layers_the_host_guard_on_the_router_it_serves() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        assert!(src[start..].contains("guard_host_origin(router, local.port())"));
     }
 
     #[tokio::test]

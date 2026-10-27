@@ -92,6 +92,7 @@ pub fn render_plist(
         <string>serve</string>
         <string>--port</string>
         <string>0</string>
+        <string>--ready-omit-token</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -218,6 +219,33 @@ fn bootout_if_loaded() {
     let _ = launchctl(&["bootout", &target]);
 }
 
+/// S-04: the logs hold daemon output and a stray secret is one `tracing` line
+/// away, so the directory is owner-only (0700) and each file is created 0600
+/// BEFORE launchd opens it for `StandardOutPath` (launchd would otherwise create
+/// it with the umask default, typically 0644). Existing dirs/files are tightened.
+fn prepare_log_files(dir: &Path, files: &[&Path]) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("securing {}: {e}", dir.display()))?;
+        for f in files {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(f)
+                .map_err(|e| format!("creating {}: {e}", f.display()))?;
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("securing {}: {e}", f.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = files;
+    Ok(())
+}
+
 /// Install (or reinstall) the LaunchAgent and start it.
 pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     if !exec.exists() {
@@ -229,7 +257,9 @@ pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     }
     let plist = plist_path().ok_or("HOME not set")?;
     let logs = log_dir().ok_or("HOME not set")?;
-    std::fs::create_dir_all(&logs).map_err(|e| format!("creating {}: {e}", logs.display()))?;
+    let out_log = logs.join("agent24d.out.log");
+    let err_log = logs.join("agent24d.err.log");
+    prepare_log_files(&logs, &[&out_log, &err_log])?;
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
@@ -239,12 +269,7 @@ pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     bootout_if_loaded();
 
     let env = capture_env();
-    let body = render_plist(
-        exec,
-        &logs.join("agent24d.out.log"),
-        &logs.join("agent24d.err.log"),
-        &env,
-    );
+    let body = render_plist(exec, &out_log, &err_log, &env);
     std::fs::write(&plist, body).map_err(|e| format!("writing {}: {e}", plist.display()))?;
     // The captured env can include OMLX_API_KEY, so keep the plist owner-only.
     #[cfg(unix)]
@@ -318,6 +343,33 @@ mod tests {
         // output survives for diagnosis
         assert!(p.contains("/logs/out.log"));
         assert!(p.contains("/logs/err.log"));
+    }
+
+    #[test]
+    fn plist_tells_the_daemon_not_to_print_its_token_into_the_log() {
+        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &[]);
+        assert!(p.contains("<string>--ready-omit-token</string>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_dir_is_0700_and_log_files_0600_even_when_they_pre_exist() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("a24-logs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (out, err) = (logs.join("o.log"), logs.join("e.log"));
+        std::fs::write(&out, "old").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
+        prepare_log_files(&logs, &[&out, &err]).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&logs), 0o700);
+        assert_eq!(mode(&out), 0o600);
+        assert_eq!(mode(&err), 0o600);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
