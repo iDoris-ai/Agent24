@@ -6640,7 +6640,7 @@ export interface operations {
             content: {
                 "application/json": {
                     name: string;
-                    invitees?: string[];
+                    invitees: string[];
                     identity?: string;
                 };
             };
