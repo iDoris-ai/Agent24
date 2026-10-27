@@ -7,8 +7,8 @@
 //! it up, and its offset is written instead.
 //!
 //! The caller runs the writes as [`super::journal`] orders them and reports
-//! each back. New bindings are in `create`, identity changes in `identity`;
-//! calls and the start follow in later slices.
+//! each back. New bindings are in `create`, identity changes in `identity`,
+//! issuances in `issue`; calls and the start follow in later slices.
 
 use std::collections::HashMap;
 
@@ -24,6 +24,7 @@ use super::replay::Record;
 
 mod create;
 mod identity;
+mod issue;
 
 pub use create::Created;
 
