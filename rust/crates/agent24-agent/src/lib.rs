@@ -1477,17 +1477,22 @@ impl RunManager {
         // is the one this approval decided (settle from the row, no second ask);
         // any calls after it in the same fan-out were never approved, so they go
         // through the normal gate via run_tool_call (which may itself re-park).
+        // Only one call is settled: a provider can repeat an id within a turn,
+        // and a second call sharing it would otherwise run with no row of its
+        // own, so the peer view could not see it (K1-6b.5f-3, #1349 F1).
         let Some(unanswered) = unanswered_calls_of_last_turn(&messages) else {
             tracing::warn!("run {run_id}: no unanswered parked turn on resume; aborting");
             self.finish_cancelled(&run_id).await;
             return;
         };
+        let mut settled = false;
         for call in unanswered {
             if cancel.is_cancelled() {
                 self.finish_cancelled(&run_id).await;
                 return;
             }
-            let answer = if call.id == tool_call_id {
+            let answer = if !settled && call.id == tool_call_id {
+                settled = true;
                 if call.name.trim() == PROPOSE_PLAN {
                     // H8: the parked call is a plan approval (the only thing a
                     // plan-mode run can park on — read tools never gate, and no

@@ -673,4 +673,195 @@ mod tests {
         let (status, _) = get(&state, "/api/v1/peer/runs/run_missing").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// Answers every turn with plain text and no tool calls.
+    struct Done;
+
+    #[async_trait::async_trait]
+    impl agent24_models::ModelProvider for Done {
+        fn name(&self) -> &str {
+            "done"
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, agent24_models::ModelError> {
+            Ok(agent24_models::CompletionResponse {
+                message: agent24_models::Msg::assistant(Some("done".into()), vec![]),
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                },
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, agent24_models::ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    /// #1349 F1: a provider may repeat a call id within a turn. A run parked
+    /// on an approved fs_write whose turn also holds an http_fetch under the
+    /// same id must not settle both on resume: the fetch would run with no row
+    /// of its own, its refusal (which names the address a lookup resolved)
+    /// untagged, and the run relayed. The same run with the fs_write alone is
+    /// relayed, so the fixture would show a leak.
+    #[tokio::test]
+    async fn a_resumed_turn_that_repeats_a_call_id_is_still_withheld() {
+        for repeated in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let note = dir.path().canonicalize().unwrap().join("note.txt");
+            let state = AppState::new(crate::server::AppDeps {
+                token: "testtoken".to_owned(),
+                router: std::sync::Arc::new(agent24_models::router::ModelRouter::with_defaults(
+                    vec![(
+                        std::sync::Arc::new(Done)
+                            as std::sync::Arc<dyn agent24_models::ModelProvider>,
+                        agent24_models::router::Tier::Local,
+                    )],
+                )),
+                tools: agent24_tools::ToolRegistry::builtin(dir.path().to_path_buf()),
+                store: agent24_store::Store::open_memory().await.unwrap(),
+                shutdown: crate::server::Shutdown::new(tokio_util::sync::CancellationToken::new()),
+                guardian: None,
+                memory: None,
+                workspace_service: None,
+                mcp_servers: Vec::new(),
+                risk_overrides: std::sync::Arc::new(
+                    agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+                ),
+                packages_root: std::sync::Arc::new(dir.path().to_path_buf()),
+            });
+            let mut parked = run("run_dup", RunStatus::AwaitingApproval);
+            parked.output = None;
+            parked.ended_at = None;
+            state.store.insert_run(&parked).await.unwrap();
+            state
+                .store
+                .append_run_message(
+                    "run_dup",
+                    "user",
+                    Some("write it"),
+                    &serde_json::json!([]),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            tag(
+                &state,
+                "run_dup",
+                0,
+                SourceRef::user_input("run_dup", now_iso8601()),
+            )
+            .await;
+            // Both tools read only their own keys, so one set of arguments
+            // serves either call.
+            let args = serde_json::json!({
+                "path": note.to_str().unwrap(),
+                "content": "x",
+                "url": "http://localhost/",
+            });
+            let mut calls = vec![serde_json::json!({
+                "id": "call_dup", "name": "fs_write", "arguments": args.to_string(),
+            })];
+            if repeated {
+                calls.push(serde_json::json!({
+                    "id": "call_dup", "name": "http_fetch", "arguments": args.to_string(),
+                }));
+            }
+            state
+                .store
+                .append_run_message(
+                    "run_dup",
+                    "assistant",
+                    None,
+                    &serde_json::json!(calls),
+                    None,
+                    &now_iso8601(),
+                )
+                .await
+                .unwrap();
+            state
+                .store
+                .insert_tool_call(&agent24_protocol::ToolCall {
+                    id: "tc_parked".to_owned(),
+                    run_id: "run_dup".to_owned(),
+                    tool: "fs_write".to_owned(),
+                    input: args.as_object().unwrap().clone(),
+                    status: agent24_protocol::ToolCallStatus::Running,
+                    output_summary: None,
+                    started_at: now_iso8601(),
+                    ended_at: None,
+                })
+                .await
+                .unwrap();
+            state
+                .store
+                .insert_approval(&agent24_protocol::Approval {
+                    id: "apr_dup".to_owned(),
+                    run_id: "run_dup".to_owned(),
+                    tool_call_id: "tc_parked".to_owned(),
+                    kind: "write".to_owned(),
+                    summary: "fs_write".to_owned(),
+                    payload: args.as_object().unwrap().clone(),
+                    available_decisions: vec!["approve".to_owned(), "deny".to_owned()],
+                    standing_target: None,
+                    status: agent24_protocol::ApprovalStatus::Pending,
+                    decision: None,
+                    expires_at: agent24_core::util::iso8601_after(std::time::Duration::from_secs(
+                        30,
+                    )),
+                    created_at: now_iso8601(),
+                    decided_at: None,
+                })
+                .await
+                .unwrap();
+            state
+                .broker
+                .resolve(
+                    "apr_dup",
+                    agent24_protocol::Decision {
+                        kind: "approve".to_owned(),
+                        reason: None,
+                        extra: serde_json::Map::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            state
+                .runs
+                .resume_run("run_dup".to_owned(), "apr_dup".to_owned())
+                .await
+                .unwrap();
+            // Resumed: it ends, or parks again on a call it has not been
+            // allowed yet.
+            let mut settled = None;
+            for _ in 0..200 {
+                let run = state.store.get_run("run_dup").await.unwrap().unwrap();
+                let reparked = run.status == RunStatus::AwaitingApproval
+                    && state.store.list_tool_calls("run_dup").await.unwrap().len() > 1;
+                if agent24_core::run_is_terminal(run.status) || reparked {
+                    settled = Some(run);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let settled = settled.expect("the resumed run never settled");
+            assert!(note.exists(), "the approved write ran: {settled:?}");
+            let (view, body) = peer_run(&state, "run_dup").await;
+            if repeated {
+                assert_withheld(&view, &body);
+            } else {
+                assert_eq!(settled.status, RunStatus::Completed, "{body}");
+                assert!(!view.withheld, "{body}");
+            }
+        }
+    }
 }
