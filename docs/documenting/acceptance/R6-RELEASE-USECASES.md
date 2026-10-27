@@ -126,25 +126,27 @@ R 组用 U1 导入的文档（EPA 煮沸通知，第 1 页 17 个块，「boil�
 
 | ID | 做什么 | 期望 |
 |---|---|---|
-| R1 | `text <doc> 1 --limit 2`，再用它的 `next_cursor` 读下一页 | 每页两个块，两页合起来正是 O6 整页读取的前 4 个块（这就是文字分页） |
+| R1 | `text <doc> 1 --limit 2`，再用它的 `next_cursor` 读下一页 | 每页正好两个块，两页合起来正是 O6 整页读取的前 4 个块（这就是文字分页） |
 | R2 | `text <doc> 1 --block <O6 的第 3 个块> --limit 1` | 正好是那个块，文字也相同 |
-| R3 | `text --block … --cursor … --json` | 退出 1，一行 result，400 `invalid_request`，提示 `give block or cursor, not both` |
-| R4 | `find <doc> 1 boil --json` | 至少 2 个匹配；每个都是本文档第 1 页的锚点，`quote` 含这个词（不分大小写） |
-| R5 | `find --limit 1`，再用 `--cursor` 取下一页 | 第一页是 R4 的第 1 个匹配，第二页是第 2 个（按 `block_id` 和起点比较） |
-| R6 | `find` 一个不存在的词 | 退出 0，没有匹配，`next_cursor` 为 null |
-| R7 | `render <doc> 1 1 --out <文件>` | 退出 0；文件是 PNG（签名对），612×792（scale 1 的 US Letter）；输出里的 `scale` 是 1.0，`written_to` 是这个文件 |
-| R8 | `render --scale 0.5 --region 0,0,100,50 --json` | `media_type` 是 `image/png`，`scale` 0.5，`bytes` 等于解码后的大小；解出的 PNG 是 50×25 |
+| R3 | `text --block … --cursor … --json` | 退出 1，stdout 只有一行 result，400 `invalid_request`，提示 `give block or cursor, not both` |
+| R4 | `find <doc> 1 boil --json` | 至少 2 个匹配；每个都是本文档第 1 页的锚点，带 `block_id` 和起点，`quote` 含这个词（不分大小写） |
+| R5 | `find --limit 1`，再用 `--cursor` 取下一页 | 每页正好一个匹配：第一页是 R4 的第 1 个，第二页是第 2 个（按 `block_id` 和起点比较；R4 拿不到这两个时判失败） |
+| R6 | `find` 一个不存在的词 | 退出 0，`matches` 是空数组，`next_cursor` 在且为 null |
+| R7 | `render <doc> 1 1 --out <文件>` | 退出 0；文件是 PNG（签名对），612×792（scale 1 的 US Letter）；输出里的 `scale` 等于 1（按数值比较），`written_to` 是这个文件 |
+| R8 | `render --scale 0.5 --region 0,0,100,50 --json` | 一行 result，`media_type` 是 `image/png`，`scale` 0.5，`bytes` 等于解码后的大小；解出的 PNG 是 50×25 |
 | R9 | `render` 第 99 页 | 退出 1，404 `not_found` |
 | R10 | `render --out` 到一个不存在的目录 | 退出 1，400 `file_unwritable`，什么都没建 |
-| R11 | `extract <doc> 1 --schema ask.json`，再 `cancel` 这个作业 | 打出 `extract job job_… (queued 或 running)`；作业的 `kind` 是 `extract`；取消后作业停在 `cancelled`。不需要模型：作业在问模型之前就被取消 |
-| R12 | `extract --rerun`，不带 `--key` | 退出 1，一行 result，400，`the Idempotency-Key header is required` |
+| R11 | `extract <doc> 1 --schema ask.json`，再 `cancel` 这个作业 | 打出 `extract job job_… (queued 或 running)`；作业的 `kind` 是 `extract`；取消后作业停在 `cancelled`。不需要模型：判的是作业建出来和取消后的结局，不判抽取出的值（本机没有模型时，作业一直停在 `running` 等模型，实测 40 秒以上） |
+| R12 | `extract --rerun`，不带 `--key` | 退出 1，stdout 只有一行 result，400，`the Idempotency-Key header is required` |
 | R13 | `extract --key k1`，不带 `--rerun` | 退出 1，400 `invalid_request`，`--key names a rerun; give --rerun with it`（不会被静默忽略） |
 | R14 | `extract --schema` 一个不是 JSON 的文件 | 退出 1，400 `the schema is not JSON`，请求没有发出 |
 | R15 | `extraction ext_000…` | 退出 1，404 `no such extraction` |
-| R16 | 按桌面端的传法 `request --host-stdin --json` 发 `find` | 一行 result，匹配数与 R4 相同 |
+| R16 | 按桌面端的传法 `request --host-stdin --json` 发 `find` | 一行 result，`matches` 是数组，个数与 R4 相同（R4 少于 2 个时判失败） |
 | R17 | 按桌面端的传法发 `renderPage`（scale 0.25） | 一行 result，`image/png`，`scale` 0.25；`png` 解码后是 153×198 的 PNG |
 
-`extract` 跑完要用本地模型，本脚本声明不需要模型，所以 R 组只验到作业建出来和取消为止。抽取结果的值由模块测试和 S01 harness（`packages/documents-accept`）覆盖。
+R3、R8、R12–R17 用 `--json`，都判 stdout 只有一行（错误提示在 stderr）。
+
+`extract` 跑完要用本地模型，本脚本声明不需要模型，所以 R 组只验到作业建出来和取消为止（作业若先因别的原因失败，失败的作业也能取消，所以 R11 不证明取消发生在问模型之前）。抽取结果的值由模块测试和 S01 harness（`packages/documents-accept`）覆盖。
 
 ## 从 r5 升级（M1–M7，带 `--old` 时跑）
 
