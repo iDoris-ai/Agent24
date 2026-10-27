@@ -4,37 +4,42 @@
 # the daemon's HTTP API only where no product entry exists (T1, T2). Cases and
 # the release scope: docs/documenting/acceptance/R6-RELEASE-USECASES.md.
 #
-#   scripts/doc1-r6-accept.sh --bin <bin dir> [--work <dir>]
+#   scripts/doc1-r6-accept.sh --bin <bin dir> [--old <main bin dir>] [--work <dir>]
 #
 # The bin dir holds `agent24`, `agent24d` and `agent24-documents`
-# (`cargo build -p agent24-cli -p agent24d -p agent24-documents`). Run it from
+# (`cargo build -p agent24-cli -p agent24d -p agent24-documents`); --old the
+# same three built from main (r5), for the upgrade cases M1-M6. Run it from
 # the release checkout: the package is assembled from the domain-os.yml, the
 # pdfkit engine sources and the samples found here. macOS only (the engine).
 # The daemon runs on its own AGENT24_DATA_DIR under --work; Z1 checks the
 # user's ~/.agent24, so stop your own daemon first. No model is needed.
-# Needs jq, curl, perl, python3 and swiftc (engines/pdfkit/build.sh).
+# Needs jq, curl, perl, python3 and swiftc (engines/pdfkit/build.sh); with
+# --old, sqlite3 too (M4 reads the migrations, which have no product entry).
 set -uo pipefail
 export LC_ALL=C
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 
-BIN="" WORK=""
+BIN="" OLD="" WORK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin) BIN=$2; shift 2 ;;
+    --old) OLD=$2; shift 2 ;;
     --work) WORK=$2; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$BIN" ] || { sed -n 2,14p "$0" >&2; exit 2; }
+[ -n "$BIN" ] || { sed -n 2,17p "$0" >&2; exit 2; }
 for b in agent24 agent24d agent24-documents; do
   [ -x "$BIN/$b" ] || { echo "missing binary: $BIN/$b" >&2; exit 2; }
+  [ -z "$OLD" ] || [ -x "$OLD/$b" ] || { echo "missing binary: $OLD/$b" >&2; exit 2; }
 done
-for t in jq curl perl python3; do
+for t in jq curl perl python3 ${OLD:+sqlite3}; do
   command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
 done
 resolve() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 BIN=$(resolve "$BIN")
+[ -z "$OLD" ] || OLD=$(resolve "$OLD")
 REAL=$(resolve "${HOME:-/nonexistent}/.agent24")
 WORK=$(resolve "${WORK:-${TMPDIR:-/tmp}/doc1-r6-accept.$$}")
 case "$WORK/" in "$REAL"/*) echo "--work must not be inside $REAL" >&2; exit 2 ;; esac
@@ -297,6 +302,91 @@ check N4 "a malformed request with no daemon: invalid_request, not backend_not_r
 
 printf 'not json' | limit 60 "$BIN/agent24" documents import --host-stdin --json > "$WORK/n5.out" 2>/dev/null; rc=$?
 check N5 "--host-stdin --json with bad input: a result line, invalid_request" "$(is "$rc/$(last "$WORK/n5.out" '"\(.type)/\(.error.code)"')" 1/result/invalid_request)" "rc=$rc; $(cut -c1-100 "$WORK/n5.out")"
+
+# --- M: upgrading from r5 (main), only with --old ------------------------------------
+# r5's CLI has no `documents`: its side is driven with its own `os` and
+# `daemon`, and documents through this release's CLI, a REST client of the API
+# r5 already served (the r5 desktop's calls).
+if [ -n "$OLD" ]; then
+  export AGENT24_DATA_DIR="$WORK/up/data"
+  DB=$AGENT24_DATA_DIR/os/documents/documents.db
+  OLDPKG=$WORK/oldpkg; mkdir -p "$OLDPKG/bin"
+  cp "$REPO/rust/apps/agent24-documents/domain-os.yml" "$OLDPKG/"
+  cp "$OLD/agent24-documents" "$PKG/bin/agent24-documents-pdfkit" "$OLDPKG/bin/"
+  # ready: the documents module answers within 30 s (P3).
+  ready() {
+    for _ in $(seq 1 150); do a24 documents capabilities > /dev/null 2>&1 && return 0; sleep 0.2; done
+    return 1
+  }
+  dbv() { sqlite3 "$DB" 'SELECT max(version) || "/" || min(success) FROM _sqlx_migrations' 2>/dev/null; }
+  dump() { sqlite3 "$DB" .dump 2>/dev/null | shasum | cut -c1-16; }
+
+  limit 120 "$OLD/agent24" os install "$OLDPKG" > "$WORK/m1.out" 2>&1; r1=$?
+  PATH="$OLD:$PATH" limit 60 "$OLD/agent24" daemon start >> "$WORK/m1.out" 2>&1; r2=$?
+  ready; r3=$?
+  a24 documents import "$SMALL" > "$WORK/m1i.out" 2>/dev/null; JOBM=$(job_of "$WORK/m1i.out")
+  stm=$(settle "$JOBM")
+  DOCM=$(a24 documents job "$JOBM" --json 2>/dev/null | tail -n 1 | jq -r '.data.document_id // empty')
+  a24 documents text "$DOCM" 1 --json > "$WORK/m1t.out" 2>/dev/null
+  blocks=$(last "$WORK/m1t.out" '.data.blocks | length')
+  limit 60 "$OLD/agent24" daemon stop >> "$WORK/m1.out" 2>&1
+  for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
+  v5=$(dbv)
+  check M1 "r5 builds a library: install, start, import a PDF, read its text" \
+    "$(is "$r1/$r2/$r3/$stm/$([ "${blocks:-0}" -ge 1 ] && echo y)/${v5%%/*}" "0/0/0/succeeded/y/6")" \
+    "r5 migrations $v5; $DOCM, $blocks blocks"
+
+  # The upgrade as a user does it: `os install` refuses a name already there.
+  a24 os uninstall documents > "$WORK/m2.out" 2>&1; r1=$?
+  a24 os install "$PKG" >> "$WORK/m2.out" 2>&1; r2=$?
+  PATH="$BIN:$PATH" limit 60 "$BIN/agent24" daemon start >> "$WORK/m2.out" 2>&1; r3=$?
+  ready; r4=$?
+  check M2 "upgrade: os uninstall, os install the r6 package, daemon start" "$(is "$r1/$r2/$r3/$r4" 0/0/0/0)" \
+    "rc=$r1/$r2/$r3/$r4; $(grep -E '^(removed|installed|daemon started)' "$WORK/m2.out" | cut -c1-40 | tr '\n' ' ')"
+
+  st=$(settle "$JOBM")
+  a24 documents text "$DOCM" 1 --json > "$WORK/m3t.out" 2>/dev/null; rc=$?
+  check M3 "r5's document, job and text are all there" \
+    "$(is "$st/$rc/$(last "$WORK/m3t.out" '.data.blocks | length')/$(a24 documents get "$DOCM" 2>/dev/null | jq -r .head_revision)" "succeeded/0/$blocks/1")" \
+    "job $st; $(last "$WORK/m3t.out" '.data.blocks | length') blocks"
+
+  v6=$(dbv)
+  check M4 "the documents library migrated to 0008, every step a success" "$(is "$v6" 8/1)" "r5 $v5 → r6 $v6"
+
+  a24 documents import "$OTHER" > "$WORK/m5.out" 2>/dev/null; st=$(settle "$(job_of "$WORK/m5.out")")
+  a24 documents list --json > "$WORK/m5l.out" 2>/dev/null
+  check M5 "on the upgraded library: a new import, then both are listed" \
+    "$(is "$st/$(last "$WORK/m5l.out" '.data.documents | length')" succeeded/2)" "import $st; $(last "$WORK/m5l.out" '.data.documents | length') documents"
+
+  # Rolling back: r5 cannot read a library r6 migrated, and must not write it.
+  limit 60 "$BIN/agent24" daemon stop > "$WORK/m6.out" 2>&1
+  for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
+  h1=$(dump)
+  a24 os uninstall documents >> "$WORK/m6.out" 2>&1
+  limit 120 "$OLD/agent24" os install "$OLDPKG" >> "$WORK/m6.out" 2>&1
+  PATH="$OLD:$PATH" limit 60 "$OLD/agent24" daemon start >> "$WORK/m6.out" 2>&1; r1=$?
+  st=""
+  for _ in $(seq 1 150); do
+    a24 documents list --json > "$WORK/m6l.out" 2>/dev/null
+    st=$(last "$WORK/m6l.out" '.error.code // "listed"')
+    [ "$st" = module_not_ready ] || break
+    sleep 0.2
+  done
+  limit 60 "$OLD/agent24" daemon stop >> "$WORK/m6.out" 2>&1
+  for _ in $(seq 1 40); do [ -s "$AGENT24_DATA_DIR/daemon.json" ] || break; sleep 0.5; done
+  h2=$(dump)
+  check M6 "back to r5: the library refused (storage_unavailable), not changed" \
+    "$(is "$r1/$st/$h2" "0/storage_unavailable/$h1")" "rc=$r1; $(last "$WORK/m6l.out" .error.message); dump $h1 → $h2"
+
+  a24 os uninstall documents > "$WORK/m7.out" 2>&1
+  a24 os install "$PKG" >> "$WORK/m7.out" 2>&1
+  PATH="$BIN:$PATH" limit 60 "$BIN/agent24" daemon start >> "$WORK/m7.out" 2>&1; r1=$?
+  ready; r2=$?
+  a24 documents list --json > "$WORK/m7l.out" 2>/dev/null
+  check M7 "r6 again: the library as it was, both documents" "$(is "$r1/$r2/$(last "$WORK/m7l.out" '.data.documents | length')" 0/0/2)" \
+    "rc=$r1/$r2; $(last "$WORK/m7l.out" '.data.documents | length') documents"
+  limit 60 "$BIN/agent24" daemon stop > /dev/null 2>&1
+fi
 
 snapshot > "$WORK/.real-after"
 z1=$(cmp -s "$WORK/.real-before" "$WORK/.real-after" && echo ok || echo fail)

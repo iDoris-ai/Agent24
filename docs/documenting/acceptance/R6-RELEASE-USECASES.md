@@ -5,10 +5,11 @@
 - **怎么跑**：在发布 head 的 checkout 里运行下面的命令。脚本从这个 checkout 取 `domain-os.yml`、pdfkit 引擎源码和 S01 样本来组装 documents 包。
 
   ```
-  scripts/doc1-r6-accept.sh --bin <二进制目录> [--work <目录>]
+  scripts/doc1-r6-accept.sh --bin <二进制目录> [--old <main 的二进制目录>] [--work <目录>]
   ```
 
   - 二进制目录里要有 `agent24`、`agent24d`、`agent24-documents`（`cargo build -p agent24-cli -p agent24d -p agent24-documents`）。
+  - `--old` 指向用 main（r5）编出的同样三个二进制。给了它，才跑升级用例 M1–M7（见「从 r5 升级」一节），这时还需要 sqlite3。发布验收要带上它。
   - 脚本逐条打出 PASS、KNOWN 或 FAIL，并在工作目录写 `report.md`。有一条 FAIL 就以非 0 退出；KNOWN 不算失败。
 - **按用户的操作走**：
   - 包按模块 README 的方式组装：`domain-os.yml`、模块二进制，再加上 `engines/pdfkit/build.sh` 编出的读取引擎。
@@ -21,7 +22,7 @@
 - **不碰用户数据**：daemon 和 CLI 都用工作目录下的 `AGENT24_DATA_DIR`，调用者 shell 里的 `A24_*`、`AGENT24_*` 以及 `AGENT24D_BIN` 这类变量全部清掉，不然 CLI 会起 `AGENT24D_BIN` 指的那个 daemon，而不是 `--bin` 里的。Z1 比较 `~/.agent24` 下每一项的路径、大小和修改时间，运行前后必须完全一样，有读不了的项也算失败；脚本发现自己的 daemon 在跑时，会在创建任何东西之前直接拒绝运行。`--work` 不能在 `~/.agent24` 下面，必须不存在或为空。
 - **不留进程**：脚本无论怎样退出，都会 `agent24 daemon stop` 停掉自己起的 daemon。停不掉时，按状态文件里的 pid 强杀。
 - **不需要模型**：抽取要用模型，但它只能由 agent 工具触发，不在本次发布的对外范围内（见 T1）。
-- **依赖**：macOS（pdfkit 引擎）、swiftc、jq、curl、perl（给 CLI 限时、计时）、python3（解析路径）。
+- **依赖**：macOS（pdfkit 引擎）、swiftc、jq、curl、perl（给 CLI 限时、计时）、python3（解析路径）；带 `--old` 时还要 sqlite3。
 
 ## 模块就绪要等一下
 
@@ -96,6 +97,30 @@
 | N5 | `import --host-stdin --json`，stdin 不是 JSON | 退出 1，一行 result，`invalid_request` |
 | Z1 | 比较 `~/.agent24` 运行前后每一项的路径、大小、修改时间 | 完全一样 |
 
+## 从 r5 升级（M1–M7，带 `--old` 时跑）
+
+r6 给 documents 库加了迁移 0007、0008（`job_acceptances`、`job_revocations`，都是新表，不改已有的表）。这几条用另一个全新的数据目录，先让 r5 建库，再按用户的步骤升级，最后试一次退回 r5。
+
+- **r5 那边怎么驱动**：r5 的 CLI 没有 `documents`，所以 r5 的安装和启动用它自己的 `os install`、`daemon start`；导入和读取用本次的 CLI，它只是 REST 客户端，调的是 r5 本来就提供的接口（r5 的桌面端也这样调）。
+- **r5 的包**：`domain-os.yml` 和 pdfkit 引擎从 r5 到 r6 没有变（`git diff origin/main` 为空），只换模块二进制。
+- **升级步骤**：`agent24 os install` 不覆盖已装的同名包，会提示先卸载；`agent24 os uninstall` 只删 `packages/documents` 下的包文件，不动 `os/documents` 下的数据。所以用户的升级步骤是：停 daemon → `os uninstall documents` → `os install <r6 的包>` → `daemon start`。release 说明要写明这一步。
+- **只有 M1、M4 直接读库**：迁移版本没有对外接口，用 sqlite3 读 `_sqlx_migrations`；M6 比较库的 `.dump` 哈希。
+
+| ID | 做什么 | 期望 |
+|---|---|---|
+| M1 | 用 r5 安装、启动，导入一个 PDF，读它的文字 | 都成功；库的迁移在 6 |
+| M2 | 停掉 r5，`os uninstall documents`，`os install` r6 的包，`daemon start` | 都退出 0，模块 30 秒内回答 |
+| M3 | 读 r5 导入的作业、文档和文字 | 作业 `succeeded`，`head_revision` 1，文字块数与 r5 读到的相同 |
+| M4 | 读迁移记录 | 最高到 8，每一步都成功（和 M1 的 6 合起来，证明确实从 6 迁到了 8） |
+| M5 | 在升级后的库上再导入一个 | 成功，列表里两个文档 |
+| M6 | 停掉 r6，装回 r5 的包再启动，`documents list` | r5 不认这个库，返回 `storage_unavailable`（提示语是 corrupt）；库的 `.dump` 前后一样，r5 什么都没写 |
+| M7 | 再装回 r6 | 两个文档都在 |
+
+M6 是退回旧版的已知行为，不是缺陷：r5 打不开 r6 迁移过的库，只是提示语写的是 corrupt，容易让人以为库坏了。数据没有动，装回 r6 就恢复（M7）。release 说明里写明：升级后不要退回 r5。
+
 ## 反面对照
 
-拿上一次发布的二进制（main）跑同一个脚本，确认用例真会失败。main 的 `agent24` 没有 `documents` 子命令，所以除了不依赖它的 P1、P2、T2、Z1，其余用例都应该是 FAIL。结果写在发布 PR 里。
+- 拿上一次发布的二进制（main）当 `--bin` 跑同一个脚本，确认用例真会失败。main 的 `agent24` 没有 `documents` 子命令，所以除了不依赖它的 P1、P2、T2、Z1，其余用例都应该是 FAIL。
+- 升级用例另做一次：`--old` 也指向 r6 的二进制。这时 M1（库已经在 8）和 M6（不会被拒）应该是 FAIL。
+
+结果写在发布 PR 里。
