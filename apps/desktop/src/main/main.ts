@@ -3,6 +3,7 @@
 import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, type BackendStatus } from './backend-manager'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
@@ -60,10 +61,22 @@ const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL ?? 'http://localhost:5173
 const DEV_SERVER_ORIGIN = new URL(DEV_SERVER_URL).origin
 const DEV_SERVER_WS_ORIGIN = DEV_SERVER_ORIGIN.replace(/^http/, 'ws')
 
+// A3: what counts as "the app's own page" for IPC sender checks and the main
+// window's navigation guard — the vite dev server in dev, exactly the bundled
+// renderer index.html when packaged.
+const isAppUrl = createAppUrlPolicy({
+  ...(isDev ? { devServerUrl: DEV_SERVER_URL } : {}),
+  rendererIndexPath: path.join(__dirname, '../renderer/index.html'),
+})
+
 // Keep tray reference alive — GC would destroy it otherwise
 let tray: Tray | null = null
 // Mutable reference so tray handlers always point to the current window
 let mainWin: BrowserWindow | null = null
+// A3: wraps every ipcMain.handle — the call must come from mainWin's main frame
+// while it shows the app's own page. The Creative WebContentsView (a different
+// WebContents, remote content) therefore can never reach these handlers.
+const guard = createIpcGuard({ getMainWindow: () => mainWin, isTrustedUrl: isAppUrl })
 // Set to true by before-quit so win.on('close') guard is skipped on app exit
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
@@ -180,6 +193,12 @@ function createMainWindow(): BrowserWindow {
 
   win.once('ready-to-show', () => win.show())
 
+  // A3: the main window only ever shows the app itself. Navigation elsewhere is
+  // blocked; http(s) targets open in the system browser, window.open is denied.
+  installNavigationGuards(win.webContents, isAppUrl, (url) => {
+    shell.openExternal(url).catch((err) => console.error('openExternal failed', err))
+  })
+
   // While the tray is active and app is not quitting, intercept close → hide.
   // isQuitting is set in before-quit so Cmd+Q / app-menu Quit work normally.
   win.on('close', (e) => {
@@ -291,24 +310,24 @@ app.whenReady().then(async () => {
     })
   })
 
-  registerIpcHandlers({ idorisStatus })
+  registerIpcHandlers({ idorisStatus, guard })
   mainWin = createMainWindow()
-  ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
-  ipcMain.handle(IpcChannels.CreativeRestart, (_event, bounds: CreativeViewBounds) => restartCreativeView(bounds))
-  ipcMain.handle(IpcChannels.CreativeBounds, (_event, bounds: CreativeViewBounds) => {
+  ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
+  ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
+  ipcMain.handle(IpcChannels.CreativeBounds, guard((_event, bounds: CreativeViewBounds) => {
     if (creativeViewFence.wantsVisible() && creativeOrigin && creativeView && !creativeView.webContents.isDestroyed()) {
       creativeView.setBounds(normalizedBounds(bounds))
     }
-  })
-  ipcMain.handle(IpcChannels.CreativeHide, () => hideCreativeView())
-  ipcMain.handle(IpcChannels.OpenDesignComponentStatus, () => openDesignComponent?.status()
-    ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' })
-  ipcMain.handle(IpcChannels.OpenDesignComponentInstall, () => openDesignComponent?.install()
-    ?? Promise.resolve({ state: 'unavailable', reason: 'Open Design component installer is unavailable' }))
-  ipcMain.handle(IpcChannels.OpenDesignComponentPause, () => {
+  }))
+  ipcMain.handle(IpcChannels.CreativeHide, guard(() => hideCreativeView()))
+  ipcMain.handle(IpcChannels.OpenDesignComponentStatus, guard(() => openDesignComponent?.status()
+    ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }))
+  ipcMain.handle(IpcChannels.OpenDesignComponentInstall, guard(() => openDesignComponent?.install()
+    ?? Promise.resolve({ state: 'unavailable', reason: 'Open Design component installer is unavailable' })))
+  ipcMain.handle(IpcChannels.OpenDesignComponentPause, guard(() => {
     openDesignComponent?.pause()
     return openDesignComponent?.status() ?? { state: 'unavailable', reason: 'Open Design component installer is unavailable' }
-  })
+  }))
   openDesignComponent?.onProgress((status) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.OpenDesignComponentProgress, status)
@@ -319,7 +338,7 @@ app.whenReady().then(async () => {
   // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice
   // panel's log. Registered once here — the log itself is process-lifetime,
   // not per-window, so no cleanup needed on window recreation.
-  ipcMain.handle(IpcChannels.AgentEarSnapshot, () => agentEarLog.snapshot())
+  ipcMain.handle(IpcChannels.AgentEarSnapshot, guard(() => agentEarLog.snapshot()))
   agentEarLog.subscribe((envelope) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.AgentEarEvent, envelope)
@@ -327,7 +346,7 @@ app.whenReady().then(async () => {
   })
 
   // ME4-desktop-model-ui: same pull+push pair, for model-call-log.ts.
-  ipcMain.handle(IpcChannels.ModelCallSnapshot, () => modelCallLog.snapshot())
+  ipcMain.handle(IpcChannels.ModelCallSnapshot, guard(() => modelCallLog.snapshot()))
   modelCallLog.subscribe((call) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.ModelCallEvent, call)

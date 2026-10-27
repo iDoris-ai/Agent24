@@ -25,6 +25,7 @@ mod allocation_types;
 mod audit;
 mod decision_log;
 mod legacy_recovery;
+mod message_origin;
 mod model_call_timings;
 mod module_approvals;
 mod module_audit_event;
@@ -74,6 +75,10 @@ pub use decision_log::{
 };
 pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
+};
+pub use message_origin::{
+    MESSAGE_ORIGIN_SCHEMA_VERSION, MessageOrigin, MessageOriginLookup, OriginatedRunMessage,
+    SnapshotRunMessage, StoredMessageOrigin, message_instance_digest,
 };
 pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
 pub use module_audit_event::{

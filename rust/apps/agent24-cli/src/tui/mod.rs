@@ -40,17 +40,7 @@ impl Conn {
     /// answers with a 3xx, since the daemon itself never redirects) would
     /// otherwise ship the bearer token off-box.
     fn client(&self) -> reqwest::Client {
-        #[expect(
-            clippy::expect_used,
-            reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
-                      redirect-following client FU-74 exists to rule out; fail closed instead"
-        )]
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("building the loopback-only daemon HTTP client failed")
+        agent24_protocol::client::loopback_client(Duration::from_secs(2))
     }
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

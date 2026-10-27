@@ -61,7 +61,11 @@ fn status(port: u16, method: &str, path: &str, bearer: Option<&str>, body: Optio
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("response timeout");
-    write!(stream, "{method} {path} HTTP/1.1\r\nhost: localhost\r\n").expect("capability request");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nhost: localhost:{port}\r\n"
+    )
+    .expect("capability request");
     if let Some(bearer) = bearer {
         write!(stream, "authorization: Bearer {bearer}\r\n").expect("capability request");
     }
@@ -99,7 +103,7 @@ fn upgrade_status(port: u16, bearer: Option<&str>) -> u16 {
     write!(
         stream,
         "GET /api/v1/events HTTP/1.1\r\n\
-         host: localhost\r\n\
+         host: localhost:{port}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Version: 13\r\n\
