@@ -279,7 +279,8 @@ async fn import(path: Option<PathBuf>, json: bool, host_stdin: bool) -> Result<(
     let mut shown = false;
     let mut on_progress = |p: Progress| {
         if json {
-            say(json!({"type": "progress", "sent": p.sent, "total": p.total}));
+            // A progress line that cannot be written is not the result.
+            let _ = say(json!({"type": "progress", "sent": p.sent, "total": p.total}));
         } else {
             let _ = write!(std::io::stderr(), "\rsent {} of {} bytes", p.sent, p.total);
             shown = true;
@@ -292,11 +293,22 @@ async fn import(path: Option<PathBuf>, json: bool, host_stdin: bool) -> Result<(
     report(&res, json)
 }
 
-/// A line on stdout. A reader that went away (the desktop closing the
-/// pipe, `| head`) is no reason to panic: the exit code still says how it
-/// went, and an import already sent goes on in the daemon.
-fn say(line: impl std::fmt::Display) {
-    let _ = writeln!(std::io::stdout().lock(), "{line}");
+/// A line on stdout.
+fn say(line: impl std::fmt::Display) -> Result<(), String> {
+    say_to(std::io::stdout().lock(), line)
+}
+
+/// A reader that went away (the desktop closing the pipe, `| head`) is no
+/// reason to panic or to fail: the exit code still says how it went, and an
+/// import already sent goes on in the daemon. Any other failure to write (a
+/// full disk) is an error, so a result nobody got never exits 0.
+fn say_to(mut out: impl Write, line: impl std::fmt::Display) -> Result<(), String> {
+    match writeln!(out, "{line}") {
+        Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err("stdout could not be written".to_owned())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The result as one JSON line, or for a person (an import job as one
@@ -306,12 +318,12 @@ fn report(res: &Response, json: bool) -> Result<(), String> {
     if json {
         let mut line = res.to_json();
         line["type"] = json!("result");
-        say(line);
+        say(line)?;
     }
     match res {
         Response::Ok { data, .. } => {
             if !json {
-                say(for_a_person(data));
+                say(for_a_person(data))?;
             }
             Ok(())
         }
@@ -397,6 +409,29 @@ mod tests {
         ] {
             assert_eq!(against_daemon(&req).await, refused(), "{req}");
         }
+    }
+
+    struct Failing(std::io::ErrorKind);
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_a_reader_that_went_away_is_not_a_failure_to_write() {
+        assert_eq!(say_to(Failing(std::io::ErrorKind::BrokenPipe), "x"), Ok(()));
+        assert_eq!(
+            say_to(Failing(std::io::ErrorKind::StorageFull), "x").unwrap_err(),
+            "stdout could not be written"
+        );
+        let mut buf = Vec::new();
+        assert_eq!(say_to(&mut buf, "line"), Ok(()));
+        assert_eq!(buf, b"line\n");
     }
 
     #[test]
