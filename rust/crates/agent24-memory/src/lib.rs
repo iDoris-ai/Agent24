@@ -19,6 +19,7 @@ mod eval_m1;
 pub mod event;
 pub mod knowledge;
 pub mod reconcile;
+pub mod rejections;
 pub mod replay;
 pub mod retriever;
 pub mod session;
@@ -388,6 +389,8 @@ pub struct KvStore {
     /// wrong one with the wrong pool). The ephemeral/file-backed split is now
     /// guaranteed by the two constructors below, not by caller convention.
     oop_admission: Option<Arc<tokio::sync::Semaphore>>,
+    /// P1-02c c3: lazily started bounded audit queue (shared by every clone).
+    rejection_queue: Arc<std::sync::OnceLock<Arc<rejections::QueuedRejections>>>,
     /// P1-02c c4: pre-write disk check, bound to this database's volume.
     /// Disabled for [`KvStore::open_memory`].
     disk: disk_gate::DiskGate,
@@ -424,6 +427,7 @@ impl KvStore {
             oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
                 (KVSTORE_MAX_CONNECTIONS - 1) as usize,
             ))),
+            rejection_queue: Default::default(),
             disk: disk_gate::DiskGate::for_path(path),
         })
     }
@@ -454,6 +458,7 @@ impl KvStore {
         Ok(Self {
             pool,
             oop_admission: None,
+            rejection_queue: Default::default(),
             disk: disk_gate::DiskGate::disabled(),
         })
     }
@@ -491,6 +496,32 @@ impl KvStore {
     /// cross-store transaction seam is MD-2b work.)
     pub fn events(&self) -> event::EventLog {
         event::EventLog::new(self.pool.clone()).with_gate(self.disk.clone())
+    }
+
+    /// P1-02c c3: the failed-write audit trail and session-gap ranges.
+    pub fn rejections(&self) -> rejections::Rejections {
+        rejections::Rejections::new(self.pool.clone())
+    }
+
+    /// The bounded, asynchronous audit queue: callers `enqueue` and never wait
+    /// on the audit write. Must first be called from inside a tokio runtime.
+    pub fn queued_rejections(&self) -> Arc<rejections::QueuedRejections> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime to host the worker: hand back an inert queue (every
+            // enqueue is counted as dropped) and do not cache it.
+            return Arc::new(
+                self.rejections()
+                    .spawn_queue(rejections::QUEUE_CAPACITY, self.oop_admission.clone()),
+            );
+        }
+        self.rejection_queue
+            .get_or_init(|| {
+                Arc::new(
+                    self.rejections()
+                        .spawn_queue(rejections::QUEUE_CAPACITY, self.oop_admission.clone()),
+                )
+            })
+            .clone()
     }
 
     /// A session event-log writer over this store's database.
@@ -1445,6 +1476,7 @@ mod tests {
         let kv = KvStore {
             pool: pool_migrated_up_to(&dir.path().join("m.db"), 16).await,
             oop_admission: None,
+            rejection_queue: Default::default(),
             disk: disk_gate::DiskGate::disabled(),
         };
 
