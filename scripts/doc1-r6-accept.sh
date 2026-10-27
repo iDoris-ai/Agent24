@@ -47,7 +47,13 @@ mkdir -p "$WORK" || exit 2
 for v in $(env | grep -oE '^(A24|AGENT24)[A-Z0-9]*_[A-Z0-9_]+'); do unset "$v"; done
 export AGENT24_DATA_DIR="$WORK/data"
 # Z1: every entry under ~/.agent24 with its size and modification time.
-snapshot() { [ -e "$REAL" ] && find "$REAL" -exec stat -f '%N %z %m' {} + 2>/dev/null | sort; }
+# A snapshot that could not read everything is no evidence: it says so, and Z1 fails.
+snapshot() {
+  [ -e "$REAL" ] || return 0
+  local out
+  out=$(find "$REAL" -exec stat -f '%N %z %m' {} + 2>&1) || { echo "UNREADABLE: $out"; return 0; }
+  printf '%s\n' "$out" | sort
+}
 snapshot > "$WORK/.real-before"
 
 FAILS=0
@@ -106,12 +112,13 @@ cp "$BIN/agent24-documents" "$PKG/bin/"
 a24 os install "$PKG" > "$WORK/p1.out" 2>&1; rc=$?
 check P1 "os install the documents package" "$(is "$rc/$(grep -c '^installed ' "$WORK/p1.out")" 0/1)" "rc=$rc; $(head -n 1 "$WORK/p1.out")"
 PATH="$BIN:$PATH" limit 60 "$BIN/agent24" daemon start > "$WORK/p2.out" 2>&1; rc=$?
+t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
 check P2 "daemon start (resident, fresh data dir)" "$(is "$rc/$(grep -c '^daemon started (pid ' "$WORK/p2.out")" 0/1)" "rc=$rc; $(one "$WORK/p2.out")"
 PORT=$(jq -r .port "$AGENT24_DATA_DIR/daemon.json" 2>/dev/null)
 TOKEN=$(jq -r .token "$AGENT24_DATA_DIR/daemon.json" 2>/dev/null)
 # A module finishes its handshake after `daemon start` returns; until then the
 # OS answers module_not_ready (the import client's three tries are back to back).
-t0=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000'); ready=fail
+ready=fail
 for _ in $(seq 1 150); do
   a24 documents capabilities > "$WORK/p3.out" 2>&1 && { ready=ok; break; }
   sleep 0.2
@@ -292,7 +299,9 @@ printf 'not json' | limit 60 "$BIN/agent24" documents import --host-stdin --json
 check N5 "--host-stdin --json with bad input: a result line, invalid_request" "$(is "$rc/$(last "$WORK/n5.out" '"\(.type)/\(.error.code)"')" 1/result/invalid_request)" "rc=$rc; $(cut -c1-100 "$WORK/n5.out")"
 
 snapshot > "$WORK/.real-after"
-check Z1 "the user's ~/.agent24 was not touched" "$(cmp -s "$WORK/.real-before" "$WORK/.real-after" && echo ok || echo fail)" \
+z1=$(cmp -s "$WORK/.real-before" "$WORK/.real-after" && echo ok || echo fail)
+grep -q '^UNREADABLE: ' "$WORK/.real-before" "$WORK/.real-after" && z1=fail
+check Z1 "the user's ~/.agent24 was not touched" "$z1" \
   "entries before=$(wc -l < "$WORK/.real-before" | tr -d ' ') after=$(wc -l < "$WORK/.real-after" | tr -d ' '); $(diff "$WORK/.real-before" "$WORK/.real-after" | grep -c '^[<>]') changed"
 
 {
