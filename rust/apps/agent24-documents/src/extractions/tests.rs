@@ -549,6 +549,8 @@ async fn under_a_tool_budget_a_first_value_is_judged_by_its_exact_body() {
         (taken.values.len(), taken.next_cursor.as_deref()),
         (1, Some("v1"))
     );
+    // The value itself as stored, not only one of the same length.
+    assert_eq!(taken.values, alone.values);
     let Err(refused) = super::get(&s.storage, EXT, None, 50, exact - 1).await else {
         panic!("taken one byte over its budget");
     };
