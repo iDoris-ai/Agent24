@@ -61,7 +61,10 @@ fn the_worst_case_stays_linear() {
     let query = format!("{}b", "a".repeat(499));
     assert_eq!(counted(&text, &query), (vec![], text.len()));
     // With matches, finding where each starts reads its own range back once:
-    // at most two steps a character in all.
+    // at most two steps a character in all. Here 65535 of the 65536: 32768
+    // forward, then 3 back for the first match and 4 for each other (the
+    // fourth clears the state). So one more step for each match also fails
+    // this, well short of quadratic.
     let text = "a b ".repeat(8 * 1024);
     let (hits, steps) = counted(&text, "a b");
     assert_eq!(hits.len(), 8 * 1024);
