@@ -190,6 +190,7 @@ dependencies = [
  "agent24-store",
  "async-trait",
  "futures",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "sha2",
@@ -316,11 +317,13 @@ dependencies = [
  "chrono",
  "fs2",
  "hex",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -410,6 +413,7 @@ dependencies = [
 name = "agent24-worker"
 version = "0.5.1"
 dependencies = [
+ "agent24-protocol",
  "async-trait",
  "base64",
  "reqwest",

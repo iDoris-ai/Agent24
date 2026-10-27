@@ -12,6 +12,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 #[derive(Clone)]
 pub struct SessionLog {
     pool: SqlitePool,
+    gate: crate::disk_gate::DiskGate,
     #[cfg(test)]
     probe: Option<std::sync::Arc<regression_tests::Probe>>,
 }
@@ -58,10 +59,15 @@ fn system_origin(source: &str) -> Origin {
 }
 
 impl SessionLog {
-    /// Uses a pool connected to a database already migrated by `KvStore`.
-    pub fn new(pool: SqlitePool) -> Self {
+    /// Uses a pool connected to a database already migrated by `KvStore`. The
+    /// disk gate is a REQUIRED argument so a caller cannot get an ungated log by
+    /// omission; pass `DiskGate::disabled()` explicitly to opt out (tests,
+    /// ephemeral pools). Production code gets a gated one from
+    /// `KvStore::session_log()`.
+    pub fn new(pool: SqlitePool, gate: crate::disk_gate::DiskGate) -> Self {
         Self {
             pool,
+            gate,
             #[cfg(test)]
             probe: None,
         }
@@ -82,6 +88,7 @@ impl SessionLog {
         assistant: &Msg,
         assistant_origin: Origin,
     ) -> Result<TurnIds> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope = Scope::owner(owner).with_session(session);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ids = TurnIds {
@@ -163,6 +170,7 @@ impl SessionLog {
         owner: &str,
         legacy: &CanonicalSession,
     ) -> Result<ImportOutcome> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope = Scope::owner(owner).with_session(&legacy.session_id);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists: bool = sqlx::query_scalar(
@@ -225,6 +233,7 @@ impl SessionLog {
         summary: &str,
         covered_through_seq: i64,
     ) -> Result<i64> {
+        self.gate.check(crate::disk_gate::WriteClass::Content)?;
         let scope = Scope::owner(owner).with_session(session);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let nonce: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM mem_events")

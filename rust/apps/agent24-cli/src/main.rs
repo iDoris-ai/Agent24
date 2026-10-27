@@ -507,17 +507,7 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
 /// itself never redirects, so a 3xx means something else is impersonating it;
 /// following it would hand over the bearer token to that impersonator.
 fn client() -> reqwest::Client {
-    #[expect(
-        clippy::expect_used,
-        reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
-                  redirect-following client FU-74 exists to rule out; fail closed instead"
-    )]
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("building the loopback-only daemon HTTP client failed")
+    agent24_protocol::client::loopback_client(Duration::from_secs(2))
 }
 
 async fn health_ok(base: &str, token: &str) -> bool {
@@ -697,7 +687,14 @@ async fn attach_only() -> Option<Endpoint> {
 /// to it. Runs until the MCP client closes stdin.
 async fn cmd_mcp() -> Result<(), String> {
     let ep = connect().await?;
+    // C-04: `agent24_run` gets a total time limit (default 600s).
+    let run_timeout = agent24_mcp::server::parse_run_timeout(
+        std::env::var(agent24_mcp::server::RUN_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    );
     let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+        .with_run_timeout(run_timeout)
         .serve_stdio()
         .await
         .map_err(|e| e.to_string());
@@ -2244,6 +2241,12 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             println!("loaded:    {}", if loaded { "yes" } else { "no" });
             if let Some(p) = plist {
                 println!("plist:     {}", p.display());
+                if installed && !service::plist_has_ready_omit_token(&p) {
+                    println!(
+                        "note:      this LaunchAgent predates --ready-omit-token and still \
+                         logs the daemon bearer token; run `agent24 service install` to update it"
+                    );
+                }
             }
             match state_file::read_live() {
                 Some(st) => println!("daemon:    running (pid {}, port {})", st.pid, st.port),

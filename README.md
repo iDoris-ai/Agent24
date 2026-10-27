@@ -22,7 +22,7 @@
 
 ## 架构（Rust Core + Polyglot，见 [ADR-026](docs/ADR-026-rust-core-polyglot.md)）
 
-内核是 Rust daemon `agent24d`——唯一核心运行时，也是桌面端默认后端（v0.1.0 起）。只有 `AGENT24_BACKEND=node` 时，桌面才改拉 `packages/node-daemon`（`apps/desktop/src/main/backend-manager.ts` 的 `selectedBackend`）。所有外壳只经 **v1 REST + WebSocket** 协议接入，互不感知实现。
+内核是 Rust daemon `agent24d`——唯一核心运行时，也是桌面端默认后端（`AGENT24_BACKEND=rust`，v0.1.0 起）。所有外壳只经 **v1 REST + WebSocket** 协议接入，互不感知实现。
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -38,23 +38,21 @@
 │           attached …（进程外领域 OS 经 os-proto 代理挂进 /<name>/*）  │
 │  crates: core · agent(Loop) · models(网关+三级路由) · scheduler ·    │
 │          store · memory · policy · tools · mcp · protocol ·          │
-│          os-proto · os-packages · comm · hw · decide                 │
+│          os-proto · os-packages（进程外领域 OS 挂载/代理/回调）       │
 └──────────┬───────────────────────────────────────┬─────────────────┘
      契约：protocol/openapi.yaml + events.schema     │ REST
      （两条生成链：REST 手写 openapi.yaml、WS 事件由 Rust 类型导出；两者共同生成 packages/api-client 的 TS 类型，CI 各有一道漂移门）
 ┌──────────▼──────────────────┐        ┌───────────▼──────────────────┐
-│ 契约测试参考实现              │        │ Python ML Worker（规划）       │
+│ TS 能力模块 / 协议参考实现    │        │ Python ML Worker（规划）       │
 │ packages/node-daemon         │        │ Embedding · Whisper ·          │
-│ （v1 协议参考实现，           │        │ 图像 · LoRA 训练                │
-│  CapabilityModule 只在这里） │        │ （agent24-ml-worker）          │
+│ （v1 协议 mock/参考实现，     │        │ 图像 · LoRA 训练                │
+│  CapabilityModule 承载）     │        │ （agent24-ml-worker）          │
 └──────────────────────────────┘        └────────────────────────────────┘
 ```
 
-进程外领域 OS 模块（独立进程，如 Sin90、Documenting）用 Rust SDK `agent24-os-sdk`（events/memory/approval/scheduler/model 五个客户端）+ `agent24-os-fd`（继承监听 socket 的 fd 传递）接入，不在上图任何一个框里跑——它们连的是内核经 `os-proto` 暴露的握手/回调通道，不是内核进程本身。Documenting 的二进制在 `rust/apps/agent24-documents`。
+进程外领域 OS 模块（独立进程，如 Sin90）用 Rust SDK `agent24-os-sdk`（events/memory/approval/scheduler/model 五个客户端）+ `agent24-os-fd`（继承监听 socket 的 fd 传递）接入，不在上图任何一个框里跑——它们连的是内核经 `os-proto` 暴露的握手/回调通道，不是内核进程本身。
 
-> **产品后端是 agent24d**（[ADR-026](docs/ADR-026-rust-core-polyglot.md)，取代 ADR-023 的「M3 切 Python FastAPI」；[ADR-037](docs/decision.md) 决策 1）：新内核能力（Agent Loop / 调度器 / 记忆 / 工作流 / 权限）从第一行起写在 Rust。`packages/node-daemon` 只作契约测试的参考实现，描述见它的 `package.json`。桌面在 `AGENT24_BACKEND=node` 时才拉起它。各平台安装包的 `extraResources` 今天仍打进 `packages/node-daemon/dist`（`apps/desktop/package.json`）。ADR-037 决策 1 要求把它移出安装包。Python **仅**用于 ML Worker（不承担会话/权限/持久化/审计）。
-
-> **数据目录**：外壳和 daemon 用同一条规则。`AGENT24_DATA_DIR` 为非空绝对路径时，整个数据根就是它；否则是 `$HOME/.agent24`（`rust/crates/agent24-protocol/src/state_file.rs` 的 `state_dir`，126–148 行；桌面 `daemonStatePath` 相同，`apps/desktop/src/main/backend-manager.ts`）。`daemon.json`、`agent24.db`、`hardware.json`、日志都在这个目录下。ADR-037 决策 3 把 Windows 定为 `%LOCALAPPDATA%\Agent24`（`docs/design/WINDOWS-PORT.md` 的 W1）。`state_dir()` 今天只认 `AGENT24_DATA_DIR` 和 `$HOME/.agent24`。
+> **为什么不是 Node/Python 主后端**（[ADR-026](docs/ADR-026-rust-core-polyglot.md)，取代 ADR-023 的「M3 切 Python FastAPI」）：新内核能力（Agent Loop / 调度器 / 记忆 / 工作流 / 权限）从第一行起写在 Rust，不在 Node 或 Python 主后端里先写一遍。`packages/node-daemon` 保留为 v1 协议的 **mock/参考实现**（`AGENT24_BACKEND=node` 可切），保障协议演进期日常开发不阻塞；Python **仅**用于 ML Worker（不承担会话/权限/持久化/审计）。
 
 ### 核心组件
 
@@ -63,7 +61,7 @@
 | 组件 | 路径 | 状态 | 职责 |
 |------|------|------|------|
 | **agent24d**（Rust daemon） | `rust/apps/agent24d` | ✅ | v1 REST+WS 核心运行时；桌面默认后端 |
-| **agent24-cli / TUI** | `rust/apps/agent24-cli` | ✅ CLI（含 `chat`）· ✅ TUI 最小版 | Attached/Standalone；CLI 有 `chat`（`main.rs` 的 `Command::Chat`）。TUI（ratatui）是 runs / 事件流 / 审批队列，headless 运维 |
+| **agent24-cli / TUI** | `rust/apps/agent24-cli` | ✅ CLI · ✅ TUI 最小版 · 🔲 chat | Attached/Standalone；TUI（ratatui）runs/事件流/审批队列，headless 运维 |
 | **agent24-core** | `rust/crates/agent24-core` | ✅ | 稳定领域模型（Session/Run/Task/ToolCall/Approval/Event/Usage…），零框架依赖 |
 | **agent24-agent** | `rust/crates/agent24-agent` | ✅ | Agent Loop：上下文 → 调模型 → 解析 ToolCall → 权限 → 执行 → 续 |
 | **agent24-models** | `rust/crates/agent24-models` | ✅ 网关/路由 · 🔲 LoRA | Model Gateway + 三级路由（本地小模型 / 远程 API / 自训领域 LoRA）。**LoRA 训练侧未建**（`agent24-worker` 自己标着 later），三级路由的 LoRA 那一级今天没有 provider 填 |
@@ -71,15 +69,10 @@
 | **agent24-store / memory / policy** | `rust/crates/agent24-{store,memory,policy}` | ✅ | 持久化 / 分层记忆 / 权限审批 |
 | **agent24-os-proto / os-packages** | `rust/crates/agent24-os-{proto,packages}` | ✅ | 进程外领域 OS：握手/帧协议、挂载、回调通道、包安装（`agent24 os install/uninstall`）。Sin90 不再编译进内核（T11），是进程外包，仓库 `iDoris-ai/Sin90` |
 | **agent24-os-sdk / os-fd** | `rust/crates/agent24-os-{sdk,fd}` | 🟡 原型 0.1.0 | 进程外模块 Rust SDK：events/memory/approval/scheduler/model 五个客户端 + fired；`os-fd` 负责继承监听 socket 的 fd 传递。接口可能变 |
-| **agent24-comm** | `rust/crates/agent24-comm` | ✅ | Hyphae（Nostr）包装：身份、收发、daemon 监管。二进制按 `hyphae.lock.json` 校验 |
-| **agent24-hw** | `rust/crates/agent24-hw` | 🟡 | 硬件探测与内存账（HW-1）。runtimes、HTTP 路由（HW-3）、能力梯未做 |
-| **agent24-decide** | `rust/crates/agent24-decide` | 🟡 | 决策服务。agent24d 提供 `GET /api/v1/decide/profile`。agent loop 未消费 `DecisionService` |
-| **agent24-documents** | `rust/apps/agent24-documents` | ✅ 进程外模块 | Documenting。正常依赖 `agent24-os-sdk`。桌面经 `documents.ts` 类型化 preload |
-| **agent24-sidecar-host** | `rust/apps/agent24-sidecar-host` | 🟡 | sidecar 生命周期宿主。Desktop 产品路径未调用，Open Design 走 `CreativeServeWeb` |
 | **附着式模块（ADR-032/A3）** | `rust/crates/agent24-os-proto`（类型）+ `rust/apps/agent24d`（注册/生命周期/反向命令） | ✅ P0–P2 | 用户自行启动的模块（如 AgentEar）经 `agent24 os attach` 注册 token 后连上内核，握手拿 offer set，反向命令走同一条连接；P3（流式）之后再做 |
 | **桌面「语音」面板** | `apps/desktop/src/renderer` | ✅ P2 | 展示附着模块（AgentEar）的实时 transcript，`speak`/`stop_playback` 按钮，转写只在内存不落盘 |
 | **api-client**（生成物） | `packages/api-client` | ✅ | openapi + events schema → **生成的 TS 协议类型**（只有 type,没有 HTTP/WS client;CI 校验零漂移） |
-| **node-daemon**（参考实现） | `packages/node-daemon` | ✅ 参考实现 | 契约测试用的 v1 参考实现。产品后端是 agent24d。安装包今天仍打进它 |
+| **node-daemon**（参考实现） | `packages/node-daemon` | ✅ | v1 协议 mock/参考；TS CapabilityModule 承载 |
 | **desktop**（Electron 壳） | `apps/desktop` | ✅ | spawn agent24d + 端口/token/托盘/preload；React UI |
 | **agent24-worker → Python ML Worker** | `rust/crates/agent24-worker` | ✅ 契约/客户端 · 🔲 Python 侧 | Rust 侧 wire 契约 + HTTP 客户端（embed/transcribe/health）；Python 服务 `agent24-ml-worker`（Embedding/Whisper/图像/LoRA）规划 |
 
@@ -150,7 +143,7 @@ pub trait KernelCtx: Send + Sync {
 }
 ```
 
-> `KERNEL_GRANTS = [Events, Memory, Approval]` 是内核对**进程内**模块最多愿意给的（`rust/apps/agent24d/src/domain.rs:75-76`）。进程外模块用另一张表 `KERNEL_OOP_GRANTS`，再多 Scheduler / Models（同文件 116–122 行）。实际拿到多少还要看：模块自己在清单里请求了什么（`Grants::granting` 取 `requested ∩ willing`，**多要无益，不要也不会白给**），以及 memory 分区登记是否成功（失败则不给）。
+> `KERNEL_GRANTS = {Events, Memory}` 是内核**最多愿意给**的（`rust/apps/agent24d/src/domain.rs`）。实际拿到多少还要看：模块自己在清单里请求了什么（`Grants::granting` 取 `requested ∩ willing`，**多要无益，不要也不会白给**），以及 memory 分区登记是否成功（失败则不给）。
 
 ### 能力模块开发（TS CapabilityModule，由 `node-daemon` 承载）
 
@@ -201,7 +194,7 @@ module.exports = myModule   // 包根必须直接是 { manifest, register }
 # 构建
 cd rust && cargo build -p agent24d -p agent24-cli
 
-# 常驻模式：启动 daemon（数据目录下的 daemon.json 供发现；默认 ~/.agent24）
+# 常驻模式：启动 daemon（~/.agent24/daemon.json 供发现）
 ./target/debug/agent24 daemon start
 ./target/debug/agent24 daemon status     # running · pid … · backend rust
 ./target/debug/agent24 models            # 需本地 oMLX(8088)/Ollama(11434)
@@ -212,7 +205,7 @@ cd rust && cargo build -p agent24d -p agent24-cli
 ./target/debug/agent24 chat "hi"
 ```
 
-端到端冒烟：`scripts/cli-smoke.sh`。Electron 壳默认拉起 agent24d。改用参考实现：`AGENT24_BACKEND=node pnpm dev`。
+端到端冒烟：`scripts/cli-smoke.sh`。Electron 壳切换 Rust 后端：`AGENT24_BACKEND=rust pnpm dev`。
 
 ## 二次开发者接口（现在就有的）
 
@@ -233,7 +226,7 @@ cd rust && cargo build -p agent24d -p agent24-cli
 **运维 / 集成面**
 
 ```bash
-agent24 daemon start|status|stop      # 进程管理（数据目录下的 daemon.json 供发现；默认 ~/.agent24）
+agent24 daemon start|status|stop      # 进程管理（~/.agent24/daemon.json 供发现）
 agent24 service install|uninstall|status   # macOS LaunchAgent：登录自启 + 自愈（24/7）
 agent24 tui                           # runs / 事件流 / 审批队列
 agent24 os list|enable|disable        # 领域 OS 处置（enable 下次启动生效；
@@ -257,16 +250,16 @@ agent24 mcp                           # 把 agent24d 自己变成 MCP server —
 |---|---|---|
 | **M-A** 契约冻结 | openapi / events / module schema · contract-tests · api-client 生成管道 | ✅ |
 | **M-B** Rust 内核 | agent24d · CLI · core / agent / models / scheduler / store / policy | ✅ |
-| **M-C** 发布 | v0.1.0 → v0.2.0 → v0.3.0 → v0.4.0 → v0.5.0 → **v0.5.1**（当前） | ✅ |
+| **M-C** 发布 | v0.1.0 → v0.2.0 → v0.3.0 → **v0.4.0**（当前） | ✅ |
 | **M-H** 人机边界 | 审批门 · payload 哈希 · durable resume · plan mode · 安装同意摘要 · Fake 渠道 harness | ✅ |
-| **M-D** 记忆重做 | 权威+投影 · 真双时相 · 治理写门 · Condenser · 巩固循环 · FTS/向量缝——crate 层的库原语与迁移已落地。agent loop 的 recall 已调用 retriever（`session_memory.rs` 的 `search_any`）。daemon 的 `GET /api/v1/memory/assertions` 在带 `q` 时也走 retriever（`memory_routes.rs:165`）。consolidator 仍无 agent loop 消费者（巩固只有调用方驱动的 `run_once`，daemon 里没有后台循环）。新 condenser 未接管现有 session 路径。`OmlxEmbedder` 只有 seam，无实现。[`SPEC-MD-ME.md`](docs/specs/SPEC-MD-ME.md) §0 的 2026-09-09 计数表仍写 retriever 在 `rust/apps` 命中为 0，那张表已过期 | 🟡 |
+| **M-D** 记忆重做 | 权威+投影 · 真双时相 · 治理写门 · Condenser · 巩固循环 · FTS/向量缝——**crate 层的库原语与迁移已落地，daemon 尚未端到端消费**（巩固只有调用方驱动的 `run_once` 无后台循环；新 condenser 未接管现有 session 路径；`OmlxEmbedder` 只有 seam 无实现）。逐行状态与判据见 [`SPEC-MD-ME.md`](docs/specs/SPEC-MD-ME.md) §0 上方那张表（**本文不复制**）。今天**没有任何一行是 ✅**：MD-2 🟡（`EventLog` 接了、`ArtifactStore` 没接），其余全 🟢 | 🟡 |
 | **M-F** 渠道 | F3 微信 ✅ · F4 Nostr ✅ 桥侧代码与契约完成（含入站活性探针；依赖外部 `agent-speaker` daemon，加密 keystore 无法 headless 解锁——挂账在上游）· F1b 托盘常驻 ✅ · **F5 7×24 泡测 🔲** | 🟡 |
 | **M-E → ME-3** 进程外领域 OS | `DomainModule`+`KernelCtx`（in-process，已无生产实现）✅ · 配置注册表 + `os` CLI ✅ · **进程外 Provider（挂载/代理/回调通道/包安装）✅ 已交付**（ADR-031，T11 已把 Sin90 迁出内核） | ✅ |
 | **ME-4** 内核回调面 + SDK + AgentEar 附着 | 调度回调 `_a24/scheduler/*` ✅ · 推理回调 `_a24/model/complete` ✅ · SDK 原型 `agent24-os-sdk` 0.1.0 ✅ · ADR-032/A3 AgentEar 附着 P0–P2 ✅（插队线，见 `tasks.md`）· Cos72 骨架/第二个进程外领域 OS 🔲（`PLAN-ME4-OS-CAPABILITIES.md` ME4-5.3.x，v0.5.0 范围） | 🟡 |
 | **P4** 生态 / 分发 | 模块市场后端 ✅（npm 发现 + 浏览过滤）· 跨用户分发 / 模块签名 / 跨设备记忆同步 🔲 | 🟡 |
 
 **当前唯一的物理阻塞**：F5 —— 需要 Mac mini + 微信扫码 + Nostr identity 连跑 7 天。启动 F5 所需的仓内代码已具备（这是一句限定，不是「全仓无待办」）。
-**当前发布**：v0.5.1。`rust/apps/agent24d/Cargo.toml` 与 `apps/desktop/package.json` 的 version 都是 `0.5.1`，标签 `v0.5.1` 已存在。v0.5.0 与 v0.5.1 之后合入 main 的工作，以 [`docs/agent/tasks.md`](docs/agent/tasks.md) 为准。
+**下一步**：v0.4.0 发布 → ME4-5.2.0/5.2.1（Sin90 迁到 SDK）→ Cos72 最小闭环（mytask）→ v0.5.0（ME-3 完整 + 回调 + SDK + Sin90/Cos72 独立可装）。详见 [`docs/agent/PLAN-ME4-OS-CAPABILITIES.md`](docs/agent/PLAN-ME4-OS-CAPABILITIES.md)。
 
 **里程碑门**：进入 P4（跨用户分发、模块签名 + 信任根）与发布 tag/Release 需用户确认，不擅自跨。
 
@@ -275,7 +268,7 @@ agent24 mcp                           # 把 agent24d 自己变成 MCP server —
 ## 文档
 
 - [工作站规划](docs/WORKSTATION_PLAN.md) — oMLX API 调研、64GB Mac 模型清单、能力 TODO
-- [决策日志](docs/decision.md) — ADR-001 ~ ADR-037
+- [决策日志](docs/decision.md) — ADR-001 ~ ADR-030
 - [实现蓝图](docs/specs/SPEC-MD-ME.md) — M-D 记忆 + M-E 领域 OS · [任务队列](docs/specs/TASKS.md) — loop 的工作来源（**M-D 的状态源是 `SPEC-MD-ME.md` §3，不是这里**）
 
 ## 参考实现

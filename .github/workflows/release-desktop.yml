@@ -139,6 +139,25 @@ jobs:
             rust/target
           key: cargo-desktop-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
 
+      - name: Assert no test-only features in the release graph
+        working-directory: rust
+        # C-19: `test-lock-override` / `test-util` are test switches that must
+        # never be reachable from a shipped binary. `-e normal,build` leaves out
+        # dev-dependency edges (the self-dev-dependencies that turn them on for
+        # `cargo test` only); a hit here means a normal dependency enabled one.
+        run: |
+          set -euo pipefail
+          # Capture first: a failing `cargo tree` (bad -p, resolver error) must
+          # fail the step, not read as "no match".
+          out=$(cargo tree -e normal,build,features -p agent24d -p agent24-cli) || {
+            echo "::error::cargo tree failed"
+            exit 1
+          }
+          if printf '%s\n' "$out" | grep -E 'test-lock-override|test-util'; then
+            echo "::error::test-only feature reachable from the release build"
+            exit 1
+          fi
+
       # agent24 ships too: the desktop's document import runs
       # `agent24 documents import` (apps/desktop/src/main/documents-import.ts).
       - name: Build agent24d and agent24 (release)

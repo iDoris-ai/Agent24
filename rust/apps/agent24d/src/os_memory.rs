@@ -149,6 +149,23 @@ const RECALL_PAGE: i64 = 500;
 /// two independently maintained copies.
 pub(crate) const MAX_KIND_BYTES: usize = 128;
 
+/// Why [`OsScopedMemory::build_remember_event`] refused a request. Kept apart
+/// from a plain message so the reserved-kind refusal stays typed on both paths.
+#[derive(Debug)]
+enum RememberRefusal {
+    Invalid(String),
+    ReservedKind,
+}
+
+/// P1-02c: kinds the kernel writes itself. Compared case-insensitively on the
+/// trimmed kind, so `" Assertion.retracted"` cannot slip past the check.
+fn is_reserved_kind(kind: &str) -> bool {
+    let k = kind.trim().to_ascii_lowercase();
+    ["assertion.", "mem.", "session."]
+        .iter()
+        .any(|p| k.starts_with(p))
+}
+
 /// The largest serialized body a module may remember in one call.
 ///
 /// Well under the 1 MiB HTTP body cap, because this is one memory rather than
@@ -662,6 +679,7 @@ pub struct OsScopedMemory {
     key: String,
     module: String,
     events: agent24_memory::event::EventLog,
+    rejections: Arc<agent24_memory::rejections::QueuedRejections>,
 }
 
 impl OsScopedMemory {
@@ -670,7 +688,22 @@ impl OsScopedMemory {
             key: partition.key.clone(),
             module: partition.module.clone(),
             events: kv.events(),
+            rejections: kv.queued_rejections(),
         }
+    }
+
+    /// P1-02c c3 (D3): leave an audit row for a refused write. Best effort: the
+    /// trail write can itself fail on a full disk or quota, in which case it is
+    /// logged inside `note` and the caller's original error stands unchanged.
+    fn note_rejection(&self, code: agent24_memory::MemoryErrorCode, kind: Option<&str>) {
+        self.rejections
+            .enqueue(&agent24_memory::rejections::Rejection {
+                owner_kind: agent24_memory::rejections::OwnerKind::Module,
+                owner_key: &self.key,
+                code,
+                rejected_kind: kind,
+                count_at: None,
+            });
     }
 
     /// Mint an id for a module's memory.
@@ -770,24 +803,33 @@ impl OsScopedMemory {
     /// `Remember` differently. Returns a human-readable message on failure;
     /// each caller maps it into its own error type (`DomainError` for the
     /// trait path, `MemoryRpcError` for the wire path).
-    fn build_remember_event(&self, what: Remember) -> Result<MemEvent, String> {
+    fn build_remember_event(&self, what: Remember) -> Result<MemEvent, RememberRefusal> {
         // Bounded BEFORE anything is written. See `MAX_KIND_BYTES`: the partition
         // stops A from reading B, and these stop A from crowding B out of the
         // database they share.
         if what.kind.trim().is_empty() {
-            return Err("kind must not be empty".into());
+            return Err(RememberRefusal::Invalid("kind must not be empty".into()));
         }
         if what.kind.len() > MAX_KIND_BYTES {
-            return Err(format!("kind exceeds {MAX_KIND_BYTES} bytes"));
+            return Err(RememberRefusal::Invalid(format!(
+                "kind exceeds {MAX_KIND_BYTES} bytes"
+            )));
+        }
+        // P1-02c: the kernel's own event kinds are not the module's to write.
+        // The quota trigger exempts `assertion.retracted` for PERSONAL owners
+        // only, but a module must not be able to forge a control or audit row
+        // under any owner either.
+        if is_reserved_kind(&what.kind) {
+            return Err(RememberRefusal::ReservedKind);
         }
         let body = serde_json::Value::Object(what.body);
-        let encoded =
-            serde_json::to_string(&body).map_err(|e| format!("body is not serialisable: {e}"))?;
+        let encoded = serde_json::to_string(&body)
+            .map_err(|e| RememberRefusal::Invalid(format!("body is not serialisable: {e}")))?;
         if encoded.len() > MAX_BODY_BYTES {
-            return Err(format!(
+            return Err(RememberRefusal::Invalid(format!(
                 "body is {} bytes, over the {MAX_BODY_BYTES}-byte limit for one memory",
                 encoded.len()
-            ));
+            )));
         }
         Ok(MemEvent::new(
             self.mint_id(),
@@ -830,15 +872,29 @@ impl OsScopedMemory {
 #[async_trait::async_trait]
 impl ScopedMemory for OsScopedMemory {
     async fn remember(&self, what: Remember) -> agent24_domain::Result<Remembered> {
-        let ev = self
-            .build_remember_event(what)
-            .map_err(DomainError::Memory)?;
+        let refused_kind = what.kind.clone();
+        let ev = match self.build_remember_event(what) {
+            Ok(ev) => ev,
+            Err(RememberRefusal::Invalid(m)) => return Err(DomainError::Memory(m)),
+            Err(RememberRefusal::ReservedKind) => {
+                self.note_rejection(
+                    agent24_memory::MemoryErrorCode::ReservedKind,
+                    Some(&refused_kind),
+                );
+                return Err(DomainError::MemoryReservedKind);
+            }
+        };
         let at = ev.at.clone();
         let id = ev.id.clone();
-        self.events
-            .append(&ev)
-            .await
-            .map_err(|e| DomainError::Store(e.to_string()))?;
+        if let Err(e) = self.events.append(&ev).await {
+            let code = e.code();
+            tracing::warn!(code = code.as_str(), error = %e, "module remember failed");
+            self.note_rejection(code, Some(&ev.kind));
+            return Err(DomainError::MemoryWriteFailed {
+                code: code.as_str(),
+                dimension: code.dimension(),
+            });
+        }
         Ok(Remembered {
             id: MemoryId::from_kernel(id),
             at,
@@ -940,9 +996,16 @@ impl OsScopedMemory {
         admission: Arc<Semaphore>,
         what: Remember,
     ) -> Result<Remembered, MemoryRpcError> {
-        let ev = self
-            .build_remember_event(what)
-            .map_err(MemoryRpcError::Invalid)?;
+        let refused_kind = what.kind.clone();
+        // A reserved-kind refusal is audited, but only AFTER the request has
+        // passed the rate limiter and connection admission and inside the module
+        // lifecycle binding (so a disabled module leaves no trace), and only by
+        // a non-blocking enqueue. `Invalid` stays unaudited and early.
+        let (ev, refused) = match self.build_remember_event(what) {
+            Ok(ev) => (Some(ev), false),
+            Err(RememberRefusal::Invalid(m)) => return Err(MemoryRpcError::Invalid(m)),
+            Err(RememberRefusal::ReservedKind) => (None, true),
+        };
         let Some(mut reservation) = Reservation::reserve(limiter, MEMORY_COST_REMEMBER) else {
             return Err(MemoryRpcError::application(
                 ErrorKind::RateLimited,
@@ -950,17 +1013,37 @@ impl OsScopedMemory {
             ));
         };
         let events = self.events.clone();
+        let rejections = self.rejections.clone();
+        let owner_key = self.key.clone();
         let outcome = bind_to_lifecycle(lifecycle, async move {
             let _permit = admission.acquire_owned().await.map_err(|_| {
                 MemoryRpcError::Store("connection admission semaphore closed".into())
             })?;
+            let audit = |code: agent24_memory::MemoryErrorCode, kind: &str| {
+                rejections.enqueue(&agent24_memory::rejections::Rejection {
+                    owner_kind: agent24_memory::rejections::OwnerKind::Module,
+                    owner_key: &owner_key,
+                    code,
+                    rejected_kind: Some(kind),
+                    count_at: None,
+                });
+            };
+            let Some(ev) = ev else {
+                debug_assert!(refused);
+                audit(agent24_memory::MemoryErrorCode::ReservedKind, &refused_kind);
+                // A refused probe still costs its token: repeating it cannot be
+                // free, so it cannot be used to flood the audit queue.
+                reservation.spend_in_full();
+                return Err(MemoryRpcError::ReservedKind);
+            };
             // About to touch the shared pool — see `Reservation::mark_touched`
             // for the precise (conservative) meaning of this boundary.
             reservation.mark_touched();
-            events
-                .append(&ev)
-                .await
-                .map_err(|e| crate::os_memory_page::map_memory_error(&e))?;
+            if let Err(e) = events.append(&ev).await {
+                // Pin the original result first; the audit is only enqueued.
+                audit(e.code(), &ev.kind);
+                return Err(crate::os_memory_page::map_memory_error(&e));
+            }
             reservation.commit();
             Ok(Remembered {
                 id: MemoryId::from_kernel(ev.id.clone()),
@@ -1346,6 +1429,448 @@ mod tests {
             .map(|r| r.body.get("n").and_then(|v| v.as_i64()).unwrap())
             .collect();
         assert_eq!(got, vec![19, 18, 17], "newest first — NOT the oldest three");
+    }
+
+    // ---- P1-02c c1 (T9, T10): reserved kinds and partition isolation ----
+
+    fn retraction_shaped(id: &str, owner: &str) -> MemEvent {
+        MemEvent::new(
+            id,
+            Scope::owner(owner),
+            "assertion.retracted",
+            serde_json::json!({ "assertion_id": "x" }),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+    }
+
+    async fn file_store() -> (tempfile::TempDir, agent24_memory::KvStore, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite");
+        let kv = agent24_memory::KvStore::open(&path).await.unwrap();
+        let admin = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        (dir, kv, admin)
+    }
+
+    async fn pin_quota(admin: &sqlx::SqlitePool, owner: &str, rows: i64) {
+        sqlx::query(
+            "INSERT INTO mem_owner_quota(owner, max_rows, max_bytes) VALUES(?, ?, 268435456)
+             ON CONFLICT(owner) DO UPDATE SET max_rows=excluded.max_rows",
+        )
+        .bind(owner)
+        .bind(rows)
+        .execute(admin)
+        .await
+        .unwrap();
+    }
+
+    /// The audit trail is written by a background task; wait (bounded) for it to
+    /// reach `want` rows instead of asserting at an arbitrary instant.
+    async fn audit_rows(
+        kv: &agent24_memory::KvStore,
+        key: &str,
+        want: usize,
+    ) -> Vec<agent24_memory::rejections::RejectionRow> {
+        for _ in 0..200 {
+            let rows = kv.rejections().list(key).await.unwrap();
+            if rows.len() >= want {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        kv.rejections().list(key).await.unwrap()
+    }
+
+    const RESERVED_KINDS: [&str; 7] = [
+        "assertion.retracted",
+        "assertion.reasserted",
+        "mem.write_decision",
+        "session.summary",
+        "session.anything",
+        " Assertion.Retracted",
+        "MEM.x",
+    ];
+
+    #[tokio::test]
+    async fn t9_in_process_entry_refuses_reserved_kinds_with_a_typed_error() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        for kind in RESERVED_KINDS {
+            let err = m
+                .remember(Remember::new(kind, serde_json::Map::new()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, DomainError::MemoryReservedKind),
+                "{kind}: {err}"
+            );
+        }
+        assert!(
+            m.recent(10).await.unwrap().is_empty(),
+            "nothing was written"
+        );
+        // c3: the refusals left an audit row (rate-limited to one per 60 s).
+        let mut rows = audit_rows(&kv, &m.key, 1).await;
+        for _ in 0..200 {
+            if rows[0].suppressed_count == RESERVED_KINDS.len() as i64 - 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            rows = kv.rejections().list(&m.key).await.unwrap();
+        }
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].code, "memory_reserved_kind");
+        assert_eq!(rows[0].suppressed_count, RESERVED_KINDS.len() as i64 - 1);
+        // Near misses are ordinary kinds.
+        for kind in ["assertions", "memory", "sessions.x", "note.assertion.x"] {
+            m.remember(Remember::new(kind, serde_json::Map::new()))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn t9_oop_entry_refuses_reserved_kinds_and_maps_to_a_wire_code() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        for kind in RESERVED_KINDS {
+            let err = m
+                .remember_checked(
+                    None,
+                    generous_limiter(),
+                    admission(4),
+                    Remember::new(kind, serde_json::Map::new()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err, MemoryRpcError::ReservedKind, "{kind}");
+        }
+        let wire = MemoryRpcError::ReservedKind.into_rpc_error();
+        assert_eq!(wire.code, agent24_os_proto::rpc::code::INVALID_PARAMS);
+        assert_eq!(
+            wire.data.as_ref().and_then(|d| d.get("code")),
+            Some(&serde_json::json!("memory_reserved_kind"))
+        );
+        assert!(
+            m.recent(10).await.unwrap().is_empty(),
+            "nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn c3_oop_reserved_kind_refusal_is_audited() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let err = m
+            .remember_checked(
+                None,
+                generous_limiter(),
+                admission(4),
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, MemoryRpcError::ReservedKind);
+        let rows = audit_rows(&kv, &m.key, 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].code, "memory_reserved_kind");
+    }
+
+    #[tokio::test]
+    async fn c3_oop_reserved_kind_is_not_audited_when_rate_limited_or_admission_closed() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        // No tokens at all: refused by the limiter before any audit.
+        let err = m
+            .remember_checked(
+                None,
+                Arc::new(RateLimiter::new(0.0, 0.0)),
+                admission(4),
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_ne!(err, MemoryRpcError::ReservedKind);
+        // Admission closed: refused before any audit.
+        let closed = admission(1);
+        closed.close();
+        let _ = m
+            .remember_checked(
+                None,
+                generous_limiter(),
+                closed,
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(kv.rejections().list(&m.key).await.unwrap().is_empty());
+    }
+
+    /// A refused reserved-kind probe still costs its token: with one token and no
+    /// refill the second probe is rate limited and never reaches the audit queue.
+    #[tokio::test]
+    async fn c3_refused_reserved_kind_probes_consume_rate_limit_tokens() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let limiter = Arc::new(RateLimiter::new(1.0, 0.0));
+        let first = m
+            .remember_checked(
+                None,
+                limiter.clone(),
+                admission(4),
+                Remember::new("mem.x", serde_json::Map::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(first, MemoryRpcError::ReservedKind);
+        for _ in 0..20 {
+            let again = m
+                .remember_checked(
+                    None,
+                    limiter.clone(),
+                    admission(4),
+                    Remember::new("mem.x", serde_json::Map::new()),
+                )
+                .await
+                .unwrap_err();
+            assert_ne!(again, MemoryRpcError::ReservedKind, "must be rate limited");
+        }
+        let rows = audit_rows(&kv, &m.key, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rows2 = kv.rejections().list(&m.key).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows2[0].suppressed_count, 0,
+            "a rate-limited probe enqueued: {rows2:?}"
+        );
+    }
+
+    /// The audit worker needs an OOP admission permit and only try-acquires one:
+    /// with every permit taken the audit is dropped and counted, business reads
+    /// are untouched, and it resumes once a permit is free.
+    #[tokio::test]
+    async fn c3_audit_is_dropped_not_waited_when_admission_is_exhausted() {
+        let (_dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let sem = kv.oop_admission().unwrap();
+        let held = sem
+            .clone()
+            .acquire_many_owned(sem.available_permits() as u32)
+            .await
+            .unwrap();
+        let err = m
+            .remember(Remember::new("mem.x", serde_json::Map::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::MemoryReservedKind));
+        let q = kv.queued_rejections();
+        for _ in 0..200 {
+            if q.dropped_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(q.dropped_count(), 1);
+        let t = std::time::Instant::now();
+        assert!(m.recent(10).await.unwrap().is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(kv.rejections().list(&m.key).await.unwrap().is_empty());
+        drop(held);
+        let _ = m
+            .remember(Remember::new("mem.y", serde_json::Map::new()))
+            .await;
+        assert_eq!(audit_rows(&kv, &m.key, 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn c3_quota_refusals_are_audited_on_both_entries() {
+        for oop in [false, true] {
+            let (_dir, kv, admin) = file_store().await;
+            let m = handle(&kv, "alice", "sin90").await;
+            m.remember(Remember::new("note", serde_json::Map::new()))
+                .await
+                .unwrap();
+            pin_quota(&admin, &m.key, 1).await;
+            if oop {
+                let err = m
+                    .remember_checked(
+                        None,
+                        generous_limiter(),
+                        admission(4),
+                        Remember::new("note", serde_json::Map::new()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, MemoryRpcError::Quota { .. }), "{err:?}");
+            } else {
+                let err = m
+                    .remember(Remember::new("note", serde_json::Map::new()))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, DomainError::MemoryWriteFailed { .. }),
+                    "{err:?}"
+                );
+            }
+            let rows = audit_rows(&kv, &m.key, 1).await;
+            assert_eq!(rows.len(), 1, "oop={oop} {rows:?}");
+            assert_eq!(rows[0].code, "memory_quota_rows", "oop={oop}");
+            assert_eq!(rows[0].rejected_kind.as_deref(), Some("note"));
+        }
+    }
+
+    /// A blocked audit table must not delay or replace the original answer, and a
+    /// flood of refused calls must only ever occupy the bounded queue.
+    #[tokio::test]
+    async fn c3_a_blocked_audit_never_delays_the_request_and_a_full_queue_drops() {
+        let (dir, kv, _admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        // Hold the database write lock from a separate connection.
+        use sqlx::Connection as _;
+        let mut locker = sqlx::SqliteConnection::connect(&format!(
+            "sqlite://{}",
+            dir.path().join("memory.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut locker)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let n = agent24_memory::rejections::QUEUE_CAPACITY + 50;
+        for _ in 0..n {
+            let err = m
+                .remember_checked(
+                    None,
+                    generous_limiter(),
+                    admission(4),
+                    Remember::new("mem.x", serde_json::Map::new()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err, MemoryRpcError::ReservedKind);
+        }
+        for _ in 0..5 {
+            let err = m
+                .remember(Remember::new("mem.x", serde_json::Map::new()))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DomainError::MemoryReservedKind));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "requests waited on the audit: {:?}",
+            started.elapsed()
+        );
+        // The worker took at most one item off the queue (and is stuck on it).
+        assert!(
+            kv.queued_rejections().dropped_count() >= 54,
+            "dropped = {}",
+            kv.queued_rejections().dropped_count()
+        );
+        sqlx::query("ROLLBACK").execute(&mut locker).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t9_a_module_owner_gets_no_retraction_exemption() {
+        let (_dir, kv, admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        m.remember(Remember::new("note", serde_json::Map::new()))
+            .await
+            .unwrap();
+        // Exactly full: one row used, one allowed.
+        pin_quota(&admin, &m.key, 1).await;
+        let err = agent24_memory::event::EventStore::append(
+            &kv.events(),
+            &retraction_shaped("forged", &m.key),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, agent24_memory::MemoryError::QuotaExceeded { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t10_a_full_module_partition_does_not_touch_personal_writes_or_retraction() {
+        use agent24_memory::assertion::{AssertionStore, BeliefQuery, Forget};
+        use agent24_memory::writer::{Candidate, MemoryWriter};
+        let (_dir, kv, admin) = file_store().await;
+        let m = handle(&kv, "alice", "sin90").await;
+        let org = org_of(&kv, "alice").await;
+        let personal = OsMemoryCatalog::default()
+            .ensure_personal_recorded(&org, "alice", &kv)
+            .await
+            .unwrap();
+        m.remember(Remember::new("note", serde_json::Map::new()))
+            .await
+            .unwrap();
+        pin_quota(&admin, &m.key, 1).await;
+        // The module is now full: its next write is refused.
+        let err = m
+            .remember(Remember::new("note", serde_json::Map::new()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DomainError::MemoryWriteFailed {
+                    code: "memory_quota_rows",
+                    dimension: Some("rows")
+                }
+            ),
+            "{err}"
+        );
+
+        // The personal partition is unaffected: write, retract.
+        let id = "assertion-t10";
+        kv.write_gate()
+            .propose(vec![
+                Candidate::new(
+                    id,
+                    Scope::owner(&personal),
+                    "user",
+                    "prefers",
+                    serde_json::json!("tea"),
+                    Origin {
+                        source: "user".into(),
+                        trust: Trust::UserSaid,
+                    },
+                )
+                .with_evidence(vec!["e".into()])
+                .remember(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.assertions()
+                .beliefs_as_of(&BeliefQuery::owner(&personal))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Fill the personal partition too: retraction still works, the module's
+        // fullness never mattered.
+        let used: i64 = sqlx::query_scalar("SELECT row_count FROM mem_owner_usage WHERE owner=?")
+            .bind(&personal)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        pin_quota(&admin, &personal, used).await;
+        assert_eq!(
+            kv.forget(&personal, id, &agent24_core::util::now_iso8601())
+                .await
+                .unwrap(),
+            Forget::Forgotten
+        );
     }
 
     #[tokio::test]

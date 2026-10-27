@@ -650,35 +650,59 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
             // outcome's NotApplicable/not). The saved/paused_not_saved/failed
             // verdict comes exclusively from `chat_remember_turn`'s LIVE
             // result, computed at commit time inside the write transaction.
-            let memory_receipt = if let (Some(sid), Some(prompt)) =
-                (chat.session_id.as_deref(), latest_user_message.as_deref())
-            {
-                let outcome = state
-                    .runs
-                    .chat_remember_turn(sid, prompt, &text, memory_source_ref)
-                    .await;
-                explicit_remember_state.and(match outcome {
-                    agent24_agent::MemoryWriteOutcome::Saved => Some(MemoryReceipt::Saved),
-                    agent24_agent::MemoryWriteOutcome::SkippedPaused => {
-                        Some(MemoryReceipt::PausedNotSaved)
-                    }
-                    agent24_agent::MemoryWriteOutcome::Failed => Some(MemoryReceipt::Failed),
-                    // Unreachable in practice when `explicit_remember_state`
-                    // is `Some`: both snapshots run the same pure
-                    // `explicit_remember(prompt)` match on the same prompt.
-                    // Falls back to "no receipt" rather than fabricating
-                    // saved/paused — never lies about a non-write.
-                    agent24_agent::MemoryWriteOutcome::NotApplicable => None,
-                })
-            } else {
-                None
-            };
+            let (memory_receipt, memory_error_code, memory_persisted) =
+                if let (Some(sid), Some(prompt)) =
+                    (chat.session_id.as_deref(), latest_user_message.as_deref())
+                {
+                    let outcome = state
+                        .runs
+                        .chat_remember_turn(sid, prompt, &text, memory_source_ref)
+                        .await;
+                    let explicit = explicit_remember_state.is_some();
+                    let (receipt, failure) = match outcome {
+                        agent24_agent::MemoryWriteOutcome::Saved => {
+                            (explicit.then_some(MemoryReceipt::Saved), None)
+                        }
+                        agent24_agent::MemoryWriteOutcome::SkippedPaused => {
+                            (explicit.then_some(MemoryReceipt::PausedNotSaved), None)
+                        }
+                        // P1-02c: a failed conversation write is never silent. An
+                        // explicit "remember" keeps `failed`; an ordinary turn,
+                        // which used to carry no receipt at all, is now `not_saved`.
+                        agent24_agent::MemoryWriteOutcome::Failed(f) => (
+                            Some(if explicit {
+                                MemoryReceipt::Failed
+                            } else {
+                                MemoryReceipt::NotSaved
+                            }),
+                            Some(f),
+                        ),
+                        // The turn is in the history, the assertion is not.
+                        agent24_agent::MemoryWriteOutcome::Partial(f) => {
+                            (Some(MemoryReceipt::Partial), Some(f))
+                        }
+                        // Unreachable in practice when `explicit_remember_state`
+                        // is `Some`: both snapshots run the same pure
+                        // `explicit_remember(prompt)` match on the same prompt.
+                        // Falls back to "no receipt" rather than fabricating
+                        // saved/paused — never lies about a non-write.
+                        agent24_agent::MemoryWriteOutcome::NotApplicable => (None, None),
+                    };
+                    (
+                        receipt,
+                        failure.map(agent24_agent::MemoryFailure::wire_code),
+                        Some(outcome.persisted()),
+                    )
+                } else {
+                    (None, None, Some(true))
+                };
             state
                 .events
                 .broadcast(EventBody::RunCompleted(RunCompletedPayload {
                     run_id,
                     output: RunOutputPayload { text: text.clone() },
                     usage: res.usage.clone(),
+                    memory_persisted,
                 }));
             Json(ChatResponse {
                 message: agent24_protocol::ChatMessage {
@@ -690,6 +714,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 tier: Some(tier.to_owned()),
                 latency_ms: Some(latency_ms),
                 memory_receipt,
+                memory_error_code,
             })
             .into_response()
         }
