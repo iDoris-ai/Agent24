@@ -13,6 +13,7 @@
 pub mod consent_gate;
 pub mod guardian;
 pub mod overrides;
+pub mod tool_summary;
 pub mod write_scope;
 
 use std::collections::{HashMap, HashSet};
@@ -1222,6 +1223,7 @@ mod tests {
                     workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
                 },
                 output: None,
                 error: None,

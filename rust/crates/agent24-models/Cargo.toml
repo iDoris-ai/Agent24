@@ -8,6 +8,7 @@ description = "Agent24 model gateway — minimal ModelProvider trait, OpenAI-com
 
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
+agent24-domain = { path = "../agent24-domain" }
 async-trait = "0.1"
 # Only to tell a backend that hung up from one that answered garbage (`classify`).
 hyper = "1"

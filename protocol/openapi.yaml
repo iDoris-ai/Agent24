@@ -81,6 +81,11 @@ tags:
       module served under `/api/v1/documents`. Every error carries
       `details.retryable`; clients branch on `error.code`, never on the HTTP
       status. Single local user (ADR-DOC-01 §3).
+  - name: comm
+    description: >-
+      The Hyphae communications bridge (identity, contacts, relays, 1:1 messages, group
+      chat), served by agent24d under `/api/v1/comm`. Errors are Hyphae-shaped
+      (`CommError`), not the kernel `Error`.
 
 paths:
   /module-consents:
@@ -200,6 +205,166 @@ paths:
                 $ref: "#/components/schemas/ModuleAuthorizationRevocation"
         "503":
           description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      operationId: decideModuleToolConsent
+      x-milestone: K1-6a
+      tags: [tools]
+      summary: Write the user's decision on a module tool's card
+      description: >-
+        The card's `fingerprint`, `module_version` and `artifact` must still
+        be what the tool is checked against when the decision is written,
+        and the module enabled and running (K1-6a-G §2.1). Replaces any
+        earlier decision for the tool.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModuleToolDecision"
+      responses:
+        "200":
+          description: The decision as written
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorization"
+        "400":
+          description: "`invalid_request`: the body is not JSON"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: >-
+            Host authority required; or `grants_closed`: the host has not
+            opened decisions (`A24_MODULE_TOOL_GRANTS=1`), or the daemon is
+            ephemeral
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No such module tool
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `protocol_too_old` or `no_package_identity`, as for the card;
+            `card_changed`: the fingerprint, version or package identity is
+            no longer the current one; `module_disabled`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: >-
+            `invalid_request`: the body is not a decision (`decision`,
+            `fingerprint`, `module_version` or `artifact` missing, a field of
+            another type, or one not defined). `invalid_decision`:
+            `expires_at` missing, null or not an RFC 3339 instant, an expiry
+            already past or past the
+            host's bound (`A24_MODULE_GRANT_MAX_DAYS`, 30 days unless set, at
+            most 90), more than 256 resources, a resource that is not
+            `<kind>:<id>` of a kind the tool declares, or a denial naming
+            resources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "`invalid_request`: the body is larger than the daemon accepts"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: "`invalid_request`: the body is not sent as `application/json`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Whether the module is enabled could not be read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /module-consents/modules/{module}/tools/{tool}/card:
+    parameters:
+      - name: module
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tool
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getModuleToolCard
+      x-milestone: K1-6a
+      tags: [tools]
+      summary: What a grant of one module tool would cover
+      description: >-
+        Built by the host from the tool's manifest declaration (risk, output
+        privacy, resource kinds, reversible draft); the module's own
+        description text is not shown. `reversible_draft` is what the
+        manifest declares, and the declaration relaxes nothing: a module
+        tool's dispatch is gated with no draft exception.
+        `fingerprint`, `module_version` and `artifact` are what a grant must
+        repeat, and what dispatch compares it with (K1-6a-G §2.1).
+      responses:
+        "200":
+          description: The tool's card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleToolCard"
+        "404":
+          description: No such module tool
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Host authority required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `protocol_too_old`: the module does not require the grants
+            protocol, so it cannot be told its grants were revoked (§2.6).
+            `no_package_identity`: no running package identity to grant
+            against (not running, not yet observed by this daemon start, or
+            an ephemeral daemon).
           content:
             application/json:
               schema:
@@ -717,8 +882,20 @@ paths:
                 $ref: "#/components/schemas/Run"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "403":
+          description: "host_authority_required: knowledge_binding_id was named by a caller other than the product host"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: "knowledge_binding_inactive: the product host has no active Knowledge binding by that id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     get:
       operationId: listRuns
       x-milestone: M-C
@@ -781,6 +958,54 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /peer/runs:
+    get:
+      operationId: listPeerRuns
+      x-milestone: K1-6b
+      tags: [runs]
+      summary: List runs as a peer bridge may relay them
+      description: |
+        K1-6b.5c-2 (ADR-K1-02 §2.4). The MCP server and the ACP bridge read
+        runs here instead of /runs. A run's prompt, output and error appear
+        only when every source tagged on it is ordinary, it has ended, and —
+        while tool results carry no source tags — it cannot have taken one in:
+        it called no tool, recalled no memory, was not started by a
+        kernel-created schedule, and has no session context (no session, or it
+        ran, and the daemon runs, without session memory). Any other run
+        carries only its id,
+        status and a fixed notice.
+      responses:
+        "200":
+          description: Peer run list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PeerRun"
+
+  /peer/runs/{id}:
+    get:
+      operationId: getPeerRun
+      x-milestone: K1-6b
+      tags: [runs]
+      summary: Get one run as a peer bridge may relay it
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Peer run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PeerRun"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -1493,6 +1718,28 @@ paths:
                 $ref: "#/components/schemas/Error"
         "404":
           description: No such assertion
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: >-
+            `memory_retract_id_too_long` — the memory partition is full and
+            the serialized retraction payload `{"assertion_id":…}` exceeds 256
+            bytes, so it falls outside the quota exemption, was charged as
+            ordinary content and refused. The test is on the serialized
+            bytes, not the id length: an id containing characters that JSON
+            escapes (`"`, `\`, control characters) crosses the limit sooner
+            than a plain one. Nothing was changed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "507":
+          description: >-
+            `memory_disk_full` — the disk holding the memory database is full
+            (SQLITE_FULL). Nothing was changed; free space and retry. The body
+            carries the code and a fixed sentence, never a partition key.
           content:
             application/json:
               schema:
@@ -2217,7 +2464,8 @@ paths:
         another rerun), so resending it replays the same rerun and a new key
         runs again; `rerun: true` without the header is 400
         `invalid_request`, and the same key with a different request — the
-        JCS hash of the whole request body differs (§5.4; David, 2026-10-10)
+        JCS hash of the request body, with `"rerun": false` left out so it
+        hashes as the body without `rerun`, differs (§5.4; David, 2026-10-10)
         — is 422 `idempotency_key_reused`. Field keys must be unique (400 otherwise).
         Field descriptions and the document text are untrusted data: the OS
         passes them to the model under a fixed extraction instruction and
@@ -2293,6 +2541,883 @@ paths:
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
         "504": { $ref: "#/components/responses/DocumentsProxyFailure" }
 
+  /comm/identity:
+    get:
+      operationId: listCommIdentities
+      tags: [comm]
+      summary: List Hyphae identities
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+    post:
+      operationId: createCommIdentity
+      tags: [comm]
+      summary: Create an identity (the first one also creates the keystore)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nickname]
+              properties:
+                nickname: { type: string }
+                default: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/identity/default:
+    post:
+      operationId: useCommIdentity
+      tags: [comm]
+      summary: Set the default identity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nickname]
+              properties:
+                nickname: { type: string }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/unlock:
+    post:
+      operationId: unlockComm
+      tags: [comm]
+      summary: Verify and remember the keystore password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                password: { type: string, writeOnly: true }
+                remember: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/contact:
+    get:
+      operationId: listCommContacts
+      tags: [comm]
+      summary: List contacts
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+    post:
+      operationId: addCommContact
+      tags: [comm]
+      summary: Add a contact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nickname, npub]
+              properties:
+                nickname: { type: string }
+                npub: { type: string }
+                role: { type: string }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/relay:
+    get:
+      operationId: listCommRelays
+      tags: [comm]
+      summary: List configured relays
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+    put:
+      operationId: setCommRelays
+      tags: [comm]
+      summary: Replace the relay list (full replace, at most 8)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [relays]
+              properties:
+                relays: { type: array, maxItems: 8, items: { type: string } }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/relay/probe:
+    post:
+      operationId: probeCommRelay
+      tags: [comm]
+      summary: Probe a relay on demand
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string, description: Defaults to the first configured relay }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/import:
+    post:
+      operationId: importCommHome
+      tags: [comm]
+      summary: Import an existing Hyphae home
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from]
+              properties:
+                from: { type: string }
+                confirm: { type: boolean, default: false }
+                password: { type: string, writeOnly: true }
+                dry_run: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/daemon:
+    get:
+      operationId: getCommDaemon
+      tags: [comm]
+      summary: Hyphae daemon status (process, relay probe, catch-up)
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+
+  /comm/daemon/start:
+    post:
+      operationId: startCommDaemon
+      tags: [comm]
+      summary: Start the Hyphae daemon
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+
+  /comm/daemon/stop:
+    post:
+      operationId: stopCommDaemon
+      tags: [comm]
+      summary: Stop the Hyphae daemon
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+
+  /comm/send:
+    post:
+      operationId: sendCommMessage
+      tags: [comm]
+      summary: Send a one-to-one message
+      description: >-
+        Part-success is `502 partial` with the Hyphae data kept; there is no resend, use the outbox retry route.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, content]
+              properties:
+                to: { type: string }
+                content: { type: string }
+                from: { type: string }
+                encrypt: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/history:
+    get:
+      operationId: listCommHistory
+      tags: [comm]
+      summary: Inbox history (pull-based)
+      parameters:
+        - { name: as, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/inbox/pull:
+    post:
+      operationId: pullCommInbox
+      tags: [comm]
+      summary: Pull the inbox once
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                as: { type: string }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/outbox:
+    get:
+      operationId: listCommOutbox
+      tags: [comm]
+      summary: List outbox entries
+      parameters:
+        - { name: failed_only, in: query, required: false, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/outbox/{event_id}/retry:
+    post:
+      operationId: retryCommOutbox
+      tags: [comm]
+      summary: Retry one outbox event (same event id)
+      parameters:
+        - { name: event_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "404":
+          $ref: "#/components/responses/CommNotFound"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/outbox/clear:
+    post:
+      operationId: clearCommOutbox
+      tags: [comm]
+      summary: Clear failed outbox entries (local bookkeeping only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm: { type: boolean, description: Must be true }
+                min_failures: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/groupchat:
+    get:
+      operationId: listCommGroups
+      tags: [comm]
+      summary: List the groups this identity belongs to
+      description: >-
+        `groupchat list`. Tier CommRead (daily).
+      x-comm-tier: CommRead
+      parameters:
+        - $ref: "#/components/parameters/CommIdentityQuery"
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupListResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+    post:
+      operationId: createCommGroup
+      tags: [comm]
+      summary: Create a group and invite npubs
+      description: >-
+        `groupchat create`. Tier CommWrite (elevated). Invitations stay local until each invitee accepts.
+      x-comm-tier: CommWrite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, invitees]
+              properties:
+                name: { type: string, maxLength: 256 }
+                invitees: { type: array, minItems: 1, maxItems: 100, items: { type: string, description: npub } }
+                identity: { type: string }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupCreateResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/groupchat/{group_id}/members:
+    parameters:
+      - $ref: "#/components/parameters/CommGroupId"
+    get:
+      operationId: listCommGroupMembers
+      tags: [comm]
+      summary: List a group's members (creator first)
+      description: >-
+        `groupchat members`. Tier CommRead (daily).
+      x-comm-tier: CommRead
+      parameters:
+        - $ref: "#/components/parameters/CommIdentityQuery"
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupMembersResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/groupchat/{group_id}/invites:
+    parameters:
+      - $ref: "#/components/parameters/CommGroupId"
+    get:
+      operationId: listCommGroupInvites
+      tags: [comm]
+      summary: List a group's invitations (creator only)
+      description: >-
+        `groupchat invite list`. Tier CommRead (daily).
+      x-comm-tier: CommRead
+      parameters:
+        - $ref: "#/components/parameters/CommIdentityQuery"
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupInvitesResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/groupchat/{group_id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/CommGroupId"
+    get:
+      operationId: listCommGroupMessages
+      tags: [comm]
+      summary: Local group history, oldest first, cursor-paged
+      description: >-
+        `groupchat history`. Tier CommRead (daily). `before_id` returns the newest `limit` messages older than that message id; `after_id` the oldest `limit` newer than it (incremental refresh). An unknown cursor, or both cursors, is `400 invalid`. An empty history is `[]`.
+      x-comm-tier: CommRead
+      parameters:
+        - $ref: "#/components/parameters/CommIdentityQuery"
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 20 } }
+        - { name: before_id, in: query, required: false, schema: { type: string } }
+        - { name: after_id, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupHistoryResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+    post:
+      operationId: sendCommGroupMessage
+      tags: [comm]
+      summary: Send a group message (per-recipient fan-out)
+      description: >-
+        `groupchat send`. Tier CommWrite (elevated). Pass `logical_id` (32 lowercase hex) so the send can be found again by status/retry. Partial fan-out failure is `502 partial` whose `data` is the full send report with per-recipient state; render that, do not re-send. `relay_accepted` means a relay took the event, not that anyone read it.
+      x-comm-tier: CommWrite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [body]
+              properties:
+                body: { type: string, maxLength: 32768 }
+                logical_id: { type: string, pattern: "^[0-9a-f]{32}$" }
+                max_retries: { type: integer, minimum: 0 }
+                identity: { type: string }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupSendReportResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/groupchat/{group_id}/messages/{logical_id}:
+    parameters:
+      - $ref: "#/components/parameters/CommGroupId"
+      - $ref: "#/components/parameters/CommLogicalId"
+    get:
+      operationId: getCommGroupMessageStatus
+      tags: [comm]
+      summary: Per-recipient delivery state of one send
+      description: >-
+        `groupchat status`. Tier CommRead (daily). A logical id Hyphae does not know is `502 upstream`.
+      x-comm-tier: CommRead
+      parameters:
+        - $ref: "#/components/parameters/CommIdentityQuery"
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupSendReportResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/groupchat/{group_id}/messages/{logical_id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/CommGroupId"
+      - $ref: "#/components/parameters/CommLogicalId"
+    post:
+      operationId: retryCommGroupMessage
+      tags: [comm]
+      summary: Requeue failed recipients of one send
+      description: >-
+        `groupchat retry`. Tier CommWrite (elevated). Reuses the original signed event (no duplicate message). Omit `recipient` to retry every failed one.
+      x-comm-tier: CommWrite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                recipient: { type: string, description: npub of one failed recipient }
+                identity: { type: string }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupSendReportResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
+  /comm/groupchat/invites/{invite_id}/accept:
+    parameters:
+      - $ref: "#/components/parameters/CommInviteId"
+    post:
+      operationId: acceptCommGroupInvite
+      tags: [comm]
+      summary: Accept a group invitation
+      description: >-
+        `groupchat accept`. Tier CommWrite (elevated). `state:"pending"` (still waiting for other members or the creator) is a success; `"active"` means the group is live. A UI must only call this after an explicit user click. Activation has no command of its own: it follows the last accept.
+      x-comm-tier: CommWrite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                identity: { type: string }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommGroupAcceptResponse"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2305,6 +3430,28 @@ components:
         upgrades that carry a browser Origin header.
 
   parameters:
+    CommGroupId:
+      name: group_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+    CommLogicalId:
+      name: logical_id
+      in: path
+      required: true
+      description: The `logical_id` the message was sent with (also the message `id` in history).
+      schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+    CommInviteId:
+      name: invite_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+    CommIdentityQuery:
+      name: identity
+      in: query
+      required: false
+      description: Local identity nickname; the default identity when omitted.
+      schema: { type: string }
     PathId:
       name: id
       in: path
@@ -2359,6 +3506,48 @@ components:
       schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
 
   responses:
+    CommInvalid:
+      description: "invalid / confirm_required (400): bad input, or Hyphae user_error such as an unknown history cursor"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommError"
+    CommNotFound:
+      description: "not_found (404)"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommError"
+    CommConflict:
+      description: "not_configured / conflict (409): no relay, no keystore, or a write conflict"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommError"
+    CommLocked:
+      description: "locked (423): keystore password missing or rejected"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommError"
+    CommBadGateway:
+      description: "network / partial / upstream (502); partial carries Hyphae data (e.g. a group send report)"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommError"
+    CommUnavailable:
+      description: "binary_rejected (503): the configured Hyphae binary failed hash verification"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommError"
+    CommTimeout:
+      description: "timeout (504): the command may still have taken effect"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommError"
     Internal:
       description: "internal: the request could not be completed"
       content:
@@ -2754,14 +3943,35 @@ components:
           description: Server-measured wall-clock milliseconds for this call.
         memory_receipt:
           type: string
-          enum: [saved, paused_not_saved, failed]
+          enum: [saved, paused_not_saved, failed, not_saved, partial]
           description: >-
             M1-T14: deterministic outcome of an explicit "记住…" turn, set by
             the daemon — never inferred from the model's own reply text.
-            Omitted when this prompt was not an explicit remember, or
-            session_id was omitted. "saved" covers the write-gate's own
-            idempotent reassert/no-op case too (an identical belief already
-            active), not just a fresh commit.
+            Omitted when this prompt was not an explicit remember (and its
+            conversation write did not fail), or session_id was omitted.
+            "saved" covers the write-gate's own idempotent reassert/no-op case
+            too (an identical belief already active), not just a fresh commit.
+            P1-02c adds the failure shapes, each with `memory_error_code`:
+            "failed" — an explicit remember wrote NOTHING; "not_saved" — an
+            ordinary turn (no explicit remember) was not written to the
+            session history; "partial" — an explicit remember's conversation
+            turn WAS saved but its assertion was not. No failure value ever
+            reads as saved, and the model's own text is not a receipt.
+        memory_error_code:
+          type: string
+          enum:
+            - memory_quota_rows
+            - memory_quota_bytes
+            - memory_disk_low
+            - memory_disk_full
+            - memory_reserved_kind
+            - memory_retract_id_too_long
+            - memory_internal
+          description: >-
+            P1-02c: why the memory write failed. Present exactly when
+            `memory_receipt` is "failed", "not_saved" or "partial". A closed
+            code, never text: no partition key, no storage error message.
+            `memory_disk_low` is emitted by the c4 pre-write disk gate.
 
     Session:
       type: object
@@ -2821,7 +4031,7 @@ components:
 
     RunInput:
       type: object
-      required: [prompt, workspace_id]
+      required: [prompt, workspace_id, knowledge_binding_id]
       properties:
         prompt:
           type: string
@@ -2833,6 +4043,11 @@ components:
           type: [string, "null"]
         mode:
           $ref: "#/components/schemas/RunMode"
+        knowledge_binding_id:
+          type: [string, "null"]
+          description: >-
+            The Knowledge binding copied from the run request; null when the run
+            has none.
 
     RunOutput:
       type: object
@@ -2885,6 +4100,43 @@ components:
           type: [string, "null"]
           format: date-time
 
+    PeerRun:
+      type: object
+      description: |
+        K1-6b.5c-2: an allowlisted view of a run for peer bridges, never a
+        filtered Run, so a field added to Run later is not relayed by default.
+      required: [id, status, withheld, prompt, output, error, notice]
+      properties:
+        id:
+          type: string
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        withheld:
+          type: boolean
+          description: |
+            True unless every source tagged on the run so far is ordinary and
+            the run called no tool, recalled no memory, was not started by a
+            kernel-created schedule and has no session context. Sources are
+            tagged before the first model call, so afterwards the value only
+            changes when the run starts a tool or the daemon restarts with
+            session memory turned on or off.
+        prompt:
+          type: [string, "null"]
+          description: Present only for an ended run that is not withheld
+        output:
+          oneOf:
+            - $ref: "#/components/schemas/RunOutput"
+            - type: "null"
+          description: Present only for a completed run that is not withheld
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorBody"
+            - type: "null"
+          description: Present only for a failed run that is not withheld
+        notice:
+          type: [string, "null"]
+          description: Fixed explanation, present exactly when withheld is true
+
     RunCreate:
       type: object
       required: [prompt]
@@ -2902,6 +4154,13 @@ components:
           type: [string, "null"]
         mode:
           $ref: "#/components/schemas/RunMode"
+        knowledge_binding_id:
+          type: [string, "null"]
+          description: >-
+            KB-HOST-01: a Knowledge binding the product host activated over its
+            private interface. A selector, not an authority: only the product
+            host may name one, and only one it has active; the run is pinned to
+            that activation. Omit/null for a run without Knowledge.
 
     ToolCallStatus:
       type: string
@@ -4610,15 +5869,72 @@ components:
         decided_at: { type: string, format: date-time }
         expires_at: { type: string, format: date-time }
         status: { type: string, enum: [granted, denied, revoked, expired, stale, not_granted] }
+        stop:
+          description: >-
+            Only for a revoked one, or an expired grant: whether the module
+            said it stopped the work the grant started when told it ended
+            (K1-6a-G §2.5). `unconfirmed` also when no answer was recorded,
+            as for a revocation made outside this daemon or an expiry not
+            yet told.
+          type: string
+          enum: [confirmed, unconfirmed, not_running]
+
+    ModuleToolCard:
+      type: object
+      required: [module, tool, module_version, scope_summary, host_risk, source, reversible_draft, resource_kinds, fingerprint, artifact]
+      additionalProperties: false
+      properties:
+        module: { type: string }
+        tool: { type: string }
+        module_version: { type: string }
+        scope_summary:
+          type: object
+          required: [readable, writable, external]
+          additionalProperties: false
+          properties:
+            readable: { type: [string, "null"] }
+            writable: { type: [string, "null"] }
+            external: { type: [string, "null"] }
+        host_risk: { type: string, enum: [low, medium, high] }
+        source: { type: string, enum: [first_party, manual_install] }
+        reversible_draft: { type: boolean }
+        resource_kinds:
+          type: array
+          items: { type: string }
+        fingerprint: { type: string }
+        artifact: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+
+    ModuleToolDecision:
+      type: object
+      required: [decision, fingerprint, module_version, artifact, expires_at]
+      additionalProperties: false
+      properties:
+        decision: { type: string, enum: [granted, denied] }
+        fingerprint: { type: string }
+        module_version: { type: string }
+        artifact: { type: string }
+        resources:
+          type: array
+          maxItems: 256
+          items: { type: string }
+        expires_at: { type: string, format: date-time }
 
     ModuleAuthorizationRevocation:
       type: object
-      required: [module, tool, status]
+      required: [module, tool, status, stop]
       additionalProperties: false
       properties:
         module: { type: string }
         tool: { type: [string, "null"] }
         status: { type: string, const: revoked }
+        stop:
+          description: >-
+            What the module answered when told (K1-6a-G §2.5): `confirmed`,
+            it stopped the work the grants started; `unconfirmed`, no 2xx
+            within the bound, so that work may still run; `not_running`, it
+            had no run. The revocation stands in every case.
+          type: string
+          enum: [confirmed, unconfirmed, not_running]
 
     Sin90Proposal:
       type: object
@@ -4652,3 +5968,173 @@ components:
           oneOf:
             - $ref: "#/components/schemas/Sin90AppliedProposal"
             - type: "null"
+
+    # ---- Comm (Hyphae bridge, /comm/*) ----
+    CommErrorCode:
+      type: string
+      description: Closed set (COMM-HYPHAE.md section 4).
+      enum: [binary_rejected, unsupported_platform, locked, not_configured, invalid, not_found, confirm_required, conflict, network, partial, timeout, upstream]
+    CommError:
+      type: object
+      description: >-
+        Hyphae's own failure envelope shape, NOT the kernel `Error`: comm routes
+        answer `{ok:false,error,message,data?}`.
+      required: [ok, error, message]
+      properties:
+        ok: { type: boolean, const: false }
+        error: { $ref: "#/components/schemas/CommErrorCode" }
+        message: { type: string }
+        data: { description: "Kept on partial / conflict (e.g. the group send report)." }
+    CommOk:
+      type: object
+      description: Hyphae envelope; `data` is the command's JSON, passed through.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data: {}
+    CommGroup:
+      type: object
+      required: [group_id, name, state, creator_npub, members, updated_at]
+      properties:
+        group_id: { type: string }
+        name: { type: string }
+        state: { type: string, description: "Open enum, e.g. active" }
+        creator_npub: { type: string }
+        members: { type: array, items: { type: string } }
+        updated_at: { type: integer }
+    CommGroupMember:
+      type: object
+      required: [npub, state, is_creator]
+      properties:
+        npub: { type: string }
+        state: { type: string }
+        is_creator: { type: boolean }
+    CommGroupInvite:
+      type: object
+      required: [invite_id, invitee_npub, group_id, state]
+      properties:
+        invite_id: { type: string }
+        invitee_npub: { type: string }
+        group_id: { type: string }
+        state: { type: string }
+    CommGroupMessage:
+      type: object
+      required: [id, event_id, group_id, sender, content, plaintext, created_at, is_encrypted]
+      description: >-
+        `id` is the send's logical id. The sender's own rows have empty
+        `event_id` and `content`; display `plaintext`. Text comes from the
+        network: strip control characters and bound its length before showing it.
+      properties:
+        id: { type: string }
+        event_id: { type: string }
+        group_id: { type: string }
+        sender: { type: string }
+        content: { type: string }
+        plaintext: { type: string }
+        created_at: { type: integer }
+        is_encrypted: { type: boolean }
+    CommGroupRecipient:
+      type: object
+      required: [recipient_npub, event_id, queue_id, state, relay_acks, relay_count, attempts, max_retries]
+      description: >-
+        Other Hyphae diagnostic fields may be present and should be ignored.
+        `relay_accepted` is not "delivered" or "read".
+      properties:
+        recipient_npub: { type: string }
+        event_id: { type: string }
+        queue_id: { type: string }
+        state: { type: string, enum: [prepared, queued, relay_accepted, failed] }
+        relay_acks: { type: integer }
+        relay_count: { type: integer }
+        attempts: { type: integer }
+        max_retries: { type: integer }
+    CommGroupSendReport:
+      type: object
+      description: Send / status / retry report (status adds `partial` and `bookkeeping`).
+      required: [group_id, logical_id, queued, failed, recipients]
+      properties:
+        group_id: { type: string }
+        logical_id: { type: string }
+        created_at: { type: integer }
+        state: { type: string }
+        accepted: { type: integer }
+        queued: { type: integer }
+        failed: { type: integer }
+        partial: { type: boolean }
+        bookkeeping: {}
+        recipients: { type: array, items: { $ref: "#/components/schemas/CommGroupRecipient" } }
+    CommGroupListResponse:
+      type: object
+      description: Groups; `[]` when there are none.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          required: [groups]
+          properties:
+            groups: { type: array, items: { $ref: "#/components/schemas/CommGroup" } }
+    CommGroupCreateResponse:
+      type: object
+      description: New group id.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          required: [group_id]
+          properties:
+            group_id: { type: string }
+    CommGroupMembersResponse:
+      type: object
+      description: Members, creator first.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          required: [members]
+          properties:
+            members: { type: array, items: { $ref: "#/components/schemas/CommGroupMember" } }
+    CommGroupInvitesResponse:
+      type: object
+      description: Invitations of a group.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          required: [invites]
+          properties:
+            invites: { type: array, items: { $ref: "#/components/schemas/CommGroupInvite" } }
+    CommGroupHistoryResponse:
+      type: object
+      description: Messages oldest first; `[]` when empty.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          required: [messages]
+          properties:
+            messages: { type: array, items: { $ref: "#/components/schemas/CommGroupMessage" } }
+    CommGroupSendReportResponse:
+      type: object
+      description: Send report.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          $ref: "#/components/schemas/CommGroupSendReport"
+    CommGroupAcceptResponse:
+      type: object
+      description: Accept result.
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          required: [group_id, state]
+          properties:
+            group_id: { type: string }
+            state: { type: string, enum: [pending, active] }

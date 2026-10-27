@@ -37,6 +37,7 @@
 //! silent omissions.
 
 use agent24_core::util::now_iso8601;
+use agent24_store::{AssertionSourceRef, strictest_classification};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -58,6 +59,7 @@ pub struct Candidate {
     predicate: String,
     object: Value,
     evidence: Vec<String>,
+    source_ref: Option<Value>,
     origin: Origin,
     explicit_remember: bool,
 }
@@ -79,6 +81,7 @@ impl Candidate {
             predicate: predicate.into(),
             object,
             evidence: Vec::new(),
+            source_ref: None,
             origin,
             explicit_remember: false,
         }
@@ -87,6 +90,14 @@ impl Candidate {
     /// requires at least one.
     pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
         self.evidence = evidence;
+        self
+    }
+    /// Attach the host-authored provenance persisted atomically with this
+    /// assertion. Callers must not derive it from the assertion id. An
+    /// identical re-assert keeps whichever of the stored and this
+    /// provenance has the stricter classification.
+    pub fn with_source_ref(mut self, source_ref: Value) -> Self {
+        self.source_ref = Some(source_ref);
         self
     }
     /// The user explicitly asked to remember this. Only meaningful for `UserSaid`;
@@ -165,11 +176,21 @@ pub trait MemoryWriter: Send + Sync {
 #[derive(Clone)]
 pub struct WriteGate {
     pool: sqlx::SqlitePool,
+    disk: crate::disk_gate::DiskGate,
 }
 
 impl WriteGate {
     pub(crate) fn new(pool: sqlx::SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            disk: crate::disk_gate::DiskGate::disabled(),
+        }
+    }
+
+    /// Attach the pre-write disk check (P1-02c c4).
+    pub(crate) fn with_gate(mut self, gate: crate::disk_gate::DiskGate) -> Self {
+        self.disk = gate;
+        self
     }
 
     /// The DETERMINISTIC policy: same candidate → same outcome, no I/O.
@@ -206,6 +227,7 @@ impl WriteGate {
             c.evidence.clone(),
         );
         a.qualified = qualified;
+        a.source_ref = c.source_ref.clone();
         a.writer_version = "md4".to_owned();
         a.modality = match c.origin.trust {
             Trust::ToolOutput => Modality::Observed,
@@ -250,6 +272,292 @@ impl WriteGate {
         )
     }
 
+    /// K1-6b.4b: an identical re-assert keeps the stricter classification of
+    /// the stored and the proposed provenance. Merging inside the caller's
+    /// `BEGIN IMMEDIATE` transaction means concurrent re-asserts can never
+    /// lower it. Shared by every idempotent re-assert path (audited and
+    /// legacy-chain) so the kernel `source_ref` invariant does not depend on
+    /// which audit shape the original commit left behind.
+    async fn tighten_source_ref(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        c: &Candidate,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> Result<()> {
+        use sqlx::Row;
+        let stored_source_ref = row
+            .get::<Option<String>, _>("source_ref")
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        let stored_class = AssertionSourceRef::classification_of(stored_source_ref.as_ref());
+        let tightens = c.source_ref.as_ref().is_some_and(|proposed| {
+            let proposed_class = AssertionSourceRef::classification_of(Some(proposed));
+            strictest_classification([stored_class, proposed_class]) != stored_class
+        });
+        if tightens {
+            sqlx::query("UPDATE mem_assertions SET source_ref = ? WHERE id = ?")
+                .bind(
+                    c.source_ref
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                )
+                .bind(&c.id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn matches_commit_audit(
+        row: &sqlx::sqlite::SqliteRow,
+        expected_scope: &str,
+        expected: &MemEvent,
+    ) -> bool {
+        use sqlx::Row;
+        let Ok(body) = serde_json::from_str::<Value>(&row.get::<String, _>("payload")) else {
+            return false;
+        };
+        let mut authorized = expected.body.clone();
+        let body_matches = [("UserSaid", true), ("System", false), ("System", true)]
+            .into_iter()
+            .any(|(trust, remember)| {
+                authorized["trust"] = serde_json::json!(trust);
+                authorized["explicit_remember"] = serde_json::json!(remember);
+                body == authorized
+            });
+        row.get::<String, _>("scope_owner") == expected.scope.owner
+            && row.get::<String, _>("scope") == expected_scope
+            && row.get::<String, _>("kind") == "mem.write_decision"
+            && row.get::<String, _>("origin_source") == "write_gate"
+            && row.get::<String, _>("origin_trust") == "system"
+            && body_matches
+    }
+
+    async fn commit_shaped_audits(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        owner: &str,
+        prefix: &str,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        let hex = "[0-9a-f]".repeat(16);
+        let hi = format!("{}.", &prefix[..prefix.len() - 1]);
+        Ok(sqlx::query(
+            "SELECT seq, id, scope_owner, scope, kind, payload, origin_source, origin_trust, at
+             FROM mem_events
+             WHERE scope_owner = ? AND kind = 'mem.write_decision'
+               AND id >= ? AND id < ?
+               AND length(id) = length(?) + 16
+               AND substr(id, 1, length(?)) = ?
+               AND lower(substr(id, length(?) + 1, 16)) GLOB ?
+             ORDER BY seq LIMIT 65",
+        )
+        .bind(owner)
+        .bind(prefix)
+        .bind(hi)
+        .bind(prefix)
+        .bind(prefix)
+        .bind(prefix)
+        .bind(prefix)
+        .bind(hex)
+        .fetch_all(&mut **tx)
+        .await?)
+    }
+
+    async fn id_range(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        owner: &str,
+        lo: &str,
+        hi: &str,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        Ok(sqlx::query(
+            "SELECT seq, id, scope_owner, scope, kind, payload, origin_source, origin_trust, at
+             FROM mem_events WHERE scope_owner = ? AND id >= ? AND id < ?
+             ORDER BY seq LIMIT 65",
+        )
+        .bind(owner)
+        .bind(lo)
+        .bind(hi)
+        .fetch_all(&mut **tx)
+        .await?)
+    }
+
+    fn hex16(s: &str) -> bool {
+        s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn positive_suffix(rest: &str) -> bool {
+        let Some(n) = rest.strip_prefix('-') else {
+            return false;
+        };
+        let mut chars = n.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_digit() && c != '0')
+            && chars.all(|c| c.is_ascii_digit())
+    }
+
+    fn exact_json(body: &Value, expected: Value) -> bool {
+        body == &expected
+    }
+
+    /// Existing pre-#1153 reassert may omit the current commit audit. Accept only a
+    /// complete commit→(retract,reassert)* chain; a forged expected ID never reaches here.
+    /// The anchor is the earliest commit-shaped audit whose reconstructed ID matches,
+    /// not merely the earliest audit in the ID range.
+    async fn legacy_reassert_chain(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        c: &Candidate,
+        expected_scope: &str,
+        current_evidence: &[String],
+    ) -> Result<bool> {
+        use sqlx::Row;
+        let owner = c.scope.owner.as_str();
+        let audit_prefix = format!("audit-{}-", c.id);
+        let audits = Self::commit_shaped_audits(tx, owner, &audit_prefix).await?;
+        let reasserts = Self::id_range(
+            tx,
+            owner,
+            &format!("reassert-{}-", c.id),
+            &format!("reassert-{}.", c.id),
+        )
+        .await?;
+        let retract_base = checksum(&serde_json::to_string(&serde_json::json!([
+            "retract", owner, c.id
+        ]))?);
+        let mut retracts = Self::id_range(
+            tx,
+            owner,
+            &format!("{retract_base}-"),
+            &format!("{retract_base}."),
+        )
+        .await?;
+        if let Some(base) = sqlx::query(
+            "SELECT seq, id, scope_owner, scope, kind, payload, origin_source, origin_trust, at
+             FROM mem_events WHERE id = ?",
+        )
+        .bind(&retract_base)
+        .fetch_optional(&mut **tx)
+        .await?
+            && base.get::<String, _>("scope_owner") == owner
+        {
+            retracts.push(base);
+        }
+        if audits.len() > 64 || reasserts.len() > 64 || retracts.len() > 64 {
+            return Ok(false);
+        }
+        let re_prefix = format!("reassert-{}-", c.id);
+        let reasserts: Vec<_> = reasserts
+            .into_iter()
+            .filter(|row| {
+                let id = row.get::<String, _>("id");
+                let rest = id.trim_start_matches(&re_prefix);
+                let (hex, suffix) = rest.split_once('-').map_or((rest, ""), |(h, s)| (h, s));
+                Self::hex16(hex)
+                    && (suffix.is_empty() || Self::positive_suffix(&format!("-{suffix}")))
+            })
+            .collect();
+        let retracts: Vec<_> = retracts
+            .into_iter()
+            .filter(|row| {
+                let id = row.get::<String, _>("id");
+                id == retract_base
+                    || id
+                        .strip_prefix(&retract_base)
+                        .is_some_and(Self::positive_suffix)
+            })
+            .collect();
+        let mut anchor_at = None;
+        for (index, row) in audits.iter().enumerate() {
+            let payload = serde_json::from_str::<Value>(&row.get::<String, _>("payload"))
+                .unwrap_or(Value::Null);
+            let Some(evidence) = payload.get("evidence").and_then(|v| v.as_array()) else {
+                return Ok(false);
+            };
+            let values: Vec<String> = evidence
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            if values.len() != evidence.len() || values.is_empty() {
+                return Ok(false);
+            }
+            let mut seeded = c.clone();
+            seeded.evidence = values;
+            let expected = Self::audit_event(&seeded, "commit", None);
+            if row.get::<String, _>("id") == expected.id
+                && Self::matches_commit_audit(row, expected_scope, &expected)
+            {
+                anchor_at = Some(index);
+                break;
+            }
+        }
+        let Some(anchor) = anchor_at.map(|index| &audits[index]) else {
+            return Ok(false);
+        };
+        let owner_scope = serde_json::to_string(&Scope::owner(owner))?;
+        let mut links: Vec<_> = retracts.into_iter().chain(reasserts).collect();
+        links.sort_by_key(|row| row.get::<i64, _>("seq"));
+        let anchor_seq = anchor.get::<i64, _>("seq");
+        if links.len() < 2
+            || links.len() % 2 != 0
+            || links
+                .iter()
+                .any(|row| row.get::<i64, _>("seq") <= anchor_seq)
+        {
+            return Ok(false);
+        }
+        for (index, row) in links.iter().enumerate() {
+            let kind = row.get::<String, _>("kind");
+            let payload = serde_json::from_str::<Value>(&row.get::<String, _>("payload"))
+                .unwrap_or(Value::Null);
+            let retract = index % 2 == 0;
+            if retract {
+                if kind != "assertion.retracted"
+                    || row.get::<String, _>("origin_source") != "memory.forget"
+                    || row.get::<String, _>("origin_trust") != "user_said"
+                    || row.get::<String, _>("scope") != owner_scope
+                    || !Self::exact_json(&payload, serde_json::json!({"assertion_id": c.id}))
+                {
+                    return Ok(false);
+                }
+            } else {
+                let evidence = payload.get("evidence").and_then(|v| v.as_array());
+                let Some(evidence) = evidence else {
+                    return Ok(false);
+                };
+                if evidence.is_empty()
+                    || kind != "assertion.reasserted"
+                    || row.get::<String, _>("origin_source") != "write_gate"
+                    || row.get::<String, _>("origin_trust") != "system"
+                    || row.get::<String, _>("scope") != expected_scope
+                    || !Self::exact_json(
+                        &payload,
+                        serde_json::json!({"assertion_id": c.id, "evidence": evidence}),
+                    )
+                {
+                    return Ok(false);
+                }
+                let values: Vec<String> = evidence
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                if values.len() != evidence.len() {
+                    return Ok(false);
+                }
+                let base = format!(
+                    "reassert-{}-{}",
+                    c.id,
+                    &checksum(&format!("{}|{:?}", row.get::<String, _>("at"), values))[..16]
+                );
+                let id = row.get::<String, _>("id");
+                if id != base && !id.strip_prefix(&base).is_some_and(Self::positive_suffix) {
+                    return Ok(false);
+                }
+            }
+        }
+        let Some(last) = links.last() else {
+            return Ok(false);
+        };
+        let last_body =
+            serde_json::from_str::<Value>(&last.get::<String, _>("payload")).unwrap_or(Value::Null);
+        Ok(last_body.get("evidence") == Some(&serde_json::json!(current_evidence)))
+    }
+
     /// Persist a Commit/Hold assertion AND its audit event in ONE transaction, so
     /// a belief can never land without its governance record (and vice versa).
     /// fix683: returns [`CommitStatus`] instead of bare `()` so a pause
@@ -262,6 +570,21 @@ impl WriteGate {
         qualified: bool,
         verdict: &str,
     ) -> Result<CommitStatus> {
+        self.commit_with_audit_using_clock(c, qualified, verdict, now_iso8601)
+            .await
+    }
+
+    async fn commit_with_audit_using_clock<F>(
+        &self,
+        c: &Candidate,
+        qualified: bool,
+        verdict: &str,
+        clock: F,
+    ) -> Result<CommitStatus>
+    where
+        F: Fn() -> String,
+    {
+        self.disk.check(crate::disk_gate::WriteClass::Content)?;
         let assertion = Self::to_assertion(c, qualified);
         let audit = Self::audit_event(c, verdict, None);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -296,7 +619,7 @@ impl WriteGate {
 
             let existing = sqlx::query(
                 "SELECT scope_owner, scope, subject, predicate, object, qualified,
-                        valid_from, valid_to, recorded_from, recorded_to, evidence
+                        valid_from, valid_to, recorded_from, recorded_to, evidence, source_ref
                  FROM mem_assertions WHERE id = ?",
             )
             .bind(&c.id)
@@ -305,7 +628,7 @@ impl WriteGate {
 
             if let Some(row) = existing {
                 use sqlx::Row;
-                let now = now_iso8601();
+                let now = clock();
                 let expected_scope = serde_json::to_string(&c.scope)?;
                 let expected_object = serde_json::to_string(&c.object)?;
                 // Same (owner, scope, subject, predicate, object) the id is
@@ -334,7 +657,7 @@ impl WriteGate {
                         // content, including its original evidence. Validate the
                         // immutable event instead of appending a retry's evidence.
                         let mut original = c.clone();
-                        original.evidence = evidence;
+                        original.evidence = evidence.clone();
                         let expected_audit = Self::audit_event(&original, "commit", None);
                         let audit_row = sqlx::query(
                             "SELECT scope_owner, scope, kind, payload, origin_source, origin_trust
@@ -344,33 +667,32 @@ impl WriteGate {
                         .fetch_optional(&mut *tx)
                         .await?;
 
-                        if let Some(audit_row) = audit_row {
-                            let body = serde_json::from_str::<Value>(
-                                &audit_row.get::<String, _>("payload"),
-                            )
-                            .ok();
-                            let body_matches = body.is_some_and(|body| {
-                                if body == expected_audit.body {
-                                    return true;
-                                }
-                                let mut system_body = expected_audit.body.clone();
-                                system_body["trust"] = serde_json::json!("System");
-                                [false, true].into_iter().any(|remember| {
-                                    system_body["explicit_remember"] = serde_json::json!(remember);
-                                    body == system_body
-                                })
-                            });
-                            let audit_matches = audit_row.get::<String, _>("scope_owner")
-                                == c.scope.owner
-                                && audit_row.get::<String, _>("scope") == expected_scope
-                                && audit_row.get::<String, _>("kind") == "mem.write_decision"
-                                && audit_row.get::<String, _>("origin_source") == "write_gate"
-                                && audit_row.get::<String, _>("origin_trust") == "system"
-                                && body_matches;
-                            if audit_matches {
+                        match audit_row {
+                            Some(audit_row)
+                                if Self::matches_commit_audit(
+                                    &audit_row,
+                                    &expected_scope,
+                                    &expected_audit,
+                                ) =>
+                            {
+                                Self::tighten_source_ref(&mut tx, c, &row).await?;
                                 tx.commit().await?;
                                 return Ok(CommitStatus::Committed);
                             }
+                            Some(_) => {}
+                            None if Self::legacy_reassert_chain(
+                                &mut tx,
+                                c,
+                                &expected_scope,
+                                &evidence,
+                            )
+                            .await? =>
+                            {
+                                Self::tighten_source_ref(&mut tx, c, &row).await?;
+                                tx.commit().await?;
+                                return Ok(CommitStatus::Committed);
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -389,19 +711,50 @@ impl WriteGate {
                 // fresh write-gate verdict.
                 let recorded_to: Option<String> = row.get("recorded_to");
                 if content_matches && recorded_to.is_some() {
+                    let existing_audit = sqlx::query(
+                        "SELECT scope_owner, scope, kind, payload, origin_source, origin_trust
+                         FROM mem_events WHERE id = ?",
+                    )
+                    .bind(&audit.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some(existing) = existing_audit {
+                        if !Self::matches_commit_audit(&existing, &expected_scope, &audit) {
+                            return Err(MemoryError::Conflict(
+                                "invalid reassert commit audit".into(),
+                            ));
+                        }
+                    } else {
+                        EventLog::append_tx(&mut tx, &audit).await?;
+                    }
                     sqlx::query(
-                        "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, qualified = 1
+                        "UPDATE mem_assertions SET recorded_to = NULL, evidence = ?, source_ref = ?, qualified = 1
                          WHERE id = ?",
                     )
                     .bind(serde_json::to_string(&c.evidence)?)
+                    .bind(c.source_ref.as_ref().map(serde_json::to_string).transpose()?)
                     .bind(&c.id)
                     .execute(&mut *tx)
                     .await?;
-                    let reassert_id = format!(
+                    let base_id = format!(
                         "reassert-{}-{}",
                         c.id,
                         &checksum(&format!("{now}|{:?}", c.evidence))[..16]
                     );
+                    // Distinct transitions can share time and evidence. Allocate
+                    // under the existing write lock; never reuse an old audit.
+                    let mut reassert_id = base_id.clone();
+                    let mut suffix = 0_u64;
+                    while sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM mem_events WHERE id = ?)",
+                    )
+                    .bind(&reassert_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    {
+                        suffix += 1;
+                        reassert_id = format!("{base_id}-{suffix}");
+                    }
                     let mut reassert = MemEvent::new(
                         reassert_id,
                         c.scope.clone(),
@@ -435,6 +788,10 @@ impl WriteGate {
 #[async_trait]
 impl MemoryWriter for WriteGate {
     async fn propose(&self, candidates: Vec<Candidate>) -> Result<Vec<WriteDecision>> {
+        // The disk gate is checked before EVERY item's transaction (in
+        // `commit_with_audit_using_clock` and the reject-audit branch below), not
+        // once per batch: items commit independently, so a disk that fills mid-batch
+        // must refuse the remaining items. The gate's 5 s cache keeps this cheap.
         let mut out = Vec::with_capacity(candidates.len());
         for c in &candidates {
             let decision = match Self::policy(c) {
@@ -451,6 +808,7 @@ impl MemoryWriter for WriteGate {
                     // malformed empty/whitespace-owner candidate has no scope to
                     // file a governance record under, so it is rejected without one.
                     if !c.scope.owner.trim().is_empty() {
+                        self.disk.check(crate::disk_gate::WriteClass::Content)?;
                         let audit = Self::audit_event(c, "reject", Some(&reason));
                         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                         EventLog::append_tx(&mut tx, &audit).await?;
@@ -490,7 +848,12 @@ mod tests {
     use crate::KvStore;
     use crate::assertion::{AssertionStore, BeliefQuery};
     use crate::event::{EventQuery, EventStore};
+    use agent24_store::SourceClassification;
     use serde_json::json;
+
+    fn source_ref(classification: SourceClassification) -> Value {
+        AssertionSourceRef::from_sources([("user_input:r1".to_owned(), classification)]).to_value()
+    }
 
     async fn gate() -> (KvStore, WriteGate) {
         let kv = KvStore::open_memory().await.unwrap();
@@ -540,6 +903,139 @@ mod tests {
             .unwrap();
         assert_eq!(d, vec![WriteDecision::Committed("c1".into())]);
         assert_eq!(recall(&kv, "u1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_identical_reassert_records_a_stricter_source_reference() {
+        let (kv, gate) = gate().await;
+        let first = source_ref(SourceClassification::Ordinary);
+        let second = source_ref(SourceClassification::Restricted);
+        for source in [&first, &second] {
+            gate.propose(vec![
+                cand("c_again", "u1", "fact", Trust::UserSaid)
+                    .with_source_ref(source.clone())
+                    .remember(),
+            ])
+            .await
+            .unwrap();
+        }
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&second));
+        // Still one commit audit: the re-assert is the idempotent path.
+        assert_eq!(audits(&kv, "u1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reassert_needs_a_valid_audit_before_source_ref_may_tighten() {
+        // H02 audit proof x K1-6b.4b in ONE re-assert: the stricter
+        // classification may only land through the audited idempotent path.
+        // Without a valid commit audit (and no legacy chain), the re-assert is not
+        // accepted and the stored provenance stays exactly as it was.
+        let (kv, gate) = gate().await;
+        let ordinary = source_ref(SourceClassification::Ordinary);
+        let restricted = source_ref(SourceClassification::Restricted);
+        gate.propose(vec![
+            cand("c_audit", "u1", "fact", Trust::UserSaid)
+                .with_source_ref(ordinary.clone())
+                .remember(),
+        ])
+        .await
+        .unwrap();
+        // Control: with the audit intact, the same proposal tightens.
+        gate.propose(vec![
+            cand("c_audit", "u1", "fact", Trust::UserSaid)
+                .with_source_ref(restricted.clone())
+                .remember(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            recall(&kv, "u1").await[0].source_ref.as_ref(),
+            Some(&restricted)
+        );
+
+        // Fresh owner: same flow, but the commit audit is gone before the re-assert.
+        gate.propose(vec![
+            cand("c_noaudit", "u2", "fact", Trust::UserSaid)
+                .with_source_ref(ordinary.clone())
+                .remember(),
+        ])
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM mem_events WHERE scope_owner = 'u2' AND kind = 'mem.write_decision'",
+        )
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+        let outcome = gate
+            .propose(vec![
+                cand("c_noaudit", "u2", "fact", Trust::UserSaid)
+                    .with_source_ref(restricted.clone())
+                    .remember(),
+            ])
+            .await;
+        assert!(
+            !matches!(outcome.as_deref(), Ok([WriteDecision::Committed(_)])),
+            "a missing audit must not make the re-assert idempotent: {outcome:?}"
+        );
+        assert_eq!(
+            recall(&kv, "u2").await[0].source_ref.as_ref(),
+            Some(&ordinary),
+            "no tightening without a valid audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identical_reassert_never_lowers_the_stored_classification() {
+        // Reverse: replacing the stored provenance whenever it differed let a
+        // later ordinary re-assert (e.g. a concurrent session) overwrite a
+        // restricted one.
+        let (kv, gate) = gate().await;
+        let restricted = source_ref(SourceClassification::Restricted);
+        let unreadable = json!({"classification": "ordinary"});
+        let proposals = [
+            restricted.clone(),
+            source_ref(SourceClassification::Ordinary),
+            source_ref(SourceClassification::Unknown),
+            unreadable,
+        ];
+        for source in proposals {
+            gate.propose(vec![
+                cand("c_keep", "u1", "fact", Trust::UserSaid)
+                    .with_source_ref(source)
+                    .remember(),
+            ])
+            .await
+            .unwrap();
+        }
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&restricted));
+    }
+
+    #[tokio::test]
+    async fn assertion_source_reference_commits_with_content_and_audit() {
+        let (kv, gate) = gate().await;
+        let source = json!({
+            "source_id": "user_input:event-1",
+            "revision_digest": "sha256:abc",
+            "classification": "ordinary",
+            "kind": "user_input",
+            "mode": "local_only"
+        });
+        gate.propose(vec![
+            cand("c_source", "u1", "fact", Trust::UserSaid)
+                .with_source_ref(source.clone())
+                .remember(),
+        ])
+        .await
+        .unwrap();
+        let stored = recall(&kv, "u1").await;
+        assert_eq!(stored[0].source_ref.as_ref(), Some(&source));
+        let audit = audits(&kv, "u1").await;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].event.body["verdict"], "commit");
     }
 
     #[tokio::test]
@@ -626,7 +1122,9 @@ mod tests {
         // collides. The whole transaction must roll back — the belief must NOT
         // land without its governance record.
         let (kv, g) = gate().await;
-        let c = cand("X", "u1", "trusted-subject", Trust::UserSaid).remember();
+        let c = cand("X", "u1", "trusted-subject", Trust::UserSaid)
+            .with_source_ref(json!({"classification":"ordinary"}))
+            .remember();
         let audit = WriteGate::audit_event(&c, "commit", None);
         let clash = MemEvent::new(
             audit.id.clone(),
@@ -722,6 +1220,209 @@ mod tests {
             .filter(|e| e.event.kind == "assertion.reasserted")
             .count();
         assert_eq!(reasserted, 1, "the reactivation is audited exactly once");
+    }
+
+    const H02_T: &str = "2999-01-01T00:00:00Z";
+    const H02_T_PLUS_ONE: &str = "2999-01-01T00:00:01Z";
+
+    fn h02_candidate(evidence: &str) -> Candidate {
+        cand("h02-clock", "h02-owner", "same statement", Trust::UserSaid)
+            .with_evidence(vec![evidence.to_owned()])
+            .remember()
+    }
+
+    async fn reassert_at(g: &WriteGate, evidence: &str, at: &'static str) -> Result<CommitStatus> {
+        g.commit_with_audit_using_clock(&h02_candidate(evidence), true, "commit", move || {
+            at.to_owned()
+        })
+        .await
+    }
+
+    async fn start_h02_cycle(kv: &KvStore, g: &WriteGate) {
+        g.propose(vec![h02_candidate("ev1")]).await.unwrap();
+        assert_eq!(
+            kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap(),
+            crate::assertion::Forget::Forgotten
+        );
+    }
+
+    #[tokio::test]
+    async fn h02_same_second_same_evidence_two_transitions_must_succeed() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        let second = reassert_at(&g, "ev2", H02_T).await;
+        assert!(second.is_ok(), "second same-time reassert: {second:?}");
+        let rows = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let reasserts: Vec<_> = rows
+            .iter()
+            .filter(|e| e.event.kind == "assertion.reasserted")
+            .collect();
+        assert_eq!(reasserts.len(), 2);
+        assert_ne!(reasserts[0].event.id, reasserts[1].event.id);
+    }
+
+    #[tokio::test]
+    async fn h02_reassert_skips_occupied_suffix_without_reusing_events() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        let events = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let base = events
+            .iter()
+            .find(|e| e.event.kind == "assertion.reasserted")
+            .unwrap()
+            .event
+            .clone();
+        for suffix in [1, 3] {
+            let mut occupied = base.clone();
+            occupied.id = format!("{}-{suffix}", base.id);
+            occupied.kind = "test.occupied".into();
+            kv.events().append(&occupied).await.unwrap();
+        }
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        let after = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| e.event.kind == "test.occupied")
+                .count(),
+            2
+        );
+        assert!(
+            after.iter().any(|e| e.event.id == format!("{}-2", base.id)
+                && e.event.kind == "assertion.reasserted")
+        );
+    }
+
+    #[tokio::test]
+    async fn h02_failed_reassert_append_is_atomic() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        let before_events = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let before_count = before_events.len();
+        let before_usage: (i64, i64) =
+            sqlx::query_as("SELECT row_count, byte_count FROM mem_owner_usage WHERE owner = ?")
+                .bind("h02-owner")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "CREATE TEMP TRIGGER h02_abort_reassert BEFORE INSERT ON mem_events
+             WHEN NEW.kind = 'assertion.reasserted'
+             BEGIN SELECT RAISE(ABORT, 'h02 injected append failure'); END",
+        )
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+        // A distinct timestamp avoids relying on the known ID collision.
+        let result = reassert_at(&g, "ev2", H02_T_PLUS_ONE).await;
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("h02 injected append failure"),
+            "the dedicated append fault must be reached: {result:?}"
+        );
+        let after_events = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        assert_eq!(
+            after_events.len(),
+            before_count,
+            "failed transaction appends no event"
+        );
+        let after_usage: (i64, i64) =
+            sqlx::query_as("SELECT row_count, byte_count FROM mem_owner_usage WHERE owner = ?")
+                .bind("h02-owner")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_usage, before_usage,
+            "failed transaction leaves usage unchanged"
+        );
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(
+                &BeliefQuery::owner("h02-owner")
+                    .valid_at(H02_T)
+                    .recorded_at(H02_T),
+            )
+            .await
+            .unwrap();
+        assert!(
+            beliefs.is_empty(),
+            "failed retry leaves the assertion withdrawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn h02_distinct_second_timestamp_and_evidence_controls_succeed() {
+        let (kv, g) = gate().await;
+        start_h02_cycle(&kv, &g).await;
+        reassert_at(&g, "ev2", H02_T).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T).await.unwrap();
+        reassert_at(&g, "ev2", H02_T_PLUS_ONE).await.unwrap();
+        kv.forget("h02-owner", "h02-clock", H02_T_PLUS_ONE)
+            .await
+            .unwrap();
+        reassert_at(&g, "ev3", H02_T_PLUS_ONE).await.unwrap();
+        let rows = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .filter(|e| e.event.kind == "assertion.reasserted")
+            .map(|e| e.event.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[tokio::test]
+    async fn h02_active_repeat_does_not_append_a_transition() {
+        let (kv, g) = gate().await;
+        g.propose(vec![h02_candidate("ev1")]).await.unwrap();
+        let before = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap()
+            .len();
+        reassert_at(&g, "ev1", H02_T_PLUS_ONE).await.unwrap();
+        let after = kv
+            .events()
+            .scan(&EventQuery::owner("h02-owner"))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before);
     }
 
     #[tokio::test]

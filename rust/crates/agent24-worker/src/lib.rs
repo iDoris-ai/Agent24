@@ -189,17 +189,7 @@ impl HttpMlWorker {
         // daemon: a bounded connect timeout classifies as Unavailable.
         // FU-74: no_proxy() + redirect::none(), unconditionally — see this
         // method's doc comment for why.
-        #[expect(
-            clippy::expect_used,
-            reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
-                      redirect-following client FU-74 exists to rule out; fail closed instead"
-        )]
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("building the loopback-only ML worker HTTP client failed");
+        let client = agent24_protocol::client::loopback_client(Duration::from_secs(2));
         Self {
             base_url,
             client,

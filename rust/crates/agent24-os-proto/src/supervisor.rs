@@ -813,7 +813,7 @@ async fn run_once(
     // comes before the child exists, and what follows it is a plain `fn`
     // (`launch::start`), so no later await can be added (FU-58). (The
     // blocking walk itself runs on to its end on its own thread, bounded by
-    // the entry cap.)
+    // the entry cap and, for the artifact identity, the byte cap.)
     let spawned = tokio::select! {
         biased;
         () = stop_requested(stop) => {

@@ -426,6 +426,8 @@ These are acceptance requirements for the implementation. They are not precondit
 | `document.package.assemble` | create-artifact | free |
 | `document.delivery.prepare` | handoff (side effect executed by Agent24) | free |
 
+The dotted names in this list are operation concepts. Agent tool names are in [ADR-DOC-02](adr/ADR-DOC-02-operation-contract.md) §4 (`documents.change_propose`, `documents.revision_list`, `documents.revision_get`, and the other names in that table's tool column).
+
 **Single commit point.**
 
 - Accepting or rejecting suggestions only updates the working-draft state. `document.revision.commit` is the only operation that creates a revision. Restore also goes through it and produces a new revision; it never rewrites history.
@@ -627,11 +629,15 @@ Needs: Agent24/connectors for execution and receipts.
 
 ### Line W — Workspace integration (formerly Phase A + Workspace part of Phase B)
 
-Independent platform work; not on Documenting's critical path. Reproducible OD baseline and golden paths → generic Workspace contract → OD compatibility adapter with regression evidence and a rollback path → WeKnora Workspace entry. Start with a trusted adapter calling WeKnora REST, rather than assuming Agent24 can consume WeKnora HTTP MCP directly.
+Independent platform work; not on Documenting's critical path. The generic hosting route remains: reproducible OD baseline and golden paths → generic Workspace contract → OD compatibility adapter with regression evidence and a rollback path → generalized knowledge hosting. It does not resume Line W or the paused OD-M11/TPI-W work.
+
+**2026-10-11 user-confirmed amendment:** initial KB integration uses trusted REST plus a dedicated isolated KnowledgeView, without waiting for generic Workspace. Agent24 is the sole conversation/agent authority; the knowledge page provides resource/Wiki management, not a second chat. This revises the first-entry ordering in the older T006 plan, not its permissions or source-of-truth rules. See [ADR-KB-01](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md) and [KB-C0–C4](../agent/PLAN-KNOWLEDGE-CONVERSATION.md); API/identity/UI contracts and host ownership still require review in [#904](https://github.com/iDoris-ai/Agent24/issues/904).
 
 ### Line K — KB service (owner: David; formerly the service part of Phase B)
 
 Upstream-tracking WeKnora fork, adapter/service contract, search/source integration, citation preservation, identity/scope mapping, explicit health/capability states, and document ↔ KB revision mapping (§7).
+
+The approved product direction adds a single Agent24 conversation, evidence-returning retrieval and only optionally a bounded knowledge executor; no second personal memory or ordinary-user model setup. The one-stop default KB experience is [fork TODO-B #1](https://github.com/iDoris-ai/WeKnora/issues/1). Its acceptance packages KB-C1–C4 remain BACKLOG, not implementation authorization. David retains Line K ownership; new host/Desktop and sales/credential responsibilities need separate owners. DOC-1 and its explicit-document scope are unchanged; DOC-2 knowledge operations use the frozen Line K contract.
 
 ## 15. First Vertical Slices
 

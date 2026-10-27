@@ -202,6 +202,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "decide",
     "events",
     "health",
+    // KB-HOST-01: `/api/v1/host/knowledge/*`, the desktop host's private interface.
+    "host",
     // M1-T10: `/api/v1/memory/assertions`, `/api/v1/memory/assertions/{id}`,
     // `/api/v1/memory/settings` — the personal-memory REST surface.
     "memory",
@@ -215,6 +217,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     // route was added, rather than leaving it to be discovered by whoever shipped
     // that module.
     "os",
+    // K1-6b.5c-2: `/api/v1/peer/runs`, the run views peer bridges relay.
+    "peer",
     "runs",
     "schedules",
     "sessions",
@@ -929,10 +933,45 @@ impl Supervisors {
         self.lock().disabled.contains_key(name)
     }
 
+    /// Records `name` as a module `os disable` asked to stop, its stop
+    /// reporting through `status` — what `disable` leaves, without a run.
+    #[cfg(test)]
+    pub fn mark_disabled(
+        &self,
+        name: &str,
+        status: tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
+    ) {
+        let current = agent24_os_proto::drain::Current::new(
+            agent24_os_proto::drain::Generation::serving_package("/nonexistent".into(), None),
+        );
+        self.lock()
+            .disabled
+            .insert(name.to_owned(), Disabled { current, status });
+    }
+
     /// A module an earlier `os disable` asked to stop.
     #[must_use]
     pub fn disabled_slot(&self, name: &str) -> Option<Disabled> {
         self.lock().disabled.get(name).cloned()
+    }
+
+    /// Whether no run of `name` can be alive under this daemon (K1-6a-G
+    /// §2.5): it is not in the list, and a stop a disable began has ended
+    /// with its process confirmed gone. Once the shutdown has closed the
+    /// list it owns every run, so then nothing is.
+    #[must_use]
+    pub fn surely_stopped(&self, name: &str) -> bool {
+        let registry = self.lock();
+        let Some(list) = registry.running.as_ref() else {
+            return false;
+        };
+        !list.iter().any(|s| s.name == name)
+            && registry.disabled.get(name).is_none_or(|d| {
+                matches!(
+                    *d.status.borrow(),
+                    agent24_os_proto::supervisor::Status::Stopped
+                )
+            })
     }
 
     /// design §5.1: the proxy slot of the module `name` if — and only if — it
@@ -3121,6 +3160,26 @@ raise SystemExit(3)
         }
     }
 
+    /// K1-6a-G §2.5: a disabled module is surely stopped only once its stop
+    /// says the process is gone; never once the shutdown owns every run.
+    #[test]
+    fn only_a_module_whose_stop_ended_is_surely_stopped() {
+        use agent24_os_proto::supervisor::Status;
+        let supervisors = Supervisors::default();
+        assert!(supervisors.surely_stopped("never-started"));
+        let (status, rx) = tokio::sync::watch::channel(Status::Stopping);
+        supervisors.mark_disabled("m", rx);
+        assert!(!supervisors.surely_stopped("m"), "still stopping");
+        status.send_replace(Status::StopFailed {
+            error: "x".to_owned(),
+        });
+        assert!(!supervisors.surely_stopped("m"), "not confirmed gone");
+        status.send_replace(Status::Stopped);
+        assert!(supervisors.surely_stopped("m"));
+        let _ = supervisors.close();
+        assert!(!supervisors.surely_stopped("never-started"));
+    }
+
     /// `disable` takes one module out of the list and stops it — once — and
     /// hands that stop to the shutdown rather than the module itself, so
     /// the shutdown waits for it and does not stop it twice (SUP-5).
@@ -3142,6 +3201,7 @@ raise SystemExit(3)
         let never = std::future::pending::<()>;
         assert!(host.supervisors.disable("nope", drain, never()).is_none());
         assert!(!host.supervisors.is_disabled("remote"));
+        assert!(!host.supervisors.surely_stopped("remote"), "in the list");
         let current = host
             .supervisors
             .disable("remote", drain, never())

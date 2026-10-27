@@ -1,9 +1,12 @@
 AgentEar contracts/ vendored copy — used by Agent24 desktop tests (A3-4).
 
 source_repo: github.com/iDoris-ai/AgentEar (local clone: /Users/jason/Dev/tools/AgentEar)
-source_commit: 522f9eba0f720c97b9bb0a63d059a82e33029dcb
-copied_at: 2026-09-27T14:39:00Z
-copy_method: git archive 522f9eb contracts/schema contracts/fixtures | tar -x
+source_commit: 0b6409bafc54ba9904e3c029ebbd8a6652356b06
+source_tag: v0.28.0
+contracts_tree: 58e625957525a35528b63c1b61e9298dc8862ea5
+contracts_schema_tree: d3dcac7030fbff5cabb3bee0df0a05f6565ebbd8
+copied_at: 2026-10-27T00:00:00Z
+copy_method: git archive 0b6409bafc54ba9904e3c029ebbd8a6652356b06 contracts/schema contracts/fixtures | tar -x
 
 README intentionally not vendored (relative links into AgentEar's own docs/,
 e.g. ../docs/agent24-embedding.md, which don't exist in this repo and only

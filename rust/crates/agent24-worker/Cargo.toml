@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Agent24 ML worker client (M-D/D4a): Rust-side wire contract + HTTP client for the Python ML worker (embedding/whisper; LoRA training later)"
 
 [dependencies]
+agent24-protocol = { path = "../agent24-protocol" }
 async-trait = "0.1"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
