@@ -74,7 +74,9 @@ touch "$WORK/.start"
 # line `agent24 daemon start` gives the daemon next to it), less those that were
 # there before this run
 release_daemons() {
-  ps -axo pid=,command= | awk -v c="$NEW/agent24d serve" '{ pid = $1; sub(/^ *[0-9]+ /, ""); if (index($0, c) == 1) print pid }' \
+  # The path goes in through the environment: awk -v would read \t and the
+  # like in it as escapes
+  ps -axo pid=,command= | C="$NEW/agent24d serve" awk '{ pid = $1; sub(/^ *[0-9]+ /, ""); if (index($0, ENVIRON["C"]) == 1) print pid }' \
     | grep -vxF -f "$WORK/.before"
 }
 : > "$WORK/.before"; release_daemons > "$WORK/.before.tmp"; mv "$WORK/.before.tmp" "$WORK/.before"
@@ -134,6 +136,8 @@ start_cli() {
     "$bin/agent24" daemon start > "$DATA.start.out" 2>&1 || { reap; return 1; }
   PID=$(jq -r .pid "$DATA/daemon.json"); PORT=$(jq -r .port "$DATA/daemon.json")
   TOKEN=$(jq -r .token "$DATA/daemon.json"); BY_CLI=$bin
+  # A start that says so but leaves no state file has not started
+  [ -n "$PID" ] && [ "$PID" != null ] || { echo "daemon start left no daemon.json in $DATA" >&2; PID="" BY_CLI=""; reap; return 1; }
 }
 # stop_daemon: `agent24 daemon stop` (or SIGTERM to a daemon started without
 # it), then SIGKILL after 10 s, so no daemon outlives a case. A `daemon stop`
