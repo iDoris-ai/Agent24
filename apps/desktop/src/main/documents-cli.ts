@@ -75,10 +75,12 @@ export function runDocumentsCli(
         }
       } else if (type === 'result' && typeof ok === 'boolean' && Number.isInteger(status)) {
         const code = status as number
-        // A resource is a JSON object with a 2xx; an error, its envelope with a 4xx or 5xx.
+        // A resource is a JSON object with a 2xx. An error keeps the CLI's
+        // status: a reply that broke the protocol is `invalid_response` with
+        // the status the daemon gave (a 302, a 200 that is not JSON).
         if (ok && code >= 200 && code < 300 && typeof data === 'object' && data !== null) {
           result = { ok: true, status: code, data: data as never }
-        } else if (!ok && code >= 400 && code < 600 && isError(error)) result = { ok: false, status: code, error }
+        } else if (!ok && isError(error)) result = { ok: false, status: code, error }
         else result = fail(502, 'invalid_response', 'the documents tool gave a result that does not fit')
       }
     }

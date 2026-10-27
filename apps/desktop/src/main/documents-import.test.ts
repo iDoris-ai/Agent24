@@ -101,12 +101,19 @@ describe('importFile through agent24 documents import', () => {
       { ok: true, status: 500, data: false },
       { ok: true, status: 200, data: 'job' },
       { ok: true, status: 302, data: JOB },
-      { ok: false, status: 200, error: { code: 'x', message: 'y' } },
       { ok: false, status: 409, error: { code: 1 } },
       { ok: false, status: 409 },
     ]) {
       const res = await importFile('/a.pdf', () => EP, () => {}, fakeCli([result(bad)]).spawn, 'agent24')
       expect(res).toEqual({ ok: false, status: 502, error: { code: 'invalid_response', message: 'the documents tool gave a result that does not fit' } })
+    }
+  })
+
+  it("keeps the status of the CLI's own invalid_response, a 302 or a 200 included", async () => {
+    for (const status of [200, 302]) {
+      const error = { code: 'invalid_response', message: `unexpected ${status} reply from the daemon` }
+      const res = await importFile('/a.pdf', () => EP, () => {}, fakeCli([result({ ok: false, status, error })]).spawn, 'agent24')
+      expect(res).toEqual({ ok: false, status, error })
     }
   })
 
