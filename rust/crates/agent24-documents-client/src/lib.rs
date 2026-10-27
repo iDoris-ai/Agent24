@@ -5,6 +5,7 @@
 //! [`Transport`]; what to send, when to send it again and what the replies
 //! mean is here, once.
 
+pub mod http;
 pub mod import;
 pub mod response;
 pub mod transport;

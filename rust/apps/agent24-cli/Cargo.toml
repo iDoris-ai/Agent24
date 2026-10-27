@@ -11,6 +11,7 @@ name = "agent24"
 path = "src/main.rs"
 
 [dependencies]
+agent24-documents-client = { path = "../../crates/agent24-documents-client" }
 agent24-hw = { path = "../../crates/agent24-hw" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
 agent24-mcp = { path = "../../crates/agent24-mcp" }

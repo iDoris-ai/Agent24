@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 mod acp;
+mod documents;
 mod service;
 mod tui;
 
@@ -63,6 +64,11 @@ enum Command {
     Os {
         #[command(subcommand)]
         action: OsAction,
+    },
+    /// The Documenting OS: import files (the same code the desktop runs)
+    Documents {
+        #[command(subcommand)]
+        action: documents::DocumentsAction,
     },
     /// Manage the embedded Hyphae-based agent communication layer:
     /// identities, contacts, and relays (COMM-HYPHAE.md §4). A REST client
@@ -2260,6 +2266,7 @@ async fn main() -> std::process::ExitCode {
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
+        Command::Documents { action } => documents::cmd_documents(action).await,
         Command::Comm { action } => cmd_comm(action).await,
         Command::Mcp => cmd_mcp().await,
         Command::Acp => cmd_acp().await,
