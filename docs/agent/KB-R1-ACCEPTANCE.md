@@ -21,14 +21,14 @@
   - 普通用户用 `agent24 daemon start` 起 daemon（legacy 模式），再按这个 daemon 的凭据调 HTTP。
   - W4 里，CLI 的 `daemon status`、`models`、`daemon stop` 都按用户的用法直接跑。
   - W4r 按 main 上桌面的方式拉起 daemon：`agent24d serve --port 0`，legacy 模式，stdin 不接。
-  - W6 走桌面端文档功能的路径（documenting r6，`apps/desktop/src/main/documents-cli.ts`）。documents 包按模块 README 的方式组装：本 checkout 的 `domain-os.yml` 加上二进制目录里的 `agent24-documents`，不带读取引擎，因为 W6 只问模块能力、列文档，用不到。先 `agent24 os install`，再按桌面的方式拉起 daemon。然后像桌面那样调 `agent24 documents request --host-stdin --json`，daemon 的地址、凭据和请求都走 stdin。模块握手要一点时间，W6a 会反复问 `capabilities`，最多等 30 秒。
+  - W6 走桌面端文档功能的路径（documenting r6，`apps/desktop/src/main/documents-cli.ts`）。documents 包按模块 README 的方式组装：本 checkout 的 `domain-os.yml` 加上二进制目录里的 `agent24-documents`，不带读取引擎，因为 W6 只问模块能力、列文档，用不到。先 `agent24 os install`，再按桌面的方式拉起 daemon。然后像桌面那样调 `agent24 documents request --host-stdin --json`，daemon 的地址、凭据和请求都走 stdin。模块握手要一点时间，W6a 会反复问 `capabilities`，每次调用都以剩下的时间为限，总共最多等 30 秒；过了 30 秒才答上来也算 FAIL。
 - **不碰用户数据**：
   - 每个 daemon 和每次 CLI 调用都用工作目录下自己的 `AGENT24_DATA_DIR`、`A24_OS_PACKAGES`，`HOME` 也指到工作目录下。
   - 调用者 shell 里以 `A24_`、`AGENT24` 开头的变量全部清掉。`AGENT24D_BIN` 也在其中，否则 CLI 拉起的会是别处的 daemon，反面对照就失真了。
   - Z1 检查 `~/.agent24` 在运行期间没有变化。
   - `--work` 不能在 `~/.agent24` 下面，并且要么不存在、要么为空。
   - `--work` 不能在另一次运行的工作目录里面。脚本在工作目录里放一个 `.kb-r1-accept` 标记，任何上级目录里有这个标记就拒绝运行，否则外层运行的 reap 会把里层运行的 daemon 当成自己的杀掉。并发运行时，各自的 `--work` 也不要互相嵌套。
-  - `--work` 解析后的路径必须是可打印 ASCII，否则在创建任何东西之前就拒绝运行。原因是 reap 按 lsof 打出的工作目录认进程，而 lsof 会把其他字节转义（C locale 下连非 ASCII 字符也转义），这样的路径永远匹配不上，残留的 daemon 就会被放过。
+  - `--work` 解析后的路径必须是可打印 ASCII，否则在创建任何东西之前就拒绝运行。原因是 reap 按 lsof 打出的工作目录认进程，而 lsof 会把其他字节转义（C locale 下连非 ASCII 字符也转义），这样的路径永远匹配不上，残留的 daemon 就会被放过。也不能带空格：reap 按 ps 打出的命令行认模块进程，命令行里的空格分隔参数，`/x/a b/m` 也可能是别人用参数 `b/m` 跑的 `/x/a`。
 - **不留进程**：
   - 宿主 daemon 靠关闭 stdin 来停：父进程租约结束，daemon 自己退出。legacy 方式拉起的发 SIGTERM。15 秒内没有退出就杀掉。
   - CLI 起的 daemon 用 `agent24 daemon stop` 停。

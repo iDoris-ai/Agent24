@@ -53,9 +53,12 @@ if WORK == REAL or WORK.startswith(REAL + os.sep):
     sys.exit(f"--work must not be inside {REAL}")
 # reap() tells this run's daemons by their working directory as lsof prints
 # it; lsof escapes other bytes (and, under the C locale, any non-ASCII), so
-# such a path would never match and a leftover daemon would be spared.
-if not all(" " <= c <= "~" for c in WORK):
-    sys.exit(f"--work must be a printable ASCII path: {WORK!r}")
+# such a path would never match and a leftover daemon would be spared. It
+# tells this run's modules by the command line ps prints, where a space
+# separates arguments: `/x/a b/m` could be `/x/a` run with `b/m`, someone
+# else's process, so no spaces either.
+if not all("!" <= c <= "~" for c in WORK):
+    sys.exit(f"--work must be a printable ASCII path with no spaces: {WORK!r}")
 if os.path.exists(WORK) and os.listdir(WORK):
     sys.exit(f"--work must be new or empty: {WORK}")
 # reap() takes every daemon running under WORK for this run's, so a run nested
@@ -319,18 +322,18 @@ def install_documents(bin_dir, data):
     return cli(bin_dir, data, "os", "install", pkg)
 
 
-def documents_request(bin_dir, data, daemon, request, token=None):
+def documents_request(bin_dir, data, daemon, request, token=None, timeout=90):
     """`agent24 documents request --host-stdin --json` the desktop's way
     (apps/desktop/src/main/documents-cli.ts): the daemon's address, the token
     and the request on stdin, none of them in argv. The token is the
     daemon's own unless one is given. (exit code, the last stdout line as
-    JSON or None.)"""
+    JSON or None; a CLI still running after `timeout` seconds is None, None.)"""
     body = {"base": f"http://127.0.0.1:{daemon.port}",
             "token": daemon.token if token is None else token, "request": request}
     try:
         out = subprocess.run([os.path.join(bin_dir, "agent24"), "documents", "request", "--host-stdin", "--json"],
                              input=json.dumps(body).encode(), env=env_for(data), cwd=data,
-                             capture_output=True, timeout=90)
+                             capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return None, None
     lines = out.stdout.decode("utf-8", "replace").strip().splitlines()
@@ -349,11 +352,13 @@ def result_of(answer):
 
 def documents_ready(bin_dir, data, daemon):
     """Asks for `capabilities` until the module has finished its handshake
-    (`module_not_ready` until then) or MODULE_READY_TIMEOUT has passed.
-    (exit code, answer, seconds waited.)"""
+    (`module_not_ready` until then), each ask cut off at what is left of
+    MODULE_READY_TIMEOUT: (exit code, answer, seconds waited). The caller
+    checks the seconds too: an answer that came late was not ready in time."""
     start = time.monotonic()
     while True:
-        code, answer = documents_request(bin_dir, data, daemon, {"op": "capabilities"})
+        left = MODULE_READY_TIMEOUT - (time.monotonic() - start)
+        code, answer = documents_request(bin_dir, data, daemon, {"op": "capabilities"}, timeout=max(left, 1))
         waited = time.monotonic() - start
         if code == 0 or waited > MODULE_READY_TIMEOUT:
             return code, answer, waited
@@ -616,7 +621,7 @@ def case_w6():
         code, answer, waited = documents_ready(NEW, data, host)
         ok, status, err = result_of(answer)
         check("W6a", "桌面的方式（CLI `--host-stdin` 带宿主凭据）问 documents 模块，能答",
-              code == 0 and ok is True and status == 200,
+              code == 0 and ok is True and status == 200 and waited <= MODULE_READY_TIMEOUT,
               f"退出 {code}，{status} {err or ''}，等了 {waited:.1f} 秒")
         code, answer = documents_request(NEW, data, host, {"op": "list"})
         ok, status, err = result_of(answer)
@@ -645,7 +650,8 @@ def case_w6():
         code, answer, waited = documents_ready(OLD, data, old)
         ok, status, err = result_of(answer)
         check("W6r", "对照：main 的桌面方式（legacy daemon）同样能答",
-              code == 0 and ok is True and status == 200, f"退出 {code}，{status} {err or ''}，等了 {waited:.1f} 秒")
+              code == 0 and ok is True and status == 200 and waited <= MODULE_READY_TIMEOUT,
+              f"退出 {code}，{status} {err or ''}，等了 {waited:.1f} 秒")
     finally:
         if old:
             old.stop()
