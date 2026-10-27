@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::response::{Response, to_response};
 use crate::transport::{Method, Request, Transport};
 
-const BASE: &str = "/api/v1/documents";
+pub(crate) const BASE: &str = "/api/v1/documents";
 /// The OS's chunk limit (ADR-DOC-02 §5.6).
 pub const CHUNK_BYTES: u64 = 786_432;
 /// Replies to send again with the same key (ADR-DOC-02 §6): the transport's
@@ -161,11 +161,17 @@ fn chain_remember(first: &str, root: &str, after: &str) {
 }
 
 fn upload_id_ok(id: &str) -> bool {
+    ulid_id(id, "upl_")
+}
+
+/// `<prefix><ULID>`: a 4-byte prefix, then 26 Crockford characters, upper
+/// case, the first one 0–7.
+pub(crate) fn ulid_id(id: &str, prefix: &str) -> bool {
     let b = id.as_bytes();
-    b.len() == 30
-        && b.starts_with(b"upl_")
-        && matches!(b[4], b'0'..=b'7')
-        && b[5..].iter().all(|c| {
+    b.len() == prefix.len() + 26
+        && b.starts_with(prefix.as_bytes())
+        && matches!(b[prefix.len()], b'0'..=b'7')
+        && b[prefix.len() + 1..].iter().all(|c| {
             matches!(
                 c,
                 b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'
@@ -173,7 +179,7 @@ fn upload_id_ok(id: &str) -> bool {
         })
 }
 
-fn safe_u64(v: &Value) -> Option<u64> {
+pub(crate) fn safe_u64(v: &Value) -> Option<u64> {
     if let Some(u) = v.as_u64() {
         return (u <= MAX_SAFE_INTEGER).then_some(u);
     }
