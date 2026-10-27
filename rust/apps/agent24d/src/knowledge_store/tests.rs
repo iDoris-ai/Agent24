@@ -237,6 +237,7 @@ async fn a_kind_and_body_that_do_not_match_are_damaged() {
         "'changes', NULL",
         "'void', 'x'",
         "'weird', NULL",
+        r#"'weird', '{"version":1,"changes":["on"]}'"#,
         "NULL, NULL",
     ] {
         let (_dir, db) = open().await;
