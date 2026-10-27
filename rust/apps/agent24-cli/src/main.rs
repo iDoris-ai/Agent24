@@ -46,13 +46,16 @@ enum Command {
         /// Model id override
         #[arg(long)]
         model: Option<String>,
-        /// Chat with personal memory on, as the desktop's chat page does for each
-        /// conversation: an explicit "记住…" is kept and its outcome shown, and
-        /// what you remember is recalled for the reply. Memory is shared by all
-        /// your conversations; this id files the turn under one of them, whose
-        /// source floor (the strictest source it has recalled) a new memory
-        /// takes. Only this one message is sent, not the turns before it
-        #[arg(long)]
+        /// Chat with the daemon's personal memory, as the desktop's chat page
+        /// does for each conversation: what you remember is recalled for the
+        /// reply, and an explicit "记住…" is kept unless memory is paused, with
+        /// the daemon's receipt printed (none when the message is not an
+        /// explicit remember, or the daemon has no personal memory). Memory is
+        /// shared by all your conversations; this id files the turn under one
+        /// of them, whose source floor (the strictest source it has recalled) a
+        /// new memory takes. Only this one message is sent, not the turns
+        /// before it
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         session: Option<String>,
     },
     /// List models known to the daemon
