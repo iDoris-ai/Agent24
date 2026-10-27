@@ -87,11 +87,13 @@ check_bin() {
 }
 MAIN="$APP/Contents/MacOS/$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$APP/Contents/Info.plist")"
 check_bin "$MAIN"
-[[ -f "$APP/Contents/Resources/backend/agent24d" ]] || fail "缺少 Contents/Resources/backend/agent24d"
-check_bin "$APP/Contents/Resources/backend/agent24d"
+for b in agent24d agent24; do
+  [[ -f "$APP/Contents/Resources/backend/$b" ]] || fail "缺少 Contents/Resources/backend/$b"
+  check_bin "$APP/Contents/Resources/backend/$b"
+done
 # 其余 Resources 下的 Mach-O（含 .node / 辅助二进制），逐个必须已签
 while IFS= read -r f; do
-  [[ "$f" == "$APP/Contents/Resources/backend/agent24d" ]] && continue
+  [[ "$f" == "$APP/Contents/Resources/backend/agent24d" || "$f" == "$APP/Contents/Resources/backend/agent24" ]] && continue
   if file -b "$f" | grep -q "Mach-O"; then
     codesign -dv "$f" >/dev/null 2>&1 || { echo "UNSIGNED  ${f#"$APP"/}"; BAD=1; }
   fi

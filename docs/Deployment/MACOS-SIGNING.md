@@ -52,7 +52,7 @@ SKIP_NOTARIZE=1 bash apps/desktop/scripts/release-mac.sh   # 只签名，本地�
 - electron-builder 25 内置公证只认 `APPLE_ID`+app 专用密码 或 App Store Connect API key 环境变量，**不支持 keychain profile**；用它就得把明文凭据放进环境变量/CI secrets。
 - 公证放在脚本里调 `notarytool --keychain-profile`：凭据留在 keychain，与 10-16 手工流程完全一致，且**公证对象是 dmg 本身**（内含 app 的票据一并登记），再 `staple` 到 dmg，离线机器打开 dmg 也能通过。
 - 因此 `package.json` 里 `mac.notarize=false`，签名由 electron-builder 完成（`hardenedRuntime`、`entitlements`、`entitlementsInherit`、`binaries`、`dmg.sign`）。
-- `mac.binaries` 显式列出 `Contents/Resources/backend/agent24d`（路径相对 `.app`）。桌面包目前不带 `agent24` CLI，如将来打进包，在此追加。
+- `mac.binaries` 显式列出 `Contents/Resources/backend/agent24d` 和 `Contents/Resources/backend/agent24`（路径相对 `.app`）。桌面端的文档导入和文档操作都调用打进包里的 `agent24` CLI（DOC-1-43、DOC-1-45），所以它和 `agent24d` 一样要签名、启用 Hardened Runtime。
 
 ### Entitlements（`apps/desktop/build/entitlements.mac.plist`）
 

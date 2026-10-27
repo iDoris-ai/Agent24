@@ -29,7 +29,7 @@
 | 幂等 | `FireId` 是带域分隔前缀、只由业务坐标决定的 SHA-256（`rust/crates/agent24-scheduler/src/fire.rs:25-44`），落库 `ON CONFLICT (fire_id) DO NOTHING`（`module_schedules.rs:443`）；`UNIQUE (module, request_id, kind)`（`rust/crates/agent24-store/migrations/0005_module_approvals.sql:39`） |
 | job | **没有** job 抽象（BASELINE §8） |
 | 错误信封 | `{error:{code,message,hint?,details?}}`，`code` 是开放枚举（`rust/crates/agent24-protocol/src/types.rs:247-264`）；413 用 `payload_too_large`（`rust/crates/agent24-domain/src/http.rs:121-122`） |
-| 工具错误 | `ToolError` = `Invalid(String) / Denied(String) / Failed(String) / Timeout(Duration) / Cancelled / AbortRun(String)`（`rust/crates/agent24-tools/src/lib.rs:153-170`）。agent loop 把 `Cancelled` 与 `AbortRun` 同等处理，**会取消整个 run**（`rust/crates/agent24-agent/src/lib.rs:1347`、`:1986`） |
+| 工具错误 | **当时**：工具错误 = `ToolError` 六变体 `Invalid(String) / Denied(String) / Failed(String) / Timeout(Duration) / Cancelled / AbortRun(String)`（`rust/crates/agent24-tools/src/lib.rs:153-170`）。agent loop 把 `Cancelled` 与 `AbortRun` 同等处理，**会取消整个 run**（`rust/crates/agent24-agent/src/lib.rs:1347`、`:1986`）。工具路径上模块错误的映射见 §6 的信封，不映射成这六个变体（DOC-1-06b，2026-10-18） |
 | 代理 | 首字节 10 s、总 30 s（`rust/crates/agent24-os-proto/src/proxy.rs:116`、`:124`）；响应体同样 1 MiB 上限（`:1709-1722`）；只自动重试无 body 的 GET/HEAD/OPTIONS（`:1546-1556`）；未派发即拒绝的 `module_stopping` / `module_overloaded` 等（`:1303-1436`），以及派发后结果未知的 503 `request_abandoned`（`:1286-1298`） |
 | 事件 | `module` 信封：`payload.module` = manifest id，`payload.kind` 为点分名（`protocol/events.schema.json:762-786`）。`_a24/events/emit` 每个 generation 令牌桶容量 20、每秒补 5（`rust/apps/agent24d/src/events_emit.rs:23-25`），payload ≤ 256 节点、字符串 ≤ 8 KiB（`:39-41`）。`EventsHub` 是广播给**所有** WS 客户端的通道（`rust/apps/agent24d/src/events.rs:22-30`，每个 WS 订阅在 `:134`） |
 
@@ -197,8 +197,8 @@
 
 ## 4. 操作清单（DOC-1）
 
-- **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。两条路径调用**同一个服务层**，操作日志记录来源（`page`，或 `run_id + tool_call_id`）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
-- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；单页响应 ≤ 512 KiB，给 1 MiB 上限留余量。`job.get` 返回单个 job，不分页；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。
+- **调用路径**：路由前缀 `/api/v1/documents`，页面经 D5 的 preload 调用，agent 工具经内核 `_a24/tools/<op>` 调用。关联信息（`run_id`、`tool_call_id`）由内核放在请求正文的 `context` 里（正文 `{"context":…,"arguments":…}`），不是请求头（DOC-1-06b，2026-10-18）。两条路径调用**同一个服务层**。操作日志的 `origin` 是 `'page'` 或 `'run'`，`'run'` 时填 `run_id`、`tool_call_id`（`oplog` 的列，`migrations/0001_init.sql:99-110`）。只读工具不写 `oplog`（内核审计已覆盖）。工具发起的 extract（新建或重放）写一行（DOC-1-06b，2026-10-18）。所有工具都声明 `output_privacy: local_only`（D8）。这只是**需求声明**，出站控制由内核的资料处理政策执行，见 ADR-DOC-01 D8 和 #735。
+- **分页**：`list`、`find`、`read_range`、抽取结果统一用 `cursor` / `limit`（默认 50，最大 200），返回 `next_cursor`；REST 单页仍 ≤ 512 KiB，给 1 MiB 上限留余量。`documents.job_get` 返回单个 job，不分页（DOC-1-06b，2026-10-18）；job 的结果如果是集合（例如抽取结果），由结果自己的资源分页（2026-10-09 澄清，回应 OpenAPI B1 的审查）。工具响应信封 ≤ 64 KiB（内核上限，`agent24d/src/module_tool_runtime.rs:18`），按 60 KiB 预算（留 4 KiB 余量）提前截断并返回 `next_cursor`；`next_cursor` 放在信封的 `payload` 里（信封 `deny_unknown_fields`，`agent24-os-proto/src/kernel_call.rs:96-98`）。单个条目本身超过预算时返回 `error{code:"payload_too_large"}`，不截断条目内容。不用内核码 `response_too_large`：内核 `result_code` 把它归成 `ResultUnknown`（`agent24-tools/src/lib.rs:962-967`），`module_error_json` 给模型 `result_unknown:true`（`:1017-1044`），把确定的拒绝报成结果未知。`payload_too_large` 在 `DocumentsErrorCode` 闭集里（`protocol/openapi.yaml:3578-3600`；`agent24-documents/src/error.rs:113`），内核收成 `module_error`，原码进 `module_code`。`documents.extraction_get` 按同一预算分页读抽取值；单条值在 REST 最大 508 KiB（512 KiB 页减去 4 KiB 信封，`agent24-documents/src/extractions.rs:22-28`），超过工具预算则 `payload_too_large`（DOC-1-06b，2026-10-18）。
 - **风险映射**（用户确认后的内核 `RiskClass`，`types.rs:1036-1050`）：read → `Read`；create-record / mutate-draft / commit / create-artifact → `WriteLocal`；handoff → `External`。**DOC-1 没有第一方默认安装，所有工具实际按 `External` 处理、每次审批**，除非用户在启用时逐个确认（D4.2）。
 
 | 片 | 操作 | REST | 工具 | 知识类 | 业务风险 |
@@ -209,15 +209,17 @@
 | 1 | render | `GET /documents/{id}/revisions/{rev}/pages/{n}?scale=`（≤ 1 MiB；超出时自动降低 scale，降到 0.25 仍超出则 413，由客户端用 `region` 分块请求） | 不通告 | free | read |
 | 1 | read_range | `GET /documents/{id}/revisions/{rev}/text?block=&cursor=` | `documents.read_range` | free | read |
 | 1 | find | `POST /documents/{id}/find {revision, query, cursor}` | `documents.find` | free | read |
-| 1 | extract | `POST /documents/{id}/extractions {revision, schema}` → 202 job；`GET /extractions/{id}` | `documents.extract` | free（显式给定文档） | read |
-| 1 | job | `GET /jobs/{id}`；`POST /jobs/{id}/cancel`；`POST /jobs/{id}/retry` | `documents.job.get`（cancel / retry 不通告，Q9） | free | read；cancel / retry 是 mutate-draft |
+| 1 | extract | `POST /documents/{id}/extractions {revision, schema}` → 202 job；`GET /extractions/{id}` | `documents.extract`、`documents.extraction_get` | free（显式给定文档） | read |
+| 1 | job | `GET /jobs/{id}`；`POST /jobs/{id}/cancel`；`POST /jobs/{id}/retry` | `documents.job_get`（cancel / retry 不通告，Q9） | free | read；cancel / retry 是 mutate-draft |
 | 1 | capabilities | `GET /capabilities`（§8） | 不单独通告 | free | read |
-| 2 | change.propose | `POST /documents/{id}/changes {base_revision, ops}` | `documents.change.propose` | optional | mutate-draft |
+| 2 | change.propose | `POST /documents/{id}/changes {base_revision, ops}` | `documents.change_propose` | optional | mutate-draft |
 | 2 | change.review | `POST /changes/{cs}/review {decisions}` | **不通告** | free | mutate-draft |
 | 2 | revision.commit | `POST /documents/{id}/revisions {base_revision, change_set_id, change_set_sha256}` | **不通告**（Q5 已定） | free | commit |
-| 2 | revision.list / get | `GET /documents/{id}/revisions[/{rev}]` | `documents.revision.list`、`documents.revision.get` | free | read |
+| 2 | revision.list / get | `GET /documents/{id}/revisions[/{rev}]` | `documents.revision_list`、`documents.revision_get` | free | read |
 | 2 | export | `POST /documents/{id}/revisions/{rev}/exports {format, options}` → 202 job；`GET /exports/{id}/content?offset=` | `documents.export` | free | create-artifact |
 
+- 「工具」列：内核要求操作名不含点（`agent24-domain/src/tool.rs:112-120`），全名按第一个点切出模块名（DOC-1-06b，2026-10-18）。
+- 工具不用 `pending` 信封（内核会收成 `result_unknown`）。`documents.extract` 只提交或重放，立即返回 `completed{payload:{status, job_id}}`，不等待抽取完成，不带抽取值，也不带 `extraction_id`。`extraction_id` 只在任务成功、提交事务时生成（`agent24-documents/src/extract/job.rs:216-231` 生成 id，`:247-267` 与 `succeeded` 同一事务）；`GET /jobs/{id}` 只有 `succeeded` 才带 `result.extraction_id`（`jobs.rs:113-117`）。agent 用 `documents.job_get` 查进度，成功后把 `result.extraction_id` 交给 `documents.extraction_get`（`GET /extractions/{id}`，`agent24-documents/src/lib.rs:184-187`）按工具字节预算分页读回。重放沿用 §5：业务键命中 `succeeded` 返回原 job；命中 `failed` 或 `interrupted` 把同一个 job 重新排队（`extract/handler.rs:203-218,253-255`），等于重跑；同一业务键但请求正文的规范化哈希不同，返回 422 `idempotency_key_reused`（`handler.rs:102-103,199-200`）。工具路径发给服务层的请求正文是 `{revision, schema}`，不含工具专有字段。REST 对规范化后的请求体算 `request_sha256`（`extract/handler.rs:102-103`）：`rerun` 为 false 时从正文里删掉，不补上，再做 JCS 哈希。不带 `rerun` 的旧请求哈希不变；显式 `rerun: false` 与省略落到同一哈希。字段仍是 `revision`、`schema`、`rerun`（省略时收成 false，`:48-53`），规范化后的哈希不同返回 422（`:199-200`）。以前若有显式发 `rerun: false` 存下的 job，这个业务键此后会一直 422：`claim()` 在返回 422 前什么都不写（`extract/handler.rs:199-200`），哈希只在键不存在时插入（`:236-244`）。目前没有客户端显式发 `rerun: false`，所以没有存量（DOC-1-06b，2026-10-18）（验收 harness 的普通抽取只发 `{revision, schema}`，`packages/documents-accept/src/extract-checks.ts:24`；OpenAPI 允许省略，`protocol/openapi.yaml:4290-4308`）。`documents.extract` 不支持 `rerun:true`：它需要 `Idempotency-Key`（`protocol/openapi.yaml:2214-2218`），内核工具请求不带额外请求头（`agent24d/src/module_tool_runtime.rs:101`）（DOC-1-06b，2026-10-18）。
 - DOC-1 的 agent 只能读、查、抽取、提议修改、导出已提交的 revision。**导入只在页面经原生文件对话框完成（Q4）；review 和 commit 只在页面、在可见 diff 上由用户完成（Q5，README §11.6）**。以后若开放 agent 导入或对话内确认提交，按 `WriteLocal` 走审批，需修订本 ADR。
 - **之后的阶段**（只定方向）：DOC-2 `search`（required）、`ask / summarize / compare / translate`（按 §9.1 逐次分类）；DOC-3 `draft.create`、`revision.restore`（用目标 revision 的内容生成 change set 再走 commit）；DOC-4 `preflight`、`package.assemble`（绑定已批准的 revision）、`delivery.prepare`（`External`，由 Agent24 执行）。
 
@@ -242,14 +244,14 @@
      |---|---|
      | `upload` | 页面的 `Idempotency-Key` |
      | `import` | `upload_id` |
-     | `extract` | `(document_id, revision, schema_sha256, extractor_version)`。实际用的模型由内核路由器在调用时决定，事先问不到，所以不进键，而是记在结果的 `model_id` 里；本地模型换了以后，同样的请求仍重放旧结果，要用新模型就显式重新抽取（David，2026-10-10，原为键里带实际模型 id）。需要重新抽取时，页面带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，在这个文档内标识这一次重新抽取，同一个键再来就重放它；同一个键换了请求体（整个请求体的 JCS 哈希不同）是 422 `idempotency_key_reused`。`idempotency` 表里两种行的 `key` 形状不同、不会相混：首次抽取存 `{document_id}/{revision}/{schema_sha256}/{extractor_version}`，rerun 存 `{document_id}/rerun/{Idempotency-Key}`；请求体里没有 `document_id`，所以作用域靠存键里的 `document_id`：同一个键用在另一份文档上，是那份文档的另一次重新抽取，不会重放这份文档的 job（回应 PR-Daemon 对 #894 的审查）（David，2026-10-10；取代 2026-10-09「并入业务键、换了 schema 就是另一个键」的写法，那样 422 永远不会出现） |
+     | `extract` | `(document_id, revision, schema_sha256, extractor_version)`。实际用的模型由内核路由器在调用时决定，事先问不到，所以不进键，而是记在结果的 `model_id` 里；本地模型换了以后，同样的请求仍重放旧结果，要用新模型就显式重新抽取（David，2026-10-10，原为键里带实际模型 id）。需要重新抽取时，页面带 `rerun: true`，同时换一个新键：新键由 `Idempotency-Key` 请求头给出，在这个文档内标识这一次重新抽取，同一个键再来就重放它；同一个键换了请求体（规范化后的 JCS 哈希不同；`rerun` 为 false 时该字段省略，见下）是 422 `idempotency_key_reused`（DOC-1-06b，2026-10-18）。`idempotency` 表里两种行的 `key` 形状不同、不会相混：首次抽取存 `{document_id}/{revision}/{schema_sha256}/{extractor_version}`，rerun 存 `{document_id}/rerun/{Idempotency-Key}`；请求体里没有 `document_id`，所以作用域靠存键里的 `document_id`：同一个键用在另一份文档上，是那份文档的另一次重新抽取，不会重放这份文档的 job（回应 PR-Daemon 对 #894 的审查）（David，2026-10-10；取代 2026-10-09「并入业务键、换了 schema 就是另一个键」的写法，那样 422 永远不会出现） |
      | `propose` | `(document_id, base_revision, ops_sha256)` |
      | `export` | `(document_id, revision, format, options_sha256)` |
      | `commit` | `commit_key` |
 
    - 同一个键对应的 `request_sha256` 不同 → 422 `idempotency_key_reused`。
    - **`request_sha256` 的规范化范围**：只覆盖**有效业务参数**，经 RFC 8785（JCS）规范化后计算 SHA-256。仅用于追踪的易变字段一律排除：`tool_call_id`、`run_id`、`x-a24-*` 请求 id、`Idempotency-Key` 头本身、时间戳、客户端版本。这样，同一个业务请求即使带着新的追踪 id，也不会被误报为 `idempotency_key_reused`。
-   - **`extract` 的 rerun 键**：请求体是闭集（`revision`、`schema`、`rerun`），只有业务参数，追踪字段都在请求头里；所以它的 `request_sha256` 就是整个请求体的 JCS 哈希，不再挑字段（David，2026-10-10）。
+   - **`extract` 的 `request_sha256`**：对规范化后的请求体算 JCS 哈希，`rerun` 为 false 时省略该字段（DOC-1-06b，2026-10-18）。请求体是闭集（`revision`、`schema`、`rerun`），追踪字段都在请求头里，不再挑这些追踪字段（David，2026-10-10）。显式 `rerun: false` 与省略是同一个哈希；不带 `rerun` 的旧请求哈希不变。以前若有显式发 `rerun: false` 存下的 job，这个业务键此后会一直 422（`claim()` 返回 422 前不写任何东西，哈希只在键不存在时插入，`extract/handler.rs:199-200,236-244`）；目前没有客户端显式发 `rerun: false`，所以没有存量（DOC-1-06b，2026-10-18）。
    - **授权每次都重新检查**：键命中时，先做本次调用的授权与可用性检查，再返回已有结果。幂等命中不能跳过授权。
    - 占键在 `BEGIN IMMEDIATE` 内完成，由 SQLite 单写者串行化。若仍遇到 UNIQUE 冲突（其他连接），回滚后重读该行并按命中处理。
 5. **agent 路径**：内核不重试，每次调用的 `tool_call_id` 都是新的。**两层分工**与 ADR-DOC-01 D4.3 一致：`tool_call_id` / `run_id` 只用于可信调用关联与审计（写进操作日志），**业务幂等只看上表的业务键**，DOC-1 没有传输层去重。页面遇到“结果未知”（`request_abandoned`、`upstream_timeout`）时用同一个键重发；代理不会重试 POST（`proxy.rs:1546-1556`）。
@@ -268,30 +270,31 @@
 `documents` 命名空间的错误码是**闭集**，新增需修改本 ADR。唯一的例外是下文的“OS 的意外故障”。
 
 - **信封**：沿用现有信封；每个错误都带 `details.retryable`。**客户端按 `code` 分支，不按 HTTP 状态分支**。
-- **工具路径**：映射成 `ToolError`，`code` 作为消息前缀。**任何模块响应都不得映射成 `ToolError::Cancelled`**，因为那会取消整个 run（§1）。
+- **工具路径**（DOC-1-06b，2026-10-18）：返回信封 `error{code, retryable}`，不映射成 `ToolError`，也不把 `code` 当作消息前缀。`DocumentsErrorCode` 的原码直接作 `code`。这些码不在内核码表里时，内核收成 `module_error`，原码进 `module_code`（`agent24-domain/src/tool.rs:506-521`；交给模型的 JSON 见 `agent24-tools/src/lib.rs:1017-1044`）。模型和内核审计都看不到 `details`：交给模型的错误 JSON 没有这个字段；内核模块工具审计事件也没有 `details` 槽（`agent24-store/src/module_audit_event.rs:396-414`，`deny_unknown_fields`）。**任何模块响应都不得变成 `ToolError::Cancelled`**，因为那会取消整个 run（§1）。`engine_unavailable` 原样返回，`retryable:true`。存储 `locked` / `busy` 返回原码 `storage_unavailable`，`retryable:true`；其余原因 `retryable:false`。文档模块的应答不用 `module_unavailable`：该码在内核码表里（`agent24-domain/src/tool.rs:510`），放进应答时 `module_code` 为空，和宿主侧的停用、熔断分不开；模块给出的 `retryable` 会被保留（`agent24-tools/src/lib.rs:1022,1037`）。ADR-K1-01 第 55 行讲宿主侧生命周期，第 75 行（§2.4）规定模块细分码收成 `module_error` 并保留原码。`internal` 归 `module_error`，不算结果未知（见下）（DOC-1-06b，2026-10-18）。
+  - 参数错误分两层：工具参数在模块入口按 `input_schema` 校验不过（结构层面，例如缺字段、类型不对、多出字段）返回内核码 `invalid_input`，`module_code` 为空；通过 schema、进入服务层后的业务参数错误（例如锚点不在字符边界、查询只有空白）返回 `DocumentsErrorCode` 的 `invalid_request`，内核收成 `module_error`，原码进 `module_code`。下表「参数错误」一行指后一种（DOC-1-06b，2026-10-18）。
 - **取消的 job 不是错误**：`GET /jobs/{id}` 返回 200，`status: cancelled`。`cancelled` 只出现在 `job.error.code` 里。
 
-| code | HTTP | ToolError | 说明 |
+| code | HTTP | 工具信封 code / retryable | 说明 |
 |---|---|---|---|
-| `invalid_request` | 400 | `Invalid` | 参数错误、锚点不在字符边界 |
-| `not_found` | 404 | `Invalid` | 文档、revision、job、上传不存在或已过期 |
-| `payload_too_large` | 413 | `Invalid` | 与 `http.rs:121-122` 同码 |
-| `unsupported_format` | 422 | `Invalid` | 格式不在 §17 #3 已声明的范围内 |
-| `parse_failed` | 422 | `Failed` | 解析整体失败 |
-| `partial_parse` | 422 | `Failed` | 仅在请求 `require_complete` 时报错；默认是 200 + `parse_status: partial` + 未解析区域列表（§11.7） |
-| `idempotency_key_reused` | 422 | `Invalid` | 同一个键对应了不同的请求 |
-| `change_set_incomplete` | 422 | `Invalid` | 还有未决定的条目 |
-| `upload_checksum_mismatch` | 422 | `Invalid` | 整个文件的哈希不符 |
-| `knowledge_disabled` | 422 | `Failed` | 用户关闭了知识；required 类操作暂停（§9.1） |
-| `revision_conflict` | 409 | `Failed` | `details.current_revision` |
-| `change_set_stale` | 409 | `Failed` | change set 在客户端读取之后被重新 review 过 |
-| `change_set_committed` | 409 | `Failed` | change set 已冻结；`details.revision` |
-| `upload_offset_mismatch` | 409 | `Invalid` | `details.received_offset` |
-| `stale_index` | 409 | `Failed` | 仅在请求 `require_fresh` 时报错；默认在结果里标出索引的 revision（§7） |
-| `permission_denied` | 403 | `Denied` | OS 侧拒绝 |
-| `knowledge_unavailable` | 503 | `Failed` | `retryable: true` |
-| `engine_unavailable` | 503 | `Failed` | `details.engine`；`retryable: true` |
-| `storage_unavailable` | 503 | `Failed` | `data_dir` 或 DB 不可用；与知识关闭是不同状态。`details.cause` 说明原因；`retryable` **按原因定**（见表下说明） |
+| `invalid_request` | 400 | `invalid_request` / `false` | 参数错误、锚点不在字符边界 |
+| `not_found` | 404 | `not_found` / `false` | 文档、revision、job、上传不存在或已过期 |
+| `payload_too_large` | 413 | `payload_too_large` / `false` | 与 `http.rs:121-122` 同码。单条超过工具字节预算也用这一码，不用内核码 `response_too_large`（见 §4「分页」） |
+| `unsupported_format` | 422 | `unsupported_format` / `false` | 格式不在 §17 #3 已声明的范围内 |
+| `parse_failed` | 422 | `parse_failed` / `false` | 解析整体失败 |
+| `partial_parse` | 422 | `partial_parse` / `false` | 仅在请求 `require_complete` 时报错；默认是 200 + `parse_status: partial` + 未解析区域列表（§11.7） |
+| `idempotency_key_reused` | 422 | `idempotency_key_reused` / `false` | 同一个键对应了不同的请求 |
+| `change_set_incomplete` | 422 | `change_set_incomplete` / `false` | 还有未决定的条目 |
+| `upload_checksum_mismatch` | 422 | `upload_checksum_mismatch` / `false` | 整个文件的哈希不符 |
+| `knowledge_disabled` | 422 | `knowledge_disabled` / `false` | 用户关闭了知识；required 类操作暂停（§9.1） |
+| `revision_conflict` | 409 | `revision_conflict` / `false` | REST 的 `details.current_revision` |
+| `change_set_stale` | 409 | `change_set_stale` / `false` | change set 在客户端读取之后被重新 review 过 |
+| `change_set_committed` | 409 | `change_set_committed` / `false` | change set 已冻结；REST 的 `details.revision` |
+| `upload_offset_mismatch` | 409 | `upload_offset_mismatch` / `false` | REST 的 `details.received_offset` |
+| `stale_index` | 409 | `stale_index` / `false` | 仅在请求 `require_fresh` 时报错；默认在结果里标出索引的 revision（§7） |
+| `permission_denied` | 403 | `permission_denied` / `false` | OS 侧拒绝；授权结束时仍在途的工具调用也回此码（§7）。此码在内核码表里（`agent24-domain/src/tool.rs:509`），内核保留它，`module_code` 为空 |
+| `knowledge_unavailable` | 503 | `knowledge_unavailable` / `true` | `retryable: true` |
+| `engine_unavailable` | 503 | `engine_unavailable` / `true` | REST 是 `engine_unavailable`，`details.engine`，`retryable: true`。工具路径原样返回这一码，`retryable:true`（DOC-1-06b，2026-10-18） |
+| `storage_unavailable` | 503 | 见下 | `data_dir` 或 DB 不可用；与知识关闭是不同状态。REST 的 `details.cause` 说明原因；`retryable` **按原因定**（见表下说明） |
 
 **`storage_unavailable` 的 `retryable`**（David，2026-10-08，回应 #803 评审）：不像 `engine_unavailable` / `knowledge_unavailable` 那样固定为 `true`，而是由 OS 按原因决定。这是有意的不对称，不要统一改成 `true`。
 
@@ -304,9 +307,11 @@
 
 界面对 `retryable: false` 的情况给出处理提示，不自动重试。
 
-**OS 的意外故障：共用内核码的唯一例外**：失败既不在上表、也不是存储不可用（例如数据库约束被触发，说明 OS 自身有 bug）时，OS 自己返回 500，用内核通用信封的 `internal` 码，`details.retryable: false`。这是唯一一个由 OS 产生、却不在本命名空间闭集里的码；OpenAPI 中 documents 路由的 500 响应和 `ModuleProxyError` 的说明里都注明了这一点。
-- 工具路径映射成 `ToolError::Failed`，`internal` 作为消息前缀；
-- 不自动重试；结果未知，用户重试时按下面的“默认规则”用同一个键重发。
+工具路径（DOC-1-06b，2026-10-18）：`locked` / `busy` 返回原码 `storage_unavailable`，`retryable:true`；`corrupt` / `not_writable` / `disk_full` 仍用原码 `storage_unavailable`，`retryable:false`（内核收成 `module_error`，原码进 `module_code`）。文档模块的应答不用 `module_unavailable`。
+
+**OS 的意外故障：`internal` 仍是不在本命名空间闭集里的唯一一个码**：失败既不在上表、也不是存储不可用（例如数据库约束被触发，说明 OS 自身有 bug）时，OS 自己返回 500，用内核通用信封的 `internal` 码，`details.retryable: false`。这个码仍是唯一一个由 OS 产生、却不在本命名空间闭集里的码，但有两种场景。OpenAPI 中 documents 路由的 500 响应和 `ModuleProxyError` 的说明里都注明了意外故障这一点（DOC-1-06b，2026-10-18）。
+- 工具路径上同一个码靠 `retryable` 区分：意外故障返回 `error{code:"internal", retryable:false}`；模块自身处理超出预算时返回 `error{code:"internal", retryable:true}`。两者都不是结果未知。`internal` 不在内核码表里，内核收成 `module_error`，`module_code` 都是 `internal`。不按下面的“默认规则”当未知重发（DOC-1-06b，2026-10-18）。
+- 意外故障不自动重试（超出处理预算的 internal 带 retryable:true，见上）。（DOC-1-06b，2026-10-18）
 
 **会看到但不属于本命名空间的内核 / 代理码**：
 
@@ -316,14 +321,14 @@
   - `upstream_unavailable`：它在 `proxy.rs:1587` 表示“未发出”，在 `:1731` 表示“响应中途断了”，无法区分，按未知处理；
   - `upstream_response_too_large`：模块可能已经执行；
   - `module_panicked`、`module_killed`、`stop_failed`。
-- **默认规则**：未列出的码一律按“结果未知”处理，用同一个键重发。
-- **内核工具代理产生**：`module_unavailable`（D4.4）。
+- **默认规则**：未列出的码一律按“结果未知”处理，用同一个键重发。这只适用于页面和 REST 客户端。工具路径上模型看 `module_code` 和 `result_unknown`（本节工具路径；交给模型的 JSON 见 `agent24-tools/src/lib.rs:1017-1044`）（DOC-1-06b，2026-10-18）。
+- **内核工具代理产生**：模块停用、退避、熔断、未运行时的 `module_unavailable`（D4.4）。停用、draining、未运行走 `generation`（`agent24d/src/module_tool_runtime.rs:39-49`）的 `ModuleToolCallError::ModuleUnavailable`，`retryable` 为 `false`，来自 `agent24-tools/src/lib.rs:1033-1034`。`unavailable()`（`:54-60`）只被 `check_available`（`:71-76`）用于操作不在登记集合，同样是 `module_unavailable`、`retryable:false`。文档模块不返回这个码（DOC-1-06b，2026-10-18）。
 
 ## 7. Job
 
 - **`jobs` 表**：`job_id`（`job_` + ULID）、`kind`、`document_id`、`revision`、`status`（`queued / running / cancelling / succeeded / failed / cancelled / interrupted`）、`attempt`、`progress {stage, done, total, unit}`、`error {code, message}`、`result_ref`、`origin`、时间戳；经键表与幂等键关联（§5.4）。
 - **键命中时**：`queued` / `running` → 返回该 job；`succeeded` → 返回结果；`failed` / `interrupted` → **自动重新启用**（同一个 `job_id`，`attempt + 1`，回到 `queued`）。**`cancelled` 不会因键命中而重启**，返回原 job 及其 `cancelled` 状态，只能由用户显式调用 `POST /jobs/{id}/retry` 重启。这样，内容推导的键（例如 agent 调用 `extract` / `export`）不会悄悄撤销用户的取消。`POST /jobs/{id}/retry` 是同一动作的显式形式。
-- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具调用最多等 manifest 声明的 `inline_wait_ms`（**严格小于**注册的超时，至少留 5 s 余量），到期返回 `{job_id, status}`，agent 用 `documents.job.get` 查询。
+- **期限**：启动型操作只做校验、占键、写 job 行，立即返回 202 `{job_id}`。工具路径上，`inline_wait_ms` 是同步等待的期限：内核用 `tokio::time::timeout(inline_wait, …)` 包住对模块的调用，超时记 `result_unknown`（`agent24-tools/src/lib.rs:868-884`）。`timeout_ms` 是整次调用的外层硬上限，同时也是发给模块的 HTTP 期限（`module_tool_runtime.rs:108-110`）。`ModuleTool::timeout()` 返回 `timeout_ms`（`:679-680`），`run_budgeted`（`:1486-1542`）从派发前的审计和同意检查算起包住整次调用；到点先取消，再等 5 s，仍未结束就调中断钩子 `ModuleTool::audit_interrupted_with_invocation`（`agent24-tools/src/lib.rs:703-767`）；`:1537` 的 `unknown_module_outcome("timeout")` 只在钩子返回 `None` 时才走到。主路径上（没有已落库终态、审计正常，钩子得到 `AppendedUnknown` / `NotFound`）模型看到 `code:"result_unknown"`、`retryable:false`、`result_unknown:true`（`:1047-1050`）；钩子在拿锁、构造时间戳或追加审计时失败会返回 `Err`（`:715-718,745,767`），钩子返回 `Err` 或超过 5 s 时，`run_budgeted` 给出 `code:"module_tool_audit_degraded_result_unknown"`（`:1538-1540`）；终态已落库（`InterruptedTerminalOutcome::Existing`）时还原那个终态：`Success` 返回 `{"completed":true,"response_available":false}`（`:756-762`），其他终态经 `persisted_terminal_error`（`:763-765,906-926`）还原成原来的错误码（可能是 `timeout`、`cancelled`、`permission_denied`、`module_error`、`result_unknown`）（DOC-1-06b，2026-10-18）。取值来自 manifest（`agent24d/src/server.rs:1634-1635`）。正常情况下先到 `inline_wait`。模块自身处理预算严格小于 `inline_wait_ms` 并留余量（`inline_wait_ms=25000` 时预算 20000）。模块自身处理超出预算时返回 `error{code:"internal", retryable:true}`（`module_code` 为 `internal`）。不用 `timeout`：`timeout` 是内核码（`agent24-domain/src/tool.rs:513`），模块返回它时 `module_code` 为空，模型会把它当成宿主侧的超时（终态已落库时还原出的宿主超时也是 `timeout`），含义混淆（DOC-1-06b，2026-10-18）。`documents.extract` 不等待抽取任务完成，只提交或重放后立即返回 `completed{payload:{status, job_id}}`（没有 `extraction_id`，见 §4 表格下方）（DOC-1-06b，2026-10-18）。
 - **完成**：结果行与 `status = succeeded` 在**同一个事务**里写入。
 - **取消**：`POST /jobs/{id}/cancel` 幂等。`running` 置 `cancelling`，工作线程在阶段边界检查，终止引擎子进程，丢弃没有提交的输出；没有工作线程在跑的 `queued` / `failed` / `interrupted` 直接置 `cancelled`，带 `cancelled` 标记（`failed` 原有的错误码被它替换），之后键命中也不会复活；其余状态不变。结果事务已提交的 job 保持 `succeeded`；commit job 一旦进入 `BEGIN IMMEDIATE` 就不可取消。
 - **崩溃恢复**：OS 启动时 `running` → `interrupted`，`queued` 也 → `interrupted`（进程重启后已没有处理它的工作线程；否则按键命中规则它会一直停在 `queued`），`cancelling` → `cancelled`（结果与状态同事务，此时必然没有已提交的输出）；清理 `tmp/` 与 `blobs/tmp/`。**不自动续跑**：下一次带同一个键的调用重新启用 job，确定性 job 从最后完成的阶段续做。
@@ -334,6 +339,14 @@
   - 事件只是提示，**job 行才是权威**；断线后用 `GET /jobs/{id}` 对账。
   - **payload 结构**（#705）：见 `openapi.yaml` 的 `DocumentsJobProgressEvent`、`DocumentsJobFinishedEvent`、`DocumentsDocumentImportedEvent`、`DocumentsRevisionCommittedEvent`；字段是闭集，客户端仍忽略不认识的 kind 与字段。`job.finished` 带 `attempt` 与 `error_code`（取值同 job 的 `error.code`）；启动恢复置为 `interrupted` / `cancelled` 的 job 也发一次（尽力而为，受同样的限流，最多 256 条；David 确认，2026-10-10）。
 - **agent run 取消**：内核目前不会通知模块。run 取消后 job 继续运行，结果保留（Q7）。
+- **授权结束**（K1-06a-grant-path §2.5、§2.5.1，DOC-1-37/38/39）：内核撤销、到期、替换授予或推进启用纪元时发 `POST _a24/authorization/revoked` `{operation, revoked_at, reason, authorization_refs}`，`operation` 为 `"*"` 表示整个模块。
+  - **按引用停**（DOC-1-39）：`authorization_refs` 是这次结束的授予引用。带了它，不论 `operation` 是什么，带引用的工作只停引用在集合里的；新授予下的工作照常。没带引用的工作（调用上下文没有 `authorization_ref`、`job_acceptances` 的引用为 NULL）无从归属，按 `operation` 停，引用集合为空时也一样（David 定，2026-10-26；Codex 主张空集合时不停）。通知没带 `authorization_refs` 时（缺省或 `null`），全部按 `operation` 停。空数组不等于没带：空数组不停任何带引用的工作。
+  - **失效引用**：收到的引用记在内存里，进程内有效，和登记在途调用用同一把锁。之后带这些引用的调用在入口直接回 `permission_denied`；在途的同样回 `permission_denied`。只在本进程内拒：重启时在途的工作由启动恢复结束（下面「按调用归属」）；重启之后带已结束引用的调用，模块已不认得，靠内核不再签发已结束的授予、也不把调用发给换过的模块运行（K1-06a §2.5.1）。引用集合与按操作名的结束计数都只增不减、没有上限：引用的数量受内核签发授予的速度限制，计数的键是模块声明的操作名；要长年常驻时再加上限或淘汰（#1234 F3、#1213）。引用为空串或超过 256 字节、`authorization_refs` 不是字符串数组，回 400。
+  - **在途调用**：模块先记下这次结束，再停其余工作。通知到达时仍在途的该操作调用，不论查到什么，都回 `permission_denied`（`retryable:false`），不给内容；应答等这些调用都结束（`extract` 的 claim 任务结束才算）。已经通过这道检查、正在写回应答的调用照常回答，相当于构建「pin 已开始」；检查和退出在途登记在同一把锁里，所以之后的结束也不再等它。通知之后开始的调用，只有带着已结束引用的才被拒（上一条）；按操作名的结束不拒之后的调用，免得误拒新授予下的。
+  - **按调用归属，不按时间**：工具调用接受（新建、重排或命中在途）一个 job attempt 时，在 claim 的同一事务里记一行 `job_acceptances`（操作、`authorization_ref`、run 与调用 id）。通知在写锁下找出该操作接受过的、job 当前那次 attempt，等待期间每轮重扫（在途调用的 claim 可能在通知之后才提交），直到某一轮开始时结束之前开始的调用都已退出：这一轮扫完，它们的 claim 都已在内，之后不再取写锁、只等已找出的 attempt；之后才接受的 attempt 不归这次通知。找到的 attempt：`queued` 直接置 `cancelled`（`message` 为 `cancelled: its authorization ended`），`running` 置 `cancelling` 并记入 `job_revocations`，worker 到安全点结算成 `cancelled` 时 `message` 同样是这句，结算前重启的由启动恢复结算，也是这句（用户取消仍是 `cancelled by the user`，重启前没结算的是 `cancelled before a restart`）。页面自己的 job、只被更早 attempt 接受过的 job 不受影响（当前 attempt 是用户自己的重试）。
+  - **文本层构建**：该操作的工具调用请求过的构建先中止（不碰存储）；该操作接受过的任一 attempt（含已结束的、被重试取代的）请求过的构建也中止，等待期间每轮重扫，attempt 停下前新请求的构建同样中止。这些构建一并中止，页面也在等的也中止（宁可多停），页面拿到可重试的 `engine_unavailable`。中止停在安全点：等引擎时立刻停（与拿到引擎同时就绪时停优先），解析中丢掉解析（引擎子进程被杀），解析刚结束、哪怕解析失败也停，查到别处刚 pin 好的层也不交出；写存储开始后不再中止。
+  - **宁可多停的范围**：带引用的通知按引用归属构建和 job（工具调用请求的构建带上调用的引用，job 按 `job_acceptances` 的引用）。一个构建被几方共用时，任何一方的授予结束都会停掉它；一个 attempt 被几次调用接受过时，任何一次的授予结束都会取消它。不带引用的通知仍按操作名，会停掉新授予下的工作。
+  - **应答**：8 秒内在途调用都结束、这些 attempt 都离开 `queued`/`running`/`cancelling`、构建都结束，回 204；否则回 503，内核记为「停止未确认」。8 秒也限住存储：写锁拿不到同样回 503。正在进行的模型调用不会被打断，所以运行中的抽取常常在 8 秒内停不下来，回 503 是如实的。
 
 ## 8. 可用性与发现（README §10.3）
 
@@ -350,7 +363,7 @@
 
 - `knowledge.state` 沿用 README §9.2 的六种状态。DOC-1 没有 required 类操作，所以只报告，不阻塞。
 - `reason` 取自 §6 的闭集。
-- **内核按这些数据过滤工具通告属于 Q7 的内核依赖**，目前不存在。在它落地前，工具照常通告，调用时返回类型化错误。
+- **内核按这些数据过滤工具通告属于 Q7 的内核依赖**，目前不存在。在它落地前，工具照常通告，调用时返回类型化错误。落地时 `/capabilities` 不改名，内核按 DOC-1-06b §3.1 的映射过滤：`list`、`get`、`read_range`、`find`、`extract` 同名，`job_get` 与 `extraction_get` 都看 `job`（`extraction_get` 只要求存储：`get_extraction` 的参数是 `Ready(storage)`，`extractions.rs:120-121`；`extract` 是 `Needs::Model`，`lib.rs:105,148`）。`SLICE1_OPERATIONS` 是 `job`、`extract` 等，没有 `job_get`、`extraction_get`（`agent24-documents/src/lib.rs:96-106`）（DOC-1-06b，2026-10-18）。
 
 ## 9. 待决事项
 
@@ -362,7 +375,7 @@
 | Q4 | agent 能否导入文件 | **已定（David，2026-10-07）**：DOC-1 不能，只从页面经原生文件对话框导入；以后可在审批下开放 | David |
 | Q5 | agent 能否在用户确认后 commit | **已定（David，2026-10-07）**：DOC-1 没有 commit 工具，agent 只读和提议；review / commit 只在页面、diff 可见时进行；对话内确认提交以后可在审批下加入 | David |
 | Q6 | 偏移单位用 UTF-8 字节（§3） | 接受 | David |
-| Q7 | 内核工具 ADR 需要提供：结构化工具错误码、工具调用的取消信号、按 `/capabilities` 过滤工具通告、`inline_wait_ms` 声明 | 写入 C 的内核 ADR 需求 | jason / Agent24 kernel |
+| Q7 | 内核工具 ADR 需要提供：结构化工具错误码、工具调用的取消信号、按 `/capabilities` 过滤工具通告、`inline_wait_ms` 声明。过滤时 `/capabilities` 不改名，按 DOC-1-06b §3.1 的映射（`job_get`→`job`，`extraction_get`→`job`，只要求存储）（DOC-1-06b，2026-10-18） | 写入 C 的内核 ADR 需求 | jason / Agent24 kernel |
 | Q8 | `partial_parse` / `stale_index` 何时作为结果状态、何时作为错误 | 默认作为结果状态，只在显式要求时报错 | David |
 | Q9 | 是否向 agent 通告 `job.cancel` / `job.retry` | DOC-1 不通告；如果通告，按 `WriteLocal` 处理，且只能操作同一个 run 启动的 job | David |
 | Q10 | commit 的内联预算（5 s）和 `inline_wait_ms` 的取值 | 先按 5 s，等第 2 片的 DOCX/PDF 实测后再调 | David |
@@ -380,5 +393,5 @@
 - 图片几何：1 像素记为 1 点，先按 EXIF 方向显示（§3）。
 - 每个抽取值最多 16 个锚点（`DocumentsEvidence`、`anchors`），冲突的候选最多 8 个。
 - `GET text` 同时给 `block` 和 `cursor` 是 400（游标已带位置）。
-- 抽取的 rerun 键被复用时，比较整个请求体的 JCS 哈希，不同就是 422 `idempotency_key_reused`（与上传、导入一致，§5.4）。
+- 抽取的 rerun 键被复用时，比较整个请求体的 JCS 哈希，不同就是 422 `idempotency_key_reused`（与上传、导入一致，§5.4）。规范化：`rerun` 为 false 时先省略再哈希（§5，DOC-1-06b，2026-10-18）。
 - 抽取的业务键去掉 `model_id`：内核路由器在调用时才选模型，事先问不到；实际模型记在结果里，换模型用 rerun（§5.4，#863）。
