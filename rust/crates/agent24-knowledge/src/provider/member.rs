@@ -133,15 +133,22 @@ impl<I: Ids> Member<I> {
         Some((left, retired.create))
     }
 
-    /// A `loading` round's issuance, as [`super::binding::BindingState::issue`].
-    pub fn issue(&mut self) -> Option<Issuance> {
-        match self.profile.slot_mut() {
-            Slot::Bound(binding) => binding.issue(),
-            Slot::Placeholder(_) => None,
-        }
+    /// A `loading` round's issuance, as [`super::binding::BindingState::issue`],
+    /// with the binding it is for.
+    pub fn issue(&mut self) -> Option<(Of<I>, Issuance)> {
+        let binding = self.binding.clone()?;
+        let Slot::Bound(state) = self.profile.slot_mut() else {
+            return None;
+        };
+        let of = Of {
+            profile: self.id.clone(),
+            binding,
+        };
+        Some((of, state.issue()?))
     }
 
-    /// S3.1: the issuer's answer to `ticket`, with what it persists into
+    /// S3.1: the issuer's answer to `ticket` for `of`, ignored unless `of` is
+    /// still this member's binding; with what it persists into
     /// `left`: the placeholder rule and the generation it invalidated to, as
     /// [`Member::leave`]; a reason entered that never retries by itself
     /// (`Stuck`, S1.4); the first revocation-class event, which ends the
@@ -149,20 +156,17 @@ impl<I: Ids> Member<I> {
     /// principal: S3.5 for the caller.
     pub fn issued(
         &mut self,
+        of: Of<I>,
         ticket: Issuance,
         answer: Issued,
         now: Instant,
         left: &mut Left<I>,
     ) -> bool {
-        let Some(binding_id) = self.binding.clone() else {
+        if of.profile != self.id || self.binding.as_ref() != Some(&of.binding) {
             return false;
-        };
+        }
         let Slot::Bound(state) = self.profile.slot_mut() else {
             return false;
-        };
-        let of = Of {
-            profile: self.id.clone(),
-            binding: binding_id,
         };
         let phase = state.connection().phase();
         let revoked = state.credentials().revoked_before();

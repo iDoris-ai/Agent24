@@ -45,8 +45,8 @@ fn before() -> Vec<Record<T>> {
 }
 
 fn answer(host: &mut H, answer: Issued) -> Output<T> {
-    let ticket = host.issue(&"a").unwrap();
-    host.issued("a", ticket, answer, Instant::now())
+    let (of, ticket) = host.issue(&"a").unwrap();
+    host.issued(of, ticket, answer, Instant::now())
 }
 
 fn stuck(cause: StuckCause) -> C {
@@ -184,12 +184,37 @@ fn an_unreachable_issuer_writes_nothing() {
 #[test]
 fn an_answer_out_of_its_round_changes_nothing() {
     let mut host = host();
-    let ticket = host.issue(&"a").unwrap();
+    let (of, ticket) = host.issue(&"a").unwrap();
     host.disable("a");
     confirmed(&mut host);
-    let out = host.issued("a", ticket, Issued::Revoked, Instant::now());
+    let out = host.issued(of, ticket, Issued::Revoked, Instant::now());
     assert_eq!(out, Output::default());
     assert!(host.take_write().is_none());
+}
+
+/// S3.1, credential ownership: a new binding numbers its rounds afresh, so
+/// an answer to the retired one's issuance, the same ticket, is not its own.
+#[test]
+fn an_answer_for_a_retired_binding_is_not_the_new_ones() {
+    let mut host = host();
+    let (old, ticket) = host.issue(&"a").unwrap();
+    let created = super::super::Created {
+        binding: 9,
+        identity: "id2",
+        principal: "alice",
+    };
+    host.identity_changed("a", IdentityChange::Instance, Some(created));
+    confirmed(&mut host);
+    confirmed(&mut host);
+    let (new, again) = host.issue(&"a").unwrap();
+    assert_eq!((new.clone(), again), (of("a", 9), ticket));
+    let out = host.issued(old, ticket, Issued::Revoked, Instant::now());
+    assert_eq!(out, Output::default());
+    assert!(host.take_write().is_none());
+    assert_eq!(phase(&host, "a"), Some(ConnectionPhase::Loading));
+    host.issued(new, again, Issued::Revoked, Instant::now());
+    let revoked = unavailable(UnavailableCause::AccessRevoked);
+    assert_eq!(phase(&host, "a"), revoked);
 }
 
 /// S3.5: granted for another principal, the binding is retired awaiting the
