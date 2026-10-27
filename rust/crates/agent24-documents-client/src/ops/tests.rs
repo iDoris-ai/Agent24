@@ -501,6 +501,23 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
             ],
             &PNG[..8],
         ),
+        // A first chunk that is not IHDR, or not 13 bytes long.
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("documents-render-scale", "1"),
+            ],
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIDAT".as_slice(),
+        ),
+        (
+            200,
+            vec![
+                ("content-type", "image/png"),
+                ("documents-render-scale", "1"),
+            ],
+            b"\x89PNG\r\n\x1a\n\0\0\0\x0cIHDR".as_slice(),
+        ),
         (
             200,
             vec![
@@ -533,24 +550,44 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
         br#"{"error":{"code":"not_found","message":"no such page"}}"#,
     ));
     assert_eq!(call(&render, &missing).await.code(), Some("not_found"));
-    // A scale asked for bounds the one the OS answers with.
-    let refused = |asked: f64, used: &str| {
-        let req = json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 1, "scale": asked});
+    // A scale asked for bounds the one the OS answers with, from 0.25 up;
+    // none asked is 1. The page is a whole file: more than its header.
+    let answer = |asked: Option<f64>, used: &str| {
+        let mut req = json!({"op": "renderPage", "documentId": DOC, "revision": 1, "page": 1});
+        if let Some(asked) = asked {
+            req["scale"] = json!(asked);
+        }
+        let body = [PNG, b"\0\0\0\x01rest of the page"].concat();
         let reply = page_reply(
             200,
             &[
                 ("content-type", "image/png"),
                 ("documents-render-scale", used),
             ],
-            PNG,
+            &body,
         );
-        async move { call(&req, &Answers(reply)).await.code() == Some("invalid_response") }
+        async move { call(&req, &Answers(reply)).await }
     };
-    assert!(!refused(0.25, "0.25").await);
-    assert!(!refused(4.0, "4").await);
-    assert!(!refused(2.0, "1.5").await);
-    assert!(refused(0.25, "0.5").await);
-    assert!(refused(2.0, "2.5").await);
+    for (asked, used) in [
+        (Some(0.25), "0.25"),
+        (Some(4.0), "4"),
+        (Some(2.0), "1.5"),
+        (None, "1"),
+        (None, "0.25"),
+    ] {
+        let res = answer(asked, used).await;
+        assert!(res.is_ok(), "{asked:?} {used}: {res:?}");
+    }
+    for (asked, used) in [
+        (Some(0.25), "0.5"),
+        (Some(2.0), "2.5"),
+        (Some(0.25), "0.1"),
+        (None, "1.5"),
+        (None, "0.2"),
+    ] {
+        let res = answer(asked, used).await;
+        assert_eq!(res.code(), Some("invalid_response"), "{asked:?} {used}");
+    }
     // A JSON operation never takes a PNG for its resource.
     let get = call(&json!({"op": "get", "documentId": DOC}), &ok).await;
     assert_eq!(get.code(), Some("invalid_response"));
