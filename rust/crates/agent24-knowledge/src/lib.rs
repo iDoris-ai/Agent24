@@ -16,6 +16,7 @@
 //!
 //! For the transport, its HTTP implementation and the Mock, see `transport.rs`,
 //! `http.rs` and `mock.rs`; for the Provider's state, `provider/` (KB-C1-04);
+//! for how the Provider decodes what the server sends, `received.rs`;
 //! for what the model reads back from the Knowledge tools, `tool/` (KB-C1-05).
 
 mod capabilities;
@@ -27,6 +28,7 @@ mod mock;
 pub mod provider;
 mod read;
 mod ready;
+pub mod received;
 mod search;
 pub mod tool;
 mod transport;
