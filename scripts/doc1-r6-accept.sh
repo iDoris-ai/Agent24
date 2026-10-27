@@ -17,19 +17,20 @@
 # --old, sqlite3 too (M4 reads the migrations, which have no product entry).
 set -uo pipefail
 export LC_ALL=C
-cd "$(dirname "$0")/.."
-REPO=$(pwd)
-
+# Relative paths are the caller's: taken from where it ran, before the cd.
+abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
 BIN="" OLD="" WORK=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --bin) BIN=$2; shift 2 ;;
-    --old) OLD=$2; shift 2 ;;
-    --work) WORK=$2; shift 2 ;;
+    --bin) BIN=$(abs "$2"); shift 2 ;;
+    --old) OLD=$(abs "$2"); shift 2 ;;
+    --work) WORK=$(abs "$2"); shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$BIN" ] || { sed -n 2,17p "$0" >&2; exit 2; }
+cd "$(dirname "$0")/.."
+REPO=$(pwd)
 for b in agent24 agent24d agent24-documents; do
   [ -x "$BIN/$b" ] || { echo "missing binary: $BIN/$b" >&2; exit 2; }
   [ -z "$OLD" ] || [ -x "$OLD/$b" ] || { echo "missing binary: $OLD/$b" >&2; exit 2; }
@@ -91,7 +92,10 @@ settle() {
   echo "$st"
 }
 # The daemon this run started is stopped however the run ends.
+# C1 makes blobs/tmp read-only for a while: an interrupted run puts it back,
+# or the work dir cannot be removed.
 cleanup() {
+  [ -n "${TMPBLOBS:-}" ] && chmod u+w "$TMPBLOBS" 2>/dev/null
   [ -s "$AGENT24_DATA_DIR/daemon.json" ] || return 0
   limit 30 "$BIN/agent24" daemon stop > /dev/null 2>&1 && return 0
   local pid; pid=$(jq -r .pid "$AGENT24_DATA_DIR/daemon.json" 2>/dev/null)
@@ -165,7 +169,7 @@ check U5 "a text file: unsupported_format, not retryable, exit 1" \
 
 printf '{"base":"http://127.0.0.1:%s","token":"%s","path":"%s"}' "$PORT" "$TOKEN" "$SMALL" \
   | limit 120 "$BIN/agent24" documents import --host-stdin --json > "$WORK/u6.out" 2>/dev/null; rc=$?
-check U6 "--host-stdin --json (the desktop's way): the same job" "$(is "$rc/$(last "$WORK/u6.out" '.data.job_id')" "0/$JOB1")" "rc=$rc; $(tail -n 1 "$WORK/u6.out" | cut -c1-100)"
+check U6 "--host-stdin --json (the desktop's way): the same job" "$(is "$rc/$(last "$WORK/u6.out" '.data.job_id')" "0/${JOB1:-no job from U1}")" "rc=$rc; $(tail -n 1 "$WORK/u6.out" | cut -c1-100)"
 
 printf '{"base":"http://127.0.0.1:%s","token":"wrong","path":"%s"}' "$PORT" "$SMALL" \
   | limit 120 "$BIN/agent24" documents import --host-stdin > /dev/null 2> "$WORK/u7.err"; rc=$?
@@ -245,9 +249,10 @@ cp "$OTHER" "$WORK/other-copy.pdf"; printf ' ' >> "$WORK/other-copy.pdf"
 a24 documents import "$WORK/other-copy.pdf" > "$WORK/c1b.out" 2>/dev/null; JOBC=$(job_of "$WORK/c1b.out")
 stf=$(settle "$JOBF"); stc=$(settle "$JOBC")
 a24 documents job "$JOBF" --json > "$WORK/c1.json" 2>/dev/null
+a24 documents job "$JOBC" --json > "$WORK/c1b.json" 2>/dev/null
 chmod 700 "$TMPBLOBS"
-check C1 "the blob store not writable: the import fails, storage_unavailable" \
-  "$(is "$stf/$stc/$(last "$WORK/c1.json" '"\(.data.error.code)/\(.data.attempt)"')" failed/failed/storage_unavailable/1)" \
+check C1 "the blob store not writable: both imports fail, storage_unavailable" \
+  "$(is "$stf/$stc/$(last "$WORK/c1.json" '"\(.data.error.code)/\(.data.attempt)"')/$(last "$WORK/c1b.json" '"\(.data.error.code)/\(.data.attempt)"')" failed/failed/storage_unavailable/1/storage_unavailable/1)" \
   "$JOBF $stf, $JOBC $stc; $(last "$WORK/c1.json" .data.error.message)"
 
 a24 documents retry "$JOBF" > "$WORK/c2.out" 2>&1; rc=$?
@@ -264,7 +269,13 @@ st=$(settle "$JOBC")
 check C4 "retry a cancelled job: it runs again and succeeds" "$(is "$rc/$st" 0/succeeded)" "rc=$rc; $(one "$WORK/c4.out"); $st"
 
 a24 documents list --json > "$WORK/c5.out" 2>/dev/null; rc=$?
-check C5 "list: the two retried imports are documents now" "$(is "$rc/$(last "$WORK/c5.out" '.data.documents | length')" 0/4)" "rc=$rc; documents=$(last "$WORK/c5.out" '.data.documents | length')"
+retried=0
+for j in "$JOBF" "$JOBC"; do
+  d=$(a24 documents job "$j" --json 2>/dev/null | tail -n 1 | jq -r '.data.document_id // empty')
+  [ -n "$d" ] && last "$WORK/c5.out" '.data.documents[].document_id' | grep -qxF "$d" && retried=$((retried + 1))
+done
+check C5 "list: the two retried imports are documents now" "$(is "$rc/$(last "$WORK/c5.out" '.data.documents | length')/$retried" 0/4/2)" \
+  "rc=$rc; documents=$(last "$WORK/c5.out" '.data.documents | length'), retried ones listed: $retried"
 
 # --- T: the agent-facing tools (not in this release) -----------------------------
 code=$(curl -s -m 30 -o "$WORK/t1.out" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/tools")

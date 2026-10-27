@@ -67,7 +67,7 @@
 | U3 | `import --json`，文件超过一个分块（768 KiB） | 有一行 progress 在 786432 字节处（第二块开始发送），一共至少 3 行；最后一行是 `ok: true` 的 result |
 | U4 | 导入不存在的文件 | 退出 1，`error: file_unreadable: the file could not be read`，输出里不带路径 |
 | U5 | `import --json` 一个文本文件 | 退出 1，422 `unsupported_format`，`retryable: false` |
-| U6 | `import --host-stdin --json`（桌面端的传法） | 退出 0，与 U1 同一个 job |
+| U6 | `import --host-stdin --json`（桌面端的传法） | 退出 0，与 U1 同一个 job（U1 没拿到 job 时这条也失败） |
 | U7 | `--host-stdin` 带错的 token | 退出 1，`error: unauthorized: …` |
 | O1 | `documents capabilities` | 存储 `ready`，pdfkit 解析引擎 `ready` |
 | O2 | `documents job <U1 的 job>`，等它结束 | 一行 `import job … (succeeded)`；U3 的 job 也成功 |
@@ -83,11 +83,11 @@
 | O12 | `request '{"op":"proxy",…}'` | 退出 1，`invalid_request: not an allowed documents operation` |
 | O13 | `request --host-stdin` 带错的 token | 退出 1，`error: unauthorized: …` |
 | O14 | `documents job` 一个不存在的 id | 退出 1，`error: not_found: no such job` |
-| C1 | 把 `blobs/tmp` 设成不可写，导入两个文件 | 两个作业都是 `failed`，`storage_unavailable`，attempt 1；之后把目录改回可写 |
+| C1 | 把 `blobs/tmp` 设成不可写，导入两个文件 | 两个作业都是 `failed`，都是 `storage_unavailable`，attempt 1；之后把目录改回可写（运行被打断时，退出前也会改回） |
 | C2 | `documents retry` 第一个作业 | 退出 0，第 2 次尝试成功，`error` 清空 |
 | C3 | `documents cancel` 第二个作业（失败的） | 退出 0，变成 `cancelled` |
 | C4 | `documents retry` 这个取消了的作业 | 退出 0，重新跑并成功 |
-| C5 | `documents list` | 4 个文档（重试的两个也在） |
+| C5 | `documents list` | 4 个文档，重试成功的两个作业各自的文档都在其中 |
 | T1 | `GET /api/v1/tools` | 期望里面有 documents 工具。现在列表正常返回（200，非空）但其中没有，记 KNOWN（#705：`domain-os.yml` 还没有声明 `tools:`）；补上声明后这条会变成 PASS。列表本身出错（非 200、没有列表）记 FAIL |
 | T2 | 从外部 `POST /api/v1/documents/_a24/tools/find` | 404 `not_found`：模块内部的工具路由不对外 |
 | N1 | `agent24 daemon stop`，再 `documents list` | 退出 1，说没有在跑的 daemon，并提示 `agent24 daemon start`；不会顺手起一个 |
@@ -120,7 +120,7 @@ M6 是退回旧版的已知行为，不是缺陷：r5 打不开 r6 迁移过的�
 
 ## 反面对照
 
-- 拿上一次发布的二进制（main）当 `--bin` 跑同一个脚本，确认用例真会失败。main 的 `agent24` 没有 `documents` 子命令，所以除了不依赖它的 P1、P2、T2、Z1，其余用例都应该是 FAIL。
+- 拿上一次发布的二进制（main）当 `--bin` 跑同一个脚本，确认用例真会失败。main 的 `agent24` 没有 `documents` 子命令，所以除了不依赖它的 P1、P2、T2、Z1 和 T1（列表正常返回、其中没有 documents 工具，仍是 KNOWN），其余用例都应该是 FAIL。
 - 升级用例另做一次：`--old` 也指向 r6 的二进制。这时 M1（库已经在 8）和 M6（不会被拒）应该是 FAIL。
 
 结果写在发布 PR 里。
