@@ -4,15 +4,17 @@
 //! binding connecting again. Pure: the caller writes what it is given and
 //! reports a generation back once it is confirmed persisted.
 
+use std::time::Instant;
+
 use super::binding::{Leave, WithRule};
 use super::connection::{Connection, Round};
-use super::credential::{Credentials, Effects};
+use super::credential::{Credentials, Effects, Issuance, Issued, Outcome};
 use super::evidence::Rule;
 use super::gate::{CallId, Gate};
 use super::placeholder::{Attempt, Attempted, Placeholder, Settled};
 use super::profile::{IdentityChange, Profile, Slot};
-use super::record::{Change, Ids, Of};
-use super::state::{PlaceholderFailure, Switches};
+use super::record::{Change, Ids, Of, StuckCause};
+use super::state::{ConnectionPhase, PlaceholderFailure, Switches};
 
 #[derive(Debug)]
 pub struct Member<I: Ids> {
@@ -129,6 +131,66 @@ impl<I: Ids> Member<I> {
         let mut left = Left::new(Change::Retire(of.clone()));
         record(of, retired.effects, retired.rule, &mut left);
         Some((left, retired.create))
+    }
+
+    /// A `loading` round's issuance, as [`super::binding::BindingState::issue`].
+    pub fn issue(&mut self) -> Option<Issuance> {
+        match self.profile.slot_mut() {
+            Slot::Bound(binding) => binding.issue(),
+            Slot::Placeholder(_) => None,
+        }
+    }
+
+    /// S3.1: the issuer's answer to `ticket`, with what it persists into
+    /// `left`: the placeholder rule and the generation it invalidated to, as
+    /// [`Member::leave`]; a reason entered that never retries by itself
+    /// (`Stuck`, S1.4); the first revocation-class event, which ends the
+    /// exception for good (`Revoked`). True when granted for another
+    /// principal: S3.5 for the caller.
+    pub fn issued(
+        &mut self,
+        ticket: Issuance,
+        answer: Issued,
+        now: Instant,
+        left: &mut Left<I>,
+    ) -> bool {
+        let Some(binding_id) = self.binding.clone() else {
+            return false;
+        };
+        let Slot::Bound(state) = self.profile.slot_mut() else {
+            return false;
+        };
+        let of = Of {
+            profile: self.id.clone(),
+            binding: binding_id,
+        };
+        let phase = state.connection().phase();
+        let revoked = state.credentials().revoked_before();
+        let WithRule {
+            value: outcome,
+            rule,
+        } = state.issued(ticket, answer, now);
+        match outcome {
+            Outcome::OtherPrincipal => true,
+            Outcome::Done(effects) => {
+                record(of.clone(), effects, rule, left);
+                let after = state.connection().phase();
+                if let Some(ConnectionPhase::Unavailable(cause)) = after
+                    && after != phase
+                    && let Ok(stuck) = StuckCause::try_from(cause)
+                {
+                    left.changes.push(Change::Stuck {
+                        of: of.clone(),
+                        cause: stuck,
+                    });
+                }
+                if !revoked && state.credentials().revoked_before() {
+                    left.changes.push(Change::Revoked(of));
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Whether the placeholder still creates `attempt`'s binding.

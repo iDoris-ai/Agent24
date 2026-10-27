@@ -135,6 +135,11 @@ impl Credentials {
         }
     }
 
+    /// Whether a revocation-class event ended S3.1's exception for good.
+    pub fn revoked_before(&self) -> bool {
+        self.revoked_before
+    }
+
     pub fn current(&self) -> Option<CredentialId> {
         self.current.map(|(id, _)| id)
     }
