@@ -1083,6 +1083,13 @@ mod tests {
         assert!(rows[0].tier.is_none());
     }
 
+    /// A row's `ts` `days` before now: the recorder `state_with_stub` spawns
+    /// prunes rows older than `RETENTION_MAX_AGE_DAYS` as it starts, so a
+    /// fixed date stops being returned once it is that old.
+    fn days_ago(days: u64) -> String {
+        agent24_core::util::iso8601_before(std::time::Duration::from_secs(days * 86_400))
+    }
+
     #[tokio::test]
     async fn get_timings_returns_recorded_rows_filtered_by_source_and_since() {
         let state = state_with_stub().await;

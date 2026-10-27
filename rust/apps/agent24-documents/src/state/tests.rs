@@ -165,12 +165,7 @@ async fn a_read_only_database_file_is_not_writable() {
     // the same inode, which would make the next open writable whatever the
     // mode. Copies are new inodes.
     let dir = tempfile::tempdir().unwrap();
-    for suffix in ["", "-wal"] {
-        let name = format!("{}{suffix}", crate::db::DB_FILE);
-        if made.path().join(&name).exists() {
-            fs::copy(made.path().join(&name), dir.path().join(&name)).unwrap();
-        }
-    }
+    copy_database(made.path(), dir.path(), None).await.unwrap();
     let file = dir.path().join(crate::db::DB_FILE);
     chmod(&file, 0o444);
     let privileged = {
@@ -185,6 +180,119 @@ async fn a_read_only_database_file_is_not_writable() {
     if !privileged {
         assert_eq!(got, Some(StorageCause::NotWritable));
     }
+}
+
+/// Copies `documents.db` from `from` into the empty directory `to`, as one
+/// self-contained file: a new inode in WAL mode with no sidecar files.
+///
+/// `closing`, when given, is a connection on `from` that is closed at the
+/// worst moment for the copy. It stands in for a connection that
+/// `Pool::close` returned without closing: sqlx drops it later on its worker
+/// thread, and as the last connection SQLite then checkpoints and deletes the
+/// WAL (#964 CI, `os error 2`). Copying the database and its WAL as two files
+/// cannot be made safe against that, so SQLite takes the snapshot itself:
+/// `VACUUM INTO` reads one consistent view through its own connection, WAL
+/// included, while the closing connection is no longer the last one. Every
+/// error, a missing source included, is returned.
+async fn copy_database(
+    from: &Path,
+    to: &Path,
+    closing: Option<sqlx::SqliteConnection>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(from.join(crate::db::DB_FILE))
+        .create_if_missing(false);
+    let mut source = sqlx::SqliteConnection::connect_with(&source).await?;
+    if let Some(conn) = closing {
+        conn.close().await?;
+    }
+    let target = to.join(crate::db::DB_FILE);
+    let target_name = target.to_str().ok_or("copy target is not UTF-8")?;
+    sqlx::query("VACUUM INTO ?")
+        .bind(target_name)
+        .execute(&mut source)
+        .await?;
+    source.close().await?;
+    // `VACUUM INTO` writes a rollback-journal file; make it the WAL database
+    // the application opens. This connection is the copy's only one, so its
+    // close removes the WAL and shared-memory files it made.
+    let target = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&target)
+        .create_if_missing(false);
+    let mut copy = sqlx::SqliteConnection::connect_with(&target).await?;
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+        .fetch_one(&mut copy)
+        .await?;
+    copy.close().await?;
+    if mode != "wal" {
+        return Err(format!("copy journal mode is {mode}, not wal").into());
+    }
+    Ok(())
+}
+
+/// A database whose last commit is only in its WAL, with the one connection
+/// that has it open.
+async fn database_with_a_live_wal(dir: &Path) -> sqlx::SqliteConnection {
+    let mut conn = connect(dir).await;
+    for sql in [
+        "PRAGMA journal_mode = WAL",
+        "PRAGMA wal_autocheckpoint = 0",
+        "CREATE TABLE t (x INTEGER NOT NULL)",
+        "INSERT INTO t (x) VALUES (42)",
+    ] {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    let wal = dir.join(format!("{}-wal", crate::db::DB_FILE));
+    assert!(wal.exists(), "the commit is in the WAL");
+    conn
+}
+
+#[tokio::test]
+async fn a_wal_closed_away_during_the_copy_still_gives_a_complete_database() {
+    let made = tempfile::tempdir().unwrap();
+    let last = database_with_a_live_wal(made.path()).await;
+    let dir = tempfile::tempdir().unwrap();
+    copy_database(made.path(), dir.path(), Some(last))
+        .await
+        .unwrap();
+    assert!(
+        !made
+            .path()
+            .join(format!("{}-wal", crate::db::DB_FILE))
+            .exists(),
+        "closing the last connection deleted the source WAL"
+    );
+    let mut copy = connect(dir.path()).await;
+    let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&mut copy)
+        .await
+        .unwrap();
+    assert_eq!(check, "ok");
+    let x: i64 = sqlx::query_scalar("SELECT x FROM t")
+        .fetch_one(&mut copy)
+        .await
+        .unwrap();
+    assert_eq!(x, 42, "the commit that was only in the WAL is in the copy");
+}
+
+#[tokio::test]
+async fn copying_a_database_that_is_not_there_is_an_error() {
+    let made = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    assert!(copy_database(made.path(), dir.path(), None).await.is_err());
+    assert!(!dir.path().join(crate::db::DB_FILE).exists());
+}
+
+#[tokio::test]
+async fn copying_into_a_missing_directory_is_an_error() {
+    let made = tempfile::tempdir().unwrap();
+    database_with_a_live_wal(made.path())
+        .await
+        .close()
+        .await
+        .unwrap();
+    let missing = made.path().join("missing");
+    assert!(copy_database(made.path(), &missing, None).await.is_err());
 }
 
 #[tokio::test]
