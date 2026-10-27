@@ -93,7 +93,7 @@ APP_ARCH="$(lipo -archs "$MAIN")"; D_ARCH="$(lipo -archs "$APP/Contents/Resource
 echo "主程序: $APP_ARCH   agent24d: $D_ARCH"
 [[ "$APP_ARCH" == "$D_ARCH" ]] || fail "主程序与 agent24d 架构不一致"
 if [[ -n "$WANT_ARCH" ]]; then
-  [[ "$APP_ARCH" == "$WANT_ARCH" ]] || fail "期望架构 $WANT_ARCH，实际 $APP_ARCH"
+  [[ "$APP_ARCH" == "$WANT_ARCH" ]] || fail "期望架构 ${WANT_ARCH}，实际 $APP_ARCH"
 fi
 if [[ "$TARGET" == *.dmg ]]; then
   case "$(basename "$TARGET")" in
