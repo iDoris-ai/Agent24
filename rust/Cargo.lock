@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-agent"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-core",
  "agent24-memory",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-cli"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-hw",
  "agent24-mcp",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-comm"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-comm",
  "async-trait",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-protocol",
  "rand 0.9.5",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-decide"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-hw",
  "async-trait",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-domain"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-protocol",
  "async-trait",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-hw"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-mcp"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-protocol",
  "agent24-tools",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-memory"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-core",
  "agent24-models",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-models"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-protocol",
  "async-trait",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-os-packages"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-domain",
  "agent24-os-proto",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-os-proto"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-domain",
  "agent24-os-fd",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-policy"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-core",
  "agent24-domain",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-protocol"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-scheduler"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-core",
  "agent24-protocol",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-store"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-core",
  "agent24-decide",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-tools"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-domain",
  "agent24-protocol",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "agent24-worker"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "agent24d"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent24-agent",
  "agent24-comm",
