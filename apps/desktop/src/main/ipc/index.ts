@@ -5,7 +5,7 @@ import http from 'node:http'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { getBackendEndpoint } from '../backend-manager'
-import { documentsCall, httpSender } from '../documents'
+import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
@@ -291,9 +291,8 @@ export function registerIpcHandlers(options: { idorisStatus?: () => Promise<Idor
     const endpoint = getBackendEndpoint()
     return endpoint ? { port: endpoint.port } : null
   })
-  const sendToDocuments = httpSender(getBackendEndpoint, BACKEND_HOST)
   ipcMain.handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
-    documentsCall(req, sendToDocuments),
+    documentsCall(req, getBackendEndpoint),
   )
   ipcMain.handle(IpcChannels.DocumentsImportFile, async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender)
