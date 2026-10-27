@@ -20,8 +20,8 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [0.6.0-preview.20261028.1] — 2026-10-28（预发布）
 
-**预发布（pre-release）体验版，不是 0.6.0 正式版。** 一次带入四条里程碑线，按合入 main 的顺序：
-kernel（K1 第二次发布）、documenting、weknora（Knowledge）、memory-p1。清单里的版本号统一
+**预发布（pre-release）体验版，不是 0.6.0 正式版。** 一次带入五条里程碑线，按合入 main 的顺序：
+kernel（K1 第二次发布）、memory-p1、documenting、weknora（Knowledge）、idoris（iDoris v0.3.1 接线）；另有发布前加固 #1358/#1364 和日程 tick 索引 P-13 #1381。清单里的版本号统一
 升到 `0.6.0`，`-preview.20261028.1` 只出现在 tag 和发布物文件名里（与 `v0.5.1-preview.20261016.2`
 同做法）。`agent24-os-sdk`、`agent24-os-fd`、`agent24-os-cwd`、`agent24-workspace`、
 `agent24-sidecar-host*`、`agent24-documents` 仍是各自独立的 `0.1.0` 版本线。
@@ -177,6 +177,24 @@ kernel（K1 第二次发布）、documenting、weknora（Knowledge）、memory-p
 
 **不在本次**：c3b（会话缺口接线）、c6（依赖 CORE-2 在场证明）、P1 剩余条目；kernel 的 #1277、K1-6b.5f
 系列与 #1290 修复。
+
+### idoris —— iDoris v0.3.1 接线（#1405，与 iDoris v0.3.1 联合发布）
+
+**新功能**
+- **独占本地网关**：设置 `IDORIS_URL` 和 data key（`IDORIS_API_KEY`，必须是 `idk_` 开头的 virtual key，Admin token 不行）后，所有模型调用只走 iDoris 网关。网关失败原样报错，**不回落**到 oMLX/Ollama 直连或云端（IDORIS-02a/02-04）。
+- **本地证据校验**：启动时校验 `/health` 身份（`service=idoris`、`contract_version=1.0.1`）；每个响应都校验 `X-iDoris-Served-Locality=loopback` 和 Record-Id 的格式；证据头重复或不是合法 UTF-8 一律拒绝（IDORIS-03、#1409）。
+- **回执**：chat 保留网关返回的真实 `response.model`、Record-Id 和 locality，CLI 打印 Record-Id，方便查询和报障（IDORIS-04）。每次调用单独签发 `X-iDoris-Request-Id`，准入 id 走 `X-iDoris-Trace-Id`。
+- **预算导出**：`agent24 hw idoris-env` 计算扣除 core 预留后的字节预算，交给手动启动的 iDoris（`IDORIS_ALLOCATED_BUDGET_BYTES`，IDORIS-05；手动启动步骤见 `docs/agent/IDORIS-MANUAL-BUDGET.md`）。硬件探测子进程不继承凭据（IDORIS-04b）。
+- 错误提示：401 指向 data key，403 指向 role 权限，503 `local_only_unavailable` 提示本地没有可用模型（#1420，ID-8 真机发现）。
+
+**配对与验收**：iDoris v0.3.1（tag `8e3a216`，`idoris-v0.3.1-aarch64-apple-darwin.tar.gz`，sha256 `1125301fc32f9e44d4d06e5127137ba14196a32f9274b7416a345e690b2ffea1`）。Agent24 不打包 iDoris，需要用户自己安装。ID-8 已在 M1 Max 上接真实 oMLX 0.6.4 跑通：`idoris/daily` → `Qwen3-0.6B-4bit`，locality=loopback，日志里没有 key。iDoris 侧证据见 #1370。
+
+**已知限制**
+- iDoris 的 resident 卡不带 oMLX key（iDoris#582，v0.3.2 修）；oMLX 开了认证时，role 卡请保持 `on_demand`。
+- 网关忽略 `temperature`（网关路径不发送这个字段）。
+- 服务模式（`agent24 service install`）不保存 `IDORIS_API_KEY`，只支持手动启动。
+- 共同 launcher、Admin token FD 交接、`idoris-any`、流式输出：本期都不做。
+- iDoris v0.3.2 的 502 `upstream_auth_failed` 终态映射（ID-ERR-1）下一期做。
 
 ## [0.5.1] — 2026-10-01
 

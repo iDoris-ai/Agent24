@@ -8,7 +8,7 @@
   - documenting：**已合并 main（r6，#1386，`8bba633e`）**。`ab/documenting`（#1293 的 base；store 无迁移，documents 模块自己的库 0007–0008）；
   - weknora：**已合并 main（KB-R1，#1396，`3659317d`）**。`ab/weknora`（KB-C1 / KB-HOST-01）；
   - 另：P-13（#1381，`bb3fb6d8`）已合并 main（store 0030）。
-  - idoris（第五线，#1370，**尚未合入 main**）：`ab/idoris`（Agent24 经 iDoris 网关调用本地模型；与 iDoris v0.3.1 联合发布，**待吸收 main 第二次并开 release PR**）。
+  - idoris（第五线，#1370）：release PR #1405 已合并，合并提交 `956e9009`（`ab/idoris`；Agent24 经 iDoris 网关调用本地模型，与 iDoris v0.3.1 联合发布）。ID-8 真机发现的提示问题由 #1420 修复。
 - **本清单没有实跑过**：起草时只读了各集成分支的代码、协议文件和测试，命令和断言依据代码核对，没有在五线合并后的 head 上执行（那个 head 还不存在）。第一次执行时，凡是 FAIL 先判断是用例写错还是产品错，用例写错就改本文件。「待核实」「缺口」两节列出起草时已经看到的疑点。
 
 ## 0. 规则对照（#1293）
